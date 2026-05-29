@@ -28,6 +28,10 @@ const (
 	sniSeedUser         = "postgres"
 	sniSeedPassword     = "postgres"
 	sniBogusPrefix      = "ignored-by-test"
+	// sniReportedCatalog is what current_database() returns for the
+	// DuckLake-backed 'local' org: the stable physical catalog name, not the
+	// per-connection routing dbname (see sessionmeta.ReportedDatabaseName).
+	sniReportedCatalog = "ducklake"
 )
 
 // connectWithSNI dials the control plane via port-forward, sets the TLS SNI
@@ -83,9 +87,12 @@ func TestSNI_MatchedHostnameUsesDatabaseParam(t *testing.T) {
 	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
 		t.Fatalf("SELECT current_database(): %v", err)
 	}
-	if current != sniSeedDatabaseName {
-		t.Fatalf("explicit database should be the routing database; got %q, want %q",
-			current, sniSeedDatabaseName)
+	// The 'local' org is DuckLake-backed, so current_database() reports the
+	// stable physical catalog ("ducklake"), not the routing dbname. SNI
+	// routing correctness is established by the successful connect above.
+	if current != sniReportedCatalog {
+		t.Fatalf("DuckLake-backed session should report the physical catalog; got %q, want %q",
+			current, sniReportedCatalog)
 	}
 }
 
@@ -112,9 +119,9 @@ func TestSNI_MatchedHostnameUsesSNIWhenDatabaseParamEmpty(t *testing.T) {
 	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
 		t.Fatalf("SELECT current_database(): %v", err)
 	}
-	if current != sniSeedDatabaseName {
-		t.Fatalf("resolved SNI org database should be the routing database; got %q, want %q",
-			current, sniSeedDatabaseName)
+	if current != sniReportedCatalog {
+		t.Fatalf("DuckLake-backed session should report the physical catalog; got %q, want %q",
+			current, sniReportedCatalog)
 	}
 }
 
@@ -175,8 +182,8 @@ func TestSNI_LegacyHostnameFallsThroughInPassthrough(t *testing.T) {
 	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
 		t.Fatalf("SELECT current_database(): %v", err)
 	}
-	if current != sniSeedDatabaseName {
-		t.Fatalf("legacy fallback should land us in the param-named database; got %q, want %q",
-			current, sniSeedDatabaseName)
+	if current != sniReportedCatalog {
+		t.Fatalf("DuckLake-backed session should report the physical catalog; got %q, want %q",
+			current, sniReportedCatalog)
 	}
 }

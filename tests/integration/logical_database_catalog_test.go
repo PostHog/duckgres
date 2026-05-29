@@ -45,29 +45,33 @@ func TestLogicalDatabaseCatalogMetadata(t *testing.T) {
 	mustExec(t, db, "CREATE SCHEMA IF NOT EXISTS bill")
 	mustExec(t, db, "CREATE OR REPLACE VIEW bill.logical_catalog_view AS SELECT 1 AS id")
 
-	t.Run("current_database_reports_logical_name", func(t *testing.T) {
+	// DuckLake-backed sessions report the stable physical catalog name
+	// ("ducklake"), not the connection dbname ("duckgres_catalog"). The
+	// connection dbname still resolves as a write alias (see
+	// TestLogicalDatabaseCatalogQualifiedNames).
+	t.Run("current_database_reports_physical_catalog", func(t *testing.T) {
 		var current string
 		if err := db.QueryRow("SELECT current_database()").Scan(&current); err != nil {
 			t.Fatalf("SELECT current_database(): %v", err)
 		}
-		if current != "duckgres_catalog" {
-			t.Fatalf("current_database() = %q, want %q", current, "duckgres_catalog")
+		if current != "ducklake" {
+			t.Fatalf("current_database() = %q, want %q", current, "ducklake")
 		}
 	})
 
-	t.Run("pg_database_reports_logical_name", func(t *testing.T) {
+	t.Run("pg_database_reports_physical_catalog", func(t *testing.T) {
 		var datname string
 		if err := db.QueryRow(
 			"SELECT datname FROM pg_catalog.pg_database WHERE datname = current_database()",
 		).Scan(&datname); err != nil {
 			t.Fatalf("pg_database lookup: %v", err)
 		}
-		if datname != "duckgres_catalog" {
-			t.Fatalf("datname = %q, want %q", datname, "duckgres_catalog")
+		if datname != "ducklake" {
+			t.Fatalf("datname = %q, want %q", datname, "ducklake")
 		}
 	})
 
-	t.Run("information_schema_catalog_columns_report_logical_name", func(t *testing.T) {
+	t.Run("information_schema_catalog_columns_report_physical_catalog", func(t *testing.T) {
 		checks := []struct {
 			name  string
 			query string
@@ -112,8 +116,8 @@ func TestLogicalDatabaseCatalogMetadata(t *testing.T) {
 				if err := db.QueryRow(tc.query).Scan(&catalog); err != nil {
 					t.Fatalf("%s query: %v", tc.name, err)
 				}
-				if catalog != "duckgres_catalog" {
-					t.Fatalf("%s catalog = %q, want %q", tc.name, catalog, "duckgres_catalog")
+				if catalog != "ducklake" {
+					t.Fatalf("%s catalog = %q, want %q", tc.name, catalog, "ducklake")
 				}
 			})
 		}
@@ -133,7 +137,7 @@ func TestLogicalDatabaseCatalogMetadata(t *testing.T) {
 		}
 	})
 
-	t.Run("show_databases_reports_only_logical_name", func(t *testing.T) {
+	t.Run("show_databases_reports_physical_catalog", func(t *testing.T) {
 		rows, err := db.Query("SHOW DATABASES")
 		if err != nil {
 			t.Fatalf("SHOW DATABASES: %v", err)
@@ -156,8 +160,8 @@ func TestLogicalDatabaseCatalogMetadata(t *testing.T) {
 			t.Fatalf("iterate SHOW DATABASES rows: %v", err)
 		}
 
-		if len(got) != 1 || got[0] != "duckgres_catalog" {
-			t.Fatalf("SHOW DATABASES = %v, want [duckgres_catalog]", got)
+		if len(got) != 1 || got[0] != "ducklake" {
+			t.Fatalf("SHOW DATABASES = %v, want [ducklake]", got)
 		}
 	})
 }

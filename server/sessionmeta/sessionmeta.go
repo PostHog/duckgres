@@ -59,6 +59,45 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 	return nil
 }
 
+// PhysicalDuckLakeCatalog is the physical catalog name DuckLake is attached as
+// on a worker. It is the stable, deployment-independent name that the
+// logical-catalog transform rewrites client references to.
+const PhysicalDuckLakeCatalog = "ducklake"
+
+// ReportedDatabaseName returns the client-visible catalog name to install as
+// current_database()/pg_database for a session, in precedence order:
+//
+//  1. A configured default catalog (e.g. "iceberg") wins. Such a session's
+//     connect-time search_path/USE is pointed at that catalog, so it is the
+//     catalog its queries resolve against and therefore what catalog-keyed
+//     tools must see as current_database().
+//
+//  2. Otherwise, a DuckLake-backed session reports the stable physical catalog
+//     name ("ducklake") rather than the per-connection startup dbname,
+//     regardless of tenancy. The startup dbname still works as an alias: the
+//     logical-catalog transform rewrites <dbname>.schema.table ->
+//     ducklake.schema.table and the USE rewriter maps USE "<dbname>" ->
+//     ducklake.main, while ducklake.* references resolve directly. Reporting a
+//     stable name keeps tools that key on the catalog — notably SQLMesh, which
+//     fully-qualifies every model as catalog.schema.object and persists that in
+//     its state — from treating a changed connection dbname as a brand-new
+//     warehouse (which would trigger a full rebuild). Because the name is the
+//     same across single- and multi-tenant deployments, an org graduating from
+//     a single-tenant duckling to a multi-tenant worker pod keeps the same
+//     catalog identity and does not churn.
+//
+//  3. Otherwise (no default catalog and no DuckLake attached — e.g. plain
+//     DuckDB), report the connection dbname unchanged.
+func ReportedDatabaseName(startupDatabase, defaultCatalog string, duckLakeBacked bool) string {
+	if defaultCatalog != "" {
+		return defaultCatalog
+	}
+	if duckLakeBacked {
+		return PhysicalDuckLakeCatalog
+	}
+	return startupDatabase
+}
+
 func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) (bool, error) {
 	query := fmt.Sprintf(
 		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = %s",

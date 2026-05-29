@@ -153,3 +153,64 @@ func TestInformationSchemaColumnsCompatLoadedIcebergColumnsKeepIcebergCatalog(t 
 		t.Fatalf("loaded Iceberg columns should not use current_database() as table_catalog in:\n%s", got)
 	}
 }
+
+func TestReportedDatabaseName(t *testing.T) {
+	tests := []struct {
+		name           string
+		startup        string
+		defaultCatalog string
+		duckLakeBacked bool
+		want           string
+	}{
+		{
+			name:           "ducklake-backed reports stable physical catalog",
+			startup:        "portola",
+			duckLakeBacked: true,
+			want:           PhysicalDuckLakeCatalog,
+		},
+		{
+			name:           "ducklake-backed with ducklake dbname is unchanged",
+			startup:        "ducklake",
+			duckLakeBacked: true,
+			want:           PhysicalDuckLakeCatalog,
+		},
+		{
+			// A multi-tenant org reports the same stable name as the same org
+			// would on a single-tenant duckling, so a single->multi migration
+			// keeps the catalog identity and does not churn catalog-keyed tools.
+			name:           "multi-tenant ducklake org reports the same stable catalog",
+			startup:        "acme",
+			duckLakeBacked: true,
+			want:           PhysicalDuckLakeCatalog,
+		},
+		{
+			// A configured default catalog wins over DuckLake: the session's
+			// search_path/USE points at iceberg, so current_database() must too.
+			name:           "iceberg default catalog wins over ducklake",
+			startup:        "acme",
+			defaultCatalog: "iceberg",
+			duckLakeBacked: true,
+			want:           "iceberg",
+		},
+		{
+			name:           "iceberg default catalog without ducklake reports iceberg",
+			startup:        "acme",
+			defaultCatalog: "iceberg",
+			duckLakeBacked: false,
+			want:           "iceberg",
+		},
+		{
+			name:           "non-ducklake, no default catalog keeps connection dbname",
+			startup:        "analytics",
+			duckLakeBacked: false,
+			want:           "analytics",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReportedDatabaseName(tc.startup, tc.defaultCatalog, tc.duckLakeBacked); got != tc.want {
+				t.Fatalf("ReportedDatabaseName(%q, %q, %v) = %q, want %q", tc.startup, tc.defaultCatalog, tc.duckLakeBacked, got, tc.want)
+			}
+		})
+	}
+}

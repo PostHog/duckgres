@@ -44,21 +44,25 @@ func TestPgwireLogicalDatabaseCatalogMapping(t *testing.T) {
 		_, _ = db.Exec(fmt.Sprintf(`DROP SCHEMA IF EXISTS ducklake.%s CASCADE`, logicalSchema))
 	})
 
-	t.Run("metadata reports logical database", func(t *testing.T) {
+	// DuckLake-backed sessions report the stable physical catalog name
+	// ("ducklake") via current_database()/pg_database/information_schema,
+	// regardless of the connection dbname ("duckgres"). The connection dbname
+	// still works as a write alias (exercised in the subtests below).
+	t.Run("metadata reports stable physical catalog", func(t *testing.T) {
 		var currentDB string
 		if err := db.QueryRow("SELECT current_database()").Scan(&currentDB); err != nil {
 			t.Fatalf("query current_database(): %v", err)
 		}
-		if currentDB != "duckgres" {
-			t.Fatalf("current_database() = %q, want %q", currentDB, "duckgres")
+		if currentDB != "ducklake" {
+			t.Fatalf("current_database() = %q, want %q", currentDB, "ducklake")
 		}
 
 		var datname string
 		if err := db.QueryRow("SELECT datname FROM pg_catalog.pg_database WHERE datname = current_database()").Scan(&datname); err != nil {
 			t.Fatalf("query pg_database/current_database: %v", err)
 		}
-		if datname != "duckgres" {
-			t.Fatalf("pg_database datname = %q, want %q", datname, "duckgres")
+		if datname != "ducklake" {
+			t.Fatalf("pg_database datname = %q, want %q", datname, "ducklake")
 		}
 
 		if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE duckgres.public.%s (id INTEGER)`, metadataProbeTable)); err != nil {
@@ -72,8 +76,8 @@ func TestPgwireLogicalDatabaseCatalogMapping(t *testing.T) {
 		)).Scan(&tableCatalog); err != nil {
 			t.Fatalf("query information_schema.tables: %v", err)
 		}
-		if tableCatalog != "duckgres" {
-			t.Fatalf("information_schema.tables table_catalog = %q, want %q", tableCatalog, "duckgres")
+		if tableCatalog != "ducklake" {
+			t.Fatalf("information_schema.tables table_catalog = %q, want %q", tableCatalog, "ducklake")
 		}
 
 		var columnCatalog string
@@ -83,16 +87,16 @@ func TestPgwireLogicalDatabaseCatalogMapping(t *testing.T) {
 		)).Scan(&columnCatalog); err != nil {
 			t.Fatalf("query information_schema.columns: %v", err)
 		}
-		if columnCatalog != "duckgres" {
-			t.Fatalf("information_schema.columns table_catalog = %q, want %q", columnCatalog, "duckgres")
+		if columnCatalog != "ducklake" {
+			t.Fatalf("information_schema.columns table_catalog = %q, want %q", columnCatalog, "ducklake")
 		}
 
 		var schemaCatalog string
 		if err := db.QueryRow("SELECT catalog_name FROM information_schema.schemata WHERE schema_name = 'public' LIMIT 1").Scan(&schemaCatalog); err != nil {
 			t.Fatalf("query information_schema.schemata: %v", err)
 		}
-		if schemaCatalog != "duckgres" {
-			t.Fatalf("information_schema.schemata catalog_name = %q, want %q", schemaCatalog, "duckgres")
+		if schemaCatalog != "ducklake" {
+			t.Fatalf("information_schema.schemata catalog_name = %q, want %q", schemaCatalog, "ducklake")
 		}
 	})
 

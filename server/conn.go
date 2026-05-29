@@ -201,7 +201,7 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 	return transpiler.New(transpiler.Config{
 		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake,
 		LogicalDatabaseName: c.database,
-		PhysicalCatalogName: "ducklake",
+		PhysicalCatalogName: physicalDuckLakeCatalog,
 		ConvertPlaceholders: convertPlaceholders,
 	})
 }
@@ -994,17 +994,25 @@ func (c *clientConn) serve() error {
 			initTimeout = DefaultSessionInitTimeout
 		}
 		initCtx, initCancel := context.WithTimeout(context.Background(), initTimeout)
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
+		// Detect DuckLake attachment first so we can report a stable catalog
+		// name. When DuckLake-backed, report the physical catalog name
+		// ("ducklake") as current_database() rather than the connection dbname
+		// (see sessionmeta.ReportedDatabaseName); the dbname still works as an
+		// alias via the logical-catalog transform.
+		duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, c.executor, physicalDuckLakeCatalog)
+		if err != nil {
+			initCancel()
+			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
+			return err
+		}
+		// Standalone has no per-user configured default catalog, so pass "".
+		reportedDatabase := sessionmeta.ReportedDatabaseName(c.database, "", duckLakeAttached)
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, reportedDatabase); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
-		duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, c.executor, "ducklake")
 		initCancel()
-		if err != nil {
-			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
-			return err
-		}
 		c.logicalCatalogMapping = duckLakeAttached
 	}
 
@@ -1711,7 +1719,7 @@ func (c *clientConn) queryWithArgsWithMetadata(ctx context.Context, query string
 }
 
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
-const physicalDuckLakeCatalog = "ducklake"
+const physicalDuckLakeCatalog = sessionmeta.PhysicalDuckLakeCatalog
 
 // executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.

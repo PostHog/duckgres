@@ -984,9 +984,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		passthroughUser = resolution.Passthrough
 		defaultCatalog = resolution.DefaultCatalog
 		// From here on, `database` reflects the effective routing database.
-		// This is what gets passed to the worker as the logical database
-		// (drives the `current_database()` macro and pg_database view) so
-		// observability surfaces the actual routing decision.
+		// It is passed to the worker as the logical database name (the
+		// logical-catalog transform rewrites <database>.schema.table ->
+		// ducklake.schema.table). Note: for DuckLake-backed sessions the
+		// client-visible current_database()/pg_database report the stable
+		// physical catalog "ducklake" (see sessionmeta.ReportedDatabaseName),
+		// not this routing name; org identity for observability comes from
+		// orgID, which is logged separately.
 		database = effectiveDatabase
 	} else {
 		// Single-tenant: static users map
@@ -1135,21 +1139,31 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	var duckLakeAttached bool
 	if !passthroughUser {
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, database); err != nil {
+		// Detect DuckLake attachment first so we can report a stable catalog
+		// name. DuckLake-backed sessions report the physical catalog name
+		// ("ducklake") as current_database() regardless of tenancy, so
+		// catalog-keyed tools (e.g. SQLMesh) see a consistent name across
+		// single-/multi-tenant and across a single->multi migration; the
+		// connection dbname still works as an alias via the logical-catalog
+		// transform. Non-DuckLake sessions (e.g. iceberg-only) keep reporting
+		// their own dbname.
+		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, physicalDuckLakeCatalog)
+		if err != nil {
+			initCancel()
+			slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
+			_ = writer.Flush()
+			return
+		}
+		reportedDatabase := sessionmeta.ReportedDatabaseName(database, defaultCatalog, duckLakeAttached)
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, reportedDatabase); err != nil {
 			initCancel()
 			slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
 			_ = writer.Flush()
 			return
 		}
-		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
 		initCancel()
-		if err != nil {
-			slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
-			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
-			_ = writer.Flush()
-			return
-		}
 
 		// Apply the effective connect-time session default AFTER metadata init.
 		// It must run here, not on the worker at session create: (1)

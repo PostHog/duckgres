@@ -17,20 +17,24 @@ func TestPgwireLogicalCatalogMapping(t *testing.T) {
 		_, _ = db.Exec("DROP TABLE IF EXISTS ducklake.main.logical_catalog_mapping_test")
 	})
 
+	// DuckLake-backed sessions report the stable physical catalog name
+	// ("ducklake") as current_database()/pg_database, regardless of the
+	// connection dbname ("test"). The connection dbname still works as a
+	// write alias (exercised below).
 	var currentDB string
 	if err := db.QueryRow("SELECT current_database()").Scan(&currentDB); err != nil {
 		t.Fatalf("query current_database(): %v", err)
 	}
-	if currentDB != "test" {
-		t.Fatalf("expected current_database() = %q, got %q", "test", currentDB)
+	if currentDB != "ducklake" {
+		t.Fatalf("expected current_database() = %q, got %q", "ducklake", currentDB)
 	}
 
 	var datname string
 	if err := db.QueryRow("SELECT datname FROM pg_database WHERE datname = current_database()").Scan(&datname); err != nil {
 		t.Fatalf("query pg_database/current_database: %v", err)
 	}
-	if datname != "test" {
-		t.Fatalf("expected pg_database row %q, got %q", "test", datname)
+	if datname != "ducklake" {
+		t.Fatalf("expected pg_database row %q, got %q", "ducklake", datname)
 	}
 
 	mustExec(t, db, "CREATE TABLE test.public.logical_catalog_mapping_test (id INTEGER)")
@@ -52,8 +56,8 @@ func TestPgwireLogicalCatalogMapping(t *testing.T) {
 	`).Scan(&tableCatalog); err != nil {
 		t.Fatalf("query information_schema.tables: %v", err)
 	}
-	if tableCatalog != "test" {
-		t.Fatalf("expected information_schema.tables.table_catalog = %q, got %q", "test", tableCatalog)
+	if tableCatalog != "ducklake" {
+		t.Fatalf("expected information_schema.tables.table_catalog = %q, got %q", "ducklake", tableCatalog)
 	}
 
 	var schemaCatalog string
@@ -66,7 +70,7 @@ func TestPgwireLogicalCatalogMapping(t *testing.T) {
 	`).Scan(&schemaCatalog); err != nil {
 		t.Fatalf("query information_schema.schemata: %v", err)
 	}
-	if schemaCatalog != "test" {
-		t.Fatalf("expected information_schema.schemata.catalog_name = %q, got %q", "test", schemaCatalog)
+	if schemaCatalog != "ducklake" {
+		t.Fatalf("expected information_schema.schemata.catalog_name = %q, got %q", "ducklake", schemaCatalog)
 	}
 }
