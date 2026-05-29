@@ -286,6 +286,11 @@ func TestDDLSchemas(t *testing.T) {
 			Query:        "DROP SCHEMA IF EXISTS ddl_schema_test",
 			DuckgresOnly: true,
 		},
+		{
+			Name:         "drop_schema_if_exists_cascade",
+			Query:        "DROP SCHEMA IF EXISTS ddl_schema_test CASCADE",
+			DuckgresOnly: true,
+		},
 	}
 	runQueryTests(t, tests)
 }
