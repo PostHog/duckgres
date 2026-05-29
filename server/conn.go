@@ -1691,11 +1691,23 @@ func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, passthrough bool) bool {
 		cfg.LakekeeperOAuth2ServerURI == ""
 }
 
-func (c *clientConn) queryContextWithMetadata(ctx context.Context, query string) (RowSet, error) {
+func (c *clientConn) queryWithMetadata(ctx context.Context, query string, run func() (RowSet, error)) (RowSet, error) {
 	if err := c.loadIcebergColumnMetadata(ctx, query); err != nil {
 		return nil, err
 	}
-	return c.executor.QueryContext(ctx, query)
+	return run()
+}
+
+func (c *clientConn) queryContextWithMetadata(ctx context.Context, query string) (RowSet, error) {
+	return c.queryWithMetadata(ctx, query, func() (RowSet, error) {
+		return c.executor.QueryContext(ctx, query)
+	})
+}
+
+func (c *clientConn) queryWithArgsWithMetadata(ctx context.Context, query string, args ...interface{}) (RowSet, error) {
+	return c.queryWithMetadata(ctx, query, func() (RowSet, error) {
+		return c.executor.Query(query, args...)
+	})
 }
 
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
@@ -5777,7 +5789,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Result-returning query: use Query with converted query
 	runQuery := func() (RowSet, error) {
-		return c.executor.Query(convertedQuery, args...)
+		return c.queryWithArgsWithMetadata(queryCtx, convertedQuery, args...)
 	}
 
 	execStart := time.Now()
