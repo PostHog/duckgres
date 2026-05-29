@@ -1743,6 +1743,18 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 		return fmt.Errorf("timeout waiting for Iceberg catalog attachment lock")
 	}
 
+	// Step instrumentation: the calls below are CGO db.Exec/LoadExtensions that
+	// emit no Go log until they return, so a stall in any one of them is
+	// invisible in the worker logs (a tenant activation that exceeds the
+	// control-plane deadline just shows warm-up then silence). Log before each
+	// step with its elapsed-since-start so the *last* "step starting" line
+	// without a matching later step pinpoints the blocking call.
+	istart := time.Now()
+	istep := func(name string) {
+		slog.Info("Iceberg activation step starting.", "step", name, "warehouse", ic.LakekeeperWarehouse, "elapsed", time.Since(istart))
+	}
+
+	istep("count-catalogs")
 	var count int
 	err := db.QueryRow(
 		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = '" + iceberg.CatalogName + "'",
@@ -1751,6 +1763,7 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 		return nil
 	}
 
+	istep("load-iceberg-extension")
 	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
 		return fmt.Errorf("load iceberg extension: %w", err)
 	}
@@ -1761,6 +1774,7 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 	// to build the iceberg_sigv4 secret. Refreshed on STS expiry by
 	// RefreshIcebergSecret. Skipped if creds absent (e.g. local/dev).
 	if keyID != "" && secret != "" {
+		istep("create-s3-data-secret")
 		if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
 			return fmt.Errorf("create Lakekeeper S3 data secret: %w", err)
 		}
@@ -1769,10 +1783,12 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 	// Catalog auth secret: only when OAuth2 is configured. In allowall mode
 	// the ATTACH uses AUTHORIZATION_TYPE 'none' and no catalog secret.
 	if stmt := iceberg.BuildLakekeeperSecretStmt(ic); stmt != "" {
+		istep("create-catalog-auth-secret")
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("create Lakekeeper iceberg secret: %w", err)
 		}
 	}
+	istep("attach-catalog")
 
 	attachStmt := iceberg.BuildLakekeeperAttachStmt(ic)
 	slog.Info("Attaching Iceberg catalog.",
@@ -1797,6 +1813,7 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 	// catalog (see iceberg.DefaultSchema). Idempotent and best-effort: an
 	// attached catalog without it still works via explicit schema references,
 	// so a transient failure here must not fail activation.
+	istep("create-default-schema")
 	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS " + iceberg.CatalogName + "." + iceberg.DefaultSchema); err != nil {
 		slog.Warn("Failed to ensure default Iceberg schema; catalog attached without it.",
 			"schema", iceberg.DefaultSchema, "warehouse", ic.LakekeeperWarehouse, "error", err)
@@ -2014,10 +2031,17 @@ func setDuckLakeDefault(db *sql.DB) error {
 // attachLakekeeperCatalog guarantees that schema exists.
 func setIcebergDefault(db *sql.DB) error {
 	stmt := fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
+	// Instrumented: this USE forces the iceberg-only path's first synchronous
+	// catalog resolution (DuckDB shadows `main` on a REST catalog). It's the
+	// sole iceberg-only-specific step after AttachIcebergCatalog, and a prime
+	// suspect for a silent stall during activation — log before+after so a hang
+	// here is distinguishable from one inside AttachIcebergCatalog.
+	t := time.Now()
+	slog.Info("Iceberg activation step starting.", "step", "set-default-catalog", "stmt", stmt)
 	if _, err := db.Exec(stmt); err != nil {
 		return fmt.Errorf("failed to set Iceberg as default catalog: %w", err)
 	}
-	slog.Info("Set Iceberg as default catalog.", "schema", iceberg.DefaultSchema)
+	slog.Info("Set Iceberg as default catalog.", "schema", iceberg.DefaultSchema, "duration", time.Since(t))
 	return nil
 }
 
