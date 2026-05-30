@@ -61,15 +61,27 @@ func (t *LogicalCatalogTransform) Transform(tree *pg_query.ParseResult, _ *Resul
 }
 
 func (t *LogicalCatalogTransform) rewriteRangeVar(rv *pg_query.RangeVar) bool {
-	if rv == nil || rv.Catalogname == "" || !strings.EqualFold(rv.Catalogname, t.LogicalDatabaseName) {
+	if rv == nil || rv.Catalogname == "" {
 		return false
 	}
 
-	rv.Catalogname = t.PhysicalCatalogName
-	if strings.EqualFold(rv.Schemaname, "public") {
+	switch {
+	case strings.EqualFold(rv.Catalogname, t.LogicalDatabaseName):
+		// Logical catalog name -> physical catalog, mapping the PG-compat
+		// "public" schema to DuckLake's real "main".
+		rv.Catalogname = t.PhysicalCatalogName
+		if strings.EqualFold(rv.Schemaname, "public") {
+			rv.Schemaname = "main"
+		}
+		return true
+	case t.PhysicalCatalogName != "" && strings.EqualFold(rv.Catalogname, t.PhysicalCatalogName) && strings.EqualFold(rv.Schemaname, "public"):
+		// Client referenced the physical catalog directly (common now that
+		// current_database() reports the physical name): its "public" schema
+		// is the compat alias for DuckLake's "main", same as the logical case.
 		rv.Schemaname = "main"
+		return true
 	}
-	return true
+	return false
 }
 
 func (t *LogicalCatalogTransform) rewriteDropObjects(objects []*pg_query.Node) bool {

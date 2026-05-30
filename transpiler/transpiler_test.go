@@ -598,6 +598,14 @@ func TestTranspile_LogicalDatabaseCatalogMapping(t *testing.T) {
 			expected: "SELECT * FROM ducklake.main.users",
 		},
 		{
+			// Clients now read current_database() == "ducklake" and may qualify
+			// as ducklake.public.*; map the compat "public" schema to "main".
+			name:     "physical ducklake public schema maps to main",
+			input:    "SELECT * FROM ducklake.public.users",
+			contains: "ducklake.main.users",
+			excludes: "ducklake.public.users",
+		},
+		{
 			name:     "unrelated external catalog preserved",
 			input:    "SELECT * FROM postgres.public.users",
 			expected: "SELECT * FROM postgres.public.users",
