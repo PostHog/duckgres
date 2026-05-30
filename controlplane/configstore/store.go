@@ -98,6 +98,7 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		&Org{},
 		&ManagedWarehouse{},
 		&ManagedWarehouseTrino{},
+		&TrinoClusterBootstrap{},
 		&OrgUser{},
 		&GlobalConfig{},
 		&DuckLakeConfig{},
