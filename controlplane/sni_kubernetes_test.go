@@ -14,6 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 )
 
 func TestExtractOrgFromSNI(t *testing.T) {
@@ -353,6 +355,46 @@ func TestFlightValidatorMatchedSNI(t *testing.T) {
 	if store.resolveSNIPrefixCalls != 1 || store.validateOrgUserCalls != 1 {
 		t.Fatalf("expected one ResolveSNIPrefix + one ValidateOrgUser; got %d / %d",
 			store.resolveSNIPrefixCalls, store.validateOrgUserCalls)
+	}
+}
+
+// flightCtxWithSNI builds a gRPC context carrying a TLS ServerName, exactly as
+// the real Flight ingress sees it, so we exercise the real SNIFromContext →
+// extractOrgFromSNI → ResolveSNIPrefix chain that routes a session to its org.
+func flightCtxWithSNI(sni string) context.Context {
+	return peer.NewContext(context.Background(), &peer.Peer{
+		AuthInfo: credentials.TLSInfo{State: tls.ConnectionState{ServerName: sni}},
+	})
+}
+
+// TestFlightOrgFromContextResolvesViaSNI verifies that session routing derives
+// the org from the connection's TLS SNI (the load-bearing path the no-collision
+// fix relies on), and fails closed for unmanaged or missing hostnames.
+func TestFlightOrgFromContextResolvesViaSNI(t *testing.T) {
+	store := &fakeConfigStore{
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			if prefix == "acme" {
+				return "org-acme", "acme_db"
+			}
+			return "", ""
+		},
+	}
+	cp := &ControlPlane{
+		cfg:         ControlPlaneConfig{ManagedHostnameSuffixes: []string{".dw.us.postwh.com"}},
+		configStore: store,
+	}
+
+	if org, ok := cp.flightOrgFromContext(flightCtxWithSNI("acme.dw.us.postwh.com")); !ok || org != "org-acme" {
+		t.Fatalf("managed SNI should resolve org-acme; got (%q, %v)", org, ok)
+	}
+	if org, ok := cp.flightOrgFromContext(flightCtxWithSNI("ghost.dw.us.postwh.com")); ok || org != "" {
+		t.Fatalf("unknown managed prefix must fail closed; got (%q, %v)", org, ok)
+	}
+	if _, ok := cp.flightOrgFromContext(flightCtxWithSNI("evil.example.com")); ok {
+		t.Fatalf("unmanaged hostname must fail closed")
+	}
+	if _, ok := cp.flightOrgFromContext(context.Background()); ok {
+		t.Fatalf("missing peer/SNI must fail closed")
 	}
 }
 

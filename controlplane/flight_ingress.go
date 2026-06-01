@@ -14,8 +14,6 @@ import (
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/flightsqlingress"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
 )
 
 type FlightIngressConfig = flightsqlingress.Config
@@ -88,6 +86,9 @@ type orgRoutedSessionProvider struct {
 func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	// Bind the session to the org of THIS connection's managed hostname, not a
 	// shared username lookup. Fail closed if the SNI no longer resolves an org.
+	if p.resolveOrg == nil {
+		return 0, nil, fmt.Errorf("flight session provider misconfigured: no org resolver")
+	}
 	orgID, ok := p.resolveOrg(ctx)
 	if !ok || orgID == "" {
 		slog.Warn("Flight SQL session: could not resolve org from connection SNI.", "username", username)
@@ -112,21 +113,6 @@ func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username s
 	p.mu.Unlock()
 
 	return workerPID, executor, nil
-}
-
-// flightSNIFromContext returns the TLS ServerName (SNI) the Flight client sent,
-// or "" if the connection isn't TLS-terminated by this server (e.g. in tests).
-// Mirrors flightsqlingress.sniFromContext, which is unexported.
-func flightSNIFromContext(ctx context.Context) string {
-	pr, ok := peer.FromContext(ctx)
-	if !ok || pr == nil {
-		return ""
-	}
-	tlsInfo, ok := pr.AuthInfo.(credentials.TLSInfo)
-	if !ok {
-		return ""
-	}
-	return tlsInfo.State.ServerName
 }
 
 func (p *orgRoutedSessionProvider) DestroySession(pid int32) {

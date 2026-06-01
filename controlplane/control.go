@@ -1805,7 +1805,7 @@ func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, p
 // context's SNI (the managed hostname). Used by orgRoutedSessionProvider to bind
 // each session to its connection's org, mirroring the auth-time resolution.
 func (cp *ControlPlane) flightOrgFromContext(ctx context.Context) (string, bool) {
-	return cp.resolveFlightOrgFromSNI(flightSNIFromContext(ctx))
+	return cp.resolveFlightOrgFromSNI(flightsqlingress.SNIFromContext(ctx))
 }
 
 // resolveFlightOrgFromSNI maps a TLS ServerName to its org, returning ok=false
