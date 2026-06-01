@@ -180,7 +180,6 @@ type ConfigStoreInterface interface {
 	// window where the snapshot could swap between two separate calls.
 	// passthrough is always false when valid is false.
 	ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool)
-	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no database param)
 	// OrgWarehouseStatus reports an org's current warehouse provisioning state so
 	// connection-time errors can distinguish "no such org" from "warehouse not
 	// ready yet". Returns (state, orgExists). state is "" when the org has no
@@ -703,9 +702,9 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 
 // SNI routing modes (values for ControlPlaneConfig.SNIRoutingMode).
 const (
-	SNIRoutingOff         = "off"         // ignore SNI entirely (default)
-	SNIRoutingPassthrough = "passthrough" // validate managed SNI, fallback only when database is empty
-	SNIRoutingEnforce     = "enforce"     // require managed SNI and same-org database routing
+	SNIRoutingOff         = "off"         // ignore SNI entirely; identity can no longer be resolved
+	SNIRoutingPassthrough = "passthrough" // require managed SNI but warn on legacy hostnames
+	SNIRoutingEnforce     = "enforce"     // default: require a managed SNI hostname that resolves to an org
 )
 
 type postgresSNIResolution struct {
@@ -901,77 +900,61 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	password := string(bytes.TrimRight(body, "\x00"))
 
-	// Authenticate
-	// In multi-tenant mode, the database name maps to an org.
-	// User uniqueness is scoped to the org.
+	// Authenticate.
+	// In multi-tenant mode the org is resolved solely from the managed hostname
+	// (SNI); the user is authenticated within that org. The startup `database`
+	// param no longer identifies the org — it selects which attached catalog
+	// (ducklake/iceberg) the session defaults to.
 	var (
-		orgID           string
-		passthroughUser bool
-		defaultCatalog  string
+		orgID            string
+		passthroughUser  bool
+		defaultCatalog   string
+		requestedCatalog string // "" | "ducklake" | "iceberg" (validated below)
 	)
 	if cp.configStore != nil {
-		// Resolve the effective database name based on SNI routing mode.
-		// "off" or unknown - legacy: use the startup `database` param.
-		// "passthrough" - use startup `database` first; for managed SNI,
-		//                 require the hostname and database to resolve to the
-		//                 same org. If the startup database is empty, fall back
-		//                 to the SNI-derived database. Non-managed hostnames
-		//                 still fall back to legacy routing with a warning.
-		// "enforce"     - require managed SNI and same-org validation, while
-		//                 still preferring explicit startup `database`.
 		sni := tlsConn.ConnectionState().ServerName
 		sniResolution := cp.resolvePostgresSNI(cp.cfg.SNIRoutingMode, sni)
-		switch cp.cfg.SNIRoutingMode {
-		case SNIRoutingEnforce:
-			if !sniResolution.isManaged {
-				hint := cp.managedHostnameHint()
-				slog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
-					"sni", sni, "expected", hint, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
-				_ = server.WriteErrorResponse(writer, "FATAL", "08006",
-					fmt.Sprintf("this server requires connecting via %s", hint))
-				_ = writer.Flush()
-				return
-			}
-		case SNIRoutingPassthrough:
-			if !sniResolution.isManaged && sni == "" {
-				slog.Warn("Postgres client connected without SNI; please migrate to a managed hostname.",
-					"expected", cp.managedHostnameHint(), "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
-			} else if !sniResolution.isManaged {
-				slog.Warn("Postgres client using legacy hostname; please migrate to a managed hostname.",
-					"sni", sni, "expected", cp.managedHostnameHint(), "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
-			}
-		default: // SNIRoutingOff or unset — legacy behavior, no SNI handling
+		if cp.cfg.SNIRoutingMode != SNIRoutingEnforce && cp.cfg.SNIRoutingMode != SNIRoutingPassthrough {
+			// Identity now comes solely from the managed hostname. The legacy
+			// database→org routing is gone, so an org cannot be resolved without
+			// SNI routing enabled. Warn loudly — this is a misconfiguration.
+			slog.Warn("Postgres connection: SNI routing disabled but identity now requires a managed hostname; set sni_routing_mode=enforce.",
+				"mode", cp.cfg.SNIRoutingMode, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+		}
+		if !sniResolution.isManaged {
+			hint := cp.managedHostnameHint()
+			slog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
+				"sni", sni, "expected", hint, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			_ = server.WriteErrorResponse(writer, "FATAL", "08006",
+				fmt.Sprintf("this server requires connecting via %s", hint))
+			_ = writer.Flush()
+			return
 		}
 
 		resolution := cp.configStore.ResolvePostgresConnection(database, sniResolution.sniPrefix, sniResolution.useManagedSNI, username, password)
-		if sniResolution.useManagedSNI && resolution.SNIResolved {
+		if resolution.SNIResolved {
 			observeSNIRoutingResolution("postgres", resolution.SNIAliasUsed)
 		}
-		effectiveDatabase := resolution.EffectiveDatabase
-		if effectiveDatabase == "" {
-			slog.Warn("Connection rejected: no database specified.", "remote_addr", remoteAddr)
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "database name is required")
+		if !resolution.SNIResolved {
+			slog.Warn("Postgres connection rejected: managed hostname does not resolve to a known organization.",
+				"sni", sni, "sni_prefix", sniResolution.sniPrefix, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			_ = server.WriteErrorResponse(writer, "FATAL", "08006",
+				fmt.Sprintf("this server requires connecting via %s", cp.managedHostnameHint()))
 			_ = writer.Flush()
 			return
 		}
-		if !resolution.DatabaseExists {
-			slog.Warn("Unknown database.", "database", effectiveDatabase, "remote_addr", remoteAddr)
-			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", fmt.Sprintf("database %q does not exist", effectiveDatabase))
-			_ = writer.Flush()
-			return
-		}
-		if !resolution.HostnameMatches {
-			slog.Warn("Postgres connection rejected: requested database does not match managed hostname.",
-				"sni", sni, "sni_prefix", sniResolution.sniPrefix, "sni_org", resolution.SNIOrgID,
-				"database", effectiveDatabase, "database_org", resolution.OrgID, "remote_addr", remoteAddr,
-				"user", username, "application_name", applicationName)
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000",
-				"requested database does not match managed hostname")
+		if !resolution.CatalogValid {
+			// The startup `database` is now a catalog selector; only
+			// "ducklake"/"iceberg"/empty are valid. No logical-name masking.
+			slog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
+				"database", database, "org", resolution.OrgID, "remote_addr", remoteAddr, "user", username)
+			_ = server.WriteErrorResponse(writer, "FATAL", "3D000",
+				fmt.Sprintf("database %q does not exist (connect with \"ducklake\" or \"iceberg\")", database))
 			_ = writer.Flush()
 			return
 		}
 		if !resolution.Valid {
-			slog.Warn("Authentication failed.", "user", username, "org", resolution.OrgID, "database", effectiveDatabase, "remote_addr", remoteAddr)
+			slog.Warn("Authentication failed.", "user", username, "org", resolution.OrgID, "database", database, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
 				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
@@ -983,11 +966,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		orgID = resolution.OrgID
 		passthroughUser = resolution.Passthrough
 		defaultCatalog = resolution.DefaultCatalog
-		// From here on, `database` reflects the effective routing database.
-		// This is what gets passed to the worker as the logical database
-		// (drives the `current_database()` macro and pg_database view) so
-		// observability surfaces the actual routing decision.
-		database = effectiveDatabase
+		requestedCatalog = resolution.EffectiveCatalog
+		// `database` is finalized post-session to the real catalog the session
+		// defaults to (once worker attachment is known), so logs and the
+		// current_database() macro surface the actual catalog.
 	} else {
 		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
@@ -1126,47 +1108,87 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	// Passthrough users skip pg_catalog initialization and logical-catalog
-	// mapping — they bypass the PG compatibility layer entirely. They still
-	// need a default catalog, though: without one the worker session stays in
-	// DuckDB's empty in-memory catalog, so current_database() reports "memory"
-	// and unqualified DDL/DML never reaches the warehouse (see the passthrough
-	// branch below).
-	var duckLakeAttached bool
+	// Probe which catalogs the worker actually attached for this session, then
+	// resolve the real catalog the session defaults to. The startup `database`
+	// selected "ducklake"/"iceberg"/"" (default); fail closed (3D000) if the
+	// requested catalog isn't attached.
+	attachCtx, attachCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+	duckLakeAttached, dlErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
+	icebergAttached, icErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalIcebergCatalog)
+	attachCancel()
+	probeErr := dlErr
+	if probeErr == nil {
+		probeErr = icErr
+	}
+	if probeErr != nil {
+		slog.Error("Failed to detect attached catalogs.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", probeErr, "worker", workerID, "worker_pod", workerPod)
+		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
+		_ = writer.Flush()
+		return
+	}
+	var effectiveCatalog string
+	if cp.configStore != nil {
+		var ok bool
+		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, defaultCatalog, duckLakeAttached, icebergAttached)
+		if !ok {
+			slog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
+				"requested", requestedCatalog, "org", orgID, "ducklake_attached", duckLakeAttached, "iceberg_attached", icebergAttached, "remote_addr", remoteAddr, "user", username)
+			msg := "no catalog is available for this connection"
+			if requestedCatalog != "" {
+				msg = fmt.Sprintf("database %q does not exist", requestedCatalog)
+			}
+			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", msg)
+			_ = writer.Flush()
+			return
+		}
+	} else {
+		// Single-tenant (process backend / static users): de-mask to the real
+		// attached catalog when present; otherwise keep the client's database name
+		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
+		switch {
+		case duckLakeAttached:
+			effectiveCatalog = physicalDuckLakeCatalog
+		case icebergAttached:
+			effectiveCatalog = physicalIcebergCatalog
+		default:
+			effectiveCatalog = database
+		}
+	}
+	// `database` now reflects the real catalog the session defaults to — this is
+	// what drives the current_database() macro/pg_database view and what logs and
+	// observability surface.
+	database = effectiveCatalog
+
+	// Passthrough users skip pg_catalog initialization and the catalog USE
+	// rewriting — they bypass the PG compatibility layer entirely. They still
+	// need their selected catalog as the session default, though: without one the
+	// worker session stays in DuckDB's empty in-memory catalog (see the
+	// passthrough branch below).
 	if !passthroughUser {
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, database); err != nil {
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, effectiveCatalog); err != nil {
 			initCancel()
 			slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
 			_ = writer.Flush()
 			return
 		}
-		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
 		initCancel()
-		if err != nil {
-			slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
-			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
-			_ = writer.Flush()
-			return
-		}
 
 		// Apply the effective connect-time session default AFTER metadata init.
-		// It must run here, not on the worker at session create: (1)
-		// InitSessionDatabaseMetadata's defer resets search_path to the ducklake
-		// default, so an earlier value is clobbered; and (2) running metadata init
-		// while the session default points at the iceberg REST catalog fails.
-		// Client-supplied search_path keeps the previous best-effort behavior;
-		// configured per-user catalog defaults fail closed because silently
-		// falling back would route the user to the wrong catalog.
-		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, defaultCatalog); cmd != "" {
+		// It must run here, not on the worker at session create:
+		// InitSessionDatabaseMetadata's defer resets the catalog/search_path, so an
+		// earlier value would be clobbered. A client-supplied search_path is
+		// best-effort; the configured catalog (Iceberg) fails closed because
+		// silently falling back would route the user to the wrong catalog.
+		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
 			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(spCtx, cmd)
 			spCancel()
 			if err != nil {
 				if source == sessionDefaultSourceConfiguredCatalog {
-					slog.Error("Failed to apply configured default catalog.", "user", username, "org", orgID, "catalog", defaultCatalog, "error", err)
-					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply configured default catalog")
+					slog.Error("Failed to apply session default catalog.", "user", username, "org", orgID, "catalog", effectiveCatalog, "error", err)
+					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 					_ = writer.Flush()
 					return
 				}
@@ -1174,37 +1196,24 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			}
 		}
 	} else {
-		// Passthrough: no pg_catalog views and no logical-catalog rewriting, but
-		// the session must still land in the tenant's catalog instead of the
-		// empty in-memory one. Standalone passthrough does this via
-		// server.setDuckLakeDefault/setIcebergDefault; the remote-worker path
-		// has to issue the equivalent explicitly here.
-		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, physicalDuckLakeCatalog)
-		if err != nil {
-			initCancel()
-			slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
-			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
-			_ = writer.Flush()
-			return
-		}
-		// Passthrough doesn't apply a client-supplied search_path (the
-		// non-passthrough best-effort path does). Surface it rather than
-		// dropping it silently — passthrough clients can issue SET search_path
-		// themselves once connected.
+		// Passthrough: no pg_catalog views and no rewriting, but the session must
+		// still land in its selected catalog instead of the empty in-memory one.
+		// Standalone passthrough does this via server.setDuckLakeDefault/
+		// setIcebergDefault; the remote-worker path issues the equivalent here.
 		if clientSearchPath != "" {
 			slog.Warn("Ignoring client connect-time search_path for passthrough session.", "user", username, "org", orgID, "search_path", clientSearchPath, "remote_addr", remoteAddr)
 		}
-		if cmd := passthroughSessionDefaultCatalogCommand(defaultCatalog, duckLakeAttached); cmd != "" {
-			if _, err := executor.ExecContext(initCtx, cmd); err != nil {
-				initCancel()
+		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
+			initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+			_, err := executor.ExecContext(initCtx, cmd)
+			initCancel()
+			if err != nil {
 				slog.Error("Failed to apply passthrough session default catalog.", "user", username, "org", orgID, "command", cmd, "error", err, "worker", workerID, "worker_pod", workerPod)
 				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 				_ = writer.Flush()
 				return
 			}
 		}
-		initCancel()
 	}
 
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
@@ -1218,11 +1227,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			server.SetConnectionIcebergConfig(cc, icebergCfg)
 		}
 	}
-	// Logical-catalog mapping (current_database masking + USE/qualified-name
-	// rewriting) is a non-passthrough feature; passthrough sessions talk raw
-	// DuckDB against the physical catalog name, so keep it disabled for them
-	// even though duckLakeAttached is now populated on the passthrough path.
-	server.SetLogicalCatalogMapping(cc, duckLakeAttached && !passthroughUser)
+	// Catalog USE rewriting (expanding bare `USE ducklake`/`USE iceberg` to the
+	// reliable two-part target) is a non-passthrough feature; passthrough sessions
+	// talk raw DuckDB, so keep it disabled for them. Enabled whenever either
+	// catalog is attached.
+	server.SetCatalogUseRewrite(cc, (duckLakeAttached || icebergAttached) && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)
@@ -1754,10 +1763,10 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 
 // startFlightIngress creates and starts the Flight SQL ingress listener.
 // cpFlightCredentialValidator authenticates Flight SQL clients in
-// multi-tenant mode. It implements both flightsqlingress.CredentialValidator
-// (legacy: scan all orgs to find the user) and SNIAwareCredentialValidator
-// (preferred: derive org from SNI, scope to that org's users only).
-// Behavior is gated on cp.cfg.SNIRoutingMode just like the Postgres path.
+// multi-tenant mode. Identity is derived solely from the managed hostname
+// (SNI): the org is resolved from the SNI prefix and the user is authenticated
+// within that org. Flight has no `database` param, so there is no catalog
+// selection here — the per-user default catalog applies.
 type cpFlightCredentialValidator struct {
 	cp          *ControlPlane
 	orgProvider *orgRoutedSessionProvider
@@ -1770,68 +1779,29 @@ func (v *cpFlightCredentialValidator) ValidateCredentials(username, password str
 func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, password string) bool {
 	cp := v.cp
 	sniPrefix, isManaged := cp.extractOrgFromSNI(sni)
-
-	switch cp.cfg.SNIRoutingMode {
-	case SNIRoutingEnforce:
-		if !isManaged {
-			slog.Warn("Flight auth rejected: SNI does not match a managed hostname.",
-				"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
-			return false
-		}
-		return v.authForSNIPrefix(sni, sniPrefix, username, password)
-	case SNIRoutingPassthrough:
-		if isManaged {
-			return v.authForSNIPrefix(sni, sniPrefix, username, password)
-		}
-		if sni == "" {
-			slog.Warn("Flight client connected without SNI; please migrate to a managed hostname.",
-				"expected", cp.managedHostnameHint(), "user", username)
-		} else {
-			slog.Warn("Flight client using legacy hostname; please migrate to a managed hostname.",
-				"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
-		}
-		return v.authByScan(username, password)
-	default: // SNIRoutingOff or unset
-		return v.authByScan(username, password)
+	if !isManaged {
+		// A username alone can collide across orgs, so identity now requires a
+		// managed hostname — there is no username-scan fallback.
+		slog.Warn("Flight auth rejected: SNI does not match a managed hostname.",
+			"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
+		return false
 	}
+	return v.authForSNIPrefix(sni, sniPrefix, username, password)
 }
 
-// authForSNIPrefix validates (username, password) against a single org
-// resolved from the SNI-derived hostname prefix. Used by enforce /
-// matched-passthrough. Translates the prefix through the hostname_alias map
-// so callers reach the right org regardless of which form (alias vs. dbname)
-// the client used.
-//
-// Alias precedence: if a prefix matches both an org's hostname_alias AND
-// another org's database_name, the alias wins (DatabaseNameForSNIPrefix
-// checks the alias map first). Operators must avoid that collision — the
-// admin API enforces unique aliases and unique dbnames separately, but does
-// not cross-validate that an alias isn't another org's dbname.
+// authForSNIPrefix validates (username, password) against the single org the
+// SNI-derived hostname prefix resolves to (via hostname_alias, database_name,
+// or DNS-safe org name — see ConfigStore.ResolveSNIPrefix).
 func (v *cpFlightCredentialValidator) authForSNIPrefix(sni, sniPrefix, username, password string) bool {
 	cp := v.cp
-	dbname := cp.configStore.DatabaseNameForSNIPrefix(sniPrefix)
-	observeSNIRoutingResolution("flight", dbname != sniPrefix)
-	orgID := cp.configStore.ResolveDatabase(dbname)
+	orgID, dbname := cp.configStore.ResolveSNIPrefix(sniPrefix)
 	if orgID == "" {
 		slog.Warn("Flight client SNI references unknown org.",
-			"sni", sni, "sni_prefix", sniPrefix, "sni_database", dbname, "user", username)
+			"sni", sni, "sni_prefix", sniPrefix, "user", username)
 		return false
 	}
+	observeSNIRoutingResolution("flight", dbname != sniPrefix)
 	if !cp.configStore.ValidateOrgUser(orgID, username, password) {
-		return false
-	}
-	v.orgProvider.mu.Lock()
-	v.orgProvider.userOrg[username] = orgID
-	v.orgProvider.mu.Unlock()
-	return true
-}
-
-// authByScan is the legacy Flight auth path: scan all orgs to find a user
-// matching (username, password). First match wins.
-func (v *cpFlightCredentialValidator) authByScan(username, password string) bool {
-	cp := v.cp
-	orgID, ok := cp.configStore.FindAndValidateUser(username, password)
-	if !ok {
 		return false
 	}
 	v.orgProvider.mu.Lock()

@@ -85,11 +85,13 @@ func CancelClientConn(cc *clientConn) {
 	}
 }
 
-// SetLogicalCatalogMapping records whether this session should rewrite DuckLake
-// metadata surfaces to the client-visible logical database name.
-func SetLogicalCatalogMapping(cc *clientConn, enabled bool) {
+// SetCatalogUseRewrite records whether this session should expand a bare
+// `USE ducklake`/`USE iceberg` into its reliable two-part target. This is not
+// masking — the catalog names are real; it only works around DuckDB's
+// bare-catalog `USE` resolution.
+func SetCatalogUseRewrite(cc *clientConn, enabled bool) {
 	if cc != nil {
-		cc.logicalCatalogMapping = enabled
+		cc.catalogUseRewrite = enabled
 	}
 }
 

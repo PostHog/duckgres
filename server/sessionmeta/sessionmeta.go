@@ -1,6 +1,10 @@
 // Package sessionmeta installs session-local catalog/metadata overrides on
 // a duckgres connection (current_database, pg_database, information_schema
-// views) so they reflect the client-visible database name on the PG wire.
+// views) so they reflect the catalog the session defaults to on the PG wire.
+//
+// The catalog name passed in is the real, attached catalog (e.g. "ducklake" or
+// "iceberg") the session uses — duckgres no longer masks a logical database
+// name onto a physical catalog, so current_database() reports the truth.
 //
 // Pure helpers — no dependency on github.com/duckdb/duckdb-go. The control
 // plane and other duckdb-free callers use this package without linking
@@ -17,20 +21,23 @@ import (
 )
 
 // InitSessionDatabaseMetadata installs session-local overrides for metadata
-// surfaces that should reflect the client-visible database name on pgwire.
-func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, database string) error {
+// surfaces (current_database, pg_database, information_schema views) so they
+// reflect `catalog` — the real, attached catalog the session defaults to. The
+// caller resolves `catalog` to "ducklake"/"iceberg" (the names the catalogs are
+// actually attached as); there is no logical→physical masking.
+func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
 	}
 
-	database = strings.TrimSpace(database)
-	if database == "" {
+	catalog = strings.TrimSpace(catalog)
+	if catalog == "" {
 		return nil
 	}
 
 	if _, err := executor.ExecContext(ctx, fmt.Sprintf(
 		"CREATE OR REPLACE TEMP MACRO current_database() AS %s",
-		quoteSQLStringLiteral(database),
+		quoteSQLStringLiteral(catalog),
 	)); err != nil {
 		return fmt.Errorf("create current_database() macro: %w", err)
 	}
@@ -44,15 +51,18 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 		return fmt.Errorf("switch to memory catalog: %w", err)
 	}
 	defer func() {
+		// Leave the session in a real catalog (we entered `memory` to install the
+		// compat views there). For DuckLake sessions, restore `ducklake` here; for
+		// Iceberg the caller issues `USE iceberg.public` after this returns. Keep
+		// memory.main on the search_path so the pg_catalog compat macros stay
+		// resolvable after the switch.
 		if duckLakeAttached {
 			_, _ = executor.ExecContext(context.Background(), "USE ducklake")
-			// USE ducklake resets search_path to ducklake.main, excluding memory.main
-			// where pg_catalog macros live. Restore it so macros remain resolvable.
 			_, _ = executor.ExecContext(context.Background(), "SET search_path = 'main,memory.main'")
 		}
 	}()
 
-	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(database)); err != nil {
+	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog)); err != nil {
 		return fmt.Errorf("apply session metadata override: %w", err)
 	}
 

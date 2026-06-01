@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -16,10 +15,14 @@ import (
 )
 
 // SNI integration tests rely on the kind manifest at k8s/kind/control-plane.yaml
-// running the control plane with --sni-routing-mode=passthrough and
+// running the control plane with --sni-routing-mode=enforce and
 // --managed-hostname-suffixes=.dw.test.local. The seeded org is "local" with
 // database name "duckgres" and user postgres/postgres
 // (k8s/kind/config-store.seed.sql).
+//
+// Identity is now established from the managed hostname (SNI) + username only;
+// the startup `database` param selects the session catalog (ducklake/iceberg/
+// empty=default), so current_database() reports the real catalog, not the org.
 
 const (
 	sniManagedSuffix    = ".dw.test.local"
@@ -27,6 +30,7 @@ const (
 	sniSeedDatabaseName = "duckgres"
 	sniSeedUser         = "postgres"
 	sniSeedPassword     = "postgres"
+	sniSeedCatalog      = "ducklake" // the default catalog for the "local" org
 	sniBogusPrefix      = "ignored-by-test"
 )
 
@@ -60,10 +64,9 @@ func connectWithSNI(ctx context.Context, sni, database, user, password string) (
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
-// TestSNI_MatchedHostnameUsesDatabaseParam: a managed SNI resolves to the same
-// org as the requested database, and the startup database remains the routing
-// key when present.
-func TestSNI_MatchedHostnameUsesDatabaseParam(t *testing.T) {
+// TestSNI_MatchedHostnameSelectsCatalog: a managed SNI resolves the org, and an
+// explicit `database=ducklake` selects that catalog for the session.
+func TestSNI_MatchedHostnameSelectsCatalog(t *testing.T) {
 	if err := waitForDBReady(60 * time.Second); err != nil {
 		t.Fatalf("waitForDBReady: %v", err)
 	}
@@ -72,10 +75,10 @@ func TestSNI_MatchedHostnameUsesDatabaseParam(t *testing.T) {
 	defer cancel()
 
 	conn, err := connectWithSNI(ctx, sniSeedOrgName+sniManagedSuffix,
-		sniSeedDatabaseName, sniSeedUser, sniSeedPassword)
+		sniSeedCatalog, sniSeedUser, sniSeedPassword)
 	if err != nil {
-		t.Fatalf("expected managed SNI=%q with database param %q to authenticate; got: %v",
-			sniSeedOrgName+sniManagedSuffix, sniSeedDatabaseName, err)
+		t.Fatalf("expected managed SNI=%q with catalog %q to authenticate; got: %v",
+			sniSeedOrgName+sniManagedSuffix, sniSeedCatalog, err)
 	}
 	defer conn.Close(ctx)
 
@@ -83,16 +86,15 @@ func TestSNI_MatchedHostnameUsesDatabaseParam(t *testing.T) {
 	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
 		t.Fatalf("SELECT current_database(): %v", err)
 	}
-	if current != sniSeedDatabaseName {
-		t.Fatalf("explicit database should be the routing database; got %q, want %q",
-			current, sniSeedDatabaseName)
+	if current != sniSeedCatalog {
+		t.Fatalf("current_database() should be the selected catalog; got %q, want %q",
+			current, sniSeedCatalog)
 	}
 }
 
-// TestSNI_MatchedHostnameUsesSNIWhenDatabaseParamEmpty: a client that omits
-// the startup database can still route through a managed hostname that resolves
-// to a configured org.
-func TestSNI_MatchedHostnameUsesSNIWhenDatabaseParamEmpty(t *testing.T) {
+// TestSNI_MatchedHostnameDefaultsCatalogWhenDatabaseEmpty: an empty startup
+// database lands the session in the org's default attached catalog.
+func TestSNI_MatchedHostnameDefaultsCatalogWhenDatabaseEmpty(t *testing.T) {
 	if err := waitForDBReady(60 * time.Second); err != nil {
 		t.Fatalf("waitForDBReady: %v", err)
 	}
@@ -112,16 +114,15 @@ func TestSNI_MatchedHostnameUsesSNIWhenDatabaseParamEmpty(t *testing.T) {
 	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
 		t.Fatalf("SELECT current_database(): %v", err)
 	}
-	if current != sniSeedDatabaseName {
-		t.Fatalf("resolved SNI org database should be the routing database; got %q, want %q",
-			current, sniSeedDatabaseName)
+	if current != sniSeedCatalog {
+		t.Fatalf("empty database should default to the org catalog; got %q, want %q",
+			current, sniSeedCatalog)
 	}
 }
 
-// TestSNI_MatchedHostnameRejectsDifferentDatabaseOrg: a managed hostname
-// cannot be used as a generic valid hostname for a different requested
-// database. The URL and startup database must resolve to the same org.
-func TestSNI_MatchedHostnameRejectsDifferentDatabaseOrg(t *testing.T) {
+// TestSNI_UnknownHostnameRejected: a managed-suffix hostname whose prefix
+// resolves to no org is rejected — identity comes solely from the hostname.
+func TestSNI_UnknownHostnameRejected(t *testing.T) {
 	if err := waitForDBReady(60 * time.Second); err != nil {
 		t.Fatalf("waitForDBReady: %v", err)
 	}
@@ -130,29 +131,23 @@ func TestSNI_MatchedHostnameRejectsDifferentDatabaseOrg(t *testing.T) {
 	defer cancel()
 
 	_, err := connectWithSNI(ctx, sniBogusPrefix+sniManagedSuffix,
-		sniSeedDatabaseName, sniSeedUser, sniSeedPassword)
+		sniSeedCatalog, sniSeedUser, sniSeedPassword)
 	if err == nil {
-		t.Fatalf("expected managed SNI for a different org to be rejected")
-	}
-	if !strings.Contains(err.Error(), "does not match managed hostname") {
-		t.Fatalf("expected database/hostname mismatch error; got: %v", err)
+		t.Fatalf("expected unknown managed hostname to be rejected")
 	}
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		t.Fatalf("expected pg error; got: %T %v", err, err)
 	}
-	if pgErr.Code != "28000" {
-		t.Fatalf("SQLSTATE = %q, want 28000", pgErr.Code)
+	if pgErr.Code != "08006" {
+		t.Fatalf("SQLSTATE = %q, want 08006", pgErr.Code)
 	}
 }
 
-// TestSNI_LegacyHostnameFallsThroughInPassthrough: with the kind setup in
-// passthrough mode, an SNI that doesn't match a managed suffix falls back
-// to the database startup param. The connection should succeed AND the
-// control plane should emit a warn log identifying the legacy caller.
-// (We can't easily assert the log line from here without log scraping; the
-// happy path itself proves the fallback works.)
-func TestSNI_LegacyHostnameFallsThroughInPassthrough(t *testing.T) {
+// TestSNI_LegacyHostnameRejected: an unmanaged hostname (e.g. the raw
+// port-forward host) has no org and is rejected under enforce — there is no
+// database-param fallback.
+func TestSNI_LegacyHostnameRejected(t *testing.T) {
 	if err := waitForDBReady(60 * time.Second); err != nil {
 		t.Fatalf("waitForDBReady: %v", err)
 	}
@@ -160,23 +155,40 @@ func TestSNI_LegacyHostnameFallsThroughInPassthrough(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Use 127.0.0.1 as the SNI (matches what lib/pq would send when
-	// connecting via port-forward without override). Definitely not on
-	// .dw.test.local, so it falls through to the legacy database-param
-	// path with a warn log.
-	conn, err := connectWithSNI(ctx, "127.0.0.1",
-		sniSeedDatabaseName, sniSeedUser, sniSeedPassword)
-	if err != nil {
-		t.Fatalf("legacy hostname should still authenticate via database-param fallback in passthrough mode; got: %v", err)
+	_, err := connectWithSNI(ctx, "127.0.0.1",
+		sniSeedCatalog, sniSeedUser, sniSeedPassword)
+	if err == nil {
+		t.Fatalf("expected unmanaged hostname to be rejected under enforce")
 	}
-	defer conn.Close(ctx)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected pg error; got: %T %v", err, err)
+	}
+	if pgErr.Code != "08006" {
+		t.Fatalf("SQLSTATE = %q, want 08006", pgErr.Code)
+	}
+}
 
-	var current string
-	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
-		t.Fatalf("SELECT current_database(): %v", err)
+// TestSNI_InvalidCatalogRejected: a managed hostname authenticates, but an
+// unknown database/catalog name fails with 3D000.
+func TestSNI_InvalidCatalogRejected(t *testing.T) {
+	if err := waitForDBReady(60 * time.Second); err != nil {
+		t.Fatalf("waitForDBReady: %v", err)
 	}
-	if current != sniSeedDatabaseName {
-		t.Fatalf("legacy fallback should land us in the param-named database; got %q, want %q",
-			current, sniSeedDatabaseName)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := connectWithSNI(ctx, sniSeedOrgName+sniManagedSuffix,
+		"not_a_catalog", sniSeedUser, sniSeedPassword)
+	if err == nil {
+		t.Fatalf("expected an invalid catalog name to be rejected")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected pg error; got: %T %v", err, err)
+	}
+	if pgErr.Code != "3D000" {
+		t.Fatalf("SQLSTATE = %q, want 3D000", pgErr.Code)
 	}
 }

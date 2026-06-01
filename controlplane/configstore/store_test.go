@@ -301,102 +301,89 @@ func TestResolvePostgresConnection(t *testing.T) {
 		},
 	}
 
-	t.Run("explicit database must match managed SNI org", func(t *testing.T) {
+	t.Run("org resolved from SNI; ducklake catalog selected", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection(
-			"test_org_smoke_1778167994",
+			"ducklake",
 			"test-org-smoke-1778167994",
 			true,
 			"root",
 			"secret",
 		)
-		if got.EffectiveDatabase != "test_org_smoke_1778167994" || got.OrgID != "test-org-smoke-1778167994" {
-			t.Fatalf("effective route = (%q, %q), want explicit db/org", got.EffectiveDatabase, got.OrgID)
+		if !got.SNIResolved || got.OrgID != "test-org-smoke-1778167994" {
+			t.Fatalf("org = (resolved=%v, %q), want test org from SNI: %+v", got.SNIResolved, got.OrgID, got)
 		}
-		if got.UsedSNIDatabase {
-			t.Fatalf("explicit database should take priority over SNI fallback")
+		if !got.CatalogValid || got.EffectiveCatalog != "ducklake" {
+			t.Fatalf("catalog = (valid=%v, %q), want ducklake: %+v", got.CatalogValid, got.EffectiveCatalog, got)
 		}
-		if !got.DatabaseExists || !got.HostnameMatches || !got.Valid || !got.Passthrough {
-			t.Fatalf("unexpected result: %+v", got)
-		}
-	})
-
-	t.Run("empty database falls back to managed SNI", func(t *testing.T) {
-		got := cs.ResolvePostgresConnection(
-			"",
-			"test-org-smoke-1778167994",
-			true,
-			"root",
-			"secret",
-		)
-		if got.EffectiveDatabase != "test_org_smoke_1778167994" || !got.UsedSNIDatabase {
-			t.Fatalf("SNI fallback result = (%q, used=%v), want test db/used", got.EffectiveDatabase, got.UsedSNIDatabase)
-		}
-		if !got.DatabaseExists || !got.HostnameMatches || !got.Valid {
-			t.Fatalf("unexpected result: %+v", got)
+		if !got.Valid || !got.Passthrough {
+			t.Fatalf("unexpected auth result: %+v", got)
 		}
 	})
 
-	t.Run("two existing orgs mismatch is rejected before auth", func(t *testing.T) {
-		got := cs.ResolvePostgresConnection(
-			"test_org_smoke_1778167994",
-			"billing",
-			true,
-			"root",
-			"secret",
-		)
-		if !got.DatabaseExists {
-			t.Fatalf("expected requested database to exist: %+v", got)
+	t.Run("iceberg catalog selected", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("iceberg", "test-org-smoke-1778167994", true, "root", "secret")
+		if !got.CatalogValid || got.EffectiveCatalog != "iceberg" {
+			t.Fatalf("catalog = (valid=%v, %q), want iceberg: %+v", got.CatalogValid, got.EffectiveCatalog, got)
 		}
-		if got.HostnameMatches {
-			t.Fatalf("expected SNI org billing to mismatch requested database org: %+v", got)
+		if !got.Valid {
+			t.Fatalf("expected valid auth: %+v", got)
+		}
+	})
+
+	t.Run("empty database means use the default catalog", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("", "test-org-smoke-1778167994", true, "root", "secret")
+		if !got.CatalogValid || got.EffectiveCatalog != "" {
+			t.Fatalf("catalog = (valid=%v, %q), want empty/use-default: %+v", got.CatalogValid, got.EffectiveCatalog, got)
+		}
+		if !got.Valid {
+			t.Fatalf("expected valid auth: %+v", got)
+		}
+	})
+
+	t.Run("legacy database name is no longer a valid catalog", func(t *testing.T) {
+		// The org's old database_name is not "ducklake"/"iceberg", so it fails the
+		// catalog check even though SNI+auth would otherwise succeed.
+		got := cs.ResolvePostgresConnection("test_org_smoke_1778167994", "test-org-smoke-1778167994", true, "root", "secret")
+		if got.CatalogValid {
+			t.Fatalf("legacy database name must not be a selectable catalog: %+v", got)
+		}
+	})
+
+	t.Run("unknown managed SNI does not resolve an org", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "ghostorg", true, "root", "secret")
+		if got.SNIResolved || got.OrgID != "" {
+			t.Fatalf("unknown SNI must not resolve an org: %+v", got)
 		}
 		if got.Valid {
-			t.Fatalf("mismatched managed hostname must not authenticate: %+v", got)
+			t.Fatalf("unknown SNI must not authenticate: %+v", got)
 		}
 	})
 
-	t.Run("unknown managed SNI with explicit database is rejected before auth", func(t *testing.T) {
-		got := cs.ResolvePostgresConnection(
-			"test_org_smoke_1778167994",
-			"ghostorg",
-			true,
-			"root",
-			"secret",
-		)
-		if !got.DatabaseExists {
-			t.Fatalf("expected requested database to exist: %+v", got)
+	t.Run("identity requires managed SNI", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "test-org-smoke-1778167994", false, "root", "secret")
+		if got.SNIResolved || got.Valid {
+			t.Fatalf("without managed SNI there is no identity: %+v", got)
 		}
-		if got.HostnameMatches {
-			t.Fatalf("expected unknown managed SNI to mismatch requested database org: %+v", got)
-		}
-		if got.Valid {
-			t.Fatalf("unknown managed SNI must not authenticate: %+v", got)
+		// Catalog validation is independent of identity.
+		if !got.CatalogValid || got.EffectiveCatalog != "ducklake" {
+			t.Fatalf("catalog should still validate: %+v", got)
 		}
 	})
 
-	t.Run("unknown SNI fallback keeps database-style error target", func(t *testing.T) {
-		got := cs.ResolvePostgresConnection(
-			"",
-			"ghostorg",
-			true,
-			"root",
-			"secret",
-		)
-		if got.EffectiveDatabase != "ghostorg" || got.DatabaseExists {
-			t.Fatalf("unknown SNI fallback = (%q, exists=%v), want ghostorg missing", got.EffectiveDatabase, got.DatabaseExists)
+	t.Run("wrong password fails auth but resolves org", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "test-org-smoke-1778167994", true, "root", "wrong")
+		if !got.SNIResolved || got.Valid {
+			t.Fatalf("expected resolved org but failed auth: %+v", got)
 		}
 	})
 
 	t.Run("valid user includes configured default catalog", func(t *testing.T) {
-		got := cs.ResolvePostgresConnection(
-			"billing_db",
-			"billing-alias",
-			true,
-			"root",
-			"secret",
-		)
+		got := cs.ResolvePostgresConnection("", "billing-alias", true, "root", "secret")
 		if !got.Valid {
 			t.Fatalf("expected valid auth: %+v", got)
+		}
+		if got.OrgID != "billing" {
+			t.Fatalf("OrgID = %q, want billing (via hostname alias)", got.OrgID)
 		}
 		if got.DefaultCatalog != "iceberg" {
 			t.Fatalf("DefaultCatalog = %q, want iceberg", got.DefaultCatalog)

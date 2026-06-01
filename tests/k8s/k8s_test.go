@@ -4,6 +4,7 @@ package k8s_test
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"log"
@@ -17,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/lib/pq"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -822,35 +825,48 @@ func openDBConn() (*sql.DB, error) {
 	return openDBConnAs("postgres", "postgres")
 }
 
+// sniOrgPrefixForUser maps a test user to the managed-hostname label that
+// resolves to its org. Identity is now established from the managed hostname +
+// username (the database param no longer routes), so every connection presents a
+// managed SNI. Tenants are seeded with org name == username; the "postgres" user
+// belongs to org "local".
+func sniOrgPrefixForUser(username string) string {
+	if username == "postgres" {
+		return "local"
+	}
+	return username
+}
+
 func openDBConnAs(username, password string) (*sql.DB, error) {
 	if portForward == nil {
 		return nil, fmt.Errorf("port-forward state is not initialized")
-	}
-	databaseName := username
-	if username == "postgres" {
-		databaseName = "duckgres"
 	}
 	pgPort := portForward.currentPort()
 	if pgPort == 0 {
 		return nil, fmt.Errorf("port-forward port is not initialized")
 	}
 
-	// kubectl port-forward passes raw TCP bytes, so the client still needs
-	// SSL. lib/pq sslmode=require skips server cert verification by default,
-	// which works with self-signed certs.
-	connStr := fmt.Sprintf(
-		"host=127.0.0.1 port=%d user=%s password=%s dbname=%s sslmode=require connect_timeout=30",
-		pgPort,
-		username,
-		password,
-		databaseName,
-	)
-
-	db, err := sql.Open("postgres", connStr)
+	// kubectl port-forward passes raw TCP bytes, so the client still needs SSL.
+	// Override the TLS ServerName (SNI) to the org's managed hostname — that is
+	// the identity signal the control plane reads. The startup database is left
+	// empty so the session lands in the org's default attached catalog
+	// (ducklake, or iceberg for iceberg-only tenants). InsecureSkipVerify is fine
+	// for the kind cluster's self-signed cert (port-forward already breaks the
+	// canonical hostname).
+	cfg, err := pgx.ParseConfig(fmt.Sprintf(
+		"postgres://%s:%s@127.0.0.1:%d/?sslmode=require&connect_timeout=30",
+		url.QueryEscape(username), url.QueryEscape(password), pgPort,
+	))
 	if err != nil {
 		return nil, err
 	}
+	cfg.Database = "" // empty → control plane selects the org's default catalog
+	cfg.TLSConfig = &tls.Config{
+		ServerName:         sniOrgPrefixForUser(username) + sniManagedSuffix,
+		InsecureSkipVerify: true, // self-signed kind cert
+	}
 
+	db := stdlib.OpenDB(*cfg)
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(30 * time.Second)
 	return db, nil
