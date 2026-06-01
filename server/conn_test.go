@@ -1392,7 +1392,7 @@ func (e *queryErrorExecutor) PingContext(context.Context) error {
 func (e *queryErrorExecutor) Close() error { return nil }
 
 type abortedSelectRecoveryExecutor struct {
-	queryCalls    int
+	queryCalls int
 	noopProfiling
 	rollbackCalls int
 }
@@ -1434,9 +1434,9 @@ func (e *abortedSelectRecoveryExecutor) Close() error { return nil }
 type abortedExecAlterViewRecoveryExecutor struct {
 	originalQuery string
 	noopProfiling
-	rewritten     string
-	execCalls     []string
-	execCtxCalls  []string
+	rewritten    string
+	execCalls    []string
+	execCtxCalls []string
 }
 
 func (e *abortedExecAlterViewRecoveryExecutor) execResult(query string, callIndex int) (ExecResult, error) {
@@ -1487,7 +1487,7 @@ func (e *abortedExecAlterViewRecoveryExecutor) Close() error { return nil }
 type abortedAlterViewRecoveryExecutor struct {
 	execContextQueries []string
 	noopProfiling
-	execQueries        []string
+	execQueries []string
 }
 
 func (e *abortedAlterViewRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
@@ -1630,11 +1630,19 @@ func TestHandleQueryEmitsCorrectSQLSTATEOnDuckDBErrors(t *testing.T) {
 // is found or the field is absent.
 func extractErrorResponseField(t *testing.T, buf []byte, field byte) string {
 	t.Helper()
+	if value, ok := errorResponseField(buf, field); ok {
+		return value
+	}
+	t.Fatalf("no ErrorResponse frame with field %q in output (%d bytes)", field, len(buf))
+	return ""
+}
+
+func errorResponseField(buf []byte, field byte) (string, bool) {
 	for i := 0; i+5 <= len(buf); {
 		msgType := buf[i]
 		length := int(binary.BigEndian.Uint32(buf[i+1 : i+5]))
 		if length < 4 || i+1+length > len(buf) {
-			return ""
+			return "", false
 		}
 		body := buf[i+5 : i+1+length]
 		if msgType == 'E' {
@@ -1645,19 +1653,18 @@ func extractErrorResponseField(t *testing.T, buf []byte, field byte) string {
 				}
 				end := bytes.IndexByte(body[j+1:], 0)
 				if end < 0 {
-					return ""
+					return "", false
 				}
 				if code == field {
-					return string(body[j+1 : j+1+end])
+					return string(body[j+1 : j+1+end]), true
 				}
 				j += 1 + end + 1
 			}
-			t.Fatalf("ErrorResponse found but field %q missing", field)
+			return "", false
 		}
 		i += 1 + length
 	}
-	t.Fatalf("no ErrorResponse frame in output (%d bytes)", len(buf))
-	return ""
+	return "", false
 }
 
 func TestExecuteSingleStatementRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
@@ -1863,6 +1870,92 @@ func TestHandleExecuteAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
 		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedExecContextCalls)
 	}
 }
+
+func TestHandleExecuteUsesCompatibilityFallbackForIcebergDropSchemaCascade(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	const query = "DROP SCHEMA IF EXISTS fivetran_testing_schema_abc CASCADE"
+	executor := &extendedDropSchemaCascadeFallbackExecutor{}
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: executor,
+		portals: map[string]*portal{
+			"p": {
+				stmt: &preparedStmt{
+					query:          query,
+					convertedQuery: query,
+				},
+			},
+		},
+	}
+
+	var body bytes.Buffer
+	body.WriteString("p")
+	body.WriteByte(0)
+	if err := binary.Write(&body, binary.BigEndian, int32(0)); err != nil {
+		t.Fatalf("encode execute body: %v", err)
+	}
+
+	c.handleExecute(body.Bytes())
+
+	if code, ok := errorResponseField(out.Bytes(), 'C'); ok {
+		t.Fatalf("unexpected ErrorResponse SQLSTATE %q", code)
+	}
+	if !slices.Equal(executor.execCalls, []string{query}) {
+		t.Fatalf("Exec calls = %v, want original query only", executor.execCalls)
+	}
+	wantExecContext := []string{`DROP SCHEMA IF EXISTS "iceberg"."fivetran_testing_schema_abc"`}
+	if !slices.Equal(executor.execContextCalls, wantExecContext) {
+		t.Fatalf("ExecContext calls = %v, want %v", executor.execContextCalls, wantExecContext)
+	}
+}
+
+type extendedDropSchemaCascadeFallbackExecutor struct {
+	noopProfiling
+	execCalls        []string
+	execContextCalls []string
+}
+
+func (e *extendedDropSchemaCascadeFallbackExecutor) QueryContext(_ context.Context, query string, _ ...any) (RowSet, error) {
+	if strings.Contains(query, "duckdb_settings()") {
+		return &icebergDropSchemaCascadeRows{values: []string{`"iceberg"."public",memory.main`}}, nil
+	}
+	return &icebergDropSchemaCascadeRows{values: nil}, nil
+}
+
+func (e *extendedDropSchemaCascadeFallbackExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	e.execContextCalls = append(e.execContextCalls, strings.TrimSpace(query))
+	return &fakeExecResult{}, nil
+}
+
+func (e *extendedDropSchemaCascadeFallbackExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *extendedDropSchemaCascadeFallbackExecutor) Exec(query string, _ ...any) (ExecResult, error) {
+	e.execCalls = append(e.execCalls, strings.TrimSpace(query))
+	return nil, errors.New("flight execute update: rpc error: code = InvalidArgument desc = failed to execute update: Not implemented Error: DROP SCHEMA <schema_name> CASCADE is not supported for Iceberg schemas currently")
+}
+
+func (e *extendedDropSchemaCascadeFallbackExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *extendedDropSchemaCascadeFallbackExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *extendedDropSchemaCascadeFallbackExecutor) Close() error { return nil }
 
 func TestHandleExecuteRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
 	clientSide, serverSide := net.Pipe()

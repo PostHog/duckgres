@@ -1448,7 +1448,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
-				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(ctx, query, err)
+				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(ctx, query, err, func(fallbackQuery string) (ExecResult, error) {
+					return c.executor.ExecContext(ctx, fallbackQuery)
+				})
 				if handled {
 					return fallbackResult, fallbackErr
 				}
@@ -2155,15 +2157,11 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, executedQuery)
 			if err != nil {
-				if isAlterTableNotTableError(err) {
-					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
-						return c.executor.ExecContext(ctx, alteredQuery)
-					}
-				}
-				if isDropTableOnViewError(err) {
-					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
-						return c.executor.ExecContext(ctx, alteredQuery)
-					}
+				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(ctx, executedQuery, err, func(fallbackQuery string) (ExecResult, error) {
+					return c.executor.ExecContext(ctx, fallbackQuery)
+				})
+				if handled {
+					return fallbackResult, fallbackErr
 				}
 			}
 			return execResult, err
@@ -5723,17 +5721,10 @@ func (c *clientConn) handleExecute(body []byte) {
 		runExec := func() (ExecResult, error) {
 			result, err := c.executor.Exec(convertedQuery, args...)
 			if err != nil {
-				// Retry ALTER TABLE as ALTER VIEW if target is a view
-				if isAlterTableNotTableError(err) {
-					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
-						return c.executor.Exec(alteredQuery, args...)
-					}
-				}
-				// Retry DROP TABLE as DROP VIEW if target is a view
-				if isDropTableOnViewError(err) {
-					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(convertedQuery); ok {
-						return c.executor.Exec(alteredQuery, args...)
-					}
+				if fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(queryCtx, convertedQuery, err, func(fallbackQuery string) (ExecResult, error) {
+					return c.executor.Exec(fallbackQuery, args...)
+				}); handled {
+					return fallbackResult, fallbackErr
 				}
 			}
 			return result, err
