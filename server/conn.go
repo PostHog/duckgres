@@ -1034,6 +1034,10 @@ func (c *clientConn) serve() error {
 			return err
 		}
 		initCancel()
+		// Keep c.database aligned with the real catalog so observability surfaces
+		// (pg_stat_activity.datname, logs) agree with current_database(). The
+		// control-plane path does the equivalent via NewClientConn(database=…).
+		c.database = catalog
 		c.catalogUseRewrite = duckLakeAttached || icebergAttached
 	}
 

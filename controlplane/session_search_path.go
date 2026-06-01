@@ -81,11 +81,19 @@ func resolveEffectiveCatalog(requested, defaultCatalog string, duckLakeAttached,
 		}
 		return "", false
 	}
-	// requested == "": fall back to the per-user default, then to whatever is
-	// attached (DuckLake preferred, then Iceberg for iceberg-only orgs).
-	if defaultCatalog == iceberg.CatalogName && icebergAttached {
-		return iceberg.CatalogName, true
+	// requested == "": fall back to the per-user configured default. If the user
+	// explicitly configured a default catalog, honor it strictly — fail closed if
+	// it isn't attached rather than silently routing to a different catalog (the
+	// connect path turns the false into a 3D000). This preserves the pre-rework
+	// fail-closed contract for configured catalogs.
+	if defaultCatalog == iceberg.CatalogName {
+		if icebergAttached {
+			return iceberg.CatalogName, true
+		}
+		return "", false
 	}
+	// No configured default: use whatever is attached (DuckLake preferred, then
+	// Iceberg for iceberg-only orgs).
 	switch {
 	case duckLakeAttached:
 		return physicalDuckLakeCatalog, true

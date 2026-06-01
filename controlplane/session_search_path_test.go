@@ -69,6 +69,7 @@ func TestResolveEffectiveCatalog(t *testing.T) {
 		{name: "explicit iceberg not attached", requested: "iceberg", duckLake: true, iceberg: false, want: "", wantOK: false},
 		{name: "default prefers ducklake", requested: "", duckLake: true, iceberg: true, want: "ducklake", wantOK: true},
 		{name: "default honors per-user iceberg", requested: "", defaultCatalog: "iceberg", duckLake: true, iceberg: true, want: "iceberg", wantOK: true},
+		{name: "configured iceberg default not attached fails closed", requested: "", defaultCatalog: "iceberg", duckLake: true, iceberg: false, want: "", wantOK: false},
 		{name: "default falls back to iceberg-only", requested: "", duckLake: false, iceberg: true, want: "iceberg", wantOK: true},
 		{name: "nothing attached fails", requested: "", duckLake: false, iceberg: false, want: "", wantOK: false},
 	}
