@@ -65,25 +65,40 @@ type flightOwnedSession struct {
 }
 
 // orgRoutedSessionProvider routes Flight SQL session operations to the correct
-// org's SessionManager based on the username→org mapping resolved during auth.
+// org's SessionManager. The org is derived from the connection's managed
+// hostname (SNI) — the same immutable per-connection identity that auth uses —
+// re-resolved at session-create time via resolveOrg. There is deliberately NO
+// username→org map: a username is only unique within an org, so a shared map
+// keyed by username collides when two tenants share a username (the auth result
+// for one connection could be overwritten by a concurrent connection's).
 type orgRoutedSessionProvider struct {
 	orgRouter   OrgRouterInterface
 	configStore ConfigStoreInterface
+	// resolveOrg resolves the org for a session from the request context's SNI.
+	// Injected so it can be stubbed in tests; production wires it to
+	// ControlPlane.flightOrgFromContext.
+	resolveOrg func(ctx context.Context) (orgID string, ok bool)
 
 	mu         sync.RWMutex
 	pidSession map[int32]flightOwnedSession // pid → owning session manager
-	userOrg    map[string]string            // username → orgID (populated during auth)
 }
 
 func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
-	p.mu.RLock()
-	orgID := p.userOrg[username]
-	p.mu.RUnlock()
+	// Bind the session to the org of THIS connection's managed hostname, not a
+	// shared username lookup. Fail closed if the SNI no longer resolves an org.
+	if p.resolveOrg == nil {
+		return 0, nil, fmt.Errorf("flight session provider misconfigured: no org resolver")
+	}
+	orgID, ok := p.resolveOrg(ctx)
+	if !ok || orgID == "" {
+		slog.Warn("Flight SQL session: could not resolve org from connection SNI.", "username", username)
+		return 0, nil, fmt.Errorf("could not resolve organization for flight session")
+	}
 
 	_, sessions, _, ok := p.orgRouter.StackForOrg(orgID)
 	if !ok {
-		slog.Warn("Flight SQL session: no org stack for user.", "username", username, "org", orgID)
-		return 0, nil, fmt.Errorf("no org configured for user %q", username)
+		slog.Warn("Flight SQL session: no org stack for org.", "username", username, "org", orgID)
+		return 0, nil, fmt.Errorf("no org stack for org %q", orgID)
 	}
 
 	// SessionManager.resolveSessionLimits handles rebalancer defaults,

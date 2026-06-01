@@ -434,7 +434,7 @@ func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(ctx context.
 	// CredentialValidator path.
 	ok := false
 	if sniAware, isSNIAware := h.validator.(SNIAwareCredentialValidator); isSNIAware {
-		ok = sniAware.ValidateCredentialsForSNI(sniFromContext(ctx), username, password)
+		ok = sniAware.ValidateCredentialsForSNI(SNIFromContext(ctx), username, password)
 	} else {
 		ok = h.validator.ValidateCredentials(username, password)
 	}
@@ -449,9 +449,11 @@ func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(ctx context.
 	return username, nil
 }
 
-// sniFromContext returns the TLS ServerName the client sent, or "" if the
-// connection isn't TLS-terminated by this server (e.g. in unit tests).
-func sniFromContext(ctx context.Context) string {
+// SNIFromContext returns the TLS ServerName (SNI) the client sent, or "" if the
+// connection isn't TLS-terminated by this server (e.g. in unit tests). Exported
+// so callers that route by org reuse the exact same extraction the auth path
+// uses — auth and routing must never disagree on a connection's hostname.
+func SNIFromContext(ctx context.Context) string {
 	pr, ok := peer.FromContext(ctx)
 	if !ok || pr == nil {
 		return ""
