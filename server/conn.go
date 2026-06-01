@@ -171,7 +171,7 @@ type clientConn struct {
 	txStatus               byte                     // current transaction status ('I', 'T', or 'E')
 	passthrough            bool                     // true for passthrough users (skip transpiler + pg_catalog)
 	cursors                map[string]*cursorState  // server-side cursor emulation
-	logicalCatalogMapping  bool                     // true when the session has an attached ducklake catalog and logical catalog masking is active
+	catalogUseRewrite      bool                     // true when bare `USE ducklake`/`USE iceberg` should expand to the reliable two-part target
 	tenantIcebergConfig    IcebergConfig
 	hasTenantIcebergConfig bool
 	ctx                    context.Context    // connection context, cancelled when connection is closed
@@ -197,11 +197,23 @@ type clientConn struct {
 }
 
 // newTranspiler creates a transpiler configured for this connection.
+//
+// LogicalDatabaseName is pinned to the physical DuckLake catalog ("ducklake")
+// rather than the client's connection database. duckgres no longer masks a
+// logical database name onto the physical catalog; the only remaining job of
+// the logical-catalog transform is to map `ducklake.public.*` → `ducklake.main.*`
+// (DuckLake's real schema is `main`). Iceberg three-part refs and arbitrary
+// names are left untouched.
 func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
+	duckLakeMode := c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake
+	logicalDatabaseName := ""
+	if duckLakeMode {
+		logicalDatabaseName = physicalDuckLakeCatalog
+	}
 	return transpiler.New(transpiler.Config{
-		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake,
-		LogicalDatabaseName: c.database,
-		PhysicalCatalogName: "ducklake",
+		DuckLakeMode:        duckLakeMode,
+		LogicalDatabaseName: logicalDatabaseName,
+		PhysicalCatalogName: physicalDuckLakeCatalog,
 		ConvertPlaceholders: convertPlaceholders,
 	})
 }
@@ -994,18 +1006,39 @@ func (c *clientConn) serve() error {
 			initTimeout = DefaultSessionInitTimeout
 		}
 		initCtx, initCancel := context.WithTimeout(context.Background(), initTimeout)
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
+		duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, c.executor, physicalDuckLakeCatalog)
+		if err != nil {
+			initCancel()
+			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
+			return err
+		}
+		icebergAttached, err := sessionmeta.HasAttachedCatalog(initCtx, c.executor, iceberg.CatalogName)
+		if err != nil {
+			initCancel()
+			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect iceberg catalog attachment: %v", err))
+			return err
+		}
+		// De-mask: current_database() and the pg_catalog surfaces should reflect
+		// the real attached catalog, not the client's connection database name.
+		// Standalone has a single backing catalog, so honor whatever is attached.
+		catalog := c.database
+		switch {
+		case duckLakeAttached:
+			catalog = physicalDuckLakeCatalog
+		case icebergAttached:
+			catalog = iceberg.CatalogName
+		}
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
-		duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, c.executor, "ducklake")
 		initCancel()
-		if err != nil {
-			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
-			return err
-		}
-		c.logicalCatalogMapping = duckLakeAttached
+		// Keep c.database aligned with the real catalog so observability surfaces
+		// (pg_stat_activity.datname, logs) agree with current_database(). The
+		// control-plane path does the equivalent via NewClientConn(database=…).
+		c.database = catalog
+		c.catalogUseRewrite = duckLakeAttached || icebergAttached
 	}
 
 	// Send initial parameters
@@ -1593,8 +1626,15 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 	return err
 }
 
+// rewriteDirectQuery expands a bare `USE ducklake`/`USE iceberg` to its reliable
+// two-part `catalog.schema` target. This is NOT logical-name masking — the
+// catalog names are real; the rewrite only works around DuckDB's bare-catalog
+// `USE` resolution (a bare `USE ducklake` issued while the session is in the
+// iceberg catalog resolves `ducklake` as a *schema* within iceberg, landing on a
+// bogus `iceberg.ducklake`). Any other `USE <name>` and all other statements are
+// passed through unchanged.
 func (c *clientConn) rewriteDirectQuery(query string) string {
-	if c == nil || c.server == nil || c.passthrough || !c.logicalCatalogMapping || strings.TrimSpace(c.database) == "" {
+	if c == nil || c.server == nil || c.passthrough || !c.catalogUseRewrite {
 		return query
 	}
 
@@ -1605,13 +1645,6 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 
 	hasSemicolon := strings.HasSuffix(stripped, ";")
 	trimmed := strings.TrimSpace(strings.TrimSuffix(stripped, ";"))
-	if strings.EqualFold(trimmed, "SHOW DATABASES") {
-		rewritten := "SELECT current_database() AS database_name"
-		if hasSemicolon {
-			rewritten += ";"
-		}
-		return rewritten
-	}
 
 	if len(trimmed) < len("USE") || !strings.EqualFold(trimmed[:len("USE")], "USE") {
 		return query
@@ -1627,29 +1660,15 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		unquoted = strings.ReplaceAll(target[1:len(target)-1], `""`, `"`)
 	}
 
-	// Rewrite a bare catalog `USE` to a two-part `catalog.schema` target.
-	// Two-part is required for reliable switching: a bare `USE ducklake`
-	// issued while the session is in the iceberg catalog resolves `ducklake`
-	// as a schema *within* iceberg (DuckDB prefers schema-in-current-catalog
-	// for a single identifier), landing on a bogus `iceberg.ducklake`.
 	var target2part string
 	switch {
-	case strings.EqualFold(unquoted, c.database) || strings.EqualFold(unquoted, physicalDuckLakeCatalog):
-		// `USE <logical-db-name>` or `USE ducklake` -> the physical ducklake.main.
-		// Checked before the iceberg arm so that a customer whose logical DB is
-		// (improbably) named "iceberg" still reaches their DuckLake warehouse.
+	case strings.EqualFold(unquoted, physicalDuckLakeCatalog):
+		// `USE ducklake` -> ducklake.main (DuckLake's real schema is `main`).
 		target2part = physicalDuckLakeCatalog + ".main"
 	case strings.EqualFold(unquoted, iceberg.CatalogName):
-		// `USE iceberg` -> the guaranteed default schema. DuckDB can't `USE`
-		// a bare REST catalog (it targets <catalog>.main, which it shadows),
-		// so we land on iceberg.<DefaultSchema> (ensured by attachLakekeeperCatalog).
-		//
-		// NOT gated on cfg.Iceberg.Enabled: rewriteDirectQuery runs on the
-		// control-plane proxy conn (server = the CP, not the per-org worker),
-		// where cfg.Iceberg.Enabled is always false — gating there silently
-		// disabled the rewrite for every tenant. If the tenant doesn't have
-		// iceberg attached, `USE iceberg.public` simply errors at the worker,
-		// same as a bare `USE iceberg` would.
+		// `USE iceberg` -> iceberg.<DefaultSchema>. DuckDB can't `USE` a bare REST
+		// catalog (it targets <catalog>.main, which it shadows), so land on the
+		// guaranteed default schema (ensured by attachLakekeeperCatalog).
 		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
 	default:
 		return query

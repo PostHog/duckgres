@@ -12,8 +12,8 @@ func TestRewriteDirectQuery(t *testing.T) {
 				Iceberg: IcebergConfig{Enabled: true},
 			},
 		},
-		database:              "test",
-		logicalCatalogMapping: true,
+		database:          "ducklake",
+		catalogUseRewrite: true,
 	}
 
 	tests := []struct {
@@ -22,26 +22,21 @@ func TestRewriteDirectQuery(t *testing.T) {
 		want  string
 	}{
 		{
-			name:  "rewrites logical use command to two-part ducklake.main",
-			query: "USE test",
-			want:  "USE ducklake.main",
-		},
-		{
-			name:  "rewrites quoted logical use command to two-part ducklake.main",
-			query: `USE "test"`,
-			want:  "USE ducklake.main",
-		},
-		{
-			name:  "rewrites commented logical use command",
-			query: "/* switch */ USE test;",
-			want:  "USE ducklake.main;",
-		},
-		{
 			// `USE ducklake` while currently in the iceberg catalog would
 			// otherwise resolve to a bogus iceberg.ducklake — two-part fixes it.
 			name:  "rewrites bare ducklake to two-part ducklake.main",
 			query: "USE ducklake",
 			want:  "USE ducklake.main",
+		},
+		{
+			name:  "rewrites quoted ducklake to two-part ducklake.main",
+			query: `USE "ducklake"`,
+			want:  "USE ducklake.main",
+		},
+		{
+			name:  "rewrites commented ducklake use",
+			query: "/* switch */ USE ducklake;",
+			want:  "USE ducklake.main;",
 		},
 		{
 			name:  "rewrites bare iceberg to its default schema",
@@ -65,19 +60,21 @@ func TestRewriteDirectQuery(t *testing.T) {
 			want:  "USE memory",
 		},
 		{
+			// An arbitrary database name is no longer remapped onto a catalog.
+			name:  "preserves use of an arbitrary name",
+			query: "USE analytics",
+			want:  "USE analytics",
+		},
+		{
 			name:  "preserves non-use query",
 			query: "SELECT current_database()",
 			want:  "SELECT current_database()",
 		},
 		{
-			name:  "rewrites show databases to logical catalog",
+			// SHOW DATABASES now lists the real attached catalogs — no rewrite.
+			name:  "preserves show databases",
 			query: "SHOW DATABASES",
-			want:  "SELECT current_database() AS database_name",
-		},
-		{
-			name:  "rewrites commented show databases with semicolon",
-			query: "/* list */ SHOW DATABASES;",
-			want:  "SELECT current_database() AS database_name;",
+			want:  "SHOW DATABASES",
 		},
 	}
 
@@ -100,61 +97,33 @@ func TestRewriteDirectQueryUseIcebergRewrittenEvenWhenCfgDisabled(t *testing.T) 
 			DuckLake: DuckLakeConfig{MetadataStore: "postgres:host=127.0.0.1 dbname=ducklake"},
 			Iceberg:  IcebergConfig{Enabled: false},
 		}},
-		database:              "test",
-		logicalCatalogMapping: true,
+		database:          "iceberg",
+		catalogUseRewrite: true,
 	}
 	if got, want := c.rewriteDirectQuery("USE iceberg"), "USE iceberg.public"; got != want {
 		t.Fatalf("rewriteDirectQuery(USE iceberg) = %q, want %q", got, want)
 	}
 }
 
-// A customer whose logical DB name is literally "iceberg" must still reach
-// their DuckLake warehouse on `USE iceberg`, not the Iceberg REST catalog.
-func TestRewriteDirectQueryLogicalDBNamedIcebergGoesToDuckLake(t *testing.T) {
-	c := &clientConn{
-		server: &Server{cfg: Config{
-			DuckLake: DuckLakeConfig{MetadataStore: "postgres:host=127.0.0.1 dbname=ducklake"},
-			Iceberg:  IcebergConfig{Enabled: true},
-		}},
-		database:              "iceberg",
-		logicalCatalogMapping: true,
-	}
-	if got, want := c.rewriteDirectQuery("USE iceberg"), "USE ducklake.main"; got != want {
-		t.Fatalf("rewriteDirectQuery(USE iceberg) with logical db 'iceberg' = %q, want %q", got, want)
-	}
-}
-
-func TestRewriteDirectQueryMultitenantShowDatabases(t *testing.T) {
-	c := &clientConn{
-		server:                &Server{},
-		database:              "duckgres",
-		logicalCatalogMapping: true,
-	}
-
-	if got, want := c.rewriteDirectQuery("SHOW DATABASES"), "SELECT current_database() AS database_name"; got != want {
-		t.Fatalf("rewriteDirectQuery(SHOW DATABASES) = %q, want %q", got, want)
-	}
-}
-
-func TestRewriteDirectQueryPassthroughPreservesShowDatabases(t *testing.T) {
+func TestRewriteDirectQueryPassthroughPreservesUse(t *testing.T) {
 	c := &clientConn{
 		server:      &Server{},
-		database:    "duckgres",
+		database:    "ducklake",
 		passthrough: true,
 	}
 
-	if got, want := c.rewriteDirectQuery("SHOW DATABASES"), "SHOW DATABASES"; got != want {
-		t.Fatalf("rewriteDirectQuery(SHOW DATABASES) = %q, want %q", got, want)
+	if got, want := c.rewriteDirectQuery("USE ducklake"), "USE ducklake"; got != want {
+		t.Fatalf("rewriteDirectQuery(USE ducklake) = %q, want %q", got, want)
 	}
 }
 
-func TestRewriteDirectQueryPreservesShowDatabasesWithoutLogicalCatalogMapping(t *testing.T) {
+func TestRewriteDirectQueryPreservesUseWithoutCatalogRewrite(t *testing.T) {
 	c := &clientConn{
 		server:   &Server{},
-		database: "duckgres",
+		database: "ducklake",
 	}
 
-	if got, want := c.rewriteDirectQuery("SHOW DATABASES"), "SHOW DATABASES"; got != want {
-		t.Fatalf("rewriteDirectQuery(SHOW DATABASES) = %q, want %q", got, want)
+	if got, want := c.rewriteDirectQuery("USE ducklake"), "USE ducklake"; got != want {
+		t.Fatalf("rewriteDirectQuery(USE ducklake) = %q, want %q", got, want)
 	}
 }

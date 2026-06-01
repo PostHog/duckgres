@@ -62,7 +62,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	configStoreConn := fs.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := fs.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
 	internalSecret := fs.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
-	sniRoutingMode := fs.String("sni-routing-mode", "", "Hostname-based org routing: 'off' (default), 'passthrough' (validate managed SNI against requested db; use SNI only when db is empty; log legacy), 'enforce' (require managed SNI and same-org db). Multi-tenant only. (env: DUCKGRES_SNI_ROUTING_MODE)")
+	sniRoutingMode := fs.String("sni-routing-mode", "", "Hostname-based org routing: 'enforce' (default; require a managed SNI hostname that resolves to an org — the database name selects the catalog, not the org), 'passthrough' (warn on legacy hostnames), 'off' (no SNI handling; identity can no longer be resolved). Multi-tenant only. (env: DUCKGRES_SNI_ROUTING_MODE)")
 	managedHostnameSuffixes := fs.String("managed-hostname-suffixes", "", "Comma-separated DNS suffixes (each starting with '.') for managed tenant hostnames, e.g. '.dw.us.postwh.com'. (env: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES)")
 	workerBackend := fs.String("worker-backend", "", "Worker backend: process (default) or remote for config-store-backed K8s multitenant mode (env: DUCKGRES_WORKER_BACKEND)")
 	k8sWorkerImage := fs.String("k8s-worker-image", "", "Container image for K8s worker pods (env: DUCKGRES_K8S_WORKER_IMAGE)")

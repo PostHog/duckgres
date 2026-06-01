@@ -45,22 +45,42 @@ type Snapshot struct {
 	QueryLog              QueryLogConfig
 }
 
+// Selectable catalog names. The startup `database` param now names the catalog
+// a session defaults to rather than identifying the org — these are the only
+// non-empty values a client may request.
+const (
+	catalogDuckLake = "ducklake"
+	catalogIceberg  = "iceberg"
+)
+
 // PostgresConnectionResolution is the result of resolving and authenticating a
 // Postgres startup packet against one immutable config snapshot.
+//
+// Identity (OrgID) comes solely from the managed hostname (SNI) plus the
+// username/password; the startup `database` param is treated as catalog
+// selection, not identity.
 type PostgresConnectionResolution struct {
-	EffectiveDatabase   string
-	OrgID               string
-	SNIOrgID            string
-	SNIDatabase         string
-	SNIAliasUsed        bool
-	UsedSNIDatabase     bool
-	RequiresSNIOrgMatch bool
-	SNIResolved         bool
-	DatabaseExists      bool
-	HostnameMatches     bool
-	Valid               bool
-	Passthrough         bool
-	DefaultCatalog      string
+	// OrgID is the organization the connection belongs to, resolved from the
+	// managed hostname (SNI). Empty unless SNIResolved.
+	OrgID string
+	// SNIOrgID mirrors OrgID; kept distinct for log/observability parity.
+	SNIOrgID string
+	// SNIAliasUsed reports whether the hostname matched via hostname_alias.
+	SNIAliasUsed bool
+	// SNIResolved is true when the managed hostname resolved to a known org.
+	SNIResolved bool
+	// EffectiveCatalog is the catalog the session should default to, selected by
+	// the startup `database` param: "" (use the per-user/attached default),
+	// "ducklake", or "iceberg".
+	EffectiveCatalog string
+	// CatalogValid is false when the requested `database` is not a selectable
+	// catalog name (anything other than "", "ducklake", "iceberg").
+	CatalogValid bool
+	// Valid is true when (OrgID, username, password) authenticated.
+	Valid bool
+	// Passthrough / DefaultCatalog are the per-user flags for the resolved user.
+	Passthrough    bool
+	DefaultCatalog string
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -359,9 +379,21 @@ func isDNSLabel(label string) bool {
 }
 
 func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) PostgresConnectionResolution {
-	result := PostgresConnectionResolution{
-		EffectiveDatabase: startupDatabase,
-		HostnameMatches:   true,
+	result := PostgresConnectionResolution{}
+
+	// The startup `database` param is now pure catalog selection, not identity.
+	// Valid values: "" (use the per-user/attached default), "ducklake", or
+	// "iceberg". Anything else fails closed — there is no logical-name masking,
+	// so an arbitrary name no longer routes anywhere.
+	switch strings.ToLower(strings.TrimSpace(startupDatabase)) {
+	case "":
+		result.CatalogValid = true
+	case catalogDuckLake:
+		result.EffectiveCatalog = catalogDuckLake
+		result.CatalogValid = true
+	case catalogIceberg:
+		result.EffectiveCatalog = catalogIceberg
+		result.CatalogValid = true
 	}
 
 	cs.mu.RLock()
@@ -370,38 +402,26 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 		return result
 	}
 
-	if useManagedSNI {
-		result.RequiresSNIOrgMatch = true
-		result.SNIOrgID, result.SNIDatabase, result.SNIAliasUsed = resolveSNIPrefixFromSnapshot(cs.snapshot, sniPrefix)
-		result.SNIResolved = result.SNIOrgID != ""
-		if result.SNIDatabase == "" {
-			result.SNIDatabase = sniPrefix
-		}
-		if startupDatabase == "" {
-			result.EffectiveDatabase = result.SNIDatabase
-			result.UsedSNIDatabase = true
-		}
-	}
-
-	if result.EffectiveDatabase == "" {
+	// Identity comes from the managed hostname (SNI) only. Without a managed,
+	// resolvable hostname there is no org to authenticate against — the database
+	// name is no longer consulted for routing.
+	if !useManagedSNI {
 		return result
 	}
-
-	orgID := cs.snapshot.DatabaseOrg[result.EffectiveDatabase]
+	orgID, _, aliasUsed := resolveSNIPrefixFromSnapshot(cs.snapshot, sniPrefix)
 	if orgID == "" {
 		return result
 	}
-	result.DatabaseExists = true
+	result.SNIResolved = true
+	result.SNIAliasUsed = aliasUsed
+	result.SNIOrgID = orgID
 	result.OrgID = orgID
 
-	if result.RequiresSNIOrgMatch && result.SNIOrgID != orgID {
-		result.HostnameMatches = false
-		return result
-	}
-
+	// Authenticate the user within the resolved org.
 	key := OrgUserKey{OrgID: orgID, Username: username}
 	storedHash, ok := cs.snapshot.OrgUserPassword[key]
 	if !ok {
+		// Timing-leak guard: still spend bcrypt time on unknown users.
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
 		return result
 	}
@@ -496,26 +516,6 @@ func (cs *ConfigStore) ValidateOrgUserAndGetPassthrough(orgID, username, passwor
 		return false, false
 	}
 	return true, cs.snapshot.OrgUserPassthrough[key]
-}
-
-// FindAndValidateUser scans all orgs to find and authenticate a user by username/password.
-// This is used for Flight SQL which doesn't have SNI-based org routing.
-func (cs *ConfigStore) FindAndValidateUser(username, password string) (string, bool) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	if cs.snapshot == nil {
-		return "", false
-	}
-	for key, storedHash := range cs.snapshot.OrgUserPassword {
-		if key.Username == username {
-			if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil {
-				return key.OrgID, true
-			}
-			return "", false
-		}
-	}
-	_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
-	return "", false
 }
 
 // HashPassword hashes a plaintext password using bcrypt.

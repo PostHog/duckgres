@@ -68,7 +68,7 @@ spec:
             - "--flight-port"
             - "8815"
             - "--sni-routing-mode"
-            - "passthrough"
+            - "enforce"
             - "--managed-hostname-suffixes"
             - ".dw.test.local"
             - "--config"
