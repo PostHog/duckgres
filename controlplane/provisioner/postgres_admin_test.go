@@ -165,6 +165,66 @@ func TestEnsureRole_AgainstLivePG(t *testing.T) {
 	}
 }
 
+// TestDropDatabaseAndRole_AgainstLivePG covers the teardown helpers added
+// for duckling delete: round-trips Ensure → Drop and confirms the role
+// and DB are both gone, plus the idempotent re-drop case.
+func TestDropDatabaseAndRole_AgainstLivePG(t *testing.T) {
+	dsn := os.Getenv("PG_ADMIN_DSN")
+	if dsn == "" {
+		t.Skip("PG_ADMIN_DSN not set")
+	}
+	dbName := fmt.Sprintf("lakekeeper_drop_test_%d", os.Getpid())
+	roleName := dbName
+	t.Cleanup(func() {
+		// Belt-and-suspenders cleanup in case the assertions short-circuit.
+		db, _ := sql.Open("pgx", dsn)
+		defer func() { _ = db.Close() }()
+		_, _ = db.Exec("DROP DATABASE IF EXISTS " + quoteIdent(dbName) + " WITH (FORCE)")
+		_, _ = db.Exec("DROP ROLE IF EXISTS " + quoteIdent(roleName))
+	})
+
+	ctx := context.Background()
+	if err := EnsureDatabase(ctx, dsn, dbName); err != nil {
+		t.Fatalf("EnsureDatabase: %v", err)
+	}
+	if err := EnsureRole(ctx, dsn, roleName, "abcdef0123456789", dbName); err != nil {
+		t.Fatalf("EnsureRole: %v", err)
+	}
+
+	if err := DropDatabase(ctx, dsn, dbName); err != nil {
+		t.Fatalf("DropDatabase: %v", err)
+	}
+	// Idempotent re-drop.
+	if err := DropDatabase(ctx, dsn, dbName); err != nil {
+		t.Fatalf("DropDatabase (idempotent): %v", err)
+	}
+	if err := DropRole(ctx, dsn, roleName); err != nil {
+		t.Fatalf("DropRole: %v", err)
+	}
+	if err := DropRole(ctx, dsn, roleName); err != nil {
+		t.Fatalf("DropRole (idempotent): %v", err)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var dbExists, roleExists bool
+	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", dbName).Scan(&dbExists); err != nil {
+		t.Fatalf("verify db gone: %v", err)
+	}
+	if dbExists {
+		t.Errorf("database %s still present after DropDatabase", dbName)
+	}
+	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", roleName).Scan(&roleExists); err != nil {
+		t.Fatalf("verify role gone: %v", err)
+	}
+	if roleExists {
+		t.Errorf("role %s still present after DropRole", roleName)
+	}
+}
+
 func TestIsSafePGPassword(t *testing.T) {
 	cases := map[string]bool{
 		"abc123":                                       true,

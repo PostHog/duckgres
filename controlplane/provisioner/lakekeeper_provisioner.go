@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server/lakekeeperbroker"
@@ -341,12 +342,26 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 // explicitly). Idempotent and NotFound-tolerant, so it's a safe no-op for orgs
 // that never had Iceberg enabled.
 //
-// What it does NOT touch: the lakekeeper_<org> Postgres database/role. On
-// cnpg-shard it's provider-sql-managed and torn down with the Duckling CR; on
-// aurora the whole cluster is torn down with the Duckling CR; on an external
-// (shared) metadata store it currently persists — dropping a database on a
-// shared RDS is destructive and out of scope for this teardown.
-func (p *LakekeeperProvisioner) DeleteForOrg(ctx context.Context, orgID string) error {
+// When inputs carry an AdminDSN (i.e. !PGPreProvisioned), additionally drops
+// the lakekeeper_<orgid> Postgres database and role on the metadata store.
+// This is what makes recreating a duckling with the same orgID work: the
+// duckgres lakekeeper provisioner rotates the k8s Secret's encryption-key on
+// every provision, and leaving the old encrypted rows behind causes
+// Lakekeeper to return SecretFetchError ("Wrong key or corrupt data") on
+// every CREATE TABLE in the next lifetime. For the cnpg-shard case
+// (PGPreProvisioned) the corresponding cleanup happens via the Crossplane
+// composition's [Delete] managementPolicy on the cnpg-tenant-role and
+// cnpg-tenant-database resources — see posthog/charts PR for the parallel
+// fix. For the aurora case the whole Aurora cluster is destroyed by
+// Crossplane on Duckling CR delete, so the DROP DATABASE here is redundant
+// but harmless (and the connection may simply refuse — tolerated below).
+//
+// Best-effort: PG drop failures are logged and swallowed so a transient
+// network issue or a half-deleted Aurora cluster doesn't permanently block
+// the duckling teardown. The k8s teardown failures (which actually leave
+// resources stranded) still surface as errors to the controller's retry
+// loop.
+func (p *LakekeeperProvisioner) DeleteForOrg(ctx context.Context, orgID string, in ProvisioningInputs) error {
 	if err := p.k8s.DeleteCR(ctx, orgID); err != nil {
 		return err
 	}
@@ -355,6 +370,24 @@ func (p *LakekeeperProvisioner) DeleteForOrg(ctx context.Context, orgID string) 
 	}
 	if err := p.k8s.DeleteServiceAccount(ctx, orgID); err != nil {
 		return err
+	}
+
+	// PG cleanup applies only when this provisioner actually created the
+	// DB/role (external + dev/orbstack paths). cnpg-shard ownership lives
+	// in the Crossplane composition.
+	if in.PGPreProvisioned || in.AdminDSN == "" {
+		return nil
+	}
+	dbName := lakekeeperDBName(orgID)
+	// DROP DATABASE first so DROP ROLE doesn't trip over the role's
+	// ownership of the database. Both best-effort.
+	if err := DropDatabase(ctx, in.AdminDSN, dbName); err != nil {
+		slog.Warn("Lakekeeper PG database drop failed; continuing teardown.",
+			"org", orgID, "database", dbName, "error", err)
+	}
+	if err := DropRole(ctx, in.AdminDSN, dbName); err != nil {
+		slog.Warn("Lakekeeper PG role drop failed; continuing teardown.",
+			"org", orgID, "role", dbName, "error", err)
 	}
 	return nil
 }

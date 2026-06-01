@@ -581,6 +581,23 @@ func addIcebergStatusUpdates(updates map[string]interface{}, w *configstore.Mana
 func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "deleting")
 
+	// Resolve the Lakekeeper inputs BEFORE deleting the Duckling CR. The
+	// inputs include the metadata-store admin DSN derived from the CR's
+	// status; once the CR is gone the resolver can't reconstruct it, and
+	// we'd lose the only way to drop the per-tenant lakekeeper_<org>
+	// Postgres database. Best-effort resolution: when the inputs aren't
+	// available (resolver unwired, CR never reconciled, dev/orbstack
+	// without env config), the subsequent DeleteForOrg call falls back to
+	// k8s-only teardown.
+	var lkInputs ProvisioningInputs
+	if c.lakekeeperProvisioner != nil && c.lakekeeperInputs != nil {
+		if in, err := c.lakekeeperInputs(ctx, w); err != nil {
+			log.Debug("Lakekeeper inputs unavailable at delete time; skipping PG cleanup.", "error", err)
+		} else {
+			lkInputs = in
+		}
+	}
+
 	log.Info("Deleting Duckling CR.")
 	if err := c.duckling.Delete(ctx, w.OrgID); err != nil {
 		// Only proceed if the CR is already gone (NotFound). For other errors
@@ -593,15 +610,17 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 	}
 
 	// Tear down the per-org Lakekeeper instance the control plane provisioned
-	// out-of-band (CR + Secret + ServiceAccount in the lakekeeper namespace).
-	// The Crossplane Duckling composition doesn't own these, so without an
-	// explicit teardown they leak after the warehouse is gone. Idempotent and
+	// out-of-band (CR + Secret + ServiceAccount in the lakekeeper namespace,
+	// and — when this provisioner created them — the lakekeeper_<org>
+	// Postgres database and role on the metadata store). The Crossplane
+	// Duckling composition doesn't own the k8s pieces, so without an explicit
+	// teardown they leak after the warehouse is gone. Idempotent and
 	// NotFound-tolerant — a clean no-op for ducklings that never enabled
 	// Iceberg. Skipped silently when the provisioner isn't wired (mirrors
 	// reconcileLakekeeper). On error we return without marking the warehouse
 	// deleted so the next reconcile pass retries.
 	if c.lakekeeperProvisioner != nil {
-		if err := c.lakekeeperProvisioner.DeleteForOrg(ctx, w.OrgID); err != nil {
+		if err := c.lakekeeperProvisioner.DeleteForOrg(ctx, w.OrgID, lkInputs); err != nil {
 			log.Warn("Failed to tear down Lakekeeper resources, will retry.", "error", err)
 			return
 		}
