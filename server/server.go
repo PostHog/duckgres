@@ -1279,6 +1279,30 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 }
 
 func shouldInstallExtension(name string) bool {
+	// The bundle-skip optimization assumes a bundled .duckdb_extension on disk
+	// is enough — LOAD finds the file via extension_directory and DuckDB treats
+	// it as installed. That holds for the PostHog-fork extensions (httpfs,
+	// ducklake) and the stable ones we ship (json, postgres_scanner): LOAD
+	// against the seeded extension_directory file just works.
+	//
+	// Iceberg behaves differently. With the bundled binary in place but no
+	// prior INSTALL, db.Exec("LOAD iceberg") blocks indefinitely (observed on
+	// a worker in mw-dev: warm-up → activation hangs past the activate-tenant
+	// deadline at the LOAD with no progress and no Go log; the bundled binary
+	// is sitting in the cache the whole time). The CDN INSTALL — which the
+	// bundle (#645) was added specifically to avoid — turns into the same
+	// silent stall the bundle was meant to fix when LOAD is left to figure
+	// things out on its own.
+	//
+	// Running INSTALL when the binary is already in extension_directory is a
+	// cheap no-op (DuckDB sees the cached file and skips the CDN download), so
+	// special-casing iceberg keeps the bundle benefit (no first-load fetch
+	// from the CDN) and unblocks LOAD. The upstream-overwrite risk that
+	// motivates skipping INSTALL for the PostHog forks doesn't apply here: we
+	// bundle the same stock iceberg build the repository would serve.
+	if name == "iceberg" {
+		return true
+	}
 	return !hasBundledExtensionBinary(name)
 }
 
