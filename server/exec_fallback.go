@@ -7,17 +7,19 @@ import (
 	"github.com/posthog/duckgres/transpiler"
 )
 
-func (c *clientConn) execCompatibilityFallback(ctx context.Context, query string, execErr error) (ExecResult, bool, error) {
+type execFallbackRunner func(string) (ExecResult, error)
+
+func (c *clientConn) execCompatibilityFallback(ctx context.Context, query string, execErr error, exec execFallbackRunner) (ExecResult, bool, error) {
 	if isAlterTableNotTableError(execErr) {
 		if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
-			result, err := c.executor.ExecContext(ctx, alteredQuery)
+			result, err := exec(alteredQuery)
 			return result, true, err
 		}
 	}
 
 	if isDropTableOnViewError(execErr) {
 		if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
-			result, err := c.executor.ExecContext(ctx, alteredQuery)
+			result, err := exec(alteredQuery)
 			return result, true, err
 		}
 	}

@@ -2,10 +2,12 @@ package sessionmeta
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
 
+	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
@@ -151,5 +153,86 @@ func TestInformationSchemaColumnsCompatLoadedIcebergColumnsKeepIcebergCatalog(t 
 	}
 	if strings.Contains(got, "current_database() AS table_catalog,\n\t\t\t\ttable_schema") {
 		t.Fatalf("loaded Iceberg columns should not use current_database() as table_catalog in:\n%s", got)
+	}
+}
+
+func TestInformationSchemaColumnsCompatPrefersLoadedIcebergMetadata(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	stmts := []string{
+		`ATTACH ':memory:' AS iceberg`,
+		`CREATE SCHEMA iceberg.stripe`,
+		`CREATE TABLE iceberg.stripe.account (requirements_currently_due INTEGER)`,
+		sessionColumnMetadataTableSQL(),
+		sessionIcebergColumnMetadataTableSQL(),
+		`INSERT INTO main.__duckgres_iceberg_column_metadata (
+			table_schema,
+			table_name,
+			column_name,
+			ordinal_position,
+			is_nullable,
+			data_type,
+			character_maximum_length,
+			character_octet_length,
+			numeric_precision,
+			numeric_scale,
+			datetime_precision
+		) VALUES (
+			'stripe',
+			'account',
+			'requirements_currently_due',
+			1,
+			'YES',
+			'STRUCT(currently_due VARCHAR[])',
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			NULL
+		)`,
+		buildSessionInformationSchemaColumnsViewSQL(),
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("exec %q: %v", stmt, err)
+		}
+	}
+
+	var dataType string
+	err = db.QueryRow(`
+		SELECT data_type
+		FROM main.information_schema_columns_compat
+		WHERE table_catalog = 'iceberg'
+		AND table_schema = 'stripe'
+		AND table_name = 'account'
+		AND column_name = 'requirements_currently_due'
+	`).Scan(&dataType)
+	if err != nil {
+		t.Fatalf("query compat data_type: %v", err)
+	}
+	if dataType != "json" {
+		t.Fatalf("data_type = %q, want json from loaded Iceberg metadata", dataType)
+	}
+}
+
+func TestInformationSchemaColumnsCompatSuppressesNativeIcebergDuplicatesExplicitly(t *testing.T) {
+	got := buildSessionInformationSchemaColumnsViewSQL()
+	for _, want := range []string{
+		"AND NOT (",
+		"FROM main.__duckgres_iceberg_column_metadata im",
+		"WHERE im.table_schema = c.table_schema",
+		"AND im.table_name = c.table_name",
+		"AND im.column_name = c.column_name",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("columns compat SQL should explicitly suppress native Iceberg duplicates; missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "source_priority") {
+		t.Fatalf("columns compat SQL should not rely on hidden source_priority ranking in:\n%s", got)
 	}
 }

@@ -11,7 +11,9 @@ func TestExecCompatibilityFallbackReturnsIcebergFallbackError(t *testing.T) {
 	execErr := errors.New("Not implemented Error: DROP SCHEMA <schema_name> CASCADE is not supported for Iceberg schemas currently")
 	c := &clientConn{executor: &failingFallbackExecutor{}}
 
-	_, handled, err := c.execCompatibilityFallback(context.Background(), "DROP SCHEMA IF EXISTS stripe CASCADE", execErr)
+	_, handled, err := c.execCompatibilityFallback(context.Background(), "DROP SCHEMA IF EXISTS stripe CASCADE", execErr, func(string) (ExecResult, error) {
+		return nil, errors.New("unexpected fallback exec")
+	})
 	if !handled {
 		t.Fatal("expected Iceberg fallback to handle unsupported DROP SCHEMA CASCADE error")
 	}

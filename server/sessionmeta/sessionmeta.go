@@ -262,6 +262,16 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				AND c.column_name = '__'
 				AND UPPER(c.data_type) = 'UNKNOWN'
 			)
+			AND NOT (
+				c.table_catalog = 'iceberg'
+				AND EXISTS (
+					SELECT 1
+					FROM main.__duckgres_iceberg_column_metadata im
+					WHERE im.table_schema = c.table_schema
+					AND im.table_name = c.table_name
+					AND im.column_name = c.column_name
+				)
+			)
 			UNION ALL
 			SELECT
 				'iceberg' AS source_catalog,
