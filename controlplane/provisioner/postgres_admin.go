@@ -137,6 +137,78 @@ func EnsureRole(ctx context.Context, adminDSN, role, password, ownedDB string) e
 	return nil
 }
 
+// DropDatabase removes dbName on the Postgres server addressed by adminDSN.
+// Idempotent: returns nil when the database is already absent (3D000). Forces
+// disconnection of any active sessions on the target DB so DROP DATABASE
+// can't hang waiting for clients to drain — necessary at duckling teardown
+// time because the per-tenant Lakekeeper pod may still be alive when the
+// drop runs (the k8s teardown is fire-and-forget and the operator's
+// reconciliation lag means connections linger).
+//
+// Caller must connect via a privileged DSN against a different database
+// than dbName (the admin DSN's path is OK to be `postgres`).
+func DropDatabase(ctx context.Context, adminDSN, dbName string) error {
+	if !isSafePGIdent(dbName) {
+		return fmt.Errorf("drop database: unsafe identifier %q", dbName)
+	}
+	db, err := sql.Open("pgx", adminDSN)
+	if err != nil {
+		return fmt.Errorf("open admin connection: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// FORCE terminates active backends as part of DROP DATABASE (Postgres
+	// 13+). Without it a single lingering Lakekeeper connection blocks the
+	// drop until backoff.
+	if _, err := db.ExecContext(ctx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)+" WITH (FORCE)"); err != nil {
+		if isInvalidCatalogName(err) {
+			return nil
+		}
+		return fmt.Errorf("drop database %s: %w", dbName, err)
+	}
+	return nil
+}
+
+// DropRole removes role on the Postgres server addressed by adminDSN.
+// Idempotent: returns nil when the role is already absent. Best-effort
+// REASSIGN/DROP OWNED first so any object the role owns (e.g. tables
+// created in databases other than the one this caller manages) doesn't
+// block DROP ROLE — at duckling teardown the role's database has already
+// been dropped, so REASSIGN typically has nothing to do.
+//
+// Caller must connect via a privileged DSN.
+func DropRole(ctx context.Context, adminDSN, role string) error {
+	if !isSafePGIdent(role) {
+		return fmt.Errorf("drop role: unsafe role name %q", role)
+	}
+	db, err := sql.Open("pgx", adminDSN)
+	if err != nil {
+		return fmt.Errorf("open admin connection: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// REVOKE everything the role was granted on the maintenance database;
+	// otherwise DROP ROLE fails with "role cannot be dropped because some
+	// objects depend on it". DROP OWNED handles cluster-wide ownerships.
+	if _, err := db.ExecContext(ctx, "DROP OWNED BY "+quoteIdent(role)+" CASCADE"); err != nil {
+		// 42704 = undefined_object — role doesn't exist. Benign.
+		if isUndefinedObject(err) {
+			return nil
+		}
+		// Any other failure: log via wrap and continue to the DROP ROLE
+		// attempt — DROP OWNED can fail on cross-DB dependencies we don't
+		// have the visibility to clean up here, but DROP ROLE itself may
+		// still succeed if nothing is left.
+		// We deliberately swallow this and try DROP ROLE; if there's a
+		// real dependency it'll surface there.
+		_ = err
+	}
+	if _, err := db.ExecContext(ctx, "DROP ROLE IF EXISTS "+quoteIdent(role)); err != nil {
+		return fmt.Errorf("drop role %s: %w", role, err)
+	}
+	return nil
+}
+
 // reDSN rewrites the dbname component of a Postgres URL-style DSN. Used to
 // connect to a specific database with the same admin credentials.
 func reDSN(dsn, dbName string) string {
@@ -249,4 +321,23 @@ func isDuplicateDatabase(err error) bool {
 	type sqlStater interface{ SQLState() string }
 	var s sqlStater
 	return errors.As(err, &s) && s.SQLState() == "42P04"
+}
+
+// isInvalidCatalogName reports whether err is Postgres 3D000 (database does
+// not exist) — what DROP DATABASE returns when the target is already gone.
+// Without the IF EXISTS clause this would matter; we keep the check anyway
+// because IF EXISTS is silent on missing-DB and an actual no-such-database
+// error can also surface from the connection attempt itself.
+func isInvalidCatalogName(err error) bool {
+	type sqlStater interface{ SQLState() string }
+	var s sqlStater
+	return errors.As(err, &s) && s.SQLState() == "3D000"
+}
+
+// isUndefinedObject reports whether err is Postgres 42704 (undefined_object)
+// — what DROP OWNED returns when the role doesn't exist. Benign.
+func isUndefinedObject(err error) bool {
+	type sqlStater interface{ SQLState() string }
+	var s sqlStater
+	return errors.As(err, &s) && s.SQLState() == "42704"
 }

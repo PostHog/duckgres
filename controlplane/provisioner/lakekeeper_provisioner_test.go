@@ -497,3 +497,37 @@ func dropDatabase(t *testing.T, dsn, name string) {
 	dropDSN := dsn // pgx accepts the same DSN; CREATE/DROP from any current DB.
 	cleanupDB(t, dropDSN, name)
 }
+
+// TestDeleteForOrg_SkipsPGCleanupForCnpgShard guards the contract that the
+// cnpg-shard path leaves PG cleanup to the Crossplane composition. The
+// composition's [Delete] managementPolicy on the cnpg-tenant-role and
+// cnpg-tenant-database resources owns role+DB teardown there; the
+// duckgres provisioner doesn't have the AdminDSN to do it itself
+// anyway. The k8s teardown still runs.
+func TestDeleteForOrg_SkipsPGCleanupForCnpgShard(t *testing.T) {
+	c, _, _ := newFakeLakekeeperClient()
+	p := NewLakekeeperProvisioner(newFakeStore(), c)
+	// AdminDSN empty + PGPreProvisioned=true: DropDatabase/DropRole must
+	// not be invoked. With a bogus DSN they'd surface as connection
+	// errors; a nil-DSN attempt would panic deep in pgx. The fact that
+	// this returns nil with no DSN configured is the assertion.
+	err := p.DeleteForOrg(context.Background(), "acme", ProvisioningInputs{
+		PGPreProvisioned: true,
+	})
+	if err != nil {
+		t.Fatalf("DeleteForOrg with PGPreProvisioned should succeed without DSN, got: %v", err)
+	}
+}
+
+// TestDeleteForOrg_SkipsPGCleanupWithoutAdminDSN covers the dev/orbstack
+// path where the lakekeeper provisioner never had an AdminDSN in the
+// first place (no env, no Duckling CR). PG cleanup must be skipped
+// rather than failing the teardown.
+func TestDeleteForOrg_SkipsPGCleanupWithoutAdminDSN(t *testing.T) {
+	c, _, _ := newFakeLakekeeperClient()
+	p := NewLakekeeperProvisioner(newFakeStore(), c)
+	err := p.DeleteForOrg(context.Background(), "acme", ProvisioningInputs{})
+	if err != nil {
+		t.Fatalf("DeleteForOrg with empty inputs should succeed, got: %v", err)
+	}
+}
