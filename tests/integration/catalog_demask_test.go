@@ -67,17 +67,21 @@ func TestCatalogIsNotMasked(t *testing.T) {
 	})
 
 	t.Run("information_schema reports the real catalog", func(t *testing.T) {
-		mustExec(t, db, "DROP SCHEMA IF EXISTS bill CASCADE")
-		mustExec(t, db, "CREATE SCHEMA bill")
-		mustExec(t, db, "CREATE OR REPLACE VIEW bill.demask_view AS SELECT 1 AS id")
-		mustExec(t, db, "CREATE TABLE bill.demask_tbl (id INTEGER)")
+		// Use a dedicated, uniquely-named schema and drop it after the test so it
+		// doesn't pollute the shared DuckLake catalog that later catalog tests
+		// compare against (e.g. \dn schema-count parity).
+		mustExec(t, db, "DROP SCHEMA IF EXISTS demask_ns CASCADE")
+		mustExec(t, db, "CREATE SCHEMA demask_ns")
+		t.Cleanup(func() { _, _ = db.Exec("DROP SCHEMA IF EXISTS demask_ns CASCADE") })
+		mustExec(t, db, "CREATE OR REPLACE VIEW demask_ns.demask_view AS SELECT 1 AS id")
+		mustExec(t, db, "CREATE TABLE demask_ns.demask_tbl (id INTEGER)")
 
 		checks := []struct {
 			name, query string
 		}{
-			{"tables", `SELECT DISTINCT table_catalog FROM information_schema.tables WHERE table_schema='bill' AND table_name='demask_tbl'`},
-			{"columns", `SELECT DISTINCT table_catalog FROM information_schema.columns WHERE table_schema='bill' AND table_name='demask_tbl'`},
-			{"views", `SELECT DISTINCT table_catalog FROM information_schema.views WHERE table_schema='bill' AND table_name='demask_view'`},
+			{"tables", `SELECT DISTINCT table_catalog FROM information_schema.tables WHERE table_schema='demask_ns' AND table_name='demask_tbl'`},
+			{"columns", `SELECT DISTINCT table_catalog FROM information_schema.columns WHERE table_schema='demask_ns' AND table_name='demask_tbl'`},
+			{"views", `SELECT DISTINCT table_catalog FROM information_schema.views WHERE table_schema='demask_ns' AND table_name='demask_view'`},
 			{"schemata", `SELECT DISTINCT catalog_name FROM information_schema.schemata WHERE schema_name='public'`},
 		}
 		for _, tc := range checks {
@@ -116,33 +120,39 @@ func TestCatalogQualifiedNames(t *testing.T) {
 	}
 
 	db := openCatalogConn(t, "ducklake")
-	mustExec(t, db, "DROP SCHEMA IF EXISTS bill CASCADE")
-	mustExec(t, db, "CREATE SCHEMA bill")
+	// Dedicated schema + table names, dropped after the test so they don't
+	// pollute the shared DuckLake catalog later catalog tests compare against.
+	mustExec(t, db, "DROP SCHEMA IF EXISTS demask_ns CASCADE")
+	mustExec(t, db, "CREATE SCHEMA demask_ns")
+	t.Cleanup(func() {
+		_, _ = db.Exec("DROP SCHEMA IF EXISTS demask_ns CASCADE")
+		_, _ = db.Exec("DROP TABLE IF EXISTS ducklake.main.demask_qualified_pub")
+	})
 
 	// public -> main mapping for the real ducklake catalog.
-	mustExec(t, db, "CREATE TABLE ducklake.public.qualified_pub (id INTEGER)")
-	mustExec(t, db, "INSERT INTO ducklake.public.qualified_pub VALUES (1), (2)")
-	mustExec(t, db, "CREATE TABLE ducklake.bill.qualified_bill (id INTEGER)")
-	mustExec(t, db, "INSERT INTO ducklake.bill.qualified_bill VALUES (7)")
+	mustExec(t, db, "CREATE TABLE ducklake.public.demask_qualified_pub (id INTEGER)")
+	mustExec(t, db, "INSERT INTO ducklake.public.demask_qualified_pub VALUES (1), (2)")
+	mustExec(t, db, "CREATE TABLE ducklake.demask_ns.qualified_bill (id INTEGER)")
+	mustExec(t, db, "INSERT INTO ducklake.demask_ns.qualified_bill VALUES (7)")
 
 	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM ducklake.public.qualified_pub").Scan(&count); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM ducklake.public.demask_qualified_pub").Scan(&count); err != nil {
 		t.Fatalf("read ducklake.public table: %v", err)
 	}
 	if count != 2 {
 		t.Fatalf("ducklake.public row count = %d, want 2", count)
 	}
 	// public maps to main, so the same table is reachable via ducklake.main.
-	if err := db.QueryRow("SELECT COUNT(*) FROM ducklake.main.qualified_pub").Scan(&count); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM ducklake.main.demask_qualified_pub").Scan(&count); err != nil {
 		t.Fatalf("read ducklake.main table: %v", err)
 	}
 	if count != 2 {
 		t.Fatalf("ducklake.main row count = %d, want 2", count)
 	}
-	if err := db.QueryRow("SELECT COUNT(*) FROM ducklake.bill.qualified_bill").Scan(&count); err != nil {
-		t.Fatalf("read ducklake.bill table: %v", err)
+	if err := db.QueryRow("SELECT COUNT(*) FROM ducklake.demask_ns.qualified_bill").Scan(&count); err != nil {
+		t.Fatalf("read ducklake.demask_ns table: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("ducklake.bill row count = %d, want 1", count)
+		t.Fatalf("ducklake.demask_ns row count = %d, want 1", count)
 	}
 }
