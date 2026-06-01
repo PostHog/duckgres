@@ -35,9 +35,10 @@ func TestRefreshIcebergSecretRotatesCredentials(t *testing.T) {
 	}
 
 	ic := IcebergConfig{
-		Enabled:     true,
-		TableBucket: "arn:aws:s3tables:us-east-1:000000000000:bucket/refresh-test",
-		Region:      "us-east-1",
+		Enabled:             true,
+		LakekeeperEndpoint:  "http://lakekeeper.invalid/catalog",
+		LakekeeperWarehouse: "org-refresh-test",
+		Region:              "us-east-1",
 	}
 
 	if err := RefreshIcebergSecret(db, ic, nil, "AKIA_INITIAL", "initial-secret", "initial-token"); err != nil {
@@ -59,32 +60,11 @@ func TestRefreshIcebergSecretNoOpWhenDisabled(t *testing.T) {
 	}
 }
 
-// TestRefreshIcebergSecretRejectsEmptyCredentials guards the invariant
-// that "credentials are required when iceberg is enabled" applies to
-// refresh too, not just initial attach. A silent fallback here would either
-// re-introduce credential_chain (the bug fixed by PR #562) or emit an
-// empty-cred config secret that fails opaquely at attach time. Applies to
-// BOTH backends: Lakekeeper no longer vends (PackedPolicyTooLarge), so the
-// worker rotates its own iceberg_sigv4 S3 secret for Lakekeeper too.
-func TestRefreshIcebergSecretRejectsEmptyCredentials(t *testing.T) {
-	err := RefreshIcebergSecret(nil, IcebergConfig{
-		Enabled:     true,
-		Backend:     iceberg.BackendS3Tables,
-		TableBucket: "arn:...",
-	}, nil, "", "", "")
-	if err == nil {
-		t.Fatal("expected error when iceberg enabled with empty credentials, got nil")
-	}
-	if !strings.Contains(err.Error(), "no AWS credentials") {
-		t.Fatalf("error message should name the missing-credentials cause, got: %v", err)
-	}
-}
-
 // TestRefreshIcebergSecretLakekeeperRequiresCreds: Lakekeeper no longer vends
 // credentials (its STS session policy overflowed AWS's packed-policy limit),
 // so the worker reads/writes S3 data with its own brokered creds and must
-// rotate that secret on the STS schedule — same as S3 Tables. An empty-cred
-// refresh is therefore an error, not a no-op.
+// rotate that secret on the STS schedule. An empty-cred refresh is therefore
+// an error, not a no-op.
 func TestRefreshIcebergSecretLakekeeperRequiresCreds(t *testing.T) {
 	err := RefreshIcebergSecret(nil, IcebergConfig{
 		Enabled:             true,

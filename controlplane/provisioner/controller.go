@@ -309,11 +309,11 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		updates["identity_state"] = configstore.ManagedWarehouseStateReady
 	}
 
-	// Iceberg is opt-in per warehouse — only track its state when enabled.
-	// When the composition writes status.iceberg.tableBucketArn, the bucket
-	// (Workspace) is reconciled and we persist the ARN + region back to the
-	// configstore so the worker activator can feed it into IcebergConfig.
-	addIcebergStatusUpdates(updates, w, status)
+	// Iceberg readiness for the Lakekeeper backend is owned by
+	// reconcileLakekeeper, which writes iceberg_state=Ready directly once
+	// the per-org Lakekeeper warehouse is provisioned. Nothing here needs
+	// to propagate from the Crossplane Duckling status — the Lakekeeper
+	// provisioner is the source of truth.
 
 	// Infrastructure is ready when all components are provisioned AND the
 	// Crossplane Ready condition is True. The Ready condition ensures all
@@ -440,68 +440,10 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 		}
 	}
 
-	// Propagate the Duckling's status.iceberg.tableBucketArn back to the
-	// configstore even after the warehouse has transitioned to Ready. This
-	// covers the late-enable case: the iceberg block can be flipped on via
-	// the admin API long after the warehouse first became Ready, and the
-	// Crossplane composition will only emit the bucket Workspace + populate
-	// status.iceberg.tableBucketArn after that flip. Without this, the ARN
-	// would only land in the configstore if the warehouse was still in
-	// Provisioning when the composition completed — never on a re-enable.
-	if w.Iceberg.Enabled {
-		// TODO: this is the third c.duckling.Get-equivalent call in this
-		// function (after GetPgBouncerEnabled + GetIcebergEnabled). All
-		// three parse the same CR. Worth consolidating to a single fetch
-		// once another caller adds a fourth — for now the extra
-		// round-trips only hit warehouses where iceberg is enabled.
-		status, err := c.duckling.Get(ctx, w.OrgID)
-		if err != nil {
-			log.Warn("Failed to read Duckling status for iceberg propagation.", "error", err)
-			return
-		}
-		updates := map[string]interface{}{}
-		addIcebergStatusUpdates(updates, w, status)
-		if len(updates) > 0 {
-			if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateReady, updates); err != nil {
-				log.Warn("Failed to persist iceberg status to configstore.", "error", err)
-			} else {
-				log.Info("Iceberg status persisted to configstore.", "updates", updates)
-				// Mirror the persisted updates onto the in-memory w so
-				// downstream reconcile steps (notably reconcileLakekeeper)
-				// see the fresh values without a re-read round-trip.
-				applyIcebergUpdatesToWarehouse(w, updates)
-			}
-		}
-	}
-
 	// Lakekeeper reconcile is independent of the Duckling state machine —
 	// provisioning a Lakekeeper for an org doesn't depend on, and doesn't
 	// block, the warehouse top-level state.
 	c.reconcileLakekeeper(ctx, w)
-}
-
-// applyIcebergUpdatesToWarehouse mirrors the column-update map onto the
-// in-memory warehouse struct so subsequent reconcile steps in the same
-// tick see the values that were just persisted, without a second store
-// read. Mirrors the column → field mapping used by the configstore's
-// UpdateWarehouseState GORM call (which writes by column name).
-//
-// Only the iceberg_* columns reconcileReady actually writes are handled
-// here; if a future caller passes other column names through this
-// function, extend the switch alongside.
-func applyIcebergUpdatesToWarehouse(w *configstore.ManagedWarehouse, updates map[string]interface{}) {
-	for k, v := range updates {
-		switch k {
-		case "iceberg_table_bucket_arn":
-			w.Iceberg.TableBucketArn = v.(string)
-		case "iceberg_region":
-			w.Iceberg.Region = v.(string)
-		case "iceberg_namespace":
-			w.Iceberg.Namespace = v.(string)
-		case "iceberg_state":
-			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
-		}
-	}
 }
 
 // reconcileLakekeeper provisions a per-org Lakekeeper instance when the
@@ -550,32 +492,6 @@ func (c *Controller) reconcileLakekeeper(ctx context.Context, w *configstore.Man
 		return
 	}
 	log.Info("Lakekeeper provisioning completed.")
-}
-
-// addIcebergStatusUpdates copies the Duckling's reported iceberg status
-// (ARN, region, namespace) into the configstore update map when fields
-// differ. Idempotent. Called from both reconcileProvisioning (initial
-// turn-up) and reconcileReady (late iceberg enable on an existing
-// warehouse). Without the reconcileReady call site, a warehouse that
-// became Ready before iceberg was opted in would never get its ARN
-// propagated to the configstore — the worker activator would then run
-// AttachIcebergCatalog with an empty TableBucket and skip the attach.
-func addIcebergStatusUpdates(updates map[string]interface{}, w *configstore.ManagedWarehouse, status *DucklingStatus) {
-	if !w.Iceberg.Enabled || status.Iceberg.TableBucketArn == "" {
-		return
-	}
-	if w.Iceberg.TableBucketArn != status.Iceberg.TableBucketArn {
-		updates["iceberg_table_bucket_arn"] = status.Iceberg.TableBucketArn
-	}
-	if w.Iceberg.Region != status.Iceberg.Region && status.Iceberg.Region != "" {
-		updates["iceberg_region"] = status.Iceberg.Region
-	}
-	if w.Iceberg.Namespace != status.Iceberg.NamespaceName && status.Iceberg.NamespaceName != "" {
-		updates["iceberg_namespace"] = status.Iceberg.NamespaceName
-	}
-	if w.IcebergState != configstore.ManagedWarehouseStateReady {
-		updates["iceberg_state"] = configstore.ManagedWarehouseStateReady
-	}
 }
 
 func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.ManagedWarehouse) {

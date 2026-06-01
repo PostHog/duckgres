@@ -107,29 +107,6 @@ func TestReconcileLakekeeper_SkipsWhenIcebergDisabled(t *testing.T) {
 	}
 }
 
-func TestReconcileLakekeeper_SkipsWhenBackendIsS3Tables(t *testing.T) {
-	called := false
-	store := newFakeStore()
-	store.warehouses["acme"] = &configstore.ManagedWarehouse{
-		OrgID: "acme",
-		State: configstore.ManagedWarehouseStateReady,
-		Iceberg: configstore.ManagedWarehouseIceberg{
-			Enabled: true,
-			Backend: configstore.IcebergBackendS3Tables,
-		},
-	}
-	c := NewControllerWithClient(store, nil, 0)
-	c.lakekeeperProvisioner = &LakekeeperProvisioner{}
-	c.lakekeeperInputs = func(_ context.Context, _ *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
-		called = true
-		return ProvisioningInputs{}, nil
-	}
-	c.reconcileLakekeeper(context.Background(), store.warehouses["acme"])
-	if called {
-		t.Errorf("inputs resolver should not be called when Backend=s3_tables")
-	}
-}
-
 func TestReconcileLakekeeper_SkipsWhenAlreadyProvisioned(t *testing.T) {
 	called := false
 	store := newFakeStore()

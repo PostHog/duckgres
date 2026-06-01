@@ -1735,97 +1735,16 @@ func isDeltaCatalogEmptyError(err error) bool {
 	return strings.Contains(err.Error(), "No files in log segment")
 }
 
-// AttachIcebergCatalog attaches the per-tenant Iceberg catalog alongside
-// DuckLake. Dispatches on Config.ResolvedBackend:
-//
-//   - "s3_tables" (legacy): a per-tenant AWS S3 Tables bucket. Requires
-//     the keyID/secret/sessionToken trio of short-lived STS credentials.
-//   - "lakekeeper" (default): a per-tenant Lakekeeper REST catalog.
-//     The AWS credentials are ignored — Lakekeeper vends short-lived STS
-//     creds to DuckDB at table-load time via ACCESS_DELEGATION_MODE.
-//
-// Idempotent if the catalog is already attached. Fail-soft for the "fresh
-// tenant, no namespaces yet" case so a worker activation isn't blocked.
+// AttachIcebergCatalog attaches the per-tenant Iceberg catalog. Lakekeeper REST
+// is the only backend; the AWS S3 Tables path was removed when S3 Tables
+// stopped being a supported product. Idempotent if the catalog is already
+// attached; fail-soft for the "fresh tenant, no namespaces yet" case so a
+// worker activation isn't blocked.
 func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
 	if !ic.Enabled {
 		return nil
 	}
-	switch ic.ResolvedBackend() {
-	case iceberg.BackendLakekeeper:
-		return attachLakekeeperCatalog(db, ic, sem, keyID, secret, sessionToken)
-	case iceberg.BackendS3Tables:
-		return attachS3TablesIcebergCatalog(db, ic, sem, keyID, secret, sessionToken)
-	default:
-		return fmt.Errorf("iceberg: unsupported backend %q", ic.Backend)
-	}
-}
-
-// attachS3TablesIcebergCatalog is the legacy S3 Tables path. Preserves the
-// previous AttachIcebergCatalog behavior exactly so existing orgs see no
-// change.
-func attachS3TablesIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
-	if ic.TableBucket == "" {
-		return nil
-	}
-	if keyID == "" || secret == "" {
-		return fmt.Errorf("iceberg catalog enabled (table_bucket=%q) but no AWS credentials in activation payload — control plane STS broker did not populate DuckLake S3 credentials", ic.TableBucket)
-	}
-
-	select {
-	case sem <- struct{}{}:
-		defer func() { <-sem }()
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("timeout waiting for Iceberg catalog attachment lock")
-	}
-
-	var count int
-	err := db.QueryRow(
-		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = '" + iceberg.CatalogName + "'",
-	).Scan(&count)
-	if err == nil && count > 0 {
-		return nil
-	}
-
-	// httpfs + S3 secret must be ready BEFORE LoadExtensions("iceberg"); see the
-	// matching comment in attachLakekeeperCatalog. The iceberg extension's
-	// LOAD-time init falls back to AWS-SDK credential discovery when no TYPE S3
-	// secret is present, which probes IMDS (blocked by the worker network
-	// policy) and hangs until the activate-tenant deadline. Iceberg + DuckLake
-	// tenants don't hit it because AttachDuckLake runs first and primes httpfs
-	// + a TYPE S3 secret; the iceberg-only path here must replicate that order.
-	if err := LoadExtensions(db, []string{"httpfs"}); err != nil {
-		return fmt.Errorf("load httpfs extension: %w", err)
-	}
-
-	if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
-		return fmt.Errorf("create Iceberg secret: %w", err)
-	}
-
-	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
-		return fmt.Errorf("load iceberg extension: %w", err)
-	}
-
-	attachStmt := iceberg.BuildIcebergAttachStmt(ic)
-	slog.Info("Attaching Iceberg catalog.", "backend", "s3_tables", "table_bucket", ic.TableBucket, "region", ic.Region)
-	if _, err := db.Exec(attachStmt); err != nil {
-		if isIcebergCatalogEmptyError(err) {
-			slog.Info("Skipping Iceberg catalog attach: no namespaces at table bucket yet.", "table_bucket", ic.TableBucket)
-			return nil
-		}
-		return fmt.Errorf("failed to attach Iceberg catalog: %w", err)
-	}
-	if _, err := db.Exec("SHOW TABLES FROM " + iceberg.CatalogName); err != nil {
-		if isIcebergCatalogEmptyError(err) {
-			if _, derr := db.Exec("DETACH " + iceberg.CatalogName); derr != nil {
-				slog.Warn("Failed to detach empty Iceberg catalog after attach probe.", "error", derr)
-			}
-			slog.Info("Detached Iceberg catalog: no namespaces at table bucket yet.", "table_bucket", ic.TableBucket)
-			return nil
-		}
-		return fmt.Errorf("failed to probe Iceberg catalog: %w", err)
-	}
-	slog.Info("Attached Iceberg catalog successfully.", "backend", "s3_tables", "table_bucket", ic.TableBucket)
-	return nil
+	return attachLakekeeperCatalog(db, ic, sem, keyID, secret, sessionToken)
 }
 
 // attachLakekeeperCatalog attaches the per-tenant Lakekeeper REST catalog.
@@ -2309,7 +2228,7 @@ func RefreshIcebergSecret(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID
 			return fmt.Errorf("refresh iceberg secret: %w", err)
 		}
 	}
-	slog.Debug("Refreshed iceberg secret for hot-idle reuse.", "table_bucket", ic.TableBucket)
+	slog.Debug("Refreshed iceberg secret for hot-idle reuse.", "warehouse", ic.LakekeeperWarehouse)
 	return nil
 }
 

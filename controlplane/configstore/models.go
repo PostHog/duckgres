@@ -175,41 +175,33 @@ type ManagedWarehouseDuckLake struct {
 	Enabled bool `json:"enabled"`
 }
 
-// ManagedWarehouseIceberg captures per-org Iceberg catalog config. Two
-// backends are supported, selected by Backend:
+// ManagedWarehouseIceberg captures per-org Iceberg catalog config. The
+// only supported backend is Lakekeeper: a per-org Lakekeeper instance
+// vends the Iceberg REST catalog. The provisioner creates the Lakekeeper
+// CR + a warehouse pointing at the org's existing S3 bucket (path
+// <s3.path-prefix>/lakekeeper/<orgid>/) and persists the endpoint +
+// OAuth2 client credentials back here. The worker activator reads these
+// and emits a (TYPE ICEBERG, CLIENT_ID/CLIENT_SECRET/OAUTH2_SERVER_URI)
+// DuckDB SECRET + ATTACH at session init.
 //
-//   - "lakekeeper" (default): a per-org Lakekeeper instance vends the
-//     Iceberg REST catalog. The provisioner creates the Lakekeeper CR + a
-//     warehouse pointing at the org's existing S3 bucket (path
-//     <s3.path-prefix>/lakekeeper/<orgid>/) and persists the endpoint +
-//     OAuth2 client credentials back here. The worker activator reads
-//     these and emits a (TYPE ICEBERG, CLIENT_ID/CLIENT_SECRET/
-//     OAUTH2_SERVER_URI) DuckDB SECRET + ATTACH at session init.
-//
-//   - "s3_tables" (legacy): provisioner controller sets spec.iceberg.enabled
-//     on the Duckling CR; the composition provisions a fresh S3 Tables
-//     bucket and writes TableBucketArn back here. Kept as a safety net /
-//     escape hatch — new orgs default to Lakekeeper.
+// The Backend column is retained for forward-compat / observability; the
+// legacy "s3_tables" value is no longer honored anywhere in the code path.
 type ManagedWarehouseIceberg struct {
 	Enabled bool `json:"enabled"`
 
-	// Backend selects the catalog backend. Empty/unset is treated as
-	// "lakekeeper" by callers.
+	// Backend is retained for schema compat. Empty/unset is treated as
+	// "lakekeeper" by callers; any other value is also treated as
+	// "lakekeeper" since no other backend is implemented.
 	Backend string `gorm:"size:32;default:'lakekeeper'" json:"backend"`
 
-	// Namespace is the default Iceberg namespace inside the catalog. Used
-	// for both backends.
+	// Namespace is the default Iceberg namespace inside the catalog.
 	Namespace string `gorm:"size:255" json:"namespace"`
 
-	// Region applies to both backends (S3 region for S3 Tables; AWS region
-	// for the Lakekeeper warehouse storage profile).
+	// Region is the AWS region for the Lakekeeper warehouse storage profile.
 	Region string `gorm:"size:64" json:"region"`
 
-	// S3 Tables fields (Backend == "s3_tables"). Empty otherwise.
-	TableBucketArn string `gorm:"size:512" json:"table_bucket_arn,omitempty"`
-
-	// Lakekeeper fields (Backend == "lakekeeper"). Populated by the
-	// provisioner after the per-org Lakekeeper is ready.
+	// Lakekeeper fields. Populated by the provisioner after the per-org
+	// Lakekeeper is ready.
 	LakekeeperEndpoint string `gorm:"size:512" json:"lakekeeper_endpoint,omitempty"`
 
 	// LakekeeperWarehouse is the warehouse NAME (e.g. "org-acme"), not the
@@ -235,7 +227,6 @@ type ManagedWarehouseIceberg struct {
 // IcebergBackend constants — string-typed to keep the GORM tag happy.
 const (
 	IcebergBackendLakekeeper = "lakekeeper"
-	IcebergBackendS3Tables   = "s3_tables"
 )
 
 // ManagedWarehouseTrino captures per-org opt-in for the customer-facing Trino

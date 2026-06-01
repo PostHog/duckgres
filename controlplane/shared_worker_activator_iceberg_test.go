@@ -13,32 +13,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-func TestBuildIcebergConfig_S3TablesPath(t *testing.T) {
-	cs := fake.NewSimpleClientset()
-	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: "duckgres"}
-
-	src := &configstore.ManagedWarehouseIceberg{
-		Enabled:        true,
-		Backend:        iceberg.BackendS3Tables,
-		Namespace:      "main",
-		Region:         "us-east-1",
-		TableBucketArn: "arn:aws:s3tables:us-east-1:123:bucket/acme",
-	}
-	ic, err := a.buildIcebergConfig(context.Background(), "acme", src)
-	if err != nil {
-		t.Fatalf("buildIcebergConfig: %v", err)
-	}
-	if ic.Backend != iceberg.BackendS3Tables {
-		t.Errorf("Backend = %q, want s3_tables", ic.Backend)
-	}
-	if ic.TableBucket != src.TableBucketArn {
-		t.Errorf("TableBucket = %q, want %q", ic.TableBucket, src.TableBucketArn)
-	}
-	if ic.LakekeeperClientSecret != "" {
-		t.Errorf("S3 Tables path should not populate LakekeeperClientSecret")
-	}
-}
-
 func TestBuildIcebergConfig_LakekeeperAllowall(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: "duckgres"}

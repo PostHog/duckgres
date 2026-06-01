@@ -108,10 +108,9 @@ type RateLimitFileConfig struct {
 // instance into Iceberg catalog attachment. In multi-tenant mode the
 // equivalent values come from the per-warehouse configstore row, not YAML.
 type IcebergFileConfig struct {
-	Enabled     *bool  `yaml:"enabled"`
-	TableBucket string `yaml:"table_bucket"`
-	Region      string `yaml:"region"`
-	Namespace   string `yaml:"namespace"`
+	Enabled   *bool  `yaml:"enabled"`
+	Region    string `yaml:"region"`
+	Namespace string `yaml:"namespace"`
 }
 
 type DuckLakeFileConfig struct {

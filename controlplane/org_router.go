@@ -14,7 +14,6 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/server"
-	"github.com/posthog/duckgres/server/iceberg"
 )
 
 // OrgStack holds the isolated worker pool and session manager for an org.
@@ -225,9 +224,6 @@ func (tr *OrgRouter) IcebergConfigForOrg(orgID string) (server.IcebergConfig, bo
 		LakekeeperWarehouse:       src.LakekeeperWarehouse,
 		LakekeeperClientID:        src.LakekeeperClientID,
 		LakekeeperOAuth2ServerURI: src.LakekeeperOAuth2ServerURI,
-	}
-	if cfg.ResolvedBackend() == iceberg.BackendS3Tables {
-		cfg.TableBucket = src.TableBucketArn
 	}
 	return cfg, true
 }

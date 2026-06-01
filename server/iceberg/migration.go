@@ -25,25 +25,20 @@ const CatalogName = "iceberg"
 // (the Postgres convention) is a safe, unshadowed default.
 const DefaultSchema = "public"
 
-// BuildIcebergSecretStmt builds the CREATE SECRET statement that the
-// DuckDB iceberg extension uses to sign AWS S3 Tables requests when an
-// `ATTACH ... (TYPE iceberg, ENDPOINT_TYPE 's3_tables')` is opened.
+// BuildIcebergSecretStmt builds the CREATE SECRET statement that lets the
+// DuckDB iceberg extension sign warehouse-data S3 requests with the
+// duckling's brokered per-org credentials.
 //
-// DuckDB's TYPE ICEBERG secret is OAuth2-only — it has a single provider
-// ('config') registered by OAuth2Authorization::CreateCatalogSecretFunction.
-// Trying to pass AUTHORIZATION_TYPE/REGION on TYPE ICEBERG fails with
-// "Unknown parameter ... with default provider 'config'". For s3_tables
-// the iceberg extension internally signs with SigV4 and pulls credentials
-// from any TYPE S3 secret in scope.
+// DuckDB's TYPE ICEBERG secret is OAuth2-only (single 'config' provider
+// registered by OAuth2Authorization::CreateCatalogSecretFunction), so the
+// data-plane credentials have to ride on a TYPE S3 secret with PROVIDER
+// config — the iceberg extension picks them up from any TYPE S3 secret in
+// scope when it issues warehouse reads/writes.
 //
-// The secret is always built with PROVIDER config and the supplied
-// short-lived credentials inlined directly. This is the only supported
-// auth model: the control plane assumes the per-tenant IAM role via STS
-// and ships the resulting temporary credentials in the worker activation
-// payload, identical to how the DuckLake S3 secret is built (see
-// buildConfigSecret in server/server.go). The same role has both s3:* and
-// s3tables:* permissions on the tenant's data and table buckets, so
-// reusing the credentials here is correct.
+// The control plane assumes the per-tenant IAM role via STS and ships the
+// resulting short-lived credentials in the activation payload (identical to
+// how the DuckLake S3 secret is built in server.buildConfigSecret); the same
+// role has s3:* on the warehouse bucket, so reusing them here is correct.
 //
 // keyID and secret are required — callers must validate upstream and emit
 // a clear error if the activation payload is missing them when iceberg is
@@ -68,24 +63,9 @@ func BuildIcebergSecretStmt(cfg Config, keyID, secret, sessionToken string) stri
 	return stmt
 }
 
-// BuildIcebergAttachStmt builds the ATTACH statement for the Iceberg
-// extension catalog, addressing the per-tenant S3 Tables bucket ARN.
-//
-// Kept as the S3 Tables-specific builder. The dispatcher in
-// server.AttachIcebergCatalog picks between this and
-// BuildLakekeeperAttachStmt based on Config.ResolvedBackend.
-func BuildIcebergAttachStmt(cfg Config) string {
-	return fmt.Sprintf(
-		"ATTACH '%s' AS %s (TYPE iceberg, ENDPOINT_TYPE 's3_tables')",
-		escapeSQLStringLiteral(cfg.TableBucket),
-		CatalogName,
-	)
-}
-
 // LakekeeperSecretName is the DuckDB SECRET name used when ATTACHing a
-// Lakekeeper REST catalog with OAuth2 client credentials. Distinct from
-// iceberg_sigv4 so a worker that has both backends configured (post-migration)
-// doesn't collide.
+// Lakekeeper REST catalog with OAuth2 client credentials. Distinct from the
+// data-plane iceberg_sigv4 (TYPE S3) so they coexist cleanly.
 const LakekeeperSecretName = "iceberg_oauth"
 
 // BuildLakekeeperSecretStmt builds a CREATE SECRET statement for the
