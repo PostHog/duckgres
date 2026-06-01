@@ -145,6 +145,15 @@ func EnsureRole(ctx context.Context, adminDSN, role, password, ownedDB string) e
 // drop runs (the k8s teardown is fire-and-forget and the operator's
 // reconciliation lag means connections linger).
 //
+// Reassigns ownership to CURRENT_USER before the drop so the admin role
+// can issue DROP DATABASE even when it doesn't own the target. EnsureRole
+// runs ALTER DATABASE ... OWNER TO <role>, which means a non-superuser
+// admin (e.g. the ducklingexample master on a shared RDS) wouldn't
+// otherwise have permission — 42501 must be owner of database. GRANT
+// role-membership first so CURRENT_USER inherits the necessary privileges
+// to ALTER OWNER (which itself requires being a member of the new owner
+// role on Postgres 14+).
+//
 // Caller must connect via a privileged DSN against a different database
 // than dbName (the admin DSN's path is OK to be `postgres`).
 func DropDatabase(ctx context.Context, adminDSN, dbName string) error {
@@ -156,6 +165,28 @@ func DropDatabase(ctx context.Context, adminDSN, dbName string) error {
 		return fmt.Errorf("open admin connection: %w", err)
 	}
 	defer func() { _ = db.Close() }()
+
+	// Probe first so the IF EXISTS hides the missing-DB case cleanly,
+	// and so we don't run the ownership reassignment against a phantom.
+	var exists bool
+	if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", dbName).Scan(&exists); err != nil {
+		return fmt.Errorf("probe pg_database: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	// EnsureRole made the tenant role the database owner. To DROP we must
+	// either be that role or a superuser; on RDS the admin is neither.
+	// Take role-membership of the current owner so we can hand ownership
+	// back to ourselves, then drop. Both GRANT and ALTER OWNER are
+	// idempotent / best-effort: if the role doesn't exist (e.g. we are
+	// already the owner) the GRANT 0LP01-likes and ALTER fail cleanly,
+	// and we continue to the DROP, which will report the real obstacle.
+	if owner, ok := databaseOwner(ctx, db, dbName); ok && owner != "" && isSafePGIdent(owner) {
+		_, _ = db.ExecContext(ctx, "GRANT "+quoteIdent(owner)+" TO CURRENT_USER")
+		_, _ = db.ExecContext(ctx, "ALTER DATABASE "+quoteIdent(dbName)+" OWNER TO CURRENT_USER")
+	}
 
 	// FORCE terminates active backends as part of DROP DATABASE (Postgres
 	// 13+). Without it a single lingering Lakekeeper connection blocks the
@@ -169,12 +200,30 @@ func DropDatabase(ctx context.Context, adminDSN, dbName string) error {
 	return nil
 }
 
+// databaseOwner returns the rolname that owns dbName, or "" if the lookup
+// fails. Used by DropDatabase to reassign ownership before DROP.
+func databaseOwner(ctx context.Context, db *sql.DB, dbName string) (string, bool) {
+	var owner string
+	err := db.QueryRowContext(ctx,
+		"SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname=$1",
+		dbName).Scan(&owner)
+	if err != nil {
+		return "", false
+	}
+	return owner, true
+}
+
 // DropRole removes role on the Postgres server addressed by adminDSN.
 // Idempotent: returns nil when the role is already absent. Best-effort
-// REASSIGN/DROP OWNED first so any object the role owns (e.g. tables
-// created in databases other than the one this caller manages) doesn't
-// block DROP ROLE — at duckling teardown the role's database has already
-// been dropped, so REASSIGN typically has nothing to do.
+// REASSIGN/DROP OWNED first so any object the role owns (e.g. grants on
+// the maintenance DB, default privileges) doesn't block DROP ROLE with
+// 2BP01 ("role cannot be dropped because some objects depend on it").
+//
+// Requires role-membership in `role` for REASSIGN OWNED + DROP OWNED to
+// run (Postgres 14+); the GRANT is best-effort because if `role` is
+// already gone the GRANT itself fails. The caller's admin must either be
+// a superuser or already a member of role; on RDS we explicitly GRANT
+// the membership first since the admin is neither.
 //
 // Caller must connect via a privileged DSN.
 func DropRole(ctx context.Context, adminDSN, role string) error {
@@ -187,20 +236,31 @@ func DropRole(ctx context.Context, adminDSN, role string) error {
 	}
 	defer func() { _ = db.Close() }()
 
-	// REVOKE everything the role was granted on the maintenance database;
-	// otherwise DROP ROLE fails with "role cannot be dropped because some
-	// objects depend on it". DROP OWNED handles cluster-wide ownerships.
+	var exists bool
+	if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", role).Scan(&exists); err != nil {
+		return fmt.Errorf("probe pg_roles: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	// Inherit the role's privileges so REASSIGN/DROP OWNED can run on
+	// shared RDS where the admin is not a superuser. Best-effort: the
+	// GRANT can fail when the admin is already a member (cycle) or is
+	// the superuser, in which case it isn't needed anyway.
+	_, _ = db.ExecContext(ctx, "GRANT "+quoteIdent(role)+" TO CURRENT_USER")
+
+	// REASSIGN handles owned database objects in this DB; DROP OWNED
+	// CASCADE then handles cluster-wide grants/default privileges. Both
+	// can fail without blocking the final DROP ROLE — if there's a real
+	// remaining dependency, DROP ROLE will surface it.
+	_, _ = db.ExecContext(ctx, "REASSIGN OWNED BY "+quoteIdent(role)+" TO CURRENT_USER")
 	if _, err := db.ExecContext(ctx, "DROP OWNED BY "+quoteIdent(role)+" CASCADE"); err != nil {
-		// 42704 = undefined_object — role doesn't exist. Benign.
 		if isUndefinedObject(err) {
 			return nil
 		}
-		// Any other failure: log via wrap and continue to the DROP ROLE
-		// attempt — DROP OWNED can fail on cross-DB dependencies we don't
-		// have the visibility to clean up here, but DROP ROLE itself may
-		// still succeed if nothing is left.
-		// We deliberately swallow this and try DROP ROLE; if there's a
-		// real dependency it'll surface there.
+		// Continue to DROP ROLE — there may be nothing to drop. Surface
+		// the underlying error only if DROP ROLE itself fails too.
 		_ = err
 	}
 	if _, err := db.ExecContext(ctx, "DROP ROLE IF EXISTS "+quoteIdent(role)); err != nil {
