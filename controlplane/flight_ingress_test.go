@@ -27,6 +27,79 @@ func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false
 func (r *reconnectTestOrgRouter) SetWarmCapacityTarget(_ int)     {}
 func (r *reconnectTestOrgRouter) ShutdownAll()                    {}
 
+// recordingOrgRouter records the orgIDs StackForOrg is asked for. It returns no
+// live stack, so CreateSession returns right after recording the routing org.
+type recordingOrgRouter struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *recordingOrgRouter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+	r.mu.Lock()
+	r.calls = append(r.calls, orgID)
+	r.mu.Unlock()
+	return nil, nil, nil, false
+}
+func (r *recordingOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig, bool) {
+	return server.IcebergConfig{}, false
+}
+func (r *recordingOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (r *recordingOrgRouter) SetWarmCapacityTarget(_ int)     {}
+func (r *recordingOrgRouter) ShutdownAll()                    {}
+
+type testFlightOrgKey struct{}
+
+// TestOrgRoutedSessionProviderRoutesByContextSNINotUsername proves the fix for
+// the username-collision: two connections sharing the username "alice" but from
+// different org hostnames each route to THEIR OWN org, because the org is
+// re-derived per-connection from the context (SNI) rather than a shared
+// username→org map.
+func TestOrgRoutedSessionProviderRoutesByContextSNINotUsername(t *testing.T) {
+	router := &recordingOrgRouter{}
+	provider := &orgRoutedSessionProvider{
+		orgRouter:  router,
+		pidSession: make(map[int32]flightOwnedSession),
+		resolveOrg: func(ctx context.Context) (string, bool) {
+			org, _ := ctx.Value(testFlightOrgKey{}).(string)
+			return org, org != ""
+		},
+	}
+
+	ctxA := context.WithValue(context.Background(), testFlightOrgKey{}, "org-a")
+	ctxB := context.WithValue(context.Background(), testFlightOrgKey{}, "org-b")
+	if _, _, err := provider.CreateSession(ctxA, "alice", 0, "", 0); err == nil {
+		t.Fatal("expected failure (no live stack)")
+	}
+	if _, _, err := provider.CreateSession(ctxB, "alice", 0, "", 0); err == nil {
+		t.Fatal("expected failure (no live stack)")
+	}
+
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	if len(router.calls) != 2 || router.calls[0] != "org-a" || router.calls[1] != "org-b" {
+		t.Fatalf("expected StackForOrg(org-a) then StackForOrg(org-b); got %v", router.calls)
+	}
+}
+
+// TestOrgRoutedSessionProviderFailsClosedWhenSNIUnresolved: if the connection's
+// SNI no longer resolves to an org, no session is created (fail closed).
+func TestOrgRoutedSessionProviderFailsClosedWhenSNIUnresolved(t *testing.T) {
+	router := &recordingOrgRouter{}
+	provider := &orgRoutedSessionProvider{
+		orgRouter:  router,
+		pidSession: make(map[int32]flightOwnedSession),
+		resolveOrg: func(_ context.Context) (string, bool) { return "", false },
+	}
+	if _, _, err := provider.CreateSession(context.Background(), "alice", 0, "", 0); err == nil {
+		t.Fatal("expected CreateSession to fail closed when org can't be resolved")
+	}
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	if len(router.calls) != 0 {
+		t.Fatalf("expected no StackForOrg call when SNI unresolved; got %v", router.calls)
+	}
+}
+
 func TestOrgRoutedSessionProviderReconnectSessionUsesDurableOrgID(t *testing.T) {
 	router := &reconnectTestOrgRouter{
 		orgID: "analytics",
@@ -34,7 +107,6 @@ func TestOrgRoutedSessionProviderReconnectSessionUsesDurableOrgID(t *testing.T) 
 	provider := &orgRoutedSessionProvider{
 		orgRouter:   router,
 		pidSession:  make(map[int32]flightOwnedSession),
-		userOrg:     make(map[string]string),
 		configStore: nil,
 	}
 
@@ -64,7 +136,6 @@ func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
 		pidSession: map[int32]flightOwnedSession{42: {orgID: "test", sessions: sm}},
-		userOrg:    make(map[string]string),
 	}
 
 	// Destroy known pid — should remove from map.
@@ -84,7 +155,6 @@ func TestOrgRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{ok: true},
 		pidSession: make(map[int32]flightOwnedSession),
-		userOrg:    make(map[string]string),
 	}
 
 	// Should not panic.
@@ -97,7 +167,6 @@ func TestOrgRoutedSessionProviderConcurrentDestroys(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
 		pidSession: make(map[int32]flightOwnedSession),
-		userOrg:    make(map[string]string),
 	}
 
 	// Pre-populate

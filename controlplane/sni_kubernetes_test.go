@@ -182,10 +182,7 @@ func newFlightValidator(t *testing.T, mode string, store *fakeConfigStore) *cpFl
 		},
 		configStore: store,
 	}
-	provider := &orgRoutedSessionProvider{
-		userOrg: make(map[string]string),
-	}
-	return &cpFlightCredentialValidator{cp: cp, orgProvider: provider}
+	return &cpFlightCredentialValidator{cp: cp}
 }
 
 func newSNIControlPlane(store *fakeConfigStore) *ControlPlane {
@@ -333,7 +330,9 @@ func testControlPlaneTLSConfig(t *testing.T) *tls.Config {
 // orgs), so a non-managed hostname always fails.
 
 // TestFlightValidatorMatchedSNI: SNI matches, so we resolve via ResolveSNIPrefix
-// and validate against that single org.
+// and validate against that single org. The validator only authenticates — it
+// stores no username→org routing state (session routing re-derives the org from
+// the connection SNI; see flight_ingress_test.go).
 func TestFlightValidatorMatchedSNI(t *testing.T) {
 	store := &fakeConfigStore{
 		resolveSNIPrefix: func(prefix string) (string, string) {
@@ -354,9 +353,6 @@ func TestFlightValidatorMatchedSNI(t *testing.T) {
 	if store.resolveSNIPrefixCalls != 1 || store.validateOrgUserCalls != 1 {
 		t.Fatalf("expected one ResolveSNIPrefix + one ValidateOrgUser; got %d / %d",
 			store.resolveSNIPrefixCalls, store.validateOrgUserCalls)
-	}
-	if got := v.orgProvider.userOrg["alice"]; got != "org-acme" {
-		t.Fatalf("expected userOrg['alice'] = org-acme; got %q", got)
 	}
 }
 

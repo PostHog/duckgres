@@ -1768,32 +1768,29 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 // within that org. Flight has no `database` param, so there is no catalog
 // selection here — the per-user default catalog applies.
 type cpFlightCredentialValidator struct {
-	cp          *ControlPlane
-	orgProvider *orgRoutedSessionProvider
+	cp *ControlPlane
 }
 
 func (v *cpFlightCredentialValidator) ValidateCredentials(username, password string) bool {
 	return v.ValidateCredentialsForSNI("", username, password)
 }
 
+// ValidateCredentialsForSNI authenticates (username, password) against the org
+// the connection's managed hostname (SNI) resolves to. It does NOT stash the
+// resolved org anywhere keyed by username — session routing re-derives the org
+// from the same SNI at create time (orgRoutedSessionProvider.resolveOrg), so the
+// authenticated principal stays bound to this connection's hostname rather than
+// a shared username→org map that two tenants could collide on.
 func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, password string) bool {
 	cp := v.cp
 	sniPrefix, isManaged := cp.extractOrgFromSNI(sni)
 	if !isManaged {
-		// A username alone can collide across orgs, so identity now requires a
+		// A username alone can collide across orgs, so identity requires a
 		// managed hostname — there is no username-scan fallback.
 		slog.Warn("Flight auth rejected: SNI does not match a managed hostname.",
 			"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
 		return false
 	}
-	return v.authForSNIPrefix(sni, sniPrefix, username, password)
-}
-
-// authForSNIPrefix validates (username, password) against the single org the
-// SNI-derived hostname prefix resolves to (via hostname_alias, database_name,
-// or DNS-safe org name — see ConfigStore.ResolveSNIPrefix).
-func (v *cpFlightCredentialValidator) authForSNIPrefix(sni, sniPrefix, username, password string) bool {
-	cp := v.cp
 	orgID, dbname := cp.configStore.ResolveSNIPrefix(sniPrefix)
 	if orgID == "" {
 		slog.Warn("Flight client SNI references unknown org.",
@@ -1801,13 +1798,25 @@ func (v *cpFlightCredentialValidator) authForSNIPrefix(sni, sniPrefix, username,
 		return false
 	}
 	observeSNIRoutingResolution("flight", dbname != sniPrefix)
-	if !cp.configStore.ValidateOrgUser(orgID, username, password) {
-		return false
+	return cp.configStore.ValidateOrgUser(orgID, username, password)
+}
+
+// flightOrgFromContext resolves the org for a Flight session from the request
+// context's SNI (the managed hostname). Used by orgRoutedSessionProvider to bind
+// each session to its connection's org, mirroring the auth-time resolution.
+func (cp *ControlPlane) flightOrgFromContext(ctx context.Context) (string, bool) {
+	return cp.resolveFlightOrgFromSNI(flightSNIFromContext(ctx))
+}
+
+// resolveFlightOrgFromSNI maps a TLS ServerName to its org, returning ok=false
+// for unmanaged hostnames or prefixes that resolve to no org.
+func (cp *ControlPlane) resolveFlightOrgFromSNI(sni string) (orgID string, ok bool) {
+	prefix, isManaged := cp.extractOrgFromSNI(sni)
+	if !isManaged {
+		return "", false
 	}
-	v.orgProvider.mu.Lock()
-	v.orgProvider.userOrg[username] = orgID
-	v.orgProvider.mu.Unlock()
-	return true
+	orgID, _ = cp.configStore.ResolveSNIPrefix(prefix)
+	return orgID, orgID != ""
 }
 
 func (cp *ControlPlane) startFlightIngress() {
@@ -1820,18 +1829,16 @@ func (cp *ControlPlane) startFlightIngress() {
 
 	switch {
 	case cp.configStore != nil && cp.orgRouter != nil:
-		// Multi-tenant: auth via config store, sessions routed per-org.
-		// When the client connected via a managed hostname, the SNI is
-		// authoritative for org routing; otherwise we fall back to scanning
-		// orgs by (username, password) and log a warning so legacy callers
-		// can be migrated.
+		// Multi-tenant: auth via config store, sessions routed per-org. The
+		// managed hostname (SNI) is authoritative for org identity at both auth
+		// and session-create time; there is no username-keyed routing state.
 		orgProvider := &orgRoutedSessionProvider{
 			orgRouter:   cp.orgRouter,
 			configStore: cp.configStore,
 			pidSession:  make(map[int32]flightOwnedSession),
-			userOrg:     make(map[string]string),
+			resolveOrg:  cp.flightOrgFromContext,
 		}
-		validator = &cpFlightCredentialValidator{cp: cp, orgProvider: orgProvider}
+		validator = &cpFlightCredentialValidator{cp: cp}
 		provider = orgProvider
 	case cp.sessions != nil:
 		// Single-tenant: static users map, single session manager.
