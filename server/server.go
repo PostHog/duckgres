@@ -1718,12 +1718,23 @@ func attachS3TablesIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{
 		return nil
 	}
 
-	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
-		return fmt.Errorf("load iceberg extension: %w", err)
+	// httpfs + S3 secret must be ready BEFORE LoadExtensions("iceberg"); see the
+	// matching comment in attachLakekeeperCatalog. The iceberg extension's
+	// LOAD-time init falls back to AWS-SDK credential discovery when no TYPE S3
+	// secret is present, which probes IMDS (blocked by the worker network
+	// policy) and hangs until the activate-tenant deadline. Iceberg + DuckLake
+	// tenants don't hit it because AttachDuckLake runs first and primes httpfs
+	// + a TYPE S3 secret; the iceberg-only path here must replicate that order.
+	if err := LoadExtensions(db, []string{"httpfs"}); err != nil {
+		return fmt.Errorf("load httpfs extension: %w", err)
 	}
 
 	if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
 		return fmt.Errorf("create Iceberg secret: %w", err)
+	}
+
+	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
+		return fmt.Errorf("load iceberg extension: %w", err)
 	}
 
 	attachStmt := iceberg.BuildIcebergAttachStmt(ic)
@@ -1787,9 +1798,26 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 		return nil
 	}
 
-	istep("load-iceberg-extension")
-	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
-		return fmt.Errorf("load iceberg extension: %w", err)
+	// httpfs + S3 data secret must be ready BEFORE LoadExtensions("iceberg").
+	// The DuckLake-attached (iceberg + DuckLake "both") path works because
+	// AttachDuckLake runs first: it auto-loads httpfs and creates a TYPE S3
+	// secret (ducklake_s3) before iceberg is ever touched. The iceberg-only
+	// path doesn't go through AttachDuckLake, so iceberg's LOAD-time init has
+	// no httpfs loaded and no S3 secret to find — and falls back to AWS-SDK
+	// credential discovery, which probes IMDS (169.254.169.254). The
+	// workers' cluster-wide network policy explicitly denies that range
+	// (defense-in-depth, see worker-network-policy.yaml), so the probe
+	// blocks until the activate-tenant deadline (~60s) with no Go-level log,
+	// taking the iceberg-only activation down with it.
+	//
+	// Mirror the DuckLake setup minimally: load httpfs (bundled, fast) and
+	// create the iceberg_sigv4 S3 secret BEFORE iceberg loads. With a TYPE S3
+	// secret already in place at LOAD time, the extension's init skips IMDS
+	// discovery and returns in milliseconds (matches the ~120ms observed in
+	// the "both" path on the same image).
+	istep("load-httpfs-extension")
+	if err := LoadExtensions(db, []string{"httpfs"}); err != nil {
+		return fmt.Errorf("load httpfs extension: %w", err)
 	}
 
 	// S3 data secret: Lakekeeper does NOT vend credentials (PackedPolicyTooLarge),
@@ -1802,6 +1830,11 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 		if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
 			return fmt.Errorf("create Lakekeeper S3 data secret: %w", err)
 		}
+	}
+
+	istep("load-iceberg-extension")
+	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
+		return fmt.Errorf("load iceberg extension: %w", err)
 	}
 
 	// Catalog auth secret: only when OAuth2 is configured. In allowall mode
