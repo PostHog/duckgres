@@ -32,17 +32,20 @@ func TestWipePersistedSecretsOnRecycle(t *testing.T) {
 
 	const secretName = "test_recycle_secret"
 
-	// open applies the same secret_directory pinning the production worker uses
-	// (server.ConfigureMainDB) and returns the DB. Caller closes it.
+	// open returns a DB pinned at the same secret_directory the worker uses.
+	// We pin it directly here rather than via ConfigureMainDB because this test
+	// exercises the wipe mechanism in isolation, and it needs persistent secrets
+	// *enabled* to create one to wipe — whereas the production worker config
+	// (DisablePersistentSecrets) both pins and disables. Caller closes the DB.
 	open := func() *sql.DB {
 		t.Helper()
 		db, err := sql.Open("duckdb", ":memory:?allow_unsigned_extensions=true")
 		if err != nil {
 			t.Fatalf("open duckdb: %v", err)
 		}
-		if err := server.ConfigureMainDB(db, cfg, "tester"); err != nil {
+		if _, err := db.Exec("SET secret_directory = '" + secretDir + "'"); err != nil {
 			_ = db.Close()
-			t.Fatalf("ConfigureMainDB: %v", err)
+			t.Fatalf("set secret_directory: %v", err)
 		}
 		return db
 	}

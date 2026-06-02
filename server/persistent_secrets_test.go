@@ -41,7 +41,7 @@ func TestDisablePersistentSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	cfg := Config{DataDir: dir, DisablePersistentSecrets: true}
 	if err := ConfigureMainDB(db, cfg, "worker"); err != nil {
 		t.Fatalf("ConfigureMainDB: %v", err)

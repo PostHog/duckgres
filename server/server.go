@@ -912,29 +912,35 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 		return fmt.Errorf("failed to configure extension_directory: %w", err)
 	}
 
-	// Pin persistent secrets to a known, per-worker location under DataDir
-	// instead of DuckDB's default ($HOME/.duckdb/stored_secrets). secret_directory
-	// is a global DuckDB setting, so applying it on the main connection covers
-	// the shared SecretManager (main + control). This both makes the persisted
-	// state predictable and lets the worker wipe it on recycle. As a side
-	// benefit, redirecting the directory means any pre-existing stale secrets in
-	// the old default path stop being loaded, so they can no longer collide with
-	// the in-memory secrets re-created at activation.
-	if secretDir := SecretDirectory(cfg); secretDir != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET secret_directory = '%s'", secretDir)); err != nil {
-			slog.Warn("Failed to set DuckDB secret_directory.", "secret_directory", secretDir, "error", err)
-		} else {
-			slog.Debug("Set DuckDB secret_directory.", "secret_directory", secretDir)
-		}
-	}
-
-	// On workers, turn off persistent secret storage entirely. This must run
-	// before the SecretManager's first use (it does — ConfigureMainDB is applied
-	// right after open, before any ATTACH or CREATE SECRET). It both prevents
-	// CREATE PERSISTENT SECRET (which would write a landmine to DataDir) and
-	// stops any pre-existing on-disk secret from being loaded, so it can never
-	// collide with the in-memory secret re-created at activation.
+	// Worker secret hardening — gated to workers (DisablePersistentSecrets, set
+	// by duckdbservice.OpenDuckDBPair). Standalone is intentionally left alone:
+	// it keeps DuckDB's default secret store ($HOME/.duckdb/stored_secrets) and
+	// its ability to use persistent secrets, so an upgrade doesn't silently
+	// relocate an existing standalone user's secrets.
+	//
+	// Both SETs must run before the SecretManager's first use — they do, since
+	// ConfigureMainDB is applied right after open, before any ATTACH or CREATE
+	// SECRET. secret_directory and allow_persistent_secrets are global DuckDB
+	// settings, so applying them on the main connection covers the shared
+	// SecretManager (main + control).
 	if cfg.DisablePersistentSecrets {
+		// Pin persistent secrets to a known, per-worker location under DataDir
+		// instead of DuckDB's $HOME default: deterministic and wipeable on
+		// recycle. (Largely belt-and-suspenders given the disable below, but it
+		// keeps the location predictable if persistent secrets are ever
+		// re-enabled.)
+		if secretDir := SecretDirectory(cfg); secretDir != "" {
+			if _, err := db.Exec(fmt.Sprintf("SET secret_directory = '%s'", secretDir)); err != nil {
+				slog.Warn("Failed to set DuckDB secret_directory.", "secret_directory", secretDir, "error", err)
+			} else {
+				slog.Debug("Set DuckDB secret_directory.", "secret_directory", secretDir)
+			}
+		}
+
+		// Turn off persistent secret storage entirely. This both prevents
+		// CREATE PERSISTENT SECRET (which would write a landmine to DataDir) and
+		// stops any pre-existing on-disk secret from being loaded, so it can
+		// never collide with the in-memory secret re-created at activation.
 		if _, err := db.Exec("SET allow_persistent_secrets = false"); err != nil {
 			slog.Warn("Failed to disable DuckDB persistent secrets.", "error", err)
 		} else {
