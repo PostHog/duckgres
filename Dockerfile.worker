@@ -13,20 +13,6 @@ FROM golang:1.25-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-# Copy the full source first. The earlier layout (COPY go.mod go.sum;
-# go get; COPY . .) silently broke per-DuckDB-version pinning: the second
-# COPY overlaid the host's go.mod/go.sum on top of the downgraded ones,
-# undoing the `go get`. Symptom: the duckgres-worker:<sha>-duckdb1.5.1
-# image was actually statically linked against duckdb-go-bindings@v0.10502.0
-# (DuckDB 1.5.2), with bundled 0.4 extensions sitting at /app/extensions/v1.5.1/
-# where the 1.5.2 runtime never looks. Catalog attach failed at runtime
-# with "extension requires version 1.0". COPY-then-pin avoids it.
-COPY . .
-
-ARG VERSION=dev
-ARG COMMIT=unknown
-ARG BUILD_TAGS=""
-ARG TARGETARCH
 
 # DuckDB driver pin. Default to whatever the repo's go.mod is currently
 # tracking; override via --build-arg when the matrix produces an image
@@ -36,6 +22,24 @@ ARG TARGETARCH
 # without the v2 prefix).
 ARG DUCKDB_GO_VERSION=
 ARG DUCKDB_BINDINGS_VERSION=
+ARG TARGETARCH
+
+# Copy ONLY the module files first, apply the per-build DuckDB pin, then
+# download + CGO-prewarm — all in layers keyed solely on go.mod/go.sum + the
+# pin args. On a source-only PR these cache-hit, so the multi-minute
+# libduckdb/libpg_query compile is skipped and the final `go build` below
+# recompiles only changed first-party code.
+#
+# The earlier layout copied the full source first (COPY . .; go get) to stop
+# the source COPY from overlaying the host's unpinned go.mod/go.sum back on
+# top of the downgraded ones — a real bug: the duckgres-worker:<sha>-duckdb1.5.1
+# image once shipped statically linked against duckdb-go-bindings@v0.10502.0
+# with extensions seeded under the wrong v1.5.1/ dir, failing catalog attach
+# at runtime ("extension requires version 1.0"). We keep that correctness by
+# stashing the pinned module files and restoring them after COPY . . (a local
+# copy, no network), while still getting cacheable prewarm. The verify layers
+# further down fail the build if the embedded bindings version ever drifts.
+COPY go.mod go.sum ./
 
 RUN if [ -n "$DUCKDB_GO_VERSION" ] && [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
       go get "github.com/duckdb/duckdb-go/v2@${DUCKDB_GO_VERSION}" \
@@ -44,10 +48,20 @@ RUN if [ -n "$DUCKDB_GO_VERSION" ] && [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
            go get "github.com/duckdb/duckdb-go-bindings/lib/${arch}@${DUCKDB_BINDINGS_VERSION}" 2>/dev/null || true; \
          done \
       && go mod tidy ; \
-    fi
+    fi \
+    && cp go.mod go.mod.pinned && cp go.sum go.sum.pinned
 
 RUN go mod download
 
+# CGO dep-prewarm — see top-level Dockerfile. Compiles libduckdb-linked
+# duckdb-go + libpg_query-linked pg_query_go into the build cache, keyed on
+# the pinned go.mod/go.sum.
+RUN CGO_ENABLED=1 go build github.com/duckdb/duckdb-go/v2 github.com/pganalyze/pg_query_go/v6 2>/dev/null || true
+
+# Bundled DuckDB extensions. Downloaded BEFORE `COPY . .` so this layer
+# depends only on the extension/pin args, not on source — a source-only PR
+# keeps the GHA layer-cache hit and skips the 5 downloads. (They previously
+# ran after the source COPY + build, so they re-fetched on every edit.)
 ARG DUCKDB_EXTENSION_VERSION=1.5.3
 ARG HTTPFS_EXTENSION_TAG=v1.5.3-stoi-fix
 ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
@@ -56,28 +70,6 @@ ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # extensions repo, overridable per-row in CI (e.g. legacy DuckDB versions
 # may need the nightly repo to match what was previously published).
 ARG POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
-
-RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
-    -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    -o duckgres-worker \
-    ./cmd/duckgres-worker
-
-# Defense-in-depth: assert the binary actually links against the bindings
-# version the build args asked for. If a future Dockerfile change re-breaks
-# the pinning, this fails the build instead of shipping a silently-wrong
-# image. The DUCKDB_BINDINGS_VERSION arg encodes DuckDB minor (e.g.
-# v0.10501.0 -> DuckDB 1.5.1); the embedded module info in the binary must
-# match exactly.
-RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
-      embedded=$(go version -m ./duckgres-worker | awk '$2 == "github.com/duckdb/duckdb-go-bindings" { print $3 }') ; \
-      if [ "$embedded" != "$DUCKDB_BINDINGS_VERSION" ]; then \
-        echo "ERROR: bindings pin mismatch — wanted $DUCKDB_BINDINGS_VERSION, got $embedded" >&2 ; \
-        echo "       (full embedded module info follows)" >&2 ; \
-        go version -m ./duckgres-worker | grep duckdb >&2 ; \
-        exit 1 ; \
-      fi ; \
-      echo "Verified: duckgres-worker linked against duckdb-go-bindings@$embedded" ; \
-    fi
 
 # Cross-check that DUCKDB_EXTENSION_VERSION (which keys the bundled-extension
 # directory layout) matches the DuckDB version implied by DUCKDB_BINDINGS_VERSION.
@@ -126,6 +118,38 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
          [ -s "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/$f.duckdb_extension" ] \
            || { echo "ERROR: $f.duckdb_extension is empty after fetch" >&2; exit 1; }; \
        done
+
+COPY . .
+
+# Restore the pinned module files clobbered by COPY . . — a local copy, no
+# `go get`, so no network and the prewarmed module/build caches stay valid.
+RUN cp go.mod.pinned go.mod && cp go.sum.pinned go.sum
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TAGS=""
+
+RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
+    -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -o duckgres-worker \
+    ./cmd/duckgres-worker
+
+# Defense-in-depth: assert the binary actually links against the bindings
+# version the build args asked for. If a future Dockerfile change re-breaks
+# the pinning, this fails the build instead of shipping a silently-wrong
+# image. The DUCKDB_BINDINGS_VERSION arg encodes DuckDB minor (e.g.
+# v0.10501.0 -> DuckDB 1.5.1); the embedded module info in the binary must
+# match exactly.
+RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
+      embedded=$(go version -m ./duckgres-worker | awk '$2 == "github.com/duckdb/duckdb-go-bindings" { print $3 }') ; \
+      if [ "$embedded" != "$DUCKDB_BINDINGS_VERSION" ]; then \
+        echo "ERROR: bindings pin mismatch — wanted $DUCKDB_BINDINGS_VERSION, got $embedded" >&2 ; \
+        echo "       (full embedded module info follows)" >&2 ; \
+        go version -m ./duckgres-worker | grep duckdb >&2 ; \
+        exit 1 ; \
+      fi ; \
+      echo "Verified: duckgres-worker linked against duckdb-go-bindings@$embedded" ; \
+    fi
 
 FROM debian:bookworm-slim
 
