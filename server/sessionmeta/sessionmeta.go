@@ -1,6 +1,10 @@
-// Package sessionmeta installs session-local catalog/metadata overrides on a
-// duckgres connection. PostgreSQL-facing metadata reflects the client-visible
-// database name while execution can still route to a physical DuckDB catalog.
+// Package sessionmeta installs session-local catalog/metadata overrides on
+// a duckgres connection (current_database, pg_database, information_schema
+// views) so they reflect the catalog the session defaults to on the PG wire.
+//
+// The catalog name passed in is the real, attached catalog (e.g. "ducklake" or
+// "iceberg") the session uses — duckgres no longer masks a logical database
+// name onto a physical catalog, so current_database() reports the truth.
 //
 // Pure helpers — no dependency on github.com/duckdb/duckdb-go. The control
 // plane and other duckdb-free callers use this package without linking
@@ -13,30 +17,27 @@ import (
 	"strings"
 
 	"github.com/posthog/duckgres/server/icebergmeta"
-	"github.com/posthog/duckgres/server/sessioncatalog"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 // InitSessionDatabaseMetadata installs session-local overrides for metadata
-// surfaces (current_database, pg_database, information_schema views). The
-// client-visible database is kept separate from the physical catalog used for
-// execution.
-func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, selection sessioncatalog.Selection) error {
+// surfaces (current_database, pg_database, information_schema views) so they
+// reflect `catalog` — the real, attached catalog the session defaults to. The
+// caller resolves `catalog` to "ducklake"/"iceberg" (the names the catalogs are
+// actually attached as); there is no logical→physical masking.
+func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
 	}
 
-	clientDatabase := strings.TrimSpace(selection.ClientDatabase)
-	if clientDatabase == "" {
-		clientDatabase = strings.TrimSpace(selection.PhysicalCatalog)
-	}
-	if clientDatabase == "" {
+	catalog = strings.TrimSpace(catalog)
+	if catalog == "" {
 		return nil
 	}
 
 	if _, err := executor.ExecContext(ctx, fmt.Sprintf(
 		"CREATE OR REPLACE TEMP MACRO current_database() AS %s",
-		quoteSQLStringLiteral(clientDatabase),
+		quoteSQLStringLiteral(catalog),
 	)); err != nil {
 		return fmt.Errorf("create current_database() macro: %w", err)
 	}
@@ -61,7 +62,7 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 		}
 	}()
 
-	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(selection)); err != nil {
+	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog)); err != nil {
 		return fmt.Errorf("apply session metadata override: %w", err)
 	}
 
@@ -130,15 +131,11 @@ func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, cat
 // All statements are independent: each is CREATE OR REPLACE VIEW or
 // CREATE TABLE IF NOT EXISTS, with no cross-statement dependencies that would
 // require ordering beyond the order they appear in the script.
-func buildSessionMetadataSQL(selection sessioncatalog.Selection) string {
-	clientDatabase := strings.TrimSpace(selection.ClientDatabase)
-	if clientDatabase == "" {
-		clientDatabase = strings.TrimSpace(selection.PhysicalCatalog)
-	}
+func buildSessionMetadataSQL(database string) string {
 	parts := []string{
 		sessionColumnMetadataTableSQL(),
 		sessionIcebergColumnMetadataTableSQL(),
-		buildSessionPgDatabaseViewSQL(clientDatabase),
+		buildSessionPgDatabaseViewSQL(database),
 		buildSessionInformationSchemaColumnsViewSQL(),
 		buildSessionInformationSchemaTablesViewSQL(),
 		buildSessionInformationSchemaSchemataViewSQL(),
@@ -243,7 +240,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 		WITH all_columns AS (
 			SELECT
 				c.table_catalog AS source_catalog,
-				CASE WHEN c.table_catalog IN ('ducklake', 'memory', 'iceberg') THEN current_database() ELSE c.table_catalog END AS table_catalog,
+				CASE WHEN c.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE c.table_catalog END AS table_catalog,
 				CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
 				c.table_name,
 				c.column_name,
@@ -280,7 +277,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			UNION ALL
 			SELECT
 				'iceberg' AS source_catalog,
-				current_database() AS table_catalog,
+				'iceberg' AS table_catalog,
 				table_schema,
 				table_name,
 				column_name,
@@ -429,7 +426,7 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 	return `
 		CREATE OR REPLACE VIEW main.information_schema_tables_compat AS
 		SELECT
-			CASE WHEN t.table_catalog IN ('ducklake', 'memory', 'iceberg') THEN current_database() ELSE t.table_catalog END AS table_catalog,
+			CASE WHEN t.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE t.table_catalog END AS table_catalog,
 			CASE WHEN t.table_schema = 'main' THEN 'public' ELSE t.table_schema END AS table_schema,
 			t.table_name,
 			t.table_type,
@@ -462,7 +459,7 @@ func buildSessionInformationSchemaSchemataViewSQL() string {
 	return `
 		CREATE OR REPLACE VIEW main.information_schema_schemata_compat AS
 		SELECT
-			CASE WHEN s.catalog_name IN ('ducklake', 'memory', 'iceberg') THEN current_database() ELSE s.catalog_name END AS catalog_name,
+			CASE WHEN s.catalog_name IN ('ducklake', 'memory') THEN current_database() ELSE s.catalog_name END AS catalog_name,
 			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schema_name,
 			'duckdb' AS schema_owner,
 			NULL AS default_character_set_catalog,
@@ -491,7 +488,7 @@ func buildSessionInformationSchemaViewsViewSQL() string {
 	return `
 		CREATE OR REPLACE VIEW main.information_schema_views_compat AS
 		SELECT
-			CASE WHEN v.table_catalog IN ('ducklake', 'memory', 'iceberg') THEN current_database() ELSE v.table_catalog END AS table_catalog,
+			CASE WHEN v.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE v.table_catalog END AS table_catalog,
 			CASE WHEN v.table_schema = 'main' THEN 'public' ELSE v.table_schema END AS table_schema,
 			v.table_name,
 			v.view_definition,

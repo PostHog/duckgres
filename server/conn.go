@@ -28,7 +28,6 @@ import (
 	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/observe"
-	"github.com/posthog/duckgres/server/sessioncatalog"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/wire"
@@ -1066,31 +1065,27 @@ func (c *clientConn) serve() error {
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect iceberg catalog attachment: %v", err))
 			return err
 		}
-		selection, ok := sessioncatalog.ResolveSelection(sessioncatalog.Request{
-			ClientDatabase: c.database,
-			Attached: sessioncatalog.AttachedCatalogs{
-				DuckLake: duckLakeAttached,
-				Iceberg:  icebergAttached,
-			},
-		})
-		if !ok {
-			initCancel()
-			c.sendError("FATAL", "3D000", "no catalog is available for this connection")
-			return fmt.Errorf("no catalog available")
+		// De-mask: current_database() and the pg_catalog surfaces should reflect
+		// the real attached catalog, not the client's connection database name.
+		// Standalone has a single backing catalog, so honor whatever is attached.
+		catalog := c.database
+		switch {
+		case duckLakeAttached:
+			catalog = physicalDuckLakeCatalog
+		case icebergAttached:
+			catalog = iceberg.CatalogName
 		}
-		// De-mask: current_database()/pg_catalog surfaces report the real catalog
-		// the session defaults to (the de-masked physical catalog), not the startup
-		// database name. When no lake catalog is attached this is a no-op (the
-		// physical catalog already equals the client database).
-		selection.ClientDatabase = selection.PhysicalCatalog
-		c.database = selection.PhysicalCatalog
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, selection); err != nil {
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
 		initCancel()
-		c.physicalCatalog = selection.PhysicalCatalog
+		// Keep c.database aligned with the real catalog so observability surfaces
+		// agree with current_database(); record the physical catalog so the
+		// transpiler selects the right backend profile (DuckLake/Iceberg).
+		c.database = catalog
+		c.physicalCatalog = catalog
 		c.catalogUseRewrite = duckLakeAttached || icebergAttached
 	}
 

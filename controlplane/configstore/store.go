@@ -45,8 +45,8 @@ type Snapshot struct {
 	QueryLog              QueryLogConfig
 }
 
-// Selectable catalog names. The startup `database` param names the catalog a
-// session defaults to rather than identifying the org — these are the only
+// Selectable catalog names. The startup `database` param now names the catalog
+// a session defaults to rather than identifying the org — these are the only
 // non-empty values a client may request.
 const (
 	catalogDuckLake = "ducklake"
@@ -69,11 +69,12 @@ type PostgresConnectionResolution struct {
 	SNIAliasUsed bool
 	// SNIResolved is true when the managed hostname resolved to a known org.
 	SNIResolved bool
-	// RequestedCatalog is the catalog the session should default to, selected by
+	// EffectiveCatalog is the catalog the session should default to, selected by
 	// the startup `database` param: "" (use the per-user/attached default),
 	// "ducklake", or "iceberg".
-	RequestedCatalog string
-	// CatalogValid is false when an explicit catalog selector is invalid.
+	EffectiveCatalog string
+	// CatalogValid is false when the requested `database` is not a selectable
+	// catalog name (anything other than "", "ducklake", "iceberg").
 	CatalogValid bool
 	// Valid is true when (OrgID, username, password) authenticated.
 	Valid bool
@@ -380,19 +381,18 @@ func isDNSLabel(label string) bool {
 func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) PostgresConnectionResolution {
 	result := PostgresConnectionResolution{}
 
-	// The startup `database` param selects which attached catalog the session
-	// defaults to; identity (OrgID) comes solely from SNI + username. Valid
-	// values: "" (use the per-user/attached default), "ducklake", or "iceberg".
-	// Anything else fails closed — there is no logical-name masking, so an
-	// arbitrary name no longer routes anywhere.
+	// The startup `database` param is now pure catalog selection, not identity.
+	// Valid values: "" (use the per-user/attached default), "ducklake", or
+	// "iceberg". Anything else fails closed — there is no logical-name masking,
+	// so an arbitrary name no longer routes anywhere.
 	switch strings.ToLower(strings.TrimSpace(startupDatabase)) {
 	case "":
 		result.CatalogValid = true
 	case catalogDuckLake:
-		result.RequestedCatalog = catalogDuckLake
+		result.EffectiveCatalog = catalogDuckLake
 		result.CatalogValid = true
 	case catalogIceberg:
-		result.RequestedCatalog = catalogIceberg
+		result.EffectiveCatalog = catalogIceberg
 		result.CatalogValid = true
 	}
 

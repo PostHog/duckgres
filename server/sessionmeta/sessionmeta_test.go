@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
-	"github.com/posthog/duckgres/server/sessioncatalog"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
@@ -85,10 +84,7 @@ func TestInitSessionDatabaseMetadataBatchesPerSessionStatements(t *testing.T) {
 		queryRows: &singleIntRow{v: 1}, // pretend ducklake is attached for HasAttachedCatalog
 	}
 
-	if err := InitSessionDatabaseMetadata(context.Background(), exec, sessioncatalog.Selection{
-		ClientDatabase:  "analytics",
-		PhysicalCatalog: "ducklake",
-	}); err != nil {
+	if err := InitSessionDatabaseMetadata(context.Background(), exec, "analytics"); err != nil {
 		t.Fatalf("InitSessionDatabaseMetadata: %v", err)
 	}
 
@@ -107,10 +103,7 @@ func TestInitSessionDatabaseMetadataBatchesPerSessionStatements(t *testing.T) {
 }
 
 func TestBuildSessionMetadataSQLContainsAllExpectedStatements(t *testing.T) {
-	got := buildSessionMetadataSQL(sessioncatalog.Selection{
-		ClientDatabase:  "analytics",
-		PhysicalCatalog: "ducklake",
-	})
+	got := buildSessionMetadataSQL("analytics")
 
 	wants := []string{
 		"CREATE TABLE IF NOT EXISTS main.__duckgres_column_metadata",
@@ -153,13 +146,13 @@ func TestInformationSchemaColumnsCompatUsesLoadedIcebergColumnsAndFiltersDummy(t
 	}
 }
 
-func TestInformationSchemaColumnsCompatLoadedIcebergColumnsUseCurrentDatabaseCatalog(t *testing.T) {
+func TestInformationSchemaColumnsCompatLoadedIcebergColumnsKeepIcebergCatalog(t *testing.T) {
 	got := buildSessionInformationSchemaColumnsViewSQL()
-	if !strings.Contains(got, "'iceberg' AS source_catalog") {
-		t.Fatalf("loaded Iceberg columns should retain internal source catalog in:\n%s", got)
+	if !strings.Contains(got, "'iceberg' AS table_catalog") {
+		t.Fatalf("loaded Iceberg columns should use the iceberg catalog in:\n%s", got)
 	}
-	if !strings.Contains(got, "current_database() AS table_catalog,\n\t\t\t\ttable_schema") {
-		t.Fatalf("loaded Iceberg columns should expose current_database() as table_catalog in:\n%s", got)
+	if strings.Contains(got, "current_database() AS table_catalog,\n\t\t\t\ttable_schema") {
+		t.Fatalf("loaded Iceberg columns should not use current_database() as table_catalog in:\n%s", got)
 	}
 }
 
@@ -183,7 +176,6 @@ func TestInformationSchemaColumnsCompatPrefersLoadedIcebergMetadata(t *testing.T
 			ordinal_position,
 			is_nullable,
 			data_type,
-			udt_name,
 			character_maximum_length,
 			character_octet_length,
 			numeric_precision,
@@ -195,8 +187,7 @@ func TestInformationSchemaColumnsCompatPrefersLoadedIcebergMetadata(t *testing.T
 			'requirements_currently_due',
 			1,
 			'YES',
-			'jsonb',
-			'jsonb',
+			'STRUCT(currently_due VARCHAR[])',
 			NULL,
 			NULL,
 			NULL,
@@ -215,7 +206,7 @@ func TestInformationSchemaColumnsCompatPrefersLoadedIcebergMetadata(t *testing.T
 	err = db.QueryRow(`
 		SELECT data_type
 		FROM main.information_schema_columns_compat
-		WHERE table_catalog = current_database()
+		WHERE table_catalog = 'iceberg'
 		AND table_schema = 'stripe'
 		AND table_name = 'account'
 		AND column_name = 'requirements_currently_due'
@@ -223,8 +214,8 @@ func TestInformationSchemaColumnsCompatPrefersLoadedIcebergMetadata(t *testing.T
 	if err != nil {
 		t.Fatalf("query compat data_type: %v", err)
 	}
-	if dataType != "jsonb" {
-		t.Fatalf("data_type = %q, want jsonb from loaded Iceberg metadata", dataType)
+	if dataType != "json" {
+		t.Fatalf("data_type = %q, want json from loaded Iceberg metadata", dataType)
 	}
 }
 

@@ -27,7 +27,6 @@ import (
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/flightsqlingress"
-	"github.com/posthog/duckgres/server/sessioncatalog"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -910,7 +909,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		orgID            string
 		passthroughUser  bool
 		defaultCatalog   string
-		requestedCatalog string // "" | "ducklake" | "iceberg"
+		requestedCatalog string // "" | "ducklake" | "iceberg" (validated below)
 	)
 	if cp.configStore != nil {
 		sni := tlsConn.ConnectionState().ServerName
@@ -945,6 +944,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 		if !resolution.CatalogValid {
+			// The startup `database` is now a catalog selector; only
+			// "ducklake"/"iceberg"/empty are valid. No logical-name masking.
 			slog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
 				"database", database, "org", resolution.OrgID, "remote_addr", remoteAddr, "user", username)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000",
@@ -965,7 +966,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		orgID = resolution.OrgID
 		passthroughUser = resolution.Passthrough
 		defaultCatalog = resolution.DefaultCatalog
-		requestedCatalog = resolution.RequestedCatalog
+		requestedCatalog = resolution.EffectiveCatalog
+		// `database` is finalized post-session to the real catalog the session
+		// defaults to (once worker attachment is known), so logs and the
+		// current_database() macro surface the actual catalog.
 	} else {
 		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
@@ -1122,19 +1126,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
-	attached := sessioncatalog.AttachedCatalogs{DuckLake: duckLakeAttached, Iceberg: icebergAttached}
-	selection := sessioncatalog.Selection{ClientDatabase: database, PhysicalCatalog: database}
+	var effectiveCatalog string
 	if cp.configStore != nil {
 		var ok bool
-		selection, ok = sessioncatalog.ResolveSelection(sessioncatalog.Request{
-			ClientDatabase:   database,
-			RequestedCatalog: requestedCatalog,
-			DefaultCatalog:   defaultCatalog,
-			Attached:         attached,
-		})
+		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, defaultCatalog, duckLakeAttached, icebergAttached)
 		if !ok {
 			slog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
-				"requested", requestedCatalog, "org", orgID, "ducklake_attached", attached.DuckLake, "iceberg_attached", attached.Iceberg, "remote_addr", remoteAddr, "user", username)
+				"requested", requestedCatalog, "org", orgID, "ducklake_attached", duckLakeAttached, "iceberg_attached", icebergAttached, "remote_addr", remoteAddr, "user", username)
 			msg := "no catalog is available for this connection"
 			if requestedCatalog != "" {
 				msg = fmt.Sprintf("database %q does not exist", requestedCatalog)
@@ -1144,25 +1142,22 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 	} else {
-		var ok bool
-		selection, ok = sessioncatalog.ResolveSelection(sessioncatalog.Request{
-			ClientDatabase: database,
-			Attached:       attached,
-		})
-		if !ok {
-			slog.Warn("Postgres connection rejected: no catalog is available.", "remote_addr", remoteAddr, "user", username)
-			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", "no catalog is available for this connection")
-			_ = writer.Flush()
-			return
+		// Single-tenant (process backend / static users): de-mask to the real
+		// attached catalog when present; otherwise keep the client's database name
+		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
+		switch {
+		case duckLakeAttached:
+			effectiveCatalog = physicalDuckLakeCatalog
+		case icebergAttached:
+			effectiveCatalog = physicalIcebergCatalog
+		default:
+			effectiveCatalog = database
 		}
 	}
-
-	// De-mask: current_database()/pg_catalog surfaces and observability report the
-	// real catalog the session defaults to, not the startup `database` selector.
-	// There is no logical-name masking — the client-visible database IS the
-	// physical catalog (`database` is only ever "", "ducklake", or "iceberg" here).
-	selection.ClientDatabase = selection.PhysicalCatalog
-	database = selection.PhysicalCatalog
+	// `database` now reflects the real catalog the session defaults to — this is
+	// what drives the current_database() macro/pg_database view and what logs and
+	// observability surface.
+	database = effectiveCatalog
 
 	// Passthrough users skip pg_catalog initialization and the catalog USE
 	// rewriting — they bypass the PG compatibility layer entirely. They still
@@ -1171,7 +1166,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// passthrough branch below).
 	if !passthroughUser {
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, selection); err != nil {
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, effectiveCatalog); err != nil {
 			initCancel()
 			slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
@@ -1186,13 +1181,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// earlier value would be clobbered. A client-supplied search_path is
 		// best-effort; the configured catalog (Iceberg) fails closed because
 		// silently falling back would route the user to the wrong catalog.
-		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, selection.PhysicalCatalog); cmd != "" {
+		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
 			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(spCtx, cmd)
 			spCancel()
 			if err != nil {
 				if source == sessionDefaultSourceConfiguredCatalog {
-					slog.Error("Failed to apply session default catalog.", "user", username, "org", orgID, "catalog", selection.PhysicalCatalog, "error", err)
+					slog.Error("Failed to apply session default catalog.", "user", username, "org", orgID, "catalog", effectiveCatalog, "error", err)
 					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 					_ = writer.Flush()
 					return
@@ -1208,7 +1203,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if clientSearchPath != "" {
 			slog.Warn("Ignoring client connect-time search_path for passthrough session.", "user", username, "org", orgID, "search_path", clientSearchPath, "remote_addr", remoteAddr)
 		}
-		if cmd := passthroughSessionDefaultCatalogCommand(selection.PhysicalCatalog); cmd != "" {
+		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
 			initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(initCtx, cmd)
 			initCancel()
@@ -1232,12 +1227,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			server.SetConnectionIcebergConfig(cc, icebergCfg)
 		}
 	}
-	server.SetConnectionPhysicalCatalog(cc, selection.PhysicalCatalog)
+	// Record the resolved physical catalog so the transpiler selects the right
+	// backend profile (DuckLake/Iceberg DDL+DML policy) for this session.
+	server.SetConnectionPhysicalCatalog(cc, effectiveCatalog)
 	// Catalog USE rewriting (expanding bare `USE ducklake`/`USE iceberg` to the
 	// reliable two-part target) is a non-passthrough feature; passthrough sessions
 	// talk raw DuckDB, so keep it disabled for them. Enabled whenever either
 	// catalog is attached.
-	server.SetCatalogUseRewrite(cc, (attached.DuckLake || attached.Iceberg) && !passthroughUser)
+	server.SetCatalogUseRewrite(cc, (duckLakeAttached || icebergAttached) && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)

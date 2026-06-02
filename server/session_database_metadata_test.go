@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
-	"github.com/posthog/duckgres/server/sessioncatalog"
 	"github.com/posthog/duckgres/server/sessionmeta"
 )
 
@@ -75,13 +74,6 @@ func (r *staticCountRowSet) Scan(dest ...any) error {
 func (r *staticCountRowSet) Close() error { return nil }
 func (r *staticCountRowSet) Err() error   { return nil }
 
-func sessionSelection(database string) sessioncatalog.Selection {
-	return sessioncatalog.Selection{
-		ClientDatabase:  database,
-		PhysicalCatalog: "ducklake",
-	}
-}
-
 func TestHasAttachedCatalogEmbedsCatalogNameWithoutBoundArgs(t *testing.T) {
 	exec := &recordingQueryExecutor{
 		rowSet: &staticCountRowSet{count: 1},
@@ -111,7 +103,7 @@ func TestInitSessionDatabaseMetadataOverridesCurrentDatabaseAndPgDatabase(t *tes
 	defer func() { _ = db.Close() }()
 
 	executor := NewLocalExecutor(db)
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, sessionSelection("analytics")); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -166,7 +158,7 @@ func TestInitSessionDatabaseMetadataOverridesInformationSchemaCatalogColumns(t *
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, sessionSelection("analytics")); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -228,7 +220,7 @@ func TestInitSessionDatabaseMetadataExcludesInternalDuckLakeMetadataCatalogs(t *
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, sessionSelection("analytics")); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -279,7 +271,7 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, sessionSelection("posthog")); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "posthog"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -356,7 +348,7 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 	}
 
 	assertColumns("ducklake.billing_public,memory.main", "posthog", "NO", "json")
-	assertColumns("iceberg.billing_public,memory.main", "posthog", "YES", "text")
+	assertColumns("iceberg.billing_public,memory.main", "iceberg", "YES", "text")
 
 	if _, err := db.Exec("USE iceberg.public"); err != nil {
 		t.Fatalf("use iceberg.public: %v", err)
@@ -371,7 +363,7 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 	`).Scan(&gotCatalog, &gotNullable); err != nil {
 		t.Fatalf("query id metadata after USE iceberg.public: %v", err)
 	}
-	if gotCatalog != "posthog" || gotNullable != "YES" {
-		t.Fatalf("id metadata after USE iceberg.public = (%q, %q), want (posthog, YES)", gotCatalog, gotNullable)
+	if gotCatalog != "iceberg" || gotNullable != "YES" {
+		t.Fatalf("id metadata after USE iceberg.public = (%q, %q), want (iceberg, YES)", gotCatalog, gotNullable)
 	}
 }

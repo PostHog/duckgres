@@ -312,8 +312,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 		if !got.SNIResolved || got.OrgID != "test-org-smoke-1778167994" {
 			t.Fatalf("org = (resolved=%v, %q), want test org from SNI: %+v", got.SNIResolved, got.OrgID, got)
 		}
-		if !got.CatalogValid || got.RequestedCatalog != "ducklake" {
-			t.Fatalf("catalog = (valid=%v requested=%q), want ducklake: %+v", got.CatalogValid, got.RequestedCatalog, got)
+		if !got.CatalogValid || got.EffectiveCatalog != "ducklake" {
+			t.Fatalf("catalog = (valid=%v, %q), want ducklake: %+v", got.CatalogValid, got.EffectiveCatalog, got)
 		}
 		if !got.Valid || !got.Passthrough {
 			t.Fatalf("unexpected auth result: %+v", got)
@@ -322,8 +322,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 
 	t.Run("iceberg catalog selected", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection("iceberg", "test-org-smoke-1778167994", true, "root", "secret")
-		if !got.CatalogValid || got.RequestedCatalog != "iceberg" {
-			t.Fatalf("catalog = (valid=%v requested=%q), want iceberg: %+v", got.CatalogValid, got.RequestedCatalog, got)
+		if !got.CatalogValid || got.EffectiveCatalog != "iceberg" {
+			t.Fatalf("catalog = (valid=%v, %q), want iceberg: %+v", got.CatalogValid, got.EffectiveCatalog, got)
 		}
 		if !got.Valid {
 			t.Fatalf("expected valid auth: %+v", got)
@@ -332,21 +332,20 @@ func TestResolvePostgresConnection(t *testing.T) {
 
 	t.Run("empty database means use the default catalog", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection("", "test-org-smoke-1778167994", true, "root", "secret")
-		if !got.CatalogValid || got.RequestedCatalog != "" {
-			t.Fatalf("catalog = (valid=%v requested=%q), want empty/use-default: %+v", got.CatalogValid, got.RequestedCatalog, got)
+		if !got.CatalogValid || got.EffectiveCatalog != "" {
+			t.Fatalf("catalog = (valid=%v, %q), want empty/use-default: %+v", got.CatalogValid, got.EffectiveCatalog, got)
 		}
 		if !got.Valid {
 			t.Fatalf("expected valid auth: %+v", got)
 		}
 	})
 
-	t.Run("non-catalog database name fails closed", func(t *testing.T) {
-		// The startup `database` param is pure catalog selection: only
-		// "" / "ducklake" / "iceberg" are accepted. An arbitrary name no longer
-		// routes anywhere and must be rejected (CatalogValid=false → 3D000).
+	t.Run("legacy database name is no longer a valid catalog", func(t *testing.T) {
+		// The org's old database_name is not "ducklake"/"iceberg", so it fails the
+		// catalog check even though SNI+auth would otherwise succeed.
 		got := cs.ResolvePostgresConnection("test_org_smoke_1778167994", "test-org-smoke-1778167994", true, "root", "secret")
-		if got.CatalogValid || got.RequestedCatalog != "" {
-			t.Fatalf("non-catalog database name should fail closed: %+v", got)
+		if got.CatalogValid {
+			t.Fatalf("legacy database name must not be a selectable catalog: %+v", got)
 		}
 	})
 
@@ -366,7 +365,7 @@ func TestResolvePostgresConnection(t *testing.T) {
 			t.Fatalf("without managed SNI there is no identity: %+v", got)
 		}
 		// Catalog validation is independent of identity.
-		if !got.CatalogValid || got.RequestedCatalog != "ducklake" {
+		if !got.CatalogValid || got.EffectiveCatalog != "ducklake" {
 			t.Fatalf("catalog should still validate: %+v", got)
 		}
 	})
