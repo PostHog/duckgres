@@ -877,6 +877,14 @@ func isDuckDBUtilityCommand(query string) bool {
 		"UNLOAD",
 		"CREATE SECRET",
 		"DROP SECRET",
+		// DuckDB's own disambiguation hint for a secret that exists in more
+		// than one storage backend is "DROP <PERSISTENT|TEMPORARY> SECRET ...".
+		// Those variants don't start with "DROP SECRET", so without these
+		// explicit prefixes they fall through to the PG transpiler and die with
+		// `syntax error at or near "PERSISTENT"` — i.e. the exact command DuckDB
+		// tells the user to run is unrunnable. Pass them straight through.
+		"DROP PERSISTENT SECRET",
+		"DROP TEMPORARY SECRET",
 		"CREATE PERSISTENT SECRET",
 		"CREATE TEMPORARY SECRET",
 		"CREATE OR REPLACE SECRET",

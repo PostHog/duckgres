@@ -21,6 +21,43 @@ import (
 	"github.com/posthog/duckgres/server/wire"
 )
 
+func TestIsDuckDBUtilityCommand(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		// Secret DDL must bypass the PG transpiler — DuckDB-only syntax.
+		{"create secret", `CREATE SECRET foo (TYPE s3)`, true},
+		{"create or replace secret", `CREATE OR REPLACE SECRET foo (TYPE s3)`, true},
+		{"drop secret", `DROP SECRET foo`, true},
+		{"drop secret if exists", `DROP SECRET IF EXISTS foo`, true},
+		// Regression: DuckDB's own ambiguity hint is "DROP <PERSISTENT|TEMPORARY>
+		// SECRET ...". These don't start with "DROP SECRET", so before the fix
+		// they fell through to pg_query and failed with a syntax error on the
+		// PERSISTENT/TEMPORARY keyword.
+		{"drop persistent secret", `DROP PERSISTENT SECRET foo`, true},
+		{"drop persistent secret if exists quoted", `DROP PERSISTENT SECRET IF EXISTS "portola_warehouse_prod_s3"`, true},
+		{"drop temporary secret", `DROP TEMPORARY SECRET foo`, true},
+		{"drop temporary secret if exists", `DROP TEMPORARY SECRET IF EXISTS foo`, true},
+		{"case insensitive", `drop persistent secret foo`, true},
+		{"leading comment", "-- cleanup\nDROP PERSISTENT SECRET foo", true},
+		// Not utility commands — must still go through the transpiler.
+		{"select", `SELECT * FROM duckdb_secrets()`, false},
+		{"drop table", `DROP TABLE foo`, false},
+		// Guard the word-boundary check: a name that merely starts with the
+		// keyword text must not be mistaken for the command.
+		{"drop secretive table", `DROP TABLE secretive`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDuckDBUtilityCommand(tt.query); got != tt.want {
+				t.Errorf("isDuckDBUtilityCommand(%q) = %v, want %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsEmptyQuery(t *testing.T) {
 	tests := []struct {
 		name     string

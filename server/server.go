@@ -843,6 +843,24 @@ func DuckDBDSN(cfg Config, username string) (string, error) {
 	return dsn, nil
 }
 
+// SecretDirectory returns the directory DuckDB should use for persistent
+// secrets for this instance, or "" to leave DuckDB's default in place.
+//
+// DuckDB defaults persistent secrets to $HOME/.duckdb/stored_secrets,
+// independent of the database file. On a worker that means a CREATE PERSISTENT
+// SECRET lands in whatever $HOME the process happens to have and survives
+// across restarts on any non-ephemeral disk — long after the in-memory secret
+// of the same name (recreated each activation) gets re-added, which is exactly
+// what produces DuckDB's "secret occurs in multiple storage backends"
+// ambiguity errors. Pinning it under DataDir makes the location deterministic
+// and, crucially, wipeable on worker recycle (see duckdbservice.Warmup).
+func SecretDirectory(cfg Config) string {
+	if cfg.DataDir == "" {
+		return ""
+	}
+	return filepath.Join(cfg.DataDir, "secrets")
+}
+
 // ConfigureMainDB applies the per-instance DuckDB settings (threads, memory,
 // temp dir, extensions, profiling) that the client-query DB needs. Shared
 // between openBaseDB (single-DB path) and OpenDuckDBPair (shared-connector
@@ -882,6 +900,22 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 
 	if err := setExtensionDirectory(db, cfg.DataDir); err != nil {
 		return fmt.Errorf("failed to configure extension_directory: %w", err)
+	}
+
+	// Pin persistent secrets to a known, per-worker location under DataDir
+	// instead of DuckDB's default ($HOME/.duckdb/stored_secrets). secret_directory
+	// is a global DuckDB setting, so applying it on the main connection covers
+	// the shared SecretManager (main + control). This both makes the persisted
+	// state predictable and lets the worker wipe it on recycle. As a side
+	// benefit, redirecting the directory means any pre-existing stale secrets in
+	// the old default path stop being loaded, so they can no longer collide with
+	// the in-memory secrets re-created at activation.
+	if secretDir := SecretDirectory(cfg); secretDir != "" {
+		if _, err := db.Exec(fmt.Sprintf("SET secret_directory = '%s'", secretDir)); err != nil {
+			slog.Warn("Failed to set DuckDB secret_directory.", "secret_directory", secretDir, "error", err)
+		} else {
+			slog.Debug("Set DuckDB secret_directory.", "secret_directory", secretDir)
+		}
 	}
 
 	// Load configured extensions

@@ -166,6 +166,22 @@ func (p *SessionPool) Warmup() error {
 		return nil
 	}
 
+	// Recycle hook: a worker process starting up is the boundary between one
+	// tenant runtime and the next on this disk (a serverless/shared-warm worker
+	// is single-org-bound for its whole life, so process start == recycle).
+	// Nuke any persisted secrets left on disk before DuckDB's SecretManager
+	// reads them, so a CREATE PERSISTENT SECRET from a prior incarnation can't
+	// resurface and collide with the in-memory secret re-created at activation,
+	// and can't leak across tenants. secret_directory is pinned under DataDir by
+	// server.ConfigureMainDB; we wipe that same path here.
+	if secretDir := server.SecretDirectory(p.cfg); secretDir != "" {
+		if err := os.RemoveAll(secretDir); err != nil {
+			slog.Warn("Failed to wipe persisted secret directory on worker startup.", "secret_directory", secretDir, "error", err)
+		} else {
+			slog.Info("Wiped persisted secret directory on worker startup.", "secret_directory", secretDir)
+		}
+	}
+
 	start := time.Now()
 	slog.Info("Pre-warming worker DuckDB instance...")
 
