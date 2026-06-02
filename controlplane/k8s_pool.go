@@ -1528,9 +1528,19 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					return nil, NewWarmCapacityExhaustedErrorForReason(hotMissReason, DefaultWarmCapacityRetryAfter)
 				}
 				if hotClaimed != nil {
-					// Check if image matches (hot-idle reclamation is strict on version)
+					// Hot-idle reclamation is strict on both version (image) and
+					// pod-shape (profile): a cached worker of the wrong shape must
+					// not serve this request.
+					expCPU, expMem, expColo := assignment.Profile.Parts()
+					profileMismatch := hotClaimed.ProfileCPU != expCPU || hotClaimed.ProfileMemory != expMem || hotClaimed.ProfileColocate != expColo
 					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
 						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
+						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
+						// Fall through to neutral idle claim or capacity backpressure.
+					} else if profileMismatch {
+						slog.Info("Hot-idle worker profile mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID,
+							"expected", fmt.Sprintf("%s/%s/colocate=%v", expCPU, expMem, expColo),
+							"got", fmt.Sprintf("%s/%s/colocate=%v", hotClaimed.ProfileCPU, hotClaimed.ProfileMemory, hotClaimed.ProfileColocate))
 						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
 						// Fall through to neutral idle claim or capacity backpressure.
 					} else {
@@ -1554,7 +1564,8 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			maxGlobalWorkers := p.maxWorkers
 			p.mu.Unlock()
 
-			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, assignment.MaxWorkers, maxGlobalWorkers)
+			profileCPU, profileMemory, profileColocate := assignment.Profile.Parts()
+			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, profileCPU, profileMemory, profileColocate, assignment.MaxWorkers, maxGlobalWorkers)
 			if err != nil {
 				return nil, err
 			}
@@ -1594,7 +1605,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		// Without this filter, a pinned org could be handed a default-image
 		// warm worker, and activation would fail with a DuckLake/extension
 		// version mismatch.
-		idle := p.findReservableWarmWorkerLocked(assignment.Image)
+		idle := p.findReservableWarmWorkerLocked(assignment.Image, assignment.Profile)
 		if idle != nil {
 			nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, assignment)
 			if err != nil {
@@ -1707,6 +1718,9 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	if claimed.PodName != "" {
 		worker.podName = claimed.PodName
 	}
+	// Carry the worker's persisted pod-shape so the reserved record and any later
+	// reconciliation round-trip it. Default/legacy rows yield the zero profile.
+	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate}
 	if worker.OwnerEpoch() > 0 && claimed.OwnerEpoch < worker.OwnerEpoch() {
 		currentEpoch := worker.OwnerEpoch()
 		p.mu.Unlock()
@@ -1782,6 +1796,10 @@ func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, e
 
 	if assignment.Image != "" && record.Image != assignment.Image {
 		return nil, fmt.Errorf("worker %d image mismatch (expected %q, got %q)", workerID, assignment.Image, record.Image)
+	}
+	if expCPU, expMem, expColo := assignment.Profile.Parts(); record.ProfileCPU != expCPU || record.ProfileMemory != expMem || record.ProfileColocate != expColo {
+		return nil, fmt.Errorf("worker %d profile mismatch (expected %s/%s/colocate=%v, got %s/%s/colocate=%v)",
+			workerID, expCPU, expMem, expColo, record.ProfileCPU, record.ProfileMemory, record.ProfileColocate)
 	}
 
 	return p.reserveClaimedWorker(ctx, record, assignment)
@@ -3176,8 +3194,11 @@ func (p *K8sWorkerPool) isWarmIdleWorkerLocked(w *ManagedWorker) bool {
 // reserve. When image is non-empty, only workers whose image matches are
 // considered — used by ReserveSharedWorker so per-org image pins aren't
 // silently bypassed when the in-memory map and runtime store disagree.
-// Pass "" to skip the image filter (legacy non-pinned callers).
-func (p *K8sWorkerPool) findReservableWarmWorkerLocked(image string) *ManagedWorker {
+// Pass "" to skip the image filter (legacy non-pinned callers). The profile
+// filter always applies: a request only reuses a warm worker of the same shape
+// (nil profile == the default/zero shape, which is what warm workers carry).
+func (p *K8sWorkerPool) findReservableWarmWorkerLocked(image string, profile *WorkerProfile) *ManagedWorker {
+	want := profile.MatchKey()
 	for _, w := range p.workers {
 		select {
 		case <-w.done:
@@ -3185,6 +3206,9 @@ func (p *K8sWorkerPool) findReservableWarmWorkerLocked(image string) *ManagedWor
 		default:
 		}
 		if image != "" && w.image != image {
+			continue
+		}
+		if w.profile.MatchKey() != want {
 			continue
 		}
 		if p.isWarmIdleWorkerLocked(w) {

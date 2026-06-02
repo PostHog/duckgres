@@ -1232,7 +1232,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // is only used to classify an unfulfilled claim after no suitable idle worker
 // exists; an existing idle worker remains claimable even when the global pool is
 // at capacity.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -1260,6 +1260,11 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, m
 		if image != "" {
 			query = query.Where("image = ?", image)
 		}
+		// Profile is a match dimension orthogonal to image: a request only claims
+		// an idle worker of the same shape. The default request ("","",false)
+		// matches default/legacy/warm rows; a colocated request only matches
+		// colocated rows (and vice versa). Always filtered, including the default.
+		query = query.Where("profile_cpu = ? AND profile_memory = ? AND profile_colocate = ?", profileCPU, profileMemory, profileColocate)
 
 		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {

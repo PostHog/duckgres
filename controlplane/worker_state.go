@@ -57,6 +57,17 @@ func (wp *WorkerProfile) Equal(other *WorkerProfile) bool {
 	return wp.MatchKey() == other.MatchKey()
 }
 
+// Parts returns the persisted/match primitives for the profile, decomposing nil
+// to the default profile. Used to cross the controlplane→configstore package
+// boundary (which cannot reference the WorkerProfile type) without losing the
+// nil==default convention.
+func (wp *WorkerProfile) Parts() (cpu, memory string, colocate bool) {
+	if wp == nil {
+		return "", "", false
+	}
+	return wp.CPU, wp.Memory, wp.Colocate
+}
+
 // WorkerAssignment carries tenant-specific metadata once a shared worker has
 // been reserved for an org.
 type WorkerAssignment struct {

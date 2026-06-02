@@ -356,7 +356,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0, 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestClaimIdleWorkerReturnsGlobalCapWhenNoIdleAndGlobalCapReached(t *testing
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestClaimIdleWorkerReturnsNoIdleWhenBelowGlobalCap(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", 0, 2)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 2)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestClaimIdleWorkerReturnsGlobalCapForImageMissAtGlobalCap(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -509,7 +509,7 @@ func TestClaimIdleWorkerClaimsMatchingIdleWorkerAtGlobalCap(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 1, 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 1, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Try claiming v2
-	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", 0, 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", "", "", false, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -616,7 +616,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Try claiming v3 (none exist)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", 0, 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", "", "", false, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -628,7 +628,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Neutral claim (no image filter) - should get v1 (lowest ID)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", 0, 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", "", "", false, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
