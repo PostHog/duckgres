@@ -24,18 +24,16 @@ ARG DUCKDB_GO_VERSION=
 ARG DUCKDB_BINDINGS_VERSION=
 ARG TARGETARCH
 
-# Copy ONLY the module files first, apply the per-build DuckDB pin, then
-# download + CGO-prewarm — all in layers keyed solely on go.mod/go.sum + the
-# pin args. On a source-only PR these cache-hit, so the multi-minute
-# libduckdb/libpg_query compile is skipped and the final `go build` below
-# recompiles only changed first-party code.
+# Copy ONLY the module files first and apply the per-build DuckDB pin, so the
+# module download + extension fetch below sit in layers keyed solely on
+# go.mod/go.sum + the pin args. On a source-only PR these cache-hit and the
+# final `go build` recompiles only changed first-party code.
 #
 # IMPORTANT: do NOT run `go mod tidy` here. With only go.mod/go.sum present
 # (no .go files), tidy prunes EVERY require directive — it sees zero imports —
-# leaving an empty go.mod and breaking both the prewarm below and the build.
-# `go get pkg@ver` explicitly records the require regardless of imports, so it
-# pins correctly without source. tidy runs after COPY . ., once the real
-# imports are visible.
+# leaving an empty go.mod that breaks the build. `go get pkg@ver` explicitly
+# records the require regardless of imports, so it pins correctly without
+# source. tidy runs after COPY . ., once the real imports are visible.
 COPY go.mod go.sum ./
 
 RUN if [ -n "$DUCKDB_GO_VERSION" ] && [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
@@ -47,11 +45,6 @@ RUN if [ -n "$DUCKDB_GO_VERSION" ] && [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
     fi
 
 RUN go mod download
-
-# CGO dep-prewarm — see top-level Dockerfile. Compiles libduckdb-linked
-# duckdb-go + libpg_query-linked pg_query_go into the build cache, keyed on
-# the pinned go.mod/go.sum.
-RUN CGO_ENABLED=1 go build github.com/duckdb/duckdb-go/v2 github.com/pganalyze/pg_query_go/v6 2>/dev/null || true
 
 # Bundled DuckDB extensions. Downloaded BEFORE `COPY . .` so this layer
 # depends only on the extension/pin args, not on source — a source-only PR
@@ -121,9 +114,8 @@ COPY . .
 # DuckDB version regardless of the matrix row (the real bug the bindings-pin
 # verify below guards against). Re-apply the pin now that the source — and
 # thus the real import set — is present, so `go mod tidy` keeps every needed
-# require instead of pruning it. The module cache + CGO build cache warmed by
-# the pre-COPY layers stay valid: same versions, so `go get` is a fast
-# metadata no-op and the prewarmed objects are reused.
+# require instead of pruning it. The module cache from the pre-COPY layers
+# stays valid: same versions, so `go get` is a fast metadata no-op.
 RUN if [ -n "$DUCKDB_GO_VERSION" ] && [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
       go get "github.com/duckdb/duckdb-go/v2@${DUCKDB_GO_VERSION}" \
       && go get "github.com/duckdb/duckdb-go-bindings@${DUCKDB_BINDINGS_VERSION}" \

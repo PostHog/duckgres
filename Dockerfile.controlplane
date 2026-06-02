@@ -20,13 +20,6 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 
-# CGO dep-prewarm. The CP image doesn't link libduckdb, but it still links
-# libpg_query via pg_query_go (the transpiler). Compile it into the Go build
-# cache in a layer keyed only on go.mod/go.sum so a source-only PR skips the
-# libpg_query compile and the final `go build` recompiles only changed
-# first-party code. See the longer note in the top-level Dockerfile.
-RUN CGO_ENABLED=1 go build github.com/pganalyze/pg_query_go/v6 2>/dev/null || true
-
 COPY . .
 
 ARG VERSION=dev
