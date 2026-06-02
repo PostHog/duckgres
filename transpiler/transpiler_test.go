@@ -1126,6 +1126,9 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 		{"CREATE INDEX", "CREATE INDEX idx_name ON users (name)", "CREATE INDEX"},
 		{"DROP INDEX", "DROP INDEX idx_name", "DROP INDEX"},
 		{"VACUUM", "VACUUM users", "VACUUM"},
+		// ANALYZE parses as a VacuumStmt too; it must be detected by Classify
+		// (it contains no other DDL trigger word) and no-op'd with its own tag.
+		{"ANALYZE", "ANALYZE users", "ANALYZE"},
 		{"GRANT", "GRANT SELECT ON users TO public", "GRANT"},
 		{"REVOKE", "REVOKE SELECT ON users FROM public", "REVOKE"},
 		{"ALTER TABLE ADD CONSTRAINT", "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id)", "ALTER TABLE"},
@@ -1157,6 +1160,21 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 				t.Errorf("Transpile(%q) NoOpTag = %q, want %q", tt.input, result.NoOpTag, tt.noOpTag)
 			}
 		})
+	}
+}
+
+// A CREATE TABLE whose only DDL trigger word is GENERATED must still be
+// classified for the DDL transform and have the generated column stripped — a
+// regression where Classify's substring list lacked "GENERATED" let STORED
+// generated columns reach DuckDB (which rejects them on lake catalogs).
+func TestTranspile_DDL_StripsGeneratedColumnWhenSoleTrigger(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+	result, err := tr.Transpile("CREATE TABLE g (id INTEGER, doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED)")
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(result.SQL), "GENERATED") {
+		t.Errorf("GENERATED not stripped: %q", result.SQL)
 	}
 }
 

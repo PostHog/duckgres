@@ -496,9 +496,9 @@ func Classify(sql string, cfg Config) Classification {
 	// SELECT ... WHERE col = 'UNIQUE'), but the DDL transform only acts on
 	// CREATE TABLE / ALTER TABLE AST nodes, so false positives are harmless.
 	if ddlPolicy.NeedsTransform() {
-		if containsAny(upper, "CREATE INDEX", "DROP INDEX", "VACUUM", "GRANT ", "REVOKE ",
+		if containsAny(upper, "CREATE INDEX", "DROP INDEX", "VACUUM", "ANALYZE", "GRANT ", "REVOKE ",
 			"PRIMARY KEY", "UNIQUE", "REFERENCES", "SERIAL", "BIGSERIAL",
-			"DEFAULT ", "FOREIGN KEY", "ALTER TABLE", "CASCADE",
+			"DEFAULT ", "GENERATED", "FOREIGN KEY", "ALTER TABLE", "CASCADE",
 			"CHECK ", "CHECK(",
 			"REINDEX", "CLUSTER", "COMMENT ON", "REFRESH ") {
 			flags |= FlagDDL

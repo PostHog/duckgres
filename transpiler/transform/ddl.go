@@ -85,9 +85,14 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 			}
 
 		case *pg_query.Node_VacuumStmt:
+			// ANALYZE and VACUUM both parse as VacuumStmt; distinguish the command
+			// tag (DuckDB rejects either against an Iceberg/DuckLake catalog).
 			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "VACUUM"
+				if n.VacuumStmt != nil && !n.VacuumStmt.IsVacuumcmd {
+					result.NoOpTag = "ANALYZE"
+				}
 				return true, nil
 			}
 
