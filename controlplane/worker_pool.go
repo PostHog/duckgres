@@ -91,28 +91,31 @@ type WorkerPool interface {
 
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
-	Namespace             string
-	CPID                  string // Control plane pod name, used in labels
-	CPInstanceID          string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
-	WorkerImage           string
-	WorkerPort            int
-	SecretName            string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
-	ConfigMap             string // ConfigMap name for duckgres.yaml
-	MaxWorkers            int
-	IdleTimeout           time.Duration
-	ConfigPath            string                                       // Path inside worker pod where config is mounted
-	ImagePullPolicy       string                                       // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount        string                                       // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
-	WorkerCPURequest      string                                       // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
-	WorkerMemoryRequest   string                                       // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
-	WorkerNodeSelector    map[string]string                            // Node selector for worker pods. Nil = no selector.
-	WorkerTolerationKey   string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
-	WorkerTolerationValue string                                       // Taint value for worker pod NoSchedule toleration.
-	WorkerExclusiveNode   bool                                         // One worker per node via pod anti-affinity.
-	OrgID                 string                                       // Org ID for pod labels (multi-tenant mode)
-	WorkerIDGenerator     func() int                                   // Shared ID generator across orgs (nil = internal counter)
-	ResolveOrgConfig      func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
-	RuntimeStore          RuntimeWorkerStore
+	Namespace                string
+	CPID                     string // Control plane pod name, used in labels
+	CPInstanceID             string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
+	WorkerImage              string
+	WorkerPort               int
+	SecretName               string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	ConfigMap                string // ConfigMap name for duckgres.yaml
+	MaxWorkers               int
+	IdleTimeout              time.Duration
+	ConfigPath               string                                       // Path inside worker pod where config is mounted
+	ImagePullPolicy          string                                       // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount           string                                       // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
+	WorkerCPURequest         string                                       // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
+	WorkerMemoryRequest      string                                       // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
+	WorkerNodeSelector       map[string]string                            // Node selector for worker pods. Nil = no selector.
+	WorkerTolerationKey      string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
+	WorkerTolerationValue    string                                       // Taint value for worker pod NoSchedule toleration.
+	WorkerExclusiveNode      bool                                         // One worker per node via pod anti-affinity.
+	ColocatedNodeSelector    map[string]string                            // Node selector for colocate=true (bin-pack) worker pods. Nil = no selector.
+	ColocatedTolerationKey   string                                       // Taint key for colocated worker pods. Empty = no toleration.
+	ColocatedTolerationValue string                                       // Taint value for colocated worker pods.
+	OrgID                    string                                       // Org ID for pod labels (multi-tenant mode)
+	WorkerIDGenerator        func() int                                   // Shared ID generator across orgs (nil = internal counter)
+	ResolveOrgConfig         func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
+	RuntimeStore             RuntimeWorkerStore
 }
 
 // RuntimeWorkerStore is the durable-store surface exposed to the K8s

@@ -879,7 +879,7 @@ func TestK8sPool_SpawnWorkerCleansUpPodAndSecretWhenRPCSecurityReadFails(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := pool.spawnWorker(ctx, workerID, "duckgres:test", false)
+	err := pool.spawnWorker(ctx, workerID, "duckgres:test", WorkerProfile{}, false)
 	if err == nil {
 		t.Fatal("spawnWorker succeeded; want readWorkerRPCSecurity failure")
 	}
@@ -929,7 +929,7 @@ func TestK8sPool_SpawnWorkerCleansUpWhenRPCSecurityReadCancelsContext(t *testing
 		return true, nil, context.Canceled
 	})
 
-	err := pool.spawnWorker(ctx, workerID, "duckgres:test", false)
+	err := pool.spawnWorker(ctx, workerID, "duckgres:test", WorkerProfile{}, false)
 	if err == nil {
 		t.Fatal("spawnWorker succeeded; want readWorkerRPCSecurity failure")
 	}
