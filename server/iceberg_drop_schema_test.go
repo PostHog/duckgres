@@ -207,7 +207,14 @@ func (r *icebergDropSchemaCascadeRows) Next() bool {
 	return true
 }
 func (r *icebergDropSchemaCascadeRows) Scan(dest ...any) error {
-	*(dest[0].(*string)) = r.values[r.idx-1]
+	// Mirror the real (Flight) RowSet contract: destinations must be *interface{}.
+	// Scanning into a typed pointer (e.g. *string) must fail, so this guards the
+	// production code against regressing to a typed scan.
+	ptr, ok := dest[0].(*interface{})
+	if !ok {
+		return errors.New("scan: destination 0 must be *interface{}")
+	}
+	*ptr = r.values[r.idx-1]
 	return nil
 }
 func (r *icebergDropSchemaCascadeRows) Close() error { return nil }

@@ -140,8 +140,8 @@ func (c *clientConn) dropIcebergSchemaCascade(ctx context.Context, query string)
 
 	var tables []string
 	for rows.Next() {
-		var table string
-		if err := rows.Scan(&table); err != nil {
+		table, err := scanStringColumn(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan iceberg schema table: %w", err)
 		}
 		tables = append(tables, table)
@@ -181,12 +181,33 @@ func (c *clientConn) currentSearchPathCatalog(ctx context.Context) (string, erro
 	if !rows.Next() {
 		return "", rows.Err()
 	}
-	var searchPath string
-	if err := rows.Scan(&searchPath); err != nil {
+	searchPath, err := scanStringColumn(rows)
+	if err != nil {
 		return "", fmt.Errorf("scan search_path: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		return "", err
 	}
 	return sqlcore.CatalogFromSearchPath(searchPath), nil
+}
+
+// scanStringColumn reads a single text column from a Duckgres RowSet. The
+// Flight executor's Scan contract requires an *interface{} destination (Arrow
+// values come back as interface{}, not typed pointers), so a plain *string
+// scan fails at runtime with "destination 0 must be *interface{}".
+func scanStringColumn(rows RowSet) (string, error) {
+	var raw interface{}
+	if err := rows.Scan(&raw); err != nil {
+		return "", err
+	}
+	switch v := raw.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	default:
+		return fmt.Sprintf("%v", v), nil
+	}
 }
