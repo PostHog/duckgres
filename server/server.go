@@ -266,15 +266,21 @@ type Config struct {
 	// while TLS, authentication, and query execution happen in child processes.
 	ProcessIsolation bool
 
-	// DisablePersistentSecrets turns off DuckDB's persistent secret storage
-	// (allow_persistent_secrets=false): existing on-disk secrets are not loaded
-	// at startup and CREATE PERSISTENT SECRET is rejected. Set for worker
-	// processes (see duckdbservice.OpenDuckDBPair), where secrets are always
-	// re-created in-memory at activation and a persisted copy on the worker's
-	// DataDir is never durable across recycles — only a latent source of
-	// "secret occurs in multiple storage backends" ambiguity. Left false for
-	// standalone, which may legitimately rely on persistent secrets.
-	DisablePersistentSecrets bool
+	// PinSecretDirectory pins DuckDB's persistent-secret directory under DataDir
+	// (<DataDir>/secrets) instead of DuckDB's $HOME default. Set for worker
+	// processes (see duckdbservice.OpenDuckDBPair): it makes the persisted-secret
+	// location deterministic and wipeable on recycle, and — by redirecting away
+	// from the $HOME default — stops stale secrets in the old location from being
+	// loaded and colliding with the in-memory secrets re-created at activation.
+	// Left false for standalone, so upgrading doesn't relocate an existing
+	// standalone user's persistent secrets.
+	//
+	// Note: we deliberately do NOT also set allow_persistent_secrets=false.
+	// Disabling persistent secrets unregisters DuckDB's local_file secret
+	// storage backend, which the DuckLake ATTACH path depends on ("Unknown
+	// secret storage found: 'local_file'") — so the directory pinning plus the
+	// recycle wipe is how workers stay clean.
+	PinSecretDirectory bool
 
 	// MemoryLimit is the DuckDB memory_limit per session (e.g., "4GB").
 	// If empty, auto-detected from system memory.
@@ -924,39 +930,25 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 		return fmt.Errorf("failed to configure extension_directory: %w", err)
 	}
 
-	// Worker secret hardening — gated to workers (DisablePersistentSecrets, set
-	// by duckdbservice.OpenDuckDBPair). Standalone is intentionally left alone:
-	// it keeps DuckDB's default secret store ($HOME/.duckdb/stored_secrets) and
-	// its ability to use persistent secrets, so an upgrade doesn't silently
-	// relocate an existing standalone user's secrets.
+	// Pin the persistent-secret directory under DataDir on workers
+	// (PinSecretDirectory, set by duckdbservice.OpenDuckDBPair). secret_directory
+	// is a global DuckDB setting, and this must run before the SecretManager's
+	// first use — it does, since ConfigureMainDB is applied right after open,
+	// before any ATTACH or CREATE SECRET. Standalone is left at DuckDB's $HOME
+	// default so an upgrade doesn't relocate an existing user's secrets.
 	//
-	// Both SETs must run before the SecretManager's first use — they do, since
-	// ConfigureMainDB is applied right after open, before any ATTACH or CREATE
-	// SECRET. secret_directory and allow_persistent_secrets are global DuckDB
-	// settings, so applying them on the main connection covers the shared
-	// SecretManager (main + control).
-	if cfg.DisablePersistentSecrets {
-		// Pin persistent secrets to a known, per-worker location under DataDir
-		// instead of DuckDB's $HOME default: deterministic and wipeable on
-		// recycle. (Largely belt-and-suspenders given the disable below, but it
-		// keeps the location predictable if persistent secrets are ever
-		// re-enabled.)
+	// We intentionally do NOT disable persistent secrets here
+	// (allow_persistent_secrets=false): that unregisters DuckDB's local_file
+	// secret storage, which the DuckLake ATTACH path requires. Pinning +
+	// the recycle wipe (see duckdbservice.wipePersistedSecrets) is what keeps
+	// workers from accumulating stale persisted secrets.
+	if cfg.PinSecretDirectory {
 		if secretDir := SecretDirectory(cfg); secretDir != "" {
 			if _, err := db.Exec(fmt.Sprintf("SET secret_directory = '%s'", secretDir)); err != nil {
 				slog.Warn("Failed to set DuckDB secret_directory.", "secret_directory", secretDir, "error", err)
 			} else {
 				slog.Debug("Set DuckDB secret_directory.", "secret_directory", secretDir)
 			}
-		}
-
-		// Turn off persistent secret storage entirely. This both prevents
-		// CREATE PERSISTENT SECRET (which would write a landmine to DataDir) and
-		// stops any pre-existing on-disk secret from being loaded, so it can
-		// never collide with the in-memory secret re-created at activation.
-		if _, err := db.Exec("SET allow_persistent_secrets = false"); err != nil {
-			slog.Warn("Failed to disable DuckDB persistent secrets.", "error", err)
-		} else {
-			slog.Debug("Disabled DuckDB persistent secrets.")
 		}
 	}
 

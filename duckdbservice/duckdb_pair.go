@@ -89,12 +89,14 @@ func (*nonClosingConnector) Close() error { return nil }
 // settings); the Control DB is intentionally minimal.
 func OpenDuckDBPair(cfg server.Config, username string) (*DuckDBPair, error) {
 	// This is the worker-process DB factory (standalone uses server.openBaseDB),
-	// so it's the single place to opt every worker out of DuckDB's persistent
-	// secret storage. Worker secrets are always re-created in-memory at
-	// activation; a persisted copy on the worker's DataDir is never durable
-	// across a recycle and only invites "secret occurs in multiple storage
-	// backends" ambiguity. ConfigureMainDB (below) applies the setting.
-	cfg.DisablePersistentSecrets = true
+	// so it's the single place to pin every worker's persistent-secret directory
+	// under DataDir. That makes the location deterministic and wipeable on
+	// recycle, and stops stale secrets in DuckDB's $HOME default from loading and
+	// colliding with the in-memory secrets re-created at activation.
+	// ConfigureMainDB (below) applies the setting. (We do NOT disable persistent
+	// secrets outright: that breaks the DuckLake ATTACH path, which needs the
+	// local_file secret storage registered.)
+	cfg.PinSecretDirectory = true
 
 	dsn, err := server.DuckDBDSN(cfg, username)
 	if err != nil {
