@@ -35,6 +35,8 @@ func buildReplaceSQL(table tableRef, cols []sourceColumn) string {
 		if col.Required {
 			nullable = "NO"
 		}
+		// Precision/scale are extracted from the raw Iceberg decimal type
+		// ("decimal(p,s)"); the stored data_type is the canonical PostgreSQL name.
 		precision, scale := decimalPrecisionScale(col.Type)
 		values = append(values, fmt.Sprintf(
 			"(%s, %s, %s, %d, %s, %s, %s, %s)",
@@ -43,7 +45,7 @@ func buildReplaceSQL(table tableRef, cols []sourceColumn) string {
 			quoteSQLString(col.Name),
 			i+1,
 			quoteSQLString(nullable),
-			quoteSQLString(col.Type),
+			quoteSQLString(CanonicalPGType(col.Type)),
 			nullableIntLiteral(precision),
 			nullableIntLiteral(scale),
 		))

@@ -341,6 +341,17 @@ func TestClassifyErrorCode(t *testing.T) {
 		{"transaction invalid", errors.New("Transaction Error: cannot begin within an existing transaction"), "25000"},
 		{"transaction context nested begin", errors.New("TransactionContext Error: cannot start a transaction within a transaction"), "25000"},
 		{"dependency error", errors.New("Dependency Error: Cannot drop entry because there are other entries that depend on it"), "2BP01"},
+		{"not implemented", errors.New("Not implemented Error: MERGE INTO is not supported for this table"), "0A000"},
+
+		// Flight/gRPC-wrapped worker errors: the underlying DuckDB exception is
+		// embedded after "desc = " and must still classify correctly rather than
+		// leaking the raw rpc string as XX000.
+		{"flight-wrapped missing table", errors.New("flight execute update: rpc error: code = InvalidArgument desc = Catalog Error: Table with name users does not exist!"), "42P01"},
+		{"flight-wrapped duplicate table", errors.New("flight execute update: rpc error: code = InvalidArgument desc = Catalog Error: Table with name \"t\" already exists!"), "42P07"},
+		{"flight-wrapped missing schema", errors.New("flight execute update: rpc error: code = InvalidArgument desc = Catalog Error: Schema with name \"missing\" does not exist!"), "3F000"},
+		{"flight-wrapped undefined column", errors.New("flight execute: rpc error: code = InvalidArgument desc = Binder Error: Referenced column \"c\" not found in FROM clause!"), "42703"},
+		{"flight-wrapped not implemented", errors.New("flight execute update: rpc error: code = InvalidArgument desc = Not implemented Error: UPDATE on this table is not supported"), "0A000"},
+		{"flight-wrapped genuine infra stays XX000", errors.New("flight execute: rpc error: code = Unavailable desc = connection refused"), "XX000"},
 	}
 
 	for _, tt := range tests {

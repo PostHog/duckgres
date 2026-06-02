@@ -437,7 +437,7 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			NULL AS commit_action
 		FROM information_schema.tables t
 		WHERE t.table_name NOT IN (
-			'__duckgres_column_metadata',
+			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',

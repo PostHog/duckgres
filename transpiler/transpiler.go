@@ -55,6 +55,7 @@ type taggedTransform struct {
 // Transpiler converts PostgreSQL SQL to DuckDB-compatible SQL
 type Transpiler struct {
 	config     Config
+	caps       transform.BackendCapabilities
 	transforms []taggedTransform
 }
 
@@ -63,8 +64,10 @@ var threePartIdentPattern = regexp.MustCompile(`(?i)(?:"[^"]+"|[a-z_][a-z0-9_$]*
 // New creates a Transpiler with the given configuration.
 // It registers all transforms appropriate for the config.
 func New(cfg Config) *Transpiler {
+	caps := cfg.capabilities()
 	t := &Transpiler{
 		config:     cfg,
+		caps:       caps,
 		transforms: make([]taggedTransform, 0),
 	}
 
@@ -78,16 +81,17 @@ func New(cfg Config) *Transpiler {
 	t.transforms = append(t.transforms, taggedTransform{FlagVersion, transform.NewVersionTransform()})
 
 	// 2. pg_catalog schema and view mappings
-	t.transforms = append(t.transforms, taggedTransform{FlagPgCatalog, transform.NewPgCatalogTransformWithConfig(cfg.DuckLakeMode)})
+	t.transforms = append(t.transforms, taggedTransform{FlagPgCatalog, transform.NewPgCatalogTransformWithConfig(caps.QualifiesCustomMacros)})
 
 	// 3. information_schema mappings to compat views
-	t.transforms = append(t.transforms, taggedTransform{FlagInfoSchema, transform.NewInformationSchemaTransformWithConfig(cfg.DuckLakeMode)})
+	t.transforms = append(t.transforms, taggedTransform{FlagInfoSchema, transform.NewInformationSchemaTransform()})
 
-	// 3.1 Map PostgreSQL "public" schema to DuckDB "main"
-	t.transforms = append(t.transforms, taggedTransform{FlagPublicSchema, transform.NewPublicSchemaTransform()})
+	// 3.1 Map PostgreSQL "public" schema to DuckDB "main" (backends whose default
+	// schema is "main"; disabled for Iceberg whose schema is literally "public")
+	t.transforms = append(t.transforms, taggedTransform{FlagPublicSchema, transform.NewPublicSchemaTransform(caps.MapPublicToMain)})
 
-	// 3.2 Map logical database catalog references to the physical DuckLake catalog
-	t.transforms = append(t.transforms, taggedTransform{FlagLogicalCatalog, transform.NewLogicalCatalogTransform(cfg.LogicalDatabaseName, cfg.PhysicalCatalogName)})
+	// 3.2 Map logical database catalog references to the physical backend catalog
+	t.transforms = append(t.transforms, taggedTransform{FlagLogicalCatalog, transform.NewLogicalCatalogTransform(cfg.LogicalDatabaseName, caps.PhysicalCatalogName, caps.MapPublicToMain)})
 
 	// 4. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagTypeMapping, transform.NewTypeMappingTransform()})
@@ -113,8 +117,9 @@ func New(cfg Config) *Transpiler {
 	// 11. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
 	t.transforms = append(t.transforms, taggedTransform{FlagExpandArray, transform.NewExpandArrayTransform()})
 
-	// 12. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
-	t.transforms = append(t.transforms, taggedTransform{FlagOnConflict, transform.NewOnConflictTransformWithConfig(cfg.DuckLakeMode)})
+	// 12. ON CONFLICT handling (rewrites ON CONFLICT to MERGE when the backend has
+	// no enforced unique constraints to infer against)
+	t.transforms = append(t.transforms, taggedTransform{FlagOnConflict, transform.NewOnConflictTransformWithConfig(caps.ConvertsOnConflictToMerge)})
 
 	// 13. Locking clause removal (FOR UPDATE, FOR SHARE, etc.) - DuckDB doesn't support these
 	t.transforms = append(t.transforms, taggedTransform{FlagLocking, transform.NewLockingTransform()})
@@ -122,9 +127,9 @@ func New(cfg Config) *Transpiler {
 	// 14. ctid → rowid mapping (PostgreSQL system column to DuckDB equivalent)
 	t.transforms = append(t.transforms, taggedTransform{FlagCtid, transform.NewCtidTransform()})
 
-	// DDL transforms only when DuckLake mode is enabled
-	if cfg.DuckLakeMode {
-		t.transforms = append(t.transforms, taggedTransform{FlagDDL, transform.NewDDLTransform()})
+	// DDL transforms only when the backend requires DDL rewriting
+	if caps.NeedsDDLTransform() {
+		t.transforms = append(t.transforms, taggedTransform{FlagDDL, transform.NewDDLTransform(caps)})
 	}
 
 	// Placeholder transform only when needed (extended query protocol)
@@ -154,7 +159,7 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 
 	// Pre-parse interceptions for SQL that isn't valid PostgreSQL syntax
 	// but has well-defined duckgres semantics (e.g., SHOW CREATE TABLE).
-	if rewritten, ok := interceptShowCreate(sql, t.config.DuckLakeMode); ok {
+	if rewritten, ok := interceptShowCreate(sql, t.caps.InterceptsShowCreate); ok {
 		return &Result{SQL: rewritten}, nil
 	}
 
@@ -308,6 +313,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 // Conservative: false positives (unnecessary transforms) are fine; false negatives are bugs.
 func Classify(sql string, cfg Config) Classification {
 	upper := strings.ToUpper(sql)
+	caps := cfg.capabilities()
 
 	var flags TransformFlags
 
@@ -479,11 +485,11 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagOnConflict
 	}
 
-	// DDL patterns (DuckLake mode only).
+	// DDL patterns (only when the backend requires DDL rewriting).
 	// "UNIQUE" and "REFERENCES" may false-positive in non-DDL contexts (e.g.,
 	// SELECT ... WHERE col = 'UNIQUE'), but the DDL transform only acts on
 	// CREATE TABLE / ALTER TABLE AST nodes, so false positives are harmless.
-	if cfg.DuckLakeMode {
+	if caps.NeedsDDLTransform() {
 		if containsAny(upper, "CREATE INDEX", "DROP INDEX", "VACUUM", "GRANT ", "REVOKE ",
 			"PRIMARY KEY", "UNIQUE", "REFERENCES", "SERIAL", "BIGSERIAL",
 			"DEFAULT ", "FOREIGN KEY", "ALTER TABLE", "CASCADE",
@@ -493,9 +499,9 @@ func Classify(sql string, cfg Config) Classification {
 		}
 	}
 
-	// ClickHouse SQL macros (DuckLake mode only).
+	// ClickHouse SQL macros (only when custom macros need qualification).
 	// These are created in memory.main and need explicit qualification.
-	if cfg.DuckLakeMode {
+	if caps.QualifiesCustomMacros {
 		if containsAny(upper,
 			"TOSTRING(", "TOINT32(", "TOINT64(", "TOFLOAT(",
 			"TOINT32ORNULL(", "TOINT32ORZERO(",
