@@ -30,7 +30,7 @@ type acquireErrorPool struct {
 	err error
 }
 
-func (p *acquireErrorPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *acquireErrorPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	return nil, p.err
 }
 
@@ -63,7 +63,7 @@ func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 		err: NewWarmCapacityExhaustedError(30 * time.Second),
 	}, nil)
 
-	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0)
+	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0, nil)
 	var capacityErr *WarmCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
 		t.Fatalf("expected warm capacity error, got %v", err)

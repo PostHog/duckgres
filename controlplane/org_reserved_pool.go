@@ -33,7 +33,7 @@ func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, ima
 	return pool
 }
 
-func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -49,7 +49,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 		p.shared.cleanDeadWorkersLocked()
 
-		if idle := p.findIdleAssignedWorkerLocked(); idle != nil {
+		if idle := p.findIdleAssignedWorkerLocked(profile); idle != nil {
 			idle.activeSessions++
 			if idle.activeSessions > idle.peakSessions {
 				idle.peakSessions = idle.activeSessions
@@ -68,6 +68,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 				OrgID:      p.orgID,
 				MaxWorkers: maxWorkers,
 				Image:      image,
+				Profile:    profile,
 			})
 			if err != nil {
 				return nil, err
@@ -170,12 +171,18 @@ func (p *OrgReservedPool) ShutdownAll() {
 	}
 }
 
-func (p *OrgReservedPool) findIdleAssignedWorkerLocked() *ManagedWorker {
+func (p *OrgReservedPool) findIdleAssignedWorkerLocked(profile *WorkerProfile) *ManagedWorker {
+	want := profile.MatchKey()
 	for _, w := range p.shared.workers {
 		select {
 		case <-w.done:
 			continue
 		default:
+		}
+		// Only reuse a worker of the requested shape — a colocated request must
+		// not land on a default/exclusive worker (and vice versa).
+		if w.profile.MatchKey() != want {
+			continue
 		}
 		if w.activeSessions == 0 && p.workerReadyForSchedulingLocked(w) {
 			return w

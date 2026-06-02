@@ -19,7 +19,7 @@ type recordingOrgRouterPool struct {
 	events *[]string
 }
 
-func (p *recordingOrgRouterPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *recordingOrgRouterPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -364,7 +364,7 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	worker, err := stack.Pool.AcquireWorker(ctx)
+	worker, err := stack.Pool.AcquireWorker(ctx, nil)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}

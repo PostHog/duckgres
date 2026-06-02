@@ -55,8 +55,10 @@ func NewWarmCapacityExhaustedErrorForReason(reason configstore.WorkerClaimMissRe
 //   - K8sWorkerPool:    creates workers as Kubernetes pods (build tag: kubernetes)
 type WorkerPool interface {
 	// AcquireWorker returns a worker for a new session. It may reuse an idle
-	// worker, spawn a new one, or assign to the least-loaded worker.
-	AcquireWorker(ctx context.Context) (*ManagedWorker, error)
+	// worker, spawn a new one, or assign to the least-loaded worker. profile is
+	// the requested pod shape (nil => the default exclusive profile); only the
+	// multi-tenant OrgReservedPool acts on it — the flat/process pools ignore it.
+	AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error)
 
 	// ReleaseWorker decrements the active session count for a worker.
 	ReleaseWorker(id int)

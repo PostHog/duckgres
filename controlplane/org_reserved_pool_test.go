@@ -37,7 +37,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	worker, err := pool.AcquireWorker(ctx)
+	worker, err := pool.AcquireWorker(ctx, nil)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	worker, err := pool.AcquireWorker(ctx)
+	worker, err := pool.AcquireWorker(ctx, nil)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	worker, err := pool.AcquireWorker(ctx)
+	worker, err := pool.AcquireWorker(ctx, nil)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	worker, err := pool.AcquireWorker(ctx)
+	worker, err := pool.AcquireWorker(ctx, nil)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 
 	seen := make(map[int]struct{}, target)
 	for i := 0; i < target; i++ {
-		w, err := pool.AcquireWorker(ctx)
+		w, err := pool.AcquireWorker(ctx, nil)
 		if err != nil {
 			t.Fatalf("AcquireWorker[%d] failed with maxWorkers=0: %v", i, err)
 		}
@@ -279,7 +279,7 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 
-	got, err := pool.AcquireWorker(ctx)
+	got, err := pool.AcquireWorker(ctx, nil)
 	if err == nil {
 		t.Fatalf("expected AcquireWorker to wait instead of reusing busy worker, got worker %d", got.ID)
 		return

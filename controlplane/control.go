@@ -886,8 +886,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// pgjdbc `currentSchema`), so a session can pick its default catalog at
 	// connect (e.g. iceberg.public). Sanitized here at the trust boundary;
 	// empty/invalid falls back to the worker's default search_path.
+	startupOptions := server.ParseStartupOptions(startupParams["options"])
 	var clientSearchPath string
-	if raw := server.ParseStartupOptions(startupParams["options"])["search_path"]; raw != "" {
+	if raw := startupOptions["search_path"]; raw != "" {
 		if sp, ok := server.SanitizeSearchPath(raw); ok {
 			clientSearchPath = sp
 		} else {
@@ -1021,6 +1022,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
+	// Resolve the requested worker shape from the connection-string startup
+	// options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
+	// nil => the default exclusive profile. Gated off by default, so this is a
+	// no-op unless the deployment opts in. A rejected profile fails the connect.
+	workerProfile, profileWarns, profileErr := cp.resolveWorkerProfile(startupOptions)
+	if profileErr != nil {
+		slog.Warn("Rejected worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", profileErr)
+		_ = server.WriteErrorResponse(writer, "FATAL", "22023", profileErr.Error())
+		_ = writer.Flush()
+		return
+	}
+	for _, w := range profileWarns {
+		slog.Warn("Adjusted worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "detail", w)
+	}
+
 	// Resolve the session manager and rebalancer for this connection.
 	// In multi-tenant mode, each org has its own stack.
 	var sessions *SessionManager
@@ -1102,7 +1118,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		threads  int
 	)
 	if cp.isRemoteBackend {
-		memLimit, threads = cp.workerDuckDBLimits()
+		memLimit, threads = cp.workerDuckDBLimits(workerProfile)
 	} else if rebalancer != nil {
 		memLimit = rebalancer.MemoryLimit()
 		threads = rebalancer.PerSessionThreads()
@@ -1113,7 +1129,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
 		func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
-			return sessions.CreateSession(ctx, username, pid, memLimit, threads)
+			return sessions.CreateSession(ctx, username, pid, memLimit, threads, workerProfile)
 		},
 	)
 	if err != nil {
@@ -1288,8 +1304,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // pod's K8s resource spec. Uses 75% of the worker's memory limit for DuckDB
 // and the full CPU request as thread count. Returns empty/zero if worker
 // resources are not configured (DuckDB will then auto-detect on the worker).
-func (cp *ControlPlane) workerDuckDBLimits() (memLimit string, threads int) {
+func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit string, threads int) {
+	// A non-default profile sizes DuckDB from the profile's pod shape, not the
+	// pool-global request, so a small colocated worker gets matching limits. An
+	// empty profile field falls back to the pool-global request (today's value).
 	memReq := cp.cfg.K8s.WorkerMemoryRequest
+	cpuReq := cp.cfg.K8s.WorkerCPURequest
+	if profile != nil {
+		if profile.Memory != "" {
+			memReq = profile.Memory
+		}
+		if profile.CPU != "" {
+			cpuReq = profile.CPU
+		}
+	}
+
 	if memReq != "" {
 		memBytes := parseK8sMemory(memReq)
 		if memBytes > 0 {
@@ -1304,7 +1333,6 @@ func (cp *ControlPlane) workerDuckDBLimits() (memLimit string, threads int) {
 		}
 	}
 
-	cpuReq := cp.cfg.K8s.WorkerCPURequest
 	if cpuReq != "" {
 		threads = parseK8sCPU(cpuReq)
 	}

@@ -286,7 +286,7 @@ func TestAcquireWorkerReusesIdleWorker(t *testing.T) {
 	pool.mu.Unlock()
 
 	// Acquire should reuse the idle worker, not spawn a new one.
-	w, err := pool.AcquireWorker(context.Background())
+	w, err := pool.AcquireWorker(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestAcquireWorkerLeastLoadedAtCapacity(t *testing.T) {
 	pool.mu.Unlock()
 
 	// Acquire should pick the least-loaded worker (w1 with 1 session).
-	w, err := pool.AcquireWorker(context.Background())
+	w, err := pool.AcquireWorker(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestAcquireWorkerSpawnsWhenBelowCapacity(t *testing.T) {
 
 	// Acquire should try to spawn (will fail since no real binary, but it
 	// should NOT pick the existing worker — it should try to spawn first).
-	_, err := pool.AcquireWorker(context.Background())
+	_, err := pool.AcquireWorker(context.Background(), nil)
 	if err == nil {
 		t.Fatal("expected spawn error with non-existent binary")
 		return
@@ -381,7 +381,7 @@ func TestAcquireWorkerCleansDeadWorkersWhenAllDead(t *testing.T) {
 	pool.mu.Unlock()
 
 	// AcquireWorker should clean dead entries and try to spawn a replacement.
-	_, err := pool.AcquireWorker(context.Background())
+	_, err := pool.AcquireWorker(context.Background(), nil)
 	// Will fail to spawn since no real binary, but dead workers should be cleaned.
 	if err == nil {
 		t.Fatal("expected spawn error")
@@ -405,7 +405,7 @@ func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
 	// spawn a worker with a fake binary, but should get past any checks).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := pool.AcquireWorker(ctx)
+	_, err := pool.AcquireWorker(ctx, nil)
 	// Will fail to spawn since there's no real binary, but the point is
 	// it didn't block.
 	if err == nil {
@@ -418,7 +418,7 @@ func TestAcquireWorkerShutdownReturnsError(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 	pool.ShutdownAll()
 
-	_, err := pool.AcquireWorker(context.Background())
+	_, err := pool.AcquireWorker(context.Background(), nil)
 	if err == nil {
 		t.Fatal("expected error after shutdown")
 		return
@@ -531,7 +531,7 @@ func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
 	results := make(chan *ManagedWorker, n)
 	for i := 0; i < n; i++ {
 		go func() {
-			w, _ := pool.AcquireWorker(context.Background())
+			w, _ := pool.AcquireWorker(context.Background(), nil)
 			results <- w
 		}()
 	}
@@ -746,7 +746,7 @@ func TestAcquireWorkerConcurrentSharing(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := pool.AcquireWorker(context.Background())
+			_, err := pool.AcquireWorker(context.Background(), nil)
 			if err != nil {
 				errors <- err
 			}

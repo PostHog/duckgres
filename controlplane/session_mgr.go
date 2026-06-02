@@ -228,11 +228,11 @@ func (sm *SessionManager) removeWaiterLocked(waiter *connectionWaiter) {
 // CreateSession acquires a worker from the configured pool, creates a session
 // on it, and rebalances memory/thread limits across all active sessions.
 // If pid is 0, a new one is generated.
-func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
-	return sm.CreateSessionWithProtocol(ctx, username, pid, memoryLimit, threads, "postgres")
+func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int, profile *WorkerProfile) (int32, *flightclient.FlightExecutor, error) {
+	return sm.CreateSessionWithProtocol(ctx, username, pid, memoryLimit, threads, "postgres", profile)
 }
 
-func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, username string, pid int32, memoryLimit string, threads int, protocol string) (int32, *flightclient.FlightExecutor, error) {
+func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, username string, pid int32, memoryLimit string, threads int, protocol string, profile *WorkerProfile) (int32, *flightclient.FlightExecutor, error) {
 	ctx, endCreation, err := sm.beginSessionCreation(ctx)
 	if err != nil {
 		return 0, nil, err
@@ -260,7 +260,7 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 	acquireStart := time.Now()
 	ctx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
 	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
-	worker, err := sm.pool.AcquireWorker(ctx)
+	worker, err := sm.pool.AcquireWorker(ctx, profile)
 	if err != nil {
 		var capacityErr *WarmCapacityExhaustedError
 		if errors.As(err, &capacityErr) {

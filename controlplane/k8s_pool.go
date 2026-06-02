@@ -1118,7 +1118,9 @@ func waitForWorkerTCPWithMetadata(addr, bearerToken string, serverCertPEM []byte
 }
 
 // AcquireWorker returns a worker for a new session.
-func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *K8sWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
+	// The flat K8s pool is the single-tenant backend; worker-profile selection is
+	// a multi-tenant (OrgReservedPool) feature, so the profile is ignored here.
 	for {
 		select {
 		case <-ctx.Done():

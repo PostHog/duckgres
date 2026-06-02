@@ -23,7 +23,7 @@ type recordingWorkerPool struct {
 	events *[]string
 }
 
-func (p *recordingWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *recordingWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -60,7 +60,7 @@ type blockingReleaseWorkerPool struct {
 	releaseOnce    sync.Once
 }
 
-func (p *blockingReleaseWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *blockingReleaseWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -218,7 +218,7 @@ type blockingCreateSessionPool struct {
 	worker *ManagedWorker
 }
 
-func (p *blockingCreateSessionPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *blockingCreateSessionPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	return p.worker, nil
 }
 
@@ -252,7 +252,7 @@ type cancelAwareWorkerPool struct {
 	reconnectOnce    sync.Once
 }
 
-func (p *cancelAwareWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *cancelAwareWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	p.once.Do(func() { close(p.entered) })
 	<-ctx.Done()
 	return nil, ctx.Err()
@@ -671,7 +671,7 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 
 	createErr := make(chan error, 1)
 	go func() {
-		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres")
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres", nil)
 		createErr <- err
 	}()
 
@@ -722,7 +722,7 @@ func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
 
 	createErr := make(chan error, 1)
 	go func() {
-		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres")
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres", nil)
 		createErr <- err
 	}()
 
@@ -771,7 +771,7 @@ func TestDestroyAllSessionsCancelsCreateBlockedInAcquireWorker(t *testing.T) {
 
 	createErr := make(chan error, 1)
 	go func() {
-		_, _, err := sm.CreateSessionWithProtocol(callerCtx, "root", 1010, "", 0, "postgres")
+		_, _, err := sm.CreateSessionWithProtocol(callerCtx, "root", 1010, "", 0, "postgres", nil)
 		createErr <- err
 	}()
 
