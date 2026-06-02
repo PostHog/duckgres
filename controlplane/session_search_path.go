@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/posthog/duckgres/server/iceberg"
-	"github.com/posthog/duckgres/server/sessioncatalog"
 )
 
 type sessionSearchPathSource string
@@ -31,11 +30,11 @@ const physicalIcebergCatalog = iceberg.CatalogName
 // owned by InitSessionDatabaseMetadata's defer (which also restores memory.main
 // on the search_path so the pg_catalog compat macros stay resolvable), so this
 // returns "" — re-issuing `USE ducklake` here would clobber that search_path.
-func effectiveSessionDefaultCommand(clientSearchPath string, selection sessioncatalog.Selection) (string, sessionSearchPathSource) {
+func effectiveSessionDefaultCommand(clientSearchPath, physicalCatalog string) (string, sessionSearchPathSource) {
 	switch {
 	case clientSearchPath != "":
 		return fmt.Sprintf("SET search_path = '%s'", ensureMemoryMainInSearchPath(clientSearchPath)), sessionSearchPathSourceClient
-	case selection.PhysicalCatalog == iceberg.CatalogName:
+	case physicalCatalog == iceberg.CatalogName:
 		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema), sessionDefaultSourceConfiguredCatalog
 	default:
 		return "", ""
@@ -50,8 +49,8 @@ func effectiveSessionDefaultCommand(clientSearchPath string, selection sessionca
 // unqualified DDL/DML never reaches the warehouse. Mirrors
 // server.setIcebergDefault / setDuckLakeDefault used by the standalone
 // passthrough path.
-func passthroughSessionDefaultCatalogCommand(selection sessioncatalog.Selection) string {
-	switch selection.PhysicalCatalog {
+func passthroughSessionDefaultCatalogCommand(physicalCatalog string) string {
+	switch physicalCatalog {
 	case iceberg.CatalogName:
 		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
 	case physicalDuckLakeCatalog:

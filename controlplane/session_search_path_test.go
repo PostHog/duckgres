@@ -1,13 +1,9 @@
 package controlplane
 
-import (
-	"testing"
-
-	"github.com/posthog/duckgres/server/sessioncatalog"
-)
+import "testing"
 
 func TestEffectiveSessionDefaultCommandUsesClientSearchPathBeforeCatalog(t *testing.T) {
-	got, source := effectiveSessionDefaultCommand("ducklake.main", sessioncatalog.Selection{PhysicalCatalog: "iceberg"})
+	got, source := effectiveSessionDefaultCommand("ducklake.main", "iceberg")
 	if got != "SET search_path = 'ducklake.main,memory.main'" {
 		t.Fatalf("command = %q, want SET search_path = 'ducklake.main,memory.main'", got)
 	}
@@ -17,7 +13,7 @@ func TestEffectiveSessionDefaultCommandUsesClientSearchPathBeforeCatalog(t *test
 }
 
 func TestEffectiveSessionDefaultCommandUsesIcebergCatalogWhenClientOmitted(t *testing.T) {
-	got, source := effectiveSessionDefaultCommand("", sessioncatalog.Selection{PhysicalCatalog: "iceberg"})
+	got, source := effectiveSessionDefaultCommand("", "iceberg")
 	if got != "USE iceberg.public" {
 		t.Fatalf("command = %q, want USE iceberg.public", got)
 	}
@@ -29,7 +25,7 @@ func TestEffectiveSessionDefaultCommandUsesIcebergCatalogWhenClientOmitted(t *te
 func TestEffectiveSessionDefaultCommandEmptyForDuckLake(t *testing.T) {
 	// DuckLake's catalog switch is owned by InitSessionDatabaseMetadata's defer,
 	// so the connect-time command for a ducklake session is empty.
-	got, source := effectiveSessionDefaultCommand("", sessioncatalog.Selection{PhysicalCatalog: "ducklake"})
+	got, source := effectiveSessionDefaultCommand("", "ducklake")
 	if got != "" {
 		t.Fatalf("command = %q, want empty", got)
 	}
@@ -50,7 +46,7 @@ func TestPassthroughSessionDefaultCatalogCommand(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := passthroughSessionDefaultCatalogCommand(sessioncatalog.Selection{PhysicalCatalog: tt.effectiveCatalog}); got != tt.want {
+			if got := passthroughSessionDefaultCatalogCommand(tt.effectiveCatalog); got != tt.want {
 				t.Fatalf("command = %q, want %q", got, tt.want)
 			}
 		})

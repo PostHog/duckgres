@@ -29,7 +29,6 @@ import (
 	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/posthog/duckgres/server/sessioncatalog"
 	"github.com/posthog/duckgres/server/sessionmeta"
-	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -702,21 +701,6 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 	}
 }
 
-func probeAttachedCatalogs(ctx context.Context, executor sqlcore.QueryExecutor) (sessioncatalog.AttachedCatalogs, error) {
-	duckLakeAttached, err := sessionmeta.HasAttachedCatalog(ctx, executor, physicalDuckLakeCatalog)
-	if err != nil {
-		return sessioncatalog.AttachedCatalogs{}, fmt.Errorf("detect ducklake catalog: %w", err)
-	}
-	icebergAttached, err := sessionmeta.HasAttachedCatalog(ctx, executor, physicalIcebergCatalog)
-	if err != nil {
-		return sessioncatalog.AttachedCatalogs{}, fmt.Errorf("detect iceberg catalog: %w", err)
-	}
-	return sessioncatalog.AttachedCatalogs{
-		DuckLake: duckLakeAttached,
-		Iceberg:  icebergAttached,
-	}, nil
-}
-
 // SNI routing modes (values for ControlPlaneConfig.SNIRoutingMode).
 const (
 	SNIRoutingOff         = "off"         // ignore SNI entirely; identity can no longer be resolved
@@ -917,10 +901,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	password := string(bytes.TrimRight(body, "\x00"))
 
-	// Authenticate. In multi-tenant mode the org is resolved from the managed
-	// hostname (SNI); the user is authenticated within that org. The startup
-	// `database` remains the PostgreSQL-visible database name, while exact
-	// catalog names may request a physical catalog.
+	// Authenticate.
+	// In multi-tenant mode the org is resolved solely from the managed hostname
+	// (SNI); the user is authenticated within that org. The startup `database`
+	// param no longer identifies the org — it selects which attached catalog
+	// (ducklake/iceberg) the session defaults to.
 	var (
 		orgID            string
 		passthroughUser  bool
@@ -981,7 +966,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		passthroughUser = resolution.Passthrough
 		defaultCatalog = resolution.DefaultCatalog
 		requestedCatalog = resolution.RequestedCatalog
-		database = resolution.ClientDatabase
 	} else {
 		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
@@ -1120,15 +1104,25 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	// Probe which catalogs the worker actually attached for this session, then
+	// resolve the real catalog the session defaults to. The startup `database`
+	// selected "ducklake"/"iceberg"/"" (default); fail closed (3D000) if the
+	// requested catalog isn't attached.
 	attachCtx, attachCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-	attached, probeErr := probeAttachedCatalogs(attachCtx, executor)
+	duckLakeAttached, dlErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
+	icebergAttached, icErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalIcebergCatalog)
 	attachCancel()
+	probeErr := dlErr
+	if probeErr == nil {
+		probeErr = icErr
+	}
 	if probeErr != nil {
 		slog.Error("Failed to detect attached catalogs.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", probeErr, "worker", workerID, "worker_pod", workerPod)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
 		_ = writer.Flush()
 		return
 	}
+	attached := sessioncatalog.AttachedCatalogs{DuckLake: duckLakeAttached, Iceberg: icebergAttached}
 	selection := sessioncatalog.Selection{ClientDatabase: database, PhysicalCatalog: database}
 	if cp.configStore != nil {
 		var ok bool
@@ -1192,7 +1186,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// earlier value would be clobbered. A client-supplied search_path is
 		// best-effort; the configured catalog (Iceberg) fails closed because
 		// silently falling back would route the user to the wrong catalog.
-		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, selection); cmd != "" {
+		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, selection.PhysicalCatalog); cmd != "" {
 			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(spCtx, cmd)
 			spCancel()
@@ -1214,7 +1208,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if clientSearchPath != "" {
 			slog.Warn("Ignoring client connect-time search_path for passthrough session.", "user", username, "org", orgID, "search_path", clientSearchPath, "remote_addr", remoteAddr)
 		}
-		if cmd := passthroughSessionDefaultCatalogCommand(selection); cmd != "" {
+		if cmd := passthroughSessionDefaultCatalogCommand(selection.PhysicalCatalog); cmd != "" {
 			initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(initCtx, cmd)
 			initCancel()

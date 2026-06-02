@@ -45,9 +45,9 @@ type Snapshot struct {
 	QueryLog              QueryLogConfig
 }
 
-// Selectable catalog names. Exact startup database matches are treated as an
-// optional catalog selector, while other names remain PostgreSQL-visible
-// database names.
+// Selectable catalog names. The startup `database` param names the catalog a
+// session defaults to rather than identifying the org — these are the only
+// non-empty values a client may request.
 const (
 	catalogDuckLake = "ducklake"
 	catalogIceberg  = "iceberg"
@@ -57,8 +57,8 @@ const (
 // Postgres startup packet against one immutable config snapshot.
 //
 // Identity (OrgID) comes solely from the managed hostname (SNI) plus the
-// username/password; the startup `database` param remains the client-visible
-// database and may also select a catalog when it exactly names one.
+// username/password; the startup `database` param is treated as catalog
+// selection, not identity.
 type PostgresConnectionResolution struct {
 	// OrgID is the organization the connection belongs to, resolved from the
 	// managed hostname (SNI). Empty unless SNIResolved.
@@ -69,10 +69,9 @@ type PostgresConnectionResolution struct {
 	SNIAliasUsed bool
 	// SNIResolved is true when the managed hostname resolved to a known org.
 	SNIResolved bool
-	// ClientDatabase is the PostgreSQL-visible database from the startup packet.
-	ClientDatabase string
-	// RequestedCatalog is an optional physical catalog selector. Empty means use
-	// the per-user/attached default.
+	// RequestedCatalog is the catalog the session should default to, selected by
+	// the startup `database` param: "" (use the per-user/attached default),
+	// "ducklake", or "iceberg".
 	RequestedCatalog string
 	// CatalogValid is false when an explicit catalog selector is invalid.
 	CatalogValid bool
@@ -381,7 +380,6 @@ func isDNSLabel(label string) bool {
 func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) PostgresConnectionResolution {
 	result := PostgresConnectionResolution{}
 
-	result.ClientDatabase = strings.TrimSpace(startupDatabase)
 	// The startup `database` param selects which attached catalog the session
 	// defaults to; identity (OrgID) comes solely from SNI + username. Valid
 	// values: "" (use the per-user/attached default), "ducklake", or "iceberg".

@@ -312,8 +312,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 		if !got.SNIResolved || got.OrgID != "test-org-smoke-1778167994" {
 			t.Fatalf("org = (resolved=%v, %q), want test org from SNI: %+v", got.SNIResolved, got.OrgID, got)
 		}
-		if got.ClientDatabase != "ducklake" || !got.CatalogValid || got.RequestedCatalog != "ducklake" {
-			t.Fatalf("catalog = (db=%q valid=%v requested=%q), want ducklake: %+v", got.ClientDatabase, got.CatalogValid, got.RequestedCatalog, got)
+		if !got.CatalogValid || got.RequestedCatalog != "ducklake" {
+			t.Fatalf("catalog = (valid=%v requested=%q), want ducklake: %+v", got.CatalogValid, got.RequestedCatalog, got)
 		}
 		if !got.Valid || !got.Passthrough {
 			t.Fatalf("unexpected auth result: %+v", got)
@@ -322,8 +322,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 
 	t.Run("iceberg catalog selected", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection("iceberg", "test-org-smoke-1778167994", true, "root", "secret")
-		if got.ClientDatabase != "iceberg" || !got.CatalogValid || got.RequestedCatalog != "iceberg" {
-			t.Fatalf("catalog = (db=%q valid=%v requested=%q), want iceberg: %+v", got.ClientDatabase, got.CatalogValid, got.RequestedCatalog, got)
+		if !got.CatalogValid || got.RequestedCatalog != "iceberg" {
+			t.Fatalf("catalog = (valid=%v requested=%q), want iceberg: %+v", got.CatalogValid, got.RequestedCatalog, got)
 		}
 		if !got.Valid {
 			t.Fatalf("expected valid auth: %+v", got)
@@ -332,8 +332,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 
 	t.Run("empty database means use the default catalog", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection("", "test-org-smoke-1778167994", true, "root", "secret")
-		if !got.CatalogValid || got.RequestedCatalog != "" || got.ClientDatabase != "" {
-			t.Fatalf("catalog = (db=%q valid=%v requested=%q), want empty/use-default: %+v", got.ClientDatabase, got.CatalogValid, got.RequestedCatalog, got)
+		if !got.CatalogValid || got.RequestedCatalog != "" {
+			t.Fatalf("catalog = (valid=%v requested=%q), want empty/use-default: %+v", got.CatalogValid, got.RequestedCatalog, got)
 		}
 		if !got.Valid {
 			t.Fatalf("expected valid auth: %+v", got)
