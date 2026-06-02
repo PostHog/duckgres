@@ -1078,6 +1078,12 @@ func (c *clientConn) serve() error {
 			c.sendError("FATAL", "3D000", "no catalog is available for this connection")
 			return fmt.Errorf("no catalog available")
 		}
+		// De-mask: current_database()/pg_catalog surfaces report the real catalog
+		// the session defaults to (the de-masked physical catalog), not the startup
+		// database name. When no lake catalog is attached this is a no-op (the
+		// physical catalog already equals the client database).
+		selection.ClientDatabase = selection.PhysicalCatalog
+		c.database = selection.PhysicalCatalog
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, selection); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
@@ -1719,21 +1725,6 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		// catalog (it targets <catalog>.main, which it shadows), so land on the
 		// guaranteed default schema (ensured by attachLakekeeperCatalog).
 		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
-	case c.database != "" && strings.EqualFold(unquoted, c.database):
-		// `USE <client-db>` — the PostgreSQL-visible database name (what
-		// current_database() returns) maps to the physical catalog backing this
-		// session. Without this, the ubiquitous round-trip of reading
-		// current_database() and then issuing `USE` on it would emit a bogus
-		// `USE <client-db>` that DuckDB rejects ("Catalog <client-db> does not
-		// exist"), stranding the session on whatever catalog was active.
-		switch c.physicalCatalog {
-		case physicalDuckLakeCatalog:
-			target2part = physicalDuckLakeCatalog + ".main"
-		case iceberg.CatalogName:
-			target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
-		default:
-			return query
-		}
 	default:
 		return query
 	}

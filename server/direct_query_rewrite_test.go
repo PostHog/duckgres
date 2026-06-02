@@ -105,64 +105,6 @@ func TestRewriteDirectQueryUseIcebergRewrittenEvenWhenCfgDisabled(t *testing.T) 
 	}
 }
 
-// A client that reads current_database() (which returns the client-visible
-// database name) and then issues `USE <that>` must land back on the physical
-// catalog backing the session — not send a bogus `USE <client-db>` that DuckDB
-// rejects. Regression test for the integration cascade where `USE <client-db>`
-// stranded the session on `memory`.
-func TestRewriteDirectQueryUseClientDatabaseMapsToPhysicalCatalog(t *testing.T) {
-	tests := []struct {
-		name     string
-		database string
-		physical string
-		query    string
-		want     string
-	}{
-		{
-			name:     "ducklake-backed client db maps to ducklake.main",
-			database: "analytics",
-			physical: physicalDuckLakeCatalog,
-			query:    "USE analytics",
-			want:     "USE ducklake.main",
-		},
-		{
-			name:     "quoted client db maps to ducklake.main",
-			database: "analytics",
-			physical: physicalDuckLakeCatalog,
-			query:    `USE "analytics";`,
-			want:     "USE ducklake.main;",
-		},
-		{
-			name:     "iceberg-backed client db maps to iceberg default schema",
-			database: "analytics",
-			physical: "iceberg",
-			query:    "USE analytics",
-			want:     "USE iceberg.public",
-		},
-		{
-			name:     "client db with no physical catalog is left untouched",
-			database: "analytics",
-			physical: "",
-			query:    "USE analytics",
-			want:     "USE analytics",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			c := &clientConn{
-				server:            &Server{cfg: Config{}},
-				database:          tc.database,
-				physicalCatalog:   tc.physical,
-				catalogUseRewrite: true,
-			}
-			if got := c.rewriteDirectQuery(tc.query); got != tc.want {
-				t.Fatalf("rewriteDirectQuery(%q) = %q, want %q", tc.query, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestRewriteDirectQueryPassthroughPreservesUse(t *testing.T) {
 	c := &clientConn{
 		server:      &Server{},

@@ -340,13 +340,13 @@ func TestResolvePostgresConnection(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy database name remains a valid client database", func(t *testing.T) {
+	t.Run("non-catalog database name fails closed", func(t *testing.T) {
+		// The startup `database` param is pure catalog selection: only
+		// "" / "ducklake" / "iceberg" are accepted. An arbitrary name no longer
+		// routes anywhere and must be rejected (CatalogValid=false → 3D000).
 		got := cs.ResolvePostgresConnection("test_org_smoke_1778167994", "test-org-smoke-1778167994", true, "root", "secret")
-		if !got.CatalogValid || got.ClientDatabase != "test_org_smoke_1778167994" || got.RequestedCatalog != "" {
-			t.Fatalf("legacy database name should remain a client database: %+v", got)
-		}
-		if !got.Valid {
-			t.Fatalf("expected valid auth: %+v", got)
+		if got.CatalogValid || got.RequestedCatalog != "" {
+			t.Fatalf("non-catalog database name should fail closed: %+v", got)
 		}
 	})
 

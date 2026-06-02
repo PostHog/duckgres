@@ -382,15 +382,20 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result := PostgresConnectionResolution{}
 
 	result.ClientDatabase = strings.TrimSpace(startupDatabase)
-	// Exact catalog names remain accepted as a convenience selector, but
-	// arbitrary database names are valid PostgreSQL-visible databases and no
-	// longer fail resolution.
-	result.CatalogValid = true
+	// The startup `database` param selects which attached catalog the session
+	// defaults to; identity (OrgID) comes solely from SNI + username. Valid
+	// values: "" (use the per-user/attached default), "ducklake", or "iceberg".
+	// Anything else fails closed — there is no logical-name masking, so an
+	// arbitrary name no longer routes anywhere.
 	switch strings.ToLower(strings.TrimSpace(startupDatabase)) {
+	case "":
+		result.CatalogValid = true
 	case catalogDuckLake:
 		result.RequestedCatalog = catalogDuckLake
+		result.CatalogValid = true
 	case catalogIceberg:
 		result.RequestedCatalog = catalogIceberg
+		result.CatalogValid = true
 	}
 
 	cs.mu.RLock()

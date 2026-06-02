@@ -960,10 +960,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 		if !resolution.CatalogValid {
-			slog.Warn("Postgres connection rejected: requested catalog is invalid.",
-				"catalog", resolution.RequestedCatalog, "org", resolution.OrgID, "remote_addr", remoteAddr, "user", username)
+			slog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
+				"database", database, "org", resolution.OrgID, "remote_addr", remoteAddr, "user", username)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000",
-				fmt.Sprintf("catalog %q does not exist", resolution.RequestedCatalog))
+				fmt.Sprintf("database %q does not exist (connect with \"ducklake\" or \"iceberg\")", database))
 			_ = writer.Flush()
 			return
 		}
@@ -1162,6 +1162,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+
+	// De-mask: current_database()/pg_catalog surfaces and observability report the
+	// real catalog the session defaults to, not the startup `database` selector.
+	// There is no logical-name masking — the client-visible database IS the
+	// physical catalog (`database` is only ever "", "ducklake", or "iceberg" here).
+	selection.ClientDatabase = selection.PhysicalCatalog
+	database = selection.PhysicalCatalog
 
 	// Passthrough users skip pg_catalog initialization and the catalog USE
 	// rewriting — they bypass the PG compatibility layer entirely. They still
