@@ -1099,6 +1099,24 @@ func TestTranspile_DDL_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_AlterColumnTypeUsingRejected(t *testing.T) {
+	tr := New(ConfigForBackend(BackendIceberg))
+	result, err := tr.Transpile("ALTER TABLE public.users ALTER COLUMN id TYPE text USING id::text")
+	if err != nil {
+		t.Fatalf("Transpile returned error: %v", err)
+	}
+	if result.Error == nil {
+		t.Fatal("expected feature-not-supported error")
+	}
+	coded, ok := result.Error.(interface{ SQLState() string })
+	if !ok {
+		t.Fatalf("error does not expose SQLState: %T", result.Error)
+	}
+	if coded.SQLState() != "0A000" {
+		t.Fatalf("SQLState = %q, want 0A000", coded.SQLState())
+	}
+}
+
 func TestTranspile_DDL_NoOps(t *testing.T) {
 	tests := []struct {
 		name    string

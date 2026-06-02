@@ -9,9 +9,8 @@ import (
 )
 
 // openCatalogConn opens a connection with an arbitrary startup `database` name.
-// duckgres no longer masks that name onto a physical catalog — in standalone
-// DuckLake mode the session lands in the real `ducklake` catalog regardless of
-// the name, and current_database() reports the truth.
+// PostgreSQL-facing metadata keeps that client-visible database name even when
+// execution routes to a physical DuckLake or Iceberg catalog.
 func openCatalogConn(t *testing.T, dbName string) *sql.DB {
 	t.Helper()
 	connStr := fmt.Sprintf(
@@ -32,41 +31,36 @@ func openCatalogConn(t *testing.T, dbName string) *sql.DB {
 	return db
 }
 
-// TestCatalogIsNotMasked verifies the de-masking contract: the connection
-// database name no longer drives current_database()/pg_catalog surfaces; they
-// reflect the real attached catalog (`ducklake`).
-func TestCatalogIsNotMasked(t *testing.T) {
+func TestCurrentDatabasePreservesStartupDatabase(t *testing.T) {
 	if !testHarness.useDuckLake {
-		t.Skip("catalog de-masking is only observable in DuckLake mode")
+		t.Skip("catalog mapping is only observable in DuckLake mode")
 	}
 
-	// Connect with a name that is NOT a real catalog — it must still de-mask to
-	// the real ducklake catalog rather than being honored as a logical name.
 	db := openCatalogConn(t, "anything_goes")
 
-	t.Run("current_database reports the real catalog", func(t *testing.T) {
+	t.Run("current_database reports the client database", func(t *testing.T) {
 		var current string
 		if err := db.QueryRow("SELECT current_database()").Scan(&current); err != nil {
 			t.Fatalf("SELECT current_database(): %v", err)
 		}
-		if current != "ducklake" {
-			t.Fatalf("current_database() = %q, want %q", current, "ducklake")
+		if current != "anything_goes" {
+			t.Fatalf("current_database() = %q, want %q", current, "anything_goes")
 		}
 	})
 
-	t.Run("pg_database reports the real catalog", func(t *testing.T) {
+	t.Run("pg_database reports the client database", func(t *testing.T) {
 		var datname string
 		if err := db.QueryRow(
 			"SELECT datname FROM pg_catalog.pg_database WHERE datname = current_database()",
 		).Scan(&datname); err != nil {
 			t.Fatalf("pg_database lookup: %v", err)
 		}
-		if datname != "ducklake" {
-			t.Fatalf("datname = %q, want %q", datname, "ducklake")
+		if datname != "anything_goes" {
+			t.Fatalf("datname = %q, want %q", datname, "anything_goes")
 		}
 	})
 
-	t.Run("information_schema reports the real catalog", func(t *testing.T) {
+	t.Run("information_schema reports the client database", func(t *testing.T) {
 		// Use a dedicated, uniquely-named schema and drop it after the test so it
 		// doesn't pollute the shared DuckLake catalog that later catalog tests
 		// compare against (e.g. \dn schema-count parity).
@@ -90,8 +84,8 @@ func TestCatalogIsNotMasked(t *testing.T) {
 				if err := db.QueryRow(tc.query).Scan(&catalog); err != nil {
 					t.Fatalf("%s query: %v", tc.name, err)
 				}
-				if catalog != "ducklake" {
-					t.Fatalf("%s catalog = %q, want %q", tc.name, catalog, "ducklake")
+				if catalog != "anything_goes" {
+					t.Fatalf("%s catalog = %q, want %q", tc.name, catalog, "anything_goes")
 				}
 			})
 		}

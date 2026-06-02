@@ -20,9 +20,9 @@ import (
 // database name "duckgres" and user postgres/postgres
 // (k8s/kind/config-store.seed.sql).
 //
-// Identity is now established from the managed hostname (SNI) + username only;
-// the startup `database` param selects the session catalog (ducklake/iceberg/
-// empty=default), so current_database() reports the real catalog, not the org.
+// Identity is established from the managed hostname (SNI) + username. The
+// startup `database` param remains PostgreSQL-visible, while exact catalog names
+// may select ducklake/iceberg.
 
 const (
 	sniManagedSuffix    = ".dw.test.local"

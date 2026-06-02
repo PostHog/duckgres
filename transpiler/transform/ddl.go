@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/posthog/duckgres/transpiler/backend"
 )
 
 // DDLTransform strips unsupported DDL features for backends (DuckLake, Iceberg)
@@ -11,12 +12,12 @@ import (
 // SERIAL types, DEFAULT now(), GENERATED columns, or indexes. Which behaviors
 // apply is driven by the backend's capabilities.
 type DDLTransform struct {
-	caps BackendCapabilities
+	policy backend.DDLPolicy
 }
 
-// NewDDLTransform creates a new DDLTransform driven by the given capabilities.
-func NewDDLTransform(caps BackendCapabilities) *DDLTransform {
-	return &DDLTransform{caps: caps}
+// NewDDLTransform creates a new DDLTransform driven by the given DDL policy.
+func NewDDLTransform(policy backend.DDLPolicy) *DDLTransform {
+	return &DDLTransform{policy: policy}
 }
 
 func (t *DDLTransform) Name() string {
@@ -41,7 +42,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_IndexStmt:
 			// CREATE INDEX is a no-op
-			if t.caps.NoOpDDL {
+			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "CREATE INDEX"
 				return true, nil
@@ -50,7 +51,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 		case *pg_query.Node_DropStmt:
 			if n.DropStmt != nil {
 				// Check if it's DROP INDEX
-				if t.caps.NoOpDDL && n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_INDEX {
+				if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL && n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_INDEX {
 					result.IsNoOp = true
 					result.NoOpTag = "DROP INDEX"
 					return true, nil
@@ -59,7 +60,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 				// Strip CASCADE by converting to RESTRICT (same approach as dbt-duckdb).
 				// See: https://github.com/duckdb/dbt-duckdb/pull/557
 				// Note: DROP SCHEMA CASCADE is supported by DuckDB natively, so preserve it.
-				if t.caps.RewritesCascadeDrop && n.DropStmt.Behavior == pg_query.DropBehavior_DROP_CASCADE {
+				if t.policy.RewriteCascadeDrop && n.DropStmt.Behavior == pg_query.DropBehavior_DROP_CASCADE {
 					if n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_TABLE ||
 						n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_VIEW ||
 						n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_MATVIEW {
@@ -70,21 +71,21 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 			}
 
 		case *pg_query.Node_ReindexStmt:
-			if t.caps.NoOpDDL {
+			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "REINDEX"
 				return true, nil
 			}
 
 		case *pg_query.Node_ClusterStmt:
-			if t.caps.NoOpDDL {
+			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "CLUSTER"
 				return true, nil
 			}
 
 		case *pg_query.Node_VacuumStmt:
-			if t.caps.NoOpDDL {
+			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "VACUUM"
 				return true, nil
@@ -92,7 +93,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_GrantStmt:
 			// GRANT and REVOKE are no-ops
-			if t.caps.NoOpDDL {
+			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				if n.GrantStmt.IsGrant {
 					result.IsNoOp = true
 					result.NoOpTag = "GRANT"
@@ -104,14 +105,14 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 			}
 
 		case *pg_query.Node_CommentStmt:
-			if t.caps.NoOpDDL {
+			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "COMMENT"
 				return true, nil
 			}
 
 		case *pg_query.Node_AlterTableStmt:
-			if t.caps.SplitsMultiCommandAlter && n.AlterTableStmt != nil {
+			if t.policy.SplitMultiAlter && n.AlterTableStmt != nil {
 				if didChange, err := t.transformAlterTableStmt(n.AlterTableStmt, result); err != nil {
 					return false, err
 				} else if didChange {
@@ -123,7 +124,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 			}
 
 		case *pg_query.Node_RefreshMatViewStmt:
-			if t.caps.NoOpDDL {
+			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "REFRESH MATERIALIZED VIEW"
 				return true, nil
@@ -153,7 +154,7 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt) bool {
 		case *pg_query.Node_Constraint:
 			// Skip table-level constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK)
 			if n.Constraint != nil {
-				if t.caps.StripsTableConstraints && t.isUnsupportedConstraint(n.Constraint) {
+				if t.policy.ConstraintHandling == backend.StripConstraints && t.isUnsupportedConstraint(n.Constraint) {
 					changed = true
 					continue // Skip this constraint
 				}
@@ -166,7 +167,7 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt) bool {
 	stmt.TableElts = newTableElts
 
 	// Remove table-level constraints from the Constraints slice
-	if t.caps.StripsTableConstraints && len(stmt.Constraints) > 0 {
+	if t.policy.ConstraintHandling == backend.StripConstraints && len(stmt.Constraints) > 0 {
 		newConstraints := make([]*pg_query.Node, 0)
 		for _, c := range stmt.Constraints {
 			if constraint := c.GetConstraint(); constraint != nil {
@@ -190,7 +191,7 @@ func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef) bool {
 	changed := false
 
 	// Convert SERIAL types to INTEGER types
-	if t.caps.RewritesSerial && col.TypeName != nil {
+	if t.policy.RewriteSerial && col.TypeName != nil {
 		if t.convertSerialType(col.TypeName) {
 			changed = true
 		}
@@ -201,19 +202,19 @@ func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef) bool {
 		newConstraints := make([]*pg_query.Node, 0)
 		for _, c := range col.Constraints {
 			if constraint := c.GetConstraint(); constraint != nil {
-				if t.caps.StripsTableConstraints && t.isUnsupportedColumnConstraint(constraint) {
+				if t.policy.ConstraintHandling == backend.StripConstraints && t.isUnsupportedColumnConstraint(constraint) {
 					changed = true
 					continue
 				}
 				// Check for DEFAULT now()/current_timestamp
-				if t.caps.StripsVolatileDefaults && constraint.Contype == pg_query.ConstrType_CONSTR_DEFAULT {
+				if t.policy.StripVolatileDefaults && constraint.Contype == pg_query.ConstrType_CONSTR_DEFAULT {
 					if t.isUnsupportedDefault(constraint.RawExpr) {
 						changed = true
 						continue
 					}
 				}
 				// Check for GENERATED columns
-				if t.caps.StripsVolatileDefaults && constraint.Contype == pg_query.ConstrType_CONSTR_GENERATED {
+				if t.policy.StripVolatileDefaults && constraint.Contype == pg_query.ConstrType_CONSTR_GENERATED {
 					changed = true
 					continue
 				}
@@ -340,17 +341,10 @@ func (t *DDLTransform) transformAlterTableStmt(stmt *pg_query.AlterTableStmt, re
 		if alterCmd == nil {
 			continue
 		}
-		// ALTER COLUMN ... TYPE x USING <expr> is an arbitrary data rewrite the
-		// backend cannot perform. A plain type change (no USING) is allowed to
-		// pass through — DuckDB rejects an unsafe one with its own error, and a
-		// type-preserving change is effectively a no-op. The USING form, however,
-		// gets a clean PostgreSQL feature-not-supported error.
-		if alterCmd.Subtype == pg_query.AlterTableType_AT_AlterColumnType {
-			if def := alterCmd.Def.GetColumnDef(); def != nil && def.RawDefault != nil {
-				result.Error = NewFeatureNotSupported(
-					"ALTER COLUMN TYPE ... USING <expression> is not supported on this catalog")
-				return false, nil
-			}
+		if alterColumnTypeHasUsingExpression(alterCmd) {
+			result.Error = NewFeatureNotSupported(
+				"ALTER COLUMN TYPE ... USING <expression> is not supported on this catalog")
+			return false, nil
 		}
 		if t.isUnsupportedAlterCommand(alterCmd) {
 			continue
@@ -406,6 +400,16 @@ func (t *DDLTransform) transformAlterTableStmt(stmt *pg_query.AlterTableStmt, re
 	result.Statements = stmts
 	result.CleanupStatements = []string{"COMMIT"}
 	return true, nil
+}
+
+func alterColumnTypeHasUsingExpression(cmd *pg_query.AlterTableCmd) bool {
+	if cmd == nil || cmd.Subtype != pg_query.AlterTableType_AT_AlterColumnType {
+		return false
+	}
+	def := cmd.Def.GetColumnDef()
+	// pg_query stores ALTER COLUMN TYPE ... USING <expr> on ColumnDef.RawDefault
+	// for AT_AlterColumnType commands.
+	return def != nil && def.RawDefault != nil
 }
 
 // isUnsupportedAlterCommand checks if an ALTER TABLE command is unsupported by DuckLake

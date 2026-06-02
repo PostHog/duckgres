@@ -45,9 +45,9 @@ type Snapshot struct {
 	QueryLog              QueryLogConfig
 }
 
-// Selectable catalog names. The startup `database` param now names the catalog
-// a session defaults to rather than identifying the org — these are the only
-// non-empty values a client may request.
+// Selectable catalog names. Exact startup database matches are treated as an
+// optional catalog selector, while other names remain PostgreSQL-visible
+// database names.
 const (
 	catalogDuckLake = "ducklake"
 	catalogIceberg  = "iceberg"
@@ -57,8 +57,8 @@ const (
 // Postgres startup packet against one immutable config snapshot.
 //
 // Identity (OrgID) comes solely from the managed hostname (SNI) plus the
-// username/password; the startup `database` param is treated as catalog
-// selection, not identity.
+// username/password; the startup `database` param remains the client-visible
+// database and may also select a catalog when it exactly names one.
 type PostgresConnectionResolution struct {
 	// OrgID is the organization the connection belongs to, resolved from the
 	// managed hostname (SNI). Empty unless SNIResolved.
@@ -69,12 +69,12 @@ type PostgresConnectionResolution struct {
 	SNIAliasUsed bool
 	// SNIResolved is true when the managed hostname resolved to a known org.
 	SNIResolved bool
-	// EffectiveCatalog is the catalog the session should default to, selected by
-	// the startup `database` param: "" (use the per-user/attached default),
-	// "ducklake", or "iceberg".
-	EffectiveCatalog string
-	// CatalogValid is false when the requested `database` is not a selectable
-	// catalog name (anything other than "", "ducklake", "iceberg").
+	// ClientDatabase is the PostgreSQL-visible database from the startup packet.
+	ClientDatabase string
+	// RequestedCatalog is an optional physical catalog selector. Empty means use
+	// the per-user/attached default.
+	RequestedCatalog string
+	// CatalogValid is false when an explicit catalog selector is invalid.
 	CatalogValid bool
 	// Valid is true when (OrgID, username, password) authenticated.
 	Valid bool
@@ -381,19 +381,16 @@ func isDNSLabel(label string) bool {
 func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) PostgresConnectionResolution {
 	result := PostgresConnectionResolution{}
 
-	// The startup `database` param is now pure catalog selection, not identity.
-	// Valid values: "" (use the per-user/attached default), "ducklake", or
-	// "iceberg". Anything else fails closed — there is no logical-name masking,
-	// so an arbitrary name no longer routes anywhere.
+	result.ClientDatabase = strings.TrimSpace(startupDatabase)
+	// Exact catalog names remain accepted as a convenience selector, but
+	// arbitrary database names are valid PostgreSQL-visible databases and no
+	// longer fail resolution.
+	result.CatalogValid = true
 	switch strings.ToLower(strings.TrimSpace(startupDatabase)) {
-	case "":
-		result.CatalogValid = true
 	case catalogDuckLake:
-		result.EffectiveCatalog = catalogDuckLake
-		result.CatalogValid = true
+		result.RequestedCatalog = catalogDuckLake
 	case catalogIceberg:
-		result.EffectiveCatalog = catalogIceberg
-		result.CatalogValid = true
+		result.RequestedCatalog = catalogIceberg
 	}
 
 	cs.mu.RLock()

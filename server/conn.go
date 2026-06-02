@@ -28,6 +28,7 @@ import (
 	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/sessioncatalog"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/wire"
@@ -188,6 +189,7 @@ type clientConn struct {
 	queryStart      atomic.Value // stores time.Time — when current query started (lock-free)
 	workerID        int          // control plane worker ID, -1 for standalone
 	workerPod       string       // K8s pod name of the worker, empty for standalone or in-process workers
+	physicalCatalog string       // selected DuckDB catalog for execution, empty for memory/standalone default
 
 	// lastProfilingSummary holds the rollup from the most recent
 	// EnrichSpanWithProfiling call on this connection. Consumed by the very
@@ -198,35 +200,34 @@ type clientConn struct {
 
 // newTranspiler creates a transpiler configured for this connection.
 //
-// The backend selects the compatibility capability preset (DDL constraint
-// stripping, ON CONFLICT→MERGE, public-schema handling, etc.). A tenant is
-// activated for exactly one catalog backend, so Iceberg and DuckLake are
-// mutually exclusive in practice; Iceberg takes precedence if both are set.
-//
-// LogicalDatabaseName drives the logical-catalog transform. duckgres no longer
-// masks a logical database name onto the physical catalog, so it is pinned to
-// the physical DuckLake catalog ("ducklake") — the transform's only remaining
-// job is to map `ducklake.public.*` → `ducklake.main.*` (DuckLake's real schema
-// is `main`). For Iceberg it is left empty so three-part refs pass through
-// untouched; Iceberg's physical schema is `public` (the preset disables the
-// public→main rewrite). The physical catalog name is supplied by the preset.
+// The backend profile selects DDL/DML/catalog compatibility policy. The client
+// database remains PostgreSQL-visible; LogicalDatabaseName maps three-part
+// references using that database to the selected physical catalog.
 func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
 	backend := transpiler.BackendMemory
+	physicalCatalog := c.physicalCatalog
 	switch {
-	case c.server.cfg.Iceberg.Enabled:
+	case physicalCatalog == iceberg.CatalogName:
 		backend = transpiler.BackendIceberg
+	case physicalCatalog == physicalDuckLakeCatalog:
+		backend = transpiler.BackendDuckLake
+	case c.server.cfg.Iceberg.Enabled || c.hasTenantIcebergConfig:
+		backend = transpiler.BackendIceberg
+		physicalCatalog = iceberg.CatalogName
 	case c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake:
 		backend = transpiler.BackendDuckLake
+		physicalCatalog = physicalDuckLakeCatalog
 	}
 
 	logicalDatabaseName := ""
-	if backend == transpiler.BackendDuckLake {
-		logicalDatabaseName = physicalDuckLakeCatalog
+	if backend == transpiler.BackendDuckLake || backend == transpiler.BackendIceberg {
+		logicalDatabaseName = c.database
 	}
 
 	return transpiler.New(transpiler.Config{
 		Backend:             backend,
 		LogicalDatabaseName: logicalDatabaseName,
+		PhysicalCatalogName: physicalCatalog,
 		ConvertPlaceholders: convertPlaceholders,
 	})
 }
@@ -1065,26 +1066,25 @@ func (c *clientConn) serve() error {
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect iceberg catalog attachment: %v", err))
 			return err
 		}
-		// De-mask: current_database() and the pg_catalog surfaces should reflect
-		// the real attached catalog, not the client's connection database name.
-		// Standalone has a single backing catalog, so honor whatever is attached.
-		catalog := c.database
-		switch {
-		case duckLakeAttached:
-			catalog = physicalDuckLakeCatalog
-		case icebergAttached:
-			catalog = iceberg.CatalogName
+		selection, ok := sessioncatalog.ResolveSelection(sessioncatalog.Request{
+			ClientDatabase: c.database,
+			Attached: sessioncatalog.AttachedCatalogs{
+				DuckLake: duckLakeAttached,
+				Iceberg:  icebergAttached,
+			},
+		})
+		if !ok {
+			initCancel()
+			c.sendError("FATAL", "3D000", "no catalog is available for this connection")
+			return fmt.Errorf("no catalog available")
 		}
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, selection); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
 		initCancel()
-		// Keep c.database aligned with the real catalog so observability surfaces
-		// (pg_stat_activity.datname, logs) agree with current_database(). The
-		// control-plane path does the equivalent via NewClientConn(database=…).
-		c.database = catalog
+		c.physicalCatalog = selection.PhysicalCatalog
 		c.catalogUseRewrite = duckLakeAttached || icebergAttached
 	}
 
@@ -1719,6 +1719,21 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		// catalog (it targets <catalog>.main, which it shadows), so land on the
 		// guaranteed default schema (ensured by attachLakekeeperCatalog).
 		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
+	case c.database != "" && strings.EqualFold(unquoted, c.database):
+		// `USE <client-db>` — the PostgreSQL-visible database name (what
+		// current_database() returns) maps to the physical catalog backing this
+		// session. Without this, the ubiquitous round-trip of reading
+		// current_database() and then issuing `USE` on it would emit a bogus
+		// `USE <client-db>` that DuckDB rejects ("Catalog <client-db> does not
+		// exist"), stranding the session on whatever catalog was active.
+		switch c.physicalCatalog {
+		case physicalDuckLakeCatalog:
+			target2part = physicalDuckLakeCatalog + ".main"
+		case iceberg.CatalogName:
+			target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
+		default:
+			return query
+		}
 	default:
 		return query
 	}

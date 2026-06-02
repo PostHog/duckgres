@@ -14,8 +14,17 @@ the privilege model.
 
 ## How it works
 
-A session is activated for exactly one catalog backend. The transpiler selects a
-**capability preset** per backend (`transpiler/transform/capabilities.go`):
+A session has two separate identities:
+
+- **Client database**: the PostgreSQL-visible database from the startup packet.
+  `current_database()`, `pg_database`, and `information_schema.*.table_catalog`
+  expose this value.
+- **Physical catalog**: the DuckDB catalog selected for execution (`ducklake` or
+  `iceberg`). This is resolved from the per-user default catalog, exact catalog
+  selector, and attached worker catalogs.
+
+The transpiler selects a typed **backend profile** per backend
+(`transpiler/backend/profile.go`):
 
 | Capability | memory | ducklake | iceberg |
 |---|:--:|:--:|:--:|
@@ -31,12 +40,11 @@ A session is activated for exactly one catalog backend. The transpiler selects a
 | Map `public` schema → `main` | ✓ | ✓ | – |
 | Physical DuckDB catalog | `memory` | `ducklake` | `iceberg` |
 
-The Iceberg preset mirrors DuckLake's DDL/DML policy but keeps the physical
+The Iceberg profile mirrors DuckLake's DDL/DML policy but keeps the physical
 schema name `public` (DuckDB shadows `main` on REST catalogs), so the
-`public`→`main` rewrite is disabled. duckgres does not mask a logical database
-name onto the physical catalog: `current_database()` reports the real attached
-catalog (`iceberg`), and `newTranspiler` leaves Iceberg three-part references
-untouched (`LogicalDatabaseName` is empty for Iceberg sessions).
+`public`→`main` rewrite is disabled. The physical catalog is not exposed as the
+PostgreSQL database unless the client explicitly connected with that database
+name.
 
 ## Compatibility matrix
 
@@ -56,7 +64,8 @@ untouched (`LogicalDatabaseName` is empty for Iceberg sessions).
   constraint exists to infer against).
 - `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` → plain integer types (no sequence).
 - `current_database()`, `table_catalog`, and the `pg_catalog` surfaces report the
-  real attached catalog (`iceberg`) consistently — no logical/physical masking.
+  client-visible PostgreSQL database consistently while query execution uses the
+  resolved physical catalog.
 
 ### No-op (acknowledged, not executed; returns the PostgreSQL command tag)
 - `CREATE INDEX`, `DROP INDEX`, `REINDEX`, `CLUSTER`, `VACUUM`, `ANALYZE`.
@@ -74,7 +83,7 @@ untouched (`LogicalDatabaseName` is empty for Iceberg sessions).
 
 ## Type mapping (canonical)
 
-One canonical map (`server/icebergmeta/typemap.go`, `CanonicalPGType`) normalizes
+One canonical map (`server/pgtypes/iceberg.go`, `ForIceberg`) normalizes
 Iceberg field types before they populate `information_schema.columns`:
 
 | Iceberg | PostgreSQL |

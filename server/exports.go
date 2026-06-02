@@ -116,6 +116,15 @@ func SetConnectionIcebergConfig(cc *clientConn, cfg IcebergConfig) {
 	}
 }
 
+// SetConnectionPhysicalCatalog records the resolved DuckDB catalog for
+// control-plane proxy connections. The PostgreSQL-visible database remains on
+// clientConn.database; this value is used only for execution/transpiler policy.
+func SetConnectionPhysicalCatalog(cc *clientConn, catalog string) {
+	if cc != nil {
+		cc.physicalCatalog = catalog
+	}
+}
+
 // HasAttachedCatalog and InitSessionDatabaseMetadata moved to
 // server/sessionmeta. Re-exports kept here for the dozen call sites in
 // the control plane and elsewhere; new code should import server/sessionmeta

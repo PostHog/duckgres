@@ -3,9 +3,9 @@ package icebergmeta
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 
+	"github.com/posthog/duckgres/server/pgtypes"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
@@ -35,19 +35,18 @@ func buildReplaceSQL(table tableRef, cols []sourceColumn) string {
 		if col.Required {
 			nullable = "NO"
 		}
-		// Precision/scale are extracted from the raw Iceberg decimal type
-		// ("decimal(p,s)"); the stored data_type is the canonical PostgreSQL name.
-		precision, scale := decimalPrecisionScale(col.Type)
+		pgType := pgtypes.ForIceberg(col.Type)
 		values = append(values, fmt.Sprintf(
-			"(%s, %s, %s, %d, %s, %s, %s, %s)",
+			"(%s, %s, %s, %d, %s, %s, %s, %s, %s)",
 			quoteSQLString(table.Schema),
 			quoteSQLString(table.Name),
 			quoteSQLString(col.Name),
 			i+1,
 			quoteSQLString(nullable),
-			quoteSQLString(CanonicalPGType(col.Type)),
-			nullableIntLiteral(precision),
-			nullableIntLiteral(scale),
+			quoteSQLString(pgType.DataType),
+			quoteSQLString(pgType.UDTName),
+			nullableIntLiteral(pgType.NumericPrecision),
+			nullableIntLiteral(pgType.NumericScale),
 		))
 	}
 	return deleteSQL + ";\n" + fmt.Sprintf(`
@@ -58,24 +57,13 @@ func buildReplaceSQL(table tableRef, cols []sourceColumn) string {
 			ordinal_position,
 			is_nullable,
 			data_type,
+			udt_name,
 			numeric_precision,
 			numeric_scale
 		)
 		VALUES %s
 	`, QualifiedColumnMetadataTable, strings.Join(values, ",\n"))
 }
-
-func decimalPrecisionScale(t string) (*int, *int) {
-	upper := strings.ToUpper(strings.TrimSpace(t))
-	if m := decimalTypeRE.FindStringSubmatch(upper); len(m) == 3 {
-		precision := atoi(m[1])
-		scale := atoi(m[2])
-		return &precision, &scale
-	}
-	return nil, nil
-}
-
-var decimalTypeRE = regexp.MustCompile(`^DECIMAL\((\d+),\s*(\d+)\)$`)
 
 func quoteSQLString(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
@@ -86,15 +74,4 @@ func nullableIntLiteral(v *int) string {
 		return "NULL"
 	}
 	return fmt.Sprintf("%d", *v)
-}
-
-func atoi(v string) int {
-	n := 0
-	for _, r := range v {
-		if r < '0' || r > '9' {
-			break
-		}
-		n = n*10 + int(r-'0')
-	}
-	return n
 }

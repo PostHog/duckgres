@@ -1125,13 +1125,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cli.Set["sni-routing-mode"] {
 		sniRoutingMode = cli.SNIRoutingMode
 	}
-	// Identity in multi-tenant mode is derived solely from the managed hostname
-	// (SNI) + username; the database name no longer routes. Default to enforcing
-	// managed SNI so unresolvable hostnames are rejected. (Consulted only on the
-	// configStore-backed multi-tenant path; standalone/process backends ignore it.)
-	if sniRoutingMode == "" {
-		sniRoutingMode = "enforce"
-	}
 	if cli.Set["managed-hostname-suffixes"] {
 		managedHostnameSuffixes = splitAndTrim(cli.ManagedHostnameSuffixes, ",")
 	}

@@ -1,14 +1,13 @@
 package transpiler
 
-import "github.com/posthog/duckgres/transpiler/transform"
+import "github.com/posthog/duckgres/transpiler/backend"
 
-// StorageBackend re-exports transform.StorageBackend so callers outside the
-// transpiler tree (e.g. the server package) can select a backend without
-// importing the internal transform package.
-type StorageBackend = transform.StorageBackend
+// StorageBackend is kept as a compatibility alias for callers selecting the
+// transpiler backend.
+type StorageBackend = backend.Name
 
 const (
-	BackendMemory   = transform.BackendMemory
-	BackendDuckLake = transform.BackendDuckLake
-	BackendIceberg  = transform.BackendIceberg
+	BackendMemory   = backend.Memory
+	BackendDuckLake = backend.DuckLake
+	BackendIceberg  = backend.Iceberg
 )
