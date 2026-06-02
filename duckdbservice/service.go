@@ -156,6 +156,40 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 	}
 }
 
+// wipePersistedSecrets removes DuckDB's persistent-secret directories for this
+// config. Called on worker startup so persisted secrets never survive a
+// recycle. Best-effort: a failure is logged, not fatal — a stale secret is a
+// correctness annoyance, not a reason to refuse to start. No-op when no DataDir
+// is configured.
+//
+// We wipe two locations:
+//   - the pinned secret_directory (server.SecretDirectory), where new secrets
+//     would land under the current config, and
+//   - the legacy DuckDB default <DataDir>/.duckdb/stored_secrets, which is where
+//     secrets accumulated before we pinned the directory (a worker whose
+//     HOME is its DataDir resolves DuckDB's default there). Without this, the
+//     historical files that caused the original ambiguity would linger on a
+//     persistent DataDir forever.
+func wipePersistedSecrets(cfg server.Config) {
+	if cfg.DataDir == "" {
+		return
+	}
+	dirs := []string{
+		server.SecretDirectory(cfg),
+		server.LegacySecretDirectory(cfg),
+	}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("Failed to wipe persisted secret directory on worker startup.", "secret_directory", dir, "error", err)
+			continue
+		}
+		slog.Info("Wiped persisted secret directory on worker startup.", "secret_directory", dir)
+	}
+}
+
 // Warmup performs one-time initialization of the shared DuckDB instance.
 // This loads extensions and attaches catalogs so that subsequent session
 // creations are nearly instantaneous.
@@ -165,6 +199,21 @@ func (p *SessionPool) Warmup() error {
 	if os.Getenv("DUCKGRES_MODE") != "duckdb-service" {
 		return nil
 	}
+
+	// Recycle hook: a worker process starting up is the boundary between one
+	// tenant runtime and the next on this disk (a serverless/shared-warm worker
+	// is single-org-bound for its whole life, so process start == recycle).
+	// Wipe any persisted secrets left on disk before DuckDB's SecretManager
+	// reads them, so a CREATE PERSISTENT SECRET from a prior incarnation can't
+	// resurface and collide with the in-memory secret re-created at activation,
+	// and can't leak across tenants.
+	//
+	// This matters whenever DataDir survives across worker processes: a
+	// container restart within the same pod (EmptyDir survives that — it's only
+	// destroyed on pod deletion), or any persistent-volume / warm-node setup. On
+	// a fresh pod with a fresh EmptyDir the directory is already empty and this
+	// is a no-op.
+	wipePersistedSecrets(p.cfg)
 
 	start := time.Now()
 	slog.Info("Pre-warming worker DuckDB instance...")
