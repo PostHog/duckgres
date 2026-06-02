@@ -29,7 +29,8 @@ type ManagedWorker struct {
 	ID                      int
 	podName                 string
 	nodeName                string //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
-	image                   string //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
+	image                   string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
+	profile                 WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
 	cmd                     *exec.Cmd
 	socketPath              string
 	bearerToken             string

@@ -548,7 +548,15 @@ type WorkerRecord struct {
 	PodName             string      `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
 	PodUID              string      `gorm:"size:255" json:"pod_uid"`
 	Image               string      `gorm:"size:512;index" json:"image"`
-	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
+	// Worker pod-shape profile (connection-string-selected sizing). Empty
+	// CPU/Memory + Colocate=false is the default exclusive profile, so legacy
+	// rows (and warm/neutral workers) read back as the default and stay
+	// claimable by default requests. Matched alongside Image when a session
+	// reserves a worker. AutoMigrate adds these columns; no migration file.
+	ProfileCPU      string `gorm:"size:32;index:idx_worker_profile" json:"profile_cpu"`
+	ProfileMemory   string `gorm:"size:32;index:idx_worker_profile" json:"profile_memory"`
+	ProfileColocate bool   `gorm:"index:idx_worker_profile" json:"profile_colocate"`
+	State           WorkerState `gorm:"size:32;not null;index" json:"state"`
 	OrgID               string      `gorm:"size:255;index" json:"org_id"`
 	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`
 	OwnerEpoch          int64       `gorm:"not null" json:"owner_epoch"`

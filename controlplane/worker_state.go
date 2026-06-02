@@ -30,11 +30,15 @@ const (
 // per node). Normalizing the default to empty strings (rather than the literal
 // 46/360 pool values) is what keeps legacy worker records claimable without a
 // data migration.
+//
+// Only these three fields are persisted (WorkerRecord) and matched. Pod
+// scheduling — nodeSelector, toleration, and the one-pod-per-node anti-affinity —
+// is DERIVED from Colocate plus the pool's config at spawn time, so the
+// reserved-spawn path can reconstruct everything it needs from the stored record.
 type WorkerProfile struct {
-	CPU          string            // normalized k8s quantity (e.g. "4"); "" => pool-global request
-	Memory       string            // normalized k8s quantity (e.g. "16Gi"); "" => pool-global request
-	Colocate     bool              // true => bin-pack (exclusiveNode=false); false => exclusive node
-	NodeSelector map[string]string // derived from Colocate; NOT part of the match key
+	CPU      string // normalized k8s quantity (e.g. "4"); "" => pool-global request
+	Memory   string // normalized k8s quantity (e.g. "16Gi"); "" => pool-global request
+	Colocate bool   // true => bin-pack (exclusiveNode=false); false => exclusive node
 }
 
 // MatchKey is the identity used to decide whether an existing worker can serve a
@@ -222,12 +226,6 @@ func cloneWorkerProfile(profile *WorkerProfile) *WorkerProfile {
 		return nil
 	}
 	cloned := *profile
-	if profile.NodeSelector != nil {
-		cloned.NodeSelector = make(map[string]string, len(profile.NodeSelector))
-		for k, v := range profile.NodeSelector {
-			cloned.NodeSelector[k] = v
-		}
-	}
 	return &cloned
 }
 

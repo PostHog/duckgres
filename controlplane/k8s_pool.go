@@ -2973,12 +2973,30 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 // Returns empty (BestEffort) if neither is set.
 // When set, limits are equal to requests (Guaranteed QoS).
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
-	requests := corev1.ResourceList{}
-	if p.workerCPURequest != "" {
-		requests[corev1.ResourceCPU] = resource.MustParse(p.workerCPURequest)
+	return p.workerResourcesForProfile(WorkerProfile{})
+}
+
+// workerResourcesForProfile builds the pod resource requirements for a worker of
+// the given profile: the profile's CPU/Memory when set, otherwise the pool-global
+// request (today's behavior). Requests are mirrored to Limits so the pod is
+// Guaranteed QoS — required before bin-packing colocated workers. A colocated
+// profile always carries non-empty CPU/Memory (resolver-enforced), so it never
+// degrades to BestEffort.
+func (p *K8sWorkerPool) workerResourcesForProfile(profile WorkerProfile) corev1.ResourceRequirements {
+	cpuReq := profile.CPU
+	if cpuReq == "" {
+		cpuReq = p.workerCPURequest
 	}
-	if p.workerMemoryRequest != "" {
-		requests[corev1.ResourceMemory] = resource.MustParse(p.workerMemoryRequest)
+	memReq := profile.Memory
+	if memReq == "" {
+		memReq = p.workerMemoryRequest
+	}
+	requests := corev1.ResourceList{}
+	if cpuReq != "" {
+		requests[corev1.ResourceCPU] = resource.MustParse(cpuReq)
+	}
+	if memReq != "" {
+		requests[corev1.ResourceMemory] = resource.MustParse(memReq)
 	}
 	if len(requests) == 0 {
 		return corev1.ResourceRequirements{}
@@ -3402,6 +3420,9 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	if worker.image != "" {
 		record.Image = worker.image
 	}
+	record.ProfileCPU = worker.profile.CPU
+	record.ProfileMemory = worker.profile.Memory
+	record.ProfileColocate = worker.profile.Colocate
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
 	}

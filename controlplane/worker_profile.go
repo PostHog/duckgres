@@ -1,7 +1,6 @@
 package controlplane
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -117,11 +116,7 @@ func (cp *ControlPlane) resolveWorkerProfile(opts map[string]string) (*WorkerPro
 		return nil, warns, nil
 	}
 
-	profile := &WorkerProfile{CPU: cpu, Memory: mem, Colocate: colocate}
-	if colocate {
-		profile.NodeSelector = parseNodeSelectorJSON(k.ColocatedWorkerNodeSelector)
-	}
-	return profile, warns, nil
+	return &WorkerProfile{CPU: cpu, Memory: mem, Colocate: colocate}, warns, nil
 }
 
 // sizeField normalizes a client-supplied size and, when clamp is set, bounds it
@@ -162,18 +157,4 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
-}
-
-// parseNodeSelectorJSON parses a JSON object string into a nodeSelector map.
-// Returns nil on empty/invalid input (the spawn path then falls back to the
-// pool-global selector); the value never affects worker matching.
-func parseNodeSelectorJSON(s string) map[string]string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	var m map[string]string
-	if err := json.Unmarshal([]byte(s), &m); err != nil || len(m) == 0 {
-		return nil
-	}
-	return m
 }

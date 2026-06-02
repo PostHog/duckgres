@@ -2,8 +2,8 @@ package controlplane
 
 import "testing"
 
-// boolPtr is a small helper for tier specs.
-func boolPtr(b bool) *bool { return &b }
+// wpBoolPtr is a small helper for tier specs.
+func wpBoolPtr(b bool) *bool { return &b }
 
 // newProfileTestCP builds a ControlPlane whose K8s config enables the
 // connection-string worker-profile feature with the prod-shaped policy.
@@ -19,8 +19,8 @@ func newProfileTestCP() *ControlPlane {
 		WorkerProfileMinMemory:       "4Gi",
 		WorkerProfileMaxMemory:       "64Gi",
 		WorkerTiers: map[string]WorkerProfileSpec{
-			"backfill": {CPU: "4", Memory: "16Gi", Colocate: boolPtr(true)},
-			"heavy":    {Colocate: boolPtr(false)},
+			"backfill": {CPU: "4", Memory: "16Gi", Colocate: wpBoolPtr(true)},
+			"heavy":    {Colocate: wpBoolPtr(false)},
 		},
 	}}}
 }
@@ -109,9 +109,6 @@ func TestResolveWorkerProfile_ExclusiveAllowed(t *testing.T) {
 	}
 	if got == nil || got.Colocate {
 		t.Fatalf("expected a non-colocated profile, got %v", got)
-	}
-	if got.NodeSelector != nil {
-		t.Fatalf("exclusive profile must not carry the colocated nodeSelector, got %v", got.NodeSelector)
 	}
 	if got.MatchKey() != "32|256Gi|false" {
 		t.Fatalf("MatchKey = %q, want %q", got.MatchKey(), "32|256Gi|false")
