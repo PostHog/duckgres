@@ -165,6 +165,7 @@ func TestInformationSchemaColumnsCompatPrefersLoadedIcebergMetadata(t *testing.T
 
 	stmts := []string{
 		`ATTACH ':memory:' AS iceberg`,
+		`CREATE OR REPLACE TEMP MACRO current_database() AS 'iceberg'`,
 		`CREATE SCHEMA iceberg.stripe`,
 		`CREATE TABLE iceberg.stripe.account (requirements_currently_due INTEGER)`,
 		sessionColumnMetadataTableSQL(),

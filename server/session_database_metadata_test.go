@@ -237,7 +237,129 @@ func TestInitSessionDatabaseMetadataExcludesInternalDuckLakeMetadataCatalogs(t *
 	}
 }
 
-func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence(t *testing.T) {
+func TestInformationSchemaCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
+	tests := []struct {
+		name           string
+		catalog        string
+		useAfterInit   string
+		wantTables     string
+		wantView       string
+		wantColumnTbls string
+	}{
+		{
+			name:           "ducklake",
+			catalog:        "ducklake",
+			wantTables:     "duck_only,duck_view",
+			wantView:       "duck_view",
+			wantColumnTbls: "duck_only,duck_view",
+		},
+		{
+			name:           "iceberg",
+			catalog:        "iceberg",
+			useAfterInit:   "USE iceberg.public",
+			wantTables:     "ice_only,ice_view",
+			wantView:       "ice_view",
+			wantColumnTbls: "ice_only,ice_view",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := sql.Open("duckdb", ":memory:")
+			if err != nil {
+				t.Fatalf("open duckdb: %v", err)
+			}
+			db.SetMaxOpenConns(1)
+			defer func() { _ = db.Close() }()
+
+			if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
+				t.Fatalf("attach ducklake: %v", err)
+			}
+			if _, err := db.Exec(`ATTACH ':memory:' AS iceberg`); err != nil {
+				t.Fatalf("attach iceberg: %v", err)
+			}
+			if err := initInformationSchema(db, true); err != nil {
+				t.Fatalf("init information_schema: %v", err)
+			}
+			if _, err := db.Exec("USE ducklake"); err != nil {
+				t.Fatalf("use ducklake: %v", err)
+			}
+			if _, err := db.Exec("CREATE SCHEMA shared"); err != nil {
+				t.Fatalf("create ducklake schema: %v", err)
+			}
+			if _, err := db.Exec("CREATE TABLE shared.duck_only(id INTEGER)"); err != nil {
+				t.Fatalf("create ducklake table: %v", err)
+			}
+			if _, err := db.Exec("CREATE VIEW shared.duck_view AS SELECT id FROM shared.duck_only"); err != nil {
+				t.Fatalf("create ducklake view: %v", err)
+			}
+			if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
+				t.Fatalf("create iceberg public schema: %v", err)
+			}
+			if _, err := db.Exec("CREATE SCHEMA iceberg.shared"); err != nil {
+				t.Fatalf("create iceberg schema: %v", err)
+			}
+			if _, err := db.Exec("CREATE TABLE iceberg.shared.ice_only(id INTEGER)"); err != nil {
+				t.Fatalf("create iceberg table: %v", err)
+			}
+			if _, err := db.Exec("CREATE VIEW iceberg.shared.ice_view AS SELECT id FROM iceberg.shared.ice_only"); err != nil {
+				t.Fatalf("create iceberg view: %v", err)
+			}
+
+			executor := NewLocalExecutor(db)
+			if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, tc.catalog); err != nil {
+				t.Fatalf("init session database metadata: %v", err)
+			}
+			if tc.useAfterInit != "" {
+				if _, err := db.Exec(tc.useAfterInit); err != nil {
+					t.Fatalf("apply selected catalog: %v", err)
+				}
+			}
+
+			assertSingleValue := func(label, query, want string) {
+				t.Helper()
+				var got string
+				if err := db.QueryRow(query).Scan(&got); err != nil {
+					t.Fatalf("%s query: %v", label, err)
+				}
+				if got != want {
+					t.Fatalf("%s = %q, want %q", label, got, want)
+				}
+			}
+
+			assertSingleValue("table", `
+				SELECT string_agg(table_name, ',' ORDER BY table_name)
+				FROM memory.main.information_schema_tables_compat
+				WHERE table_schema = 'shared'
+			`, tc.wantTables)
+			assertSingleValue("view", `
+				SELECT string_agg(table_name, ',' ORDER BY table_name)
+				FROM memory.main.information_schema_views_compat
+				WHERE table_schema = 'shared'
+			`, tc.wantView)
+			assertSingleValue("column table", `
+				SELECT string_agg(DISTINCT table_name, ',' ORDER BY table_name)
+				FROM memory.main.information_schema_columns_compat
+				WHERE table_schema = 'shared'
+					AND column_name = 'id'
+			`, tc.wantColumnTbls)
+
+			var schemaCount int
+			if err := db.QueryRow(`
+				SELECT COUNT(*)
+				FROM memory.main.information_schema_schemata_compat
+				WHERE schema_name = 'shared'
+			`).Scan(&schemaCount); err != nil {
+				t.Fatalf("schema query: %v", err)
+			}
+			if schemaCount != 1 {
+				t.Fatalf("schema rows = %d, want 1", schemaCount)
+			}
+		})
+	}
+}
+
+func TestInformationSchemaColumnsCompatScopesLoadedMetadataToSelectedCatalog(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
@@ -271,7 +393,7 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "posthog"); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "ducklake"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -347,23 +469,14 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 		}
 	}
 
-	assertColumns("ducklake.billing_public,memory.main", "posthog", "NO", "json")
-	assertColumns("iceberg.billing_public,memory.main", "iceberg", "YES", "text")
+	assertColumns("ducklake.billing_public,memory.main", "ducklake", "NO", "json")
+	assertColumns("iceberg.billing_public,memory.main", "ducklake", "NO", "json")
 
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "iceberg"); err != nil {
+		t.Fatalf("init iceberg session database metadata: %v", err)
+	}
 	if _, err := db.Exec("USE iceberg.public"); err != nil {
 		t.Fatalf("use iceberg.public: %v", err)
 	}
-	var gotCatalog, gotNullable string
-	if err := db.QueryRow(`
-		SELECT table_catalog, is_nullable
-		FROM memory.main.information_schema_columns_compat
-		WHERE table_schema = 'billing_public'
-			AND table_name = 'public_api_keys'
-			AND column_name = 'id'
-	`).Scan(&gotCatalog, &gotNullable); err != nil {
-		t.Fatalf("query id metadata after USE iceberg.public: %v", err)
-	}
-	if gotCatalog != "iceberg" || gotNullable != "YES" {
-		t.Fatalf("id metadata after USE iceberg.public = (%q, %q), want (iceberg, YES)", gotCatalog, gotNullable)
-	}
+	assertColumns("iceberg.billing_public,memory.main", "iceberg", "YES", "text")
 }
