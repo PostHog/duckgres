@@ -35,6 +35,9 @@ type captureRuntimeWorkerStore struct {
 	claimOwnerCPID                   string
 	claimOrgID                       string
 	claimImage                       string
+	claimProfileCPU                  string
+	claimProfileMemory               string
+	claimProfileColocate             bool
 	claimMaxOrgWorkers               int
 	claimMaxGlobalWorkers            int
 	spawned                          *configstore.WorkerRecord
@@ -157,13 +160,16 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
 	s.claimOwnerCPID = ownerCPInstanceID
 	s.claimOrgID = orgID
 	s.claimImage = image
+	s.claimProfileCPU = profileCPU
+	s.claimProfileMemory = profileMemory
+	s.claimProfileColocate = profileColocate
 	s.claimMaxOrgWorkers = maxOrgWorkers
 	s.claimMaxGlobalWorkers = maxGlobalWorkers
 	if s.claimErr != nil {
@@ -873,7 +879,7 @@ func TestK8sPool_SpawnWorkerCleansUpPodAndSecretWhenRPCSecurityReadFails(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := pool.spawnWorker(ctx, workerID, "duckgres:test", false)
+	err := pool.spawnWorker(ctx, workerID, "duckgres:test", WorkerProfile{}, false)
 	if err == nil {
 		t.Fatal("spawnWorker succeeded; want readWorkerRPCSecurity failure")
 	}
@@ -923,7 +929,7 @@ func TestK8sPool_SpawnWorkerCleansUpWhenRPCSecurityReadCancelsContext(t *testing
 		return true, nil, context.Canceled
 	})
 
-	err := pool.spawnWorker(ctx, workerID, "duckgres:test", false)
+	err := pool.spawnWorker(ctx, workerID, "duckgres:test", WorkerProfile{}, false)
 	if err == nil {
 		t.Fatal("spawnWorker succeeded; want readWorkerRPCSecurity failure")
 	}

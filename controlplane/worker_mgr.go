@@ -29,7 +29,8 @@ type ManagedWorker struct {
 	ID                      int
 	podName                 string
 	nodeName                string //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
-	image                   string //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
+	image                   string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
+	profile                 WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
 	cmd                     *exec.Cmd
 	socketPath              string
 	bearerToken             string
@@ -658,7 +659,8 @@ func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
 //
 // This ensures the number of worker processes never exceeds maxWorkers while
 // allowing unlimited concurrent sessions across the fixed pool.
-func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
+	// Process-backed single-tenant pool; worker-profile selection does not apply.
 	acquireStart := time.Now()
 	defer func() {
 		observeControlPlaneWorkerAcquire(time.Since(acquireStart))
@@ -735,7 +737,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 		p.mu.Unlock()
 		// Brief backoff then retry — the in-progress spawn will add a worker shortly.
 		time.Sleep(100 * time.Millisecond)
-		return p.AcquireWorker(ctx)
+		return p.AcquireWorker(ctx, nil)
 	}
 	id := p.nextWorkerID
 	p.nextWorkerID++

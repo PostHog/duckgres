@@ -70,7 +70,7 @@ func TestWorkerDuckDBLimits_RemoteBackend(t *testing.T) {
 				isRemoteBackend: true,
 			}
 
-			gotMem, gotThreads := cp.workerDuckDBLimits()
+			gotMem, gotThreads := cp.workerDuckDBLimits(nil)
 			if gotMem != tt.wantMem {
 				t.Errorf("memLimit = %q, want %q", gotMem, tt.wantMem)
 			}
@@ -124,7 +124,7 @@ func TestSessionLimitsRouting(t *testing.T) {
 		}
 
 		// In remote mode, limits should come from worker pod spec, NOT the rebalancer
-		memLimit, threads := cp.workerDuckDBLimits()
+		memLimit, threads := cp.workerDuckDBLimits(nil)
 		if memLimit != "270GB" {
 			t.Errorf("remote mode should use worker memory, got %q", memLimit)
 		}
@@ -158,7 +158,7 @@ func TestSessionLimitsRouting(t *testing.T) {
 		}
 
 		// In process mode, workerDuckDBLimits returns empty (no K8s config)
-		memLimit, threads := cp.workerDuckDBLimits()
+		memLimit, threads := cp.workerDuckDBLimits(nil)
 		if memLimit != "" || threads != 0 {
 			t.Errorf("process mode workerDuckDBLimits should be empty, got mem=%q threads=%d", memLimit, threads)
 		}

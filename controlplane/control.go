@@ -126,6 +126,34 @@ type K8sConfig struct {
 	WorkerTolerationValue           string        // Taint value for worker pod NoSchedule toleration
 	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
 	AWSRegion                       string        // AWS region for STS client
+
+	// Connection-string worker-profile selection (duckgres.colocate / worker_cpu /
+	// worker_memory / worker_tier). All default to the off/empty state, so absent
+	// config = today's exclusive behavior. See docs/design/connection-string-worker-profile.md.
+	AllowClientWorkerProfile       bool                         // Master gate: honor duckgres.* startup options at all
+	AllowClientExclusiveNode       bool                         // Permit a client to request colocate=false (a full exclusive node)
+	ColocatedWorkerCPURequest      string                       // Default CPU for colocate=true with no size (e.g. "4")
+	ColocatedWorkerMemoryRequest   string                       // Default memory for colocate=true with no size (e.g. "16Gi")
+	ColocatedWorkerNodeSelector    string                       // JSON nodeSelector for colocated (bin-pack) worker pods
+	ColocatedWorkerTolerationKey   string                       // Taint key for colocated worker pod NoSchedule toleration
+	ColocatedWorkerTolerationValue string                       // Taint value for colocated worker pod NoSchedule toleration
+	WorkerProfileMinCPU            string                       // Clamp floor for a client-supplied cpu (e.g. "1")
+	WorkerProfileMaxCPU            string                       // Clamp ceiling for a client-supplied cpu (e.g. "16")
+	WorkerProfileMinMemory         string                       // Clamp floor for a client-supplied memory (e.g. "4Gi")
+	WorkerProfileMaxMemory         string                       // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
+	OrgMaxColocatedCPU             int                          // Per-org cap on summed colocated worker CPU cores (0 = unbounded)
+	OrgMaxColocatedMemory          string                       // Per-org cap on summed colocated worker memory (e.g. "256Gi")
+	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier
+}
+
+// WorkerProfileSpec is a named tier alias: a preset {cpu, memory, colocate} bundle
+// a client can select with `duckgres.worker_tier=<name>` instead of inline sizes.
+// Explicit inline GUCs override a tier's fields. Colocate is a pointer so a tier
+// can pin exclusive (false) distinctly from "unset"; nil inherits the default.
+type WorkerProfileSpec struct {
+	CPU      string
+	Memory   string
+	Colocate *bool
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -858,8 +886,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// pgjdbc `currentSchema`), so a session can pick its default catalog at
 	// connect (e.g. iceberg.public). Sanitized here at the trust boundary;
 	// empty/invalid falls back to the worker's default search_path.
+	startupOptions := server.ParseStartupOptions(startupParams["options"])
 	var clientSearchPath string
-	if raw := server.ParseStartupOptions(startupParams["options"])["search_path"]; raw != "" {
+	if raw := startupOptions["search_path"]; raw != "" {
 		if sp, ok := server.SanitizeSearchPath(raw); ok {
 			clientSearchPath = sp
 		} else {
@@ -993,6 +1022,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
+	// Resolve the requested worker shape from the connection-string startup
+	// options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
+	// nil => the default exclusive profile. Gated off by default, so this is a
+	// no-op unless the deployment opts in. A rejected profile fails the connect.
+	workerProfile, profileWarns, profileErr := cp.resolveWorkerProfile(startupOptions)
+	if profileErr != nil {
+		slog.Warn("Rejected worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", profileErr)
+		_ = server.WriteErrorResponse(writer, "FATAL", "22023", profileErr.Error())
+		_ = writer.Flush()
+		return
+	}
+	for _, w := range profileWarns {
+		slog.Warn("Adjusted worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "detail", w)
+	}
+
 	// Resolve the session manager and rebalancer for this connection.
 	// In multi-tenant mode, each org has its own stack.
 	var sessions *SessionManager
@@ -1074,7 +1118,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		threads  int
 	)
 	if cp.isRemoteBackend {
-		memLimit, threads = cp.workerDuckDBLimits()
+		memLimit, threads = cp.workerDuckDBLimits(workerProfile)
 	} else if rebalancer != nil {
 		memLimit = rebalancer.MemoryLimit()
 		threads = rebalancer.PerSessionThreads()
@@ -1085,7 +1129,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
 		func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
-			return sessions.CreateSession(ctx, username, pid, memLimit, threads)
+			return sessions.CreateSession(ctx, username, pid, memLimit, threads, workerProfile)
 		},
 	)
 	if err != nil {
@@ -1263,8 +1307,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // pod's K8s resource spec. Uses 75% of the worker's memory limit for DuckDB
 // and the full CPU request as thread count. Returns empty/zero if worker
 // resources are not configured (DuckDB will then auto-detect on the worker).
-func (cp *ControlPlane) workerDuckDBLimits() (memLimit string, threads int) {
+func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit string, threads int) {
+	// A non-default profile sizes DuckDB from the profile's pod shape, not the
+	// pool-global request, so a small colocated worker gets matching limits. An
+	// empty profile field falls back to the pool-global request (today's value).
 	memReq := cp.cfg.K8s.WorkerMemoryRequest
+	cpuReq := cp.cfg.K8s.WorkerCPURequest
+	if profile != nil {
+		if profile.Memory != "" {
+			memReq = profile.Memory
+		}
+		if profile.CPU != "" {
+			cpuReq = profile.CPU
+		}
+	}
+
 	if memReq != "" {
 		memBytes := parseK8sMemory(memReq)
 		if memBytes > 0 {
@@ -1279,7 +1336,6 @@ func (cp *ControlPlane) workerDuckDBLimits() (memLimit string, threads int) {
 		}
 	}
 
-	cpuReq := cp.cfg.K8s.WorkerCPURequest
 	if cpuReq != "" {
 		threads = parseK8sCPU(cpuReq)
 	}
