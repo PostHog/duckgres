@@ -293,6 +293,19 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				datetime_precision
 			FROM main.__duckgres_iceberg_column_metadata
 		),
+		active_catalog AS (
+			SELECT current_database() AS catalog
+		),
+		filtered_columns AS (
+			SELECT c.*
+			FROM all_columns c
+			CROSS JOIN active_catalog ac
+			WHERE c.source_catalog = ac.catalog
+			OR (
+				ac.catalog <> 'iceberg'
+				AND c.source_catalog IN ('ducklake', 'memory')
+			)
+		),
 		active_search_path AS (
 			SELECT
 				',' || COALESCE(
@@ -337,7 +350,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 						END,
 						c.source_catalog
 				) AS search_path_rank
-			FROM all_columns c
+			FROM filtered_columns c
 			CROSS JOIN active_search_path sp
 		)
 		SELECT
@@ -449,6 +462,13 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
 		)
+		AND (
+			t.table_catalog = current_database()
+			OR (
+				current_database() <> 'iceberg'
+				AND t.table_catalog IN ('ducklake', 'memory')
+			)
+		)
 		AND t.table_name NOT LIKE 'duckdb_%'
 		AND t.table_name NOT LIKE 'sqlite_%'
 		AND t.table_name NOT LIKE 'pragma_%'
@@ -469,6 +489,13 @@ func buildSessionInformationSchemaSchemataViewSQL() string {
 		FROM information_schema.schemata s
 		WHERE s.schema_name NOT IN ('main', 'pg_catalog', 'information_schema')
 		AND s.catalog_name NOT LIKE '__ducklake_metadata_%'
+		AND (
+			s.catalog_name = current_database()
+			OR (
+				current_database() <> 'iceberg'
+				AND s.catalog_name IN ('ducklake', 'memory')
+			)
+		)
 		UNION ALL
 		SELECT current_database() AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
@@ -507,6 +534,13 @@ func buildSessionInformationSchemaViewsViewSQL() string {
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
+		)
+		AND (
+			v.table_catalog = current_database()
+			OR (
+				current_database() <> 'iceberg'
+				AND v.table_catalog IN ('ducklake', 'memory')
+			)
 		)
 		AND v.table_name NOT LIKE 'duckdb_%'
 		AND v.table_name NOT LIKE 'sqlite_%'
