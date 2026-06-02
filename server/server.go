@@ -871,6 +871,18 @@ func SecretDirectory(cfg Config) string {
 	return filepath.Join(cfg.DataDir, "secrets")
 }
 
+// LegacySecretDirectory returns DuckDB's pre-pinning default persistent-secret
+// location for a worker whose HOME is its DataDir (<DataDir>/.duckdb/stored_secrets).
+// This is where secrets accumulated before SecretDirectory pinning existed, and
+// the only reason it's a named helper is so the recycle wipe and this derivation
+// stay colocated and can't drift apart. Returns "" when DataDir is unset.
+func LegacySecretDirectory(cfg Config) string {
+	if cfg.DataDir == "" {
+		return ""
+	}
+	return filepath.Join(cfg.DataDir, ".duckdb", "stored_secrets")
+}
+
 // ConfigureMainDB applies the per-instance DuckDB settings (threads, memory,
 // temp dir, extensions, profiling) that the client-query DB needs. Shared
 // between openBaseDB (single-DB path) and OpenDuckDBPair (shared-connector

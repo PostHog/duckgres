@@ -86,7 +86,7 @@ func TestWipePersistedSecretsOnRecycle(t *testing.T) {
 	// Also plant a file in the legacy default location (<DataDir>/.duckdb/
 	// stored_secrets) — where a worker whose HOME is its DataDir accumulated
 	// secrets before we pinned secret_directory. The recycle must clear this too.
-	legacyDir := filepath.Join(cfg.DataDir, ".duckdb", "stored_secrets")
+	legacyDir := server.LegacySecretDirectory(cfg)
 	if err := os.MkdirAll(legacyDir, 0o750); err != nil {
 		t.Fatalf("mkdir legacy secret dir: %v", err)
 	}

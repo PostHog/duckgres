@@ -56,11 +56,17 @@ func TestDisablePersistentSecrets(t *testing.T) {
 		t.Errorf("seeded persistent secret was loaded (count=%d); allow_persistent_secrets=false should prevent it", loaded)
 	}
 
-	// (a) CREATE PERSISTENT SECRET must be rejected.
-	if _, err := db.Exec("CREATE PERSISTENT SECRET nope (TYPE s3, KEY_ID 'a', SECRET 'b')"); err == nil {
-		t.Error("CREATE PERSISTENT SECRET succeeded; expected it to be rejected when persistent secrets are disabled")
-	} else if !strings.Contains(strings.ToLower(err.Error()), "persistent secrets are disabled") {
-		t.Errorf("CREATE PERSISTENT SECRET rejected, but not for the expected reason: %v", err)
+	// (a) CREATE PERSISTENT SECRET must be rejected — including the OR REPLACE
+	// variant, which is what most callers actually write.
+	for _, stmt := range []string{
+		"CREATE PERSISTENT SECRET nope (TYPE s3, KEY_ID 'a', SECRET 'b')",
+		"CREATE OR REPLACE PERSISTENT SECRET nope2 (TYPE s3, KEY_ID 'a', SECRET 'b')",
+	} {
+		if _, err := db.Exec(stmt); err == nil {
+			t.Errorf("%q succeeded; expected rejection when persistent secrets are disabled", stmt)
+		} else if !strings.Contains(strings.ToLower(err.Error()), "persistent secrets are disabled") {
+			t.Errorf("%q rejected, but not for the expected reason: %v", stmt, err)
+		}
 	}
 
 	// A temporary (in-memory) secret — the kind workers actually use — must
@@ -78,5 +84,13 @@ func TestSecretDirectory(t *testing.T) {
 	want := filepath.Join("/data", "secrets")
 	if got := SecretDirectory(Config{DataDir: "/data"}); got != want {
 		t.Errorf("SecretDirectory(/data) = %q, want %q", got, want)
+	}
+
+	if got := LegacySecretDirectory(Config{}); got != "" {
+		t.Errorf("LegacySecretDirectory with empty DataDir = %q, want \"\"", got)
+	}
+	wantLegacy := filepath.Join("/data", ".duckdb", "stored_secrets")
+	if got := LegacySecretDirectory(Config{DataDir: "/data"}); got != wantLegacy {
+		t.Errorf("LegacySecretDirectory(/data) = %q, want %q", got, wantLegacy)
 	}
 }

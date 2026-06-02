@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,7 +176,7 @@ func wipePersistedSecrets(cfg server.Config) {
 	}
 	dirs := []string{
 		server.SecretDirectory(cfg),
-		filepath.Join(cfg.DataDir, ".duckdb", "stored_secrets"),
+		server.LegacySecretDirectory(cfg),
 	}
 	for _, dir := range dirs {
 		if dir == "" {
