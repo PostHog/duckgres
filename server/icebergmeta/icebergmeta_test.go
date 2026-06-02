@@ -123,9 +123,12 @@ func TestLoadColumnsUsesLakekeeperREST(t *testing.T) {
 		"'public_api_keys'",
 		"'id'",
 		"'NO'",
-		"'string'",
+		// data_type is normalized to the canonical PostgreSQL type name:
+		// Iceberg "string" -> "text", "decimal(10,2)" -> "numeric" (with
+		// precision/scale carried in their own columns).
+		"'text'",
 		"'amount'",
-		"'decimal(10,2)'",
+		"'numeric'",
 		"10",
 		"2",
 		"'billing_productseat'",

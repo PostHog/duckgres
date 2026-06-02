@@ -12,10 +12,14 @@ import (
 // information_schema, etc.). Without this transform, schema-qualified user queries like
 // `SELECT * FROM public.mytable` are sent to DuckDB unchanged and fail because DuckDB has no "public"
 // schema by default.
-type PublicSchemaTransform struct{}
+type PublicSchemaTransform struct {
+	// enabled gates the public→main rewrite. It is false for backends (Iceberg)
+	// whose physical default schema is literally "public".
+	enabled bool
+}
 
-func NewPublicSchemaTransform() *PublicSchemaTransform {
-	return &PublicSchemaTransform{}
+func NewPublicSchemaTransform(enabled bool) *PublicSchemaTransform {
+	return &PublicSchemaTransform{enabled: enabled}
 }
 
 func (t *PublicSchemaTransform) Name() string {
@@ -23,6 +27,10 @@ func (t *PublicSchemaTransform) Name() string {
 }
 
 func (t *PublicSchemaTransform) Transform(tree *pg_query.ParseResult, _ *Result) (bool, error) {
+	if !t.enabled {
+		return false, nil
+	}
+
 	changed := false
 
 	WalkFunc(tree, func(node *pg_query.Node) bool {

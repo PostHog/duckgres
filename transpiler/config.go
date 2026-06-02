@@ -1,11 +1,19 @@
 package transpiler
 
+import backendpkg "github.com/posthog/duckgres/transpiler/backend"
+
 // Config controls transpilation behavior
 type Config struct {
-	// DuckLakeMode enables DDL constraint stripping for DuckLake compatibility.
-	// When true, PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints are removed,
-	// SERIAL types are converted to INTEGER, and DEFAULT now() is stripped.
+	// DuckLakeMode is a legacy convenience: when Backend is unset, DuckLakeMode==true
+	// selects the DuckLake backend profile and false selects the memory profile.
+	// Prefer setting Backend explicitly. When true, PRIMARY KEY, UNIQUE, FOREIGN KEY,
+	// CHECK constraints are removed, SERIAL types are converted to INTEGER, and
+	// DEFAULT now() is stripped.
 	DuckLakeMode bool
+
+	// Backend selects the storage backend profile. When empty, it is derived from
+	// DuckLakeMode (ducklake when true, memory when false).
+	Backend backendpkg.Name
 
 	// LogicalDatabaseName is the client-visible database name for the session.
 	// When set in DuckLake mode, three-part references using this catalog are
@@ -29,6 +37,28 @@ func DefaultConfig() Config {
 		PhysicalCatalogName: "",
 		ConvertPlaceholders: false,
 	}
+}
+
+// resolveBackend returns the effective backend. An explicit Backend wins;
+// otherwise it is derived from the legacy DuckLakeMode flag.
+func (c Config) resolveBackend() backendpkg.Name {
+	if c.Backend != "" {
+		return c.Backend
+	}
+	if c.DuckLakeMode {
+		return backendpkg.DuckLake
+	}
+	return backendpkg.Memory
+}
+
+// profile returns the backend profile for this config, with any explicit
+// PhysicalCatalogName override applied.
+func (c Config) profile() backendpkg.Profile {
+	return backendpkg.WithPhysicalCatalog(backendpkg.ForName(c.resolveBackend()), c.PhysicalCatalogName)
+}
+
+func ConfigForBackend(name backendpkg.Name) Config {
+	return Config{Backend: name}
 }
 
 // Result contains the output of transpilation

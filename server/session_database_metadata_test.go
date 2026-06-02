@@ -283,6 +283,7 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 			ordinal_position,
 			is_nullable,
 			data_type,
+			udt_name,
 			character_maximum_length,
 			character_octet_length,
 			numeric_precision,
@@ -290,8 +291,8 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 			datetime_precision
 		)
 		VALUES
-			('billing_public', 'public_api_keys', 'id', 1, 'YES', 'STRING', NULL, NULL, NULL, NULL, NULL),
-			('billing_public', 'public_api_keys', 'permissions', 2, 'YES', 'STRING', NULL, NULL, NULL, NULL, NULL)
+			('billing_public', 'public_api_keys', 'id', 1, 'YES', 'text', 'text', NULL, NULL, NULL, NULL, NULL),
+			('billing_public', 'public_api_keys', 'permissions', 2, 'YES', 'text', 'text', NULL, NULL, NULL, NULL, NULL)
 	`); err != nil {
 		t.Fatalf("insert iceberg metadata: %v", err)
 	}

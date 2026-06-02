@@ -188,6 +188,7 @@ type clientConn struct {
 	queryStart      atomic.Value // stores time.Time — when current query started (lock-free)
 	workerID        int          // control plane worker ID, -1 for standalone
 	workerPod       string       // K8s pod name of the worker, empty for standalone or in-process workers
+	physicalCatalog string       // selected DuckDB catalog for execution, empty for memory/standalone default
 
 	// lastProfilingSummary holds the rollup from the most recent
 	// EnrichSpanWithProfiling call on this connection. Consumed by the very
@@ -198,22 +199,34 @@ type clientConn struct {
 
 // newTranspiler creates a transpiler configured for this connection.
 //
-// LogicalDatabaseName is pinned to the physical DuckLake catalog ("ducklake")
-// rather than the client's connection database. duckgres no longer masks a
-// logical database name onto the physical catalog; the only remaining job of
-// the logical-catalog transform is to map `ducklake.public.*` → `ducklake.main.*`
-// (DuckLake's real schema is `main`). Iceberg three-part refs and arbitrary
-// names are left untouched.
+// The backend profile selects DDL/DML/catalog compatibility policy. The client
+// database remains PostgreSQL-visible; LogicalDatabaseName maps three-part
+// references using that database to the selected physical catalog.
 func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
-	duckLakeMode := c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake
-	logicalDatabaseName := ""
-	if duckLakeMode {
-		logicalDatabaseName = physicalDuckLakeCatalog
+	backend := transpiler.BackendMemory
+	physicalCatalog := c.physicalCatalog
+	switch {
+	case physicalCatalog == iceberg.CatalogName:
+		backend = transpiler.BackendIceberg
+	case physicalCatalog == physicalDuckLakeCatalog:
+		backend = transpiler.BackendDuckLake
+	case c.server.cfg.Iceberg.Enabled || c.hasTenantIcebergConfig:
+		backend = transpiler.BackendIceberg
+		physicalCatalog = iceberg.CatalogName
+	case c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake:
+		backend = transpiler.BackendDuckLake
+		physicalCatalog = physicalDuckLakeCatalog
 	}
+
+	logicalDatabaseName := ""
+	if backend == transpiler.BackendDuckLake || backend == transpiler.BackendIceberg {
+		logicalDatabaseName = c.database
+	}
+
 	return transpiler.New(transpiler.Config{
-		DuckLakeMode:        duckLakeMode,
+		Backend:             backend,
 		LogicalDatabaseName: logicalDatabaseName,
-		PhysicalCatalogName: physicalDuckLakeCatalog,
+		PhysicalCatalogName: physicalCatalog,
 		ConvertPlaceholders: convertPlaceholders,
 	})
 }
@@ -431,7 +444,12 @@ func classifyErrorCode(err error) string {
 		return "40001" // serialization_failure — client should retry
 	}
 
-	msg := err.Error()
+	// Workers reach the control plane over Arrow Flight SQL, so DuckDB errors
+	// arrive wrapped as "flight execute update: rpc error: code = X desc = <msg>".
+	// Unwrap to recover the underlying DuckDB exception message so the prefix
+	// classifiers below apply; otherwise every Iceberg/DuckLake worker error
+	// would fall through to XX000 and the client would see the raw rpc string.
+	msg := unwrapFlightError(err.Error())
 	switch {
 	case strings.HasPrefix(msg, "Catalog Error:"):
 		return catalogErrorCode(msg)
@@ -447,6 +465,9 @@ func classifyErrorCode(err error) string {
 		return constraintErrorCode(msg)
 	case strings.HasPrefix(msg, "Permission Error:"):
 		return "42501" // insufficient_privilege
+	case strings.HasPrefix(msg, "Not implemented Error:"),
+		strings.HasPrefix(msg, "Invalid Input Error: Not implemented"):
+		return "0A000" // feature_not_supported
 	case strings.HasPrefix(msg, "Transaction Error:"),
 		strings.HasPrefix(msg, "TransactionContext Error:"):
 		return "25000" // invalid_transaction_state — DuckDB emits both prefixes
@@ -460,6 +481,32 @@ func classifyErrorCode(err error) string {
 	// path. If a future DuckDB error needs to land in a user class, add
 	// a prefix branch above instead of moving the fallback.
 	return "XX000"
+}
+
+// transformErrorSQLState returns the SQLSTATE for a transpiler-detected error.
+// A transform may attach an explicit code (e.g. 0A000 for an unsupported
+// feature via transform.CodedError); otherwise it defaults to 42704
+// (undefined_object), matching the historical behavior for unrecognized config
+// parameters.
+func transformErrorSQLState(err error) string {
+	var coded interface{ SQLState() string }
+	if errors.As(err, &coded) {
+		return coded.SQLState()
+	}
+	return "42704"
+}
+
+// unwrapFlightError recovers the underlying error message from an Arrow Flight /
+// gRPC wrapper. gRPC errors stringify as "… rpc error: code = X desc = <message>",
+// and the control plane further prefixes worker failures with "flight execute
+// update: " (and similar). When the message is not Flight-wrapped it is returned
+// unchanged, so this is safe to apply unconditionally before prefix matching.
+func unwrapFlightError(msg string) string {
+	// gRPC puts the real message after the final "desc = ".
+	if idx := strings.LastIndex(msg, "desc = "); idx != -1 {
+		return strings.TrimSpace(msg[idx+len("desc = "):])
+	}
+	return strings.TrimSpace(msg)
 }
 
 // catalogErrorCode narrows a "Catalog Error: …" message to a specific SQLSTATE
@@ -1046,9 +1093,10 @@ func (c *clientConn) serve() error {
 		}
 		initCancel()
 		// Keep c.database aligned with the real catalog so observability surfaces
-		// (pg_stat_activity.datname, logs) agree with current_database(). The
-		// control-plane path does the equivalent via NewClientConn(database=…).
+		// agree with current_database(); record the physical catalog so the
+		// transpiler selects the right backend profile (DuckLake/Iceberg).
 		c.database = catalog
+		c.physicalCatalog = catalog
 		c.catalogUseRewrite = duckLakeAttached || icebergAttached
 	}
 
@@ -1424,7 +1472,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
 	if result.Error != nil {
-		c.sendError("ERROR", "42704", result.Error.Error())
+		c.sendError("ERROR", transformErrorSQLState(result.Error), result.Error.Error())
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2128,7 +2176,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	}
 
 	if result.Error != nil {
-		c.sendError("ERROR", "42704", result.Error.Error())
+		c.sendError("ERROR", transformErrorSQLState(result.Error), result.Error.Error())
 		return true, nil
 	}
 
@@ -5234,7 +5282,7 @@ func (c *clientConn) handleParse(body []byte) {
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
 	if result.Error != nil {
-		c.sendError("ERROR", "42704", result.Error.Error())
+		c.sendError("ERROR", transformErrorSQLState(result.Error), result.Error.Error())
 		return
 	}
 

@@ -1227,6 +1227,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			server.SetConnectionIcebergConfig(cc, icebergCfg)
 		}
 	}
+	// Record the resolved physical catalog so the transpiler selects the right
+	// backend profile (DuckLake/Iceberg DDL+DML policy) for this session.
+	server.SetConnectionPhysicalCatalog(cc, effectiveCatalog)
 	// Catalog USE rewriting (expanding bare `USE ducklake`/`USE iceberg` to the
 	// reliable two-part target) is a non-passthrough feature; passthrough sessions
 	// talk raw DuckDB, so keep it disabled for them. Enabled whenever either

@@ -1,6 +1,8 @@
 package transform
 
 import (
+	"strings"
+
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
@@ -43,6 +45,18 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 		}
 
 		if insert := stmt.Stmt.GetInsertStmt(); insert != nil {
+			// On a constraint-less backend (MERGE rewrite enabled), ON CONFLICT ON
+			// CONSTRAINT <name> cannot be honored: there is no named constraint to
+			// infer the conflict target from. Reject it with a clean PostgreSQL
+			// error rather than letting it fail opaquely at DuckDB.
+			if t.DuckLakeMode && insert.OnConflictClause != nil &&
+				insert.OnConflictClause.Infer != nil &&
+				strings.TrimSpace(insert.OnConflictClause.Infer.Conname) != "" {
+				result.Error = NewFeatureNotSupported(
+					"ON CONFLICT ON CONSTRAINT is not supported: this catalog does not enforce named constraints")
+				return false, nil
+			}
+
 			if mergeStmt := t.transformInsertToMerge(insert); mergeStmt != nil {
 				// Replace the INSERT statement with MERGE
 				stmt.Stmt = &pg_query.Node{

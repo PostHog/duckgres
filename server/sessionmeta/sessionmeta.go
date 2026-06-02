@@ -167,6 +167,7 @@ func sessionIcebergColumnMetadataTableSQL() string {
 			ordinal_position INTEGER NOT NULL,
 			is_nullable VARCHAR NOT NULL,
 			data_type VARCHAR NOT NULL,
+			udt_name VARCHAR,
 			character_maximum_length INTEGER,
 			character_octet_length INTEGER,
 			numeric_precision INTEGER,
@@ -247,6 +248,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				c.column_default,
 				c.is_nullable,
 				c.data_type,
+				c.udt_name,
 				COALESCE(m.character_maximum_length, c.character_maximum_length) AS character_maximum_length,
 				c.character_octet_length,
 				COALESCE(m.numeric_precision, c.numeric_precision) AS numeric_precision,
@@ -283,6 +285,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				NULL AS column_default,
 				is_nullable,
 				data_type,
+				udt_name,
 				character_maximum_length,
 				character_octet_length,
 				numeric_precision,
@@ -397,7 +400,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			NULL AS domain_name,
 			NULL AS udt_catalog,
 			NULL AS udt_schema,
-			NULL AS udt_name,
+			c.udt_name,
 			NULL AS scope_catalog,
 			NULL AS scope_schema,
 			NULL AS scope_name,
@@ -437,7 +440,7 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			NULL AS commit_action
 		FROM information_schema.tables t
 		WHERE t.table_name NOT IN (
-			'__duckgres_column_metadata',
+			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',

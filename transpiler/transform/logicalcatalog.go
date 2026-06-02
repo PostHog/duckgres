@@ -11,15 +11,19 @@ import (
 type LogicalCatalogTransform struct {
 	LogicalDatabaseName string
 	PhysicalCatalogName string
+	// MapPublicToMain rewrites a "public" schema reference to "main" when
+	// rewriting the catalog. False for Iceberg, whose physical schema is "public".
+	MapPublicToMain bool
 }
 
-func NewLogicalCatalogTransform(logicalDatabaseName, physicalCatalogName string) *LogicalCatalogTransform {
+func NewLogicalCatalogTransform(logicalDatabaseName, physicalCatalogName string, mapPublicToMain bool) *LogicalCatalogTransform {
 	if physicalCatalogName == "" {
 		physicalCatalogName = "ducklake"
 	}
 	return &LogicalCatalogTransform{
 		LogicalDatabaseName: logicalDatabaseName,
 		PhysicalCatalogName: physicalCatalogName,
+		MapPublicToMain:     mapPublicToMain,
 	}
 }
 
@@ -66,7 +70,7 @@ func (t *LogicalCatalogTransform) rewriteRangeVar(rv *pg_query.RangeVar) bool {
 	}
 
 	rv.Catalogname = t.PhysicalCatalogName
-	if strings.EqualFold(rv.Schemaname, "public") {
+	if t.MapPublicToMain && strings.EqualFold(rv.Schemaname, "public") {
 		rv.Schemaname = "main"
 	}
 	return true
@@ -87,9 +91,11 @@ func (t *LogicalCatalogTransform) rewriteDropObjects(objects []*pg_query.Node) b
 		}
 
 		catalog.Sval = t.PhysicalCatalogName
-		schema := list.Items[1].GetString_()
-		if schema != nil && strings.EqualFold(schema.Sval, "public") {
-			schema.Sval = "main"
+		if t.MapPublicToMain {
+			schema := list.Items[1].GetString_()
+			if schema != nil && strings.EqualFold(schema.Sval, "public") {
+				schema.Sval = "main"
+			}
 		}
 		changed = true
 	}

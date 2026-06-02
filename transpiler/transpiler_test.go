@@ -1,6 +1,7 @@
 package transpiler
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -296,6 +297,132 @@ func TestTranspile_LogicalCatalogMapping_DuckLakeMode(t *testing.T) {
 			}
 			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
 				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_PublicSchema_Iceberg(t *testing.T) {
+	// Iceberg's physical schema is literally "public" (DuckDB shadows "main" on
+	// REST catalogs), so the public→main rewrite must be DISABLED for Iceberg.
+	// Iceberg sessions are wired with an empty LogicalDatabaseName (newTranspiler),
+	// so three-part references pass through untouched.
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "two-part public reference stays public (not rewritten to main)",
+			input:    "SELECT * FROM public.users",
+			contains: "public.users",
+			excludes: "main.users",
+		},
+		{
+			name:     "explicit iceberg catalog is preserved",
+			input:    "SELECT * FROM iceberg.public.users",
+			contains: "iceberg.public.users",
+			excludes: "iceberg.main.users",
+		},
+		{
+			name:     "arbitrary three-part reference is left untouched",
+			input:    "SELECT * FROM analytics.public.users",
+			contains: "analytics.public.users",
+			excludes: "analytics.main.users",
+		},
+	}
+
+	tr := New(Config{Backend: BackendIceberg})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_DDL_Iceberg(t *testing.T) {
+	// The Iceberg backend uses the same DDL policy as DuckLake: strip enforced
+	// constraints, rewrite SERIAL, no-op unsupported DDL.
+	tr := New(Config{Backend: BackendIceberg})
+
+	t.Run("strip PRIMARY KEY and convert SERIAL", func(t *testing.T) {
+		result, err := tr.Transpile("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if strings.Contains(strings.ToUpper(result.SQL), "PRIMARY KEY") {
+			t.Errorf("PRIMARY KEY not stripped: %q", result.SQL)
+		}
+		if strings.Contains(strings.ToUpper(result.SQL), "SERIAL") {
+			t.Errorf("SERIAL not converted: %q", result.SQL)
+		}
+	})
+
+	t.Run("CREATE INDEX is a no-op", func(t *testing.T) {
+		result, err := tr.Transpile("CREATE INDEX idx ON t (id)")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if !result.IsNoOp || result.NoOpTag != "CREATE INDEX" {
+			t.Errorf("expected CREATE INDEX no-op, got IsNoOp=%v tag=%q", result.IsNoOp, result.NoOpTag)
+		}
+	})
+}
+
+func TestTranspile_FeatureNotSupported_Rejected(t *testing.T) {
+	assertFeatureNotSupported := func(t *testing.T, result *Result) {
+		t.Helper()
+		if result.Error == nil {
+			t.Fatalf("expected an error, got SQL=%q", result.SQL)
+		}
+		var coded interface{ SQLState() string }
+		if !errors.As(result.Error, &coded) {
+			t.Fatalf("error %v does not carry a SQLSTATE", result.Error)
+		}
+		if got := coded.SQLState(); got != "0A000" {
+			t.Errorf("SQLSTATE = %q, want 0A000", got)
+		}
+	}
+
+	for _, backend := range []StorageBackend{BackendDuckLake, BackendIceberg} {
+		tr := New(Config{Backend: backend})
+
+		t.Run(string(backend)+"/ON CONFLICT ON CONSTRAINT", func(t *testing.T) {
+			result, err := tr.Transpile(
+				"INSERT INTO t (id, v) VALUES (1, 2) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING")
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			assertFeatureNotSupported(t, result)
+		})
+
+		t.Run(string(backend)+"/ALTER COLUMN TYPE USING", func(t *testing.T) {
+			result, err := tr.Transpile(
+				"ALTER TABLE t ALTER COLUMN c TYPE integer USING c::integer")
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			assertFeatureNotSupported(t, result)
+		})
+
+		t.Run(string(backend)+"/ALTER COLUMN TYPE without USING is allowed", func(t *testing.T) {
+			result, err := tr.Transpile("ALTER TABLE t ALTER COLUMN c TYPE integer")
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			if result.Error != nil {
+				t.Errorf("plain ALTER COLUMN TYPE should not error, got %v", result.Error)
 			}
 		})
 	}
@@ -972,6 +1099,24 @@ func TestTranspile_DDL_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_AlterColumnTypeUsingRejected(t *testing.T) {
+	tr := New(ConfigForBackend(BackendIceberg))
+	result, err := tr.Transpile("ALTER TABLE public.users ALTER COLUMN id TYPE text USING id::text")
+	if err != nil {
+		t.Fatalf("Transpile returned error: %v", err)
+	}
+	if result.Error == nil {
+		t.Fatal("expected feature-not-supported error")
+	}
+	coded, ok := result.Error.(interface{ SQLState() string })
+	if !ok {
+		t.Fatalf("error does not expose SQLState: %T", result.Error)
+	}
+	if coded.SQLState() != "0A000" {
+		t.Fatalf("SQLState = %q, want 0A000", coded.SQLState())
+	}
+}
+
 func TestTranspile_DDL_NoOps(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -981,6 +1126,9 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 		{"CREATE INDEX", "CREATE INDEX idx_name ON users (name)", "CREATE INDEX"},
 		{"DROP INDEX", "DROP INDEX idx_name", "DROP INDEX"},
 		{"VACUUM", "VACUUM users", "VACUUM"},
+		// ANALYZE parses as a VacuumStmt too; it must be detected by Classify
+		// (it contains no other DDL trigger word) and no-op'd with its own tag.
+		{"ANALYZE", "ANALYZE users", "ANALYZE"},
 		{"GRANT", "GRANT SELECT ON users TO public", "GRANT"},
 		{"REVOKE", "REVOKE SELECT ON users FROM public", "REVOKE"},
 		{"ALTER TABLE ADD CONSTRAINT", "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id)", "ALTER TABLE"},
@@ -1012,6 +1160,21 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 				t.Errorf("Transpile(%q) NoOpTag = %q, want %q", tt.input, result.NoOpTag, tt.noOpTag)
 			}
 		})
+	}
+}
+
+// A CREATE TABLE whose only DDL trigger word is GENERATED must still be
+// classified for the DDL transform and have the generated column stripped — a
+// regression where Classify's substring list lacked "GENERATED" let STORED
+// generated columns reach DuckDB (which rejects them on lake catalogs).
+func TestTranspile_DDL_StripsGeneratedColumnWhenSoleTrigger(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+	result, err := tr.Transpile("CREATE TABLE g (id INTEGER, doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED)")
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(result.SQL), "GENERATED") {
+		t.Errorf("GENERATED not stripped: %q", result.SQL)
 	}
 }
 
