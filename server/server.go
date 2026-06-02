@@ -266,6 +266,16 @@ type Config struct {
 	// while TLS, authentication, and query execution happen in child processes.
 	ProcessIsolation bool
 
+	// DisablePersistentSecrets turns off DuckDB's persistent secret storage
+	// (allow_persistent_secrets=false): existing on-disk secrets are not loaded
+	// at startup and CREATE PERSISTENT SECRET is rejected. Set for worker
+	// processes (see duckdbservice.OpenDuckDBPair), where secrets are always
+	// re-created in-memory at activation and a persisted copy on the worker's
+	// DataDir is never durable across recycles — only a latent source of
+	// "secret occurs in multiple storage backends" ambiguity. Left false for
+	// standalone, which may legitimately rely on persistent secrets.
+	DisablePersistentSecrets bool
+
 	// MemoryLimit is the DuckDB memory_limit per session (e.g., "4GB").
 	// If empty, auto-detected from system memory.
 	MemoryLimit string
@@ -915,6 +925,20 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 			slog.Warn("Failed to set DuckDB secret_directory.", "secret_directory", secretDir, "error", err)
 		} else {
 			slog.Debug("Set DuckDB secret_directory.", "secret_directory", secretDir)
+		}
+	}
+
+	// On workers, turn off persistent secret storage entirely. This must run
+	// before the SecretManager's first use (it does — ConfigureMainDB is applied
+	// right after open, before any ATTACH or CREATE SECRET). It both prevents
+	// CREATE PERSISTENT SECRET (which would write a landmine to DataDir) and
+	// stops any pre-existing on-disk secret from being loaded, so it can never
+	// collide with the in-memory secret re-created at activation.
+	if cfg.DisablePersistentSecrets {
+		if _, err := db.Exec("SET allow_persistent_secrets = false"); err != nil {
+			slog.Warn("Failed to disable DuckDB persistent secrets.", "error", err)
+		} else {
+			slog.Debug("Disabled DuckDB persistent secrets.")
 		}
 	}
 

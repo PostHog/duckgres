@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -156,21 +157,38 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 	}
 }
 
-// wipePersistedSecrets removes DuckDB's persistent-secret directory for this
-// config (server.SecretDirectory, pinned under DataDir). Called on worker
-// startup so persisted secrets never survive a recycle. Best-effort: a failure
-// is logged, not fatal — a stale secret is a correctness annoyance, not a
-// reason to refuse to start. No-op when no DataDir is configured.
+// wipePersistedSecrets removes DuckDB's persistent-secret directories for this
+// config. Called on worker startup so persisted secrets never survive a
+// recycle. Best-effort: a failure is logged, not fatal — a stale secret is a
+// correctness annoyance, not a reason to refuse to start. No-op when no DataDir
+// is configured.
+//
+// We wipe two locations:
+//   - the pinned secret_directory (server.SecretDirectory), where new secrets
+//     would land under the current config, and
+//   - the legacy DuckDB default <DataDir>/.duckdb/stored_secrets, which is where
+//     secrets accumulated before we pinned the directory (a worker whose
+//     HOME is its DataDir resolves DuckDB's default there). Without this, the
+//     historical files that caused the original ambiguity would linger on a
+//     persistent DataDir forever.
 func wipePersistedSecrets(cfg server.Config) {
-	secretDir := server.SecretDirectory(cfg)
-	if secretDir == "" {
+	if cfg.DataDir == "" {
 		return
 	}
-	if err := os.RemoveAll(secretDir); err != nil {
-		slog.Warn("Failed to wipe persisted secret directory on worker startup.", "secret_directory", secretDir, "error", err)
-		return
+	dirs := []string{
+		server.SecretDirectory(cfg),
+		filepath.Join(cfg.DataDir, ".duckdb", "stored_secrets"),
 	}
-	slog.Info("Wiped persisted secret directory on worker startup.", "secret_directory", secretDir)
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("Failed to wipe persisted secret directory on worker startup.", "secret_directory", dir, "error", err)
+			continue
+		}
+		slog.Info("Wiped persisted secret directory on worker startup.", "secret_directory", dir)
+	}
 }
 
 // Warmup performs one-time initialization of the shared DuckDB instance.

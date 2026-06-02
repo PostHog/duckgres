@@ -3,6 +3,7 @@ package duckdbservice
 import (
 	"database/sql"
 	"os"
+	"path/filepath"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -79,6 +80,18 @@ func TestWipePersistedSecretsOnRecycle(t *testing.T) {
 		t.Fatalf("secret_directory %s is empty; persistent secret was not written to disk", secretDir)
 	}
 
+	// Also plant a file in the legacy default location (<DataDir>/.duckdb/
+	// stored_secrets) — where a worker whose HOME is its DataDir accumulated
+	// secrets before we pinned secret_directory. The recycle must clear this too.
+	legacyDir := filepath.Join(cfg.DataDir, ".duckdb", "stored_secrets")
+	if err := os.MkdirAll(legacyDir, 0o750); err != nil {
+		t.Fatalf("mkdir legacy secret dir: %v", err)
+	}
+	legacyFile := filepath.Join(legacyDir, "old_secret.duckdb_secret")
+	if err := os.WriteFile(legacyFile, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write legacy secret file: %v", err)
+	}
+
 	// Phase 2 (non-vacuous control): reopen WITHOUT recycling. The persistent
 	// secret must reload from disk — this is exactly the state that, combined
 	// with the in-memory secret re-created at activation, produces the
@@ -94,6 +107,9 @@ func TestWipePersistedSecretsOnRecycle(t *testing.T) {
 	wipePersistedSecrets(cfg)
 	if _, err := os.Stat(secretDir); !os.IsNotExist(err) {
 		t.Fatalf("secret_directory still exists after wipe (stat err = %v)", err)
+	}
+	if _, err := os.Stat(legacyFile); !os.IsNotExist(err) {
+		t.Fatalf("legacy secret file still exists after wipe (stat err = %v)", err)
 	}
 
 	// Phase 4: reopen after recycle. The persistent secret must be gone.
