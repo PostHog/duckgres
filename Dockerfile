@@ -5,6 +5,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-d
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
+
+# CGO dep-prewarm. Compiles the two heavy C/C++ dependencies — duckdb-go
+# (links libduckdb) and pg_query_go (links libpg_query) — into the Go build
+# cache in a layer keyed ONLY on go.mod/go.sum. On a source-only PR (the
+# common case) this layer is a GHA layer-cache hit, so the multi-minute
+# libduckdb/libpg_query compile is skipped and the final `go build` below
+# only recompiles changed first-party packages. Without it, `COPY . .`
+# busts the build layer on every source edit and the CGO deps recompile
+# from scratch each run (~3-5 min). `|| true` so a transient resolve error
+# doesn't fail the build — worst case the final build recompiles.
+RUN CGO_ENABLED=1 go build github.com/duckdb/duckdb-go/v2 github.com/pganalyze/pg_query_go/v6 2>/dev/null || true
+
 COPY . .
 ARG VERSION=dev
 ARG COMMIT=unknown
