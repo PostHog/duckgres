@@ -1,6 +1,9 @@
 package controlplane
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+)
 
 // WorkerLifecycleState models the shared warm-worker lifecycle introduced for
 // late tenant binding. The current production worker pools do not act on this
@@ -17,12 +20,49 @@ const (
 	WorkerLifecycleRetired    WorkerLifecycleState = "retired"
 )
 
+// WorkerProfile describes the pod shape a session asked for via connection-string
+// startup options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
+// It is a match dimension on WorkerAssignment, ORTHOGONAL to Image: a reserved or
+// warm worker may only be handed to a request whose profile Equal()s it.
+//
+// The nil/zero profile is the DEFAULT exclusive profile — today's behavior:
+// empty CPU/Memory (the pool-global request applies) and Colocate=false (one pod
+// per node). Normalizing the default to empty strings (rather than the literal
+// 46/360 pool values) is what keeps legacy worker records claimable without a
+// data migration.
+type WorkerProfile struct {
+	CPU          string            // normalized k8s quantity (e.g. "4"); "" => pool-global request
+	Memory       string            // normalized k8s quantity (e.g. "16Gi"); "" => pool-global request
+	Colocate     bool              // true => bin-pack (exclusiveNode=false); false => exclusive node
+	NodeSelector map[string]string // derived from Colocate; NOT part of the match key
+}
+
+// MatchKey is the identity used to decide whether an existing worker can serve a
+// request. NodeSelector is excluded because it is derived from Colocate. A nil
+// profile shares the key of the zero/default profile, so legacy and default
+// requests match the same workers.
+func (wp *WorkerProfile) MatchKey() string {
+	if wp == nil {
+		return "||false"
+	}
+	return wp.CPU + "|" + wp.Memory + "|" + strconv.FormatBool(wp.Colocate)
+}
+
+// Equal reports whether two profiles match (nil == zero == default).
+func (wp *WorkerProfile) Equal(other *WorkerProfile) bool {
+	return wp.MatchKey() == other.MatchKey()
+}
+
 // WorkerAssignment carries tenant-specific metadata once a shared worker has
 // been reserved for an org.
 type WorkerAssignment struct {
 	OrgID      string
 	MaxWorkers int
 	Image      string
+	// Profile is the requested worker shape. nil => the default exclusive
+	// profile (today's behavior). It is immutable for a reserved worker's life;
+	// enforcement is wired in alongside the scheduling changes (see design doc).
+	Profile *WorkerProfile
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared
@@ -173,6 +213,21 @@ func cloneWorkerAssignment(assignment *WorkerAssignment) *WorkerAssignment {
 		return nil
 	}
 	cloned := *assignment
+	cloned.Profile = cloneWorkerProfile(assignment.Profile)
+	return &cloned
+}
+
+func cloneWorkerProfile(profile *WorkerProfile) *WorkerProfile {
+	if profile == nil {
+		return nil
+	}
+	cloned := *profile
+	if profile.NodeSelector != nil {
+		cloned.NodeSelector = make(map[string]string, len(profile.NodeSelector))
+		for k, v := range profile.NodeSelector {
+			cloned.NodeSelector[k] = v
+		}
+	}
 	return &cloned
 }
 

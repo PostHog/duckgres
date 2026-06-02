@@ -126,6 +126,34 @@ type K8sConfig struct {
 	WorkerTolerationValue           string        // Taint value for worker pod NoSchedule toleration
 	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
 	AWSRegion                       string        // AWS region for STS client
+
+	// Connection-string worker-profile selection (duckgres.colocate / worker_cpu /
+	// worker_memory / worker_tier). All default to the off/empty state, so absent
+	// config = today's exclusive behavior. See docs/design/connection-string-worker-profile.md.
+	AllowClientWorkerProfile       bool                         // Master gate: honor duckgres.* startup options at all
+	AllowClientExclusiveNode       bool                         // Permit a client to request colocate=false (a full exclusive node)
+	ColocatedWorkerCPURequest      string                       // Default CPU for colocate=true with no size (e.g. "4")
+	ColocatedWorkerMemoryRequest   string                       // Default memory for colocate=true with no size (e.g. "16Gi")
+	ColocatedWorkerNodeSelector    string                       // JSON nodeSelector for colocated (bin-pack) worker pods
+	ColocatedWorkerTolerationKey   string                       // Taint key for colocated worker pod NoSchedule toleration
+	ColocatedWorkerTolerationValue string                       // Taint value for colocated worker pod NoSchedule toleration
+	WorkerProfileMinCPU            string                       // Clamp floor for a client-supplied cpu (e.g. "1")
+	WorkerProfileMaxCPU            string                       // Clamp ceiling for a client-supplied cpu (e.g. "16")
+	WorkerProfileMinMemory         string                       // Clamp floor for a client-supplied memory (e.g. "4Gi")
+	WorkerProfileMaxMemory         string                       // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
+	OrgMaxColocatedCPU             int                          // Per-org cap on summed colocated worker CPU cores (0 = unbounded)
+	OrgMaxColocatedMemory          string                       // Per-org cap on summed colocated worker memory (e.g. "256Gi")
+	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier
+}
+
+// WorkerProfileSpec is a named tier alias: a preset {cpu, memory, colocate} bundle
+// a client can select with `duckgres.worker_tier=<name>` instead of inline sizes.
+// Explicit inline GUCs override a tier's fields. Colocate is a pointer so a tier
+// can pin exclusive (false) distinctly from "unset"; nil inherits the default.
+type WorkerProfileSpec struct {
+	CPU      string
+	Memory   string
+	Colocate *bool
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
