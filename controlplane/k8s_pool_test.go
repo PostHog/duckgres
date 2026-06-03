@@ -75,6 +75,9 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
+	hotIdleClaimProfileCPU           string
+	hotIdleClaimProfileMemory        string
+	hotIdleClaimProfileColocate      bool
 	hotIdleClaimMaxOrgWorkers        int
 	recordMissCalls                  int
 	recordMissScopes                 []string
@@ -185,11 +188,14 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, im
 	return &claimed, configstore.WorkerClaimMissReasonNone, nil
 }
 
-func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hotIdleClaimCPID = ownerCPInstanceID
 	s.hotIdleClaimOrgID = orgID
+	s.hotIdleClaimProfileCPU = profileCPU
+	s.hotIdleClaimProfileMemory = profileMemory
+	s.hotIdleClaimProfileColocate = profileColocate
 	s.hotIdleClaimMaxOrgWorkers = maxOrgWorkers
 	if s.hotIdleClaimResult != nil {
 		r := *s.hotIdleClaimResult

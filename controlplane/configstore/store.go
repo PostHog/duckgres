@@ -1317,7 +1317,7 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 // When maxOrgWorkers is set, the org cap is checked under the same advisory
 // lock as neutral idle claims, excluding hot-idle rows from the count so a
 // cached worker can be reclaimed as the org's only active slot.
-func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -1341,6 +1341,11 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOr
 		err := tx.Table(cs.runtimeTable(current.TableName())).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("state = ? AND org_id = ?", WorkerStateHotIdle, orgID).
+			// Only reclaim a hot-idle worker of the requested shape, so a
+			// differently-shaped request (e.g. an 8/48 colocated backfill) doesn't
+			// claim-and-retire this org's default-shape hot-idle workers. COALESCE
+			// keeps legacy NULL-profile rows in the default bucket.
+			Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate).
 			Order("worker_id ASC").
 			Take(&current).Error
 		if err != nil {

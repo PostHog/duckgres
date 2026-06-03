@@ -1548,7 +1548,8 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			// Try reclaiming a hot-idle worker for the same org first (fast path:
 			// DuckLake is already attached, only needs epoch bump).
 			if assignment.OrgID != "" {
-				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
+				hotProfileCPU, hotProfileMem, hotProfileColo := assignment.Profile.Parts()
+				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, hotProfileColo, assignment.MaxWorkers)
 				if err != nil {
 					return nil, err
 				}
@@ -1557,19 +1558,12 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					return nil, NewWarmCapacityExhaustedErrorForReason(hotMissReason, DefaultWarmCapacityRetryAfter)
 				}
 				if hotClaimed != nil {
-					// Hot-idle reclamation is strict on both version (image) and
-					// pod-shape (profile): a cached worker of the wrong shape must
-					// not serve this request.
-					expCPU, expMem, expColo := assignment.Profile.Parts()
-					profileMismatch := hotClaimed.ProfileCPU != expCPU || hotClaimed.ProfileMemory != expMem || hotClaimed.ProfileColocate != expColo
+					// ClaimHotIdleWorker already filters by profile, so a reclaimed
+					// hot-idle worker always matches the requested shape. It is NOT
+					// filtered by image, so still retire on a version mismatch (e.g.
+					// after an image bump) rather than serve a stale-version worker.
 					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
 						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
-						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
-						// Fall through to neutral idle claim or capacity backpressure.
-					} else if profileMismatch {
-						slog.Info("Hot-idle worker profile mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID,
-							"expected", fmt.Sprintf("%s/%s/colocate=%v", expCPU, expMem, expColo),
-							"got", fmt.Sprintf("%s/%s/colocate=%v", hotClaimed.ProfileCPU, hotClaimed.ProfileMemory, hotClaimed.ProfileColocate))
 						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
 						// Fall through to neutral idle claim or capacity backpressure.
 					} else {

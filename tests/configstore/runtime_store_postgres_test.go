@@ -728,7 +728,7 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(second): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -805,7 +805,7 @@ func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) 
 		}
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -857,7 +857,7 @@ func TestClaimHotIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -896,7 +896,7 @@ func TestClaimHotIdleWorkerAllowsOnlyHotIdleAtCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -930,7 +930,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		}
 	}
 
-	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(first): %v", err)
 	}
@@ -941,7 +941,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		t.Fatalf("expected first claim to have no miss reason, got %q", missReason)
 	}
 
-	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", 1)
+	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(second): %v", err)
 	}
@@ -2552,7 +2552,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		t.Fatalf("expected worker 3602 hot-idle snapshot, got %#v", expired)
 	}
 
-	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
