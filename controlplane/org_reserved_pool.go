@@ -98,6 +98,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 				if (p.maxColocatedCPU > 0 && curCPU+reqCPU > p.maxColocatedCPU) ||
 					(p.maxColocatedMemBytes > 0 && curMem+reqMem > p.maxColocatedMemBytes) {
 					p.shared.mu.Unlock()
+					observeOrgColocatedQuotaRejection(p.orgID)
 					return nil, ErrOrgResourceQuotaExceeded
 				}
 			}

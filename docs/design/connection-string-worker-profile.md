@@ -26,7 +26,7 @@ options=-c duckgres.worker_tier=backfill        # ergonomic alias = {cpu, mem, c
 - **Runtime-store delta: additive GORM columns, no `.sql` migration** (`worker_records` is AutoMigrated on boot). Adds `ProfileCPU`, `ProfileMemory`, `ProfileColocate` + composite index.
 - **Guaranteed QoS already holds** (`workerResources()` copies requests→limits) and MUST be preserved; colocated profiles are always non-empty (clamped 4/16) so they never schedule BestEffort.
 - **Wire-supplied cpu/mem are clamped to `[min,max]`, behind a per-deployment gate, and accounted against a per-org resource quota** (count-based `maxWorkers` is insufficient when pods vary ~50×). Explicit `colocate=false` is separately gated (a full node is the expensive button).
-- **Warmth = node headroom** on the bin-pack nodepool (Karpenter overprovision pause pods), not warm worker pools. The client's `connect_timeout=60s` + retry absorbs residual schedule/bootstrap latency.
+- **Warmth = a shape-aware colocated warm pool + node headroom.** Each configured colocated shape (e.g. 4/16 and 8/48) is kept warm to its own target, background-replenished and topped up on claim; on top of that, overprovision pause pods on the bin-pack nodepool hold node headroom so a burst beyond the warm pool schedules without a fresh Karpenter node. Worker pods carry a PriorityClass above the pause pods so they preempt the headroom. The client's deepened `connect_timeout` + retry absorbs any residual cold-node latency.
 
 ## Build sequence (default behavior unchanged until P6)
 
@@ -53,3 +53,16 @@ Iceberg dual-write does `INSERT … SELECT * FROM read_parquet(full-day)` (memor
 1. Explicit `colocate=false` when `AllowClientExclusiveNode=false` → **reject** (clear error), not silent downgrade.
 2. Default profile → **empty strings**, not 46/360 (legacy claimability).
 3. `WorkerAssignment.Profile` is `*WorkerProfile` (nil = default); `MatchKey`/`Equal` are nil-safe.
+
+## Post-review hardening (applied)
+
+An adversarial multi-agent review (36/37 findings confirmed) drove these fixes:
+
+- **Shape-aware warm pool** (was single-shape 4/16): an 8/48 Iceberg request now matches a warm worker instead of permanent backpressure (`ColocatedWarmShapes`).
+- **NULL-safe claim filters** (`COALESCE`): legacy `worker_records` rows (profile columns NULL before AutoMigrate) stay claimable by the default request.
+- **Profile-filtered `ClaimHotIdleWorker`**: a differently-shaped request no longer reclaims-and-retires an org's default-shape hot-idle workers.
+- **Authoritative per-org colocated quota** inside the claim txn (cross-CP), not just in-process.
+- **`countNeutralWarmWorkersForImage` is default-shape only**: colocated workers no longer starve the exclusive per-image warm pool.
+- **Worker PriorityClass** so worker pods preempt the overprovision headroom pause pods (else a real worker forces a fresh node).
+- **`worker_tier` wired from env** (`DUCKGRES_K8S_WORKER_TIERS`); previously unreachable in production.
+- **Deeper client connect retry** (~5 min) to outlast a cold colocated-node provision.
