@@ -2405,6 +2405,18 @@ func TestTranspile_JSONOperators_CreateTableAs(t *testing.T) {
 			contains: []string{"json_extract_string(json_extract(b, '$.id'), '$.value')"},
 			excludes: []string{"->"}, // the bug: a bare arrow surviving the AND
 		},
+		{
+			name:     "arrow in GROUP BY / ORDER BY inside CTAS",
+			input:    "CREATE TABLE x AS SELECT data->>'type' AS t, count(*) AS c FROM src GROUP BY data->>'type' ORDER BY data->>'rank'",
+			contains: []string{"json_extract_string(data, 'type')", "json_extract_string(data, 'rank')"},
+			excludes: []string{"->"},
+		},
+		{
+			name:     "CREATE OR REPLACE VIEW converts arrows",
+			input:    "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE flag AND data->>'k' = 'v'",
+			contains: []string{"CREATE OR REPLACE VIEW", "json_extract_string(data, 'k')"},
+			excludes: []string{"->"},
+		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

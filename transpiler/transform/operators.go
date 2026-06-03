@@ -49,9 +49,22 @@ func (t *OperatorTransform) Transform(tree *pg_query.ParseResult, result *Result
 			// normalized away by the pg_query round-trip — e.g. a SQLMesh
 			// `CREATE OR REPLACE TABLE ... AS ... CASE WHEN x AND (j -> 'a') ->>
 			// 'b' LIKE ... ` materialization fails with a spurious numeric cast.
+			// Query is usually a SelectStmt; for `CREATE TABLE t AS EXECUTE plan`
+			// it's an ExecuteStmt (no arrows to rewrite), so the nil-check below
+			// intentionally skips it.
 			if ctasStmt.Query != nil {
 				if ctasSelect := ctasStmt.Query.GetSelectStmt(); ctasSelect != nil {
 					if t.transformSelectStmt(ctasSelect) {
+						changed = true
+					}
+				}
+			}
+		} else if viewStmt := stmt.Stmt.GetViewStmt(); viewStmt != nil {
+			// CREATE [OR REPLACE] VIEW ... AS SELECT ... — the view body carries
+			// the same arrow-precedence risk as a CTAS body.
+			if viewStmt.Query != nil {
+				if viewSelect := viewStmt.Query.GetSelectStmt(); viewSelect != nil {
+					if t.transformSelectStmt(viewSelect) {
 						changed = true
 					}
 				}
@@ -92,6 +105,25 @@ func (t *OperatorTransform) transformSelectStmt(stmt *pg_query.SelectStmt) bool 
 		if newHaving := t.transformExpression(stmt.HavingClause); newHaving != nil {
 			stmt.HavingClause = newHaving
 			changed = true
+		}
+	}
+
+	// Transform GROUP BY expressions (e.g. GROUP BY data->>'type')
+	for i, group := range stmt.GroupClause {
+		if newGroup := t.transformExpression(group); newGroup != nil {
+			stmt.GroupClause[i] = newGroup
+			changed = true
+		}
+	}
+
+	// Transform ORDER BY expressions. Each SortClause element is a SortBy node
+	// wrapping the sort expression, so descend into its Node.
+	for _, sort := range stmt.SortClause {
+		if sortBy := sort.GetSortBy(); sortBy != nil && sortBy.Node != nil {
+			if newNode := t.transformExpression(sortBy.Node); newNode != nil {
+				sortBy.Node = newNode
+				changed = true
+			}
 		}
 	}
 
