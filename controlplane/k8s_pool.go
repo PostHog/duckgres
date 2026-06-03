@@ -3430,12 +3430,20 @@ func (p *K8sWorkerPool) idleWarmWorkerCountLocked() int {
 // image each worker was spawned with. Used by the per-image warm floor to
 // decide whether to spawn a new worker of a specific pinned image.
 func (p *K8sWorkerPool) idleWarmWorkerCountByImageLocked() map[string]int {
+	// Only DEFAULT-shape workers count toward the per-image warm target. Colocated
+	// workers share p.workerImage but belong to their own warm pool; counting them
+	// here would starve the exclusive per-image pool. Mirrors the SQL filter in
+	// countNeutralWarmWorkersForImage.
+	defaultKey := (&WorkerProfile{}).MatchKey()
 	counts := make(map[string]int)
 	for _, w := range p.workers {
 		select {
 		case <-w.done:
 			continue
 		default:
+		}
+		if w.profile.MatchKey() != defaultKey {
+			continue
 		}
 		if p.isWarmIdleWorkerLocked(w) {
 			counts[w.image]++

@@ -1264,7 +1264,7 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 		// an idle worker of the same shape. The default request ("","",false)
 		// matches default/legacy/warm rows; a colocated request only matches
 		// colocated rows (and vice versa). Always filtered, including the default.
-		query = query.Where("profile_cpu = ? AND profile_memory = ? AND profile_colocate = ?", profileCPU, profileMemory, profileColocate)
+		query = query.Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate)
 
 		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {
@@ -2101,7 +2101,7 @@ func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB, profileCPU, profileM
 	var count int64
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("org_id = ''").
-		Where("profile_cpu = ? AND profile_memory = ? AND profile_colocate = ?", profileCPU, profileMemory, profileColocate).
+		Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate).
 		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
 		Count(&count).Error; err != nil {
 		return 0, err
@@ -2114,6 +2114,13 @@ func (cs *ConfigStore) countNeutralWarmWorkersForImage(tx *gorm.DB, image string
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("org_id = ''").
 		Where("image = ?", image).
+		// Only the DEFAULT (exclusive) shape counts toward the per-image warm
+		// target — colocated workers share p.workerImage but live in their own
+		// warm pool, so without this filter they'd cross-count and starve the
+		// exclusive pool. COALESCE keeps legacy NULL-profile rows in the default
+		// bucket. Keep in sync with countNeutralWarmWorkers / the default
+		// MatchKey ("","",false).
+		Where("COALESCE(profile_cpu, '') = '' AND COALESCE(profile_memory, '') = '' AND COALESCE(profile_colocate, false) = false").
 		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
 		Count(&count).Error; err != nil {
 		return 0, err
