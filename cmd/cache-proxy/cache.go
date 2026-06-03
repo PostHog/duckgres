@@ -263,6 +263,12 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	}
 
 	c.mu.Lock()
+	// dropLocked again before appending: in production singleFlight serializes
+	// writes per key so the earlier drop is enough, but guarding here keeps the
+	// "one entry per key" invariant (and currentSize) correct even if some
+	// future caller writes the same key concurrently — a duplicate entry would
+	// otherwise permanently inflate currentSize.
+	c.dropLocked(key)
 	c.order = append(c.order, cacheEntry{
 		key:        key,
 		size:       size,
