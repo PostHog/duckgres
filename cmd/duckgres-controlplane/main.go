@@ -242,7 +242,7 @@ func main() {
 			AllowClientExclusiveNode:        resolved.K8sAllowClientExclusiveNode,
 			ColocatedWorkerCPURequest:       resolved.K8sColocatedWorkerCPURequest,
 			ColocatedWorkerMemoryRequest:    resolved.K8sColocatedWorkerMemoryRequest,
-			ColocatedSharedWarmTarget:       resolved.K8sColocatedSharedWarmTarget,
+			ColocatedWarmShapes:             resolved.K8sColocatedWarmShapes,
 			ColocatedWorkerNodeSelector:     resolved.K8sColocatedWorkerNodeSelector,
 			ColocatedWorkerTolerationKey:    resolved.K8sColocatedWorkerTolerationKey,
 			ColocatedWorkerTolerationValue:  resolved.K8sColocatedWorkerTolerationValue,

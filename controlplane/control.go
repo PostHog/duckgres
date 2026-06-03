@@ -134,7 +134,7 @@ type K8sConfig struct {
 	AllowClientExclusiveNode       bool                         // Permit a client to request colocate=false (a full exclusive node)
 	ColocatedWorkerCPURequest      string                       // Default CPU for colocate=true with no size (e.g. "4")
 	ColocatedWorkerMemoryRequest   string                       // Default memory for colocate=true with no size (e.g. "16Gi")
-	ColocatedSharedWarmTarget      int                          // Warm-idle colocated (default-shape) workers to keep ready (0 = none)
+	ColocatedWarmShapes            []ColocatedWarmShape         // Colocated shapes to keep warm (each {cpu,memory,target}); empty = no colocated warm pool
 	ColocatedWorkerNodeSelector    string                       // JSON nodeSelector for colocated (bin-pack) worker pods
 	ColocatedWorkerTolerationKey   string                       // Taint key for colocated worker pod NoSchedule toleration
 	ColocatedWorkerTolerationValue string                       // Taint value for colocated worker pod NoSchedule toleration
@@ -145,6 +145,18 @@ type K8sConfig struct {
 	OrgMaxColocatedCPU             int                          // Per-org cap on summed colocated worker CPU cores (0 = unbounded)
 	OrgMaxColocatedMemory          string                       // Per-org cap on summed colocated worker memory (e.g. "256Gi")
 	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier
+}
+
+// ColocatedWarmShape is one colocated pod shape the control plane keeps warm:
+// `target` idle bin-packed workers of {CPU, Memory}. The warm pool is shape-aware
+// so distinct client shapes (e.g. 4/16 default and 8/48 for Iceberg orgs) each
+// get a ready pod. CPU/Memory must be canonical k8s quantities matching what the
+// resolver normalizes a client request to (e.g. "4", "16Gi"), or the warm worker
+// won't match.
+type ColocatedWarmShape struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"memory"`
+	Target int    `json:"target"`
 }
 
 // WorkerProfileSpec is a named tier alias: a preset {cpu, memory, colocate} bundle

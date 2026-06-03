@@ -82,9 +82,7 @@ type K8sWorkerPool struct {
 	colocatedWorkerNodeSelector    map[string]string
 	colocatedWorkerTolerationKey   string
 	colocatedWorkerTolerationValue string
-	colocatedWorkerCPURequest      string                                       // default CPU for the colocated warm pool's pod shape
-	colocatedWorkerMemoryRequest   string                                       // default memory for the colocated warm pool's pod shape
-	colocatedWarmTarget            int                                          // warm-idle colocated workers to maintain (0 = none)
+	colocatedWarmShapes            []ColocatedWarmShape                         // colocated shapes to keep warm (each {cpu,memory,target})
 	orgID                          string                                       // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator              func() int                                   // shared ID generator across orgs (nil = internal counter)
 	resolveOrgConfig               func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
@@ -195,9 +193,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		colocatedWorkerNodeSelector:    cfg.ColocatedNodeSelector,
 		colocatedWorkerTolerationKey:   cfg.ColocatedTolerationKey,
 		colocatedWorkerTolerationValue: cfg.ColocatedTolerationValue,
-		colocatedWorkerCPURequest:      cfg.ColocatedCPURequest,
-		colocatedWorkerMemoryRequest:   cfg.ColocatedMemoryRequest,
-		colocatedWarmTarget:            cfg.ColocatedWarmTarget,
+		colocatedWarmShapes:            cfg.ColocatedWarmShapes,
 
 		orgID:             cfg.OrgID,
 		workerIDGenerator: cfg.WorkerIDGenerator,
@@ -1607,7 +1603,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				if reserveErr == nil {
 					p.triggerPerImageReplenish(claimed.Image)
 					if claimed.ProfileColocate {
-						p.triggerColocatedWarmReplenish()
+						p.triggerColocatedWarmReplenish(WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: true})
 					}
 					return worker, nil
 				}
@@ -1681,7 +1677,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			}
 			p.triggerPerImageReplenish(idle.image)
 			if idle.profile.Colocate {
-				p.triggerColocatedWarmReplenish()
+				p.triggerColocatedWarmReplenish(idle.profile)
 			}
 			return idle, nil
 		}
@@ -2318,22 +2314,10 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 	return stderrors.Join(errs...)
 }
 
-// colocatedWarmProfile is the pod shape the colocated warm pool pre-warms: the
-// deployment's default colocated size, bin-packed. Empty when colocated defaults
-// aren't configured (then the colocated warm pool is effectively disabled).
-func (p *K8sWorkerPool) colocatedWarmProfile() WorkerProfile {
-	return WorkerProfile{
-		CPU:      p.colocatedWorkerCPURequest,
-		Memory:   p.colocatedWorkerMemoryRequest,
-		Colocate: true,
-	}
-}
-
-// idleColocatedWarmWorkerCountLocked counts warm-idle workers of the colocated
-// default shape. Caller holds p.mu.
-func (p *K8sWorkerPool) idleColocatedWarmWorkerCountLocked() int {
-	prof := p.colocatedWarmProfile()
-	want := prof.MatchKey()
+// idleColocatedWarmWorkerCountLocked counts warm-idle workers matching the given
+// colocated shape. Caller holds p.mu.
+func (p *K8sWorkerPool) idleColocatedWarmWorkerCountLocked(profile WorkerProfile) int {
+	want := profile.MatchKey()
 	count := 0
 	for _, w := range p.workers {
 		select {
@@ -2351,14 +2335,13 @@ func (p *K8sWorkerPool) idleColocatedWarmWorkerCountLocked() int {
 	return count
 }
 
-// SpawnMinColocatedWorkers ensures at least count warm-idle colocated workers
-// (the default colocated shape, default image) exist, so a colocate=true request
-// bursts into a ready pod instead of paying a cold spawn. Mirrors
-// SpawnMinWorkersForImage but for the colocated shape; a no-op without a runtime
-// store, without configured colocated defaults, or when count <= 0.
-func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, count int) error {
-	profile := p.colocatedWarmProfile()
-	if count <= 0 || p.runtimeStore == nil || profile.CPU == "" || profile.Memory == "" {
+// SpawnMinColocatedWorkers ensures at least `target` warm-idle workers of the
+// given colocated shape (default image) exist, so a matching colocate=true
+// request bursts into a ready pod instead of paying a cold spawn. Mirrors
+// SpawnMinWorkersForImage but for a specific colocated shape; a no-op without a
+// runtime store, an incomplete/non-colocated shape, or target <= 0.
+func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, profile WorkerProfile, target int) error {
+	if target <= 0 || p.runtimeStore == nil || profile.CPU == "" || profile.Memory == "" || !profile.Colocate {
 		return nil
 	}
 
@@ -2368,7 +2351,7 @@ func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, count int)
 		return nil
 	}
 	p.cleanDeadWorkersLocked()
-	missing := count - p.idleColocatedWarmWorkerCountLocked()
+	missing := target - p.idleColocatedWarmWorkerCountLocked(profile)
 	if missing <= 0 {
 		p.mu.Unlock()
 		return nil
@@ -2394,7 +2377,7 @@ func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, count int)
 			profile.CPU,
 			profile.Memory,
 			profile.Colocate,
-			count,
+			target,
 			p.maxWorkers,
 		)
 		if err != nil {
@@ -2439,24 +2422,39 @@ func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, count int)
 	return stderrors.Join(errs...)
 }
 
-// triggerColocatedWarmReplenish tops the colocated warm pool back up to its
-// target in the background. Called after a colocated worker is claimed so the
-// next request still finds a ready pod, independent of allocation rate.
-func (p *K8sWorkerPool) triggerColocatedWarmReplenish() {
+// reconcileColocatedWarm tops every configured colocated warm shape up to its
+// target. Called from the periodic warm-capacity reconcile.
+func (p *K8sWorkerPool) reconcileColocatedWarm(ctx context.Context) {
+	for _, shape := range p.colocatedWarmShapes {
+		profile := WorkerProfile{CPU: shape.CPU, Memory: shape.Memory, Colocate: true}
+		if err := p.SpawnMinColocatedWorkers(ctx, profile, shape.Target); err != nil {
+			slog.Warn("Colocated warm reconcile failed.", "cpu", shape.CPU, "memory", shape.Memory, "target", shape.Target, "error", err)
+		}
+	}
+}
+
+// triggerColocatedWarmReplenish tops the just-claimed colocated shape's warm pool
+// back up in the background, so the next matching request still finds a ready pod.
+// A no-op if the claimed shape isn't a configured warm shape.
+func (p *K8sWorkerPool) triggerColocatedWarmReplenish(profile WorkerProfile) {
 	if p.runtimeStore == nil {
 		return
 	}
-	p.mu.RLock()
-	target := p.colocatedWarmTarget
-	p.mu.RUnlock()
+	target := 0
+	for _, shape := range p.colocatedWarmShapes {
+		if shape.CPU == profile.CPU && shape.Memory == profile.Memory {
+			target = shape.Target
+			break
+		}
+	}
 	if target <= 0 {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := p.SpawnMinColocatedWorkers(ctx, target); err != nil {
-			slog.Warn("Colocated warm replenish failed.", "target", target, "error", err)
+		if err := p.SpawnMinColocatedWorkers(ctx, profile, target); err != nil {
+			slog.Warn("Colocated warm replenish failed.", "cpu", profile.CPU, "memory", profile.Memory, "error", err)
 		}
 	}()
 }

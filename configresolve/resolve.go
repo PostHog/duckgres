@@ -9,6 +9,7 @@
 package configresolve
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -132,7 +133,7 @@ type Resolved struct {
 	K8sAllowClientExclusiveNode        bool
 	K8sColocatedWorkerCPURequest       string
 	K8sColocatedWorkerMemoryRequest    string
-	K8sColocatedSharedWarmTarget       int
+	K8sColocatedWarmShapes             []controlplane.ColocatedWarmShape
 	K8sColocatedWorkerNodeSelector     string
 	K8sColocatedWorkerTolerationKey    string
 	K8sColocatedWorkerTolerationValue  string
@@ -213,7 +214,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	// Connection-string worker-profile config (all default to off/empty).
 	var k8sAllowClientWorkerProfile, k8sAllowClientExclusiveNode bool
 	var k8sColocatedWorkerCPURequest, k8sColocatedWorkerMemoryRequest string
-	var k8sColocatedSharedWarmTarget int
+	var k8sColocatedWarmShapes []controlplane.ColocatedWarmShape
 	var k8sColocatedWorkerNodeSelector, k8sColocatedWorkerTolerationKey, k8sColocatedWorkerTolerationValue string
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
 	var k8sOrgMaxColocatedCPU int
@@ -965,11 +966,12 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_MEMORY_REQUEST"); v != "" {
 		k8sColocatedWorkerMemoryRequest = v
 	}
-	if v := getenv("DUCKGRES_K8S_COLOCATED_SHARED_WARM_TARGET"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sColocatedSharedWarmTarget = n
+	if v := getenv("DUCKGRES_K8S_COLOCATED_WARM_SHAPES"); v != "" {
+		var shapes []controlplane.ColocatedWarmShape
+		if err := json.Unmarshal([]byte(v), &shapes); err == nil {
+			k8sColocatedWarmShapes = shapes
 		} else {
-			warn("Invalid DUCKGRES_K8S_COLOCATED_SHARED_WARM_TARGET: " + err.Error())
+			warn("Invalid DUCKGRES_K8S_COLOCATED_WARM_SHAPES (want JSON [{\"cpu\":\"4\",\"memory\":\"16Gi\",\"target\":8}]): " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_NODE_SELECTOR"); v != "" {
@@ -1399,7 +1401,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sAllowClientExclusiveNode:        k8sAllowClientExclusiveNode,
 		K8sColocatedWorkerCPURequest:       k8sColocatedWorkerCPURequest,
 		K8sColocatedWorkerMemoryRequest:    k8sColocatedWorkerMemoryRequest,
-		K8sColocatedSharedWarmTarget:       k8sColocatedSharedWarmTarget,
+		K8sColocatedWarmShapes:             k8sColocatedWarmShapes,
 		K8sColocatedWorkerNodeSelector:     k8sColocatedWorkerNodeSelector,
 		K8sColocatedWorkerTolerationKey:    k8sColocatedWorkerTolerationKey,
 		K8sColocatedWorkerTolerationValue:  k8sColocatedWorkerTolerationValue,

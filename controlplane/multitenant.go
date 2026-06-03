@@ -189,9 +189,7 @@ func SetupMultiTenant(
 		ColocatedNodeSelector:    parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
 		ColocatedTolerationKey:   cfg.K8s.ColocatedWorkerTolerationKey,
 		ColocatedTolerationValue: cfg.K8s.ColocatedWorkerTolerationValue,
-		ColocatedCPURequest:      cfg.K8s.ColocatedWorkerCPURequest,
-		ColocatedMemoryRequest:   cfg.K8s.ColocatedWorkerMemoryRequest,
-		ColocatedWarmTarget:      cfg.K8s.ColocatedSharedWarmTarget,
+		ColocatedWarmShapes:      cfg.K8s.ColocatedWarmShapes,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {
@@ -295,13 +293,12 @@ func SetupMultiTenant(
 		router.sharedPool.SetPerImageWarmTargets(targets)
 		reconcileWarmCapacityImageTargets(router.sharedPool, targets)
 
-		// Maintain the colocated (bin-pack) warm pool alongside the default
-		// per-image pools, so colocate=true requests also burst into a ready pod.
-		if colocatedTarget := cfg.K8s.ColocatedSharedWarmTarget; colocatedTarget > 0 {
+		// Maintain the shape-aware colocated (bin-pack) warm pool alongside the
+		// default per-image pools, so every configured colocate=true shape (e.g.
+		// 4/16 and 8/48) bursts into a ready pod.
+		if len(cfg.K8s.ColocatedWarmShapes) > 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := router.sharedPool.SpawnMinColocatedWorkers(ctx, colocatedTarget); err != nil {
-				slog.Warn("Janitor failed to reconcile colocated warm capacity.", "target", colocatedTarget, "error", err)
-			}
+			router.sharedPool.reconcileColocatedWarm(ctx)
 			cancel()
 		}
 	}
