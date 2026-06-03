@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1398,21 +1399,48 @@ type trinoCatalogHTTPClient struct {
 }
 
 // NewTrinoCatalogHTTPClient builds an HTTP-backed TrinoCatalogClient.
-// baseURL is the customer Trino coordinator endpoint (typically the
-// in-cluster Service: http://trino-coordinator.trino-customer.svc:8080).
+// baseURL is the customer Trino coordinator endpoint. Prefer HTTPS: Trino
+// only accepts password (Basic) authentication over a secure channel — over
+// plain HTTP it routes to the insecure (passwordless) authenticator and
+// rejects a Basic password outright ("Password not allowed for insecure
+// authentication"). A plain-http baseURL therefore cannot authenticate the
+// admin principal for catalog DDL.
+//
+// tlsServerName, when non-empty, is the name the coordinator's TLS certificate
+// is verified against, overriding the baseURL host for verification (Go's
+// crypto/tls ServerName). cert-manager issues the coordinator cert for the
+// EXTERNAL hostname (e.g. trino.dw.dev.postwh.com), which doesn't match the
+// in-cluster Service address the provisioner dials; this keeps FULL cert
+// verification (chain + the overridden name) instead of disabling it. Empty =
+// standard verification against the baseURL host (correct when baseURL already
+// uses the cert hostname). Ignored for http URLs.
 //
 // Credentials are typically empty here and populated by the first
 // Reconcile via SetCredentials (after ensureClusterSecrets bootstraps
 // the admin password). Production callers MAY pre-supply credentials
 // for the rare case where the bootstrap is known upfront (e.g. tests);
 // the username defaults to opa.AdminPrincipal if empty.
-func NewTrinoCatalogHTTPClient(baseURL, username, password string) TrinoCatalogClient {
+func NewTrinoCatalogHTTPClient(baseURL, username, password, tlsServerName string) TrinoCatalogClient {
 	if username == "" {
 		username = opa.AdminPrincipal
 	}
+	hc := &http.Client{Timeout: 30 * time.Second}
+	if tlsServerName != "" {
+		// Clone the default transport to keep its proxy/dial/keepalive
+		// defaults, then pin the TLS verification name. This is NOT
+		// InsecureSkipVerify — the cert chain is still validated, just against
+		// tlsServerName rather than the dialed host. Applies to every request
+		// the client makes, including the /v1/statement nextUri follow-ups.
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{
+			ServerName: tlsServerName,
+			MinVersion: tls.VersionTLS12,
+		}
+		hc.Transport = transport
+	}
 	return &trinoCatalogHTTPClient{
 		baseURL:  strings.TrimRight(baseURL, "/"),
-		hc:       &http.Client{Timeout: 30 * time.Second},
+		hc:       hc,
 		username: username,
 		password: password,
 	}
