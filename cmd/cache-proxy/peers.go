@@ -25,27 +25,44 @@ var (
 	})
 )
 
+// Peer timeouts. The /cache/has probe is a tiny HEAD-like check, so it gets a
+// short budget; the /cache/get body transfer can move many MB of a Parquet
+// range over the VPC, so it gets a much larger one. They are deliberately
+// separate: sharing one 2s budget (as the original code did) meant a slow
+// has-race ate into the body-transfer time and large peer ranges timed out
+// mid-stream, silently downgrading the hit to a full S3 fetch.
+const (
+	peerHasTimeout = 1 * time.Second
+	peerGetTimeout = 30 * time.Second
+)
+
 // PeerManager discovers and communicates with cache proxy peers
 // via a Kubernetes headless Service.
 type PeerManager struct {
-	serviceName string
-	peerPort    string // port for peer API (e.g. ":8081")
-	client      *http.Client
+	serviceName  string
+	peerPort     string // port for peer API (e.g. ":8081")
+	client       *http.Client // /cache/has probes (short timeout)
+	streamClient *http.Client // /cache/get body transfers (long timeout)
 
 	mu    sync.RWMutex
 	peers []string // peer addresses (ip:port)
 }
 
 func NewPeerManager(serviceName, peerPort string) *PeerManager {
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     30 * time.Second,
+	}
 	return &PeerManager{
 		serviceName: serviceName,
 		peerPort:    peerPort,
 		client: &http.Client{
-			Timeout: 2 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     30 * time.Second,
-			},
+			Timeout:   peerHasTimeout,
+			Transport: transport,
+		},
+		streamClient: &http.Client{
+			Timeout:   peerGetTimeout,
+			Transport: transport,
 		},
 	}
 }
@@ -123,16 +140,17 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int
 
 	peerFetchesTotal.Inc()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
 	// Phase 1: ask every peer "do you have this?" in parallel (cheap, no body)
-	// and take the first that says yes.
+	// and take the first that says yes. Its own short context bounds the probe
+	// so a slow/dead peer can't eat into the body-transfer budget below.
+	hasCtx, hasCancel := context.WithTimeout(context.Background(), peerHasTimeout)
+	defer hasCancel()
+
 	holderCh := make(chan string, len(peers))
 	for _, addr := range peers {
 		go func(addr string) {
 			hasURL := fmt.Sprintf("http://%s/cache/has?key=%s", addr, cacheKey)
-			req, err := http.NewRequestWithContext(ctx, "GET", hasURL, nil)
+			req, err := http.NewRequestWithContext(hasCtx, "GET", hasURL, nil)
 			if err != nil {
 				holderCh <- ""
 				return
@@ -161,15 +179,22 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int
 	if holder == "" {
 		return "", 0, false
 	}
+	// Probes for the losing peers are no longer needed — release them so they
+	// don't hold connections open for the rest of the has-timeout window.
+	hasCancel()
 
-	// Phase 2: stream the body from the chosen holder straight into sink. Only
+	// Phase 2: stream the body from the chosen holder straight into sink, with
+	// its own generous budget (a multi-MB Parquet range can take a while). Only
 	// the winner is fetched, so we never pull a body we won't use.
+	getCtx, getCancel := context.WithTimeout(context.Background(), peerGetTimeout)
+	defer getCancel()
+
 	getURL := fmt.Sprintf("http://%s/cache/get?key=%s", holder, cacheKey)
-	req, err := http.NewRequestWithContext(ctx, "GET", getURL, nil)
+	req, err := http.NewRequestWithContext(getCtx, "GET", getURL, nil)
 	if err != nil {
 		return "", 0, false
 	}
-	resp, err := pm.client.Do(req)
+	resp, err := pm.streamClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			_ = resp.Body.Close()
