@@ -57,6 +57,9 @@ type captureRuntimeWorkerStore struct {
 	neutralSpawnOwnerCPID            string
 	neutralSpawnPodPrefix            string
 	neutralSpawnImage                string
+	neutralSpawnProfileCPU           string
+	neutralSpawnProfileMemory        string
+	neutralSpawnProfileColocate      bool
 	neutralSpawnTarget               int
 	neutralSpawnMaxGlobal            int
 	perImageSpawned                  *configstore.WorkerRecord
@@ -72,6 +75,9 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
+	hotIdleClaimProfileCPU           string
+	hotIdleClaimProfileMemory        string
+	hotIdleClaimProfileColocate      bool
 	hotIdleClaimMaxOrgWorkers        int
 	recordMissCalls                  int
 	recordMissScopes                 []string
@@ -160,7 +166,7 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int, maxColocatedCPU int, maxColocatedMemBytes uint64) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
@@ -182,11 +188,14 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, im
 	return &claimed, configstore.WorkerClaimMissReasonNone, nil
 }
 
-func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hotIdleClaimCPID = ownerCPInstanceID
 	s.hotIdleClaimOrgID = orgID
+	s.hotIdleClaimProfileCPU = profileCPU
+	s.hotIdleClaimProfileMemory = profileMemory
+	s.hotIdleClaimProfileColocate = profileColocate
 	s.hotIdleClaimMaxOrgWorkers = maxOrgWorkers
 	if s.hotIdleClaimResult != nil {
 		r := *s.hotIdleClaimResult
@@ -226,13 +235,16 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 	return &spawned, nil
 }
 
-func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.neutralSpawnCalls++
 	s.neutralSpawnOwnerCPID = ownerCPInstanceID
 	s.neutralSpawnPodPrefix = podNamePrefix
 	s.neutralSpawnImage = image
+	s.neutralSpawnProfileCPU = profileCPU
+	s.neutralSpawnProfileMemory = profileMemory
+	s.neutralSpawnProfileColocate = profileColocate
 	s.neutralSpawnTarget = targetWarmWorkers
 	s.neutralSpawnMaxGlobal = maxGlobalWorkers
 	if s.neutralSpawnErr != nil {
@@ -2383,7 +2395,7 @@ func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
 		return nil
 	}
 
-	if err := pool.spawnWarmWorker(context.Background(), 0, pool.workerImage); err != nil {
+	if err := pool.spawnWarmWorker(context.Background(), 0, pool.workerImage, WorkerProfile{}); err != nil {
 		t.Fatalf("spawnWarmWorker: %v", err)
 	}
 	if spawnedID != 41 {

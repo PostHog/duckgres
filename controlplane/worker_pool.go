@@ -109,9 +109,11 @@ type K8sWorkerPoolConfig struct {
 	WorkerTolerationKey      string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
 	WorkerTolerationValue    string                                       // Taint value for worker pod NoSchedule toleration.
 	WorkerExclusiveNode      bool                                         // One worker per node via pod anti-affinity.
+	WorkerPriorityClassName  string                                       // PriorityClass for worker pods (so they preempt overprovision pause pods). Empty = none.
 	ColocatedNodeSelector    map[string]string                            // Node selector for colocate=true (bin-pack) worker pods. Nil = no selector.
 	ColocatedTolerationKey   string                                       // Taint key for colocated worker pods. Empty = no toleration.
 	ColocatedTolerationValue string                                       // Taint value for colocated worker pods.
+	ColocatedWarmShapes      []ColocatedWarmShape                         // Colocated shapes to keep warm (each {cpu,memory,target}).
 	OrgID                    string                                       // Org ID for pod labels (multi-tenant mode)
 	WorkerIDGenerator        func() int                                   // Shared ID generator across orgs (nil = internal counter)
 	ResolveOrgConfig         func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
@@ -130,11 +132,11 @@ type K8sWorkerPoolConfig struct {
 // satisfies both interfaces.
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
-	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
-	ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
+	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int, maxColocatedCPU int, maxColocatedMemBytes uint64) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
+	ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
 	RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, now time.Time) error
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
-	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)

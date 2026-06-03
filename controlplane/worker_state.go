@@ -78,6 +78,11 @@ type WorkerAssignment struct {
 	// profile (today's behavior). It is immutable for a reserved worker's life;
 	// enforcement is wired in alongside the scheduling changes (see design doc).
 	Profile *WorkerProfile
+	// MaxColocatedCPU / MaxColocatedMemBytes are the org's colocated resource
+	// budget, enforced authoritatively (cross-CP) inside the claim transaction.
+	// 0 = unbounded on that axis. Only colocated claims count against them.
+	MaxColocatedCPU      int
+	MaxColocatedMemBytes uint64
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared

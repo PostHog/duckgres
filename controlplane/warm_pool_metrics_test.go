@@ -143,7 +143,7 @@ func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *te
 	worker.reservedAt = time.Now().Add(-2 * time.Second)
 	pool.workers[1] = worker
 
-	orgPool := NewOrgReservedPool(pool, "org-1", 1, pool.workerImage, nil)
+	orgPool := NewOrgReservedPool(pool, "org-1", 1, pool.workerImage, nil, 0, 0)
 	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
 		if err != nil {

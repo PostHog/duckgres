@@ -356,7 +356,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestClaimIdleWorkerReturnsGlobalCapWhenNoIdleAndGlobalCapReached(t *testing
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestClaimIdleWorkerReturnsNoIdleWhenBelowGlobalCap(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 2)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 2, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestClaimIdleWorkerReturnsGlobalCapForImageMissAtGlobalCap(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -509,7 +509,7 @@ func TestClaimIdleWorkerClaimsMatchingIdleWorkerAtGlobalCap(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 1, 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 1, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Try claiming v2
-	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", "", "", false, 0, 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", "", "", false, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -616,7 +616,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Try claiming v3 (none exist)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", "", "", false, 0, 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", "", "", false, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -628,7 +628,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Neutral claim (no image filter) - should get v1 (lowest ID)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", "", "", false, 0, 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", "", "", false, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -668,7 +668,7 @@ func TestClaimIdleWorkerRespectsProfileAffinity(t *testing.T) {
 	}
 
 	// A colocated request claims only the colocated worker (never the default).
-	claimed, _, err := store.ClaimIdleWorker("cp-1", "org-1", "", "4", "16Gi", true, 0, 0)
+	claimed, _, err := store.ClaimIdleWorker("cp-1", "org-1", "", "4", "16Gi", true, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker(colocated): %v", err)
 	}
@@ -677,7 +677,7 @@ func TestClaimIdleWorkerRespectsProfileAffinity(t *testing.T) {
 	}
 
 	// A default request claims only the default worker (never the colocated one).
-	claimed, _, err = store.ClaimIdleWorker("cp-1", "org-1", "", "", "", false, 0, 0)
+	claimed, _, err = store.ClaimIdleWorker("cp-1", "org-1", "", "", "", false, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker(default): %v", err)
 	}
@@ -687,7 +687,7 @@ func TestClaimIdleWorkerRespectsProfileAffinity(t *testing.T) {
 
 	// With both workers now reserved, a colocated request that finds no matching
 	// idle worker misses (rather than crossing shapes onto a default worker).
-	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "", "8", "48Gi", true, 0, 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "", "8", "48Gi", true, 0, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker(unmatched colocated): %v", err)
 	}
@@ -696,6 +696,51 @@ func TestClaimIdleWorkerRespectsProfileAffinity(t *testing.T) {
 	}
 	if missReason != configstore.WorkerClaimMissReasonNoIdle {
 		t.Fatalf("expected no-idle miss for unmatched profile, got %q", missReason)
+	}
+}
+
+// TestClaimIdleWorkerColocatedQuota proves the authoritative per-org colocated
+// CPU budget enforced inside the claim transaction (review M1): once an org's
+// summed colocated CPU would exceed the cap, the next colocated claim misses
+// with OrgCap rather than being granted.
+func TestClaimIdleWorkerColocatedQuota(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	for id := 21; id <= 23; id++ {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:        id,
+			PodName:         fmt.Sprintf("duckgres-worker-colo-%d", id),
+			State:           configstore.WorkerStateIdle,
+			ProfileCPU:      "4",
+			ProfileMemory:   "16Gi",
+			ProfileColocate: true,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+
+	// Cap = 8 colocated CPU. The first two 4-CPU claims fit (4, then 8); the
+	// third (would be 12) is rejected with OrgCap.
+	const maxCPU = 8
+	for n := 1; n <= 2; n++ {
+		claimed, miss, err := store.ClaimIdleWorker("cp-1", "org-1", "", "4", "16Gi", true, 0, 0, maxCPU, 0)
+		if err != nil {
+			t.Fatalf("claim %d: %v", n, err)
+		}
+		if claimed == nil {
+			t.Fatalf("claim %d: expected a worker within the colocated quota, got miss %q", n, miss)
+		}
+	}
+
+	claimed, miss, err := store.ClaimIdleWorker("cp-1", "org-1", "", "4", "16Gi", true, 0, 0, maxCPU, 0)
+	if err != nil {
+		t.Fatalf("over-quota claim: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected the over-quota colocated claim rejected, got worker %d", claimed.WorkerID)
+	}
+	if miss != configstore.WorkerClaimMissReasonOrgCap {
+		t.Fatalf("expected OrgCap miss for over-quota colocated claim, got %q", miss)
 	}
 }
 
@@ -728,7 +773,7 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(second): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -805,7 +850,7 @@ func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) 
 		}
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -857,7 +902,7 @@ func TestClaimHotIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -896,7 +941,7 @@ func TestClaimHotIdleWorkerAllowsOnlyHotIdleAtCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -930,7 +975,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		}
 	}
 
-	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(first): %v", err)
 	}
@@ -941,7 +986,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		t.Fatalf("expected first claim to have no miss reason, got %q", missReason)
 	}
 
-	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", 1)
+	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", "", "", false, 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(second): %v", err)
 	}
@@ -1253,7 +1298,7 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(existing neutral): %v", err)
 	}
 
-	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", 1, 5)
+	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", "", "", false, 1, 5)
 	if err != nil {
 		t.Fatalf("CreateNeutralWarmWorkerSlot(shared target): %v", err)
 	}
@@ -1261,7 +1306,7 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 		t.Fatalf("expected shared warm target to block spawning, got %#v", blocked)
 	}
 
-	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", 2, 5)
+	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", "", "", false, 2, 5)
 	if err != nil {
 		t.Fatalf("CreateNeutralWarmWorkerSlot(expand target): %v", err)
 	}
@@ -2552,7 +2597,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		t.Fatalf("expected worker 3602 hot-idle snapshot, got %#v", expired)
 	}
 
-	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}

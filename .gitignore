@@ -48,3 +48,7 @@ bench-results/
 
 # Local prototype/scratch dirs (e.g. tmp/lakekeeper-proto/)
 tmp/
+
+# Built Go binaries (build artifacts, never commit)
+/duckgres-controlplane
+/duckgres-worker

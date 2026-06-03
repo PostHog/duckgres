@@ -125,6 +125,7 @@ type K8sConfig struct {
 	WorkerTolerationKey             string        // Taint key for worker pod NoSchedule toleration
 	WorkerTolerationValue           string        // Taint value for worker pod NoSchedule toleration
 	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
+	WorkerPriorityClassName         string        // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
 	AWSRegion                       string        // AWS region for STS client
 
 	// Connection-string worker-profile selection (duckgres.colocate / worker_cpu /
@@ -134,6 +135,7 @@ type K8sConfig struct {
 	AllowClientExclusiveNode       bool                         // Permit a client to request colocate=false (a full exclusive node)
 	ColocatedWorkerCPURequest      string                       // Default CPU for colocate=true with no size (e.g. "4")
 	ColocatedWorkerMemoryRequest   string                       // Default memory for colocate=true with no size (e.g. "16Gi")
+	ColocatedWarmShapes            []ColocatedWarmShape         // Colocated shapes to keep warm (each {cpu,memory,target}); empty = no colocated warm pool
 	ColocatedWorkerNodeSelector    string                       // JSON nodeSelector for colocated (bin-pack) worker pods
 	ColocatedWorkerTolerationKey   string                       // Taint key for colocated worker pod NoSchedule toleration
 	ColocatedWorkerTolerationValue string                       // Taint value for colocated worker pod NoSchedule toleration
@@ -146,14 +148,26 @@ type K8sConfig struct {
 	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier
 }
 
+// ColocatedWarmShape is one colocated pod shape the control plane keeps warm:
+// `target` idle bin-packed workers of {CPU, Memory}. The warm pool is shape-aware
+// so distinct client shapes (e.g. 4/16 default and 8/48 for Iceberg orgs) each
+// get a ready pod. CPU/Memory must be canonical k8s quantities matching what the
+// resolver normalizes a client request to (e.g. "4", "16Gi"), or the warm worker
+// won't match.
+type ColocatedWarmShape struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"memory"`
+	Target int    `json:"target"`
+}
+
 // WorkerProfileSpec is a named tier alias: a preset {cpu, memory, colocate} bundle
 // a client can select with `duckgres.worker_tier=<name>` instead of inline sizes.
 // Explicit inline GUCs override a tier's fields. Colocate is a pointer so a tier
 // can pin exclusive (false) distinctly from "unset"; nil inherits the default.
 type WorkerProfileSpec struct {
-	CPU      string
-	Memory   string
-	Colocate *bool
+	CPU      string `json:"cpu"`
+	Memory   string `json:"memory"`
+	Colocate *bool  `json:"colocate"`
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -723,6 +737,8 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 		return "53300", "timed out waiting for an available worker"
 	case errors.Is(err, ErrTooManyConnections):
 		return "53300", "too many connections"
+	case errors.Is(err, ErrOrgResourceQuotaExceeded):
+		return "53400", "organization worker resource quota exceeded, please retry shortly"
 	default:
 		return "58000", fmt.Sprintf("failed to create session: %v", err)
 	}

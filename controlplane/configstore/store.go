@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // OrgUserKey is the composite key for org-scoped user lookups.
@@ -1232,7 +1233,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // is only used to classify an unfulfilled claim after no suitable idle worker
 // exists; an existing idle worker remains claimable even when the global pool is
 // at capacity.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int, maxColocatedCPU int, maxColocatedMemBytes uint64) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -1264,7 +1265,7 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 		// an idle worker of the same shape. The default request ("","",false)
 		// matches default/legacy/warm rows; a colocated request only matches
 		// colocated rows (and vice versa). Always filtered, including the default.
-		query = query.Where("profile_cpu = ? AND profile_memory = ? AND profile_colocate = ?", profileCPU, profileMemory, profileColocate)
+		query = query.Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate)
 
 		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {
@@ -1283,6 +1284,24 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 				return nil
 			}
 			return err
+		}
+
+		// Authoritative per-org colocated resource quota (cross-CP): summed under
+		// the org advisory lock held above, so it can't be raced by another CP.
+		// Only colocated claims count; reusing OrgCap surfaces as retryable
+		// backpressure. The in-process OrgReservedPool check is the fast pre-filter.
+		if profileColocate && orgID != "" && (maxColocatedCPU > 0 || maxColocatedMemBytes > 0) {
+			curCPU, curMem, sErr := cs.sumOrgColocatedResources(tx, orgID)
+			if sErr != nil {
+				return sErr
+			}
+			reqCPU := parseColocatedCPUCores(current.ProfileCPU)
+			reqMem := parseColocatedMemBytes(current.ProfileMemory)
+			if (maxColocatedCPU > 0 && curCPU+reqCPU > maxColocatedCPU) ||
+				(maxColocatedMemBytes > 0 && curMem+reqMem > maxColocatedMemBytes) {
+				missReason = WorkerClaimMissReasonOrgCap
+				return nil
+			}
 		}
 
 		now := time.Now()
@@ -1317,7 +1336,7 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 // When maxOrgWorkers is set, the org cap is checked under the same advisory
 // lock as neutral idle claims, excluding hot-idle rows from the count so a
 // cached worker can be reclaimed as the org's only active slot.
-func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -1341,6 +1360,11 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOr
 		err := tx.Table(cs.runtimeTable(current.TableName())).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("state = ? AND org_id = ?", WorkerStateHotIdle, orgID).
+			// Only reclaim a hot-idle worker of the requested shape, so a
+			// differently-shaped request (e.g. an 8/48 colocated backfill) doesn't
+			// claim-and-retire this org's default-shape hot-idle workers. COALESCE
+			// keeps legacy NULL-profile rows in the default bucket.
+			Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate).
 			Order("worker_id ASC").
 			Take(&current).Error
 		if err != nil {
@@ -1857,7 +1881,7 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, po
 // neutral warm pool under advisory-lock protected cluster-wide warm-target and
 // global capacity checks. A nil result means capacity already satisfies the target
 // or the global worker cap blocked the spawn.
-func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
 	if strings.TrimSpace(podNamePrefix) == "" {
 		return nil, fmt.Errorf("pod name prefix is required")
 	}
@@ -1872,7 +1896,7 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 		}
 
 		if targetWarmWorkers > 0 {
-			count, err := cs.countNeutralWarmWorkers(tx)
+			count, err := cs.countNeutralWarmWorkers(tx, profileCPU, profileMemory, profileColocate)
 			if err != nil {
 				return err
 			}
@@ -1900,6 +1924,9 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 			WorkerID:          int(workerID),
 			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
 			Image:             image,
+			ProfileCPU:        profileCPU,
+			ProfileMemory:     profileMemory,
+			ProfileColocate:   profileColocate,
 			State:             WorkerStateSpawning,
 			OrgID:             "",
 			OwnerCPInstanceID: ownerCPInstanceID,
@@ -2091,10 +2118,59 @@ func workerTerminalEligibleStates(targetState WorkerState) []WorkerState {
 	return workerActiveStates()
 }
 
-func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB) (int64, error) {
+// countNeutralWarmWorkers counts neutral (unassigned) warm workers of a single
+// profile shape. The warm pool is maintained per shape, so the default
+// ("","",false) and colocated targets are counted independently.
+// sumOrgColocatedResources sums the CPU (whole cores) and memory (bytes) of an
+// org's live colocated workers. Used inside ClaimIdleWorker's advisory-locked txn
+// to enforce the per-org colocated budget authoritatively across CP replicas.
+func (cs *ConfigStore) sumOrgColocatedResources(tx *gorm.DB, orgID string) (cpuCores int, memBytes uint64, err error) {
+	var rows []WorkerRecord
+	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Select("profile_cpu", "profile_memory").
+		Where("org_id = ? AND COALESCE(profile_colocate, false) = true AND state <> ?", orgID, WorkerStateRetired).
+		Find(&rows).Error; err != nil {
+		return 0, 0, err
+	}
+	for _, r := range rows {
+		cpuCores += parseColocatedCPUCores(r.ProfileCPU)
+		memBytes += parseColocatedMemBytes(r.ProfileMemory)
+	}
+	return cpuCores, memBytes, nil
+}
+
+// parseColocatedCPUCores parses a CPU quantity to whole cores (e.g. "4" -> 4).
+func parseColocatedCPUCores(s string) int {
+	if s == "" {
+		return 0
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0
+	}
+	return int(q.Value())
+}
+
+// parseColocatedMemBytes parses a memory quantity to bytes (e.g. "16Gi").
+func parseColocatedMemBytes(s string) uint64 {
+	if s == "" {
+		return 0
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0
+	}
+	if v := q.Value(); v > 0 {
+		return uint64(v)
+	}
+	return 0
+}
+
+func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB, profileCPU, profileMemory string, profileColocate bool) (int64, error) {
 	var count int64
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("org_id = ''").
+		Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate).
 		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
 		Count(&count).Error; err != nil {
 		return 0, err
@@ -2107,6 +2183,13 @@ func (cs *ConfigStore) countNeutralWarmWorkersForImage(tx *gorm.DB, image string
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("org_id = ''").
 		Where("image = ?", image).
+		// Only the DEFAULT (exclusive) shape counts toward the per-image warm
+		// target — colocated workers share p.workerImage but live in their own
+		// warm pool, so without this filter they'd cross-count and starve the
+		// exclusive pool. COALESCE keeps legacy NULL-profile rows in the default
+		// bucket. Keep in sync with countNeutralWarmWorkers / the default
+		// MatchKey ("","",false).
+		Where("COALESCE(profile_cpu, '') = '' AND COALESCE(profile_memory, '') = '' AND COALESCE(profile_colocate, false) = false").
 		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
 		Count(&count).Error; err != nil {
 		return 0, err
