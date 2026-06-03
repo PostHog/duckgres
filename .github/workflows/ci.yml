@@ -269,7 +269,7 @@ jobs:
       # AWS_* credentials are populated by configure-aws-credentials below
       # via OIDC; the three iceberg-specific values are bucket coordinates
       # provisioned in mw-dev.
-      DUCKGRES_K8S_ICEBERG_TABLE_BUCKET_ARN: arn:aws:s3tables:us-east-1:373313242555:bucket/posthog-duckgres-iceberg-test-mw-dev
+      DUCKGRES_K8S_ICEBERG_TABLE_BUCKET_ARN: arn:aws:s3tables:us-east-1:${{ secrets.MW_DEV_ACCOUNT_ID }}:bucket/posthog-duckgres-iceberg-test-mw-dev
       DUCKGRES_K8S_ICEBERG_REGION: us-east-1
       DUCKGRES_K8S_ICEBERG_DATA_BUCKET: posthog-duckgres-iceberg-test-data-mw-dev
 
@@ -328,7 +328,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v4.0.2
         with:
           aws-region: us-east-1
-          role-to-assume: arn:aws:iam::373313242555:role/github-duckgres-iceberg-ci-testing-role
+          role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-iceberg-ci-testing-role
           role-duration-seconds: 3600
       - name: Run Kubernetes integration tests
         run: just test-k8s-integration

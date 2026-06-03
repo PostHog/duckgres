@@ -1,0 +1,103 @@
+# Reusable single-image build. Factored out of the per-image CD workflows so
+# the PR e2e flow (.github/workflows/e2e-mw-dev.yml) can build the SAME images
+# the CD pipeline builds, but arm64-only and tagged per-PR, without
+# duplicating the buildx + ECR-login + cache wiring.
+#
+# Caller passes the Dockerfile, image name, tag, platform, and the DuckDB
+# build-args (worker only). Pushes to ECR (and optionally GHCR). The CD
+# workflows can migrate onto this later; for now they keep their own matrix
+# blocks and only the e2e flow consumes this — keeps the prod image pipeline
+# untouched while the harness lands.
+name: _image-build
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: "Path to the Dockerfile to build."
+        required: true
+        type: string
+      image-name:
+        description: "ECR/GHCR repository name, e.g. duckgres-worker."
+        required: true
+        type: string
+      tag:
+        description: "Image tag to push, e.g. pr-123-<sha>-arm64."
+        required: true
+        type: string
+      platform:
+        description: "Build platform. PR e2e uses linux/arm64 (mw-dev is arm64)."
+        required: false
+        default: linux/arm64
+        type: string
+      build-args:
+        description: "Multiline docker build-args (worker needs the DuckDB pins)."
+        required: false
+        default: ""
+        type: string
+      cache-scope:
+        description: "GHA cache scope key — keep distinct per (image,platform)."
+        required: true
+        type: string
+    secrets:
+      ecr-role:
+        description: "IAM role ARN for ECR push (OIDC)."
+        required: true
+    outputs:
+      image:
+        description: "Fully-qualified image ref that was pushed."
+        value: ${{ jobs.build.outputs.image }}
+
+env:
+  ECR_REGISTRY: 795637471508.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  build:
+    # arm64 runner so linux/arm64 builds run natively (no QEMU). mw-dev worker
+    # nodes are arm64, so the e2e flow only ever needs arm64.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Compute image ref
+        id: ref
+        # Pass inputs via env (not inline ${{ }} in run) to avoid shell
+        # injection — semgrep run-shell-injection.
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          TAG: ${{ inputs.tag }}
+        run: echo "image=${ECR_REGISTRY}/${IMAGE_NAME}:${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.ecr-role }}
+          aws-region: us-east-1
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platform }}
+          push: true
+          tags: ${{ steps.ref.outputs.image }}
+          build-args: |
+            VERSION=pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+            BUILD_TAGS=kubernetes
+            ${{ inputs.build-args }}
+          cache-from: type=gha,scope=${{ inputs.cache-scope }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.cache-scope }}

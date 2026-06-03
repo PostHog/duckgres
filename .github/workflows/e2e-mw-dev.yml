@@ -1,0 +1,159 @@
+# Per-PR end-to-end test against the real posthog-mw-dev EKS cluster.
+#
+# Replaces what kind (tests/k8s/) cannot exercise: real Cilium network
+# policies, real Crossplane Duckling provisioning, real cnpg-shard + external
+# RDS metadata stores, and the real per-org Lakekeeper operator — the layers
+# where this quarter's bugs actually lived (Cilium egress, lakekeeper
+# encryption-key drift, cnpg role drift, RBAC delete gaps).
+#
+# Flow:
+#   1. build arm64-only worker + control-plane images, tagged pr-<N>-<sha>,
+#      pushed to ECR (mw-dev is arm64, so one arch is enough for a PR).
+#   2. join the org tailnet via OIDC/WIF → reach the private mw-dev EKS API.
+#   3. stand up an isolated namespace duckgres-ci-pr-<N>: a throwaway
+#      config-store Postgres + a control-plane Deployment running the PR image,
+#      spawning worker pods in the same namespace.
+#   4. run the e2e harness as a Job INSIDE the namespace, talking to the CP
+#      ClusterIP service (no public DNS / NLB needed). Covers cnpg + ext
+#      (aurora is being retired — out of scope).
+#   5. always tear the namespace down (and deprovision the ci-pr ducklings so
+#      no S3 / cnpg role / lakekeeper CR leaks on shared infra).
+#
+# SECURITY — who can run this:
+#   Same model as the AWS/OIDC job in ci.yml: the gate is the repo setting
+#   "Require approval for outside collaborators". Members' PRs run
+#   automatically; fork PRs from outside collaborators get NO secrets and don't
+#   run until a maintainer clicks approve-and-run, so they can't reach the
+#   cluster or assume the IAM role unapproved. (No per-workflow guard job /
+#   required-reviewer Environment — that would either block external PRs even
+#   after approval, or force an approval click on every maintainer push.)
+#
+# Required repo configuration (one-time, see tests/e2e-mw-dev/README.md):
+#   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV
+#   secrets: AWS_ECR_PUBLISH_IAM_ROLE (already exists, used by CD),
+#            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it)
+#   IAM:     github-duckgres-e2e role in the mw-dev account (posthog-cloud-infra)
+#            — stripped down, NOT the account-admin terraform-infra role.
+#   Repo setting: "Require approval for all outside collaborators".
+name: e2e-mw-dev
+
+on:
+  pull_request:
+    branches: [main]
+    # Scope: only run when something that could change runtime behavior moves.
+    # (Docs-only PRs shouldn't spin up a cluster namespace.)
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile*"
+      - "tests/e2e-mw-dev/**"
+      - ".github/workflows/e2e-mw-dev.yml"
+      - ".github/workflows/_image-build.yml"
+  workflow_dispatch:
+
+# One in-flight run per PR; a new push cancels the old run (and its namespace
+# is GC'd by the always() teardown of the cancelled run + the janitor).
+concurrency:
+  group: e2e-mw-dev-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # mw-dev runs ONE all-in-one `duckgres` image for both roles: the control
+  # plane is `--mode control-plane` on it, and DUCKGRES_K8S_WORKER_IMAGE points
+  # at the same image (workers run `--mode duckdb-service`). So the e2e flow
+  # builds that single image — not the separate worker/controlplane CD images —
+  # to match what actually ships to mw-dev.
+  build:
+    uses: ./.github/workflows/_image-build.yml
+    with:
+      dockerfile: Dockerfile
+      image-name: duckgres
+      tag: pr-${{ github.event.pull_request.number }}-${{ github.sha }}-arm64
+      platform: linux/arm64
+      cache-scope: e2e-duckgres-arm64
+      # Default DuckDB row (1.5.3) — mirrors the default:true matrix entry in
+      # container-image-worker-cd.yml. Keep in lock-step on a version bump.
+      build-args: |
+        DUCKDB_EXTENSION_VERSION=1.5.3
+        HTTPFS_EXTENSION_TAG=v1.5.3-stoi-fix
+        DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
+        DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
+        POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
+    secrets:
+      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+
+  e2e:
+    needs: [build]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      NAMESPACE: duckgres-ci-pr-${{ github.event.pull_request.number }}
+      # Single all-in-one image for both CP and workers (mw-dev parity).
+      WORKER_IMAGE: ${{ needs.build.outputs.image }}
+      CONTROLPLANE_IMAGE: ${{ needs.build.outputs.image }}
+      KUBE_CONTEXT: posthog-mw-dev
+      CLUSTER_NAME: posthog-mw-dev
+      EKS_CLUSTER_NAME: posthog-mw-dev
+      AWS_REGION: us-east-1
+      # The per-PR CP assumes the SAME EKS Pod Identity role as the real mw-dev
+      # control plane, so STS-brokered S3 activation works with no cred
+      # injection. Built from the account-id secret (no account id committed) +
+      # the non-sensitive role name.
+      CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          # Dedicated, stripped-down e2e role (NOT the account-admin
+          # terraform-infra role): eks:DescribeCluster + Pod Identity
+          # association calls + iam:PassRole on the CP role, plus an EKS access
+          # entry for the kubectl it needs. Defined in posthog-cloud-infra
+          # (mw-dev account). Account id comes from a repo secret so no AWS
+          # account id is committed; the role name is not sensitive.
+          role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
+          aws-region: us-east-1
+
+      # Private EKS API — join the org tailnet so kubectl can reach it. OIDC/WIF,
+      # no static key. Mirrors PostHog/hogland deploy.yml. The subnet router
+      # advertises the mw-dev VPC incl. the private API endpoint.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
+        with:
+          oauth-client-id: ${{ vars.TS_WIF_CLIENT_ID_MW_DEV }}
+          audience: ${{ vars.TS_WIF_AUDIENCE_MW_DEV }}
+          tags: tag:github-runner
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+
+      - name: Update kubeconfig
+        # --alias so the context is named posthog-mw-dev (matches KUBE_CONTEXT /
+        # run.sh's explicit --context). Without it the context defaults to the
+        # full cluster ARN and `kubectl --context posthog-mw-dev` fails with
+        # "context does not exist".
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
+
+      - name: Deploy isolated namespace
+        run: bash tests/e2e-mw-dev/run.sh deploy
+
+      - name: Run e2e harness (in-cluster Job)
+        run: bash tests/e2e-mw-dev/run.sh test
+
+      - name: Collect diagnostics
+        if: always()
+        run: bash tests/e2e-mw-dev/run.sh diagnostics
+
+      # Always tear down — deprovision the ci-pr ducklings (so no S3 / cnpg
+      # role+db / lakekeeper CR leaks on shared infra) then delete the
+      # namespace. Runs even on cancel/failure.
+      - name: Teardown
+        if: always()
+        run: bash tests/e2e-mw-dev/run.sh teardown
