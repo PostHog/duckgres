@@ -18,6 +18,7 @@ import (
 const restCatalogConcurrency = 8
 
 var errRESTCatalogUnavailable = errors.New("lakekeeper REST catalog metadata unavailable")
+var errRESTCatalogTableNotFound = fmt.Errorf("%w: table not found", errRESTCatalogUnavailable)
 
 type restCatalogMetadataSource struct {
 	endpoint string
@@ -62,7 +63,7 @@ func (c Config) restMetadataSource() (restCatalogMetadataSource, error) {
 	}, nil
 }
 
-func (s restCatalogMetadataSource) LoadColumns(ctx context.Context, warehouse string, tables []tableRef) (map[tableRef][]sourceColumn, error) {
+func (s restCatalogMetadataSource) LoadColumns(ctx context.Context, warehouse string, tables []tableRef, strictMissing bool) (map[tableRef][]sourceColumn, error) {
 	if len(tables) == 0 {
 		return nil, nil
 	}
@@ -81,6 +82,9 @@ func (s restCatalogMetadataSource) LoadColumns(ctx context.Context, warehouse st
 		g.Go(func() error {
 			cols, err := s.loadTableColumns(ctx, prefix, table)
 			if err != nil {
+				if !strictMissing && errors.Is(err, errRESTCatalogTableNotFound) {
+					return nil
+				}
 				return err
 			}
 			mu.Lock()
@@ -158,7 +162,10 @@ func (s restCatalogMetadataSource) getJSON(ctx context.Context, requestURL strin
 	if err != nil {
 		return fmt.Errorf("%w: read GET %s response: %v", errRESTCatalogUnavailable, requestURL, err)
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%w: GET %s returned HTTP %d", errRESTCatalogTableNotFound, requestURL, resp.StatusCode)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("%w: GET %s returned HTTP %d", errRESTCatalogUnavailable, requestURL, resp.StatusCode)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

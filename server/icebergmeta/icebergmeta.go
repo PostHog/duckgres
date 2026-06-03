@@ -24,6 +24,11 @@ type Config struct {
 	LakekeeperOAuth2ServerURI string
 }
 
+type tableFilter struct {
+	Schema string
+	Name   string
+}
+
 type sourceColumn struct {
 	Name     string
 	Type     string
@@ -44,7 +49,8 @@ func LoadColumns(ctx context.Context, executor sqlcore.QueryExecutor, query stri
 		return nil
 	}
 
-	tables, err := listCandidateTables(ctx, executor)
+	filter := extractTableFilter(query)
+	tables, err := listCandidateTables(ctx, executor, filter)
 	if err != nil {
 		return err
 	}
@@ -56,7 +62,8 @@ func LoadColumns(ctx context.Context, executor sqlcore.QueryExecutor, query stri
 	if err != nil {
 		return err
 	}
-	columns, err := source.LoadColumns(ctx, cfg.LakekeeperWarehouse, tables)
+	strictMissing := filter.Schema != "" || filter.Name != ""
+	columns, err := source.LoadColumns(ctx, cfg.LakekeeperWarehouse, tables, strictMissing)
 	if err != nil {
 		return err
 	}
@@ -70,14 +77,54 @@ func firstConfig(configs []Config) Config {
 	return configs[0]
 }
 
-func listCandidateTables(ctx context.Context, executor sqlcore.QueryExecutor) ([]tableRef, error) {
+func extractTableFilter(query string) tableFilter {
+	lower := strings.ToLower(query)
+	return tableFilter{
+		Schema: extractSingleQuotedPredicate(query, lower, "table_schema"),
+		Name:   extractSingleQuotedPredicate(query, lower, "table_name"),
+	}
+}
+
+func extractSingleQuotedPredicate(query, lowerQuery, column string) string {
+	markers := []string{
+		column + " = '",
+		column + "='",
+		"c." + column + " = '",
+		"c." + column + "='",
+	}
+	for _, marker := range markers {
+		idx := strings.Index(lowerQuery, marker)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(marker)
+		end := strings.Index(query[start:], "'")
+		if end < 0 {
+			return ""
+		}
+		value := query[start : start+end]
+		if strings.Contains(value, "%") {
+			return ""
+		}
+		return value
+	}
+	return ""
+}
+
+func listCandidateTables(ctx context.Context, executor sqlcore.QueryExecutor, filter tableFilter) ([]tableRef, error) {
 	query := `
 		SELECT table_schema, table_name
 		FROM information_schema.tables
 		WHERE table_catalog = 'iceberg'
 		AND table_type = 'BASE TABLE'
-		ORDER BY table_schema, table_name
 	`
+	if filter.Schema != "" {
+		query += "\n\t\tAND table_schema = " + quoteSQLString(filter.Schema)
+	}
+	if filter.Name != "" {
+		query += "\n\t\tAND table_name = " + quoteSQLString(filter.Name)
+	}
+	query += "\n\t\tORDER BY table_schema, table_name"
 
 	rows, err := executor.QueryContext(ctx, query)
 	if err != nil {
