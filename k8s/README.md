@@ -147,6 +147,42 @@ just multitenant-config-store-down
 
 After code changes, rerun `just run-multitenant-kind` to rebuild, redeploy, and reseed the default local environment.
 
+## Iceberg (Lakekeeper) Local Dev
+
+The local multitenant flows (both kind and OrbStack) now bring up a [Lakekeeper](https://lakekeeper.io/) Iceberg REST catalog alongside the existing MinIO + Postgres dependencies, and seed the `local` tenant as a **"both" warehouse** — DuckLake *and* Iceberg enabled on the same row. No extra commands are needed: `just run-multitenant-local` / `just run-multitenant-kind` start and bootstrap it automatically.
+
+What runs (added to `k8s/local-config-store.compose.yaml`):
+
+- `lakekeeper-catalog` — Postgres backing Lakekeeper's own catalog metadata (tmpfs).
+- `lakekeeper-migrate` — one-shot schema migration; `serve` waits for it.
+- `lakekeeper` — the REST catalog in **allow-all (no-auth)** mode, pinned to `quay.io/lakekeeper/catalog:v0.12.3`, exposed on host port **38181** in both flows.
+
+After the catalog is healthy, `k8s/lakekeeper/bootstrap.sh` (run by the `…-config-store-up` recipes) bootstraps the server and creates the warehouse `local` against the MinIO bucket `duckgres-local`. It is idempotent — the catalog Postgres is tmpfs, so bootstrap re-runs cleanly on every `up`.
+
+Connect to the Iceberg catalog by selecting `dbname=iceberg`:
+
+```bash
+just multitenant-port-forward-pg   # in another shell
+PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres dbname=iceberg sslmode=require"
+
+# e.g.
+CREATE SCHEMA demo;
+CREATE TABLE demo.t (id int, name text);
+INSERT INTO demo.t VALUES (1, 'a');
+DROP SCHEMA demo CASCADE;
+```
+
+How the wiring works:
+
+- The worker reaches Lakekeeper at `host.docker.internal:38181/catalog` (OrbStack) or `duckgres-lakekeeper:8181/catalog` (kind) — see the `iceberg_*` columns in the seed files.
+- ATTACH uses `AUTHORIZATION_TYPE 'none'` (allow-all), so no OAuth2 secret is needed.
+- **Iceberg data S3 access reuses the DuckLake `ducklake_s3` secret.** The iceberg-only S3 secret has no MinIO endpoint knobs, so an Iceberg session only gets working MinIO reads/writes when a DuckLake catalog is attached first in the same session — hence the "both" tenant. Lakekeeper itself reaches MinIO via the compose service name (`http://minio:9000`); both point at the same bucket, and Iceberg metadata stores absolute `s3://` paths, so the differing endpoints are consistent.
+- NetworkPolicy is **not enforced** on OrbStack/kind (default CNIs don't enforce it), so the worker can reach Lakekeeper on a non-standard port without policy changes. The policies in this directory still document the intended production boundaries.
+
+### Validating the Iceberg DROP SCHEMA CASCADE path
+
+`just qa-iceberg-drop-schema` runs `tests/clusterqa/iceberg_drop_schema_test.go` against the running cluster (needs an active `just multitenant-port-forward-pg`). It connects with `dbname=iceberg`, creates a populated schema, and runs `DROP SCHEMA … CASCADE` — exercising the `server/iceberg_drop_schema.go` fallback whose internal list-tables query hit the Flight `?`-placeholder bug. It fails on an unfixed image and passes once the fix is in.
+
 ### Running Integration Tests
 
 ```bash

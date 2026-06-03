@@ -11,3 +11,11 @@ services:
     ports:
       - "39000:9000"
       - "39001:9001"
+
+  # Lakekeeper management + Iceberg REST catalog. Exposed on the host so the
+  # bootstrap script (run from the host) can reach it at 127.0.0.1:38181; the
+  # worker pods reach it via host.docker.internal:38181 (see the iceberg_*
+  # columns in k8s/local-config-store.seed.sql).
+  lakekeeper:
+    ports:
+      - "38181:8181"

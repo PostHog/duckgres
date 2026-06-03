@@ -77,7 +77,8 @@ check-multitenant-local-ports:
       "35434 warehouse-postgres" \
       "35433 ducklake-metadata" \
       "39000 minio-api" \
-      "39001 minio-console"; do \
+      "39001 minio-console" \
+      "38181 lakekeeper"; do \
       port="${spec%% *}"; \
       name="${spec#* }"; \
       if nc -z 127.0.0.1 "${port}" >/dev/null 2>&1; then \
@@ -99,13 +100,23 @@ check-multitenant-local-ports:
 [group('dev')]
 check-multitenant-kind-ports:
     @set -eu; \
-    if nc -z 127.0.0.1 5434 >/dev/null 2>&1; then \
-      echo "Required local dev port 5434 is already in use (config-store-postgres)."; \
-      if command -v lsof >/dev/null 2>&1; then \
-        lsof -nP -iTCP:5434 -sTCP:LISTEN || true; \
-      elif command -v ss >/dev/null 2>&1; then \
-        ss -ltn "( sport = :5434 )" || true; \
+    failed=0; \
+    for spec in \
+      "5434 config-store-postgres" \
+      "38181 lakekeeper"; do \
+      port="${spec%% *}"; \
+      name="${spec#* }"; \
+      if nc -z 127.0.0.1 "${port}" >/dev/null 2>&1; then \
+        echo "Required local dev port ${port} is already in use (${name})."; \
+        if command -v lsof >/dev/null 2>&1; then \
+          lsof -nP -iTCP:"${port}" -sTCP:LISTEN || true; \
+        elif command -v ss >/dev/null 2>&1; then \
+          ss -ltn "( sport = :${port} )" || true; \
+        fi; \
+        failed=1; \
       fi; \
+    done; \
+    if [ "${failed}" -ne 0 ]; then \
       echo "Free the occupied local dev port before running the duckgres multitenant kind setup."; \
       exit 1; \
     fi
@@ -116,6 +127,7 @@ multitenant-config-store-up: check-multitenant-local-ports
     docker compose -f k8s/local-config-store.compose.yaml -f k8s/orbstack/dependency-ports.overlay.yaml up -d --wait
     docker exec duckgres-local-minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
     docker exec duckgres-local-minio mc mb local/duckgres-local --ignore-existing
+    bash k8s/lakekeeper/bootstrap.sh
 
 # Start the local PostgreSQL config store used by the kind-backed multi-tenant K8s flow
 [group('dev')]
@@ -123,6 +135,7 @@ multitenant-config-store-up-kind: check-multitenant-kind-ports
     docker compose -f k8s/local-config-store.compose.yaml -f k8s/kind/config-store.overlay.yaml up -d --wait
     docker exec duckgres-local-minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
     docker exec duckgres-local-minio mc mb local/duckgres-local --ignore-existing
+    bash k8s/lakekeeper/bootstrap.sh
 
 # Stop the local PostgreSQL config store used by the multi-tenant K8s flow
 [group('dev')]
@@ -225,6 +238,14 @@ multitenant-port-forward-pg:
 [group('dev')]
 multitenant-port-forward-api:
     kubectl -n duckgres port-forward deployment/duckgres-control-plane 8080:8080
+
+# Validate the Iceberg DROP SCHEMA ... CASCADE path against a running local
+# multi-tenant cluster (requires `just multitenant-port-forward-pg` active).
+# Connects to the Iceberg catalog (dbname=iceberg) and exercises the
+# iceberg_drop_schema.go fallback that hit the Flight `?` placeholder bug.
+[group('dev')]
+qa-iceberg-drop-schema:
+    DUCKGRES_QA_CLUSTER=1 go test ./tests/clusterqa/ -run TestClusterIcebergDropSchema -count=1 -v
 
 # Run with DuckLake config
 [group('dev')]

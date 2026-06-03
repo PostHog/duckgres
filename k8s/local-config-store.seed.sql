@@ -3,7 +3,17 @@ VALUES ('local', 'duckgres', 0, '', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
 
+-- duckgres_managed_warehouses is now keyed by team_name (FK -> duckgres_teams),
+-- so seed a team the warehouse can attach to. Resolution still reads warehouses
+-- and users by org_id (see configstore models), so the warehouse row below also
+-- carries org_id = 'local'.
+INSERT INTO duckgres_teams (name, max_workers, min_workers, memory_budget, idle_timeout_s, created_at, updated_at)
+VALUES ('local', 0, 0, '', 0, NOW(), NOW())
+ON CONFLICT (name) DO UPDATE
+SET updated_at = NOW();
+
 INSERT INTO duckgres_managed_warehouses (
+    team_name,
     org_id,
     warehouse_database_region,
     warehouse_database_endpoint,
@@ -24,6 +34,14 @@ INSERT INTO duckgres_managed_warehouses (
     s3_endpoint,
     s3_use_ssl,
     s3_url_style,
+    iceberg_enabled,
+    iceberg_backend,
+    iceberg_namespace,
+    iceberg_region,
+    iceberg_lakekeeper_endpoint,
+    iceberg_lakekeeper_warehouse,
+    iceberg_state,
+    iceberg_status_message,
     worker_identity_namespace,
     worker_identity_service_account_name,
     worker_identity_iam_role_arn,
@@ -58,6 +76,7 @@ INSERT INTO duckgres_managed_warehouses (
 )
 VALUES (
     'local',
+    'local',
     'local-dev',
     'host.docker.internal',
     35434,
@@ -77,6 +96,18 @@ VALUES (
     'host.docker.internal:39000',
     false,
     'path',
+    -- Iceberg (Lakekeeper) "both" tenant: DuckLake stays enabled above; this
+    -- adds the Iceberg REST catalog. Worker reaches Lakekeeper via the host
+    -- gateway (OrbStack flow); data S3 access reuses the ducklake_s3 MinIO
+    -- secret. Connect with dbname=iceberg to use this catalog.
+    true,
+    'lakekeeper',
+    'public',
+    'us-east-1',
+    'http://host.docker.internal:38181/catalog',
+    'local',
+    'ready',
+    'local iceberg (lakekeeper) seeded',
     'duckgres',
     'duckgres-local-worker',
     'arn:aws:iam::000000000000:role/duckgres-local-worker',
@@ -109,7 +140,7 @@ VALUES (
     NOW(),
     NOW()
 )
-ON CONFLICT (org_id) DO UPDATE
+ON CONFLICT (team_name) DO UPDATE
 SET warehouse_database_region = EXCLUDED.warehouse_database_region,
     warehouse_database_endpoint = EXCLUDED.warehouse_database_endpoint,
     warehouse_database_port = EXCLUDED.warehouse_database_port,
@@ -129,6 +160,14 @@ SET warehouse_database_region = EXCLUDED.warehouse_database_region,
     s3_endpoint = EXCLUDED.s3_endpoint,
     s3_use_ssl = EXCLUDED.s3_use_ssl,
     s3_url_style = EXCLUDED.s3_url_style,
+    iceberg_enabled = EXCLUDED.iceberg_enabled,
+    iceberg_backend = EXCLUDED.iceberg_backend,
+    iceberg_namespace = EXCLUDED.iceberg_namespace,
+    iceberg_region = EXCLUDED.iceberg_region,
+    iceberg_lakekeeper_endpoint = EXCLUDED.iceberg_lakekeeper_endpoint,
+    iceberg_lakekeeper_warehouse = EXCLUDED.iceberg_lakekeeper_warehouse,
+    iceberg_state = EXCLUDED.iceberg_state,
+    iceberg_status_message = EXCLUDED.iceberg_status_message,
     worker_identity_namespace = EXCLUDED.worker_identity_namespace,
     worker_identity_service_account_name = EXCLUDED.worker_identity_service_account_name,
     worker_identity_iam_role_arn = EXCLUDED.worker_identity_iam_role_arn,

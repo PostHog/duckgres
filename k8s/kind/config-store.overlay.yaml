@@ -23,6 +23,33 @@ services:
         aliases:
           - duckgres-local-minio
 
+  # Lakekeeper's catalog Postgres and migrate one-shot must share the kind
+  # network so the lakekeeper service (also on kind) can reach them by service
+  # name. They keep their default service-name aliases here.
+  lakekeeper-catalog:
+    networks:
+      kind:
+        aliases:
+          - duckgres-local-lakekeeper-catalog
+
+  lakekeeper-migrate:
+    networks:
+      kind:
+        aliases:
+          - duckgres-local-lakekeeper-migrate
+
+  # Worker pods reach the REST catalog at duckgres-lakekeeper:8181 (see the
+  # iceberg_* columns in k8s/kind/config-store.seed.sql). Also exposed on the
+  # host port 38181 so the bootstrap script can reach it the same way as the
+  # OrbStack flow.
+  lakekeeper:
+    networks:
+      kind:
+        aliases:
+          - duckgres-lakekeeper
+    ports:
+      - "38181:8181"
+
 networks:
   kind:
     external: true

@@ -61,5 +61,66 @@ services:
     tmpfs:
       - /data
 
+  # Postgres backing the local Lakekeeper Iceberg REST catalog's own metadata
+  # (separate from the org's DuckLake metadata store). tmpfs: wiped on restart,
+  # which is why the migrate + bootstrap steps are idempotent and re-run on
+  # every `up`.
+  lakekeeper-catalog:
+    image: postgres:16-alpine
+    container_name: duckgres-local-lakekeeper-catalog
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper -d lakekeeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  # One-shot schema migration for Lakekeeper. `serve` depends on this completing
+  # successfully, so a single `docker compose up --wait` orders it correctly.
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.12.3
+    container_name: duckgres-local-lakekeeper-migrate
+    command: ["migrate"]
+    restart: "no"
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: local-dev-not-secure
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper@lakekeeper-catalog:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper@lakekeeper-catalog:5432/lakekeeper
+    depends_on:
+      lakekeeper-catalog:
+        condition: service_healthy
+
+  # Lakekeeper Iceberg REST catalog in allow-all (no-auth) mode for local dev.
+  # The worker ATTACHes this with AUTHORIZATION_TYPE 'none'; data S3 access is
+  # covered by the DuckLake ducklake_s3 secret (the "both" tenant model), since
+  # the iceberg-only S3 secret has no MinIO endpoint knobs.
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.12.3
+    container_name: duckgres-local-lakekeeper
+    command: ["serve"]
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: local-dev-not-secure
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper@lakekeeper-catalog:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper@lakekeeper-catalog:5432/lakekeeper
+      LAKEKEEPER__AUTHZ_BACKEND: allowall
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      timeout: 10s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      lakekeeper-catalog:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
 volumes:
   duckgres-config-store-data:
