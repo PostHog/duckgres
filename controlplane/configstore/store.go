@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // OrgUserKey is the composite key for org-scoped user lookups.
@@ -1232,7 +1233,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // is only used to classify an unfulfilled claim after no suitable idle worker
 // exists; an existing idle worker remains claimable even when the global pool is
 // at capacity.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int, maxColocatedCPU int, maxColocatedMemBytes uint64) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -1283,6 +1284,24 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 				return nil
 			}
 			return err
+		}
+
+		// Authoritative per-org colocated resource quota (cross-CP): summed under
+		// the org advisory lock held above, so it can't be raced by another CP.
+		// Only colocated claims count; reusing OrgCap surfaces as retryable
+		// backpressure. The in-process OrgReservedPool check is the fast pre-filter.
+		if profileColocate && orgID != "" && (maxColocatedCPU > 0 || maxColocatedMemBytes > 0) {
+			curCPU, curMem, sErr := cs.sumOrgColocatedResources(tx, orgID)
+			if sErr != nil {
+				return sErr
+			}
+			reqCPU := parseColocatedCPUCores(current.ProfileCPU)
+			reqMem := parseColocatedMemBytes(current.ProfileMemory)
+			if (maxColocatedCPU > 0 && curCPU+reqCPU > maxColocatedCPU) ||
+				(maxColocatedMemBytes > 0 && curMem+reqMem > maxColocatedMemBytes) {
+				missReason = WorkerClaimMissReasonOrgCap
+				return nil
+			}
 		}
 
 		now := time.Now()
@@ -2102,6 +2121,51 @@ func workerTerminalEligibleStates(targetState WorkerState) []WorkerState {
 // countNeutralWarmWorkers counts neutral (unassigned) warm workers of a single
 // profile shape. The warm pool is maintained per shape, so the default
 // ("","",false) and colocated targets are counted independently.
+// sumOrgColocatedResources sums the CPU (whole cores) and memory (bytes) of an
+// org's live colocated workers. Used inside ClaimIdleWorker's advisory-locked txn
+// to enforce the per-org colocated budget authoritatively across CP replicas.
+func (cs *ConfigStore) sumOrgColocatedResources(tx *gorm.DB, orgID string) (cpuCores int, memBytes uint64, err error) {
+	var rows []WorkerRecord
+	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Select("profile_cpu", "profile_memory").
+		Where("org_id = ? AND COALESCE(profile_colocate, false) = true AND state <> ?", orgID, WorkerStateRetired).
+		Find(&rows).Error; err != nil {
+		return 0, 0, err
+	}
+	for _, r := range rows {
+		cpuCores += parseColocatedCPUCores(r.ProfileCPU)
+		memBytes += parseColocatedMemBytes(r.ProfileMemory)
+	}
+	return cpuCores, memBytes, nil
+}
+
+// parseColocatedCPUCores parses a CPU quantity to whole cores (e.g. "4" -> 4).
+func parseColocatedCPUCores(s string) int {
+	if s == "" {
+		return 0
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0
+	}
+	return int(q.Value())
+}
+
+// parseColocatedMemBytes parses a memory quantity to bytes (e.g. "16Gi").
+func parseColocatedMemBytes(s string) uint64 {
+	if s == "" {
+		return 0
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0
+	}
+	if v := q.Value(); v > 0 {
+		return uint64(v)
+	}
+	return 0
+}
+
 func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB, profileCPU, profileMemory string, profileColocate bool) (int64, error) {
 	var count int64
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).

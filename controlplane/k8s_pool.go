@@ -1588,7 +1588,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			p.mu.Unlock()
 
 			profileCPU, profileMemory, profileColocate := assignment.Profile.Parts()
-			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, profileCPU, profileMemory, profileColocate, assignment.MaxWorkers, maxGlobalWorkers)
+			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, profileCPU, profileMemory, profileColocate, assignment.MaxWorkers, maxGlobalWorkers, assignment.MaxColocatedCPU, assignment.MaxColocatedMemBytes)
 			if err != nil {
 				return nil, err
 			}

@@ -106,10 +106,12 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 			p.shared.mu.Unlock()
 
 			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				OrgID:      p.orgID,
-				MaxWorkers: maxWorkers,
-				Image:      image,
-				Profile:    profile,
+				OrgID:                p.orgID,
+				MaxWorkers:           maxWorkers,
+				Image:                image,
+				Profile:              profile,
+				MaxColocatedCPU:      p.maxColocatedCPU,
+				MaxColocatedMemBytes: p.maxColocatedMemBytes,
 			})
 			if err != nil {
 				return nil, err
