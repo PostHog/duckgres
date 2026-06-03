@@ -724,6 +724,8 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 		return "53300", "timed out waiting for an available worker"
 	case errors.Is(err, ErrTooManyConnections):
 		return "53300", "too many connections"
+	case errors.Is(err, ErrOrgResourceQuotaExceeded):
+		return "53400", "organization worker resource quota exceeded, please retry shortly"
 	default:
 		return "58000", fmt.Sprintf("failed to create session: %v", err)
 	}

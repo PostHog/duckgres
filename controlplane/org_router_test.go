@@ -188,7 +188,7 @@ func TestOrgRouterAdapterSetWarmCapacityTargetZeroClearsAllWarmTargets(t *testin
 
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil, 0, 0)
 
 	oldTC := &configstore.OrgConfig{
 		Name: "analytics",
@@ -230,7 +230,7 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 
 func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	pool := NewOrgReservedPool(sharedPool, "analytics", 2, "posthog/duckgres:v1.0.0", nil)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, "posthog/duckgres:v1.0.0", nil, 0, 0)
 
 	oldTC := &configstore.OrgConfig{
 		Name: "analytics",

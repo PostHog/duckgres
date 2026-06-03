@@ -30,7 +30,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -81,7 +81,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -115,7 +115,7 @@ func TestOrgReservedPoolReleaseWorkerTransitionsToHotIdleOnLastSession(t *testin
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
 	pool.ReleaseWorker(worker.ID)
 
 	w, ok := shared.Worker(worker.ID)
@@ -147,7 +147,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	}
 
 	activated := false
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated = true
 		return nil
@@ -184,7 +184,7 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
 	activated := 0
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated++
@@ -236,7 +236,7 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 
 	// maxWorkers = 0 — the change under test. AcquireWorker must NOT
 	// reject on max-workers grounds.
-	pool := NewOrgReservedPool(shared, "analytics", 0, shared.workerImage, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 0, shared.workerImage, nil, 0, 0)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -274,7 +274,7 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()

@@ -19,18 +19,46 @@ type OrgReservedPool struct {
 	image                  string
 	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
+	// Per-org colocated resource caps. A count-based maxWorkers is insufficient
+	// when colocated pods vary in size, so colocated CPU/memory is also bounded.
+	// 0 = unbounded on that axis. Only colocated workers count against these.
+	maxColocatedCPU      int
+	maxColocatedMemBytes uint64
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker, maxColocatedCPU int, maxColocatedMemBytes uint64) *OrgReservedPool {
 	pool := &OrgReservedPool{
-		shared:     shared,
-		orgID:      orgID,
-		maxWorkers: maxWorkers,
-		image:      image,
-		stsBroker:  stsBroker,
+		shared:               shared,
+		orgID:                orgID,
+		maxWorkers:           maxWorkers,
+		image:                image,
+		stsBroker:            stsBroker,
+		maxColocatedCPU:      maxColocatedCPU,
+		maxColocatedMemBytes: maxColocatedMemBytes,
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
 	return pool
+}
+
+// assignedColocatedResourcesLocked sums the CPU (cores) and memory (bytes) of
+// this org's currently-assigned colocated workers. Caller holds p.shared.mu.
+func (p *OrgReservedPool) assignedColocatedResourcesLocked() (cpu int, memBytes uint64) {
+	for _, w := range p.shared.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
+			continue
+		}
+		if !p.workerBelongsToOrgLocked(w) || !w.profile.Colocate {
+			continue
+		}
+		cpu += parseK8sCPU(w.profile.CPU)
+		memBytes += parseK8sMemory(w.profile.Memory)
+	}
+	return cpu, memBytes
 }
 
 func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
@@ -60,6 +88,19 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 
 		assignedCount := p.assignedWorkerCountLocked()
 		if p.maxWorkers == 0 || assignedCount < p.maxWorkers {
+			// Resource-aware quota for colocated workers: a new colocated worker
+			// must not push the org over its colocated CPU/memory budget. Reusing
+			// an idle worker (handled above) adds nothing, so this gates only the
+			// spawn of a new one.
+			if profile != nil && profile.Colocate && (p.maxColocatedCPU > 0 || p.maxColocatedMemBytes > 0) {
+				curCPU, curMem := p.assignedColocatedResourcesLocked()
+				reqCPU, reqMem := parseK8sCPU(profile.CPU), parseK8sMemory(profile.Memory)
+				if (p.maxColocatedCPU > 0 && curCPU+reqCPU > p.maxColocatedCPU) ||
+					(p.maxColocatedMemBytes > 0 && curMem+reqMem > p.maxColocatedMemBytes) {
+					p.shared.mu.Unlock()
+					return nil, ErrOrgResourceQuotaExceeded
+				}
+			}
 			maxWorkers := p.maxWorkers
 			image := p.image
 			p.shared.mu.Unlock()

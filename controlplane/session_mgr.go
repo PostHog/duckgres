@@ -18,6 +18,11 @@ import (
 var ErrTooManyConnections = errors.New("too many connections")
 var ErrSessionManagerDraining = errors.New("session manager is draining")
 
+// ErrOrgResourceQuotaExceeded is returned when reserving a new colocated worker
+// would push the org over its colocated CPU/memory budget. Retryable: capacity
+// frees as the org's colocated sessions finish.
+var ErrOrgResourceQuotaExceeded = errors.New("organization colocated worker resource quota exceeded")
+
 const (
 	connectionLeaseReleaseMaxAttempts = 3
 	connectionLeaseReleaseRetryDelay  = 50 * time.Millisecond
