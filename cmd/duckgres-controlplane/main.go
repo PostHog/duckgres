@@ -243,6 +243,8 @@ func main() {
 			ColocatedWorkerCPURequest:       resolved.K8sColocatedWorkerCPURequest,
 			ColocatedWorkerMemoryRequest:    resolved.K8sColocatedWorkerMemoryRequest,
 			ColocatedWarmShapes:             resolved.K8sColocatedWarmShapes,
+			WorkerPriorityClassName:         resolved.K8sWorkerPriorityClassName,
+			WorkerTiers:                     resolved.K8sWorkerTiers,
 			ColocatedWorkerNodeSelector:     resolved.K8sColocatedWorkerNodeSelector,
 			ColocatedWorkerTolerationKey:    resolved.K8sColocatedWorkerTolerationKey,
 			ColocatedWorkerTolerationValue:  resolved.K8sColocatedWorkerTolerationValue,

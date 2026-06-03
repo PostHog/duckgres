@@ -56,24 +56,25 @@ type K8sWorkerPool struct {
 	shuttingDown       bool
 	shutdownCh         chan struct{}
 
-	clientset             kubernetes.Interface
-	namespace             string
-	cpID                  string
-	cpInstanceID          string
-	cpUID                 types.UID
-	workerImage           string
-	workerPort            int
-	secretName            string
-	configMap             string
-	configPath            string
-	imagePullPolicy       corev1.PullPolicy
-	serviceAccount        string
-	workerCPURequest      string            // CPU request for worker pods (e.g., "500m")
-	workerMemoryRequest   string            // memory request for worker pods (e.g., "1Gi")
-	workerNodeSelector    map[string]string // node selector for worker pods
-	workerTolerationKey   string            // taint key for NoSchedule toleration
-	workerTolerationValue string            // taint value for NoSchedule toleration
-	workerExclusiveNode   bool              // one worker per node via anti-affinity
+	clientset               kubernetes.Interface
+	namespace               string
+	cpID                    string
+	cpInstanceID            string
+	cpUID                   types.UID
+	workerImage             string
+	workerPort              int
+	secretName              string
+	configMap               string
+	configPath              string
+	imagePullPolicy         corev1.PullPolicy
+	serviceAccount          string
+	workerCPURequest        string            // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest     string            // memory request for worker pods (e.g., "1Gi")
+	workerNodeSelector      map[string]string // node selector for worker pods
+	workerTolerationKey     string            // taint key for NoSchedule toleration
+	workerTolerationValue   string            // taint value for NoSchedule toleration
+	workerExclusiveNode     bool              // one worker per node via anti-affinity
+	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
 	// Colocated (bin-pack) scheduling for colocate=true worker profiles. When a
 	// spawned worker's profile is colocated, these replace the default
@@ -167,28 +168,29 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	spawnConcurrency := 50
 	retireConcurrency := 5
 	pool := &K8sWorkerPool{
-		workers:               make(map[int]*ManagedWorker),
-		maxWorkers:            cfg.MaxWorkers,
-		idleTimeout:           cfg.IdleTimeout,
-		shutdownCh:            make(chan struct{}),
-		stopInform:            make(chan struct{}),
-		clientset:             clientset,
-		namespace:             cfg.Namespace,
-		cpID:                  cfg.CPID,
-		cpInstanceID:          cfg.CPInstanceID,
-		workerImage:           cfg.WorkerImage,
-		workerPort:            cfg.WorkerPort,
-		secretName:            cfg.SecretName,
-		configMap:             cfg.ConfigMap,
-		configPath:            cfg.ConfigPath,
-		imagePullPolicy:       corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:        cfg.ServiceAccount,
-		workerCPURequest:      cfg.WorkerCPURequest,
-		workerMemoryRequest:   cfg.WorkerMemoryRequest,
-		workerNodeSelector:    cfg.WorkerNodeSelector,
-		workerTolerationKey:   cfg.WorkerTolerationKey,
-		workerTolerationValue: cfg.WorkerTolerationValue,
-		workerExclusiveNode:   cfg.WorkerExclusiveNode,
+		workers:                 make(map[int]*ManagedWorker),
+		maxWorkers:              cfg.MaxWorkers,
+		idleTimeout:             cfg.IdleTimeout,
+		shutdownCh:              make(chan struct{}),
+		stopInform:              make(chan struct{}),
+		clientset:               clientset,
+		namespace:               cfg.Namespace,
+		cpID:                    cfg.CPID,
+		cpInstanceID:            cfg.CPInstanceID,
+		workerImage:             cfg.WorkerImage,
+		workerPort:              cfg.WorkerPort,
+		secretName:              cfg.SecretName,
+		configMap:               cfg.ConfigMap,
+		configPath:              cfg.ConfigPath,
+		imagePullPolicy:         corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:          cfg.ServiceAccount,
+		workerCPURequest:        cfg.WorkerCPURequest,
+		workerMemoryRequest:     cfg.WorkerMemoryRequest,
+		workerNodeSelector:      cfg.WorkerNodeSelector,
+		workerTolerationKey:     cfg.WorkerTolerationKey,
+		workerTolerationValue:   cfg.WorkerTolerationValue,
+		workerExclusiveNode:     cfg.WorkerExclusiveNode,
+		workerPriorityClassName: cfg.WorkerPriorityClassName,
 
 		colocatedWorkerNodeSelector:    cfg.ColocatedNodeSelector,
 		colocatedWorkerTolerationKey:   cfg.ColocatedTolerationKey,
@@ -707,6 +709,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			RestartPolicy:                corev1.RestartPolicyNever,
 			ServiceAccountName:           p.workerServiceAccountName(),
 			AutomountServiceAccountToken: boolPtr(false),
+			PriorityClassName:            p.workerPriorityClassName,
 			NodeSelector:                 p.nodeSelectorForProfile(profile),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),

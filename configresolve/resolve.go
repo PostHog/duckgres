@@ -134,6 +134,8 @@ type Resolved struct {
 	K8sColocatedWorkerCPURequest       string
 	K8sColocatedWorkerMemoryRequest    string
 	K8sColocatedWarmShapes             []controlplane.ColocatedWarmShape
+	K8sWorkerPriorityClassName         string
+	K8sWorkerTiers                     map[string]controlplane.WorkerProfileSpec
 	K8sColocatedWorkerNodeSelector     string
 	K8sColocatedWorkerTolerationKey    string
 	K8sColocatedWorkerTolerationValue  string
@@ -219,6 +221,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
 	var k8sOrgMaxColocatedCPU int
 	var k8sOrgMaxColocatedMemory string
+	var k8sWorkerPriorityClassName string
+	var k8sWorkerTiers map[string]controlplane.WorkerProfileSpec
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
@@ -1005,6 +1009,17 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_ORG_MAX_COLOCATED_MEMORY"); v != "" {
 		k8sOrgMaxColocatedMemory = v
 	}
+	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
+		k8sWorkerPriorityClassName = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_TIERS"); v != "" {
+		var tiers map[string]controlplane.WorkerProfileSpec
+		if err := json.Unmarshal([]byte(v), &tiers); err == nil {
+			k8sWorkerTiers = tiers
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_TIERS (want JSON {\"backfill\":{\"cpu\":\"4\",\"memory\":\"16Gi\",\"colocate\":true}}): " + err.Error())
+		}
+	}
 
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
@@ -1402,6 +1417,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sColocatedWorkerCPURequest:       k8sColocatedWorkerCPURequest,
 		K8sColocatedWorkerMemoryRequest:    k8sColocatedWorkerMemoryRequest,
 		K8sColocatedWarmShapes:             k8sColocatedWarmShapes,
+		K8sWorkerPriorityClassName:         k8sWorkerPriorityClassName,
+		K8sWorkerTiers:                     k8sWorkerTiers,
 		K8sColocatedWorkerNodeSelector:     k8sColocatedWorkerNodeSelector,
 		K8sColocatedWorkerTolerationKey:    k8sColocatedWorkerTolerationKey,
 		K8sColocatedWorkerTolerationValue:  k8sColocatedWorkerTolerationValue,

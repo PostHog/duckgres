@@ -125,6 +125,7 @@ type K8sConfig struct {
 	WorkerTolerationKey             string        // Taint key for worker pod NoSchedule toleration
 	WorkerTolerationValue           string        // Taint value for worker pod NoSchedule toleration
 	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
+	WorkerPriorityClassName         string        // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
 	AWSRegion                       string        // AWS region for STS client
 
 	// Connection-string worker-profile selection (duckgres.colocate / worker_cpu /
@@ -164,9 +165,9 @@ type ColocatedWarmShape struct {
 // Explicit inline GUCs override a tier's fields. Colocate is a pointer so a tier
 // can pin exclusive (false) distinctly from "unset"; nil inherits the default.
 type WorkerProfileSpec struct {
-	CPU      string
-	Memory   string
-	Colocate *bool
+	CPU      string `json:"cpu"`
+	Memory   string `json:"memory"`
+	Colocate *bool  `json:"colocate"`
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.

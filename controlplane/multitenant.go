@@ -186,6 +186,7 @@ func SetupMultiTenant(
 		WorkerTolerationKey:      cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue:    cfg.K8s.WorkerTolerationValue,
 		WorkerExclusiveNode:      cfg.K8s.WorkerExclusiveNode,
+		WorkerPriorityClassName:  cfg.K8s.WorkerPriorityClassName,
 		ColocatedNodeSelector:    parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
 		ColocatedTolerationKey:   cfg.K8s.ColocatedWorkerTolerationKey,
 		ColocatedTolerationValue: cfg.K8s.ColocatedWorkerTolerationValue,
@@ -295,8 +296,9 @@ func SetupMultiTenant(
 
 		// Maintain the shape-aware colocated (bin-pack) warm pool alongside the
 		// default per-image pools, so every configured colocate=true shape (e.g.
-		// 4/16 and 8/48) bursts into a ready pod.
-		if len(cfg.K8s.ColocatedWarmShapes) > 0 {
+		// 4/16 and 8/48) bursts into a ready pod. Coupled to the master gate so we
+		// don't pre-warm colocated pods that no client can route to.
+		if cfg.K8s.AllowClientWorkerProfile && len(cfg.K8s.ColocatedWarmShapes) > 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			router.sharedPool.reconcileColocatedWarm(ctx)
 			cancel()

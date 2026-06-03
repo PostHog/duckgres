@@ -109,6 +109,7 @@ type K8sWorkerPoolConfig struct {
 	WorkerTolerationKey      string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
 	WorkerTolerationValue    string                                       // Taint value for worker pod NoSchedule toleration.
 	WorkerExclusiveNode      bool                                         // One worker per node via pod anti-affinity.
+	WorkerPriorityClassName  string                                       // PriorityClass for worker pods (so they preempt overprovision pause pods). Empty = none.
 	ColocatedNodeSelector    map[string]string                            // Node selector for colocate=true (bin-pack) worker pods. Nil = no selector.
 	ColocatedTolerationKey   string                                       // Taint key for colocated worker pods. Empty = no toleration.
 	ColocatedTolerationValue string                                       // Taint value for colocated worker pods.
