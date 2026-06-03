@@ -189,6 +189,9 @@ func SetupMultiTenant(
 		ColocatedNodeSelector:    parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
 		ColocatedTolerationKey:   cfg.K8s.ColocatedWorkerTolerationKey,
 		ColocatedTolerationValue: cfg.K8s.ColocatedWorkerTolerationValue,
+		ColocatedCPURequest:      cfg.K8s.ColocatedWorkerCPURequest,
+		ColocatedMemoryRequest:   cfg.K8s.ColocatedWorkerMemoryRequest,
+		ColocatedWarmTarget:      cfg.K8s.ColocatedSharedWarmTarget,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {
@@ -291,6 +294,16 @@ func SetupMultiTenant(
 		targets := targetSnapshot.EffectiveTargets
 		router.sharedPool.SetPerImageWarmTargets(targets)
 		reconcileWarmCapacityImageTargets(router.sharedPool, targets)
+
+		// Maintain the colocated (bin-pack) warm pool alongside the default
+		// per-image pools, so colocate=true requests also burst into a ready pod.
+		if colocatedTarget := cfg.K8s.ColocatedSharedWarmTarget; colocatedTarget > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := router.sharedPool.SpawnMinColocatedWorkers(ctx, colocatedTarget); err != nil {
+				slog.Warn("Janitor failed to reconcile colocated warm capacity.", "target", colocatedTarget, "error", err)
+			}
+			cancel()
+		}
 	}
 	janitor.retireMismatchedVersionWorker = func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

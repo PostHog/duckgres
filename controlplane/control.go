@@ -134,6 +134,7 @@ type K8sConfig struct {
 	AllowClientExclusiveNode       bool                         // Permit a client to request colocate=false (a full exclusive node)
 	ColocatedWorkerCPURequest      string                       // Default CPU for colocate=true with no size (e.g. "4")
 	ColocatedWorkerMemoryRequest   string                       // Default memory for colocate=true with no size (e.g. "16Gi")
+	ColocatedSharedWarmTarget      int                          // Warm-idle colocated (default-shape) workers to keep ready (0 = none)
 	ColocatedWorkerNodeSelector    string                       // JSON nodeSelector for colocated (bin-pack) worker pods
 	ColocatedWorkerTolerationKey   string                       // Taint key for colocated worker pod NoSchedule toleration
 	ColocatedWorkerTolerationValue string                       // Taint value for colocated worker pod NoSchedule toleration

@@ -82,6 +82,9 @@ type K8sWorkerPool struct {
 	colocatedWorkerNodeSelector    map[string]string
 	colocatedWorkerTolerationKey   string
 	colocatedWorkerTolerationValue string
+	colocatedWorkerCPURequest      string                                       // default CPU for the colocated warm pool's pod shape
+	colocatedWorkerMemoryRequest   string                                       // default memory for the colocated warm pool's pod shape
+	colocatedWarmTarget            int                                          // warm-idle colocated workers to maintain (0 = none)
 	orgID                          string                                       // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator              func() int                                   // shared ID generator across orgs (nil = internal counter)
 	resolveOrgConfig               func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
@@ -192,6 +195,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		colocatedWorkerNodeSelector:    cfg.ColocatedNodeSelector,
 		colocatedWorkerTolerationKey:   cfg.ColocatedTolerationKey,
 		colocatedWorkerTolerationValue: cfg.ColocatedTolerationValue,
+		colocatedWorkerCPURequest:      cfg.ColocatedCPURequest,
+		colocatedWorkerMemoryRequest:   cfg.ColocatedMemoryRequest,
+		colocatedWarmTarget:            cfg.ColocatedWarmTarget,
 
 		orgID:             cfg.OrgID,
 		workerIDGenerator: cfg.WorkerIDGenerator,
@@ -1600,6 +1606,9 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				worker, reserveErr := p.reserveClaimedWorker(ctx, claimed, assignment)
 				if reserveErr == nil {
 					p.triggerPerImageReplenish(claimed.Image)
+					if claimed.ProfileColocate {
+						p.triggerColocatedWarmReplenish()
+					}
 					return worker, nil
 				}
 				if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
@@ -1671,6 +1680,9 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.spawnWarmWorkerBackground(replenishID, p.workerImage)
 			}
 			p.triggerPerImageReplenish(idle.image)
+			if idle.profile.Colocate {
+				p.triggerColocatedWarmReplenish()
+			}
 			return idle, nil
 		}
 
@@ -2304,6 +2316,149 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 	}
 	wg.Wait()
 	return stderrors.Join(errs...)
+}
+
+// colocatedWarmProfile is the pod shape the colocated warm pool pre-warms: the
+// deployment's default colocated size, bin-packed. Empty when colocated defaults
+// aren't configured (then the colocated warm pool is effectively disabled).
+func (p *K8sWorkerPool) colocatedWarmProfile() WorkerProfile {
+	return WorkerProfile{
+		CPU:      p.colocatedWorkerCPURequest,
+		Memory:   p.colocatedWorkerMemoryRequest,
+		Colocate: true,
+	}
+}
+
+// idleColocatedWarmWorkerCountLocked counts warm-idle workers of the colocated
+// default shape. Caller holds p.mu.
+func (p *K8sWorkerPool) idleColocatedWarmWorkerCountLocked() int {
+	prof := p.colocatedWarmProfile()
+	want := prof.MatchKey()
+	count := 0
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if w.profile.MatchKey() != want {
+			continue
+		}
+		if p.isWarmIdleWorkerLocked(w) {
+			count++
+		}
+	}
+	return count
+}
+
+// SpawnMinColocatedWorkers ensures at least count warm-idle colocated workers
+// (the default colocated shape, default image) exist, so a colocate=true request
+// bursts into a ready pod instead of paying a cold spawn. Mirrors
+// SpawnMinWorkersForImage but for the colocated shape; a no-op without a runtime
+// store, without configured colocated defaults, or when count <= 0.
+func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, count int) error {
+	profile := p.colocatedWarmProfile()
+	if count <= 0 || p.runtimeStore == nil || profile.CPU == "" || profile.Memory == "" {
+		return nil
+	}
+
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil
+	}
+	p.cleanDeadWorkersLocked()
+	missing := count - p.idleColocatedWarmWorkerCountLocked()
+	if missing <= 0 {
+		p.mu.Unlock()
+		return nil
+	}
+	if p.maxWorkers > 0 {
+		room := p.maxWorkers - p.liveWorkerCountLocked()
+		if room <= 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		if missing > room {
+			missing = room
+		}
+	}
+	p.mu.Unlock()
+
+	var slots []*configstore.WorkerRecord
+	for i := 0; i < missing; i++ {
+		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
+			p.cpInstanceID,
+			p.workerPodNamePrefix(),
+			p.workerImage,
+			profile.CPU,
+			profile.Memory,
+			profile.Colocate,
+			count,
+			p.maxWorkers,
+		)
+		if err != nil {
+			for _, s := range slots {
+				p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
+			}
+			return err
+		}
+		if slot == nil {
+			break
+		}
+		slots = append(slots, slot)
+	}
+
+	if len(slots) == 0 {
+		return nil
+	}
+
+	p.mu.Lock()
+	p.spawning += len(slots)
+	p.mu.Unlock()
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(slots))
+	for i, slot := range slots {
+		wg.Add(1)
+		go func(i int, slot *configstore.WorkerRecord) {
+			defer wg.Done()
+			err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image, WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate})
+
+			p.mu.Lock()
+			p.spawning--
+			p.mu.Unlock()
+
+			if err != nil {
+				p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
+				errs[i] = err
+			}
+		}(i, slot)
+	}
+	wg.Wait()
+	return stderrors.Join(errs...)
+}
+
+// triggerColocatedWarmReplenish tops the colocated warm pool back up to its
+// target in the background. Called after a colocated worker is claimed so the
+// next request still finds a ready pod, independent of allocation rate.
+func (p *K8sWorkerPool) triggerColocatedWarmReplenish() {
+	if p.runtimeStore == nil {
+		return
+	}
+	p.mu.RLock()
+	target := p.colocatedWarmTarget
+	p.mu.RUnlock()
+	if target <= 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := p.SpawnMinColocatedWorkers(ctx, target); err != nil {
+			slog.Warn("Colocated warm replenish failed.", "target", target, "error", err)
+		}
+	}()
 }
 
 // HealthCheckLoop periodically checks worker health.

@@ -112,6 +112,9 @@ type K8sWorkerPoolConfig struct {
 	ColocatedNodeSelector    map[string]string                            // Node selector for colocate=true (bin-pack) worker pods. Nil = no selector.
 	ColocatedTolerationKey   string                                       // Taint key for colocated worker pods. Empty = no toleration.
 	ColocatedTolerationValue string                                       // Taint value for colocated worker pods.
+	ColocatedCPURequest      string                                       // Default CPU for the colocated warm pool's pod shape.
+	ColocatedMemoryRequest   string                                       // Default memory for the colocated warm pool's pod shape.
+	ColocatedWarmTarget      int                                          // Warm-idle colocated workers to maintain (0 = none).
 	OrgID                    string                                       // Org ID for pod labels (multi-tenant mode)
 	WorkerIDGenerator        func() int                                   // Shared ID generator across orgs (nil = internal counter)
 	ResolveOrgConfig         func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
