@@ -66,3 +66,20 @@ An adversarial multi-agent review (36/37 findings confirmed) drove these fixes:
 - **Worker PriorityClass** so worker pods preempt the overprovision headroom pause pods (else a real worker forces a fresh node).
 - **`worker_tier` wired from env** (`DUCKGRES_K8S_WORKER_TIERS`); previously unreachable in production.
 - **Deeper client connect retry** (~5 min) to outlast a cold colocated-node provision.
+
+## Post-deploy fix: colocated workers skip the cache proxy
+
+First mw-prod-us deploy churned: every colocated worker blocked forever in
+`waitForCacheProxy()`. The cache-proxy DaemonSet is pinned to the
+`duckgres-workers` nodepool (nodeSelector + toleration) and mounts the node's
+NVMe (`hostPath: /mnt/.ephemeral`). The colocated bin-pack nodepool runs no
+cache proxy and is deliberately NVMe-free, so the proxy can't run there. Workers
+with `DUCKGRES_CACHE_ENABLED=true` waited on a health endpoint that never came
+up, never answered the control plane's gRPC health check, and were torn
+down/respawned every ~90s — which also saturated the shared client-go rate
+limiter (the 8/48 shape couldn't even read its configmap).
+
+Fix: the control plane omits `DUCKGRES_CACHE_ENABLED`/`NODE_IP` when spawning a
+colocated worker (`spawnWorker`, gated on `!profile.Colocate`). Colocated
+workers talk to S3 directly; exclusive workers keep the node-local cache. No
+worker-code change — `cacheEnabled()` already no-ops when the env is unset.

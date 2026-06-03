@@ -800,7 +800,13 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	// DaemonSet proxy on the same node via the node IP + fixed hostPort.
 	// Inject NODE_IP via the Downward API so the worker process can resolve
 	// the proxy address at runtime.
-	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" {
+	//
+	// Colocated workers are exempt: they bin-pack onto the dedicated colocated
+	// nodepool, which runs no cache-proxy DaemonSet (and has no NVMe to back
+	// one). If they inherited DUCKGRES_CACHE_ENABLED they would block forever in
+	// waitForCacheProxy() waiting on a proxy that never comes up, never answer
+	// the control plane's gRPC health check, and churn. They talk to S3 directly.
+	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" && !profile.Colocate {
 		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
 			corev1.EnvVar{
 				Name:  "DUCKGRES_CACHE_ENABLED",
