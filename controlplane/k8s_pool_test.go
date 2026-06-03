@@ -956,6 +956,95 @@ func TestK8sPool_SpawnWorkerCleansUpWhenRPCSecurityReadCancelsContext(t *testing
 	}
 }
 
+// createdPodEnv returns the container env of the pod created via the fake
+// clientset under the given name. spawnWorker creates the pod before any of its
+// later steps can fail, so this is observable even when spawnWorker errors out.
+func createdPodEnv(t *testing.T, cs *fake.Clientset, podName string) []corev1.EnvVar {
+	t.Helper()
+	for _, action := range cs.Actions() {
+		if !action.Matches("create", "pods") {
+			continue
+		}
+		ca, ok := action.(k8stesting.CreateAction)
+		if !ok {
+			continue
+		}
+		pod, ok := ca.GetObject().(*corev1.Pod)
+		if !ok || pod.Name != podName {
+			continue
+		}
+		return pod.Spec.Containers[0].Env
+	}
+	t.Fatalf("no create pods action for %q; actions=%v", podName, cs.Actions())
+	return nil
+}
+
+func envHasName(env []corev1.EnvVar, name string) bool {
+	for _, e := range env {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Colocated workers run on the bin-pack nodepool, which has no cache-proxy
+// DaemonSet. They must not inherit DUCKGRES_CACHE_ENABLED, or they block forever
+// in waitForCacheProxy() and never answer the control plane's gRPC health check.
+func TestK8sPool_SpawnWorker_ColocatedSkipsCacheProxyEnv(t *testing.T) {
+	t.Setenv("DUCKGRES_CACHE_ENABLED", "true")
+
+	cases := []struct {
+		name         string
+		profile      WorkerProfile
+		wantCacheEnv bool
+	}{
+		{"exclusive worker gets cache proxy env", WorkerProfile{}, true},
+		{"colocated worker skips cache proxy env", WorkerProfile{Colocate: true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, cs := newTestK8sPool(t, 5)
+			workerID := 11
+			podName := pool.podNameForWorker(workerID)
+			secretName := pool.workerRPCSecretName(podName)
+
+			cs.Fake.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				ga, ok := action.(k8stesting.GetAction)
+				if !ok || ga.GetName() != podName {
+					return false, nil, nil
+				}
+				return true, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: pool.namespace},
+					Spec:       corev1.PodSpec{NodeName: "node-a"},
+					Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.11"},
+				}, nil
+			})
+			// Force a failure after the pod is created (we only inspect the pod spec).
+			cs.Fake.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				ga, ok := action.(k8stesting.GetAction)
+				if !ok || ga.GetName() != secretName {
+					return false, nil, nil
+				}
+				return true, nil, k8serrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, secretName)
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			_ = pool.spawnWorker(ctx, workerID, "duckgres:test", tc.profile, false)
+
+			env := createdPodEnv(t, cs, podName)
+			gotCache := envHasName(env, "DUCKGRES_CACHE_ENABLED")
+			gotNodeIP := envHasName(env, "NODE_IP")
+			if gotCache != tc.wantCacheEnv || gotNodeIP != tc.wantCacheEnv {
+				t.Fatalf("profile %+v: DUCKGRES_CACHE_ENABLED=%v NODE_IP=%v, want both %v",
+					tc.profile, gotCache, gotNodeIP, tc.wantCacheEnv)
+			}
+		})
+	}
+}
+
 func TestK8sPool_WorkerLookup(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
