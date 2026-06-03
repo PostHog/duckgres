@@ -2354,6 +2354,90 @@ func TestTranspile_JSONOperators(t *testing.T) {
 	}
 }
 
+// TestTranspile_JSONOperators_CreateTableAs is the regression test for the
+// CREATE TABLE AS / CREATE OR REPLACE TABLE AS path.
+//
+// Before the fix, OperatorTransform.Transform dispatched only on
+// SELECT/INSERT/UPDATE/DELETE, so it never descended into a CreateTableAsStmt's
+// AS-SELECT body. A chained JSON arrow there survived as a raw operator; the
+// pg_query Parse->Deparse round-trip (PostgreSQL precedence, where ->> binds
+// tighter than AND) then stripped the protective outer parens, and DuckDB 1.5
+// (which binds ->> *looser* than AND) mis-bound "x AND (j -> 'a') ->> 'b'",
+// throwing a spurious "Conversion Error: Failed to cast value to numerical" on
+// the JSON object. This regressed once #639 started routing CREATE OR REPLACE
+// TABLE through the transpile pipeline. Converting the arrows to
+// json_extract/json_extract_string makes the extraction precedence-immune.
+func TestTranspile_JSONOperators_CreateTableAs(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	t.Run("exact: CREATE TABLE AS double arrow", func(t *testing.T) {
+		in := "CREATE TABLE x AS SELECT data->>'key' FROM t"
+		want := "CREATE TABLE x AS SELECT json_extract_string(data, 'key') FROM t"
+		got, err := tr.Transpile(in)
+		if err != nil {
+			t.Fatalf("Transpile(%q): %v", in, err)
+		}
+		if got.SQL != want {
+			t.Errorf("\n  got:  %q\n  want: %q", got.SQL, want)
+		}
+	})
+
+	cases := []struct {
+		name     string
+		input    string
+		contains []string
+		excludes []string
+	}{
+		{
+			name:     "CREATE OR REPLACE TABLE AS converts arrows in body + WHERE",
+			input:    "CREATE OR REPLACE TABLE x AS SELECT id, data->>'name' AS n FROM t WHERE flag AND data->>'k' = 'v'",
+			contains: []string{"CREATE OR REPLACE TABLE", "json_extract_string(data, 'name')", "json_extract_string(data, 'k')"},
+			excludes: []string{"->"}, // no raw arrow operator may survive
+		},
+		{
+			// The SQLMesh shape that failed in prod: chained arrow inside a CASE,
+			// inside a CTE, inside CREATE OR REPLACE TABLE AS, in an AND context.
+			name: "chained arrow in CASE in CTE in CREATE OR REPLACE TABLE AS",
+			input: "CREATE OR REPLACE TABLE core AS WITH ue AS (" +
+				"SELECT CASE WHEN NOT b IS NULL AND (b -> '$.id') ->> '$.value' LIKE 'usr_%' " +
+				"THEN (b -> '$.id') ->> '$.value' ELSE NULL END AS user_id FROM src" +
+				") SELECT * FROM ue",
+			contains: []string{"json_extract_string(json_extract(b, '$.id'), '$.value')"},
+			excludes: []string{"->"}, // the bug: a bare arrow surviving the AND
+		},
+		{
+			name:     "arrow in GROUP BY / ORDER BY inside CTAS",
+			input:    "CREATE TABLE x AS SELECT data->>'type' AS t, count(*) AS c FROM src GROUP BY data->>'type' ORDER BY data->>'rank'",
+			contains: []string{"json_extract_string(data, 'type')", "json_extract_string(data, 'rank')"},
+			excludes: []string{"->"},
+		},
+		{
+			name:     "CREATE OR REPLACE VIEW converts arrows",
+			input:    "CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE flag AND data->>'k' = 'v'",
+			contains: []string{"CREATE OR REPLACE VIEW", "json_extract_string(data, 'k')"},
+			excludes: []string{"->"},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q): %v", tt.input, err)
+			}
+			for _, c := range tt.contains {
+				if !strings.Contains(got.SQL, c) {
+					t.Errorf("output missing %q\n  got: %s", c, got.SQL)
+				}
+			}
+			for _, e := range tt.excludes {
+				if strings.Contains(got.SQL, e) {
+					t.Errorf("raw arrow %q survived (the precedence bug)\n  got: %s", e, got.SQL)
+				}
+			}
+		})
+	}
+}
+
 func TestTranspile_ExpandArray(t *testing.T) {
 	tests := []struct {
 		name     string
