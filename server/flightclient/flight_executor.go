@@ -714,13 +714,100 @@ func (c *bearerCreds) RequireTransportSecurity() bool {
 // Safety: args come from PostgreSQL wire protocol typed parameter binding,
 // not raw user strings. The caller (handleBind) decodes typed values from
 // the binary protocol, so the values are trusted internal data.
+// interpolateArgs inlines query arguments into the SQL string. The Flight
+// executor sends ad-hoc statements without separate bind parameters, so any
+// placeholder left in the query reaches the worker unbound and fails to prepare
+// ("incorrect argument count for command"). It supports both placeholder styles
+// the rest of the stack emits:
+//   - `$N` PostgreSQL positional placeholders (selects args[N-1]); and
+//   - `?` positional placeholders (each consumes the next arg in order), which
+//     the transpiler produces for prepared statements (convertPlaceholders) and
+//     a few internal queries.
+//
+// Placeholders inside single-quoted string literals, double-quoted identifiers,
+// and `--` / `/* */` comments are left untouched. Unmatched placeholders (no
+// corresponding arg) are passed through unchanged.
 func interpolateArgs(query string, args []any) string {
-	for i := len(args); i >= 1; i-- {
-		placeholder := fmt.Sprintf("$%d", i)
-		replacement := formatArgValue(args[i-1])
-		query = strings.ReplaceAll(query, placeholder, replacement)
+	if len(args) == 0 {
+		return query
 	}
-	return query
+
+	var b strings.Builder
+	b.Grow(len(query) + 16*len(args))
+	nextPositional := 0
+
+	for i := 0; i < len(query); {
+		ch := query[i]
+		switch {
+		case ch == '\'' || ch == '"':
+			// String literal ('...') or quoted identifier ("..."); copy verbatim,
+			// honoring doubled-quote escapes.
+			end := scanQuoted(query, i, ch)
+			b.WriteString(query[i:end])
+			i = end
+		case ch == '-' && i+1 < len(query) && query[i+1] == '-':
+			end := indexOrEnd(query, i+2, "\n")
+			b.WriteString(query[i:end])
+			i = end
+		case ch == '/' && i+1 < len(query) && query[i+1] == '*':
+			end := blockCommentEnd(query, i+2)
+			b.WriteString(query[i:end])
+			i = end
+		case ch == '?':
+			if nextPositional < len(args) {
+				b.WriteString(formatArgValue(args[nextPositional]))
+				nextPositional++
+			} else {
+				b.WriteByte(ch)
+			}
+			i++
+		case ch == '$' && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9':
+			j := i + 1
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+			}
+			if n, err := strconv.Atoi(query[i+1 : j]); err == nil && n >= 1 && n <= len(args) {
+				b.WriteString(formatArgValue(args[n-1]))
+			} else {
+				b.WriteString(query[i:j])
+			}
+			i = j
+		default:
+			b.WriteByte(ch)
+			i++
+		}
+	}
+	return b.String()
+}
+
+// scanQuoted returns the index just past a quoted region starting at start
+// (query[start] == quote), treating a doubled quote ('' or "") as an escape.
+func scanQuoted(query string, start int, quote byte) int {
+	for i := start + 1; i < len(query); i++ {
+		if query[i] != quote {
+			continue
+		}
+		if i+1 < len(query) && query[i+1] == quote {
+			i++ // skip the doubled (escaped) quote
+			continue
+		}
+		return i + 1
+	}
+	return len(query)
+}
+
+func indexOrEnd(query string, start int, sub string) int {
+	if idx := strings.Index(query[start:], sub); idx >= 0 {
+		return start + idx + len(sub)
+	}
+	return len(query)
+}
+
+func blockCommentEnd(query string, start int) int {
+	if idx := strings.Index(query[start:], "*/"); idx >= 0 {
+		return start + idx + 2
+	}
+	return len(query)
 }
 
 func formatArgValue(v any) string {
