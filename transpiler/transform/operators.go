@@ -40,6 +40,22 @@ func (t *OperatorTransform) Transform(tree *pg_query.ParseResult, result *Result
 			if t.transformDeleteStmt(deleteStmt) {
 				changed = true
 			}
+		} else if ctasStmt := stmt.Stmt.GetCreateTableAsStmt(); ctasStmt != nil {
+			// CREATE TABLE AS SELECT (and CREATE OR REPLACE TABLE AS, which the
+			// transpiler routes here after stripping OR REPLACE; also CREATE
+			// MATERIALIZED VIEW AS / SELECT INTO). Without descending into the
+			// AS-SELECT body, a chained JSON arrow there is left as a raw
+			// operator and hits DuckDB's ->> precedence bug once the parens are
+			// normalized away by the pg_query round-trip — e.g. a SQLMesh
+			// `CREATE OR REPLACE TABLE ... AS ... CASE WHEN x AND (j -> 'a') ->>
+			// 'b' LIKE ... ` materialization fails with a spurious numeric cast.
+			if ctasStmt.Query != nil {
+				if ctasSelect := ctasStmt.Query.GetSelectStmt(); ctasSelect != nil {
+					if t.transformSelectStmt(ctasSelect) {
+						changed = true
+					}
+				}
+			}
 		}
 	}
 
