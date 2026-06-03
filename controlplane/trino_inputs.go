@@ -65,6 +65,17 @@ const (
 	// enabled.
 	envTrinoCoordinatorURL = "DUCKGRES_TRINO_COORDINATOR_URL"
 
+	// envTrinoCoordinatorServerName is the TLS server name (the coordinator
+	// cert's CN/SAN, e.g. trino.dw.dev.postwh.com) to verify against when
+	// DUCKGRES_TRINO_COORDINATOR_URL is https. The provisioner dials the
+	// in-cluster Service address, but cert-manager issues the coordinator cert
+	// for the external hostname, which doesn't match; setting this keeps full
+	// TLS verification (chain + this name) without InsecureSkipVerify. Empty =
+	// verify against the URL host (correct if the URL already uses the cert
+	// hostname). Ignored for http URLs. Trino rejects password auth over plain
+	// http, so https is effectively required for the provisioner to authenticate.
+	envTrinoCoordinatorServerName = "DUCKGRES_TRINO_COORDINATOR_SERVER_NAME"
+
 	// envTrinoIAMAccountID is the AWS account id used to assemble the
 	// per-org s3.iam-role property (`arn:aws:iam::<acct>:role/duckling-<orgid>`).
 	// Required for AWS deployments: an empty value silently omits the
@@ -173,8 +184,11 @@ func buildTrinoWiring(store *configstore.ConfigStore, kc kubernetes.Interface) (
 
 	// Catalog client with empty credentials — Bootstrap (below) calls
 	// SetCredentials with the bootstrapped admin pair before the
-	// provisioner issues any catalog REST call.
-	catalogClient := provisioner.NewTrinoCatalogHTTPClient(coordinatorURL, opa.AdminPrincipal, "")
+	// provisioner issues any catalog REST call. coordinatorServerName pins TLS
+	// verification to the coordinator cert's hostname when the URL is https but
+	// dials the in-cluster Service address (see envTrinoCoordinatorServerName).
+	coordinatorServerName := strings.TrimSpace(os.Getenv(envTrinoCoordinatorServerName))
+	catalogClient := provisioner.NewTrinoCatalogHTTPClient(coordinatorURL, opa.AdminPrincipal, "", coordinatorServerName)
 
 	bundleStore := &opa.BundleStore{}
 
