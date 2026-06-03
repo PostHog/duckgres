@@ -1,0 +1,239 @@
+# Per-PR isolated duckgres stack for the mw-dev e2e harness. Rendered by
+# run.sh via envsubst with: NAMESPACE, PR_NUMBER, CONTROLPLANE_IMAGE,
+# WORKER_IMAGE, INTERNAL_SECRET.
+#
+# Isolation model (decided with the design): a DEDICATED control plane +
+# throwaway config-store per PR, provisioning REAL ducklings (PR-prefixed org
+# IDs) through the SHARED Crossplane / cnpg-shards / external RDS / Lakekeeper
+# operator. The shared infra is what kind can't model and where the bugs live.
+# Everything PR-specific lives in ${NAMESPACE} and is deleted on teardown; the
+# shared-infra footprint (ducklings, lakekeeper CRs, cnpg roles, S3) is removed
+# by deprovisioning the ci-pr ducklings before the namespace goes.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: e2e-mw-dev
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+---
+# Throwaway config-store. Ephemeral (emptyDir) — the control plane AutoMigrates
+# the schema on boot and the provisioning API creates every row, so no seed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-config-store
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: duckgres-config-store }
+  template:
+    metadata:
+      labels: { app: duckgres-config-store }
+    spec:
+      containers:
+        - name: postgres
+          image: public.ecr.aws/docker/library/postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: duckgres }
+            - { name: POSTGRES_PASSWORD, value: duckgres }
+            - { name: POSTGRES_DB, value: duckgres }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "duckgres"] }
+            periodSeconds: 3
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-config-store
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: duckgres-config-store }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-tokens
+  namespace: ${NAMESPACE}
+stringData:
+  internal-secret: "${INTERNAL_SECRET}"
+---
+# Worker mTLS bearer token (the CP mints per-worker secrets at runtime; this is
+# the shared seed the chart references via DUCKGRES_K8S_WORKER_SECRET).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-worker-token
+  namespace: ${NAMESPACE}
+stringData:
+  token: "${INTERNAL_SECRET}"
+---
+# Worker config. data_dir MUST be /data — the control plane's worker pod
+# factory mounts an emptyDir there; without this the worker defaults to ./data
+# (=/app/data, not writable for the non-root user) and dies at boot with
+# "mkdir data/extensions: permission denied". Mirrors the prod duckgres-config.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckgres-config
+  namespace: ${NAMESPACE}
+data:
+  duckgres.yaml: |
+    data_dir: "/data"
+    extensions:
+      - ducklake
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres
+  namespace: ${NAMESPACE}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres-worker
+  namespace: ${NAMESPACE}
+automountServiceAccountToken: false
+---
+# In-namespace CP permissions: spawn/patch worker pods, manage per-worker
+# secrets, read the worker configmap, hold the janitor lease. Mirrors the
+# chart's duckgres-control-plane Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # list/watch needed by the CP's stranded-secret reconciler (the prod chart
+    # Role grants them implicitly via the shared duckgres namespace; spelled
+    # out here for the isolated CI namespace).
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+subjects:
+  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
+roleRef:
+  { kind: Role, name: duckgres-control-plane, apiGroup: rbac.authorization.k8s.io }
+---
+# Cross-namespace duckling provisioning. Reuses the cluster-scoped
+# `duckgres-duckling-reader` ClusterRole already installed by the duckgres
+# chart (verbs get/list/watch/create/delete/patch on ducklings.k8s.posthog.com).
+# Per-PR binding so the namespace SA can drive real duckling provisioning;
+# deleted on teardown with the namespace label sweep.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-duckling-reader
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+subjects:
+  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
+roleRef:
+  { kind: ClusterRole, name: duckgres-duckling-reader, apiGroup: rbac.authorization.k8s.io }
+---
+# Cross-namespace Lakekeeper provisioning. Reuses the `duckgres-lakekeeper-provisioner`
+# Role in the shared `lakekeeper` namespace (the one PR #11518 fixed to include
+# delete). Per-PR RoleBinding; deleted on teardown.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}
+  namespace: lakekeeper
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+subjects:
+  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
+roleRef:
+  { kind: Role, name: duckgres-lakekeeper-provisioner, apiGroup: rbac.authorization.k8s.io }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: duckgres-control-plane }
+  template:
+    metadata:
+      labels: { app: duckgres-control-plane }
+    spec:
+      serviceAccountName: duckgres
+      containers:
+        - name: controlplane
+          image: ${CONTROLPLANE_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args: ["--mode", "control-plane", "--worker-backend", "remote", "--flight-port", "8815"]
+          env:
+            - name: DUCKGRES_CONFIG_STORE
+              value: "postgres://duckgres:duckgres@duckgres-config-store.${NAMESPACE}.svc:5432/duckgres?sslmode=disable"
+            - { name: DUCKGRES_K8S_WORKER_IMAGE, value: "${WORKER_IMAGE}" }
+            - { name: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY, value: "IfNotPresent" }
+            # Spawn workers in THIS namespace so teardown is a single ns delete.
+            - { name: DUCKGRES_K8S_WORKER_NAMESPACE, value: "${NAMESPACE}" }
+            - { name: DUCKGRES_K8S_WORKER_SECRET, value: "duckgres-worker-token" }
+            - { name: DUCKGRES_K8S_WORKER_CONFIGMAP, value: "duckgres-config" }
+            - { name: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT, value: "duckgres-worker" }
+            - { name: DUCKGRES_K8S_SHARED_WARM_TARGET, value: "0" }
+            - name: DUCKGRES_INTERNAL_SECRET
+              valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
+            - { name: DUCKGRES_AWS_REGION, value: "us-east-1" }
+            # Land workers on the dedicated worker nodepool (mw-dev arm64).
+            - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"posthog.com/nodepool":"duckgres-workers"}' }
+            - { name: DUCKGRES_K8S_WORKER_TOLERATION_KEY, value: "posthog.com/nodepool" }
+            - { name: DUCKGRES_K8S_WORKER_TOLERATION_VALUE, value: "duckgres-workers" }
+            # Provision real per-org Lakekeeper instances (iceberg path).
+            - { name: DUCKGRES_LAKEKEEPER_PROVISIONER_ENABLED, value: "true" }
+            # Org identity is resolved from the TLS SNI hostname
+            # <org-id>.<managed-suffix> (the server rejects connections without
+            # it). The harness connects with libpq host=<org>.<suffix> (→ SNI)
+            # + hostaddr=<CP ClusterIP> (→ TCP target), and dbname selects the
+            # catalog. Suffix is CI-internal; it never needs to resolve in DNS.
+            - { name: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES, value: ".ci.duckgres.local" }
+            - { name: DUCKGRES_SNI_ROUTING_MODE, value: "passthrough" }
+          ports:
+            - { name: pg, containerPort: 5432 }
+            - { name: api, containerPort: 8080 }
+            - { name: flight, containerPort: 8815 }
+          readinessProbe:
+            httpGet: { path: /health, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: duckgres-control-plane }
+  ports:
+    - { name: pg, port: 5432, targetPort: pg }
+    - { name: api, port: 8080, targetPort: api }
