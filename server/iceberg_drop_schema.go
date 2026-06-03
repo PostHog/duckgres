@@ -126,13 +126,18 @@ func (c *clientConn) dropIcebergSchemaCascade(ctx context.Context, query string)
 		return nil, fmt.Errorf("DROP SCHEMA CASCADE fallback only supports iceberg catalog, got %q", catalog)
 	}
 
-	rows, err := c.executor.QueryContext(ctx, `
+	// Inline the schema as an escaped string literal rather than a `?` bind
+	// param: the Flight executor (control plane → worker) applies args by
+	// string-inlining $N placeholders only, and sends no bind params, so a `?`
+	// reaches the worker unbound and fails ("incorrect argument count: have 0
+	// want 1"). Inlining works on both the Flight and standalone executors.
+	rows, err := c.executor.QueryContext(ctx, fmt.Sprintf(`
 		SELECT table_name
 		FROM information_schema.tables
 		WHERE table_catalog = 'iceberg'
-		AND table_schema = ?
+		AND table_schema = '%s'
 		ORDER BY table_name
-	`, target.Schema)
+	`, escapeSQLStringLiteral(target.Schema)))
 	if err != nil {
 		return nil, fmt.Errorf("list iceberg schema tables: %w", err)
 	}

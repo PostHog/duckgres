@@ -145,6 +145,56 @@ func TestDropIcebergSchemaCascadeRejectsNonIcebergSearchPath(t *testing.T) {
 	}
 }
 
+// The list-tables query must inline the schema as an escaped string literal,
+// not a `?` bind param: the Flight executor inlines only $N placeholders and
+// sends no bind params, so a `?` reaches the worker unbound ("incorrect argument
+// count: have 0 want 1"). Regression test for that Flight-path failure.
+func TestDropIcebergSchemaCascadeInlinesSchemaLiteralNoBindParam(t *testing.T) {
+	exec := &icebergDropSchemaCascadeExecutor{
+		tableNames: []string{"person"},
+	}
+	c := &clientConn{executor: exec}
+
+	if _, err := c.dropIcebergSchemaCascade(context.Background(), `DROP SCHEMA IF EXISTS iceberg.fivetran_testing_schema_abc CASCADE`); err != nil {
+		t.Fatalf("dropIcebergSchemaCascade returned error: %v", err)
+	}
+
+	var listQuery string
+	for _, q := range exec.queryQueries {
+		if strings.Contains(q, "information_schema.tables") {
+			listQuery = q
+		}
+	}
+	if listQuery == "" {
+		t.Fatal("list-tables query was not issued")
+	}
+	if strings.Contains(listQuery, "?") {
+		t.Fatalf("list-tables query must not use a `?` bind param (breaks on Flight):\n%s", listQuery)
+	}
+	if !strings.Contains(listQuery, "table_schema = 'fivetran_testing_schema_abc'") {
+		t.Fatalf("list-tables query must inline the escaped schema literal:\n%s", listQuery)
+	}
+}
+
+// A schema name containing a single quote must be escaped (doubled) when inlined.
+func TestDropIcebergSchemaCascadeEscapesSchemaLiteral(t *testing.T) {
+	exec := &icebergDropSchemaCascadeExecutor{}
+	c := &clientConn{executor: exec}
+
+	if _, err := c.dropIcebergSchemaCascade(context.Background(), `DROP SCHEMA IF EXISTS "iceberg"."o'brien" CASCADE`); err != nil {
+		t.Fatalf("dropIcebergSchemaCascade returned error: %v", err)
+	}
+	var listQuery string
+	for _, q := range exec.queryQueries {
+		if strings.Contains(q, "information_schema.tables") {
+			listQuery = q
+		}
+	}
+	if !strings.Contains(listQuery, "table_schema = 'o''brien'") {
+		t.Fatalf("schema literal must be single-quote-escaped:\n%s", listQuery)
+	}
+}
+
 func TestQuoteIdentifier(t *testing.T) {
 	if got := sqlcore.QuoteIdentifier(`a"b`); got != `"a""b"` {
 		t.Fatalf("QuoteIdentifier = %q", got)
@@ -153,12 +203,17 @@ func TestQuoteIdentifier(t *testing.T) {
 
 type icebergDropSchemaCascadeExecutor struct {
 	noopProfiling
-	searchPath  string
-	execQueries []string
-	tableNames  []string
+	searchPath   string
+	execQueries  []string
+	queryQueries []string
+	tableNames   []string
 }
 
-func (e *icebergDropSchemaCascadeExecutor) QueryContext(_ context.Context, query string, _ ...any) (RowSet, error) {
+func (e *icebergDropSchemaCascadeExecutor) QueryContext(_ context.Context, query string, args ...any) (RowSet, error) {
+	e.queryQueries = append(e.queryQueries, query)
+	// The Flight executor sends no bind params (it inlines $N), so callers must
+	// not rely on `?`/args here — mirror that by ignoring args entirely.
+	_ = args
 	if strings.Contains(query, "duckdb_settings()") {
 		return &icebergDropSchemaCascadeRows{values: []string{e.searchPath}}, nil
 	}
