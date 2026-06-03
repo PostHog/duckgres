@@ -1,13 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 )
+
+// collectSink returns a sink that streams the peer body into buf, mirroring how
+// DiskCache.PutStream consumes it in production (without touching disk).
+func collectSink(buf *bytes.Buffer) func(io.Reader) (int64, error) {
+	return func(r io.Reader) (int64, error) {
+		return io.Copy(buf, r)
+	}
+}
 
 // newPeerServer returns an httptest server exposing /cache/has and /cache/get
 // for the supplied key and data. hasCallback/getCallback increment counters.
@@ -57,12 +67,16 @@ func TestFetchFromPeersHit(t *testing.T) {
 	addr := newPeerServer(t, key, data, &hasCalls, &getCalls)
 	pm := peerManagerWith([]string{addr})
 
-	got, from, ok := pm.FetchFromPeers(key)
+	var buf bytes.Buffer
+	from, n, ok := pm.FetchFromPeers(key, collectSink(&buf))
 	if !ok {
 		t.Fatal("expected peer hit")
 	}
-	if string(got) != string(data) {
-		t.Errorf("peer data = %q, want %q", got, data)
+	if buf.String() != string(data) {
+		t.Errorf("peer data = %q, want %q", buf.String(), data)
+	}
+	if n != int64(len(data)) {
+		t.Errorf("streamed bytes = %d, want %d", n, len(data))
 	}
 	if from != addr {
 		t.Errorf("peer addr = %q, want %q", from, addr)
@@ -84,9 +98,10 @@ func TestFetchFromPeersMissFromAll(t *testing.T) {
 	addr := newPeerServer(t, other, []byte("not-ours"), &hasCalls, &getCalls)
 	pm := peerManagerWith([]string{addr})
 
-	got, _, ok := pm.FetchFromPeers(key)
+	var buf bytes.Buffer
+	_, _, ok := pm.FetchFromPeers(key, collectSink(&buf))
 	if ok {
-		t.Fatalf("expected miss, got %q", got)
+		t.Fatalf("expected miss, got %q", buf.String())
 	}
 	if atomic.LoadInt32(&hasCalls) != 1 {
 		t.Errorf("peer /cache/has calls = %d, want 1", hasCalls)
@@ -108,12 +123,13 @@ func TestFetchFromPeersReturnsFirstHit(t *testing.T) {
 	addr2 := newPeerServer(t, key, data, &has2, &get2)
 	pm := peerManagerWith([]string{addr1, addr2})
 
-	got, _, ok := pm.FetchFromPeers(key)
+	var buf bytes.Buffer
+	_, _, ok := pm.FetchFromPeers(key, collectSink(&buf))
 	if !ok {
 		t.Fatal("expected peer hit from one of two peers")
 	}
-	if string(got) != string(data) {
-		t.Errorf("peer data = %q, want %q", got, data)
+	if buf.String() != string(data) {
+		t.Errorf("peer data = %q, want %q", buf.String(), data)
 	}
 	// At least one peer must have been asked; both may have responded.
 	totalHas := atomic.LoadInt32(&has1) + atomic.LoadInt32(&has2)
@@ -124,7 +140,8 @@ func TestFetchFromPeersReturnsFirstHit(t *testing.T) {
 
 func TestFetchFromPeersEmptyPeerList(t *testing.T) {
 	pm := peerManagerWith(nil)
-	if _, _, ok := pm.FetchFromPeers(strings.Repeat("a", 64)); ok {
+	var buf bytes.Buffer
+	if _, _, ok := pm.FetchFromPeers(strings.Repeat("a", 64), collectSink(&buf)); ok {
 		t.Error("expected miss when no peers are known")
 	}
 }

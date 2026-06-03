@@ -30,6 +30,16 @@ type CacheProxy struct {
 	cacheHostSuffixes []string
 }
 
+// fetchResult describes a body that fetchDedup has materialized onto local
+// disk under its cache key. It deliberately carries no body bytes — the data
+// lives on NVMe and is served by streaming straight from the file, so a flood
+// of concurrent fetches no longer pins one buffer per request in memory.
+type fetchResult struct {
+	size        int64
+	contentType string // origin Content-Type ("" for peer fetches and hits)
+	source      string // "peer" or "miss"
+}
+
 type singleFlight struct {
 	mu sync.Mutex
 	m  map[string]*call
@@ -37,11 +47,11 @@ type singleFlight struct {
 
 type call struct {
 	wg  sync.WaitGroup
-	val []byte
+	res fetchResult
 	err error
 }
 
-func (sf *singleFlight) Do(key string, fn func() ([]byte, error)) ([]byte, error) {
+func (sf *singleFlight) Do(key string, fn func() (fetchResult, error)) (fetchResult, error) {
 	sf.mu.Lock()
 	if sf.m == nil {
 		sf.m = make(map[string]*call)
@@ -49,21 +59,21 @@ func (sf *singleFlight) Do(key string, fn func() ([]byte, error)) ([]byte, error
 	if c, ok := sf.m[key]; ok {
 		sf.mu.Unlock()
 		c.wg.Wait()
-		return c.val, c.err
+		return c.res, c.err
 	}
 	c := &call{}
 	c.wg.Add(1)
 	sf.m[key] = c
 	sf.mu.Unlock()
 
-	c.val, c.err = fn()
+	c.res, c.err = fn()
 	c.wg.Done()
 
 	sf.mu.Lock()
 	delete(sf.m, key)
 	sf.mu.Unlock()
 
-	return c.val, c.err
+	return c.res, c.err
 }
 
 func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []string) *CacheProxy {
@@ -220,15 +230,16 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	rangeHeader := r.Header.Get("Range")
 	cacheKey := CacheKey(r.URL.String(), rangeHeader)
 
-	if data, ok := p.store.Get(cacheKey); ok {
-		cacheBytesServed.WithLabelValues("local").Add(float64(len(data)))
-		slog.Info("Served.", "source", "hit", "url", r.URL.String(), "range", rangeHeader, "bytes", len(data))
-		p.serveBody(w, data, rangeHeader, "")
+	if reader, size, ok := p.store.Open(cacheKey); ok {
+		cacheBytesServed.WithLabelValues("local").Add(float64(size))
+		slog.Info("Served.", "source", "hit", "url", r.URL.String(), "range", rangeHeader, "bytes", size)
+		p.serveStream(w, reader, size, rangeHeader, "")
+		_ = reader.Close()
 		return
 	}
 	cacheMissesTotal.Inc()
 
-	data, contentType, source, err := p.fetchDedup(cacheKey, r, rangeHeader)
+	res, err := p.fetchDedup(cacheKey, r, rangeHeader)
 	if err != nil {
 		// An origin that responded with a non-2xx (e.g. S3 returning a 400 with
 		// <Code>ExpiredToken</Code> in an XML envelope) is forwarded back to
@@ -251,49 +262,58 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := p.store.Put(cacheKey, data); err != nil {
-		slog.Warn("Failed to cache.", "key", cacheKey[:16], "error", err)
+	// fetchDedup already committed the body to disk under cacheKey. Serve it by
+	// streaming from the file (openFile, not Open — the miss was already counted,
+	// so this must not also register a hit).
+	reader, size, ok := p.store.openFile(cacheKey)
+	if !ok {
+		// The entry was evicted in the narrow window between commit and serve.
+		// 502 so httpfs retries rather than receiving a truncated body.
+		slog.Warn("Cached entry vanished before serve.", "url", r.URL.String(), "range", rangeHeader)
+		http.Error(w, "cache entry vanished", http.StatusBadGateway)
+		return
 	}
-	slog.Info("Served.", "source", source, "url", r.URL.String(), "range", rangeHeader, "bytes", len(data))
-	p.serveBody(w, data, rangeHeader, contentType)
+	defer func() { _ = reader.Close() }()
+	slog.Info("Served.", "source", res.source, "url", r.URL.String(), "range", rangeHeader, "bytes", size)
+	p.serveStream(w, reader, size, rangeHeader, res.contentType)
 }
 
-// fetchDedup tries peers then origin, deduplicating concurrent fetches.
-// contentType is reported only for origin fetches (peers strip it).
-// source is "peer" or "miss" depending on where the data came from.
-func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) ([]byte, string, string, error) {
-	var contentType, source string
-	data, err := p.flights.Do(cacheKey, func() ([]byte, error) {
+// fetchDedup tries peers then origin, deduplicating concurrent fetches. On
+// success the body has been committed to local disk under cacheKey; the caller
+// serves it by streaming from the file. Nothing here holds the body in memory.
+func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) (fetchResult, error) {
+	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
-			if peerData, peerAddr, ok := p.peers.FetchFromPeers(cacheKey); ok {
-				cacheBytesServed.WithLabelValues("peer").Add(float64(len(peerData)))
-				source = "peer"
-				_ = peerAddr
-				return peerData, nil
+			if _, n, ok := p.peers.FetchFromPeers(cacheKey, func(body io.Reader) (int64, error) {
+				return p.store.PutStream(cacheKey, body)
+			}); ok {
+				cacheBytesServed.WithLabelValues("peer").Add(float64(n))
+				return fetchResult{size: n, source: "peer"}, nil
 			}
 		}
-		data, ct, err := p.fetchOrigin(r)
+		size, ct, err := p.fetchOrigin(cacheKey, r)
 		if err != nil {
-			return nil, err
+			return fetchResult{}, err
 		}
-		contentType = ct
-		cacheBytesServed.WithLabelValues("s3").Add(float64(len(data)))
-		source = "miss"
-		return data, nil
+		cacheBytesServed.WithLabelValues("s3").Add(float64(size))
+		return fetchResult{size: size, contentType: ct, source: "miss"}, nil
 	})
-	return data, contentType, source, err
 }
 
 // fetchOrigin forwards the request verbatim (headers, Host, signature) to the
-// real origin and returns the body. The SigV4 signature remains valid because
-// the URL and Host header are unchanged.
-func (p *CacheProxy) fetchOrigin(r *http.Request) ([]byte, string, error) {
+// real origin and streams a successful body straight to the on-disk cache,
+// returning the stored size and Content-Type. The SigV4 signature remains valid
+// because the URL and Host header are unchanged. Streaming to disk (rather than
+// io.ReadAll into a []byte) is what keeps proxy memory flat under concurrent
+// large range reads. A non-2xx response is NOT cached — its (capped) error body
+// is captured and returned as an originStatusError for verbatim forwarding.
+func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, string, error) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, r.URL.String(), nil)
 	if err != nil {
-		return nil, "", err
+		return 0, "", err
 	}
 	for k, vv := range r.Header {
 		if hopByHop[strings.ToLower(k)] {
@@ -307,7 +327,7 @@ func (p *CacheProxy) fetchOrigin(r *http.Request) ([]byte, string, error) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, "", err
+		return 0, "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -316,18 +336,18 @@ func (p *CacheProxy) fetchOrigin(r *http.Request) ([]byte, string, error) {
 		// typically <1 KiB; the cap is just a guard against a misbehaving
 		// origin streaming forever. The 60s context above also protects us.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, originErrorBodyCap))
-		return nil, "", &originStatusError{
+		return 0, "", &originStatusError{
 			status:  resp.StatusCode,
 			headers: resp.Header.Clone(),
 			body:    body,
 		}
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	size, err := p.store.PutStream(cacheKey, resp.Body)
 	if err != nil {
-		return nil, "", err
+		return 0, "", err
 	}
-	return data, resp.Header.Get("Content-Type"), nil
+	return size, resp.Header.Get("Content-Type"), nil
 }
 
 // originErrorBodyCap is the maximum number of bytes we'll buffer from a
@@ -377,18 +397,21 @@ func previewBody(body []byte) string {
 	return string(body[:max]) + "...(truncated)"
 }
 
-// serveBody writes cached data back to the client, reconstructing 206 Partial
-// Content semantics when the original request had a Range header.
-func (p *CacheProxy) serveBody(w http.ResponseWriter, data []byte, rangeHeader, contentType string) {
+// serveStream copies a cached body from r back to the client, reconstructing
+// 206 Partial Content semantics when the original request had a Range header.
+// size is the on-disk length (known up front), so Content-Length and the
+// Content-Range total are set before any body bytes flow — same response shape
+// the old buffered serveBody produced, without holding the body in memory.
+func (p *CacheProxy) serveStream(w http.ResponseWriter, r io.Reader, size int64, rangeHeader, contentType string) {
 	if contentType != "" {
 		w.Header().Set("Content-Type", contentType)
 	}
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 	if rangeHeader != "" {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %s/%d", strings.TrimPrefix(rangeHeader, "bytes="), len(data)))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %s/%d", strings.TrimPrefix(rangeHeader, "bytes="), size))
 		w.WriteHeader(http.StatusPartialContent)
 	}
-	_, _ = w.Write(data)
+	_, _ = io.Copy(w, r)
 }
 
 // forwardUncached forwards a request to the origin without caching. Used for

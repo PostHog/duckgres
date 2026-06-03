@@ -25,27 +25,44 @@ var (
 	})
 )
 
+// Peer timeouts. The /cache/has probe is a tiny HEAD-like check, so it gets a
+// short budget; the /cache/get body transfer can move many MB of a Parquet
+// range over the VPC, so it gets a much larger one. They are deliberately
+// separate: sharing one 2s budget (as the original code did) meant a slow
+// has-race ate into the body-transfer time and large peer ranges timed out
+// mid-stream, silently downgrading the hit to a full S3 fetch.
+const (
+	peerHasTimeout = 1 * time.Second
+	peerGetTimeout = 30 * time.Second
+)
+
 // PeerManager discovers and communicates with cache proxy peers
 // via a Kubernetes headless Service.
 type PeerManager struct {
-	serviceName string
-	peerPort    string // port for peer API (e.g. ":8081")
-	client      *http.Client
+	serviceName  string
+	peerPort     string // port for peer API (e.g. ":8081")
+	client       *http.Client // /cache/has probes (short timeout)
+	streamClient *http.Client // /cache/get body transfers (long timeout)
 
 	mu    sync.RWMutex
 	peers []string // peer addresses (ip:port)
 }
 
 func NewPeerManager(serviceName, peerPort string) *PeerManager {
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     30 * time.Second,
+	}
 	return &PeerManager{
 		serviceName: serviceName,
 		peerPort:    peerPort,
 		client: &http.Client{
-			Timeout: 2 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     30 * time.Second,
-			},
+			Timeout:   peerHasTimeout,
+			Transport: transport,
+		},
+		streamClient: &http.Client{
+			Timeout:   peerGetTimeout,
+			Transport: transport,
 		},
 	}
 }
@@ -106,89 +123,92 @@ func (pm *PeerManager) resolve() {
 	}
 }
 
-// FetchFromPeers asks all peers in parallel if they have the given cache key.
-// Returns the data from the first peer that has it, or false if none do.
-func (pm *PeerManager) FetchFromPeers(cacheKey string) ([]byte, string, bool) {
+// FetchFromPeers locates a peer holding cacheKey and streams its body into
+// sink, returning the serving peer's address and the number of bytes streamed.
+// ok is false if no peer has the key (or the chosen peer's body couldn't be
+// streamed). The body is never buffered here — sink (typically DiskCache.PutStream)
+// consumes it as it arrives, so a peer hit costs only sink's copy buffer.
+func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int64, error)) (string, int64, bool) {
 	pm.mu.RLock()
 	peers := make([]string, len(pm.peers))
 	copy(peers, pm.peers)
 	pm.mu.RUnlock()
 
 	if len(peers) == 0 {
-		return nil, "", false
+		return "", 0, false
 	}
 
 	peerFetchesTotal.Inc()
 
-	type result struct {
-		data []byte
-		addr string
-		ok   bool
-	}
+	// Phase 1: ask every peer "do you have this?" in parallel (cheap, no body)
+	// and take the first that says yes. Its own short context bounds the probe
+	// so a slow/dead peer can't eat into the body-transfer budget below.
+	hasCtx, hasCancel := context.WithTimeout(context.Background(), peerHasTimeout)
+	defer hasCancel()
 
-	// Ask all peers in parallel
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	results := make(chan result, len(peers))
-
+	holderCh := make(chan string, len(peers))
 	for _, addr := range peers {
 		go func(addr string) {
-			// First check if peer has the key (cheap HEAD-like check)
 			hasURL := fmt.Sprintf("http://%s/cache/has?key=%s", addr, cacheKey)
-			req, err := http.NewRequestWithContext(ctx, "GET", hasURL, nil)
+			req, err := http.NewRequestWithContext(hasCtx, "GET", hasURL, nil)
 			if err != nil {
-				results <- result{ok: false}
+				holderCh <- ""
 				return
 			}
 			resp, err := pm.client.Do(req)
-			if err != nil || resp.StatusCode != http.StatusOK {
-				if resp != nil {
-					_ = resp.Body.Close()
-				}
-				results <- result{ok: false}
+			if err != nil {
+				holderCh <- ""
 				return
 			}
 			_ = resp.Body.Close()
-
-			// Peer has it — fetch the data
-			getURL := fmt.Sprintf("http://%s/cache/get?key=%s", addr, cacheKey)
-			req2, err := http.NewRequestWithContext(ctx, "GET", getURL, nil)
-			if err != nil {
-				results <- result{ok: false}
-				return
+			if resp.StatusCode == http.StatusOK {
+				holderCh <- addr
+			} else {
+				holderCh <- ""
 			}
-			resp2, err := pm.client.Do(req2)
-			if err != nil || resp2.StatusCode != http.StatusOK {
-				if resp2 != nil {
-					_ = resp2.Body.Close()
-				}
-				results <- result{ok: false}
-				return
-			}
-			defer func() { _ = resp2.Body.Close() }()
-
-			data, err := io.ReadAll(resp2.Body)
-			if err != nil {
-				results <- result{ok: false}
-				return
-			}
-
-			results <- result{data: data, addr: addr, ok: true}
 		}(addr)
 	}
 
-	// Return first successful result
+	var holder string
 	for range peers {
-		r := <-results
-		if r.ok {
-			peerHitsTotal.Inc()
-			cancel() // cancel remaining peer requests
-			return r.data, r.addr, true
+		if a := <-holderCh; a != "" {
+			holder = a
+			break
 		}
 	}
+	if holder == "" {
+		return "", 0, false
+	}
+	// Probes for the losing peers are no longer needed — release them so they
+	// don't hold connections open for the rest of the has-timeout window.
+	hasCancel()
 
-	return nil, "", false
+	// Phase 2: stream the body from the chosen holder straight into sink, with
+	// its own generous budget (a multi-MB Parquet range can take a while). Only
+	// the winner is fetched, so we never pull a body we won't use.
+	getCtx, getCancel := context.WithTimeout(context.Background(), peerGetTimeout)
+	defer getCancel()
+
+	getURL := fmt.Sprintf("http://%s/cache/get?key=%s", holder, cacheKey)
+	req, err := http.NewRequestWithContext(getCtx, "GET", getURL, nil)
+	if err != nil {
+		return "", 0, false
+	}
+	resp, err := pm.streamClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return "", 0, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	n, err := sink(resp.Body)
+	if err != nil {
+		return "", 0, false
+	}
+	peerHitsTotal.Inc()
+	return holder, n, true
 }
 
 func getLocalIPs() []string {

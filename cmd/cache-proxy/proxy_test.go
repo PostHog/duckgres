@@ -327,21 +327,21 @@ func TestHandlePeerRejectsInvalidKey(t *testing.T) {
 func TestSingleFlightDedups(t *testing.T) {
 	var sf singleFlight
 	var calls int32
-	fn := func() ([]byte, error) {
+	fn := func() (fetchResult, error) {
 		atomic.AddInt32(&calls, 1)
-		return []byte("payload"), nil
+		return fetchResult{size: 7, source: "miss"}, nil
 	}
 
 	// Sequential calls with the same key should still invoke fn each time
 	// (singleflight only coalesces concurrent in-flight callers). We verify
 	// that the return values are correct rather than count.
 	got1, err := sf.Do("k", fn)
-	if err != nil || string(got1) != "payload" {
-		t.Fatalf("sf.Do: got=%q err=%v", got1, err)
+	if err != nil || got1.size != 7 {
+		t.Fatalf("sf.Do: got=%+v err=%v", got1, err)
 	}
 	got2, err := sf.Do("k", fn)
-	if err != nil || string(got2) != "payload" {
-		t.Fatalf("sf.Do repeat: got=%q err=%v", got2, err)
+	if err != nil || got2.size != 7 {
+		t.Fatalf("sf.Do repeat: got=%+v err=%v", got2, err)
 	}
 	if atomic.LoadInt32(&calls) != 2 {
 		t.Errorf("sequential calls invoked fn %d times, want 2", calls)
