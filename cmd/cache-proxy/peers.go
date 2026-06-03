@@ -106,89 +106,84 @@ func (pm *PeerManager) resolve() {
 	}
 }
 
-// FetchFromPeers asks all peers in parallel if they have the given cache key.
-// Returns the data from the first peer that has it, or false if none do.
-func (pm *PeerManager) FetchFromPeers(cacheKey string) ([]byte, string, bool) {
+// FetchFromPeers locates a peer holding cacheKey and streams its body into
+// sink, returning the serving peer's address and the number of bytes streamed.
+// ok is false if no peer has the key (or the chosen peer's body couldn't be
+// streamed). The body is never buffered here — sink (typically DiskCache.PutStream)
+// consumes it as it arrives, so a peer hit costs only sink's copy buffer.
+func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int64, error)) (string, int64, bool) {
 	pm.mu.RLock()
 	peers := make([]string, len(pm.peers))
 	copy(peers, pm.peers)
 	pm.mu.RUnlock()
 
 	if len(peers) == 0 {
-		return nil, "", false
+		return "", 0, false
 	}
 
 	peerFetchesTotal.Inc()
 
-	type result struct {
-		data []byte
-		addr string
-		ok   bool
-	}
-
-	// Ask all peers in parallel
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	results := make(chan result, len(peers))
-
+	// Phase 1: ask every peer "do you have this?" in parallel (cheap, no body)
+	// and take the first that says yes.
+	holderCh := make(chan string, len(peers))
 	for _, addr := range peers {
 		go func(addr string) {
-			// First check if peer has the key (cheap HEAD-like check)
 			hasURL := fmt.Sprintf("http://%s/cache/has?key=%s", addr, cacheKey)
 			req, err := http.NewRequestWithContext(ctx, "GET", hasURL, nil)
 			if err != nil {
-				results <- result{ok: false}
+				holderCh <- ""
 				return
 			}
 			resp, err := pm.client.Do(req)
-			if err != nil || resp.StatusCode != http.StatusOK {
-				if resp != nil {
-					_ = resp.Body.Close()
-				}
-				results <- result{ok: false}
+			if err != nil {
+				holderCh <- ""
 				return
 			}
 			_ = resp.Body.Close()
-
-			// Peer has it — fetch the data
-			getURL := fmt.Sprintf("http://%s/cache/get?key=%s", addr, cacheKey)
-			req2, err := http.NewRequestWithContext(ctx, "GET", getURL, nil)
-			if err != nil {
-				results <- result{ok: false}
-				return
+			if resp.StatusCode == http.StatusOK {
+				holderCh <- addr
+			} else {
+				holderCh <- ""
 			}
-			resp2, err := pm.client.Do(req2)
-			if err != nil || resp2.StatusCode != http.StatusOK {
-				if resp2 != nil {
-					_ = resp2.Body.Close()
-				}
-				results <- result{ok: false}
-				return
-			}
-			defer func() { _ = resp2.Body.Close() }()
-
-			data, err := io.ReadAll(resp2.Body)
-			if err != nil {
-				results <- result{ok: false}
-				return
-			}
-
-			results <- result{data: data, addr: addr, ok: true}
 		}(addr)
 	}
 
-	// Return first successful result
+	var holder string
 	for range peers {
-		r := <-results
-		if r.ok {
-			peerHitsTotal.Inc()
-			cancel() // cancel remaining peer requests
-			return r.data, r.addr, true
+		if a := <-holderCh; a != "" {
+			holder = a
+			break
 		}
 	}
+	if holder == "" {
+		return "", 0, false
+	}
 
-	return nil, "", false
+	// Phase 2: stream the body from the chosen holder straight into sink. Only
+	// the winner is fetched, so we never pull a body we won't use.
+	getURL := fmt.Sprintf("http://%s/cache/get?key=%s", holder, cacheKey)
+	req, err := http.NewRequestWithContext(ctx, "GET", getURL, nil)
+	if err != nil {
+		return "", 0, false
+	}
+	resp, err := pm.client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return "", 0, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	n, err := sink(resp.Body)
+	if err != nil {
+		return "", 0, false
+	}
+	peerHitsTotal.Inc()
+	return holder, n, true
 }
 
 func getLocalIPs() []string {
