@@ -1253,7 +1253,7 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(existing neutral): %v", err)
 	}
 
-	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", 1, 5)
+	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", "", "", false, 1, 5)
 	if err != nil {
 		t.Fatalf("CreateNeutralWarmWorkerSlot(shared target): %v", err)
 	}
@@ -1261,7 +1261,7 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 		t.Fatalf("expected shared warm target to block spawning, got %#v", blocked)
 	}
 
-	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", 2, 5)
+	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", "", "", false, 2, 5)
 	if err != nil {
 		t.Fatalf("CreateNeutralWarmWorkerSlot(expand target): %v", err)
 	}

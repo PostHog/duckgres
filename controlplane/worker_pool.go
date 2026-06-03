@@ -134,7 +134,7 @@ type RuntimeWorkerStore interface {
 	ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
 	RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, now time.Time) error
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
-	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)

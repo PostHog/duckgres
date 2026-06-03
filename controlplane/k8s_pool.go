@@ -1248,7 +1248,7 @@ func (p *K8sWorkerPool) spawnWorkerBackground(id int, image string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	err := p.spawnWarmWorker(ctx, id, image)
+	err := p.spawnWarmWorker(ctx, id, image, WorkerProfile{})
 
 	p.mu.Lock()
 	p.spawning--
@@ -2100,6 +2100,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				p.cpInstanceID,
 				p.workerPodNamePrefix(),
 				p.workerImage,
+				"", "", false,
 				count,
 				p.maxWorkers,
 			)
@@ -2132,7 +2133,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 			wg.Add(1)
 			go func(i int, slot *configstore.WorkerRecord) {
 				defer wg.Done()
-				err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image)
+				err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image, WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate})
 
 				p.mu.Lock()
 				p.spawning--
@@ -2176,7 +2177,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 		wg.Add(1)
 		go func(i int, id int) {
 			defer wg.Done()
-			err := p.spawnWarmWorker(ctx, id, p.workerImage)
+			err := p.spawnWarmWorker(ctx, id, p.workerImage, WorkerProfile{})
 
 			p.mu.Lock()
 			p.spawning--
@@ -2289,7 +2290,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 		wg.Add(1)
 		go func(i int, slot *configstore.WorkerRecord) {
 			defer wg.Done()
-			err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image)
+			err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image, WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate})
 
 			p.mu.Lock()
 			p.spawning--
@@ -3302,7 +3303,7 @@ func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
 	return p.maxWorkers == 0 || liveCount < p.maxWorkers
 }
 
-func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image string) error {
+func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image string, profile WorkerProfile) error {
 	if id <= 0 && p.runtimeStore != nil {
 		if image == "" {
 			image = p.workerImage
@@ -3311,6 +3312,9 @@ func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image strin
 			p.cpInstanceID,
 			p.workerPodNamePrefix(),
 			image,
+			profile.CPU,
+			profile.Memory,
+			profile.Colocate,
 			p.minWorkers,
 			p.maxWorkers,
 		)
@@ -3323,11 +3327,12 @@ func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image strin
 		}
 		id = slot.WorkerID
 		image = slot.Image
+		profile = WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate}
 	}
 	if p.spawnWarmWorkerFunc != nil {
 		return p.spawnWarmWorkerFunc(ctx, id)
 	}
-	return p.SpawnWorker(ctx, id, image)
+	return p.spawnWorker(ctx, id, image, profile, true)
 }
 
 func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {

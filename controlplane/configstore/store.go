@@ -1857,7 +1857,7 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, po
 // neutral warm pool under advisory-lock protected cluster-wide warm-target and
 // global capacity checks. A nil result means capacity already satisfies the target
 // or the global worker cap blocked the spawn.
-func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
 	if strings.TrimSpace(podNamePrefix) == "" {
 		return nil, fmt.Errorf("pod name prefix is required")
 	}
@@ -1872,7 +1872,7 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 		}
 
 		if targetWarmWorkers > 0 {
-			count, err := cs.countNeutralWarmWorkers(tx)
+			count, err := cs.countNeutralWarmWorkers(tx, profileCPU, profileMemory, profileColocate)
 			if err != nil {
 				return err
 			}
@@ -1900,6 +1900,9 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 			WorkerID:          int(workerID),
 			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
 			Image:             image,
+			ProfileCPU:        profileCPU,
+			ProfileMemory:     profileMemory,
+			ProfileColocate:   profileColocate,
 			State:             WorkerStateSpawning,
 			OrgID:             "",
 			OwnerCPInstanceID: ownerCPInstanceID,
@@ -2091,10 +2094,14 @@ func workerTerminalEligibleStates(targetState WorkerState) []WorkerState {
 	return workerActiveStates()
 }
 
-func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB) (int64, error) {
+// countNeutralWarmWorkers counts neutral (unassigned) warm workers of a single
+// profile shape. The warm pool is maintained per shape, so the default
+// ("","",false) and colocated targets are counted independently.
+func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB, profileCPU, profileMemory string, profileColocate bool) (int64, error) {
 	var count int64
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("org_id = ''").
+		Where("profile_cpu = ? AND profile_memory = ? AND profile_colocate = ?", profileCPU, profileMemory, profileColocate).
 		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
 		Count(&count).Error; err != nil {
 		return 0, err
