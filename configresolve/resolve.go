@@ -128,6 +128,20 @@ type Resolved struct {
 	K8sWorkerTolerationKey             string
 	K8sWorkerTolerationValue           string
 	K8sWorkerExclusiveNode             bool
+	K8sAllowClientWorkerProfile        bool
+	K8sAllowClientExclusiveNode        bool
+	K8sColocatedWorkerCPURequest       string
+	K8sColocatedWorkerMemoryRequest    string
+	K8sColocatedSharedWarmTarget       int
+	K8sColocatedWorkerNodeSelector     string
+	K8sColocatedWorkerTolerationKey    string
+	K8sColocatedWorkerTolerationValue  string
+	K8sWorkerProfileMinCPU             string
+	K8sWorkerProfileMaxCPU             string
+	K8sWorkerProfileMinMemory          string
+	K8sWorkerProfileMaxMemory          string
+	K8sOrgMaxColocatedCPU              int
+	K8sOrgMaxColocatedMemory           string
 	AWSRegion                          string
 	ConfigStoreConn                    string
 	ConfigPollInterval                 time.Duration
@@ -196,6 +210,14 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var processMinWorkers, processMaxWorkers int
 	var processRetireOnSessionEnd bool
 	var workerBackend string
+	// Connection-string worker-profile config (all default to off/empty).
+	var k8sAllowClientWorkerProfile, k8sAllowClientExclusiveNode bool
+	var k8sColocatedWorkerCPURequest, k8sColocatedWorkerMemoryRequest string
+	var k8sColocatedSharedWarmTarget int
+	var k8sColocatedWorkerNodeSelector, k8sColocatedWorkerTolerationKey, k8sColocatedWorkerTolerationValue string
+	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
+	var k8sOrgMaxColocatedCPU int
+	var k8sOrgMaxColocatedMemory string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
@@ -921,6 +943,67 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			k8sWorkerExclusiveNode = b
 		}
 	}
+
+	// Connection-string worker-profile config.
+	if v := getenv("DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sAllowClientWorkerProfile = b
+		} else {
+			warn("Invalid DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_ALLOW_CLIENT_EXCLUSIVE_NODE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sAllowClientExclusiveNode = b
+		} else {
+			warn("Invalid DUCKGRES_K8S_ALLOW_CLIENT_EXCLUSIVE_NODE: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_CPU_REQUEST"); v != "" {
+		k8sColocatedWorkerCPURequest = v
+	}
+	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_MEMORY_REQUEST"); v != "" {
+		k8sColocatedWorkerMemoryRequest = v
+	}
+	if v := getenv("DUCKGRES_K8S_COLOCATED_SHARED_WARM_TARGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sColocatedSharedWarmTarget = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_COLOCATED_SHARED_WARM_TARGET: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_NODE_SELECTOR"); v != "" {
+		k8sColocatedWorkerNodeSelector = v
+	}
+	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_TOLERATION_KEY"); v != "" {
+		k8sColocatedWorkerTolerationKey = v
+	}
+	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_TOLERATION_VALUE"); v != "" {
+		k8sColocatedWorkerTolerationValue = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU"); v != "" {
+		k8sWorkerProfileMinCPU = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU"); v != "" {
+		k8sWorkerProfileMaxCPU = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY"); v != "" {
+		k8sWorkerProfileMinMemory = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY"); v != "" {
+		k8sWorkerProfileMaxMemory = v
+	}
+	if v := getenv("DUCKGRES_K8S_ORG_MAX_COLOCATED_CPU"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sOrgMaxColocatedCPU = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_ORG_MAX_COLOCATED_CPU: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_ORG_MAX_COLOCATED_MEMORY"); v != "" {
+		k8sOrgMaxColocatedMemory = v
+	}
+
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
 	}
@@ -1312,6 +1395,20 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerTolerationKey:             k8sWorkerTolerationKey,
 		K8sWorkerTolerationValue:           k8sWorkerTolerationValue,
 		K8sWorkerExclusiveNode:             k8sWorkerExclusiveNode,
+		K8sAllowClientWorkerProfile:        k8sAllowClientWorkerProfile,
+		K8sAllowClientExclusiveNode:        k8sAllowClientExclusiveNode,
+		K8sColocatedWorkerCPURequest:       k8sColocatedWorkerCPURequest,
+		K8sColocatedWorkerMemoryRequest:    k8sColocatedWorkerMemoryRequest,
+		K8sColocatedSharedWarmTarget:       k8sColocatedSharedWarmTarget,
+		K8sColocatedWorkerNodeSelector:     k8sColocatedWorkerNodeSelector,
+		K8sColocatedWorkerTolerationKey:    k8sColocatedWorkerTolerationKey,
+		K8sColocatedWorkerTolerationValue:  k8sColocatedWorkerTolerationValue,
+		K8sWorkerProfileMinCPU:             k8sWorkerProfileMinCPU,
+		K8sWorkerProfileMaxCPU:             k8sWorkerProfileMaxCPU,
+		K8sWorkerProfileMinMemory:          k8sWorkerProfileMinMemory,
+		K8sWorkerProfileMaxMemory:          k8sWorkerProfileMaxMemory,
+		K8sOrgMaxColocatedCPU:              k8sOrgMaxColocatedCPU,
+		K8sOrgMaxColocatedMemory:           k8sOrgMaxColocatedMemory,
 		AWSRegion:                          awsRegion,
 		ConfigStoreConn:                    configStoreConn,
 		ConfigPollInterval:                 configPollInterval,
