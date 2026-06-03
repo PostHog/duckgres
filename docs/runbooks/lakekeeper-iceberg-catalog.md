@@ -136,6 +136,12 @@ schema, so raw `information_schema.columns` may expose placeholder
 Lakekeeper REST catalog to load current table schemas with bounded
 concurrency before returning `information_schema.columns` results.
 
+For simple PostgreSQL client metadata predicates such as
+`table_schema = 'x' AND table_name = 'y'`, Duckgres targets the preload to the
+requested table. For broad metadata scans, stale Lakekeeper `404` table entries
+are skipped because DuckDB's Iceberg `information_schema.tables` may
+temporarily expose dropped tables from a worker/session-local catalog view.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Action |

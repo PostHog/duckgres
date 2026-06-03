@@ -107,8 +107,8 @@ func TestLoadColumnsUsesLakekeeperREST(t *testing.T) {
 	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "DESCRIBE SELECT") {
 		t.Fatalf("REST metadata path should not describe Iceberg tables, queries:\n%s", got)
 	}
-	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "table_schema IN") || strings.Contains(got, "table_name IN") {
-		t.Fatalf("metadata loading should not parse user query predicates into table filters, queries:\n%s", got)
+	if got := strings.Join(exec.queries, "\n"); !strings.Contains(got, "table_schema = 'billing_public'") {
+		t.Fatalf("metadata loading should filter simple table_schema predicates, queries:\n%s", got)
 	}
 	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "NOT EXISTS") {
 		t.Fatalf("metadata loading should refresh tables explicitly instead of relying on hidden session cache, queries:\n%s", got)
@@ -144,6 +144,67 @@ func TestLoadColumnsUsesLakekeeperREST(t *testing.T) {
 	}
 }
 
+func TestLoadColumnsFiltersCandidatesFromSimpleCompatPredicates(t *testing.T) {
+	var loadedPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/config":
+			_, _ = w.Write([]byte(`{"defaults":{"prefix":"warehouse-id"}}`))
+		case "/v1/warehouse-id/namespaces/stripe_test/tables/product":
+			loadedPaths = append(loadedPaths, r.URL.Path)
+			_, _ = w.Write([]byte(`{
+				"metadata": {
+					"current-schema-id": 1,
+					"schemas": [
+						{
+							"schema-id": 1,
+							"type": "struct",
+							"fields": [
+								{"id": 1, "name": "id", "type": "string", "required": true}
+							]
+						}
+					]
+				}
+			}`))
+		default:
+			t.Fatalf("unexpected REST path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	exec := &scriptedExecutor{
+		rows: []sqlcore.RowSet{
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{
+				{"stripe_test", "product"},
+			}},
+		},
+	}
+
+	err := LoadColumns(context.Background(), exec, `
+		SELECT c.column_name, c.data_type
+		FROM memory.main.information_schema_columns_compat c
+		WHERE c.table_schema = 'stripe_test'
+		AND c.table_name = 'product'
+	`, Config{
+		LakekeeperEndpoint:  srv.URL,
+		LakekeeperWarehouse: "org-acme",
+	})
+	if err != nil {
+		t.Fatalf("LoadColumns: %v", err)
+	}
+
+	listQuery := strings.Join(exec.queries, "\n")
+	if !strings.Contains(listQuery, "table_schema = 'stripe_test'") {
+		t.Fatalf("candidate query did not filter table_schema:\n%s", listQuery)
+	}
+	if !strings.Contains(listQuery, "table_name = 'product'") {
+		t.Fatalf("candidate query did not filter table_name:\n%s", listQuery)
+	}
+	if got, want := len(loadedPaths), 1; got != want {
+		t.Fatalf("REST table loads = %d, want %d", got, want)
+	}
+}
+
 func TestLoadColumnsReturnsLakekeeperRESTUnavailableError(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
@@ -166,6 +227,101 @@ func TestLoadColumnsReturnsLakekeeperRESTUnavailableError(t *testing.T) {
 	}
 	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "DESCRIBE SELECT") {
 		t.Fatalf("REST-only metadata path should not describe Iceberg tables, queries:\n%s", got)
+	}
+}
+
+func TestLoadColumnsSkipsMissingTablesDuringBroadRefresh(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/config":
+			_, _ = w.Write([]byte(`{"defaults":{"prefix":"warehouse-id"}}`))
+		case "/v1/warehouse-id/namespaces/live/tables/product":
+			_, _ = w.Write([]byte(`{
+				"metadata": {
+					"current-schema-id": 1,
+					"schemas": [
+						{
+							"schema-id": 1,
+							"type": "struct",
+							"fields": [
+								{"id": 1, "name": "id", "type": "string", "required": true}
+							]
+						}
+					]
+				}
+			}`))
+		case "/v1/warehouse-id/namespaces/stale/tables/dropped":
+			http.NotFound(w, r)
+		default:
+			t.Fatalf("unexpected REST path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	exec := &scriptedExecutor{
+		rows: []sqlcore.RowSet{
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{
+				{"live", "product"},
+				{"stale", "dropped"},
+			}},
+		},
+	}
+
+	err := LoadColumns(context.Background(), exec, `
+		SELECT c.column_name, c.data_type
+		FROM memory.main.information_schema_columns_compat c
+	`, Config{
+		LakekeeperEndpoint:  srv.URL,
+		LakekeeperWarehouse: "org-acme",
+	})
+	if err != nil {
+		t.Fatalf("LoadColumns should skip stale broad-refresh 404s: %v", err)
+	}
+
+	insert := strings.Join(exec.execs, "\n")
+	if !strings.Contains(insert, "'live'") || !strings.Contains(insert, "'product'") {
+		t.Fatalf("live table metadata was not inserted:\n%s", insert)
+	}
+	if strings.Contains(insert, "'stale'") || strings.Contains(insert, "'dropped'") {
+		t.Fatalf("stale missing table metadata should not be inserted:\n%s", insert)
+	}
+}
+
+func TestLoadColumnsFailsMissingRequestedTable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/config":
+			_, _ = w.Write([]byte(`{"defaults":{"prefix":"warehouse-id"}}`))
+		case "/v1/warehouse-id/namespaces/stripe_test/tables/product":
+			http.NotFound(w, r)
+		default:
+			t.Fatalf("unexpected REST path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	exec := &scriptedExecutor{
+		rows: []sqlcore.RowSet{
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{
+				{"stripe_test", "product"},
+			}},
+		},
+	}
+
+	err := LoadColumns(context.Background(), exec, `
+		SELECT c.column_name, c.data_type
+		FROM memory.main.information_schema_columns_compat c
+		WHERE c.table_schema = 'stripe_test'
+		AND c.table_name = 'product'
+	`, Config{
+		LakekeeperEndpoint:  srv.URL,
+		LakekeeperWarehouse: "org-acme",
+	})
+	if err == nil {
+		t.Fatal("expected missing requested table to fail")
+	}
+	if !errors.Is(err, errRESTCatalogTableNotFound) {
+		t.Fatalf("error = %v, want errRESTCatalogTableNotFound", err)
 	}
 }
 
@@ -261,7 +417,7 @@ func TestRestCatalogMetadataSourceLimitsConcurrency(t *testing.T) {
 		tables[i] = tableRef{Schema: "billing_public", Name: fmt.Sprintf("t_%02d", i)}
 	}
 
-	cols, err := restCatalogMetadataSource{endpoint: srv.URL}.LoadColumns(context.Background(), "org-acme", tables)
+	cols, err := restCatalogMetadataSource{endpoint: srv.URL}.LoadColumns(context.Background(), "org-acme", tables, true)
 	if err != nil {
 		t.Fatalf("LoadColumns: %v", err)
 	}
