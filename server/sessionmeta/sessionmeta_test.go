@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -79,6 +80,68 @@ func (r *singleIntRow) RowsAffected() (int64, error) { return 0, nil }
 func (r *singleIntRow) LastInsertId() (int64, error) { return 0, nil }
 func (r *singleIntRow) LastProfilingOutput() string  { return "" }
 
+type duckDBTestExecutor struct {
+	db *sql.DB
+}
+
+func (e *duckDBTestExecutor) QueryContext(ctx context.Context, query string, args ...any) (sqlcore.RowSet, error) {
+	rows, err := e.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &duckDBTestRows{rows: rows}, nil
+}
+
+func (e *duckDBTestExecutor) ExecContext(ctx context.Context, query string, args ...any) (sqlcore.ExecResult, error) {
+	return e.db.ExecContext(ctx, query, args...)
+}
+
+func (e *duckDBTestExecutor) Query(query string, args ...any) (sqlcore.RowSet, error) {
+	rows, err := e.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &duckDBTestRows{rows: rows}, nil
+}
+
+func (e *duckDBTestExecutor) Exec(query string, args ...any) (sqlcore.ExecResult, error) {
+	return e.db.Exec(query, args...)
+}
+
+func (e *duckDBTestExecutor) ConnContext(ctx context.Context) (sqlcore.RawConn, error) {
+	return e.db.Conn(ctx)
+}
+
+func (e *duckDBTestExecutor) PingContext(ctx context.Context) error { return e.db.PingContext(ctx) }
+func (e *duckDBTestExecutor) Close() error                          { return e.db.Close() }
+func (e *duckDBTestExecutor) LastProfilingOutput() string           { return "" }
+
+type duckDBTestRows struct {
+	rows *sql.Rows
+}
+
+func (r *duckDBTestRows) Columns() ([]string, error) { return r.rows.Columns() }
+
+func (r *duckDBTestRows) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
+	colTypes, err := r.rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]sqlcore.ColumnTyper, len(colTypes))
+	for i, ct := range colTypes {
+		result[i] = ct
+	}
+	return result, nil
+}
+
+func (r *duckDBTestRows) Next() bool                   { return r.rows.Next() }
+func (r *duckDBTestRows) Scan(dest ...any) error       { return r.rows.Scan(dest...) }
+func (r *duckDBTestRows) Close() error                 { return r.rows.Close() }
+func (r *duckDBTestRows) Err() error                   { return r.rows.Err() }
+func (r *duckDBTestRows) RowsAffected() (int64, error) { return 0, nil }
+func (r *duckDBTestRows) LastInsertId() (int64, error) { return 0, nil }
+func (r *duckDBTestRows) LastProfilingOutput() string  { return "" }
+
 func TestInitSessionDatabaseMetadataBatchesPerSessionStatements(t *testing.T) {
 	exec := &countingExecutor{
 		queryRows: &singleIntRow{v: 1}, // pretend ducklake is attached for HasAttachedCatalog
@@ -99,6 +162,36 @@ func TestInitSessionDatabaseMetadataBatchesPerSessionStatements(t *testing.T) {
 		t.Errorf("ExecContext call count = %d, want %d.\nQueries:\n%s",
 			exec.execCalls, expectedExecCalls,
 			strings.Join(exec.execQueries, "\n---\n"))
+	}
+}
+
+func TestInitSessionDatabaseMetadataWorksOnFileBackedDatabase(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "alice.duckdb")
+	db, err := sql.Open("duckdb", dbPath+"?allow_unsigned_extensions=true")
+	if err != nil {
+		t.Fatalf("open file-backed duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	executor := &duckDBTestExecutor{db: db}
+	if err := InitSessionDatabaseMetadata(context.Background(), executor, "alice"); err != nil {
+		t.Fatalf("InitSessionDatabaseMetadata on file-backed DB failed: %v", err)
+	}
+
+	var currentDB string
+	if err := db.QueryRow("SELECT current_database()").Scan(&currentDB); err != nil {
+		t.Fatalf("query current_database(): %v", err)
+	}
+	if currentDB != "alice" {
+		t.Fatalf("current_database() = %q, want %q", currentDB, "alice")
+	}
+
+	var datname string
+	if err := db.QueryRow("SELECT datname FROM pg_database WHERE datname = current_database()").Scan(&datname); err != nil {
+		t.Fatalf("query pg_database: %v", err)
+	}
+	if datname != "alice" {
+		t.Fatalf("pg_database datname = %q, want %q", datname, "alice")
 	}
 }
 
