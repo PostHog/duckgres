@@ -2630,19 +2630,30 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							if count >= maxConsecutiveHealthFailures {
 								// Planned node disruption (Karpenter drift/
 								// consolidation, kubelet drain) is not a worker
-								// crash: the pod is already Terminating. Marking
-								// it Lost here cancels the in-flight query after
-								// ~3 health intervals (~5s), even though the
+								// crash: the pod is already Terminating. Marking a
+								// BUSY worker Lost here cancels its in-flight query
+								// after ~3 health intervals (~5s), even though the
 								// worker is draining and its node typically lives
-								// ~100s+ longer. Defer to the informer-driven
-								// w.done path above, which fires when the pod is
-								// actually gone and runs the same cleanup — so the
-								// query drains (bounded by the pod's
-								// terminationGracePeriodSeconds) instead of being
-								// killed mid-flight. Cache-only read; no API call.
-								if p.workerPodTerminating(p.workerPodName(w)) {
-									slog.Warn("K8s worker failing health checks while pod is Terminating (planned node disruption); deferring to graceful drain instead of marking lost.",
-										"id", lease.workerID, "pod", p.workerPodName(w), "consecutive_failures", count)
+								// ~100s+ longer. For a busy worker, defer to the
+								// informer-driven w.done path above (fires when the
+								// pod is actually gone and runs the same cleanup) so
+								// the query drains, bounded by the pod's
+								// terminationGracePeriodSeconds. Cache-only read.
+								//
+								// Gate on activeSessions>0: an idle worker has no
+								// query to protect, and leaving a Terminating-but-
+								// not-yet-deleted worker in the pool would let
+								// AcquireWorker route a new session to a shutting-
+								// down pod (findIdle/leastLoaded only skip workers
+								// whose done channel is closed, i.e. already gone).
+								// So idle workers fall through and are marked Lost
+								// promptly, exactly as before this change.
+								p.mu.RLock()
+								active := w.activeSessions
+								p.mu.RUnlock()
+								if active > 0 && p.workerPodTerminating(p.workerPodName(w)) {
+									slog.Warn("Busy K8s worker failing health checks while pod is Terminating (planned node drain); deferring to graceful drain instead of canceling its query.",
+										"id", lease.workerID, "pod", p.workerPodName(w), "active_sessions", active, "consecutive_failures", count)
 									return
 								}
 								lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginHealthCheckCrash)
