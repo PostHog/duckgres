@@ -1360,6 +1360,38 @@ func TestK8sPool_LiveWorkerCount(t *testing.T) {
 	}
 }
 
+// TestK8sPool_LiveExclusiveWorkerCount confirms the exclusive-only live count
+// excludes colocated workers (which are unbounded) while still counting
+// in-flight default-shape background spawns. This is the count the exclusive
+// worker-count cap is charged against.
+func TestK8sPool_LiveExclusiveWorkerCount(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	alive := make(chan struct{})
+	dead := make(chan struct{})
+	close(dead)
+
+	excl := &ManagedWorker{ID: 1, done: alive}
+	colo := &ManagedWorker{ID: 2, done: alive}
+	colo.profile = WorkerProfile{CPU: "8", Memory: "48Gi", Colocate: true}
+	deadColo := &ManagedWorker{ID: 3, done: dead}
+	deadColo.profile = WorkerProfile{Colocate: true}
+
+	pool.workers[1] = excl
+	pool.workers[2] = colo
+	pool.workers[3] = deadColo
+	pool.spawning = 2 // in-flight default-shape (exclusive) spawns
+
+	// liveWorkerCountLocked counts everything alive + spawning: 1 excl + 1 colo + 2 spawning = 4
+	if got := pool.liveWorkerCountLocked(); got != 4 {
+		t.Fatalf("liveWorkerCountLocked: expected 4, got %d", got)
+	}
+	// Exclusive-only: 1 excl + 2 spawning, colocated excluded = 3
+	if got := pool.liveExclusiveWorkerCountLocked(); got != 3 {
+		t.Fatalf("liveExclusiveWorkerCountLocked: expected 3 (colocated excluded), got %d", got)
+	}
+}
+
 func TestK8sPoolSpawnMinWorkersTracksWarmCapacityAndSpawnsMissingWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	pool.workers[41] = &ManagedWorker{ID: 41, done: make(chan struct{})}
