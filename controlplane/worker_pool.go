@@ -14,6 +14,11 @@ const DefaultWarmCapacityMissWindow = 2 * time.Minute
 const DefaultWarmCapacityMissesPerWorker = 8
 const DefaultWarmCapacityDemandTTL = 15 * time.Minute
 
+// WarmAcquireRetryInterval is how often a session-acquire that missed the warm
+// pool re-attempts the claim while waiting (within WarmAcquireTimeout) for the
+// warm pool to replenish.
+const WarmAcquireRetryInterval = 2 * time.Second
+
 // WarmCapacityExhaustedError is returned when a user request misses the ready
 // warm pool. The caller should fail fast with a retryable capacity response
 // instead of waiting for a foreground cold worker spawn.
@@ -91,14 +96,20 @@ type WorkerPool interface {
 
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
-	Namespace                string
-	CPID                     string // Control plane pod name, used in labels
-	CPInstanceID             string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
-	WorkerImage              string
-	WorkerPort               int
-	SecretName               string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
-	ConfigMap                string // ConfigMap name for duckgres.yaml
-	MaxWorkers               int
+	Namespace    string
+	CPID         string // Control plane pod name, used in labels
+	CPInstanceID string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
+	WorkerImage  string
+	WorkerPort   int
+	SecretName   string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	ConfigMap    string // ConfigMap name for duckgres.yaml
+	MaxWorkers   int
+	// WarmAcquireTimeout: how long a session-acquire blocks server-side waiting
+	// for a warm worker to become available before returning the retryable
+	// "no warm worker" backpressure. 0 = fail fast (legacy behavior). Bounded
+	// per-request by the client's connection context, so a client with a short
+	// deadline still fails fast.
+	WarmAcquireTimeout       time.Duration
 	IdleTimeout              time.Duration
 	ConfigPath               string                                       // Path inside worker pod where config is mounted
 	ImagePullPolicy          string                                       // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")

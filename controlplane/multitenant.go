@@ -167,6 +167,19 @@ func SetupMultiTenant(
 	bootIDHex := hex.EncodeToString(bootID)
 	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
 
+	// Optional server-side patience for a session-acquire that misses the warm
+	// pool: block up to this long for a warm worker (replenishing in the
+	// background, possibly after a cold node provision) before returning the
+	// retryable "no warm worker" backpressure. 0 / unset = fail fast (legacy).
+	warmAcquireTimeout := time.Duration(0)
+	if v := os.Getenv("DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			warmAcquireTimeout = d
+		} else {
+			slog.Warn("Invalid DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT; ignoring.", "value", v, "error", err)
+		}
+	}
+
 	baseCfg := K8sWorkerPoolConfig{
 		Namespace:                namespace,
 		CPID:                     cpID,
@@ -176,6 +189,7 @@ func SetupMultiTenant(
 		SecretName:               cfg.K8s.WorkerSecret,
 		ConfigMap:                cfg.K8s.WorkerConfigMap,
 		MaxWorkers:               maxWorkers,
+		WarmAcquireTimeout:       warmAcquireTimeout,
 		IdleTimeout:              cfg.WorkerIdleTimeout,
 		ConfigPath:               cfg.ConfigPath,
 		ImagePullPolicy:          cfg.K8s.ImagePullPolicy,

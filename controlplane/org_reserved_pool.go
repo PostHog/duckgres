@@ -4,10 +4,25 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
+
+// isRetryableWarmMiss reports whether a worker-acquire error is a transient
+// "no idle warm worker" miss — the only capacity miss that resolves on its own
+// once the warm pool replenishes. Org/global-cap and shutdown misses are not
+// retried (waiting won't change them).
+func isRetryableWarmMiss(err error) bool {
+	var capErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capErr) {
+		return false
+	}
+	return capErr.missReason() == configstore.WorkerClaimMissReasonNoIdle
+}
 
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
@@ -62,6 +77,11 @@ func (p *OrgReservedPool) assignedColocatedResourcesLocked() (cpu int, memBytes 
 }
 
 func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
+	// Server-side patience: block up to warmAcquireTimeout for the warm pool to
+	// replenish before surfacing a "no warm worker" miss to the client. Always
+	// bounded by the request ctx, so a client with a short deadline still fails
+	// fast. 0 = legacy fail-fast.
+	warmDeadline := time.Now().Add(p.shared.warmAcquireTimeout)
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,6 +139,19 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 				MaxColocatedMemBytes: p.maxColocatedMemBytes,
 			})
 			if err != nil {
+				// A transient warm-pool miss resolves once a worker replenishes
+				// (each miss records demand that drives the warm reconciler, and a
+				// colocated shape may first need a cold node). Wait and retry the
+				// claim until warmAcquireTimeout elapses rather than failing the
+				// client immediately. Bounded by ctx below.
+				if p.shared.warmAcquireTimeout > 0 && isRetryableWarmMiss(err) && time.Now().Before(warmDeadline) {
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(WarmAcquireRetryInterval):
+					}
+					continue
+				}
 				return nil, err
 			}
 

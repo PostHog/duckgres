@@ -6,6 +6,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 func addNeutralWarmWorker(shared *K8sWorkerPool, id int) *ManagedWorker {
@@ -294,6 +296,29 @@ func TestOrgReservedPoolAssignedCountExcludesColocated(t *testing.T) {
 	shared.mu.Unlock()
 	if got != 1 {
 		t.Fatalf("expected exclusive-only count of 1, got %d (colocated workers must not count)", got)
+	}
+}
+
+// TestIsRetryableWarmMiss confirms only a transient no-idle warm miss is treated
+// as retryable by the server-side acquire wait — org/global-cap and non-capacity
+// errors are not (waiting won't change them).
+func TestIsRetryableWarmMiss(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no-idle", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonNoIdle, 0), true},
+		{"org-cap", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, 0), false},
+		{"global-cap", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonGlobalCap, 0), false},
+		{"shutting-down", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonShuttingDown, 0), false},
+		{"plain-error", context.DeadlineExceeded, false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := isRetryableWarmMiss(c.err); got != c.want {
+			t.Errorf("%s: isRetryableWarmMiss = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 

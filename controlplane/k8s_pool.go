@@ -61,7 +61,10 @@ type K8sWorkerPool struct {
 	nextWorkerID int
 	spawning     int
 	maxWorkers   int
-	minWorkers   int
+	// warmAcquireTimeout: server-side block window for a session-acquire that
+	// missed the warm pool (0 = fail fast). Read by OrgReservedPool.AcquireWorker.
+	warmAcquireTimeout time.Duration
+	minWorkers         int
 	// perImageWarmTarget is an additive floor on top of minWorkers: for each
 	// image listed, the pool aims to keep at least N warm-idle workers of
 	// that exact image alive so a per-org pin always has a hot pod waiting.
@@ -185,6 +188,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	pool := &K8sWorkerPool{
 		workers:                 make(map[int]*ManagedWorker),
 		maxWorkers:              cfg.MaxWorkers,
+		warmAcquireTimeout:      cfg.WarmAcquireTimeout,
 		idleTimeout:             cfg.IdleTimeout,
 		shutdownCh:              make(chan struct{}),
 		stopInform:              make(chan struct{}),
