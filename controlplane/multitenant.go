@@ -176,6 +176,7 @@ func SetupMultiTenant(
 		SecretName:               cfg.K8s.WorkerSecret,
 		ConfigMap:                cfg.K8s.WorkerConfigMap,
 		MaxWorkers:               maxWorkers,
+		WarmAcquireTimeout:       cfg.K8s.WarmAcquireTimeout,
 		IdleTimeout:              cfg.WorkerIdleTimeout,
 		ConfigPath:               cfg.ConfigPath,
 		ImagePullPolicy:          cfg.K8s.ImagePullPolicy,

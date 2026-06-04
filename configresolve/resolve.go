@@ -82,6 +82,7 @@ type CLIInputs struct {
 	K8sSharedWarmTarget                int
 	K8sDynamicWarmCapacityEnabled      bool
 	K8sWarmCapacityMissWindow          string
+	K8sWarmAcquireTimeout              string
 	K8sWarmCapacityMissesPerWorker     int
 	K8sWarmCapacityDemandTTL           string
 	K8sWarmCapacityDynamicImageCeiling int
@@ -118,6 +119,7 @@ type Resolved struct {
 	K8sSharedWarmTarget                int
 	K8sDynamicWarmCapacityEnabled      bool
 	K8sWarmCapacityMissWindow          time.Duration
+	K8sWarmAcquireTimeout              time.Duration
 	K8sWarmCapacityMissesPerWorker     int
 	K8sWarmCapacityDemandTTL           time.Duration
 	K8sWarmCapacityDynamicImageCeiling int
@@ -229,6 +231,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sMaxWorkers, k8sSharedWarmTarget int
 	k8sDynamicWarmCapacityEnabled := true
 	k8sWarmCapacityMissWindow := controlplane.DefaultWarmCapacityMissWindow
+	k8sWarmAcquireTimeout := time.Duration(0)
 	k8sWarmCapacityMissesPerWorker := controlplane.DefaultWarmCapacityMissesPerWorker
 	k8sWarmCapacityDemandTTL := controlplane.DefaultWarmCapacityDemandTTL
 	var k8sWarmCapacityDynamicImageCeiling, k8sWarmCapacityDynamicTotalCeiling int
@@ -535,6 +538,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 				k8sWarmCapacityMissWindow = d
 			} else {
 				warn("Invalid k8s.warm_capacity_miss_window duration: " + err.Error())
+			}
+		}
+		if fileCfg.K8s.WarmAcquireTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.K8s.WarmAcquireTimeout); err == nil {
+				k8sWarmAcquireTimeout = d
+			} else {
+				warn("Invalid k8s.warm_acquire_timeout duration: " + err.Error())
 			}
 		}
 		if fileCfg.K8s.WarmCapacityMissesPerWorker != 0 {
@@ -891,6 +901,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			k8sWarmCapacityMissWindow = d
 		} else {
 			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			k8sWarmAcquireTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT duration: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER"); v != "" {
@@ -1268,6 +1285,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid --k8s-warm-capacity-miss-window duration: " + err.Error())
 		}
 	}
+	if cli.Set["k8s-warm-acquire-timeout"] {
+		if d, err := time.ParseDuration(cli.K8sWarmAcquireTimeout); err == nil {
+			k8sWarmAcquireTimeout = d
+		} else {
+			warn("Invalid --k8s-warm-acquire-timeout duration: " + err.Error())
+		}
+	}
 	if cli.Set["k8s-warm-capacity-misses-per-worker"] {
 		k8sWarmCapacityMissesPerWorker = cli.K8sWarmCapacityMissesPerWorker
 	}
@@ -1392,6 +1416,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sSharedWarmTarget:                k8sSharedWarmTarget,
 		K8sDynamicWarmCapacityEnabled:      k8sDynamicWarmCapacityEnabled,
 		K8sWarmCapacityMissWindow:          k8sWarmCapacityMissWindow,
+		K8sWarmAcquireTimeout:              k8sWarmAcquireTimeout,
 		K8sWarmCapacityMissesPerWorker:     k8sWarmCapacityMissesPerWorker,
 		K8sWarmCapacityDemandTTL:           k8sWarmCapacityDemandTTL,
 		K8sWarmCapacityDynamicImageCeiling: k8sWarmCapacityDynamicImageCeiling,

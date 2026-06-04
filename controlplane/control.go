@@ -115,6 +115,7 @@ type K8sConfig struct {
 	SharedWarmTarget                int           // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 	DynamicWarmCapacityEnabled      bool          // Enable configstore-driven dynamic warm-capacity target computation
 	WarmCapacityMissWindow          time.Duration // Window of recent no-idle misses that contributes to dynamic targets
+	WarmAcquireTimeout              time.Duration // Server-side block window for a session-acquire that misses the warm pool (0 = fail fast)
 	WarmCapacityMissesPerWorker     int           // Number of recent misses that translate to one extra warm worker
 	WarmCapacityDemandTTL           time.Duration // Retention TTL for warm-capacity miss buckets
 	WarmCapacityDynamicImageCeiling int           // Max dynamic extra warm workers per image (0 = unlimited)

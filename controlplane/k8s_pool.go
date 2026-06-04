@@ -61,7 +61,10 @@ type K8sWorkerPool struct {
 	nextWorkerID int
 	spawning     int
 	maxWorkers   int
-	minWorkers   int
+	// warmAcquireTimeout: server-side block window for a session-acquire that
+	// missed the warm pool (0 = fail fast). Read by OrgReservedPool.AcquireWorker.
+	warmAcquireTimeout time.Duration
+	minWorkers         int
 	// perImageWarmTarget is an additive floor on top of minWorkers: for each
 	// image listed, the pool aims to keep at least N warm-idle workers of
 	// that exact image alive so a per-org pin always has a hot pod waiting.
@@ -185,6 +188,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	pool := &K8sWorkerPool{
 		workers:                 make(map[int]*ManagedWorker),
 		maxWorkers:              cfg.MaxWorkers,
+		warmAcquireTimeout:      cfg.WarmAcquireTimeout,
 		idleTimeout:             cfg.IdleTimeout,
 		shutdownCh:              make(chan struct{}),
 		stopInform:              make(chan struct{}),
@@ -1708,6 +1712,13 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 }
 
 func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, reason configstore.WorkerClaimMissReason) {
+	// A server-side acquire wait polls every WarmAcquireRetryInterval; it sets
+	// this to record demand + the miss metric at most once per throttle interval
+	// rather than on every poll, so one waiting connection doesn't inflate the
+	// demand signal and miss counter ~Nx.
+	if assignment != nil && assignment.SuppressWarmMissRecord {
+		return
+	}
 	policy := warmCapacityMissPolicyForReason(reason)
 	image := ""
 	if assignment != nil {
