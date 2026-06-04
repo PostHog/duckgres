@@ -253,6 +253,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 
 	observeControlPlaneWorkers(0)
 	go pool.idleReaper()
+	go pool.disruptionGuardReconciler()
 
 	return pool, nil
 }
@@ -725,11 +726,16 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			Labels:    podLabels,
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:                corev1.RestartPolicyNever,
-			ServiceAccountName:           p.workerServiceAccountName(),
-			AutomountServiceAccountToken: boolPtr(false),
-			PriorityClassName:            p.workerPriorityClassName,
-			NodeSelector:                 p.nodeSelectorForProfile(profile),
+			RestartPolicy: corev1.RestartPolicyNever,
+			// Give in-flight queries a real drain window on SIGTERM instead of
+			// the 30s k8s default. Pairs with karpenter.sh/do-not-disrupt
+			// (set on busy workers) so a node roll defers to the query; this is
+			// the fallback for the residual race and involuntary eviction.
+			TerminationGracePeriodSeconds: int64Ptr(workerTerminationGracePeriodSeconds),
+			ServiceAccountName:            p.workerServiceAccountName(),
+			AutomountServiceAccountToken:  boolPtr(false),
+			PriorityClassName:             p.workerPriorityClassName,
+			NodeSelector:                  p.nodeSelectorForProfile(profile),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -2622,6 +2628,23 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							slog.Warn("K8s worker health check failed.", "id", lease.workerID, "error", healthErr, "consecutive_failures", count)
 
 							if count >= maxConsecutiveHealthFailures {
+								// Planned node disruption (Karpenter drift/
+								// consolidation, kubelet drain) is not a worker
+								// crash: the pod is already Terminating. Marking
+								// it Lost here cancels the in-flight query after
+								// ~3 health intervals (~5s), even though the
+								// worker is draining and its node typically lives
+								// ~100s+ longer. Defer to the informer-driven
+								// w.done path above, which fires when the pod is
+								// actually gone and runs the same cleanup — so the
+								// query drains (bounded by the pod's
+								// terminationGracePeriodSeconds) instead of being
+								// killed mid-flight. Cache-only read; no API call.
+								if p.workerPodTerminating(p.workerPodName(w)) {
+									slog.Warn("K8s worker failing health checks while pod is Terminating (planned node disruption); deferring to graceful drain instead of marking lost.",
+										"id", lease.workerID, "pod", p.workerPodName(w), "consecutive_failures", count)
+									return
+								}
 								lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginHealthCheckCrash)
 								if err != nil {
 									slog.Error("K8s worker unresponsive but lease validation failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)

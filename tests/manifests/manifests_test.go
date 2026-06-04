@@ -27,6 +27,21 @@ func TestControlPlaneRBACIncludesLeaseAccess(t *testing.T) {
 	}
 }
 
+func TestControlPlaneRBACIncludesWorkerPodPatch(t *testing.T) {
+	// Drain-aware eviction sets/clears karpenter.sh/do-not-disrupt on busy
+	// worker pods via a merge patch, so the control plane Role must grant
+	// "patch" on pods (in addition to create/delete/get/list/watch).
+	content := readManifest(t, "k8s", "rbac.yaml")
+	for _, want := range []string{
+		`resources: ["pods"]`,
+		`verbs: ["create", "delete", "get", "list", "patch", "watch"]`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in k8s/rbac.yaml", want)
+		}
+	}
+}
+
 func TestControlPlaneRBACIncludesSharedWorkerConfigMapRead(t *testing.T) {
 	content := readManifest(t, "k8s", "rbac.yaml")
 	for _, want := range []string{

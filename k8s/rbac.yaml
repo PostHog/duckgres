@@ -17,10 +17,11 @@ metadata:
   name: duckgres-control-plane
   namespace: duckgres
 rules:
-  # Manage worker pods
+  # Manage worker pods. "patch" is required to set/clear the
+  # karpenter.sh/do-not-disrupt annotation on busy workers (drain-aware eviction).
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
   # Validate the shared neutral worker startup config before spawn
   - apiGroups: [""]
     resources: ["configmaps"]

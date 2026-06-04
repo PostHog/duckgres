@@ -26,25 +26,29 @@ import (
 
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
-	ID                      int
-	podName                 string
-	nodeName                string //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
-	image                   string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
-	profile                 WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
-	cmd                     *exec.Cmd
-	socketPath              string
-	bearerToken             string
-	client                  *flightsql.Client
-	parentListener          net.Listener    // CP-side listener; lifecycle managed by releaseSocket
-	prebound                *preboundSocket // non-nil if using a pre-bound socket slot
-	releaseOnce             sync.Once       // ensures releaseWorkerSocket body runs exactly once
-	done                    chan struct{}   // closed when process exits
-	exitErr                 error
-	activeSessions          int       // Number of sessions currently assigned to this worker
-	lastUsed                time.Time // Last time a session was destroyed on this worker
-	sharedState             SharedWorkerState
-	reservedAt              time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
-	peakSessions            int       // High-water mark of concurrent sessions (for retirement metrics)
+	ID             int
+	podName        string
+	nodeName       string        //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
+	image          string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
+	profile        WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
+	cmd            *exec.Cmd
+	socketPath     string
+	bearerToken    string
+	client         *flightsql.Client
+	parentListener net.Listener    // CP-side listener; lifecycle managed by releaseSocket
+	prebound       *preboundSocket // non-nil if using a pre-bound socket slot
+	releaseOnce    sync.Once       // ensures releaseWorkerSocket body runs exactly once
+	done           chan struct{}   // closed when process exits
+	exitErr        error
+	activeSessions int       // Number of sessions currently assigned to this worker
+	lastUsed       time.Time // Last time a session was destroyed on this worker
+	// doNotDisruptApplied tracks whether karpenter.sh/do-not-disrupt is currently
+	// set on this worker's pod, so the disruption-guard reconciler only issues a
+	// patch on busy<->idle transitions rather than every tick.
+	doNotDisruptApplied bool //nolint:unused // only set in kubernetes warm-pool disruption guard
+	sharedState         SharedWorkerState
+	reservedAt          time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
+	peakSessions        int       // High-water mark of concurrent sessions (for retirement metrics)
 	// ownerEpoch is guarded by epochMu so cred-refresh's
 	// "RefreshLease then SetOwnerEpoch" sequence appears atomic to
 	// concurrent readers (notably ShutdownAll's lease minting).

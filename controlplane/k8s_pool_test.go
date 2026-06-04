@@ -3552,6 +3552,12 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 		t.Fatal("expected automountServiceAccountToken=false for shared warm worker pods")
 	}
 
+	// Drain-aware eviction: a real grace window for in-flight queries, not the
+	// 30s k8s default.
+	if pod.Spec.TerminationGracePeriodSeconds == nil || *pod.Spec.TerminationGracePeriodSeconds != workerTerminationGracePeriodSeconds {
+		t.Fatalf("expected terminationGracePeriodSeconds=%d, got %v", workerTerminationGracePeriodSeconds, pod.Spec.TerminationGracePeriodSeconds)
+	}
+
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
 		t.Fatal("expected runAsNonRoot=true")
 	}
