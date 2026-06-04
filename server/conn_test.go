@@ -3023,6 +3023,16 @@ func TestCopyBinaryRegex(t *testing.T) {
 			shouldMatch: true,
 		},
 		{
+			name:        "WITH BINARY shorthand",
+			query:       "COPY (select 1 as x) TO STDOUT WITH BINARY",
+			shouldMatch: true,
+		},
+		{
+			name:        "bare BINARY shorthand",
+			query:       "COPY users TO STDOUT BINARY",
+			shouldMatch: true,
+		},
+		{
 			name:        "FORMAT csv should not match",
 			query:       "COPY users TO STDOUT (FORMAT csv)",
 			shouldMatch: false,
@@ -3033,8 +3043,23 @@ func TestCopyBinaryRegex(t *testing.T) {
 			shouldMatch: false,
 		},
 		{
+			name:        "table named binary should not match",
+			query:       "COPY binary TO STDOUT",
+			shouldMatch: false,
+		},
+		{
+			name:        "source string containing WITH BINARY should not match",
+			query:       "COPY (SELECT 'WITH BINARY' AS x) TO STDOUT",
+			shouldMatch: false,
+		},
+		{
 			name:        "FORMAT binary in FROM STDIN",
 			query:       "COPY users FROM STDIN (FORMAT binary)",
+			shouldMatch: true,
+		},
+		{
+			name:        "WITH BINARY in FROM STDIN",
+			query:       "COPY users FROM STDIN WITH BINARY",
 			shouldMatch: true,
 		},
 	}
@@ -3046,6 +3071,63 @@ func TestCopyBinaryRegex(t *testing.T) {
 				t.Errorf("copyBinaryRegex.Match(%q) = %v, want %v", tt.query, matched, tt.shouldMatch)
 			}
 		})
+	}
+}
+
+func TestHandleCopyOutWithBinaryShorthandWritesBinaryStream(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var out bytes.Buffer
+	c := &clientConn{
+		writer:   bufio.NewWriter(&out),
+		executor: NewLocalExecutor(db),
+		server:   &Server{},
+		txStatus: txStatusIdle,
+		ctx:      context.Background(),
+	}
+
+	query := "COPY (select 1 as x) TO STDOUT WITH BINARY"
+	if err := c.handleCopyOut(query, strings.ToUpper(query)); err != nil {
+		t.Fatalf("handleCopyOut returned error: %v", err)
+	}
+
+	reader := bytes.NewReader(out.Bytes())
+	msgType, body, err := wire.ReadMessage(reader)
+	if err != nil {
+		t.Fatalf("read CopyOutResponse: %v", err)
+	}
+	if msgType != wire.MsgCopyOutResponse {
+		t.Fatalf("first message type = %q, want CopyOutResponse", msgType)
+	}
+	if len(body) != 5 {
+		t.Fatalf("CopyOutResponse body length = %d, want 5", len(body))
+	}
+	if body[0] != 1 {
+		t.Fatalf("overall copy format = %d, want binary format 1", body[0])
+	}
+	if got := binary.BigEndian.Uint16(body[1:3]); got != 1 {
+		t.Fatalf("column count = %d, want 1", got)
+	}
+	if got := binary.BigEndian.Uint16(body[3:5]); got != 1 {
+		t.Fatalf("column format = %d, want binary format 1", got)
+	}
+
+	msgType, body, err = wire.ReadMessage(reader)
+	if err != nil {
+		t.Fatalf("read first CopyData: %v", err)
+	}
+	if msgType != wire.MsgCopyData {
+		t.Fatalf("second message type = %q, want CopyData", msgType)
+	}
+	if bytes.Equal(body, []byte("1\n")) {
+		t.Fatal("WITH BINARY wrote text COPY data")
+	}
+	if !bytes.HasPrefix(body, []byte{'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xFF, '\r', '\n', 0x00}) {
+		t.Fatalf("first CopyData does not start with PostgreSQL binary COPY signature: %x", body[:min(len(body), 11)])
 	}
 }
 

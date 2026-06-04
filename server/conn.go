@@ -3442,7 +3442,7 @@ func shouldHandleCopyBeforeTranspile(query string) bool {
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
 	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s*(?:\(([^)]+)\)\s*)?FROM\s+STDIN`)
-	copyBinaryRegex     = regexp.MustCompile(`(?i)\bFORMAT\s+(?:"?binary"?|BINARY)\b`)
+	copyBinaryRegex     = regexp.MustCompile(`(?i)\b(?:STDIN|STDOUT)\b(?:[^;]*\bFORMAT\s+(?:"?binary"?|BINARY)\b|(?:\s+WITH)?\s+BINARY\b)`)
 	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
