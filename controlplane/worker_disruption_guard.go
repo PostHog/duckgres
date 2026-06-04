@@ -82,17 +82,20 @@ func (p *K8sWorkerPool) disruptionGuardReconciler() {
 }
 
 // reconcileDisruptionGuards patches the do-not-disrupt annotation onto workers
-// that became busy and removes it from workers that went idle. It snapshots the
-// desired vs. applied state under the lock, then performs K8s API calls without
-// holding it.
+// that became busy and removes it from workers that went idle.
 //
-// doNotDisruptApplied is in-memory, so a CP restart resets it to false. The
-// failure direction is safe: a still-busy worker (busy=true, applied=false)
-// gets re-patched set on the next tick; the only residue is a worker that went
-// idle exactly across the restart, whose stale annotation merely defers its
-// node's consolidation until the idle reaper retires it. It never clears a busy
-// worker's annotation. (Initializing applied from the live pod annotation on
-// adoption would remove even that residue — a follow-up.)
+// Desired state (busy) is compared against the pod's ACTUAL annotation, read
+// from the pod informer cache — not an in-memory flag. This keeps the reconcile
+// stateless and self-correcting across control-plane restarts and failover:
+// when a CP dies, the worker's session(s) die with it (so the worker goes idle)
+// but its pod keeps the annotation the dead CP stamped. A surviving/replacement
+// CP that adopts the worker has no in-memory memory of having set it; reading
+// the live annotation lets it see desired=idle vs current=set and clear the
+// orphan. (An in-memory "applied" flag would miss this — it would read
+// applied=false==busy=false and never clear the stale annotation.)
+//
+// It snapshots desired state under the lock, reads current state from the
+// cache, and issues K8s API calls without holding the lock.
 func (p *K8sWorkerPool) reconcileDisruptionGuards(ctx context.Context) {
 	type guardTarget struct {
 		worker  *ManagedWorker
@@ -108,11 +111,7 @@ func (p *K8sWorkerPool) reconcileDisruptionGuards(ctx context.Context) {
 			continue // worker exiting; nothing to guard
 		default:
 		}
-		busy := w.activeSessions > 0
-		if busy == w.doNotDisruptApplied {
-			continue // already in desired state
-		}
-		targets = append(targets, guardTarget{worker: w, podName: p.workerPodName(w), busy: busy})
+		targets = append(targets, guardTarget{worker: w, podName: p.workerPodName(w), busy: w.activeSessions > 0})
 	}
 	p.mu.RUnlock()
 
@@ -120,25 +119,38 @@ func (p *K8sWorkerPool) reconcileDisruptionGuards(ctx context.Context) {
 		if t.podName == "" {
 			continue
 		}
+		if t.busy == p.podHasDoNotDisrupt(t.podName) {
+			continue // pod already in the desired state (steady state: no API call)
+		}
 		if err := p.patchWorkerDoNotDisrupt(ctx, t.podName, t.busy); err != nil {
 			if apierrors.IsNotFound(err) {
-				// Pod already gone — drop the optimistic applied flag so a
-				// replacement pod with the same worker is re-evaluated.
-				p.mu.Lock()
-				t.worker.doNotDisruptApplied = false
-				p.mu.Unlock()
-				continue
+				continue // pod gone; nothing to guard
 			}
 			slog.Warn("Failed to reconcile worker do-not-disrupt annotation.",
 				"worker", t.worker.ID, "pod", t.podName, "busy", t.busy, "error", err)
 			continue
 		}
-		p.mu.Lock()
-		t.worker.doNotDisruptApplied = t.busy
-		p.mu.Unlock()
 		slog.Debug("Reconciled worker do-not-disrupt annotation.",
 			"worker", t.worker.ID, "pod", t.podName, "do_not_disrupt", t.busy)
 	}
+}
+
+// podHasDoNotDisrupt reports whether the worker pod currently carries the
+// karpenter.sh/do-not-disrupt annotation, read from the pod informer cache
+// (no API call). Returns false if the pod is not in the cache yet.
+func (p *K8sWorkerPool) podHasDoNotDisrupt(podName string) bool {
+	if p.informer == nil || podName == "" {
+		return false
+	}
+	obj, exists, err := p.informer.GetIndexer().GetByKey(p.namespace + "/" + podName)
+	if err != nil || !exists {
+		return false
+	}
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return false
+	}
+	return pod.Annotations[karpenterDoNotDisruptAnnotation] == karpenterDoNotDisruptValue
 }
 
 // patchWorkerDoNotDisrupt sets (enable) or removes (disable) the

@@ -11,93 +11,125 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
 
-// TestReconcileDisruptionGuardsSetsAndClears verifies the reconciler stamps
-// karpenter.sh/do-not-disrupt onto a busy worker's pod and removes it once the
-// worker goes idle, and that it only patches on busy<->idle transitions.
+// guardPodAnnotated builds a worker pod with/without the do-not-disrupt annotation.
+func guardPodAnnotated(name string, annotated bool) *corev1.Pod {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
+	if annotated {
+		pod.Annotations = map[string]string{karpenterDoNotDisruptAnnotation: karpenterDoNotDisruptValue}
+	}
+	return pod
+}
+
+// withGuardInformer attaches a (non-running) pod informer to the pool and seeds
+// the cache, so podHasDoNotDisrupt reads the pods we stage. Returns a function
+// to (re)sync the cache from a set of pods, simulating the informer observing a
+// patch.
+func withGuardInformer(t *testing.T, pool *K8sWorkerPool, cs *fake.Clientset, pods ...*corev1.Pod) func(...*corev1.Pod) {
+	t.Helper()
+	pool.informer = informers.NewSharedInformerFactory(cs, 0).Core().V1().Pods().Informer()
+	idx := pool.informer.GetIndexer()
+	sync := func(ps ...*corev1.Pod) {
+		for _, p := range ps {
+			if err := idx.Add(p); err != nil {
+				t.Fatalf("seed informer: %v", err)
+			}
+		}
+	}
+	sync(pods...)
+	return sync
+}
+
+func countPatchReactor(cs *fake.Clientset, n *int32) {
+	cs.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		atomic.AddInt32(n, 1)
+		return false, nil, nil // fall through to default reactor (applies the patch)
+	})
+}
+
+// TestReconcileDisruptionGuardsSetsAndClears: a busy worker's pod gets the
+// annotation; an idle worker's pod has it removed; steady state issues no patch.
 func TestReconcileDisruptionGuardsSetsAndClears(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	ctx := context.Background()
 
-	busyPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name: "wpod-busy", Namespace: "default",
-		Labels: map[string]string{"duckgres/worker-id": "1"},
-	}}
-	idlePod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name: "wpod-idle", Namespace: "default",
-		Labels:      map[string]string{"duckgres/worker-id": "2"},
-		Annotations: map[string]string{karpenterDoNotDisruptAnnotation: karpenterDoNotDisruptValue},
-	}}
+	busyPod := guardPodAnnotated("wpod-busy", false)
+	idlePod := guardPodAnnotated("wpod-idle", true)
 	for _, pod := range []*corev1.Pod{busyPod, idlePod} {
 		if _, err := cs.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 			t.Fatalf("create pod %s: %v", pod.Name, err)
 		}
 	}
+	resync := withGuardInformer(t, pool, cs, busyPod, idlePod)
 
 	var patches int32
-	cs.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
-		atomic.AddInt32(&patches, 1)
-		return false, nil, nil // fall through to the default reactor (applies the patch)
-	})
+	countPatchReactor(cs, &patches)
 
-	// w1 busy and not yet guarded; w2 idle but still carrying the annotation.
-	pool.workers[1] = &ManagedWorker{ID: 1, podName: "wpod-busy", activeSessions: 1, doNotDisruptApplied: false, done: make(chan struct{})}
-	pool.workers[2] = &ManagedWorker{ID: 2, podName: "wpod-idle", activeSessions: 0, doNotDisruptApplied: true, done: make(chan struct{})}
+	pool.workers[1] = &ManagedWorker{ID: 1, podName: "wpod-busy", activeSessions: 1, done: make(chan struct{})}
+	pool.workers[2] = &ManagedWorker{ID: 2, podName: "wpod-idle", activeSessions: 0, done: make(chan struct{})}
 
 	pool.reconcileDisruptionGuards(ctx)
 
-	got, err := cs.CoreV1().Pods("default").Get(ctx, "wpod-busy", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
+	if got := podAnno(t, cs, "wpod-busy"); got != karpenterDoNotDisruptValue {
+		t.Fatalf("busy worker: want do-not-disrupt=true, got %q", got)
 	}
-	if got.Annotations[karpenterDoNotDisruptAnnotation] != karpenterDoNotDisruptValue {
-		t.Fatalf("busy worker: want do-not-disrupt=true, got annotations=%v", got.Annotations)
+	if got := podAnno(t, cs, "wpod-idle"); got != "" {
+		t.Fatalf("idle worker: want do-not-disrupt cleared, got %q", got)
 	}
-	if !pool.workers[1].doNotDisruptApplied {
-		t.Fatal("busy worker: expected doNotDisruptApplied=true after reconcile")
-	}
-
-	got, err = cs.CoreV1().Pods("default").Get(ctx, "wpod-idle", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := got.Annotations[karpenterDoNotDisruptAnnotation]; ok {
-		t.Fatalf("idle worker: want do-not-disrupt cleared, got annotations=%v", got.Annotations)
-	}
-	if pool.workers[2].doNotDisruptApplied {
-		t.Fatal("idle worker: expected doNotDisruptApplied=false after reconcile")
-	}
-
 	if n := atomic.LoadInt32(&patches); n != 2 {
 		t.Fatalf("expected exactly 2 patches (1 set, 1 clear), got %d", n)
 	}
 
-	// Steady state: nothing changed, so no further patches.
+	// Steady state: cache now reflects the patched annotations -> no more patches.
+	resync(guardPodAnnotated("wpod-busy", true), guardPodAnnotated("wpod-idle", false))
 	pool.reconcileDisruptionGuards(ctx)
 	if n := atomic.LoadInt32(&patches); n != 2 {
-		t.Fatalf("expected no additional patches on steady state, got %d", n)
+		t.Fatalf("expected no additional patches in steady state, got %d", n)
 	}
 }
 
-// TestReconcileDisruptionGuardsSkipsExitingWorker verifies a worker whose done
-// channel is closed (exiting) is not patched — nothing to guard.
+// TestReconcileDisruptionGuardsClearsStaleAnnotationAfterFailover is the
+// CP-failover regression: a CP stamps do-not-disrupt on a busy worker, then
+// dies; its sessions die with it so the worker is idle, but the pod keeps the
+// annotation. A surviving/replacement CP (no in-memory record of having set it)
+// must still clear the orphan. The cache-based reconcile does; an in-memory
+// "applied" flag would not (it would read applied=false==busy=false and skip).
+func TestReconcileDisruptionGuardsClearsStaleAnnotationAfterFailover(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	ctx := context.Background()
+
+	stale := guardPodAnnotated("wpod-orphan", true) // annotation left by the dead CP
+	if _, err := cs.CoreV1().Pods("default").Create(ctx, stale, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	withGuardInformer(t, pool, cs, stale)
+
+	// Adopted worker, freshly in memory: idle (sessions died with the old CP).
+	pool.workers[7] = &ManagedWorker{ID: 7, podName: "wpod-orphan", activeSessions: 0, done: make(chan struct{})}
+
+	pool.reconcileDisruptionGuards(ctx)
+
+	if got := podAnno(t, cs, "wpod-orphan"); got != "" {
+		t.Fatalf("orphaned do-not-disrupt not cleared after failover: got %q", got)
+	}
+}
+
+// TestReconcileDisruptionGuardsSkipsExitingWorker: a worker whose done channel
+// is closed (exiting) is not patched.
 func TestReconcileDisruptionGuardsSkipsExitingWorker(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	ctx := context.Background()
 
-	if _, err := cs.CoreV1().Pods("default").Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name: "wpod-exiting", Namespace: "default",
-	}}, metav1.CreateOptions{}); err != nil {
+	if _, err := cs.CoreV1().Pods("default").Create(ctx, guardPodAnnotated("wpod-exiting", false), metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	withGuardInformer(t, pool, cs, guardPodAnnotated("wpod-exiting", false))
 
 	var patches int32
-	cs.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
-		atomic.AddInt32(&patches, 1)
-		return false, nil, nil
-	})
+	countPatchReactor(cs, &patches)
 
 	done := make(chan struct{})
 	close(done)
@@ -109,8 +141,8 @@ func TestReconcileDisruptionGuardsSkipsExitingWorker(t *testing.T) {
 	}
 }
 
-// TestWorkerPodTerminating verifies the cache-only Terminating check that the
-// health-check loop uses to distinguish a planned node drain from a crash.
+// TestWorkerPodTerminating verifies the cache-only Terminating check the health
+// loop uses to distinguish a planned node drain from a crash.
 func TestWorkerPodTerminating(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.informer = informers.NewSharedInformerFactory(cs, 0).Core().V1().Pods().Informer()
@@ -126,15 +158,24 @@ func TestWorkerPodTerminating(t *testing.T) {
 	}
 
 	if !pool.workerPodTerminating("wpod-term") {
-		t.Fatal("expected Terminating pod (deletionTimestamp set) → true")
+		t.Fatal("expected Terminating pod (deletionTimestamp set) -> true")
 	}
 	if pool.workerPodTerminating("wpod-alive") {
-		t.Fatal("expected live pod → false")
+		t.Fatal("expected live pod -> false")
 	}
 	if pool.workerPodTerminating("wpod-missing") {
-		t.Fatal("expected pod absent from cache → false")
+		t.Fatal("expected pod absent from cache -> false")
 	}
 	if pool.workerPodTerminating("") {
-		t.Fatal("expected empty pod name → false")
+		t.Fatal("expected empty pod name -> false")
 	}
+}
+
+func podAnno(t *testing.T, cs *fake.Clientset, name string) string {
+	t.Helper()
+	pod, err := cs.CoreV1().Pods("default").Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pod %s: %v", name, err)
+	}
+	return pod.Annotations[karpenterDoNotDisruptAnnotation]
 }
