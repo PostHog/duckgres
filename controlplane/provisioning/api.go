@@ -124,16 +124,6 @@ type provisionMetadataReq struct {
 	// External is required when Type == "external": a pre-existing Postgres
 	// referenced by host + an AWS Secrets Manager secret for the password.
 	External *provisionExternalReq `json:"external,omitempty"`
-	// Aurora is required when Type == "aurora": serverless v2 sizing for the
-	// per-org Aurora cluster the composition provisions.
-	Aurora *provisionAuroraReq `json:"aurora,omitempty"`
-}
-
-// provisionAuroraReq is the serverless-v2 ACU sizing for an aurora metadata
-// store. MaxACU must be > 0; MinACU defaults to 0 (scale-to-zero).
-type provisionAuroraReq struct {
-	MinACU float64 `json:"min_acu"`
-	MaxACU float64 `json:"max_acu"`
 }
 
 // provisionDuckLakeReq toggles the DuckLake catalog. Independent of Iceberg and
@@ -302,19 +292,8 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 			PasswordAWSSecret: ext.PasswordAWSSecret,
 		}
 
-	case configstore.MetadataStoreKindAurora:
-		// A per-org Aurora serverless-v2 cluster the composition provisions.
-		a := req.MetadataStore.Aurora
-		if a == nil || a.MaxACU <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.type 'aurora' requires metadata_store.aurora.max_acu > 0"})
-			return
-		}
-		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindAurora
-		warehouse.AuroraMinACU = a.MinACU
-		warehouse.AuroraMaxACU = a.MaxACU
-
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type must be %q, %q, or %q (got %q)", configstore.MetadataStoreKindCnpgShard, configstore.MetadataStoreKindExternal, configstore.MetadataStoreKindAurora, req.MetadataStore.Type)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type must be %q or %q (got %q)", configstore.MetadataStoreKindCnpgShard, configstore.MetadataStoreKindExternal, req.MetadataStore.Type)})
 		return
 	}
 

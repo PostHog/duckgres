@@ -83,15 +83,11 @@ type ManagedWarehouseDatabase struct {
 //
 //   - "cnpg-shard": the per-tenant Lakekeeper Iceberg catalog Postgres backend
 //     on the shared CloudNativePG shard (always paired with iceberg.enabled).
-//   - "external": a pre-existing Postgres (e.g. RDS), referenced by endpoint +
-//     an AWS Secrets Manager secret for the password. Backs either a DuckLake
-//     catalog (iceberg disabled) or the Lakekeeper catalog (iceberg enabled).
-//
-// "aurora" is no longer provisionable (the control plane never stands up a new
-// Aurora cluster); the constant is retained so DucklingClient.Create can still
-// reconcile pre-existing aurora ducklings.
+//   - "external": a pre-existing Postgres (e.g. RDS/Aurora), referenced by
+//     endpoint + an AWS Secrets Manager secret for the password. Backs either a
+//     DuckLake catalog (iceberg disabled) or the Lakekeeper catalog (iceberg
+//     enabled).
 const (
-	MetadataStoreKindAurora    = "aurora"
 	MetadataStoreKindCnpgShard = "cnpg-shard"
 	MetadataStoreKindExternal  = "external"
 )
@@ -110,8 +106,8 @@ type ManagedWarehouseMetadataStore struct {
 	// metadata DB password. Only meaningful when Kind == "external": it's
 	// passed through to the Duckling CR's spec.metadataStore.external.
 	// passwordAwsSecret, where the composition resolves it (via ESO) into the
-	// status password the worker activator reads. Empty for aurora/cnpg-shard
-	// (those mint their own credentials).
+	// status password the worker activator reads. Empty for cnpg-shard
+	// (which mints its own credentials).
 	PasswordAWSSecret string `gorm:"size:255" json:"password_aws_secret,omitempty"`
 }
 
@@ -162,15 +158,14 @@ type ManagedWarehouseWorkerIdentity struct {
 
 // ManagedWarehouseDuckLake captures whether the org's DuckLake catalog is
 // enabled. Decoupled from the metadata-store type and from Iceberg: a duckling
-// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg / external
-// / aurora). The DuckLake catalog lives in the metadata Postgres — the
-// per-tenant database for cnpg-shard, or the metadata database for
-// external/aurora.
+// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg /
+// external). The DuckLake catalog lives in the metadata Postgres — the
+// per-tenant database for cnpg-shard, or the metadata database for external.
 //
 // For ducklings created before this field existed the column is absent/false;
 // the worker activator does NOT key off it directly — it reads the Duckling
 // CR's spec.ducklake.enabled (present/absent) so legacy ducklings keep their
-// implied behavior (external/aurora ⇒ DuckLake, cnpg ⇒ none).
+// implied behavior (external ⇒ DuckLake, cnpg ⇒ none).
 type ManagedWarehouseDuckLake struct {
 	Enabled bool `json:"enabled"`
 }
@@ -333,10 +328,8 @@ func (i ManagedWarehouseIceberg) ResolvedBackend() string {
 type ManagedWarehouse struct {
 	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
 
-	Image           string  `gorm:"size:512" json:"image"`
-	DuckLakeVersion string  `gorm:"size:32" json:"ducklake_version"`
-	AuroraMinACU    float64 `json:"aurora_min_acu"`
-	AuroraMaxACU    float64 `json:"aurora_max_acu"`
+	Image           string `gorm:"size:512" json:"image"`
+	DuckLakeVersion string `gorm:"size:32" json:"ducklake_version"`
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
@@ -657,8 +650,6 @@ type ManagedWarehouseConfig struct {
 
 	Image           string
 	DuckLakeVersion string
-	AuroraMinACU    float64
-	AuroraMaxACU    float64
 
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
@@ -699,8 +690,6 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		OrgID:                          warehouse.OrgID,
 		Image:                          warehouse.Image,
 		DuckLakeVersion:                warehouse.DuckLakeVersion,
-		AuroraMinACU:                   warehouse.AuroraMinACU,
-		AuroraMaxACU:                   warehouse.AuroraMaxACU,
 		WarehouseDatabase:              warehouse.WarehouseDatabase,
 		MetadataStore:                  warehouse.MetadataStore,
 		PgBouncer:                      warehouse.PgBouncer,

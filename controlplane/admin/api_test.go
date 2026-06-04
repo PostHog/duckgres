@@ -1233,7 +1233,7 @@ func TestPatchTenantPinningRejectsUnknownFields(t *testing.T) {
 	store.warehouses["analytics"] = &configstore.ManagedWarehouse{OrgID: "analytics"}
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"image":"x","aurora_max_acu":42}`)
+	body := []byte(`{"image":"x","not_a_real_field":42}`)
 	req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/analytics/warehouse/pinning", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

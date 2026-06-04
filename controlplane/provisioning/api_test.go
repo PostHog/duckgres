@@ -202,18 +202,17 @@ func newTestRouter(store Store) *gin.Engine {
 	return r
 }
 
-// TestProvisionRejectsAurora locks in that DuckLake (aurora) is no longer
-// provisionable — even with a valid sizing block — now that cnpg-shard is the
-// only creatable backend. Existing DuckLake deployments are unaffected; this
-// only gates new creation.
-func TestProvisionAuroraDuckLake(t *testing.T) {
+// TestProvisionRejectsAurora locks in that the removed "aurora" metadata-store
+// backend is no longer provisionable — the only creatable backends are
+// cnpg-shard and external.
+func TestProvisionRejectsAurora(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestRouter(store)
 
 	body := []byte(`{
 		"database_name": "analytics-db",
-		"metadata_store": {"type": "aurora", "aurora": {"min_acu": 0.5, "max_acu": 2}},
+		"metadata_store": {"type": "aurora"},
 		"ducklake": {"enabled": true}
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
@@ -221,29 +220,11 @@ func TestProvisionAuroraDuckLake(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	w := store.warehouses["analytics"]
-	if w == nil || w.MetadataStore.Kind != configstore.MetadataStoreKindAurora {
-		t.Fatalf("expected aurora warehouse, got %+v", w)
-	}
-	if w.AuroraMaxACU != 2 || !w.DuckLake.Enabled || w.Iceberg.Enabled {
-		t.Errorf("expected aurora max_acu=2, ducklake on, iceberg off; got max=%v ducklake=%v iceberg=%v", w.AuroraMaxACU, w.DuckLake.Enabled, w.Iceberg.Enabled)
-	}
-}
-
-func TestProvisionAuroraRequiresSizing(t *testing.T) {
-	store := newFakeStore()
-	router := newTestRouter(store)
-	// aurora with a catalog but no max_acu → 400.
-	body := []byte(`{"database_name":"a-db","metadata_store":{"type":"aurora"},"ducklake":{"enabled":true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/aco/provision", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 400 (aurora removed): %s", rec.Code, rec.Body.String())
+	}
+	if store.warehouses["analytics"] != nil {
+		t.Fatal("aurora request must not create a warehouse")
 	}
 }
 
@@ -707,7 +688,7 @@ func TestProvisionCnpgShard(t *testing.T) {
 	store.orgs["shardco"] = &configstore.Org{Name: "shardco"}
 	router := newTestRouter(store)
 
-	// No aurora block — cnpg-shard takes no sizing and auto-enables iceberg.
+	// cnpg-shard takes no sizing and auto-enables iceberg.
 	body := []byte(`{"database_name": "shardco-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/shardco/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -726,9 +707,6 @@ func TestProvisionCnpgShard(t *testing.T) {
 	}
 	if !w.Iceberg.Enabled || w.Iceberg.Backend != configstore.IcebergBackendLakekeeper {
 		t.Errorf("expected iceberg enabled with lakekeeper backend, got %+v", w.Iceberg)
-	}
-	if w.AuroraMaxACU != 0 {
-		t.Errorf("cnpg-shard must not set aurora sizing, got max_acu=%f", w.AuroraMaxACU)
 	}
 }
 

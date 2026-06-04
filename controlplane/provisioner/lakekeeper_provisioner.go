@@ -43,7 +43,7 @@ type ClientFactory func(baseURL string) *LakekeeperClient
 // environment that doesn't live in the warehouse row yet.
 type ProvisioningInputs struct {
 	// AdminDSN is a pgx-compatible DSN with permission to CREATE DATABASE
-	// on the org's Aurora cluster. Caller resolves this from a K8s Secret
+	// on the org's metadata Postgres. Caller resolves this from a K8s Secret
 	// managed by Crossplane.
 	AdminDSN string
 
@@ -352,12 +352,10 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 // (PGPreProvisioned) the corresponding cleanup happens via the Crossplane
 // composition's [Delete] managementPolicy on the cnpg-tenant-role and
 // cnpg-tenant-database resources — see posthog/charts PR for the parallel
-// fix. For the aurora case the whole Aurora cluster is destroyed by
-// Crossplane on Duckling CR delete, so the DROP DATABASE here is redundant
-// but harmless (and the connection may simply refuse — tolerated below).
+// fix.
 //
 // Best-effort: PG drop failures are logged and swallowed so a transient
-// network issue or a half-deleted Aurora cluster doesn't permanently block
+// network issue or a half-deleted metadata store doesn't permanently block
 // the duckling teardown. The k8s teardown failures (which actually leave
 // resources stranded) still surface as errors to the controller's retry
 // loop.

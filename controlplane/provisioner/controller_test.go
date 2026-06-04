@@ -183,10 +183,14 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-a"] = &configstore.ManagedWarehouse{
-		OrgID:        "org-a",
-		State:        configstore.ManagedWarehouseStatePending,
-		AuroraMinACU: 0.5,
-		AuroraMaxACU: 2,
+		OrgID: "org-a",
+		State: configstore.ManagedWarehouseStatePending,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:              configstore.MetadataStoreKindExternal,
+			Endpoint:          "ext.example.internal",
+			PasswordAWSSecret: "ext-secret",
+		},
+		DuckLake: configstore.ManagedWarehouseDuckLake{Enabled: true},
 	}
 
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
@@ -208,18 +212,18 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	if !ok {
 		t.Fatal("expected metadataStore in spec")
 	}
-	if metadataStore["type"] != "aurora" {
-		t.Fatalf("expected metadataStore type aurora, got %v", metadataStore["type"])
+	if metadataStore["type"] != "external" {
+		t.Fatalf("expected metadataStore type external, got %v", metadataStore["type"])
 	}
-	aurora, ok := metadataStore["aurora"].(map[string]interface{})
+	external, ok := metadataStore["external"].(map[string]interface{})
 	if !ok {
-		t.Fatal("expected aurora in metadataStore")
+		t.Fatal("expected external in metadataStore")
 	}
-	if aurora["minACU"] != 0.5 {
-		t.Fatalf("expected minACU 0.5, got %v", aurora["minACU"])
+	if external["endpoint"] != "ext.example.internal" {
+		t.Fatalf("expected endpoint ext.example.internal, got %v", external["endpoint"])
 	}
-	if aurora["maxACU"] != 2.0 {
-		t.Fatalf("expected maxACU 2, got %v", aurora["maxACU"])
+	if external["passwordAwsSecret"] != "ext-secret" {
+		t.Fatalf("expected passwordAwsSecret ext-secret, got %v", external["passwordAwsSecret"])
 	}
 
 	// Verify state transitioned to provisioning
@@ -240,11 +244,15 @@ func TestReconcilePendingEmitsPgBouncerBlock(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-pgb"] = &configstore.ManagedWarehouse{
-		OrgID:        "org-pgb",
-		State:        configstore.ManagedWarehouseStatePending,
-		AuroraMinACU: 0.5,
-		AuroraMaxACU: 4,
-		PgBouncer:    configstore.ManagedWarehousePgBouncer{Enabled: true},
+		OrgID: "org-pgb",
+		State: configstore.ManagedWarehouseStatePending,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:              configstore.MetadataStoreKindExternal,
+			Endpoint:          "ext.example.internal",
+			PasswordAWSSecret: "ext-secret",
+		},
+		DuckLake:  configstore.ManagedWarehouseDuckLake{Enabled: true},
+		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
 	}
 
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
@@ -284,10 +292,10 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOn(t *testing.T) {
 		},
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
-				"type": "aurora",
-				"aurora": map[string]interface{}{
-					"minACU": 0.5,
-					"maxACU": 2.0,
+				"type": "external",
+				"external": map[string]interface{}{
+					"endpoint":          "ext.example.internal",
+					"passwordAwsSecret": "ext-secret",
 				},
 			},
 		},
@@ -313,11 +321,11 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOn(t *testing.T) {
 		t.Fatalf("expected pgbouncer.enabled=true, got %v", pgb["enabled"])
 	}
 	// Merge-patch must not wipe sibling metadataStore fields.
-	if ms["type"] != "aurora" {
+	if ms["type"] != "external" {
 		t.Fatalf("expected metadataStore.type preserved, got %v", ms["type"])
 	}
-	if _, ok := ms["aurora"].(map[string]interface{}); !ok {
-		t.Fatalf("expected aurora block preserved, got %v", ms)
+	if _, ok := ms["external"].(map[string]interface{}); !ok {
+		t.Fatalf("expected external block preserved, got %v", ms)
 	}
 }
 
@@ -340,7 +348,7 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOff(t *testing.T) {
 		},
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
-				"type": "aurora",
+				"type": "external",
 				"pgbouncer": map[string]interface{}{
 					"enabled": true,
 				},
@@ -385,10 +393,10 @@ func TestReconcileReadyPatchesCRWhenIcebergFlippedOn(t *testing.T) {
 		},
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
-				"type": "aurora",
-				"aurora": map[string]interface{}{
-					"minACU": 0.5,
-					"maxACU": 2.0,
+				"type": "external",
+				"external": map[string]interface{}{
+					"endpoint":          "ext.example.internal",
+					"passwordAwsSecret": "ext-secret",
 				},
 			},
 			"dataStore": map[string]interface{}{"type": "s3bucket"},
@@ -439,7 +447,7 @@ func TestReconcileReadyPatchesCRWhenIcebergFlippedOff(t *testing.T) {
 			"namespace": ducklingNamespace,
 		},
 		"spec": map[string]interface{}{
-			"metadataStore": map[string]interface{}{"type": "aurora"},
+			"metadataStore": map[string]interface{}{"type": "external"},
 			"dataStore":     map[string]interface{}{"type": "s3bucket"},
 			"iceberg":       map[string]interface{}{"enabled": true},
 		},
@@ -480,7 +488,7 @@ func TestReconcileReadyNoDriftDoesNotPatch(t *testing.T) {
 		},
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
-				"type":      "aurora",
+				"type":      "external",
 				"pgbouncer": map[string]interface{}{"enabled": true},
 			},
 		},
@@ -522,7 +530,7 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 			},
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":     "aurora",
+					"type":     "external",
 					"endpoint": "org-b.cluster.us-east-1.rds.amazonaws.com",
 					"password": "supersecret123",
 					"user":     "postgres",
@@ -583,7 +591,7 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 
 // TestReconcileProvisioningProbeFailsKeepsProvisioning verifies the controller
 // stays in the Provisioning state when the metadata-store probe fails — the
-// case our load test surfaced where Aurora reports Available but its DNS
+// case our load test surfaced where the RDS reports Available but its DNS
 // hasn't propagated yet. Flipping to Ready in that window produces a flurry
 // of "Worker activation failed" errors as workers try to connect through
 // pgbouncer.
@@ -606,7 +614,7 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 			},
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":              "aurora",
+					"type":              "external",
 					"endpoint":          "org-probe.cluster.us-east-1.rds.amazonaws.com",
 					"pgbouncerEndpoint": "pgbouncer-duckling-org-probe.ducklings.svc.cluster.local:6543",
 					"password":          "supersecret123",
@@ -634,7 +642,7 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctrl.SetProbe(func(_ context.Context, endpoint, _, _, _, sslMode string) error {
 		// PgBouncer is disabled by default (ManagedWarehousePgBouncer.Enabled
-		// zero value), so the controller should probe the direct Aurora
+		// zero value), so the controller should probe the direct RDS
 		// endpoint with sslmode=require — not the pgbouncer Service.
 		if endpoint != "org-probe.cluster.us-east-1.rds.amazonaws.com" {
 			t.Errorf("expected direct endpoint, got %q", endpoint)
@@ -674,7 +682,7 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 
 // TestReconcileProvisioningProbesPgBouncerWhenEnabled asserts that warehouses
 // with pgbouncer.enabled=true have their end-to-end probe directed at the
-// pgbouncer Service (sslmode=disable), not the direct Aurora endpoint —
+// pgbouncer Service (sslmode=disable), not the direct RDS endpoint —
 // pgbouncer's resolver is the slow lookup that motivated the probe.
 func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
@@ -696,7 +704,7 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 			},
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":              "aurora",
+					"type":              "external",
 					"endpoint":          "org-pgb.cluster.us-east-1.rds.amazonaws.com",
 					"pgbouncerEndpoint": "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543",
 					"password":          "supersecret123",
@@ -807,7 +815,7 @@ func TestParseDucklingStatusSyncedFalse(t *testing.T) {
 					map[string]interface{}{
 						"type":    "Synced",
 						"status":  "False",
-						"message": "cannot create Aurora cluster: InvalidParameterException",
+						"message": "cannot create metadata store: InvalidParameterException",
 					},
 				},
 			},
@@ -818,7 +826,7 @@ func TestParseDucklingStatusSyncedFalse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if status.SyncedFalseMessage != "cannot create Aurora cluster: InvalidParameterException" {
+	if status.SyncedFalseMessage != "cannot create metadata store: InvalidParameterException" {
 		t.Fatalf("expected synced false message, got %q", status.SyncedFalseMessage)
 	}
 	if status.ReadyCondition {
@@ -831,7 +839,7 @@ func TestParseDucklingStatusPgBouncerEndpoint(t *testing.T) {
 		Object: map[string]interface{}{
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":              "aurora",
+					"type":              "external",
 					"endpoint":          "posthog-duckling-foo.cluster-xyz.us-east-1.rds.amazonaws.com",
 					"pgbouncerEndpoint": "pgbouncer-duckling-foo.ducklings.svc.cluster.local:6543",
 					"user":              "postgres",
@@ -850,7 +858,7 @@ func TestParseDucklingStatusPgBouncerEndpoint(t *testing.T) {
 		t.Fatalf("PgBouncerEndpoint = %q, want pooler DNS", got)
 	}
 	if got := status.MetadataStore.Endpoint; got != "posthog-duckling-foo.cluster-xyz.us-east-1.rds.amazonaws.com" {
-		t.Fatalf("Endpoint = %q, want Aurora DNS", got)
+		t.Fatalf("Endpoint = %q, want RDS DNS", got)
 	}
 }
 
@@ -904,7 +912,7 @@ func TestFakeStoreUpdateWarehouseState(t *testing.T) {
 
 // TestReconcilePendingCreatesCnpgShardCR verifies that a warehouse whose
 // metadata-store kind is cnpg-shard produces a Duckling CR with
-// metadataStore.type=cnpg-shard, no aurora/pgbouncer blocks, and the iceberg
+// metadataStore.type=cnpg-shard, no external/pgbouncer blocks, and the iceberg
 // block enabled — the shape the composition expects for a Lakekeeper-backed
 // shard tenant.
 func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
@@ -935,8 +943,8 @@ func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
 	if metadataStore["type"] != configstore.MetadataStoreKindCnpgShard {
 		t.Fatalf("metadataStore.type = %v, want cnpg-shard", metadataStore["type"])
 	}
-	if _, present := metadataStore["aurora"]; present {
-		t.Errorf("cnpg-shard CR must not carry an aurora block, got %v", metadataStore["aurora"])
+	if _, present := metadataStore["external"]; present {
+		t.Errorf("cnpg-shard CR must not carry an external block, got %v", metadataStore["external"])
 	}
 	if _, present := metadataStore["pgbouncer"]; present {
 		t.Errorf("cnpg-shard CR must not carry a pgbouncer block, got %v", metadataStore["pgbouncer"])

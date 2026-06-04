@@ -1205,7 +1205,7 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 	// "metadata store" is the Lakekeeper Postgres backend, not a DuckLake
 	// catalog (and which the worker has no egress to reach). The control plane
 	// signals this by leaving DuckLake.MetadataStore empty while enabling
-	// Iceberg. External/aurora tenants keep DuckLake (+ optional Iceberg) and
+	// Iceberg. External tenants keep DuckLake (+ optional Iceberg) and
 	// take the branch below unchanged.
 	icebergOnly := cfg.DuckLake.MetadataStore == ""
 	if icebergOnly && !cfg.Iceberg.Enabled {

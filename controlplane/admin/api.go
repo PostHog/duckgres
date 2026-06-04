@@ -397,8 +397,6 @@ func managedWarehouseUpsertColumns() []string {
 		// DB column name. Mismatching this against the actual column makes
 		// the ON CONFLICT … DO UPDATE clause throw 42703.
 		"duck_lake_version",
-		"aurora_min_acu",
-		"aurora_max_acu",
 		"warehouse_database_region",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",
