@@ -4,6 +4,8 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -169,6 +171,67 @@ func TestWorkerPodTerminating(t *testing.T) {
 	if pool.workerPodTerminating("") {
 		t.Fatal("expected empty pod name -> false")
 	}
+}
+
+// TestReconcileDisruptionGuardsNoDataRace runs the reconciler in a tight loop
+// while many goroutines flip activeSessions under the pool lock (as Acquire/
+// ReleaseWorker do). Run with -race, this asserts the reconciler's snapshot-
+// under-RLock / patch-without-lock discipline has no data race against concurrent
+// session churn.
+func TestReconcileDisruptionGuardsNoDataRace(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 100)
+	ctx := context.Background()
+
+	const n = 16
+	var pods []*corev1.Pod
+	for i := 1; i <= n; i++ {
+		name := fmt.Sprintf("wpod-%d", i)
+		pod := guardPodAnnotated(name, i%2 == 0)
+		if _, err := cs.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		pods = append(pods, pod)
+		pool.workers[i] = &ManagedWorker{ID: i, podName: name, done: make(chan struct{})}
+	}
+	withGuardInformer(t, pool, cs, pods...)
+
+	stop := make(chan struct{})
+
+	// Mutators: flip activeSessions under the pool lock, mirroring Acquire/Release.
+	var muWG sync.WaitGroup
+	for i := 1; i <= n; i++ {
+		muWG.Add(1)
+		go func(id int) {
+			defer muWG.Done()
+			for j := 0; j < 2000; j++ {
+				pool.mu.Lock()
+				if w := pool.workers[id]; w != nil {
+					w.activeSessions ^= 1
+				}
+				pool.mu.Unlock()
+			}
+		}(i)
+	}
+
+	// Reconciler + health-path read, looping concurrently with the mutators.
+	var recWG sync.WaitGroup
+	recWG.Add(1)
+	go func() {
+		defer recWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				pool.reconcileDisruptionGuards(ctx)
+				pool.workerPodTerminating("wpod-1")
+			}
+		}
+	}()
+
+	muWG.Wait()
+	close(stop)
+	recWG.Wait()
 }
 
 func podAnno(t *testing.T, cs *fake.Clientset, name string) string {
