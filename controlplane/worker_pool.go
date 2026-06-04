@@ -26,9 +26,10 @@ const WarmAcquireRetryInterval = 2 * time.Second
 // keep driving the warm reconciler.
 const WarmMissRecordInterval = 30 * time.Second
 
-// WarmCapacityExhaustedError is returned when a user request misses the ready
-// warm pool. The caller should fail fast with a retryable capacity response
-// instead of waiting for a foreground cold worker spawn.
+// WarmCapacityExhaustedError is returned internally when a worker acquire misses
+// ready warm capacity. Retryable no-idle misses are kept inside session acquire;
+// quota and shutdown misses still surface to callers because waiting will not
+// resolve them.
 type WarmCapacityExhaustedError struct {
 	// RetryAfter is the client-facing retry hint for protocol-specific error responses.
 	RetryAfter time.Duration
@@ -111,11 +112,9 @@ type K8sWorkerPoolConfig struct {
 	SecretName   string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
 	ConfigMap    string // ConfigMap name for duckgres.yaml
 	MaxWorkers   int
-	// WarmAcquireTimeout: how long a session-acquire blocks server-side waiting
-	// for a warm worker to become available before returning the retryable
-	// "no warm worker" backpressure. 0 = fail fast (legacy behavior). Bounded
-	// per-request by the client's connection context, so a client with a short
-	// deadline still fails fast.
+	// WarmAcquireTimeout: optional server-side warm-pool wait budget. In remote
+	// control-plane mode, 0 means use the worker queue timeout. Bounded
+	// per-request by the client's connection context.
 	WarmAcquireTimeout       time.Duration
 	IdleTimeout              time.Duration
 	ConfigPath               string                                       // Path inside worker pod where config is mounted

@@ -38,12 +38,11 @@ client-go:
 
 - **wire/query** — `SELECT 1` round-trips; 5 concurrent connections stay
   distinct (ported from `TestK8sMultipleConcurrentConnections`).
-- **warm-pool backpressure** — a cold-pool burst of sessions outruns the worker
-  pool (`shared_warm_target=0`); the CP must answer the surplus with the
-  graceful client-visible `no warm Duckgres worker … retry in about 45 seconds`
-  hint (not a hang/500/drop), and the pool must then drain so a retrying
-  connection succeeds. The harness asserts the hint **and** handles it (the
-  concurrency tests retry through it).
+- **warm-pool wait/recovery** — a cold-pool burst of sessions outruns the worker
+  pool (`shared_warm_target=0`); the CP must keep retryable no-idle misses
+  internal, avoid the old client-visible no-warm retry hint, and then drain so a
+  retrying connection succeeds. The concurrency tests retry through bounded
+  session-startup timeouts.
 - **activation** — DuckLake **and** Iceberg catalogs attach and read/write.
 - **extension forks** — the bundled `ducklake`/`httpfs` extensions are the
   PostHog forks, not upstream (ported from the `*IsBundledFork` tests).

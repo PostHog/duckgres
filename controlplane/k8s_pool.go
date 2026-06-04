@@ -61,8 +61,8 @@ type K8sWorkerPool struct {
 	nextWorkerID int
 	spawning     int
 	maxWorkers   int
-	// warmAcquireTimeout: server-side block window for a session-acquire that
-	// missed the warm pool (0 = fail fast). Read by OrgReservedPool.AcquireWorker.
+	// warmAcquireTimeout: optional server-side block window for a session-acquire
+	// that missed the warm pool. Read by OrgReservedPool.AcquireWorker.
 	warmAcquireTimeout time.Duration
 	minWorkers         int
 	// perImageWarmTarget is an additive floor on top of minWorkers: for each
@@ -1653,9 +1653,9 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		// Runtime-store-less K8s mode uses the local worker map as its source
 		// of truth. Filter by assignment.Image so a per-org pin is honored: if
 		// the assignment names a specific image and no in-memory warm worker
-		// matches, fail fast with warm-capacity backpressure. Warm capacity is
-		// supplied by configured warm reconciliation rather than by the
-		// foreground user connection.
+		// matches, return the internal warm-capacity signal. Session acquisition
+		// keeps retryable no-idle misses waiting instead of exposing this to the
+		// client.
 		// Without this filter, a pinned org could be handed a default-image
 		// warm worker, and activation would fail with a DuckLake/extension
 		// version mismatch.

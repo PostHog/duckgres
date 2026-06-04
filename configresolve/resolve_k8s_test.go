@@ -115,7 +115,8 @@ func TestResolveEffectiveK8sDynamicWarmCapacityPrecedence(t *testing.T) {
 }
 
 func TestResolveEffectiveK8sWarmAcquireTimeout(t *testing.T) {
-	// Default: unset everywhere => 0 (fail-fast).
+	// Default: unset everywhere => 0. Remote control-plane startup expands this
+	// to worker_queue_timeout so no-idle warm misses wait at the session boundary.
 	def := ResolveEffective(&configloader.FileConfig{}, CLIInputs{}, func(string) string { return "" }, nil)
 	if def.K8sWarmAcquireTimeout != 0 {
 		t.Fatalf("expected default warm-acquire-timeout 0, got %s", def.K8sWarmAcquireTimeout)

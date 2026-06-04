@@ -107,17 +107,11 @@ resolve_cp_ip() {
   [ -n "$CP_IP" ] || fail "could not resolve $PGHOST"
 }
 
-# Warm-pool backpressure ("no warm Duckgres worker … retry in about 45 seconds")
-# is a FEATURE, not an error: with shared_warm_target=0 the per-org pool is cold,
-# so ANY new-session acquisition — a fresh catalog (ducklake→iceberg), a burst,
-# or the first connect after the pool churned (worker kills / idle timeout) — can
-# transiently get it while the CP spawns a worker. It is a FATAL at session
-# create, BEFORE any SQL runs, so retrying the whole command is safe (no
-# half-applied INSERT). So every harness query tolerates it via bounded retry.
-# Auth failures and real SQL errors are NOT retried — they surface immediately,
-# so this never feeds the rate limiter or masks a genuine failure. (The
-# backpressure *contract itself* is asserted separately in
-# warm_capacity_backpressure, which uses raw psql to observe the hint.)
+# Warm-pool acquisition can wait while the CP replenishes capacity. If the
+# caller deadline expires first, retrying the whole command is safe because the
+# failure happens at session create, BEFORE any SQL runs (no half-applied
+# INSERT). Auth failures and real SQL errors are NOT retried — they surface
+# immediately, so this never feeds the rate limiter or masks a genuine failure.
 _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
   a=0 out=""
   while [ "$a" -lt 12 ]; do
@@ -127,7 +121,7 @@ _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
       printf %s "$out"; return 0
     fi
     case "$out" in
-      *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
+      *"capacity exhausted"*|*"timed out waiting for an available worker"*|\
       *"still provisioning"*|*"failed to initialize session"*)
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out" >&2; return 1 ;;
@@ -156,7 +150,7 @@ pg_try() { # org password dbname sql
       printf %s "$out"; return 0
     fi
     case "$out" in
-      *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
+      *"capacity exhausted"*|*"timed out waiting for an available worker"*|\
       *"still provisioning"*|*"failed to initialize session"*)
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out"; return 1 ;;
@@ -168,10 +162,9 @@ pg_try() { # org password dbname sql
 # Connect preflight: a warm worker isn't always available the instant a
 # warehouse goes ready (shared_warm_target=0, so the first connection for an
 # org cold-spawns a worker; a second org can find the pool momentarily
-# exhausted). The CP returns a transient "no warm Duckgres worker is currently
-# available; retry in ~45s" / "still provisioning" / "failed to initialize
-# session". Retry `SELECT 1` through those, bounded, BEFORE the R/W. Auth
-# failures are NOT in this set, so this never feeds the rate limiter.
+# exhausted). Retry `SELECT 1` through startup timeouts / "still provisioning" /
+# "failed to initialize session", bounded, BEFORE the R/W. Auth failures are NOT
+# in this set, so this never feeds the rate limiter.
 wait_worker() { # org password catalog
   attempt=0
   while [ "$attempt" -lt 12 ]; do
@@ -184,7 +177,7 @@ wait_worker() { # org password catalog
     sleep 15
     attempt=$((attempt + 1))
   done
-  fail "no warm worker for $1/$3 after retries"
+  fail "worker not ready for $1/$3 after retries"
 }
 
 # ---- wire protocol --------------------------------------------------------
@@ -194,31 +187,25 @@ basic_query() { # org password
   [ "$n" = "1" ] || fail "$1 SELECT 1 returned '$n'"
 }
 
-# Warm-pool backpressure is a FEATURE: when a burst of sessions outruns the
-# cold worker pool (shared_warm_target=0), the CP rejects the surplus with a
-# graceful, client-visible "no warm Duckgres worker is currently available;
-# retry in about 45 seconds" rather than hanging, 500-ing, or dropping the
-# connection. Assert both halves of the contract: (1) under a cold-pool burst at
-# least one connection receives that exact graceful hint, and (2) the pool then
-# drains so a (retrying) connection succeeds. Run this BEFORE the heavier
-# concurrency tests, while only one worker is warm, so the burst reliably
-# exceeds instantaneous spawn capacity.
+# Warm-pool wait contract: when a burst of sessions outruns the cold worker pool
+# (shared_warm_target=0), the CP must not expose the old no-warm retry hint.
+# The pool should still recover so a retrying connection succeeds. Run this
+# BEFORE the heavier concurrency tests, while only one worker is warm.
 warm_capacity_backpressure() { # org password
-  log "warm-pool backpressure contract on $1"
-  burst=12; seen=/tmp/bp_seen; rm -f "$seen"; pids=""
+  log "warm-pool wait contract on $1"
+  burst=12; bad=/tmp/bp_bad; rm -f "$bad"; pids=""
   i=0
   while [ "$i" -lt "$burst" ]; do
     ( o="$(PGPASSWORD="$2" psql \
         "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
         -tAc 'SELECT 1' 2>&1 || true)"
       case "$o" in
-        *"no warm Duckgres worker"*|*"retry in about"*|*"capacity exhausted"*) echo x >> "$seen" ;;
+        *"no warm Duckgres"*worker*|*"retry in"*seconds*) echo "$o" >> "$bad" ;;
       esac ) &
     pids="$pids $!"; i=$((i + 1))
   done
   for p in $pids; do wait "$p" || true; done
-  [ -s "$seen" ] || fail "expected graceful 'retry in ~45s' backpressure under a cold-pool burst of $burst, but no connection saw it"
-  log "backpressure observed: $(wc -l < "$seen" | tr -d ' ')/$burst connections got the graceful retry hint"
+  [ ! -s "$bad" ] || fail "old no-warm retry hint leaked under a cold-pool burst of $burst: $(head -1 "$bad")"
   # The pool must recover: a retrying connection succeeds.
   v="$(pgc "$1" "$2" ducklake 'SELECT 1')"
   [ "$v" = "1" ] || fail "pool did not recover after backpressure (got '$v')"

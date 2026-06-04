@@ -226,6 +226,7 @@ Run with config file:
 | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Default-image neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm; subject to `DUCKGRES_K8S_MAX_WORKERS`) | `0` |
 | `DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED` | Enable configstore-driven dynamic warm-capacity target computation from recent no-idle misses | `true` |
 | `DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW` | Recent no-idle miss window used for dynamic warm-capacity demand | `2m` |
+| `DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT` | Optional server-side wait budget for retryable no-idle warm-pool misses; `0`/unset uses `DUCKGRES_WORKER_QUEUE_TIMEOUT` in remote K8s mode, and the effective worker queue timeout is extended when needed | `0` |
 | `DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER` | Recent misses required for one extra dynamic warm worker | `8` |
 | `DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL` | Retention TTL for warm-capacity miss buckets; clamped to at least the miss window | `15m` |
 | `DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING` | Max dynamic extra warm workers per image (`0` means unlimited) | `0` |

@@ -40,7 +40,7 @@ type ControlPlaneConfig struct {
 	SocketDir            string
 	ConfigPath           string // Path to config file, passed to workers
 	HealthCheckInterval  time.Duration
-	WorkerQueueTimeout   time.Duration // How long to wait for an available worker/org connection slot (default: 60s)
+	WorkerQueueTimeout   time.Duration // How long to wait for an available worker/org connection slot (default: 60s; extended to cover warm acquire waits)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade. 0 = unbounded (wait until k8s SIGKILL via terminationGracePeriodSeconds). Default: 0 in remote mode (so a CP rolling out doesn't kill in-flight customer queries at a self-imposed wall — see drainAndShutdown), 24h in process mode.
@@ -115,7 +115,7 @@ type K8sConfig struct {
 	SharedWarmTarget                int           // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 	DynamicWarmCapacityEnabled      bool          // Enable configstore-driven dynamic warm-capacity target computation
 	WarmCapacityMissWindow          time.Duration // Window of recent no-idle misses that contributes to dynamic targets
-	WarmAcquireTimeout              time.Duration // Server-side block window for a session-acquire that misses the warm pool (0 = fail fast)
+	WarmAcquireTimeout              time.Duration // Server-side block window for a session-acquire that misses the warm pool (0 = use worker queue timeout)
 	WarmCapacityMissesPerWorker     int           // Number of recent misses that translate to one extra warm worker
 	WarmCapacityDemandTTL           time.Duration // Retention TTL for warm-capacity miss buckets
 	WarmCapacityDynamicImageCeiling int           // Max dynamic extra warm workers per image (0 = unlimited)
@@ -255,6 +255,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 	if cfg.WorkerQueueTimeout == 0 {
 		cfg.WorkerQueueTimeout = 60 * time.Second
+	}
+	if cfg.WorkerBackend == "remote" {
+		if cfg.K8s.WarmAcquireTimeout == 0 {
+			cfg.K8s.WarmAcquireTimeout = cfg.WorkerQueueTimeout
+		}
+		cfg.WorkerQueueTimeout = effectiveSessionAcquireTimeout(cfg.WorkerQueueTimeout, cfg.K8s.WarmAcquireTimeout)
 	}
 	if cfg.WorkerIdleTimeout == 0 {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
@@ -725,6 +731,17 @@ func createSessionWithRegisteredCancel(
 	defer srv.UnregisterQuery(key)
 
 	return createFn(ctx)
+}
+
+func effectiveSessionAcquireTimeout(workerQueueTimeout, warmAcquireTimeout time.Duration) time.Duration {
+	if warmAcquireTimeout <= 0 {
+		return workerQueueTimeout
+	}
+	warmWaitBudget := warmAcquireTimeout + WarmAcquireRetryInterval
+	if workerQueueTimeout <= 0 || warmWaitBudget > workerQueueTimeout {
+		return warmWaitBudget
+	}
+	return workerQueueTimeout
 }
 
 func sessionCreationErrorResponse(err error) (code string, message string) {

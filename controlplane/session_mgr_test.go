@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server/flightclient"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -60,7 +61,7 @@ func (p *acquireErrorPool) ShutdownAll() {}
 func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 	controlPlaneWorkerAcquireFailuresCounter.Reset()
 	sm := NewSessionManager(&acquireErrorPool{
-		err: NewWarmCapacityExhaustedError(30 * time.Second),
+		err: NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, 30*time.Second),
 	}, nil)
 
 	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0, nil)
@@ -79,6 +80,28 @@ func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 	}
 	if got := metric.GetCounter().GetValue(); got != 1 {
 		t.Fatalf("expected one warm capacity acquisition failure, got %v", got)
+	}
+}
+
+func TestCreateSessionNoIdleWarmCapacityWaitsForCallerDeadline(t *testing.T) {
+	sm := NewSessionManager(&acquireErrorPool{
+		err: NewWarmCapacityExhaustedError(30 * time.Second),
+	}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err := sm.CreateSession(ctx, "root", 1001, "", 0, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	var capacityErr *WarmCapacityExhaustedError
+	if errors.As(err, &capacityErr) {
+		t.Fatalf("expected no-idle warm capacity miss to stay internal, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
+		t.Fatalf("expected create session to wait for caller deadline, returned after %s", elapsed)
 	}
 }
 

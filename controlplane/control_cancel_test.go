@@ -63,6 +63,46 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 	}
 }
 
+func TestEffectiveSessionAcquireTimeoutExtendsForWarmAcquire(t *testing.T) {
+	tests := []struct {
+		name               string
+		workerQueueTimeout time.Duration
+		warmAcquireTimeout time.Duration
+		want               time.Duration
+	}{
+		{
+			name:               "worker queue only",
+			workerQueueTimeout: 60 * time.Second,
+			want:               60 * time.Second,
+		},
+		{
+			name:               "warm acquire below queue",
+			workerQueueTimeout: 60 * time.Second,
+			warmAcquireTimeout: 30 * time.Second,
+			want:               60 * time.Second,
+		},
+		{
+			name:               "warm acquire exceeds queue",
+			workerQueueTimeout: 60 * time.Second,
+			warmAcquireTimeout: 5 * time.Minute,
+			want:               5*time.Minute + WarmAcquireRetryInterval,
+		},
+		{
+			name:               "warm acquire only",
+			warmAcquireTimeout: 90 * time.Second,
+			want:               90*time.Second + WarmAcquireRetryInterval,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectiveSessionAcquireTimeout(tt.workerQueueTimeout, tt.warmAcquireTimeout); got != tt.want {
+				t.Fatalf("effectiveSessionAcquireTimeout() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSessionCreationErrorResponse(t *testing.T) {
 	t.Run("cancelled", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(context.Canceled)
@@ -99,7 +139,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		if code != "53300" {
 			t.Fatalf("code = %q, want 53300", code)
 		}
-		want := "no warm Duckgres worker is currently available; retry in about 45 seconds"
+		want := "timed out waiting for an available worker"
 		if message != want {
 			t.Fatalf("message = %q, want %q", message, want)
 		}

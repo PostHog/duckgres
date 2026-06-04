@@ -4,25 +4,10 @@ package controlplane
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
-
-	"github.com/posthog/duckgres/controlplane/configstore"
 )
-
-// isRetryableWarmMiss reports whether a worker-acquire error is a transient
-// "no idle warm worker" miss — the only capacity miss that resolves on its own
-// once the warm pool replenishes. Org/global-cap and shutdown misses are not
-// retried (waiting won't change them).
-func isRetryableWarmMiss(err error) bool {
-	var capErr *WarmCapacityExhaustedError
-	if !errors.As(err, &capErr) {
-		return false
-	}
-	return capErr.missReason() == configstore.WorkerClaimMissReasonNoIdle
-}
 
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
@@ -77,11 +62,13 @@ func (p *OrgReservedPool) assignedColocatedResourcesLocked() (cpu int, memBytes 
 }
 
 func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
-	// Server-side patience: block up to warmAcquireTimeout for the warm pool to
-	// replenish before surfacing a "no warm worker" miss to the client. Always
-	// bounded by the request ctx, so a client with a short deadline still fails
-	// fast. 0 = legacy fail-fast.
-	warmDeadline := time.Now().Add(p.shared.warmAcquireTimeout)
+	// Server-side patience: transient no-idle warm-pool misses stay internal and
+	// are retried until the caller context or optional warm-acquire deadline
+	// expires. Org/global-cap and shutdown misses still return immediately.
+	var warmDeadline time.Time
+	if p.shared.warmAcquireTimeout > 0 {
+		warmDeadline = time.Now().Add(p.shared.warmAcquireTimeout)
+	}
 	// Throttle warm-miss recording across the wait's repeated polls.
 	var lastWarmMissAt time.Time
 	for {
@@ -151,16 +138,12 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 				if recordMiss {
 					lastWarmMissAt = time.Now()
 				}
-				// Server-side patience: a transient no-idle miss on a colocated
-				// request resolves once the warm pool replenishes (a colocated
-				// shape may first need a cold node, minutes). Wait and retry until
-				// warmAcquireTimeout elapses rather than failing immediately;
-				// bounded by ctx. Restricted to colocated requests — a default /
-				// exclusive miss replenishes quickly and the client retries, so we
-				// don't block interactive/default traffic (e.g. data imports) for
-				// minutes.
-				if p.shared.warmAcquireTimeout > 0 && isColocated && isRetryableWarmMiss(err) && time.Now().Before(warmDeadline) {
-					timer := time.NewTimer(WarmAcquireRetryInterval)
+				if isRetryableWarmMiss(err) {
+					wait, ok := warmAcquireRetryDelay(ctx, warmDeadline)
+					if !ok {
+						return nil, context.DeadlineExceeded
+					}
+					timer := time.NewTimer(wait)
 					select {
 					case <-ctx.Done():
 						timer.Stop()
@@ -199,6 +182,29 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func warmAcquireRetryDelay(ctx context.Context, warmDeadline time.Time) (time.Duration, bool) {
+	wait := WarmAcquireRetryInterval
+	if !warmDeadline.IsZero() {
+		remaining := time.Until(warmDeadline)
+		if remaining <= 0 {
+			return 0, false
+		}
+		if remaining < wait {
+			wait = remaining
+		}
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, false
+		}
+		if remaining < wait {
+			wait = remaining
+		}
+	}
+	return wait, true
 }
 
 func (p *OrgReservedPool) ReleaseWorker(id int) {

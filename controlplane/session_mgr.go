@@ -265,8 +265,19 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 	acquireStart := time.Now()
 	ctx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
 	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
-	worker, err := sm.pool.AcquireWorker(ctx, profile)
-	if err != nil {
+	var worker *ManagedWorker
+	for {
+		worker, err = sm.pool.AcquireWorker(ctx, profile)
+		if err == nil {
+			break
+		}
+		if isRetryableWarmMiss(err) {
+			if waitErr := waitForWarmAcquireRetry(ctx); waitErr != nil {
+				acquireSpan.End()
+				return 0, nil, fmt.Errorf("acquire worker: %w", waitErr)
+			}
+			continue
+		}
 		var capacityErr *WarmCapacityExhaustedError
 		if errors.As(err, &capacityErr) {
 			missReason := capacityErr.missReason()
@@ -298,6 +309,31 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 	}
 	success = true
 	return pid, exec, nil
+}
+
+func waitForWarmAcquireRetry(ctx context.Context) error {
+	wait := WarmAcquireRetryInterval
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.DeadlineExceeded
+		}
+		if remaining < wait {
+			wait = remaining
+		}
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) (string, int) {

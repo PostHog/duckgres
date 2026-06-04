@@ -1,7 +1,6 @@
 package controlplane
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -45,7 +44,7 @@ func warmCapacityMissPolicyForReason(reason configstore.WorkerClaimMissReason) w
 func (p warmCapacityMissPolicy) errorString(retryAfter time.Duration) string {
 	switch p.messageKind {
 	case warmCapacityMessageNoIdle:
-		return fmt.Sprintf("warm worker capacity exhausted; retry in about %s", normalizedWarmCapacityRetryAfter(retryAfter).Round(time.Second))
+		return "timed out waiting for warm worker capacity"
 	case warmCapacityMessageOrgCap:
 		return "warm worker capacity exhausted for organization"
 	case warmCapacityMessageGlobalCap:
@@ -60,7 +59,7 @@ func (p warmCapacityMissPolicy) errorString(retryAfter time.Duration) string {
 func (p warmCapacityMissPolicy) sqlMessage(retryAfter time.Duration) string {
 	switch p.messageKind {
 	case warmCapacityMessageNoIdle:
-		return fmt.Sprintf("no warm Duckgres worker is currently available; retry in about %d seconds", warmCapacityRetrySeconds(retryAfter))
+		return "timed out waiting for an available worker"
 	case warmCapacityMessageOrgCap:
 		return "Duckgres worker capacity for this organization is currently exhausted; retry later"
 	case warmCapacityMessageGlobalCap:

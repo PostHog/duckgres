@@ -322,6 +322,62 @@ func TestIsRetryableWarmMiss(t *testing.T) {
 	}
 }
 
+func TestOrgReservedPoolWaitsForNoIdleWarmMissUntilWarmDeadline(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 5)
+	shared.warmAcquireTimeout = 20 * time.Millisecond
+
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
+
+	start := time.Now()
+	got, err := pool.AcquireWorker(context.Background(), nil)
+	if err != context.DeadlineExceeded {
+		t.Fatalf("expected deadline exceeded after waiting for warm capacity, got worker=%v err=%v", got, err)
+	}
+	if elapsed := time.Since(start); elapsed < shared.warmAcquireTimeout {
+		t.Fatalf("expected acquire to wait at least %s, returned after %s", shared.warmAcquireTimeout, elapsed)
+	}
+}
+
+func TestOrgReservedPoolAcquireNoIdleMissReturnsWorkerWhenWarmCapacityArrivesBeforeDeadline(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 5)
+	shared.warmAcquireTimeout = 50 * time.Millisecond
+	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
+
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
+
+	type acquireResult struct {
+		worker *ManagedWorker
+		err    error
+	}
+	resultCh := make(chan acquireResult, 1)
+	go func() {
+		worker, err := pool.AcquireWorker(context.Background(), nil)
+		resultCh <- acquireResult{worker: worker, err: err}
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+	shared.mu.Lock()
+	addNeutralWarmWorker(shared, 7)
+	shared.mu.Unlock()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("expected worker after warm capacity arrived, got error %v", result.err)
+		}
+		if result.worker == nil || result.worker.ID != 7 {
+			t.Fatalf("expected worker 7, got %#v", result.worker)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for acquire to use arriving warm capacity")
+	}
+}
+
 func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 3, activeSessions: 1, done: make(chan struct{})}

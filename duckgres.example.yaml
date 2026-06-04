@@ -128,6 +128,9 @@ ducklake:
 #   # image-specific warm targets after recent no-idle misses.
 #   dynamic_warm_capacity_enabled: true
 #   warm_capacity_miss_window: "2m"
+#   # Optional wait budget for no-idle warm-pool misses. Unset/0 uses
+#   # worker_queue_timeout in remote K8s mode.
+#   warm_acquire_timeout: "0s"
 #   warm_capacity_misses_per_worker: 8
 #   # Retain miss buckets at least as long as the miss window.
 #   warm_capacity_demand_ttl: "15m"
