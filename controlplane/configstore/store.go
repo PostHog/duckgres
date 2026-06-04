@@ -1242,8 +1242,12 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 				return err
 			}
 		}
-		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
+		// The worker-count cap bounds only exclusive workers — each pins a
+		// dedicated node. Colocated workers bin-pack and are intentionally
+		// unbounded: a colocated request never counts toward the cap and is
+		// never refused because the exclusive budget is full.
+		if maxOrgWorkers > 0 && orgID != "" && !profileColocate {
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND COALESCE(profile_colocate, false) = false", orgID)
 			if err != nil {
 				return err
 			}
@@ -1270,8 +1274,10 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {
 			if err == gorm.ErrRecordNotFound {
-				if maxGlobalWorkers > 0 {
-					count, err := cs.countActiveWorkers(tx)
+				// Exclusive-only global cap, bypassed for colocated requests —
+				// see the org-cap note above.
+				if maxGlobalWorkers > 0 && !profileColocate {
+					count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 					if err != nil {
 						return err
 					}
@@ -1345,8 +1351,10 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 				return err
 			}
 		}
-		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ? AND state <> ?", orgID, WorkerStateHotIdle)
+		// Exclusive-only count cap, bypassed for colocated requests — colocated
+		// workers bin-pack and are intentionally unbounded.
+		if maxOrgWorkers > 0 && orgID != "" && !profileColocate {
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND state <> ? AND COALESCE(profile_colocate, false) = false", orgID, WorkerStateHotIdle)
 			if err != nil {
 				return err
 			}
@@ -1759,8 +1767,9 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 			return err
 		}
 
+		// Exclusive-only count caps: colocated workers bin-pack and are unbounded.
 		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND COALESCE(profile_colocate, false) = false", orgID)
 			if err != nil {
 				return err
 			}
@@ -1770,7 +1779,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 		}
 
 		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx)
+			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 			if err != nil {
 				return err
 			}
@@ -1840,8 +1849,10 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, po
 			}
 		}
 
+		// Exclusive-only global cap: colocated workers are unbounded and must
+		// not block an exclusive warm spawn.
 		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx)
+			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 			if err != nil {
 				return err
 			}
@@ -1905,8 +1916,10 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 			}
 		}
 
-		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx)
+		// Exclusive-only global cap, bypassed for colocated warm shapes —
+		// colocated workers bin-pack and are intentionally unbounded.
+		if maxGlobalWorkers > 0 && !profileColocate {
+			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 			if err != nil {
 				return err
 			}
