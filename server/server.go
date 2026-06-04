@@ -1224,17 +1224,10 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 		return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
 	}
 
-	// The pg_class/pg_namespace recreation and the duckLakeMode information_schema
-	// reflect the DuckLake catalog; skip the DuckLake-specific rewrites when
-	// there's no DuckLake attached.
-	if !icebergOnly {
-		if err := recreatePgClassForDuckLake(db); err != nil {
-			slog.Warn("Failed to recreate pg_class_full for DuckLake during activation.", "user", username, "error", err)
-		}
-		if err := recreatePgNamespaceForDuckLake(db); err != nil {
-			slog.Warn("Failed to recreate pg_namespace for DuckLake during activation.", "user", username, "error", err)
-		}
-	}
+	// Catalog-scoped pg_class/pg_namespace/pg_attribute views are installed by
+	// sessionmeta.InitSessionDatabaseMetadata for each Postgres session. Do not
+	// install DuckLake-only global pg_catalog views here; dual-catalog workers
+	// must not leak DuckLake metadata into Iceberg sessions.
 	if err := initInformationSchema(db, !icebergOnly); err != nil {
 		slog.Warn("Failed to initialize information_schema during activation.", "user", username, "error", err)
 	}
