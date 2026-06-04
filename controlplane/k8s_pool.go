@@ -37,6 +37,21 @@ import (
 
 const defaultActivatingTimeout = 2 * time.Minute
 
+// workerPodReadyTimeout bounds how long a spawn waits for a worker pod to become
+// Ready. A cold spawn may need Karpenter to provision a fresh node (a single-
+// tenant exclusive 46/360 worker gets a dedicated large instance), so this is
+// generous.
+const workerPodReadyTimeout = 5 * time.Minute
+
+// warmSpawnReconcileTimeout bounds a warm-pool replenish/reconcile spawn. It MUST
+// exceed workerPodReadyTimeout: a warm spawn does the same waitForPodReady, so a
+// shorter deadline cancels every cold spawn before its node can provision. The
+// old 30s value meant the warm reconcile could never refill an exclusive worker
+// that needed a fresh node — after a CP restart the default/exclusive pool would
+// sit empty, churning "context deadline exceeded", while only colocated (small,
+// fast, bin-packed) shapes refilled. See TestWarmSpawnTimeoutExceedsPodReady.
+const warmSpawnReconcileTimeout = 6 * time.Minute
+
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
 
 // K8sWorkerPool manages worker pods in Kubernetes.
@@ -925,7 +940,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	}
 
 	// Wait for pod to get an IP via informer (no polling).
-	ready, err := p.waitForPodReady(ctx, podName, 5*time.Minute)
+	ready, err := p.waitForPodReady(ctx, podName, workerPodReadyTimeout)
 	if err != nil {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
@@ -2216,7 +2231,7 @@ func (p *K8sWorkerPool) triggerPerImageReplenish(image string) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
 		defer cancel()
 		if err := p.SpawnMinWorkersForImage(ctx, image, target); err != nil {
 			slog.Warn("Per-image warm replenish failed.", "image", image, "error", err)
@@ -2454,7 +2469,7 @@ func (p *K8sWorkerPool) triggerColocatedWarmReplenish(profile WorkerProfile) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
 		defer cancel()
 		if err := p.SpawnMinColocatedWorkers(ctx, profile, target); err != nil {
 			slog.Warn("Colocated warm replenish failed.", "cpu", profile.CPU, "memory", profile.Memory, "error", err)
