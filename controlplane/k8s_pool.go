@@ -2269,8 +2269,11 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 		p.mu.Unlock()
 		return nil
 	}
+	// Exclusive-only room: this spawns default-shape (exclusive) warm workers,
+	// so colocated workers must not shrink the budget — consistent with the
+	// exclusive-only DB-side global cap in CreateNeutralWarmWorkerSlotForImage.
 	if p.maxWorkers > 0 {
-		room := p.maxWorkers - p.liveWorkerCountLocked()
+		room := p.maxWorkers - p.liveExclusiveWorkerCountLocked()
 		if room <= 0 {
 			p.mu.Unlock()
 			return nil
@@ -2374,16 +2377,11 @@ func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, profile Wo
 		p.mu.Unlock()
 		return nil
 	}
-	if p.maxWorkers > 0 {
-		room := p.maxWorkers - p.liveWorkerCountLocked()
-		if room <= 0 {
-			p.mu.Unlock()
-			return nil
-		}
-		if missing > room {
-			missing = room
-		}
-	}
+	// No exclusive worker-count cap here: colocated workers bin-pack and are
+	// intentionally unbounded (the DB-side global cap is exclusive-only and
+	// skips colocated too). `missing` is already bounded by this shape's warm
+	// target, and CreateNeutralWarmWorkerSlot enforces that target per shape,
+	// so the spawn loop self-limits without consulting p.maxWorkers.
 	p.mu.Unlock()
 
 	var slots []*configstore.WorkerRecord
@@ -3117,6 +3115,27 @@ func (p *K8sWorkerPool) liveWorkerCountLocked() int {
 		default:
 			count++
 		}
+	}
+	return count
+}
+
+// liveExclusiveWorkerCountLocked counts only the live workers that consume the
+// exclusive worker-count budget: every non-colocated worker plus in-flight
+// background (default-shape) spawns. Colocated workers bin-pack and are
+// intentionally unbounded, so they must not be charged against the cap — this
+// mirrors the exclusive-only count used by the DB-side cap checks.
+func (p *K8sWorkerPool) liveExclusiveWorkerCountLocked() int {
+	count := p.spawning
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if w.profile.Colocate {
+			continue
+		}
+		count++
 	}
 	return count
 }

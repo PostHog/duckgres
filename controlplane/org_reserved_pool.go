@@ -86,8 +86,12 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 			return idle, nil
 		}
 
+		// The count cap bounds only exclusive workers (each pins a dedicated
+		// node). A colocated request bin-packs and is intentionally unbounded:
+		// never refuse it because the exclusive budget is full.
+		isColocated := profile != nil && profile.Colocate
 		assignedCount := p.assignedWorkerCountLocked()
-		if p.maxWorkers == 0 || assignedCount < p.maxWorkers {
+		if p.maxWorkers == 0 || isColocated || assignedCount < p.maxWorkers {
 			// Resource-aware quota for colocated workers: a new colocated worker
 			// must not push the org over its colocated CPU/memory budget. Reusing
 			// an idle worker (handled above) adds nothing, so this gates only the
@@ -266,6 +270,11 @@ func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 		// against maxWorkers so AcquireWorker can reach ReserveSharedWorker
 		// and ClaimHotIdleWorker.
 		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
+			continue
+		}
+		// Colocated workers are unbounded and must not consume the exclusive
+		// worker budget that maxWorkers governs.
+		if w.profile.Colocate {
 			continue
 		}
 		if p.workerBelongsToOrgLocked(w) {
