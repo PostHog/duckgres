@@ -92,7 +92,7 @@ func TestKindConfigStoreSeedSQL(t *testing.T) {
 }
 
 func TestTenantIsolationConfigStoreSeedSQL(t *testing.T) {
-	seedPath := filepath.Join(findProjectRoot(t), "tests", "k8s", "testdata", "tenant-isolation.seed.sql")
+	seedPath := filepath.Join(findProjectRoot(t), "tests", "configstore", "testdata", "tenant-isolation.seed.sql")
 	seedSQL, err := os.ReadFile(seedPath)
 	if err != nil {
 		t.Fatalf("read tenant isolation seed: %v", err)
