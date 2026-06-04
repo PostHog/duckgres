@@ -299,7 +299,7 @@ func SetupMultiTenant(
 		// 4/16 and 8/48) bursts into a ready pod. Coupled to the master gate so we
 		// don't pre-warm colocated pods that no client can route to.
 		if cfg.K8s.AllowClientWorkerProfile && len(cfg.K8s.ColocatedWarmShapes) > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
 			router.sharedPool.reconcileColocatedWarm(ctx)
 			cancel()
 		}
@@ -636,7 +636,7 @@ func reconcileWarmCapacityImageTargets(pool *K8sWorkerPool, targets map[string]i
 		wg.Add(1)
 		go func(image string, count int) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
 			defer cancel()
 			if err := pool.SpawnMinWorkersForImage(ctx, image, count); err != nil {
 				slog.Warn("Janitor failed to reconcile image warm capacity.", "image", image, "target", count, "error", err)
