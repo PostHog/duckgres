@@ -101,24 +101,44 @@ The project uses [just](https://github.com/casey/just) as a command runner. Run 
 
 ## Testing
 
+**Every feature, behavior change, bugfix, AND refactor that affects runtime or
+cluster behavior MUST ship with a solid end-to-end test case in
+`tests/e2e-mw-dev/` (`harness.sh`).** This is not just for new features — any
+change to how the system behaves at runtime (new capability, changed semantics,
+a fixed bug, a new config knob, an activation/routing/teardown tweak) extends or
+adds a harness assertion in the same PR. Refactors count too: when you move or
+rewrite a code path the harness covers, confirm the relevant assertion still
+exercises it (and update it if the path moved) — a refactor that quietly drops
+e2e coverage is a regression in the test suite even if behavior is unchanged. Unit/package tests are necessary but not sufficient: a
+change is only "done" once it is exercised against the real mw-dev cluster —
+real worker pods, real Crossplane ducklings, real cnpg/RDS metadata, real
+Lakekeeper, real S3/Iceberg/STS. "Solid" means a deterministic pass/fail
+assertion of the actual user-visible behavior (not just "it didn't error"), with
+transient/cold-pool conditions handled, on both metadata backends (cnpg + ext)
+where it touches metadata. A bugfix gets a regression assertion that would have
+caught the bug. If a change genuinely cannot be asserted in-Job (e.g. it needs
+cnpg-shards exec, or warm-pool-only state), say so explicitly in the
+harness/README with the reason — don't silently skip. The harness is the gate
+that catches what unit tests fake.
+
 Three test lanes worth knowing about, in increasing order of blast radius:
 
-- **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives.
+- **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives. Includes `tests/manifests/` (static-manifest artifact asserts for `k8s/rbac.yaml` + `k8s/networkpolicy.yaml`).
 - **`tests/integration/`** (`just test-integration`): spins up the standalone server binary against a real MinIO + Postgres metadata store via docker compose. Covers wire protocol, DuckLake on real S3-compatible storage, transpilation against a live server.
-- **`tests/k8s/`** (`just test-k8s-integration`): real kind cluster, real control-plane pod, real worker pods, real config-store Postgres. Multi-tenant activation, worker pool, Flight RPC, k8s pod lifecycle. **The iceberg test in here additionally hits real AWS S3 Tables** in the mw-dev sandbox via GitHub OIDC. See `tests/k8s/CLAUDE.md` before touching anything in there — TestMain is destructive against the current kubeconfig.
+- **`tests/e2e-mw-dev/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real per-org Lakekeeper, real AWS S3/Iceberg. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/e2e-mw-dev/README.md`.
 
 ### When code changes obligate test changes
 
-The k8s integration suite is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating `tests/k8s/` as part of the change, not a follow-up:
+`tests/e2e-mw-dev/` is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating the harness as part of the change, not a follow-up:
 
 - `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`, `server.IcebergConfig`)
 - `server/server.go::AttachDeltaCatalog`, `server.AttachIcebergCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
-- `server/iceberg/` (config, dispatcher, backend implementations) — every backend split needs a seed update in `tests/k8s/iceberg_test.go::buildIcebergConfigStoreSeed` (the iceberg_backend column default is "lakekeeper", so omitting it silently routes to the wrong path)
-- `controlplane/configstore/models.go` — new columns on `ManagedWarehouse` / `ManagedWarehouseIceberg` / sub-structs need to be set in the test seed, otherwise GORM defaults take over silently
+- `server/iceberg/` (config, dispatcher, backend implementations) — the harness provisions iceberg-enabled ducklings on both cnpg + ext backends and asserts the catalog attaches + reads/writes
+- `controlplane/configstore/models.go` — new columns flow through the provisioning API the harness calls; exercise them via a provision body field
 - `duckdbservice/activation.go`, `worker_activation.go` — worker-side activation order
 - Any code path that wires AWS credentials through to DuckDB SECRETs
 
-The contract is: if a test that already exists no longer exercises the path you changed, **update it** (don't add a new one that duplicates the setup). If your change removes a path the tests still assert against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers tests in `tests/k8s/ducklake_test.go` and the iceberg activation test in `tests/k8s/iceberg_test.go` are the load-bearing ones for catalog wiring — keep them honest.
+The contract: if the harness no longer exercises a path you changed, **update `harness.sh`**; if your change removes a path it asserts against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers / iceberg activation checks in `harness.sh` are the load-bearing ones for catalog wiring — keep them honest.
 
 ## Dependencies
 
