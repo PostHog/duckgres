@@ -68,6 +68,7 @@ type K8sFileConfig struct {
 	SharedWarmTarget                int    `yaml:"shared_warm_target"`
 	DynamicWarmCapacityEnabled      *bool  `yaml:"dynamic_warm_capacity_enabled"`
 	WarmCapacityMissWindow          string `yaml:"warm_capacity_miss_window"`
+	WarmAcquireTimeout              string `yaml:"warm_acquire_timeout"`
 	WarmCapacityMissesPerWorker     int    `yaml:"warm_capacity_misses_per_worker"`
 	WarmCapacityDemandTTL           string `yaml:"warm_capacity_demand_ttl"`
 	WarmCapacityDynamicImageCeiling int    `yaml:"warm_capacity_dynamic_image_ceiling"`

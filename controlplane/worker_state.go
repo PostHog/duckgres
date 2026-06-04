@@ -83,6 +83,12 @@ type WorkerAssignment struct {
 	// 0 = unbounded on that axis. Only colocated claims count against them.
 	MaxColocatedCPU      int
 	MaxColocatedMemBytes uint64
+	// SuppressWarmMissRecord skips recording a warm-capacity miss (demand signal
+	// + metric) for this acquire attempt. Set by a server-side acquire wait that
+	// polls repeatedly so it records demand at most once per throttle interval
+	// instead of on every retry, keeping the demand signal and miss counter from
+	// being inflated ~Nx by a single waiting connection.
+	SuppressWarmMissRecord bool
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared

@@ -19,6 +19,13 @@ const DefaultWarmCapacityDemandTTL = 15 * time.Minute
 // warm pool to replenish.
 const WarmAcquireRetryInterval = 2 * time.Second
 
+// WarmMissRecordInterval throttles warm-capacity miss recording (demand signal +
+// metric) while an acquire waits: at most one record per interval per waiting
+// connection, instead of one per WarmAcquireRetryInterval poll. Kept well under
+// DefaultWarmCapacityMissWindow (2m) so the demand signal stays fresh enough to
+// keep driving the warm reconciler.
+const WarmMissRecordInterval = 30 * time.Second
+
 // WarmCapacityExhaustedError is returned when a user request misses the ready
 // warm pool. The caller should fail fast with a retryable capacity response
 // instead of waiting for a foreground cold worker spawn.

@@ -82,6 +82,8 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	// bounded by the request ctx, so a client with a short deadline still fails
 	// fast. 0 = legacy fail-fast.
 	warmDeadline := time.Now().Add(p.shared.warmAcquireTimeout)
+	// Throttle warm-miss recording across the wait's repeated polls.
+	var lastWarmMissAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -130,25 +132,40 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 			image := p.image
 			p.shared.mu.Unlock()
 
+			// While waiting (below) we poll every WarmAcquireRetryInterval, but
+			// record the warm miss (demand + metric) at most once per
+			// WarmMissRecordInterval so one waiting connection doesn't inflate the
+			// demand signal / miss counter.
+			recordMiss := lastWarmMissAt.IsZero() || time.Since(lastWarmMissAt) >= WarmMissRecordInterval
+
 			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				OrgID:                p.orgID,
-				MaxWorkers:           maxWorkers,
-				Image:                image,
-				Profile:              profile,
-				MaxColocatedCPU:      p.maxColocatedCPU,
-				MaxColocatedMemBytes: p.maxColocatedMemBytes,
+				OrgID:                  p.orgID,
+				MaxWorkers:             maxWorkers,
+				Image:                  image,
+				Profile:                profile,
+				MaxColocatedCPU:        p.maxColocatedCPU,
+				MaxColocatedMemBytes:   p.maxColocatedMemBytes,
+				SuppressWarmMissRecord: !recordMiss,
 			})
 			if err != nil {
-				// A transient warm-pool miss resolves once a worker replenishes
-				// (each miss records demand that drives the warm reconciler, and a
-				// colocated shape may first need a cold node). Wait and retry the
-				// claim until warmAcquireTimeout elapses rather than failing the
-				// client immediately. Bounded by ctx below.
-				if p.shared.warmAcquireTimeout > 0 && isRetryableWarmMiss(err) && time.Now().Before(warmDeadline) {
+				if recordMiss {
+					lastWarmMissAt = time.Now()
+				}
+				// Server-side patience: a transient no-idle miss on a colocated
+				// request resolves once the warm pool replenishes (a colocated
+				// shape may first need a cold node, minutes). Wait and retry until
+				// warmAcquireTimeout elapses rather than failing immediately;
+				// bounded by ctx. Restricted to colocated requests — a default /
+				// exclusive miss replenishes quickly and the client retries, so we
+				// don't block interactive/default traffic (e.g. data imports) for
+				// minutes.
+				if p.shared.warmAcquireTimeout > 0 && isColocated && isRetryableWarmMiss(err) && time.Now().Before(warmDeadline) {
+					timer := time.NewTimer(WarmAcquireRetryInterval)
 					select {
 					case <-ctx.Done():
+						timer.Stop()
 						return nil, ctx.Err()
-					case <-time.After(WarmAcquireRetryInterval):
+					case <-timer.C:
 					}
 					continue
 				}

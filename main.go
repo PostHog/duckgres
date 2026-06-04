@@ -362,6 +362,7 @@ func main() {
 				SharedWarmTarget:                resolved.K8sSharedWarmTarget,
 				DynamicWarmCapacityEnabled:      resolved.K8sDynamicWarmCapacityEnabled,
 				WarmCapacityMissWindow:          resolved.K8sWarmCapacityMissWindow,
+				WarmAcquireTimeout:              resolved.K8sWarmAcquireTimeout,
 				WarmCapacityMissesPerWorker:     resolved.K8sWarmCapacityMissesPerWorker,
 				WarmCapacityDemandTTL:           resolved.K8sWarmCapacityDemandTTL,
 				WarmCapacityDynamicImageCeiling: resolved.K8sWarmCapacityDynamicImageCeiling,

@@ -47,6 +47,7 @@ func fieldNameToFlagName(name string) string {
 		{"K8sSharedWarmTarget", "k8s-shared-warm-target"},
 		{"K8sDynamicWarmCapacityEnabled", "k8s-dynamic-warm-capacity-enabled"},
 		{"K8sWarmCapacityMissWindow", "k8s-warm-capacity-miss-window"},
+		{"K8sWarmAcquireTimeout", "k8s-warm-acquire-timeout"},
 		{"K8sWarmCapacityMissesPerWorker", "k8s-warm-capacity-misses-per-worker"},
 		{"K8sWarmCapacityDemandTTL", "k8s-warm-capacity-demand-ttl"},
 		{"K8sWarmCapacityDynamicImageCeiling", "k8s-warm-capacity-dynamic-image-ceiling"},
