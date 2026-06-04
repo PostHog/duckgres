@@ -49,10 +49,14 @@ const (
 	// disruptionGuardReconcileInterval is how often the busy/idle → annotation
 	// reconcile runs. A worker busy for longer than this is protected before the
 	// next Karpenter disruption decision; the only exposure is a query that both
-	// starts and is selected for voluntary disruption within one interval, which
-	// would be a sub-interval query anyway. Patches only fire on transitions, so
-	// steady state costs zero API calls.
-	disruptionGuardReconcileInterval = 5 * time.Second
+	// starts and is selected for voluntary disruption within one interval. Kept
+	// at the health-check cadence (2s) to bound that race window; with the
+	// NodePool terminationGracePeriod ceiling in place a disruption inside the
+	// window is non-fatal anyway (the query still gets its drain). Eager-stamping
+	// on the 0→1 session transition would close the window entirely but touches
+	// the hot acquire path on both pools — deferred. Patches fire only on
+	// transitions, so steady state costs zero API calls regardless of cadence.
+	disruptionGuardReconcileInterval = 2 * time.Second
 
 	// workerTerminationGracePeriodSeconds is the worker pod's grace period.
 	// Unset historically (→ k8s default 30s), far too short for analytical
@@ -167,6 +171,32 @@ func (p *K8sWorkerPool) patchWorkerDoNotDisrupt(ctx context.Context, podName str
 		"metadata": map[string]interface{}{
 			"annotations": map[string]interface{}{
 				karpenterDoNotDisruptAnnotation: value,
+			},
+		},
+	}
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err = p.clientset.CoreV1().Pods(p.namespace).Patch(ctx, podName, types.MergePatchType, data, metav1.PatchOptions{})
+	return err
+}
+
+// relabelAdoptedPodToThisCP patches a worker pod's duckgres/control-plane label
+// to this control plane's ID. Called when one CP adopts a worker spawned by
+// another (failover/rollout). The pod informer is label-scoped to
+// duckgres/control-plane=<cpID> (see startInformer), so without this an adopted
+// worker is invisible to THIS CP's informer cache — making podHasDoNotDisrupt,
+// workerPodTerminating, and the informer-driven pod-terminated cleanup all blind
+// to it (the do-not-disrupt reconcile and the planned-drain health guard would
+// silently not apply, and a stale do-not-disrupt annotation would never clear).
+func (p *K8sWorkerPool) relabelAdoptedPodToThisCP(ctx context.Context, podName string) error {
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": map[string]interface{}{
+				"duckgres/control-plane": p.cpID,
 			},
 		},
 	}

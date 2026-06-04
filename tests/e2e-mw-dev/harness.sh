@@ -347,36 +347,49 @@ assert_worker_pod() {
 # contract is what gates Karpenter, so that is what we assert.)
 DND_JSONPATH='{.metadata.annotations.karpenter\.sh/do-not-disrupt}'
 worker_dnd() { k get pod "$1" -o jsonpath="$DND_JSONPATH" 2>/dev/null; }
+# Space-padded list of worker pods currently carrying do-not-disrupt.
+annotated_workers() {
+  out=" "
+  for p in $(k get pods -l app=duckgres-worker -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    [ "$(worker_dnd "$p")" = "true" ] && out="$out$p "
+  done
+  printf '%s' "$out"
+}
 assert_drain_aware_eviction() { # org password
   log "drain-aware eviction: busy worker carries do-not-disrupt, idle worker clears it"
   wait_worker "$1" "$2" ducklake
 
-  # Hold a session open ~30s. SELECT 1 proves the worker is acquired; the
-  # trailing sleep keeps stdin (and thus the connection, and activeSessions>0)
-  # open without blocking the harness.
-  { printf 'SELECT 1;\n'; sleep 30; } | PGPASSWORD="$2" psql \
+  # Attribute the annotation to OUR session: snapshot which workers are already
+  # annotated, then look for a NEWLY annotated one while we hold a session (a
+  # pre-existing busy worker must not make this pass for the wrong reason).
+  before="$(annotated_workers)"
+
+  # Hold a session open ~40s. SELECT 1 proves the worker is acquired; the
+  # trailing sleep keeps stdin (and the connection, so activeSessions>0) open
+  # without blocking the harness.
+  { printf 'SELECT 1;\n'; sleep 40; } | PGPASSWORD="$2" psql \
     "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
     -v ON_ERROR_STOP=1 -tA >/dev/null 2>&1 &
   hold_pid=$!
 
-  busy=""
-  for _ in $(seq 1 12); do        # up to ~24s for the reconciler to stamp it
-    for p in $(k get pods -l app=duckgres-worker -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-      [ "$(worker_dnd "$p")" = "true" ] && { busy="$p"; break; }
+  busy=""; i=0
+  while [ "$i" -lt 15 ]; do        # up to ~30s for the reconciler to stamp it
+    for p in $(annotated_workers); do
+      case "$before" in *" $p "*) : ;; *) busy="$p"; break ;; esac
     done
     [ -n "$busy" ] && break
-    sleep 2
+    sleep 2; i=$((i + 1))
   done
-  [ -n "$busy" ] || { kill "$hold_pid" 2>/dev/null; fail "no busy worker received karpenter.sh/do-not-disrupt"; }
-  log "  busy worker $busy carries do-not-disrupt=true"
+  [ -n "$busy" ] || { kill "$hold_pid" 2>/dev/null; fail "no worker acquired karpenter.sh/do-not-disrupt while a session was held"; }
+  log "  session worker $busy carries do-not-disrupt=true"
 
   wait "$hold_pid" 2>/dev/null || true   # session ends -> worker goes idle
-  cleared=""
-  for _ in $(seq 1 15); do        # up to ~30s for the reconciler to clear it
+  cleared=""; i=0
+  while [ "$i" -lt 20 ]; do         # up to ~40s for the reconciler to clear it
     [ -z "$(worker_dnd "$busy")" ] && { cleared=1; break; }
-    sleep 2
+    sleep 2; i=$((i + 1))
   done
-  [ -n "$cleared" ] || fail "do-not-disrupt not cleared on idle worker $busy"
+  [ -n "$cleared" ] || fail "do-not-disrupt not cleared on idle worker $busy after session end"
   log "  do-not-disrupt cleared after session end on $busy"
 }
 

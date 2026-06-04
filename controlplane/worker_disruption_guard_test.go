@@ -93,12 +93,46 @@ func TestReconcileDisruptionGuardsSetsAndClears(t *testing.T) {
 	}
 }
 
+// TestRelabelAdoptedPodToThisCP verifies the adoption relabel makes a pod
+// spawned by another CP carry THIS CP's control-plane label (so this CP's
+// label-scoped informer can see it) while preserving the pod's other labels.
+func TestRelabelAdoptedPodToThisCP(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5) // pool.cpID == "test-cp"
+	ctx := context.Background()
+
+	if _, err := cs.CoreV1().Pods("default").Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:      "wpod-adopted",
+		Namespace: "default",
+		Labels:    map[string]string{"duckgres/control-plane": "old-cp", "duckgres/worker-id": "9"},
+	}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pool.relabelAdoptedPodToThisCP(ctx, "wpod-adopted"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := cs.CoreV1().Pods("default").Get(ctx, "wpod-adopted", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Labels["duckgres/control-plane"] != "test-cp" {
+		t.Fatalf("want control-plane=test-cp after relabel, got %q", got.Labels["duckgres/control-plane"])
+	}
+	if got.Labels["duckgres/worker-id"] != "9" {
+		t.Fatalf("merge patch clobbered other labels: %v", got.Labels)
+	}
+}
+
 // TestReconcileDisruptionGuardsClearsStaleAnnotationAfterFailover is the
 // CP-failover regression: a CP stamps do-not-disrupt on a busy worker, then
 // dies; its sessions die with it so the worker is idle, but the pod keeps the
 // annotation. A surviving/replacement CP (no in-memory record of having set it)
-// must still clear the orphan. The cache-based reconcile does; an in-memory
-// "applied" flag would not (it would read applied=false==busy=false and skip).
+// must still clear the orphan. In production the pod becomes visible to the new
+// CP's label-scoped informer via relabelAdoptedPodToThisCP on adoption (tested
+// above); this test seeds the cache to that post-relabel state and asserts the
+// cache-based reconcile clears the orphan. An in-memory "applied" flag would not
+// (it would read applied=false==busy=false and skip).
 func TestReconcileDisruptionGuardsClearsStaleAnnotationAfterFailover(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	ctx := context.Background()

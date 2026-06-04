@@ -343,6 +343,11 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 	if !p.workerBelongsToOrgLocked(w) {
 		return false
 	}
+	// Don't hand a new session to a worker whose pod is already Terminating
+	// (planned node drain) — see isGenericSessionSchedulableWorkerLocked.
+	if p.shared.workerPodTerminating(p.shared.workerPodName(w)) {
+		return false
+	}
 	lifecycle := w.SharedState().NormalizedLifecycle()
 	return lifecycle == WorkerLifecycleHot
 }

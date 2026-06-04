@@ -1885,6 +1885,27 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
 	}
 
+	// Don't adopt a worker whose pod is already Terminating (its node is being
+	// drained): activating it would hand a new session to a shutting-down pod.
+	// The local scheduler predicates (isGenericSessionSchedulableWorkerLocked /
+	// workerReadyForSchedulingLocked) only cover workers already in p.workers,
+	// not runtime-store claims, so gate the claim here. The error routes into the
+	// caller's claim-retire/fallback path (reserveClaimedWorker callers).
+	if pod.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("claimed worker pod %s is terminating; not adopting", claimed.PodName)
+	}
+
+	// Relabel the adopted pod to this control plane so our label-scoped pod
+	// informer sees it; otherwise the do-not-disrupt reconcile, the planned-drain
+	// health guard, and informer-driven pod-terminated cleanup are all blind to
+	// adopted workers. Best-effort: the worker still functions if this fails.
+	if pod.Labels["duckgres/control-plane"] != p.cpID {
+		if relErr := p.relabelAdoptedPodToThisCP(ctx, claimed.PodName); relErr != nil {
+			slog.Warn("Failed to relabel adopted worker pod to this control plane; informer-based guards may not apply until relabel succeeds.",
+				"worker", claimed.WorkerID, "worker_pod", claimed.PodName, "error", relErr)
+		}
+	}
+
 	// For hot-idle workers, skip the epoch-validated health check. The worker's
 	// epoch and CP instance ID are from the previous owner, and ClaimHotIdleWorker
 	// already bumped the epoch in the DB. The health check requires exact epoch
@@ -3456,7 +3477,11 @@ func (p *K8sWorkerPool) dropLocalWorkerIfSameLeaseLocked(lease workerLeaseSnapsh
 }
 
 func (p *K8sWorkerPool) isGenericSessionSchedulableWorkerLocked(w *ManagedWorker) bool {
-	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleIdle
+	// Exclude a worker whose pod is already Terminating (planned node drain): the
+	// 2a health guard keeps such a busy worker in the pool to let its query
+	// drain, but it must not receive a NEW session on a shutting-down pod.
+	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleIdle &&
+		!p.workerPodTerminating(p.workerPodName(w))
 }
 
 func (p *K8sWorkerPool) isWarmIdleWorkerLocked(w *ManagedWorker) bool {
