@@ -139,6 +139,9 @@ func buildSessionMetadataSQL(database string) string {
 		buildSessionPgClassViewSQL(),
 		buildSessionPgNamespaceViewSQL(),
 		buildSessionPgAttributeViewSQL(),
+		buildSessionPgTablesViewSQL(),
+		buildSessionPgViewsViewSQL(),
+		buildSessionPgSequencesViewSQL(),
 		buildSessionInformationSchemaColumnsViewSQL(),
 		buildSessionInformationSchemaTablesViewSQL(),
 		buildSessionInformationSchemaSchemataViewSQL(),
@@ -244,6 +247,7 @@ func internalCompatRelationNamesSQL() string {
 		'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 		'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 		'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
+		'pg_tables', 'pg_views', 'pg_sequences',
 		'information_schema_columns_compat', 'information_schema_tables_compat',
 		'information_schema_schemata_compat', 'information_schema_views_compat',
 		'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
@@ -612,6 +616,93 @@ func buildSessionPgAttributeViewSQL() string {
 	`, nativeTypeOID, loadedTypeOID)
 }
 
+// buildSessionPgTablesViewSQL builds the catalog-scoped pg_catalog.pg_tables
+// compat view. DuckDB's native pg_tables spans EVERY attached catalog and
+// ignores current_database(), so on a dual-catalog worker (DuckLake + Iceberg
+// attached on one connection) a bare pg_tables would leak the other catalog's
+// table names into the session. This view sources duckdb_tables() filtered to
+// current_database() so an Iceberg session only sees Iceberg tables and a
+// DuckLake session only sees DuckLake tables. Column shape mirrors DuckDB's
+// native pg_tables (schemaname, tablename, tableowner, tablespace, hasindexes,
+// hasrules, hastriggers) so clients see no change beyond the scoping.
+func buildSessionPgTablesViewSQL() string {
+	internalNames := internalCompatRelationNamesSQL()
+	return fmt.Sprintf(`
+		CREATE OR REPLACE VIEW main.pg_tables AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		)
+		SELECT
+			CASE WHEN t.schema_name = 'main' THEN 'public' ELSE t.schema_name END AS schemaname,
+			t.table_name AS tablename,
+			'duckdb' AS tableowner,
+			NULL AS tablespace,
+			(t.index_count > 0) AS hasindexes,
+			false AS hasrules,
+			false AS hastriggers
+		FROM duckdb_tables() t
+		CROSS JOIN active_catalog ac
+		WHERE t.database_name = ac.catalog
+			AND t.schema_name NOT LIKE '__ducklake_metadata_%%'
+			AND t.table_name NOT IN (%s)
+	`, internalNames)
+}
+
+// buildSessionPgViewsViewSQL builds the catalog-scoped pg_catalog.pg_views
+// compat view (same cross-catalog-leak rationale as buildSessionPgTablesViewSQL).
+// Sources duckdb_views() filtered to current_database(); the compat views
+// themselves live in memory.main and are excluded by name so a memory-catalog
+// session does not surface them as user views.
+func buildSessionPgViewsViewSQL() string {
+	internalNames := internalCompatRelationNamesSQL()
+	return fmt.Sprintf(`
+		CREATE OR REPLACE VIEW main.pg_views AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		)
+		SELECT
+			CASE WHEN v.schema_name = 'main' THEN 'public' ELSE v.schema_name END AS schemaname,
+			v.view_name AS viewname,
+			'duckdb' AS viewowner,
+			v.sql AS definition
+		FROM duckdb_views() v
+		CROSS JOIN active_catalog ac
+		WHERE v.database_name = ac.catalog
+			AND v.schema_name NOT LIKE '__ducklake_metadata_%%'
+			AND v.view_name NOT IN (%s)
+	`, internalNames)
+}
+
+// buildSessionPgSequencesViewSQL builds the catalog-scoped pg_catalog.pg_sequences
+// compat view (same cross-catalog-leak rationale as buildSessionPgTablesViewSQL).
+// Sources duckdb_sequences() filtered to current_database(). DuckDB's
+// duckdb_sequences() does not expose data_type/cache_size, so those are
+// synthesized to match PostgreSQL's pg_sequences shape.
+func buildSessionPgSequencesViewSQL() string {
+	return `
+		CREATE OR REPLACE VIEW main.pg_sequences AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		)
+		SELECT
+			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schemaname,
+			s.sequence_name AS sequencename,
+			'duckdb' AS sequenceowner,
+			'bigint' AS data_type,
+			s.start_value AS start_value,
+			s.min_value AS min_value,
+			s.max_value AS max_value,
+			s.increment_by AS increment_by,
+			s.cycle AS cycle,
+			NULL AS cache_size,
+			s.last_value AS last_value
+		FROM duckdb_sequences() s
+		CROSS JOIN active_catalog ac
+		WHERE s.database_name = ac.catalog
+			AND s.schema_name NOT LIKE '__ducklake_metadata_%'
+	`
+}
+
 func buildSessionInformationSchemaColumnsViewSQL() string {
 	return `
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
@@ -837,6 +928,7 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
+			'pg_tables', 'pg_views', 'pg_sequences',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
 		)
@@ -910,6 +1002,7 @@ func buildSessionInformationSchemaViewsViewSQL() string {
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
+			'pg_tables', 'pg_views', 'pg_sequences',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
 		)

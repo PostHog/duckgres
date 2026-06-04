@@ -91,6 +91,23 @@ func TestTranspile_PgCatalog(t *testing.T) {
 			excludes: "pg_catalog",
 		},
 		{
+			name:     "pg_catalog.pg_tables -> memory.main.pg_tables",
+			input:    "SELECT * FROM pg_catalog.pg_tables",
+			contains: "memory.main.pg_tables",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "unqualified pg_views -> memory.main.pg_views",
+			input:    "SELECT * FROM pg_views",
+			contains: "memory.main.pg_views",
+		},
+		{
+			name:     "pg_catalog.pg_sequences -> memory.main.pg_sequences",
+			input:    "SELECT * FROM pg_catalog.pg_sequences",
+			contains: "memory.main.pg_sequences",
+			excludes: "pg_catalog",
+		},
+		{
 			name:     "pg_catalog.pg_statio_user_tables -> memory.main.pg_statio_user_tables",
 			input:    "SELECT * FROM pg_catalog.pg_statio_user_tables",
 			contains: "memory.main.pg_statio_user_tables",

@@ -575,6 +575,143 @@ func TestHexMetadataQueryDoesNotLeakDuckLakeIntoIceberg(t *testing.T) {
 	}
 }
 
+func TestPgTablesViewsSequencesOnlyExposeSelectedCatalog(t *testing.T) {
+	// DuckDB's native pg_tables/pg_views/pg_sequences span every attached
+	// catalog and ignore current_database(); the session-scoped compat views
+	// must return only the selected catalog's objects so a dual-catalog worker
+	// does not leak the other catalog's object names through these discovery
+	// surfaces.
+	tests := []struct {
+		name         string
+		selected     string
+		useAfterInit string
+		wantTable    string
+		wantView     string
+		wantSequence string
+		rejectTable  string
+	}{
+		{
+			name:         "ducklake session sees ducklake only",
+			selected:     "ducklake",
+			wantTable:    "duck_only",
+			wantView:     "duck_view",
+			wantSequence: "duck_seq",
+			rejectTable:  "ice_only",
+		},
+		{
+			name:         "iceberg session sees iceberg only",
+			selected:     "iceberg",
+			useAfterInit: "USE iceberg.public",
+			wantTable:    "ice_only",
+			wantView:     "ice_view",
+			wantSequence: "ice_seq",
+			rejectTable:  "duck_only",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := sql.Open("duckdb", ":memory:")
+			if err != nil {
+				t.Fatalf("open duckdb: %v", err)
+			}
+			db.SetMaxOpenConns(1)
+			defer func() { _ = db.Close() }()
+
+			if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
+				t.Fatalf("attach ducklake: %v", err)
+			}
+			if _, err := db.Exec(`ATTACH ':memory:' AS iceberg`); err != nil {
+				t.Fatalf("attach iceberg: %v", err)
+			}
+
+			if _, err := db.Exec("USE ducklake"); err != nil {
+				t.Fatalf("use ducklake: %v", err)
+			}
+			if _, err := db.Exec("CREATE SCHEMA shared"); err != nil {
+				t.Fatalf("create ducklake schema: %v", err)
+			}
+			if _, err := db.Exec("CREATE TABLE shared.duck_only(id INTEGER)"); err != nil {
+				t.Fatalf("create ducklake table: %v", err)
+			}
+			if _, err := db.Exec("CREATE VIEW shared.duck_view AS SELECT id FROM shared.duck_only"); err != nil {
+				t.Fatalf("create ducklake view: %v", err)
+			}
+			if _, err := db.Exec("CREATE SEQUENCE shared.duck_seq"); err != nil {
+				t.Fatalf("create ducklake sequence: %v", err)
+			}
+
+			if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
+				t.Fatalf("create iceberg public schema: %v", err)
+			}
+			if _, err := db.Exec("CREATE SCHEMA iceberg.shared"); err != nil {
+				t.Fatalf("create iceberg schema: %v", err)
+			}
+			if _, err := db.Exec("CREATE TABLE iceberg.shared.ice_only(id INTEGER)"); err != nil {
+				t.Fatalf("create iceberg table: %v", err)
+			}
+			if _, err := db.Exec("CREATE VIEW iceberg.shared.ice_view AS SELECT id FROM iceberg.shared.ice_only"); err != nil {
+				t.Fatalf("create iceberg view: %v", err)
+			}
+			if _, err := db.Exec("CREATE SEQUENCE iceberg.shared.ice_seq"); err != nil {
+				t.Fatalf("create iceberg sequence: %v", err)
+			}
+			if _, err := db.Exec("USE memory"); err != nil {
+				t.Fatalf("use memory: %v", err)
+			}
+
+			executor := NewLocalExecutor(db)
+			if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, tc.selected); err != nil {
+				t.Fatalf("init session database metadata: %v", err)
+			}
+			if tc.useAfterInit != "" {
+				if _, err := db.Exec(tc.useAfterInit); err != nil {
+					t.Fatalf("apply selected catalog: %v", err)
+				}
+			}
+
+			assertSingleValue := func(label, query, want string) {
+				t.Helper()
+				var got string
+				if err := db.QueryRow(query).Scan(&got); err != nil {
+					t.Fatalf("%s query: %v", label, err)
+				}
+				if got != want {
+					t.Fatalf("%s = %q, want %q", label, got, want)
+				}
+			}
+
+			assertSingleValue("pg_tables", `
+				SELECT string_agg(tablename, ',' ORDER BY tablename)
+				FROM memory.main.pg_tables
+				WHERE schemaname = 'shared'
+			`, tc.wantTable)
+			assertSingleValue("pg_views", `
+				SELECT string_agg(viewname, ',' ORDER BY viewname)
+				FROM memory.main.pg_views
+				WHERE schemaname = 'shared'
+			`, tc.wantView)
+			assertSingleValue("pg_sequences", `
+				SELECT string_agg(sequencename, ',' ORDER BY sequencename)
+				FROM memory.main.pg_sequences
+				WHERE schemaname = 'shared'
+			`, tc.wantSequence)
+
+			var leakCount int
+			if err := db.QueryRow(`
+				SELECT COUNT(*)
+				FROM memory.main.pg_tables
+				WHERE schemaname = 'shared' AND tablename = ?
+			`, tc.rejectTable).Scan(&leakCount); err != nil {
+				t.Fatalf("pg_tables leak query: %v", err)
+			}
+			if leakCount != 0 {
+				t.Fatalf("pg_tables leaked %q into %s session", tc.rejectTable, tc.selected)
+			}
+		})
+	}
+}
+
 func TestInformationSchemaColumnsCompatScopesLoadedMetadataToSelectedCatalog(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
