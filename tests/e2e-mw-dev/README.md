@@ -18,7 +18,7 @@ layers where this quarter's production bugs lived.
    config-store Postgres + a control-plane Deployment on the PR image, spawning
    worker pods in the same namespace.
 4. **Test** via an in-cluster Job hitting the CP ClusterIP service. Covers
-   **cnpg + ext** (aurora out of scope).
+   the **cnpg + ext** metadata backends.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
 

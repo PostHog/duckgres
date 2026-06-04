@@ -199,7 +199,7 @@ func (c *LakekeeperK8sClient) EnsureServiceAccount(ctx context.Context, orgID st
 
 // LakekeeperCRSpec carries the inputs we need to render a Lakekeeper CR.
 // One CR per org. PG connection points at the org's existing managed-warehouse
-// Aurora cluster, with the lakekeeper_<orgid> database created by
+// metadata Postgres, with the lakekeeper_<orgid> database created by
 // EnsureDatabase.
 type LakekeeperCRSpec struct {
 	OrgID      string

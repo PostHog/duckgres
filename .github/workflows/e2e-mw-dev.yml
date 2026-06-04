@@ -14,8 +14,8 @@
 #      config-store Postgres + a control-plane Deployment running the PR image,
 #      spawning worker pods in the same namespace.
 #   4. run the e2e harness as a Job INSIDE the namespace, talking to the CP
-#      ClusterIP service (no public DNS / NLB needed). Covers cnpg + ext
-#      (aurora is being retired — out of scope).
+#      ClusterIP service (no public DNS / NLB needed). Covers the cnpg-shard
+#      and external metadata backends.
 #   5. always tear the namespace down (and deprovision the ci-pr ducklings so
 #      no S3 / cnpg role / lakekeeper CR leaks on shared infra).
 #

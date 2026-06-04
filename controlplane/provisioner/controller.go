@@ -214,8 +214,6 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		"iceberg_enabled", w.Iceberg.Enabled)
 	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
 		MetadataStoreType:         w.MetadataStore.Kind,
-		MinACU:                    w.AuroraMinACU,
-		MaxACU:                    w.AuroraMaxACU,
 		PgBouncerEnabled:          w.PgBouncer.Enabled,
 		ExternalEndpoint:          w.MetadataStore.Endpoint,
 		ExternalPasswordAWSSecret: w.MetadataStore.PasswordAWSSecret,
@@ -275,7 +273,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 
 	// Check for Crossplane failure — only fail on persistent sync errors.
 	// Crossplane resources commonly flap Synced=False transiently (e.g., IAM
-	// eventual consistency, Aurora cold start delays), so we only transition
+	// eventual consistency, metadata-store endpoint DNS propagation), so we only transition
 	// to failed if 10+ minutes have passed, giving transient errors time to resolve.
 	if status.SyncedFalseMessage != "" && time.Since(startedAt) > 10*time.Minute {
 		log.Warn("Crossplane sync failure.", "message", status.SyncedFalseMessage)
@@ -317,7 +315,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 
 	// Infrastructure is ready when all components are provisioned AND the
 	// Crossplane Ready condition is True. The Ready condition ensures all
-	// composed resources (including the Aurora instance) are fully reconciled,
+	// composed resources (including the metadata store) are fully reconciled,
 	// not just that individual status fields are populated.
 	s3Ready := w.S3State == configstore.ManagedWarehouseStateReady || updates["s3_state"] == configstore.ManagedWarehouseStateReady
 	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
@@ -329,7 +327,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		updates["iceberg_state"] == configstore.ManagedWarehouseStateReady
 
 	if s3Ready && metaReady && secretsReady && identReady && icebergReady && status.ReadyCondition {
-		// End-to-end probe: AWS reports the Aurora cluster Available before
+		// End-to-end probe: AWS reports the metadata store (RDS) Available before
 		// its DNS record has propagated to in-cluster CoreDNS, and even longer
 		// before pgbouncer's resolver picks it up. Flipping to Ready on
 		// AWS-Available alone produces a 3-5 minute window where worker
@@ -339,7 +337,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		//
 		// PgBouncer is opt-in per duckling: when enabled, workers connect
 		// through the pgbouncer Service (plaintext); when disabled they
-		// connect to the Aurora endpoint directly (TLS required). The probe
+		// connect to the RDS endpoint directly (TLS required). The probe
 		// has to match that — otherwise we'd be testing a path nobody uses.
 		probe := c.probe
 		if probe == nil {

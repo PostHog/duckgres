@@ -77,8 +77,8 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Postgres (the org's managed-warehouse Aurora). Open to any IP since
-    # Aurora endpoints aren't necessarily in-cluster.
+    # Postgres (the org's managed-warehouse RDS/Aurora). Open to any IP since
+    # those endpoints aren't necessarily in-cluster.
     - ports:
         - port: 5432
           protocol: TCP

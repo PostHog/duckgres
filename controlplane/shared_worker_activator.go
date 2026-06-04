@@ -432,9 +432,9 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 	// DuckLake is attached iff this tenant has it enabled. The CR's
 	// spec.ducklake.enabled is authoritative (decoupled ducklings); legacy CRs
 	// that predate the field fall back to the historical coupling — DuckLake on
-	// for external/aurora, off for cnpg-shard. When on, the catalog lives in the
+	// for external, off for cnpg-shard. When on, the catalog lives in the
 	// metadata Postgres (the per-tenant lakekeeper_<org> DB on cnpg, or the
-	// metadata DB on external/aurora); when off the worker attaches Iceberg only
+	// metadata DB on external); when off the worker attaches Iceberg only
 	// (server.ActivateDBConnection takes its iceberg-only branch).
 	ducklakeEnabled := status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
 	if status.DuckLakeEnabled != nil {
@@ -494,7 +494,7 @@ func ducklingMetadataStoreAddress(status *provisioner.DucklingStatus, orgID stri
 		return h, portNum, true, nil
 	}
 
-	// No pooler — fall back to the direct Aurora endpoint. Guard against an
+	// No pooler — fall back to the direct RDS endpoint. Guard against an
 	// empty endpoint here rather than letting a malformed DSN surface later
 	// as an opaque connect error.
 	if status.MetadataStore.Endpoint == "" {
