@@ -36,7 +36,9 @@ type sourceColumn struct {
 }
 
 func ShouldLoadColumns(query string) bool {
-	return strings.Contains(strings.ToLower(query), "information_schema_columns_compat")
+	lower := strings.ToLower(query)
+	return strings.Contains(lower, "information_schema_columns_compat") ||
+		strings.Contains(lower, "pg_attribute")
 }
 
 func LoadColumns(ctx context.Context, executor sqlcore.QueryExecutor, query string, configs ...Config) error {
@@ -79,9 +81,17 @@ func firstConfig(configs []Config) Config {
 
 func extractTableFilter(query string) tableFilter {
 	lower := strings.ToLower(query)
+	schema := extractSingleQuotedPredicate(query, lower, "table_schema")
+	if schema == "" {
+		schema = extractSingleQuotedPredicate(query, lower, "nspname")
+	}
+	name := extractSingleQuotedPredicate(query, lower, "table_name")
+	if name == "" {
+		name = extractSingleQuotedPredicate(query, lower, "relname")
+	}
 	return tableFilter{
-		Schema: extractSingleQuotedPredicate(query, lower, "table_schema"),
-		Name:   extractSingleQuotedPredicate(query, lower, "table_name"),
+		Schema: schema,
+		Name:   name,
 	}
 }
 
@@ -91,6 +101,12 @@ func extractSingleQuotedPredicate(query, lowerQuery, column string) string {
 		column + "='",
 		"c." + column + " = '",
 		"c." + column + "='",
+		"n." + column + " = '",
+		"n." + column + "='",
+		"pg_namespace." + column + " = '",
+		"pg_namespace." + column + "='",
+		"pg_class_full." + column + " = '",
+		"pg_class_full." + column + "='",
 	}
 	for _, marker := range markers {
 		idx := strings.Index(lowerQuery, marker)

@@ -136,6 +136,12 @@ func buildSessionMetadataSQL(database string) string {
 		sessionColumnMetadataTableSQL(),
 		sessionIcebergColumnMetadataTableSQL(),
 		buildSessionPgDatabaseViewSQL(database),
+		buildSessionPgClassViewSQL(),
+		buildSessionPgNamespaceViewSQL(),
+		buildSessionPgAttributeViewSQL(),
+		buildSessionPgTablesViewSQL(),
+		buildSessionPgViewsViewSQL(),
+		buildSessionPgSequencesViewSQL(),
 		buildSessionInformationSchemaColumnsViewSQL(),
 		buildSessionInformationSchemaTablesViewSQL(),
 		buildSessionInformationSchemaSchemataViewSQL(),
@@ -232,6 +238,469 @@ func buildSessionPgDatabaseViewSQL(database string) string {
 			daticulocale, daticurules, datcollversion, datacl
 		FROM requested
 	`, lit, lit, lit, lit, lit, lit, lit)
+}
+
+func internalCompatRelationNamesSQL() string {
+	return `
+		'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+		'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+		'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
+		'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
+		'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
+		'pg_tables', 'pg_views', 'pg_sequences',
+		'information_schema_columns_compat', 'information_schema_tables_compat',
+		'information_schema_schemata_compat', 'information_schema_views_compat',
+		'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+	`
+}
+
+func buildSessionPgClassViewSQL() string {
+	internalNames := internalCompatRelationNamesSQL()
+	return fmt.Sprintf(`
+		CREATE OR REPLACE VIEW main.pg_class_full AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		),
+		relations AS (
+			SELECT
+				table_oid AS oid,
+				table_name AS relname,
+				schema_oid AS relnamespace,
+				0 AS reltype,
+				0 AS reloftype,
+				0 AS relowner,
+				0 AS relam,
+				0 AS relfilenode,
+				0 AS reltablespace,
+				0 AS relpages,
+				CAST(estimated_size AS FLOAT) AS reltuples,
+				0 AS relallvisible,
+				0 AS reltoastrelid,
+				0::BIGINT AS reltoastidxid,
+				(index_count > 0) AS relhasindex,
+				false AS relisshared,
+				CASE WHEN temporary THEN 't' ELSE 'p' END AS relpersistence,
+				'r' AS relkind,
+				column_count AS relnatts,
+				check_constraint_count AS relchecks,
+				false AS relhasoids,
+				has_primary_key AS relhaspkey,
+				false AS relhasrules,
+				false AS relhastriggers,
+				false AS relhassubclass,
+				false AS relrowsecurity,
+				false AS relforcerowsecurity,
+				true AS relispopulated,
+				NULL AS relreplident,
+				false AS relispartition,
+				0 AS relrewrite,
+				0 AS relfrozenxid,
+				NULL AS relminmxid,
+				NULL AS relacl,
+				NULL AS reloptions,
+				NULL AS relpartbound,
+				database_name
+			FROM duckdb_tables()
+			WHERE table_name NOT IN (%s)
+			UNION ALL
+			SELECT
+				view_oid AS oid,
+				view_name AS relname,
+				schema_oid AS relnamespace,
+				0 AS reltype,
+				0 AS reloftype,
+				0 AS relowner,
+				0 AS relam,
+				0 AS relfilenode,
+				0 AS reltablespace,
+				0 AS relpages,
+				0 AS reltuples,
+				0 AS relallvisible,
+				0 AS reltoastrelid,
+				0::BIGINT AS reltoastidxid,
+				false AS relhasindex,
+				false AS relisshared,
+				CASE WHEN temporary THEN 't' ELSE 'p' END AS relpersistence,
+				'v' AS relkind,
+				column_count AS relnatts,
+				0 AS relchecks,
+				false AS relhasoids,
+				false AS relhaspkey,
+				false AS relhasrules,
+				false AS relhastriggers,
+				false AS relhassubclass,
+				false AS relrowsecurity,
+				false AS relforcerowsecurity,
+				true AS relispopulated,
+				NULL AS relreplident,
+				false AS relispartition,
+				0 AS relrewrite,
+				0 AS relfrozenxid,
+				NULL AS relminmxid,
+				NULL AS relacl,
+				NULL AS reloptions,
+				NULL AS relpartbound,
+				database_name
+			FROM duckdb_views()
+			WHERE view_name NOT IN (%s)
+			UNION ALL
+			SELECT
+				sequence_oid AS oid,
+				sequence_name AS relname,
+				schema_oid AS relnamespace,
+				0 AS reltype,
+				0 AS reloftype,
+				0 AS relowner,
+				0 AS relam,
+				0 AS relfilenode,
+				0 AS reltablespace,
+				0 AS relpages,
+				0 AS reltuples,
+				0 AS relallvisible,
+				0 AS reltoastrelid,
+				0::BIGINT AS reltoastidxid,
+				false AS relhasindex,
+				false AS relisshared,
+				CASE WHEN temporary THEN 't' ELSE 'p' END AS relpersistence,
+				'S' AS relkind,
+				0 AS relnatts,
+				0 AS relchecks,
+				false AS relhasoids,
+				false AS relhaspkey,
+				false AS relhasrules,
+				false AS relhastriggers,
+				false AS relhassubclass,
+				false AS relrowsecurity,
+				false AS relforcerowsecurity,
+				true AS relispopulated,
+				NULL AS relreplident,
+				false AS relispartition,
+				0 AS relrewrite,
+				0 AS relfrozenxid,
+				NULL AS relminmxid,
+				NULL AS relacl,
+				NULL AS reloptions,
+				NULL AS relpartbound,
+				database_name
+			FROM duckdb_sequences()
+			WHERE sequence_name NOT IN (%s)
+			UNION ALL
+			SELECT
+				index_oid AS oid,
+				index_name AS relname,
+				schema_oid AS relnamespace,
+				0 AS reltype,
+				0 AS reloftype,
+				0 AS relowner,
+				0 AS relam,
+				0 AS relfilenode,
+				0 AS reltablespace,
+				0 AS relpages,
+				0 AS reltuples,
+				0 AS relallvisible,
+				0 AS reltoastrelid,
+				0::BIGINT AS reltoastidxid,
+				false AS relhasindex,
+				false AS relisshared,
+				't' AS relpersistence,
+				'i' AS relkind,
+				NULL AS relnatts,
+				0 AS relchecks,
+				false AS relhasoids,
+				false AS relhaspkey,
+				false AS relhasrules,
+				false AS relhastriggers,
+				false AS relhassubclass,
+				false AS relrowsecurity,
+				false AS relforcerowsecurity,
+				true AS relispopulated,
+				NULL AS relreplident,
+				false AS relispartition,
+				0 AS relrewrite,
+				0 AS relfrozenxid,
+				NULL AS relminmxid,
+				NULL AS relacl,
+				NULL AS reloptions,
+				NULL AS relpartbound,
+				database_name
+			FROM duckdb_indexes()
+			WHERE index_name NOT IN (%s)
+		)
+		SELECT
+			oid, relname, relnamespace, reltype, reloftype, relowner, relam,
+			relfilenode, reltablespace, relpages, reltuples, relallvisible,
+			reltoastrelid, reltoastidxid, relhasindex, relisshared,
+			relpersistence, relkind, relnatts, relchecks, relhasoids,
+			relhaspkey, relhasrules, relhastriggers, relhassubclass,
+			relrowsecurity, relforcerowsecurity, relispopulated, relreplident,
+			relispartition, relrewrite, relfrozenxid, relminmxid, relacl,
+			reloptions, relpartbound
+		FROM relations r
+		CROSS JOIN active_catalog ac
+		WHERE r.database_name = ac.catalog
+	`, internalNames, internalNames, internalNames, internalNames)
+}
+
+func buildSessionPgNamespaceViewSQL() string {
+	return `
+		CREATE OR REPLACE VIEW main.pg_namespace AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		),
+		user_namespaces AS (
+			SELECT schema_oid AS oid, schema_name, database_name FROM duckdb_tables()
+			UNION
+			SELECT schema_oid AS oid, schema_name, database_name FROM duckdb_views()
+			UNION
+			SELECT schema_oid AS oid, schema_name, database_name FROM duckdb_sequences()
+			UNION
+			SELECT schema_oid AS oid, schema_name, database_name FROM duckdb_indexes()
+		)
+		SELECT DISTINCT
+			oid,
+			CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname,
+			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
+			NULL AS nspacl
+		FROM user_namespaces n
+		CROSS JOIN active_catalog ac
+		WHERE n.database_name = ac.catalog
+			AND n.schema_name NOT LIKE '__ducklake_metadata_%'
+		UNION ALL
+		SELECT 11::BIGINT AS oid, 'pg_catalog' AS nspname, 10::BIGINT AS nspowner, NULL AS nspacl
+		UNION ALL
+		SELECT 12::BIGINT AS oid, 'information_schema' AS nspname, 10::BIGINT AS nspowner, NULL AS nspacl
+		UNION ALL
+		SELECT 99::BIGINT AS oid, 'pg_toast' AS nspname, 10::BIGINT AS nspowner, NULL AS nspacl
+	`
+}
+
+func pgTypeOIDCaseSQL(dataTypeExpr, fallbackExpr string) string {
+	template := `CASE
+		WHEN {dt} LIKE 'DECIMAL%' OR {dt} LIKE 'NUMERIC%' THEN 1700::UINTEGER
+		WHEN {dt} = 'INTEGER' THEN 23::UINTEGER
+		WHEN {dt} = 'BIGINT' THEN 20::UINTEGER
+		WHEN {dt} = 'SMALLINT' THEN 21::UINTEGER
+		WHEN {dt} = 'TINYINT' THEN 21::UINTEGER
+		WHEN {dt} = 'HUGEINT' THEN 1700::UINTEGER
+		WHEN {dt} = 'UBIGINT' THEN 1700::UINTEGER
+		WHEN {dt} = 'UINTEGER' THEN 20::UINTEGER
+		WHEN {dt} = 'USMALLINT' THEN 23::UINTEGER
+		WHEN {dt} = 'UTINYINT' THEN 21::UINTEGER
+		WHEN {dt} = 'FLOAT' OR {dt} = 'DOUBLE' THEN 701::UINTEGER
+		WHEN {dt} = 'REAL' THEN 700::UINTEGER
+		WHEN {dt} = 'VARCHAR' THEN 1043::UINTEGER
+		WHEN {dt} = 'TEXT' THEN 25::UINTEGER
+		WHEN {dt} = 'CHAR' OR {dt} = 'BPCHAR' THEN 1042::UINTEGER
+		WHEN {dt} = 'BOOLEAN' THEN 16::UINTEGER
+		WHEN {dt} = 'BLOB' OR {dt} = 'BYTEA' THEN 17::UINTEGER
+		WHEN {dt} = 'DATE' THEN 1082::UINTEGER
+		WHEN {dt} = 'TIME' THEN 1083::UINTEGER
+		WHEN {dt} = 'TIMESTAMP' THEN 1114::UINTEGER
+		WHEN {dt} LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 1184::UINTEGER
+		WHEN {dt} LIKE 'TIME WITH TIME ZONE%' THEN 1266::UINTEGER
+		WHEN {dt} = 'INTERVAL' THEN 1186::UINTEGER
+		WHEN {dt} = 'UUID' THEN 2950::UINTEGER
+		WHEN {dt} = 'BIT' THEN 1560::UINTEGER
+		WHEN {dt} = 'JSON' THEN 114::UINTEGER
+		WHEN {dt} = 'INTEGER[]' THEN 1007::UINTEGER
+		WHEN {dt} = 'BIGINT[]' THEN 1016::UINTEGER
+		WHEN {dt} = 'SMALLINT[]' THEN 1005::UINTEGER
+		WHEN {dt} = 'VARCHAR[]' THEN 1015::UINTEGER
+		WHEN {dt} = 'TEXT[]' THEN 1009::UINTEGER
+		WHEN {dt} = 'BOOLEAN[]' THEN 1000::UINTEGER
+		WHEN {dt} = 'FLOAT[]' OR {dt} = 'DOUBLE[]' THEN 1022::UINTEGER
+		WHEN {dt} = 'REAL[]' THEN 1021::UINTEGER
+		WHEN {dt} = 'DATE[]' THEN 1182::UINTEGER
+		WHEN {dt} = 'TIMESTAMP[]' THEN 1115::UINTEGER
+		WHEN {dt} LIKE 'NUMERIC%[]' OR {dt} LIKE 'DECIMAL%[]' THEN 1231::UINTEGER
+		WHEN {dt} = 'UUID[]' THEN 2951::UINTEGER
+		WHEN {dt} = 'INTERVAL[]' THEN 1187::UINTEGER
+		WHEN {dt} = 'BLOB[]' OR {dt} = 'BYTEA[]' THEN 1001::UINTEGER
+		WHEN {dt} LIKE 'STRUCT%' THEN 2249::UINTEGER
+		ELSE {fallback}::UINTEGER
+	END`
+	return strings.NewReplacer("{dt}", dataTypeExpr, "{fallback}", fallbackExpr).Replace(template)
+}
+
+func buildSessionPgAttributeViewSQL() string {
+	nativeTypeOID := pgTypeOIDCaseSQL("UPPER(dc.data_type)", "a.atttypid")
+	loadedTypeOID := pgTypeOIDCaseSQL("UPPER(im.data_type)", "1043")
+	return fmt.Sprintf(`
+		CREATE OR REPLACE VIEW main.pg_attribute AS
+		WITH native_attributes AS (
+			SELECT
+				a.attrelid::UINTEGER AS attrelid,
+				a.attname,
+				%s AS atttypid,
+				a.attstattarget,
+				a.attlen,
+				a.attnum::SMALLINT AS attnum,
+				a.attndims::SMALLINT AS attndims,
+				a.attcacheoff,
+				CASE
+					WHEN (dc.data_type LIKE 'DECIMAL%%' OR dc.data_type LIKE 'NUMERIC%%') AND a.atttypmod > 0 THEN
+						(((a.atttypmod / 1000)::INTEGER << 16) | ((a.atttypmod %% 1000)::INTEGER + 4))::INTEGER
+					ELSE a.atttypmod
+				END AS atttypmod,
+				a.attbyval,
+				a.attalign,
+				a.attstorage,
+				a.attcompression,
+				a.attnotnull,
+				a.atthasdef,
+				a.atthasmissing,
+				a.attidentity,
+				a.attgenerated,
+				a.attisdropped,
+				a.attislocal,
+				a.attinhcount::INTEGER AS attinhcount,
+				a.attcollation::UINTEGER AS attcollation,
+				a.attacl,
+				a.attoptions,
+				a.attfdwoptions,
+				a.attmissingval
+			FROM pg_catalog.pg_attribute a
+			JOIN main.pg_class_full c ON c.oid = a.attrelid
+			JOIN main.pg_namespace n ON n.oid = c.relnamespace
+			LEFT JOIN duckdb_columns() dc ON dc.table_oid = a.attrelid AND dc.column_name = a.attname
+			WHERE NOT (
+				current_database() = 'iceberg'
+				AND a.attname = '__'
+			)
+			AND NOT (
+				current_database() = 'iceberg'
+				AND EXISTS (
+					SELECT 1
+					FROM main.__duckgres_iceberg_column_metadata im
+					WHERE im.table_schema = n.nspname
+					AND im.table_name = c.relname
+				)
+			)
+		),
+		loaded_iceberg_attributes AS (
+			SELECT
+				c.oid::UINTEGER AS attrelid,
+				im.column_name AS attname,
+				%s AS atttypid,
+				-1::INTEGER AS attstattarget,
+				-1::INTEGER AS attlen,
+				im.ordinal_position::SMALLINT AS attnum,
+				0::SMALLINT AS attndims,
+				0::INTEGER AS attcacheoff,
+				-1::INTEGER AS atttypmod,
+				false AS attbyval,
+				'i' AS attalign,
+				'x' AS attstorage,
+				NULL AS attcompression,
+				(im.is_nullable = 'NO') AS attnotnull,
+				false AS atthasdef,
+				false AS atthasmissing,
+				'' AS attidentity,
+				'' AS attgenerated,
+				false AS attisdropped,
+				true AS attislocal,
+				0::INTEGER AS attinhcount,
+				0::UINTEGER AS attcollation,
+				NULL AS attacl,
+				NULL AS attoptions,
+				NULL AS attfdwoptions,
+				NULL AS attmissingval
+			FROM main.__duckgres_iceberg_column_metadata im
+			JOIN main.pg_namespace n ON n.nspname = im.table_schema
+			JOIN main.pg_class_full c ON c.relnamespace = n.oid AND c.relname = im.table_name
+			WHERE current_database() = 'iceberg'
+		)
+		SELECT * FROM native_attributes
+		UNION ALL
+		SELECT * FROM loaded_iceberg_attributes
+	`, nativeTypeOID, loadedTypeOID)
+}
+
+// buildSessionPgTablesViewSQL builds the catalog-scoped pg_catalog.pg_tables
+// compat view. DuckDB's native pg_tables spans EVERY attached catalog and
+// ignores current_database(), so on a dual-catalog worker (DuckLake + Iceberg
+// attached on one connection) a bare pg_tables would leak the other catalog's
+// table names into the session. This view sources duckdb_tables() filtered to
+// current_database() so an Iceberg session only sees Iceberg tables and a
+// DuckLake session only sees DuckLake tables. Column shape mirrors DuckDB's
+// native pg_tables (schemaname, tablename, tableowner, tablespace, hasindexes,
+// hasrules, hastriggers) so clients see no change beyond the scoping.
+func buildSessionPgTablesViewSQL() string {
+	internalNames := internalCompatRelationNamesSQL()
+	return fmt.Sprintf(`
+		CREATE OR REPLACE VIEW main.pg_tables AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		)
+		SELECT
+			CASE WHEN t.schema_name = 'main' THEN 'public' ELSE t.schema_name END AS schemaname,
+			t.table_name AS tablename,
+			'duckdb' AS tableowner,
+			NULL AS tablespace,
+			(t.index_count > 0) AS hasindexes,
+			false AS hasrules,
+			false AS hastriggers
+		FROM duckdb_tables() t
+		CROSS JOIN active_catalog ac
+		WHERE t.database_name = ac.catalog
+			AND t.schema_name NOT LIKE '__ducklake_metadata_%%'
+			AND t.table_name NOT IN (%s)
+	`, internalNames)
+}
+
+// buildSessionPgViewsViewSQL builds the catalog-scoped pg_catalog.pg_views
+// compat view (same cross-catalog-leak rationale as buildSessionPgTablesViewSQL).
+// Sources duckdb_views() filtered to current_database(); the compat views
+// themselves live in memory.main and are excluded by name so a memory-catalog
+// session does not surface them as user views.
+func buildSessionPgViewsViewSQL() string {
+	internalNames := internalCompatRelationNamesSQL()
+	return fmt.Sprintf(`
+		CREATE OR REPLACE VIEW main.pg_views AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		)
+		SELECT
+			CASE WHEN v.schema_name = 'main' THEN 'public' ELSE v.schema_name END AS schemaname,
+			v.view_name AS viewname,
+			'duckdb' AS viewowner,
+			v.sql AS definition
+		FROM duckdb_views() v
+		CROSS JOIN active_catalog ac
+		WHERE v.database_name = ac.catalog
+			AND v.schema_name NOT LIKE '__ducklake_metadata_%%'
+			AND v.view_name NOT IN (%s)
+	`, internalNames)
+}
+
+// buildSessionPgSequencesViewSQL builds the catalog-scoped pg_catalog.pg_sequences
+// compat view (same cross-catalog-leak rationale as buildSessionPgTablesViewSQL).
+// Sources duckdb_sequences() filtered to current_database(). DuckDB's
+// duckdb_sequences() does not expose data_type/cache_size, so those are
+// synthesized to match PostgreSQL's pg_sequences shape.
+func buildSessionPgSequencesViewSQL() string {
+	return `
+		CREATE OR REPLACE VIEW main.pg_sequences AS
+		WITH active_catalog AS (
+			SELECT current_database() AS catalog
+		)
+		SELECT
+			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schemaname,
+			s.sequence_name AS sequencename,
+			'duckdb' AS sequenceowner,
+			'bigint' AS data_type,
+			s.start_value AS start_value,
+			s.min_value AS min_value,
+			s.max_value AS max_value,
+			s.increment_by AS increment_by,
+			s.cycle AS cycle,
+			NULL AS cache_size,
+			s.last_value AS last_value
+		FROM duckdb_sequences() s
+		CROSS JOIN active_catalog ac
+		WHERE s.database_name = ac.catalog
+			AND s.schema_name NOT LIKE '__ducklake_metadata_%'
+	`
 }
 
 func buildSessionInformationSchemaColumnsViewSQL() string {
@@ -459,6 +928,7 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
+			'pg_tables', 'pg_views', 'pg_sequences',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
 		)
@@ -532,6 +1002,7 @@ func buildSessionInformationSchemaViewsViewSQL() string {
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
+			'pg_tables', 'pg_views', 'pg_sequences',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
 		)

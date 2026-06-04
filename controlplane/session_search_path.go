@@ -26,17 +26,37 @@ const physicalIcebergCatalog = iceberg.CatalogName
 
 // effectiveSessionDefaultCommand returns the connect-time command for a
 // non-passthrough session, given the resolved real catalog the session defaults
-// to (effectiveCatalog, one of "ducklake"/"iceberg"). A client-supplied
-// search_path always wins. For DuckLake the catalog switch is owned by
-// InitSessionDatabaseMetadata's defer (which also restores memory.main on the
-// search_path so the pg_catalog compat macros stay resolvable), so this returns
-// "" — re-issuing `USE ducklake` here would clobber that search_path.
+// to (effectiveCatalog, one of "ducklake"/"iceberg").
+//
+// For DuckLake the catalog switch is owned by InitSessionDatabaseMetadata's
+// defer (which also restores memory.main on the search_path so the pg_catalog
+// compat macros stay resolvable), so a DuckLake session only needs a command
+// when the client supplied its own search_path.
+//
+// For Iceberg there is no such defer, so the `USE iceberg.<schema>` catalog
+// switch MUST be issued here — even when the client also supplied a search_path.
+// Otherwise the session stays in the ephemeral `memory` catalog while
+// current_database() reports 'iceberg', and unqualified DDL/DML silently misses
+// the warehouse. The Iceberg USE is load-bearing, so when it is combined with a
+// client search_path the command fails closed (sessionDefaultSourceConfiguredCatalog)
+// rather than treating the whole thing as a best-effort search_path.
 func effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog string) (string, sessionSearchPathSource) {
+	icebergUse := ""
+	if effectiveCatalog == iceberg.CatalogName {
+		icebergUse = fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
+	}
+
 	switch {
 	case clientSearchPath != "":
-		return fmt.Sprintf("SET search_path = '%s'", ensureMemoryMainInSearchPath(clientSearchPath)), sessionSearchPathSourceClient
-	case effectiveCatalog == iceberg.CatalogName:
-		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema), sessionDefaultSourceConfiguredCatalog
+		searchPath := fmt.Sprintf("SET search_path = '%s'", ensureMemoryMainInSearchPath(clientSearchPath))
+		if icebergUse != "" {
+			// Switch into Iceberg first, then apply the client search_path (the
+			// USE resets it). The catalog switch is fail-closed.
+			return icebergUse + "; " + searchPath, sessionDefaultSourceConfiguredCatalog
+		}
+		return searchPath, sessionSearchPathSourceClient
+	case icebergUse != "":
+		return icebergUse, sessionDefaultSourceConfiguredCatalog
 	default:
 		return "", ""
 	}
