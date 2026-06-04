@@ -736,10 +736,11 @@ func TestReuseExistingActivationRefreshesIcebergAlongsideS3(t *testing.T) {
 					S3SessionToken: "OLD_TOK",
 				},
 				Iceberg: server.IcebergConfig{
-					Enabled:     true,
-					TableBucket: "arn:aws:s3tables:us-east-1:000000000000:bucket/analytics",
-					Region:      "us-east-1",
-					Namespace:   "main",
+					Enabled:             true,
+					LakekeeperEndpoint:  "http://lakekeeper-analytics.lakekeeper.svc:8181/catalog",
+					LakekeeperWarehouse: "org-analytics",
+					Region:              "us-east-1",
+					Namespace:           "main",
 				},
 			},
 			db: mainDB,
@@ -776,10 +777,11 @@ func TestReuseExistingActivationRefreshesIcebergAlongsideS3(t *testing.T) {
 			S3SessionToken: "NEW_TOK",
 		},
 		Iceberg: server.IcebergConfig{
-			Enabled:     true,
-			TableBucket: "arn:aws:s3tables:us-east-1:000000000000:bucket/analytics",
-			Region:      "us-east-1",
-			Namespace:   "main",
+			Enabled:             true,
+			LakekeeperEndpoint:  "http://lakekeeper-analytics.lakekeeper.svc:8181/catalog",
+			LakekeeperWarehouse: "org-analytics",
+			Region:              "us-east-1",
+			Namespace:           "main",
 		},
 	}
 
@@ -797,7 +799,7 @@ func TestReuseExistingActivationRefreshesIcebergAlongsideS3(t *testing.T) {
 		t.Errorf("iceberg refresh got stale credentials: keyID=%q secret=%q token=%q, want NEW_AK/NEW_SK/NEW_TOK",
 			icebergKeyID, icebergSecret, icebergToken)
 	}
-	if icebergCfg.TableBucket != newPayload.Iceberg.TableBucket || icebergCfg.Region != newPayload.Iceberg.Region {
+	if icebergCfg.LakekeeperWarehouse != newPayload.Iceberg.LakekeeperWarehouse || icebergCfg.Region != newPayload.Iceberg.Region {
 		t.Errorf("iceberg refresh got wrong config: %+v, want %+v", icebergCfg, newPayload.Iceberg)
 	}
 }

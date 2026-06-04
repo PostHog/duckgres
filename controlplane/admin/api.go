@@ -422,7 +422,6 @@ func managedWarehouseUpsertColumns() []string {
 		"s3_delta_catalog_enabled",
 		"s3_delta_catalog_path",
 		"iceberg_enabled",
-		"iceberg_table_bucket_arn",
 		"iceberg_region",
 		"iceberg_namespace",
 		"worker_identity_namespace",

@@ -32,7 +32,6 @@ func fieldNameToFlagName(name string) string {
 		{"DuckLakeDeltaCatalogPath", "ducklake-delta-catalog-path"},
 		{"DuckLakeDefaultSpecVersion", "ducklake-default-spec-version"},
 		{"IcebergEnabled", "iceberg-enabled"},
-		{"IcebergTableBucket", "iceberg-table-bucket"},
 		{"IcebergRegion", "iceberg-region"},
 		{"IcebergNamespace", "iceberg-namespace"},
 		{"FlightSessionIdleTTL", "flight-session-idle-ttl"},

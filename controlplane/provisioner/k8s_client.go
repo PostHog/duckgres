@@ -44,15 +44,13 @@ type DucklingStatus struct {
 		BucketName string
 		S3Region   string
 	}
-	// Iceberg is populated when spec.iceberg.enabled=true and the
-	// composition has reconciled the per-tenant S3 Tables bucket. Empty
-	// when the tenant has not opted in. TableBucketArn arrives last
-	// (after the bucket is reconciled); the controller uses its presence
-	// as the trigger to flip iceberg_state to Ready in the configstore.
+	// Iceberg is populated when spec.iceberg.enabled=true. The
+	// composition provisions a per-org Lakekeeper instance; the
+	// Lakekeeper provisioner extension drives readiness off the
+	// Lakekeeper CR itself, so we only need namespace/region here.
 	Iceberg struct {
-		TableBucketArn string
-		NamespaceName  string
-		Region         string
+		NamespaceName string
+		Region        string
 	}
 	IAMRoleARN         string
 	ReadyCondition     bool
@@ -493,7 +491,6 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 
 	// Parse status.iceberg (only populated when spec.iceberg.enabled=true)
 	if ic, ok := status["iceberg"].(map[string]interface{}); ok {
-		ds.Iceberg.TableBucketArn = getNestedString(ic, "tableBucketArn")
 		ds.Iceberg.NamespaceName = getNestedString(ic, "namespaceName")
 		ds.Iceberg.Region = getNestedString(ic, "region")
 	}

@@ -50,7 +50,6 @@ type CLIInputs struct {
 	DuckLakeDeltaCatalogPath           string
 	DuckLakeDefaultSpecVersion         string
 	IcebergEnabled                     bool
-	IcebergTableBucket                 string
 	IcebergRegion                      string
 	IcebergNamespace                   string
 	ProcessMinWorkers                  int
@@ -339,9 +338,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.Iceberg.Enabled != nil {
 			cfg.Iceberg.Enabled = *fileCfg.Iceberg.Enabled
-		}
-		if fileCfg.Iceberg.TableBucket != "" {
-			cfg.Iceberg.TableBucket = fileCfg.Iceberg.TableBucket
 		}
 		if fileCfg.Iceberg.Region != "" {
 			cfg.Iceberg.Region = fileCfg.Iceberg.Region
@@ -636,9 +632,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		} else {
 			warn("Invalid DUCKGRES_ICEBERG_ENABLED: " + err.Error())
 		}
-	}
-	if v := getenv("DUCKGRES_ICEBERG_TABLE_BUCKET"); v != "" {
-		cfg.Iceberg.TableBucket = v
 	}
 	if v := getenv("DUCKGRES_ICEBERG_REGION"); v != "" {
 		cfg.Iceberg.Region = v
@@ -1148,9 +1141,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if cli.Set["iceberg-enabled"] {
 		cfg.Iceberg.Enabled = cli.IcebergEnabled
-	}
-	if cli.Set["iceberg-table-bucket"] {
-		cfg.Iceberg.TableBucket = cli.IcebergTableBucket
 	}
 	if cli.Set["iceberg-region"] {
 		cfg.Iceberg.Region = cli.IcebergRegion

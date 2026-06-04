@@ -305,37 +305,23 @@ func TestResolveEffectiveConfigIceberg(t *testing.T) {
 		t.Fatal("expected Iceberg.Enabled to default to false")
 	}
 
-	// File config opts in.
+	// File config opts in; remaining knobs (region/namespace) flow through.
 	fileEnabled := true
 	resolved = configresolve.ResolveEffective(&FileConfig{
 		Iceberg: IcebergFileConfig{
-			Enabled:     &fileEnabled,
-			TableBucket: "arn:aws:s3tables:us-east-1:111:bucket/yaml",
-			Region:      "us-east-1",
-			Namespace:   "main",
+			Enabled:   &fileEnabled,
+			Region:    "us-east-1",
+			Namespace: "main",
 		},
 	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if !resolved.Server.Iceberg.Enabled {
 		t.Fatal("expected YAML iceberg.enabled=true to enable Iceberg")
 	}
-	if got, want := resolved.Server.Iceberg.TableBucket, "arn:aws:s3tables:us-east-1:111:bucket/yaml"; got != want {
-		t.Fatalf("expected YAML table bucket %q, got %q", want, got)
+	if got, want := resolved.Server.Iceberg.Region, "us-east-1"; got != want {
+		t.Fatalf("expected YAML iceberg region %q, got %q", want, got)
 	}
-
-	// Env overrides YAML; CLI overrides env.
-	resolved = configresolve.ResolveEffective(&FileConfig{
-		Iceberg: IcebergFileConfig{
-			Enabled:     &fileEnabled,
-			TableBucket: "arn:aws:s3tables:us-east-1:111:bucket/yaml",
-		},
-	}, configresolve.CLIInputs{
-		Set:                map[string]bool{"iceberg-table-bucket": true},
-		IcebergTableBucket: "arn:aws:s3tables:us-east-1:333:bucket/cli",
-	}, envFromMap(map[string]string{
-		"DUCKGRES_ICEBERG_TABLE_BUCKET": "arn:aws:s3tables:us-east-1:222:bucket/env",
-	}), nil)
-	if got, want := resolved.Server.Iceberg.TableBucket, "arn:aws:s3tables:us-east-1:333:bucket/cli"; got != want {
-		t.Fatalf("expected CLI table bucket %q to win, got %q", want, got)
+	if got, want := resolved.Server.Iceberg.Namespace, "main"; got != want {
+		t.Fatalf("expected YAML iceberg namespace %q, got %q", want, got)
 	}
 }
 
