@@ -462,8 +462,8 @@ func TestReconcile_CreatesCatalogProjectsSecretAndConfigMap(t *testing.T) {
 	if !strings.Contains(props["s3.iam-role"], "duckling-42") {
 		t.Errorf("expected duckling-42 role ARN under s3.iam-role, got %q", props["s3.iam-role"])
 	}
-	if props["fs.s3.enabled"] != "true" {
-		t.Errorf("expected fs.s3.enabled=true, got %q", props["fs.s3.enabled"])
+	if props["fs.native-s3.enabled"] != "true" {
+		t.Errorf("expected fs.native-s3.enabled=true, got %q", props["fs.native-s3.enabled"])
 	}
 	// Old property names must NOT be emitted — they're silently ignored
 	// or rejected by current Trino.

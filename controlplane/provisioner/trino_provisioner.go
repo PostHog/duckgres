@@ -955,11 +955,14 @@ func (p *TrinoProvisioner) reconcileCatalogs(ctx context.Context, orgs []configs
 // credentials are embedded here — just the endpoint, the warehouse
 // name, and the per-org S3 IAM role.
 //
-// Property names follow Trino's current file-system / Iceberg-REST
-// surface (matching the working maintenance chart at
-// charts/charts/trino/files/trino_maintenance.py):
+// Property names MUST stay in sync with the working maintenance chart at
+// charts/charts/trino/files/trino_maintenance.py — this set drifted from it
+// once (fs.s3.enabled vs fs.native-s3.enabled), which Trino 476 rejects at
+// CREATE CATALOG ("Configuration property 'fs.s3.enabled' was not used"):
 //
-//	fs.s3.enabled=true              enable the unified S3 file system
+//	fs.native-s3.enabled=true       enable Trino's native S3 file system
+//	                                (required since Trino 458; the legacy
+//	                                Hadoop fs.s3.* surface is rejected by 476)
 //	s3.region=<region>              forwarded to the AWS SDK
 //	s3.iam-role=<arn>               per-org duckling-<orgid> role
 //
@@ -974,7 +977,7 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, ic *configstore.
 		"iceberg.catalog.type":           "rest",
 		"iceberg.rest-catalog.uri":       ic.LakekeeperEndpoint,
 		"iceberg.rest-catalog.warehouse": ic.LakekeeperWarehouse,
-		"fs.s3.enabled":                  "true",
+		"fs.native-s3.enabled":           "true",
 	}
 	if p.iamAccountID != "" {
 		props["s3.iam-role"] = fmt.Sprintf("arn:aws:iam::%s:role/duckling-%s", p.iamAccountID, orgID)
