@@ -475,7 +475,7 @@ func TestGetWarehouseNotFound(t *testing.T) {
 
 func TestProvisionEnablesTrinoWhenRequested(t *testing.T) {
 	store := newFakeStore()
-	// Trino enable requires a numeric org id (posthog team_id).
+	// Org.Name is a DNS-1123 label; "42" is one valid (numeric) shape.
 	store.orgs["42"] = &configstore.Org{Name: "42"}
 	router := newTestRouter(store)
 
@@ -550,7 +550,11 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	}
 }
 
-func TestProvisionRejectsTrinoWithNonNumericOrgID(t *testing.T) {
+func TestProvisionEnablesTrinoWithNonNumericOrgID(t *testing.T) {
+	// Org names are DNS-1123 labels (e.g. "analytics", "ben-iceberg-cnpg"), not
+	// numeric team_ids. Trino opt-in must accept them — the catalog name is
+	// derived via injective sanitization (org_<sanitize(Name)>_iceberg), not
+	// assumed numeric.
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestRouter(store)
@@ -565,8 +569,11 @@ func TestProvisionRejectsTrinoWithNonNumericOrgID(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 with non-numeric org id: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d for non-numeric org id: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if row := store.trino["analytics"]; row == nil || !row.Enabled {
+		t.Fatalf("expected trino row Enabled=true for analytics; got %+v", row)
 	}
 }
 
@@ -590,12 +597,14 @@ func TestProvisionWithoutTrinoLeavesTrinoRowUnset(t *testing.T) {
 }
 
 func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
+	// A DNS-1123-named org (the real shape, e.g. "ben-iceberg-cnpg") — not a
+	// numeric team_id — opts into Trino via the standalone endpoint.
 	store := newFakeStore()
-	store.orgs["42"] = &configstore.Org{Name: "42"}
+	store.orgs["ben-iceberg-cnpg"] = &configstore.Org{Name: "ben-iceberg-cnpg"}
 	router := newTestRouter(store)
 
 	body := []byte(`{"enabled": true, "tier": "growth"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/42/trino", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-iceberg-cnpg/trino", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -603,24 +612,27 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	row := store.trino["42"]
+	row := store.trino["ben-iceberg-cnpg"]
 	if row == nil || !row.Enabled || row.Tier != "growth" {
 		t.Fatalf("expected trino row enabled with tier growth; got %+v", row)
 	}
 }
 
-func TestEnableTrinoRejectsNonNumericOrgID(t *testing.T) {
+func TestEnableTrinoRejectsInvalidOrgID(t *testing.T) {
+	// A non-numeric name is fine (DNS-1123); a name that is NOT a valid DNS-1123
+	// label (uppercase, underscore, punctuation) is rejected — the catalog/group
+	// sanitization's collision-freeness depends on the DNS-1123 charset.
 	store := newFakeStore()
 	router := newTestRouter(store)
 
 	body := []byte(`{"enabled": true}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/trino", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/Bad_Org/trino", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 with non-numeric org id: %s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 400 for invalid (non-DNS-1123) org id: %s", rec.Code, rec.Body.String())
 	}
 }
 

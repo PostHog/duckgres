@@ -27,19 +27,6 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &s) && s.SQLState() == "23505"
 }
 
-// trinoOrgIDPattern is the team_id shape Trino's customer-facing path
-// requires: ASCII digits only. The plan establishes the v1 invariant
-// that Org.Name (== posthog team_id) is an integer string; Trino's
-// catalog naming and group-file projection don't tolerate punctuation,
-// and silently sanitizing it would let two distinct team_ids collide
-// into one catalog. Rejecting non-numeric IDs at the API boundary is
-// safer than catching the collision downstream.
-//
-// Org IDs flowing into the existing /provision endpoint are not
-// constrained by this — only the Trino opt-in surfaces (the standalone
-// /trino enable endpoint and the optional trino block on /provision).
-var trinoOrgIDPattern = regexp.MustCompile(`^[0-9]+$`)
-
 // ducklingOrgIDPattern constrains org IDs that get a provisioned warehouse to a
 // single DNS-1123 label (lowercase alphanumerics + hyphens, start/end
 // alphanumeric). This is the shape every derived name needs:
@@ -331,15 +318,12 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Validate Trino opt-in BEFORE generating the password — the
-	// numeric-orgID check is a request-validation failure (400), and
-	// running it inside the tx would just roll back and waste a hash.
+	// orgID was already validated as a DNS-1123 label at the top of the handler
+	// (ducklingOrgIDPattern) — that's all the Trino catalog/group naming needs,
+	// since TrinoCatalogName sanitizes it injectively (org_<sanitize(Name)>_iceberg).
+	// No extra per-Trino constraint; org names are not numeric team_ids.
 	var trinoSettings *configstore.TrinoSettings
 	if req.Trino != nil && req.Trino.Enabled {
-		if !trinoOrgIDPattern.MatchString(orgID) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "trino.enabled requires a numeric org id (posthog team_id); got: " + orgID})
-			return
-		}
 		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier}
 	}
 
@@ -412,8 +396,8 @@ func (h *handler) enableTrino(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
 		return
 	}
-	if !trinoOrgIDPattern.MatchString(orgID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be numeric (posthog team_id); got: " + orgID})
+	if !ducklingOrgIDPattern.MatchString(orgID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be a DNS-1123 label (lowercase alphanumerics + hyphens); got: " + orgID})
 		return
 	}
 

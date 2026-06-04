@@ -14,7 +14,8 @@
 #                                         Trino's file group provider (v1)
 #                                         or OIDC group claim (post-v1).
 #                                         Customer principals get
-#                                         `org_<team_id>`; the admin gets
+#                                         `org_<org>` (org = sanitized
+#                                         Org.Name); the admin gets
 #                                         the admin group. Customer access
 #                                         decisions key on this, not on the
 #                                         username -- so the bundle schema
@@ -73,7 +74,7 @@ default allow := false
 # is defense in depth: in v1 both signals come from the same K8s Secret
 # (password.db + group.db projected by the provisioner), but the
 # conjunction guards against a regression in projection logic that lets
-# a customer's team_id collide with the admin name OR be added to the
+# a customer's org name collide with the admin name OR be added to the
 # admin group. Under v2 OIDC, the username + group claim ride together
 # in a signed JWT; the conjunction still hardens the boundary should
 # any future identity flow split them.

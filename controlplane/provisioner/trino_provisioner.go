@@ -127,8 +127,8 @@ func TrinoGroupName(orgName string) string {
 // get re-interpreted as a hierarchy separator in Trino's resource-
 // group path (and so the selector + subgroup names stay aligned across
 // the catalog, group, and resource-group projections). Customer
-// principals' Trino username == orgName (numeric team_id in v1), but
-// the underlying type is still a string so we sanitize defensively.
+// principals' Trino username == orgName (a DNS-1123 label), and we
+// sanitize defensively so a non-identifier char can't reshape the path.
 func TrinoResourceGroupName(orgName string) string {
 	return "root.tenants." + trinoSanitize(orgName)
 }
@@ -1010,13 +1010,14 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 //
 // Format conventions:
 //
-//	password.db: <team_id>:<bcrypt hash from OrgUser.Password>
-//	             One line per org. Hash is copied through unchanged
-//	             — it's already bcrypt in the configstore.
+//	password.db: <org_name>:<bcrypt hash from OrgUser.Password>
+//	             One line per org (org_name is the DNS-1123 Org.Name, the
+//	             customer principal's Trino username). Hash is copied
+//	             through unchanged — it's already bcrypt in the configstore.
 //	group.db:    <group_name>:<comma-separated users>
 //	             NOTE: this is the opposite direction from password.db.
 //	             For v1 (one user per org) the value is the single
-//	             team_id. Easy to get backwards, hence this comment.
+//	             org_name. Easy to get backwards, hence this comment.
 //
 // Orgs without a RootPasswordHash are skipped silently (the listing
 // query already filters to (org, root-user) pairs, so this is just
@@ -1045,7 +1046,7 @@ func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, adminPasswordHash s
 		}
 		pwLines = append(pwLines, fmt.Sprintf("%s:%s", o.OrgID, o.RootPasswordHash))
 		// group_name first, comma-separated users second. For v1 this
-		// is one user per group (team_id only).
+		// is one user per group (the org name only).
 		grpLines = append(grpLines, fmt.Sprintf("%s:%s", TrinoGroupName(o.OrgID), o.OrgID))
 	}
 	// Trailing newline so a file with one entry round-trips through
@@ -1075,7 +1076,8 @@ func (p *TrinoProvisioner) reconcileResourceGroups(ctx context.Context, orgs []c
 }
 
 // resourceGroupSubGroup is the per-org subgroup serialized into
-// resource-groups.json under root.tenants.<team_id>.
+// resource-groups.json under root.tenants.<sanitized-org-name>
+// (trinoSanitize(Org.Name), so ben-iceberg-cnpg → ben_iceberg_cnpg).
 type resourceGroupSubGroup struct {
 	Name                 string `json:"name"`
 	SoftMemoryLimit      string `json:"softMemoryLimit"`
@@ -1147,12 +1149,15 @@ func tierLimits(tier string) resourceGroupSubGroup {
 //
 //	root
 //	  └─ tenants
-//	       ├─ 42        (team_id)
-//	       ├─ 43
+//	       ├─ acme              (org name; sanitize is a no-op)
+//	       ├─ ben_iceberg_cnpg  (= trinoSanitize("ben-iceberg-cnpg"))
 //	       └─ ...
 //
-// Selectors map Trino username (== team_id for customer principals) to
-// the root.tenants.<team_id> group. The admin principal lives under a
+// The tenant node name is trinoSanitize(org name), so a hyphenated org
+// like ben-iceberg-cnpg lands at root.tenants.ben_iceberg_cnpg. The
+// selector matches the Trino username (the raw org name, == auth-time
+// current_user) and maps it to that sanitized root.tenants.<sanitized>
+// group. The admin principal lives under a
 // sibling root.admin.<admin_user> path so its catalog-DDL traffic is
 // isolated from tenant traffic and so it matches a selector at all
 // (without an admin selector, Trino's resource-group manager rejects
@@ -1239,7 +1244,8 @@ func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error
 //
 // Keying is by *group*, not by username — the policy authorises via
 // `data.group_catalogs[group][catalog]`. Customer principals' groups
-// are `org_<team_id>` (TrinoGroupName); the admin group owns every
+// are `org_<sanitized-org-name>` (TrinoGroupName — trinoSanitize, so
+// ben-iceberg-cnpg → org_ben_iceberg_cnpg); the admin group owns every
 // managed catalog so the provisioner's own SHOW CATALOGS idempotency
 // check (run as opa.AdminPrincipal) is allowed.
 //

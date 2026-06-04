@@ -130,7 +130,8 @@ func TestBuildTrinoAuthFiles_OneUserPerOrg(t *testing.T) {
 	// admin-line projection is exercised in its own test below.
 	pw, grp := BuildTrinoAuthFiles(orgs, "")
 
-	// Password file: <team_id>:<bcrypt hash>
+	// Password file: <org_name>:<bcrypt hash> (numeric-shaped names used
+	// here are just compact DNS-1123 fixtures, not team_ids).
 	wantPw := "42:$2a$10$hash42\n43:$2a$10$hash43\n"
 	if pw != wantPw {
 		t.Errorf("password.db mismatch:\n got=%q\nwant=%q", pw, wantPw)
@@ -248,11 +249,12 @@ func TestTrinoCatalogNameMatchesManagedNamePattern(t *testing.T) {
 	}
 
 	// Positive cases: representative inputs the production path could
-	// produce. The v1 invariant enforced by trinoOrgIDPattern in
-	// provisioning/api.go is numeric team_ids, but trinoSanitize also
-	// handles non-numeric / punctuated inputs defensively (admin-API
-	// writes or future schema relaxation) — verify those too so any
-	// future relaxation that breaks the regex match is caught here.
+	// produce. Org names are DNS-1123 labels (validated by
+	// ducklingOrgIDPattern in provisioning/api.go), e.g. "42", "acme",
+	// "with-dash"; trinoSanitize maps non-[a-z0-9_] chars to '_'
+	// (injective over DNS-1123). It also handles odder inputs (dots,
+	// case, underscores) defensively — verify those too so any future
+	// change that breaks the regex match is caught here.
 	positive := []string{
 		"42",
 		"100",
@@ -338,7 +340,7 @@ func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 	if len(subs) != 4 {
 		t.Fatalf("expected 4 org subgroups under tenants, got %d", len(subs))
 	}
-	// Selector + subgroup name == team_id; verify the join.
+	// Selector + subgroup name == org name; verify the join.
 	wantByName := map[string]int{ // hardConcurrencyLimit per tier
 		"42": 3,  // free
 		"43": 10, // growth
@@ -356,7 +358,7 @@ func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 		}
 	}
 	// Selectors: admin + one per org. Admin maps to root.admin.<admin>,
-	// each tenant maps to root.tenants.<team_id>. Without the admin
+	// each tenant maps to root.tenants.<org_name>. Without the admin
 	// selector the provisioner's own queries get rejected by Trino's
 	// resource-group manager before reaching OPA.
 	wantSel := map[string]string{
