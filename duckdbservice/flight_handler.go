@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -29,6 +30,13 @@ type FlightSQLHandler struct {
 	flightsql.BaseServer
 	pool  *SessionPool
 	alloc memory.Allocator
+}
+
+func workerDrainingStatus(err error) error {
+	if errors.Is(err, ErrWorkerDraining) {
+		return status.Error(codes.Unavailable, "worker is draining")
+	}
+	return nil
 }
 
 // sessionFromContext extracts the session from gRPC metadata.
@@ -92,6 +100,9 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	if req.Username == "" {
 		return status.Error(codes.InvalidArgument, "username is required")
 	}
+	if h.pool.IsDraining() {
+		return status.Error(codes.Unavailable, "worker is draining")
+	}
 	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
 	}
@@ -110,6 +121,9 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	}
 
 	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return drainErr
+	}
 	if err != nil {
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}
@@ -131,6 +145,14 @@ func (h *FlightSQLHandler) doActivateTenant(body []byte, stream flight.FlightSer
 	if current := h.pool.currentActivation(); current != nil && current.payload.OrgID != payload.OrgID {
 		return status.Errorf(codes.FailedPrecondition, "activate tenant: worker already activated for org %q", current.payload.OrgID)
 	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return drainErr
+	}
+	if err != nil {
+		return status.Errorf(codes.Internal, "start activation drain tracking: %v", err)
+	}
+	defer finishDrain()
 
 	if err := h.pool.activateTenantFunc(payload); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "activate tenant: %v", err)
@@ -282,7 +304,9 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 
 	resp, _ := json.Marshal(map[string]interface{}{
 		"healthy":          true,
+		"draining":         h.pool.IsDraining(),
 		"sessions":         h.pool.ActiveSessions(),
+		"active_queries":   h.pool.ActiveDrainWork(),
 		"uptime_ns":        time.Since(h.pool.startTime).Nanoseconds(),
 		"session_progress": sessionProgress,
 	})
@@ -300,10 +324,18 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	}
 
 	query := cmd.GetQuery()
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return nil, drainErr
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "start query drain tracking: %v", err)
+	}
 
 	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
 	// Return an empty schema instead of sending to DuckDB which rejects empty queries.
 	if isEmptyFlightQuery(query) {
+		finishDrain()
 		emptySchema := arrow.NewSchema(nil, nil)
 		handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
 		session.mu.Lock()
@@ -327,6 +359,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 
 	tx, txnKey, err := session.getOpenTxn(cmd.GetTransactionId())
 	if err != nil {
+		finishDrain()
 		return nil, err
 	}
 
@@ -368,6 +401,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		)
 	}
 	if err != nil {
+		finishDrain()
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
 
@@ -377,11 +411,15 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 
 	handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
 	session.mu.Lock()
-	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey}
+	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, finishDrain: finishDrain}
 	session.mu.Unlock()
 
 	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handleID))
 	if err != nil {
+		finishDrain()
+		session.mu.Lock()
+		delete(session.queries, handleID)
+		session.mu.Unlock()
 		return nil, status.Errorf(codes.Internal, "failed to create ticket: %v", err)
 	}
 
@@ -412,6 +450,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 	if !ok {
 		return nil, nil, status.Error(codes.NotFound, "query handle not found")
 	}
+	finishDrain := handle.finishDrain
 
 	var tx *sql.Tx
 	if handle.TxnID != "" {
@@ -419,6 +458,12 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		ttx := session.txns[handle.TxnID]
 		session.mu.RUnlock()
 		if ttx == nil || ttx.tx == nil {
+			session.mu.Lock()
+			delete(session.queries, handleID)
+			session.mu.Unlock()
+			if finishDrain != nil {
+				finishDrain()
+			}
 			return nil, nil, status.Error(codes.NotFound, "transaction not found")
 		}
 		ttx.lastUsed.Store(time.Now().UnixNano())
@@ -431,6 +476,9 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 
 	// Empty queries have no rows to fetch — return an empty stream immediately.
 	if isEmptyFlightQuery(handle.Query) {
+		if finishDrain != nil {
+			finishDrain()
+		}
 		close(ch)
 		return schema, ch, nil
 	}
@@ -441,6 +489,9 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			session.mu.Lock()
 			delete(session.queries, handleID)
 			session.mu.Unlock()
+			if finishDrain != nil {
+				finishDrain()
+			}
 		}()
 
 		session.progress.queryActive.Store(true)
@@ -512,6 +563,14 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if err != nil {
 		return 0, err
 	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return 0, drainErr
+	}
+	if err != nil {
+		return 0, status.Errorf(codes.Internal, "start update drain tracking: %v", err)
+	}
+	defer finishDrain()
 
 	tx, _, err := session.getOpenTxn(cmd.GetTransactionId())
 	if err != nil {
@@ -598,6 +657,14 @@ func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return nil, drainErr
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "start transaction drain tracking: %v", err)
+	}
+	defer finishDrain()
 	_ = req
 
 	tx, err := session.Conn.BeginTx(context.Background(), nil)
@@ -641,6 +708,11 @@ func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 	if !ok || ttx == nil || ttx.tx == nil {
 		return status.Error(codes.NotFound, "transaction not found")
 	}
+	finishDrain, err := h.pool.beginDrainWork(true)
+	if err != nil {
+		return status.Errorf(codes.Internal, "start transaction finalization drain tracking: %v", err)
+	}
+	defer finishDrain()
 
 	switch req.GetAction() {
 	case flightsql.EndTransactionCommit:
@@ -666,6 +738,14 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, drainErr
+	}
+	if err != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.Internal, "start prepare drain tracking: %v", err)
+	}
+	defer finishDrain()
 
 	tx, txnKey, err := session.getOpenTxn(req.GetTransactionId())
 	if err != nil {
@@ -727,6 +807,9 @@ func (h *FlightSQLHandler) GetFlightInfoPreparedStatement(ctx context.Context, c
 	if err != nil {
 		return nil, err
 	}
+	if h.pool.IsDraining() {
+		return nil, status.Error(codes.Unavailable, "worker is draining")
+	}
 
 	handleID := string(cmd.GetPreparedStatementHandle())
 	session.mu.RLock()
@@ -754,11 +837,19 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 	if err != nil {
 		return nil, nil, err
 	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return nil, nil, drainErr
+	}
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "start prepared query drain tracking: %v", err)
+	}
 
 	session.mu.RLock()
 	handle, ok := session.queries[string(cmd.GetPreparedStatementHandle())]
 	session.mu.RUnlock()
 	if !ok {
+		finishDrain()
 		return nil, nil, status.Error(codes.NotFound, "prepared statement not found")
 	}
 
@@ -768,6 +859,7 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 		ttx := session.txns[handle.TxnID]
 		session.mu.RUnlock()
 		if ttx == nil || ttx.tx == nil {
+			finishDrain()
 			return nil, nil, status.Error(codes.NotFound, "transaction not found")
 		}
 		ttx.lastUsed.Store(time.Now().UnixNano())
@@ -780,12 +872,14 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 
 	// Empty queries have no rows to fetch — return an empty stream immediately.
 	if isEmptyFlightQuery(handle.Query) {
+		finishDrain()
 		close(ch)
 		return schema, ch, nil
 	}
 
 	go func() {
 		defer close(ch)
+		defer finishDrain()
 		session.progress.queryActive.Store(true)
 		defer session.progress.queryActive.Store(false)
 		var rows *sql.Rows
@@ -826,6 +920,9 @@ func (h *FlightSQLHandler) GetFlightInfoSchemas(ctx context.Context, cmd flights
 	if err != nil {
 		return nil, err
 	}
+	if h.pool.IsDraining() {
+		return nil, status.Error(codes.Unavailable, "worker is draining")
+	}
 
 	return &flight.FlightInfo{
 		Schema:           flight.SerializeSchema(schema_ref.DBSchemas, h.alloc),
@@ -844,6 +941,13 @@ func (h *FlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd flightsql.Get
 	session, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, nil, err
+	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return nil, nil, drainErr
+	}
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "start schema metadata drain tracking: %v", err)
 	}
 
 	schema := schema_ref.DBSchemas
@@ -865,6 +969,7 @@ func (h *FlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd flightsql.Get
 	ch := make(chan flight.StreamChunk, 1)
 	go func() {
 		defer close(ch)
+		defer finishDrain()
 		var rows *sql.Rows
 		var qerr error
 		if activeTx != nil {
@@ -920,6 +1025,9 @@ func (h *FlightSQLHandler) GetFlightInfoTables(ctx context.Context, cmd flightsq
 	if err != nil {
 		return nil, err
 	}
+	if h.pool.IsDraining() {
+		return nil, status.Error(codes.Unavailable, "worker is draining")
+	}
 
 	schema := schema_ref.Tables
 	if cmd.GetIncludeSchema() {
@@ -943,6 +1051,13 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 	session, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, nil, err
+	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return nil, nil, drainErr
+	}
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "start table metadata drain tracking: %v", err)
 	}
 
 	schema := schema_ref.Tables
@@ -982,6 +1097,7 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 	ch := make(chan flight.StreamChunk, 1)
 	go func() {
 		defer close(ch)
+		defer finishDrain()
 		var rows *sql.Rows
 		var qerr error
 		if activeTx != nil {

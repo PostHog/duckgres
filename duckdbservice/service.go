@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -32,6 +33,8 @@ import (
 
 var bootstrapBundledExtensions = server.BootstrapBundledExtensions
 var exitProcess = os.Exit
+
+var ErrWorkerDraining = errors.New("worker is draining")
 
 // DuckDBService is a standalone Arrow Flight SQL service backed by DuckDB.
 type DuckDBService struct {
@@ -87,6 +90,12 @@ type SessionPool struct {
 	// DuckLake stays fresh. Defaults to server.RefreshIcebergSecret;
 	// stubbed by tests the same way refreshS3Secret is.
 	refreshIcebergSecret func(*sql.DB, server.IcebergConfig, chan struct{}, string, string, string) error
+
+	drainMu       sync.Mutex
+	draining      bool
+	activeWork    int
+	drainZero     chan struct{}
+	drainZeroOpen bool
 }
 
 type trackedTx struct {
@@ -124,9 +133,10 @@ type Session struct {
 
 // QueryHandle stores a prepared or ad-hoc query for later execution.
 type QueryHandle struct {
-	Query  string
-	Schema *arrow.Schema
-	TxnID  string
+	Query       string
+	Schema      *arrow.Schema
+	TxnID       string
+	finishDrain func()
 }
 
 // NewDuckDBService creates a new DuckDB service with the given config.
@@ -145,6 +155,8 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		activateDBConnection: server.ActivateDBConnection,
 		refreshS3Secret:      server.RefreshS3Secret,
 		refreshIcebergSecret: server.RefreshIcebergSecret,
+		drainZero:            make(chan struct{}),
+		drainZeroOpen:        true,
 	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
@@ -243,6 +255,7 @@ const (
 	txnIdleTimeout          = 10 * time.Minute
 	reapInterval            = 1 * time.Minute
 	metadataMetricsInterval = 30 * time.Second
+	workerShutdownDrainTime = 55 * time.Minute
 )
 
 func (p *SessionPool) reapLoop() {
@@ -425,6 +438,13 @@ func Run(cfg ServiceConfig) {
 
 	go func() {
 		<-sigChan
+		slog.Info("Draining DuckDB service before shutdown...")
+		svc.BeginDrain()
+		ctx, cancel := context.WithTimeout(context.Background(), workerShutdownDrainTime)
+		if !svc.WaitForDrain(ctx) {
+			slog.Warn("DuckDB service drain timed out before shutdown.", "timeout", workerShutdownDrainTime)
+		}
+		cancel()
 		slog.Info("Shutting down DuckDB service...")
 		svc.Shutdown()
 		os.Exit(0)
@@ -484,9 +504,28 @@ func (svc *DuckDBService) Shutdown() {
 	svc.pool.CloseAll()
 }
 
+func (svc *DuckDBService) BeginDrain() {
+	if svc.pool != nil {
+		svc.pool.BeginDrain()
+	}
+}
+
+func (svc *DuckDBService) WaitForDrain(ctx context.Context) bool {
+	if svc.pool == nil {
+		return true
+	}
+	return svc.pool.WaitForDrain(ctx)
+}
+
 // CreateSession creates a new DuckDB session for the given username.
 func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (*Session, error) {
 	start := time.Now()
+	finishDrain, drainErr := p.beginDrainWork(false)
+	if drainErr != nil {
+		return nil, drainErr
+	}
+	defer finishDrain()
+
 	// Reserve a slot under the lock to prevent TOCTOU race on maxSessions.
 	p.mu.Lock()
 	if p.maxSessions > 0 && len(p.sessions)+p.reserved >= p.maxSessions {
@@ -762,6 +801,83 @@ func (p *SessionPool) ActiveSessions() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.sessions)
+}
+
+func (p *SessionPool) BeginDrain() {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	p.ensureDrainChannelLocked()
+	p.draining = true
+	if p.activeWork == 0 && p.drainZeroOpen {
+		close(p.drainZero)
+		p.drainZeroOpen = false
+	}
+}
+
+func (p *SessionPool) IsDraining() bool {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	return p.draining
+}
+
+func (p *SessionPool) ActiveDrainWork() int {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	return p.activeWork
+}
+
+func (p *SessionPool) WaitForDrain(ctx context.Context) bool {
+	p.drainMu.Lock()
+	p.ensureDrainChannelLocked()
+	if p.activeWork == 0 {
+		p.drainMu.Unlock()
+		return true
+	}
+	ch := p.drainZero
+	p.drainMu.Unlock()
+
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (p *SessionPool) beginDrainWork(allowWhenDraining bool) (func(), error) {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	p.ensureDrainChannelLocked()
+	if p.draining && !allowWhenDraining {
+		return nil, ErrWorkerDraining
+	}
+	if !p.drainZeroOpen {
+		p.drainZero = make(chan struct{})
+		p.drainZeroOpen = true
+	}
+	p.activeWork++
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.drainMu.Lock()
+			defer p.drainMu.Unlock()
+			if p.activeWork > 0 {
+				p.activeWork--
+			}
+			if p.draining && p.activeWork == 0 && p.drainZeroOpen {
+				close(p.drainZero)
+				p.drainZeroOpen = false
+			}
+		})
+	}, nil
+}
+
+func (p *SessionPool) ensureDrainChannelLocked() {
+	if p.drainZero == nil {
+		p.drainZero = make(chan struct{})
+		p.drainZeroOpen = true
+	}
 }
 
 // CloseAll closes all sessions.

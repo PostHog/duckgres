@@ -108,6 +108,37 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 	}
 }
 
+func TestHealthCheckReportsDraining(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+	}
+	close(pool.warmupDone)
+	pool.BeginDrain()
+
+	handler := &FlightSQLHandler{pool: pool}
+	stream := &mockDoActionStream{}
+
+	if err := handler.doHealthCheck([]byte(`{}`), stream); err != nil {
+		t.Fatalf("health check returned error: %v", err)
+	}
+	if len(stream.results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(stream.results))
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(stream.results[0].Body, &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp["healthy"] != true {
+		t.Errorf("expected healthy=true, got %v", resp["healthy"])
+	}
+	if resp["draining"] != true {
+		t.Errorf("expected draining=true, got %v", resp["draining"])
+	}
+}
+
 func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
 		sessions:          make(map[string]*Session),
@@ -130,6 +161,33 @@ func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	err := handler.doHealthCheck([]byte(`{}`), stream)
 	if err != nil {
 		t.Fatalf("health check should succeed regardless of epoch mismatch, got %v", err)
+	}
+}
+
+func TestCreateSessionRejectsWhileDraining(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+		cfg:         server.Config{Users: map[string]string{"alice": "pass"}},
+	}
+	close(pool.warmupDone)
+	pool.BeginDrain()
+
+	handler := &FlightSQLHandler{pool: pool}
+	stream := &mockDoActionStream{}
+
+	body, err := json.Marshal(server.WorkerCreateSessionPayload{
+		Username: "alice",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	err = handler.doCreateSession(body, stream)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable while draining, got %v", err)
 	}
 }
 

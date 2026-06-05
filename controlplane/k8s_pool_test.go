@@ -15,6 +15,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -3172,6 +3173,151 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 	}
 }
 
+func TestK8sPoolHealthCheckLoopMarksDrainingWorkerUnschedulable(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateIdle,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleIdle}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	origHealthCheck := doHealthCheckWithMetadata
+	doHealthCheckWithMetadata = func(context.Context, *flightsql.Client, server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+		return &healthCheckResult{Healthy: true, Draining: true}, nil
+	}
+	t.Cleanup(func() { doHealthCheckWithMetadata = origHealthCheck })
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	deadline := time.After(time.Second)
+	for {
+		pool.mu.RLock()
+		state := worker.SharedState().NormalizedLifecycle()
+		schedulable := pool.isGenericSessionSchedulableWorkerLocked(worker)
+		pool.mu.RUnlock()
+		if state == WorkerLifecycleDraining {
+			if schedulable {
+				t.Fatal("draining worker must not remain schedulable")
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected draining health response to mark worker draining, got %q", state)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("draining worker must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	store.mu.Lock()
+	markLostCalls := store.markLostCalls
+	markDrainingCalls := store.markDrainingCalls
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markLostCalls != 0 {
+		t.Fatalf("draining worker must not be marked lost, got %d lost calls", markLostCalls)
+	}
+	if markDrainingCalls != 1 {
+		t.Fatalf("expected one draining CAS, got %d", markDrainingCalls)
+	}
+	if recordState != configstore.WorkerStateDraining {
+		t.Fatalf("expected durable worker state draining, got %q", recordState)
+	}
+}
+
+func TestK8sPoolHealthCheckLoopRetiresDrainingWorkerAfterPodExit(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateDraining,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+	close(worker.done)
+
+	deadline := time.After(time.Second)
+	for {
+		pool.mu.RLock()
+		_, stillPresent := pool.workers[worker.ID]
+		pool.mu.RUnlock()
+		if !stillPresent {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected drained pod exit to remove local worker")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("drained pod exit must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	store.mu.Lock()
+	markLostCalls := store.markLostCalls
+	retireDrainingCalls := store.retireDrainingCalls
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markLostCalls != 0 {
+		t.Fatalf("drained pod exit must not mark worker lost, got %d lost calls", markLostCalls)
+	}
+	if retireDrainingCalls != 1 {
+		t.Fatalf("expected one retire-draining CAS, got %d", retireDrainingCalls)
+	}
+	if recordState != configstore.WorkerStateRetired {
+		t.Fatalf("expected durable worker state retired, got %q", recordState)
+	}
+}
+
 func TestK8sPoolMarkWorkerLostIfCurrentLeaseAllowsUnstampedLocalWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{
@@ -3550,6 +3696,9 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	}
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
 		t.Fatal("expected automountServiceAccountToken=false for shared warm worker pods")
+	}
+	if pod.Spec.TerminationGracePeriodSeconds == nil || *pod.Spec.TerminationGracePeriodSeconds != workerTerminationGracePeriodSeconds {
+		t.Fatalf("expected terminationGracePeriodSeconds=%d, got %v", workerTerminationGracePeriodSeconds, pod.Spec.TerminationGracePeriodSeconds)
 	}
 
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {

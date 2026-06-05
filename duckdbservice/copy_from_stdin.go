@@ -48,6 +48,14 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	if err != nil {
 		return err
 	}
+	finishDrain, err := h.pool.beginDrainWork(false)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return drainErr
+	}
+	if err != nil {
+		return status.Errorf(codes.Internal, "copy-from-stdin: start drain tracking: %v", err)
+	}
+	defer finishDrain()
 
 	desc := first.GetFlightDescriptor()
 	if desc == nil || len(desc.Cmd) == 0 {

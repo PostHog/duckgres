@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"testing"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -300,4 +301,42 @@ func TestRunExitsWhenBundledExtensionBootstrapFails(t *testing.T) {
 
 	Run(ServiceConfig{})
 	t.Fatal("expected Run to exit")
+}
+
+func TestSessionPoolDrainWaitsForActiveWorkAndRejectsNewWork(t *testing.T) {
+	pool := &SessionPool{}
+
+	finish, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin tracked work: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("expected one active drain work item, got %d", got)
+	}
+
+	pool.BeginDrain()
+	if !pool.IsDraining() {
+		t.Fatal("expected pool to be draining")
+	}
+
+	if _, err := pool.beginDrainWork(false); !errors.Is(err, ErrWorkerDraining) {
+		t.Fatalf("expected new work to be rejected while draining, got %v", err)
+	}
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("expected drain wait to time out while active work is still running")
+	}
+
+	finish()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected drain wait to complete after active work finishes")
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("expected no active drain work, got %d", got)
+	}
 }
