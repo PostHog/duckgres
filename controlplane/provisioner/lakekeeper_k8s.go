@@ -32,6 +32,20 @@ func isValidOrgIDLabel(orgID string) bool {
 // by default but we co-locate the CRs to keep RBAC tight.
 const LakekeeperNamespace = "lakekeeper"
 
+// Per-org Lakekeeper pod resource shape. Requests == limits → Guaranteed QoS.
+// Lakekeeper is a light Rust REST catalog (mostly idle metadata ops), so a
+// modest fixed shape is plenty; bump these if a tenant needs more headroom.
+const (
+	lakekeeperPodCPU    = "500m"
+	lakekeeperPodMemory = "512Mi"
+)
+
+// lakekeeperMetricsPort is the operator's default metrics container port
+// (lakekeeper-operator getMetricsPort default). We don't set
+// spec.server.metricsPort, so this is where the metrics endpoint listens and
+// the value advertised to vmagent via the prometheus.io/port pod annotation.
+const lakekeeperMetricsPort = "9000"
+
 // lakekeeperGVR matches the operator at /Users/james/opt/ph/lakekeeper-operator.
 var lakekeeperGVR = schema.GroupVersionResource{
 	Group:    "lakekeeper.k8s.lakekeeper.io",
@@ -325,6 +339,39 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 							"allowDirectSystemCredentials": true,
 							"assumeRoleRequireExternalID":  false,
 						},
+					},
+				},
+				// Pin a fixed pod shape with requests == limits → Guaranteed QoS.
+				// The managed-warehouse clusters require it; an unbounded catalog
+				// pod runs BestEffort and is first evicted under node pressure.
+				// Lakekeeper is a light Rust REST catalog, so a modest shape is
+				// plenty — tune the consts if a tenant needs more.
+				"resources": map[string]interface{}{
+					"requests": map[string]interface{}{
+						"cpu":    lakekeeperPodCPU,
+						"memory": lakekeeperPodMemory,
+					},
+					"limits": map[string]interface{}{
+						"cpu":    lakekeeperPodCPU,
+						"memory": lakekeeperPodMemory,
+					},
+				},
+				// Stamp Prometheus scrape annotations onto the operator-managed
+				// pods. The managed-warehouse clusters have no prometheus-operator;
+				// vmagent discovers targets by pod annotation (kubernetes_sd), and
+				// the Lakekeeper CRD exposes no other pod-metadata hook — so without
+				// this the per-org catalog pods are never scraped. Lakekeeper serves
+				// metrics on the operator's "metrics" container port (its
+				// getMetricsPort default = lakekeeperMetricsPort). Requires the
+				// spec.podMetadata passthrough from PostHog's operator fork (branch
+				// posthog/serviceaccountname); on an operator without it the CRD
+				// prunes the field and these annotations are dropped — a safe no-op
+				// until the new operator image ships.
+				"podMetadata": map[string]interface{}{
+					"annotations": map[string]interface{}{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/port":   lakekeeperMetricsPort,
+						"prometheus.io/path":   "/metrics",
 					},
 				},
 			},
