@@ -233,23 +233,7 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	}
 
 	// 3. Apply the Lakekeeper CR pointing at the org's PG + the Secret.
-	pgPort := in.PGPort
-	if pgPort == 0 {
-		pgPort = 5432
-	}
-	if err := p.k8s.EnsureCR(ctx, LakekeeperCRSpec{
-		OrgID:                   w.OrgID,
-		Image:                   p.image,
-		Replicas:                1,
-		PGHost:                  in.PGHost,
-		PGPort:                  pgPort,
-		PGDatabase:              dbName,
-		SecretName:              secretName,
-		BaseURI:                 baseURL,
-		PGSSLMode:               in.PGSSLMode,
-		ServiceAccountName:      LakekeeperServiceAccountName(w.OrgID),
-		KubernetesAuthAudiences: in.KubernetesAuthAudiences,
-	}); err != nil {
+	if err := p.k8s.EnsureCR(ctx, p.buildCRSpec(w, in)); err != nil {
 		return fmt.Errorf("ensure lakekeeper cr: %w", err)
 	}
 
@@ -333,6 +317,54 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		return fmt.Errorf("persist lakekeeper config: %w", err)
 	}
 	return nil
+}
+
+// buildCRSpec assembles the desired Lakekeeper CR spec for an org. Shared by
+// EnsureForOrg (initial provisioning) and EnsureCRSpec (drift correction) so the
+// two never diverge — every field the operator renders into the Deployment is
+// defined in exactly one place.
+func (p *LakekeeperProvisioner) buildCRSpec(w *configstore.ManagedWarehouse, in ProvisioningInputs) LakekeeperCRSpec {
+	dbName := lakekeeperDBName(w.OrgID)
+	if in.PGPreProvisioned {
+		dbName = in.PGDatabase
+	}
+	pgPort := in.PGPort
+	if pgPort == 0 {
+		pgPort = 5432
+	}
+	resourceName := LakekeeperResourceName(w.OrgID)
+	return LakekeeperCRSpec{
+		OrgID:                   w.OrgID,
+		Image:                   p.image,
+		Replicas:                1,
+		PGHost:                  in.PGHost,
+		PGPort:                  pgPort,
+		PGDatabase:              dbName,
+		SecretName:              resourceName,
+		BaseURI:                 fmt.Sprintf("http://%s.%s.svc:8181", resourceName, p.k8s.namespace),
+		PGSSLMode:               in.PGSSLMode,
+		ServiceAccountName:      LakekeeperServiceAccountName(w.OrgID),
+		KubernetesAuthAudiences: in.KubernetesAuthAudiences,
+	}
+}
+
+// EnsureCRSpec re-applies only the Lakekeeper CR spec for an org, skipping the
+// database / Secret / REST-warehouse pipeline. It's the drift-correction path
+// for already-provisioned orgs: when the desired CR shape changes (resources,
+// podMetadata, image, ...), the controller's Ready loop calls this so existing
+// CRs converge without re-running full provisioning. Idempotent — EnsureCR does
+// create-or-update and preserves the operator-owned status. Field validation is
+// delegated to EnsureCR (OrgID/Image/PGHost/PGDatabase/SecretName required), so
+// a momentarily-incomplete inputs resolution surfaces as a logged error and a
+// skipped tick rather than a partial write.
+func (p *LakekeeperProvisioner) EnsureCRSpec(ctx context.Context, w *configstore.ManagedWarehouse, in ProvisioningInputs) error {
+	if w == nil {
+		return errors.New("EnsureCRSpec: warehouse is nil")
+	}
+	if !isValidOrgIDLabel(w.OrgID) {
+		return fmt.Errorf("EnsureCRSpec: orgID %q is not a valid K8s label value", w.OrgID)
+	}
+	return p.k8s.EnsureCR(ctx, p.buildCRSpec(w, in))
 }
 
 // DeleteForOrg tears down the per-org Lakekeeper instance that EnsureForOrg
