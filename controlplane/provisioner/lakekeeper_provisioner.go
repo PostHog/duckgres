@@ -319,10 +319,10 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	return nil
 }
 
-// buildCRSpec assembles the desired Lakekeeper CR spec for an org. Shared by
-// EnsureForOrg (initial provisioning) and EnsureCRSpec (drift correction) so the
-// two never diverge — every field the operator renders into the Deployment is
-// defined in exactly one place.
+// buildCRSpec assembles the desired Lakekeeper CR spec for an org, used by
+// EnsureForOrg on initial provisioning. (Drift correction for already-
+// provisioned orgs goes through PatchPodShape, which patches the live CR by
+// label rather than rebuilding the whole spec under a recomputed name.)
 func (p *LakekeeperProvisioner) buildCRSpec(w *configstore.ManagedWarehouse, in ProvisioningInputs) LakekeeperCRSpec {
 	dbName := lakekeeperDBName(w.OrgID)
 	if in.PGPreProvisioned {
@@ -336,7 +336,7 @@ func (p *LakekeeperProvisioner) buildCRSpec(w *configstore.ManagedWarehouse, in 
 	return LakekeeperCRSpec{
 		OrgID:                   w.OrgID,
 		Image:                   p.image,
-		Replicas:                1,
+		Replicas:                lakekeeperPodReplicas,
 		PGHost:                  in.PGHost,
 		PGPort:                  pgPort,
 		PGDatabase:              dbName,
@@ -348,23 +348,18 @@ func (p *LakekeeperProvisioner) buildCRSpec(w *configstore.ManagedWarehouse, in 
 	}
 }
 
-// EnsureCRSpec re-applies only the Lakekeeper CR spec for an org, skipping the
-// database / Secret / REST-warehouse pipeline. It's the drift-correction path
-// for already-provisioned orgs: when the desired CR shape changes (resources,
-// podMetadata, image, ...), the controller's Ready loop calls this so existing
-// CRs converge without re-running full provisioning. Idempotent — EnsureCR does
-// create-or-update and preserves the operator-owned status. Field validation is
-// delegated to EnsureCR (OrgID/Image/PGHost/PGDatabase/SecretName required), so
-// a momentarily-incomplete inputs resolution surfaces as a logged error and a
-// skipped tick rather than a partial write.
-func (p *LakekeeperProvisioner) EnsureCRSpec(ctx context.Context, w *configstore.ManagedWarehouse, in ProvisioningInputs) error {
-	if w == nil {
-		return errors.New("EnsureCRSpec: warehouse is nil")
-	}
-	if !isValidOrgIDLabel(w.OrgID) {
-		return fmt.Errorf("EnsureCRSpec: orgID %q is not a valid K8s label value", w.OrgID)
-	}
-	return p.k8s.EnsureCR(ctx, p.buildCRSpec(w, in))
+// PatchPodShape is the drift-correction path for already-provisioned orgs: it
+// converges the pod-shape fields (replicas + resource requests + scrape
+// annotations) onto the org's existing Lakekeeper CR(s) without re-running the
+// database / Secret / REST-warehouse pipeline and without resolving inputs.
+//
+// It matches CRs by the duckgres/active-org label rather than recomputing the
+// name, so it patches whatever CR actually exists — important because a legacy
+// org's CR keeps the de-hyphenated name (derived from the no-hyphen Duckling XR)
+// while LakekeeperResourceName now preserves hyphens. See
+// LakekeeperK8sClient.PatchPodShape for the merge-patch (conflict-free) details.
+func (p *LakekeeperProvisioner) PatchPodShape(ctx context.Context, orgID string) error {
+	return p.k8s.PatchPodShape(ctx, orgID)
 }
 
 // DeleteForOrg tears down the per-org Lakekeeper instance that EnsureForOrg
