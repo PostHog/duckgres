@@ -96,6 +96,42 @@ func TestHandleDescribePortalUsesLimitZeroProbe(t *testing.T) {
 	}
 }
 
+func TestHandleDescribeExplainDoesNotExecute(t *testing.T) {
+	// Describing an EXPLAIN [ANALYZE] must NOT execute a probe query — for
+	// EXPLAIN ANALYZE of a write that would mutate, then Execute mutates again.
+	for _, tc := range []struct {
+		name    string
+		query   string
+		wantCol string
+	}{
+		{"statement explain", "EXPLAIN SELECT 1", "physical_plan"},
+		{"portal explain analyze", "EXPLAIN ANALYZE INSERT INTO t VALUES (1)", "analyzed_plan"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &describeRecordingExecutor{}
+			var out bytes.Buffer
+			c := &clientConn{
+				executor: exec,
+				writer:   bufio.NewWriter(&out),
+				stmts: map[string]*preparedStmt{
+					"s1": {query: tc.query, convertedQuery: tc.query},
+				},
+				portals: map[string]*portal{
+					"p1": {stmt: &preparedStmt{query: tc.query, convertedQuery: tc.query}},
+				},
+				cursors: map[string]*cursorState{},
+			}
+
+			c.handleDescribe([]byte{'S', 's', '1', 0})
+			c.handleDescribe([]byte{'P', 'p', '1', 0})
+
+			if len(exec.queries) != 0 {
+				t.Fatalf("EXPLAIN describe executed probe queries: %v", exec.queries)
+			}
+		})
+	}
+}
+
 func TestHandleDescribePortalPreservesExistingLimit(t *testing.T) {
 	exec := &describeRecordingExecutor{
 		rowSet: &describeStaticRowSet{

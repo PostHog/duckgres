@@ -34,6 +34,7 @@ const (
 	FlagCtid                                         // ctid -> rowid mapping
 	FlagDDL                                          // DDL constraint stripping
 	FlagPlaceholder                                  // $1/$2 placeholder conversion
+	FlagLiterals                                     // bytea hex / bit-string literal rewrites
 	flagSentinel                                     // must be last — used to derive FlagAll
 
 	FlagAll TransformFlags = flagSentinel - 1 // All flags set
@@ -96,6 +97,10 @@ func New(cfg Config) *Transpiler {
 
 	// 3.2 Map logical database catalog references to the physical backend catalog
 	t.transforms = append(t.transforms, taggedTransform{FlagLogicalCatalog, transform.NewLogicalCatalogTransform(cfg.LogicalDatabaseName, catalogPolicy.PhysicalName, catalogPolicy.MapPublicToMain)})
+
+	// 3.3 Literal rewrites (bytea \x hex, bit-string B'..') — MUST run before
+	// TypeMapping so it still sees the `bytea` type name.
+	t.transforms = append(t.transforms, taggedTransform{FlagLiterals, transform.NewLiteralTransform()})
 
 	// 4. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagTypeMapping, transform.NewTypeMappingTransform()})
@@ -265,6 +270,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
 				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
 				ParamCount:        transformResult.ParamCount,
+				Warnings:          transformResult.Warnings,
 			}, nil
 		}
 
@@ -277,6 +283,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				IsNoOp:       transformResult.IsNoOp,
 				NoOpTag:      transformResult.NoOpTag,
 				IsIgnoredSet: transformResult.IsIgnoredSet,
+				Warnings:     transformResult.Warnings,
 			}, nil
 		}
 
@@ -293,6 +300,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 			IsNoOp:       transformResult.IsNoOp,
 			NoOpTag:      transformResult.NoOpTag,
 			IsIgnoredSet: transformResult.IsIgnoredSet,
+			Warnings:     transformResult.Warnings,
 		}, nil
 	}
 
@@ -309,6 +317,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 		IsNoOp:       transformResult.IsNoOp,
 		NoOpTag:      transformResult.NoOpTag,
 		IsIgnoredSet: transformResult.IsIgnoredSet,
+		Warnings:     transformResult.Warnings,
 	}, nil
 }
 
@@ -395,6 +404,14 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagTypeMapping
 	}
 
+	// Literal rewrites: bytea \x hex literals and B'..' bit-string literals.
+	// Over-triggering is safe — LiteralTransform is a no-op when nothing matches —
+	// but we must not match B' inside an identifier (e.g. "my.db'") or it would
+	// pull plain DuckDB statements out of the Tier-0 direct path.
+	if strings.Contains(upper, `'\X`) || containsBitStringLiteral(upper) {
+		flags |= FlagLiterals
+	}
+
 	// Type casts that need rewriting
 	if containsAny(upper, "::REGTYPE", "::REGCLASS", "::REGNAMESPACE", "::REGPROC", "::OID") {
 		flags |= FlagTypeCast
@@ -458,7 +475,7 @@ func Classify(sql string, cfg Config) Classification {
 	// This is acceptable: false positive just runs the operator transform (cheap),
 	// while a false negative would break PostgreSQL regex queries that DuckDB
 	// handles via regexp_matches rewrite.
-	if containsAny(upper, "->", "~") {
+	if containsAny(upper, "->", "~", "||") {
 		flags |= FlagOperators
 	}
 	// Also check for SIMILAR TO which gets transformed through operators
@@ -564,6 +581,27 @@ func containsAny(s string, substrs ...string) bool {
 		}
 	}
 	return false
+}
+
+// containsBitStringLiteral reports whether the (upper-cased) SQL contains a
+// bit-string literal B'..'. The B must be a standalone token (not preceded by an
+// identifier character) so it doesn't match B' inside names like "my.db'".
+func containsBitStringLiteral(upper string) bool {
+	for i := 0; i+1 < len(upper); i++ {
+		if upper[i] == 'B' && upper[i+1] == '\'' {
+			if i == 0 || !isIdentChar(upper[i-1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isIdentChar(b byte) bool {
+	return b == '_' ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9')
 }
 
 // hasAnyPrefix returns true if s starts with any of the given prefixes.

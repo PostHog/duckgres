@@ -36,6 +36,18 @@ type DDLPolicy struct {
 	UnsupportedDDL        UnsupportedDDLHandling
 	RewriteCascadeDrop    bool
 	SplitMultiAlter       bool
+
+	// WarnOnStrippedConstraints emits a NoticeResponse (WARNING) when an
+	// unenforceable constraint (PK/UNIQUE/CHECK/FK/EXCLUSION) is stripped, so
+	// the client knows the constraint is accepted-but-not-enforced rather than
+	// silently dropped.
+	WarnOnStrippedConstraints bool
+
+	// ErrorOnSilentNullDefaults rejects (rather than silently stripping) the DDL
+	// features that otherwise produce silently-NULL data on a lake catalog:
+	// SERIAL/BIGSERIAL, GENERATED ... STORED, and non-literal DEFAULT expressions
+	// (including DEFAULT now()/CURRENT_TIMESTAMP and DEFAULT true/false).
+	ErrorOnSilentNullDefaults bool
 }
 
 func (p DDLPolicy) NeedsTransform() bool {
@@ -44,7 +56,9 @@ func (p DDLPolicy) NeedsTransform() bool {
 		p.StripVolatileDefaults ||
 		p.UnsupportedDDL == NoOpUnsupportedDDL ||
 		p.RewriteCascadeDrop ||
-		p.SplitMultiAlter
+		p.SplitMultiAlter ||
+		p.WarnOnStrippedConstraints ||
+		p.ErrorOnSilentNullDefaults
 }
 
 type DMLPolicy struct {
@@ -86,9 +100,13 @@ func (p Profile) Metadata() MetadataPolicy {
 func ForName(name Name) Profile {
 	switch name {
 	case DuckLake:
-		return lakeProfile(DuckLake, "ducklake", true)
+		// DuckLake keeps the historical silent-strip behavior (sqlmesh/dbt issue
+		// PK/serial/DEFAULT now() DDL and rely on it succeeding).
+		return lakeProfile(DuckLake, "ducklake", true, false)
 	case Iceberg:
-		return lakeProfile(Iceberg, "iceberg", false)
+		// Iceberg surfaces the dropped Postgres semantics: WARNING for unenforced
+		// constraints, ERROR for silently-NULL data features.
+		return lakeProfile(Iceberg, "iceberg", false, true)
 	default:
 		return Profile{
 			name:    Memory,
@@ -102,7 +120,7 @@ func ForName(name Name) Profile {
 	}
 }
 
-func lakeProfile(name Name, physical string, mapPublicToMain bool) Profile {
+func lakeProfile(name Name, physical string, mapPublicToMain, hybridDDLGuards bool) Profile {
 	return Profile{
 		name: name,
 		catalog: CatalogPolicy{
@@ -111,12 +129,14 @@ func lakeProfile(name Name, physical string, mapPublicToMain bool) Profile {
 			QualifyMacros:   true,
 		},
 		ddl: DDLPolicy{
-			ConstraintHandling:    StripConstraints,
-			RewriteSerial:         true,
-			StripVolatileDefaults: true,
-			UnsupportedDDL:        NoOpUnsupportedDDL,
-			RewriteCascadeDrop:    true,
-			SplitMultiAlter:       true,
+			ConstraintHandling:        StripConstraints,
+			RewriteSerial:             true,
+			StripVolatileDefaults:     true,
+			UnsupportedDDL:            NoOpUnsupportedDDL,
+			RewriteCascadeDrop:        true,
+			SplitMultiAlter:           true,
+			WarnOnStrippedConstraints: hybridDDLGuards,
+			ErrorOnSilentNullDefaults: hybridDDLGuards,
 		},
 		dml:      DMLPolicy{ConflictHandling: RewriteToMerge},
 		metadata: MetadataPolicy{InterceptShowCreate: true},

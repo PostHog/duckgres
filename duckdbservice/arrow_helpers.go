@@ -76,6 +76,24 @@ type contextQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// isExplainQuery reports whether the (already upper-cased) query is an EXPLAIN
+// statement, i.e. starts with the EXPLAIN keyword followed by a delimiter.
+func isExplainQuery(upper string) bool {
+	s := strings.TrimSpace(upper)
+	const kw = "EXPLAIN"
+	if !strings.HasPrefix(s, kw) {
+		return false
+	}
+	if len(s) == len(kw) {
+		return true
+	}
+	switch s[len(kw)] {
+	case ' ', '\t', '\n', '\r', '(':
+		return true
+	}
+	return false
+}
+
 func isNil(i contextQueryer) bool {
 	if i == nil {
 		return true
@@ -89,6 +107,20 @@ func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx con
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
 	queryWithLimit := q
 	upper := strings.ToUpper(q)
+	// EXPLAIN [ANALYZE] returns a fixed single-column textual plan. We must NOT
+	// execute it to discover its schema: EXPLAIN ANALYZE runs the statement to
+	// gather statistics, so executing it here as a schema probe would run (and,
+	// for a write, mutate) the statement a second time on top of the real DoGet
+	// execution. Return a synthetic schema without executing.
+	if isExplainQuery(upper) {
+		name := "physical_plan"
+		if strings.Contains(upper, "ANALYZE") {
+			name = "analyzed_plan"
+		}
+		return arrow.NewSchema([]arrow.Field{
+			{Name: name, Type: arrowmap.DuckDBTypeToArrow("VARCHAR"), Nullable: true},
+		}, nil), nil
+	}
 	// Only append LIMIT 0 for SELECT/WITH/VALUES/TABLE statements.
 	// SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. don't support LIMIT.
 	if !strings.Contains(upper, "LIMIT") && arrowmap.SupportsLimit(upper) {

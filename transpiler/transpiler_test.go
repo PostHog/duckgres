@@ -369,20 +369,34 @@ func TestTranspile_PublicSchema_Iceberg(t *testing.T) {
 }
 
 func TestTranspile_DDL_Iceberg(t *testing.T) {
-	// The Iceberg backend uses the same DDL policy as DuckLake: strip enforced
-	// constraints, rewrite SERIAL, no-op unsupported DDL.
+	// The Iceberg backend strips unenforceable constraints (with a WARNING) and
+	// no-ops unsupported DDL, but ERRORs on silently-NULL data features (SERIAL,
+	// GENERATED STORED, DEFAULT <expr>).
 	tr := New(Config{Backend: BackendIceberg})
 
-	t.Run("strip PRIMARY KEY and convert SERIAL", func(t *testing.T) {
-		result, err := tr.Transpile("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)")
+	t.Run("strip PRIMARY KEY with a warning", func(t *testing.T) {
+		result, err := tr.Transpile("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
 		if err != nil {
 			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.Error != nil {
+			t.Fatalf("expected no error, got %v", result.Error)
 		}
 		if strings.Contains(strings.ToUpper(result.SQL), "PRIMARY KEY") {
 			t.Errorf("PRIMARY KEY not stripped: %q", result.SQL)
 		}
-		if strings.Contains(strings.ToUpper(result.SQL), "SERIAL") {
-			t.Errorf("SERIAL not converted: %q", result.SQL)
+		if len(result.Warnings) == 0 {
+			t.Errorf("expected a PRIMARY KEY warning, got none")
+		}
+	})
+
+	t.Run("SERIAL is rejected", func(t *testing.T) {
+		result, err := tr.Transpile("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.Error == nil {
+			t.Errorf("expected SERIAL to be rejected, got SQL=%q", result.SQL)
 		}
 	})
 

@@ -1,6 +1,8 @@
 package transform
 
 import (
+	"strings"
+
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
@@ -288,6 +290,14 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, false)
 		case "->>":
 			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, true)
+		// jsonb || jsonb is an object merge in Postgres, but DuckDB treats || as
+		// string concatenation, silently producing invalid JSON. Rewrite to
+		// json_merge_patch only when an operand is clearly JSON; otherwise leave
+		// || alone (string/array concat is the safe default).
+		case "||":
+			if looksJSON(aexpr.Lexpr) || looksJSON(aexpr.Rexpr) {
+				return t.createJSONMergeFuncCall(aexpr.Lexpr, aexpr.Rexpr)
+			}
 		// Regex operators — only match binary ~ (both operands present).
 		// Unary ~ (bitwise NOT, e.g. ~id) has Lexpr=nil and must be left as-is;
 		// DuckDB supports ~ as bitwise NOT natively. Passing nil into
@@ -489,6 +499,55 @@ func (t *OperatorTransform) createJsonExtractFuncCall(left, right *pg_query.Node
 			FuncCall: &pg_query.FuncCall{
 				Funcname: []*pg_query.Node{
 					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: funcName}}},
+				},
+				Args: []*pg_query.Node{left, right},
+			},
+		},
+	}
+}
+
+// looksJSON reports whether a node is syntactically JSON: a cast to json/jsonb,
+// or a json* function call (including the json_extract calls this transform
+// produces from -> / ->>). Used to gate the || -> json_merge_patch rewrite so
+// genuine string/array concatenation is left untouched.
+func looksJSON(node *pg_query.Node) bool {
+	if node == nil {
+		return false
+	}
+	if tc := node.GetTypeCast(); tc != nil && tc.TypeName != nil && len(tc.TypeName.Names) > 0 {
+		if last := tc.TypeName.Names[len(tc.TypeName.Names)-1].GetString_(); last != nil {
+			switch strings.ToLower(last.Sval) {
+			case "json", "jsonb":
+				return true
+			}
+		}
+	}
+	if fc := node.GetFuncCall(); fc != nil && len(fc.Funcname) > 0 {
+		if last := fc.Funcname[len(fc.Funcname)-1].GetString_(); last != nil {
+			if strings.HasPrefix(strings.ToLower(last.Sval), "json") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// createJSONMergeFuncCall rewrites `a || b` to json_merge_patch(a, b). Note this
+// is RFC 7396 merge-patch semantics (recursive, and a null value deletes a key),
+// which matches Postgres jsonb || for the common flat-object-merge case but
+// diverges for nested objects and explicit nulls.
+func (t *OperatorTransform) createJSONMergeFuncCall(left, right *pg_query.Node) *pg_query.Node {
+	if newLeft := t.transformExpression(left); newLeft != nil {
+		left = newLeft
+	}
+	if newRight := t.transformExpression(right); newRight != nil {
+		right = newRight
+	}
+	return &pg_query.Node{
+		Node: &pg_query.Node_FuncCall{
+			FuncCall: &pg_query.FuncCall{
+				Funcname: []*pg_query.Node{
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "json_merge_patch"}}},
 				},
 				Args: []*pg_query.Node{left, right},
 			},

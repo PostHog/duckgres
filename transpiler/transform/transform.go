@@ -36,6 +36,12 @@ type Result struct {
 	// for the final query but before streaming results. Typically DROP TEMP TABLE
 	// and COMMIT statements. Execute these with best-effort (ignore errors).
 	CleanupStatements []string
+
+	// Warnings holds human-readable messages a transform wants surfaced to the
+	// client as NoticeResponse (WARNING) while still allowing the statement to
+	// run. Used e.g. when a constraint is accepted-but-not-enforced on a lake
+	// catalog so the client is told its Postgres semantics were dropped.
+	Warnings []string
 }
 
 // Transform defines the interface for SQL transformations.
