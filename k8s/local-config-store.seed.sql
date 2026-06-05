@@ -3,17 +3,9 @@ VALUES ('local', 'duckgres', 0, '', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
 
--- duckgres_managed_warehouses is now keyed by team_name (FK -> duckgres_teams),
--- so seed a team the warehouse can attach to. Resolution still reads warehouses
--- and users by org_id (see configstore models), so the warehouse row below also
--- carries org_id = 'local'.
-INSERT INTO duckgres_teams (name, max_workers, min_workers, memory_budget, idle_timeout_s, created_at, updated_at)
-VALUES ('local', 0, 0, '', 0, NOW(), NOW())
-ON CONFLICT (name) DO UPDATE
-SET updated_at = NOW();
-
+-- duckgres_managed_warehouses is keyed by org_id; resolution reads warehouses
+-- and users by org_id (see configstore models).
 INSERT INTO duckgres_managed_warehouses (
-    team_name,
     org_id,
     warehouse_database_region,
     warehouse_database_endpoint,
@@ -75,7 +67,6 @@ INSERT INTO duckgres_managed_warehouses (
     updated_at
 )
 VALUES (
-    'local',
     'local',
     'local-dev',
     'host.docker.internal',
@@ -140,7 +131,7 @@ VALUES (
     NOW(),
     NOW()
 )
-ON CONFLICT (team_name) DO UPDATE
+ON CONFLICT (org_id) DO UPDATE
 SET warehouse_database_region = EXCLUDED.warehouse_database_region,
     warehouse_database_endpoint = EXCLUDED.warehouse_database_endpoint,
     warehouse_database_port = EXCLUDED.warehouse_database_port,
