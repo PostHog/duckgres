@@ -1789,7 +1789,7 @@ func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRunt
 	}
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:      "portola",
+		OrgID:      "tenant-alpha",
 		Image:      pinnedImage,
 		MaxWorkers: 2,
 	})
