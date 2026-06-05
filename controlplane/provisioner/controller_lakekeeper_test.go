@@ -15,6 +15,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestReconcileDeleting_TearsDownLakekeeper(t *testing.T) {
@@ -108,13 +109,30 @@ func TestReconcileLakekeeper_SkipsWhenIcebergDisabled(t *testing.T) {
 }
 
 func TestReconcileLakekeeper_DriftCorrectsWhenAlreadyProvisioned(t *testing.T) {
-	// An already-provisioned org (LakekeeperEndpoint set) must NOT be skipped:
-	// the Ready loop re-applies just the CR spec so changes to the desired shape
-	// (resources, podMetadata, image, ...) converge onto the existing CR. The
-	// full DB/Secret/REST pipeline must NOT run — only EnsureCR.
+	// An already-provisioned org (LakekeeperEndpoint set) is NOT skipped: the
+	// Ready loop patches the pod shape (replicas/requests/scrape) onto the org's
+	// existing CR, matched by the duckgres/active-org label. No inputs are
+	// resolved, and no duplicate CR is created under the recomputed name.
 	called := false
 	k8sClient, dyn, _ := newFakeLakekeeperClient()
-	p := NewLakekeeperProvisioner(newFakeStore(), k8sClient, WithImage("drift:test"))
+	p := NewLakekeeperProvisioner(newFakeStore(), k8sClient)
+
+	// Seed a legacy-named CR carrying the org label. Its name intentionally
+	// differs from LakekeeperResourceName("acme") to prove the patch is matched
+	// by label, not by a recomputed name (the post-#632 hyphenation bug).
+	seed := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "lakekeeper.k8s.lakekeeper.io/v1alpha1",
+		"kind":       "Lakekeeper",
+		"metadata": map[string]interface{}{
+			"name":      "lakekeeper-acme-legacy",
+			"namespace": k8sClient.namespace,
+			"labels":    map[string]interface{}{"duckgres/active-org": "acme"},
+		},
+		"spec": map[string]interface{}{"replicas": int64(1)},
+	}}
+	if _, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Create(context.Background(), seed, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
 
 	store := newFakeStore()
 	store.warehouses["acme"] = &configstore.ManagedWarehouse{
@@ -129,29 +147,31 @@ func TestReconcileLakekeeper_DriftCorrectsWhenAlreadyProvisioned(t *testing.T) {
 	c := NewControllerWithClient(store, nil, 0).
 		WithLakekeeperProvisioner(p, func(_ context.Context, _ *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
 			called = true
-			// S3 deliberately unset: drift correction re-applies only the CR
-			// spec, so it must not depend on S3/REST inputs.
-			return ProvisioningInputs{PGHost: "acme-pg", PGPort: 5432, PGSSLMode: "require"}, nil
+			return ProvisioningInputs{}, nil
 		})
 
 	c.reconcileLakekeeper(context.Background(), store.warehouses["acme"])
 
-	if !called {
-		t.Fatalf("inputs resolver should be called for CR drift correction when already provisioned")
+	// Pod-shape drift correction needs no inputs — the resolver must not run.
+	if called {
+		t.Errorf("inputs resolver should NOT be called for pod-shape drift correction")
 	}
-	// EnsureCRSpec create-or-updated the CR with the desired spec, without the
-	// DB/Secret/REST pipeline running.
-	got, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), LakekeeperResourceName("acme"), metav1.GetOptions{})
+	// The existing legacy-named CR was patched in place by label.
+	got, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), "lakekeeper-acme-legacy", metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("CR not applied by drift correction: %v", err)
+		t.Fatalf("get patched CR: %v", err)
 	}
-	if spec := got.Object["spec"].(map[string]interface{}); spec["image"] != "drift:test" {
-		t.Errorf("CR image = %v, want drift:test", spec["image"])
+	spec := got.Object["spec"].(map[string]interface{})
+	if rv := spec["replicas"]; rv != int64(lakekeeperPodReplicas) && rv != float64(lakekeeperPodReplicas) {
+		t.Errorf("replicas = %v, want %d", rv, lakekeeperPodReplicas)
 	}
-	// The warehouse row stays untouched — drift correction never re-runs the
-	// pipeline, so it doesn't rewrite the persisted warehouse name.
-	if store.warehouses["acme"].Iceberg.LakekeeperWarehouse != "" {
-		t.Errorf("drift correction unexpectedly wrote the warehouse row")
+	ann := spec["podMetadata"].(map[string]interface{})["annotations"].(map[string]interface{})
+	if ann["prometheus.io/scrape"] != "true" {
+		t.Errorf("scrape annotation not applied: %v", ann)
+	}
+	// No duplicate CR created under the recomputed (hyphenated) name.
+	if _, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), LakekeeperResourceName("acme"), metav1.GetOptions{}); err == nil {
+		t.Errorf("drift correction created a duplicate CR under the recomputed name")
 	}
 }
 
