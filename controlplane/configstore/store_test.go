@@ -181,22 +181,22 @@ func TestDatabaseNameForSNIPrefix(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
 			Orgs: map[string]*OrgConfig{
-				"portola-uuid": {Name: "portola-uuid", DatabaseName: "portola"},
-				"acme":         {Name: "acme", DatabaseName: "acme"},
+				"tenant-alpha-uuid": {Name: "tenant-alpha-uuid", DatabaseName: "tenant_alpha"},
+				"acme":              {Name: "acme", DatabaseName: "acme"},
 			},
 			DatabaseOrg: map[string]string{
-				"portola": "portola-uuid",
-				"acme":    "acme",
+				"tenant_alpha": "tenant-alpha-uuid",
+				"acme":         "acme",
 			},
 			HostnameAliasOrg: map[string]string{
-				"entirely-chief-wildcat": "portola-uuid",
+				"entirely-chief-wildcat": "tenant-alpha-uuid",
 			},
 		},
 	}
 
 	// Alias resolves to the org's database_name (the security-through-obscurity case).
-	if got := cs.DatabaseNameForSNIPrefix("entirely-chief-wildcat"); got != "portola" {
-		t.Errorf("DatabaseNameForSNIPrefix(alias) = %q, want %q", got, "portola")
+	if got := cs.DatabaseNameForSNIPrefix("entirely-chief-wildcat"); got != "tenant_alpha" {
+		t.Errorf("DatabaseNameForSNIPrefix(alias) = %q, want %q", got, "tenant_alpha")
 	}
 	// Plain prefix passes through unchanged so legacy tenants (no alias) keep working.
 	if got := cs.DatabaseNameForSNIPrefix("acme"); got != "acme" {
@@ -221,19 +221,19 @@ func TestResolveSNIPrefix(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
 			Orgs: map[string]*OrgConfig{
-				"portola-uuid":    {Name: "portola-uuid", DatabaseName: "portola"},
+				"tenant-alpha-id": {Name: "tenant-alpha-id", DatabaseName: "tenant_alpha"},
 				"team-hyphen":     {Name: "team-hyphen", DatabaseName: "team_hyphen"},
 				"team_underscore": {Name: "team_underscore", DatabaseName: "teamdb"},
 				"acme":            {Name: "acme", DatabaseName: "acme"},
 			},
 			DatabaseOrg: map[string]string{
-				"portola":     "portola-uuid",
-				"team_hyphen": "team-hyphen",
-				"teamdb":      "team_underscore",
-				"acme":        "acme",
+				"tenant_alpha": "tenant-alpha-id",
+				"team_hyphen":  "team-hyphen",
+				"teamdb":       "team_underscore",
+				"acme":         "acme",
 			},
 			HostnameAliasOrg: map[string]string{
-				"entirely-chief-wildcat": "portola-uuid",
+				"entirely-chief-wildcat": "tenant-alpha-id",
 			},
 		},
 	}
@@ -244,7 +244,7 @@ func TestResolveSNIPrefix(t *testing.T) {
 		wantOrg string
 		wantDB  string
 	}{
-		{"hostname alias", "entirely-chief-wildcat", "portola-uuid", "portola"},
+		{"hostname alias", "entirely-chief-wildcat", "tenant-alpha-id", "tenant_alpha"},
 		{"database name", "acme", "acme", "acme"},
 		{"hyphenated org name", "team-hyphen", "team-hyphen", "team_hyphen"},
 		{"non DNS-safe org name", "team_underscore", "", ""},

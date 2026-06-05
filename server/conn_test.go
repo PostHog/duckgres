@@ -37,7 +37,7 @@ func TestIsDuckDBUtilityCommand(t *testing.T) {
 		// they fell through to pg_query and failed with a syntax error on the
 		// PERSISTENT/TEMPORARY keyword.
 		{"drop persistent secret", `DROP PERSISTENT SECRET foo`, true},
-		{"drop persistent secret if exists quoted", `DROP PERSISTENT SECRET IF EXISTS "portola_warehouse_prod_s3"`, true},
+		{"drop persistent secret if exists quoted", `DROP PERSISTENT SECRET IF EXISTS "tenant_alpha_warehouse_prod_s3"`, true},
 		{"drop temporary secret", `DROP TEMPORARY SECRET foo`, true},
 		{"drop temporary secret if exists", `DROP TEMPORARY SECRET IF EXISTS foo`, true},
 		{"case insensitive", `drop persistent secret foo`, true},

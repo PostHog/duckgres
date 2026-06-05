@@ -1261,7 +1261,7 @@ func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"portola-uuid","database_name":"portola","hostname_alias":"entirely-chief-wildcat"}`)
+	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant_alpha","hostname_alias":"entirely-chief-wildcat"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1270,7 +1270,7 @@ func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	stored := store.orgs["portola-uuid"]
+	stored := store.orgs["tenant-alpha-id"]
 	if stored == nil {
 		t.Fatal("org not stored")
 	}
@@ -1304,15 +1304,15 @@ func TestCreateOrgEmptyHostnameAliasIsTreatedAsNone(t *testing.T) {
 func TestUpdateOrgClearsHostnameAliasWithEmptyString(t *testing.T) {
 	store := newFakeAPIStore()
 	alias := "entirely-chief-wildcat"
-	store.orgs["portola-uuid"] = &configstore.Org{
-		Name:          "portola-uuid",
-		DatabaseName:  "portola",
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:          "tenant-alpha-id",
+		DatabaseName:  "tenant_alpha",
 		HostnameAlias: &alias,
 	}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{"hostname_alias":""}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/portola-uuid", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1320,7 +1320,7 @@ func TestUpdateOrgClearsHostnameAliasWithEmptyString(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	stored := store.orgs["portola-uuid"]
+	stored := store.orgs["tenant-alpha-id"]
 	if stored.HostnameAlias != nil {
 		t.Errorf("HostnameAlias not cleared: %v", stored.HostnameAlias)
 	}
@@ -1398,15 +1398,15 @@ func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
 func TestUpdateOrgOmittingHostnameAliasPreservesIt(t *testing.T) {
 	store := newFakeAPIStore()
 	alias := "entirely-chief-wildcat"
-	store.orgs["portola-uuid"] = &configstore.Org{
-		Name:          "portola-uuid",
-		DatabaseName:  "portola",
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:          "tenant-alpha-id",
+		DatabaseName:  "tenant_alpha",
 		HostnameAlias: &alias,
 	}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{"max_workers":8}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/portola-uuid", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1414,7 +1414,7 @@ func TestUpdateOrgOmittingHostnameAliasPreservesIt(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	stored := store.orgs["portola-uuid"]
+	stored := store.orgs["tenant-alpha-id"]
 	if stored.HostnameAlias == nil || *stored.HostnameAlias != "entirely-chief-wildcat" {
 		t.Errorf("HostnameAlias not preserved: %v", stored.HostnameAlias)
 	}
