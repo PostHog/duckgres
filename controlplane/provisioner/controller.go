@@ -467,14 +467,26 @@ func (c *Controller) reconcileLakekeeper(ctx context.Context, w *configstore.Man
 	if w.Iceberg.ResolvedBackend() != configstore.IcebergBackendLakekeeper {
 		return
 	}
+	log := slog.With("org", w.OrgID, "phase", "lakekeeper")
+
 	if w.Iceberg.LakekeeperEndpoint != "" {
-		// Already provisioned. Future drift correction (e.g. image bumps)
-		// will be handled by the operator's reconcile loop reading the CR
-		// spec on every tick; nothing to do here.
+		// Already provisioned. Re-apply just the CR spec so changes to the
+		// desired shape (resources, podMetadata, image, ...) converge onto the
+		// existing CR. Cheap + idempotent: skips the DB/Secret/REST pipeline;
+		// the operator only rolls the Deployment when the spec actually changes.
+		// (The operator can't add fields that aren't in the CR, so a spec change
+		// in the provisioner must be written back here — it won't appear on its
+		// own.)
+		inputs, err := c.lakekeeperInputs(ctx, w)
+		if err != nil {
+			log.Warn("Failed to resolve lakekeeper inputs for CR drift correction.", "error", err)
+			return
+		}
+		if err := c.lakekeeperProvisioner.EnsureCRSpec(ctx, w, inputs); err != nil {
+			log.Warn("Lakekeeper CR drift correction failed.", "error", err)
+		}
 		return
 	}
-
-	log := slog.With("org", w.OrgID, "phase", "lakekeeper")
 
 	inputs, err := c.lakekeeperInputs(ctx, w)
 	if err != nil {

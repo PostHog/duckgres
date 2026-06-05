@@ -107,8 +107,15 @@ func TestReconcileLakekeeper_SkipsWhenIcebergDisabled(t *testing.T) {
 	}
 }
 
-func TestReconcileLakekeeper_SkipsWhenAlreadyProvisioned(t *testing.T) {
+func TestReconcileLakekeeper_DriftCorrectsWhenAlreadyProvisioned(t *testing.T) {
+	// An already-provisioned org (LakekeeperEndpoint set) must NOT be skipped:
+	// the Ready loop re-applies just the CR spec so changes to the desired shape
+	// (resources, podMetadata, image, ...) converge onto the existing CR. The
+	// full DB/Secret/REST pipeline must NOT run — only EnsureCR.
 	called := false
+	k8sClient, dyn, _ := newFakeLakekeeperClient()
+	p := NewLakekeeperProvisioner(newFakeStore(), k8sClient, WithImage("drift:test"))
+
 	store := newFakeStore()
 	store.warehouses["acme"] = &configstore.ManagedWarehouse{
 		OrgID: "acme",
@@ -119,15 +126,32 @@ func TestReconcileLakekeeper_SkipsWhenAlreadyProvisioned(t *testing.T) {
 			LakekeeperEndpoint: "http://lk-acme.lakekeeper.svc:8181/catalog",
 		},
 	}
-	c := NewControllerWithClient(store, nil, 0)
-	c.lakekeeperProvisioner = &LakekeeperProvisioner{}
-	c.lakekeeperInputs = func(_ context.Context, _ *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
-		called = true
-		return ProvisioningInputs{}, nil
-	}
+	c := NewControllerWithClient(store, nil, 0).
+		WithLakekeeperProvisioner(p, func(_ context.Context, _ *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
+			called = true
+			// S3 deliberately unset: drift correction re-applies only the CR
+			// spec, so it must not depend on S3/REST inputs.
+			return ProvisioningInputs{PGHost: "acme-pg", PGPort: 5432, PGSSLMode: "require"}, nil
+		})
+
 	c.reconcileLakekeeper(context.Background(), store.warehouses["acme"])
-	if called {
-		t.Errorf("inputs resolver should not be called when LakekeeperEndpoint already set")
+
+	if !called {
+		t.Fatalf("inputs resolver should be called for CR drift correction when already provisioned")
+	}
+	// EnsureCRSpec create-or-updated the CR with the desired spec, without the
+	// DB/Secret/REST pipeline running.
+	got, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), LakekeeperResourceName("acme"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("CR not applied by drift correction: %v", err)
+	}
+	if spec := got.Object["spec"].(map[string]interface{}); spec["image"] != "drift:test" {
+		t.Errorf("CR image = %v, want drift:test", spec["image"])
+	}
+	// The warehouse row stays untouched — drift correction never re-runs the
+	// pipeline, so it doesn't rewrite the persisted warehouse name.
+	if store.warehouses["acme"].Iceberg.LakekeeperWarehouse != "" {
+		t.Errorf("drift correction unexpectedly wrote the warehouse row")
 	}
 }
 
