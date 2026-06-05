@@ -225,6 +225,27 @@ func TestEnsureCR_CreateAndShape(t *testing.T) {
 	if pg["host"] != spec.PGHost || pg["database"] != spec.PGDatabase {
 		t.Errorf("pg host/db = %v/%v, want %s/%s", pg["host"], pg["database"], spec.PGHost, spec.PGDatabase)
 	}
+	// Resources are pinned with requests == limits (Guaranteed QoS).
+	res := specMap["resources"].(map[string]interface{})
+	reqs := res["requests"].(map[string]interface{})
+	lims := res["limits"].(map[string]interface{})
+	if reqs["cpu"] != lakekeeperPodCPU || lims["cpu"] != lakekeeperPodCPU {
+		t.Errorf("cpu req/lim = %v/%v, want %s/%s", reqs["cpu"], lims["cpu"], lakekeeperPodCPU, lakekeeperPodCPU)
+	}
+	if reqs["memory"] != lakekeeperPodMemory || lims["memory"] != lakekeeperPodMemory {
+		t.Errorf("memory req/lim = %v/%v, want %s/%s", reqs["memory"], lims["memory"], lakekeeperPodMemory, lakekeeperPodMemory)
+	}
+	// Prometheus scrape annotations are stamped onto the pod via podMetadata.
+	ann := specMap["podMetadata"].(map[string]interface{})["annotations"].(map[string]interface{})
+	if ann["prometheus.io/scrape"] != "true" {
+		t.Errorf("prometheus.io/scrape = %v, want true", ann["prometheus.io/scrape"])
+	}
+	if ann["prometheus.io/port"] != lakekeeperMetricsPort {
+		t.Errorf("prometheus.io/port = %v, want %s", ann["prometheus.io/port"], lakekeeperMetricsPort)
+	}
+	if ann["prometheus.io/path"] != "/metrics" {
+		t.Errorf("prometheus.io/path = %v, want /metrics", ann["prometheus.io/path"])
+	}
 }
 
 func TestEnsureCR_KubernetesAuthOff_OmitsAuthenticationBlock(t *testing.T) {
