@@ -340,3 +340,46 @@ func TestSessionPoolDrainWaitsForActiveWorkAndRejectsNewWork(t *testing.T) {
 		t.Fatalf("expected no active drain work, got %d", got)
 	}
 }
+
+func TestSessionPoolRejectsContinuationAfterDrainReachesZero(t *testing.T) {
+	pool := &SessionPool{}
+
+	pool.BeginDrain()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected drain to complete with no active work")
+	}
+
+	if _, err := pool.beginDrainWork(true); !errors.Is(err, ErrWorkerDraining) {
+		t.Fatalf("expected continuation to be rejected after drain completed, got %v", err)
+	}
+}
+
+func TestDestroySessionReleasesPendingQueryDrainWork(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin pending query drain work: %v", err)
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:      "session-1",
+		queries: map[string]*QueryHandle{"query-1": {Query: "SELECT 1", finishDrain: finishDrain}},
+		txns:    make(map[string]*trackedTx),
+	}
+
+	pool.BeginDrain()
+	if err := pool.DestroySession("session-1"); err != nil {
+		t.Fatalf("destroy session: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected destroying the session to release pending query drain work")
+	}
+}

@@ -54,6 +54,7 @@ type SessionPool struct {
 	startTime   time.Time
 	maxSessions int
 	stopCh      chan struct{}
+	stopOnce    sync.Once
 	warmupDB    *sql.DB       // Keep this open to keep shared cache alive
 	warmupDone  chan struct{} // Closed when Warmup() completes (success or failure)
 	dbInitOnce  sync.Once     // Serializes fallback CreateDBConnection when warmup fails
@@ -99,8 +100,9 @@ type SessionPool struct {
 }
 
 type trackedTx struct {
-	tx       *sql.Tx
-	lastUsed atomic.Int64 // unix nano
+	tx          *sql.Tx
+	finishDrain func()
+	lastUsed    atomic.Int64 // unix nano
 }
 
 // Session represents a single DuckDB session.
@@ -112,11 +114,12 @@ type Session struct {
 	CreatedAt time.Time
 	lastUsed  atomic.Int64 // unix nano
 
-	mu            sync.RWMutex
-	queries       map[string]*QueryHandle
-	txns          map[string]*trackedTx
-	txnOwner      map[string]string
-	handleCounter atomic.Uint64
+	mu             sync.RWMutex
+	queries        map[string]*QueryHandle
+	metadataDrains map[string][]func()
+	txns           map[string]*trackedTx
+	txnOwner       map[string]string
+	handleCounter  atomic.Uint64
 
 	// sqlTxActive tracks whether a SQL-level transaction is in progress on this
 	// session's Conn (i.e., BEGIN was sent as raw SQL without a corresponding
@@ -133,10 +136,11 @@ type Session struct {
 
 // QueryHandle stores a prepared or ad-hoc query for later execution.
 type QueryHandle struct {
-	Query       string
-	Schema      *arrow.Schema
-	TxnID       string
-	finishDrain func()
+	Query         string
+	Schema        *arrow.Schema
+	TxnID         string
+	finishDrain   func()
+	pendingDrains []func()
 }
 
 // NewDuckDBService creates a new DuckDB service with the given config.
@@ -443,6 +447,9 @@ func Run(cfg ServiceConfig) {
 		ctx, cancel := context.WithTimeout(context.Background(), workerShutdownDrainTime)
 		if !svc.WaitForDrain(ctx) {
 			slog.Warn("DuckDB service drain timed out before shutdown.", "timeout", workerShutdownDrainTime)
+			cancel()
+			svc.CloseAll()
+			os.Exit(0)
 		}
 		cancel()
 		slog.Info("Shutting down DuckDB service...")
@@ -501,7 +508,13 @@ func (svc *DuckDBService) Shutdown() {
 	if svc.flightSrv != nil {
 		svc.flightSrv.Shutdown()
 	}
-	svc.pool.CloseAll()
+	svc.CloseAll()
+}
+
+func (svc *DuckDBService) CloseAll() {
+	if svc.pool != nil {
+		svc.pool.CloseAll()
+	}
 }
 
 func (svc *DuckDBService) BeginDrain() {
@@ -645,15 +658,16 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 
 	token := generateSessionToken()
 	session := &Session{
-		ID:         token,
-		DB:         db,
-		Conn:       conn,
-		Username:   username,
-		CreatedAt:  time.Now(),
-		queries:    make(map[string]*QueryHandle),
-		txns:       make(map[string]*trackedTx),
-		txnOwner:   make(map[string]string),
-		duckdbConn: duckConn,
+		ID:             token,
+		DB:             db,
+		Conn:           conn,
+		Username:       username,
+		CreatedAt:      time.Now(),
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]func()),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+		duckdbConn:     duckConn,
 	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
@@ -726,14 +740,38 @@ func (p *SessionPool) DestroySession(token string) error {
 		return fmt.Errorf("session not found")
 	}
 
+	var releaseDrains []func()
+
 	// Roll back any open transactions
 	session.mu.Lock()
+	for id, handle := range session.queries {
+		if handle.finishDrain != nil {
+			releaseDrains = append(releaseDrains, handle.finishDrain)
+			handle.finishDrain = nil
+		}
+		releaseDrains = append(releaseDrains, handle.pendingDrains...)
+		handle.pendingDrains = nil
+		delete(session.queries, id)
+	}
+	for key, drains := range session.metadataDrains {
+		releaseDrains = append(releaseDrains, drains...)
+		delete(session.metadataDrains, key)
+	}
 	for id, ttx := range session.txns {
 		_ = ttx.tx.Rollback()
+		if ttx.finishDrain != nil {
+			releaseDrains = append(releaseDrains, ttx.finishDrain)
+			ttx.finishDrain = nil
+		}
 		delete(session.txns, id)
 		delete(session.txnOwner, id)
 	}
 	session.mu.Unlock()
+	for _, release := range releaseDrains {
+		if release != nil {
+			release()
+		}
+	}
 
 	if stop != nil {
 		stop()
@@ -851,6 +889,9 @@ func (p *SessionPool) beginDrainWork(allowWhenDraining bool) (func(), error) {
 	if p.draining && !allowWhenDraining {
 		return nil, ErrWorkerDraining
 	}
+	if p.draining && !p.drainZeroOpen {
+		return nil, ErrWorkerDraining
+	}
 	if !p.drainZeroOpen {
 		p.drainZero = make(chan struct{})
 		p.drainZeroOpen = true
@@ -882,7 +923,11 @@ func (p *SessionPool) ensureDrainChannelLocked() {
 
 // CloseAll closes all sessions.
 func (p *SessionPool) CloseAll() {
-	close(p.stopCh)
+	p.stopOnce.Do(func() {
+		if p.stopCh != nil {
+			close(p.stopCh)
+		}
+	})
 	p.mu.Lock()
 	sessions := make(map[string]*Session, len(p.sessions))
 	stops := make(map[string]func(), len(p.stopRefresh))
@@ -903,12 +948,36 @@ func (p *SessionPool) CloseAll() {
 	}
 
 	for _, session := range sessions {
+		var releaseDrains []func()
 		session.mu.Lock()
+		for id, handle := range session.queries {
+			if handle.finishDrain != nil {
+				releaseDrains = append(releaseDrains, handle.finishDrain)
+				handle.finishDrain = nil
+			}
+			releaseDrains = append(releaseDrains, handle.pendingDrains...)
+			handle.pendingDrains = nil
+			delete(session.queries, id)
+		}
+		for key, drains := range session.metadataDrains {
+			releaseDrains = append(releaseDrains, drains...)
+			delete(session.metadataDrains, key)
+		}
 		for id, ttx := range session.txns {
 			_ = ttx.tx.Rollback()
+			if ttx.finishDrain != nil {
+				releaseDrains = append(releaseDrains, ttx.finishDrain)
+				ttx.finishDrain = nil
+			}
 			delete(session.txns, id)
+			delete(session.txnOwner, id)
 		}
 		session.mu.Unlock()
+		for _, release := range releaseDrains {
+			if release != nil {
+				release()
+			}
+		}
 
 		if session.Conn != nil {
 			_ = session.Conn.Close()

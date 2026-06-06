@@ -136,6 +136,11 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	if mErr != nil {
 		return status.Errorf(codes.Internal, "marshal DoPutUpdateResult: %v", mErr)
 	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 	if err := stream.Send(&flight.PutResult{AppMetadata: app}); err != nil {
 		return fmt.Errorf("copy-from-stdin: send PutResult: %w", err)
 	}
