@@ -48,7 +48,7 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	if err != nil {
 		return err
 	}
-	finishDrain, err := h.pool.beginDrainWork(false)
+	finishDrain, err := h.pool.beginDrainWork(session.allowsDrainContinuation(""))
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
 		return drainErr
 	}

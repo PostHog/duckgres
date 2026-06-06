@@ -129,6 +129,7 @@ type Session struct {
 	// transient error would run in autocommit mode (the transaction is dead)
 	// and mask the failure from the client.
 	sqlTxActive atomic.Bool
+	sqlTxDrain  func()
 
 	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
 	progress   progressState    // stall detection state
@@ -141,6 +142,56 @@ type QueryHandle struct {
 	TxnID         string
 	finishDrain   func()
 	pendingDrains []func()
+}
+
+func releaseDrainFunc(release func()) {
+	if release != nil {
+		release()
+	}
+}
+
+func (s *Session) hasTrackedTxDrain(txnKey string) bool {
+	if txnKey == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ttx := s.txns[txnKey]
+	return ttx != nil && ttx.finishDrain != nil
+}
+
+func (s *Session) hasSQLTransactionDrain() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sqlTxDrain != nil
+}
+
+func (s *Session) allowsDrainContinuation(txnKey string) bool {
+	if s.hasTrackedTxDrain(txnKey) {
+		return true
+	}
+	return s.sqlTxActive.Load() && s.hasSQLTransactionDrain()
+}
+
+func (s *Session) setSQLTransactionDrain(release func()) {
+	if release == nil {
+		return
+	}
+	var old func()
+	s.mu.Lock()
+	old = s.sqlTxDrain
+	s.sqlTxDrain = release
+	s.mu.Unlock()
+	releaseDrainFunc(old)
+}
+
+func (s *Session) releaseSQLTransactionDrain() {
+	var release func()
+	s.mu.Lock()
+	release = s.sqlTxDrain
+	s.sqlTxDrain = nil
+	s.mu.Unlock()
+	releaseDrainFunc(release)
 }
 
 // NewDuckDBService creates a new DuckDB service with the given config.
@@ -269,29 +320,42 @@ func (p *SessionPool) reapLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			p.mu.RLock()
-			sessions := make([]*Session, 0, len(p.sessions))
-			for _, s := range p.sessions {
-				sessions = append(sessions, s)
-			}
-			p.mu.RUnlock()
-
-			now := time.Now()
-			for _, s := range sessions {
-				s.mu.Lock()
-				for id, ttx := range s.txns {
-					last := time.Unix(0, ttx.lastUsed.Load())
-					if now.Sub(last) > txnIdleTimeout {
-						slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
-						_ = ttx.tx.Rollback()
-						delete(s.txns, id)
-						delete(s.txnOwner, id)
-					}
-				}
-				s.mu.Unlock()
-			}
+			p.reapIdleTransactions(time.Now())
 		case <-p.stopCh:
 			return
+		}
+	}
+}
+
+func (p *SessionPool) reapIdleTransactions(now time.Time) {
+	p.mu.RLock()
+	sessions := make([]*Session, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		sessions = append(sessions, s)
+	}
+	p.mu.RUnlock()
+
+	for _, s := range sessions {
+		var releaseDrains []func()
+		s.mu.Lock()
+		for id, ttx := range s.txns {
+			last := time.Unix(0, ttx.lastUsed.Load())
+			if now.Sub(last) > txnIdleTimeout {
+				slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
+				if ttx.tx != nil {
+					_ = ttx.tx.Rollback()
+				}
+				if ttx.finishDrain != nil {
+					releaseDrains = append(releaseDrains, ttx.finishDrain)
+					ttx.finishDrain = nil
+				}
+				delete(s.txns, id)
+				delete(s.txnOwner, id)
+			}
+		}
+		s.mu.Unlock()
+		for _, release := range releaseDrains {
+			releaseDrainFunc(release)
 		}
 	}
 }
@@ -757,8 +821,15 @@ func (p *SessionPool) DestroySession(token string) error {
 		releaseDrains = append(releaseDrains, drains...)
 		delete(session.metadataDrains, key)
 	}
+	if session.sqlTxDrain != nil {
+		releaseDrains = append(releaseDrains, session.sqlTxDrain)
+		session.sqlTxDrain = nil
+		session.sqlTxActive.Store(false)
+	}
 	for id, ttx := range session.txns {
-		_ = ttx.tx.Rollback()
+		if ttx.tx != nil {
+			_ = ttx.tx.Rollback()
+		}
 		if ttx.finishDrain != nil {
 			releaseDrains = append(releaseDrains, ttx.finishDrain)
 			ttx.finishDrain = nil
@@ -768,9 +839,7 @@ func (p *SessionPool) DestroySession(token string) error {
 	}
 	session.mu.Unlock()
 	for _, release := range releaseDrains {
-		if release != nil {
-			release()
-		}
+		releaseDrainFunc(release)
 	}
 
 	if stop != nil {
@@ -963,8 +1032,15 @@ func (p *SessionPool) CloseAll() {
 			releaseDrains = append(releaseDrains, drains...)
 			delete(session.metadataDrains, key)
 		}
+		if session.sqlTxDrain != nil {
+			releaseDrains = append(releaseDrains, session.sqlTxDrain)
+			session.sqlTxDrain = nil
+			session.sqlTxActive.Store(false)
+		}
 		for id, ttx := range session.txns {
-			_ = ttx.tx.Rollback()
+			if ttx.tx != nil {
+				_ = ttx.tx.Rollback()
+			}
 			if ttx.finishDrain != nil {
 				releaseDrains = append(releaseDrains, ttx.finishDrain)
 				ttx.finishDrain = nil
@@ -974,9 +1050,7 @@ func (p *SessionPool) CloseAll() {
 		}
 		session.mu.Unlock()
 		for _, release := range releaseDrains {
-			if release != nil {
-				release()
-			}
+			releaseDrainFunc(release)
 		}
 
 		if session.Conn != nil {

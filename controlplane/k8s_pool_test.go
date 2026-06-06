@@ -1296,6 +1296,33 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	}
 }
 
+func TestK8sPoolReserveSharedWorkerSkipsDrainingIdleWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 2)
+	draining := &ManagedWorker{ID: 1, done: make(chan struct{})}
+	if err := draining.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleIdle}); err != nil {
+		t.Fatalf("SetSharedState(draining): %v", err)
+	}
+	pool.workers[draining.ID] = draining
+
+	pool.healthCheckFunc = func(context.Context, *ManagedWorker) error {
+		return validateReservedWorkerHealth(&healthCheckResult{Healthy: true, Draining: true})
+	}
+
+	got, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion after draining worker, got worker=%#v err=%v", got, err)
+	}
+	if got != nil {
+		t.Fatalf("expected no worker on draining reservation, got %d", got.ID)
+	}
+	if _, ok := pool.Worker(draining.ID); ok {
+		t.Fatal("expected draining worker to be retired from the pool")
+	}
+}
+
 func TestK8sPool_CleanDeadWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
@@ -3501,6 +3528,55 @@ func TestK8sPoolCleanDeadWorkersLeavesCurrentRuntimeLeaseForHealthLoop(t *testin
 	}
 	if records := store.snapshot(); len(records) != 0 {
 		t.Fatalf("current runtime lease clean-dead path must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolCleanDeadWorkersRetiresDrainingWorkerAfterPodExit(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			16: {
+				WorkerID:          16,
+				PodName:           "test-cp-worker-16",
+				State:             configstore.WorkerStateDraining,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	done := make(chan struct{})
+	close(done)
+	worker := &ManagedWorker{ID: 16, done: done}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-16", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.16"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	pool.cleanDeadWorkersLocked()
+
+	if _, ok := pool.workers[worker.ID]; ok {
+		t.Fatal("cleanDeadWorkersLocked should remove exited draining worker")
+	}
+	if store.retireDrainingCalls != 1 {
+		t.Fatalf("expected one retire-draining CAS, got %d", store.retireDrainingCalls)
+	}
+	store.mu.Lock()
+	recordState := store.preloadedRecords[worker.ID].State
+	recordReason := store.preloadedRecords[worker.ID].RetireReason
+	store.mu.Unlock()
+	if recordState != configstore.WorkerStateRetired || recordReason != RetireReasonNormal {
+		t.Fatalf("expected draining worker to retire normally, got state=%q reason=%q", recordState, recordReason)
 	}
 }
 

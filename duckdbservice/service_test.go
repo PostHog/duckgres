@@ -383,3 +383,31 @@ func TestDestroySessionReleasesPendingQueryDrainWork(t *testing.T) {
 		t.Fatal("expected destroying the session to release pending query drain work")
 	}
 }
+
+func TestReapIdleTransactionsReleasesDrainWork(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin transaction drain work: %v", err)
+	}
+	ttx := &trackedTx{finishDrain: finishDrain}
+	ttx.lastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	pool.sessions["session-1"] = &Session{
+		ID:       "session-1",
+		queries:  make(map[string]*QueryHandle),
+		txns:     map[string]*trackedTx{"txn-1": ttx},
+		txnOwner: map[string]string{"txn-1": "alice"},
+	}
+
+	pool.BeginDrain()
+	pool.reapIdleTransactions(time.Now())
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected idle transaction reaper to release transaction drain work")
+	}
+}

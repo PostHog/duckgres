@@ -2113,11 +2113,27 @@ func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker 
 			}
 			hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
-			_, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
-			return err
+			result, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
+			if err != nil {
+				return err
+			}
+			return validateReservedWorkerHealth(result)
 		}
 	}
 	return check(ctx, worker)
+}
+
+func validateReservedWorkerHealth(result *healthCheckResult) error {
+	if result == nil {
+		return fmt.Errorf("worker health check returned no result")
+	}
+	if !result.Healthy {
+		return fmt.Errorf("worker health check reported unhealthy")
+	}
+	if result.Draining {
+		return fmt.Errorf("worker is draining")
+	}
+	return nil
 }
 
 // SpawnMinWorkers pre-warms the pool with count workers.
@@ -3187,21 +3203,58 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 			deletePod := true
 			if p.runtimeStore != nil {
 				lease := p.workerLeaseSnapshot(w)
-				// cleanDeadWorkersLocked sweeps for pods whose informer
-				// fired w.done — cluster-driven termination (eviction,
-				// OOM, manual delete), not our health-check decision.
-				lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
-				if err != nil {
-					slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
-						"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
-					continue
-				}
-				switch lostDisposition {
-				case workerLostLeaseStale:
+				if p.workerMatchesLease(w, lease) && w.SharedState().NormalizedLifecycle() == WorkerLifecycleDraining {
+					lc := p.ensureLifecycle()
+					if lc != nil {
+						outcome, err := lc.RetireDrained(
+							configstore.NewWorkerLease(lease.workerID, lease.ownerCPInstanceID, lease.ownerEpoch, lease.image),
+							RetireReasonNormal,
+							LifecycleOriginInformerCrash,
+						)
+						if err != nil {
+							slog.Warn("Clean dead worker: retire draining CAS failed; leaving cleanup to retry.",
+								"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+							continue
+						}
+						if !outcome.Transitioned {
+							record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+							if err != nil {
+								slog.Warn("Clean dead worker: retire draining verification failed; leaving cleanup to retry.",
+									"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+								continue
+							}
+							if record == nil || record.OwnerCPInstanceID != lease.ownerCPInstanceID ||
+								record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateRetired {
+								continue
+							}
+						}
+					}
+					p.markWorkerRetiredInMemoryLocked(w)
+					delete(p.workers, id)
+					removedWorker = w
 					deletePod = false
-					removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
-				case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
-					continue
+					if p.shouldReplenishWarmCapacityLocked() {
+						replacementID = p.allocateBackgroundSpawnIDLocked()
+						p.spawning++
+						shouldReplenish = true
+					}
+				} else {
+					// cleanDeadWorkersLocked sweeps for pods whose informer
+					// fired w.done — cluster-driven termination (eviction,
+					// OOM, manual delete), not our health-check decision.
+					lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
+					if err != nil {
+						slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
+							"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+						continue
+					}
+					switch lostDisposition {
+					case workerLostLeaseStale:
+						deletePod = false
+						removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
+					case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
+						continue
+					}
 				}
 			} else {
 				removedWorker, _, replacementID, shouldReplenish = p.removeWorkerLocked(id)
