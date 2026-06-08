@@ -340,6 +340,62 @@ func TestUptimeMacros(t *testing.T) {
 	}
 }
 
+func TestArrayLowerCompatibilityMacro(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
+		t.Fatalf("Failed to init pg_catalog: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  sql.NullInt64
+	}{
+		{
+			name:  "one dimensional non-empty array",
+			query: "SELECT array_lower(ARRAY[1, 2, 3], 1)",
+			want:  sql.NullInt64{Int64: 1, Valid: true},
+		},
+		{
+			name:  "empty array",
+			query: "SELECT array_lower(ARRAY[]::INTEGER[], 1)",
+			want:  sql.NullInt64{},
+		},
+		{
+			name:  "null array",
+			query: "SELECT array_lower(NULL::INTEGER[], 1)",
+			want:  sql.NullInt64{},
+		},
+		{
+			name:  "unsupported dimension",
+			query: "SELECT array_lower(ARRAY[1, 2, 3], 2)",
+			want:  sql.NullInt64{},
+		},
+		{
+			name:  "null dimension",
+			query: "SELECT array_lower(ARRAY[1, 2, 3], NULL)",
+			want:  sql.NullInt64{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got sql.NullInt64
+			if err := db.QueryRow(tt.query).Scan(&got); err != nil {
+				t.Fatalf("%s failed: %v", tt.query, err)
+			}
+			if got.Valid != tt.want.Valid || got.Int64 != tt.want.Int64 {
+				t.Fatalf("array_lower result = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestUtilityMacrosWithoutPgCatalog(t *testing.T) {
 	// Verify that initUtilityMacros works independently of initPgCatalog,
 	// so passthrough users get uptime/version macros.

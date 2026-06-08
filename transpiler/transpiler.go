@@ -407,7 +407,7 @@ func Classify(sql string, cfg Config) Classification {
 	// PostgreSQL functions that need mapping
 	if containsAny(upper,
 		// Array functions
-		"ARRAY_AGG(", "ARRAY_LENGTH(", "ARRAY_UPPER(", "ARRAY_TO_STRING(",
+		"ARRAY_AGG(", "ARRAY_LENGTH(", "ARRAY_UPPER(", "ARRAY_LOWER(", "ARRAY_TO_STRING(",
 		"ARRAY_CAT(", "ARRAY_APPEND(", "ARRAY_PREPEND(", "ARRAY_REMOVE(", "ARRAY_POSITION(",
 		"STRING_TO_ARRAY(",
 		// String functions
