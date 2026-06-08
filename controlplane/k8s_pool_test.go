@@ -3277,6 +3277,354 @@ func TestK8sPoolHealthCheckLoopMarksDrainingWorkerUnschedulable(t *testing.T) {
 	}
 }
 
+func TestK8sPoolHealthCheckLoopKeepsDrainingWorkerOnHealthFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateDraining,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	origHealthCheck := doHealthCheckWithMetadata
+	t.Cleanup(func() { doHealthCheckWithMetadata = origHealthCheck })
+	checked := make(chan struct{})
+	var checkedOnce sync.Once
+	doHealthCheckWithMetadata = func(ctx context.Context, _ *flightsql.Client, _ server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+		first := false
+		checkedOnce.Do(func() {
+			first = true
+			close(checked)
+		})
+		if first {
+			return nil, context.DeadlineExceeded
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, 10*time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	select {
+	case <-checked:
+	case <-time.After(time.Second):
+		t.Fatal("expected health check to run")
+	}
+
+	pool.mu.RLock()
+	_, stillPresent := pool.workers[worker.ID]
+	pool.mu.RUnlock()
+	if !stillPresent {
+		t.Fatal("draining worker health failure must not drop local worker before pod exit")
+	}
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("draining worker health failure must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	store.mu.Lock()
+	markLostCalls := store.markLostCalls
+	retireDrainingCalls := store.retireDrainingCalls
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markLostCalls != 0 {
+		t.Fatalf("draining worker health failure must not mark worker lost, got %d calls", markLostCalls)
+	}
+	if retireDrainingCalls != 0 {
+		t.Fatalf("draining worker health failure before pod exit must not retire-draining, got %d calls", retireDrainingCalls)
+	}
+	if recordState != configstore.WorkerStateDraining {
+		t.Fatalf("expected durable worker state to remain draining, got %q", recordState)
+	}
+}
+
+func TestK8sPoolHealthCheckLoopRepairsLocalDrainingDurableHotWorkerOnHealthFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{}), activeSessions: 1}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining, Assignment: &WorkerAssignment{OrgID: "org-a"}}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	origHealthCheck := doHealthCheckWithMetadata
+	t.Cleanup(func() { doHealthCheckWithMetadata = origHealthCheck })
+	checked := make(chan struct{})
+	var checkedOnce sync.Once
+	doHealthCheckWithMetadata = func(ctx context.Context, _ *flightsql.Client, _ server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+		first := false
+		checkedOnce.Do(func() {
+			first = true
+			close(checked)
+		})
+		if first {
+			return nil, context.DeadlineExceeded
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, 10*time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	select {
+	case <-checked:
+	case <-time.After(time.Second):
+		t.Fatal("expected health check to run")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		store.mu.Lock()
+		markDrainingCalls := store.markDrainingCalls
+		recordState := store.preloadedRecords[worker.ID].State
+		store.mu.Unlock()
+		if recordState == configstore.WorkerStateDraining {
+			if markDrainingCalls != 1 {
+				t.Fatalf("expected one durable drain repair call, got %d", markDrainingCalls)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected health failure path to repair durable state to draining, got %q", recordState)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("durably repaired draining worker must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+}
+
+func TestK8sPoolHealthCheckLoopMarksActiveDrainingWorkerDurableDraining(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{}), activeSessions: 1}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleHot, Assignment: &WorkerAssignment{OrgID: "org-a"}}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	origHealthCheck := doHealthCheckWithMetadata
+	doHealthCheckWithMetadata = func(context.Context, *flightsql.Client, server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+		return &healthCheckResult{Healthy: true, Draining: true, ActiveQueries: 1}, nil
+	}
+	t.Cleanup(func() { doHealthCheckWithMetadata = origHealthCheck })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, 10*time.Millisecond, nil, nil)
+
+	deadline := time.After(time.Second)
+	for {
+		pool.mu.RLock()
+		state := worker.SharedState().NormalizedLifecycle()
+		schedulable := pool.isGenericSessionSchedulableWorkerLocked(worker)
+		pool.mu.RUnlock()
+		if state == WorkerLifecycleDraining {
+			if schedulable {
+				t.Fatal("active draining worker must not remain locally schedulable")
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected draining health response to mark local worker draining, got %q", state)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	store.mu.Lock()
+	markDrainingCalls := store.markDrainingCalls
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markDrainingCalls != 1 {
+		t.Fatalf("active draining worker must be durably marked draining, got %d durable drain calls", markDrainingCalls)
+	}
+	if recordState != configstore.WorkerStateDraining {
+		t.Fatalf("active draining worker should be durable draining, got %q", recordState)
+	}
+}
+
+func TestK8sPoolHealthCheckLoopRepairsLocalDrainingDurableHotWorkerOnHealth(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{}), activeSessions: 1}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining, Assignment: &WorkerAssignment{OrgID: "org-a"}}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	origHealthCheck := doHealthCheckWithMetadata
+	doHealthCheckWithMetadata = func(context.Context, *flightsql.Client, server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+		return &healthCheckResult{Healthy: true, Draining: true, ActiveQueries: 1}, nil
+	}
+	t.Cleanup(func() { doHealthCheckWithMetadata = origHealthCheck })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, 10*time.Millisecond, nil, nil)
+
+	deadline := time.After(time.Second)
+	for {
+		store.mu.Lock()
+		markDrainingCalls := store.markDrainingCalls
+		recordState := store.preloadedRecords[worker.ID].State
+		store.mu.Unlock()
+		if recordState == configstore.WorkerStateDraining {
+			if markDrainingCalls != 1 {
+				t.Fatalf("expected one durable drain repair call, got %d", markDrainingCalls)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected health loop to repair durable state to draining, got %q", recordState)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func TestK8sPoolHealthCheckLoopRepairsInconsistentLocalDrainingDurableHotWorkerAfterPodExit(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, 10*time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+	close(worker.done)
+
+	deadline := time.After(time.Second)
+	for {
+		pool.mu.RLock()
+		_, stillPresent := pool.workers[worker.ID]
+		pool.mu.RUnlock()
+		if !stillPresent {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected inconsistent local-draining durable-hot pod exit to remove local worker")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("inconsistent local-draining durable-hot pod exit must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	store.mu.Lock()
+	markDrainingCalls := store.markDrainingCalls
+	retireDrainingCalls := store.retireDrainingCalls
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markDrainingCalls != 1 {
+		t.Fatalf("expected one drain CAS before retire, got %d", markDrainingCalls)
+	}
+	if retireDrainingCalls != 2 {
+		t.Fatalf("expected initial retire miss plus final retire-draining CAS, got %d", retireDrainingCalls)
+	}
+	if recordState != configstore.WorkerStateRetired {
+		t.Fatalf("expected durable worker state retired, got %q", recordState)
+	}
+}
+
 func TestK8sPoolHealthCheckLoopRetiresDrainingWorkerAfterPodExit(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{

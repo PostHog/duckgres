@@ -10,8 +10,8 @@
 # two real metadata backends cnpg + ext (aurora is retired — out of scope):
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
-#                  and a cold-pool burst gets the graceful warm-pool backpressure
-#                  hint ("retry in ~45s") then recovers.
+#                  and a cold-pool burst waits for cold workers to spawn instead
+#                  of failing or leaking session state.
 #   activation   : DuckLake + Iceberg catalogs attach and read/write.
 #   ext forks    : the bundled ducklake/httpfs extensions are the PostHog forks,
 #                  not upstream (detects an accidental upstream swap in the image).
@@ -109,17 +109,12 @@ resolve_cp_ip() {
   [ -n "$CP_IP" ] || fail "could not resolve $PGHOST"
 }
 
-# Warm-pool backpressure ("no warm Duckgres worker … retry in about 45 seconds")
-# is a FEATURE, not an error: with shared_warm_target=0 the per-org pool is cold,
-# so ANY new-session acquisition — a fresh catalog (ducklake→iceberg), a burst,
-# or the first connect after the pool churned (worker kills / idle timeout) — can
-# transiently get it while the CP spawns a worker. It is a FATAL at session
-# create, BEFORE any SQL runs, so retrying the whole command is safe (no
-# half-applied INSERT). So every harness query tolerates it via bounded retry.
-# Auth failures and real SQL errors are NOT retried — they surface immediately,
-# so this never feeds the rate limiter or masks a genuine failure. (The
-# backpressure *contract itself* is asserted separately in
-# warm_capacity_backpressure, which uses raw psql to observe the hint.)
+# With shared_warm_target=0, the first connection for an org and occasional
+# bursts may need to wait while the CP cold-spawns workers. Most paths should now
+# queue up to worker_queue_timeout instead of returning the older hard
+# "retry in ~45s" rejection. The bounded retry below remains to tolerate
+# transitional provisioning errors that happen before SQL starts; auth failures
+# and real SQL errors are NOT retried.
 _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
   a=0 out=""
   while [ "$a" -lt 12 ]; do
@@ -196,39 +191,36 @@ basic_query() { # org password
   [ "$n" = "1" ] || fail "$1 SELECT 1 returned '$n'"
 }
 
-# Warm-pool backpressure is a FEATURE: when a burst of sessions outruns the
-# cold worker pool (shared_warm_target=0), the CP rejects the surplus with a
-# graceful, client-visible "no warm Duckgres worker is currently available;
-# retry in about 45 seconds" rather than hanging, 500-ing, or dropping the
-# connection. Assert both halves of the contract: (1) under a cold-pool burst at
-# least one connection receives that exact graceful hint, and (2) the pool then
-# drains so a (retrying) connection succeeds. Run this BEFORE the heavier
-# concurrency tests, while only one worker is warm, so the burst reliably
-# exceeds instantaneous spawn capacity.
-warm_capacity_backpressure() { # org password
-  log "warm-pool backpressure contract on $1"
-  burst=12; seen=/tmp/bp_seen; rm -f "$seen"; pids=""
+# Cold-spawn queue contract: when a burst of sessions outruns the current warm
+# pool (shared_warm_target=0), the CP should queue clients while workers spawn
+# rather than requiring clients to reconnect on the old "retry in ~45s" hard
+# rejection path. The helper still tolerates transitional pre-SQL provisioning
+# errors via bounded retry, but the assertion is success/recovery, not seeing a
+# specific retry hint.
+cold_spawn_queue_burst() { # org password
+  log "cold-spawn queue burst on $1"
+  burst=12; ok=/tmp/cold_spawn_ok; failout=/tmp/cold_spawn_fail; rm -f "$ok" "$failout"; pids=""
   i=0
   while [ "$i" -lt "$burst" ]; do
-    ( o="$(PGPASSWORD="$2" psql \
-        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
-        -tAc 'SELECT 1' 2>&1 || true)"
-      case "$o" in
-        *"no warm Duckgres worker"*|*"retry in about"*|*"capacity exhausted"*) echo x >> "$seen" ;;
-      esac ) &
+    ( if o="$(pgc "$1" "$2" ducklake 'SELECT 1')" && [ "$o" = "1" ]; then
+        echo x >> "$ok"
+      else
+        printf '%s\n' "$o" >> "$failout"
+      fi ) &
     pids="$pids $!"; i=$((i + 1))
   done
   for p in $pids; do wait "$p" || true; done
-  [ -s "$seen" ] || fail "expected graceful 'retry in ~45s' backpressure under a cold-pool burst of $burst, but no connection saw it"
-  log "backpressure observed: $(wc -l < "$seen" | tr -d ' ')/$burst connections got the graceful retry hint"
-  # The pool must recover: a retrying connection succeeds.
+  got="$(wc -l < "$ok" 2>/dev/null | tr -d ' ')"
+  [ "$got" = "$burst" ] || fail "cold-spawn burst succeeded for $got/$burst connections; failures: $(cat "$failout" 2>/dev/null | tr '\n' ';')"
+  log "cold-spawn burst succeeded for $got/$burst connections"
+  # The pool must still recover for a later connection.
   v="$(pgc "$1" "$2" ducklake 'SELECT 1')"
-  [ "$v" = "1" ] || fail "pool did not recover after backpressure (got '$v')"
+  [ "$v" = "1" ] || fail "pool did not recover after cold-spawn burst (got '$v')"
 }
 
 # N concurrent connections each run a distinct query and must each see their own
-# value (no cross-talk / session bleed). Uses pgc so the cold-pool backpressure
-# (asserted separately in warm_capacity_backpressure) is handled, not fatal.
+# value (no cross-talk / session bleed). Uses pgc so transitional cold-spawn
+# provisioning errors are retried, not fatal.
 # Ported from TestK8sMultipleConcurrentConnections.
 concurrent_connections() { # org password
   log "5 concurrent connections on $1"
@@ -558,7 +550,7 @@ main() {
   # ---- cnpg backend (full coverage incl. pod-level + resilience) ----
   wait_worker "$CNPG" "$cnpg_pw" ducklake
   basic_query            "$CNPG" "$cnpg_pw"
-  warm_capacity_backpressure "$CNPG" "$cnpg_pw"   # while only one worker is warm
+  cold_spawn_queue_burst "$CNPG" "$cnpg_pw"   # while only one worker is warm
   rw_ducklake            "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
   rw_iceberg             "$CNPG" "$cnpg_pw"
@@ -589,7 +581,7 @@ main() {
   # end-to-end would need a warm target >0 in the per-PR CP (see README).
   log "SKIP shared-warm-activation + version-reaper (CP runs warm-target=0; see README)"
 
-  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: wire + cold-spawn-queue + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

@@ -35,6 +35,7 @@ var bootstrapBundledExtensions = server.BootstrapBundledExtensions
 var exitProcess = os.Exit
 
 var ErrWorkerDraining = errors.New("worker is draining")
+var errSessionClosed = errors.New("session closed")
 
 // DuckDBService is a standalone Arrow Flight SQL service backed by DuckDB.
 type DuckDBService struct {
@@ -103,6 +104,7 @@ type trackedTx struct {
 	tx          *sql.Tx
 	finishDrain func()
 	lastUsed    atomic.Int64 // unix nano
+	activeWork  atomic.Int32
 }
 
 // Session represents a single DuckDB session.
@@ -115,10 +117,14 @@ type Session struct {
 	lastUsed  atomic.Int64 // unix nano
 
 	mu             sync.RWMutex
+	connMu         sync.Mutex // serializes operations on Conn and session-owned transactions
 	queries        map[string]*QueryHandle
 	metadataDrains map[string][]drainToken
 	txns           map[string]*trackedTx
 	txnOwner       map[string]string
+	closed         bool
+	connWork       int
+	connWorkDone   *sync.Cond
 	handleCounter  atomic.Uint64
 
 	// sqlTxActive tracks whether a SQL-level transaction is in progress on this
@@ -128,8 +134,9 @@ type Session struct {
 	// retrying statements inside a user-managed transaction — a retry after a
 	// transient error would run in autocommit mode (the transaction is dead)
 	// and mask the failure from the client.
-	sqlTxActive atomic.Bool
-	sqlTxDrain  func()
+	sqlTxActive   atomic.Bool
+	sqlTxDrain    func()
+	sqlTxLastUsed atomic.Int64
 
 	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
 	progress   progressState    // stall detection state
@@ -196,16 +203,37 @@ func (s *Session) allowsDrainContinuation(txnKey string) bool {
 	return s.sqlTxActive.Load() && s.hasSQLTransactionDrain()
 }
 
-func (s *Session) setSQLTransactionDrain(release func()) {
+func (t *trackedTx) beginWork() func() {
+	if t == nil {
+		return func() {}
+	}
+	t.activeWork.Add(1)
+	t.lastUsed.Store(time.Now().UnixNano())
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.lastUsed.Store(time.Now().UnixNano())
+			t.activeWork.Add(-1)
+		})
+	}
+}
+
+func (s *Session) setSQLTransactionDrain(release func()) bool {
 	if release == nil {
-		return
+		return true
 	}
 	var old func()
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
 	old = s.sqlTxDrain
 	s.sqlTxDrain = release
+	s.sqlTxLastUsed.Store(time.Now().UnixNano())
 	s.mu.Unlock()
 	releaseDrainFunc(old)
+	return true
 }
 
 func (s *Session) releaseSQLTransactionDrain() {
@@ -213,8 +241,177 @@ func (s *Session) releaseSQLTransactionDrain() {
 	s.mu.Lock()
 	release = s.sqlTxDrain
 	s.sqlTxDrain = nil
+	s.sqlTxLastUsed.Store(0)
 	s.mu.Unlock()
 	releaseDrainFunc(release)
+}
+
+// beginConnWork fences any operation that uses the session connection while a
+// raw SQL transaction may be open. It intentionally does not mutate queryActive:
+// conn work includes COPY receive and metadata/planning work, while queryActive
+// is reserved for query progress and stall reporting.
+func (s *Session) beginConnWork() (func(), bool) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, false
+	}
+	s.connWork++
+	if s.sqlTxActive.Load() {
+		s.sqlTxLastUsed.Store(time.Now().UnixNano())
+	}
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if s.connWork > 0 {
+				s.connWork--
+			}
+			if s.connWork == 0 && s.connWorkDone != nil {
+				s.connWorkDone.Broadcast()
+			}
+			if s.sqlTxActive.Load() {
+				s.sqlTxLastUsed.Store(time.Now().UnixNano())
+			}
+			s.mu.Unlock()
+		})
+	}, true
+}
+
+func (s *Session) waitConnWorkDoneLocked() {
+	if s.connWorkDone == nil {
+		s.connWorkDone = sync.NewCond(&s.mu)
+	}
+	for s.connWork > 0 {
+		s.connWorkDone.Wait()
+	}
+}
+
+func (s *Session) exec(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	if tx != nil {
+		s.connMu.Lock()
+		defer s.connMu.Unlock()
+		return tx.ExecContext(ctx, query, args...)
+	}
+	return s.execConn(ctx, query, args...)
+}
+
+func (s *Session) execConn(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, errSessionClosed
+	}
+	defer end()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.Conn == nil {
+		return nil, errSessionClosed
+	}
+	return s.Conn.ExecContext(ctx, query, args...)
+}
+
+func (s *Session) rollbackConn(ctx context.Context) error {
+	_, err := s.execConn(ctx, "ROLLBACK")
+	return err
+}
+
+func (s *Session) beginTx(ctx context.Context) (*sql.Tx, error) {
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, errSessionClosed
+	}
+	defer end()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.Conn == nil {
+		return nil, errSessionClosed
+	}
+	return s.Conn.BeginTx(ctx, nil)
+}
+
+func (s *Session) queryRows(ctx context.Context, tx *sql.Tx, query string, args ...any) (*sql.Rows, func() error, error) {
+	if tx != nil {
+		s.connMu.Lock()
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			s.connMu.Unlock()
+			return nil, nil, err
+		}
+		var once sync.Once
+		closeRows := func() error {
+			var closeErr error
+			once.Do(func() {
+				closeErr = rows.Close()
+				s.connMu.Unlock()
+			})
+			return closeErr
+		}
+		return rows, closeRows, nil
+	}
+	return s.queryConnRows(ctx, query, args...)
+}
+
+func (s *Session) queryConnRows(ctx context.Context, query string, args ...any) (*sql.Rows, func() error, error) {
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, nil, errSessionClosed
+	}
+	s.connMu.Lock()
+	if s.Conn == nil {
+		s.connMu.Unlock()
+		end()
+		return nil, nil, errSessionClosed
+	}
+	rows, err := s.Conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		s.connMu.Unlock()
+		end()
+		return nil, nil, err
+	}
+	var once sync.Once
+	closeRows := func() error {
+		var closeErr error
+		once.Do(func() {
+			closeErr = rows.Close()
+			s.connMu.Unlock()
+			end()
+		})
+		return closeErr
+	}
+	return rows, closeRows, nil
+}
+
+func (s *Session) getQuerySchema(ctx context.Context, query string, tx *sql.Tx) (*arrow.Schema, error) {
+	if tx != nil {
+		s.connMu.Lock()
+		defer s.connMu.Unlock()
+		return GetQuerySchema(ctx, nil, query, tx)
+	}
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, errSessionClosed
+	}
+	defer end()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.Conn == nil {
+		return nil, errSessionClosed
+	}
+	return GetQuerySchema(ctx, s.Conn, query, nil)
+}
+
+func (s *Session) commitTx(tx *sql.Tx) error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return tx.Commit()
+}
+
+func (s *Session) rollbackTx(tx *sql.Tx) error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return tx.Rollback()
 }
 
 // NewDuckDBService creates a new DuckDB service with the given config.
@@ -375,16 +572,54 @@ func (p *SessionPool) reapIdle(now time.Time) {
 		for id, ttx := range s.txns {
 			last := time.Unix(0, ttx.lastUsed.Load())
 			if now.Sub(last) > txnIdleTimeout {
+				if ttx.activeWork.Load() > 0 {
+					continue
+				}
+				if !s.connMu.TryLock() {
+					continue
+				}
 				slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
 				if ttx.tx != nil {
 					_ = ttx.tx.Rollback()
 				}
+				s.connMu.Unlock()
 				if ttx.finishDrain != nil {
 					releaseDrains = append(releaseDrains, ttx.finishDrain)
 					ttx.finishDrain = nil
 				}
 				delete(s.txns, id)
 				delete(s.txnOwner, id)
+			}
+		}
+		if s.sqlTxActive.Load() && s.sqlTxDrain != nil {
+			lastNanos := s.sqlTxLastUsed.Load()
+			if lastNanos == 0 {
+				lastNanos = s.lastUsed.Load()
+			}
+			last := time.Unix(0, lastNanos)
+			if now.Sub(last) > txnIdleTimeout {
+				if s.connWork > 0 {
+					// The connection may be executing, streaming, or planning work inside
+					// this raw SQL transaction. Leave the transaction drain token active.
+				} else if s.Conn == nil {
+					slog.Warn("Skipping idle raw SQL transaction rollback without a session connection.", "user", s.Username)
+				} else if !s.connMu.TryLock() {
+					// A same-session operation is using the connection but has not reached
+					// a connWork-tracked path. Skip instead of blocking the reaper loop.
+				} else {
+					slog.Warn("Rolling back idle raw SQL transaction.", "user", s.Username)
+					rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), time.Second)
+					if _, err := s.Conn.ExecContext(rollbackCtx, "ROLLBACK"); err != nil {
+						slog.Warn("Idle raw SQL transaction rollback failed; keeping drain work active.", "user", s.Username, "error", err)
+					} else {
+						releaseDrains = append(releaseDrains, s.sqlTxDrain)
+						s.sqlTxDrain = nil
+						s.sqlTxActive.Store(false)
+						s.sqlTxLastUsed.Store(0)
+					}
+					rollbackCancel()
+					s.connMu.Unlock()
+				}
 			}
 		}
 		// Drain tokens stranded on query handles. An actively-streaming DoGet has
@@ -892,9 +1127,11 @@ func (p *SessionPool) DestroySession(token string) error {
 	}
 
 	var releaseDrains []func()
+	var rollbackTxs []*sql.Tx
 
 	// Roll back any open transactions
 	session.mu.Lock()
+	session.closed = true
 	for id, handle := range session.queries {
 		if handle.finishDrain != nil {
 			releaseDrains = append(releaseDrains, handle.finishDrain)
@@ -912,10 +1149,11 @@ func (p *SessionPool) DestroySession(token string) error {
 		releaseDrains = append(releaseDrains, session.sqlTxDrain)
 		session.sqlTxDrain = nil
 		session.sqlTxActive.Store(false)
+		session.sqlTxLastUsed.Store(0)
 	}
 	for id, ttx := range session.txns {
 		if ttx.tx != nil {
-			_ = ttx.tx.Rollback()
+			rollbackTxs = append(rollbackTxs, ttx.tx)
 		}
 		if ttx.finishDrain != nil {
 			releaseDrains = append(releaseDrains, ttx.finishDrain)
@@ -924,7 +1162,11 @@ func (p *SessionPool) DestroySession(token string) error {
 		delete(session.txns, id)
 		delete(session.txnOwner, id)
 	}
+	session.waitConnWorkDoneLocked()
 	session.mu.Unlock()
+	for _, tx := range rollbackTxs {
+		_ = session.rollbackTx(tx)
+	}
 	for _, release := range releaseDrains {
 		releaseDrainFunc(release)
 	}
@@ -933,6 +1175,7 @@ func (p *SessionPool) DestroySession(token string) error {
 		stop()
 	}
 	if session.Conn != nil {
+		session.connMu.Lock()
 		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
 		// pool rather than closing it. DuckDB temp tables, temp views, and
 		// temp macros are connection-scoped, so without intervention they'd
@@ -974,6 +1217,7 @@ func (p *SessionPool) DestroySession(token string) error {
 			"cleanup_duration", time.Since(cleanupStart),
 			"close_duration", time.Since(connCloseStart),
 			"evicted", evicted)
+		session.connMu.Unlock()
 	}
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
@@ -1105,7 +1349,9 @@ func (p *SessionPool) CloseAll() {
 
 	for _, session := range sessions {
 		var releaseDrains []func()
+		var rollbackTxs []*sql.Tx
 		session.mu.Lock()
+		session.closed = true
 		for id, handle := range session.queries {
 			if handle.finishDrain != nil {
 				releaseDrains = append(releaseDrains, handle.finishDrain)
@@ -1123,10 +1369,11 @@ func (p *SessionPool) CloseAll() {
 			releaseDrains = append(releaseDrains, session.sqlTxDrain)
 			session.sqlTxDrain = nil
 			session.sqlTxActive.Store(false)
+			session.sqlTxLastUsed.Store(0)
 		}
 		for id, ttx := range session.txns {
 			if ttx.tx != nil {
-				_ = ttx.tx.Rollback()
+				rollbackTxs = append(rollbackTxs, ttx.tx)
 			}
 			if ttx.finishDrain != nil {
 				releaseDrains = append(releaseDrains, ttx.finishDrain)
@@ -1135,13 +1382,19 @@ func (p *SessionPool) CloseAll() {
 			delete(session.txns, id)
 			delete(session.txnOwner, id)
 		}
+		session.waitConnWorkDoneLocked()
 		session.mu.Unlock()
+		for _, tx := range rollbackTxs {
+			_ = session.rollbackTx(tx)
+		}
 		for _, release := range releaseDrains {
 			releaseDrainFunc(release)
 		}
 
 		if session.Conn != nil {
+			session.connMu.Lock()
 			_ = session.Conn.Close()
+			session.connMu.Unlock()
 		}
 		if session.DB != nil && session.DB != p.warmupDB && session.DB != p.fallbackDB {
 			_ = session.DB.Close()

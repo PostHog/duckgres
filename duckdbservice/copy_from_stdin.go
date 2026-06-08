@@ -48,13 +48,20 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	if err != nil {
 		return err
 	}
+	endConnWork, ok := session.beginConnWork()
+	if !ok {
+		return status.Error(codes.NotFound, "session closed")
+	}
 	finishDrain, err := h.pool.beginDrainWork(session.allowsDrainContinuation(""))
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		endConnWork()
 		return drainErr
 	}
 	if err != nil {
+		endConnWork()
 		return status.Errorf(codes.Internal, "copy-from-stdin: start drain tracking: %v", err)
 	}
+	defer endConnWork()
 	defer finishDrain()
 
 	desc := first.GetFlightDescriptor()
@@ -122,8 +129,11 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	slog.Debug("copy-from-stdin: executing COPY",
 		"frames", frames, "bytes", bytesWritten, "tmp", tmpPath)
 
-	res, execErr := session.Conn.ExecContext(ctx, finalSQL)
+	res, execErr := session.execConn(ctx, finalSQL)
 	if execErr != nil {
+		if closedErr := sessionClosedStatus(execErr); closedErr != nil {
+			return closedErr
+		}
 		return status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
 	var rowCount int64
