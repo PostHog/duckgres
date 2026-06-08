@@ -136,6 +136,11 @@ type Resolved struct {
 	K8sColocatedWorkerMemoryRequest    string
 	K8sColocatedWarmShapes             []controlplane.ColocatedWarmShape
 	K8sWorkerPriorityClassName         string
+	K8sHeadroomPercent                 int
+	K8sPlaceholderImage                string
+	K8sPlaceholderCPU                  string
+	K8sPlaceholderMemory               string
+	K8sPlaceholderPriorityClassName    string
 	K8sWorkerTiers                     map[string]controlplane.WorkerProfileSpec
 	K8sColocatedWorkerNodeSelector     string
 	K8sColocatedWorkerTolerationKey    string
@@ -223,6 +228,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sOrgMaxColocatedCPU int
 	var k8sOrgMaxColocatedMemory string
 	var k8sWorkerPriorityClassName string
+	var k8sHeadroomPercent int
+	var k8sPlaceholderImage, k8sPlaceholderCPU, k8sPlaceholderMemory, k8sPlaceholderPriorityClassName string
 	var k8sWorkerTiers map[string]controlplane.WorkerProfileSpec
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
@@ -1022,6 +1029,23 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
 		k8sWorkerPriorityClassName = v
 	}
+	if v := getenv("DUCKGRES_K8S_HEADROOM_PERCENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sHeadroomPercent = n
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_IMAGE"); v != "" {
+		k8sPlaceholderImage = v
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_CPU"); v != "" {
+		k8sPlaceholderCPU = v
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_MEMORY"); v != "" {
+		k8sPlaceholderMemory = v
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_PRIORITY_CLASS"); v != "" {
+		k8sPlaceholderPriorityClassName = v
+	}
 	if v := getenv("DUCKGRES_K8S_WORKER_TIERS"); v != "" {
 		var tiers map[string]controlplane.WorkerProfileSpec
 		if err := json.Unmarshal([]byte(v), &tiers); err == nil {
@@ -1433,6 +1457,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sColocatedWorkerMemoryRequest:    k8sColocatedWorkerMemoryRequest,
 		K8sColocatedWarmShapes:             k8sColocatedWarmShapes,
 		K8sWorkerPriorityClassName:         k8sWorkerPriorityClassName,
+		K8sHeadroomPercent:                 k8sHeadroomPercent,
+		K8sPlaceholderImage:                k8sPlaceholderImage,
+		K8sPlaceholderCPU:                  k8sPlaceholderCPU,
+		K8sPlaceholderMemory:               k8sPlaceholderMemory,
+		K8sPlaceholderPriorityClassName:    k8sPlaceholderPriorityClassName,
 		K8sWorkerTiers:                     k8sWorkerTiers,
 		K8sColocatedWorkerNodeSelector:     k8sColocatedWorkerNodeSelector,
 		K8sColocatedWorkerTolerationKey:    k8sColocatedWorkerTolerationKey,

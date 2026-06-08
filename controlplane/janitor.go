@@ -45,6 +45,7 @@ type ControlPlaneJanitor struct {
 	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
+	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured node-headroom % (leader-only)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -202,6 +203,10 @@ func (j *ControlPlaneJanitor) runOnce() {
 
 	if j.reconcileWarmCapacity != nil {
 		j.reconcileWarmCapacity()
+	}
+
+	if j.reconcileHeadroom != nil {
+		j.reconcileHeadroom()
 	}
 }
 
