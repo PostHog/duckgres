@@ -1839,6 +1839,15 @@ func (p *K8sWorkerPool) spawnReservedSizedWorker(ctx context.Context, assignment
 			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
 		}
 		id = slot.WorkerID
+		// Stamp the requested size + TTL onto the slot row immediately, so any
+		// adoption/reconciliation that reconstructs the worker from the DB before
+		// it is reserved already carries the profile (CreateSpawningWorkerSlot
+		// creates the row with an empty profile).
+		slot.ProfileCPU = profile.CPU
+		slot.ProfileMemory = profile.Memory
+		slot.ProfileColocate = profile.Colocate
+		slot.TTLMinutes = int(profile.TTL.Minutes())
+		_ = p.persistWorkerRecord(slot)
 	} else {
 		p.mu.Lock()
 		id = p.allocateWorkerIDLocked()
@@ -2042,7 +2051,17 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		image:       claimed.Image,
 		bearerToken: token,
 		client:      client,
-		done:        make(chan struct{}),
+		// Restore the worker's size + TTL from the persisted record so a re-adopted
+		// worker keeps its shape. Without this, re-adopting a sized worker reset its
+		// profile to the default and the next hot-idle persist dropped its
+		// cpu/mem/ttl, so a same-size request could no longer reuse it.
+		profile: WorkerProfile{
+			CPU:      claimed.ProfileCPU,
+			Memory:   claimed.ProfileMemory,
+			Colocate: claimed.ProfileColocate,
+			TTL:      time.Duration(claimed.TTLMinutes) * time.Minute,
+		},
+		done: make(chan struct{}),
 	}
 	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
 	worker.SetOwnerEpoch(claimed.OwnerEpoch)
