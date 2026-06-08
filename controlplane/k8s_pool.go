@@ -96,6 +96,15 @@ type K8sWorkerPool struct {
 	workerExclusiveNode     bool              // one worker per node via anti-affinity
 	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
+	// Headroom controller: keep headroomPercent% of worker-nodepool allocatable
+	// CPU+mem held by low-priority placeholder pods so a worker spawn schedules
+	// immediately (preempting placeholders) instead of waiting on a fresh node.
+	headroomPercent              int
+	placeholderImage             string
+	placeholderCPU               string
+	placeholderMemory            string
+	placeholderPriorityClassName string
+
 	// Colocated (bin-pack) scheduling for colocate=true worker profiles. When a
 	// spawned worker's profile is colocated, these replace the default
 	// nodeSelector/toleration and the exclusive-node anti-affinity is dropped so
@@ -212,6 +221,12 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerTolerationValue:   cfg.WorkerTolerationValue,
 		workerExclusiveNode:     cfg.WorkerExclusiveNode,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
+
+		headroomPercent:              cfg.HeadroomPercent,
+		placeholderImage:             cfg.PlaceholderImage,
+		placeholderCPU:               cfg.PlaceholderCPU,
+		placeholderMemory:            cfg.PlaceholderMemory,
+		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
 
 		colocatedWorkerNodeSelector:    cfg.ColocatedNodeSelector,
 		colocatedWorkerTolerationKey:   cfg.ColocatedTolerationKey,

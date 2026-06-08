@@ -168,30 +168,35 @@ func SetupMultiTenant(
 	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
 
 	baseCfg := K8sWorkerPoolConfig{
-		Namespace:                namespace,
-		CPID:                     cpID,
-		CPInstanceID:             cpInstanceID,
-		WorkerImage:              cfg.K8s.WorkerImage,
-		WorkerPort:               cfg.K8s.WorkerPort,
-		SecretName:               cfg.K8s.WorkerSecret,
-		ConfigMap:                cfg.K8s.WorkerConfigMap,
-		MaxWorkers:               maxWorkers,
-		WarmAcquireTimeout:       cfg.K8s.WarmAcquireTimeout,
-		IdleTimeout:              cfg.WorkerIdleTimeout,
-		ConfigPath:               cfg.ConfigPath,
-		ImagePullPolicy:          cfg.K8s.ImagePullPolicy,
-		ServiceAccount:           cfg.K8s.ServiceAccount,
-		WorkerCPURequest:         cfg.K8s.WorkerCPURequest,
-		WorkerMemoryRequest:      cfg.K8s.WorkerMemoryRequest,
-		WorkerNodeSelector:       parseNodeSelector(cfg.K8s.WorkerNodeSelector),
-		WorkerTolerationKey:      cfg.K8s.WorkerTolerationKey,
-		WorkerTolerationValue:    cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:      cfg.K8s.WorkerExclusiveNode,
-		WorkerPriorityClassName:  cfg.K8s.WorkerPriorityClassName,
-		ColocatedNodeSelector:    parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
-		ColocatedTolerationKey:   cfg.K8s.ColocatedWorkerTolerationKey,
-		ColocatedTolerationValue: cfg.K8s.ColocatedWorkerTolerationValue,
-		ColocatedWarmShapes:      cfg.K8s.ColocatedWarmShapes,
+		Namespace:                    namespace,
+		CPID:                         cpID,
+		CPInstanceID:                 cpInstanceID,
+		WorkerImage:                  cfg.K8s.WorkerImage,
+		WorkerPort:                   cfg.K8s.WorkerPort,
+		SecretName:                   cfg.K8s.WorkerSecret,
+		ConfigMap:                    cfg.K8s.WorkerConfigMap,
+		MaxWorkers:                   maxWorkers,
+		WarmAcquireTimeout:           cfg.K8s.WarmAcquireTimeout,
+		IdleTimeout:                  cfg.WorkerIdleTimeout,
+		ConfigPath:                   cfg.ConfigPath,
+		ImagePullPolicy:              cfg.K8s.ImagePullPolicy,
+		ServiceAccount:               cfg.K8s.ServiceAccount,
+		WorkerCPURequest:             cfg.K8s.WorkerCPURequest,
+		WorkerMemoryRequest:          cfg.K8s.WorkerMemoryRequest,
+		WorkerNodeSelector:           parseNodeSelector(cfg.K8s.WorkerNodeSelector),
+		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,
+		WorkerExclusiveNode:          cfg.K8s.WorkerExclusiveNode,
+		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
+		HeadroomPercent:              cfg.K8s.HeadroomPercent,
+		PlaceholderImage:             cfg.K8s.PlaceholderImage,
+		PlaceholderCPU:               cfg.K8s.PlaceholderCPU,
+		PlaceholderMemory:            cfg.K8s.PlaceholderMemory,
+		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,
+		ColocatedNodeSelector:        parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
+		ColocatedTolerationKey:       cfg.K8s.ColocatedWorkerTolerationKey,
+		ColocatedTolerationValue:     cfg.K8s.ColocatedWorkerTolerationValue,
+		ColocatedWarmShapes:          cfg.K8s.ColocatedWarmShapes,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {
@@ -329,6 +334,17 @@ func SetupMultiTenant(
 			slog.Info("Stranded worker RPC secrets reconciled.", "count", n)
 		}
 		secretCancel()
+	}
+
+	// Node-headroom controller: keep low-priority placeholder pods holding the
+	// configured % of worker-nodepool allocatable free so worker spawns schedule
+	// immediately. Leader-only (runs on the janitor tick). No-op when disabled.
+	if cfg.K8s.HeadroomPercent > 0 {
+		janitor.reconcileHeadroom = func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			router.sharedPool.reconcileHeadroom(ctx)
+		}
 	}
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance
