@@ -1820,30 +1820,34 @@ func (p *K8sWorkerPool) spawnReservedSizedWorker(ctx context.Context, assignment
 		p.mu.Unlock()
 		return nil, fmt.Errorf("pool is shutting down")
 	}
-	// Respect the org's worker cap before spawning (in-process count; the DB-side
-	// cap on the claim path is cross-CP, this bounds the foreground sized-spawn).
-	if assignment.MaxWorkers > 0 {
-		n := 0
-		for _, w := range p.workers {
-			select {
-			case <-w.done:
-				continue
-			default:
-			}
-			st := w.SharedState()
-			if st.Assignment != nil && st.Assignment.OrgID == assignment.OrgID && st.NormalizedLifecycle() != WorkerLifecycleRetired {
-				n++
-			}
-		}
-		if n >= assignment.MaxWorkers {
-			p.mu.Unlock()
-			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
-		}
-	}
-	id := p.allocateBackgroundSpawnIDLocked()
-	p.spawning++
+	maxGlobal := p.maxWorkers
 	p.mu.Unlock()
 
+	// Allocate a real, unique worker id. In the runtime-store path this MUST come
+	// from the DB via CreateSpawningWorkerSlot (which also enforces the per-org and
+	// global worker caps cross-CP and returns a nil slot when capped) — the
+	// background id allocator returns a placeholder 0 that collides across spawns.
+	var id int
+	if p.runtimeStore != nil {
+		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+			p.cpInstanceID, assignment.OrgID, assignment.Image, 0,
+			p.workerPodNamePrefix(), assignment.MaxWorkers, maxGlobal)
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+		}
+		id = slot.WorkerID
+	} else {
+		p.mu.Lock()
+		id = p.allocateWorkerIDLocked()
+		p.mu.Unlock()
+	}
+
+	p.mu.Lock()
+	p.spawning++
+	p.mu.Unlock()
 	err := p.spawnWorker(ctx, id, assignment.Image, profile, false)
 	p.mu.Lock()
 	p.spawning--
