@@ -144,6 +144,16 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"hostmask":                          true, // inet host mask
 			"set_masklen":                       true, // inet set prefix length
 			"inet_same_family":                  true, // inet family compare
+			"array_positions":                   true, // indices of all matching elements
+			"array_replace":                     true, // replace all matching elements
+			"array_fill":                        true, // 1-D fill
+			"trim_array":                        true, // drop last n elements
+			"array_dims":                        true, // 1-D bounds string
+			"date_bin":                          true, // bin timestamp to stride
+			"make_interval":                     true, // interval from components
+			"justify_hours":                     true, // roll 24h into days
+			"justify_days":                      true, // roll 30d into months
+			"justify_interval":                  true, // roll hours and days
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -213,6 +223,16 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"hostmask":                          true, // inet host mask
 			"set_masklen":                       true, // inet set prefix length
 			"inet_same_family":                  true, // inet family compare
+			"array_positions":                   true, // indices of all matching elements
+			"array_replace":                     true, // replace all matching elements
+			"array_fill":                        true, // 1-D fill
+			"trim_array":                        true, // drop last n elements
+			"array_dims":                        true, // 1-D bounds string
+			"date_bin":                          true, // bin timestamp to stride
+			"make_interval":                     true, // interval from components
+			"justify_hours":                     true, // roll 24h into days
+			"justify_days":                      true, // roll 30d into months
+			"justify_interval":                  true, // roll hours and days
 
 			// ClickHouse SQL macros (server/chsql.go initClickHouseMacros)
 			"tostring":          true,

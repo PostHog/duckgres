@@ -461,6 +461,8 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_INPUT_IS_VALID(", "TO_REGCLASS(", "TO_REGTYPE(", "TO_REGPROC(", "JSONB_PRETTY(",
 		"TO_ASCII(", "CONVERT_FROM(", "WIDTH_BUCKET(", "SCALE(", "MIN_SCALE(",
 		"MASKLEN(", "HOSTMASK(", "SET_MASKLEN(", "INET_SAME_FAMILY(",
+		"ARRAY_POSITIONS(", "ARRAY_REPLACE(", "ARRAY_FILL(", "TRIM_ARRAY(", "ARRAY_DIMS(",
+		"DATE_BIN(", "MAKE_INTERVAL(", "JUSTIFY_HOURS(", "JUSTIFY_DAYS(", "JUSTIFY_INTERVAL(",
 	) {
 		flags |= FlagFunctions
 	}

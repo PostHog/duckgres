@@ -119,3 +119,49 @@ func TestCompatMacros_BatchA(t *testing.T) {
 		{"inet_same_family_mixed", `SELECT inet_same_family('192.168.1.5'::inet,'::1'::inet)::VARCHAR`, "false", false},
 	})
 }
+
+func TestCompatMacros_BatchB(t *testing.T) {
+	runMacroCases(t, []macroCase{
+		// array_positions — indices (1-based) of all matches; empty array (not NULL) on no match
+		{"array_positions_matches", `SELECT (array_positions(ARRAY[1,2,3,2], 2) = [2,4])::VARCHAR`, "true", false},
+		{"array_positions_none", `SELECT (array_positions(ARRAY[1,2,3], 9) = []::BIGINT[])::VARCHAR`, "true", false},
+		{"array_positions_nulls", `SELECT (array_positions(ARRAY[1,NULL,2,NULL], NULL) = [2,4])::VARCHAR`, "true", false},
+
+		// array_replace — replace all occurrences (NULL-target aware)
+		{"array_replace_basic", `SELECT (array_replace(ARRAY[1,2,3,2], 2, 9) = [1,9,3,9])::VARCHAR`, "true", false},
+		{"array_replace_null_target", `SELECT (array_replace(ARRAY[1,NULL,3], NULL, 9) = [1,9,3])::VARCHAR`, "true", false},
+
+		// array_fill — 1-D fill of val repeated dims[1] times
+		{"array_fill_basic", `SELECT (array_fill(7, ARRAY[3]) = [7,7,7])::VARCHAR`, "true", false},
+		{"array_fill_zero", `SELECT (array_fill(7, ARRAY[0]) = []::INTEGER[])::VARCHAR`, "true", false},
+
+		// trim_array — drop last n elements
+		{"trim_array_basic", `SELECT (trim_array(ARRAY[1,2,3,4,5], 2) = [1,2,3])::VARCHAR`, "true", false},
+		{"trim_array_all", `SELECT (trim_array(ARRAY[1,2,3], 3) = []::INTEGER[])::VARCHAR`, "true", false},
+
+		// array_dims — 1-D bounds string; NULL for empty/NULL
+		{"array_dims_basic", `SELECT array_dims(ARRAY[1,2,3])`, "[1:3]", false},
+		{"array_dims_empty", `SELECT array_dims(ARRAY[]::int[])::VARCHAR`, "", true},
+		{"array_dims_null", `SELECT array_dims(NULL::int[])::VARCHAR`, "", true},
+
+		// date_bin — bin a timestamp to a stride anchored at origin
+		{"date_bin_aligned", `SELECT (date_bin(INTERVAL '15 minutes', TIMESTAMP '2024-01-01 00:17:00', TIMESTAMP '2024-01-01 00:00:00') = TIMESTAMP '2024-01-01 00:15:00')::VARCHAR`, "true", false},
+		{"date_bin_offset_origin", `SELECT (date_bin(INTERVAL '15 minutes', TIMESTAMP '2024-01-01 00:17:00', TIMESTAMP '2024-01-01 00:05:00') = TIMESTAMP '2024-01-01 00:05:00')::VARCHAR`, "true", false},
+
+		// make_interval — named-default constructor; weeks fold into days
+		{"make_interval_positional", `SELECT (make_interval(0,0,0,4,5,6,7) = INTERVAL '4 days 5 hours 6 minutes 7 seconds')::VARCHAR`, "true", false},
+		{"make_interval_weeks", `SELECT (make_interval(1,2,3,4,5,6,7) = INTERVAL '1 year 2 months 25 days 5 hours 6 minutes 7 seconds')::VARCHAR`, "true", false},
+		{"make_interval_named", `SELECT (make_interval(days => 5) = INTERVAL '5 days')::VARCHAR`, "true", false},
+
+		// justify_* — roll over 24h/30day periods
+		{"justify_hours", `SELECT (justify_hours(INTERVAL '27 hours') = INTERVAL '1 day 3 hours')::VARCHAR`, "true", false},
+		{"justify_days", `SELECT (justify_days(INTERVAL '35 days') = INTERVAL '1 month 5 days')::VARCHAR`, "true", false},
+		{"justify_interval", `SELECT (justify_interval(INTERVAL '35 days 27 hours') = INTERVAL '1 month 6 days 3 hours')::VARCHAR`, "true", false},
+		{"justify_hours_frac", `SELECT (justify_hours(INTERVAL '25 hours 90.5 seconds') = INTERVAL '1 day 1 hour 1 minute 30.5 seconds')::VARCHAR`, "true", false},
+
+		// overlaps — half-open time-range overlap (OVERLAPS keyword -> overlaps() in DuckDB)
+		{"overlaps_true", `SELECT ((DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-01-15', DATE '2024-03-01'))::VARCHAR`, "true", false},
+		{"overlaps_disjoint", `SELECT ((DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-03-01', DATE '2024-04-01'))::VARCHAR`, "false", false},
+		{"overlaps_touching", `SELECT ((DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-02-01', DATE '2024-03-01'))::VARCHAR`, "false", false},
+	})
+}

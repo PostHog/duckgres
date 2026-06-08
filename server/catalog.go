@@ -1177,6 +1177,59 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			ELSE NULL END)`,
 		`CREATE OR REPLACE MACRO set_masklen(a, len) AS ((host(a) || '/' || CAST(len AS VARCHAR))::inet)`,
 		`CREATE OR REPLACE MACRO inet_same_family(a, b) AS (family(a) = family(b))`,
+
+		// array_positions - indices (1-based) of all elements equal to elem; empty array (not NULL)
+		// when none match. IS NOT DISTINCT FROM gives PG's NULL-element matching.
+		`CREATE OR REPLACE MACRO array_positions(arr, elem) AS
+			list_transform(list_filter(range(1, len(arr)+1), i -> arr[i] IS NOT DISTINCT FROM elem), i -> i)`,
+
+		// array_replace - replace every element equal to from_elem (NULL-aware) with to_elem.
+		`CREATE OR REPLACE MACRO array_replace(arr, from_elem, to_elem) AS
+			list_transform(arr, x -> CASE WHEN x IS NOT DISTINCT FROM from_elem THEN to_elem ELSE x END)`,
+
+		// array_fill - 1-D array of val repeated dims[1] times (the common PG usage).
+		`CREATE OR REPLACE MACRO array_fill(val, dims) AS list_transform(range(1, dims[1] + 1), x -> val)`,
+
+		// trim_array - array with the last n elements removed.
+		`CREATE OR REPLACE MACRO trim_array(arr, n) AS arr[1:len(arr)-n]`,
+
+		// array_dims - 1-D bounds string '[1:N]'; NULL for empty/NULL arrays.
+		`CREATE OR REPLACE MACRO array_dims(arr) AS
+			CASE WHEN arr IS NULL OR len(arr)=0 THEN NULL ELSE '[1:' || len(arr) || ']' END`,
+
+		// date_bin - bin a timestamp into stride-width buckets anchored at origin (PG14).
+		`CREATE OR REPLACE MACRO date_bin(stride, source, origin) AS time_bucket(stride, source, origin)`,
+
+		// make_interval - build an interval from named components; DuckDB lacks make_interval.
+		// Named defaults support both positional and named (days => N) call forms, matching PG.
+		`CREATE OR REPLACE MACRO make_interval(years := 0, months := 0, weeks := 0, days := 0, hours := 0, mins := 0, secs := 0) AS
+			to_years(years) + to_months(months) + to_days(weeks*7 + days) + to_hours(hours) + to_minutes(mins) + to_seconds(secs)`,
+
+		// justify_hours / justify_days / justify_interval - roll 24h periods into days and/or
+		// 30-day periods into months. DuckDB lacks these. Microsecond-based time math preserves
+		// fractional seconds (datepart('second') would truncate them).
+		`CREATE OR REPLACE MACRO justify_hours(i) AS
+			to_months(datepart('year',i)*12 + datepart('month',i))
+			+ to_days(datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000)
+			+ to_microseconds(((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) % 86400000000)`,
+		`CREATE OR REPLACE MACRO justify_days(i) AS
+			to_months(datepart('year',i)*12 + datepart('month',i) + datepart('day',i) // 30)
+			+ to_days(datepart('day',i) % 30)
+			+ to_microseconds((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i))`,
+		`CREATE OR REPLACE MACRO justify_interval(i) AS
+			to_months(datepart('year',i)*12 + datepart('month',i) + (datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000) // 30)
+			+ to_days((datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000) % 30)
+			+ to_microseconds(((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) % 86400000000)`,
+
+		// overlaps - PG's (s1,e1) OVERLAPS (s2,e2) half-open range test. DuckDB parses the
+		// OVERLAPS keyword into an overlaps() call but has no such function. Name must be
+		// double-quoted: OVERLAPS is a reserved keyword.
+		`CREATE OR REPLACE MACRO "overlaps"(s1, e1, s2, e2) AS
+			CASE
+				WHEN least(s1, e1) > least(s2, e2) THEN least(s1, e1) < greatest(s2, e2)
+				WHEN least(s1, e1) < least(s2, e2) THEN least(s2, e2) < greatest(s1, e1)
+				ELSE TRUE
+			END`,
 	}
 
 	for _, f := range functions {
