@@ -154,6 +154,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"justify_hours":                     true, // roll 24h into days
 			"justify_days":                      true, // roll 30d into months
 			"justify_interval":                  true, // roll hours and days
+			"decode":                            true, // bytea decode (base64/hex/escape) macro
+			"encode":                            true, // bytea encode (base64/hex/escape) macro
+			"inet_server_addr":                  true, // INET-typed NULL stub
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -233,6 +236,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"justify_hours":                     true, // roll 24h into days
 			"justify_days":                      true, // roll 30d into months
 			"justify_interval":                  true, // roll hours and days
+			"decode":                            true, // bytea decode (base64/hex/escape) macro
+			"encode":                            true, // bytea encode (base64/hex/escape) macro
+			"inet_server_addr":                  true, // INET-typed NULL stub
 
 			// ClickHouse SQL macros (server/chsql.go initClickHouseMacros)
 			"tostring":          true,

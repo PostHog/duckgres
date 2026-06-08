@@ -165,3 +165,23 @@ func TestCompatMacros_BatchB(t *testing.T) {
 		{"overlaps_touching", `SELECT ((DATE '2024-01-01', DATE '2024-02-01') OVERLAPS (DATE '2024-02-01', DATE '2024-03-01'))::VARCHAR`, "false", false},
 	})
 }
+
+func TestCompatMacros_BatchC(t *testing.T) {
+	runMacroCases(t, []macroCase{
+		// decode(text, format) -> bytea. DuckDB's builtin decode is 1-arg and wrong-direction;
+		// the 2-arg macro shadows it and returns correct bytes (base64/hex/escape).
+		{"decode_base64_len", `SELECT octet_length(decode('YWJj','base64'))::VARCHAR`, "3", false},
+		{"decode_base64_roundtrip", `SELECT (decode('YWJj','base64') = 'abc'::blob)::VARCHAR`, "true", false},
+		{"decode_hex_len", `SELECT octet_length(decode('616263','hex'))::VARCHAR`, "3", false},
+		{"decode_null", `SELECT (decode(NULL,'hex') IS NULL)::VARCHAR`, "true", false},
+
+		// encode(bytea, format) -> text. The 2-arg macro shadows the 1-arg builtin.
+		{"encode_base64", `SELECT encode('abc'::blob,'base64')`, "YWJj", false},
+		{"encode_hex", `SELECT encode('abc'::blob,'hex')`, "616263", false},
+		{"encode_decode_roundtrip", `SELECT encode(decode('YWJj','base64'),'hex')`, "616263", false},
+
+		// inet_server_addr - DuckDB's builtin returns a wrong-typed NULL; macro returns INET NULL.
+		{"inet_server_addr_null", `SELECT (inet_server_addr() IS NULL)::VARCHAR`, "true", false},
+		{"inet_server_addr_type", `SELECT typeof(inet_server_addr())`, "INET", false},
+	})
+}

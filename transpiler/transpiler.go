@@ -463,6 +463,7 @@ func Classify(sql string, cfg Config) Classification {
 		"MASKLEN(", "HOSTMASK(", "SET_MASKLEN(", "INET_SAME_FAMILY(",
 		"ARRAY_POSITIONS(", "ARRAY_REPLACE(", "ARRAY_FILL(", "TRIM_ARRAY(", "ARRAY_DIMS(",
 		"DATE_BIN(", "MAKE_INTERVAL(", "JUSTIFY_HOURS(", "JUSTIFY_DAYS(", "JUSTIFY_INTERVAL(",
+		"DECODE(", "ENCODE(", "INET_SERVER_ADDR(",
 	) {
 		flags |= FlagFunctions
 	}

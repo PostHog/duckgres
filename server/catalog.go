@@ -1221,6 +1221,32 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			+ to_days((datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000) % 30)
 			+ to_microseconds(((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) % 86400000000)`,
 
+		// decode(text, format) -> bytea. DuckDB's builtin decode is single-arg and points the
+		// wrong way (returns the input unchanged for the 2-arg call). This 2-arg macro shadows it
+		// and returns correct bytes. 'escape' maps text straight to its byte representation.
+		`CREATE OR REPLACE MACRO decode(s, fmt) AS
+			CASE lower(fmt)
+				WHEN 'base64' THEN from_base64(s)
+				WHEN 'hex' THEN unhex(s)
+				WHEN 'escape' THEN s::blob
+				ELSE error('unsupported decode format: ' || fmt)
+			END`,
+
+		// encode(bytea, format) -> text. DuckDB's builtin encode is single-arg (varchar->blob);
+		// this 2-arg macro shadows it for the PG direction (bytea->text). DuckDB lacks macro
+		// overloading, so internal callers needing the old varchar->blob cast must use ::blob.
+		`CREATE OR REPLACE MACRO encode(data, fmt) AS
+			CASE lower(fmt)
+				WHEN 'base64' THEN to_base64(data)
+				WHEN 'hex' THEN lower(hex(data))
+				WHEN 'escape' THEN CAST(data AS VARCHAR)
+				ELSE error('unsupported encode format: ' || fmt)
+			END`,
+
+		// inet_server_addr - DuckDB ships a builtin that returns a wrong-typed NULL; shadow it
+		// with an INET-typed NULL so typeof() reports the PG type.
+		`CREATE OR REPLACE MACRO inet_server_addr() AS CAST(NULL AS INET)`,
+
 		// overlaps - PG's (s1,e1) OVERLAPS (s2,e2) half-open range test. DuckDB parses the
 		// OVERLAPS keyword into an overlaps() call but has no such function. Name must be
 		// double-quoted: OVERLAPS is a reserved keyword.
