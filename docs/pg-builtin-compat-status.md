@@ -40,11 +40,21 @@ array `@>` left native), `#>>` (literal text[] path → `json_extract_string`).
 (`'{1,2,3}'::int[]` → `ARRAY[...]::int[]`) via a sound PG-array-literal parser
 (handles quoted/embedded-comma/NULL elements; bails on multi-dimensional).
 
-**Transpiler correctness fixes surfaced during integration:**
+**Transpiler correctness fixes surfaced during integration / live-DuckLake QA:**
 - `Classify` now flags `@>` / `#>>` for `OperatorTransform` (previously these
   rewrote only when a query *also* contained `->`/`~`/`||` — a latent bug).
 - `TypeCastTransform.walkAndTransform` now recurses into `A_Indirection`
   (subscript) nodes, so casts inside `(expr)[n]` are transformed.
+- `TypeCastTransform.walkSelectStmt` now recurses into `ValuesLists`, so array
+  casts inside `INSERT … VALUES ('{1,2}'::int[])` are transformed.
+- The `inet` helpers (`masklen`/`hostmask`/`set_masklen`/`inet_same_family`) are
+  text-based: the transpiler maps PG `inet` → `text`, so the DuckDB INET type /
+  `family()` / `host()` are not available through the pipeline.
+
+**Known limitation:** an array literal with **no** explicit cast in an `INSERT …
+VALUES` row (e.g. `INSERT INTO t(arr) VALUES ('{a,b}')`) is not rewritten — the
+target column type isn't known at transpile time. Use `'{a,b}'::text[]` or
+`ARRAY['a','b']`. The explicit-cast forms are handled.
 
 ## Deferred to a follow-up PR (Batch E — 7 Go `functions.go` transforms)
 
