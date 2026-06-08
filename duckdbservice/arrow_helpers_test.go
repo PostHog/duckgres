@@ -1021,6 +1021,54 @@ func TestNestedTypesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGetQuerySchemaExplainDoesNotExecute(t *testing.T) {
+	// Regression: GetQuerySchema used to execute EXPLAIN ANALYZE to learn its
+	// schema, which for a write mutates — and DoGet then executes it again,
+	// double-inserting. EXPLAIN must now yield a synthetic schema without running.
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		query   string
+		wantCol string
+	}{
+		{"explain select", "EXPLAIN SELECT 1", "physical_plan"},
+		{"explain analyze insert", "EXPLAIN ANALYZE INSERT INTO t VALUES (1)", "analyzed_plan"},
+		{"explain analyze parens", "EXPLAIN (ANALYZE) INSERT INTO t VALUES (2)", "analyzed_plan"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := GetQuerySchema(context.Background(), db, tc.query, nil)
+			if err != nil {
+				t.Fatalf("GetQuerySchema(%q) error: %v", tc.query, err)
+			}
+			if schema.NumFields() != 1 {
+				t.Fatalf("GetQuerySchema(%q) = %d fields, want 1", tc.query, schema.NumFields())
+			}
+			if got := schema.Field(0).Name; got != tc.wantCol {
+				t.Errorf("column name = %q, want %q", got, tc.wantCol)
+			}
+		})
+	}
+
+	// The schema probes above must NOT have inserted any rows.
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM t").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("EXPLAIN ANALYZE schema probe executed the write: %d rows, want 0", n)
+	}
+}
+
 func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 	// Regression test: queries ending with ";" caused "syntax error at or near LIMIT"
 	// because GetQuerySchema appended " LIMIT 0" after the semicolon, producing "; LIMIT 0".
