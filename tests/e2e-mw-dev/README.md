@@ -55,7 +55,14 @@ client-go:
   a worker restart; concurrent writers (fork conflict-retry, the test that was
   flaking on main); graceful drain (a worker SIGTERM'd mid-query drains — the
   in-flight query completes correctly while the pod is Terminating — then retires
-  cleanly; regression net for the worker drain protocol, #690).
+  cleanly; regression net for the worker drain protocol, #690); one session per
+  worker (two concurrent queries for one org land on two distinct worker pods,
+  never sharing a pod's DuckDB — workers run DUCKGRES_DUCKDB_MAX_SESSIONS=1 so a
+  query owns the whole pod's resources). The org-at-max-workers clear error and
+  the under-cap hold-for-spawn / FIFO anti-snatch paths are covered by unit tests
+  (controlplane/org_reserved_pool_test.go, org_acquire_gate_test.go) — exercising
+  them in-Job would need a dedicated max_workers=1 org and deterministic cold-spawn
+  timing the shared cluster can't guarantee.
 - **isolation** — two tenants (cnpg vs ext) see distinct catalogs; a
   cross-tenant read is denied.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling

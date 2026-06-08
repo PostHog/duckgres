@@ -162,6 +162,64 @@ DML with RETURNING is rejected at extended-query Describe time with SQLSTATE `0A
 - LIMIT 0 does NOT prevent CTE side effects — Postgres CTEs are optimization fences, so writable CTEs execute even with LIMIT 0.
 - DuckDB does not currently support MERGE. If it adds MERGE RETURNING, add `MERGE` to the prefix check in `isDMLReturning`.
 
+## Worker Session Model (k8s / remote backend) — LOAD-BEARING CONTRACT
+
+In the **control-plane remote/k8s backend** a worker pod serves **exactly one
+client query session at a time**. This is deliberate: `workerDuckDBLimits`
+(`controlplane/control.go`) gives the single session ~75% of the *whole pod's*
+RAM + all CPU cores — it does NOT divide by session count. Two sessions on one
+pod would each believe they own 75% → ~150% overcommit → nondeterministic OOM /
+a heavy query killed by a co-resident one. Do not break the following:
+
+- **One session per worker is enforced, not emergent.** The CP spawns remote
+  worker pods with `DUCKGRES_DUCKDB_MAX_SESSIONS=1` (`k8s_pool.go::spawnWorker`).
+  A 2nd concurrent `CreateSession` on a worker is rejected, not silently
+  overcommitted. Internal control/maintenance work uses the worker's side
+  connections (`controlDB`/`warmupDB`), which are NOT counted sessions — so
+  cap=1 does not starve them. Do not raise this to >1 for k8s workers, and do not
+  route internal work through `CreateSession`.
+- **`OrgReservedPool` (remote/multitenant) must never co-assign.** It reuses only
+  idle (`activeSessions==0`, Hot, org-owned) workers via
+  `findIdleAssignedWorkerLocked`, or claims/spawns a fresh one. There is NO
+  least-loaded "share onto a busy worker" path (that exists only in the
+  single-tenant flat `K8sWorkerPool.AcquireWorker`, which is not used in remote
+  mode). Do NOT add one, and do not resurrect a `leastLoaded*` helper here.
+- **At org max workers + all busy → fail fast with the clear org-cap message**
+  (`WorkerClaimMissReasonOrgCap`, see `warm_capacity_policy.go`). Never
+  busy-wait at cap.
+- **Under cap + all busy → hold for a spawn** up to `warmAcquireTimeout` (bounded
+  by the client ctx). This applies to default/exclusive requests too, not just
+  colocated.
+- **FIFO anti-snatch:** the slow acquisition path is serialized per org by
+  `orgAcquireGate` (`org_acquire_gate.go`) so a worker the CP scaled up for an
+  earlier waiter cannot be snatched by a later connection. Keep the gate
+  cancel-safe (a queued waiter whose ctx is cancelled must be skipped, not
+  deadlock the gate).
+- **Destroy-before-reuse ordering:** `SessionManager.DestroySession`
+  (`session_mgr.go`) MUST await the worker-side `DestroySession` RPC *before*
+  `ReleaseWorker`, so a reused (hot-idle) worker's prior session is gone before
+  the next one is assigned (otherwise cap=1 spuriously rejects the reuse).
+
+Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
+`k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`, or
+`duckdbservice` session counting → update the unit tests
+(`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
+`duckdbservice/service_test.go`) AND the `one_session_per_worker` assertion in
+`tests/e2e-mw-dev/harness.sh`.
+
+## Worker Drain Protocol (graceful shutdown, #690)
+
+Remote worker pods drain on SIGTERM (pod deletion): they reject new work, keep
+in-flight work alive, then exit; the CP marks them `Draining` (not crashed) and
+retires them cleanly. Drain readiness is tracked by a refcount (`activeWork` in
+`duckdbservice/service.go`) of "drain tokens" — one taken per unit of in-flight
+work (query, txn, metadata stream, COPY, activation), released when it finishes.
+Invariants: take exactly one token when work starts and release exactly one when
+it ends on **every** path (a leak hangs drain to the shutdown timeout, an early
+release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
+`GetFlightInfo` whose `DoGet` never arrived. `terminationGracePeriodSeconds=3600`
+(`k8s_pool.go`) must stay above `workerShutdownDrainTime` (55m).
+
 ## TODO Reference
 
 See `TODO.md` for the full feature roadmap and known issues.

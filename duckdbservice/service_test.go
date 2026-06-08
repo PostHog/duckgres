@@ -4,11 +4,34 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
+
+// With MaxSessions=1 (how the control plane spawns remote worker pods), a worker
+// serves exactly one client query session — a second concurrent CreateSession is
+// rejected rather than silently overcommitting the pod's resources. Internal
+// control/maintenance connections (controlDB/warmupDB) are not counted sessions
+// and are unaffected.
+func TestCreateSessionRejectsSecondSessionWhenMaxIsOne(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		maxSessions: 1,
+	}
+	pool.sessions["existing"] = &Session{ID: "existing"}
+
+	_, err := pool.CreateSession("u", "", 0)
+	if err == nil {
+		t.Fatal("expected second CreateSession to be rejected at MaxSessions=1")
+	}
+	if !strings.Contains(err.Error(), "max sessions reached") {
+		t.Fatalf("expected 'max sessions reached' error, got %v", err)
+	}
+}
 
 type exitPanic struct {
 	code int
