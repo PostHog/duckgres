@@ -636,7 +636,7 @@ func buildSessionPgTablesViewSQL() string {
 			CASE WHEN t.schema_name = 'main' THEN 'public' ELSE t.schema_name END AS schemaname,
 			t.table_name AS tablename,
 			'duckdb' AS tableowner,
-			NULL AS tablespace,
+			NULL::INTEGER AS tablespace,
 			(t.index_count > 0) AS hasindexes,
 			false AS hasrules,
 			false AS hastriggers
@@ -675,9 +675,11 @@ func buildSessionPgViewsViewSQL() string {
 
 // buildSessionPgSequencesViewSQL builds the catalog-scoped pg_catalog.pg_sequences
 // compat view (same cross-catalog-leak rationale as buildSessionPgTablesViewSQL).
-// Sources duckdb_sequences() filtered to current_database(). DuckDB's
-// duckdb_sequences() does not expose data_type/cache_size, so those are
-// synthesized to match PostgreSQL's pg_sequences shape.
+// Sources duckdb_sequences() filtered to current_database(). Column names and
+// types mirror DuckDB's native pg_sequences (the view these queries resolved to
+// before scoping) so the only behavior change is the catalog filter: data_type
+// and cache_size are INTEGER (DuckDB does not expose real values, so NULL), and
+// the value columns are BIGINT.
 func buildSessionPgSequencesViewSQL() string {
 	return `
 		CREATE OR REPLACE VIEW main.pg_sequences AS
@@ -688,14 +690,14 @@ func buildSessionPgSequencesViewSQL() string {
 			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schemaname,
 			s.sequence_name AS sequencename,
 			'duckdb' AS sequenceowner,
-			'bigint' AS data_type,
-			s.start_value AS start_value,
-			s.min_value AS min_value,
-			s.max_value AS max_value,
-			s.increment_by AS increment_by,
+			NULL::INTEGER AS data_type,
+			s.start_value::BIGINT AS start_value,
+			s.min_value::BIGINT AS min_value,
+			s.max_value::BIGINT AS max_value,
+			s.increment_by::BIGINT AS increment_by,
 			s.cycle AS cycle,
-			NULL AS cache_size,
-			s.last_value AS last_value
+			NULL::INTEGER AS cache_size,
+			s.last_value::BIGINT AS last_value
 		FROM duckdb_sequences() s
 		CROSS JOIN active_catalog ac
 		WHERE s.database_name = ac.catalog

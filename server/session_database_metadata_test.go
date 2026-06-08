@@ -712,6 +712,54 @@ func TestPgTablesViewsSequencesOnlyExposeSelectedCatalog(t *testing.T) {
 	}
 }
 
+func TestPgCatalogConvenienceViewsMatchNativeShape(t *testing.T) {
+	// The scoped pg_tables/pg_views/pg_sequences compat views replace DuckDB's
+	// native pg_catalog views in client queries. To make the only behavior change
+	// the catalog row-filter (not the result shape), each compat view's column
+	// names AND types must match the native view exactly.
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
+		t.Fatalf("attach ducklake: %v", err)
+	}
+	executor := NewLocalExecutor(db)
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "ducklake"); err != nil {
+		t.Fatalf("init session database metadata: %v", err)
+	}
+
+	shapeOf := func(relation string) string {
+		rows, err := db.Query("SELECT column_name || ' ' || column_type FROM (DESCRIBE SELECT * FROM " + relation + ") ORDER BY column_name")
+		if err != nil {
+			t.Fatalf("describe %s: %v", relation, err)
+		}
+		defer func() { _ = rows.Close() }()
+		var cols []string
+		for rows.Next() {
+			var c string
+			if err := rows.Scan(&c); err != nil {
+				t.Fatalf("scan %s: %v", relation, err)
+			}
+			cols = append(cols, c)
+		}
+		return strings.Join(cols, ", ")
+	}
+
+	for _, view := range []string{"pg_tables", "pg_views", "pg_sequences"} {
+		t.Run(view, func(t *testing.T) {
+			native := shapeOf("pg_catalog." + view)
+			compat := shapeOf("memory.main." + view)
+			if native != compat {
+				t.Fatalf("%s shape mismatch:\n native = %s\n compat = %s", view, native, compat)
+			}
+		})
+	}
+}
+
 func TestInformationSchemaColumnsCompatScopesLoadedMetadataToSelectedCatalog(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
