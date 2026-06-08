@@ -29,13 +29,17 @@ var functionNameMapping = map[string]string{
 	"array_append":  "list_append",
 	"array_prepend": "list_prepend",
 	"array_position": "list_position",
-	"unnest":        "unnest", // same name, but semantics differ slightly
+	"unnest":         "unnest", // same name, but semantics differ slightly
+	// PG cardinality counts elements (array-only). DuckDB's builtin cardinality
+	// is MAP-only; len() gives the (outer-dimension) element count, which matches
+	// PG for the common flat-array case.
+	"cardinality": "len",
 
 	// String functions
-	"strpos":       "strpos",    // same
-	"substr":       "substr",    // same
-	"substring":    "substring", // same
-	"btrim":        "trim",
+	"strpos": "strpos", // same
+	// substr/substring are handled as special functions (PG window / regex
+	// semantics differ from DuckDB) — see handleSpecialFunction.
+	"btrim": "trim",
 	"ltrim":        "ltrim", // same
 	"rtrim":        "rtrim", // same
 	"lpad":         "lpad",  // same
@@ -152,6 +156,8 @@ var specialFunctions = map[string]bool{
 	"array_agg":      true, // becomes list()
 	"string_to_array": true, // argument order
 	"log":             true, // 1-arg -> log10, 2-arg -> ln(value)/ln(base)
+	"substr":          true, // PG negative/zero-start window clamping
+	"substring":       true, // SQL regex FROM-pattern form -> regexp_extract
 }
 
 func (t *FunctionTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
@@ -163,6 +169,13 @@ func (t *FunctionTransform) Transform(tree *pg_query.ParseResult, result *Result
 			// Must happen here because it replaces the FuncCall node with an A_Expr
 			if t.isLogTwoArg(fc) {
 				t.replaceLogWithLnDivision(node, fc)
+				changed = true
+				return true
+			}
+			// Compat rewrites that replace the whole FuncCall node (format, 3-arg
+			// date_trunc, overlay, isfinite-interval) must run here, where node is
+			// available. See functions_compat.go.
+			if t.replaceCompatFuncNode(node, fc) {
 				changed = true
 				return true
 			}
@@ -282,6 +295,12 @@ func (t *FunctionTransform) handleSpecialFunction(fc *pg_query.FuncCall, funcNam
 
 	case "to_timestamp":
 		return t.handleToTimestamp(fc, funcNameIdx)
+
+	case "substr":
+		return t.handleSubstrClamp(fc)
+
+	case "substring":
+		return t.handleSubstringRegex(fc, funcNameIdx)
 
 	default:
 		return false

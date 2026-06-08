@@ -3366,10 +3366,12 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 			excludes: []string{`"position"(`},
 		},
 		{
-			name:     "OVERLAY preserves SQL syntax with PLACING FROM FOR keywords",
+			// DuckDB has no overlay(); the compat transform rewrites it to a
+			// substr(...) || repl || substr(...) expression (functions_compat.go).
+			name:     "OVERLAY rewritten to substr concatenation",
 			input:    "SELECT OVERLAY('hello' PLACING 'XX' FROM 2 FOR 3)",
-			contains: []string{"overlay", " placing ", " from "},
-			excludes: []string{`"overlay"(`},
+			contains: []string{"substr(", "||"},
+			excludes: []string{" placing ", "overlay"},
 		},
 
 		// Renamed SQL syntax functions - btrim->trim strips prefix, uses function call
