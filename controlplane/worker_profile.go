@@ -25,61 +25,75 @@ const (
 )
 
 // resolveWorkerProfile turns the client's worker_cpu / worker_memory / worker_ttl
-// startup options into a concrete *WorkerProfile (a worker size + hot-idle TTL).
+// startup options into a *WorkerProfile (a worker size + hot-idle TTL), or nil.
 //
-// Every request resolves to a concrete size: the deployment default
-// (WorkerCPURequest / WorkerMemoryRequest, defaultWorkerTTL) when a field is
-// unset or client sizing is gated off, otherwise the clamped client value.
-// Client cpu/mem are clamped to [min,max] and ttl to [0,maxTTL]; an out-of-range
-// value is clamped with a warning, an unparseable/negative one errors (rejecting
-// the connection). Returns (profile, warns, nil) on success.
+//   - (nil, nil, nil)  => the DEFAULT profile: gate off, or no sizing GUC set.
+//     nil is the sentinel that matches the neutral/default worker pool (the warm
+//     pool spawns neutral workers with no profile), so default traffic reuses
+//     warm workers exactly as before. The default worker SIZE then comes from the
+//     pool-global WorkerCPURequest/MemoryRequest, not from this profile.
+//   - (profile, warns, nil) => the client explicitly requested a size/ttl. cpu/mem
+//     default to the pool-global request (else built-in 8/16Gi) for any field the
+//     client omitted, clamped to [min,max]; ttl to [0,WorkerMaxTTL], default 20m.
+//   - (nil, nil, err) => an unparseable/negative value (rejects the connection).
+//
+// IMPORTANT: a no-sizing request MUST return nil, not a concrete-default profile.
+// Returning concrete here regresses warm-pool reuse — the concrete key (e.g.
+// "8|16Gi|false") never matches a neutral warm worker's key ("||false"), so the
+// request can neither reuse a warm worker nor be served by warm replenishment
+// (which spawns neutral workers), and fails with "no warm worker available".
+// Concrete sizing only becomes fully functional once the warm pool is removed
+// (see docs/design/worker-ttl-pool.md) — until then it is opt-in via the gate.
 func (cp *ControlPlane) resolveWorkerProfile(opts map[string]string) (*WorkerProfile, []string, error) {
 	k := cp.cfg.K8s
+	if !k.AllowClientWorkerProfile {
+		return nil, nil, nil
+	}
+
+	rawCPU := strings.TrimSpace(opts[gucWorkerCPU])
+	rawMem := strings.TrimSpace(opts[gucWorkerMemory])
+	rawTTL := strings.TrimSpace(opts[gucWorkerTTL])
+	if rawCPU == "" && rawMem == "" && rawTTL == "" {
+		return nil, nil, nil // no client sizing -> default (nil) profile
+	}
 
 	cpu := firstNonEmpty(strings.TrimSpace(k.WorkerCPURequest), defaultWorkerCPU)
 	mem := firstNonEmpty(strings.TrimSpace(k.WorkerMemoryRequest), defaultWorkerMemory)
 	ttl := defaultWorkerTTL
 
 	var warns []string
-	if k.AllowClientWorkerProfile {
-		rawCPU := strings.TrimSpace(opts[gucWorkerCPU])
-		rawMem := strings.TrimSpace(opts[gucWorkerMemory])
-		rawTTL := strings.TrimSpace(opts[gucWorkerTTL])
-
-		if rawCPU != "" {
-			v, warn, err := sizeField(gucWorkerCPU, rawCPU, k.WorkerProfileMinCPU, k.WorkerProfileMaxCPU)
-			if err != nil {
-				return nil, nil, err
-			}
-			cpu = v
-			if warn != "" {
-				warns = append(warns, warn)
-			}
+	if rawCPU != "" {
+		v, warn, err := sizeField(gucWorkerCPU, rawCPU, k.WorkerProfileMinCPU, k.WorkerProfileMaxCPU)
+		if err != nil {
+			return nil, nil, err
 		}
-		if rawMem != "" {
-			v, warn, err := sizeField(gucWorkerMemory, rawMem, k.WorkerProfileMinMemory, k.WorkerProfileMaxMemory)
-			if err != nil {
-				return nil, nil, err
-			}
-			mem = v
-			if warn != "" {
-				warns = append(warns, warn)
-			}
+		cpu = v
+		if warn != "" {
+			warns = append(warns, warn)
 		}
-		if rawTTL != "" {
-			v, warn, err := ttlField(rawTTL, k.WorkerMaxTTL)
-			if err != nil {
-				return nil, nil, err
-			}
-			ttl = v
-			if warn != "" {
-				warns = append(warns, warn)
-			}
+	}
+	if rawMem != "" {
+		v, warn, err := sizeField(gucWorkerMemory, rawMem, k.WorkerProfileMinMemory, k.WorkerProfileMaxMemory)
+		if err != nil {
+			return nil, nil, err
+		}
+		mem = v
+		if warn != "" {
+			warns = append(warns, warn)
+		}
+	}
+	if rawTTL != "" {
+		v, warn, err := ttlField(rawTTL, k.WorkerMaxTTL)
+		if err != nil {
+			return nil, nil, err
+		}
+		ttl = v
+		if warn != "" {
+			warns = append(warns, warn)
 		}
 	}
 
-	// Normalize the (possibly default) sizes so reuse-matching is canonical
-	// (e.g. "16Gi" vs "16384Mi" compare equal once normalized).
+	// Normalize the sizes so reuse-matching is canonical ("16Gi" == "16384Mi").
 	cpuN, _, err := sizeField(gucWorkerCPU, cpu, "", "")
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid default worker cpu: %w", err)

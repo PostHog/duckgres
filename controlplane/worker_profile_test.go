@@ -25,15 +25,16 @@ func TestResolveWorkerProfileSizing(t *testing.T) {
 	tests := []struct {
 		name     string
 		opts     map[string]string
-		wantKey  string // CPU|Memory|Colocate
+		wantNil  bool // expect the default (nil) profile — matches the neutral warm pool
+		wantKey  string // CPU|Memory|Colocate (only when !wantNil)
 		wantTTL  time.Duration
 		wantErr  bool
 		wantWarn bool
 	}{
-		{name: "no opts -> defaults", opts: map[string]string{}, wantKey: "8|16Gi|false", wantTTL: defaultWorkerTTL},
-		{name: "unrelated opts -> defaults", opts: map[string]string{"search_path": "iceberg.public"}, wantKey: "8|16Gi|false", wantTTL: defaultWorkerTTL},
+		{name: "no opts -> default (nil)", opts: map[string]string{}, wantNil: true},
+		{name: "unrelated opts -> default (nil)", opts: map[string]string{"search_path": "iceberg.public"}, wantNil: true},
 		{name: "client cpu+mem", opts: map[string]string{gucWorkerCPU: "4", gucWorkerMemory: "32Gi"}, wantKey: "4|32Gi|false", wantTTL: defaultWorkerTTL},
-		{name: "client ttl", opts: map[string]string{gucWorkerTTL: "5m"}, wantKey: "8|16Gi|false", wantTTL: 5 * time.Minute},
+		{name: "client ttl only -> concrete w/ default size", opts: map[string]string{gucWorkerTTL: "5m"}, wantKey: "8|16Gi|false", wantTTL: 5 * time.Minute},
 		{name: "cpu over max -> clamp+warn", opts: map[string]string{gucWorkerCPU: "64"}, wantKey: "16|16Gi|false", wantTTL: defaultWorkerTTL, wantWarn: true},
 		{name: "mem under min -> clamp+warn", opts: map[string]string{gucWorkerMemory: "1Gi"}, wantKey: "8|4Gi|false", wantTTL: defaultWorkerTTL, wantWarn: true},
 		{name: "ttl over max -> clamp+warn", opts: map[string]string{gucWorkerTTL: "24h"}, wantKey: "8|16Gi|false", wantTTL: time.Hour, wantWarn: true},
@@ -56,8 +57,14 @@ func TestResolveWorkerProfileSizing(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil (default) profile, got %s", got.MatchKey())
+				}
+				return
+			}
 			if got == nil {
-				t.Fatal("expected a concrete profile, got nil")
+				t.Fatalf("expected concrete profile %q, got nil", tt.wantKey)
 			}
 			if got.MatchKey() != tt.wantKey {
 				t.Fatalf("MatchKey = %q, want %q", got.MatchKey(), tt.wantKey)
@@ -75,8 +82,8 @@ func TestResolveWorkerProfileSizing(t *testing.T) {
 	}
 }
 
-// Gate off: every GUC is ignored and the deployment defaults are returned (never
-// an error, even for garbage values).
+// Gate off: every GUC is ignored and the default (nil) profile is returned (never
+// an error, even for garbage values) — preserving warm-pool reuse.
 func TestResolveWorkerProfileSizing_GateOff(t *testing.T) {
 	cp := newSizingTestCP()
 	cp.cfg.K8s.AllowClientWorkerProfile = false
@@ -87,19 +94,34 @@ func TestResolveWorkerProfileSizing_GateOff(t *testing.T) {
 	if len(warns) != 0 {
 		t.Fatalf("gate off must not warn, got %v", warns)
 	}
-	if got == nil || got.MatchKey() != "8|16Gi|false" || got.TTL != defaultWorkerTTL {
-		t.Fatalf("gate off must return defaults, got %v / ttl=%v", got, got.TTL)
+	if got != nil {
+		t.Fatalf("gate off must return the default (nil) profile, got %s", got.MatchKey())
 	}
 }
 
-// With no configured default size, the built-in 8/16Gi/20m applies.
-func TestResolveWorkerProfileSizing_BuiltinDefaults(t *testing.T) {
-	cp := &ControlPlane{cfg: ControlPlaneConfig{K8s: K8sConfig{AllowClientWorkerProfile: true}}}
+// A no-sizing request must return the nil default sentinel so it matches the
+// neutral warm pool (regression guard: returning a concrete-default profile here
+// broke worker acquisition on a warm-pool-enabled deploy).
+func TestResolveWorkerProfileSizing_NoSizingIsNil(t *testing.T) {
+	cp := newSizingTestCP()
 	got, _, err := cp.resolveWorkerProfile(map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.CPU != defaultWorkerCPU || got.Memory != defaultWorkerMemory || got.TTL != defaultWorkerTTL {
-		t.Fatalf("built-in defaults = %s/%s/%s, want %s/%s/%s", got.CPU, got.Memory, got.TTL, defaultWorkerCPU, defaultWorkerMemory, defaultWorkerTTL)
+	if got != nil {
+		t.Fatalf("no-sizing request must return nil (default), got %s", got.MatchKey())
+	}
+}
+
+// When the client DOES set sizing and no default size is configured, the built-in
+// 8/16Gi/20m applies for the omitted fields.
+func TestResolveWorkerProfileSizing_BuiltinDefaults(t *testing.T) {
+	cp := &ControlPlane{cfg: ControlPlaneConfig{K8s: K8sConfig{AllowClientWorkerProfile: true}}}
+	got, _, err := cp.resolveWorkerProfile(map[string]string{gucWorkerTTL: "1m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.CPU != defaultWorkerCPU || got.Memory != defaultWorkerMemory || got.TTL != time.Minute {
+		t.Fatalf("built-in defaults = %v, want %s/%s/1m", got, defaultWorkerCPU, defaultWorkerMemory)
 	}
 }
