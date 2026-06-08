@@ -867,7 +867,6 @@ func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
 	})
 }
 
-
 func migrateOrgUserPK(db *gorm.DB) error {
 	// Check if the PK already has 2 columns (idempotent)
 	var count int64
@@ -1360,10 +1359,20 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 
 // ListExpiredHotIdleWorkers returns hot-idle workers whose updated_at timestamp
 // is at or before the given cutoff time.
-func (cs *ConfigStore) ListExpiredHotIdleWorkers(before time.Time) ([]WorkerRecord, error) {
+// ListExpiredHotIdleWorkers returns hot-idle workers whose per-worker TTL has
+// elapsed since they last became idle (updated_at, bumped on the hot->hot_idle
+// transition at session end, so the TTL resets on each query). A worker's
+// ttl_seconds governs it; 0 falls back to defaultTTL (default/warm/neutral and
+// legacy rows).
+func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
+	defMins := int64(defaultTTL.Minutes())
+	if defMins < 0 {
+		defMins = 0
+	}
 	var workers []WorkerRecord
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("state = ? AND updated_at <= ?", WorkerStateHotIdle, before).
+		Where("state = ? AND updated_at + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+			WorkerStateHotIdle, defMins, now).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)

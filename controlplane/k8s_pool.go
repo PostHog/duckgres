@@ -965,6 +965,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		spawnRecord.ProfileCPU = profile.CPU
 		spawnRecord.ProfileMemory = profile.Memory
 		spawnRecord.ProfileColocate = profile.Colocate
+		spawnRecord.TTLMinutes = int(profile.TTL.Minutes())
 		_ = p.persistWorkerRecord(spawnRecord)
 	}
 
@@ -3921,6 +3922,7 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	record.ProfileCPU = worker.profile.CPU
 	record.ProfileMemory = worker.profile.Memory
 	record.ProfileColocate = worker.profile.Colocate
+	record.TTLMinutes = int(worker.profile.TTL.Minutes())
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
 	}

@@ -812,6 +812,56 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 	}
 }
 
+// Per-worker TTL: ListExpiredHotIdleWorkers retires a hot-idle worker once its
+// own ttl_minutes has elapsed since updated_at (last became idle); ttl=0 falls
+// back to the deployment default; non-hot-idle workers are never returned.
+func TestListExpiredHotIdleWorkersPerWorkerTTL(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	mk := func(id, ttlMin int, state configstore.WorkerState) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-ttl-%d", id),
+			State:             state,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        ttlMin,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	mk(1, 0, configstore.WorkerStateHotIdle)   // uses default TTL
+	mk(2, 5, configstore.WorkerStateHotIdle)   // short per-worker TTL
+	mk(3, 120, configstore.WorkerStateHotIdle) // long per-worker TTL
+	mk(4, 1, configstore.WorkerStateHot)       // not hot-idle: never reaped
+
+	// As of base+30m with a 10m default: ttl=0 (default 10m) and ttl=5m have
+	// elapsed; ttl=120m has not; the hot (active) worker is excluded.
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	got := map[int]bool{}
+	for _, w := range expired {
+		got[w.WorkerID] = true
+	}
+	if !got[1] {
+		t.Error("ttl=0 worker should expire via the 10m default by base+30m")
+	}
+	if !got[2] {
+		t.Error("ttl=5m worker should expire by base+30m")
+	}
+	if got[3] {
+		t.Error("ttl=120m worker should NOT expire by base+30m")
+	}
+	if got[4] {
+		t.Error("non-hot-idle (hot) worker must never be returned")
+	}
+}
+
 func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
@@ -2589,7 +2639,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour), time.Minute)
 	if err != nil {
 		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
 	}
@@ -2651,7 +2701,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterTouchPostgres(t *testin
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour), time.Minute)
 	if err != nil {
 		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
 	}

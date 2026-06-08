@@ -20,7 +20,7 @@ type controlPlaneExpiryStore interface {
 	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)
 	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 	ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error)
-	ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
+	ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 }
 
@@ -154,8 +154,9 @@ func (j *ControlPlaneJanitor) runOnce() {
 		}
 
 		if j.hotIdleTTL > 0 {
-			cutoff := j.now().Add(-j.hotIdleTTL)
-			expired, err := j.store.ListExpiredHotIdleSnapshots(cutoff)
+			// Per-worker TTL: a worker's ttl_minutes governs its hot-idle life;
+			// hotIdleTTL is the fallback for default/warm/legacy workers (ttl=0).
+			expired, err := j.store.ListExpiredHotIdleSnapshots(j.now(), j.hotIdleTTL)
 			if err != nil {
 				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 			}
@@ -209,4 +210,3 @@ func (j *ControlPlaneJanitor) runOnce() {
 		j.reconcileHeadroom()
 	}
 }
-

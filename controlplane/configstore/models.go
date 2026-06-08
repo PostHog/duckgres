@@ -528,10 +528,10 @@ type WorkerLifecycleStats struct {
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
-	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`
-	PodName             string      `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
-	PodUID              string      `gorm:"size:255" json:"pod_uid"`
-	Image               string      `gorm:"size:512;index" json:"image"`
+	WorkerID int    `gorm:"primaryKey" json:"worker_id"`
+	PodName  string `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
+	PodUID   string `gorm:"size:255" json:"pod_uid"`
+	Image    string `gorm:"size:512;index" json:"image"`
 	// Worker pod-shape profile (connection-string-selected sizing). Empty
 	// CPU/Memory + Colocate=false is the default exclusive profile, so legacy
 	// rows (and warm/neutral workers) read back as the default and stay
@@ -540,7 +540,13 @@ type WorkerRecord struct {
 	ProfileCPU      string `gorm:"size:32;index:idx_worker_profile" json:"profile_cpu"`
 	ProfileMemory   string `gorm:"size:32;index:idx_worker_profile" json:"profile_memory"`
 	ProfileColocate bool   `gorm:"index:idx_worker_profile" json:"profile_colocate"`
-	State           WorkerState `gorm:"size:32;not null;index" json:"state"`
+	// TTLMinutes is how long this worker stays hot-idle after its last query
+	// before the janitor retires it (client-selected duckgres.worker_ttl, rounded
+	// down to whole minutes). 0 = use the deployment's global hot-idle TTL
+	// (default/warm/neutral workers and legacy rows). AutoMigrate adds this
+	// column; no migration file.
+	TTLMinutes          int         `gorm:"default:0" json:"ttl_minutes"`
+	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
 	OrgID               string      `gorm:"size:255;index" json:"org_id"`
 	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`
 	OwnerEpoch          int64       `gorm:"not null" json:"owner_epoch"`
