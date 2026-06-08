@@ -403,11 +403,80 @@ func TestReapIdleTransactionsReleasesDrainWork(t *testing.T) {
 	}
 
 	pool.BeginDrain()
-	pool.reapIdleTransactions(time.Now())
+	pool.reapIdle(time.Now())
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if !pool.WaitForDrain(waitCtx) {
 		t.Fatal("expected idle transaction reaper to release transaction drain work")
+	}
+}
+
+// A GetFlightInfo whose matching DoGet never arrives must not hold the drain
+// open forever: the reaper releases drain tokens stranded on stale ad-hoc query
+// handles, stale prepared pendingDrains, and stale metadata streams — while
+// leaving fresh handles and long-lived prepared handles intact.
+func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	mustToken := func() func() {
+		f, err := pool.beginDrainWork(false)
+		if err != nil {
+			t.Fatalf("begin drain work: %v", err)
+		}
+		return f
+	}
+	stale := time.Now().Add(-handleIdleTimeout - time.Minute)
+	fresh := time.Now()
+
+	staleAdhoc := mustToken()
+	freshAdhoc := mustToken()
+	stalePrepared := mustToken()
+	staleMeta := mustToken()
+
+	sess := &Session{
+		ID: "s1",
+		queries: map[string]*QueryHandle{
+			"query-1": {Query: "SELECT 1", createdAt: stale, finishDrain: staleAdhoc},
+			"query-2": {Query: "SELECT 2", createdAt: fresh, finishDrain: freshAdhoc},
+			"prep-1":  {Query: "SELECT 3", Prepared: true, createdAt: stale, pendingDrains: []drainToken{{finish: stalePrepared, at: stale}}},
+		},
+		metadataDrains: map[string][]drainToken{
+			"schemas|x": {{finish: staleMeta, at: stale}},
+		},
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
+	}
+	pool.sessions["s1"] = sess
+
+	if got := pool.ActiveDrainWork(); got != 4 {
+		t.Fatalf("activeWork=%d want 4 before reap", got)
+	}
+
+	pool.reapIdle(time.Now())
+
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("activeWork=%d want 1 (only the fresh ad-hoc handle should remain)", got)
+	}
+
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	if _, ok := sess.queries["query-1"]; ok {
+		t.Error("stale ad-hoc handle query-1 was not reaped")
+	}
+	if _, ok := sess.queries["query-2"]; !ok {
+		t.Error("fresh ad-hoc handle query-2 was wrongly reaped")
+	}
+	prep, ok := sess.queries["prep-1"]
+	if !ok {
+		t.Fatal("prepared handle prep-1 was wrongly dropped (must outlive a stale pendingDrain)")
+	}
+	if len(prep.pendingDrains) != 0 {
+		t.Errorf("stale prepared pendingDrain not released: %d remain", len(prep.pendingDrains))
+	}
+	if _, ok := sess.metadataDrains["schemas|x"]; ok {
+		t.Error("stale metadata drain was not reaped")
 	}
 }

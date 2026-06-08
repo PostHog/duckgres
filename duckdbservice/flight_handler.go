@@ -105,7 +105,7 @@ func releaseQueryHandleValue(handle *QueryHandle) {
 		releaseDrains = append(releaseDrains, handle.finishDrain)
 		handle.finishDrain = nil
 	}
-	releaseDrains = append(releaseDrains, handle.pendingDrains...)
+	releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
 	handle.pendingDrains = nil
 	for _, release := range releaseDrains {
 		releaseDrainFunc(release)
@@ -130,7 +130,7 @@ func appendPreparedDrain(session *Session, handleID string, finishDrain func()) 
 	if !ok {
 		return false
 	}
-	handle.pendingDrains = append(handle.pendingDrains, finishDrain)
+	handle.pendingDrains = append(handle.pendingDrains, drainToken{finish: finishDrain, at: time.Now()})
 	return true
 }
 
@@ -144,7 +144,7 @@ func popPreparedDrain(session *Session, handleID string) (*QueryHandle, func(), 
 	if len(handle.pendingDrains) == 0 {
 		return handle, nil, true
 	}
-	finishDrain := handle.pendingDrains[0]
+	finishDrain := handle.pendingDrains[0].finish
 	copy(handle.pendingDrains, handle.pendingDrains[1:])
 	handle.pendingDrains = handle.pendingDrains[:len(handle.pendingDrains)-1]
 	return handle, finishDrain, true
@@ -154,9 +154,9 @@ func appendMetadataDrain(session *Session, key string, finishDrain func()) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.metadataDrains == nil {
-		session.metadataDrains = make(map[string][]func())
+		session.metadataDrains = make(map[string][]drainToken)
 	}
-	session.metadataDrains[key] = append(session.metadataDrains[key], finishDrain)
+	session.metadataDrains[key] = append(session.metadataDrains[key], drainToken{finish: finishDrain, at: time.Now()})
 }
 
 func popMetadataDrain(session *Session, key string) func() {
@@ -165,7 +165,7 @@ func popMetadataDrain(session *Session, key string) func() {
 	if len(session.metadataDrains[key]) == 0 {
 		return nil
 	}
-	finishDrain := session.metadataDrains[key][0]
+	finishDrain := session.metadataDrains[key][0].finish
 	copy(session.metadataDrains[key], session.metadataDrains[key][1:])
 	session.metadataDrains[key] = session.metadataDrains[key][:len(session.metadataDrains[key])-1]
 	if len(session.metadataDrains[key]) == 0 {
@@ -491,7 +491,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		emptySchema := arrow.NewSchema(nil, nil)
 		handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
 		session.mu.Lock()
-		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema}
+		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema, createdAt: time.Now()}
 		session.mu.Unlock()
 
 		ticketBytes, ticketErr := flightsql.CreateStatementQueryTicket([]byte(handleID))
@@ -560,7 +560,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		return nil, status.Errorf(codes.Internal, "failed to create ticket: %v", err)
 	}
 	session.mu.Lock()
-	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, finishDrain: finishDrain}
+	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, finishDrain: finishDrain, createdAt: time.Now()}
 	session.mu.Unlock()
 	releaseOnReturn = false
 
@@ -902,7 +902,7 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 		emptySchema := arrow.NewSchema(nil, nil)
 		handleID := fmt.Sprintf("prep-%d", session.handleCounter.Add(1))
 		session.mu.Lock()
-		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema, TxnID: txnKey}
+		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema, TxnID: txnKey, Prepared: true, createdAt: time.Now()}
 		session.mu.Unlock()
 		return flightsql.ActionCreatePreparedStatementResult{
 			Handle:        []byte(handleID),
@@ -919,7 +919,7 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 
 	handleID := fmt.Sprintf("prep-%d", session.handleCounter.Add(1))
 	session.mu.Lock()
-	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey}
+	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, Prepared: true, createdAt: time.Now()}
 	session.mu.Unlock()
 
 	return flightsql.ActionCreatePreparedStatementResult{

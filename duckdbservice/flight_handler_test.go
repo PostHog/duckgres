@@ -578,7 +578,7 @@ func TestRawSQLTransactionKeepsDrainOpenUntilCommit(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]func()),
+		metadataDrains: make(map[string][]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -627,7 +627,7 @@ func TestRawSQLTransactionKeepsDrainOpenAfterFailedCommit(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]func()),
+		metadataDrains: make(map[string][]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -834,7 +834,7 @@ func TestMetadataDoGetConsumesMatchingDrainToken(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]func()),
+		metadataDrains: make(map[string][]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}

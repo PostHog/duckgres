@@ -116,7 +116,7 @@ type Session struct {
 
 	mu             sync.RWMutex
 	queries        map[string]*QueryHandle
-	metadataDrains map[string][]func()
+	metadataDrains map[string][]drainToken
 	txns           map[string]*trackedTx
 	txnOwner       map[string]string
 	handleCounter  atomic.Uint64
@@ -137,17 +137,40 @@ type Session struct {
 
 // QueryHandle stores a prepared or ad-hoc query for later execution.
 type QueryHandle struct {
-	Query         string
-	Schema        *arrow.Schema
-	TxnID         string
-	finishDrain   func()
-	pendingDrains []func()
+	Query     string
+	Schema    *arrow.Schema
+	TxnID     string
+	Prepared  bool      // prepared statements live until ClosePreparedStatement; the reaper never drops them, only their stale pendingDrains
+	createdAt time.Time // when registered; the reaper drops a stale ad-hoc handle whose DoGet never arrived (guarded by Session.mu)
+	// finishDrain is the drain token of an ad-hoc query awaiting its DoGet.
+	finishDrain func()
+	// pendingDrains are drain tokens of GetFlightInfo[Prepared] calls awaiting
+	// their DoGet (a prepared handle accumulates one per GetFlightInfo).
+	pendingDrains []drainToken
+}
+
+// drainToken pairs a drain-release closure with the time it was registered, so
+// the reaper can release a token stranded by a GetFlightInfo whose matching
+// DoGet never arrived (client cancelled between the two RPCs, session kept).
+type drainToken struct {
+	finish func()
+	at     time.Time
 }
 
 func releaseDrainFunc(release func()) {
 	if release != nil {
 		release()
 	}
+}
+
+// appendDrainTokenFuncs appends the release closures of tokens to dst.
+func appendDrainTokenFuncs(dst []func(), tokens []drainToken) []func() {
+	for _, t := range tokens {
+		if t.finish != nil {
+			dst = append(dst, t.finish)
+		}
+	}
+	return dst
 }
 
 func (s *Session) hasTrackedTxDrain(txnKey string) bool {
@@ -307,7 +330,14 @@ func (p *SessionPool) Warmup() error {
 }
 
 const (
-	txnIdleTimeout          = 10 * time.Minute
+	txnIdleTimeout = 10 * time.Minute
+	// handleIdleTimeout bounds how long a drain token may sit stranded on a query
+	// handle / metadata stream whose matching DoGet never arrived (client
+	// cancelled between GetFlightInfo and DoGet, session kept). Without reaping,
+	// such a token holds the worker's drain open until the full
+	// workerShutdownDrainTime, then a forced shutdown kills genuinely in-flight
+	// work. The real GetFlightInfo→DoGet gap is sub-second, so this is generous.
+	handleIdleTimeout       = 10 * time.Minute
 	reapInterval            = 1 * time.Minute
 	metadataMetricsInterval = 30 * time.Second
 	workerShutdownDrainTime = 55 * time.Minute
@@ -320,14 +350,18 @@ func (p *SessionPool) reapLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			p.reapIdleTransactions(time.Now())
+			p.reapIdle(time.Now())
 		case <-p.stopCh:
 			return
 		}
 	}
 }
 
-func (p *SessionPool) reapIdleTransactions(now time.Time) {
+// reapIdle rolls back idle transactions and releases drain tokens stranded by a
+// GetFlightInfo whose matching DoGet never arrived. Both are bounded so a single
+// abandoned client RPC cannot hold the worker's drain open until the shutdown
+// timeout (and then force-kill genuinely in-flight work).
+func (p *SessionPool) reapIdle(now time.Time) {
 	p.mu.RLock()
 	sessions := make([]*Session, 0, len(p.sessions))
 	for _, s := range p.sessions {
@@ -351,6 +385,59 @@ func (p *SessionPool) reapIdleTransactions(now time.Time) {
 				}
 				delete(s.txns, id)
 				delete(s.txnOwner, id)
+			}
+		}
+		// Drain tokens stranded on query handles. An actively-streaming DoGet has
+		// already popped its handle out of this map (ad-hoc) or its pendingDrain
+		// entry (prepared), so anything still here past the TTL was abandoned
+		// mid-handshake.
+		for id, h := range s.queries {
+			if h.Prepared {
+				// Long-lived prepared handle: never drop it, only release
+				// pendingDrains (a GetFlightInfoPreparedStatement with no DoGet) gone stale.
+				kept := h.pendingDrains[:0]
+				for _, t := range h.pendingDrains {
+					if now.Sub(t.at) > handleIdleTimeout {
+						if t.finish != nil {
+							releaseDrains = append(releaseDrains, t.finish)
+						}
+						continue
+					}
+					kept = append(kept, t)
+				}
+				h.pendingDrains = kept
+				continue
+			}
+			// Ad-hoc handle awaiting its DoGetStatement; drop it and release its
+			// tokens once stale.
+			if now.Sub(h.createdAt) > handleIdleTimeout {
+				if h.finishDrain != nil {
+					releaseDrains = append(releaseDrains, h.finishDrain)
+					h.finishDrain = nil
+				}
+				releaseDrains = appendDrainTokenFuncs(releaseDrains, h.pendingDrains)
+				h.pendingDrains = nil
+				slog.Warn("Reaping abandoned query handle (no DoGet).", "user", s.Username, "handle", id)
+				delete(s.queries, id)
+			}
+		}
+		// Drain tokens stranded on metadata streams (GetFlightInfoSchemas/Tables
+		// with no DoGet).
+		for key, tokens := range s.metadataDrains {
+			kept := tokens[:0]
+			for _, t := range tokens {
+				if now.Sub(t.at) > handleIdleTimeout {
+					if t.finish != nil {
+						releaseDrains = append(releaseDrains, t.finish)
+					}
+					continue
+				}
+				kept = append(kept, t)
+			}
+			if len(kept) == 0 {
+				delete(s.metadataDrains, key)
+			} else {
+				s.metadataDrains[key] = kept
 			}
 		}
 		s.mu.Unlock()
@@ -728,7 +815,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		Username:       username,
 		CreatedAt:      time.Now(),
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]func()),
+		metadataDrains: make(map[string][]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 		duckdbConn:     duckConn,
@@ -813,12 +900,12 @@ func (p *SessionPool) DestroySession(token string) error {
 			releaseDrains = append(releaseDrains, handle.finishDrain)
 			handle.finishDrain = nil
 		}
-		releaseDrains = append(releaseDrains, handle.pendingDrains...)
+		releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
 		handle.pendingDrains = nil
 		delete(session.queries, id)
 	}
 	for key, drains := range session.metadataDrains {
-		releaseDrains = append(releaseDrains, drains...)
+		releaseDrains = appendDrainTokenFuncs(releaseDrains, drains)
 		delete(session.metadataDrains, key)
 	}
 	if session.sqlTxDrain != nil {
@@ -961,10 +1048,10 @@ func (p *SessionPool) beginDrainWork(allowWhenDraining bool) (func(), error) {
 	if p.draining && !p.drainZeroOpen {
 		return nil, ErrWorkerDraining
 	}
-	if !p.drainZeroOpen {
-		p.drainZero = make(chan struct{})
-		p.drainZeroOpen = true
-	}
+	// Invariant: drainZeroOpen only goes false while draining (BeginDrain / the
+	// release closure), and draining never clears, so reaching here means the
+	// channel is open — !draining implies drainZeroOpen, and draining implies it
+	// per the guard above. No reopen needed.
 	p.activeWork++
 
 	var once sync.Once
@@ -1024,12 +1111,12 @@ func (p *SessionPool) CloseAll() {
 				releaseDrains = append(releaseDrains, handle.finishDrain)
 				handle.finishDrain = nil
 			}
-			releaseDrains = append(releaseDrains, handle.pendingDrains...)
+			releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
 			handle.pendingDrains = nil
 			delete(session.queries, id)
 		}
 		for key, drains := range session.metadataDrains {
-			releaseDrains = append(releaseDrains, drains...)
+			releaseDrains = appendDrainTokenFuncs(releaseDrains, drains)
 			delete(session.metadataDrains, key)
 		}
 		if session.sqlTxDrain != nil {

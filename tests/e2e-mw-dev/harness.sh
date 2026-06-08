@@ -18,7 +18,8 @@
 #   worker pods  : labels, securityContext (non-root, no priv-esc), Downward-API
 #                  POD_NAME/NODE_NAME env, and NO ambient SA-token mount.
 #   resilience   : worker-pod kill → crash recovery; DuckLake durability across a
-#                  worker restart; concurrent writers (fork conflict-retry).
+#                  worker restart; concurrent writers (fork conflict-retry);
+#                  graceful drain (in-flight query survives a worker SIGTERM, #690).
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
 #   lifecycle    : deprovision → warehouse deleted → Duckling CR fully gone
 #                  (finalizer cascade that drops the cnpg role+db completed).
@@ -341,6 +342,58 @@ crash_recovery() { # org password
   basic_query "$1" "$2"
 }
 
+# Graceful drain (regression net for the worker drain protocol, #690): a worker
+# that receives SIGTERM (pod deletion) must DRAIN — finish its in-flight query
+# rather than dropping the connection — then retire cleanly. Distinct from
+# crash_recovery, which kills a worker and only asserts a *fresh* query recovers;
+# here the SAME query that was running at SIGTERM must still return correctly.
+# A passing result after a mid-flight SIGTERM is impossible without the drain
+# protocol (pre-#690 the worker shut down immediately and the query errored).
+graceful_drain() { # org password
+  log "graceful drain: in-flight query survives worker SIGTERM on $1"
+  out="$(mktemp)"; rc="$(mktemp)"
+  # range() is lazy and count over it is metadata-fast, so the modulo filter
+  # forces real per-row work; 8e9 rows reliably outlast the few seconds before
+  # the delete. Expected = count of even i in [0, 8e9) = 4e9. The `if` keeps the
+  # query's failure from tripping `set -e` inside the subshell before we record rc.
+  ( if pg_try "$1" "$2" ducklake \
+        "SELECT count(*) FROM range(8000000000) t(i) WHERE i % 2 = 0;" >"$out" 2>&1
+    then echo 0 >"$rc"; else echo 1 >"$rc"; fi ) &
+  qpid=$!
+
+  # Let the query land on and start running on the worker, then identify the pod
+  # serving it and gracefully delete it (SIGTERM → drain; the pod's
+  # terminationGracePeriodSeconds=3600 keeps it alive long enough to finish).
+  sleep 6
+  pod="$(newest_worker)"
+  [ -n "$pod" ] || { kill "$qpid" 2>/dev/null || true; fail "graceful_drain: no worker pod serving the query"; }
+  k delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+
+  # Overlap proof: the pod must be Terminating (deletionTimestamp set) WHILE the
+  # query is still running — i.e. the SIGTERM landed mid-flight. Without this the
+  # test could false-pass on a query that finished before the delete.
+  ts="$(k get pod "$pod" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)"
+  [ -n "$ts" ] || { wait "$qpid" 2>/dev/null || true; fail "graceful_drain: pod $pod not Terminating after delete"; }
+  kill -0 "$qpid" 2>/dev/null \
+    || fail "graceful_drain: query finished before SIGTERM landed — raise the row count (not a mid-flight test)"
+
+  # The in-flight query must complete successfully despite the SIGTERM.
+  wait "$qpid" 2>/dev/null || true
+  [ "$(cat "$rc")" = 0 ] \
+    || fail "graceful_drain: in-flight query died on worker SIGTERM: $(tr -d '\n' <"$out" | tail -c 200)"
+  n="$(tr -dc '0-9' <"$out")"
+  [ "$n" = "4000000000" ] \
+    || fail "graceful_drain: in-flight result=$n want 4000000000 (drain corrupted the query)"
+  rm -f "$out" "$rc"
+
+  # Once drained the worker must retire cleanly — the pod exits on its own and
+  # the CP retires it (not a crash). Then re-establish a worker for later steps.
+  k wait --for=delete "pod/$pod" --timeout=300s >/dev/null 2>&1 \
+    || fail "graceful_drain: drained worker $pod did not exit/retire within 300s"
+  wait_worker "$1" "$2" ducklake
+  basic_query "$1" "$2"
+}
+
 # Data committed to DuckLake survives a worker restart (parquet in object store +
 # metadata snapshot in Postgres are the source of truth).
 # Ported from TestK8sDuckLakeDurabilityAcrossWorkerRestart.
@@ -468,6 +521,7 @@ main() {
   concurrent_writers     "$CNPG" "$cnpg_pw"
   durability_across_restart "$CNPG" "$cnpg_pw"
   crash_recovery         "$CNPG" "$cnpg_pw"
+  graceful_drain         "$CNPG" "$cnpg_pw"
 
   # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
   wait_worker "$EXT" "$ext_pw" ducklake
@@ -488,7 +542,7 @@ main() {
   # end-to-end would need a warm target >0 in the per-PR CP (see README).
   log "SKIP shared-warm-activation + version-reaper (CP runs warm-target=0; see README)"
 
-  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"
