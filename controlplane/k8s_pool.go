@@ -1671,6 +1671,21 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				continue
 			}
 
+			// A sized request (non-default profile) is NOT served by the neutral
+			// warm pool — warm replenishment spawns default/neutral workers that
+			// never match a concrete size. So when no same-size hot-idle/idle worker
+			// exists, foreground-spawn a worker of the requested size and reserve it
+			// for the org, instead of returning backpressure that would never clear.
+			// Only on a transient no-idle miss; an org/global cap is respected.
+			if assignment.Profile != nil &&
+				(missReason == configstore.WorkerClaimMissReasonNone || missReason == configstore.WorkerClaimMissReasonNoIdle) {
+				worker, spawnErr := p.spawnReservedSizedWorker(ctx, assignment)
+				if spawnErr != nil {
+					return nil, spawnErr
+				}
+				return worker, nil
+			}
+
 			p.recordWarmCapacityMiss(assignment, missReason)
 			return nil, NewWarmCapacityExhaustedErrorForReason(missReason, DefaultWarmCapacityRetryAfter)
 		}
@@ -1739,6 +1754,16 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		p.mu.Unlock()
 
+		// Sized request with no matching warm worker: foreground-spawn one of the
+		// requested size (see the runtime-store branch above for rationale).
+		if assignment.Profile != nil {
+			worker, spawnErr := p.spawnReservedSizedWorker(ctx, assignment)
+			if spawnErr != nil {
+				return nil, spawnErr
+			}
+			return worker, nil
+		}
+
 		p.recordWarmCapacityMiss(assignment, configstore.WorkerClaimMissReasonNoIdle)
 		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
 	}
@@ -1775,6 +1800,85 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
 		slog.Warn("Failed to record warm capacity miss.", "image", image, "reason", policy.reason, "error", err)
 	}
+}
+
+// spawnReservedSizedWorker foreground-spawns a worker of the assignment's
+// requested size and reserves it for the org, returning it in Reserved state
+// (the caller activates it, same as a claimed warm worker). Used when a sized
+// request finds no same-size idle/hot-idle worker — the neutral warm pool can't
+// satisfy a concrete size, so we spawn one directly instead of failing. The pod
+// is sized from the profile (workerResourcesForProfile); the reserved record
+// round-trips the profile + TTL.
+func (p *K8sWorkerPool) spawnReservedSizedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	if assignment == nil || assignment.Profile == nil {
+		return nil, fmt.Errorf("spawnReservedSizedWorker requires a sized assignment")
+	}
+	profile := *assignment.Profile
+
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+	// Respect the org's worker cap before spawning (in-process count; the DB-side
+	// cap on the claim path is cross-CP, this bounds the foreground sized-spawn).
+	if assignment.MaxWorkers > 0 {
+		n := 0
+		for _, w := range p.workers {
+			select {
+			case <-w.done:
+				continue
+			default:
+			}
+			st := w.SharedState()
+			if st.Assignment != nil && st.Assignment.OrgID == assignment.OrgID && st.NormalizedLifecycle() != WorkerLifecycleRetired {
+				n++
+			}
+		}
+		if n >= assignment.MaxWorkers {
+			p.mu.Unlock()
+			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+		}
+	}
+	id := p.allocateBackgroundSpawnIDLocked()
+	p.spawning++
+	p.mu.Unlock()
+
+	err := p.spawnWorker(ctx, id, assignment.Image, profile, false)
+	p.mu.Lock()
+	p.spawning--
+	p.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("spawn sized worker: %w", err)
+	}
+
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("sized worker %d missing after spawn", id)
+	}
+	// spawnWorker does not stamp the profile on the in-memory worker; do it here
+	// so reuse-matching and the reserved record carry the size + TTL.
+	w.profile = profile
+	nextState, err := w.SharedState().Transition(WorkerLifecycleReserved, assignment)
+	if err != nil {
+		p.mu.Unlock()
+		p.retireWorkerWithReason(id, RetireReasonCrash, LifecycleOriginReserveFailure)
+		return nil, err
+	}
+	if err := w.SetSharedState(nextState); err != nil {
+		p.mu.Unlock()
+		p.retireWorkerWithReason(id, RetireReasonCrash, LifecycleOriginReserveFailure)
+		return nil, err
+	}
+	w.SetOwnerCPInstanceID(p.cpInstanceID)
+	w.IncrementOwnerEpoch()
+	w.reservedAt = time.Now()
+	reservedRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
+	p.mu.Unlock()
+	_ = p.persistWorkerRecord(reservedRecord)
+	return w, nil
 }
 
 func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) (*ManagedWorker, error) {
