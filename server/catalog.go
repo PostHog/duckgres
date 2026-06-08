@@ -1221,6 +1221,51 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			+ to_days((datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000) % 30)
 			+ to_microseconds(((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) % 86400000000)`,
 
+		// === Set-returning table macros (used in FROM position) ===
+
+		// json_array_elements / jsonb_array_elements - one row per array element (value json).
+		`CREATE OR REPLACE MACRO json_array_elements(j) AS TABLE SELECT unnest(json_extract(j, '$[*]')) AS value`,
+		`CREATE OR REPLACE MACRO jsonb_array_elements(j) AS TABLE SELECT unnest(json_extract(j, '$[*]')) AS value`,
+
+		// json_array_elements_text - SETOF text; values unquoted, JSON null -> SQL NULL.
+		`CREATE OR REPLACE MACRO json_array_elements_text(j) AS TABLE SELECT unnest(j ->> '$[*]') AS value`,
+
+		// jsonb_each - (key text, value json). Keys are JSONPath-quoted so dotted keys work.
+		`CREATE OR REPLACE MACRO jsonb_each(j) AS TABLE
+			SELECT k AS key, json_extract(j, '$."' || k || '"') AS value FROM (SELECT unnest(json_keys(j)) AS k)`,
+
+		// json_each_text - (key text, value text); values unquoted via ->>.
+		`CREATE OR REPLACE MACRO json_each_text(j) AS TABLE
+			SELECT k AS key, j ->> ('$."' || k || '"') AS value FROM (SELECT unnest(json_keys(j)) AS k)`,
+
+		// pg_options_to_table - split reloptions ['name=value'] into (option_name, option_value).
+		`CREATE OR REPLACE MACRO pg_options_to_table(opts) AS TABLE
+			SELECT split_part(o,'=',1) AS option_name, split_part(o,'=',2) AS option_value
+			FROM unnest(COALESCE(opts, [])) AS t(o)`,
+
+		// aclexplode - duckgres exposes no real ACLs; zero rows for any input (correct columns).
+		`CREATE OR REPLACE MACRO aclexplode(acl) AS TABLE
+			SELECT NULL::BIGINT AS grantor, NULL::BIGINT AS grantee, NULL::VARCHAR AS privilege_type, NULL::BOOLEAN AS is_grantable WHERE false`,
+
+		// pg_get_keywords - SQL keyword catalog (word, catcode, barelabel, catdesc, baredesc).
+		`CREATE OR REPLACE MACRO pg_get_keywords() AS TABLE
+			SELECT keyword_name AS word,
+				CASE keyword_category
+					WHEN 'reserved' THEN 'R' WHEN 'unreserved' THEN 'U'
+					WHEN 'type_function' THEN 'T' WHEN 'column_name' THEN 'C' ELSE 'U'
+				END AS catcode,
+				true AS barelabel, '' AS catdesc, '' AS baredesc
+			FROM duckdb_keywords()`,
+
+		// pg_identify_object - single-row (type, schema, name, identity) for an object address.
+		// Only relations (classid 1259) are resolvable here; everything else yields NULLs.
+		`CREATE OR REPLACE MACRO pg_identify_object(classid, objid, objsubid) AS TABLE
+			SELECT CASE WHEN classid = 1259 AND c.relname IS NOT NULL THEN 'table' ELSE NULL END::VARCHAR AS type,
+				n.nspname::VARCHAR AS schema, c.relname::VARCHAR AS name, c.relname::VARCHAR AS identity
+			FROM (SELECT classid AS cid, objid AS oid) p
+			LEFT JOIN pg_catalog.pg_class c ON p.cid = 1259 AND c.oid = p.oid
+			LEFT JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid`,
+
 		// decode(text, format) -> bytea. DuckDB's builtin decode is single-arg and points the
 		// wrong way (returns the input unchanged for the 2-arg call). This 2-arg macro shadows it
 		// and returns correct bytes. 'escape' maps text straight to its byte representation.

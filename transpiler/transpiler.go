@@ -464,6 +464,10 @@ func Classify(sql string, cfg Config) Classification {
 		"ARRAY_POSITIONS(", "ARRAY_REPLACE(", "ARRAY_FILL(", "TRIM_ARRAY(", "ARRAY_DIMS(",
 		"DATE_BIN(", "MAKE_INTERVAL(", "JUSTIFY_HOURS(", "JUSTIFY_DAYS(", "JUSTIFY_INTERVAL(",
 		"DECODE(", "ENCODE(", "INET_SERVER_ADDR(",
+		// Set-returning table macros (FROM-clause)
+		"JSON_ARRAY_ELEMENTS(", "JSONB_ARRAY_ELEMENTS(", "JSON_ARRAY_ELEMENTS_TEXT(",
+		"JSONB_EACH(", "JSON_EACH_TEXT(", "PG_OPTIONS_TO_TABLE(", "ACLEXPLODE(",
+		"PG_GET_KEYWORDS(", "PG_IDENTIFY_OBJECT(",
 	) {
 		flags |= FlagFunctions
 	}

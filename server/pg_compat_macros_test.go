@@ -185,3 +185,42 @@ func TestCompatMacros_BatchC(t *testing.T) {
 		{"inet_server_addr_type", `SELECT typeof(inet_server_addr())`, "INET", false},
 	})
 }
+
+// Batch D — set-returning table macros, exercised in FROM position and reduced to a
+// single scalar so they reuse runMacroCases.
+func TestCompatTableMacros_BatchD(t *testing.T) {
+	runMacroCases(t, []macroCase{
+		// json/jsonb_array_elements — one row per array element
+		{"json_array_elements_count", `SELECT count(*)::VARCHAR FROM json_array_elements('[1,2,3]'::json)`, "3", false},
+		{"json_array_elements_vals", `SELECT string_agg(value::VARCHAR, ',' ORDER BY value::VARCHAR) FROM json_array_elements('[1,2,3]'::json)`, "1,2,3", false},
+		{"json_array_elements_empty", `SELECT count(*)::VARCHAR FROM json_array_elements('[]'::json)`, "0", false},
+		{"jsonb_array_elements_count", `SELECT count(*)::VARCHAR FROM jsonb_array_elements('[1,2,3]'::json)`, "3", false},
+
+		// jsonb_each — (key, value json) rows
+		{"jsonb_each", `SELECT string_agg(key || '=' || value::VARCHAR, ',' ORDER BY key) FROM jsonb_each('{"a":1,"b":2}'::json)`, "a=1,b=2", false},
+		{"jsonb_each_empty", `SELECT count(*)::VARCHAR FROM jsonb_each('{}'::json)`, "0", false},
+
+		// json_each_text — (key, value text); values unquoted, JSON null -> SQL NULL
+		{"json_each_text", `SELECT string_agg(key || '=' || coalesce(value,'<null>'), ',' ORDER BY key) FROM json_each_text('{"a":"hello","b":2}'::json)`, "a=hello,b=2", false},
+		{"json_each_text_null", `SELECT string_agg(key || '=' || coalesce(value,'<null>'), ',' ORDER BY key) FROM json_each_text('{"a":null,"b":"x"}'::json)`, "a=<null>,b=x", false},
+
+		// json_array_elements_text — SETOF text, unquoted
+		{"json_array_elements_text", `SELECT string_agg(value, ',') FROM json_array_elements_text('["x","y"]'::json)`, "x,y", false},
+
+		// pg_options_to_table — split name=value option strings
+		{"pg_options_to_table", `SELECT option_name || '=' || option_value FROM pg_options_to_table(['fillfactor=70'])`, "fillfactor=70", false},
+		{"pg_options_to_table_null", `SELECT count(*)::VARCHAR FROM pg_options_to_table(NULL)`, "0", false},
+
+		// aclexplode — duckgres has no real ACLs; zero rows, correct columns
+		{"aclexplode_zero", `SELECT count(*)::VARCHAR FROM aclexplode(NULL)`, "0", false},
+		{"aclexplode_cols", `SELECT (grantor IS NULL)::VARCHAR FROM (SELECT NULL::BIGINT grantor) UNION ALL SELECT (grantor IS NULL)::VARCHAR FROM aclexplode(NULL) LIMIT 1`, "true", false},
+
+		// pg_get_keywords — SQL keyword catalog
+		{"pg_get_keywords_many", `SELECT (count(*) > 100)::VARCHAR FROM pg_get_keywords()`, "true", false},
+		{"pg_get_keywords_reserved", `SELECT catcode FROM pg_get_keywords() WHERE word = 'select'`, "R", false},
+
+		// pg_identify_object — single-row record function
+		{"pg_identify_object_empty_row", `SELECT count(*)::VARCHAR FROM pg_identify_object(0, 0, 0)`, "1", false},
+		{"pg_identify_object_null_type", `SELECT (type IS NULL)::VARCHAR FROM pg_identify_object(0, 0, 0)`, "true", false},
+	})
+}

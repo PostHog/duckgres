@@ -4364,6 +4364,16 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			input:    "SELECT set_config('search_path', 'main', false)",
 			contains: "memory.main.set_config",
 		},
+		{
+			name:     "decode gets memory.main prefix",
+			input:    "SELECT decode('YWJj', 'base64')",
+			contains: "memory.main.decode",
+		},
+		{
+			name:     "json_array_elements (FROM-clause SRF) gets memory.main prefix",
+			input:    "SELECT value FROM json_array_elements('[1,2,3]'::json)",
+			contains: "memory.main.json_array_elements",
+		},
 	}
 
 	tr := New(Config{DuckLakeMode: true})

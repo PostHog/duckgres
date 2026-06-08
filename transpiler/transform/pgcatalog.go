@@ -157,6 +157,15 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"decode":                            true, // bytea decode (base64/hex/escape) macro
 			"encode":                            true, // bytea encode (base64/hex/escape) macro
 			"inet_server_addr":                  true, // INET-typed NULL stub
+			"json_array_elements":               true, // SRF: array elements (json)
+			"jsonb_array_elements":              true, // SRF: array elements (jsonb)
+			"json_array_elements_text":          true, // SRF: array elements (text)
+			"jsonb_each":                        true, // SRF: object key/value (json)
+			"json_each_text":                    true, // SRF: object key/value (text)
+			"pg_options_to_table":               true, // SRF: reloptions split
+			"aclexplode":                        true, // SRF: ACL explode (empty)
+			"pg_get_keywords":                   true, // SRF: keyword catalog
+			"pg_identify_object":                true, // object address -> identity row
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -239,6 +248,15 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"decode":                            true, // bytea decode (base64/hex/escape) macro
 			"encode":                            true, // bytea encode (base64/hex/escape) macro
 			"inet_server_addr":                  true, // INET-typed NULL stub
+			"json_array_elements":               true, // SRF: array elements (json)
+			"jsonb_array_elements":              true, // SRF: array elements (jsonb)
+			"json_array_elements_text":          true, // SRF: array elements (text)
+			"jsonb_each":                        true, // SRF: object key/value (json)
+			"json_each_text":                    true, // SRF: object key/value (text)
+			"pg_options_to_table":               true, // SRF: reloptions split
+			"aclexplode":                        true, // SRF: ACL explode (empty)
+			"pg_get_keywords":                   true, // SRF: keyword catalog
+			"pg_identify_object":                true, // object address -> identity row
 
 			// ClickHouse SQL macros (server/chsql.go initClickHouseMacros)
 			"tostring":          true,
