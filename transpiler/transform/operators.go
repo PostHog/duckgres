@@ -298,6 +298,20 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 			if looksJSON(aexpr.Lexpr) || looksJSON(aexpr.Rexpr) {
 				return t.createJSONMergeFuncCall(aexpr.Lexpr, aexpr.Rexpr)
 			}
+		// jsonb @> jsonb is containment in Postgres; DuckDB has no @>(JSON,JSON) but does
+		// have json_contains(). Only rewrite when an operand is clearly JSON — array @> array
+		// is native in DuckDB and must be left alone.
+		case "@>":
+			if looksJSON(aexpr.Lexpr) || looksJSON(aexpr.Rexpr) {
+				return t.createJSONContainsFuncCall(aexpr.Lexpr, aexpr.Rexpr)
+			}
+		// json #>> '{a,b}' extracts the value at a text[] path as text. DuckDB lacks #>> but
+		// json_extract_string(j, '$."a"."b"') is equivalent. Only literal path arrays can be
+		// converted at transpile time; a non-literal path is left as-is.
+		case "#>>":
+			if jsonPath := pgPathArrayToJSONPath(aexpr.Rexpr); jsonPath != "" {
+				return t.createJsonExtractFuncCall(aexpr.Lexpr, stringConstNode(jsonPath), true)
+			}
 		// Regex operators — only match binary ~ (both operands present).
 		// Unary ~ (bitwise NOT, e.g. ~id) has Lexpr=nil and must be left as-is;
 		// DuckDB supports ~ as bitwise NOT natively. Passing nil into
@@ -553,6 +567,92 @@ func (t *OperatorTransform) createJSONMergeFuncCall(left, right *pg_query.Node) 
 			},
 		},
 	}
+}
+
+// createJSONContainsFuncCall rewrites `a @> b` to json_contains(a, b), matching
+// Postgres jsonb containment for the common object/array cases.
+func (t *OperatorTransform) createJSONContainsFuncCall(left, right *pg_query.Node) *pg_query.Node {
+	if newLeft := t.transformExpression(left); newLeft != nil {
+		left = newLeft
+	}
+	if newRight := t.transformExpression(right); newRight != nil {
+		right = newRight
+	}
+	return &pg_query.Node{
+		Node: &pg_query.Node_FuncCall{
+			FuncCall: &pg_query.FuncCall{
+				Funcname: []*pg_query.Node{
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "json_contains"}}},
+				},
+				Args: []*pg_query.Node{left, right},
+			},
+		},
+	}
+}
+
+// stringConstNode builds an A_Const string node carrying the given value.
+func stringConstNode(s string) *pg_query.Node {
+	return &pg_query.Node{
+		Node: &pg_query.Node_AConst{
+			AConst: &pg_query.A_Const{
+				Val: &pg_query.A_Const_Sval{Sval: &pg_query.String{Sval: s}},
+			},
+		},
+	}
+}
+
+// pgPathArrayToJSONPath converts a literal Postgres text[] path (e.g. '{a,b}' or
+// '{a,0,b}') into a DuckDB JSONPath ('$."a"."b"', '$."a"[0]."b"'). Keys are
+// double-quoted so dotted keys are handled; all-digit elements become array
+// indices. Returns "" for non-literal operands (left untransformed).
+func pgPathArrayToJSONPath(node *pg_query.Node) string {
+	if node == nil {
+		return ""
+	}
+	// Unwrap an explicit cast like '{a,b}'::text[].
+	if tc := node.GetTypeCast(); tc != nil {
+		node = tc.Arg
+	}
+	ac := node.GetAConst()
+	if ac == nil {
+		return ""
+	}
+	sval := ac.GetSval()
+	if sval == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(sval.Sval)
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
+		return ""
+	}
+	inner := raw[1 : len(raw)-1]
+	if strings.TrimSpace(inner) == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("$")
+	for _, part := range strings.Split(inner, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && isAllDigits(part) {
+			b.WriteString("[")
+			b.WriteString(part)
+			b.WriteString("]")
+			continue
+		}
+		b.WriteString(`."`)
+		b.WriteString(strings.ReplaceAll(part, `"`, `""`))
+		b.WriteString(`"`)
+	}
+	return b.String()
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // createRegexFuncCall creates a regexp_matches function call node

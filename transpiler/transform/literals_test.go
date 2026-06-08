@@ -81,3 +81,66 @@ func TestOperatorTransform_StringConcatUnchanged(t *testing.T) {
 		t.Errorf("string concat || should be preserved, got %q", out)
 	}
 }
+
+func TestOperatorTransform_JSONBContains(t *testing.T) {
+	tr := NewOperatorTransform()
+	out := deparseAfter(t, tr, `SELECT '{"a":1,"b":2}'::jsonb @> '{"a":1}'::jsonb`)
+	if !strings.Contains(strings.ToLower(out), "json_contains") {
+		t.Errorf("expected json_contains, got %q", out)
+	}
+}
+
+func TestOperatorTransform_ArrayContainsUnchanged(t *testing.T) {
+	tr := NewOperatorTransform()
+	// Array @> array is native in DuckDB; must NOT be rewritten to json_contains.
+	out := deparseAfter(t, tr, `SELECT ARRAY[1,2,3] @> ARRAY[2]`)
+	if strings.Contains(strings.ToLower(out), "json_contains") {
+		t.Errorf("array containment should stay native @>, got %q", out)
+	}
+	if !strings.Contains(out, "@>") {
+		t.Errorf("array @> should be preserved, got %q", out)
+	}
+}
+
+func TestOperatorTransform_JSONPathExtractText(t *testing.T) {
+	tr := NewOperatorTransform()
+	out := deparseAfter(t, tr, `SELECT '{"a":{"b":1}}'::json #>> '{a,b}'`)
+	low := strings.ToLower(out)
+	if !strings.Contains(low, "json_extract_string") {
+		t.Errorf("expected json_extract_string, got %q", out)
+	}
+	if !strings.Contains(out, `$."a"."b"`) {
+		t.Errorf("expected JSONPath $.\"a\".\"b\", got %q", out)
+	}
+}
+
+func TestTypeCastTransform_ArrayLiteral(t *testing.T) {
+	tr := NewTypeCastTransform()
+	cases := []struct {
+		name    string
+		in      string
+		wantSub []string // substrings that must be present
+		wantNo  []string // substrings that must be absent
+	}{
+		{"int_array", `SELECT '{1,2,3}'::integer[]`, []string{"ARRAY[", "'1'", "'2'", "'3'"}, []string{"{1,2,3}"}},
+		{"text_array", `SELECT '{a,b}'::text[]`, []string{"ARRAY[", "'a'", "'b'"}, []string{"{a,b}"}},
+		{"empty_array", `SELECT '{}'::integer[]`, []string{"ARRAY["}, []string{"'{}'"}},
+		{"null_element", `SELECT '{1,NULL,3}'::integer[]`, []string{"ARRAY[", "NULL"}, []string{"{1,NULL,3}"}},
+		{"quoted_embedded_comma", `SELECT '{"a,b",c}'::text[]`, []string{"ARRAY[", "'a,b'", "'c'"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := deparseAfter(t, tr, tc.in)
+			for _, sub := range tc.wantSub {
+				if !strings.Contains(out, sub) {
+					t.Errorf("%s: expected %q in %q", tc.name, sub, out)
+				}
+			}
+			for _, no := range tc.wantNo {
+				if strings.Contains(out, no) {
+					t.Errorf("%s: did not expect %q in %q", tc.name, no, out)
+				}
+			}
+		})
+	}
+}

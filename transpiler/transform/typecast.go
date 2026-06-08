@@ -59,6 +59,15 @@ func (t *TypeCastTransform) walkAndTransform(node *pg_query.Node, changed *bool)
 	switch n := node.Node.(type) {
 	case *pg_query.Node_TypeCast:
 		if n.TypeCast != nil && n.TypeCast.TypeName != nil {
+			// PG curly-brace array literal cast: '{1,2,3}'::int[] -> ARRAY['1','2','3']::int[].
+			// DuckDB cannot parse PG's array_in text form; rewrite the literal to an ARRAY[...]
+			// expression and keep the element-wise ::TARGET[] cast.
+			if len(n.TypeCast.TypeName.ArrayBounds) > 0 {
+				if arrExpr := pgArrayLiteralToArrayExpr(n.TypeCast.Arg); arrExpr != nil {
+					n.TypeCast.Arg = arrExpr
+					*changed = true
+				}
+			}
 			// Check if this is a pg_catalog type cast
 			typeName := n.TypeCast.TypeName
 			typeLower := ""
@@ -575,4 +584,114 @@ func isTextType(typeName string) bool {
 		return true
 	}
 	return false
+}
+
+// pgArrayLiteralToArrayExpr converts a literal Postgres array text form (e.g.
+// '{1,2,3}', '{a,b}', '{1,NULL,3}', '{"a,b",c}') into a DuckDB ARRAY[...]
+// expression node. Each element becomes a single-quoted string A_Const (or a
+// NULL const for the bare NULL token); the surrounding ::TARGET[] cast then
+// applies the element type. Returns nil (leave untransformed) for non-literal
+// args or nested/multi-dimensional literals.
+func pgArrayLiteralToArrayExpr(arg *pg_query.Node) *pg_query.Node {
+	if arg == nil {
+		return nil
+	}
+	ac := arg.GetAConst()
+	if ac == nil {
+		return nil
+	}
+	sval := ac.GetSval()
+	if sval == nil {
+		return nil
+	}
+	elems, ok := parsePGArrayLiteral(sval.Sval)
+	if !ok {
+		return nil
+	}
+	nodes := make([]*pg_query.Node, 0, len(elems))
+	for _, e := range elems {
+		if e.isNull {
+			nodes = append(nodes, &pg_query.Node{
+				Node: &pg_query.Node_AConst{AConst: &pg_query.A_Const{Isnull: true}},
+			})
+			continue
+		}
+		nodes = append(nodes, stringConstNode(e.val))
+	}
+	return &pg_query.Node{
+		Node: &pg_query.Node_AArrayExpr{
+			AArrayExpr: &pg_query.A_ArrayExpr{Elements: nodes},
+		},
+	}
+}
+
+type pgArrayElem struct {
+	val    string
+	isNull bool
+}
+
+// parsePGArrayLiteral parses a one-dimensional Postgres array literal '{...}'.
+// It handles unquoted elements, double-quoted elements (with \" and \\ escapes
+// and embedded commas), and the bare unquoted NULL token. It returns ok=false
+// for input that is not a brace-wrapped literal or that contains a nested '{'
+// (multi-dimensional arrays are left untransformed).
+func parsePGArrayLiteral(s string) ([]pgArrayElem, bool) {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return nil, false
+	}
+	inner := s[1 : len(s)-1]
+	if strings.Contains(inner, "{") {
+		return nil, false // multi-dimensional: out of scope
+	}
+	var elems []pgArrayElem
+	if strings.TrimSpace(inner) == "" {
+		return elems, true // empty array
+	}
+	i, n := 0, len(inner)
+	for i < n {
+		for i < n && (inner[i] == ' ' || inner[i] == '\t') {
+			i++
+		}
+		if i < n && inner[i] == '"' {
+			i++
+			var b strings.Builder
+			for i < n {
+				c := inner[i]
+				if c == '\\' && i+1 < n {
+					b.WriteByte(inner[i+1])
+					i += 2
+					continue
+				}
+				if c == '"' {
+					i++
+					break
+				}
+				b.WriteByte(c)
+				i++
+			}
+			elems = append(elems, pgArrayElem{val: b.String()})
+			for i < n && inner[i] != ',' {
+				i++
+			}
+			if i < n {
+				i++
+			}
+			continue
+		}
+		start := i
+		for i < n && inner[i] != ',' {
+			i++
+		}
+		tok := strings.TrimSpace(inner[start:i])
+		if i < n {
+			i++
+		}
+		if strings.EqualFold(tok, "NULL") {
+			elems = append(elems, pgArrayElem{isNull: true})
+		} else {
+			elems = append(elems, pgArrayElem{val: tok})
+		}
+	}
+	return elems, true
 }
