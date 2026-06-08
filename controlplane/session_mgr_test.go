@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -79,6 +80,30 @@ func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 	}
 	if got := metric.GetCounter().GetValue(); got != 1 {
 		t.Fatalf("expected one warm capacity acquisition failure, got %v", got)
+	}
+}
+
+func TestIsWorkerSessionCapError(t *testing.T) {
+	// The worker maps a MaxSessions rejection to a gRPC ResourceExhausted error
+	// whose message contains "max sessions reached"; the CP wraps it twice on the
+	// way up. The classifier must see through that wrapping and ignore unrelated
+	// errors (otherwise the cap-drift recycle/retry would fire on the wrong thing).
+	capLike := fmt.Errorf("create session on worker 7: %w",
+		fmt.Errorf("create session recv: %w",
+			errors.New("rpc error: code = ResourceExhausted desc = create session: max sessions reached (1)")))
+	if !isWorkerSessionCapError(capLike) {
+		t.Fatalf("expected wrapped 'max sessions reached' error to be classified as a session-cap error")
+	}
+
+	for _, e := range []error{
+		nil,
+		errors.New("create session on worker 7: connection refused"),
+		NewWarmCapacityExhaustedError(time.Second),
+		context.DeadlineExceeded,
+	} {
+		if isWorkerSessionCapError(e) {
+			t.Fatalf("did not expect %v to be classified as a session-cap error", e)
+		}
 	}
 }
 

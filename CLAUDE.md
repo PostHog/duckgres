@@ -199,6 +199,15 @@ a heavy query killed by a co-resident one. Do not break the following:
   (`session_mgr.go`) MUST await the worker-side `DestroySession` RPC *before*
   `ReleaseWorker`, so a reused (hot-idle) worker's prior session is gone before
   the next one is assigned (otherwise cap=1 spuriously rejects the reuse).
+- **Cap-drift is recovered, not fatal:** if a worker still rejects a CP-scheduled
+  session at its cap (CP↔worker accounting drift — should never happen),
+  `SessionManager.CreateSessionWithProtocol` does NOT fail the client: it logs
+  loudly (ERROR), bumps `duckgres_control_plane_worker_session_cap_drift_total`,
+  retires (recycles) the inconsistent worker, and re-acquires a fresh one
+  (bounded by `maxWorkerSessionCapDriftRetries`). Detection is
+  `isWorkerSessionCapError` (matches the worker's "max sessions reached"
+  message). A nonzero drift metric means the scheduling invariant is broken —
+  fix the root cause, don't just lean on the retry.
 
 Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
 `k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`, or
