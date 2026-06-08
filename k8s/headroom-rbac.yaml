@@ -1,0 +1,25 @@
+# Cluster-scoped node-read for the headroom controller. The control-plane's
+# in-namespace Role (k8s/rbac.yaml) already grants pods create/delete/list for
+# the placeholder pods; only node allocatable (cluster-scoped) needs this extra
+# ClusterRole. Apply when enabling headroom (DUCKGRES_K8S_HEADROOM_PERCENT > 0).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: duckgres-headroom-nodes
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: duckgres-headroom-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: duckgres-headroom-nodes
+subjects:
+  - kind: ServiceAccount
+    name: duckgres-control-plane
+    namespace: duckgres

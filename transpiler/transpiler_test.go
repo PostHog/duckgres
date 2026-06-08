@@ -4374,6 +4374,11 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			input:    "SELECT value FROM json_array_elements('[1,2,3]'::json)",
 			contains: "memory.main.json_array_elements",
 		},
+		{
+			name:     "array_lower gets memory.main prefix",
+			input:    "SELECT array_lower(conkey, 1) FROM pg_constraint",
+			contains: "memory.main.array_lower",
+		},
 	}
 
 	tr := New(Config{DuckLakeMode: true})

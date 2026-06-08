@@ -88,6 +88,20 @@ func observeControlPlaneWorkerAcquireFailure(reason string) {
 	controlPlaneWorkerAcquireFailuresCounter.WithLabelValues(reason).Inc()
 }
 
+// controlPlaneWorkerSessionCapDriftCounter counts times a worker rejected a
+// control-plane-scheduled CreateSession because it already held its max session
+// — a CP↔worker accounting drift that must never happen under the
+// one-session-per-worker contract. Should sit at 0; a sustained nonzero rate
+// means scheduling is double-assigning workers (alert on it).
+var controlPlaneWorkerSessionCapDriftCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_control_plane_worker_session_cap_drift_total",
+	Help: "Times a worker rejected a CP-scheduled CreateSession at its session cap (CP↔worker accounting drift; recovered by recycling the worker and retrying).",
+})
+
+func observeWorkerSessionCapDrift() {
+	controlPlaneWorkerSessionCapDriftCounter.Inc()
+}
+
 func observeFlightSessionsReaped(trigger string, count int) {
 	if count <= 0 {
 		return

@@ -1,0 +1,23 @@
+# PriorityClasses for the node-headroom controller (docs/design/worker-ttl-pool.md).
+# Apply when enabling headroom (DUCKGRES_K8S_HEADROOM_PERCENT > 0). Worker pods set
+# duckgres-worker; placeholder pods set duckgres-headroom. Worker value > placeholder
+# value, so the scheduler preempts as many placeholders as needed to fit a worker.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: duckgres-worker
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Duckgres worker pods. Preempt the headroom placeholder pods to schedule immediately."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: duckgres-headroom
+value: -10
+globalDefault: false
+# Never preempt other pods — placeholders only hold spare node capacity and are
+# themselves the first thing evicted when a real worker needs the room.
+preemptionPolicy: Never
+description: "Duckgres node-headroom placeholder (pause) pods. Lowest priority; evicted to make room for workers."

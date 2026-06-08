@@ -4,10 +4,34 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
+
+// With MaxSessions=1 (how the control plane spawns remote worker pods), a worker
+// serves exactly one client query session — a second concurrent CreateSession is
+// rejected rather than silently overcommitting the pod's resources. Internal
+// control/maintenance connections (controlDB/warmupDB) are not counted sessions
+// and are unaffected.
+func TestCreateSessionRejectsSecondSessionWhenMaxIsOne(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		maxSessions: 1,
+	}
+	pool.sessions["existing"] = &Session{ID: "existing"}
+
+	_, err := pool.CreateSession("u", "", 0)
+	if err == nil {
+		t.Fatal("expected second CreateSession to be rejected at MaxSessions=1")
+	}
+	if !strings.Contains(err.Error(), "max sessions reached") {
+		t.Fatalf("expected 'max sessions reached' error, got %v", err)
+	}
+}
 
 type exitPanic struct {
 	code int
@@ -300,4 +324,182 @@ func TestRunExitsWhenBundledExtensionBootstrapFails(t *testing.T) {
 
 	Run(ServiceConfig{})
 	t.Fatal("expected Run to exit")
+}
+
+func TestSessionPoolDrainWaitsForActiveWorkAndRejectsNewWork(t *testing.T) {
+	pool := &SessionPool{}
+
+	finish, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin tracked work: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("expected one active drain work item, got %d", got)
+	}
+
+	pool.BeginDrain()
+	if !pool.IsDraining() {
+		t.Fatal("expected pool to be draining")
+	}
+
+	if _, err := pool.beginDrainWork(false); !errors.Is(err, ErrWorkerDraining) {
+		t.Fatalf("expected new work to be rejected while draining, got %v", err)
+	}
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("expected drain wait to time out while active work is still running")
+	}
+
+	finish()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected drain wait to complete after active work finishes")
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("expected no active drain work, got %d", got)
+	}
+}
+
+func TestSessionPoolRejectsContinuationAfterDrainReachesZero(t *testing.T) {
+	pool := &SessionPool{}
+
+	pool.BeginDrain()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected drain to complete with no active work")
+	}
+
+	if _, err := pool.beginDrainWork(true); !errors.Is(err, ErrWorkerDraining) {
+		t.Fatalf("expected continuation to be rejected after drain completed, got %v", err)
+	}
+}
+
+func TestDestroySessionReleasesPendingQueryDrainWork(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin pending query drain work: %v", err)
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:      "session-1",
+		queries: map[string]*QueryHandle{"query-1": {Query: "SELECT 1", finishDrain: finishDrain}},
+		txns:    make(map[string]*trackedTx),
+	}
+
+	pool.BeginDrain()
+	if err := pool.DestroySession("session-1"); err != nil {
+		t.Fatalf("destroy session: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected destroying the session to release pending query drain work")
+	}
+}
+
+func TestReapIdleTransactionsReleasesDrainWork(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin transaction drain work: %v", err)
+	}
+	ttx := &trackedTx{finishDrain: finishDrain}
+	ttx.lastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	pool.sessions["session-1"] = &Session{
+		ID:       "session-1",
+		queries:  make(map[string]*QueryHandle),
+		txns:     map[string]*trackedTx{"txn-1": ttx},
+		txnOwner: map[string]string{"txn-1": "alice"},
+	}
+
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected idle transaction reaper to release transaction drain work")
+	}
+}
+
+// A GetFlightInfo whose matching DoGet never arrives must not hold the drain
+// open forever: the reaper releases drain tokens stranded on stale ad-hoc query
+// handles, stale prepared pendingDrains, and stale metadata streams — while
+// leaving fresh handles and long-lived prepared handles intact.
+func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	mustToken := func() func() {
+		f, err := pool.beginDrainWork(false)
+		if err != nil {
+			t.Fatalf("begin drain work: %v", err)
+		}
+		return f
+	}
+	stale := time.Now().Add(-handleIdleTimeout - time.Minute)
+	fresh := time.Now()
+
+	staleAdhoc := mustToken()
+	freshAdhoc := mustToken()
+	stalePrepared := mustToken()
+	staleMeta := mustToken()
+
+	sess := &Session{
+		ID: "s1",
+		queries: map[string]*QueryHandle{
+			"query-1": {Query: "SELECT 1", createdAt: stale, finishDrain: staleAdhoc},
+			"query-2": {Query: "SELECT 2", createdAt: fresh, finishDrain: freshAdhoc},
+			"prep-1":  {Query: "SELECT 3", Prepared: true, createdAt: stale, pendingDrains: []drainToken{{finish: stalePrepared, at: stale}}},
+		},
+		metadataDrains: map[string][]drainToken{
+			"schemas|x": {{finish: staleMeta, at: stale}},
+		},
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
+	}
+	pool.sessions["s1"] = sess
+
+	if got := pool.ActiveDrainWork(); got != 4 {
+		t.Fatalf("activeWork=%d want 4 before reap", got)
+	}
+
+	pool.reapIdle(time.Now())
+
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("activeWork=%d want 1 (only the fresh ad-hoc handle should remain)", got)
+	}
+
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	if _, ok := sess.queries["query-1"]; ok {
+		t.Error("stale ad-hoc handle query-1 was not reaped")
+	}
+	if _, ok := sess.queries["query-2"]; !ok {
+		t.Error("fresh ad-hoc handle query-2 was wrongly reaped")
+	}
+	prep, ok := sess.queries["prep-1"]
+	if !ok {
+		t.Fatal("prepared handle prep-1 was wrongly dropped (must outlive a stale pendingDrain)")
+	}
+	if len(prep.pendingDrains) != 0 {
+		t.Errorf("stale prepared pendingDrain not released: %d remain", len(prep.pendingDrains))
+	}
+	if _, ok := sess.metadataDrains["schemas|x"]; ok {
+		t.Error("stale metadata drain was not reaped")
+	}
 }

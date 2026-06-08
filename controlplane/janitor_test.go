@@ -94,7 +94,7 @@ func (s *captureControlPlaneExpiryStore) ExpireFlightSessionRecords(before time.
 // by the migrated janitor hot-idle path. The mock wraps the same
 // underlying slice through NewWorkerSnapshot so existing
 // tests can opt into the lifecycle path by setting expiredHotIdleWorkers.
-func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.expiredHotIdleWorkers) == 0 {

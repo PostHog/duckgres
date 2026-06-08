@@ -20,7 +20,7 @@ type controlPlaneExpiryStore interface {
 	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)
 	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 	ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error)
-	ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
+	ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 }
 
@@ -45,6 +45,7 @@ type ControlPlaneJanitor struct {
 	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
+	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured node-headroom % (leader-only)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -153,8 +154,9 @@ func (j *ControlPlaneJanitor) runOnce() {
 		}
 
 		if j.hotIdleTTL > 0 {
-			cutoff := j.now().Add(-j.hotIdleTTL)
-			expired, err := j.store.ListExpiredHotIdleSnapshots(cutoff)
+			// Per-worker TTL: a worker's ttl_minutes governs its hot-idle life;
+			// hotIdleTTL is the fallback for default/warm/legacy workers (ttl=0).
+			expired, err := j.store.ListExpiredHotIdleSnapshots(j.now(), j.hotIdleTTL)
 			if err != nil {
 				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 			}
@@ -203,5 +205,8 @@ func (j *ControlPlaneJanitor) runOnce() {
 	if j.reconcileWarmCapacity != nil {
 		j.reconcileWarmCapacity()
 	}
-}
 
+	if j.reconcileHeadroom != nil {
+		j.reconcileHeadroom()
+	}
+}

@@ -867,7 +867,6 @@ func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
 	})
 }
 
-
 func migrateOrgUserPK(db *gorm.DB) error {
 	// Check if the PK already has 2 columns (idempotent)
 	var count int64
@@ -1123,8 +1122,13 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	protectedStates := []WorkerState{WorkerStateDraining, WorkerStateRetired, WorkerStateLost}
 	result := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "worker_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at"}),
+		Columns: []clause.Column{{Name: "worker_id"}},
+		// profile_cpu/memory/colocate + ttl_minutes are in the update set so a
+		// sized worker's shape (set after CreateSpawningWorkerSlot inserts the row
+		// with an empty profile) actually persists. Without them the ON CONFLICT
+		// update silently dropped the profile, so a sized worker's hot-idle row
+		// stayed empty and ClaimHotIdleWorker could never match it (no reuse).
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at", "profile_cpu", "profile_memory", "profile_colocate", "ttl_minutes"}),
 		Where: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: `"worker_records"."state" NOT IN ?`, Vars: []any{protectedStates}},
 			clause.Expr{SQL: `(excluded."owner_epoch" > "worker_records"."owner_epoch" OR (excluded."owner_epoch" = "worker_records"."owner_epoch" AND excluded."owner_cp_instance_id" = "worker_records"."owner_cp_instance_id"))`},
@@ -1360,10 +1364,20 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 
 // ListExpiredHotIdleWorkers returns hot-idle workers whose updated_at timestamp
 // is at or before the given cutoff time.
-func (cs *ConfigStore) ListExpiredHotIdleWorkers(before time.Time) ([]WorkerRecord, error) {
+// ListExpiredHotIdleWorkers returns hot-idle workers whose per-worker TTL has
+// elapsed since they last became idle (updated_at, bumped on the hot->hot_idle
+// transition at session end, so the TTL resets on each query). A worker's
+// ttl_seconds governs it; 0 falls back to defaultTTL (default/warm/neutral and
+// legacy rows).
+func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
+	defMins := int64(defaultTTL.Minutes())
+	if defMins < 0 {
+		defMins = 0
+	}
 	var workers []WorkerRecord
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("state = ? AND updated_at <= ?", WorkerStateHotIdle, before).
+		Where("state = ? AND updated_at + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+			WorkerStateHotIdle, defMins, now).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)

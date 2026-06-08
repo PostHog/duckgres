@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -262,42 +263,90 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
-	acquireStart := time.Now()
-	ctx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
-	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
-	worker, err := sm.pool.AcquireWorker(ctx, profile)
-	if err != nil {
-		var capacityErr *WarmCapacityExhaustedError
-		if errors.As(err, &capacityErr) {
-			missReason := capacityErr.missReason()
-			observeControlPlaneWorkerAcquireFailure("warm_capacity_exhausted")
-			observeControlPlaneWorkerAcquireFailure("warm_capacity_" + string(missReason))
-			acquireSpan.SetAttributes(
-				attribute.String("warm_capacity.reason", string(missReason)),
-				attribute.Int("warm_capacity.retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter)),
-			)
-			slog.Warn("Worker acquisition failed.",
-				"pid", pid,
-				"user", username,
-				"duration", time.Since(acquireStart),
-				"reason", missReason,
-				"retry_after", capacityErr.RetryAfter,
-				"retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter),
-				"error", err,
-			)
+	// Acquire a worker and create the session on it. Normally one pass. If the
+	// worker rejects our session because it already holds its max session — a
+	// CP↔worker accounting drift that must never happen under one-session-per-
+	// worker — we do NOT fail the client for our own broken logic: recycle the
+	// inconsistent worker and try a fresh one (bounded), logging loudly so the
+	// drift is visible. ctx is the budget; each attempt also re-checks it.
+	var lastCapDriftErr error
+	for attempt := 1; attempt <= maxWorkerSessionCapDriftRetries+1; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+
+		acquireStart := time.Now()
+		actx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
+		slog.Debug("Acquiring worker for session.", "pid", pid, "user", username, "attempt", attempt)
+		worker, err := sm.pool.AcquireWorker(actx, profile)
+		if err != nil {
+			var capacityErr *WarmCapacityExhaustedError
+			if errors.As(err, &capacityErr) {
+				missReason := capacityErr.missReason()
+				observeControlPlaneWorkerAcquireFailure("warm_capacity_exhausted")
+				observeControlPlaneWorkerAcquireFailure("warm_capacity_" + string(missReason))
+				acquireSpan.SetAttributes(
+					attribute.String("warm_capacity.reason", string(missReason)),
+					attribute.Int("warm_capacity.retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter)),
+				)
+				slog.Warn("Worker acquisition failed.",
+					"pid", pid,
+					"user", username,
+					"duration", time.Since(acquireStart),
+					"reason", missReason,
+					"retry_after", capacityErr.RetryAfter,
+					"retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter),
+					"error", err,
+				)
+			}
+			acquireSpan.End()
+			return 0, nil, fmt.Errorf("acquire worker: %w", err)
 		}
 		acquireSpan.End()
-		return 0, nil, fmt.Errorf("acquire worker: %w", err)
-	}
-	acquireSpan.End()
-	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
+		slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, memoryLimit, threads, worker, protocol, true, lease)
-	if err != nil {
-		return 0, nil, err
+		newPID, exec, err := sm.createSessionOnWorker(actx, username, pid, memoryLimit, threads, worker, protocol, true, lease)
+		if err == nil {
+			success = true
+			return newPID, exec, nil
+		}
+		if !isWorkerSessionCapError(err) {
+			return 0, nil, err
+		}
+
+		// One-session-per-worker invariant violated: the CP scheduled this worker
+		// believing it idle, but the worker still holds a session. Recycle it
+		// (graceful drain via retire) so it leaves the schedulable pool, and retry
+		// with a fresh worker. Loud ERROR + metric so we can find and fix the drift.
+		lastCapDriftErr = err
+		observeWorkerSessionCapDrift()
+		slog.Error("Worker rejected a CP-scheduled session at its session cap — one-session-per-worker accounting drift; recycling worker and re-acquiring.",
+			"pid", pid,
+			"user", username,
+			"worker", worker.ID,
+			"attempt", attempt,
+			"error", err,
+		)
+		sm.pool.RetireWorker(worker.ID)
 	}
-	success = true
-	return pid, exec, nil
+
+	// Exhausted retries — every fresh worker drifted, which means scheduling is
+	// systemically broken. Surface a clear error rather than spinning.
+	return 0, nil, fmt.Errorf("create session: worker session-cap drift persisted across %d attempts: %w", maxWorkerSessionCapDriftRetries+1, lastCapDriftErr)
+}
+
+// maxWorkerSessionCapDriftRetries bounds how many EXTRA fresh workers we try when
+// a worker rejects a CP-scheduled session at its cap (one-session-per-worker
+// accounting drift). Total attempts = this + 1. Small: a single drift is a rare
+// race that a fresh worker fixes; persistent drift is a bug to surface, not spin on.
+const maxWorkerSessionCapDriftRetries = 2
+
+// isWorkerSessionCapError reports whether err is a worker's rejection of a new
+// session because it already holds its configured maximum (MaxSessions). The
+// worker maps this to gRPC ResourceExhausted with the duckdbservice message
+// "max sessions reached (N)", which propagates through the wrapped error chain.
+func isWorkerSessionCapError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "max sessions reached")
 }
 
 func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) (string, int) {

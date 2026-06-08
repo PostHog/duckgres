@@ -38,11 +38,12 @@ client-go:
 
 - **wire/query** — `SELECT 1` round-trips; 5 concurrent connections stay
   distinct (ported from `TestK8sMultipleConcurrentConnections`).
-- **warm-pool backpressure** — a cold-pool burst of sessions outruns the worker
-  pool (`shared_warm_target=0`); the CP must answer the surplus with the
-  graceful client-visible `no warm Duckgres worker … retry in about 45 seconds`
-  hint (not a hang/500/drop), and the pool must then drain so a retrying
-  connection succeeds. The harness asserts the hint **and** handles it (the
+- **warm-pool backpressure** — a cold-pool burst of sessions may outrun the
+  worker pool (`shared_warm_target=0`); if it does, the CP must answer the
+  surplus with the graceful client-visible
+  `no warm Duckgres worker … retry in about 45 seconds` hint (not a
+  hang/500/drop), and the pool must then drain so a retrying connection
+  succeeds. The harness asserts the hint when observed **and** handles it (the
   concurrency tests retry through it).
 - **activation** — DuckLake **and** Iceberg catalogs attach and read/write.
 - **extension forks** — the bundled `ducklake`/`httpfs` extensions are the
@@ -53,7 +54,16 @@ client-go:
   SA-token mount.
 - **resilience** — worker-pod kill → crash recovery; DuckLake durability across
   a worker restart; concurrent writers (fork conflict-retry, the test that was
-  flaking on main).
+  flaking on main); graceful drain (a worker SIGTERM'd mid-query drains — the
+  in-flight query completes correctly while the pod is Terminating — then retires
+  cleanly; regression net for the worker drain protocol, #690); one session per
+  worker (two concurrent queries for one org land on two distinct worker pods,
+  never sharing a pod's DuckDB — workers run DUCKGRES_DUCKDB_MAX_SESSIONS=1 so a
+  query owns the whole pod's resources). The org-at-max-workers clear error and
+  the under-cap hold-for-spawn / FIFO anti-snatch paths are covered by unit tests
+  (controlplane/org_reserved_pool_test.go, org_acquire_gate_test.go) — exercising
+  them in-Job would need a dedicated max_workers=1 org and deterministic cold-spawn
+  timing the shared cluster can't guarantee.
 - **isolation** — two tenants (cnpg vs ext) see distinct catalogs; a
   cross-tenant read is denied.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling
@@ -89,9 +99,15 @@ normal `go test ./...` lane.
 
 Dedicated CP + throwaway config-store **per PR**, provisioning **real**
 ducklings (org IDs `ci-pr-<N>-cnpg`, `ci-pr-<N>-ext`) through the **shared**
-Crossplane / cnpg-shards / external RDS / Lakekeeper operator. Everything
-PR-specific lives in the namespace and is deleted; the shared-infra footprint
-is removed by deprovisioning the ducklings first.
+Crossplane / cnpg-shards / external RDS / Lakekeeper operator. The config-store
+uses a namespace-scoped PVC so a pod recreation during the harness does not
+erase provisioned org rows. Everything PR-specific lives in the namespace and
+is deleted; the shared-infra footprint is removed by deprovisioning the
+ducklings first.
+
+Each deploy first reaps any existing resources for the same PR number (namespace,
+Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role)
+so a rerun never applies over stale Lakekeeper services or network policies.
 
 ## One-time repo configuration
 

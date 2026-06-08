@@ -18,8 +18,20 @@ metadata:
     app.kubernetes.io/managed-by: e2e-mw-dev
     duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
 ---
-# Throwaway config-store. Ephemeral (emptyDir) — the control plane AutoMigrates
-# the schema on boot and the provisioning API creates every row, so no seed.
+# Throwaway config-store. The namespace-scoped PVC is deleted on teardown, but
+# survives a config-store pod recreation during the e2e run; losing these rows
+# mid-harness makes the control plane forget already-provisioned orgs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: duckgres-config-store
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -46,7 +58,10 @@ spec:
           readinessProbe:
             exec: { command: ["pg_isready", "-U", "duckgres"] }
             periodSeconds: 3
-      volumes: [{ name: data, emptyDir: {} }]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: duckgres-config-store
 ---
 apiVersion: v1
 kind: Service

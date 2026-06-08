@@ -50,6 +50,7 @@ const (
 	LifecycleOriginMismatchedVersionReaper LifecycleOrigin = "mismatched_version_reaper"
 	LifecycleOriginShutdownAll             LifecycleOrigin = "shutdown_all"
 	LifecycleOriginHealthCheckCrash        LifecycleOrigin = "health_check_crash"
+	LifecycleOriginWorkerDrain             LifecycleOrigin = "worker_drain"
 	LifecycleOriginSpawnFailure            LifecycleOrigin = "spawn_failure"
 	LifecycleOriginReserveImageMismatch    LifecycleOrigin = "reserve_image_mismatch"
 	LifecycleOriginCredRefresh             LifecycleOrigin = "cred_refresh"
