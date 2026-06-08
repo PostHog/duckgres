@@ -454,6 +454,13 @@ func Classify(sql string, cfg Config) Classification {
 		"CLOCK_TIMESTAMP(",
 		// Identity functions
 		"SESSION_USER", "USER(",
+		// PostgreSQL builtin-compatibility macros (see docs/pg-builtin-compat-gaps.md)
+		"SET_CONFIG(", "UUID_GENERATE_V4(", "STATEMENT_TIMESTAMP(",
+		"PG_GET_FUNCTION_ARGUMENTS(", "PG_GET_FUNCTION_RESULT(", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS(",
+		"PG_GET_TRIGGERDEF(", "PG_JIT_AVAILABLE(", "ROW_SECURITY_ACTIVE(", "PG_COLLATION_FOR(",
+		"PG_INPUT_IS_VALID(", "TO_REGCLASS(", "TO_REGTYPE(", "TO_REGPROC(", "JSONB_PRETTY(",
+		"TO_ASCII(", "CONVERT_FROM(", "WIDTH_BUCKET(", "SCALE(", "MIN_SCALE(",
+		"MASKLEN(", "HOSTMASK(", "SET_MASKLEN(", "INET_SAME_FAMILY(",
 	) {
 		flags |= FlagFunctions
 	}

@@ -119,6 +119,31 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_ident":                     true, // Quote identifier
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
+			// PostgreSQL builtin-compat macros (docs/pg-builtin-compat-gaps.md)
+			"set_config":                        true, // Session-setting writer (value-returning)
+			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
+			"statement_timestamp":               true, // now() alias
+			"pg_get_function_arguments":         true, // \df signature stub
+			"pg_get_function_result":            true, // \df result-type stub
+			"pg_get_function_identity_arguments": true, // identity-arg stub
+			"pg_get_triggerdef":                 true, // Trigger DDL stub (NULL)
+			"pg_jit_available":                  true, // JIT stub (false)
+			"row_security_active":               true, // RLS stub (false)
+			"pg_collation_for":                  true, // Collation stub
+			"pg_input_is_valid":                 true, // Bounded input validator
+			"to_regclass":                       true, // Name->oid probe
+			"to_regtype":                        true, // Type-name->oid probe
+			"to_regproc":                        true, // Function-name->oid probe
+			"jsonb_pretty":                      true, // Indented JSON
+			"to_ascii":                          true, // Accent-stripping transliteration
+			"convert_from":                      true, // bytea->text (UTF8)
+			"width_bucket":                      true, // Equi-width histogram bucketing
+			"scale":                             true, // Numeric scale
+			"min_scale":                         true, // Numeric min scale
+			"masklen":                           true, // inet prefix length
+			"hostmask":                          true, // inet host mask
+			"set_masklen":                       true, // inet set prefix length
+			"inet_same_family":                  true, // inet family compare
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -163,6 +188,31 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_ident":                     true, // Quote identifier
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
+			// PostgreSQL builtin-compat macros (docs/pg-builtin-compat-gaps.md)
+			"set_config":                        true, // Session-setting writer (value-returning)
+			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
+			"statement_timestamp":               true, // now() alias
+			"pg_get_function_arguments":         true, // \df signature stub
+			"pg_get_function_result":            true, // \df result-type stub
+			"pg_get_function_identity_arguments": true, // identity-arg stub
+			"pg_get_triggerdef":                 true, // Trigger DDL stub (NULL)
+			"pg_jit_available":                  true, // JIT stub (false)
+			"row_security_active":               true, // RLS stub (false)
+			"pg_collation_for":                  true, // Collation stub
+			"pg_input_is_valid":                 true, // Bounded input validator
+			"to_regclass":                       true, // Name->oid probe
+			"to_regtype":                        true, // Type-name->oid probe
+			"to_regproc":                        true, // Function-name->oid probe
+			"jsonb_pretty":                      true, // Indented JSON
+			"to_ascii":                          true, // Accent-stripping transliteration
+			"convert_from":                      true, // bytea->text (UTF8)
+			"width_bucket":                      true, // Equi-width histogram bucketing
+			"scale":                             true, // Numeric scale
+			"min_scale":                         true, // Numeric min scale
+			"masklen":                           true, // inet prefix length
+			"hostmask":                          true, // inet host mask
+			"set_masklen":                       true, // inet set prefix length
+			"inet_same_family":                  true, // inet family compare
 
 			// ClickHouse SQL macros (server/chsql.go initClickHouseMacros)
 			"tostring":          true,

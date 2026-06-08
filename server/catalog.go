@@ -1056,6 +1056,127 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			CASE WHEN val IS NULL THEN 'NULL'
 			ELSE '''' || REPLACE(CAST(val AS VARCHAR), '''', '''''') || ''''
 			END`,
+
+		// === PostgreSQL builtin-compatibility macros (see docs/pg-builtin-compat-gaps.md) ===
+
+		// set_config - PG drivers/ORMs/poolers emit SELECT set_config('search_path'|..., v, local)
+		// at connection startup so it runs in the data path. Value-returning compat only: this
+		// does NOT mutate the session GUC (a true side effect would need a setshow transform); it
+		// returns new_value so the SELECT succeeds and the client proceeds. is_local is ignored.
+		`CREATE OR REPLACE MACRO set_config(setting_name, new_value, is_local) AS new_value`,
+
+		// uuid_generate_v4 - uuid-ossp v4 generator alias; DuckDB uuid() emits RFC-4122 v4 UUIDs.
+		`CREATE OR REPLACE MACRO uuid_generate_v4() AS uuid()`,
+
+		// statement_timestamp - start time of the current statement; now() is close enough here.
+		`CREATE OR REPLACE MACRO statement_timestamp() AS now()`,
+
+		// pg_get_function_arguments / _result / _identity_arguments - psql \df selects these from
+		// pg_proc; the missing symbols abort the whole query. We have no pg_proc rows to derive a
+		// real signature, so return '' (a valid PG value for a no-arg function) to keep \df working.
+		`CREATE OR REPLACE MACRO pg_get_function_arguments(func_oid) AS ''`,
+		`CREATE OR REPLACE MACRO pg_get_function_result(func_oid) AS ''`,
+		`CREATE OR REPLACE MACRO pg_get_function_identity_arguments(func_oid) AS ''`,
+
+		// pg_get_triggerdef - DuckDB has no triggers; always NULL (1-arg and 2-arg pretty forms).
+		`CREATE OR REPLACE MACRO pg_get_triggerdef(trigger_oid, pretty := false) AS CAST(NULL AS VARCHAR)`,
+
+		// pg_jit_available / row_security_active - capability stubs (no JIT, no RLS).
+		`CREATE OR REPLACE MACRO pg_jit_available() AS false`,
+		`CREATE OR REPLACE MACRO row_security_active(rel) AS false`,
+
+		// pg_collation_for - effective collation of an expression; we report the default collation.
+		`CREATE OR REPLACE MACRO pg_collation_for(x) AS '"default"'`,
+
+		// pg_input_is_valid - PG15 input validator over a bounded set of types via try_cast.
+		`CREATE OR REPLACE MACRO pg_input_is_valid(s, t) AS
+			CASE lower(t)
+				WHEN 'integer' THEN try_cast(s AS INTEGER) IS NOT NULL
+				WHEN 'int' THEN try_cast(s AS INTEGER) IS NOT NULL
+				WHEN 'int4' THEN try_cast(s AS INTEGER) IS NOT NULL
+				WHEN 'smallint' THEN try_cast(s AS SMALLINT) IS NOT NULL
+				WHEN 'int2' THEN try_cast(s AS SMALLINT) IS NOT NULL
+				WHEN 'bigint' THEN try_cast(s AS BIGINT) IS NOT NULL
+				WHEN 'int8' THEN try_cast(s AS BIGINT) IS NOT NULL
+				WHEN 'numeric' THEN try_cast(s AS DECIMAL(38,10)) IS NOT NULL
+				WHEN 'decimal' THEN try_cast(s AS DECIMAL(38,10)) IS NOT NULL
+				WHEN 'real' THEN try_cast(s AS REAL) IS NOT NULL
+				WHEN 'float4' THEN try_cast(s AS REAL) IS NOT NULL
+				WHEN 'double precision' THEN try_cast(s AS DOUBLE) IS NOT NULL
+				WHEN 'float8' THEN try_cast(s AS DOUBLE) IS NOT NULL
+				WHEN 'boolean' THEN try_cast(s AS BOOLEAN) IS NOT NULL
+				WHEN 'bool' THEN try_cast(s AS BOOLEAN) IS NOT NULL
+				WHEN 'date' THEN try_cast(s AS DATE) IS NOT NULL
+				WHEN 'timestamp' THEN try_cast(s AS TIMESTAMP) IS NOT NULL
+				WHEN 'time' THEN try_cast(s AS TIME) IS NOT NULL
+				WHEN 'uuid' THEN try_cast(s AS UUID) IS NOT NULL
+				ELSE NULL
+			END`,
+
+		// to_regclass / to_regtype / to_regproc - NULL-safe name->oid probes. PG returns NULL (not
+		// an error) when the object is absent; clients use them as existence checks.
+		`CREATE OR REPLACE MACRO to_regclass(rel) AS (
+			SELECT oid FROM pg_catalog.pg_class
+			WHERE relname = CASE WHEN position('.' IN rel) > 0 THEN split_part(rel, '.', -1) ELSE rel END
+			LIMIT 1)`,
+		`CREATE OR REPLACE MACRO to_regtype(name) AS (
+			SELECT oid FROM pg_type WHERE typname = (CASE lower(trim(name))
+				WHEN 'integer' THEN 'int4' WHEN 'int' THEN 'int4'
+				WHEN 'bigint' THEN 'int8' WHEN 'smallint' THEN 'int2'
+				WHEN 'boolean' THEN 'bool' WHEN 'real' THEN 'float4'
+				WHEN 'double precision' THEN 'float8'
+				WHEN 'character varying' THEN 'varchar'
+				WHEN 'character' THEN 'bpchar' WHEN 'char' THEN 'bpchar'
+				WHEN 'decimal' THEN 'numeric'
+				WHEN 'timestamp without time zone' THEN 'timestamp'
+				WHEN 'timestamp with time zone' THEN 'timestamptz'
+				WHEN 'time without time zone' THEN 'time'
+				ELSE lower(trim(name)) END)
+			LIMIT 1)`,
+		`CREATE OR REPLACE MACRO to_regproc(name) AS (
+			SELECT function_oid FROM duckdb_functions() WHERE function_name = lower(name) LIMIT 1)`,
+
+		// jsonb_pretty - indented JSON rendering.
+		`CREATE OR REPLACE MACRO jsonb_pretty(j) AS json_pretty(j)`,
+
+		// to_ascii - approximate transliteration to ASCII via accent stripping.
+		`CREATE OR REPLACE MACRO to_ascii(s) AS strip_accents(s)`,
+
+		// convert_from - decode bytea to text in a source encoding (UTF8 supported).
+		`CREATE OR REPLACE MACRO convert_from(b, enc) AS
+			CASE WHEN upper(replace(enc,'-','')) IN ('UTF8','UTF') THEN CAST(b AS VARCHAR)
+			ELSE error('unsupported source encoding: ' || enc) END`,
+
+		// width_bucket - SQL-standard equi-width histogram bucketing (below-range -> 0,
+		// at/above high -> count+1). DuckDB lacks the 4-arg numeric form.
+		`CREATE OR REPLACE MACRO width_bucket(operand, low, high, cnt) AS
+			CASE
+				WHEN operand < low THEN 0
+				WHEN operand >= high THEN cnt + 1
+				ELSE CAST(floor((operand - low) / ((high - low) / cnt)) AS INTEGER) + 1
+			END`,
+
+		// scale / min_scale - fractional-digit counts of a numeric (string-based).
+		`CREATE OR REPLACE MACRO scale(n) AS
+			CASE WHEN position('.' IN CAST(n AS VARCHAR)) = 0 THEN 0
+			ELSE length(split_part(CAST(n AS VARCHAR),'.',2)) END`,
+		`CREATE OR REPLACE MACRO min_scale(n) AS
+			CASE WHEN position('.' IN CAST(n AS VARCHAR)) = 0 THEN 0
+			ELSE length(rtrim(split_part(CAST(n AS VARCHAR),'.',2),'0')) END`,
+
+		// inet helpers - DuckDB has an INET type and family()/host(); these add PG's accessors.
+		`CREATE OR REPLACE MACRO masklen(a) AS (
+			CASE WHEN contains(CAST(a AS VARCHAR), '/') THEN CAST(split_part(CAST(a AS VARCHAR), '/', 2) AS INTEGER)
+			WHEN family(a) = 4 THEN 32 ELSE 128 END)`,
+		`CREATE OR REPLACE MACRO hostmask(a) AS (
+			CASE WHEN family(a) = 4 THEN
+				(((((1::BIGINT << (32 - masklen(a))) - 1) >> 24 & 255) || '.' ||
+				  ((((1::BIGINT << (32 - masklen(a))) - 1) >> 16 & 255)) || '.' ||
+				  ((((1::BIGINT << (32 - masklen(a))) - 1) >> 8 & 255)) || '.' ||
+				  (((1::BIGINT << (32 - masklen(a))) - 1) & 255))::inet)
+			ELSE NULL END)`,
+		`CREATE OR REPLACE MACRO set_masklen(a, len) AS ((host(a) || '/' || CAST(len AS VARCHAR))::inet)`,
+		`CREATE OR REPLACE MACRO inet_same_family(a, b) AS (family(a) = family(b))`,
 	}
 
 	for _, f := range functions {

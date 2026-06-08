@@ -4349,6 +4349,21 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			input:    "SELECT pg_catalog.format_type(atttypid, atttypmod) FROM pg_attribute",
 			contains: "memory.main.format_type",
 		},
+		{
+			name:     "width_bucket gets memory.main prefix",
+			input:    "SELECT width_bucket(v, 0, 10, 5) FROM t",
+			contains: "memory.main.width_bucket",
+		},
+		{
+			name:     "uuid_generate_v4 gets memory.main prefix",
+			input:    "SELECT uuid_generate_v4()",
+			contains: "memory.main.uuid_generate_v4",
+		},
+		{
+			name:     "set_config gets memory.main prefix",
+			input:    "SELECT set_config('search_path', 'main', false)",
+			contains: "memory.main.set_config",
+		},
 	}
 
 	tr := New(Config{DuckLakeMode: true})
