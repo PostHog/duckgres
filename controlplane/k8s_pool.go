@@ -1839,15 +1839,6 @@ func (p *K8sWorkerPool) spawnReservedSizedWorker(ctx context.Context, assignment
 			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
 		}
 		id = slot.WorkerID
-		// Stamp the requested size + TTL onto the slot row immediately, so any
-		// adoption/reconciliation that reconstructs the worker from the DB before
-		// it is reserved already carries the profile (CreateSpawningWorkerSlot
-		// creates the row with an empty profile).
-		slot.ProfileCPU = profile.CPU
-		slot.ProfileMemory = profile.Memory
-		slot.ProfileColocate = profile.Colocate
-		slot.TTLMinutes = int(profile.TTL.Minutes())
-		_ = p.persistWorkerRecord(slot)
 	} else {
 		p.mu.Lock()
 		id = p.allocateWorkerIDLocked()
