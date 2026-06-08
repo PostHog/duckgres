@@ -862,6 +862,58 @@ func TestListExpiredHotIdleWorkersPerWorkerTTL(t *testing.T) {
 	}
 }
 
+// Regression: UpsertWorkerRecord must update the profile (cpu/mem/colocate) and
+// ttl_minutes columns on conflict. CreateSpawningWorkerSlot inserts a sized
+// worker's row with an empty profile, and the reserve/hot-idle persists set it
+// via upsert — if the ON CONFLICT update omits these columns, a sized worker's
+// hot-idle row stays empty and ClaimHotIdleWorker can never match it (no reuse).
+func TestUpsertWorkerRecordPersistsProfileOnConflict(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+
+	// Row created with an empty profile (as CreateSpawningWorkerSlot does).
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7001,
+		PodName:           "duckgres-worker-7001",
+		State:             configstore.WorkerStateSpawning,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("insert empty-profile row: %v", err)
+	}
+
+	// Later persist (reserve / hot-idle) sets the concrete size + ttl.
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7001,
+		PodName:           "duckgres-worker-7001",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+		ProfileCPU:        "4",
+		ProfileMemory:     "8Gi",
+		TTLMinutes:        15,
+	}); err != nil {
+		t.Fatalf("upsert profile on conflict: %v", err)
+	}
+
+	got, err := store.GetWorkerRecord(7001)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if got.ProfileCPU != "4" || got.ProfileMemory != "8Gi" || got.TTLMinutes != 15 {
+		t.Fatalf("profile not persisted on conflict: cpu=%q mem=%q ttl=%d", got.ProfileCPU, got.ProfileMemory, got.TTLMinutes)
+	}
+	if got.State != configstore.WorkerStateHotIdle {
+		t.Fatalf("state = %q, want hot_idle", got.State)
+	}
+}
+
 func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
