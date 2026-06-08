@@ -117,12 +117,12 @@ func (s SharedWorkerState) Validate() error {
 			return fmt.Errorf("lifecycle %q cannot have an assignment", lifecycle)
 		}
 		return nil
-	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle, WorkerLifecycleDraining:
+	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle:
 		if err := validateWorkerAssignment(s.Assignment); err != nil {
 			return fmt.Errorf("lifecycle %q requires a valid assignment: %w", lifecycle, err)
 		}
 		return nil
-	case WorkerLifecycleRetired:
+	case WorkerLifecycleDraining, WorkerLifecycleRetired:
 		if s.Assignment == nil {
 			return nil
 		}
@@ -151,12 +151,20 @@ func (s SharedWorkerState) Transition(next WorkerLifecycleState, assignment *Wor
 	switch next {
 	case WorkerLifecycleIdle:
 		nextState.Assignment = nil
-	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle, WorkerLifecycleDraining:
+	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle:
 		resolved, err := resolveWorkerAssignment(s.Assignment, assignment)
 		if err != nil {
 			return SharedWorkerState{}, err
 		}
 		nextState.Assignment = resolved
+	case WorkerLifecycleDraining:
+		if s.Assignment != nil || assignment != nil {
+			resolved, err := resolveWorkerAssignment(s.Assignment, assignment)
+			if err != nil {
+				return SharedWorkerState{}, err
+			}
+			nextState.Assignment = resolved
+		}
 	case WorkerLifecycleRetired:
 		if assignment != nil {
 			resolved, err := resolveWorkerAssignment(s.Assignment, assignment)
@@ -180,15 +188,15 @@ func (s SharedWorkerState) Transition(next WorkerLifecycleState, assignment *Wor
 func isAllowedWorkerLifecycleTransition(current, next WorkerLifecycleState) bool {
 	switch current {
 	case WorkerLifecycleIdle:
-		return next == WorkerLifecycleReserved || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleReserved || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleReserved:
-		return next == WorkerLifecycleActivating || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleActivating || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleActivating:
-		return next == WorkerLifecycleHot || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleHot || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleHot:
 		return next == WorkerLifecycleDraining || next == WorkerLifecycleRetired || next == WorkerLifecycleHotIdle
 	case WorkerLifecycleHotIdle:
-		return next == WorkerLifecycleReserved || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleReserved || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleDraining:
 		return next == WorkerLifecycleRetired
 	case WorkerLifecycleRetired:

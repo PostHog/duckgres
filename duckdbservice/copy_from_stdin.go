@@ -48,6 +48,14 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	if err != nil {
 		return err
 	}
+	finishDrain, err := h.pool.beginDrainWork(session.allowsDrainContinuation(""))
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return drainErr
+	}
+	if err != nil {
+		return status.Errorf(codes.Internal, "copy-from-stdin: start drain tracking: %v", err)
+	}
+	defer finishDrain()
 
 	desc := first.GetFlightDescriptor()
 	if desc == nil || len(desc.Cmd) == 0 {
@@ -127,6 +135,11 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	app, mErr := proto.Marshal(updateResult)
 	if mErr != nil {
 		return status.Errorf(codes.Internal, "marshal DoPutUpdateResult: %v", mErr)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 	if err := stream.Send(&flight.PutResult{AppMetadata: app}); err != nil {
 		return fmt.Errorf("copy-from-stdin: send PutResult: %w", err)

@@ -52,6 +52,8 @@ const workerPodReadyTimeout = 5 * time.Minute
 // fast, bin-packed) shapes refilled. See TestWarmSpawnTimeoutExceedsPodReady.
 const warmSpawnReconcileTimeout = 6 * time.Minute
 
+const workerTerminationGracePeriodSeconds int64 = 3600
+
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
 
 // K8sWorkerPool manages worker pods in Kubernetes.
@@ -725,11 +727,12 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			Labels:    podLabels,
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:                corev1.RestartPolicyNever,
-			ServiceAccountName:           p.workerServiceAccountName(),
-			AutomountServiceAccountToken: boolPtr(false),
-			PriorityClassName:            p.workerPriorityClassName,
-			NodeSelector:                 p.nodeSelectorForProfile(profile),
+			RestartPolicy:                 corev1.RestartPolicyNever,
+			TerminationGracePeriodSeconds: int64Ptr(workerTerminationGracePeriodSeconds),
+			ServiceAccountName:            p.workerServiceAccountName(),
+			AutomountServiceAccountToken:  boolPtr(false),
+			PriorityClassName:             p.workerPriorityClassName,
+			NodeSelector:                  p.nodeSelectorForProfile(profile),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -2110,11 +2113,27 @@ func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker 
 			}
 			hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
-			_, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
-			return err
+			result, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
+			if err != nil {
+				return err
+			}
+			return validateReservedWorkerHealth(result)
 		}
 	}
 	return check(ctx, worker)
+}
+
+func validateReservedWorkerHealth(result *healthCheckResult) error {
+	if result == nil {
+		return fmt.Errorf("worker health check returned no result")
+	}
+	if !result.Healthy {
+		return fmt.Errorf("worker health check reported unhealthy")
+	}
+	if result.Draining {
+		return fmt.Errorf("worker is draining")
+	}
+	return nil
 }
 
 // SpawnMinWorkers pre-warms the pool with count workers.
@@ -2534,6 +2553,23 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						delete(failures, lease)
 						mu.Unlock()
 
+						removedWorker, workerCount, replacementID, shouldReplenish, err := p.removeWorkerAfterDrainedLease(lease, LifecycleOriginWorkerDrain)
+						if err != nil {
+							slog.Error("K8s worker terminated after draining but retire CAS failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+							return
+						}
+						if removedWorker != nil {
+							observeControlPlaneWorkers(workerCount)
+							slog.Info("K8s worker terminated after draining.", "id", lease.workerID)
+							if removedWorker.client != nil {
+								_ = removedWorker.client.Close()
+							}
+							if shouldReplenish {
+								p.spawnWarmWorkerBackground(replacementID, p.workerImage)
+							}
+							return
+						}
+
 						lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
 						if err != nil {
 							slog.Error("K8s worker terminated but lease validation failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
@@ -2559,7 +2595,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						}
 
 						p.mu.Lock()
-						removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerAfterLostLeaseLocked(lease)
+						removedWorker, workerCount, replacementID, shouldReplenish = p.removeWorkerAfterLostLeaseLocked(lease)
 						p.mu.Unlock()
 						if removedWorker == nil {
 							return
@@ -2680,6 +2716,10 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							mu.Lock()
 							delete(failures, lease)
 							mu.Unlock()
+
+							if hcResult != nil && hcResult.Draining {
+								p.markWorkerDrainingFromHealth(lease)
+							}
 
 							// Forward progress data to the control plane.
 							if onProgress != nil && hcResult != nil {
@@ -3163,21 +3203,58 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 			deletePod := true
 			if p.runtimeStore != nil {
 				lease := p.workerLeaseSnapshot(w)
-				// cleanDeadWorkersLocked sweeps for pods whose informer
-				// fired w.done — cluster-driven termination (eviction,
-				// OOM, manual delete), not our health-check decision.
-				lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
-				if err != nil {
-					slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
-						"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
-					continue
-				}
-				switch lostDisposition {
-				case workerLostLeaseStale:
+				if p.workerMatchesLease(w, lease) && w.SharedState().NormalizedLifecycle() == WorkerLifecycleDraining {
+					lc := p.ensureLifecycle()
+					if lc != nil {
+						outcome, err := lc.RetireDrained(
+							configstore.NewWorkerLease(lease.workerID, lease.ownerCPInstanceID, lease.ownerEpoch, lease.image),
+							RetireReasonNormal,
+							LifecycleOriginInformerCrash,
+						)
+						if err != nil {
+							slog.Warn("Clean dead worker: retire draining CAS failed; leaving cleanup to retry.",
+								"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+							continue
+						}
+						if !outcome.Transitioned {
+							record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+							if err != nil {
+								slog.Warn("Clean dead worker: retire draining verification failed; leaving cleanup to retry.",
+									"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+								continue
+							}
+							if record == nil || record.OwnerCPInstanceID != lease.ownerCPInstanceID ||
+								record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateRetired {
+								continue
+							}
+						}
+					}
+					p.markWorkerRetiredInMemoryLocked(w)
+					delete(p.workers, id)
+					removedWorker = w
 					deletePod = false
-					removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
-				case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
-					continue
+					if p.shouldReplenishWarmCapacityLocked() {
+						replacementID = p.allocateBackgroundSpawnIDLocked()
+						p.spawning++
+						shouldReplenish = true
+					}
+				} else {
+					// cleanDeadWorkersLocked sweeps for pods whose informer
+					// fired w.done — cluster-driven termination (eviction,
+					// OOM, manual delete), not our health-check decision.
+					lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
+					if err != nil {
+						slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
+							"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+						continue
+					}
+					switch lostDisposition {
+					case workerLostLeaseStale:
+						deletePod = false
+						removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
+					case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
+						continue
+					}
 				}
 			} else {
 				removedWorker, _, replacementID, shouldReplenish = p.removeWorkerLocked(id)
@@ -3394,6 +3471,123 @@ func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot, 
 		return false, err
 	}
 	return outcome.Transitioned, nil
+}
+
+func (p *K8sWorkerPool) markWorkerDrainingFromHealth(lease workerLeaseSnapshot) {
+	if lease.ownerCPInstanceID != p.cpInstanceID {
+		return
+	}
+	p.mu.Lock()
+	w, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(w, lease) {
+		p.mu.Unlock()
+		return
+	}
+	previous := w.SharedState()
+	switch previous.NormalizedLifecycle() {
+	case WorkerLifecycleDraining, WorkerLifecycleRetired:
+		p.mu.Unlock()
+		return
+	}
+	next, err := previous.Transition(WorkerLifecycleDraining, previous.Assignment)
+	if err != nil {
+		p.mu.Unlock()
+		slog.Warn("Worker reported draining but local lifecycle transition failed.",
+			"worker_id", lease.workerID, "state", previous.NormalizedLifecycle(), "error", err)
+		return
+	}
+	w.sharedState = next
+	p.mu.Unlock()
+
+	durableVerified := false
+	defer func() {
+		if durableVerified {
+			return
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		w, ok := p.workers[lease.workerID]
+		if !ok || !p.workerMatchesLease(w, lease) {
+			return
+		}
+		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleDraining {
+			w.sharedState = previous
+		}
+	}()
+
+	lc := p.ensureLifecycle()
+	if lc != nil {
+		outcome, err := lc.Drain(
+			configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
+			LifecycleOriginWorkerDrain,
+		)
+		if err != nil {
+			slog.Warn("Worker reported draining but durable drain CAS failed; keeping local worker schedulable until retry.",
+				"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+			return
+		}
+		if !outcome.Transitioned {
+			record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+			if err != nil {
+				slog.Warn("Worker reported draining but durable worker record could not be verified after CAS miss.",
+					"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+				return
+			}
+			if record == nil || record.OwnerCPInstanceID != p.cpInstanceID || record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateDraining {
+				return
+			}
+		}
+	}
+	durableVerified = true
+}
+
+func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot, origin LifecycleOrigin) (*ManagedWorker, int, int, bool, error) {
+	p.mu.RLock()
+	w, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(w, lease) || w.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
+		p.mu.RUnlock()
+		return nil, 0, 0, false, nil
+	}
+	p.mu.RUnlock()
+
+	lc := p.ensureLifecycle()
+	if lc != nil {
+		outcome, err := lc.RetireDrained(
+			configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
+			RetireReasonNormal,
+			origin,
+		)
+		if err != nil {
+			return nil, 0, 0, false, err
+		}
+		if !outcome.Transitioned {
+			record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+			if err != nil {
+				return nil, 0, 0, false, err
+			}
+			if record == nil || record.OwnerCPInstanceID != p.cpInstanceID || record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateRetired {
+				return nil, 0, 0, false, nil
+			}
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(current, lease) || current.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
+		return nil, 0, 0, false, nil
+	}
+	p.markWorkerRetiredInMemoryLocked(current)
+	delete(p.workers, current.ID)
+	workerCount := len(p.workers)
+	replacementID := 0
+	shouldReplenish := false
+	if p.shouldReplenishWarmCapacityLocked() {
+		replacementID = p.allocateBackgroundSpawnIDLocked()
+		p.spawning++
+		shouldReplenish = true
+	}
+	return current, workerCount, replacementID, shouldReplenish, nil
 }
 
 func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {

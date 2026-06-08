@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -18,10 +22,22 @@ import (
 // mockDoActionStream implements flight.FlightService_DoActionServer for testing.
 type mockDoActionStream struct {
 	grpc.ServerStream
+	ctx     context.Context
 	results []*flight.Result
+	sendErr error
+}
+
+func (m *mockDoActionStream) Context() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
 }
 
 func (m *mockDoActionStream) Send(r *flight.Result) error {
+	if m.sendErr != nil {
+		return m.sendErr
+	}
 	m.results = append(m.results, r)
 	return nil
 }
@@ -30,6 +46,83 @@ func (m *mockDoActionStream) SetHeader(metadata.MD) error  { return nil }
 func (m *mockDoActionStream) SendHeader(metadata.MD) error { return nil }
 func (m *mockDoActionStream) SetTrailer(metadata.MD)       {}
 
+type testEndTransactionRequest struct {
+	transactionID []byte
+	action        flightsql.EndTransactionRequestType
+}
+
+func (r testEndTransactionRequest) GetTransactionId() []byte {
+	return r.transactionID
+}
+
+func (r testEndTransactionRequest) GetAction() flightsql.EndTransactionRequestType {
+	return r.action
+}
+
+type testPreparedStatementQuery struct {
+	handle []byte
+}
+
+func (q testPreparedStatementQuery) GetPreparedStatementHandle() []byte {
+	return q.handle
+}
+
+type testGetDBSchemas struct {
+	catalog *string
+	pattern *string
+}
+
+func (g testGetDBSchemas) GetCatalog() *string {
+	return g.catalog
+}
+
+func (g testGetDBSchemas) GetDBSchemaFilterPattern() *string {
+	return g.pattern
+}
+
+type testGetTables struct{}
+
+func (testGetTables) GetCatalog() *string {
+	return nil
+}
+
+func (testGetTables) GetDBSchemaFilterPattern() *string {
+	return nil
+}
+
+func (testGetTables) GetTableNameFilterPattern() *string {
+	return nil
+}
+
+func (testGetTables) GetTableTypes() []string {
+	return nil
+}
+
+func (testGetTables) GetIncludeSchema() bool {
+	return false
+}
+
+type testStatementQueryTicket struct {
+	handle []byte
+}
+
+func (t testStatementQueryTicket) GetStatementHandle() []byte {
+	return t.handle
+}
+
+type testStatementUpdate struct {
+	query         string
+	transactionID []byte
+}
+
+func (u testStatementUpdate) GetQuery() string {
+	return u.query
+}
+
+func (u testStatementUpdate) GetTransactionId() []byte {
+	return u.transactionID
+}
+
 func TestHealthCheckBlocksUntilWarmup(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
@@ -37,7 +130,7 @@ func TestHealthCheckBlocksUntilWarmup(t *testing.T) {
 		warmupDone:  make(chan struct{}),
 		startTime:   time.Now(),
 	}
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	stream := &mockDoActionStream{}
 
 	// Health check in a goroutine — should block until warmup completes
@@ -90,7 +183,7 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 	// Warmup already completed
 	close(pool.warmupDone)
 
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	stream := &mockDoActionStream{}
 
 	done := make(chan error, 1)
@@ -108,6 +201,37 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 	}
 }
 
+func TestHealthCheckReportsDraining(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+	}
+	close(pool.warmupDone)
+	pool.BeginDrain()
+
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	stream := &mockDoActionStream{}
+
+	if err := handler.doHealthCheck([]byte(`{}`), stream); err != nil {
+		t.Fatalf("health check returned error: %v", err)
+	}
+	if len(stream.results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(stream.results))
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(stream.results[0].Body, &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp["healthy"] != true {
+		t.Errorf("expected healthy=true, got %v", resp["healthy"])
+	}
+	if resp["draining"] != true {
+		t.Errorf("expected draining=true, got %v", resp["draining"])
+	}
+}
+
 func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
 		sessions:          make(map[string]*Session),
@@ -121,7 +245,7 @@ func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	stream := &mockDoActionStream{}
 
 	// Health checks no longer validate epoch — a fresh CP with epoch 0 should
@@ -130,6 +254,67 @@ func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	err := handler.doHealthCheck([]byte(`{}`), stream)
 	if err != nil {
 		t.Fatalf("health check should succeed regardless of epoch mismatch, got %v", err)
+	}
+}
+
+func TestCreateSessionRejectsWhileDraining(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+		cfg:         server.Config{Users: map[string]string{"alice": "pass"}},
+	}
+	close(pool.warmupDone)
+	pool.BeginDrain()
+
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	stream := &mockDoActionStream{}
+
+	body, err := json.Marshal(server.WorkerCreateSessionPayload{
+		Username: "alice",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	err = handler.doCreateSession(body, stream)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected Unavailable while draining, got %v", err)
+	}
+}
+
+func TestCreateSessionSendFailureDestroysSession(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+		cfg:         server.Config{Users: map[string]string{"alice": "pass"}},
+		duckLakeSem: make(chan struct{}, 1),
+	}
+	close(pool.warmupDone)
+	pool.createDBPair = func(server.Config, chan struct{}, string, time.Time, string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		return PairFromMain(db), nil
+	}
+
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	stream := &mockDoActionStream{sendErr: errors.New("send failed")}
+
+	body, err := json.Marshal(server.WorkerCreateSessionPayload{Username: "alice"})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	if err := handler.doCreateSession(body, stream); err == nil {
+		t.Fatal("expected send failure")
+	}
+	if got := len(pool.sessions); got != 0 {
+		t.Fatalf("expected failed response to destroy created session, got %d sessions", got)
 	}
 }
 
@@ -144,7 +329,7 @@ func TestCreateSessionRequiresActivationForSharedWarmMode(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	stream := &mockDoActionStream{}
 
 	body, err := json.Marshal(map[string]any{
@@ -179,7 +364,7 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	}
 	pool.activateTenantFunc = pool.activateTenant
 
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	stream := &mockDoActionStream{}
 
 	firstBody, err := json.Marshal(ActivationPayload{
@@ -241,7 +426,7 @@ func TestCreateSessionAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 		return PairFromMain(db), nil
 	}
 
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	stream := &mockDoActionStream{}
 
 	// Session creation with a mismatched epoch should now succeed past the
@@ -277,7 +462,7 @@ func TestSessionFromContextAcceptsMismatchedEpoch(t *testing.T) {
 	close(pool.warmupDone)
 	pool.sessions["session-1"] = &Session{ID: "session-1"}
 
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
 		"x-duckgres-session", "session-1",
 		"x-duckgres-owner-epoch", "4",
@@ -307,7 +492,7 @@ func TestSessionFromContextRejectsMismatchedControlIdentity(t *testing.T) {
 	close(pool.warmupDone)
 	pool.sessions["session-1"] = &Session{ID: "session-1"}
 
-	handler := &FlightSQLHandler{pool: pool}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
 		"x-duckgres-session", "session-1",
 		"x-duckgres-owner-epoch", "5",
@@ -318,5 +503,436 @@ func TestSessionFromContextRejectsMismatchedControlIdentity(t *testing.T) {
 	_, err := handler.sessionFromContext(ctx)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestEndTransactionKeepsDrainOpenForOpenTransaction(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:       "session-1",
+		Conn:     conn,
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+
+	txnID, err := handler.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+
+	pool.BeginDrain()
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("expected open transaction to keep drain active")
+	}
+
+	if err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: txnID,
+		action:        flightsql.EndTransactionRollback,
+	}); err != nil {
+		t.Fatalf("rollback during drain: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected drain to complete after transaction finalization")
+	}
+}
+
+func TestRawSQLTransactionKeepsDrainOpenUntilCommit(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+
+	if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "BEGIN"}); err != nil {
+		t.Fatalf("raw BEGIN: %v", err)
+	}
+
+	pool.BeginDrain()
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("expected raw SQL transaction to keep drain active")
+	}
+
+	if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "COMMIT"}); err != nil {
+		t.Fatalf("raw COMMIT during drain: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected raw SQL transaction drain token to release on COMMIT")
+	}
+}
+
+func TestRawSQLTransactionKeepsDrainOpenAfterFailedCommit(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+
+	if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "BEGIN"}); err != nil {
+		t.Fatalf("raw BEGIN: %v", err)
+	}
+	pool.BeginDrain()
+
+	if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "COMMIT INVALID"}); err == nil {
+		t.Fatal("expected invalid COMMIT to fail")
+	}
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("expected failed COMMIT to keep raw SQL transaction drain active")
+	}
+
+	if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "ROLLBACK"}); err != nil {
+		t.Fatalf("raw ROLLBACK during drain: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected raw SQL transaction drain token to release on ROLLBACK")
+	}
+}
+
+func TestPreparedStatementDoGetContinuesAfterDrainStarts(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {Query: "", Schema: arrow.NewSchema(nil, nil)},
+		},
+		txns: make(map[string]*trackedTx),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+	cmd := testPreparedStatementQuery{handle: []byte("prep-1")}
+
+	if _, err := handler.GetFlightInfoPreparedStatement(ctx, cmd, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get prepared flight info: %v", err)
+	}
+	pool.BeginDrain()
+
+	_, ch, err := handler.DoGetPreparedStatement(ctx, cmd)
+	if err != nil {
+		t.Fatalf("prepared DoGet should continue after drain starts: %v", err)
+	}
+	for range ch {
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected prepared continuation to release drain work")
+	}
+}
+
+func TestDoGetStatementEmptyQueryDeletesHandle(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"query-1": {Query: "", Schema: arrow.NewSchema(nil, nil)},
+		},
+		txns: make(map[string]*trackedTx),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+
+	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte("query-1")})
+	if err != nil {
+		t.Fatalf("DoGetStatement: %v", err)
+	}
+	for range ch {
+	}
+
+	session := pool.sessions["session-1"]
+	session.mu.RLock()
+	_, ok := session.queries["query-1"]
+	session.mu.RUnlock()
+	if ok {
+		t.Fatal("expected empty query handle to be deleted")
+	}
+}
+
+func TestDoGetStatementConsumesHandleBeforeStreaming(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:   "session-1",
+		Conn: conn,
+		queries: map[string]*QueryHandle{
+			"query-1": {Query: "SELECT 1", Schema: arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.PrimitiveTypes.Int32}}, nil)},
+		},
+		txns: make(map[string]*trackedTx),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+
+	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte("query-1")})
+	if err != nil {
+		t.Fatalf("first DoGetStatement: %v", err)
+	}
+	if _, _, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte("query-1")}); status.Code(err) != codes.NotFound {
+		t.Fatalf("expected duplicate DoGetStatement to be rejected, got %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("first stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+}
+
+func TestMetadataDoGetContinuesAfterDrainStarts(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:       "session-1",
+		Conn:     conn,
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+	cmd := testGetDBSchemas{}
+
+	if _, err := handler.GetFlightInfoSchemas(ctx, cmd, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get schemas flight info: %v", err)
+	}
+	pool.BeginDrain()
+
+	_, ch, err := handler.DoGetDBSchemas(ctx, cmd)
+	if err != nil {
+		t.Fatalf("metadata DoGet should continue after drain starts: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("metadata stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+}
+
+func TestMetadataDoGetConsumesMatchingDrainToken(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+	firstPattern := "%"
+	secondPattern := "main"
+	first := testGetDBSchemas{pattern: &firstPattern}
+	second := testGetDBSchemas{pattern: &secondPattern}
+
+	if _, err := handler.GetFlightInfoSchemas(ctx, first, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("first GetFlightInfoSchemas: %v", err)
+	}
+	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("second GetFlightInfoSchemas: %v", err)
+	}
+	pool.BeginDrain()
+
+	_, ch, err := handler.DoGetDBSchemas(ctx, second)
+	if err != nil {
+		t.Fatalf("second DoGetDBSchemas: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("second stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+
+	session := pool.sessions["session-1"]
+	session.mu.RLock()
+	firstPending := len(session.metadataDrains[metadataSchemasDrainKey(first)])
+	secondPending := len(session.metadataDrains[metadataSchemasDrainKey(second)])
+	session.mu.RUnlock()
+	if firstPending != 1 {
+		t.Fatalf("expected first metadata token to remain pending, got %d", firstPending)
+	}
+	if secondPending != 0 {
+		t.Fatalf("expected second metadata token to be consumed, got %d", secondPending)
+	}
+	release := popMetadataDrain(session, metadataSchemasDrainKey(first))
+	releaseDrainFunc(release)
+}
+
+func TestTablesMetadataDoGetContinuesAfterDrainStarts(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:       "session-1",
+		Conn:     conn,
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+	cmd := testGetTables{}
+
+	if _, err := handler.GetFlightInfoTables(ctx, cmd, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get tables flight info: %v", err)
+	}
+	pool.BeginDrain()
+
+	_, ch, err := handler.DoGetTables(ctx, cmd)
+	if err != nil {
+		t.Fatalf("table metadata DoGet should continue after drain starts: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("table metadata stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+}
+
+func TestSendStreamChunkReturnsOnCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ch := make(chan flight.StreamChunk)
+
+	if sendStreamChunk(ctx, ch, flight.StreamChunk{}) {
+		t.Fatal("expected send to fail after context cancellation")
 	}
 }

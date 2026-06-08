@@ -53,7 +53,9 @@ client-go:
   SA-token mount.
 - **resilience** — worker-pod kill → crash recovery; DuckLake durability across
   a worker restart; concurrent writers (fork conflict-retry, the test that was
-  flaking on main).
+  flaking on main); graceful drain (a worker SIGTERM'd mid-query drains — the
+  in-flight query completes correctly while the pod is Terminating — then retires
+  cleanly; regression net for the worker drain protocol, #690).
 - **isolation** — two tenants (cnpg vs ext) see distinct catalogs; a
   cross-tenant read is denied.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling
