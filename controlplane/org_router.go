@@ -429,15 +429,20 @@ func (tr *OrgRouter) computeBaseWarmCapacityTargets(snap *configstore.Snapshot) 
 	)
 }
 
-// computePerImageWarmTargets returns "keep at least 1 warm worker for each
-// distinct image" — covering the cluster default plus every pinned
-// Warehouse.Image used by an org that currently has an active stack. Orgs
-// without a live stack (e.g. warehouse not yet ready) are skipped so we don't
-// pre-warm pods for images nobody can route to yet.
+// computePerImageWarmTargets returns "keep at least SharedWarmTarget warm workers
+// for each distinct image" — covering the cluster default plus every pinned
+// Warehouse.Image used by an org that currently has an active stack. With the
+// warm pool torn down (SharedWarmTarget=0) it returns no floors, so no neutral
+// workers are pre-spawned; requests foreground-spawn on demand instead. Orgs
+// without a live stack (e.g. warehouse not yet ready) are skipped.
 func (tr *OrgRouter) computePerImageWarmTargets(snap *configstore.Snapshot) map[string]int {
 	targets := make(map[string]int)
+	floor := tr.globalCfg.K8s.SharedWarmTarget
+	if floor <= 0 {
+		return targets // warm pool disabled — no per-image floor
+	}
 	if defaultImage := strings.TrimSpace(tr.baseCfg.WorkerImage); defaultImage != "" {
-		targets[defaultImage] = 1
+		targets[defaultImage] = floor
 	}
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
@@ -450,7 +455,7 @@ func (tr *OrgRouter) computePerImageWarmTargets(snap *configstore.Snapshot) map[
 		if image == "" {
 			continue
 		}
-		targets[image] = 1
+		targets[image] = floor
 	}
 	return targets
 }

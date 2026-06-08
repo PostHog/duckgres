@@ -1671,15 +1671,15 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				continue
 			}
 
-			// A sized request (non-default profile) is NOT served by the neutral
-			// warm pool — warm replenishment spawns default/neutral workers that
-			// never match a concrete size. So when no same-size hot-idle/idle worker
-			// exists, foreground-spawn a worker of the requested size and reserve it
-			// for the org, instead of returning backpressure that would never clear.
-			// Only on a transient no-idle miss; an org/global cap is respected.
+			// A sized request foreground-spawns a worker of the requested size here
+			// (the warm pool only ever spawns default/neutral shapes, which can't
+			// satisfy a concrete size). A DEFAULT request returns the no-idle miss;
+			// the no-warm-pool foreground spawn for default requests is driven one
+			// layer up in OrgReservedPool.AcquireWorker, which keeps this method's
+			// contract (and its tests) unchanged. Org/global cap is respected.
 			if assignment.Profile != nil &&
 				(missReason == configstore.WorkerClaimMissReasonNone || missReason == configstore.WorkerClaimMissReasonNoIdle) {
-				worker, spawnErr := p.spawnReservedSizedWorker(ctx, assignment)
+				worker, spawnErr := p.foregroundSpawnReservedWorker(ctx, assignment)
 				if spawnErr != nil {
 					return nil, spawnErr
 				}
@@ -1754,10 +1754,12 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		p.mu.Unlock()
 
-		// Sized request with no matching warm worker: foreground-spawn one of the
-		// requested size (see the runtime-store branch above for rationale).
+		// The production warm-pool teardown lives in the runtime-store branch above
+		// (it foreground-spawns for every request). This runtime-store-less branch
+		// is non-production (tests / standalone k8s); only a sized request
+		// foreground-spawns here, a default request still surfaces a no-idle miss.
 		if assignment.Profile != nil {
-			worker, spawnErr := p.spawnReservedSizedWorker(ctx, assignment)
+			worker, spawnErr := p.foregroundSpawnReservedWorker(ctx, assignment)
 			if spawnErr != nil {
 				return nil, spawnErr
 			}
@@ -1802,48 +1804,57 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 	}
 }
 
-// spawnReservedSizedWorker foreground-spawns a worker of the assignment's
-// requested size and reserves it for the org, returning it in Reserved state
-// (the caller activates it, same as a claimed warm worker). Used when a sized
-// request finds no same-size idle/hot-idle worker — the neutral warm pool can't
-// satisfy a concrete size, so we spawn one directly instead of failing. The pod
-// is sized from the profile (workerResourcesForProfile); the reserved record
-// round-trips the profile + TTL.
-func (p *K8sWorkerPool) spawnReservedSizedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
-	if assignment == nil || assignment.Profile == nil {
-		return nil, fmt.Errorf("spawnReservedSizedWorker requires a sized assignment")
+// spawnReservedWorker foreground-spawns a worker for the org and reserves it,
+// returning it in Reserved state (the caller activates it, same as a claimed
+// worker). This is the only spawn path now that the warm pool is gone: a request
+// either reuses a hot-idle worker (claim) or spawns one here. The pod is sized
+// from the request profile, or the pool-global default for a default (nil
+// profile) request (workerResourcesForProfile); the reserved record round-trips
+// the profile + TTL.
+func (p *K8sWorkerPool) foregroundSpawnReservedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	if assignment == nil {
+		return nil, fmt.Errorf("spawnReservedWorker requires an assignment")
 	}
-	profile := *assignment.Profile
+	// A default (nil profile) request spawns a default-sized worker: the zero
+	// profile makes workerResourcesForProfile fall back to the pool-global request.
+	var profile WorkerProfile
+	if assignment.Profile != nil {
+		profile = *assignment.Profile
+	}
 
 	p.mu.Lock()
 	if p.shuttingDown {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("pool is shutting down")
 	}
-	// Respect the org's worker cap before spawning (in-process count; the DB-side
-	// cap on the claim path is cross-CP, this bounds the foreground sized-spawn).
-	if assignment.MaxWorkers > 0 {
-		n := 0
-		for _, w := range p.workers {
-			select {
-			case <-w.done:
-				continue
-			default:
-			}
-			st := w.SharedState()
-			if st.Assignment != nil && st.Assignment.OrgID == assignment.OrgID && st.NormalizedLifecycle() != WorkerLifecycleRetired {
-				n++
-			}
-		}
-		if n >= assignment.MaxWorkers {
-			p.mu.Unlock()
-			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
-		}
-	}
-	id := p.allocateBackgroundSpawnIDLocked()
-	p.spawning++
+	maxGlobal := p.maxWorkers
 	p.mu.Unlock()
 
+	// Allocate a real, unique worker id. In the runtime-store path this MUST come
+	// from the DB via CreateSpawningWorkerSlot (which also enforces the per-org and
+	// global worker caps cross-CP and returns a nil slot when capped) — the
+	// background id allocator returns a placeholder 0 that collides across spawns.
+	var id int
+	if p.runtimeStore != nil {
+		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+			p.cpInstanceID, assignment.OrgID, assignment.Image, 0,
+			p.workerPodNamePrefix(), assignment.MaxWorkers, maxGlobal)
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+		}
+		id = slot.WorkerID
+	} else {
+		p.mu.Lock()
+		id = p.allocateWorkerIDLocked()
+		p.mu.Unlock()
+	}
+
+	p.mu.Lock()
+	p.spawning++
+	p.mu.Unlock()
 	err := p.spawnWorker(ctx, id, assignment.Image, profile, false)
 	p.mu.Lock()
 	p.spawning--
@@ -1921,7 +1932,14 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	}
 	// Carry the worker's persisted pod-shape so the reserved record and any later
 	// reconciliation round-trip it. Default/legacy rows yield the zero profile.
-	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate}
+	// TTL resets to the new request's value on reuse (a query hitting the worker
+	// extends its life by the requested ttl); fall back to the worker's persisted
+	// ttl when the request carries none.
+	reuseTTL := time.Duration(claimed.TTLMinutes) * time.Minute
+	if assignment != nil && assignment.Profile != nil && assignment.Profile.TTL > 0 {
+		reuseTTL = assignment.Profile.TTL
+	}
+	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate, TTL: reuseTTL}
 	if worker.OwnerEpoch() > 0 && claimed.OwnerEpoch < worker.OwnerEpoch() {
 		currentEpoch := worker.OwnerEpoch()
 		p.mu.Unlock()
@@ -2038,7 +2056,17 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		image:       claimed.Image,
 		bearerToken: token,
 		client:      client,
-		done:        make(chan struct{}),
+		// Restore the worker's size + TTL from the persisted record so a re-adopted
+		// worker keeps its shape. Without this, re-adopting a sized worker reset its
+		// profile to the default and the next hot-idle persist dropped its
+		// cpu/mem/ttl, so a same-size request could no longer reuse it.
+		profile: WorkerProfile{
+			CPU:      claimed.ProfileCPU,
+			Memory:   claimed.ProfileMemory,
+			Colocate: claimed.ProfileColocate,
+			TTL:      time.Duration(claimed.TTLMinutes) * time.Minute,
+		},
+		done: make(chan struct{}),
 	}
 	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
 	worker.SetOwnerEpoch(claimed.OwnerEpoch)

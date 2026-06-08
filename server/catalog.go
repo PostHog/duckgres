@@ -999,6 +999,15 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// array_remove - remove all occurrences of element from array
 		`CREATE OR REPLACE MACRO array_remove(arr, elem) AS list_filter(arr, x -> x != elem)`,
 
+		// array_lower - DuckDB lists do not preserve PostgreSQL custom lower-bound
+		// metadata, so return the representable PostgreSQL default for non-empty
+		// one-dimensional arrays and NULL for null, empty, or unsupported dimensions.
+		`CREATE OR REPLACE MACRO array_lower(arr, dim) AS
+			CASE
+				WHEN arr IS NULL OR dim IS NULL OR dim != 1 OR COALESCE(len(arr), 0) = 0 THEN NULL
+				ELSE 1
+			END`,
+
 		// to_number - parse formatted number string to numeric
 		// Simplified: strips common formatting characters and casts to NUMERIC
 		`CREATE OR REPLACE MACRO to_number(text_val, fmt) AS CAST(REPLACE(REPLACE(REPLACE(text_val, ',', ''), ' ', ''), '$', '') AS NUMERIC)`,

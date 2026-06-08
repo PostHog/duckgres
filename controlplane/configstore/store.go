@@ -1122,8 +1122,13 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	protectedStates := []WorkerState{WorkerStateDraining, WorkerStateRetired, WorkerStateLost}
 	result := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "worker_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at"}),
+		Columns: []clause.Column{{Name: "worker_id"}},
+		// profile_cpu/memory/colocate + ttl_minutes are in the update set so a
+		// sized worker's shape (set after CreateSpawningWorkerSlot inserts the row
+		// with an empty profile) actually persists. Without them the ON CONFLICT
+		// update silently dropped the profile, so a sized worker's hot-idle row
+		// stayed empty and ClaimHotIdleWorker could never match it (no reuse).
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at", "profile_cpu", "profile_memory", "profile_colocate", "ttl_minutes"}),
 		Where: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: `"worker_records"."state" NOT IN ?`, Vars: []any{protectedStates}},
 			clause.Expr{SQL: `(excluded."owner_epoch" > "worker_records"."owner_epoch" OR (excluded."owner_epoch" = "worker_records"."owner_epoch" AND excluded."owner_cp_instance_id" = "worker_records"."owner_cp_instance_id"))`},

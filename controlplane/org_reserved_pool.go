@@ -106,8 +106,8 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	}
 	defer p.gate.release()
 
-	warmDeadline := time.Now().Add(p.shared.warmAcquireTimeout)
-	// Throttle warm-miss recording across the wait's repeated polls.
+	// Throttle warm-miss recording (the miss is still recorded for demand metrics
+	// even though we now foreground-spawn rather than wait for a replenish).
 	var lastWarmMissAt time.Time
 	for {
 		select {
@@ -181,17 +181,24 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 				return nil, NewWarmCapacityExhaustedErrorForReason(
 					configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
 			}
-			if p.shared.warmAcquireTimeout > 0 && time.Now().Before(warmDeadline) {
-				timer := time.NewTimer(WarmAcquireRetryInterval)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return nil, ctx.Err()
-				case <-timer.C:
-				}
-				continue
+			// No warm pool: foreground-spawn a worker for this request instead of
+			// waiting for a warm replenish that will never come. A sized request
+			// already foreground-spawned inside ReserveSharedWorker (so it returned a
+			// worker, not this miss); this path covers default requests. The spawn
+			// re-checks the org/global cap (CreateSpawningWorkerSlot) and reserves the
+			// worker, which then activates below.
+			worker, err = p.shared.foregroundSpawnReservedWorker(ctx, &WorkerAssignment{
+				OrgID:                p.orgID,
+				MaxWorkers:           maxWorkers,
+				Image:                image,
+				Profile:              profile,
+				MaxColocatedCPU:      p.maxColocatedCPU,
+				MaxColocatedMemBytes: p.maxColocatedMemBytes,
+			})
+			if err != nil {
+				return nil, err
 			}
-			return nil, err
+			// worker is now a freshly reserved worker; fall through to activation.
 		}
 
 		if err := p.activateWorkerForOrg(ctx, worker); err != nil {
