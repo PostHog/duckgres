@@ -3,6 +3,7 @@ package controlplane
 import (
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // WorkerLifecycleState models the shared warm-worker lifecycle introduced for
@@ -36,9 +37,10 @@ const (
 // is DERIVED from Colocate plus the pool's config at spawn time, so the
 // reserved-spawn path can reconstruct everything it needs from the stored record.
 type WorkerProfile struct {
-	CPU      string // normalized k8s quantity (e.g. "4"); "" => pool-global request
-	Memory   string // normalized k8s quantity (e.g. "16Gi"); "" => pool-global request
-	Colocate bool   // true => bin-pack (exclusiveNode=false); false => exclusive node
+	CPU      string        // normalized k8s quantity (e.g. "8"); the worker's CPU size
+	Memory   string        // normalized k8s quantity (e.g. "16Gi"); the worker's memory size
+	Colocate bool          // deprecated: always false; bin-pack/colocate is being removed
+	TTL      time.Duration // how long the worker stays hot-idle after its last query (reset per query); not part of MatchKey
 }
 
 // MatchKey is the identity used to decide whether an existing worker can serve a

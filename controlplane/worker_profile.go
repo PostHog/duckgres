@@ -2,127 +2,100 @@ package controlplane
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-// Startup-option GUC names a client uses to select its worker shape. Parsed from
-// the libpq `options` parameter exactly like search_path (see control.go).
+// Startup-option GUC names a client uses to select its worker size + idle TTL.
+// Parsed from the libpq `options` parameter exactly like search_path (control.go).
 const (
-	gucColocate     = "duckgres.colocate"
 	gucWorkerCPU    = "duckgres.worker_cpu"
 	gucWorkerMemory = "duckgres.worker_memory"
-	gucWorkerTier   = "duckgres.worker_tier"
+	gucWorkerTTL    = "duckgres.worker_ttl"
 )
 
-// resolveWorkerProfile turns the parsed startup-option GUCs into a *WorkerProfile
-// under this deployment's gate/clamp/tier policy.
+// Built-in defaults when a request omits a field (or client sizing is gated off)
+// and the deployment did not configure its own default size/TTL.
+const (
+	defaultWorkerCPU    = "8"
+	defaultWorkerMemory = "16Gi"
+	defaultWorkerTTL    = 20 * time.Minute
+)
+
+// resolveWorkerProfile turns the client's worker_cpu / worker_memory / worker_ttl
+// startup options into a concrete *WorkerProfile (a worker size + hot-idle TTL).
 //
-// Returns:
-//   - (nil, warns, nil)  => the default exclusive profile (gate off, no GUCs, or a
-//     selection that normalizes to the default). nil is the sentinel that matches
-//     legacy/default workers, so callers thread it straight through unchanged.
-//   - (profile, warns, nil) => a non-default profile to schedule.
-//   - (nil, nil, err) => reject the connection (unknown tier, disallowed
-//     colocate=false, or an unparseable/non-positive size). Clamping never errors;
-//     an out-of-range size is capped and reported via warns.
+// Every request resolves to a concrete size: the deployment default
+// (WorkerCPURequest / WorkerMemoryRequest, defaultWorkerTTL) when a field is
+// unset or client sizing is gated off, otherwise the clamped client value.
+// Client cpu/mem are clamped to [min,max] and ttl to [0,maxTTL]; an out-of-range
+// value is clamped with a warning, an unparseable/negative one errors (rejecting
+// the connection). Returns (profile, warns, nil) on success.
 func (cp *ControlPlane) resolveWorkerProfile(opts map[string]string) (*WorkerProfile, []string, error) {
 	k := cp.cfg.K8s
-	if !k.AllowClientWorkerProfile {
-		return nil, nil, nil
-	}
 
-	rawColocate := strings.TrimSpace(opts[gucColocate])
-	rawCPU := strings.TrimSpace(opts[gucWorkerCPU])
-	rawMem := strings.TrimSpace(opts[gucWorkerMemory])
-	rawTier := strings.TrimSpace(opts[gucWorkerTier])
+	cpu := firstNonEmpty(strings.TrimSpace(k.WorkerCPURequest), defaultWorkerCPU)
+	mem := firstNonEmpty(strings.TrimSpace(k.WorkerMemoryRequest), defaultWorkerMemory)
+	ttl := defaultWorkerTTL
 
-	if rawColocate == "" && rawCPU == "" && rawMem == "" && rawTier == "" {
-		return nil, nil, nil // no selection -> default exclusive profile
-	}
-
-	// Tier alias expands first; explicit inline GUCs override its fields below.
-	var (
-		tierColocate     *bool
-		tierCPU, tierMem string
-	)
-	if rawTier != "" {
-		spec, ok := k.WorkerTiers[rawTier]
-		if !ok {
-			return nil, nil, fmt.Errorf("unknown worker tier %q", rawTier)
-		}
-		tierColocate, tierCPU, tierMem = spec.Colocate, spec.CPU, spec.Memory
-	}
-
-	// colocate: inline GUC > tier > default(false)
-	colocate := false
-	if tierColocate != nil {
-		colocate = *tierColocate
-	}
-	if rawColocate != "" {
-		b, err := strconv.ParseBool(rawColocate)
-		if err != nil {
-			return nil, nil, fmt.Errorf("invalid %s %q (want true or false)", gucColocate, rawColocate)
-		}
-		colocate = b
-	}
-
-	// A full exclusive node is the expensive button; gate it independently.
-	if !colocate && !k.AllowClientExclusiveNode {
-		return nil, nil, fmt.Errorf("client-selected exclusive workers (colocate=false) are not permitted on this deployment")
-	}
-
-	// size: inline GUC > tier > colocate default. colocate=false with no size stays
-	// empty -> the pool-global request (today's 46/360) applies.
-	cpu := firstNonEmpty(rawCPU, tierCPU)
-	mem := firstNonEmpty(rawMem, tierMem)
-	if cpu == "" && mem == "" && colocate {
-		cpu = k.ColocatedWorkerCPURequest
-		mem = k.ColocatedWorkerMemoryRequest
-	}
-
-	// Normalize both sizes; clamp only COLOCATED sizes. The clamp range is the
-	// bin-pack safety bound — it would wrongly cap an exclusive full-node request
-	// (46/360 is well above it), and exclusive is already gated + quota'd.
 	var warns []string
-	cpu, warn, err := sizeField(gucWorkerCPU, cpu, k.WorkerProfileMinCPU, k.WorkerProfileMaxCPU, colocate)
+	if k.AllowClientWorkerProfile {
+		rawCPU := strings.TrimSpace(opts[gucWorkerCPU])
+		rawMem := strings.TrimSpace(opts[gucWorkerMemory])
+		rawTTL := strings.TrimSpace(opts[gucWorkerTTL])
+
+		if rawCPU != "" {
+			v, warn, err := sizeField(gucWorkerCPU, rawCPU, k.WorkerProfileMinCPU, k.WorkerProfileMaxCPU)
+			if err != nil {
+				return nil, nil, err
+			}
+			cpu = v
+			if warn != "" {
+				warns = append(warns, warn)
+			}
+		}
+		if rawMem != "" {
+			v, warn, err := sizeField(gucWorkerMemory, rawMem, k.WorkerProfileMinMemory, k.WorkerProfileMaxMemory)
+			if err != nil {
+				return nil, nil, err
+			}
+			mem = v
+			if warn != "" {
+				warns = append(warns, warn)
+			}
+		}
+		if rawTTL != "" {
+			v, warn, err := ttlField(rawTTL, k.WorkerMaxTTL)
+			if err != nil {
+				return nil, nil, err
+			}
+			ttl = v
+			if warn != "" {
+				warns = append(warns, warn)
+			}
+		}
+	}
+
+	// Normalize the (possibly default) sizes so reuse-matching is canonical
+	// (e.g. "16Gi" vs "16384Mi" compare equal once normalized).
+	cpuN, _, err := sizeField(gucWorkerCPU, cpu, "", "")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("invalid default worker cpu: %w", err)
 	}
-	if warn != "" {
-		warns = append(warns, warn)
-	}
-	mem, warn, err = sizeField(gucWorkerMemory, mem, k.WorkerProfileMinMemory, k.WorkerProfileMaxMemory, colocate)
+	memN, _, err := sizeField(gucWorkerMemory, mem, "", "")
 	if err != nil {
-		return nil, nil, err
-	}
-	if warn != "" {
-		warns = append(warns, warn)
+		return nil, nil, fmt.Errorf("invalid default worker memory: %w", err)
 	}
 
-	// Guaranteed-QoS safety: a colocated (bin-packed) pod must carry explicit
-	// non-empty resources, or it would schedule BestEffort and be first to OOM
-	// under bin-packing. The colocate defaults guarantee this; this guards a
-	// misconfigured deployment (colocated defaults unset).
-	if colocate && (cpu == "" || mem == "") {
-		return nil, nil, fmt.Errorf("colocated workers require both cpu and memory; set %s/%s or configure colocated defaults", gucWorkerCPU, gucWorkerMemory)
-	}
-
-	// Normalizes to the default exclusive profile -> return the nil sentinel so it
-	// matches legacy/default workers rather than forming a distinct key.
-	if cpu == "" && mem == "" && !colocate {
-		return nil, warns, nil
-	}
-
-	return &WorkerProfile{CPU: cpu, Memory: mem, Colocate: colocate}, warns, nil
+	return &WorkerProfile{CPU: cpuN, Memory: memN, TTL: ttl}, warns, nil
 }
 
-// sizeField normalizes a client-supplied size and, when clamp is set, bounds it
-// into [min,max], returning a human-readable warning if it was capped. An empty
-// raw value passes through unchanged (=> pool-global request).
-func sizeField(name, raw, min, max string, clamp bool) (normalized, warn string, err error) {
+// sizeField normalizes a client-supplied size and, when min/max are set, bounds
+// it into [min,max], returning a human-readable warning if it was capped. A
+// negative/zero or unparseable value errors.
+func sizeField(name, raw, min, max string) (normalized, warn string, err error) {
 	if raw == "" {
 		return "", "", nil
 	}
@@ -133,23 +106,37 @@ func sizeField(name, raw, min, max string, clamp bool) (normalized, warn string,
 	if q.Sign() <= 0 {
 		return "", "", fmt.Errorf("%s: quantity %q must be positive", name, raw)
 	}
-	if clamp {
-		capped := false
-		if min != "" {
-			if lo, e := resource.ParseQuantity(min); e == nil && q.Cmp(lo) < 0 {
-				q, capped = lo, true
-			}
-		}
-		if max != "" {
-			if hi, e := resource.ParseQuantity(max); e == nil && q.Cmp(hi) > 0 {
-				q, capped = hi, true
-			}
-		}
-		if capped {
-			warn = fmt.Sprintf("%s %q clamped to %q", name, raw, q.String())
+	capped := false
+	if min != "" {
+		if lo, e := resource.ParseQuantity(min); e == nil && q.Cmp(lo) < 0 {
+			q, capped = lo, true
 		}
 	}
+	if max != "" {
+		if hi, e := resource.ParseQuantity(max); e == nil && q.Cmp(hi) > 0 {
+			q, capped = hi, true
+		}
+	}
+	if capped {
+		warn = fmt.Sprintf("%s %q clamped to %q", name, raw, q.String())
+	}
 	return q.String(), warn, nil
+}
+
+// ttlField parses a worker TTL (Go duration) and clamps it to [0,maxTTL] when
+// maxTTL > 0. ttl=0 means "retire as soon as the last query finishes".
+func ttlField(raw string, maxTTL time.Duration) (time.Duration, string, error) {
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, "", fmt.Errorf("%s: invalid duration %q", gucWorkerTTL, raw)
+	}
+	if d < 0 {
+		return 0, "", fmt.Errorf("%s: duration %q must be >= 0", gucWorkerTTL, raw)
+	}
+	if maxTTL > 0 && d > maxTTL {
+		return maxTTL, fmt.Sprintf("%s %q clamped to %q", gucWorkerTTL, raw, maxTTL.String()), nil
+	}
+	return d, "", nil
 }
 
 func firstNonEmpty(a, b string) string {
