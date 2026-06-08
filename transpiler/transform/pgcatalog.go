@@ -105,6 +105,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"worker_version":                  true, // Worker process version
 			"div":                             true, // Integer division macro
 			"array_remove":                    true, // Remove element from array macro
+			"array_lower":                     true, // PostgreSQL array lower-bound compatibility macro
 			"to_number":                       true, // Parse formatted number string macro
 			"pg_backend_pid":                  true, // Backend process ID macro
 			"pg_total_relation_size":          true, // Total table size stub
@@ -149,6 +150,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"worker_version":                  true, // Worker process version
 			"div":                             true, // Integer division
 			"array_remove":                    true, // Remove element from array
+			"array_lower":                     true, // PostgreSQL array lower-bound compatibility
 			"to_number":                       true, // Parse formatted number string
 			"pg_backend_pid":                  true, // Backend process ID
 			"pg_stat_get_numscans":            true, // Index/table scan count

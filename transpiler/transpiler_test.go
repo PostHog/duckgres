@@ -4335,6 +4335,11 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			input:    "SELECT pg_catalog.format_type(atttypid, atttypmod) FROM pg_attribute",
 			contains: "memory.main.format_type",
 		},
+		{
+			name:     "array_lower gets memory.main prefix",
+			input:    "SELECT array_lower(conkey, 1) FROM pg_constraint",
+			contains: "memory.main.array_lower",
+		},
 	}
 
 	tr := New(Config{DuckLakeMode: true})

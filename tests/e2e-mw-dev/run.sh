@@ -114,9 +114,40 @@ drop_cnpg_role() { # org-id
     psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
 }
 
-cmd_deploy() {
-  # Clean slate for the cnpg org before anything provisions (see drop_cnpg_role).
+delete_ci_ducklings() { # pr-number
+  local pr="$1" org
+  for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
+    "${KUBECTL[@]}" -n ducklings delete "duckling/$org" --ignore-not-found --wait=false 2>/dev/null || true
+  done
+}
+
+wait_ci_ducklings_deleted() { # pr-number timeout
+  local pr="$1" timeout="$2" org
+  for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
+    "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout="$timeout" 2>/dev/null || true
+  done
+}
+
+delete_ci_bindings() { # pr-number
+  local pr="$1"
+  "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+  "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+}
+
+reset_pr_stack() {
+  # A cancelled or failed run can leave a namespace, config-store rows, and
+  # shared Duckling/Lakekeeper resources for this PR. Start from a clean slate
+  # so apply never reuses stale network policies, services, or tenant state.
+  delete_ci_ducklings "$PR_NUMBER"
+  wait_ci_ducklings_deleted "$PR_NUMBER" 300s
   drop_cnpg_role "ci-pr-${PR_NUMBER}-cnpg"
+  delete_pod_identity
+  delete_ci_bindings "$PR_NUMBER"
+  "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=300s
+}
+
+cmd_deploy() {
+  reset_pr_stack
 
   echo "::group::Apply manifests ($NS)"
   render | "${KUBECTL[@]}" apply -f -
@@ -239,9 +270,8 @@ cmd_teardown() {
   # against a stranded cnpg role whose password has drifted -> the Lakekeeper
   # migrate Job hits SASL auth failure and the warehouse never goes ready.
   # `wait --for=delete` blocks until the CR (and its cascade) is gone.
-  for org in "ci-pr-${PR_NUMBER}-cnpg" "ci-pr-${PR_NUMBER}-ext"; do
-    "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout=300s 2>/dev/null || true
-  done
+  delete_ci_ducklings "$PR_NUMBER"
+  wait_ci_ducklings_deleted "$PR_NUMBER" 300s
 
   # Deterministically drop the cnpg role+db in case the composition's async
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
@@ -251,8 +281,7 @@ cmd_teardown() {
   delete_pod_identity
 
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
-  "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${PR_NUMBER}" --ignore-not-found
-  "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${PR_NUMBER}" --ignore-not-found
+  delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=false
 }
 
@@ -280,16 +309,11 @@ cmd_e2e_cleanup() {
       fi
       pr="${ns#duckgres-ci-pr-}"
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
-      for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
-        "${KUBECTL[@]}" -n ducklings delete "duckling/$org" --ignore-not-found --wait=false 2>/dev/null || true
-      done
-      for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
-        "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout=300s 2>/dev/null || true
-      done
+      delete_ci_ducklings "$pr"
+      wait_ci_ducklings_deleted "$pr" 300s
       drop_cnpg_role "ci-pr-${pr}-cnpg"
       NS="$ns" delete_pod_identity
-      "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
-      "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+      delete_ci_bindings "$pr"
       "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false
     done
 }

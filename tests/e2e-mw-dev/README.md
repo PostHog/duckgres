@@ -38,11 +38,12 @@ client-go:
 
 - **wire/query** — `SELECT 1` round-trips; 5 concurrent connections stay
   distinct (ported from `TestK8sMultipleConcurrentConnections`).
-- **warm-pool backpressure** — a cold-pool burst of sessions outruns the worker
-  pool (`shared_warm_target=0`); the CP must answer the surplus with the
-  graceful client-visible `no warm Duckgres worker … retry in about 45 seconds`
-  hint (not a hang/500/drop), and the pool must then drain so a retrying
-  connection succeeds. The harness asserts the hint **and** handles it (the
+- **warm-pool backpressure** — a cold-pool burst of sessions may outrun the
+  worker pool (`shared_warm_target=0`); if it does, the CP must answer the
+  surplus with the graceful client-visible
+  `no warm Duckgres worker … retry in about 45 seconds` hint (not a
+  hang/500/drop), and the pool must then drain so a retrying connection
+  succeeds. The harness asserts the hint when observed **and** handles it (the
   concurrency tests retry through it).
 - **activation** — DuckLake **and** Iceberg catalogs attach and read/write.
 - **extension forks** — the bundled `ducklake`/`httpfs` extensions are the
@@ -98,9 +99,15 @@ normal `go test ./...` lane.
 
 Dedicated CP + throwaway config-store **per PR**, provisioning **real**
 ducklings (org IDs `ci-pr-<N>-cnpg`, `ci-pr-<N>-ext`) through the **shared**
-Crossplane / cnpg-shards / external RDS / Lakekeeper operator. Everything
-PR-specific lives in the namespace and is deleted; the shared-infra footprint
-is removed by deprovisioning the ducklings first.
+Crossplane / cnpg-shards / external RDS / Lakekeeper operator. The config-store
+uses a namespace-scoped PVC so a pod recreation during the harness does not
+erase provisioned org rows. Everything PR-specific lives in the namespace and
+is deleted; the shared-infra footprint is removed by deprovisioning the
+ducklings first.
+
+Each deploy first reaps any existing resources for the same PR number (namespace,
+Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role)
+so a rerun never applies over stale Lakekeeper services or network policies.
 
 ## One-time repo configuration
 
