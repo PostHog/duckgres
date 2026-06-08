@@ -1925,7 +1925,14 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	}
 	// Carry the worker's persisted pod-shape so the reserved record and any later
 	// reconciliation round-trip it. Default/legacy rows yield the zero profile.
-	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate}
+	// TTL resets to the new request's value on reuse (a query hitting the worker
+	// extends its life by the requested ttl); fall back to the worker's persisted
+	// ttl when the request carries none.
+	reuseTTL := time.Duration(claimed.TTLMinutes) * time.Minute
+	if assignment != nil && assignment.Profile != nil && assignment.Profile.TTL > 0 {
+		reuseTTL = assignment.Profile.TTL
+	}
+	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate, TTL: reuseTTL}
 	if worker.OwnerEpoch() > 0 && claimed.OwnerEpoch < worker.OwnerEpoch() {
 		currentEpoch := worker.OwnerEpoch()
 		p.mu.Unlock()
