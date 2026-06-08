@@ -164,6 +164,13 @@ func (t *TypeCastTransform) walkAndTransform(node *pg_query.Node, changed *bool)
 			t.walkAndTransform(n.AExpr.Rexpr, changed)
 		}
 
+	case *pg_query.Node_AIndirection:
+		// Subscript / field access like (expr)[2] — recurse into the base expression
+		// so casts inside it (e.g. ('{1,2,3}'::int[])[2]) are still transformed.
+		if n.AIndirection != nil {
+			t.walkAndTransform(n.AIndirection.Arg, changed)
+		}
+
 	case *pg_query.Node_BoolExpr:
 		if n.BoolExpr != nil {
 			for _, arg := range n.BoolExpr.Args {

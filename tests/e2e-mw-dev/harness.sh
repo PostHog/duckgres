@@ -194,6 +194,38 @@ basic_query() { # org password
   [ "$n" = "1" ] || fail "$1 SELECT 1 returned '$n'"
 }
 
+# pg_compat_functions exercises the PostgreSQL builtin-compatibility macros and
+# transforms (docs/pg-builtin-compat-gaps.md) end-to-end in DuckLake mode, where
+# the memory.main qualification matters. Each check is a deterministic value
+# assertion of real PG semantics through the full transpile path on a live
+# worker — not just "it didn't error". A regression here means a real client
+# (JDBC/SQLAlchemy/psql introspection) would break or get wrong data.
+assert_compat() { # org password dbname sql expected label
+  got="$(pg "$1" "$2" "$3" "$4")"
+  [ "$got" = "$5" ] || fail "$1 compat[$6]: '$4' returned '$got', expected '$5'"
+}
+pg_compat_functions() { # org password
+  log "pg builtin-compat functions on $1 (DuckLake mode)"
+  # set_config: connection-startup unblocker (JDBC/SQLAlchemy/psycopg/poolers).
+  assert_compat "$1" "$2" ducklake "SELECT set_config('search_path','main',false)" "main" "set_config"
+  # width_bucket: equi-width histogram bucketing (BI tools / dbt).
+  assert_compat "$1" "$2" ducklake "SELECT width_bucket(5.35,0.024,10.06,5)::text" "3" "width_bucket"
+  # uuid_generate_v4: uuid-ossp default-expression alias.
+  assert_compat "$1" "$2" ducklake "SELECT length(uuid_generate_v4()::text)::text" "36" "uuid_generate_v4"
+  # decode/encode: bytea round-trip (was silently corrupting before the macros).
+  assert_compat "$1" "$2" ducklake "SELECT encode(decode('YWJj','base64'),'hex')" "616263" "encode_decode"
+  # @> jsonb containment (Django/SQLAlchemy/ActiveRecord).
+  assert_compat "$1" "$2" ducklake "SELECT ('{\"a\":1,\"b\":2}'::jsonb @> '{\"a\":1}'::jsonb)::int::text" "1" "jsonb_contains"
+  # #>> jsonpath text extraction.
+  assert_compat "$1" "$2" ducklake "SELECT '{\"a\":{\"b\":1}}'::json #>> '{a,b}'" "1" "jsonb_path_text"
+  # PG curly-brace array literal cast.
+  assert_compat "$1" "$2" ducklake "SELECT array_length('{1,2,3}'::int[],1)::text" "3" "array_literal_cast"
+  # set-returning table macro in FROM position (memory.main-qualified).
+  assert_compat "$1" "$2" ducklake "SELECT count(*)::text FROM json_array_elements('[1,2,3]'::json)" "3" "json_array_elements"
+  # make_interval: interval constructor (DuckDB has no native make_interval).
+  assert_compat "$1" "$2" ducklake "SELECT make_interval(days=>2)::text" "2 days" "make_interval"
+}
+
 # Warm-pool backpressure is a FEATURE: when a burst of sessions outruns the
 # cold worker pool (shared_warm_target=0), the CP rejects the surplus with a
 # graceful, client-visible "no warm Duckgres worker is currently available;
@@ -459,6 +491,7 @@ main() {
   # ---- cnpg backend (full coverage incl. pod-level + resilience) ----
   wait_worker "$CNPG" "$cnpg_pw" ducklake
   basic_query            "$CNPG" "$cnpg_pw"
+  pg_compat_functions    "$CNPG" "$cnpg_pw"
   warm_capacity_backpressure "$CNPG" "$cnpg_pw"   # while only one worker is warm
   rw_ducklake            "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
@@ -472,6 +505,7 @@ main() {
   # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
   wait_worker "$EXT" "$ext_pw" ducklake
   basic_query  "$EXT" "$ext_pw"
+  pg_compat_functions "$EXT" "$ext_pw"
   rw_ducklake  "$EXT" "$ext_pw"
   rw_iceberg   "$EXT" "$ext_pw"
 

@@ -416,6 +416,13 @@ func Classify(sql string, cfg Config) Classification {
 	if containsAny(upper, "::REGTYPE", "::REGCLASS", "::REGNAMESPACE", "::REGPROC", "::OID") {
 		flags |= FlagTypeCast
 	}
+	// PG curly-brace array literal casts like '{1,2,3}'::int[] — the '}''::' signature
+	// marks a brace-terminated string literal immediately cast (rewritten to ARRAY[...]
+	// in TypeCastTransform). Over-triggers harmlessly on object casts like '{...}'::json
+	// (no array bounds -> left untouched).
+	if strings.Contains(upper, "}'::") {
+		flags |= FlagTypeCast
+	}
 	// Also catch pg_catalog. qualified casts
 	if strings.Contains(upper, "::PG_CATALOG.") {
 		flags |= FlagTypeCast | FlagTypeMapping
@@ -489,7 +496,7 @@ func Classify(sql string, cfg Config) Classification {
 	// This is acceptable: false positive just runs the operator transform (cheap),
 	// while a false negative would break PostgreSQL regex queries that DuckDB
 	// handles via regexp_matches rewrite.
-	if containsAny(upper, "->", "~", "||") {
+	if containsAny(upper, "->", "~", "||", "@>", "#>>") {
 		flags |= FlagOperators
 	}
 	// Also check for SIMILAR TO which gets transformed through operators
