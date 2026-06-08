@@ -117,6 +117,14 @@ func TestCompatMacros_BatchA(t *testing.T) {
 		{"hostmask_24", `SELECT hostmask('192.168.1.5/24'::inet)::VARCHAR`, "0.0.0.255", false},
 		{"set_masklen_16", `SELECT set_masklen('192.168.1.5/24'::inet, 16)::VARCHAR`, "192.168.1.5/16", false},
 		{"inet_same_family_mixed", `SELECT inet_same_family('192.168.1.5'::inet,'::1'::inet)::VARCHAR`, "false", false},
+		// Text inputs: the transpiler maps PG inet -> text, so the macros must work
+		// on plain CIDR strings, not just the DuckDB INET type.
+		{"masklen_text", `SELECT masklen('192.168.1.5/24')::VARCHAR`, "24", false},
+		{"masklen_text_bare", `SELECT masklen('192.168.1.5')::VARCHAR`, "32", false},
+		{"masklen_text_ipv6", `SELECT masklen('2001:db8::')::VARCHAR`, "128", false},
+		{"hostmask_text", `SELECT hostmask('10.0.0.0/8')`, "0.255.255.255", false},
+		{"set_masklen_text", `SELECT set_masklen('192.168.1.5/24', 16)`, "192.168.1.5/16", false},
+		{"inet_same_family_text", `SELECT inet_same_family('192.168.1.5','::1')::VARCHAR`, "false", false},
 	})
 }
 

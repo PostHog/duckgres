@@ -301,6 +301,12 @@ func (t *TypeCastTransform) walkSelectStmt(stmt *pg_query.SelectStmt, changed *b
 	t.walkAndTransform(stmt.LimitCount, changed)
 	t.walkAndTransform(stmt.LimitOffset, changed)
 
+	// VALUES (...) rows — e.g. INSERT INTO t VALUES ('{1,2}'::int[]) — so casts
+	// in a VALUES list (including PG array literals) are transformed.
+	for _, valuesList := range stmt.ValuesLists {
+		t.walkAndTransform(valuesList, changed)
+	}
+
 	if stmt.WithClause != nil {
 		t.walkAndTransform(&pg_query.Node{Node: &pg_query.Node_WithClause{WithClause: stmt.WithClause}}, changed)
 	}

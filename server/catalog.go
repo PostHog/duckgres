@@ -1164,19 +1164,25 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			CASE WHEN position('.' IN CAST(n AS VARCHAR)) = 0 THEN 0
 			ELSE length(rtrim(split_part(CAST(n AS VARCHAR),'.',2),'0')) END`,
 
-		// inet helpers - DuckDB has an INET type and family()/host(); these add PG's accessors.
+		// inet helpers - text-based. The transpiler maps the PG inet type to text
+		// (DuckDB's INET type is not preserved through the pipeline), so these operate
+		// on the textual CIDR form rather than family()/host()/INET. IPv6 is detected
+		// by the presence of ':'; the IPv4 prefix/host math uses the mask length only.
 		`CREATE OR REPLACE MACRO masklen(a) AS (
-			CASE WHEN contains(CAST(a AS VARCHAR), '/') THEN CAST(split_part(CAST(a AS VARCHAR), '/', 2) AS INTEGER)
-			WHEN family(a) = 4 THEN 32 ELSE 128 END)`,
+			CASE
+				WHEN contains(CAST(a AS VARCHAR), '/') THEN CAST(split_part(CAST(a AS VARCHAR), '/', 2) AS INTEGER)
+				WHEN contains(CAST(a AS VARCHAR), ':') THEN 128
+				ELSE 32
+			END)`,
 		`CREATE OR REPLACE MACRO hostmask(a) AS (
-			CASE WHEN family(a) = 4 THEN
-				(((((1::BIGINT << (32 - masklen(a))) - 1) >> 24 & 255) || '.' ||
+			CASE WHEN contains(CAST(a AS VARCHAR), ':') THEN NULL
+			ELSE ((((1::BIGINT << (32 - masklen(a))) - 1) >> 24 & 255) || '.' ||
 				  ((((1::BIGINT << (32 - masklen(a))) - 1) >> 16 & 255)) || '.' ||
 				  ((((1::BIGINT << (32 - masklen(a))) - 1) >> 8 & 255)) || '.' ||
-				  (((1::BIGINT << (32 - masklen(a))) - 1) & 255))::inet)
-			ELSE NULL END)`,
-		`CREATE OR REPLACE MACRO set_masklen(a, len) AS ((host(a) || '/' || CAST(len AS VARCHAR))::inet)`,
-		`CREATE OR REPLACE MACRO inet_same_family(a, b) AS (family(a) = family(b))`,
+				  (((1::BIGINT << (32 - masklen(a))) - 1) & 255))
+			END)`,
+		`CREATE OR REPLACE MACRO set_masklen(a, len) AS (split_part(CAST(a AS VARCHAR), '/', 1) || '/' || CAST(len AS VARCHAR))`,
+		`CREATE OR REPLACE MACRO inet_same_family(a, b) AS (contains(CAST(a AS VARCHAR), ':') = contains(CAST(b AS VARCHAR), ':'))`,
 
 		// array_positions - indices (1-based) of all elements equal to elem; empty array (not NULL)
 		// when none match. IS NOT DISTINCT FROM gives PG's NULL-element matching.

@@ -114,6 +114,19 @@ func TestOperatorTransform_JSONPathExtractText(t *testing.T) {
 	}
 }
 
+func TestTypeCastTransform_ArrayLiteralInInsertValues(t *testing.T) {
+	tr := NewTypeCastTransform()
+	// PG array-literal casts inside an INSERT ... VALUES list must be rewritten
+	// (the VALUES rows live in SelectStmt.ValuesLists, not the target list).
+	out := deparseAfter(t, tr, `INSERT INTO t VALUES (1, '{a,b}'::text[])`)
+	if !strings.Contains(out, "ARRAY[") {
+		t.Errorf("array literal in VALUES not rewritten to ARRAY[...]: %q", out)
+	}
+	if strings.Contains(out, "'{a,b}'") {
+		t.Errorf("raw curly array literal should be gone: %q", out)
+	}
+}
+
 func TestTypeCastTransform_ArrayLiteral(t *testing.T) {
 	tr := NewTypeCastTransform()
 	cases := []struct {
