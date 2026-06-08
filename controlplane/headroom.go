@@ -156,11 +156,13 @@ func (p *K8sWorkerPool) listPlaceholderPods(ctx context.Context) ([]string, erro
 }
 
 func (p *K8sWorkerPool) createPlaceholderPod(ctx context.Context, cpu, mem resource.Quantity) error {
-	name := fmt.Sprintf("%s-%s-%d", headroomPodLabel, p.cpID, p.allocateBackgroundSpawnID())
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: p.namespace,
+			// GenerateName lets the API server assign a unique suffix per pod —
+			// the controller creates N placeholders per reconcile and does not
+			// track ids, so a fixed/derived name would collide ("already exists").
+			GenerateName: fmt.Sprintf("%s-%s-", headroomPodLabel, p.cpID),
+			Namespace:    p.namespace,
 			Labels: map[string]string{
 				"app":                    headroomPodLabel,
 				"duckgres/control-plane": p.cpID,
@@ -205,14 +207,6 @@ func (p *K8sWorkerPool) createPlaceholderPod(ctx context.Context, cpu, mem resou
 	}
 	_, err := p.clientset.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{})
 	return err
-}
-
-// allocateBackgroundSpawnID returns a process-unique id (shares the worker id
-// space; only used to make placeholder pod names unique).
-func (p *K8sWorkerPool) allocateBackgroundSpawnID() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.allocateBackgroundSpawnIDLocked()
 }
 
 func nodeIsReady(n *corev1.Node) bool {
