@@ -3793,6 +3793,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	foundSharedWarmWorkerEnv := false
 	foundTLSCertEnv := false
 	foundTLSKeyEnv := false
+	foundMaxSessionsEnv := false
 	for _, env := range c.Env {
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
@@ -3808,6 +3809,9 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 		if env.Name == "DUCKGRES_KEY" && env.Value == "/etc/duckgres/worker-rpc/tls.key" {
 			foundTLSKeyEnv = true
 		}
+		if env.Name == "DUCKGRES_DUCKDB_MAX_SESSIONS" && env.Value == "1" {
+			foundMaxSessionsEnv = true
+		}
 	}
 	if !foundEnv {
 		t.Fatal("bearer token env var not found or incorrect")
@@ -3817,6 +3821,9 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	}
 	if !foundTLSCertEnv || !foundTLSKeyEnv {
 		t.Fatal("expected worker RPC TLS env vars to be present")
+	}
+	if !foundMaxSessionsEnv {
+		t.Fatal("expected DUCKGRES_DUCKDB_MAX_SESSIONS=1 (one query session per worker)")
 	}
 
 	if len(pod.Spec.Volumes) == 0 {

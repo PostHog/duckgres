@@ -62,7 +62,7 @@ func (p warmCapacityMissPolicy) sqlMessage(retryAfter time.Duration) string {
 	case warmCapacityMessageNoIdle:
 		return fmt.Sprintf("no warm Duckgres worker is currently available; retry in about %d seconds", warmCapacityRetrySeconds(retryAfter))
 	case warmCapacityMessageOrgCap:
-		return "Duckgres worker capacity for this organization is currently exhausted; retry later"
+		return "your organization has reached its maximum number of concurrent Duckgres workers and they are all busy; retry once a query finishes"
 	case warmCapacityMessageGlobalCap:
 		return "Duckgres worker capacity is currently exhausted; retry later"
 	case warmCapacityMessageShuttingDown:

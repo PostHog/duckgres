@@ -19,7 +19,8 @@
 #                  POD_NAME/NODE_NAME env, and NO ambient SA-token mount.
 #   resilience   : worker-pod kill → crash recovery; DuckLake durability across a
 #                  worker restart; concurrent writers (fork conflict-retry);
-#                  graceful drain (in-flight query survives a worker SIGTERM, #690).
+#                  graceful drain (in-flight query survives a worker SIGTERM, #690);
+#                  one session per worker (concurrent queries land on distinct pods).
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
 #   lifecycle    : deprovision → warehouse deleted → Duckling CR fully gone
 #                  (finalizer cascade that drops the cnpg role+db completed).
@@ -394,6 +395,51 @@ graceful_drain() { # org password
   basic_query "$1" "$2"
 }
 
+# One session per worker: two concurrent queries for the same org must land on
+# two DISTINCT worker pods, never share a single pod's DuckDB. The control plane
+# spawns remote workers with DUCKGRES_DUCKDB_MAX_SESSIONS=1, so each query owns a
+# whole pod's resources and a heavy query can't be starved by a co-resident one.
+# Regression net: if a worker were ever shared (pre-change least-loaded sharing),
+# the org would peak at a single active-org-labeled pod for both queries.
+# Assumes the worker nodepool is already warm (prior resilience steps spawned
+# pods), so the second pod schedules within the queries' runtime.
+one_session_per_worker() { # org password
+  log "one session per worker: concurrent queries land on distinct pods on $1"
+  o1="$(mktemp)"; o2="$(mktemp)"; r1="$(mktemp)"; r2="$(mktemp)"
+  # Deterministic, multi-second query (range() is lazy; the modulo filter forces
+  # real per-row work). Expected = count of even i in [0, 8e9) = 4e9.
+  q="SELECT count(*) FROM range(8000000000) t(i) WHERE i % 2 = 0;"
+  ( if pg_try "$1" "$2" ducklake "$q" >"$o1" 2>&1; then echo 0 >"$r1"; else echo 1 >"$r1"; fi ) &
+  p1=$!
+  ( if pg_try "$1" "$2" ducklake "$q" >"$o2" 2>&1; then echo 0 >"$r2"; else echo 1 >"$r2"; fi ) &
+  p2=$!
+
+  # While both queries run, the org must reach >=2 worker pods — one per session.
+  # MaxSessions=1 forces the second query onto its own pod (it cannot join the
+  # first's busy pod), so co-residence is impossible.
+  peak=0 a=0
+  while [ "$a" -lt 180 ]; do
+    kill -0 "$p1" 2>/dev/null || break
+    kill -0 "$p2" 2>/dev/null || break
+    c="$(k get pods -l "duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
+    [ "$c" -gt "$peak" ] && peak="$c"
+    [ "$peak" -ge 2 ] && break
+    sleep 1; a=$((a + 1))
+  done
+
+  wait "$p1" 2>/dev/null || true
+  wait "$p2" 2>/dev/null || true
+  { [ "$(cat "$r1")" = 0 ] && [ "$(cat "$r2")" = 0 ]; } \
+    || fail "one_session_per_worker: a concurrent query errored ($(tr -d '\n' <"$o1" | tail -c 120) | $(tr -d '\n' <"$o2" | tail -c 120))"
+  n1="$(tr -dc '0-9' <"$o1")"; n2="$(tr -dc '0-9' <"$o2")"
+  { [ "$n1" = "4000000000" ] && [ "$n2" = "4000000000" ]; } \
+    || fail "one_session_per_worker: wrong results n1=$n1 n2=$n2 want 4000000000"
+  [ "$peak" -ge 2 ] \
+    || fail "one_session_per_worker: org peaked at $peak worker pod(s) for 2 concurrent queries — sessions shared a worker"
+  rm -f "$o1" "$o2" "$r1" "$r2"
+  log "one session per worker: OK (peak $peak pods for $1)"
+}
+
 # Data committed to DuckLake survives a worker restart (parquet in object store +
 # metadata snapshot in Postgres are the source of truth).
 # Ported from TestK8sDuckLakeDurabilityAcrossWorkerRestart.
@@ -522,6 +568,7 @@ main() {
   durability_across_restart "$CNPG" "$cnpg_pw"
   crash_recovery         "$CNPG" "$cnpg_pw"
   graceful_drain         "$CNPG" "$cnpg_pw"
+  one_session_per_worker "$CNPG" "$cnpg_pw"
 
   # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
   wait_worker "$EXT" "$ext_pw" ducklake
@@ -542,7 +589,7 @@ main() {
   # end-to-end would need a warm target >0 in the per-PR CP (see README).
   log "SKIP shared-warm-activation + version-reaper (CP runs warm-target=0; see README)"
 
-  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

@@ -775,6 +775,20 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 							Name:  "DUCKGRES_KEY",
 							Value: workerRPCMountDir + "/" + workerRPCKeyKey,
 						},
+						{
+							// One client query session per worker pod: the pod's full
+							// resources (workerDuckDBLimits gives the session ~75% of pod
+							// RAM + all cores) belong to a single query, so queries never
+							// contend and a heavy query can't be OOM'd by a co-resident
+							// one. The CP scheduler (OrgReservedPool) already never
+							// co-assigns; this is the hard worker-side guarantee — a 2nd
+							// CreateSession is rejected rather than silently overcommitting.
+							// Internal control/maintenance work runs on the worker's side
+							// connections (controlDB/warmupDB), which are NOT counted
+							// sessions, so this does not starve them.
+							Name:  "DUCKGRES_DUCKDB_MAX_SESSIONS",
+							Value: "1",
+						},
 					},
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: boolPtr(false),
