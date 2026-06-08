@@ -144,6 +144,7 @@ type K8sConfig struct {
 	WorkerProfileMaxCPU            string                       // Clamp ceiling for a client-supplied cpu (e.g. "16")
 	WorkerProfileMinMemory         string                       // Clamp floor for a client-supplied memory (e.g. "4Gi")
 	WorkerProfileMaxMemory         string                       // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
+	WorkerMaxTTL                   time.Duration                // Clamp ceiling for a client-supplied duckgres.worker_ttl (0 = unbounded)
 	OrgMaxColocatedCPU             int                          // Per-org cap on summed colocated worker CPU cores (0 = unbounded)
 	OrgMaxColocatedMemory          string                       // Per-org cap on summed colocated worker memory (e.g. "256Gi")
 	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier
