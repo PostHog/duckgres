@@ -17,13 +17,13 @@ import (
 
 func TestDucklingMetadataStoreAddressUsesDirectEndpointByDefault(t *testing.T) {
 	status := &provisioner.DucklingStatus{}
-	status.MetadataStore.Endpoint = "direct-aurora.example.internal"
+	status.MetadataStore.Endpoint = "direct-rds.example.internal"
 
 	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, "analytics")
 	if err != nil {
 		t.Fatalf("ducklingMetadataStoreAddress: %v", err)
 	}
-	if host != "direct-aurora.example.internal" {
+	if host != "direct-rds.example.internal" {
 		t.Fatalf("host = %q, want direct endpoint", host)
 	}
 	if port != 5432 {
@@ -36,7 +36,7 @@ func TestDucklingMetadataStoreAddressUsesDirectEndpointByDefault(t *testing.T) {
 
 func TestDucklingMetadataStoreAddressPrefersPgBouncerEndpoint(t *testing.T) {
 	status := &provisioner.DucklingStatus{}
-	status.MetadataStore.Endpoint = "direct-aurora.example.internal"
+	status.MetadataStore.Endpoint = "direct-rds.example.internal"
 	status.MetadataStore.PgBouncerEndpoint = "pooler.ducklings.svc.cluster.local:6543"
 
 	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, "analytics")
@@ -56,7 +56,7 @@ func TestDucklingMetadataStoreAddressPrefersPgBouncerEndpoint(t *testing.T) {
 
 func TestDucklingMetadataStoreAddressRejectsInvalidPgBouncerEndpoint(t *testing.T) {
 	status := &provisioner.DucklingStatus{}
-	status.MetadataStore.Endpoint = "direct-aurora.example.internal"
+	status.MetadataStore.Endpoint = "direct-rds.example.internal"
 	status.MetadataStore.PgBouncerEndpoint = "not-a-host-port"
 
 	_, _, _, err := ducklingMetadataStoreAddress(status, "analytics")

@@ -43,9 +43,8 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	duckLakeDeltaCatalogEnabled := fs.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := fs.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach, defaults to sibling delta/ prefix at DuckLake object-store root (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	duckLakeDefaultSpecVersion := fs.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
-	icebergEnabled := fs.Bool("iceberg-enabled", false, "Attach a per-tenant Iceberg catalog (AWS S3 Tables) at session init (env: DUCKGRES_ICEBERG_ENABLED)")
-	icebergTableBucket := fs.String("iceberg-table-bucket", "", "Iceberg S3 Tables bucket ARN, e.g. arn:aws:s3tables:us-east-1:<acct>:bucket/<name> (env: DUCKGRES_ICEBERG_TABLE_BUCKET)")
-	icebergRegion := fs.String("iceberg-region", "", "AWS region for the Iceberg table bucket (default: us-east-1) (env: DUCKGRES_ICEBERG_REGION)")
+	icebergEnabled := fs.Bool("iceberg-enabled", false, "Attach a per-tenant Iceberg catalog (Lakekeeper REST) at session init (env: DUCKGRES_ICEBERG_ENABLED)")
+	icebergRegion := fs.String("iceberg-region", "", "AWS region for S3 object access by Iceberg (default: us-east-1) (env: DUCKGRES_ICEBERG_REGION)")
 	icebergNamespace := fs.String("iceberg-namespace", "", "Default Iceberg namespace (informational; default: main) (env: DUCKGRES_ICEBERG_NAMESPACE)")
 	processMinWorkers := fs.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
 	processMaxWorkers := fs.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
@@ -77,6 +76,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	k8sSharedWarmTarget := fs.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
 	k8sDynamicWarmCapacityEnabled := fs.Bool("k8s-dynamic-warm-capacity-enabled", true, "Enable configstore-driven dynamic warm-capacity target computation (default true; use --k8s-dynamic-warm-capacity-enabled=false to disable; env: DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED)")
 	k8sWarmCapacityMissWindow := fs.String("k8s-warm-capacity-miss-window", "", "Recent no-idle miss window for dynamic warm-capacity demand (default: 2m) (env: DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW)")
+	k8sWarmAcquireTimeout := fs.String("k8s-warm-acquire-timeout", "", "How long a session-acquire blocks server-side for a warm colocated worker before returning backpressure (e.g. 5m; default 0 = fail fast) (env: DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT)")
 	k8sWarmCapacityMissesPerWorker := fs.Int("k8s-warm-capacity-misses-per-worker", 0, "Recent misses required for one extra dynamic warm worker (default: 8) (env: DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER)")
 	k8sWarmCapacityDemandTTL := fs.String("k8s-warm-capacity-demand-ttl", "", "Retention TTL for warm-capacity miss buckets (default: 15m) (env: DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL)")
 	k8sWarmCapacityDynamicImageCeiling := fs.Int("k8s-warm-capacity-dynamic-image-ceiling", 0, "Max dynamic extra warm workers per image, 0=unlimited (env: DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING)")
@@ -111,7 +111,6 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.DuckLakeDeltaCatalogPath = *duckLakeDeltaCatalogPath
 		cli.DuckLakeDefaultSpecVersion = *duckLakeDefaultSpecVersion
 		cli.IcebergEnabled = *icebergEnabled
-		cli.IcebergTableBucket = *icebergTableBucket
 		cli.IcebergRegion = *icebergRegion
 		cli.IcebergNamespace = *icebergNamespace
 		cli.ProcessMinWorkers = *processMinWorkers
@@ -144,6 +143,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.K8sSharedWarmTarget = *k8sSharedWarmTarget
 		cli.K8sDynamicWarmCapacityEnabled = *k8sDynamicWarmCapacityEnabled
 		cli.K8sWarmCapacityMissWindow = *k8sWarmCapacityMissWindow
+		cli.K8sWarmAcquireTimeout = *k8sWarmAcquireTimeout
 		cli.K8sWarmCapacityMissesPerWorker = *k8sWarmCapacityMissesPerWorker
 		cli.K8sWarmCapacityDemandTTL = *k8sWarmCapacityDemandTTL
 		cli.K8sWarmCapacityDynamicImageCeiling = *k8sWarmCapacityDynamicImageCeiling

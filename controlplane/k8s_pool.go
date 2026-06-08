@@ -37,6 +37,23 @@ import (
 
 const defaultActivatingTimeout = 2 * time.Minute
 
+// workerPodReadyTimeout bounds how long a spawn waits for a worker pod to become
+// Ready. A cold spawn may need Karpenter to provision a fresh node (a single-
+// tenant exclusive 46/360 worker gets a dedicated large instance), so this is
+// generous.
+const workerPodReadyTimeout = 5 * time.Minute
+
+// warmSpawnReconcileTimeout bounds a warm-pool replenish/reconcile spawn. It MUST
+// exceed workerPodReadyTimeout: a warm spawn does the same waitForPodReady, so a
+// shorter deadline cancels every cold spawn before its node can provision. The
+// old 30s value meant the warm reconcile could never refill an exclusive worker
+// that needed a fresh node — after a CP restart the default/exclusive pool would
+// sit empty, churning "context deadline exceeded", while only colocated (small,
+// fast, bin-packed) shapes refilled. See TestWarmSpawnTimeoutExceedsPodReady.
+const warmSpawnReconcileTimeout = 6 * time.Minute
+
+const workerTerminationGracePeriodSeconds int64 = 3600
+
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
 
 // K8sWorkerPool manages worker pods in Kubernetes.
@@ -46,7 +63,10 @@ type K8sWorkerPool struct {
 	nextWorkerID int
 	spawning     int
 	maxWorkers   int
-	minWorkers   int
+	// warmAcquireTimeout: server-side block window for a session-acquire that
+	// missed the warm pool (0 = fail fast). Read by OrgReservedPool.AcquireWorker.
+	warmAcquireTimeout time.Duration
+	minWorkers         int
 	// perImageWarmTarget is an additive floor on top of minWorkers: for each
 	// image listed, the pool aims to keep at least N warm-idle workers of
 	// that exact image alive so a per-org pin always has a hot pod waiting.
@@ -75,6 +95,15 @@ type K8sWorkerPool struct {
 	workerTolerationValue   string            // taint value for NoSchedule toleration
 	workerExclusiveNode     bool              // one worker per node via anti-affinity
 	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
+
+	// Headroom controller: keep headroomPercent% of worker-nodepool allocatable
+	// CPU+mem held by low-priority placeholder pods so a worker spawn schedules
+	// immediately (preempting placeholders) instead of waiting on a fresh node.
+	headroomPercent              int
+	placeholderImage             string
+	placeholderCPU               string
+	placeholderMemory            string
+	placeholderPriorityClassName string
 
 	// Colocated (bin-pack) scheduling for colocate=true worker profiles. When a
 	// spawned worker's profile is colocated, these replace the default
@@ -170,6 +199,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	pool := &K8sWorkerPool{
 		workers:                 make(map[int]*ManagedWorker),
 		maxWorkers:              cfg.MaxWorkers,
+		warmAcquireTimeout:      cfg.WarmAcquireTimeout,
 		idleTimeout:             cfg.IdleTimeout,
 		shutdownCh:              make(chan struct{}),
 		stopInform:              make(chan struct{}),
@@ -191,6 +221,12 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerTolerationValue:   cfg.WorkerTolerationValue,
 		workerExclusiveNode:     cfg.WorkerExclusiveNode,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
+
+		headroomPercent:              cfg.HeadroomPercent,
+		placeholderImage:             cfg.PlaceholderImage,
+		placeholderCPU:               cfg.PlaceholderCPU,
+		placeholderMemory:            cfg.PlaceholderMemory,
+		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
 
 		colocatedWorkerNodeSelector:    cfg.ColocatedNodeSelector,
 		colocatedWorkerTolerationKey:   cfg.ColocatedTolerationKey,
@@ -706,11 +742,12 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			Labels:    podLabels,
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:                corev1.RestartPolicyNever,
-			ServiceAccountName:           p.workerServiceAccountName(),
-			AutomountServiceAccountToken: boolPtr(false),
-			PriorityClassName:            p.workerPriorityClassName,
-			NodeSelector:                 p.nodeSelectorForProfile(profile),
+			RestartPolicy:                 corev1.RestartPolicyNever,
+			TerminationGracePeriodSeconds: int64Ptr(workerTerminationGracePeriodSeconds),
+			ServiceAccountName:            p.workerServiceAccountName(),
+			AutomountServiceAccountToken:  boolPtr(false),
+			PriorityClassName:             p.workerPriorityClassName,
+			NodeSelector:                  p.nodeSelectorForProfile(profile),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -752,6 +789,20 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 						{
 							Name:  "DUCKGRES_KEY",
 							Value: workerRPCMountDir + "/" + workerRPCKeyKey,
+						},
+						{
+							// One client query session per worker pod: the pod's full
+							// resources (workerDuckDBLimits gives the session ~75% of pod
+							// RAM + all cores) belong to a single query, so queries never
+							// contend and a heavy query can't be OOM'd by a co-resident
+							// one. The CP scheduler (OrgReservedPool) already never
+							// co-assigns; this is the hard worker-side guarantee — a 2nd
+							// CreateSession is rejected rather than silently overcommitting.
+							// Internal control/maintenance work runs on the worker's side
+							// connections (controlDB/warmupDB), which are NOT counted
+							// sessions, so this does not starve them.
+							Name:  "DUCKGRES_DUCKDB_MAX_SESSIONS",
+							Value: "1",
 						},
 					},
 					SecurityContext: &corev1.SecurityContext{
@@ -914,6 +965,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		spawnRecord.ProfileCPU = profile.CPU
 		spawnRecord.ProfileMemory = profile.Memory
 		spawnRecord.ProfileColocate = profile.Colocate
+		spawnRecord.TTLMinutes = int(profile.TTL.Minutes())
 		_ = p.persistWorkerRecord(spawnRecord)
 	}
 
@@ -925,7 +977,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	}
 
 	// Wait for pod to get an IP via informer (no polling).
-	ready, err := p.waitForPodReady(ctx, podName, 5*time.Minute)
+	ready, err := p.waitForPodReady(ctx, podName, workerPodReadyTimeout)
 	if err != nil {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
@@ -1619,6 +1671,21 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				continue
 			}
 
+			// A sized request foreground-spawns a worker of the requested size here
+			// (the warm pool only ever spawns default/neutral shapes, which can't
+			// satisfy a concrete size). A DEFAULT request returns the no-idle miss;
+			// the no-warm-pool foreground spawn for default requests is driven one
+			// layer up in OrgReservedPool.AcquireWorker, which keeps this method's
+			// contract (and its tests) unchanged. Org/global cap is respected.
+			if assignment.Profile != nil &&
+				(missReason == configstore.WorkerClaimMissReasonNone || missReason == configstore.WorkerClaimMissReasonNoIdle) {
+				worker, spawnErr := p.foregroundSpawnReservedWorker(ctx, assignment)
+				if spawnErr != nil {
+					return nil, spawnErr
+				}
+				return worker, nil
+			}
+
 			p.recordWarmCapacityMiss(assignment, missReason)
 			return nil, NewWarmCapacityExhaustedErrorForReason(missReason, DefaultWarmCapacityRetryAfter)
 		}
@@ -1687,12 +1754,31 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		p.mu.Unlock()
 
+		// The production warm-pool teardown lives in the runtime-store branch above
+		// (it foreground-spawns for every request). This runtime-store-less branch
+		// is non-production (tests / standalone k8s); only a sized request
+		// foreground-spawns here, a default request still surfaces a no-idle miss.
+		if assignment.Profile != nil {
+			worker, spawnErr := p.foregroundSpawnReservedWorker(ctx, assignment)
+			if spawnErr != nil {
+				return nil, spawnErr
+			}
+			return worker, nil
+		}
+
 		p.recordWarmCapacityMiss(assignment, configstore.WorkerClaimMissReasonNoIdle)
 		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
 	}
 }
 
 func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, reason configstore.WorkerClaimMissReason) {
+	// A server-side acquire wait polls every WarmAcquireRetryInterval; it sets
+	// this to record demand + the miss metric at most once per throttle interval
+	// rather than on every poll, so one waiting connection doesn't inflate the
+	// demand signal and miss counter ~Nx.
+	if assignment != nil && assignment.SuppressWarmMissRecord {
+		return
+	}
 	policy := warmCapacityMissPolicyForReason(reason)
 	image := ""
 	if assignment != nil {
@@ -1716,6 +1802,94 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
 		slog.Warn("Failed to record warm capacity miss.", "image", image, "reason", policy.reason, "error", err)
 	}
+}
+
+// spawnReservedWorker foreground-spawns a worker for the org and reserves it,
+// returning it in Reserved state (the caller activates it, same as a claimed
+// worker). This is the only spawn path now that the warm pool is gone: a request
+// either reuses a hot-idle worker (claim) or spawns one here. The pod is sized
+// from the request profile, or the pool-global default for a default (nil
+// profile) request (workerResourcesForProfile); the reserved record round-trips
+// the profile + TTL.
+func (p *K8sWorkerPool) foregroundSpawnReservedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	if assignment == nil {
+		return nil, fmt.Errorf("spawnReservedWorker requires an assignment")
+	}
+	// A default (nil profile) request spawns a default-sized worker: the zero
+	// profile makes workerResourcesForProfile fall back to the pool-global request.
+	var profile WorkerProfile
+	if assignment.Profile != nil {
+		profile = *assignment.Profile
+	}
+
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+	maxGlobal := p.maxWorkers
+	p.mu.Unlock()
+
+	// Allocate a real, unique worker id. In the runtime-store path this MUST come
+	// from the DB via CreateSpawningWorkerSlot (which also enforces the per-org and
+	// global worker caps cross-CP and returns a nil slot when capped) — the
+	// background id allocator returns a placeholder 0 that collides across spawns.
+	var id int
+	if p.runtimeStore != nil {
+		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+			p.cpInstanceID, assignment.OrgID, assignment.Image, 0,
+			p.workerPodNamePrefix(), assignment.MaxWorkers, maxGlobal)
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+		}
+		id = slot.WorkerID
+	} else {
+		p.mu.Lock()
+		id = p.allocateWorkerIDLocked()
+		p.mu.Unlock()
+	}
+
+	p.mu.Lock()
+	p.spawning++
+	p.mu.Unlock()
+	err := p.spawnWorker(ctx, id, assignment.Image, profile, false)
+	p.mu.Lock()
+	p.spawning--
+	p.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("spawn sized worker: %w", err)
+	}
+
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("sized worker %d missing after spawn", id)
+	}
+	// spawnWorker does not stamp the profile on the in-memory worker; do it here
+	// so reuse-matching and the reserved record carry the size + TTL.
+	w.profile = profile
+	nextState, err := w.SharedState().Transition(WorkerLifecycleReserved, assignment)
+	if err != nil {
+		p.mu.Unlock()
+		p.retireWorkerWithReason(id, RetireReasonCrash, LifecycleOriginReserveFailure)
+		return nil, err
+	}
+	if err := w.SetSharedState(nextState); err != nil {
+		p.mu.Unlock()
+		p.retireWorkerWithReason(id, RetireReasonCrash, LifecycleOriginReserveFailure)
+		return nil, err
+	}
+	w.SetOwnerCPInstanceID(p.cpInstanceID)
+	w.IncrementOwnerEpoch()
+	w.reservedAt = time.Now()
+	reservedRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
+	p.mu.Unlock()
+	_ = p.persistWorkerRecord(reservedRecord)
+	return w, nil
 }
 
 func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) (*ManagedWorker, error) {
@@ -1758,7 +1932,14 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	}
 	// Carry the worker's persisted pod-shape so the reserved record and any later
 	// reconciliation round-trip it. Default/legacy rows yield the zero profile.
-	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate}
+	// TTL resets to the new request's value on reuse (a query hitting the worker
+	// extends its life by the requested ttl); fall back to the worker's persisted
+	// ttl when the request carries none.
+	reuseTTL := time.Duration(claimed.TTLMinutes) * time.Minute
+	if assignment != nil && assignment.Profile != nil && assignment.Profile.TTL > 0 {
+		reuseTTL = assignment.Profile.TTL
+	}
+	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate, TTL: reuseTTL}
 	if worker.OwnerEpoch() > 0 && claimed.OwnerEpoch < worker.OwnerEpoch() {
 		currentEpoch := worker.OwnerEpoch()
 		p.mu.Unlock()
@@ -1875,7 +2056,17 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		image:       claimed.Image,
 		bearerToken: token,
 		client:      client,
-		done:        make(chan struct{}),
+		// Restore the worker's size + TTL from the persisted record so a re-adopted
+		// worker keeps its shape. Without this, re-adopting a sized worker reset its
+		// profile to the default and the next hot-idle persist dropped its
+		// cpu/mem/ttl, so a same-size request could no longer reuse it.
+		profile: WorkerProfile{
+			CPU:      claimed.ProfileCPU,
+			Memory:   claimed.ProfileMemory,
+			Colocate: claimed.ProfileColocate,
+			TTL:      time.Duration(claimed.TTLMinutes) * time.Minute,
+		},
+		done: make(chan struct{}),
 	}
 	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
 	worker.SetOwnerEpoch(claimed.OwnerEpoch)
@@ -2084,11 +2275,27 @@ func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker 
 			}
 			hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
-			_, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
-			return err
+			result, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
+			if err != nil {
+				return err
+			}
+			return validateReservedWorkerHealth(result)
 		}
 	}
 	return check(ctx, worker)
+}
+
+func validateReservedWorkerHealth(result *healthCheckResult) error {
+	if result == nil {
+		return fmt.Errorf("worker health check returned no result")
+	}
+	if !result.Healthy {
+		return fmt.Errorf("worker health check reported unhealthy")
+	}
+	if result.Draining {
+		return fmt.Errorf("worker is draining")
+	}
+	return nil
 }
 
 // SpawnMinWorkers pre-warms the pool with count workers.
@@ -2216,7 +2423,7 @@ func (p *K8sWorkerPool) triggerPerImageReplenish(image string) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
 		defer cancel()
 		if err := p.SpawnMinWorkersForImage(ctx, image, target); err != nil {
 			slog.Warn("Per-image warm replenish failed.", "image", image, "error", err)
@@ -2254,8 +2461,11 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 		p.mu.Unlock()
 		return nil
 	}
+	// Exclusive-only room: this spawns default-shape (exclusive) warm workers,
+	// so colocated workers must not shrink the budget — consistent with the
+	// exclusive-only DB-side global cap in CreateNeutralWarmWorkerSlotForImage.
 	if p.maxWorkers > 0 {
-		room := p.maxWorkers - p.liveWorkerCountLocked()
+		room := p.maxWorkers - p.liveExclusiveWorkerCountLocked()
 		if room <= 0 {
 			p.mu.Unlock()
 			return nil
@@ -2359,16 +2569,11 @@ func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, profile Wo
 		p.mu.Unlock()
 		return nil
 	}
-	if p.maxWorkers > 0 {
-		room := p.maxWorkers - p.liveWorkerCountLocked()
-		if room <= 0 {
-			p.mu.Unlock()
-			return nil
-		}
-		if missing > room {
-			missing = room
-		}
-	}
+	// No exclusive worker-count cap here: colocated workers bin-pack and are
+	// intentionally unbounded (the DB-side global cap is exclusive-only and
+	// skips colocated too). `missing` is already bounded by this shape's warm
+	// target, and CreateNeutralWarmWorkerSlot enforces that target per shape,
+	// so the spawn loop self-limits without consulting p.maxWorkers.
 	p.mu.Unlock()
 
 	var slots []*configstore.WorkerRecord
@@ -2454,7 +2659,7 @@ func (p *K8sWorkerPool) triggerColocatedWarmReplenish(profile WorkerProfile) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
 		defer cancel()
 		if err := p.SpawnMinColocatedWorkers(ctx, profile, target); err != nil {
 			slog.Warn("Colocated warm replenish failed.", "cpu", profile.CPU, "memory", profile.Memory, "error", err)
@@ -2510,6 +2715,23 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						delete(failures, lease)
 						mu.Unlock()
 
+						removedWorker, workerCount, replacementID, shouldReplenish, err := p.removeWorkerAfterDrainedLease(lease, LifecycleOriginWorkerDrain)
+						if err != nil {
+							slog.Error("K8s worker terminated after draining but retire CAS failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+							return
+						}
+						if removedWorker != nil {
+							observeControlPlaneWorkers(workerCount)
+							slog.Info("K8s worker terminated after draining.", "id", lease.workerID)
+							if removedWorker.client != nil {
+								_ = removedWorker.client.Close()
+							}
+							if shouldReplenish {
+								p.spawnWarmWorkerBackground(replacementID, p.workerImage)
+							}
+							return
+						}
+
 						lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
 						if err != nil {
 							slog.Error("K8s worker terminated but lease validation failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
@@ -2535,7 +2757,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						}
 
 						p.mu.Lock()
-						removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerAfterLostLeaseLocked(lease)
+						removedWorker, workerCount, replacementID, shouldReplenish = p.removeWorkerAfterLostLeaseLocked(lease)
 						p.mu.Unlock()
 						if removedWorker == nil {
 							return
@@ -2656,6 +2878,10 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							mu.Lock()
 							delete(failures, lease)
 							mu.Unlock()
+
+							if hcResult != nil && hcResult.Draining {
+								p.markWorkerDrainingFromHealth(lease)
+							}
 
 							// Forward progress data to the control plane.
 							if onProgress != nil && hcResult != nil {
@@ -3106,6 +3332,27 @@ func (p *K8sWorkerPool) liveWorkerCountLocked() int {
 	return count
 }
 
+// liveExclusiveWorkerCountLocked counts only the live workers that consume the
+// exclusive worker-count budget: every non-colocated worker plus in-flight
+// background (default-shape) spawns. Colocated workers bin-pack and are
+// intentionally unbounded, so they must not be charged against the cap — this
+// mirrors the exclusive-only count used by the DB-side cap checks.
+func (p *K8sWorkerPool) liveExclusiveWorkerCountLocked() int {
+	count := p.spawning
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if w.profile.Colocate {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	var spawnIDs []int
 	removedAny := false
@@ -3118,21 +3365,58 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 			deletePod := true
 			if p.runtimeStore != nil {
 				lease := p.workerLeaseSnapshot(w)
-				// cleanDeadWorkersLocked sweeps for pods whose informer
-				// fired w.done — cluster-driven termination (eviction,
-				// OOM, manual delete), not our health-check decision.
-				lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
-				if err != nil {
-					slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
-						"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
-					continue
-				}
-				switch lostDisposition {
-				case workerLostLeaseStale:
+				if p.workerMatchesLease(w, lease) && w.SharedState().NormalizedLifecycle() == WorkerLifecycleDraining {
+					lc := p.ensureLifecycle()
+					if lc != nil {
+						outcome, err := lc.RetireDrained(
+							configstore.NewWorkerLease(lease.workerID, lease.ownerCPInstanceID, lease.ownerEpoch, lease.image),
+							RetireReasonNormal,
+							LifecycleOriginInformerCrash,
+						)
+						if err != nil {
+							slog.Warn("Clean dead worker: retire draining CAS failed; leaving cleanup to retry.",
+								"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+							continue
+						}
+						if !outcome.Transitioned {
+							record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+							if err != nil {
+								slog.Warn("Clean dead worker: retire draining verification failed; leaving cleanup to retry.",
+									"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+								continue
+							}
+							if record == nil || record.OwnerCPInstanceID != lease.ownerCPInstanceID ||
+								record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateRetired {
+								continue
+							}
+						}
+					}
+					p.markWorkerRetiredInMemoryLocked(w)
+					delete(p.workers, id)
+					removedWorker = w
 					deletePod = false
-					removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
-				case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
-					continue
+					if p.shouldReplenishWarmCapacityLocked() {
+						replacementID = p.allocateBackgroundSpawnIDLocked()
+						p.spawning++
+						shouldReplenish = true
+					}
+				} else {
+					// cleanDeadWorkersLocked sweeps for pods whose informer
+					// fired w.done — cluster-driven termination (eviction,
+					// OOM, manual delete), not our health-check decision.
+					lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
+					if err != nil {
+						slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
+							"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+						continue
+					}
+					switch lostDisposition {
+					case workerLostLeaseStale:
+						deletePod = false
+						removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
+					case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
+						continue
+					}
 				}
 			} else {
 				removedWorker, _, replacementID, shouldReplenish = p.removeWorkerLocked(id)
@@ -3349,6 +3633,123 @@ func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot, 
 		return false, err
 	}
 	return outcome.Transitioned, nil
+}
+
+func (p *K8sWorkerPool) markWorkerDrainingFromHealth(lease workerLeaseSnapshot) {
+	if lease.ownerCPInstanceID != p.cpInstanceID {
+		return
+	}
+	p.mu.Lock()
+	w, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(w, lease) {
+		p.mu.Unlock()
+		return
+	}
+	previous := w.SharedState()
+	switch previous.NormalizedLifecycle() {
+	case WorkerLifecycleDraining, WorkerLifecycleRetired:
+		p.mu.Unlock()
+		return
+	}
+	next, err := previous.Transition(WorkerLifecycleDraining, previous.Assignment)
+	if err != nil {
+		p.mu.Unlock()
+		slog.Warn("Worker reported draining but local lifecycle transition failed.",
+			"worker_id", lease.workerID, "state", previous.NormalizedLifecycle(), "error", err)
+		return
+	}
+	w.sharedState = next
+	p.mu.Unlock()
+
+	durableVerified := false
+	defer func() {
+		if durableVerified {
+			return
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		w, ok := p.workers[lease.workerID]
+		if !ok || !p.workerMatchesLease(w, lease) {
+			return
+		}
+		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleDraining {
+			w.sharedState = previous
+		}
+	}()
+
+	lc := p.ensureLifecycle()
+	if lc != nil {
+		outcome, err := lc.Drain(
+			configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
+			LifecycleOriginWorkerDrain,
+		)
+		if err != nil {
+			slog.Warn("Worker reported draining but durable drain CAS failed; keeping local worker schedulable until retry.",
+				"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+			return
+		}
+		if !outcome.Transitioned {
+			record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+			if err != nil {
+				slog.Warn("Worker reported draining but durable worker record could not be verified after CAS miss.",
+					"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+				return
+			}
+			if record == nil || record.OwnerCPInstanceID != p.cpInstanceID || record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateDraining {
+				return
+			}
+		}
+	}
+	durableVerified = true
+}
+
+func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot, origin LifecycleOrigin) (*ManagedWorker, int, int, bool, error) {
+	p.mu.RLock()
+	w, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(w, lease) || w.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
+		p.mu.RUnlock()
+		return nil, 0, 0, false, nil
+	}
+	p.mu.RUnlock()
+
+	lc := p.ensureLifecycle()
+	if lc != nil {
+		outcome, err := lc.RetireDrained(
+			configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
+			RetireReasonNormal,
+			origin,
+		)
+		if err != nil {
+			return nil, 0, 0, false, err
+		}
+		if !outcome.Transitioned {
+			record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+			if err != nil {
+				return nil, 0, 0, false, err
+			}
+			if record == nil || record.OwnerCPInstanceID != p.cpInstanceID || record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateRetired {
+				return nil, 0, 0, false, nil
+			}
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(current, lease) || current.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
+		return nil, 0, 0, false, nil
+	}
+	p.markWorkerRetiredInMemoryLocked(current)
+	delete(p.workers, current.ID)
+	workerCount := len(p.workers)
+	replacementID := 0
+	shouldReplenish := false
+	if p.shouldReplenishWarmCapacityLocked() {
+		replacementID = p.allocateBackgroundSpawnIDLocked()
+		p.spawning++
+		shouldReplenish = true
+	}
+	return current, workerCount, replacementID, shouldReplenish, nil
 }
 
 func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {
@@ -3653,6 +4054,7 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	record.ProfileCPU = worker.profile.CPU
 	record.ProfileMemory = worker.profile.Memory
 	record.ProfileColocate = worker.profile.Colocate
+	record.TTLMinutes = int(worker.profile.TTL.Minutes())
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
 	}

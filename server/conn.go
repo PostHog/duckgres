@@ -1091,6 +1091,22 @@ func (c *clientConn) serve() error {
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
+		// InitSessionDatabaseMetadata's defer only restores the catalog for
+		// DuckLake sessions; it otherwise leaves the session in `memory`. For an
+		// Iceberg session we must issue the USE ourselves, or current_database()
+		// reports 'iceberg' while unqualified DDL/DML silently lands in the
+		// ephemeral in-memory catalog. Mirror server.setIcebergDefault and the
+		// control plane's effectiveSessionDefaultCommand: target
+		// iceberg.<DefaultSchema> (not a bare `USE iceberg`) because DuckDB
+		// shadows `main` on a REST catalog.
+		if catalog == iceberg.CatalogName {
+			useStmt := fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
+			if _, err := c.executor.ExecContext(initCtx, useStmt); err != nil {
+				initCancel()
+				c.sendError("FATAL", "XX000", fmt.Sprintf("failed to set iceberg as default catalog: %v", err))
+				return err
+			}
+		}
 		initCancel()
 		// Keep c.database aligned with the real catalog so observability surfaces
 		// agree with current_database(); record the physical catalog so the
@@ -1743,8 +1759,11 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 }
 
 func (c *clientConn) loadIcebergColumnMetadata(ctx context.Context, query string) error {
+	if c == nil {
+		return nil
+	}
 	cfg := c.effectiveIcebergConfig()
-	if c == nil || !shouldLoadIcebergColumnMetadata(cfg, c.passthrough) {
+	if !shouldLoadIcebergColumnMetadata(cfg, c.physicalCatalog, c.passthrough) {
 		return nil
 	}
 	return icebergmeta.LoadColumns(ctx, c.executor, query, icebergmeta.Config{
@@ -1764,8 +1783,18 @@ func (c *clientConn) effectiveIcebergConfig() IcebergConfig {
 	return IcebergConfig{}
 }
 
-func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, passthrough bool) bool {
+// shouldLoadIcebergColumnMetadata reports whether a query should trigger the
+// on-demand Iceberg column-metadata load. physicalCatalog is the session's
+// resolved DuckDB catalog (set during session init, and via
+// SetConnectionPhysicalCatalog on the control plane). The metadata load issues
+// Lakekeeper REST calls and DELETE/INSERT against the shared
+// memory.main.__duckgres_iceberg_column_metadata table, so it must only run for
+// Iceberg sessions — otherwise a DuckLake session on a dual-catalog worker would
+// trigger cross-catalog REST I/O and churn shared state it can never read (the
+// compat views gate reads on current_database()='iceberg').
+func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, physicalCatalog string, passthrough bool) bool {
 	return !passthrough &&
+		physicalCatalog == iceberg.CatalogName &&
 		cfg.Enabled &&
 		cfg.ResolvedBackend() == iceberg.BackendLakekeeper &&
 		cfg.LakekeeperOAuth2ServerURI == ""
@@ -3442,7 +3471,7 @@ func shouldHandleCopyBeforeTranspile(query string) bool {
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
 	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s*(?:\(([^)]+)\)\s*)?FROM\s+STDIN`)
-	copyBinaryRegex     = regexp.MustCompile(`(?i)\bFORMAT\s+(?:"?binary"?|BINARY)\b`)
+	copyBinaryRegex     = regexp.MustCompile(`(?i)\b(?:STDIN|STDOUT)\b(?:[^;]*\bFORMAT\s+(?:"?binary"?|BINARY)\b|(?:\s+WITH)?\s+BINARY\b)`)
 	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)

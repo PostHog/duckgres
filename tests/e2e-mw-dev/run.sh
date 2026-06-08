@@ -14,7 +14,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTX="${KUBE_CONTEXT:?}"
-NS="${NAMESPACE:?}"
+# NAMESPACE is required by deploy|test|diagnostics|teardown but NOT by
+# e2e-cleanup (which discovers stale namespaces itself). Don't require it here.
+NS="${NAMESPACE:-}"
 KUBECTL=(kubectl --context "$CTX")
 EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-posthog-mw-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -112,9 +114,40 @@ drop_cnpg_role() { # org-id
     psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
 }
 
-cmd_deploy() {
-  # Clean slate for the cnpg org before anything provisions (see drop_cnpg_role).
+delete_ci_ducklings() { # pr-number
+  local pr="$1" org
+  for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
+    "${KUBECTL[@]}" -n ducklings delete "duckling/$org" --ignore-not-found --wait=false 2>/dev/null || true
+  done
+}
+
+wait_ci_ducklings_deleted() { # pr-number timeout
+  local pr="$1" timeout="$2" org
+  for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
+    "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout="$timeout" 2>/dev/null || true
+  done
+}
+
+delete_ci_bindings() { # pr-number
+  local pr="$1"
+  "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+  "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+}
+
+reset_pr_stack() {
+  # A cancelled or failed run can leave a namespace, config-store rows, and
+  # shared Duckling/Lakekeeper resources for this PR. Start from a clean slate
+  # so apply never reuses stale network policies, services, or tenant state.
+  delete_ci_ducklings "$PR_NUMBER"
+  wait_ci_ducklings_deleted "$PR_NUMBER" 300s
   drop_cnpg_role "ci-pr-${PR_NUMBER}-cnpg"
+  delete_pod_identity
+  delete_ci_bindings "$PR_NUMBER"
+  "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=300s
+}
+
+cmd_deploy() {
+  reset_pr_stack
 
   echo "::group::Apply manifests ($NS)"
   render | "${KUBECTL[@]}" apply -f -
@@ -202,7 +235,7 @@ cmd_diagnostics() {
 cmd_teardown() {
   # Deprovision the ci-pr ducklings FIRST so shared-infra resources (S3 bucket,
   # cnpg role+db, lakekeeper CR/secret/SA) are cleaned up by the control plane
-  # before we delete it. Best-effort — the namespace delete + janitor are the
+  # before we delete it. Best-effort — the namespace delete + e2e-cleanup are the
   # backstop. Uses the CP admin API via a short-lived port-forward.
   if "${KUBECTL[@]}" -n "$NS" get deploy/duckgres-control-plane >/dev/null 2>&1; then
     secret="$(cat "$internal_secret_file" 2>/dev/null || true)"
@@ -237,9 +270,8 @@ cmd_teardown() {
   # against a stranded cnpg role whose password has drifted -> the Lakekeeper
   # migrate Job hits SASL auth failure and the warehouse never goes ready.
   # `wait --for=delete` blocks until the CR (and its cascade) is gone.
-  for org in "ci-pr-${PR_NUMBER}-cnpg" "ci-pr-${PR_NUMBER}-ext"; do
-    "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout=300s 2>/dev/null || true
-  done
+  delete_ci_ducklings "$PR_NUMBER"
+  wait_ci_ducklings_deleted "$PR_NUMBER" 300s
 
   # Deterministically drop the cnpg role+db in case the composition's async
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
@@ -249,15 +281,48 @@ cmd_teardown() {
   delete_pod_identity
 
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
-  "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${PR_NUMBER}" --ignore-not-found
-  "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${PR_NUMBER}" --ignore-not-found
+  delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=false
 }
 
-case "${1:?usage: run.sh deploy|test|diagnostics|teardown}" in
-  deploy) cmd_deploy ;;
-  test) cmd_test ;;
-  diagnostics) cmd_diagnostics ;;
-  teardown) cmd_teardown ;;
+# Sweep stale per-PR namespaces left behind by runs that died hard (cancelled
+# mid-flight, runner OOM, etc.) before their always() teardown could fire.
+# Backstop, not the primary cleanup. Discovers namespaces by the
+# managed-by=e2e-mw-dev label and deletes any older than E2E_CLEANUP_MAX_AGE_HOURS
+# (default 6h — a real run finishes in <40m, so anything older is orphaned).
+# For each: delete its ducklings directly (drives the Crossplane teardown
+# without needing the now-gone per-run CP), drop the cnpg role+db, drop the Pod
+# Identity association, and sweep the ci-pr-labelled cross-ns bindings + the ns.
+# Named e2e-cleanup (not "janitor") to avoid colliding with duckgres's own
+# control-plane janitor. NAMESPACE is not required for this path.
+cmd_e2e_cleanup() {
+  local max_age_h now ns created age pr
+  max_age_h="${E2E_CLEANUP_MAX_AGE_HOURS:-6}"
+  now="$(date +%s)"
+  "${KUBECTL[@]}" get ns -l app.kubernetes.io/managed-by=e2e-mw-dev \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}' 2>/dev/null \
+  | while read -r ns created; do
+      [ -n "$ns" ] || continue
+      age=$(( (now - $(date -d "$created" +%s)) / 3600 ))
+      if [ "$age" -lt "$max_age_h" ]; then
+        echo "e2e-cleanup: keep $ns (age ${age}h < ${max_age_h}h)"; continue
+      fi
+      pr="${ns#duckgres-ci-pr-}"
+      echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
+      delete_ci_ducklings "$pr"
+      wait_ci_ducklings_deleted "$pr" 300s
+      drop_cnpg_role "ci-pr-${pr}-cnpg"
+      NS="$ns" delete_pod_identity
+      delete_ci_bindings "$pr"
+      "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false
+    done
+}
+
+case "${1:?usage: run.sh deploy|test|diagnostics|teardown|e2e-cleanup}" in
+  deploy) : "${NAMESPACE:?}"; cmd_deploy ;;
+  test) : "${NAMESPACE:?}"; cmd_test ;;
+  diagnostics) : "${NAMESPACE:?}"; cmd_diagnostics ;;
+  teardown) : "${NAMESPACE:?}"; cmd_teardown ;;
+  e2e-cleanup) cmd_e2e_cleanup ;;
   *) echo "unknown: $1" >&2; exit 2 ;;
 esac

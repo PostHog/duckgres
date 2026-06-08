@@ -202,18 +202,17 @@ func newTestRouter(store Store) *gin.Engine {
 	return r
 }
 
-// TestProvisionRejectsAurora locks in that DuckLake (aurora) is no longer
-// provisionable — even with a valid sizing block — now that cnpg-shard is the
-// only creatable backend. Existing DuckLake deployments are unaffected; this
-// only gates new creation.
-func TestProvisionAuroraDuckLake(t *testing.T) {
+// TestProvisionRejectsAurora locks in that the removed "aurora" metadata-store
+// backend is no longer provisionable — the only creatable backends are
+// cnpg-shard and external.
+func TestProvisionRejectsAurora(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestRouter(store)
 
 	body := []byte(`{
 		"database_name": "analytics-db",
-		"metadata_store": {"type": "aurora", "aurora": {"min_acu": 0.5, "max_acu": 2}},
+		"metadata_store": {"type": "aurora"},
 		"ducklake": {"enabled": true}
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
@@ -221,29 +220,11 @@ func TestProvisionAuroraDuckLake(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	w := store.warehouses["analytics"]
-	if w == nil || w.MetadataStore.Kind != configstore.MetadataStoreKindAurora {
-		t.Fatalf("expected aurora warehouse, got %+v", w)
-	}
-	if w.AuroraMaxACU != 2 || !w.DuckLake.Enabled || w.Iceberg.Enabled {
-		t.Errorf("expected aurora max_acu=2, ducklake on, iceberg off; got max=%v ducklake=%v iceberg=%v", w.AuroraMaxACU, w.DuckLake.Enabled, w.Iceberg.Enabled)
-	}
-}
-
-func TestProvisionAuroraRequiresSizing(t *testing.T) {
-	store := newFakeStore()
-	router := newTestRouter(store)
-	// aurora with a catalog but no max_acu → 400.
-	body := []byte(`{"database_name":"a-db","metadata_store":{"type":"aurora"},"ducklake":{"enabled":true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/aco/provision", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 400 (aurora removed): %s", rec.Code, rec.Body.String())
+	}
+	if store.warehouses["analytics"] != nil {
+		t.Fatal("aurora request must not create a warehouse")
 	}
 }
 
@@ -475,7 +456,7 @@ func TestGetWarehouseNotFound(t *testing.T) {
 
 func TestProvisionEnablesTrinoWhenRequested(t *testing.T) {
 	store := newFakeStore()
-	// Trino enable requires a numeric org id (posthog team_id).
+	// Org.Name is a DNS-1123 label; "42" is one valid (numeric) shape.
 	store.orgs["42"] = &configstore.Org{Name: "42"}
 	router := newTestRouter(store)
 
@@ -550,7 +531,11 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	}
 }
 
-func TestProvisionRejectsTrinoWithNonNumericOrgID(t *testing.T) {
+func TestProvisionEnablesTrinoWithNonNumericOrgID(t *testing.T) {
+	// Org names are DNS-1123 labels (e.g. "analytics", "ben-iceberg-cnpg"), not
+	// numeric team_ids. Trino opt-in must accept them — the catalog name is
+	// derived via injective sanitization (org_<sanitize(Name)>_iceberg), not
+	// assumed numeric.
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestRouter(store)
@@ -565,8 +550,11 @@ func TestProvisionRejectsTrinoWithNonNumericOrgID(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 with non-numeric org id: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d for non-numeric org id: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if row := store.trino["analytics"]; row == nil || !row.Enabled {
+		t.Fatalf("expected trino row Enabled=true for analytics; got %+v", row)
 	}
 }
 
@@ -590,12 +578,14 @@ func TestProvisionWithoutTrinoLeavesTrinoRowUnset(t *testing.T) {
 }
 
 func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
+	// A DNS-1123-named org (the real shape, e.g. "ben-iceberg-cnpg") — not a
+	// numeric team_id — opts into Trino via the standalone endpoint.
 	store := newFakeStore()
-	store.orgs["42"] = &configstore.Org{Name: "42"}
+	store.orgs["ben-iceberg-cnpg"] = &configstore.Org{Name: "ben-iceberg-cnpg"}
 	router := newTestRouter(store)
 
 	body := []byte(`{"enabled": true, "tier": "growth"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/42/trino", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-iceberg-cnpg/trino", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -603,24 +593,27 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	row := store.trino["42"]
+	row := store.trino["ben-iceberg-cnpg"]
 	if row == nil || !row.Enabled || row.Tier != "growth" {
 		t.Fatalf("expected trino row enabled with tier growth; got %+v", row)
 	}
 }
 
-func TestEnableTrinoRejectsNonNumericOrgID(t *testing.T) {
+func TestEnableTrinoRejectsInvalidOrgID(t *testing.T) {
+	// A non-numeric name is fine (DNS-1123); a name that is NOT a valid DNS-1123
+	// label (uppercase, underscore, punctuation) is rejected — the catalog/group
+	// sanitization's collision-freeness depends on the DNS-1123 charset.
 	store := newFakeStore()
 	router := newTestRouter(store)
 
 	body := []byte(`{"enabled": true}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/trino", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/Bad_Org/trino", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 with non-numeric org id: %s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 400 for invalid (non-DNS-1123) org id: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -695,7 +688,7 @@ func TestProvisionCnpgShard(t *testing.T) {
 	store.orgs["shardco"] = &configstore.Org{Name: "shardco"}
 	router := newTestRouter(store)
 
-	// No aurora block — cnpg-shard takes no sizing and auto-enables iceberg.
+	// cnpg-shard takes no sizing and auto-enables iceberg.
 	body := []byte(`{"database_name": "shardco-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/shardco/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -714,9 +707,6 @@ func TestProvisionCnpgShard(t *testing.T) {
 	}
 	if !w.Iceberg.Enabled || w.Iceberg.Backend != configstore.IcebergBackendLakekeeper {
 		t.Errorf("expected iceberg enabled with lakekeeper backend, got %+v", w.Iceberg)
-	}
-	if w.AuroraMaxACU != 0 {
-		t.Errorf("cnpg-shard must not set aurora sizing, got max_acu=%f", w.AuroraMaxACU)
 	}
 }
 

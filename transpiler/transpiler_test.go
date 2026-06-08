@@ -91,6 +91,23 @@ func TestTranspile_PgCatalog(t *testing.T) {
 			excludes: "pg_catalog",
 		},
 		{
+			name:     "pg_catalog.pg_tables -> memory.main.pg_tables",
+			input:    "SELECT * FROM pg_catalog.pg_tables",
+			contains: "memory.main.pg_tables",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "unqualified pg_views -> memory.main.pg_views",
+			input:    "SELECT * FROM pg_views",
+			contains: "memory.main.pg_views",
+		},
+		{
+			name:     "pg_catalog.pg_sequences -> memory.main.pg_sequences",
+			input:    "SELECT * FROM pg_catalog.pg_sequences",
+			contains: "memory.main.pg_sequences",
+			excludes: "pg_catalog",
+		},
+		{
 			name:     "pg_catalog.pg_statio_user_tables -> memory.main.pg_statio_user_tables",
 			input:    "SELECT * FROM pg_catalog.pg_statio_user_tables",
 			contains: "memory.main.pg_statio_user_tables",
@@ -433,7 +450,7 @@ func TestTranspile_CreateOrReplaceTable_LogicalCatalog(t *testing.T) {
 	// OR REPLACE for TABLE). Before the pre-parse interceptor this fell back
 	// to native and was forwarded raw, so the logical catalog name was never
 	// rewritten to the physical catalog — breaking multi-tenant dbt/SQLMesh
-	// table materializations with "Catalog \"portola\" does not exist".
+	// table materializations with "Catalog \"analytics\" does not exist".
 	tests := []struct {
 		name     string
 		input    string
@@ -442,37 +459,37 @@ func TestTranspile_CreateOrReplaceTable_LogicalCatalog(t *testing.T) {
 	}{
 		{
 			name:     "CTAS target and source both rewritten, OR REPLACE preserved",
-			input:    `CREATE OR REPLACE TABLE "portola"."core"."payment_events" AS SELECT * FROM "portola"."core"."raw_payments"`,
+			input:    `CREATE OR REPLACE TABLE "analytics"."core"."payment_events" AS SELECT * FROM "analytics"."core"."raw_payments"`,
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.payment_events", "ducklake.core.raw_payments"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 		{
 			name:     "public schema maps to main; OR REPLACE preserved",
-			input:    `CREATE OR REPLACE TABLE portola.public.t AS SELECT 1 AS x`,
+			input:    `CREATE OR REPLACE TABLE analytics.public.t AS SELECT 1 AS x`,
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.main.t"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 		{
 			name:     "multi-line AS SELECT body still rewritten",
-			input:    "CREATE OR REPLACE TABLE portola.core.t AS\nSELECT a\nFROM portola.core.src\nWHERE a > 0",
+			input:    "CREATE OR REPLACE TABLE analytics.core.t AS\nSELECT a\nFROM analytics.core.src\nWHERE a > 0",
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.t", "ducklake.core.src"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 		{
 			name:     "TEMP variant preserves OR REPLACE and TEMP",
-			input:    `CREATE OR REPLACE TEMP TABLE t AS SELECT * FROM portola.core.src`,
+			input:    `CREATE OR REPLACE TEMP TABLE t AS SELECT * FROM analytics.core.src`,
 			contains: []string{"OR REPLACE", "TEMP", "ducklake.core.src"},
-			excludes: "portola.core.src",
+			excludes: "analytics.core.src",
 		},
 		{
 			name:     "plain column-def form (no AS) rewrites target",
-			input:    `CREATE OR REPLACE TABLE portola.core.t (id INTEGER)`,
+			input:    `CREATE OR REPLACE TABLE analytics.core.t (id INTEGER)`,
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.t"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 	}
 
-	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "portola", PhysicalCatalogName: "ducklake"})
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "analytics", PhysicalCatalogName: "ducklake"})
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -498,8 +515,8 @@ func TestTranspile_CreateOrReplaceTable_LogicalCatalog(t *testing.T) {
 // CREATE OR REPLACE VIEW is valid PostgreSQL and must NOT be touched by the
 // CREATE OR REPLACE TABLE interceptor.
 func TestTranspile_CreateOrReplaceView_Unaffected(t *testing.T) {
-	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "portola", PhysicalCatalogName: "ducklake"})
-	result, err := tr.Transpile(`CREATE OR REPLACE VIEW portola.core.v AS SELECT * FROM portola.core.t`)
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "analytics", PhysicalCatalogName: "ducklake"})
+	result, err := tr.Transpile(`CREATE OR REPLACE VIEW analytics.core.v AS SELECT * FROM analytics.core.t`)
 	if err != nil {
 		t.Fatalf("Transpile error: %v", err)
 	}
@@ -509,8 +526,8 @@ func TestTranspile_CreateOrReplaceView_Unaffected(t *testing.T) {
 	if !strings.Contains(result.SQL, "ducklake.core.v") || !strings.Contains(result.SQL, "ducklake.core.t") {
 		t.Errorf("view logical catalog not rewritten: %q", result.SQL)
 	}
-	if strings.Contains(result.SQL, "portola") {
-		t.Errorf("portola should have been rewritten away: %q", result.SQL)
+	if strings.Contains(result.SQL, "analytics") {
+		t.Errorf("logical catalog should have been rewritten away: %q", result.SQL)
 	}
 }
 
@@ -4317,6 +4334,11 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			name:     "format_type gets memory.main prefix",
 			input:    "SELECT pg_catalog.format_type(atttypid, atttypmod) FROM pg_attribute",
 			contains: "memory.main.format_type",
+		},
+		{
+			name:     "array_lower gets memory.main prefix",
+			input:    "SELECT array_lower(conkey, 1) FROM pg_constraint",
+			contains: "memory.main.array_lower",
 		},
 	}
 

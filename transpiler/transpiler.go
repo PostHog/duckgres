@@ -335,6 +335,7 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_INDEX", "PG_CONSTRAINT", "PG_DATABASE", "PG_ROLES", "PG_STAT",
 		"PG_STATIO", "PG_COLLATION", "PG_POLICY", "PG_PUBLICATION",
 		"PG_INHERITS", "PG_MATVIEWS", "PG_ENUM", "PG_INDEXES",
+		"PG_TABLES", "PG_VIEWS", "PG_SEQUENCES",
 		"PG_ATTRDEF", "PG_AM", "PG_DESCRIPTION", "PG_DEPEND",
 		"PG_SHDESCRIPTION", "PG_PROC", "PG_EXTENSION",
 		"PG_AVAILABLE_EXTENSIONS", "PG_SETTINGS",
@@ -406,7 +407,7 @@ func Classify(sql string, cfg Config) Classification {
 	// PostgreSQL functions that need mapping
 	if containsAny(upper,
 		// Array functions
-		"ARRAY_AGG(", "ARRAY_LENGTH(", "ARRAY_UPPER(", "ARRAY_TO_STRING(",
+		"ARRAY_AGG(", "ARRAY_LENGTH(", "ARRAY_UPPER(", "ARRAY_LOWER(", "ARRAY_TO_STRING(",
 		"ARRAY_CAT(", "ARRAY_APPEND(", "ARRAY_PREPEND(", "ARRAY_REMOVE(", "ARRAY_POSITION(",
 		"STRING_TO_ARRAY(",
 		// String functions

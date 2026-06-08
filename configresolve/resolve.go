@@ -50,7 +50,6 @@ type CLIInputs struct {
 	DuckLakeDeltaCatalogPath           string
 	DuckLakeDefaultSpecVersion         string
 	IcebergEnabled                     bool
-	IcebergTableBucket                 string
 	IcebergRegion                      string
 	IcebergNamespace                   string
 	ProcessMinWorkers                  int
@@ -83,6 +82,7 @@ type CLIInputs struct {
 	K8sSharedWarmTarget                int
 	K8sDynamicWarmCapacityEnabled      bool
 	K8sWarmCapacityMissWindow          string
+	K8sWarmAcquireTimeout              string
 	K8sWarmCapacityMissesPerWorker     int
 	K8sWarmCapacityDemandTTL           string
 	K8sWarmCapacityDynamicImageCeiling int
@@ -119,6 +119,7 @@ type Resolved struct {
 	K8sSharedWarmTarget                int
 	K8sDynamicWarmCapacityEnabled      bool
 	K8sWarmCapacityMissWindow          time.Duration
+	K8sWarmAcquireTimeout              time.Duration
 	K8sWarmCapacityMissesPerWorker     int
 	K8sWarmCapacityDemandTTL           time.Duration
 	K8sWarmCapacityDynamicImageCeiling int
@@ -135,6 +136,11 @@ type Resolved struct {
 	K8sColocatedWorkerMemoryRequest    string
 	K8sColocatedWarmShapes             []controlplane.ColocatedWarmShape
 	K8sWorkerPriorityClassName         string
+	K8sHeadroomPercent                 int
+	K8sPlaceholderImage                string
+	K8sPlaceholderCPU                  string
+	K8sPlaceholderMemory               string
+	K8sPlaceholderPriorityClassName    string
 	K8sWorkerTiers                     map[string]controlplane.WorkerProfileSpec
 	K8sColocatedWorkerNodeSelector     string
 	K8sColocatedWorkerTolerationKey    string
@@ -222,6 +228,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sOrgMaxColocatedCPU int
 	var k8sOrgMaxColocatedMemory string
 	var k8sWorkerPriorityClassName string
+	var k8sHeadroomPercent int
+	var k8sPlaceholderImage, k8sPlaceholderCPU, k8sPlaceholderMemory, k8sPlaceholderPriorityClassName string
 	var k8sWorkerTiers map[string]controlplane.WorkerProfileSpec
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
@@ -230,6 +238,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sMaxWorkers, k8sSharedWarmTarget int
 	k8sDynamicWarmCapacityEnabled := true
 	k8sWarmCapacityMissWindow := controlplane.DefaultWarmCapacityMissWindow
+	k8sWarmAcquireTimeout := time.Duration(0)
 	k8sWarmCapacityMissesPerWorker := controlplane.DefaultWarmCapacityMissesPerWorker
 	k8sWarmCapacityDemandTTL := controlplane.DefaultWarmCapacityDemandTTL
 	var k8sWarmCapacityDynamicImageCeiling, k8sWarmCapacityDynamicTotalCeiling int
@@ -339,9 +348,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.Iceberg.Enabled != nil {
 			cfg.Iceberg.Enabled = *fileCfg.Iceberg.Enabled
-		}
-		if fileCfg.Iceberg.TableBucket != "" {
-			cfg.Iceberg.TableBucket = fileCfg.Iceberg.TableBucket
 		}
 		if fileCfg.Iceberg.Region != "" {
 			cfg.Iceberg.Region = fileCfg.Iceberg.Region
@@ -541,6 +547,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 				warn("Invalid k8s.warm_capacity_miss_window duration: " + err.Error())
 			}
 		}
+		if fileCfg.K8s.WarmAcquireTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.K8s.WarmAcquireTimeout); err == nil {
+				k8sWarmAcquireTimeout = d
+			} else {
+				warn("Invalid k8s.warm_acquire_timeout duration: " + err.Error())
+			}
+		}
 		if fileCfg.K8s.WarmCapacityMissesPerWorker != 0 {
 			k8sWarmCapacityMissesPerWorker = fileCfg.K8s.WarmCapacityMissesPerWorker
 		}
@@ -636,9 +649,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		} else {
 			warn("Invalid DUCKGRES_ICEBERG_ENABLED: " + err.Error())
 		}
-	}
-	if v := getenv("DUCKGRES_ICEBERG_TABLE_BUCKET"); v != "" {
-		cfg.Iceberg.TableBucket = v
 	}
 	if v := getenv("DUCKGRES_ICEBERG_REGION"); v != "" {
 		cfg.Iceberg.Region = v
@@ -900,6 +910,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			k8sWarmAcquireTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			k8sWarmCapacityMissesPerWorker = n
@@ -1011,6 +1028,23 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
 		k8sWorkerPriorityClassName = v
+	}
+	if v := getenv("DUCKGRES_K8S_HEADROOM_PERCENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sHeadroomPercent = n
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_IMAGE"); v != "" {
+		k8sPlaceholderImage = v
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_CPU"); v != "" {
+		k8sPlaceholderCPU = v
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_MEMORY"); v != "" {
+		k8sPlaceholderMemory = v
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_PRIORITY_CLASS"); v != "" {
+		k8sPlaceholderPriorityClassName = v
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_TIERS"); v != "" {
 		var tiers map[string]controlplane.WorkerProfileSpec
@@ -1149,9 +1183,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cli.Set["iceberg-enabled"] {
 		cfg.Iceberg.Enabled = cli.IcebergEnabled
 	}
-	if cli.Set["iceberg-table-bucket"] {
-		cfg.Iceberg.TableBucket = cli.IcebergTableBucket
-	}
 	if cli.Set["iceberg-region"] {
 		cfg.Iceberg.Region = cli.IcebergRegion
 	}
@@ -1278,6 +1309,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid --k8s-warm-capacity-miss-window duration: " + err.Error())
 		}
 	}
+	if cli.Set["k8s-warm-acquire-timeout"] {
+		if d, err := time.ParseDuration(cli.K8sWarmAcquireTimeout); err == nil {
+			k8sWarmAcquireTimeout = d
+		} else {
+			warn("Invalid --k8s-warm-acquire-timeout duration: " + err.Error())
+		}
+	}
 	if cli.Set["k8s-warm-capacity-misses-per-worker"] {
 		k8sWarmCapacityMissesPerWorker = cli.K8sWarmCapacityMissesPerWorker
 	}
@@ -1402,6 +1440,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sSharedWarmTarget:                k8sSharedWarmTarget,
 		K8sDynamicWarmCapacityEnabled:      k8sDynamicWarmCapacityEnabled,
 		K8sWarmCapacityMissWindow:          k8sWarmCapacityMissWindow,
+		K8sWarmAcquireTimeout:              k8sWarmAcquireTimeout,
 		K8sWarmCapacityMissesPerWorker:     k8sWarmCapacityMissesPerWorker,
 		K8sWarmCapacityDemandTTL:           k8sWarmCapacityDemandTTL,
 		K8sWarmCapacityDynamicImageCeiling: k8sWarmCapacityDynamicImageCeiling,
@@ -1418,6 +1457,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sColocatedWorkerMemoryRequest:    k8sColocatedWorkerMemoryRequest,
 		K8sColocatedWarmShapes:             k8sColocatedWarmShapes,
 		K8sWorkerPriorityClassName:         k8sWorkerPriorityClassName,
+		K8sHeadroomPercent:                 k8sHeadroomPercent,
+		K8sPlaceholderImage:                k8sPlaceholderImage,
+		K8sPlaceholderCPU:                  k8sPlaceholderCPU,
+		K8sPlaceholderMemory:               k8sPlaceholderMemory,
+		K8sPlaceholderPriorityClassName:    k8sPlaceholderPriorityClassName,
 		K8sWorkerTiers:                     k8sWorkerTiers,
 		K8sColocatedWorkerNodeSelector:     k8sColocatedWorkerNodeSelector,
 		K8sColocatedWorkerTolerationKey:    k8sColocatedWorkerTolerationKey,

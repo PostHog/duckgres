@@ -15,6 +15,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1045,6 +1046,20 @@ func TestK8sPool_SpawnWorker_ColocatedSkipsCacheProxyEnv(t *testing.T) {
 	}
 }
 
+// A warm-pool reconcile spawn does the same waitForPodReady as any spawn, so its
+// context deadline must outlast workerPodReadyTimeout — otherwise a cold spawn
+// (fresh Karpenter node, e.g. an exclusive 46/360 worker on a dedicated large
+// instance) is cancelled before its node can provision. When that happened the
+// default/exclusive warm pool sat empty after a CP restart, churning
+// "context deadline exceeded", while only the small/fast colocated shapes refilled.
+func TestWarmSpawnTimeoutExceedsPodReady(t *testing.T) {
+	if warmSpawnReconcileTimeout <= workerPodReadyTimeout {
+		t.Fatalf("warmSpawnReconcileTimeout (%s) must exceed workerPodReadyTimeout (%s); "+
+			"a shorter warm deadline cancels cold spawns before their node provisions",
+			warmSpawnReconcileTimeout, workerPodReadyTimeout)
+	}
+}
+
 func TestK8sPool_WorkerLookup(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
@@ -1281,6 +1296,33 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	}
 }
 
+func TestK8sPoolReserveSharedWorkerSkipsDrainingIdleWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 2)
+	draining := &ManagedWorker{ID: 1, done: make(chan struct{})}
+	if err := draining.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleIdle}); err != nil {
+		t.Fatalf("SetSharedState(draining): %v", err)
+	}
+	pool.workers[draining.ID] = draining
+
+	pool.healthCheckFunc = func(context.Context, *ManagedWorker) error {
+		return validateReservedWorkerHealth(&healthCheckResult{Healthy: true, Draining: true})
+	}
+
+	got, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion after draining worker, got worker=%#v err=%v", got, err)
+	}
+	if got != nil {
+		t.Fatalf("expected no worker on draining reservation, got %d", got.ID)
+	}
+	if _, ok := pool.Worker(draining.ID); ok {
+		t.Fatal("expected draining worker to be retired from the pool")
+	}
+}
+
 func TestK8sPool_CleanDeadWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
@@ -1343,6 +1385,38 @@ func TestK8sPool_LiveWorkerCount(t *testing.T) {
 	count := pool.liveWorkerCountLocked()
 	if count != 3 { // 2 alive + 1 spawning
 		t.Fatalf("expected 3 live workers, got %d", count)
+	}
+}
+
+// TestK8sPool_LiveExclusiveWorkerCount confirms the exclusive-only live count
+// excludes colocated workers (which are unbounded) while still counting
+// in-flight default-shape background spawns. This is the count the exclusive
+// worker-count cap is charged against.
+func TestK8sPool_LiveExclusiveWorkerCount(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	alive := make(chan struct{})
+	dead := make(chan struct{})
+	close(dead)
+
+	excl := &ManagedWorker{ID: 1, done: alive}
+	colo := &ManagedWorker{ID: 2, done: alive}
+	colo.profile = WorkerProfile{CPU: "8", Memory: "48Gi", Colocate: true}
+	deadColo := &ManagedWorker{ID: 3, done: dead}
+	deadColo.profile = WorkerProfile{Colocate: true}
+
+	pool.workers[1] = excl
+	pool.workers[2] = colo
+	pool.workers[3] = deadColo
+	pool.spawning = 2 // in-flight default-shape (exclusive) spawns
+
+	// liveWorkerCountLocked counts everything alive + spawning: 1 excl + 1 colo + 2 spawning = 4
+	if got := pool.liveWorkerCountLocked(); got != 4 {
+		t.Fatalf("liveWorkerCountLocked: expected 4, got %d", got)
+	}
+	// Exclusive-only: 1 excl + 2 spawning, colocated excluded = 3
+	if got := pool.liveExclusiveWorkerCountLocked(); got != 3 {
+		t.Fatalf("liveExclusiveWorkerCountLocked: expected 3 (colocated excluded), got %d", got)
 	}
 }
 
@@ -1743,7 +1817,7 @@ func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRunt
 	}
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:      "portola",
+		OrgID:      "tenant-alpha",
 		Image:      pinnedImage,
 		MaxWorkers: 2,
 	})
@@ -3126,6 +3200,151 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 	}
 }
 
+func TestK8sPoolHealthCheckLoopMarksDrainingWorkerUnschedulable(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateIdle,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleIdle}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	origHealthCheck := doHealthCheckWithMetadata
+	doHealthCheckWithMetadata = func(context.Context, *flightsql.Client, server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+		return &healthCheckResult{Healthy: true, Draining: true}, nil
+	}
+	t.Cleanup(func() { doHealthCheckWithMetadata = origHealthCheck })
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	deadline := time.After(time.Second)
+	for {
+		pool.mu.RLock()
+		state := worker.SharedState().NormalizedLifecycle()
+		schedulable := pool.isGenericSessionSchedulableWorkerLocked(worker)
+		pool.mu.RUnlock()
+		if state == WorkerLifecycleDraining {
+			if schedulable {
+				t.Fatal("draining worker must not remain schedulable")
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected draining health response to mark worker draining, got %q", state)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("draining worker must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	store.mu.Lock()
+	markLostCalls := store.markLostCalls
+	markDrainingCalls := store.markDrainingCalls
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markLostCalls != 0 {
+		t.Fatalf("draining worker must not be marked lost, got %d lost calls", markLostCalls)
+	}
+	if markDrainingCalls != 1 {
+		t.Fatalf("expected one draining CAS, got %d", markDrainingCalls)
+	}
+	if recordState != configstore.WorkerStateDraining {
+		t.Fatalf("expected durable worker state draining, got %q", recordState)
+	}
+}
+
+func TestK8sPoolHealthCheckLoopRetiresDrainingWorkerAfterPodExit(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "test-cp-worker-8",
+				State:             configstore.WorkerStateDraining,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining}); err != nil {
+		t.Fatalf("set worker state: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+	close(worker.done)
+
+	deadline := time.After(time.Second)
+	for {
+		pool.mu.RLock()
+		_, stillPresent := pool.workers[worker.ID]
+		pool.mu.RUnlock()
+		if !stillPresent {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected drained pod exit to remove local worker")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("drained pod exit must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	store.mu.Lock()
+	markLostCalls := store.markLostCalls
+	retireDrainingCalls := store.retireDrainingCalls
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markLostCalls != 0 {
+		t.Fatalf("drained pod exit must not mark worker lost, got %d lost calls", markLostCalls)
+	}
+	if retireDrainingCalls != 1 {
+		t.Fatalf("expected one retire-draining CAS, got %d", retireDrainingCalls)
+	}
+	if recordState != configstore.WorkerStateRetired {
+		t.Fatalf("expected durable worker state retired, got %q", recordState)
+	}
+}
+
 func TestK8sPoolMarkWorkerLostIfCurrentLeaseAllowsUnstampedLocalWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{
@@ -3309,6 +3528,55 @@ func TestK8sPoolCleanDeadWorkersLeavesCurrentRuntimeLeaseForHealthLoop(t *testin
 	}
 	if records := store.snapshot(); len(records) != 0 {
 		t.Fatalf("current runtime lease clean-dead path must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolCleanDeadWorkersRetiresDrainingWorkerAfterPodExit(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			16: {
+				WorkerID:          16,
+				PodName:           "test-cp-worker-16",
+				State:             configstore.WorkerStateDraining,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	done := make(chan struct{})
+	close(done)
+	worker := &ManagedWorker{ID: 16, done: done}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-16", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.16"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	pool.cleanDeadWorkersLocked()
+
+	if _, ok := pool.workers[worker.ID]; ok {
+		t.Fatal("cleanDeadWorkersLocked should remove exited draining worker")
+	}
+	if store.retireDrainingCalls != 1 {
+		t.Fatalf("expected one retire-draining CAS, got %d", store.retireDrainingCalls)
+	}
+	store.mu.Lock()
+	recordState := store.preloadedRecords[worker.ID].State
+	recordReason := store.preloadedRecords[worker.ID].RetireReason
+	store.mu.Unlock()
+	if recordState != configstore.WorkerStateRetired || recordReason != RetireReasonNormal {
+		t.Fatalf("expected draining worker to retire normally, got state=%q reason=%q", recordState, recordReason)
 	}
 }
 
@@ -3505,6 +3773,9 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
 		t.Fatal("expected automountServiceAccountToken=false for shared warm worker pods")
 	}
+	if pod.Spec.TerminationGracePeriodSeconds == nil || *pod.Spec.TerminationGracePeriodSeconds != workerTerminationGracePeriodSeconds {
+		t.Fatalf("expected terminationGracePeriodSeconds=%d, got %v", workerTerminationGracePeriodSeconds, pod.Spec.TerminationGracePeriodSeconds)
+	}
 
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
 		t.Fatal("expected runAsNonRoot=true")
@@ -3522,6 +3793,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	foundSharedWarmWorkerEnv := false
 	foundTLSCertEnv := false
 	foundTLSKeyEnv := false
+	foundMaxSessionsEnv := false
 	for _, env := range c.Env {
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
@@ -3537,6 +3809,9 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 		if env.Name == "DUCKGRES_KEY" && env.Value == "/etc/duckgres/worker-rpc/tls.key" {
 			foundTLSKeyEnv = true
 		}
+		if env.Name == "DUCKGRES_DUCKDB_MAX_SESSIONS" && env.Value == "1" {
+			foundMaxSessionsEnv = true
+		}
 	}
 	if !foundEnv {
 		t.Fatal("bearer token env var not found or incorrect")
@@ -3546,6 +3821,9 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	}
 	if !foundTLSCertEnv || !foundTLSKeyEnv {
 		t.Fatal("expected worker RPC TLS env vars to be present")
+	}
+	if !foundMaxSessionsEnv {
+		t.Fatal("expected DUCKGRES_DUCKDB_MAX_SESSIONS=1 (one query session per worker)")
 	}
 
 	if len(pod.Spec.Volumes) == 0 {

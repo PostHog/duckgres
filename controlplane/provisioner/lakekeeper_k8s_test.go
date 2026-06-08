@@ -225,6 +225,86 @@ func TestEnsureCR_CreateAndShape(t *testing.T) {
 	if pg["host"] != spec.PGHost || pg["database"] != spec.PGDatabase {
 		t.Errorf("pg host/db = %v/%v, want %s/%s", pg["host"], pg["database"], spec.PGHost, spec.PGDatabase)
 	}
+	// Resources are requests-only (no limits → Burstable).
+	res := specMap["resources"].(map[string]interface{})
+	reqs := res["requests"].(map[string]interface{})
+	if reqs["cpu"] != lakekeeperPodCPU || reqs["memory"] != lakekeeperPodMemory {
+		t.Errorf("requests cpu/mem = %v/%v, want %s/%s", reqs["cpu"], reqs["memory"], lakekeeperPodCPU, lakekeeperPodMemory)
+	}
+	if _, hasLimits := res["limits"]; hasLimits {
+		t.Errorf("resources.limits set, want none (requests-only): %v", res["limits"])
+	}
+	// Two replicas.
+	if specMap["replicas"] != int64(lakekeeperPodReplicas) {
+		t.Errorf("replicas = %v, want %d", specMap["replicas"], lakekeeperPodReplicas)
+	}
+	// Prometheus scrape annotations are stamped onto the pod via podMetadata.
+	ann := specMap["podMetadata"].(map[string]interface{})["annotations"].(map[string]interface{})
+	if ann["prometheus.io/scrape"] != "true" {
+		t.Errorf("prometheus.io/scrape = %v, want true", ann["prometheus.io/scrape"])
+	}
+	if ann["prometheus.io/port"] != lakekeeperMetricsPort {
+		t.Errorf("prometheus.io/port = %v, want %s", ann["prometheus.io/port"], lakekeeperMetricsPort)
+	}
+	if ann["prometheus.io/path"] != "/metrics" {
+		t.Errorf("prometheus.io/path = %v, want /metrics", ann["prometheus.io/path"])
+	}
+}
+
+func TestPatchPodShape_LabelMatchedStripsLimits(t *testing.T) {
+	c, dc, _ := newFakeLakekeeperClient()
+	ctx := context.Background()
+	// Two CRs for one org under different names (legacy de-hyphenated + new
+	// hyphenated), both label-tagged; the first carries a stale limits block.
+	names := []string{"lakekeeper-acme", "lakekeeper-a-c-m-e"}
+	for i, name := range names {
+		spec := map[string]interface{}{"replicas": int64(1)}
+		if i == 0 {
+			spec["resources"] = map[string]interface{}{
+				"limits":   map[string]interface{}{"cpu": "250m", "memory": "256Mi"},
+				"requests": map[string]interface{}{"cpu": "250m", "memory": "256Mi"},
+			}
+		}
+		cr := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "lakekeeper.k8s.lakekeeper.io/v1alpha1",
+			"kind":       "Lakekeeper",
+			"metadata": map[string]interface{}{
+				"name":      name,
+				"namespace": "lakekeeper",
+				"labels":    map[string]interface{}{"duckgres/active-org": "acme"},
+			},
+			"spec": spec,
+		}}
+		if _, err := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Create(ctx, cr, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+
+	if err := c.PatchPodShape(ctx, "acme"); err != nil {
+		t.Fatalf("PatchPodShape: %v", err)
+	}
+
+	for _, name := range names {
+		got, err := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		spec := got.Object["spec"].(map[string]interface{})
+		if rv := spec["replicas"]; rv != int64(lakekeeperPodReplicas) && rv != float64(lakekeeperPodReplicas) {
+			t.Errorf("%s replicas = %v, want %d", name, rv, lakekeeperPodReplicas)
+		}
+		res := spec["resources"].(map[string]interface{})
+		if _, ok := res["limits"]; ok {
+			t.Errorf("%s resources.limits still present after patch: %v", name, res["limits"])
+		}
+		if res["requests"].(map[string]interface{})["cpu"] != lakekeeperPodCPU {
+			t.Errorf("%s requests.cpu = %v, want %s", name, res["requests"], lakekeeperPodCPU)
+		}
+		ann := spec["podMetadata"].(map[string]interface{})["annotations"].(map[string]interface{})
+		if ann["prometheus.io/scrape"] != "true" {
+			t.Errorf("%s scrape annotation not applied: %v", name, ann)
+		}
+	}
 }
 
 func TestEnsureCR_KubernetesAuthOff_OmitsAuthenticationBlock(t *testing.T) {

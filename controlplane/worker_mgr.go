@@ -26,25 +26,25 @@ import (
 
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
-	ID                      int
-	podName                 string
-	nodeName                string //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
-	image                   string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
-	profile                 WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
-	cmd                     *exec.Cmd
-	socketPath              string
-	bearerToken             string
-	client                  *flightsql.Client
-	parentListener          net.Listener    // CP-side listener; lifecycle managed by releaseSocket
-	prebound                *preboundSocket // non-nil if using a pre-bound socket slot
-	releaseOnce             sync.Once       // ensures releaseWorkerSocket body runs exactly once
-	done                    chan struct{}   // closed when process exits
-	exitErr                 error
-	activeSessions          int       // Number of sessions currently assigned to this worker
-	lastUsed                time.Time // Last time a session was destroyed on this worker
-	sharedState             SharedWorkerState
-	reservedAt              time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
-	peakSessions            int       // High-water mark of concurrent sessions (for retirement metrics)
+	ID             int
+	podName        string
+	nodeName       string        //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
+	image          string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
+	profile        WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
+	cmd            *exec.Cmd
+	socketPath     string
+	bearerToken    string
+	client         *flightsql.Client
+	parentListener net.Listener    // CP-side listener; lifecycle managed by releaseSocket
+	prebound       *preboundSocket // non-nil if using a pre-bound socket slot
+	releaseOnce    sync.Once       // ensures releaseWorkerSocket body runs exactly once
+	done           chan struct{}   // closed when process exits
+	exitErr        error
+	activeSessions int       // Number of sessions currently assigned to this worker
+	lastUsed       time.Time // Last time a session was destroyed on this worker
+	sharedState    SharedWorkerState
+	reservedAt     time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
+	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
 	// ownerEpoch is guarded by epochMu so cred-refresh's
 	// "RefreshLease then SetOwnerEpoch" sequence appears atomic to
 	// concurrent readers (notably ShutdownAll's lease minting).
@@ -551,6 +551,8 @@ type sessionProgressJSON struct {
 // healthCheckResult is the parsed health check response from a worker.
 type healthCheckResult struct {
 	Healthy         bool                            `json:"healthy"`
+	Draining        bool                            `json:"draining"`
+	ActiveQueries   int                             `json:"active_queries"`
 	SessionProgress map[string]*sessionProgressJSON `json:"session_progress"`
 }
 
@@ -579,7 +581,9 @@ func doHealthCheck(ctx context.Context, client *flightsql.Client) (*healthCheckR
 	return doHealthCheckWithMetadata(ctx, client, server.WorkerHealthCheckPayload{})
 }
 
-func doHealthCheckWithMetadata(ctx context.Context, client *flightsql.Client, payload server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+var doHealthCheckWithMetadata = doHealthCheckWithMetadataImpl
+
+func doHealthCheckWithMetadataImpl(ctx context.Context, client *flightsql.Client, payload server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
 	body, _ := json.Marshal(payload)
 
 	// Use the underlying flight client for custom actions.

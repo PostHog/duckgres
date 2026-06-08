@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -31,6 +33,95 @@ func isValidOrgIDLabel(orgID string) bool {
 // instances live. The lakekeeper-operator and its CRD watch every namespace
 // by default but we co-locate the CRs to keep RBAC tight.
 const LakekeeperNamespace = "lakekeeper"
+
+// Per-org Lakekeeper pod resource shape. Requests only (no limits) → Burstable
+// QoS: a CPU limit would CFS-throttle the catalog, and we intentionally leave
+// memory unbounded too. Lakekeeper is a light Rust REST catalog (mostly idle
+// metadata ops), so a modest request floor is plenty; bump if a tenant needs
+// more headroom.
+const (
+	lakekeeperPodCPU      = "500m"
+	lakekeeperPodMemory   = "512Mi"
+	lakekeeperPodReplicas = 2
+)
+
+// lakekeeperMetricsPort is the operator's default metrics container port
+// (lakekeeper-operator getMetricsPort default). We don't set
+// spec.server.metricsPort, so this is where the metrics endpoint listens and
+// the value advertised to vmagent via the prometheus.io/port pod annotation.
+const lakekeeperMetricsPort = "9000"
+
+// lakekeeperResourceRequests returns the CR spec.resources block: requests only,
+// no limits (Burstable). Shared by EnsureCR (create) and PatchPodShape (drift)
+// so the create and drift paths never diverge.
+func lakekeeperResourceRequests() map[string]interface{} {
+	return map[string]interface{}{
+		"requests": map[string]interface{}{
+			"cpu":    lakekeeperPodCPU,
+			"memory": lakekeeperPodMemory,
+		},
+	}
+}
+
+// lakekeeperPodMetadata returns the CR spec.podMetadata block carrying the
+// Prometheus scrape annotations (see EnsureCR for the rationale).
+func lakekeeperPodMetadata() map[string]interface{} {
+	return map[string]interface{}{
+		"annotations": map[string]interface{}{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   lakekeeperMetricsPort,
+			"prometheus.io/path":   "/metrics",
+		},
+	}
+}
+
+// PatchPodShape converges the pod-shape fields (replicas + resource requests +
+// scrape annotations) onto every existing Lakekeeper CR for the org, matched by
+// the duckgres/active-org label.
+//
+// It deliberately does NOT recompute the CR name from the orgID. Post-#632,
+// LakekeeperResourceName preserves hyphens, but a legacy org's CR — and its
+// Secret, ServiceAccount, and EKS pod-identity, all derived from the no-hyphen
+// Duckling XR name — keeps the de-hyphenated name. Looking up by label patches
+// whatever name actually exists (no-dash for legacy orgs, hyphenated for new
+// ones) instead of minting a duplicate CR under a name that has no matching
+// Secret/SA/pod-identity.
+//
+// Uses a JSON merge patch, which carries no resourceVersion, so it never races
+// the operator's frequent status writes (the "object has been modified"
+// conflicts seen under multiple control-plane replicas). limits is explicitly
+// nulled so the patch strips any stale CPU/memory limit (requests-only shape).
+func (c *LakekeeperK8sClient) PatchPodShape(ctx context.Context, orgID string) error {
+	if !isValidOrgIDLabel(orgID) {
+		return fmt.Errorf("PatchPodShape: orgID %q is not a valid K8s label value", orgID)
+	}
+	resource := c.dynamic.Resource(lakekeeperGVR).Namespace(c.namespace)
+	list, err := resource.List(ctx, metav1.ListOptions{
+		LabelSelector: "duckgres/active-org=" + orgID,
+	})
+	if err != nil {
+		return fmt.Errorf("list lakekeeper CRs for org %s: %w", orgID, err)
+	}
+	resources := lakekeeperResourceRequests()
+	resources["limits"] = nil // merge-patch removes any pre-existing limit block
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"replicas":    lakekeeperPodReplicas,
+			"resources":   resources,
+			"podMetadata": lakekeeperPodMetadata(),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal pod-shape patch: %w", err)
+	}
+	for i := range list.Items {
+		name := list.Items[i].GetName()
+		if _, err := resource.Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("patch lakekeeper CR %s pod shape: %w", name, err)
+		}
+	}
+	return nil
+}
 
 // lakekeeperGVR matches the operator at /Users/james/opt/ph/lakekeeper-operator.
 var lakekeeperGVR = schema.GroupVersionResource{
@@ -199,7 +290,7 @@ func (c *LakekeeperK8sClient) EnsureServiceAccount(ctx context.Context, orgID st
 
 // LakekeeperCRSpec carries the inputs we need to render a Lakekeeper CR.
 // One CR per org. PG connection points at the org's existing managed-warehouse
-// Aurora cluster, with the lakekeeper_<orgid> database created by
+// metadata Postgres, with the lakekeeper_<orgid> database created by
 // EnsureDatabase.
 type LakekeeperCRSpec struct {
 	OrgID      string
@@ -251,7 +342,7 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 		return fmt.Errorf("EnsureCR: missing required field in spec: %+v", spec)
 	}
 	if spec.Replicas == 0 {
-		spec.Replicas = 1
+		spec.Replicas = lakekeeperPodReplicas
 	}
 	if spec.PGPort == 0 {
 		spec.PGPort = 5432
@@ -327,6 +418,25 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 						},
 					},
 				},
+				// Pin a resource request floor (requests only, no limits →
+				// Burstable). Without it the catalog pod runs BestEffort and is
+				// first evicted under node pressure; a CPU limit would CFS-throttle
+				// it. Lakekeeper is a light Rust REST catalog, so a modest floor is
+				// plenty — tune the consts if a tenant needs more. Kept in sync with
+				// the drift-correction patch in PatchPodShape.
+				"resources": lakekeeperResourceRequests(),
+				// Stamp Prometheus scrape annotations onto the operator-managed
+				// pods. The managed-warehouse clusters have no prometheus-operator;
+				// vmagent discovers targets by pod annotation (kubernetes_sd), and
+				// the Lakekeeper CRD exposes no other pod-metadata hook — so without
+				// this the per-org catalog pods are never scraped. Lakekeeper serves
+				// metrics on the operator's "metrics" container port (its
+				// getMetricsPort default = lakekeeperMetricsPort). Requires the
+				// spec.podMetadata passthrough from PostHog's operator fork (branch
+				// posthog/serviceaccountname); on an operator without it the CRD
+				// prunes the field and these annotations are dropped — a safe no-op
+				// until the new operator image ships.
+				"podMetadata": lakekeeperPodMetadata(),
 			},
 		},
 	}

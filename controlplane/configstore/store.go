@@ -134,10 +134,6 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	if err := migrateDeltaCatalogDefaultEnabled(db); err != nil {
 		return nil, fmt.Errorf("migrate delta catalog default: %w", err)
 	}
-	if err := migrateIcebergBackendBackfill(db); err != nil {
-		return nil, fmt.Errorf("migrate iceberg backend backfill: %w", err)
-	}
-
 	runtimeSchema, err := resolveRuntimeSchema(db)
 	if err != nil {
 		return nil, fmt.Errorf("resolve runtime schema: %w", err)
@@ -871,53 +867,6 @@ func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
 	})
 }
 
-// migrateIcebergBackendBackfill stamps iceberg_backend = 's3_tables' on any
-// existing row whose iceberg_table_bucket_arn is populated but whose
-// iceberg_backend is empty. Without this, ResolvedBackend() on those rows
-// would return "lakekeeper" (the empty-default semantics) and the worker
-// activator + controller reconcile loop would treat them as Lakekeeper
-// orgs — silently breaking S3 Tables ATTACH AND firing redundant
-// Lakekeeper provisioning attempts.
-//
-// New rows inserted after the GORM `default:'lakekeeper'` migration get
-// the default at insert time, so this migration only matters for rows
-// that predate the column. One-shot, tracked in duckgres_schema_migrations.
-const icebergBackendBackfillMigrationName = "2026_05_iceberg_backend_backfill"
-
-func migrateIcebergBackendBackfill(db *gorm.DB) error {
-	var existing SchemaMigration
-	err := db.Where("name = ?", icebergBackendBackfillMigrationName).First(&existing).Error
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return fmt.Errorf("check schema migration: %w", err)
-	}
-	return db.Transaction(func(tx *gorm.DB) error {
-		// Backfill rows that have a populated S3 Tables ARN but no
-		// explicit backend — these are pre-feature rows whose semantics
-		// would change without this stamp.
-		res := tx.Exec(
-			`UPDATE duckgres_managed_warehouses
-			   SET iceberg_backend = 's3_tables'
-			 WHERE COALESCE(iceberg_table_bucket_arn, '') <> ''
-			   AND COALESCE(iceberg_backend, '') = ''`,
-		)
-		if res.Error != nil {
-			return fmt.Errorf("backfill iceberg_backend: %w", res.Error)
-		}
-		if err := tx.Create(&SchemaMigration{
-			Name:      icebergBackendBackfillMigrationName,
-			AppliedAt: time.Now().UTC(),
-		}).Error; err != nil {
-			return fmt.Errorf("record schema migration: %w", err)
-		}
-		slog.Info("Backfilled iceberg_backend=s3_tables on pre-Lakekeeper rows.",
-			"rows", res.RowsAffected)
-		return nil
-	})
-}
-
 func migrateOrgUserPK(db *gorm.DB) error {
 	// Check if the PK already has 2 columns (idempotent)
 	var count int64
@@ -1173,8 +1122,13 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	protectedStates := []WorkerState{WorkerStateDraining, WorkerStateRetired, WorkerStateLost}
 	result := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "worker_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at"}),
+		Columns: []clause.Column{{Name: "worker_id"}},
+		// profile_cpu/memory/colocate + ttl_minutes are in the update set so a
+		// sized worker's shape (set after CreateSpawningWorkerSlot inserts the row
+		// with an empty profile) actually persists. Without them the ON CONFLICT
+		// update silently dropped the profile, so a sized worker's hot-idle row
+		// stayed empty and ClaimHotIdleWorker could never match it (no reuse).
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at", "profile_cpu", "profile_memory", "profile_colocate", "ttl_minutes"}),
 		Where: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: `"worker_records"."state" NOT IN ?`, Vars: []any{protectedStates}},
 			clause.Expr{SQL: `(excluded."owner_epoch" > "worker_records"."owner_epoch" OR (excluded."owner_epoch" = "worker_records"."owner_epoch" AND excluded."owner_cp_instance_id" = "worker_records"."owner_cp_instance_id"))`},
@@ -1242,8 +1196,12 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 				return err
 			}
 		}
-		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
+		// The worker-count cap bounds only exclusive workers — each pins a
+		// dedicated node. Colocated workers bin-pack and are intentionally
+		// unbounded: a colocated request never counts toward the cap and is
+		// never refused because the exclusive budget is full.
+		if maxOrgWorkers > 0 && orgID != "" && !profileColocate {
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND COALESCE(profile_colocate, false) = false", orgID)
 			if err != nil {
 				return err
 			}
@@ -1270,8 +1228,10 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, p
 		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {
 			if err == gorm.ErrRecordNotFound {
-				if maxGlobalWorkers > 0 {
-					count, err := cs.countActiveWorkers(tx)
+				// Exclusive-only global cap, bypassed for colocated requests —
+				// see the org-cap note above.
+				if maxGlobalWorkers > 0 && !profileColocate {
+					count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 					if err != nil {
 						return err
 					}
@@ -1345,8 +1305,10 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 				return err
 			}
 		}
-		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ? AND state <> ?", orgID, WorkerStateHotIdle)
+		// Exclusive-only count cap, bypassed for colocated requests — colocated
+		// workers bin-pack and are intentionally unbounded.
+		if maxOrgWorkers > 0 && orgID != "" && !profileColocate {
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND state <> ? AND COALESCE(profile_colocate, false) = false", orgID, WorkerStateHotIdle)
 			if err != nil {
 				return err
 			}
@@ -1402,10 +1364,20 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 
 // ListExpiredHotIdleWorkers returns hot-idle workers whose updated_at timestamp
 // is at or before the given cutoff time.
-func (cs *ConfigStore) ListExpiredHotIdleWorkers(before time.Time) ([]WorkerRecord, error) {
+// ListExpiredHotIdleWorkers returns hot-idle workers whose per-worker TTL has
+// elapsed since they last became idle (updated_at, bumped on the hot->hot_idle
+// transition at session end, so the TTL resets on each query). A worker's
+// ttl_seconds governs it; 0 falls back to defaultTTL (default/warm/neutral and
+// legacy rows).
+func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
+	defMins := int64(defaultTTL.Minutes())
+	if defMins < 0 {
+		defMins = 0
+	}
 	var workers []WorkerRecord
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("state = ? AND updated_at <= ?", WorkerStateHotIdle, before).
+		Where("state = ? AND updated_at + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+			WorkerStateHotIdle, defMins, now).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)
@@ -1759,8 +1731,9 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 			return err
 		}
 
+		// Exclusive-only count caps: colocated workers bin-pack and are unbounded.
 		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND COALESCE(profile_colocate, false) = false", orgID)
 			if err != nil {
 				return err
 			}
@@ -1770,7 +1743,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 		}
 
 		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx)
+			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 			if err != nil {
 				return err
 			}
@@ -1840,8 +1813,10 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, po
 			}
 		}
 
+		// Exclusive-only global cap: colocated workers are unbounded and must
+		// not block an exclusive warm spawn.
 		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx)
+			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 			if err != nil {
 				return err
 			}
@@ -1905,8 +1880,10 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 			}
 		}
 
-		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx)
+		// Exclusive-only global cap, bypassed for colocated warm shapes —
+		// colocated workers bin-pack and are intentionally unbounded.
+		if maxGlobalWorkers > 0 && !profileColocate {
+			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
 			if err != nil {
 				return err
 			}

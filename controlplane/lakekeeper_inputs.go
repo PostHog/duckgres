@@ -145,10 +145,10 @@ func lakekeeperInputsFromDuckling(
 		}, true, nil
 	}
 
-	// aurora/external: status carries the metadata-store master credentials,
+	// external: status carries the metadata-store master credentials,
 	// which double as the admin connection that can CREATE the
 	// lakekeeper_<orgid> database/role. Admin DDL (CREATE DATABASE/ROLE) goes
-	// to the direct Aurora endpoint, not the PgBouncer pooler — transaction
+	// to the direct RDS endpoint, not the PgBouncer pooler — transaction
 	// pooling breaks CREATE DATABASE and the session-level statements
 	// EnsureRole runs. We connect to the existing metadata-store database;
 	// CREATE DATABASE can be issued from any database.

@@ -465,7 +465,7 @@ func TestOrgRouterReconcileWarmCapacityFloorsOnePerActiveImage(t *testing.T) {
 		baseCfg: K8sWorkerPoolConfig{
 			WorkerImage: "posthog/duckgres:default",
 		},
-		globalCfg: ControlPlaneConfig{},
+		globalCfg: ControlPlaneConfig{K8s: K8sConfig{SharedWarmTarget: 1}},
 		orgs: map[string]*OrgStack{
 			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
 			"billing":   {Config: &configstore.OrgConfig{Name: "billing"}},
@@ -545,10 +545,36 @@ func TestOrgRouterReconcileWarmCapacityTreatsSharedWarmTargetAsDefaultImageBase(
 	got := sharedPool.PerImageWarmTargets()
 	want := map[string]int{
 		"posthog/duckgres:default": 4,
-		"posthog/duckgres:v1.5.1":  1,
+		"posthog/duckgres:v1.5.1":  4,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("expected per-image targets %v, got %v", want, got)
+	}
+}
+
+// Warm-pool teardown: SharedWarmTarget=0 means no per-image warm floor, so no
+// neutral workers are pre-spawned (requests foreground-spawn on demand instead).
+func TestOrgRouterReconcileWarmCapacityZeroTargetDisablesWarmPool(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	tr := &OrgRouter{
+		sharedPool: sharedPool,
+		baseCfg:    K8sWorkerPoolConfig{WorkerImage: "posthog/duckgres:default"},
+		globalCfg:  ControlPlaneConfig{K8s: K8sConfig{SharedWarmTarget: 0}},
+		orgs: map[string]*OrgStack{
+			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
+		},
+	}
+	snap := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"analytics": {
+				Name:      "analytics",
+				Warehouse: &configstore.ManagedWarehouseConfig{Image: "posthog/duckgres:v1.5.1"},
+			},
+		},
+	}
+	tr.reconcileWarmCapacity(snap)
+	if got := sharedPool.PerImageWarmTargets(); len(got) != 0 {
+		t.Fatalf("expected no per-image warm targets with SharedWarmTarget=0, got %v", got)
 	}
 }
 
@@ -558,7 +584,7 @@ func TestOrgRouterReconcileWarmCapacitySkipsEmptyClusterDefault(t *testing.T) {
 	tr := &OrgRouter{
 		sharedPool: sharedPool,
 		baseCfg:    K8sWorkerPoolConfig{}, // WorkerImage unset
-		globalCfg:  ControlPlaneConfig{},
+		globalCfg:  ControlPlaneConfig{K8s: K8sConfig{SharedWarmTarget: 1}},
 		orgs: map[string]*OrgStack{
 			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
 		},

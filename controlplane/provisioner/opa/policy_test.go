@@ -67,7 +67,7 @@ func twoOrgFixture() GroupCatalogs {
 
 // groupsFor returns the Trino group memberships we model for a given user.
 // Mirrors the provisioner's projection logic: customers belong to
-// `org_<team_id>`; the admin user belongs to AdminGroup.
+// `org_<org>` (org = sanitized Org.Name); the admin user belongs to AdminGroup.
 func groupsFor(user string) []string {
 	if user == AdminPrincipal {
 		return []string{AdminGroup}

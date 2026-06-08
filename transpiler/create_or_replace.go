@@ -10,9 +10,9 @@ import "regexp"
 // pg_query cannot parse this DuckDB-specific form. Without interception the
 // transpiler would set FallbackToNative and conn.go would forward the SQL
 // raw — skipping every transform, including the logical-catalog rewrite
-// (logical database name -> physical catalog, e.g. `portola` -> `ducklake`).
+// (logical database name -> physical catalog, e.g. `analytics` -> `ducklake`).
 // On a multi-tenant worker the physical catalog is `ducklake`, so the
-// un-rewritten logical name fails to bind ("Catalog \"portola\" does not
+// un-rewritten logical name fails to bind ("Catalog \"analytics\" does not
 // exist"). dbt-duckdb and SQLMesh both materialize tables with
 // `CREATE OR REPLACE TABLE ... AS ...`, so this hit real tenants.
 //

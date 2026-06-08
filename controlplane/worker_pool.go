@@ -14,6 +14,18 @@ const DefaultWarmCapacityMissWindow = 2 * time.Minute
 const DefaultWarmCapacityMissesPerWorker = 8
 const DefaultWarmCapacityDemandTTL = 15 * time.Minute
 
+// WarmAcquireRetryInterval is how often a session-acquire that missed the warm
+// pool re-attempts the claim while waiting (within WarmAcquireTimeout) for the
+// warm pool to replenish.
+const WarmAcquireRetryInterval = 2 * time.Second
+
+// WarmMissRecordInterval throttles warm-capacity miss recording (demand signal +
+// metric) while an acquire waits: at most one record per interval per waiting
+// connection, instead of one per WarmAcquireRetryInterval poll. Kept well under
+// DefaultWarmCapacityMissWindow (2m) so the demand signal stays fresh enough to
+// keep driving the warm reconciler.
+const WarmMissRecordInterval = 30 * time.Second
+
 // WarmCapacityExhaustedError is returned when a user request misses the ready
 // warm pool. The caller should fail fast with a retryable capacity response
 // instead of waiting for a foreground cold worker spawn.
@@ -91,33 +103,44 @@ type WorkerPool interface {
 
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
-	Namespace                string
-	CPID                     string // Control plane pod name, used in labels
-	CPInstanceID             string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
-	WorkerImage              string
-	WorkerPort               int
-	SecretName               string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
-	ConfigMap                string // ConfigMap name for duckgres.yaml
-	MaxWorkers               int
-	IdleTimeout              time.Duration
-	ConfigPath               string                                       // Path inside worker pod where config is mounted
-	ImagePullPolicy          string                                       // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount           string                                       // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
-	WorkerCPURequest         string                                       // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
-	WorkerMemoryRequest      string                                       // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
-	WorkerNodeSelector       map[string]string                            // Node selector for worker pods. Nil = no selector.
-	WorkerTolerationKey      string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
-	WorkerTolerationValue    string                                       // Taint value for worker pod NoSchedule toleration.
-	WorkerExclusiveNode      bool                                         // One worker per node via pod anti-affinity.
-	WorkerPriorityClassName  string                                       // PriorityClass for worker pods (so they preempt overprovision pause pods). Empty = none.
-	ColocatedNodeSelector    map[string]string                            // Node selector for colocate=true (bin-pack) worker pods. Nil = no selector.
-	ColocatedTolerationKey   string                                       // Taint key for colocated worker pods. Empty = no toleration.
-	ColocatedTolerationValue string                                       // Taint value for colocated worker pods.
-	ColocatedWarmShapes      []ColocatedWarmShape                         // Colocated shapes to keep warm (each {cpu,memory,target}).
-	OrgID                    string                                       // Org ID for pod labels (multi-tenant mode)
-	WorkerIDGenerator        func() int                                   // Shared ID generator across orgs (nil = internal counter)
-	ResolveOrgConfig         func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
-	RuntimeStore             RuntimeWorkerStore
+	Namespace    string
+	CPID         string // Control plane pod name, used in labels
+	CPInstanceID string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
+	WorkerImage  string
+	WorkerPort   int
+	SecretName   string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	ConfigMap    string // ConfigMap name for duckgres.yaml
+	MaxWorkers   int
+	// WarmAcquireTimeout: how long a session-acquire blocks server-side waiting
+	// for a warm worker to become available before returning the retryable
+	// "no warm worker" backpressure. 0 = fail fast (legacy behavior). Bounded
+	// per-request by the client's connection context, so a client with a short
+	// deadline still fails fast.
+	WarmAcquireTimeout           time.Duration
+	IdleTimeout                  time.Duration
+	ConfigPath                   string                                       // Path inside worker pod where config is mounted
+	ImagePullPolicy              string                                       // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount               string                                       // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
+	WorkerCPURequest             string                                       // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
+	WorkerMemoryRequest          string                                       // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
+	WorkerNodeSelector           map[string]string                            // Node selector for worker pods. Nil = no selector.
+	WorkerTolerationKey          string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
+	WorkerTolerationValue        string                                       // Taint value for worker pod NoSchedule toleration.
+	WorkerExclusiveNode          bool                                         // One worker per node via pod anti-affinity.
+	WorkerPriorityClassName      string                                       // PriorityClass for worker pods (so they preempt overprovision pause pods). Empty = none.
+	HeadroomPercent              int                                          // Keep this % of worker-nodepool allocatable CPU+mem free via low-priority placeholder pods (0 = disabled).
+	PlaceholderImage             string                                       // Image for headroom placeholder pods (a pause image).
+	PlaceholderCPU               string                                       // CPU request per placeholder pod (e.g. "8").
+	PlaceholderMemory            string                                       // Memory request per placeholder pod (e.g. "16Gi").
+	PlaceholderPriorityClassName string                                       // PriorityClass for placeholder pods — MUST be below WorkerPriorityClassName so workers preempt them.
+	ColocatedNodeSelector        map[string]string                            // Node selector for colocate=true (bin-pack) worker pods. Nil = no selector.
+	ColocatedTolerationKey       string                                       // Taint key for colocated worker pods. Empty = no toleration.
+	ColocatedTolerationValue     string                                       // Taint value for colocated worker pods.
+	ColocatedWarmShapes          []ColocatedWarmShape                         // Colocated shapes to keep warm (each {cpu,memory,target}).
+	OrgID                        string                                       // Org ID for pod labels (multi-tenant mode)
+	WorkerIDGenerator            func() int                                   // Shared ID generator across orgs (nil = internal counter)
+	ResolveOrgConfig             func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
+	RuntimeStore                 RuntimeWorkerStore
 }
 
 // RuntimeWorkerStore is the durable-store surface exposed to the K8s

@@ -101,24 +101,44 @@ The project uses [just](https://github.com/casey/just) as a command runner. Run 
 
 ## Testing
 
+**Every feature, behavior change, bugfix, AND refactor that affects runtime or
+cluster behavior MUST ship with a solid end-to-end test case in
+`tests/e2e-mw-dev/` (`harness.sh`).** This is not just for new features — any
+change to how the system behaves at runtime (new capability, changed semantics,
+a fixed bug, a new config knob, an activation/routing/teardown tweak) extends or
+adds a harness assertion in the same PR. Refactors count too: when you move or
+rewrite a code path the harness covers, confirm the relevant assertion still
+exercises it (and update it if the path moved) — a refactor that quietly drops
+e2e coverage is a regression in the test suite even if behavior is unchanged. Unit/package tests are necessary but not sufficient: a
+change is only "done" once it is exercised against the real mw-dev cluster —
+real worker pods, real Crossplane ducklings, real cnpg/RDS metadata, real
+Lakekeeper, real S3/Iceberg/STS. "Solid" means a deterministic pass/fail
+assertion of the actual user-visible behavior (not just "it didn't error"), with
+transient/cold-pool conditions handled, on both metadata backends (cnpg + ext)
+where it touches metadata. A bugfix gets a regression assertion that would have
+caught the bug. If a change genuinely cannot be asserted in-Job (e.g. it needs
+cnpg-shards exec, or warm-pool-only state), say so explicitly in the
+harness/README with the reason — don't silently skip. The harness is the gate
+that catches what unit tests fake.
+
 Three test lanes worth knowing about, in increasing order of blast radius:
 
-- **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives.
+- **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives. Includes `tests/manifests/` (static-manifest artifact asserts for `k8s/rbac.yaml` + `k8s/networkpolicy.yaml`).
 - **`tests/integration/`** (`just test-integration`): spins up the standalone server binary against a real MinIO + Postgres metadata store via docker compose. Covers wire protocol, DuckLake on real S3-compatible storage, transpilation against a live server.
-- **`tests/k8s/`** (`just test-k8s-integration`): real kind cluster, real control-plane pod, real worker pods, real config-store Postgres. Multi-tenant activation, worker pool, Flight RPC, k8s pod lifecycle. **The iceberg test in here additionally hits real AWS S3 Tables** in the mw-dev sandbox via GitHub OIDC. See `tests/k8s/CLAUDE.md` before touching anything in there — TestMain is destructive against the current kubeconfig.
+- **`tests/e2e-mw-dev/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real per-org Lakekeeper, real AWS S3/Iceberg. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/e2e-mw-dev/README.md`.
 
 ### When code changes obligate test changes
 
-The k8s integration suite is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating `tests/k8s/` as part of the change, not a follow-up:
+`tests/e2e-mw-dev/` is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating the harness as part of the change, not a follow-up:
 
 - `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`, `server.IcebergConfig`)
 - `server/server.go::AttachDeltaCatalog`, `server.AttachIcebergCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
-- `server/iceberg/` (config, dispatcher, backend implementations) — every backend split needs a seed update in `tests/k8s/iceberg_test.go::buildIcebergConfigStoreSeed` (the iceberg_backend column default is "lakekeeper", so omitting it silently routes to the wrong path)
-- `controlplane/configstore/models.go` — new columns on `ManagedWarehouse` / `ManagedWarehouseIceberg` / sub-structs need to be set in the test seed, otherwise GORM defaults take over silently
+- `server/iceberg/` (config, dispatcher, backend implementations) — the harness provisions iceberg-enabled ducklings on both cnpg + ext backends and asserts the catalog attaches + reads/writes
+- `controlplane/configstore/models.go` — new columns flow through the provisioning API the harness calls; exercise them via a provision body field
 - `duckdbservice/activation.go`, `worker_activation.go` — worker-side activation order
 - Any code path that wires AWS credentials through to DuckDB SECRETs
 
-The contract is: if a test that already exists no longer exercises the path you changed, **update it** (don't add a new one that duplicates the setup). If your change removes a path the tests still assert against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers tests in `tests/k8s/ducklake_test.go` and the iceberg activation test in `tests/k8s/iceberg_test.go` are the load-bearing ones for catalog wiring — keep them honest.
+The contract: if the harness no longer exercises a path you changed, **update `harness.sh`**; if your change removes a path it asserts against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers / iceberg activation checks in `harness.sh` are the load-bearing ones for catalog wiring — keep them honest.
 
 ## Dependencies
 
@@ -141,6 +161,73 @@ DML with RETURNING is rejected at extended-query Describe time with SQLSTATE `0A
 - All detection is heuristic string scanning. If precision becomes critical, switch to `pg_query_go` AST parsing.
 - LIMIT 0 does NOT prevent CTE side effects — Postgres CTEs are optimization fences, so writable CTEs execute even with LIMIT 0.
 - DuckDB does not currently support MERGE. If it adds MERGE RETURNING, add `MERGE` to the prefix check in `isDMLReturning`.
+
+## Worker Session Model (k8s / remote backend) — LOAD-BEARING CONTRACT
+
+In the **control-plane remote/k8s backend** a worker pod serves **exactly one
+client query session at a time**. This is deliberate: `workerDuckDBLimits`
+(`controlplane/control.go`) gives the single session ~75% of the *whole pod's*
+RAM + all CPU cores — it does NOT divide by session count. Two sessions on one
+pod would each believe they own 75% → ~150% overcommit → nondeterministic OOM /
+a heavy query killed by a co-resident one. Do not break the following:
+
+- **One session per worker is enforced, not emergent.** The CP spawns remote
+  worker pods with `DUCKGRES_DUCKDB_MAX_SESSIONS=1` (`k8s_pool.go::spawnWorker`).
+  A 2nd concurrent `CreateSession` on a worker is rejected, not silently
+  overcommitted. Internal control/maintenance work uses the worker's side
+  connections (`controlDB`/`warmupDB`), which are NOT counted sessions — so
+  cap=1 does not starve them. Do not raise this to >1 for k8s workers, and do not
+  route internal work through `CreateSession`.
+- **`OrgReservedPool` (remote/multitenant) must never co-assign.** It reuses only
+  idle (`activeSessions==0`, Hot, org-owned) workers via
+  `findIdleAssignedWorkerLocked`, or claims/spawns a fresh one. There is NO
+  least-loaded "share onto a busy worker" path (that exists only in the
+  single-tenant flat `K8sWorkerPool.AcquireWorker`, which is not used in remote
+  mode). Do NOT add one, and do not resurrect a `leastLoaded*` helper here.
+- **At org max workers + all busy → fail fast with the clear org-cap message**
+  (`WorkerClaimMissReasonOrgCap`, see `warm_capacity_policy.go`). Never
+  busy-wait at cap.
+- **Under cap + all busy → hold for a spawn** up to `warmAcquireTimeout` (bounded
+  by the client ctx). This applies to default/exclusive requests too, not just
+  colocated.
+- **FIFO anti-snatch:** the slow acquisition path is serialized per org by
+  `orgAcquireGate` (`org_acquire_gate.go`) so a worker the CP scaled up for an
+  earlier waiter cannot be snatched by a later connection. Keep the gate
+  cancel-safe (a queued waiter whose ctx is cancelled must be skipped, not
+  deadlock the gate).
+- **Destroy-before-reuse ordering:** `SessionManager.DestroySession`
+  (`session_mgr.go`) MUST await the worker-side `DestroySession` RPC *before*
+  `ReleaseWorker`, so a reused (hot-idle) worker's prior session is gone before
+  the next one is assigned (otherwise cap=1 spuriously rejects the reuse).
+- **Cap-drift is recovered, not fatal:** if a worker still rejects a CP-scheduled
+  session at its cap (CP↔worker accounting drift — should never happen),
+  `SessionManager.CreateSessionWithProtocol` does NOT fail the client: it logs
+  loudly (ERROR), bumps `duckgres_control_plane_worker_session_cap_drift_total`,
+  retires (recycles) the inconsistent worker, and re-acquires a fresh one
+  (bounded by `maxWorkerSessionCapDriftRetries`). Detection is
+  `isWorkerSessionCapError` (matches the worker's "max sessions reached"
+  message). A nonzero drift metric means the scheduling invariant is broken —
+  fix the root cause, don't just lean on the retry.
+
+Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
+`k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`, or
+`duckdbservice` session counting → update the unit tests
+(`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
+`duckdbservice/service_test.go`) AND the `one_session_per_worker` assertion in
+`tests/e2e-mw-dev/harness.sh`.
+
+## Worker Drain Protocol (graceful shutdown, #690)
+
+Remote worker pods drain on SIGTERM (pod deletion): they reject new work, keep
+in-flight work alive, then exit; the CP marks them `Draining` (not crashed) and
+retires them cleanly. Drain readiness is tracked by a refcount (`activeWork` in
+`duckdbservice/service.go`) of "drain tokens" — one taken per unit of in-flight
+work (query, txn, metadata stream, COPY, activation), released when it finishes.
+Invariants: take exactly one token when work starts and release exactly one when
+it ends on **every** path (a leak hangs drain to the shutdown timeout, an early
+release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
+`GetFlightInfo` whose `DoGet` never arrived. `terminationGracePeriodSeconds=3600`
+(`k8s_pool.go`) must stay above `workerShutdownDrainTime` (55m).
 
 ## TODO Reference
 

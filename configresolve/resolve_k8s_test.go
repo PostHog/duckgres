@@ -114,6 +114,39 @@ func TestResolveEffectiveK8sDynamicWarmCapacityPrecedence(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveK8sWarmAcquireTimeout(t *testing.T) {
+	// Default: unset everywhere => 0 (fail-fast).
+	def := ResolveEffective(&configloader.FileConfig{}, CLIInputs{}, func(string) string { return "" }, nil)
+	if def.K8sWarmAcquireTimeout != 0 {
+		t.Fatalf("expected default warm-acquire-timeout 0, got %s", def.K8sWarmAcquireTimeout)
+	}
+
+	// Env (test-pluggable getenv) is honored.
+	env := map[string]string{"DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT": "5m"}
+	got := ResolveEffective(&configloader.FileConfig{}, CLIInputs{}, func(k string) string { return env[k] }, nil)
+	if got.K8sWarmAcquireTimeout != 5*time.Minute {
+		t.Fatalf("expected warm-acquire-timeout 5m from env, got %s", got.K8sWarmAcquireTimeout)
+	}
+
+	// CLI overrides env.
+	cli := CLIInputs{Set: map[string]bool{"k8s-warm-acquire-timeout": true}, K8sWarmAcquireTimeout: "90s"}
+	gotCLI := ResolveEffective(&configloader.FileConfig{}, cli, func(k string) string { return env[k] }, nil)
+	if gotCLI.K8sWarmAcquireTimeout != 90*time.Second {
+		t.Fatalf("expected CLI 90s to override env 5m, got %s", gotCLI.K8sWarmAcquireTimeout)
+	}
+
+	// Invalid value falls back to 0 (default), not a crash.
+	bad := ResolveEffective(&configloader.FileConfig{}, CLIInputs{}, func(k string) string {
+		if k == "DUCKGRES_K8S_WARM_ACQUIRE_TIMEOUT" {
+			return "not-a-duration"
+		}
+		return ""
+	}, func(string) {})
+	if bad.K8sWarmAcquireTimeout != 0 {
+		t.Fatalf("expected invalid warm-acquire-timeout to fall back to 0, got %s", bad.K8sWarmAcquireTimeout)
+	}
+}
+
 func TestResolveEffectiveK8sDynamicWarmCapacityRejectsInvalidValues(t *testing.T) {
 	fileEnabled := true
 	fileCfg := &configloader.FileConfig{

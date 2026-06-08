@@ -28,8 +28,9 @@ var ducklingGVR = schema.GroupVersionResource{
 const ducklingNamespace = "ducklings"
 
 // DucklingStatus holds the parsed status from a Duckling CR.
-// The Duckling composition provisions AWS infrastructure (Aurora, S3, IAM)
-// but not K8s workloads — those are managed by the duckgres Helm chart.
+// The Duckling composition provisions AWS infrastructure (S3, IAM) and the
+// per-tenant metadata Postgres, but not K8s workloads — those are managed by
+// the duckgres Helm chart.
 type DucklingStatus struct {
 	MetadataStore struct {
 		Type              string
@@ -44,15 +45,13 @@ type DucklingStatus struct {
 		BucketName string
 		S3Region   string
 	}
-	// Iceberg is populated when spec.iceberg.enabled=true and the
-	// composition has reconciled the per-tenant S3 Tables bucket. Empty
-	// when the tenant has not opted in. TableBucketArn arrives last
-	// (after the bucket is reconciled); the controller uses its presence
-	// as the trigger to flip iceberg_state to Ready in the configstore.
+	// Iceberg is populated when spec.iceberg.enabled=true. The
+	// composition provisions a per-org Lakekeeper instance; the
+	// Lakekeeper provisioner extension drives readiness off the
+	// Lakekeeper CR itself, so we only need namespace/region here.
 	Iceberg struct {
-		TableBucketArn string
-		NamespaceName  string
-		Region         string
+		NamespaceName string
+		Region        string
 	}
 	IAMRoleARN         string
 	ReadyCondition     bool
@@ -61,7 +60,7 @@ type DucklingStatus struct {
 	// DuckLakeEnabled is spec.ducklake.enabled, read present/absent: nil when
 	// the CR predates the decoupled ducklake field (the worker activator then
 	// falls back to the legacy type-based default — DuckLake on for
-	// external/aurora, off for cnpg-shard). Non-nil for decoupled ducklings.
+	// external, off for cnpg-shard). Non-nil for decoupled ducklings.
 	DuckLakeEnabled *bool
 }
 
@@ -129,14 +128,10 @@ func legacyDucklingName(orgID string) string {
 
 // CreateOptions carries per-org knobs that shape the generated Duckling CR.
 type CreateOptions struct {
-	// MetadataStoreType selects the Duckling's metadata-store backend. Empty
-	// is treated as configstore.MetadataStoreKindAurora (the historical
-	// default, retained only for reconciling pre-existing aurora ducklings).
-	// The control plane creates cnpg-shard and external; any other value is
-	// rejected by Create.
+	// MetadataStoreType selects the Duckling's metadata-store backend. The
+	// control plane creates cnpg-shard and external; any other value (including
+	// empty) is rejected by Create.
 	MetadataStoreType string
-	MinACU            float64
-	MaxACU            float64
 	PgBouncerEnabled  bool
 
 	// External metadata store (MetadataStoreType == "external"). Endpoint and
@@ -156,8 +151,8 @@ type CreateOptions struct {
 	DataStoreRegion string
 
 	// IcebergEnabled toggles spec.iceberg.enabled on the Duckling CR. The
-	// composition only provisions a per-tenant S3 Tables bucket when this
-	// is true; flipping it post-create is handled by the controller's
+	// composition only provisions the per-tenant Lakekeeper Iceberg catalog
+	// when this is true; flipping it post-create is handled by the controller's
 	// Ready-state drift logic.
 	IcebergEnabled bool
 	// IcebergNamespace is the Iceberg namespace within the tenant's catalog.
@@ -186,9 +181,8 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		if !opts.IcebergEnabled && !opts.DuckLakeEnabled {
 			return fmt.Errorf("create duckling CR %q: metadata store type %q requires at least one of ducklake or iceberg enabled", name, configstore.MetadataStoreKindCnpgShard)
 		}
-		// No aurora block and no pgbouncer block: cnpg-shard tenants reach
-		// Postgres through the shard's own session-mode Pooler, not a
-		// per-Duckling PgBouncer.
+		// No pgbouncer block: cnpg-shard tenants reach Postgres through the
+		// shard's own session-mode Pooler, not a per-Duckling PgBouncer.
 		metadataStore = map[string]interface{}{"type": configstore.MetadataStoreKindCnpgShard}
 	case configstore.MetadataStoreKindExternal:
 		// A pre-existing Postgres (e.g. RDS), referenced by endpoint + an AWS
@@ -212,19 +206,6 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		metadataStore = map[string]interface{}{
 			"type":     configstore.MetadataStoreKindExternal,
 			"external": external,
-		}
-		if opts.PgBouncerEnabled {
-			metadataStore["pgbouncer"] = map[string]interface{}{
-				"enabled": true,
-			}
-		}
-	case "", configstore.MetadataStoreKindAurora:
-		metadataStore = map[string]interface{}{
-			"type": configstore.MetadataStoreKindAurora,
-			"aurora": map[string]interface{}{
-				"minACU": opts.MinACU,
-				"maxACU": opts.MaxACU,
-			},
 		}
 		if opts.PgBouncerEnabled {
 			metadataStore["pgbouncer"] = map[string]interface{}{
@@ -359,7 +340,7 @@ func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) 
 // SetPgBouncerEnabled patches spec.metadataStore.pgbouncer.enabled on the
 // Duckling CR for the given org. Uses a JSON merge patch (RFC 7396) so the
 // call is idempotent and only touches the pgbouncer block — sibling fields
-// under metadataStore (aurora, type) are left untouched.
+// under metadataStore (type, external) are left untouched.
 func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, enabled bool) error {
 	_, name, err := d.getCR(ctx, orgID)
 	if err != nil {
@@ -493,7 +474,6 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 
 	// Parse status.iceberg (only populated when spec.iceberg.enabled=true)
 	if ic, ok := status["iceberg"].(map[string]interface{}); ok {
-		ds.Iceberg.TableBucketArn = getNestedString(ic, "tableBucketArn")
 		ds.Iceberg.NamespaceName = getNestedString(ic, "namespaceName")
 		ds.Iceberg.Region = getNestedString(ic, "region")
 	}

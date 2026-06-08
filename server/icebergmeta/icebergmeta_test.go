@@ -22,6 +22,22 @@ func TestShouldLoadColumnsOnlyForCompatView(t *testing.T) {
 	}
 }
 
+func TestShouldLoadColumnsForPgAttributeDiscovery(t *testing.T) {
+	query := `
+		SELECT *
+		FROM memory.main.pg_namespace n
+		JOIN memory.main.pg_class_full c ON c.relnamespace = n.oid
+		JOIN memory.main.pg_attribute a ON a.attrelid = c.oid
+		WHERE c.relkind IN ('r', 'p', 'v', 'f', 'm')
+			AND a.attnum > 0
+			AND NOT a.attisdropped
+			AND current_database() = 'iceberg'
+	`
+	if !ShouldLoadColumns(query) {
+		t.Fatal("expected pg_attribute metadata discovery query to require Iceberg column loading")
+	}
+}
+
 func TestLoadColumnsRequiresLakekeeperRESTConfig(t *testing.T) {
 	exec := &scriptedExecutor{
 		rows: []sqlcore.RowSet{
@@ -185,6 +201,69 @@ func TestLoadColumnsFiltersCandidatesFromSimpleCompatPredicates(t *testing.T) {
 		FROM memory.main.information_schema_columns_compat c
 		WHERE c.table_schema = 'stripe_test'
 		AND c.table_name = 'product'
+	`, Config{
+		LakekeeperEndpoint:  srv.URL,
+		LakekeeperWarehouse: "org-acme",
+	})
+	if err != nil {
+		t.Fatalf("LoadColumns: %v", err)
+	}
+
+	listQuery := strings.Join(exec.queries, "\n")
+	if !strings.Contains(listQuery, "table_schema = 'stripe_test'") {
+		t.Fatalf("candidate query did not filter table_schema:\n%s", listQuery)
+	}
+	if !strings.Contains(listQuery, "table_name = 'product'") {
+		t.Fatalf("candidate query did not filter table_name:\n%s", listQuery)
+	}
+	if got, want := len(loadedPaths), 1; got != want {
+		t.Fatalf("REST table loads = %d, want %d", got, want)
+	}
+}
+
+func TestLoadColumnsFiltersCandidatesFromPgCatalogPredicates(t *testing.T) {
+	var loadedPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/config":
+			_, _ = w.Write([]byte(`{"defaults":{"prefix":"warehouse-id"}}`))
+		case "/v1/warehouse-id/namespaces/stripe_test/tables/product":
+			loadedPaths = append(loadedPaths, r.URL.Path)
+			_, _ = w.Write([]byte(`{
+				"metadata": {
+					"current-schema-id": 1,
+					"schemas": [
+						{
+							"schema-id": 1,
+							"type": "struct",
+							"fields": [
+								{"id": 1, "name": "id", "type": "string", "required": true}
+							]
+						}
+					]
+				}
+			}`))
+		default:
+			t.Fatalf("unexpected REST path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	exec := &scriptedExecutor{
+		rows: []sqlcore.RowSet{
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{
+				{"stripe_test", "product"},
+			}},
+		},
+	}
+
+	err := LoadColumns(context.Background(), exec, `
+		SELECT *
+		FROM memory.main.pg_namespace n
+		JOIN memory.main.pg_class_full c ON c.relnamespace = n.oid
+		JOIN memory.main.pg_attribute a ON a.attrelid = c.oid
+		WHERE n.nspname = 'stripe_test'
+		AND c.relname = 'product'
 	`, Config{
 		LakekeeperEndpoint:  srv.URL,
 		LakekeeperWarehouse: "org-acme",

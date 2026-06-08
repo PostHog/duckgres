@@ -113,7 +113,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		{
 			name:    "org capacity exhausted",
 			reason:  configstore.WorkerClaimMissReasonOrgCap,
-			message: "Duckgres worker capacity for this organization is currently exhausted; retry later",
+			message: "your organization has reached its maximum number of concurrent Duckgres workers and they are all busy; retry once a query finishes",
 		},
 		{
 			name:    "global capacity exhausted",

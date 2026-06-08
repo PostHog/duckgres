@@ -47,7 +47,7 @@ var ScanRowsPerSecondHistogram = promauto.NewHistogramVec(prometheus.HistogramOp
 // operators per query. This is the DuckDB-side view of time spent in the
 // DuckLake metadata DB roundtrips — distinguishable from time spent on S3
 // data reads (which dominate ScanWallSecondsHistogram). A regression here
-// is the first signal of metadata-DB pressure (slow Aurora, conn-pool
+// is the first signal of metadata-DB pressure (slow metadata Postgres, conn-pool
 // starvation, pgbouncer queueing).
 var PostgresScanSecondsHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_postgres_scan_seconds",

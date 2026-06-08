@@ -18,7 +18,8 @@
 //
 // Keying choice: the policy authorizes by *group* membership, not by
 // username. Trino's file group provider (and, post-v1, OIDC group claims)
-// stamps `org_<team_id>` (and `__admin_provisioner` for the admin) into
+// stamps `org_<org>` (sanitized Org.Name; and `__admin_provisioner` for
+// the admin) into
 // every request's `identity.groups`. Keying on groups means the bundle
 // schema does not change when v2 moves from password-file auth to OIDC
 // with per-user identity within an org -- only the source of
@@ -27,9 +28,10 @@
 // per-user and require a bundle-shape migration during the OIDC rollout.
 package opa
 
-// GroupCatalogs maps a Trino group name (e.g. `org_<team_id>` for customer
-// orgs, or the admin group for the provisioner's smoke-test access) to the
-// set of catalog names that group owns.
+// GroupCatalogs maps a Trino group name (e.g. `org_<org>` for customer
+// orgs, where `org` is the sanitized Org.Name; or the admin group for
+// the provisioner's smoke-test access) to the set of catalog names that
+// group owns.
 //
 // The "set" is represented as map[string]bool with the value always true,
 // so the Rego policy can do an O(1) presence check

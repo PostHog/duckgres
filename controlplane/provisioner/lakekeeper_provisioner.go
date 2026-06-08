@@ -43,7 +43,7 @@ type ClientFactory func(baseURL string) *LakekeeperClient
 // environment that doesn't live in the warehouse row yet.
 type ProvisioningInputs struct {
 	// AdminDSN is a pgx-compatible DSN with permission to CREATE DATABASE
-	// on the org's Aurora cluster. Caller resolves this from a K8s Secret
+	// on the org's metadata Postgres. Caller resolves this from a K8s Secret
 	// managed by Crossplane.
 	AdminDSN string
 
@@ -233,23 +233,7 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	}
 
 	// 3. Apply the Lakekeeper CR pointing at the org's PG + the Secret.
-	pgPort := in.PGPort
-	if pgPort == 0 {
-		pgPort = 5432
-	}
-	if err := p.k8s.EnsureCR(ctx, LakekeeperCRSpec{
-		OrgID:                   w.OrgID,
-		Image:                   p.image,
-		Replicas:                1,
-		PGHost:                  in.PGHost,
-		PGPort:                  pgPort,
-		PGDatabase:              dbName,
-		SecretName:              secretName,
-		BaseURI:                 baseURL,
-		PGSSLMode:               in.PGSSLMode,
-		ServiceAccountName:      LakekeeperServiceAccountName(w.OrgID),
-		KubernetesAuthAudiences: in.KubernetesAuthAudiences,
-	}); err != nil {
+	if err := p.k8s.EnsureCR(ctx, p.buildCRSpec(w, in)); err != nil {
 		return fmt.Errorf("ensure lakekeeper cr: %w", err)
 	}
 
@@ -335,6 +319,49 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	return nil
 }
 
+// buildCRSpec assembles the desired Lakekeeper CR spec for an org, used by
+// EnsureForOrg on initial provisioning. (Drift correction for already-
+// provisioned orgs goes through PatchPodShape, which patches the live CR by
+// label rather than rebuilding the whole spec under a recomputed name.)
+func (p *LakekeeperProvisioner) buildCRSpec(w *configstore.ManagedWarehouse, in ProvisioningInputs) LakekeeperCRSpec {
+	dbName := lakekeeperDBName(w.OrgID)
+	if in.PGPreProvisioned {
+		dbName = in.PGDatabase
+	}
+	pgPort := in.PGPort
+	if pgPort == 0 {
+		pgPort = 5432
+	}
+	resourceName := LakekeeperResourceName(w.OrgID)
+	return LakekeeperCRSpec{
+		OrgID:                   w.OrgID,
+		Image:                   p.image,
+		Replicas:                lakekeeperPodReplicas,
+		PGHost:                  in.PGHost,
+		PGPort:                  pgPort,
+		PGDatabase:              dbName,
+		SecretName:              resourceName,
+		BaseURI:                 fmt.Sprintf("http://%s.%s.svc:8181", resourceName, p.k8s.namespace),
+		PGSSLMode:               in.PGSSLMode,
+		ServiceAccountName:      LakekeeperServiceAccountName(w.OrgID),
+		KubernetesAuthAudiences: in.KubernetesAuthAudiences,
+	}
+}
+
+// PatchPodShape is the drift-correction path for already-provisioned orgs: it
+// converges the pod-shape fields (replicas + resource requests + scrape
+// annotations) onto the org's existing Lakekeeper CR(s) without re-running the
+// database / Secret / REST-warehouse pipeline and without resolving inputs.
+//
+// It matches CRs by the duckgres/active-org label rather than recomputing the
+// name, so it patches whatever CR actually exists — important because a legacy
+// org's CR keeps the de-hyphenated name (derived from the no-hyphen Duckling XR)
+// while LakekeeperResourceName now preserves hyphens. See
+// LakekeeperK8sClient.PatchPodShape for the merge-patch (conflict-free) details.
+func (p *LakekeeperProvisioner) PatchPodShape(ctx context.Context, orgID string) error {
+	return p.k8s.PatchPodShape(ctx, orgID)
+}
+
 // DeleteForOrg tears down the per-org Lakekeeper instance that EnsureForOrg
 // created: the CR (which cascades to the operator-managed Deployment, Service,
 // and migration Job via ownerReferences) plus the standalone Secret and
@@ -352,12 +379,10 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 // (PGPreProvisioned) the corresponding cleanup happens via the Crossplane
 // composition's [Delete] managementPolicy on the cnpg-tenant-role and
 // cnpg-tenant-database resources — see posthog/charts PR for the parallel
-// fix. For the aurora case the whole Aurora cluster is destroyed by
-// Crossplane on Duckling CR delete, so the DROP DATABASE here is redundant
-// but harmless (and the connection may simply refuse — tolerated below).
+// fix.
 //
 // Best-effort: PG drop failures are logged and swallowed so a transient
-// network issue or a half-deleted Aurora cluster doesn't permanently block
+// network issue or a half-deleted metadata store doesn't permanently block
 // the duckling teardown. The k8s teardown failures (which actually leave
 // resources stranded) still surface as errors to the controller's retry
 // loop.

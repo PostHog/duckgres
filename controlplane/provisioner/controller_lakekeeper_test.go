@@ -15,6 +15,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestReconcileDeleting_TearsDownLakekeeper(t *testing.T) {
@@ -107,31 +108,32 @@ func TestReconcileLakekeeper_SkipsWhenIcebergDisabled(t *testing.T) {
 	}
 }
 
-func TestReconcileLakekeeper_SkipsWhenBackendIsS3Tables(t *testing.T) {
+func TestReconcileLakekeeper_DriftCorrectsWhenAlreadyProvisioned(t *testing.T) {
+	// An already-provisioned org (LakekeeperEndpoint set) is NOT skipped: the
+	// Ready loop patches the pod shape (replicas/requests/scrape) onto the org's
+	// existing CR, matched by the duckgres/active-org label. No inputs are
+	// resolved, and no duplicate CR is created under the recomputed name.
 	called := false
-	store := newFakeStore()
-	store.warehouses["acme"] = &configstore.ManagedWarehouse{
-		OrgID: "acme",
-		State: configstore.ManagedWarehouseStateReady,
-		Iceberg: configstore.ManagedWarehouseIceberg{
-			Enabled: true,
-			Backend: configstore.IcebergBackendS3Tables,
-		},
-	}
-	c := NewControllerWithClient(store, nil, 0)
-	c.lakekeeperProvisioner = &LakekeeperProvisioner{}
-	c.lakekeeperInputs = func(_ context.Context, _ *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
-		called = true
-		return ProvisioningInputs{}, nil
-	}
-	c.reconcileLakekeeper(context.Background(), store.warehouses["acme"])
-	if called {
-		t.Errorf("inputs resolver should not be called when Backend=s3_tables")
-	}
-}
+	k8sClient, dyn, _ := newFakeLakekeeperClient()
+	p := NewLakekeeperProvisioner(newFakeStore(), k8sClient)
 
-func TestReconcileLakekeeper_SkipsWhenAlreadyProvisioned(t *testing.T) {
-	called := false
+	// Seed a legacy-named CR carrying the org label. Its name intentionally
+	// differs from LakekeeperResourceName("acme") to prove the patch is matched
+	// by label, not by a recomputed name (the post-#632 hyphenation bug).
+	seed := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "lakekeeper.k8s.lakekeeper.io/v1alpha1",
+		"kind":       "Lakekeeper",
+		"metadata": map[string]interface{}{
+			"name":      "lakekeeper-acme-legacy",
+			"namespace": k8sClient.namespace,
+			"labels":    map[string]interface{}{"duckgres/active-org": "acme"},
+		},
+		"spec": map[string]interface{}{"replicas": int64(1)},
+	}}
+	if _, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Create(context.Background(), seed, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+
 	store := newFakeStore()
 	store.warehouses["acme"] = &configstore.ManagedWarehouse{
 		OrgID: "acme",
@@ -142,15 +144,34 @@ func TestReconcileLakekeeper_SkipsWhenAlreadyProvisioned(t *testing.T) {
 			LakekeeperEndpoint: "http://lk-acme.lakekeeper.svc:8181/catalog",
 		},
 	}
-	c := NewControllerWithClient(store, nil, 0)
-	c.lakekeeperProvisioner = &LakekeeperProvisioner{}
-	c.lakekeeperInputs = func(_ context.Context, _ *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
-		called = true
-		return ProvisioningInputs{}, nil
-	}
+	c := NewControllerWithClient(store, nil, 0).
+		WithLakekeeperProvisioner(p, func(_ context.Context, _ *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
+			called = true
+			return ProvisioningInputs{}, nil
+		})
+
 	c.reconcileLakekeeper(context.Background(), store.warehouses["acme"])
+
+	// Pod-shape drift correction needs no inputs — the resolver must not run.
 	if called {
-		t.Errorf("inputs resolver should not be called when LakekeeperEndpoint already set")
+		t.Errorf("inputs resolver should NOT be called for pod-shape drift correction")
+	}
+	// The existing legacy-named CR was patched in place by label.
+	got, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), "lakekeeper-acme-legacy", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get patched CR: %v", err)
+	}
+	spec := got.Object["spec"].(map[string]interface{})
+	if rv := spec["replicas"]; rv != int64(lakekeeperPodReplicas) && rv != float64(lakekeeperPodReplicas) {
+		t.Errorf("replicas = %v, want %d", rv, lakekeeperPodReplicas)
+	}
+	ann := spec["podMetadata"].(map[string]interface{})["annotations"].(map[string]interface{})
+	if ann["prometheus.io/scrape"] != "true" {
+		t.Errorf("scrape annotation not applied: %v", ann)
+	}
+	// No duplicate CR created under the recomputed (hyphenated) name.
+	if _, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), LakekeeperResourceName("acme"), metav1.GetOptions{}); err == nil {
+		t.Errorf("drift correction created a duplicate CR under the recomputed name")
 	}
 }
 

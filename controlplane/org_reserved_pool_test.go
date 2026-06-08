@@ -4,8 +4,11 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 func addNeutralWarmWorker(shared *K8sWorkerPool, id int) *ManagedWorker {
@@ -261,7 +264,69 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 	}
 }
 
-func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testing.T) {
+// TestOrgReservedPoolAssignedCountExcludesColocated confirms the exclusive
+// worker count cap (maxWorkers) does not count an org's colocated workers.
+// Colocated workers bin-pack and are intentionally unbounded, so they must
+// not consume the exclusive budget that gates default/exclusive spawns.
+func TestOrgReservedPoolAssignedCountExcludesColocated(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 5)
+
+	seed := func(id int, colocate bool) {
+		w := &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
+		w.profile = WorkerProfile{Colocate: colocate}
+		if colocate {
+			w.profile.CPU, w.profile.Memory = "8", "48Gi"
+		}
+		if err := w.SetSharedState(SharedWorkerState{
+			Lifecycle:  WorkerLifecycleHot,
+			Assignment: &WorkerAssignment{OrgID: "analytics"},
+		}); err != nil {
+			t.Fatalf("SetSharedState(%d): %v", id, err)
+		}
+		shared.workers[id] = w
+	}
+
+	seed(1, false) // one exclusive worker
+	seed(2, true)  // two colocated workers — must not count
+	seed(3, true)
+
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
+
+	shared.mu.Lock()
+	got := pool.assignedWorkerCountLocked()
+	shared.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("expected exclusive-only count of 1, got %d (colocated workers must not count)", got)
+	}
+}
+
+// TestIsRetryableWarmMiss confirms only a transient no-idle warm miss is treated
+// as retryable by the server-side acquire wait — org/global-cap and non-capacity
+// errors are not (waiting won't change them).
+func TestIsRetryableWarmMiss(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"no-idle", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonNoIdle, 0), true},
+		{"org-cap", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, 0), false},
+		{"global-cap", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonGlobalCap, 0), false},
+		{"shutting-down", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonShuttingDown, 0), false},
+		{"plain-error", context.DeadlineExceeded, false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := isRetryableWarmMiss(c.err); got != c.want {
+			t.Errorf("%s: isRetryableWarmMiss = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// At the org's max concurrent workers with all of them busy, AcquireWorker must
+// fail FAST with the clear org-cap message — not busy-wait until the client's
+// deadline, and not reuse the busy worker (one session per worker).
+func TestOrgReservedPoolAcquireFailsClearlyAtOrgCap(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 3, activeSessions: 1, done: make(chan struct{})}
 	if err := worker.SetSharedState(SharedWorkerState{
@@ -276,19 +341,24 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 
 	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	// Generous deadline: the call must return promptly on its own, well before this.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	start := time.Now()
 	got, err := pool.AcquireWorker(ctx, nil)
 	if err == nil {
-		t.Fatalf("expected AcquireWorker to wait instead of reusing busy worker, got worker %d", got.ID)
-		return
+		t.Fatalf("expected AcquireWorker to fail at org cap, got worker %d", got.ID)
 	}
 	if got != nil {
-		t.Fatalf("expected no worker on timeout, got %v", got)
+		t.Fatalf("expected no worker at org cap, got %v", got)
 	}
-	if err != context.DeadlineExceeded {
-		t.Fatalf("expected context deadline exceeded, got %v", err)
+	var capErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capErr) || capErr.missReason() != configstore.WorkerClaimMissReasonOrgCap {
+		t.Fatalf("expected org-cap WarmCapacityExhaustedError, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected fast failure at org cap, took %s", elapsed)
 	}
 	if worker.activeSessions != 1 {
 		t.Fatalf("expected busy worker session count to stay at 1, got %d", worker.activeSessions)

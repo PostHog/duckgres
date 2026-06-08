@@ -115,6 +115,7 @@ type K8sConfig struct {
 	SharedWarmTarget                int           // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 	DynamicWarmCapacityEnabled      bool          // Enable configstore-driven dynamic warm-capacity target computation
 	WarmCapacityMissWindow          time.Duration // Window of recent no-idle misses that contributes to dynamic targets
+	WarmAcquireTimeout              time.Duration // Server-side block window for a session-acquire that misses the warm pool (0 = fail fast)
 	WarmCapacityMissesPerWorker     int           // Number of recent misses that translate to one extra warm worker
 	WarmCapacityDemandTTL           time.Duration // Retention TTL for warm-capacity miss buckets
 	WarmCapacityDynamicImageCeiling int           // Max dynamic extra warm workers per image (0 = unlimited)
@@ -127,6 +128,16 @@ type K8sConfig struct {
 	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
 	WorkerPriorityClassName         string        // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
 	AWSRegion                       string        // AWS region for STS client
+
+	// Node-headroom controller: keep HeadroomPercent% of the worker nodepool's
+	// allocatable CPU+memory free via low-priority placeholder pods, so a worker
+	// spawn schedules immediately (preempting placeholders) rather than waiting
+	// on a fresh Karpenter node. 0 = disabled.
+	HeadroomPercent              int    // % of worker-nodepool allocatable to hold free (0 = disabled)
+	PlaceholderImage             string // Image for placeholder pods (a pause image)
+	PlaceholderCPU               string // CPU request per placeholder pod (default: worker default cpu)
+	PlaceholderMemory            string // Memory request per placeholder pod (default: worker default memory)
+	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName
 
 	// Connection-string worker-profile selection (duckgres.colocate / worker_cpu /
 	// worker_memory / worker_tier). All default to the off/empty state, so absent
@@ -143,6 +154,7 @@ type K8sConfig struct {
 	WorkerProfileMaxCPU            string                       // Clamp ceiling for a client-supplied cpu (e.g. "16")
 	WorkerProfileMinMemory         string                       // Clamp floor for a client-supplied memory (e.g. "4Gi")
 	WorkerProfileMaxMemory         string                       // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
+	WorkerMaxTTL                   time.Duration                // Clamp ceiling for a client-supplied duckgres.worker_ttl (0 = unbounded)
 	OrgMaxColocatedCPU             int                          // Per-org cap on summed colocated worker CPU cores (0 = unbounded)
 	OrgMaxColocatedMemory          string                       // Per-org cap on summed colocated worker memory (e.g. "256Gi")
 	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier

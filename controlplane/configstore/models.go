@@ -83,15 +83,11 @@ type ManagedWarehouseDatabase struct {
 //
 //   - "cnpg-shard": the per-tenant Lakekeeper Iceberg catalog Postgres backend
 //     on the shared CloudNativePG shard (always paired with iceberg.enabled).
-//   - "external": a pre-existing Postgres (e.g. RDS), referenced by endpoint +
-//     an AWS Secrets Manager secret for the password. Backs either a DuckLake
-//     catalog (iceberg disabled) or the Lakekeeper catalog (iceberg enabled).
-//
-// "aurora" is no longer provisionable (the control plane never stands up a new
-// Aurora cluster); the constant is retained so DucklingClient.Create can still
-// reconcile pre-existing aurora ducklings.
+//   - "external": a pre-existing Postgres (e.g. RDS/Aurora), referenced by
+//     endpoint + an AWS Secrets Manager secret for the password. Backs either a
+//     DuckLake catalog (iceberg disabled) or the Lakekeeper catalog (iceberg
+//     enabled).
 const (
-	MetadataStoreKindAurora    = "aurora"
 	MetadataStoreKindCnpgShard = "cnpg-shard"
 	MetadataStoreKindExternal  = "external"
 )
@@ -110,8 +106,8 @@ type ManagedWarehouseMetadataStore struct {
 	// metadata DB password. Only meaningful when Kind == "external": it's
 	// passed through to the Duckling CR's spec.metadataStore.external.
 	// passwordAwsSecret, where the composition resolves it (via ESO) into the
-	// status password the worker activator reads. Empty for aurora/cnpg-shard
-	// (those mint their own credentials).
+	// status password the worker activator reads. Empty for cnpg-shard
+	// (which mints its own credentials).
 	PasswordAWSSecret string `gorm:"size:255" json:"password_aws_secret,omitempty"`
 }
 
@@ -162,54 +158,45 @@ type ManagedWarehouseWorkerIdentity struct {
 
 // ManagedWarehouseDuckLake captures whether the org's DuckLake catalog is
 // enabled. Decoupled from the metadata-store type and from Iceberg: a duckling
-// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg / external
-// / aurora). The DuckLake catalog lives in the metadata Postgres — the
-// per-tenant database for cnpg-shard, or the metadata database for
-// external/aurora.
+// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg /
+// external). The DuckLake catalog lives in the metadata Postgres — the
+// per-tenant database for cnpg-shard, or the metadata database for external.
 //
 // For ducklings created before this field existed the column is absent/false;
 // the worker activator does NOT key off it directly — it reads the Duckling
 // CR's spec.ducklake.enabled (present/absent) so legacy ducklings keep their
-// implied behavior (external/aurora ⇒ DuckLake, cnpg ⇒ none).
+// implied behavior (external ⇒ DuckLake, cnpg ⇒ none).
 type ManagedWarehouseDuckLake struct {
 	Enabled bool `json:"enabled"`
 }
 
-// ManagedWarehouseIceberg captures per-org Iceberg catalog config. Two
-// backends are supported, selected by Backend:
+// ManagedWarehouseIceberg captures per-org Iceberg catalog config. The
+// only supported backend is Lakekeeper: a per-org Lakekeeper instance
+// vends the Iceberg REST catalog. The provisioner creates the Lakekeeper
+// CR + a warehouse pointing at the org's existing S3 bucket (path
+// <s3.path-prefix>/lakekeeper/<orgid>/) and persists the endpoint +
+// OAuth2 client credentials back here. The worker activator reads these
+// and emits a (TYPE ICEBERG, CLIENT_ID/CLIENT_SECRET/OAUTH2_SERVER_URI)
+// DuckDB SECRET + ATTACH at session init.
 //
-//   - "lakekeeper" (default): a per-org Lakekeeper instance vends the
-//     Iceberg REST catalog. The provisioner creates the Lakekeeper CR + a
-//     warehouse pointing at the org's existing S3 bucket (path
-//     <s3.path-prefix>/lakekeeper/<orgid>/) and persists the endpoint +
-//     OAuth2 client credentials back here. The worker activator reads
-//     these and emits a (TYPE ICEBERG, CLIENT_ID/CLIENT_SECRET/
-//     OAUTH2_SERVER_URI) DuckDB SECRET + ATTACH at session init.
-//
-//   - "s3_tables" (legacy): provisioner controller sets spec.iceberg.enabled
-//     on the Duckling CR; the composition provisions a fresh S3 Tables
-//     bucket and writes TableBucketArn back here. Kept as a safety net /
-//     escape hatch — new orgs default to Lakekeeper.
+// The Backend column is retained for forward-compat / observability; the
+// legacy "s3_tables" value is no longer honored anywhere in the code path.
 type ManagedWarehouseIceberg struct {
 	Enabled bool `json:"enabled"`
 
-	// Backend selects the catalog backend. Empty/unset is treated as
-	// "lakekeeper" by callers.
+	// Backend is retained for schema compat. Empty/unset is treated as
+	// "lakekeeper" by callers; any other value is also treated as
+	// "lakekeeper" since no other backend is implemented.
 	Backend string `gorm:"size:32;default:'lakekeeper'" json:"backend"`
 
-	// Namespace is the default Iceberg namespace inside the catalog. Used
-	// for both backends.
+	// Namespace is the default Iceberg namespace inside the catalog.
 	Namespace string `gorm:"size:255" json:"namespace"`
 
-	// Region applies to both backends (S3 region for S3 Tables; AWS region
-	// for the Lakekeeper warehouse storage profile).
+	// Region is the AWS region for the Lakekeeper warehouse storage profile.
 	Region string `gorm:"size:64" json:"region"`
 
-	// S3 Tables fields (Backend == "s3_tables"). Empty otherwise.
-	TableBucketArn string `gorm:"size:512" json:"table_bucket_arn,omitempty"`
-
-	// Lakekeeper fields (Backend == "lakekeeper"). Populated by the
-	// provisioner after the per-org Lakekeeper is ready.
+	// Lakekeeper fields. Populated by the provisioner after the per-org
+	// Lakekeeper is ready.
 	LakekeeperEndpoint string `gorm:"size:512" json:"lakekeeper_endpoint,omitempty"`
 
 	// LakekeeperWarehouse is the warehouse NAME (e.g. "org-acme"), not the
@@ -235,7 +222,6 @@ type ManagedWarehouseIceberg struct {
 // IcebergBackend constants — string-typed to keep the GORM tag happy.
 const (
 	IcebergBackendLakekeeper = "lakekeeper"
-	IcebergBackendS3Tables   = "s3_tables"
 )
 
 // ManagedWarehouseTrino captures per-org opt-in for the customer-facing Trino
@@ -342,10 +328,8 @@ func (i ManagedWarehouseIceberg) ResolvedBackend() string {
 type ManagedWarehouse struct {
 	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
 
-	Image           string  `gorm:"size:512" json:"image"`
-	DuckLakeVersion string  `gorm:"size:32" json:"ducklake_version"`
-	AuroraMinACU    float64 `json:"aurora_min_acu"`
-	AuroraMaxACU    float64 `json:"aurora_max_acu"`
+	Image           string `gorm:"size:512" json:"image"`
+	DuckLakeVersion string `gorm:"size:32" json:"ducklake_version"`
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
@@ -544,10 +528,10 @@ type WorkerLifecycleStats struct {
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
-	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`
-	PodName             string      `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
-	PodUID              string      `gorm:"size:255" json:"pod_uid"`
-	Image               string      `gorm:"size:512;index" json:"image"`
+	WorkerID int    `gorm:"primaryKey" json:"worker_id"`
+	PodName  string `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
+	PodUID   string `gorm:"size:255" json:"pod_uid"`
+	Image    string `gorm:"size:512;index" json:"image"`
 	// Worker pod-shape profile (connection-string-selected sizing). Empty
 	// CPU/Memory + Colocate=false is the default exclusive profile, so legacy
 	// rows (and warm/neutral workers) read back as the default and stay
@@ -556,7 +540,13 @@ type WorkerRecord struct {
 	ProfileCPU      string `gorm:"size:32;index:idx_worker_profile" json:"profile_cpu"`
 	ProfileMemory   string `gorm:"size:32;index:idx_worker_profile" json:"profile_memory"`
 	ProfileColocate bool   `gorm:"index:idx_worker_profile" json:"profile_colocate"`
-	State           WorkerState `gorm:"size:32;not null;index" json:"state"`
+	// TTLMinutes is how long this worker stays hot-idle after its last query
+	// before the janitor retires it (client-selected duckgres.worker_ttl, rounded
+	// down to whole minutes). 0 = use the deployment's global hot-idle TTL
+	// (default/warm/neutral workers and legacy rows). AutoMigrate adds this
+	// column; no migration file.
+	TTLMinutes          int         `gorm:"default:0" json:"ttl_minutes"`
+	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
 	OrgID               string      `gorm:"size:255;index" json:"org_id"`
 	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`
 	OwnerEpoch          int64       `gorm:"not null" json:"owner_epoch"`
@@ -666,8 +656,6 @@ type ManagedWarehouseConfig struct {
 
 	Image           string
 	DuckLakeVersion string
-	AuroraMinACU    float64
-	AuroraMaxACU    float64
 
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
@@ -708,8 +696,6 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		OrgID:                          warehouse.OrgID,
 		Image:                          warehouse.Image,
 		DuckLakeVersion:                warehouse.DuckLakeVersion,
-		AuroraMinACU:                   warehouse.AuroraMinACU,
-		AuroraMaxACU:                   warehouse.AuroraMaxACU,
 		WarehouseDatabase:              warehouse.WarehouseDatabase,
 		MetadataStore:                  warehouse.MetadataStore,
 		PgBouncer:                      warehouse.PgBouncer,

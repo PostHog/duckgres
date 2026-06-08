@@ -14,8 +14,8 @@
 #      config-store Postgres + a control-plane Deployment running the PR image,
 #      spawning worker pods in the same namespace.
 #   4. run the e2e harness as a Job INSIDE the namespace, talking to the CP
-#      ClusterIP service (no public DNS / NLB needed). Covers cnpg + ext
-#      (aurora is being retired — out of scope).
+#      ClusterIP service (no public DNS / NLB needed). Covers the cnpg-shard
+#      and external metadata backends.
 #   5. always tear the namespace down (and deprovision the ci-pr ducklings so
 #      no S3 / cnpg role / lakekeeper CR leaks on shared infra).
 #
@@ -51,9 +51,14 @@ on:
       - ".github/workflows/e2e-mw-dev.yml"
       - ".github/workflows/_image-build.yml"
   workflow_dispatch:
+  # Cleanup backstop: every 6h, sweep per-PR namespaces orphaned by runs that
+  # died hard (cancelled mid-flight, runner OOM) before their always() teardown
+  # could fire. Only the `e2e-cleanup` job runs on this trigger.
+  schedule:
+    - cron: "0 */6 * * *"
 
 # One in-flight run per PR; a new push cancels the old run (and its namespace
-# is GC'd by the always() teardown of the cancelled run + the janitor).
+# is GC'd by the always() teardown of the cancelled run + the e2e-cleanup sweep).
 concurrency:
   group: e2e-mw-dev-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -69,6 +74,8 @@ jobs:
   # builds that single image — not the separate worker/controlplane CD images —
   # to match what actually ships to mw-dev.
   build:
+    # PR / manual only — the scheduled trigger runs nothing but e2e-cleanup.
+    if: github.event_name != 'schedule'
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
@@ -89,6 +96,7 @@ jobs:
 
   e2e:
     needs: [build]
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     env:
@@ -157,3 +165,37 @@ jobs:
       - name: Teardown
         if: always()
         run: bash tests/e2e-mw-dev/run.sh teardown
+
+  # Backstop sweep of orphaned per-PR namespaces. Scheduled-trigger only (the
+  # PR/manual triggers run build+e2e instead). Reuses the same Tailscale + e2e
+  # IAM role as the e2e job; run.sh e2e-cleanup discovers stale namespaces by the
+  # managed-by=e2e-mw-dev label and reaps anything older than 6h. Named
+  # e2e-cleanup (not "janitor") to avoid colliding with duckgres's own janitor.
+  e2e-cleanup:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      KUBE_CONTEXT: posthog-mw-dev
+      CLUSTER_NAME: posthog-mw-dev
+      EKS_CLUSTER_NAME: posthog-mw-dev
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
+          aws-region: us-east-1
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
+        with:
+          oauth-client-id: ${{ vars.TS_WIF_CLIENT_ID_MW_DEV }}
+          audience: ${{ vars.TS_WIF_AUDIENCE_MW_DEV }}
+          tags: tag:github-runner
+      - name: Install kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
+      - name: Sweep stale per-PR namespaces
+        run: bash tests/e2e-mw-dev/run.sh e2e-cleanup

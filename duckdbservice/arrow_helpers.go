@@ -38,7 +38,15 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 
 	numFields := schema.NumFields()
 	count := 0
-	for rows.Next() && count < batchSize {
+	// Order matters: check `count < batchSize` first, then call rows.Next().
+	// The reverse (rows.Next() && count < batchSize) advances the cursor once
+	// more after the final scan and that row is silently dropped — the next
+	// call to RowsToRecord starts from the row *after* the one we skipped.
+	// Production reads were losing one row at every batch boundary
+	// (batchSize=1024) for unbounded SELECTs; COUNT(*) still returned the
+	// parquet-metadata row count, so the discrepancy was invisible to
+	// aggregation queries. See TestRowsToRecordNoRowsLostAtBatchBoundary.
+	for count < batchSize && rows.Next() {
 		values := make([]interface{}, numFields)
 		valuePtrs := make([]interface{}, numFields)
 		for i := range values {
@@ -73,7 +81,7 @@ func isNil(i contextQueryer) bool {
 		return true
 	}
 	v := reflect.ValueOf(i)
-	return v.Kind() == reflect.Ptr && v.IsNil()
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.

@@ -313,7 +313,6 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		a.CheckpointInterval == b.CheckpointInterval &&
 		ai.Enabled == bi.Enabled &&
 		ai.Backend == bi.Backend &&
-		ai.TableBucket == bi.TableBucket &&
 		ai.Region == bi.Region &&
 		ai.Namespace == bi.Namespace &&
 		// Lakekeeper-side identity. Without this, a hot-idle worker

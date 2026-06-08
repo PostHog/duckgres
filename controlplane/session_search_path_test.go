@@ -2,10 +2,25 @@ package controlplane
 
 import "testing"
 
-func TestEffectiveSessionDefaultCommandUsesClientSearchPathBeforeCatalog(t *testing.T) {
-	got, source := effectiveSessionDefaultCommand("ducklake.main", "iceberg")
-	if got != "SET search_path = 'ducklake.main,memory.main'" {
-		t.Fatalf("command = %q, want SET search_path = 'ducklake.main,memory.main'", got)
+func TestEffectiveSessionDefaultCommandIcebergSwitchSurvivesClientSearchPath(t *testing.T) {
+	// An Iceberg session with a client-supplied search_path must STILL switch
+	// into the Iceberg catalog (there is no InitSessionDatabaseMetadata defer to
+	// do it). The catalog switch precedes the search_path and is fail-closed.
+	got, source := effectiveSessionDefaultCommand("public", "iceberg")
+	if got != "USE iceberg.public; SET search_path = 'public,memory.main'" {
+		t.Fatalf("command = %q, want USE iceberg.public; SET search_path = 'public,memory.main'", got)
+	}
+	if source != sessionDefaultSourceConfiguredCatalog {
+		t.Fatalf("source = %q, want %q", source, sessionDefaultSourceConfiguredCatalog)
+	}
+}
+
+func TestEffectiveSessionDefaultCommandDuckLakeClientSearchPathOnly(t *testing.T) {
+	// DuckLake's catalog switch is owned by InitSessionDatabaseMetadata's defer,
+	// so a client search_path is applied alone and best-effort.
+	got, source := effectiveSessionDefaultCommand("analytics", "ducklake")
+	if got != "SET search_path = 'analytics,memory.main'" {
+		t.Fatalf("command = %q, want SET search_path = 'analytics,memory.main'", got)
 	}
 	if source != sessionSearchPathSourceClient {
 		t.Fatalf("source = %q, want %q", source, sessionSearchPathSourceClient)
@@ -36,9 +51,9 @@ func TestEffectiveSessionDefaultCommandEmptyForDuckLake(t *testing.T) {
 
 func TestPassthroughSessionDefaultCatalogCommand(t *testing.T) {
 	tests := []struct {
-		name            string
+		name             string
 		effectiveCatalog string
-		want            string
+		want             string
 	}{
 		{name: "ducklake selected", effectiveCatalog: "ducklake", want: "USE ducklake"},
 		{name: "iceberg selected", effectiveCatalog: "iceberg", want: "USE iceberg.public"},

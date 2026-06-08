@@ -14,25 +14,29 @@ import (
 )
 
 func TestShouldLoadIcebergColumnMetadataOnlyForLakekeeper(t *testing.T) {
-	if !shouldLoadIcebergColumnMetadata(IcebergConfig{
+	lakekeeperCfg := IcebergConfig{
 		Enabled:             true,
 		Backend:             iceberg.BackendLakekeeper,
 		LakekeeperEndpoint:  "http://lakekeeper.invalid/catalog",
 		LakekeeperWarehouse: "org-acme",
-	}, false) {
+	}
+	if !shouldLoadIcebergColumnMetadata(lakekeeperCfg, iceberg.CatalogName, false) {
 		t.Fatal("expected Lakekeeper catalog to load Iceberg column metadata")
 	}
 	if shouldLoadIcebergColumnMetadata(IcebergConfig{
 		Enabled: true,
-		Backend: iceberg.BackendS3Tables,
-	}, false) {
-		t.Fatal("S3 Tables catalog should not use Lakekeeper REST metadata loading")
-	}
-	if shouldLoadIcebergColumnMetadata(IcebergConfig{
-		Enabled: true,
 		Backend: iceberg.BackendLakekeeper,
-	}, true) {
+	}, iceberg.CatalogName, true) {
 		t.Fatal("passthrough connections should not load Iceberg column metadata")
+	}
+	// A DuckLake session on a dual-catalog worker must not trigger the Iceberg
+	// metadata load (cross-catalog REST I/O + shared-table churn it can't read).
+	if shouldLoadIcebergColumnMetadata(lakekeeperCfg, physicalDuckLakeCatalog, false) {
+		t.Fatal("DuckLake sessions should not load Iceberg column metadata")
+	}
+	// A session whose catalog has not yet resolved must not trigger the load.
+	if shouldLoadIcebergColumnMetadata(lakekeeperCfg, "", false) {
+		t.Fatal("sessions without a resolved Iceberg catalog should not load metadata")
 	}
 }
 
@@ -48,7 +52,7 @@ func TestLoadIcebergColumnMetadataUsesConnectionIcebergConfig(t *testing.T) {
 	})
 
 	cfg := cc.effectiveIcebergConfig()
-	if !shouldLoadIcebergColumnMetadata(cfg, false) {
+	if !shouldLoadIcebergColumnMetadata(cfg, iceberg.CatalogName, false) {
 		t.Fatalf("expected tenant Iceberg config to enable metadata loading")
 	}
 	if cfg.LakekeeperEndpoint != "http://lakekeeper.example/catalog" {
@@ -90,7 +94,8 @@ func TestQueryWithArgsWithMetadataLoadsIcebergColumns(t *testing.T) {
 
 	exec := &metadataTrackingExecutor{}
 	cc := &clientConn{
-		executor: exec,
+		executor:        exec,
+		physicalCatalog: iceberg.CatalogName,
 		tenantIcebergConfig: IcebergConfig{
 			Enabled:             true,
 			Backend:             iceberg.BackendLakekeeper,

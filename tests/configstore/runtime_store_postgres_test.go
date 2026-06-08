@@ -812,6 +812,108 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 	}
 }
 
+// Per-worker TTL: ListExpiredHotIdleWorkers retires a hot-idle worker once its
+// own ttl_minutes has elapsed since updated_at (last became idle); ttl=0 falls
+// back to the deployment default; non-hot-idle workers are never returned.
+func TestListExpiredHotIdleWorkersPerWorkerTTL(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	mk := func(id, ttlMin int, state configstore.WorkerState) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-ttl-%d", id),
+			State:             state,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        ttlMin,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	mk(1, 0, configstore.WorkerStateHotIdle)   // uses default TTL
+	mk(2, 5, configstore.WorkerStateHotIdle)   // short per-worker TTL
+	mk(3, 120, configstore.WorkerStateHotIdle) // long per-worker TTL
+	mk(4, 1, configstore.WorkerStateHot)       // not hot-idle: never reaped
+
+	// As of base+30m with a 10m default: ttl=0 (default 10m) and ttl=5m have
+	// elapsed; ttl=120m has not; the hot (active) worker is excluded.
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	got := map[int]bool{}
+	for _, w := range expired {
+		got[w.WorkerID] = true
+	}
+	if !got[1] {
+		t.Error("ttl=0 worker should expire via the 10m default by base+30m")
+	}
+	if !got[2] {
+		t.Error("ttl=5m worker should expire by base+30m")
+	}
+	if got[3] {
+		t.Error("ttl=120m worker should NOT expire by base+30m")
+	}
+	if got[4] {
+		t.Error("non-hot-idle (hot) worker must never be returned")
+	}
+}
+
+// Regression: UpsertWorkerRecord must update the profile (cpu/mem/colocate) and
+// ttl_minutes columns on conflict. CreateSpawningWorkerSlot inserts a sized
+// worker's row with an empty profile, and the reserve/hot-idle persists set it
+// via upsert — if the ON CONFLICT update omits these columns, a sized worker's
+// hot-idle row stays empty and ClaimHotIdleWorker can never match it (no reuse).
+func TestUpsertWorkerRecordPersistsProfileOnConflict(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+
+	// Row created with an empty profile (as CreateSpawningWorkerSlot does).
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7001,
+		PodName:           "duckgres-worker-7001",
+		State:             configstore.WorkerStateSpawning,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("insert empty-profile row: %v", err)
+	}
+
+	// Later persist (reserve / hot-idle) sets the concrete size + ttl.
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7001,
+		PodName:           "duckgres-worker-7001",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+		ProfileCPU:        "4",
+		ProfileMemory:     "8Gi",
+		TTLMinutes:        15,
+	}); err != nil {
+		t.Fatalf("upsert profile on conflict: %v", err)
+	}
+
+	got, err := store.GetWorkerRecord(7001)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if got.ProfileCPU != "4" || got.ProfileMemory != "8Gi" || got.TTLMinutes != 15 {
+		t.Fatalf("profile not persisted on conflict: cpu=%q mem=%q ttl=%d", got.ProfileCPU, got.ProfileMemory, got.TTLMinutes)
+	}
+	if got.State != configstore.WorkerStateHotIdle {
+		t.Fatalf("state = %q, want hot_idle", got.State)
+	}
+}
+
 func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
@@ -2589,7 +2691,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour), time.Minute)
 	if err != nil {
 		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
 	}
@@ -2651,7 +2753,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterTouchPostgres(t *testin
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour), time.Minute)
 	if err != nil {
 		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
 	}
