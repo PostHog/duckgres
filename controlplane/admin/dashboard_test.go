@@ -68,6 +68,12 @@ func TestDashboardRejectsTokenQueryParam(t *testing.T) {
 		if got := rec.Header().Get("Location"); got != "" {
 			t.Errorf("GET %s redirected to %q, want no redirect", path, got)
 		}
+		// The login page must not echo the secret back (e.g. inside the
+		// hidden "next" field) — that would re-embed it in the page and
+		// redirect it back into the URL bar after login.
+		if strings.Contains(rec.Body.String(), "secret") {
+			t.Errorf("GET %s login page echoes the token", path)
+		}
 	}
 }
 
