@@ -346,10 +346,10 @@ pipeline_error_recovery() { # org password
     out="$(PGPASSWORD="$2" psql \
         "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" 2>&1 <<EOF || true
 \startpipeline
-SELEC deliberately_broken \bind \g
-INSERT INTO $t VALUES (1) \bind \g
+SELEC deliberately_broken \bind \sendpipeline
+INSERT INTO $t VALUES (1) \bind \sendpipeline
 \syncpipeline
-INSERT INTO $t VALUES (2) \bind \g
+INSERT INTO $t VALUES (2) \bind \sendpipeline
 \endpipeline
 EOF
 )"
