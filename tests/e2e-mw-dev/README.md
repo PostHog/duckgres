@@ -46,6 +46,19 @@ client-go:
   succeeds. The harness asserts the hint when observed **and** handles it (the
   concurrency tests retry through it).
 - **activation** — DuckLake **and** Iceberg catalogs attach and read/write.
+- **worker sizing** (TTL-pool model, `docs/design/worker-ttl-pool.md`) — a
+  client-sized connection (`duckgres.worker_cpu`/`worker_memory`/`worker_ttl`
+  startup options, sent via `PGOPTIONS`; CP runs `allowClientWorkerProfile=true`
+  with clamps) spawns a worker pod whose `duckdb-worker` container carries the
+  requested CPU+memory on **both** requests and limits — proving the shape flows
+  control-plane → k8s pod spec, not BestEffort. A same-shape reconnect **reuses**
+  that hot-idle worker (no respawn — the count of that-shape pods stays 1).
+  Asserted on cnpg for **both** the ducklake and iceberg catalogs, with a
+  distinct shape per catalog (2/4Gi vs 3/6Gi) so the catalog-agnostic worker
+  can't satisfy the second from the first's hot-idle pool. The per-PR CP also
+  runs `DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED=false`, so the only workers
+  are the ones a request sizes + spawns (no neutral warm-miss-driven workers).
+  Clamp enforcement itself is unit-covered (`controlplane/worker_profile_test.go`).
 - **extension forks** — the bundled `ducklake`/`httpfs` extensions are the
   PostHog forks, not upstream (ported from the `*IsBundledFork` tests).
 - **worker pods** — labels (`app`, `duckgres/control-plane`,

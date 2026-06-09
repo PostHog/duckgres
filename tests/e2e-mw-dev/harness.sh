@@ -13,6 +13,10 @@
 #                  and a cold-pool burst gets the graceful warm-pool backpressure
 #                  hint ("retry in ~45s") then recovers.
 #   activation   : DuckLake + Iceberg catalogs attach and read/write.
+#   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
+#                  spawns a worker pod carrying the requested CPU+memory, and a
+#                  same-shape reconnect reuses that hot-idle worker (no respawn)
+#                  — asserted on cnpg for BOTH the ducklake and iceberg catalogs.
 #   ext forks    : the bundled ducklake/httpfs extensions are the PostHog forks,
 #                  not upstream (detects an accidental upstream swap in the image).
 #   worker pods  : labels, securityContext (non-root, no priv-esc), Downward-API
@@ -332,6 +336,71 @@ assert_worker_pod() {
   fi
 }
 
+# ---- worker sizing (TTL-pool model) ---------------------------------------
+# The TTL-pool model (docs/design/worker-ttl-pool.md) lets a client pick the
+# worker shape + TTL via the duckgres.worker_cpu/worker_memory/worker_ttl
+# startup options (gated by allowClientWorkerProfile, clamped by the CP). Assert
+# end-to-end that a sized connection spawns a worker pod whose duckdb-worker
+# container carries the requested CPU+memory on BOTH requests and limits — i.e.
+# the shape flows control-plane → k8s pod spec, not BestEffort. A distinct shape
+# (no other test, and no other catalog of this org, uses it) guarantees a fresh
+# spawn: the implemented reuse path is EXACT-profile-match only, so it can't hand
+# back a default or other-shape hot-idle worker — the newest worker pod for the
+# org is unambiguously ours. The connection's dbname forces that catalog's
+# activation at session-create, so this also exercises sizing × catalog together.
+WORKER_C='{.spec.containers[?(@.name=="duckdb-worker")]'
+sized_worker() { # org password catalog cpu memory ttl
+  org="$1"; pw="$2"; cat="$3"; cpu="$4"; mem="$5"; ttl="$6"
+  log "sized worker spawn on $org/$cat: cpu=$cpu memory=$mem ttl=$ttl"
+  # PGOPTIONS (scoped to this subshell) carries the startup options; libpq sends
+  # them in the StartupMessage exactly like search_path. Run a real query so the
+  # CP actually spawns + activates the sized worker.
+  ( export PGOPTIONS="-c duckgres.worker_cpu=$cpu -c duckgres.worker_memory=$mem -c duckgres.worker_ttl=$ttl"
+    _pg_exec "$org" "$pw" "$cat" 'SELECT 1' ) >/dev/null \
+    || fail "sized worker query failed on $org/$cat"
+  pod="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" \
+        --sort-by=.metadata.creationTimestamp \
+        -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)"
+  [ -n "$pod" ] || fail "sized worker: no worker pod for $org"
+  rcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
+  rmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  lcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.cpu}")"
+  lmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.memory}")"
+  [ "$rcpu" = "$cpu" ] || fail "sized worker $pod requests.cpu='$rcpu' want '$cpu' (sizing not applied — BestEffort?)"
+  [ "$rmem" = "$mem" ] || fail "sized worker $pod requests.memory='$rmem' want '$mem'"
+  [ "$lcpu" = "$cpu" ] || fail "sized worker $pod limits.cpu='$lcpu' want '$cpu'"
+  [ "$lmem" = "$mem" ] || fail "sized worker $pod limits.memory='$lmem' want '$mem'"
+  log "sized worker OK: $pod requests/limits cpu=$rcpu mem=$rmem"
+}
+
+# Same-shape reconnect must REUSE the hot-idle sized worker, not spawn a second.
+# After sized_worker leaves exactly one hot-idle worker of this shape for the
+# org, an identical sized connection re-uses it (Destroy-before-reuse makes the
+# prior session gone before the next is assigned), so the count of worker pods
+# of that CPU stays 1 — a respawn would make it 2. A non-trivial TTL keeps the
+# first alive across this check.
+count_org_workers_of_cpu() { # org cpu  -> prints count
+  n=0
+  for p in $(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" \
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    c="$(k get pod "$p" -o jsonpath="${WORKER_C}.resources.requests.cpu}" 2>/dev/null)"
+    [ "$c" = "$2" ] && n=$((n + 1))
+  done
+  echo "$n"
+}
+reuse_sized_worker() { # org password catalog cpu memory ttl
+  org="$1"; pw="$2"; cat="$3"; cpu="$4"; mem="$5"; ttl="$6"
+  log "sized worker reuse on $org/$cat (same shape must not respawn)"
+  # Let the prior sized session fully release to hot-idle before re-acquiring.
+  sleep 5
+  ( export PGOPTIONS="-c duckgres.worker_cpu=$cpu -c duckgres.worker_memory=$mem -c duckgres.worker_ttl=$ttl"
+    _pg_exec "$org" "$pw" "$cat" 'SELECT 1' ) >/dev/null \
+    || fail "sized worker reuse query failed on $org/$cat"
+  n="$(count_org_workers_of_cpu "$org" "$cpu")"
+  [ "$n" = "1" ] || fail "sized worker reuse: org $org has $n pods of cpu=$cpu, want 1 (same-shape request respawned instead of reusing the hot-idle worker)"
+  log "sized worker reuse OK: 1 pod of cpu=$cpu (reused, no respawn)"
+}
+
 # ---- resilience -----------------------------------------------------------
 # Worker pod killed mid-life → CP refills and a fresh query succeeds.
 # Ported from TestK8sWorkerCrashRecovery.
@@ -571,6 +640,16 @@ main() {
   graceful_drain         "$CNPG" "$cnpg_pw"
   one_session_per_worker "$CNPG" "$cnpg_pw"
 
+  # ---- worker sizing (TTL-pool model) on cnpg, both catalogs ----
+  # Distinct shapes per catalog (2/4Gi vs 3/6Gi) so the iceberg sized request
+  # can't reuse the ducklake org's hot-idle 2-CPU worker (workers are
+  # catalog-agnostic; only the profile shape gates reuse) — each catalog gets a
+  # verified fresh sized spawn, then a verified same-shape reuse.
+  sized_worker        "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
+  reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
+  sized_worker        "$CNPG" "$cnpg_pw" iceberg  3 6Gi 15m
+  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  3 6Gi 15m
+
   # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
   wait_worker "$EXT" "$ext_pw" ducklake
   basic_query  "$EXT" "$ext_pw"
@@ -590,7 +669,7 @@ main() {
   # end-to-end would need a warm target >0 in the per-PR CP (see README).
   log "SKIP shared-warm-activation + version-reaper (CP runs warm-target=0; see README)"
 
-  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"
