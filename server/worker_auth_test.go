@@ -83,7 +83,7 @@ func TestAuthenticateChildClientUnknownUserIndistinguishable(t *testing.T) {
 		t.Fatalf("expected cleartext password request before failure, got %c (err %v)", msgType, err)
 	}
 	msgType, body, err := wire.ReadMessage(reader)
-	if err != nil || msgType != 'E' {
+	if err != nil || msgType != wire.MsgErrorResponse {
 		t.Fatalf("expected ErrorResponse, got %c (err %v)", msgType, err)
 	}
 	if !bytes.Contains(body, []byte("28P01")) {
