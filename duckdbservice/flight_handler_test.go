@@ -190,6 +190,78 @@ func TestStatementFlightInfoHoldsSessionOperationUntilDoGet(t *testing.T) {
 	}
 }
 
+func TestStatementFlightInfoNonEmptyHoldsSessionOperationUntilDoGet(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 1"}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("first GetFlightInfoStatement: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("active drain work=%d want 1 before DoGet", got)
+	}
+
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 2"}, &flight.FlightDescriptor{}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected second same-session operation to be rejected, got %v", err)
+	}
+
+	var handleID string
+	session.mu.RLock()
+	for id := range session.queries {
+		handleID = id
+		break
+	}
+	session.mu.RUnlock()
+	if handleID == "" {
+		t.Fatal("expected first GetFlightInfoStatement to store a query handle")
+	}
+
+	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte(handleID)})
+	if err != nil {
+		t.Fatalf("DoGetStatement: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after DoGet", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after DoGet")
+	} else {
+		finish()
+	}
+}
+
 func TestHealthCheckBlocksUntilWarmup(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
@@ -625,6 +697,71 @@ func TestEndTransactionKeepsDrainOpenForOpenTransaction(t *testing.T) {
 	}
 }
 
+func TestEndTransactionRollbackReleasesAbandonedStatementOperation(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	txnID, err := handler.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 1", transactionID: txnID}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get in-transaction flight info: %v", err)
+	}
+
+	if err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: txnID,
+		action:        flightsql.EndTransactionRollback,
+	}); err != nil {
+		session.mu.Lock()
+		ttx := session.txns[string(txnID)]
+		if ttx != nil {
+			delete(session.txns, string(txnID))
+			delete(session.txnOwner, string(txnID))
+		}
+		session.mu.Unlock()
+		if ttx != nil && ttx.tx != nil {
+			_ = session.rollbackTx(ttx.tx)
+		}
+		if ttx != nil && ttx.finishDrain != nil {
+			ttx.finishDrain()
+		}
+		t.Fatalf("rollback should clean up abandoned in-transaction statement: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after rollback", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after rollback cleanup")
+	} else {
+		finish()
+	}
+}
+
 func TestRawSQLTransactionKeepsDrainOpenUntilCommit(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -757,6 +894,45 @@ func TestPreparedStatementDoGetContinuesAfterDrainStarts(t *testing.T) {
 	defer cancel()
 	if !pool.WaitForDrain(waitCtx) {
 		t.Fatal("expected prepared continuation to release drain work")
+	}
+}
+
+func TestClosePreparedStatementReleasesAbandonedOperation(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {Query: "", Schema: arrow.NewSchema(nil, nil), Prepared: true},
+		},
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+	cmd := testPreparedStatementQuery{handle: []byte("prep-1")}
+
+	if _, err := handler.GetFlightInfoPreparedStatement(ctx, cmd, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get prepared flight info: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("active drain work=%d want 1 before close", got)
+	}
+
+	if err := handler.ClosePreparedStatement(ctx, cmd); err != nil {
+		t.Fatalf("close prepared should clean up abandoned pending operation: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after close", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after close prepared")
+	} else {
+		finish()
 	}
 }
 

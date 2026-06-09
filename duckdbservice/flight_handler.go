@@ -130,6 +130,48 @@ func releaseQueryHandleValue(handle *QueryHandle) {
 	}
 }
 
+func appendQueryHandleReleaseFuncs(handle *QueryHandle, drainReleases, operationReleases []func()) ([]func(), []func()) {
+	if handle == nil {
+		return drainReleases, operationReleases
+	}
+	if handle.finishDrain != nil {
+		drainReleases = append(drainReleases, handle.finishDrain)
+		handle.finishDrain = nil
+	}
+	if handle.finishOperation != nil {
+		operationReleases = append(operationReleases, handle.finishOperation)
+		handle.finishOperation = nil
+	}
+	for _, token := range handle.pendingDrains {
+		if token.finish != nil {
+			drainReleases = append(drainReleases, token.finish)
+		}
+		if token.finishOperation != nil {
+			operationReleases = append(operationReleases, token.finishOperation)
+		}
+	}
+	handle.pendingDrains = nil
+	return drainReleases, operationReleases
+}
+
+func popTransactionQueryHandles(session *Session, txnKey string) ([]func(), []func()) {
+	var drainReleases []func()
+	var operationReleases []func()
+	if txnKey == "" {
+		return drainReleases, operationReleases
+	}
+	session.mu.Lock()
+	for id, handle := range session.queries {
+		if handle.TxnID != txnKey {
+			continue
+		}
+		delete(session.queries, id)
+		drainReleases, operationReleases = appendQueryHandleReleaseFuncs(handle, drainReleases, operationReleases)
+	}
+	session.mu.Unlock()
+	return drainReleases, operationReleases
+}
+
 func popQueryHandle(session *Session, handleID string) (*QueryHandle, bool) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -943,15 +985,33 @@ func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	finishOperation, ok := session.beginOperation()
-	if busyErr := sessionBusyStatus(ok); busyErr != nil {
-		return busyErr
-	}
-	defer finishOperation()
 
 	txnKey := string(req.GetTransactionId())
 	if txnKey == "" {
 		return status.Error(codes.InvalidArgument, "missing transaction id")
+	}
+
+	finishOperation, ok := session.beginOperation()
+	var handleDrainReleases []func()
+	var handleOperationReleases []func()
+	if !ok {
+		handleDrainReleases, handleOperationReleases = popTransactionQueryHandles(session, txnKey)
+		if len(handleOperationReleases) == 0 {
+			if busyErr := sessionBusyStatus(false); busyErr != nil {
+				return busyErr
+			}
+		}
+	} else {
+		handleDrainReleases, handleOperationReleases = popTransactionQueryHandles(session, txnKey)
+		handleOperationReleases = append(handleOperationReleases, finishOperation)
+	}
+	defer func() {
+		for _, release := range handleOperationReleases {
+			releaseDrainFunc(release)
+		}
+	}()
+	for _, release := range handleDrainReleases {
+		releaseDrainFunc(release)
 	}
 
 	session.mu.Lock()
@@ -1070,11 +1130,6 @@ func (h *FlightSQLHandler) ClosePreparedStatement(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	finishOperation, ok := session.beginOperation()
-	if busyErr := sessionBusyStatus(ok); busyErr != nil {
-		return busyErr
-	}
-	defer finishOperation()
 
 	handleID := string(req.GetPreparedStatementHandle())
 	releaseQueryHandle(session, handleID)
