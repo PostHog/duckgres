@@ -106,9 +106,6 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	}
 	defer p.gate.release()
 
-	// Throttle warm-miss recording (the miss is still recorded for demand metrics
-	// even though we now foreground-spawn rather than wait for a replenish).
-	var lastWarmMissAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -144,61 +141,30 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 		image := p.image
 		p.shared.mu.Unlock()
 
-		// While waiting (below) we poll every WarmAcquireRetryInterval, but record
-		// the warm miss (demand + metric) at most once per WarmMissRecordInterval
-		// so one waiting connection doesn't inflate the demand signal / miss counter.
-		recordMiss := lastWarmMissAt.IsZero() || time.Since(lastWarmMissAt) >= WarmMissRecordInterval
+		// At the org's max concurrent (exclusive) workers with all busy → fail fast
+		// with the clear org-cap message; waiting cannot help (no new worker will
+		// spawn). Colocated workers bin-pack and are bounded by the CPU/mem budget
+		// checked above, not this count cap.
+		isColocated := profile != nil && profile.Colocate
+		if !isColocated && p.atOrgWorkerCap() {
+			return nil, NewWarmCapacityExhaustedErrorForReason(
+				configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+		}
 
+		// Under cap: reuse a hot-idle worker for this org, or spawn one on demand.
+		// ReserveSharedWorker re-checks the org/global cap authoritatively
+		// (CreateSpawningWorkerSlot, cross-CP) and returns the reason-specific cap
+		// error; an org/global-cap or shutdown error won't resolve by waiting.
 		worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-			OrgID:                  p.orgID,
-			MaxWorkers:             maxWorkers,
-			Image:                  image,
-			Profile:                profile,
-			MaxColocatedCPU:        p.maxColocatedCPU,
-			MaxColocatedMemBytes:   p.maxColocatedMemBytes,
-			SuppressWarmMissRecord: !recordMiss,
+			OrgID:                p.orgID,
+			MaxWorkers:           maxWorkers,
+			Image:                image,
+			Profile:              profile,
+			MaxColocatedCPU:      p.maxColocatedCPU,
+			MaxColocatedMemBytes: p.maxColocatedMemBytes,
 		})
 		if err != nil {
-			if recordMiss {
-				lastWarmMissAt = time.Now()
-			}
-			// An org/global-cap or shutdown miss will NOT resolve by waiting —
-			// surface it immediately with its clear, reason-specific message.
-			if !isRetryableWarmMiss(err) {
-				return nil, err
-			}
-			// A retryable "no idle warm worker" miss: distinguish two cases.
-			//   - At the org's max concurrent (exclusive) workers and all busy →
-			//     waiting cannot help (no new worker will spawn); fail fast with the
-			//     clear org-cap message so the client knows it hit its own limit.
-			//     This also makes the contract hold without a runtime store, whose
-			//     in-memory claim cannot itself classify the miss as org-cap.
-			//   - Under the cap → a worker is (being) spawned, so hold up to
-			//     warmAcquireTimeout for it rather than bouncing the client. Applies
-			//     to default/exclusive requests too, not just colocated.
-			isColocated := profile != nil && profile.Colocate
-			if !isColocated && p.atOrgWorkerCap() {
-				return nil, NewWarmCapacityExhaustedErrorForReason(
-					configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
-			}
-			// No warm pool: foreground-spawn a worker for this request instead of
-			// waiting for a warm replenish that will never come. A sized request
-			// already foreground-spawned inside ReserveSharedWorker (so it returned a
-			// worker, not this miss); this path covers default requests. The spawn
-			// re-checks the org/global cap (CreateSpawningWorkerSlot) and reserves the
-			// worker, which then activates below.
-			worker, err = p.shared.spawnReservedWorker(ctx, &WorkerAssignment{
-				OrgID:                p.orgID,
-				MaxWorkers:           maxWorkers,
-				Image:                image,
-				Profile:              profile,
-				MaxColocatedCPU:      p.maxColocatedCPU,
-				MaxColocatedMemBytes: p.maxColocatedMemBytes,
-			})
-			if err != nil {
-				return nil, err
-			}
-			// worker is now a freshly reserved worker; fall through to activation.
+			return nil, err
 		}
 
 		if err := p.activateWorkerForOrg(ctx, worker); err != nil {

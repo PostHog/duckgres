@@ -23,7 +23,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 		return nil
 	}
 	addNeutralWarmWorker(shared, 1)
-	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
 		// Mirror production SpawnWorker behavior: the spawned worker carries
 		// the image it was built from. Required since findReservableWarmWorkerLocked
@@ -74,7 +74,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	shared.workers[other.ID] = other
 	addNeutralWarmWorker(shared, 2)
 
-	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
 		// Mirror production SpawnWorker behavior: the spawned worker carries
 		// the image it was built from. Required since findReservableWarmWorkerLocked
@@ -139,7 +139,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 		return nil
 	}
 	addNeutralWarmWorker(shared, 1)
-	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
 		// Mirror production SpawnWorker behavior: the spawned worker carries
 		// the image it was built from. Required since findReservableWarmWorkerLocked
@@ -177,7 +177,7 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 		return nil
 	}
 	addNeutralWarmWorker(shared, 1)
-	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
 		// Mirror production SpawnWorker behavior: the spawned worker carries
 		// the image it was built from. Required since findReservableWarmWorkerLocked
@@ -230,7 +230,7 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 	for i := 1; i <= target; i++ {
 		addNeutralWarmWorker(shared, i)
 	}
-	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
 		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()

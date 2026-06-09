@@ -132,29 +132,6 @@ func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSess
 	}
 }
 
-func TestOrgRouterAdapterSetWarmCapacityTargetZeroClearsAllWarmTargets(t *testing.T) {
-	sharedPool, _ := newTestK8sPool(t, 10)
-	sharedPool.SetWarmCapacityTarget(4)
-	sharedPool.SetPerImageWarmTargets(map[string]int{
-		"posthog/duckgres:default": 4,
-		"posthog/duckgres:v1.5.1":  1,
-	})
-	adapter := &orgRouterAdapter{
-		router: &OrgRouter{
-			sharedPool: sharedPool,
-		},
-	}
-
-	adapter.SetWarmCapacityTarget(0)
-
-	if got := sharedPool.WarmCapacityTarget(); got != 0 {
-		t.Fatalf("expected shared warm target 0, got %d", got)
-	}
-	if got := sharedPool.PerImageWarmTargets(); len(got) != 0 {
-		t.Fatalf("expected per-image warm targets to be cleared, got %v", got)
-	}
-}
-
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
 	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil, 0, 0)
@@ -239,7 +216,7 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 	sharedPool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	sharedPool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+	sharedPool.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		sharedPool.mu.Lock()
 		sharedPool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
 		sharedPool.mu.Unlock()

@@ -49,13 +49,6 @@ func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
 }
 
-func (a *orgRouterAdapter) SetWarmCapacityTarget(n int) {
-	a.router.sharedPool.SetWarmCapacityTarget(n)
-	if n <= 0 {
-		a.router.sharedPool.SetPerImageWarmTargets(nil)
-	}
-}
-
 func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }

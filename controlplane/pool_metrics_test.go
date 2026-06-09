@@ -91,15 +91,22 @@ func TestReservedAtTracking(t *testing.T) {
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-
-	w := makeTestWorker(WorkerLifecycleIdle, nil)
-	pool.workers[1] = w
+	// Spawn-on-demand: register the spawned worker so ReserveSharedWorker can
+	// reserve it and stamp reservedAt.
+	pool.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
+		w := makeTestWorker(WorkerLifecycleIdle, nil)
+		w.ID = id
+		pool.mu.Lock()
+		pool.workers[id] = w
+		pool.mu.Unlock()
+		return nil
+	}
 
 	before := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	_, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
+	got, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
 		OrgID: "org-1",
 	})
 	if err != nil {
@@ -107,8 +114,8 @@ func TestReservedAtTracking(t *testing.T) {
 	}
 	after := time.Now()
 
-	if w.reservedAt.Before(before) || w.reservedAt.After(after) {
-		t.Fatalf("reservedAt %v not between %v and %v", w.reservedAt, before, after)
+	if got.reservedAt.Before(before) || got.reservedAt.After(after) {
+		t.Fatalf("reservedAt %v not between %v and %v", got.reservedAt, before, after)
 	}
 }
 
@@ -165,13 +172,7 @@ func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *te
 
 func TestReapStuckActivatingWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	pool.minWorkers = 2
 	pool.activatingTimeout = 50 * time.Millisecond
-
-	spawnedIDs := make(chan int, 10)
-	pool.spawnWarmWorkerBackgroundFunc = func(id int) {
-		spawnedIDs <- id
-	}
 
 	// One idle worker (healthy), one stuck activating worker
 	idle := makeTestWorker(WorkerLifecycleIdle, nil)
@@ -185,7 +186,8 @@ func TestReapStuckActivatingWorkers(t *testing.T) {
 
 	pool.reapStuckActivatingWorkers()
 
-	// Stuck worker should be removed
+	// Stuck worker should be removed; the healthy idle worker left alone. There
+	// is no warm pool, so nothing is spawned to replace the reaped worker.
 	pool.mu.RLock()
 	_, stuckExists := pool.workers[2]
 	_, idleExists := pool.workers[1]
@@ -196,14 +198,6 @@ func TestReapStuckActivatingWorkers(t *testing.T) {
 	}
 	if !idleExists {
 		t.Fatal("idle worker should not have been reaped")
-	}
-
-	// Should have spawned a replacement since minWorkers=2 and only 1 remains
-	select {
-	case <-spawnedIDs:
-		// good
-	case <-time.After(time.Second):
-		t.Fatal("expected replacement worker to be spawned")
 	}
 }
 
