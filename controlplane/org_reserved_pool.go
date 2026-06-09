@@ -187,7 +187,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 			// worker, not this miss); this path covers default requests. The spawn
 			// re-checks the org/global cap (CreateSpawningWorkerSlot) and reserves the
 			// worker, which then activates below.
-			worker, err = p.shared.foregroundSpawnReservedWorker(ctx, &WorkerAssignment{
+			worker, err = p.shared.spawnReservedWorker(ctx, &WorkerAssignment{
 				OrgID:                p.orgID,
 				MaxWorkers:           maxWorkers,
 				Image:                image,
