@@ -13,6 +13,8 @@
 #                  a malformed startup-message length is rejected cleanly (no CP
 #                  crash, #715), and a cold burst is absorbed (workers spawn on
 #                  demand; any surplus gets a graceful retry hint) then served.
+#                  jsonb || keeps Postgres concat semantics through
+#                  transpilation (#716).
 #   activation   : DuckLake + Iceberg catalogs attach and read/write.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
@@ -248,6 +250,24 @@ malformed_startup_resilience() { # org password
   [ "$after" = "$before" ] || fail "CP pod $cp_pod restarted on malformed startup (restarts $before -> $after)"
   v="$(pg "$1" "$2" ducklake 'SELECT 1')"
   [ "$v" = "1" ] || fail "CP stopped serving after malformed startup (got '$v')"
+}
+
+# jsonb || must keep Postgres concatenation semantics through the full CP
+# transpile → worker DuckDB execute path (regression for #716: the transpiler
+# used to rewrite it to json_merge_patch, which REPLACED arrays instead of
+# concatenating them — silently corrupting the common `col || '["x"]'::jsonb`
+# append idiom — and deleted null-valued keys instead of keeping them).
+# Backend-independent (no metadata touched), so cnpg-only is sufficient.
+jsonb_concat_semantics() { # org password
+  log "jsonb || semantics on $1"
+  v="$(pg "$1" "$2" ducklake "SELECT '[1,2]'::jsonb || '[3,4]'::jsonb")"
+  [ "$v" = '[1,2,3,4]' ] || fail "jsonb array concat returned '$v' (want [1,2,3,4])"
+  v="$(pg "$1" "$2" ducklake "SELECT '{\"a\":1}'::jsonb || '{\"a\":null}'::jsonb")"
+  [ "$v" = '{"a":null}' ] || fail "jsonb null-value merge returned '$v' (want {\"a\":null})"
+  v="$(pg "$1" "$2" ducklake "SELECT '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb")"
+  [ "$v" = '{"a":1,"b":2}' ] || fail "jsonb object merge returned '$v' (want {\"a\":1,\"b\":2})"
+  v="$(pg "$1" "$2" ducklake "SELECT '[1,2]'::jsonb || '3'::jsonb")"
+  [ "$v" = '[1,2,3]' ] || fail "jsonb array append returned '$v' (want [1,2,3])"
 }
 
 # Cold-burst absorption: there is no warm pool — workers are spawned on demand
@@ -701,6 +721,7 @@ main() {
   wait_worker "$CNPG" "$cnpg_pw" ducklake
   basic_query            "$CNPG" "$cnpg_pw"
   malformed_startup_resilience "$CNPG" "$cnpg_pw"
+  jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # before more workers exist
   rw_ducklake            "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
@@ -743,7 +764,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

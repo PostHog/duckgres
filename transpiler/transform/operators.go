@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"google.golang.org/protobuf/proto"
 )
 
 // OperatorTransform converts PostgreSQL operators to DuckDB equivalents.
@@ -290,13 +291,15 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, false)
 		case "->>":
 			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, true)
-		// jsonb || jsonb is an object merge in Postgres, but DuckDB treats || as
-		// string concatenation, silently producing invalid JSON. Rewrite to
-		// json_merge_patch only when an operand is clearly JSON; otherwise leave
-		// || alone (string/array concat is the safe default).
+		// jsonb || jsonb is concatenation in Postgres (object merge / array
+		// concat), but DuckDB treats || as string concatenation, silently
+		// producing invalid JSON. Rewrite to a json_type()-dispatching CASE
+		// that reproduces Postgres semantics only when an operand is clearly
+		// JSON; otherwise leave || alone (string/array concat is the safe
+		// default).
 		case "||":
 			if looksJSON(aexpr.Lexpr) || looksJSON(aexpr.Rexpr) {
-				return t.createJSONMergeFuncCall(aexpr.Lexpr, aexpr.Rexpr)
+				return t.createJSONConcatExpr(aexpr.Lexpr, aexpr.Rexpr)
 			}
 		// Regex operators — only match binary ~ (both operands present).
 		// Unary ~ (bitwise NOT, e.g. ~id) has Lexpr=nil and must be left as-is;
@@ -507,9 +510,12 @@ func (t *OperatorTransform) createJsonExtractFuncCall(left, right *pg_query.Node
 }
 
 // looksJSON reports whether a node is syntactically JSON: a cast to json/jsonb,
-// or a json* function call (including the json_extract calls this transform
-// produces from -> / ->>). Used to gate the || -> json_merge_patch rewrite so
-// genuine string/array concatenation is left untouched.
+// or a JSON-returning json* function call (including the json_extract calls this
+// transform produces from -> / ->>). Used to gate the || JSON-concat rewrite so
+// genuine string/array concatenation is left untouched. json*-named functions
+// that return text/numbers/booleans (json_extract_string, json_array_length,
+// json_type, ...) are excluded: `json_extract_string(d,'a') || 'x'` is plain
+// text concat in Postgres and must stay that way.
 func looksJSON(node *pg_query.Node) bool {
 	if node == nil {
 		return false
@@ -524,7 +530,8 @@ func looksJSON(node *pg_query.Node) bool {
 	}
 	if fc := node.GetFuncCall(); fc != nil && len(fc.Funcname) > 0 {
 		if last := fc.Funcname[len(fc.Funcname)-1].GetString_(); last != nil {
-			if strings.HasPrefix(strings.ToLower(last.Sval), "json") {
+			name := strings.ToLower(last.Sval)
+			if strings.HasPrefix(name, "json") && !jsonFuncReturnsNonJSON(name) {
 				return true
 			}
 		}
@@ -532,27 +539,149 @@ func looksJSON(node *pg_query.Node) bool {
 	return false
 }
 
-// createJSONMergeFuncCall rewrites `a || b` to json_merge_patch(a, b). Note this
-// is RFC 7396 merge-patch semantics (recursive, and a null value deletes a key),
-// which matches Postgres jsonb || for the common flat-object-merge case but
-// diverges for nested objects and explicit nulls.
-func (t *OperatorTransform) createJSONMergeFuncCall(left, right *pg_query.Node) *pg_query.Node {
+// jsonFuncReturnsNonJSON reports whether a json*-named function returns a
+// non-JSON value (VARCHAR, BIGINT, BOOLEAN, ...), so its result concatenated
+// with || must keep DuckDB string-concat semantics. Covers both the PostgreSQL
+// names and the DuckDB names FunctionTransform rewrites them to (function
+// mapping runs before this transform in the pipeline).
+func jsonFuncReturnsNonJSON(name string) bool {
+	for _, suffix := range []string{"_string", "_text", "_length", "_keys", "_valid", "_exists", "_contains"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	switch name {
+	case "json_type", "json_typeof", "jsonb_typeof":
+		return true
+	}
+	return false
+}
+
+// createJSONConcatExpr rewrites `a || b` (with a JSON-looking operand) to a
+// CASE expression reproducing Postgres jsonb || semantics in DuckDB:
+//
+//	object || object  -> shallow merge, right side wins, explicit nulls are
+//	                     KEPT (unlike json_merge_patch, which deep-merges and
+//	                     deletes null-valued keys)
+//	array  || array   -> element concatenation
+//	array  || other   -> append   (non-array side wrapped as a one-element array)
+//	other  || array   -> prepend
+//	scalar || scalar  -> two-element array
+//	NULL   || any     -> NULL (SQL NULL, not JSON null)
+//
+// Emitted shape (L/R = operands):
+//
+//	CASE
+//	  WHEN L IS NULL OR R IS NULL THEN NULL
+//	  WHEN json_type(L) = 'OBJECT' AND json_type(R) = 'OBJECT'
+//	    THEN to_json(map_concat(json_transform(L, '"MAP(VARCHAR, JSON)"'),
+//	                            json_transform(R, '"MAP(VARCHAR, JSON)"')))
+//	  ELSE to_json(list_concat(<L as JSON[]>, <R as JSON[]>))
+//	END
+//
+// where <x as JSON[]> is CASE WHEN json_type(x) = 'ARRAY' THEN
+// json_transform(x, '["JSON"]') ELSE list_value(CAST(x AS JSON)) END.
+// map_concat is last-wins on key collision and to_json inlines JSON-typed
+// values, which is exactly the Postgres shallow-merge behavior (verified
+// against PostgreSQL output for all the cases above; key ORDER may differ —
+// Postgres sorts jsonb keys, DuckDB preserves left-operand order — but jsonb
+// objects are semantically unordered). Operands are cloned per use site so
+// later pipeline transforms never visit a shared node twice.
+func (t *OperatorTransform) createJSONConcatExpr(left, right *pg_query.Node) *pg_query.Node {
 	if newLeft := t.transformExpression(left); newLeft != nil {
 		left = newLeft
 	}
 	if newRight := t.transformExpression(right); newRight != nil {
 		right = newRight
 	}
-	return &pg_query.Node{
-		Node: &pg_query.Node_FuncCall{
-			FuncCall: &pg_query.FuncCall{
-				Funcname: []*pg_query.Node{
-					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "json_merge_patch"}}},
-				},
-				Args: []*pg_query.Node{left, right},
-			},
-		},
+
+	asObjectMap := func(operand *pg_query.Node) *pg_query.Node {
+		return jsonFuncCall("json_transform", cloneNode(operand), strConst(`"MAP(VARCHAR, JSON)"`))
 	}
+	// CASE WHEN json_type(x) = 'ARRAY' THEN json_transform(x, '["JSON"]')
+	// ELSE list_value(CAST(x AS JSON)) END — Postgres treats every non-array
+	// operand of a non-object||object concat as a one-element array.
+	asElementList := func(operand *pg_query.Node) *pg_query.Node {
+		return &pg_query.Node{Node: &pg_query.Node_CaseExpr{CaseExpr: &pg_query.CaseExpr{
+			Args: []*pg_query.Node{{Node: &pg_query.Node_CaseWhen{CaseWhen: &pg_query.CaseWhen{
+				Expr:   jsonTypeEquals(operand, "ARRAY"),
+				Result: jsonFuncCall("json_transform", cloneNode(operand), strConst(`["JSON"]`)),
+			}}}},
+			Defresult: jsonFuncCall("list_value", castToJSON(cloneNode(operand))),
+		}}}
+	}
+
+	return &pg_query.Node{Node: &pg_query.Node_CaseExpr{CaseExpr: &pg_query.CaseExpr{
+		Args: []*pg_query.Node{
+			// WHEN L IS NULL OR R IS NULL THEN NULL — Postgres jsonb || is
+			// strict; without this guard the ELSE branch would wrap a SQL
+			// NULL operand into [null, ...].
+			{Node: &pg_query.Node_CaseWhen{CaseWhen: &pg_query.CaseWhen{
+				Expr: &pg_query.Node{Node: &pg_query.Node_BoolExpr{BoolExpr: &pg_query.BoolExpr{
+					Boolop: pg_query.BoolExprType_OR_EXPR,
+					Args:   []*pg_query.Node{isNullTest(left), isNullTest(right)},
+				}}},
+				Result: nullConstNode(0),
+			}}},
+			// WHEN both objects THEN shallow merge, right side wins.
+			{Node: &pg_query.Node_CaseWhen{CaseWhen: &pg_query.CaseWhen{
+				Expr: &pg_query.Node{Node: &pg_query.Node_BoolExpr{BoolExpr: &pg_query.BoolExpr{
+					Boolop: pg_query.BoolExprType_AND_EXPR,
+					Args:   []*pg_query.Node{jsonTypeEquals(left, "OBJECT"), jsonTypeEquals(right, "OBJECT")},
+				}}},
+				Result: jsonFuncCall("to_json", jsonFuncCall("map_concat", asObjectMap(left), asObjectMap(right))),
+			}}},
+		},
+		// ELSE array concatenation (with non-arrays wrapped as one element).
+		Defresult: jsonFuncCall("to_json", jsonFuncCall("list_concat", asElementList(left), asElementList(right))),
+	}}}
+}
+
+// jsonFuncCall builds an unqualified function-call node.
+func jsonFuncCall(name string, args ...*pg_query.Node) *pg_query.Node {
+	return &pg_query.Node{Node: &pg_query.Node_FuncCall{FuncCall: &pg_query.FuncCall{
+		Funcname: []*pg_query.Node{
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: name}}},
+		},
+		Args: args,
+	}}}
+}
+
+// jsonTypeEquals builds `json_type(<operand clone>) = '<typ>'`.
+func jsonTypeEquals(operand *pg_query.Node, typ string) *pg_query.Node {
+	return &pg_query.Node{Node: &pg_query.Node_AExpr{AExpr: &pg_query.A_Expr{
+		Kind: pg_query.A_Expr_Kind_AEXPR_OP,
+		Name: []*pg_query.Node{
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "="}}},
+		},
+		Lexpr: jsonFuncCall("json_type", cloneNode(operand)),
+		Rexpr: strConst(typ),
+	}}}
+}
+
+// isNullTest builds `<operand clone> IS NULL`.
+func isNullTest(operand *pg_query.Node) *pg_query.Node {
+	return &pg_query.Node{Node: &pg_query.Node_NullTest{NullTest: &pg_query.NullTest{
+		Arg:          cloneNode(operand),
+		Nulltesttype: pg_query.NullTestType_IS_NULL,
+	}}}
+}
+
+// castToJSON builds `CAST(<operand> AS json)`.
+func castToJSON(operand *pg_query.Node) *pg_query.Node {
+	return &pg_query.Node{Node: &pg_query.Node_TypeCast{TypeCast: &pg_query.TypeCast{
+		Arg: operand,
+		TypeName: &pg_query.TypeName{
+			Names:   []*pg_query.Node{{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "json"}}}},
+			Typemod: -1,
+		},
+	}}}
+}
+
+// cloneNode deep-copies an AST node so an operand can appear at several
+// positions in the emitted expression without sharing mutable state.
+func cloneNode(node *pg_query.Node) *pg_query.Node {
+	return proto.Clone(node).(*pg_query.Node)
 }
 
 // createRegexFuncCall creates a regexp_matches function call node
