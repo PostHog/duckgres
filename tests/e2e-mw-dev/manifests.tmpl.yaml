@@ -214,6 +214,22 @@ spec:
             - { name: DUCKGRES_K8S_WORKER_CONFIGMAP, value: "duckgres-config" }
             - { name: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT, value: "duckgres-worker" }
             - { name: DUCKGRES_K8S_SHARED_WARM_TARGET, value: "0" }
+            # Worker-TTL-pool model (docs/design/worker-ttl-pool.md): no warm pool.
+            # With shared-warm-target=0 the configstore-driven dynamic warm-capacity
+            # spawner would still add neutral (org="") workers from warm-miss history,
+            # defeating the on-demand model — disable it so the only workers are the
+            # ones a client request sizes + spawns.
+            - { name: DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED, value: "false" }
+            # Honor client-supplied worker shape/TTL startup options
+            # (duckgres.worker_cpu/worker_memory/worker_ttl), clamped to a sane band.
+            # The harness sized_worker assertion connects with these and verifies the
+            # spawned pod carries the requested CPU+memory.
+            - { name: DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE, value: "true" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU, value: "1" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY, value: "16Gi" }
+            - { name: DUCKGRES_K8S_WORKER_MAX_TTL, value: "24h" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             - { name: DUCKGRES_AWS_REGION, value: "us-east-1" }
