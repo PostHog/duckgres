@@ -157,6 +157,87 @@ func TestReapAbandonedQueryHandleReleasesOperation(t *testing.T) {
 	}
 }
 
+func TestReapAbandonedPreparedDrainReleasesOperation(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin drain work: %v", err)
+	}
+	session := &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {
+				Query:    "SELECT 1",
+				Prepared: true,
+				pendingDrains: []drainToken{{
+					finish: finishDrain,
+					at:     time.Now().Add(-handleIdleTimeout - time.Minute),
+				}},
+			},
+		},
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+	}
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("expected operation to start")
+	}
+	session.queries["prep-1"].pendingDrains[0].finishOperation = finishOperation
+	pool.sessions[session.ID] = session
+
+	pool.reapIdle(time.Now())
+
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("activeWork=%d want 0 after stale prepared drain reap", got)
+	}
+	if finish2, ok := session.beginOperation(); !ok {
+		t.Fatal("expected stale prepared drain reaper to release the operation")
+	} else {
+		finish2()
+	}
+}
+
+func TestReapAbandonedMetadataDrainReleasesOperation(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin drain work: %v", err)
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+	}
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("expected operation to start")
+	}
+	session.metadataDrains["schemas|x"] = []drainToken{{
+		finish:          finishDrain,
+		finishOperation: finishOperation,
+		at:              time.Now().Add(-handleIdleTimeout - time.Minute),
+	}}
+	pool.sessions[session.ID] = session
+
+	pool.reapIdle(time.Now())
+
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("activeWork=%d want 0 after stale metadata drain reap", got)
+	}
+	if finish2, ok := session.beginOperation(); !ok {
+		t.Fatal("expected stale metadata drain reaper to release the operation")
+	} else {
+		finish2()
+	}
+}
+
 type exitPanic struct {
 	code int
 }

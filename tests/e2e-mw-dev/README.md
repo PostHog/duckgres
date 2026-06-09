@@ -107,6 +107,14 @@ normal `go test ./...` lane.
   pooler + `lakekeeper:8181` but not a denied destination needs a stable
   exec-into-worker probe; deferred (high flake risk). The policies themselves
   are asserted statically in `tests/manifests/`.
+- **Concurrent worker operations on one session** — the worker rejects
+  overlapping same-session Flight operations with `FailedPrecondition`, but the
+  harness enters through pgwire, where one client connection maps to one worker
+  session and operations are serialized by the control plane. Driving this
+  specific defense-in-depth path end-to-end would need a bespoke concurrent
+  Flight-ingress client, so the rejection contract and abandoned-continuation
+  cleanup are covered by `duckdbservice` unit tests. The harness still asserts
+  the cluster invariant this protects: one active session owns one worker.
 
 ## Isolation model
 

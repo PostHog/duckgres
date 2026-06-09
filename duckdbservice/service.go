@@ -178,12 +178,17 @@ func releaseDrainFunc(release func()) {
 // appendDrainTokenFuncs appends the release closures of tokens to dst.
 func appendDrainTokenFuncs(dst []func(), tokens []drainToken) []func() {
 	for _, t := range tokens {
-		if t.finish != nil {
-			dst = append(dst, t.finish)
-		}
-		if t.finishOperation != nil {
-			dst = append(dst, t.finishOperation)
-		}
+		dst = appendDrainTokenFunc(dst, t)
+	}
+	return dst
+}
+
+func appendDrainTokenFunc(dst []func(), t drainToken) []func() {
+	if t.finish != nil {
+		dst = append(dst, t.finish)
+	}
+	if t.finishOperation != nil {
+		dst = append(dst, t.finishOperation)
 	}
 	return dst
 }
@@ -666,9 +671,7 @@ func (p *SessionPool) reapIdle(now time.Time) {
 				kept := h.pendingDrains[:0]
 				for _, t := range h.pendingDrains {
 					if now.Sub(t.at) > handleIdleTimeout {
-						if t.finish != nil {
-							releaseDrains = append(releaseDrains, t.finish)
-						}
+						releaseDrains = appendDrainTokenFunc(releaseDrains, t)
 						continue
 					}
 					kept = append(kept, t)
@@ -699,9 +702,7 @@ func (p *SessionPool) reapIdle(now time.Time) {
 			kept := tokens[:0]
 			for _, t := range tokens {
 				if now.Sub(t.at) > handleIdleTimeout {
-					if t.finish != nil {
-						releaseDrains = append(releaseDrains, t.finish)
-					}
+					releaseDrains = appendDrainTokenFunc(releaseDrains, t)
 					continue
 				}
 				kept = append(kept, t)

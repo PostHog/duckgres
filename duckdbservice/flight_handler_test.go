@@ -1001,6 +1001,24 @@ func TestMetadataGetFlightInfoRejectsConcurrentSessionOperation(t *testing.T) {
 	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); err != nil {
 		t.Fatalf("metadata operation should release after DoGet: %v", err)
 	}
+	_, ch, err = handler.DoGetDBSchemas(ctx, second)
+	if err != nil {
+		t.Fatalf("second DoGetDBSchemas: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("second stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+	session := pool.sessions["session-1"]
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	if len(session.metadataDrains) != 0 {
+		t.Fatalf("metadata drains were not consumed: %v", session.metadataDrains)
+	}
 }
 
 func TestTablesMetadataDoGetContinuesAfterDrainStarts(t *testing.T) {
