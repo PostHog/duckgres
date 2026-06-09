@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"time"
@@ -838,4 +839,152 @@ func readCString(r *bytes.Reader) (string, error) {
 		buf.WriteByte(b)
 	}
 	return buf.String(), nil
+}
+
+// runExtendedQueryMessage dispatches an extended-query protocol message
+// (Parse/Bind/Describe/Execute/Close), implementing the protocol's error
+// recovery rule: after an error while processing any extended-query message
+// the server must discard subsequent extended-protocol messages until Sync
+// arrives. Without this, pipelined clients (libpq pipeline mode, pgx
+// SendBatch, JDBC batch) execute queued messages against broken state and
+// desync their response accounting.
+//
+// An error is detected by observing sendError — the single ErrorResponse
+// funnel for an established connection — so deep failure paths inside Execute
+// arm the skip too. The trigger is deliberately the error event itself, NOT
+// txStatus == txStatusError: an aborted transaction must still accept the
+// Parse/Bind/Execute of a ROLLBACK sent after Sync.
+func (c *clientConn) runExtendedQueryMessage(handler func([]byte), body []byte) {
+	if c.ignoreTillSync {
+		return
+	}
+	before := c.errorResponsesSent
+	handler(body)
+	if c.errorResponsesSent != before {
+		c.ignoreTillSync = true
+	}
+}
+
+func (c *clientConn) handleBind(body []byte) {
+	// Bind message format:
+	// - Portal name (null-terminated)
+	// - Statement name (null-terminated)
+	// - Number of parameter format codes (int16)
+	// - Parameter format codes (int16 each)
+	// - Number of parameter values (int16)
+	// - Parameter values (length int32, then data)
+	// - Number of result format codes (int16)
+	// - Result format codes (int16 each)
+
+	reader := bytes.NewReader(body)
+
+	// Read portal name
+	portalName, err := readCString(reader)
+	if err != nil {
+		c.sendError("ERROR", "08P01", "invalid Bind message")
+		return
+	}
+
+	// Read statement name
+	stmtName, err := readCString(reader)
+	if err != nil {
+		c.sendError("ERROR", "08P01", "invalid Bind message")
+		return
+	}
+
+	// Look up prepared statement
+	ps, ok := c.stmts[stmtName]
+	if !ok {
+		c.sendError("ERROR", "26000", fmt.Sprintf("prepared statement %q does not exist", stmtName))
+		return
+	}
+
+	// Read parameter format codes
+	var numParamFormats int16
+	if err := binary.Read(reader, binary.BigEndian, &numParamFormats); err != nil {
+		c.sendError("ERROR", "08P01", "invalid Bind message")
+		return
+	}
+	if numParamFormats < 0 {
+		c.sendError("ERROR", "08P01", "invalid parameter format count in Bind message")
+		return
+	}
+	paramFormats := make([]int16, numParamFormats)
+	for i := int16(0); i < numParamFormats; i++ {
+		if err := binary.Read(reader, binary.BigEndian, &paramFormats[i]); err != nil {
+			c.sendError("ERROR", "08P01", "invalid Bind message")
+			return
+		}
+	}
+
+	// Read parameter values
+	var numParams int16
+	if err := binary.Read(reader, binary.BigEndian, &numParams); err != nil {
+		c.sendError("ERROR", "08P01", "invalid Bind message")
+		return
+	}
+	if numParams < 0 {
+		c.sendError("ERROR", "08P01", "invalid parameter count in Bind message")
+		return
+	}
+	paramValues := make([][]byte, numParams)
+	for i := int16(0); i < numParams; i++ {
+		var length int32
+		if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+			c.sendError("ERROR", "08P01", "invalid Bind message")
+			return
+		}
+		if length == -1 {
+			paramValues[i] = nil // NULL
+		} else if length < 0 {
+			// Only -1 (NULL) is a valid negative length.
+			c.sendError("ERROR", "08P01", "invalid parameter length in Bind message")
+			return
+		} else {
+			// The length field is client-controlled; bound the allocation by
+			// the remaining bytes of the already-framed Bind message body — a
+			// parameter value can never legitimately exceed it. Without this
+			// check a client could reserve multi-GiB per parameter (#717).
+			if int64(length) > int64(reader.Len()) {
+				c.sendError("ERROR", "08P01", fmt.Sprintf("invalid Bind message: parameter %d length %d exceeds remaining message size %d", i+1, length, reader.Len()))
+				return
+			}
+			paramValues[i] = make([]byte, length)
+			if _, err := io.ReadFull(reader, paramValues[i]); err != nil {
+				c.sendError("ERROR", "08P01", "invalid Bind message")
+				return
+			}
+		}
+	}
+
+	// Read result format codes
+	var numResultFormats int16
+	if err := binary.Read(reader, binary.BigEndian, &numResultFormats); err != nil {
+		c.sendError("ERROR", "08P01", "invalid Bind message")
+		return
+	}
+	if numResultFormats < 0 {
+		c.sendError("ERROR", "08P01", "invalid result format count in Bind message")
+		return
+	}
+	resultFormats := make([]int16, numResultFormats)
+	for i := int16(0); i < numResultFormats; i++ {
+		if err := binary.Read(reader, binary.BigEndian, &resultFormats[i]); err != nil {
+			c.sendError("ERROR", "08P01", "invalid Bind message")
+			return
+		}
+	}
+
+	// Close existing portal with same name
+	delete(c.portals, portalName)
+
+	c.portals[portalName] = &portal{
+		stmt:          ps,
+		paramValues:   paramValues,
+		paramFormats:  paramFormats,
+		resultFormats: resultFormats,
+		described:     ps.described, // Inherit from statement if Describe(S) was called
+	}
+
+	_ = wire.WriteBindComplete(c.writer)
 }
