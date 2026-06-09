@@ -37,7 +37,10 @@ from its mounted SA token) for the pod-level checks the Go suite made via
 client-go:
 
 - **wire/query** — `SELECT 1` round-trips; 5 concurrent connections stay
-  distinct (ported from `TestK8sMultipleConcurrentConnections`).
+  distinct (ported from `TestK8sMultipleConcurrentConnections`); a malformed
+  post-TLS startup-message length (negative / ~2GiB / truncated, injected via
+  `openssl s_client -starttls postgres`) gets a clean connection close — the CP
+  pod must not restart and must keep serving (regression for #715).
 - **cold-burst absorption** — there is no warm pool, so a burst of cold sessions
   spawns workers on demand; if it outruns the org/global cap the surplus gets a
   graceful client-visible hint (`no Duckgres worker … retry in about 45 seconds`
