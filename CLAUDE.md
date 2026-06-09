@@ -75,7 +75,7 @@ Key CLI flags for control-plane mode:
 - `--ducklake-delta-catalog-enabled` / `--ducklake-delta-catalog-path`
 - Remote backend (requires `--config-store`; `-tags kubernetes` for K8s pool):
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
-  - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account`, `--k8s-max-workers`, `--k8s-shared-warm-target`
+  - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account`, `--k8s-max-workers`
   - AWS / STS: `--aws-region`
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
 
@@ -185,11 +185,10 @@ a heavy query killed by a co-resident one. Do not break the following:
   single-tenant flat `K8sWorkerPool.AcquireWorker`, which is not used in remote
   mode). Do NOT add one, and do not resurrect a `leastLoaded*` helper here.
 - **At org max workers + all busy → fail fast with the clear org-cap message**
-  (`WorkerClaimMissReasonOrgCap`, see `warm_capacity_policy.go`). Never
-  busy-wait at cap.
-- **Under cap + all busy → hold for a spawn** up to `warmAcquireTimeout` (bounded
-  by the client ctx). This applies to default/exclusive requests too, not just
-  colocated.
+  (`WorkerClaimMissReasonOrgCap`, see `capacity_policy.go`). Never busy-wait at cap.
+- **Under cap → spawn a worker on demand** (`spawnReservedWorker`, bounded by the
+  client ctx). There is no warm pool to wait on; the cap is re-checked
+  authoritatively cross-CP in `CreateSpawningWorkerSlot`.
 - **FIFO anti-snatch:** the slow acquisition path is serialized per org by
   `orgAcquireGate` (`org_acquire_gate.go`) so a worker the CP scaled up for an
   earlier waiter cannot be snatched by a later connection. Keep the gate
