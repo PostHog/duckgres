@@ -43,6 +43,15 @@ func assertJSONConcatShape(t *testing.T, sql string) {
 	if strings.Contains(out, "json_merge_patch") {
 		t.Errorf("jsonb || must not use json_merge_patch (wrong for arrays/nulls), got %q", out)
 	}
+	// The whole CASE must be cast to JSON. Without this, DuckDB versions that
+	// don't report the to_json()/list_concat() result type as JSON make the
+	// wire layer render the column as an untyped list ("[1 2 3 4]") instead of
+	// JSON text ("[1,2,3,4]") — the #716 runtime regression that the emitted-
+	// shape markers alone did not catch. The outer cast deparses as the
+	// trailing `END::"json"`.
+	if !strings.Contains(out, `end::"json"`) {
+		t.Errorf("jsonb || result must be cast to JSON (expected trailing `END::\"json\"`), got %q", out)
+	}
 }
 
 func TestOperatorTransform_JSONBConcatObjects(t *testing.T) {

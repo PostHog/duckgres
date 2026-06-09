@@ -644,7 +644,15 @@ func (t *OperatorTransform) createJSONConcatExpr(left, right *pg_query.Node) *pg
 		}}}
 	}
 
-	return &pg_query.Node{Node: &pg_query.Node_CaseExpr{CaseExpr: &pg_query.CaseExpr{
+	// The whole CASE is wrapped in an explicit CAST(... AS JSON). DuckDB's
+	// to_json()/map_concat()/list_concat() result type is not reported as JSON
+	// by every bundled DuckDB version — on some versions the wire layer then
+	// sees the column as an untyped list and renders it with Go's %v
+	// ("[1 2 3 4]") instead of routing it through the JSON re-serializer
+	// ("[1,2,3,4]"). Forcing the column to JSON pins OID 114 so server's
+	// encodeJSON path always produces valid JSON text. The cast is idempotent
+	// on versions that already type it as JSON. (#716 regression.)
+	return castToJSON(&pg_query.Node{Node: &pg_query.Node_CaseExpr{CaseExpr: &pg_query.CaseExpr{
 		Args: []*pg_query.Node{
 			// WHEN L IS NULL OR R IS NULL THEN NULL — Postgres jsonb || is
 			// strict; without this guard the ELSE branch would wrap a SQL
@@ -667,7 +675,7 @@ func (t *OperatorTransform) createJSONConcatExpr(left, right *pg_query.Node) *pg
 		},
 		// ELSE array concatenation (with non-arrays wrapped as one element).
 		Defresult: jsonFuncCall("to_json", jsonFuncCall("list_concat", asElementList(left), asElementList(right))),
-	}}}
+	}}})
 }
 
 // jsonFuncCall builds an unqualified function-call node.
