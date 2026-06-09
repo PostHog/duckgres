@@ -455,7 +455,7 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_TYPEOF(", "TO_CHAR(", "TO_DATE(", "TO_NUMBER(",
 		"TO_TIMESTAMP(",
 		// JSON functions
-		"JSON_OBJECT_KEYS(", "JSONB_OBJECT_KEYS(",
+		"JSON_OBJECT_KEYS(", "JSONB_OBJECT_KEYS(", "TO_JSONB(",
 		// Date/time functions
 		"TIMEOFDAY(", "LOCALTIME(", "LOCALTIMESTAMP(",
 		"CLOCK_TIMESTAMP(",

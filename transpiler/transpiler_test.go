@@ -4491,6 +4491,37 @@ func TestClassify_Direct(t *testing.T) {
 	}
 }
 
+// Functions in functionNameMapping must each have a Classify token: a query
+// whose ONLY PG-ism is that function must still be rewritten. Regression for
+// the to_jsonb gap (mapped since long ago, but never fired when it was the
+// only classified token in the query — e.g. SELECT to_jsonb(metadata) FROM t).
+func TestTranspile_MappedFunctionsFireAlone(t *testing.T) {
+	tr := New(DefaultConfig())
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{"to_jsonb alone", "SELECT to_jsonb(metadata) AS m FROM stripe.customer", "to_json(", "to_jsonb("},
+		{"jsonb_array_length alone", "SELECT jsonb_array_length(data) FROM t", "json_array_length(", "jsonb_array_length("},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestClassify_NeedsTransform(t *testing.T) {
 	// Queries with PostgreSQL-specific patterns should return correct flags
 	cfg := DefaultConfig()
