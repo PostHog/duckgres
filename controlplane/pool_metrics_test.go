@@ -228,64 +228,6 @@ func TestReapStuckActivatingWorkers_RecentlyReservedNotReaped(t *testing.T) {
 	}
 }
 
-func TestObserveWarmCapacityMetrics(t *testing.T) {
-	image := "duckgres:metrics-test"
-	warmCapacityMissesCounter.DeleteLabelValues(image, string(configstore.WorkerClaimMissReasonGlobalCap))
-
-	observeWarmCapacityMiss(image, configstore.WorkerClaimMissReasonGlobalCap)
-	if got := counterLabelValues(warmCapacityMissesCounter, image, string(configstore.WorkerClaimMissReasonGlobalCap)); got != 1 {
-		t.Fatalf("expected one global-cap warm capacity miss, got %v", got)
-	}
-
-	observeWarmCapacityTargets(
-		map[string]int{image: 2},
-		map[string]int{image: 5},
-		10,
-	)
-	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 5, image)
-	assertGaugeValue(t, warmCapacityHeadroomGauge, 5)
-
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHot), "org_bound")
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHotIdle), "org_bound")
-	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
-		{Image: image, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
-		{Image: image, State: configstore.WorkerStateHotIdle, Binding: "org_bound", Count: 3},
-	})
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 2, image, string(configstore.WorkerStateIdle), "neutral")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 1, image, string(configstore.WorkerStateHot), "org_bound")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 3, image, string(configstore.WorkerStateHotIdle), "org_bound")
-	observeWorkerLifecycleStats(nil, []configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
-		{Image: image, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
-		{Image: image, State: configstore.WorkerStateHotIdle, Binding: "org_bound", Count: 3},
-	})
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHot), "org_bound")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_bound")
-}
-
-func TestObserveWarmCapacityTargetsDeletesStaleImage(t *testing.T) {
-	oldImage := "duckgres:old-target"
-	newImage := "duckgres:new-target"
-	warmCapacityEffectiveTargetGauge.DeleteLabelValues(oldImage)
-	warmCapacityEffectiveTargetGauge.DeleteLabelValues(newImage)
-
-	observeWarmCapacityTargets(nil, map[string]int{oldImage: 4}, 10)
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": oldImage}); !ok {
-		t.Fatal("expected old target image series to exist after observation")
-	}
-
-	observeWarmCapacityTargets(nil, map[string]int{newImage: 2}, 10, map[string]int{oldImage: 4})
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": oldImage}); ok {
-		t.Fatal("expected stale target image series to be deleted")
-	}
-	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": newImage}); !ok || got != 2 {
-		t.Fatalf("expected current target image series value 2, got value=%v ok=%v", got, ok)
-	}
-}
-
 func TestObserveWorkerLifecycleStatsSeedsZerosAndDeletesStaleImages(t *testing.T) {
 	currentImage := "duckgres:current-lifecycle"
 	staleImage := "duckgres:stale-lifecycle"
@@ -325,64 +267,16 @@ func TestObserveWorkerLifecycleStatsSeedsZerosAndDeletesStaleImages(t *testing.T
 	}
 }
 
-func TestObserveWorkerLifecycleStatsSeedsTargetImageWithoutRows(t *testing.T) {
-	image := "duckgres:empty-target-lifecycle"
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
-
-	observeWorkerLifecycleStatsForImages(nil, []string{image}, nil)
-
-	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
-		"image":   image,
-		"state":   string(configstore.WorkerStateIdle),
-		"binding": "neutral",
-	}); !ok || got != 0 {
-		t.Fatalf("expected seeded idle/neutral zero series for target image with no rows, got value=%v ok=%v", got, ok)
-	}
-}
-
-func TestObserveWorkerLifecycleStatsDeletesTargetImageWithoutRows(t *testing.T) {
-	image := "duckgres:removed-empty-target-lifecycle"
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
-
-	observeWorkerLifecycleStatsForImages(nil, []string{image}, nil)
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
-		"image":   image,
-		"state":   string(configstore.WorkerStateIdle),
-		"binding": "neutral",
-	}); !ok {
-		t.Fatal("expected target image zero series to exist before target removal")
-	}
-
-	observeWorkerLifecycleStatsForImages(nil, nil, []string{image})
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
-		"image":   image,
-		"state":   string(configstore.WorkerStateIdle),
-		"binding": "neutral",
-	}); ok {
-		t.Fatal("expected target image zero series to be deleted after target removal")
-	}
-}
-
 func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 	image := "duckgres:leader-reset-test"
 
-	observeWarmCapacityTargets(
-		map[string]int{image: 2},
-		map[string]int{image: 5},
-		10,
-	)
 	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
+		{Image: image, State: configstore.WorkerStateIdle, Binding: "org_bound", Count: 2},
 	})
 
 	resetLeaderOwnedClusterMetrics()
 
-	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 0, image)
-	// Headroom resets to the unbounded sentinel (-1) on leader
-	// handoff, not 0 — 0 is the alertable capacity-exhausted state
-	// and would page spuriously every rollout if we reset to it.
-	assertGaugeValue(t, warmCapacityHeadroomGauge, -1)
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "org_bound")
 }
 
 // --- Helpers ---

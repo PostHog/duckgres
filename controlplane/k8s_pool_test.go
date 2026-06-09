@@ -2040,38 +2040,6 @@ func TestK8sPoolReserveSharedWorkerBackpressuresWhenRuntimeClaimReturnsNil(t *te
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerRecordsNoIdleMissByResolvedImage(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 5)
-	store := &captureRuntimeWorkerStore{
-		claimMissReason: configstore.WorkerClaimMissReasonNoIdle,
-	}
-	pool.runtimeStore = store
-
-	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID: "analytics",
-		Image: "duckgres:v2",
-	})
-	var capacityErr *WarmCapacityExhaustedError
-	if !errors.As(err, &capacityErr) {
-		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
-	}
-	if worker != nil {
-		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
-	}
-	if store.recordMissCalls != 1 {
-		t.Fatalf("expected one recorded miss, got %d", store.recordMissCalls)
-	}
-	if got := store.recordMissScopes[0]; got != "image:duckgres:v2" {
-		t.Fatalf("expected miss scope image:duckgres:v2, got %q", got)
-	}
-	if got := store.recordMissReasons[0]; got != configstore.WorkerClaimMissReasonNoIdle {
-		t.Fatalf("expected no-idle miss reason, got %q", got)
-	}
-	if store.spawnCalls != 0 || store.neutralSpawnCalls != 0 || store.perImageSpawnCalls != 0 {
-		t.Fatalf("did not expect foreground or async spawn, got spawn=%d neutral=%d per_image=%d", store.spawnCalls, store.neutralSpawnCalls, store.perImageSpawnCalls)
-	}
-}
-
 func TestK8sPoolReserveSharedWorkerDoesNotRecordOrgCapMiss(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{
@@ -2149,33 +2117,6 @@ func TestK8sPoolReserveSharedWorkerDoesNotRecordShuttingDownMiss(t *testing.T) {
 	}
 	if store.recordMissCalls != 0 {
 		t.Fatalf("expected no recorded miss for shutting-down, got %d", store.recordMissCalls)
-	}
-}
-
-func TestK8sPoolReserveSharedWorkerIgnoresWarmCapacityMissRecordError(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 5)
-	store := &captureRuntimeWorkerStore{
-		claimMissReason: configstore.WorkerClaimMissReasonNoIdle,
-		recordMissErr:   errors.New("recording failed"),
-	}
-	pool.runtimeStore = store
-
-	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID: "analytics",
-		Image: "duckgres:v2",
-	})
-	var capacityErr *WarmCapacityExhaustedError
-	if !errors.As(err, &capacityErr) {
-		t.Fatalf("expected warm capacity exhaustion despite record error, got worker=%#v err=%v", worker, err)
-	}
-	if worker != nil {
-		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
-	}
-	if store.recordMissCalls != 1 {
-		t.Fatalf("expected one best-effort record attempt, got %d", store.recordMissCalls)
-	}
-	if capacityErr.Reason != configstore.WorkerClaimMissReasonNoIdle {
-		t.Fatalf("expected capacity miss reason no-idle, got %q", capacityErr.Reason)
 	}
 }
 

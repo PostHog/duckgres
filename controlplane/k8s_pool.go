@@ -1615,7 +1615,6 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					return nil, err
 				}
 				if hotClaimed == nil && hotMissReason != configstore.WorkerClaimMissReasonNone && hotMissReason != configstore.WorkerClaimMissReasonNoIdle {
-					p.recordWarmCapacityMiss(assignment, hotMissReason)
 					return nil, NewWarmCapacityExhaustedErrorForReason(hotMissReason, DefaultWarmCapacityRetryAfter)
 				}
 				if hotClaimed != nil {
@@ -1686,7 +1685,6 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				return worker, nil
 			}
 
-			p.recordWarmCapacityMiss(assignment, missReason)
 			return nil, NewWarmCapacityExhaustedErrorForReason(missReason, DefaultWarmCapacityRetryAfter)
 		}
 
@@ -1766,41 +1764,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			return worker, nil
 		}
 
-		p.recordWarmCapacityMiss(assignment, configstore.WorkerClaimMissReasonNoIdle)
 		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
-	}
-}
-
-func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, reason configstore.WorkerClaimMissReason) {
-	// A server-side acquire wait polls every WarmAcquireRetryInterval; it sets
-	// this to record demand + the miss metric at most once per throttle interval
-	// rather than on every poll, so one waiting connection doesn't inflate the
-	// demand signal and miss counter ~Nx.
-	if assignment != nil && assignment.SuppressWarmMissRecord {
-		return
-	}
-	policy := warmCapacityMissPolicyForReason(reason)
-	image := ""
-	if assignment != nil {
-		image = strings.TrimSpace(assignment.Image)
-	}
-	if image == "" {
-		image = strings.TrimSpace(p.workerImage)
-	}
-	if image == "" {
-		return
-	}
-
-	observeWarmCapacityMiss(image, policy.reason)
-	if !policy.recordDynamicDemand {
-		return
-	}
-	if p.runtimeStore == nil {
-		return
-	}
-	scope := warmCapacityScopeForImage(image)
-	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
-		slog.Warn("Failed to record warm capacity miss.", "image", image, "reason", policy.reason, "error", err)
 	}
 }
 
