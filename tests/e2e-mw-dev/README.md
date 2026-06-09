@@ -38,14 +38,25 @@ client-go:
 
 - **wire/query** — `SELECT 1` round-trips; 5 concurrent connections stay
   distinct (ported from `TestK8sMultipleConcurrentConnections`).
-- **warm-pool backpressure** — a cold-pool burst of sessions may outrun the
-  worker pool (`shared_warm_target=0`); if it does, the CP must answer the
-  surplus with the graceful client-visible
-  `no warm Duckgres worker … retry in about 45 seconds` hint (not a
-  hang/500/drop), and the pool must then drain so a retrying connection
-  succeeds. The harness asserts the hint when observed **and** handles it (the
-  concurrency tests retry through it).
+- **cold-burst absorption** — there is no warm pool, so a burst of cold sessions
+  spawns workers on demand; if it outruns the org/global cap the surplus gets a
+  graceful client-visible hint (`no Duckgres worker … retry in about 45 seconds`
+  / `timed out waiting for an available worker`) rather than a hang/500/drop, and
+  the pool must then serve a retrying connection. The harness logs whether
+  backpressure was observed **and** handles it (queries retry through it).
 - **activation** — DuckLake **and** Iceberg catalogs attach and read/write.
+- **worker sizing** (TTL-pool model, `docs/design/worker-ttl-pool.md`) — a
+  client-sized connection (`duckgres.worker_cpu`/`worker_memory`/`worker_ttl`
+  startup options, sent via `PGOPTIONS`; CP runs `allowClientWorkerProfile=true`
+  with clamps) spawns a worker pod whose `duckdb-worker` container carries the
+  requested CPU+memory on **both** requests and limits — proving the shape flows
+  control-plane → k8s pod spec, not BestEffort. A same-shape reconnect **reuses**
+  that hot-idle worker (no respawn — the count of that-shape pods stays 1).
+  Asserted on cnpg for **both** the ducklake and iceberg catalogs, with a
+  distinct shape per catalog (2/4Gi vs 1/2Gi) so the catalog-agnostic worker
+  can't satisfy the second from the first's hot-idle pool. There is no warm pool,
+  so the only workers are the ones a request sizes + spawns on demand.
+  Clamp enforcement itself is unit-covered (`controlplane/worker_profile_test.go`).
 - **extension forks** — the bundled `ducklake`/`httpfs` extensions are the
   PostHog forks, not upstream (ported from the `*IsBundledFork` tests).
 - **worker pods** — labels (`app`, `duckgres/control-plane`,
@@ -81,11 +92,8 @@ normal `go test ./...` lane.
 
 ### Deliberately not covered here
 
-- **Shared-warm-worker activation** and the **version-mismatch idle-worker
-  reaper** — the per-PR CP runs `DUCKGRES_K8S_SHARED_WARM_TARGET=0`, so there
-  are no idle warm workers to assert on. These stay covered by `controlplane/`
-  unit tests; running them end-to-end would need a warm target >0 in the per-PR
-  CP.
+- **Version-mismatch worker reaper** — needs a mid-run image bump, so it stays
+  covered by `controlplane/` unit tests rather than in-Job.
 - **Physical object-store-prefix isolation** — the Go suite listed the MinIO
   prefix to prove writes land only in a tenant's own path. Against real mw-dev
   S3 the Job holds no list creds, so isolation is asserted **logically** (the

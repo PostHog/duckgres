@@ -79,10 +79,10 @@ func NewWorkerLifecycle(store workerLifecycleStore, cleanup WorkerPhysicalCleanu
 
 // RetireFromSnapshot moves the observed worker row to a terminal state
 // (retired or lost) fenced by the snapshot. Used by paths that already
-// own the worker but observed a separate snapshot (e.g.
-// retireCurrentRuntimeWorker before slot retirement) — the broad
-// MarkWorkerTerminalIfCurrent fence ensures we don't trample a row that
-// has been taken over since the snapshot was captured.
+// own the worker but observed a separate snapshot (e.g. the janitor's
+// hot-idle TTL reaper) — the broad MarkWorkerTerminalIfCurrent fence
+// ensures we don't trample a row that has been taken over since the
+// snapshot was captured.
 func (l *WorkerLifecycle) RetireFromSnapshot(snap configstore.WorkerSnapshot, target configstore.WorkerState, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
 	const op = LifecycleOpRetireFromSnapshot
 	start := time.Now()

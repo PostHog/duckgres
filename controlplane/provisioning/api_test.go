@@ -18,7 +18,6 @@ type fakeStore struct {
 	orgs                  map[string]*configstore.Org
 	users                 map[configstore.OrgUserKey]string
 	warehouses            map[string]*configstore.ManagedWarehouse
-	trino                 map[string]*configstore.ManagedWarehouseTrino
 	provisionUserFailHook error // set non-nil to simulate user-step failure inside Provision
 }
 
@@ -27,7 +26,6 @@ func newFakeStore() *fakeStore {
 		orgs:       make(map[string]*configstore.Org),
 		users:      make(map[configstore.OrgUserKey]string),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
-		trino:      make(map[string]*configstore.ManagedWarehouseTrino),
 	}
 }
 
@@ -109,7 +107,6 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	shadowOrg := s.orgs[req.OrgID]
 	shadowWarehouse := s.warehouses[req.OrgID]
 	shadowUserHash, hadUser := s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}]
-	shadowTrino, hadTrino := s.trino[req.OrgID]
 
 	// 1. Warehouse + Org
 	if _, ok := s.orgs[req.OrgID]; !ok {
@@ -142,19 +139,9 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	}
 	s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}] = req.RootUserHash
 
-	// 3. Optional Trino
-	if req.Trino != nil {
-		s.trino[req.OrgID] = &configstore.ManagedWarehouseTrino{
-			OrgID:   req.OrgID,
-			Enabled: true,
-			Tier:    req.Trino.Tier,
-			State:   configstore.ManagedWarehouseStatePending,
-		}
-	}
-
 	// Reference the shadow vars so the linter doesn't complain about
 	// declared-and-unused on the success path.
-	_, _, _, _ = shadowUserHash, hadUser, shadowTrino, hadTrino
+	_, _ = shadowUserHash, hadUser
 	return nil
 }
 
@@ -165,22 +152,6 @@ func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {
 		}
 	}
 	return true, nil
-}
-
-func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
-	s.trino[orgID] = &configstore.ManagedWarehouseTrino{
-		OrgID:   orgID,
-		Enabled: true,
-		Tier:    settings.Tier,
-	}
-	return nil
-}
-
-func (s *fakeStore) DisableTrino(orgID string) error {
-	if row, ok := s.trino[orgID]; ok {
-		row.Enabled = false
-	}
-	return nil
 }
 
 func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
@@ -454,34 +425,6 @@ func TestGetWarehouseNotFound(t *testing.T) {
 	}
 }
 
-func TestProvisionEnablesTrinoWhenRequested(t *testing.T) {
-	store := newFakeStore()
-	// Org.Name is a DNS-1123 label; "42" is one valid (numeric) shape.
-	store.orgs["42"] = &configstore.Org{Name: "42"}
-	router := newTestRouter(store)
-
-	// cnpg-shard is the only provisionable backend post-#627. The
-	// provision handler auto-enables Iceberg (Lakekeeper) for any
-	// cnpg-shard warehouse, which is the prerequisite for Trino.
-	body := []byte(`{
-		"database_name": "team-42-db",
-		"metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true},
-		"trino": {"enabled": true, "tier": "free"}
-	}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/42/provision", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	row := store.trino["42"]
-	if row == nil || !row.Enabled || row.Tier != "free" {
-		t.Fatalf("expected trino row with Enabled=true, Tier=free; got %+v", row)
-	}
-}
-
 func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	// Pattern A's whole point: when a downstream write inside the
 	// transactional Provision fails, the upstream writes must roll
@@ -502,8 +445,8 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 		t.Fatalf("status = %d, want 500 (transactional failure): %s", rec.Code, rec.Body.String())
 	}
 
-	// After rollback: no warehouse row, no user row, no Trino row,
-	// no Org row. Retry would treat this as a brand-new provision.
+	// After rollback: no warehouse row, no user row, no Org row.
+	// Retry would treat this as a brand-new provision.
 	if _, ok := store.warehouses["7"]; ok {
 		t.Errorf("expected warehouse to be rolled back, got %+v", store.warehouses["7"])
 	}
@@ -528,139 +471,6 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	}
 	if _, ok := store.warehouses["7"]; !ok {
 		t.Errorf("expected warehouse to be created on retry")
-	}
-}
-
-func TestProvisionEnablesTrinoWithNonNumericOrgID(t *testing.T) {
-	// Org names are DNS-1123 labels (e.g. "analytics", "ben-iceberg-cnpg"), not
-	// numeric team_ids. Trino opt-in must accept them — the catalog name is
-	// derived via injective sanitization (org_<sanitize(Name)>_iceberg), not
-	// assumed numeric.
-	store := newFakeStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	router := newTestRouter(store)
-
-	body := []byte(`{
-		"database_name": "analytics-db",
-		"metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true},
-		"trino": {"enabled": true}
-	}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d for non-numeric org id: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	if row := store.trino["analytics"]; row == nil || !row.Enabled {
-		t.Fatalf("expected trino row Enabled=true for analytics; got %+v", row)
-	}
-}
-
-func TestProvisionWithoutTrinoLeavesTrinoRowUnset(t *testing.T) {
-	store := newFakeStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	router := newTestRouter(store)
-
-	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	if _, ok := store.trino["analytics"]; ok {
-		t.Fatalf("expected no trino row when request omits trino block")
-	}
-}
-
-func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
-	// A DNS-1123-named org (the real shape, e.g. "ben-iceberg-cnpg") — not a
-	// numeric team_id — opts into Trino via the standalone endpoint.
-	store := newFakeStore()
-	store.orgs["ben-iceberg-cnpg"] = &configstore.Org{Name: "ben-iceberg-cnpg"}
-	router := newTestRouter(store)
-
-	body := []byte(`{"enabled": true, "tier": "growth"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-iceberg-cnpg/trino", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	row := store.trino["ben-iceberg-cnpg"]
-	if row == nil || !row.Enabled || row.Tier != "growth" {
-		t.Fatalf("expected trino row enabled with tier growth; got %+v", row)
-	}
-}
-
-func TestEnableTrinoRejectsInvalidOrgID(t *testing.T) {
-	// A non-numeric name is fine (DNS-1123); a name that is NOT a valid DNS-1123
-	// label (uppercase, underscore, punctuation) is rejected — the catalog/group
-	// sanitization's collision-freeness depends on the DNS-1123 charset.
-	store := newFakeStore()
-	router := newTestRouter(store)
-
-	body := []byte(`{"enabled": true}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/Bad_Org/trino", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 for invalid (non-DNS-1123) org id: %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestEnableTrinoRejectsEnabledFalse(t *testing.T) {
-	store := newFakeStore()
-	router := newTestRouter(store)
-
-	body := []byte(`{"enabled": false}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/trino", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
-	}
-}
-
-func TestDisableTrinoEndpoint(t *testing.T) {
-	store := newFakeStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true, Tier: "free"}
-	router := newTestRouter(store)
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics/trino", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
-	}
-	row := store.trino["analytics"]
-	if row == nil || row.Enabled {
-		t.Fatalf("expected trino row to be present but disabled; got %+v", row)
-	}
-}
-
-func TestDisableTrinoOnMissingRowIsNoOp(t *testing.T) {
-	store := newFakeStore()
-	router := newTestRouter(store)
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/unknown/trino", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
 }
 

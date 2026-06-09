@@ -10,9 +10,13 @@
 # two real metadata backends cnpg + ext (aurora is retired — out of scope):
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
-#                  and a cold-pool burst gets the graceful warm-pool backpressure
-#                  hint ("retry in ~45s") then recovers.
+#                  and a cold burst is absorbed (workers spawn on demand; any
+#                  surplus gets a graceful retry hint) then served.
 #   activation   : DuckLake + Iceberg catalogs attach and read/write.
+#   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
+#                  spawns a worker pod carrying the requested CPU+memory, and a
+#                  same-shape reconnect reuses that hot-idle worker (no respawn)
+#                  — asserted on cnpg for BOTH the ducklake and iceberg catalogs.
 #   ext forks    : the bundled ducklake/httpfs extensions are the PostHog forks,
 #                  not upstream (detects an accidental upstream swap in the image).
 #   worker pods  : labels, securityContext (non-root, no priv-esc), Downward-API
@@ -109,17 +113,16 @@ resolve_cp_ip() {
   [ -n "$CP_IP" ] || fail "could not resolve $PGHOST"
 }
 
-# Warm-pool backpressure ("no warm Duckgres worker … retry in about 45 seconds")
-# is a FEATURE, not an error: with shared_warm_target=0 the per-org pool is cold,
-# so ANY new-session acquisition — a fresh catalog (ducklake→iceberg), a burst,
-# or the first connect after the pool churned (worker kills / idle timeout) — can
-# transiently get it while the CP spawns a worker. It is a FATAL at session
-# create, BEFORE any SQL runs, so retrying the whole command is safe (no
-# half-applied INSERT). So every harness query tolerates it via bounded retry.
-# Auth failures and real SQL errors are NOT retried — they surface immediately,
-# so this never feeds the rate limiter or masks a genuine failure. (The
-# backpressure *contract itself* is asserted separately in
-# warm_capacity_backpressure, which uses raw psql to observe the hint.)
+# On-demand spawn backpressure ("…retry in about 45 seconds" / "timed out waiting
+# for an available worker") is a FEATURE, not an error: there is no warm pool, so
+# ANY new-session acquisition — a fresh catalog (ducklake→iceberg), a burst, or
+# the first connect after the pool churned (worker kills / idle timeout) — can
+# transiently get it while the CP spawns a worker (or while a freshly-spawned pod
+# is still pulling/booting). It is a FATAL at session create, BEFORE any SQL runs,
+# so retrying the whole command is safe (no half-applied INSERT). So every harness
+# query tolerates it via bounded retry. Auth failures and real SQL errors are NOT
+# retried — they surface immediately, so this never feeds the rate limiter or
+# masks a genuine failure. (The behavior is exercised in cold_burst_absorption.)
 _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
   a=0 out=""
   while [ "$a" -lt 12 ]; do
@@ -129,8 +132,17 @@ _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
       printf %s "$out"; return 0
     fi
     case "$out" in
-      *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
-      *"still provisioning"*|*"failed to initialize session"*)
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
+        # The last three cover an on-demand cold spawn that needed a fresh node
+        # (sized worker too big for the warm node): the first connect can hit the
+        # spawn ceiling while the pod is still pulling/booting; by the retry it is
+        # hot-idle and the reconnect reuses it. Same transient class as a cold pool.
+        # "failed to detect attached catalogs" is the session-init catalog probe
+        # racing a freshly-spawned worker whose ATTACH is still settling — it fires
+        # BEFORE any user SQL runs, so retrying the whole command is safe.
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out" >&2; return 1 ;;
     esac
@@ -158,8 +170,10 @@ pg_try() { # org password dbname sql
       printf %s "$out"; return 0
     fi
     case "$out" in
-      *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
-      *"still provisioning"*|*"failed to initialize session"*)
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out"; return 1 ;;
     esac
@@ -167,10 +181,10 @@ pg_try() { # org password dbname sql
   printf %s "$out"; return 1
 }
 
-# Connect preflight: a warm worker isn't always available the instant a
-# warehouse goes ready (shared_warm_target=0, so the first connection for an
-# org cold-spawns a worker; a second org can find the pool momentarily
-# exhausted). The CP returns a transient "no warm Duckgres worker is currently
+# Connect preflight: a worker isn't ready the instant a warehouse goes ready —
+# there is no warm pool, so the first connection for an org cold-spawns a worker
+# (and a burst can momentarily hit the org/global cap). The CP returns a
+# transient "no Duckgres worker is currently
 # available; retry in ~45s" / "still provisioning" / "failed to initialize
 # session". Retry `SELECT 1` through those, bounded, BEFORE the R/W. Auth
 # failures are NOT in this set, so this never feeds the rate limiter.
@@ -186,7 +200,7 @@ wait_worker() { # org password catalog
     sleep 15
     attempt=$((attempt + 1))
   done
-  fail "no warm worker for $1/$3 after retries"
+  fail "no Duckgres worker for $1/$3 after retries"
 }
 
 # ---- wire protocol --------------------------------------------------------
@@ -228,15 +242,15 @@ pg_compat_functions() { # org password
   assert_compat "$1" "$2" ducklake "SELECT make_interval(days=>2)::text" "2 days" "make_interval"
 }
 
-# Warm-pool backpressure is a FEATURE: when a burst of sessions outruns the
-# cold worker pool (shared_warm_target=0), the CP rejects the surplus with a
-# graceful, client-visible "no warm Duckgres worker is currently available;
-# retry in about 45 seconds" rather than hanging, 500-ing, or dropping the
-# connection. The exact saturation point is environment-dependent, so this check
-# asserts the graceful hint if the burst observes backpressure, and always
-# asserts that the pool drains so a (retrying) connection succeeds.
-warm_capacity_backpressure() { # org password
-  log "warm-pool backpressure contract on $1"
+# Cold-burst absorption: there is no warm pool — workers are spawned on demand
+# per request — so a burst of cold sessions either all spawn (under the org/global
+# cap) or the surplus gets a graceful, client-visible cap/backpressure hint
+# ("...retry in about 45 seconds" / "timed out waiting for an available worker")
+# rather than hanging, 500-ing, or dropping the connection. The saturation point
+# is environment-dependent, so this logs whether backpressure was observed and
+# always asserts the pool serves a (retrying) connection.
+cold_burst_absorption() { # org password
+  log "cold-burst absorption on $1"
   burst=12; seen=/tmp/bp_seen; rm -f "$seen"; pids=""
   i=0
   while [ "$i" -lt "$burst" ]; do
@@ -244,24 +258,24 @@ warm_capacity_backpressure() { # org password
         "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
         -tAc 'SELECT 1' 2>&1 || true)"
       case "$o" in
-        *"no warm Duckgres worker"*|*"retry in about"*|*"capacity exhausted"*) echo x >> "$seen" ;;
+        *"no Duckgres worker"*|*"retry in about"*|*"capacity exhausted"*|*"timed out waiting for an available worker"*) echo x >> "$seen" ;;
       esac ) &
     pids="$pids $!"; i=$((i + 1))
   done
   for p in $pids; do wait "$p" || true; done
   if [ -s "$seen" ]; then
-    log "backpressure observed: $(wc -l < "$seen" | tr -d ' ')/$burst connections got the graceful retry hint"
+    log "backpressure observed: $(wc -l < "$seen" | tr -d ' ')/$burst connections got a graceful retry hint"
   else
     log "backpressure not observed: pool absorbed $burst cold-burst connections"
   fi
-  # The pool must recover: a retrying connection succeeds.
+  # The pool must serve work: a retrying connection succeeds.
   v="$(pgc "$1" "$2" ducklake 'SELECT 1')"
-  [ "$v" = "1" ] || fail "pool did not recover after cold-burst check (got '$v')"
+  [ "$v" = "1" ] || fail "pool did not serve work after cold-burst check (got '$v')"
 }
 
 # N concurrent connections each run a distinct query and must each see their own
-# value (no cross-talk / session bleed). Uses pgc so the cold-pool backpressure
-# (asserted separately in warm_capacity_backpressure) is handled, not fatal.
+# value (no cross-talk / session bleed). Uses pgc so transient cold-spawn
+# backpressure is handled, not fatal.
 # Ported from TestK8sMultipleConcurrentConnections.
 concurrent_connections() { # org password
   log "5 concurrent connections on $1"
@@ -362,6 +376,71 @@ assert_worker_pod() {
   if echo "$mounts" | grep -q '/var/run/secrets/kubernetes.io/serviceaccount'; then
     fail "worker $pod mounts a kubernetes.io/serviceaccount token"
   fi
+}
+
+# ---- worker sizing (TTL-pool model) ---------------------------------------
+# The TTL-pool model (docs/design/worker-ttl-pool.md) lets a client pick the
+# worker shape + TTL via the duckgres.worker_cpu/worker_memory/worker_ttl
+# startup options (gated by allowClientWorkerProfile, clamped by the CP). Assert
+# end-to-end that a sized connection spawns a worker pod whose duckdb-worker
+# container carries the requested CPU+memory on BOTH requests and limits — i.e.
+# the shape flows control-plane → k8s pod spec, not BestEffort. A distinct shape
+# (no other test, and no other catalog of this org, uses it) guarantees a fresh
+# spawn: the implemented reuse path is EXACT-profile-match only, so it can't hand
+# back a default or other-shape hot-idle worker — the newest worker pod for the
+# org is unambiguously ours. The connection's dbname forces that catalog's
+# activation at session-create, so this also exercises sizing × catalog together.
+WORKER_C='{.spec.containers[?(@.name=="duckdb-worker")]'
+sized_worker() { # org password catalog cpu memory ttl
+  org="$1"; pw="$2"; cat="$3"; cpu="$4"; mem="$5"; ttl="$6"
+  log "sized worker spawn on $org/$cat: cpu=$cpu memory=$mem ttl=$ttl"
+  # PGOPTIONS (scoped to this subshell) carries the startup options; libpq sends
+  # them in the StartupMessage exactly like search_path. Run a real query so the
+  # CP actually spawns + activates the sized worker.
+  ( export PGOPTIONS="-c duckgres.worker_cpu=$cpu -c duckgres.worker_memory=$mem -c duckgres.worker_ttl=$ttl"
+    _pg_exec "$org" "$pw" "$cat" 'SELECT 1' ) >/dev/null \
+    || fail "sized worker query failed on $org/$cat"
+  pod="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" \
+        --sort-by=.metadata.creationTimestamp \
+        -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)"
+  [ -n "$pod" ] || fail "sized worker: no worker pod for $org"
+  rcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
+  rmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  lcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.cpu}")"
+  lmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.memory}")"
+  [ "$rcpu" = "$cpu" ] || fail "sized worker $pod requests.cpu='$rcpu' want '$cpu' (sizing not applied — BestEffort?)"
+  [ "$rmem" = "$mem" ] || fail "sized worker $pod requests.memory='$rmem' want '$mem'"
+  [ "$lcpu" = "$cpu" ] || fail "sized worker $pod limits.cpu='$lcpu' want '$cpu'"
+  [ "$lmem" = "$mem" ] || fail "sized worker $pod limits.memory='$lmem' want '$mem'"
+  log "sized worker OK: $pod requests/limits cpu=$rcpu mem=$rmem"
+}
+
+# Same-shape reconnect must REUSE the hot-idle sized worker, not spawn a second.
+# After sized_worker leaves exactly one hot-idle worker of this shape for the
+# org, an identical sized connection re-uses it (Destroy-before-reuse makes the
+# prior session gone before the next is assigned), so the count of worker pods
+# of that CPU stays 1 — a respawn would make it 2. A non-trivial TTL keeps the
+# first alive across this check.
+count_org_workers_of_cpu() { # org cpu  -> prints count
+  n=0
+  for p in $(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" \
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    c="$(k get pod "$p" -o jsonpath="${WORKER_C}.resources.requests.cpu}" 2>/dev/null)"
+    [ "$c" = "$2" ] && n=$((n + 1))
+  done
+  echo "$n"
+}
+reuse_sized_worker() { # org password catalog cpu memory ttl
+  org="$1"; pw="$2"; cat="$3"; cpu="$4"; mem="$5"; ttl="$6"
+  log "sized worker reuse on $org/$cat (same shape must not respawn)"
+  # Let the prior sized session fully release to hot-idle before re-acquiring.
+  sleep 5
+  ( export PGOPTIONS="-c duckgres.worker_cpu=$cpu -c duckgres.worker_memory=$mem -c duckgres.worker_ttl=$ttl"
+    _pg_exec "$org" "$pw" "$cat" 'SELECT 1' ) >/dev/null \
+    || fail "sized worker reuse query failed on $org/$cat"
+  n="$(count_org_workers_of_cpu "$org" "$cpu")"
+  [ "$n" = "1" ] || fail "sized worker reuse: org $org has $n pods of cpu=$cpu, want 1 (same-shape request respawned instead of reusing the hot-idle worker)"
+  log "sized worker reuse OK: 1 pod of cpu=$cpu (reused, no respawn)"
 }
 
 # ---- resilience -----------------------------------------------------------
@@ -592,7 +671,7 @@ main() {
   wait_worker "$CNPG" "$cnpg_pw" ducklake
   basic_query            "$CNPG" "$cnpg_pw"
   pg_compat_functions    "$CNPG" "$cnpg_pw"
-  warm_capacity_backpressure "$CNPG" "$cnpg_pw"   # while only one worker is warm
+  cold_burst_absorption  "$CNPG" "$cnpg_pw"   # before more workers exist
   rw_ducklake            "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
   rw_iceberg             "$CNPG" "$cnpg_pw"
@@ -603,6 +682,20 @@ main() {
   crash_recovery         "$CNPG" "$cnpg_pw"
   graceful_drain         "$CNPG" "$cnpg_pw"
   one_session_per_worker "$CNPG" "$cnpg_pw"
+
+  # ---- worker sizing (TTL-pool model) on cnpg, both catalogs ----
+  # Distinct shapes per catalog (2/4Gi vs 1/2Gi) so the iceberg sized request
+  # can't reuse the ducklake org's hot-idle 2-CPU worker (workers are
+  # catalog-agnostic; only the profile shape gates reuse) — each catalog gets a
+  # verified fresh sized spawn, then a verified same-shape reuse. Both shapes are
+  # small enough to bin-pack onto an already-warm worker node (2+1 CPU), so the
+  # iceberg spawn doesn't force a cold node scale-up that would outrun the CP's
+  # spawn ceiling (the on-demand cold-spawn case is tolerated by _pg_exec's retry
+  # set regardless, but keeping it warm makes the assertion fast + deterministic).
+  sized_worker        "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
+  reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
+  sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
+  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
 
   # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
   wait_worker "$EXT" "$ext_pw" ducklake
@@ -617,14 +710,11 @@ main() {
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
   lifecycle_teardown_cnpg "$CNPG"
 
-  # NOTE: warm-pool-specific behaviors (shared-warm-worker activation, and the
-  # version-mismatch idle-worker reaper) are NOT exercised here: the per-PR CP
-  # runs DUCKGRES_K8S_SHARED_WARM_TARGET=0, so there are no idle warm workers to
-  # assert on. They stay covered by the controlplane/ unit tests; running them
-  # end-to-end would need a warm target >0 in the per-PR CP (see README).
-  log "SKIP shared-warm-activation + version-reaper (CP runs warm-target=0; see README)"
+  # NOTE: the version-mismatch worker reaper is not exercised in-Job (it needs a
+  # mid-run image bump); it stays covered by the controlplane/ unit tests.
+  log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: wire + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

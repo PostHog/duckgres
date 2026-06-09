@@ -59,8 +59,6 @@ spec:
             - "duckgres-worker-token"
             - "--k8s-worker-configmap"
             - "duckgres-config"
-            - "--k8s-shared-warm-target"
-            - "1"
             - "--cert"
             - "/certs/server.crt"
             - "--key"

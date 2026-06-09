@@ -45,8 +45,8 @@ Unplanned control-plane failure is different:
    kubectl -n duckgres logs <old-pod-name>
    ```
 
-4. Confirm the new pod is serving traffic and warm capacity recovers.
-   - `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` returns to target
+4. Confirm the new pod is serving traffic and new sessions acquire workers.
+   - `sum(duckgres_worker_lifecycle_count{state="spawning"})` settles back toward 0 (on-demand spawns succeed)
    - `sum(duckgres_worker_lifecycle_count{state="hot"})` does not drop unexpectedly
    - client reconnect errors do not spike
 

@@ -75,22 +75,6 @@ func newConfigStoreOnSameSchema(t *testing.T, store *cpconfigstore.ConfigStore) 
 	})
 	return other
 }
-
-func assertWarmCapacityMissBucketCount(t *testing.T, store *cpconfigstore.ConfigStore, scope string, reason cpconfigstore.WorkerClaimMissReason, bucketStart time.Time, want int64) {
-	t.Helper()
-
-	var got int64
-	if err := store.DB().Table(store.RuntimeSchema()+".warm_capacity_miss_buckets").
-		Where("scope = ? AND reason = ? AND bucket_start = ?", scope, string(reason), bucketStart).
-		Select("COALESCE(SUM(count), 0)").
-		Scan(&got).Error; err != nil {
-		t.Fatalf("lookup warm capacity miss bucket: %v", err)
-	}
-	if got != want {
-		t.Fatalf("expected bucket count %d for scope=%q reason=%q bucket=%s, got %d", want, scope, reason, bucketStart.Format(time.RFC3339), got)
-	}
-}
-
 func ensureIntegrationPostgres(t *testing.T) {
 	t.Helper()
 

@@ -39,6 +39,13 @@ func workerDrainingStatus(err error) error {
 	return nil
 }
 
+func sessionClosedStatus(err error) error {
+	if errors.Is(err, errSessionClosed) {
+		return status.Error(codes.NotFound, "session closed")
+	}
+	return nil
+}
+
 const (
 	metadataDrainSchemas = "schemas"
 	metadataDrainTables  = "tables"
@@ -123,14 +130,44 @@ func popQueryHandle(session *Session, handleID string) (*QueryHandle, bool) {
 	return handle, true
 }
 
+func addQueryHandle(session *Session, handleID string, handle *QueryHandle) bool {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed {
+		return false
+	}
+	session.queries[handleID] = handle
+	return true
+}
+
+func addTrackedTransaction(session *Session, txnKey string, ttx *trackedTx) bool {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed {
+		return false
+	}
+	session.txns[txnKey] = ttx
+	session.txnOwner[txnKey] = session.Username
+	return true
+}
+
 func appendPreparedDrain(session *Session, handleID string, finishDrain func()) bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	if session.closed {
+		return false
+	}
 	handle, ok := session.queries[handleID]
 	if !ok {
 		return false
 	}
-	handle.pendingDrains = append(handle.pendingDrains, drainToken{finish: finishDrain, at: time.Now()})
+	now := time.Now()
+	if handle.TxnID != "" {
+		if ttx := session.txns[handle.TxnID]; ttx != nil {
+			ttx.lastUsed.Store(now.UnixNano())
+		}
+	}
+	handle.pendingDrains = append(handle.pendingDrains, drainToken{finish: finishDrain, at: now})
 	return true
 }
 
@@ -150,13 +187,17 @@ func popPreparedDrain(session *Session, handleID string) (*QueryHandle, func(), 
 	return handle, finishDrain, true
 }
 
-func appendMetadataDrain(session *Session, key string, finishDrain func()) {
+func appendMetadataDrain(session *Session, key string, finishDrain func()) bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	if session.closed {
+		return false
+	}
 	if session.metadataDrains == nil {
 		session.metadataDrains = make(map[string][]drainToken)
 	}
 	session.metadataDrains[key] = append(session.metadataDrains[key], drainToken{finish: finishDrain, at: time.Now()})
+	return true
 }
 
 func popMetadataDrain(session *Session, key string) func() {
@@ -465,11 +506,21 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	query := cmd.GetQuery()
 	var tx *sql.Tx
 	var txnKey string
+	var ttx *trackedTx
 	if !isEmptyFlightQuery(query) {
-		tx, txnKey, err = session.getOpenTxn(cmd.GetTransactionId())
+		tx, txnKey, ttx, err = session.getOpenTxn(cmd.GetTransactionId())
 		if err != nil {
 			return nil, err
 		}
+	}
+	var endConnWork func()
+	if tx == nil && !isEmptyFlightQuery(query) {
+		var ok bool
+		endConnWork, ok = session.beginConnWork()
+		if !ok {
+			return nil, status.Error(codes.NotFound, "session closed")
+		}
+		defer endConnWork()
 	}
 	finishDrain, err := h.pool.beginDrainWork(session.allowsDrainContinuation(txnKey))
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
@@ -490,9 +541,9 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	if isEmptyFlightQuery(query) {
 		emptySchema := arrow.NewSchema(nil, nil)
 		handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
-		session.mu.Lock()
-		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema, createdAt: time.Now()}
-		session.mu.Unlock()
+		if !addQueryHandle(session, handleID, &QueryHandle{Query: query, Schema: emptySchema, createdAt: time.Now()}) {
+			return nil, status.Error(codes.NotFound, "session closed")
+		}
 
 		ticketBytes, ticketErr := flightsql.CreateStatementQueryTicket([]byte(handleID))
 		if ticketErr != nil {
@@ -511,6 +562,8 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
+	endTxnWork := ttx.beginWork()
+	defer endTxnWork()
 
 	// Only retry on transient errors for autocommit queries. Inside a
 	// transaction, a transient error invalidates the transaction — retrying
@@ -518,35 +571,35 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	inTransaction := tx != nil || session.sqlTxActive.Load()
 	var schema *arrow.Schema
 	if inTransaction {
-		schema, err = GetQuerySchema(ctx, session.Conn, query, tx)
+		schema, err = session.getQuerySchema(ctx, query, tx)
 	} else {
 		schema, err = retryOnTransient(func() (*arrow.Schema, error) {
-			return GetQuerySchema(ctx, session.Conn, query, tx)
+			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
 	// Conflict retry for autocommit only. Note: if retryOnTransient exhausted on a
 	// transient error that also matches "Transaction conflict", this chains into
 	// conflict retry — acceptable since the error patterns are distinct in practice.
-	if err != nil && tx == nil && isDuckLakeTransactionConflict(err) {
+	if shouldRetryDuckLakeConflict(err, inTransaction) {
 		ducklakeConflictTotal.Inc()
 		schema, err = retryOnConflict(func() (*arrow.Schema, error) {
-			return GetQuerySchema(ctx, session.Conn, query, tx)
+			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
 	if err != nil {
 		schema, err, _ = recoverAbortedTransaction(
 			err,
 			!inTransaction,
-			func() error {
-				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
-				return rollbackErr
-			},
+			func() error { return session.rollbackConn(context.Background()) },
 			func() (*arrow.Schema, error) {
-				return GetQuerySchema(ctx, session.Conn, query, tx)
+				return session.getQuerySchema(ctx, query, tx)
 			},
 		)
 	}
 	if err != nil {
+		if closedErr := sessionClosedStatus(err); closedErr != nil {
+			return nil, closedErr
+		}
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
 
@@ -559,9 +612,9 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create ticket: %v", err)
 	}
-	session.mu.Lock()
-	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, finishDrain: finishDrain, createdAt: time.Now()}
-	session.mu.Unlock()
+	if !addQueryHandle(session, handleID, &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, finishDrain: finishDrain, createdAt: time.Now()}) {
+		return nil, status.Error(codes.NotFound, "session closed")
+	}
 	releaseOnReturn = false
 
 	return &flight.FlightInfo{
@@ -591,9 +644,10 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 	}
 
 	var tx *sql.Tx
+	var ttx *trackedTx
 	if handle.TxnID != "" {
 		session.mu.RLock()
-		ttx := session.txns[handle.TxnID]
+		ttx = session.txns[handle.TxnID]
 		session.mu.RUnlock()
 		if ttx == nil || ttx.tx == nil {
 			releaseQueryHandleValue(handle)
@@ -613,22 +667,38 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		close(ch)
 		return schema, ch, nil
 	}
-
+	var endConnWork func()
+	if tx == nil {
+		var ok bool
+		endConnWork, ok = session.beginConnWork()
+		if !ok {
+			releaseQueryHandleValue(handle)
+			return nil, nil, status.Error(codes.NotFound, "session closed")
+		}
+	} else {
+		endConnWork = func() {}
+	}
 	go func() {
 		defer close(ch)
 		defer func() {
 			releaseQueryHandleValue(handle)
 		}()
+		defer endConnWork()
 
 		session.progress.queryActive.Store(true)
 		defer session.progress.queryActive.Store(false)
+		endTxnWork := ttx.beginWork()
+		defer endTxnWork()
 
 		inTxn := tx != nil || session.sqlTxActive.Load()
+		var closeRows func() error
 		queryFn := func() (*sql.Rows, error) {
-			if tx != nil {
-				return tx.QueryContext(ctx, handle.Query)
+			rows, closer, err := session.queryRows(ctx, tx, handle.Query)
+			if err != nil {
+				return nil, err
 			}
-			return session.Conn.QueryContext(ctx, handle.Query)
+			closeRows = closer
+			return rows, nil
 		}
 
 		var rows *sql.Rows
@@ -639,23 +709,18 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			rows, qerr = retryOnTransient(queryFn)
 		}
 		// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
-		if qerr != nil && tx == nil && isDuckLakeTransactionConflict(qerr) {
+		if shouldRetryDuckLakeConflict(qerr, inTxn) {
 			ducklakeConflictTotal.Inc()
 			rows, qerr = retryOnConflict(func() (*sql.Rows, error) {
-				return session.Conn.QueryContext(ctx, handle.Query)
+				return queryFn()
 			})
 		}
 		if qerr != nil {
 			rows, qerr, _ = recoverAbortedTransaction(
 				qerr,
 				!inTxn,
-				func() error {
-					_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
-					return rollbackErr
-				},
-				func() (*sql.Rows, error) {
-					return session.Conn.QueryContext(ctx, handle.Query)
-				},
+				func() error { return session.rollbackConn(context.Background()) },
+				func() (*sql.Rows, error) { return queryFn() },
 			)
 		}
 		if qerr != nil {
@@ -663,7 +728,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			return
 		}
 		defer func() {
-			_ = rows.Close()
+			_ = closeRows()
 		}()
 
 		for {
@@ -693,12 +758,21 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		return 0, err
 	}
 
-	tx, _, err := session.getOpenTxn(cmd.GetTransactionId())
+	tx, _, ttx, err := session.getOpenTxn(cmd.GetTransactionId())
 	if err != nil {
 		return 0, err
 	}
 
 	query := cmd.GetQuery()
+	var endConnWork func()
+	if tx == nil && !isEmptyFlightQuery(query) {
+		var ok bool
+		endConnWork, ok = session.beginConnWork()
+		if !ok {
+			return 0, status.Error(codes.NotFound, "session closed")
+		}
+		defer endConnWork()
+	}
 	finishDrain, err := h.pool.beginDrainWork(session.allowsDrainContinuation(string(cmd.GetTransactionId())))
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
 		return 0, drainErr
@@ -719,12 +793,11 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	}
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
+	endTxnWork := ttx.beginWork()
+	defer endTxnWork()
 
 	execFn := func() (sql.Result, error) {
-		if tx != nil {
-			return tx.ExecContext(ctx, query)
-		}
-		return session.Conn.ExecContext(ctx, query)
+		return session.exec(ctx, tx, query)
 	}
 
 	// Determine whether this statement is safe to retry on transient errors.
@@ -750,20 +823,17 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	}
 
 	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
-	if execErr != nil && tx == nil && isDuckLakeTransactionConflict(execErr) {
+	if shouldRetryDuckLakeConflict(execErr, inTransaction) {
 		ducklakeConflictTotal.Inc()
 		result, execErr = retryOnConflict(func() (sql.Result, error) {
-			return session.Conn.ExecContext(ctx, query)
+			return session.execConn(ctx, query)
 		})
 	}
 	if execErr != nil {
 		result, execErr, _ = recoverAbortedTransaction(
 			execErr,
 			!inTransaction,
-			func() error {
-				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
-				return rollbackErr
-			},
+			func() error { return session.rollbackConn(context.Background()) },
 			func() (sql.Result, error) {
 				return execFn()
 			},
@@ -772,13 +842,18 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	// Track SQL-level transaction state for BEGIN/COMMIT/ROLLBACK sent as raw SQL.
 	trackSQLTransactionState(query, execErr, &session.sqlTxActive)
 	if tx == nil && isTransactionStartStmt(query) && execErr == nil {
-		session.setSQLTransactionDrain(finishDrain)
+		if !session.setSQLTransactionDrain(finishDrain) {
+			return 0, status.Error(codes.NotFound, "session closed")
+		}
 		releaseOnReturn = false
 	}
 	if tx == nil && isTxControl && execErr == nil {
 		session.releaseSQLTransactionDrain()
 	}
 	if execErr != nil {
+		if closedErr := sessionClosedStatus(execErr); closedErr != nil {
+			return 0, closedErr
+		}
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
 
@@ -807,9 +882,12 @@ func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,
 	}
 	_ = req
 
-	tx, err := session.Conn.BeginTx(context.Background(), nil)
+	tx, err := session.beginTx(context.Background())
 	if err != nil {
 		finishDrain()
+		if closedErr := sessionClosedStatus(err); closedErr != nil {
+			return nil, closedErr
+		}
 		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %v", err)
 	}
 
@@ -817,10 +895,11 @@ func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,
 	ttx := &trackedTx{tx: tx, finishDrain: finishDrain}
 	ttx.lastUsed.Store(time.Now().UnixNano())
 
-	session.mu.Lock()
-	session.txns[txnKey] = ttx
-	session.txnOwner[txnKey] = session.Username
-	session.mu.Unlock()
+	if !addTrackedTransaction(session, txnKey, ttx) {
+		_ = session.rollbackTx(tx)
+		finishDrain()
+		return nil, status.Error(codes.NotFound, "session closed")
+	}
 
 	return []byte(txnKey), nil
 }
@@ -858,17 +937,17 @@ func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 
 	switch req.GetAction() {
 	case flightsql.EndTransactionCommit:
-		if err := ttx.tx.Commit(); err != nil {
+		if err := session.commitTx(ttx.tx); err != nil {
 			return status.Errorf(codes.Internal, "failed to commit transaction: %v", err)
 		}
 		return nil
 	case flightsql.EndTransactionRollback:
-		if err := ttx.tx.Rollback(); err != nil {
+		if err := session.rollbackTx(ttx.tx); err != nil {
 			return status.Errorf(codes.Internal, "failed to rollback transaction: %v", err)
 		}
 		return nil
 	default:
-		_ = ttx.tx.Rollback()
+		_ = session.rollbackTx(ttx.tx)
 		return status.Error(codes.InvalidArgument, "unsupported end transaction action")
 	}
 }
@@ -881,7 +960,7 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
 
-	tx, txnKey, err := session.getOpenTxn(req.GetTransactionId())
+	tx, txnKey, ttx, err := session.getOpenTxn(req.GetTransactionId())
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
@@ -901,26 +980,40 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 	if isEmptyFlightQuery(query) {
 		emptySchema := arrow.NewSchema(nil, nil)
 		handleID := fmt.Sprintf("prep-%d", session.handleCounter.Add(1))
-		session.mu.Lock()
-		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema, TxnID: txnKey, Prepared: true, createdAt: time.Now()}
-		session.mu.Unlock()
+		if !addQueryHandle(session, handleID, &QueryHandle{Query: query, Schema: emptySchema, TxnID: txnKey, Prepared: true, createdAt: time.Now()}) {
+			return flightsql.ActionCreatePreparedStatementResult{}, status.Error(codes.NotFound, "session closed")
+		}
 		return flightsql.ActionCreatePreparedStatementResult{
 			Handle:        []byte(handleID),
 			DatasetSchema: emptySchema,
 		}, nil
 	}
+	var endConnWork func()
+	if tx == nil {
+		var ok bool
+		endConnWork, ok = session.beginConnWork()
+		if !ok {
+			return flightsql.ActionCreatePreparedStatementResult{}, status.Error(codes.NotFound, "session closed")
+		}
+		defer endConnWork()
+	}
 
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
-	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
+	endTxnWork := ttx.beginWork()
+	defer endTxnWork()
+	schema, err := session.getQuerySchema(ctx, query, tx)
 	if err != nil {
+		if closedErr := sessionClosedStatus(err); closedErr != nil {
+			return flightsql.ActionCreatePreparedStatementResult{}, closedErr
+		}
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare: %v", err)
 	}
 
 	handleID := fmt.Sprintf("prep-%d", session.handleCounter.Add(1))
-	session.mu.Lock()
-	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, Prepared: true, createdAt: time.Now()}
-	session.mu.Unlock()
+	if !addQueryHandle(session, handleID, &QueryHandle{Query: query, Schema: schema, TxnID: txnKey, Prepared: true, createdAt: time.Now()}) {
+		return flightsql.ActionCreatePreparedStatementResult{}, status.Error(codes.NotFound, "session closed")
+	}
 
 	return flightsql.ActionCreatePreparedStatementResult{
 		Handle:        []byte(handleID),
@@ -1010,9 +1103,10 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 	}
 
 	var tx *sql.Tx
+	var ttx *trackedTx
 	if handle.TxnID != "" {
 		session.mu.RLock()
-		ttx := session.txns[handle.TxnID]
+		ttx = session.txns[handle.TxnID]
 		session.mu.RUnlock()
 		if ttx == nil || ttx.tx == nil {
 			finishDrain()
@@ -1032,25 +1126,33 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 		close(ch)
 		return schema, ch, nil
 	}
+	var endConnWork func()
+	if tx == nil {
+		var ok bool
+		endConnWork, ok = session.beginConnWork()
+		if !ok {
+			finishDrain()
+			return nil, nil, status.Error(codes.NotFound, "session closed")
+		}
+	} else {
+		endConnWork = func() {}
+	}
 
 	go func() {
 		defer close(ch)
 		defer finishDrain()
+		defer endConnWork()
 		session.progress.queryActive.Store(true)
 		defer session.progress.queryActive.Store(false)
-		var rows *sql.Rows
-		var qerr error
-		if tx != nil {
-			rows, qerr = tx.QueryContext(ctx, handle.Query)
-		} else {
-			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
-		}
+		endTxnWork := ttx.beginWork()
+		defer endTxnWork()
+		rows, closeRows, qerr := session.queryRows(ctx, tx, handle.Query)
 		if qerr != nil {
 			_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: qerr})
 			return
 		}
 		defer func() {
-			_ = rows.Close()
+			_ = closeRows()
 		}()
 
 		for {
@@ -1086,7 +1188,16 @@ func (h *FlightSQLHandler) GetFlightInfoSchemas(ctx context.Context, cmd flights
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "start schema metadata drain tracking: %v", err)
 	}
-	appendMetadataDrain(session, metadataSchemasDrainKey(cmd), finishDrain)
+	releaseOnReturn := true
+	defer func() {
+		if releaseOnReturn {
+			finishDrain()
+		}
+	}()
+	if !appendMetadataDrain(session, metadataSchemasDrainKey(cmd), finishDrain) {
+		return nil, status.Error(codes.NotFound, "session closed")
+	}
+	releaseOnReturn = false
 
 	return &flight.FlightInfo{
 		Schema:           flight.SerializeSchema(schema_ref.DBSchemas, h.alloc),
@@ -1132,25 +1243,33 @@ func (h *FlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd flightsql.Get
 	}
 	query += " ORDER BY catalog_name, db_schema_name"
 
-	activeTx := session.getActiveTxn()
+	activeTx, activeTTX := session.getActiveTxn()
+	var endConnWork func()
+	if activeTx == nil {
+		var ok bool
+		endConnWork, ok = session.beginConnWork()
+		if !ok {
+			finishDrain()
+			return nil, nil, status.Error(codes.NotFound, "session closed")
+		}
+	} else {
+		endConnWork = func() {}
+	}
 
 	ch := make(chan flight.StreamChunk, 1)
 	go func() {
 		defer close(ch)
 		defer finishDrain()
-		var rows *sql.Rows
-		var qerr error
-		if activeTx != nil {
-			rows, qerr = activeTx.QueryContext(ctx, query, args...)
-		} else {
-			rows, qerr = session.Conn.QueryContext(ctx, query, args...)
-		}
+		defer endConnWork()
+		endTxnWork := activeTTX.beginWork()
+		defer endTxnWork()
+		rows, closeRows, qerr := session.queryRows(ctx, activeTx, query, args...)
 		if qerr != nil {
 			_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: qerr})
 			return
 		}
 		defer func() {
-			_ = rows.Close()
+			_ = closeRows()
 		}()
 
 		builder := array.NewRecordBuilder(h.alloc, schema)
@@ -1204,7 +1323,16 @@ func (h *FlightSQLHandler) GetFlightInfoTables(ctx context.Context, cmd flightsq
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "start table metadata drain tracking: %v", err)
 	}
-	appendMetadataDrain(session, metadataTablesDrainKey(cmd), finishDrain)
+	releaseOnReturn := true
+	defer func() {
+		if releaseOnReturn {
+			finishDrain()
+		}
+	}()
+	if !appendMetadataDrain(session, metadataTablesDrainKey(cmd), finishDrain) {
+		return nil, status.Error(codes.NotFound, "session closed")
+	}
+	releaseOnReturn = false
 
 	schema := schema_ref.Tables
 	if cmd.GetIncludeSchema() {
@@ -1273,19 +1401,27 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 	}
 	query += " ORDER BY table_catalog, table_schema, table_name"
 
-	activeTx := session.getActiveTxn()
+	activeTx, activeTTX := session.getActiveTxn()
+	var endConnWork func()
+	if activeTx == nil {
+		var ok bool
+		endConnWork, ok = session.beginConnWork()
+		if !ok {
+			finishDrain()
+			return nil, nil, status.Error(codes.NotFound, "session closed")
+		}
+	} else {
+		endConnWork = func() {}
+	}
 
 	ch := make(chan flight.StreamChunk, 1)
 	go func() {
 		defer close(ch)
 		defer finishDrain()
-		var rows *sql.Rows
-		var qerr error
-		if activeTx != nil {
-			rows, qerr = activeTx.QueryContext(ctx, query, args...)
-		} else {
-			rows, qerr = session.Conn.QueryContext(ctx, query, args...)
-		}
+		defer endConnWork()
+		endTxnWork := activeTTX.beginWork()
+		defer endTxnWork()
+		rows, rowsCloser, qerr := session.queryRows(ctx, activeTx, query, args...)
 		if qerr != nil {
 			_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: qerr})
 			return
@@ -1296,7 +1432,7 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 				return nil
 			}
 			rowsOpen = false
-			return rows.Close()
+			return rowsCloser()
 		}
 		defer func() {
 			_ = closeRows()
@@ -1352,7 +1488,7 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 
 			if includeSchema {
 				qualified := QualifyTableName(t.catalog, t.schema, t.name)
-				tableSchema, schemaErr := GetQuerySchema(ctx, session.Conn, "SELECT * FROM "+qualified, activeTx)
+				tableSchema, schemaErr := session.getQuerySchema(ctx, "SELECT * FROM "+qualified, activeTx)
 				if schemaErr != nil {
 					_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: schemaErr})
 					return
@@ -1408,29 +1544,29 @@ func stripFlightComments(query string) string {
 
 // Session helpers
 
-func (s *Session) getOpenTxn(transactionID []byte) (*sql.Tx, string, error) {
+func (s *Session) getOpenTxn(transactionID []byte) (*sql.Tx, string, *trackedTx, error) {
 	if len(transactionID) == 0 {
-		return nil, "", nil
+		return nil, "", nil, nil
 	}
 	txnKey := string(transactionID)
 	s.mu.RLock()
 	ttx, ok := s.txns[txnKey]
 	s.mu.RUnlock()
 	if !ok || ttx == nil || ttx.tx == nil {
-		return nil, "", status.Error(codes.NotFound, "transaction not found")
+		return nil, "", nil, status.Error(codes.NotFound, "transaction not found")
 	}
 	ttx.lastUsed.Store(time.Now().UnixNano())
-	return ttx.tx, txnKey, nil
+	return ttx.tx, txnKey, ttx, nil
 }
 
-func (s *Session) getActiveTxn() *sql.Tx {
+func (s *Session) getActiveTxn() (*sql.Tx, *trackedTx) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, ttx := range s.txns {
 		if ttx != nil && ttx.tx != nil {
 			ttx.lastUsed.Store(time.Now().UnixNano())
-			return ttx.tx
+			return ttx.tx, ttx
 		}
 	}
-	return nil
+	return nil, nil
 }

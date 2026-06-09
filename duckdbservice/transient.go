@@ -16,7 +16,7 @@ import (
 // "cannot commit - no transaction is active" error.
 // BEGIN is excluded because it carries no transaction state and is safe to retry.
 func isTransactionControlStmt(query string) bool {
-	q := strings.TrimSpace(query)
+	q := stripLeadingSQLComments(query)
 	if len(q) == 0 {
 		return false
 	}
@@ -27,13 +27,13 @@ func isTransactionControlStmt(query string) bool {
 }
 
 func isTransactionStartStmt(query string) bool {
-	upper := strings.ToUpper(strings.TrimSpace(query))
+	upper := strings.ToUpper(stripLeadingSQLComments(query))
 	return strings.HasPrefix(upper, "BEGIN") ||
 		strings.HasPrefix(upper, "START")
 }
 
 func trackSQLTransactionState(query string, execErr error, sqlTxActive *atomic.Bool) {
-	upper := strings.ToUpper(strings.TrimSpace(query))
+	upper := strings.ToUpper(stripLeadingSQLComments(query))
 	if len(upper) == 0 {
 		return
 	}
@@ -46,6 +46,28 @@ func trackSQLTransactionState(query string, execErr error, sqlTxActive *atomic.B
 	if isTransactionControlStmt(upper) {
 		if execErr == nil {
 			sqlTxActive.Store(false)
+		}
+	}
+}
+
+func stripLeadingSQLComments(query string) string {
+	q := strings.TrimSpace(query)
+	for {
+		switch {
+		case strings.HasPrefix(q, "--"):
+			newline := strings.IndexByte(q, '\n')
+			if newline < 0 {
+				return ""
+			}
+			q = strings.TrimSpace(q[newline+1:])
+		case strings.HasPrefix(q, "/*"):
+			end := strings.Index(q[2:], "*/")
+			if end < 0 {
+				return q
+			}
+			q = strings.TrimSpace(q[end+4:])
+		default:
+			return q
 		}
 	}
 }
@@ -149,6 +171,10 @@ func isDuckLakeTransactionConflict(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "Transaction conflict")
+}
+
+func shouldRetryDuckLakeConflict(err error, inTransaction bool) bool {
+	return !inTransaction && isDuckLakeTransactionConflict(err)
 }
 
 const (

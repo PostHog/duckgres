@@ -24,7 +24,6 @@ func (r *reconnectTestOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergCo
 }
 
 func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false }
-func (r *reconnectTestOrgRouter) SetWarmCapacityTarget(_ int)     {}
 func (r *reconnectTestOrgRouter) ShutdownAll()                    {}
 
 // recordingOrgRouter records the orgIDs StackForOrg is asked for. It returns no
@@ -44,7 +43,6 @@ func (r *recordingOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig
 	return server.IcebergConfig{}, false
 }
 func (r *recordingOrgRouter) IsMigratingForOrg(_ string) bool { return false }
-func (r *recordingOrgRouter) SetWarmCapacityTarget(_ int)     {}
 func (r *recordingOrgRouter) ShutdownAll()                    {}
 
 type testFlightOrgKey struct{}
