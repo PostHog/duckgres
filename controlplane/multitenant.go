@@ -167,7 +167,6 @@ func SetupMultiTenant(
 		SecretName:                   cfg.K8s.WorkerSecret,
 		ConfigMap:                    cfg.K8s.WorkerConfigMap,
 		MaxWorkers:                   maxWorkers,
-		WarmAcquireTimeout:           cfg.K8s.WarmAcquireTimeout,
 		IdleTimeout:                  cfg.WorkerIdleTimeout,
 		ConfigPath:                   cfg.ConfigPath,
 		ImagePullPolicy:              cfg.K8s.ImagePullPolicy,
@@ -184,10 +183,6 @@ func SetupMultiTenant(
 		PlaceholderCPU:               cfg.K8s.PlaceholderCPU,
 		PlaceholderMemory:            cfg.K8s.PlaceholderMemory,
 		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,
-		ColocatedNodeSelector:        parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
-		ColocatedTolerationKey:       cfg.K8s.ColocatedWorkerTolerationKey,
-		ColocatedTolerationValue:     cfg.K8s.ColocatedWorkerTolerationValue,
-		ColocatedWarmShapes:          cfg.K8s.ColocatedWarmShapes,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {

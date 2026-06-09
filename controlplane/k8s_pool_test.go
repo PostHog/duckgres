@@ -1269,7 +1269,7 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 		MaxWorkers: 1,
 		Image:      "duckgres:v2",
 	})
-	var capacityErr *WarmCapacityExhaustedError
+	var capacityErr *WorkerCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
 		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}

@@ -63,11 +63,8 @@ type K8sWorkerPool struct {
 	nextWorkerID int
 	spawning     int
 	maxWorkers   int
-	// warmAcquireTimeout: server-side block window for a session-acquire that
-	// missed the warm pool (0 = fail fast). Read by OrgReservedPool.AcquireWorker.
-	warmAcquireTimeout time.Duration
-	idleTimeout        time.Duration
-	shuttingDown       bool
+	idleTimeout  time.Duration
+	shuttingDown bool
 	shutdownCh         chan struct{}
 
 	clientset               kubernetes.Interface
@@ -184,7 +181,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	pool := &K8sWorkerPool{
 		workers:                 make(map[int]*ManagedWorker),
 		maxWorkers:              cfg.MaxWorkers,
-		warmAcquireTimeout:      cfg.WarmAcquireTimeout,
 		idleTimeout:             cfg.IdleTimeout,
 		shutdownCh:              make(chan struct{}),
 		stopInform:              make(chan struct{}),
@@ -1576,7 +1572,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					return nil, err
 				}
 				if hotClaimed == nil && hotMissReason != configstore.WorkerClaimMissReasonNone && hotMissReason != configstore.WorkerClaimMissReasonNoIdle {
-					return nil, NewWarmCapacityExhaustedErrorForReason(hotMissReason, DefaultWarmCapacityRetryAfter)
+					return nil, NewWorkerCapacityExhaustedErrorForReason(hotMissReason, DefaultWorkerSpawnRetryAfter)
 				}
 				if hotClaimed != nil {
 					// ClaimHotIdleWorker already filters by profile, so a reclaimed
@@ -1673,7 +1669,7 @@ func (p *K8sWorkerPool) spawnReservedWorker(ctx context.Context, assignment *Wor
 			return nil, err
 		}
 		if slot == nil {
-			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+			return nil, NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
 		}
 		id = slot.WorkerID
 	} else {

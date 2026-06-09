@@ -61,11 +61,11 @@ func (p *acquireErrorPool) ShutdownAll() {}
 func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 	controlPlaneWorkerAcquireFailuresCounter.Reset()
 	sm := NewSessionManager(&acquireErrorPool{
-		err: NewWarmCapacityExhaustedError(30 * time.Second),
+		err: NewWorkerCapacityExhaustedError(30 * time.Second),
 	}, nil)
 
 	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0, nil)
-	var capacityErr *WarmCapacityExhaustedError
+	var capacityErr *WorkerCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
 		t.Fatalf("expected warm capacity error, got %v", err)
 	}
@@ -98,7 +98,7 @@ func TestIsWorkerSessionCapError(t *testing.T) {
 	for _, e := range []error{
 		nil,
 		errors.New("create session on worker 7: connection refused"),
-		NewWarmCapacityExhaustedError(time.Second),
+		NewWorkerCapacityExhaustedError(time.Second),
 		context.DeadlineExceeded,
 	} {
 		if isWorkerSessionCapError(e) {

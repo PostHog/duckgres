@@ -136,13 +136,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool (0=unbounded)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED  Enable dynamic warm-capacity targets (default: true)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW  Recent no-idle miss window for dynamic targets (default: 2m)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER  Misses per extra warm worker (default: 8)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL  Retention TTL for warm-capacity miss buckets (default: 15m)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING  Max dynamic extra warm workers per image (0=unlimited)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING  Max dynamic extra warm workers across images (0=unlimited)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
@@ -359,14 +352,6 @@ func main() {
 				ImagePullPolicy:                 resolved.K8sWorkerImagePullPolicy,
 				ServiceAccount:                  resolved.K8sWorkerServiceAccount,
 				MaxWorkers:                      resolved.K8sMaxWorkers,
-				SharedWarmTarget:                resolved.K8sSharedWarmTarget,
-				DynamicWarmCapacityEnabled:      resolved.K8sDynamicWarmCapacityEnabled,
-				WarmCapacityMissWindow:          resolved.K8sWarmCapacityMissWindow,
-				WarmAcquireTimeout:              resolved.K8sWarmAcquireTimeout,
-				WarmCapacityMissesPerWorker:     resolved.K8sWarmCapacityMissesPerWorker,
-				WarmCapacityDemandTTL:           resolved.K8sWarmCapacityDemandTTL,
-				WarmCapacityDynamicImageCeiling: resolved.K8sWarmCapacityDynamicImageCeiling,
-				WarmCapacityDynamicTotalCeiling: resolved.K8sWarmCapacityDynamicTotalCeiling,
 				WorkerCPURequest:                resolved.K8sWorkerCPURequest,
 				WorkerMemoryRequest:             resolved.K8sWorkerMemoryRequest,
 				WorkerNodeSelector:              resolved.K8sWorkerNodeSelector,
@@ -374,26 +359,16 @@ func main() {
 				WorkerTolerationValue:           resolved.K8sWorkerTolerationValue,
 				WorkerExclusiveNode:             resolved.K8sWorkerExclusiveNode,
 				AllowClientWorkerProfile:        resolved.K8sAllowClientWorkerProfile,
-				AllowClientExclusiveNode:        resolved.K8sAllowClientExclusiveNode,
-				ColocatedWorkerCPURequest:       resolved.K8sColocatedWorkerCPURequest,
-				ColocatedWorkerMemoryRequest:    resolved.K8sColocatedWorkerMemoryRequest,
-				ColocatedWarmShapes:             resolved.K8sColocatedWarmShapes,
 				WorkerPriorityClassName:         resolved.K8sWorkerPriorityClassName,
 				HeadroomPercent:                 resolved.K8sHeadroomPercent,
 				PlaceholderImage:                resolved.K8sPlaceholderImage,
 				PlaceholderCPU:                  resolved.K8sPlaceholderCPU,
 				PlaceholderMemory:               resolved.K8sPlaceholderMemory,
 				PlaceholderPriorityClassName:    resolved.K8sPlaceholderPriorityClassName,
-				WorkerTiers:                     resolved.K8sWorkerTiers,
-				ColocatedWorkerNodeSelector:     resolved.K8sColocatedWorkerNodeSelector,
-				ColocatedWorkerTolerationKey:    resolved.K8sColocatedWorkerTolerationKey,
-				ColocatedWorkerTolerationValue:  resolved.K8sColocatedWorkerTolerationValue,
 				WorkerProfileMinCPU:             resolved.K8sWorkerProfileMinCPU,
 				WorkerProfileMaxCPU:             resolved.K8sWorkerProfileMaxCPU,
 				WorkerProfileMinMemory:          resolved.K8sWorkerProfileMinMemory,
 				WorkerProfileMaxMemory:          resolved.K8sWorkerProfileMaxMemory,
-				OrgMaxColocatedCPU:              resolved.K8sOrgMaxColocatedCPU,
-				OrgMaxColocatedMemory:           resolved.K8sOrgMaxColocatedMemory,
 				AWSRegion:                       resolved.AWSRegion,
 			},
 		}

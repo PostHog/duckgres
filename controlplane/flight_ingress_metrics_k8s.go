@@ -24,19 +24,6 @@ var orgWorkerCrashesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Total worker crashes per org",
 }, []string{"org"})
 
-// orgColocatedQuotaRejectionsCounter counts colocated worker acquisitions an org
-// was denied because it would exceed its colocated CPU/memory budget. A sustained
-// nonzero rate means an org is hitting its colocated quota — alert/tune before it
-// silently caps that org's backfill throughput.
-var orgColocatedQuotaRejectionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_org_colocated_quota_rejections_total",
-	Help: "Total colocated worker acquisitions rejected by the per-org colocated resource quota",
-}, []string{"org"})
-
-func observeOrgColocatedQuotaRejection(orgID string) {
-	orgColocatedQuotaRejectionsCounter.WithLabelValues(orgID).Inc()
-}
-
 // orgPgSessionsAcceptedCounter tracks every PG session that completes auth and
 // is dispatched to a worker, partitioned by org and passthrough mode. Useful
 // for spotting unexpected passthrough usage spikes (a misconfigured client) or

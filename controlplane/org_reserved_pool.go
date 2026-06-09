@@ -4,25 +4,12 @@ package controlplane
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
-
-// isRetryableWarmMiss reports whether a worker-acquire error is a transient
-// "no idle warm worker" miss — the only capacity miss that resolves on its own
-// once the warm pool replenishes. Org/global-cap and shutdown misses are not
-// retried (waiting won't change them).
-func isRetryableWarmMiss(err error) bool {
-	var capErr *WarmCapacityExhaustedError
-	if !errors.As(err, &capErr) {
-		return false
-	}
-	return capErr.missReason() == configstore.WorkerClaimMissReasonNoIdle
-}
 
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
@@ -102,8 +89,8 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 		// At the org's max concurrent workers with all busy → fail fast with the
 		// clear org-cap message; waiting cannot help (no new worker will spawn).
 		if p.atOrgWorkerCap() {
-			return nil, NewWarmCapacityExhaustedErrorForReason(
-				configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+			return nil, NewWorkerCapacityExhaustedErrorForReason(
+				configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
 		}
 
 		// Under cap: reuse a hot-idle worker for this org, or spawn one on demand.

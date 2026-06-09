@@ -263,29 +263,6 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 		t.Fatalf("expected at least %d assigned workers, got %d", target, got)
 	}
 }
-// TestIsRetryableWarmMiss confirms only a transient no-idle warm miss is treated
-// as retryable by the server-side acquire wait — org/global-cap and non-capacity
-// errors are not (waiting won't change them).
-func TestIsRetryableWarmMiss(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"no-idle", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonNoIdle, 0), true},
-		{"org-cap", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, 0), false},
-		{"global-cap", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonGlobalCap, 0), false},
-		{"shutting-down", NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonShuttingDown, 0), false},
-		{"plain-error", context.DeadlineExceeded, false},
-		{"nil", nil, false},
-	}
-	for _, c := range cases {
-		if got := isRetryableWarmMiss(c.err); got != c.want {
-			t.Errorf("%s: isRetryableWarmMiss = %v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
 // At the org's max concurrent workers with all of them busy, AcquireWorker must
 // fail FAST with the clear org-cap message — not busy-wait until the client's
 // deadline, and not reuse the busy worker (one session per worker).
@@ -316,9 +293,9 @@ func TestOrgReservedPoolAcquireFailsClearlyAtOrgCap(t *testing.T) {
 	if got != nil {
 		t.Fatalf("expected no worker at org cap, got %v", got)
 	}
-	var capErr *WarmCapacityExhaustedError
+	var capErr *WorkerCapacityExhaustedError
 	if !errors.As(err, &capErr) || capErr.missReason() != configstore.WorkerClaimMissReasonOrgCap {
-		t.Fatalf("expected org-cap WarmCapacityExhaustedError, got %v", err)
+		t.Fatalf("expected org-cap WorkerCapacityExhaustedError, got %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("expected fast failure at org cap, took %s", elapsed)

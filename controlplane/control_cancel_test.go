@@ -95,7 +95,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 	})
 
 	t.Run("warm capacity exhausted", func(t *testing.T) {
-		code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedError(45 * time.Second))
+		code, message := sessionCreationErrorResponse(NewWorkerCapacityExhaustedError(45 * time.Second))
 		if code != "53300" {
 			t.Fatalf("code = %q, want 53300", code)
 		}
@@ -127,7 +127,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedErrorForReason(tt.reason, 45*time.Second))
+			code, message := sessionCreationErrorResponse(NewWorkerCapacityExhaustedErrorForReason(tt.reason, 45*time.Second))
 			if code != "53300" {
 				t.Fatalf("code = %q, want 53300", code)
 			}
@@ -162,7 +162,7 @@ func TestWarmCapacityMissPolicyForKnownReasons(t *testing.T) {
 		{name: "shutting_down", reason: configstore.WorkerClaimMissReasonShuttingDown, policyReason: configstore.WorkerClaimMissReasonShuttingDown, recordDynamicDemand: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			policy := warmCapacityMissPolicyForReason(tt.reason)
+			policy := capacityMissPolicyForReason(tt.reason)
 			if policy.reason != tt.policyReason {
 				t.Fatalf("policy reason = %q, want %q", policy.reason, tt.policyReason)
 			}
