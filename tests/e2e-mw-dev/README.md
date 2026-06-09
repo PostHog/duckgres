@@ -41,6 +41,12 @@ client-go:
   post-TLS startup-message length (negative / ~2GiB / truncated, injected via
   `openssl s_client -starttls postgres`) gets a clean connection close — the CP
   pod must not restart and must keep serving (regression for #715).
+- **pipeline error recovery** (#718) — a pipelined extended-query batch (psql
+  18 `\startpipeline`) whose first statement errors must have its queued
+  statements **discarded until Sync** (the queued INSERT must not execute);
+  the statement after `\syncpipeline` must execute normally. This is why the
+  harness Job image is `postgres:18-alpine` (pipeline meta-commands are
+  psql 18+).
 - **cold-burst absorption** — there is no warm pool, so a burst of cold sessions
   spawns workers on demand; if it outruns the org/global cap the surplus gets a
   graceful client-visible hint (`no Duckgres worker … retry in about 45 seconds`

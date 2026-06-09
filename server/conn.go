@@ -170,6 +170,8 @@ type clientConn struct {
 	stmts                  map[string]*preparedStmt // prepared statements by name
 	portals                map[string]*portal       // portals by name
 	txStatus               byte                     // current transaction status ('I', 'T', or 'E')
+	ignoreTillSync         bool                     // discard extended-query messages until Sync after an error; see runExtendedQueryMessage
+	errorResponsesSent     uint64                   // ErrorResponses sent via sendError; observed by runExtendedQueryMessage
 	passthrough            bool                     // true for passthrough users (skip transpiler + pg_catalog)
 	cursors                map[string]*cursorState  // server-side cursor emulation
 	catalogUseRewrite      bool                     // true when bare `USE ducklake`/`USE iceberg` should expand to the reliable two-part target
@@ -1337,6 +1339,10 @@ func (c *clientConn) messageLoop() error {
 
 		switch msgType {
 		case wire.MsgQuery:
+			// A simple Query resets extended-protocol state: it is processed
+			// (not discarded by skip-until-Sync) — its trailing ReadyForQuery
+			// resynchronizes the client.
+			c.ignoreTillSync = false
 			if err := c.handleQuery(body); err != nil {
 				if isConnectionBroken(err) {
 					slog.Info("Client connection lost during query.", "user", c.username, "error", err)
@@ -1347,22 +1353,24 @@ func (c *clientConn) messageLoop() error {
 
 		case wire.MsgParse:
 			// Extended query protocol - Parse
-			c.handleParse(body)
+			c.runExtendedQueryMessage(c.handleParse, body)
 
 		case wire.MsgBind:
 			// Extended query protocol - Bind
-			c.handleBind(body)
+			c.runExtendedQueryMessage(c.handleBind, body)
 
 		case wire.MsgDescribe:
 			// Extended query protocol - Describe
-			c.handleDescribe(body)
+			c.runExtendedQueryMessage(c.handleDescribe, body)
 
 		case wire.MsgExecute:
 			// Extended query protocol - Execute
-			c.handleExecute(body)
+			c.runExtendedQueryMessage(c.handleExecute, body)
 
 		case wire.MsgSync:
-			// Extended query protocol - Sync
+			// Extended query protocol - Sync: ends any skip-until-Sync error
+			// recovery, then reports readiness.
+			c.ignoreTillSync = false
 			if err := wire.WriteReadyForQuery(c.writer, c.txStatus); err != nil {
 				return err
 			}
@@ -1370,10 +1378,14 @@ func (c *clientConn) messageLoop() error {
 
 		case wire.MsgClose:
 			// Extended query protocol - Close
-			c.handleClose(body)
+			c.runExtendedQueryMessage(c.handleClose, body)
 
 		case wire.MsgFlush:
-			_ = c.writer.Flush()
+			// Discarded during skip-until-Sync error recovery, like real
+			// PostgreSQL (the ErrorResponse was already flushed by sendError).
+			if !c.ignoreTillSync {
+				_ = c.writer.Flush()
+			}
 
 		case wire.MsgTerminate:
 			return nil
@@ -1381,6 +1393,30 @@ func (c *clientConn) messageLoop() error {
 		default:
 			slog.Warn("Unknown message type.", "type", string(msgType))
 		}
+	}
+}
+
+// runExtendedQueryMessage dispatches an extended-query protocol message
+// (Parse/Bind/Describe/Execute/Close), implementing the protocol's error
+// recovery rule: after an error while processing any extended-query message
+// the server must discard subsequent extended-protocol messages until Sync
+// arrives. Without this, pipelined clients (libpq pipeline mode, pgx
+// SendBatch, JDBC batch) execute queued messages against broken state and
+// desync their response accounting.
+//
+// An error is detected by observing sendError — the single ErrorResponse
+// funnel for an established connection — so deep failure paths inside Execute
+// arm the skip too. The trigger is deliberately the error event itself, NOT
+// txStatus == txStatusError: an aborted transaction must still accept the
+// Parse/Bind/Execute of a ROLLBACK sent after Sync.
+func (c *clientConn) runExtendedQueryMessage(handler func([]byte), body []byte) {
+	if c.ignoreTillSync {
+		return
+	}
+	before := c.errorResponsesSent
+	handler(body)
+	if c.errorResponsesSent != before {
+		c.ignoreTillSync = true
 	}
 }
 
@@ -5216,6 +5252,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 		queryErrorsCounter.WithLabelValues(c.orgID).Inc()
 	}
 	slog.Debug("Sending error to client.", "user", c.username, "severity", severity, "code", code, "message", message)
+	c.errorResponsesSent++
 	_ = wire.WriteErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()
 }

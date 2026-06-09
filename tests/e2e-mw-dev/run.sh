@@ -185,7 +185,11 @@ spec:
       restartPolicy: Never
       containers:
         - name: harness
-          image: public.ecr.aws/docker/library/postgres:16-alpine
+          # postgres:18-alpine: psql 18 ships the pipeline meta-commands
+          # (\startpipeline/\syncpipeline/\endpipeline) that the harness's
+          # pipeline_error_recovery check (#718) drives the extended-query
+          # protocol with. Earlier psql cannot pipeline.
+          image: public.ecr.aws/docker/library/postgres:18-alpine
           command: ["/bin/sh", "/harness/harness.sh"]
           env:
             - { name: NAMESPACE, value: "$NS" }
