@@ -300,7 +300,7 @@ func (t *FunctionTransform) handleSpecialFunction(fc *pg_query.FuncCall, funcNam
 		return t.handleSubstrClamp(fc)
 
 	case "substring":
-		return t.handleSubstringRegex(fc, funcNameIdx)
+		return t.handleSubstring(fc, funcNameIdx)
 
 	default:
 		return false

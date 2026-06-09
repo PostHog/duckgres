@@ -31,8 +31,13 @@ func (t *FunctionTransform) replaceCompatFuncNode(node *pg_query.Node, fc *pg_qu
 
 // rewriteFormat rewrites format('...literal template...', args...) with PG
 // %-specifiers into a || concatenation. Only fires for a literal first arg
-// containing at least one %-spec; %I->quote_ident, %L->quote_literal,
-// %s->CAST(.. AS VARCHAR), %%->'%'. Unsupported specs (positional/width) bail.
+// containing at least one %-spec. NULL handling matches PG: %s renders NULL as
+// empty string (coalesce), %L as the unquoted keyword NULL (quote_nullable);
+// %I with a NULL arg yields a NULL result where PG raises — acceptable, since a
+// NULL identifier is a bug either way. Malformed templates (dangling %, too few
+// args) and unsupported specs (%1$s positional, width/precision) are rewritten
+// to an error() call: DuckDB's native format would silently return the template
+// unsubstituted, which is the exact corruption mode this transform exists to fix.
 func (t *FunctionTransform) rewriteFormat(node *pg_query.Node, fc *pg_query.FuncCall) bool {
 	if len(fc.Args) == 0 {
 		return false
@@ -40,6 +45,10 @@ func (t *FunctionTransform) rewriteFormat(node *pg_query.Node, fc *pg_query.Func
 	tmpl := extractStringConstant(fc.Args[0])
 	if tmpl == "" || !strings.Contains(tmpl, "%") {
 		return false // non-literal or no specifier: leave for native format
+	}
+	rewriteToError := func(msg string) bool {
+		node.Node = funcCallNode("error", strConstNode(msg)).Node
+		return true
 	}
 	var segments []*pg_query.Node
 	var lit strings.Builder
@@ -56,7 +65,7 @@ func (t *FunctionTransform) rewriteFormat(node *pg_query.Node, fc *pg_query.Func
 			continue
 		}
 		if i+1 >= len(tmpl) {
-			return false // dangling '%'
+			return rewriteToError("format(): unterminated format specifier")
 		}
 		spec := tmpl[i+1]
 		i++
@@ -65,21 +74,24 @@ func (t *FunctionTransform) rewriteFormat(node *pg_query.Node, fc *pg_query.Func
 			lit.WriteByte('%')
 		case 's', 'I', 'L':
 			if argIdx >= len(fc.Args) {
-				return false // not enough args
+				return rewriteToError("format(): too few arguments for format string")
 			}
 			arg := fc.Args[argIdx]
 			argIdx++
 			flushLit()
 			switch spec {
 			case 's':
-				segments = append(segments, castToVarchar(arg))
+				// PG renders a NULL %s argument as the empty string.
+				segments = append(segments, coalesceNode(castToVarchar(arg), strConstNode("")))
 			case 'I':
 				segments = append(segments, funcCallNode("quote_ident", arg))
 			case 'L':
-				segments = append(segments, funcCallNode("quote_literal", arg))
+				// quote_nullable matches PG %L exactly: NULL -> unquoted keyword NULL.
+				segments = append(segments, funcCallNode("quote_nullable", arg))
 			}
 		default:
-			return false // positional/width/precision specs: out of scope, bail
+			return rewriteToError("format(): unsupported format specifier %" + string(spec) +
+				" (only %s, %I, %L and %% are supported)")
 		}
 	}
 	flushLit()
@@ -106,6 +118,9 @@ func (t *FunctionTransform) rewriteDateTrunc3(node *pg_query.Node, fc *pg_query.
 
 // rewriteOverlay rewrites overlay(s placing repl from start [for len]) into
 // substr(s,1,start-1) || repl || substr(s, start+len). Default len = length(repl).
+// s, start and (in the FROM-only form) repl are each referenced more than once —
+// volatile expressions would be evaluated repeatedly; fine for the common
+// literal/column case.
 func (t *FunctionTransform) rewriteOverlay(node *pg_query.Node, fc *pg_query.FuncCall) bool {
 	if len(fc.Args) < 3 {
 		return false
@@ -137,6 +152,9 @@ func (t *FunctionTransform) rewriteIsfiniteInterval(node *pg_query.Node, fc *pg_
 // handleSubstrClamp rewrites substr/substring positional args in place to match
 // PG's window semantics for non-positive start: start -> greatest(start,1) and
 // (for the 3-arg form) count -> greatest(0, count + start - greatest(start,1)).
+// Note the start expression is referenced up to three times in the rewrite — a
+// volatile start (e.g. a subquery or random()) would be evaluated repeatedly.
+// Acceptable for the overwhelmingly common literal/column case.
 func (t *FunctionTransform) handleSubstrClamp(fc *pg_query.FuncCall) bool {
 	if len(fc.Args) == 2 {
 		start := fc.Args[1]
@@ -154,27 +172,53 @@ func (t *FunctionTransform) handleSubstrClamp(fc *pg_query.FuncCall) bool {
 	return false
 }
 
-// handleSubstringRegex rewrites the SQL regex form substring(text FROM pattern)
-// — a 2-arg call whose second arg is a string literal — into
-// regexp_extract(text, pattern, group), where group is 1 if the pattern has a
-// capture group, else 0 (PG returns the first group if present, else the whole
-// match). Other arg shapes (positional / FROM..FOR) are left to native substring.
-func (t *FunctionTransform) handleSubstringRegex(fc *pg_query.FuncCall, funcNameIdx int) bool {
-	if len(fc.Args) != 2 {
+// handleSubstring dispatches PostgreSQL substring() by arg shape:
+//   - 2-arg with a string-literal second arg — the SQL regex FROM-pattern form —
+//     becomes regexp_extract(text, pattern, group), group 1 if the pattern has a
+//     capture group else 0 (PG returns the first group if present, else the
+//     whole match).
+//   - 3-arg (FROM..FOR) and 2-arg with an integer second arg are positional and
+//     share substr's PG window semantics for non-positive start, so they get the
+//     same clamp rewrite (deparsed as a plain call so the clamped expressions
+//     don't ride on the SUBSTRING(.. FROM .. FOR ..) keyword syntax).
+//   - 2-arg with a non-literal second arg is ambiguous at transpile time (text
+//     column = regex, int column = positional) and is left untouched.
+func (t *FunctionTransform) handleSubstring(fc *pg_query.FuncCall, funcNameIdx int) bool {
+	if len(fc.Args) == 2 {
+		if pattern := extractStringConstant(fc.Args[1]); pattern != "" {
+			group := 0
+			if patternHasCaptureGroup(pattern) {
+				group = 1
+			}
+			renameFuncAndStripPrefix(fc, funcNameIdx, "regexp_extract")
+			fc.Funcformat = pg_query.CoercionForm_COERCE_EXPLICIT_CALL
+			fc.Args = append(fc.Args, intConstNode(group))
+			return true
+		}
+		if !isIntegerConst(fc.Args[1]) {
+			return false // ambiguous non-literal second arg: leave native
+		}
+	}
+	if len(fc.Args) == 2 || len(fc.Args) == 3 {
+		if t.handleSubstrClamp(fc) {
+			renameFuncAndStripPrefix(fc, funcNameIdx, "substring")
+			fc.Funcformat = pg_query.CoercionForm_COERCE_EXPLICIT_CALL
+			return true
+		}
+	}
+	return false
+}
+
+// isIntegerConst reports whether a node is an integer A_Const (possibly inside
+// a unary minus, which pg_query folds into the constant for literals like -2).
+func isIntegerConst(node *pg_query.Node) bool {
+	if node == nil {
 		return false
 	}
-	pattern := extractStringConstant(fc.Args[1])
-	if pattern == "" {
-		return false // non-literal or non-string second arg: native substring
+	if ac := node.GetAConst(); ac != nil {
+		return ac.GetIval() != nil || (ac.Val == nil && !ac.Isnull)
 	}
-	group := 0
-	if patternHasCaptureGroup(pattern) {
-		group = 1
-	}
-	renameFuncAndStripPrefix(fc, funcNameIdx, "regexp_extract")
-	fc.Funcformat = pg_query.CoercionForm_COERCE_EXPLICIT_CALL
-	fc.Args = append(fc.Args, intConstNode(group))
-	return true
+	return false
 }
 
 // ---- small AST constructors ----
@@ -204,6 +248,14 @@ func intConstNode(n int) *pg_query.Node {
 func boolConstNode(b bool) *pg_query.Node {
 	return &pg_query.Node{Node: &pg_query.Node_AConst{AConst: &pg_query.A_Const{
 		Val: &pg_query.A_Const_Boolval{Boolval: &pg_query.Boolean{Boolval: b}},
+	}}}
+}
+
+// coalesceNode builds a COALESCE(...) expression. COALESCE is grammar syntax,
+// not a callable function — a plain FuncCall would deparse quoted and fail.
+func coalesceNode(args ...*pg_query.Node) *pg_query.Node {
+	return &pg_query.Node{Node: &pg_query.Node_CoalesceExpr{CoalesceExpr: &pg_query.CoalesceExpr{
+		Args: args,
 	}}}
 }
 

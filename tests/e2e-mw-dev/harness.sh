@@ -293,8 +293,9 @@ pg_compat_functions() { # org password
   assert_compat "$1" "$2" ducklake "SELECT overlay('Txxxxas' PLACING 'hom' FROM 2 FOR 4)" "Thomas" "overlay"
   # cardinality(): array element count (DuckDB builtin is MAP-only).
   assert_compat "$1" "$2" ducklake "SELECT cardinality(ARRAY[10,20,30])::text" "3" "cardinality"
-  # isfinite(interval): always true (DuckDB lacks the interval overload).
-  assert_compat "$1" "$2" ducklake "SELECT isfinite(INTERVAL '1 day')::text" "t" "isfinite_interval"
+  # isfinite(interval): always true (DuckDB lacks the interval overload). The
+  # cast happens inside DuckDB, so the textual form is 'true', not PG's 't'.
+  assert_compat "$1" "$2" ducklake "SELECT isfinite(INTERVAL '1 day')::text" "true" "isfinite_interval"
 }
 
 # Regression for #715: the CP reads the post-TLS startup message with the shared

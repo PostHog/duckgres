@@ -61,6 +61,12 @@ func TestCompatTransforms_BatchE(t *testing.T) {
 		{"format_ident_literal", `SELECT format('%I = %L','foo bar','baz')`, `"foo bar" = 'baz'`, false},
 		{"format_percent", `SELECT format('%s and %%','hello')`, "hello and %", false},
 		{"format_two_s", `SELECT format('%s-%s','a','b')`, "a-b", false},
+		// PG NULL semantics: %s renders NULL as empty string; %L renders the
+		// unquoted keyword NULL. A bare || chain would collapse the whole result
+		// to NULL instead.
+		{"format_s_null", `SELECT format('x%s', NULL)`, "x", false},
+		{"format_l_null", `SELECT format('%L', NULL)`, "NULL", false},
+		{"format_l_null_mixed", `SELECT format('v=%L;', NULL)`, "v=NULL;", false},
 
 		// substr — PG negative/zero-start window semantics
 		{"substr_neg_count", `SELECT substr('alphabet',-2,5)`, "al", false},
@@ -72,6 +78,11 @@ func TestCompatTransforms_BatchE(t *testing.T) {
 		{"substring_group", `SELECT substring('Thomas' FROM 'o(.)')`, "m", false},
 		{"substring_whole", `SELECT substring('Thomas' FROM 'mas$')`, "mas", false},
 		{"substring_from_for", `SELECT substring('Thomas' FROM 4 FOR 3)`, "mas", false},
+		// substring's positional forms share substr's PG window semantics for
+		// non-positive start — must get the same clamp rewrite.
+		{"substring_neg_from_for", `SELECT substring('alphabet' FROM -2 FOR 5)`, "al", false},
+		{"substring_zero_from_for", `SELECT substring('alphabet' FROM 0 FOR 3)`, "al", false},
+		{"substring_neg_from", `SELECT substring('alphabet' FROM -3)`, "alphabet", false},
 
 		// overlay — replace a substring window
 		{"overlay_from_for", `SELECT overlay('Txxxxas' PLACING 'hom' FROM 2 FOR 4)`, "Thomas", false},
@@ -90,4 +101,33 @@ func TestCompatTransforms_BatchE(t *testing.T) {
 		// isfinite — interval is always finite (DuckDB lacks the INTERVAL overload)
 		{"isfinite_interval", `SELECT isfinite(INTERVAL '1 day')::text`, "true", false},
 	})
+}
+
+// Unsupported format() specs must hard-error, not silently return the template
+// unsubstituted (DuckDB's native format behavior — the corruption mode the
+// transform exists to fix).
+func TestCompatTransforms_FormatUnsupportedSpecErrors(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
+		t.Fatalf("initPgCatalog: %v", err)
+	}
+	tr := transpiler.New(transpiler.Config{})
+	for _, q := range []string{
+		`SELECT format('%1$s', 'a')`, // positional spec
+		`SELECT format('%s %s', 'only-one')`, // too few args
+		`SELECT format('dangling %', 'x')`, // unterminated spec
+	} {
+		res, err := tr.Transpile(q)
+		if err != nil {
+			t.Fatalf("transpile %q: %v", q, err)
+		}
+		var got string
+		if err := db.QueryRow(res.SQL).Scan(&got); err == nil {
+			t.Errorf("%q should error, returned %q (transpiled %q)", q, got, res.SQL)
+		}
+	}
 }
