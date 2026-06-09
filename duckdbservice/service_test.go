@@ -4,12 +4,76 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
+
+func TestReapIdleRawSQLRollbackUsesBoundedContext(t *testing.T) {
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, "service.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse service.go: %v", err)
+	}
+
+	var found bool
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		fn, ok := node.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "reapIdle" {
+			return true
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || len(call.Args) < 2 {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "ExecContext" {
+				return true
+			}
+			recv, ok := sel.X.(*ast.SelectorExpr)
+			if !ok || recv.Sel.Name != "Conn" {
+				return true
+			}
+			recvIdent, ok := recv.X.(*ast.Ident)
+			if !ok || recvIdent.Name != "s" {
+				return true
+			}
+			query, ok := call.Args[1].(*ast.BasicLit)
+			if !ok || query.Value != `"ROLLBACK"` {
+				return true
+			}
+			found = true
+			if isContextBackgroundCall(call.Args[0]) {
+				pos := fset.Position(call.Args[0].Pos())
+				t.Errorf("idle raw SQL rollback uses unbounded context at %s", pos)
+			}
+			return true
+		})
+		return false
+	})
+	if !found {
+		t.Fatal("did not find idle raw SQL rollback ExecContext in reapIdle")
+	}
+}
+
+func isContextBackgroundCall(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "Background" {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "context"
+}
 
 // With MaxSessions=1 (how the control plane spawns remote worker pods), a worker
 // serves exactly one client query session — a second concurrent CreateSession is
@@ -432,6 +496,546 @@ func TestReapIdleTransactionsReleasesDrainWork(t *testing.T) {
 	defer cancel()
 	if !pool.WaitForDrain(waitCtx) {
 		t.Fatal("expected idle transaction reaper to release transaction drain work")
+	}
+}
+
+func TestReapIdleTransactionsKeepsDrainWorkWhenTransactionActive(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin transaction drain work: %v", err)
+	}
+	ttx := &trackedTx{finishDrain: finishDrain}
+	ttx.lastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	ttx.activeWork.Store(1)
+	session := &Session{
+		ID:       "session-1",
+		queries:  make(map[string]*QueryHandle),
+		txns:     map[string]*trackedTx{"txn-1": ttx},
+		txnOwner: map[string]string{"txn-1": "alice"},
+	}
+	pool.sessions[session.ID] = session
+
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+	assertSessionMutexUnlocked(t, session)
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("active Flight SQL transaction must keep drain work open")
+	}
+	session.mu.RLock()
+	_, stillTracked := session.txns["txn-1"]
+	session.mu.RUnlock()
+	if !stillTracked {
+		t.Fatal("active Flight SQL transaction should not be reaped")
+	}
+	releaseDrainFunc(finishDrain)
+}
+
+func TestAppendPreparedDrainRefreshesTrackedTransaction(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	txnFinish, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin transaction drain work: %v", err)
+	}
+	pendingFinish, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin prepared drain work: %v", err)
+	}
+	ttx := &trackedTx{finishDrain: txnFinish}
+	ttx.lastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	session := &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {Query: "SELECT 1", Prepared: true, TxnID: "txn-1"},
+		},
+		txns:     map[string]*trackedTx{"txn-1": ttx},
+		txnOwner: map[string]string{"txn-1": "alice"},
+	}
+	pool.sessions[session.ID] = session
+
+	if !appendPreparedDrain(session, "prep-1", pendingFinish) {
+		t.Fatal("appendPreparedDrain failed")
+	}
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+	assertSessionMutexUnlocked(t, session)
+
+	session.mu.RLock()
+	_, stillTracked := session.txns["txn-1"]
+	handle := session.queries["prep-1"]
+	session.mu.RUnlock()
+	if !stillTracked {
+		t.Fatal("prepared continuation should refresh its tracked transaction before idle reap")
+	}
+	releaseDrainFunc(pendingFinish)
+	releaseDrainFunc(txnFinish)
+	releaseQueryHandleValue(handle)
+}
+
+func TestReapIdleRawSQLTransactionReleasesDrainWork(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN"); err != nil {
+		t.Fatalf("begin raw transaction: %v", err)
+	}
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin raw transaction drain work: %v", err)
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+		sqlTxDrain:     finishDrain,
+	}
+	session.sqlTxActive.Store(true)
+	session.lastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	pool.sessions[session.ID] = session
+
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected idle raw SQL transaction reaper to release drain work")
+	}
+	if session.sqlTxActive.Load() {
+		t.Fatal("expected idle raw SQL transaction reaper to clear sqlTxActive")
+	}
+	if session.sqlTxDrain != nil {
+		t.Fatal("expected idle raw SQL transaction reaper to clear sqlTxDrain")
+	}
+	if _, err := conn.ExecContext(context.Background(), "COMMIT"); err == nil {
+		t.Fatal("expected COMMIT after idle reaper rollback to fail")
+	}
+}
+
+func TestReapIdleRawSQLTransactionKeepsDrainWorkWhenConnWorkActive(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin raw transaction drain work: %v", err)
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+		sqlTxDrain:     finishDrain,
+	}
+	session.sqlTxActive.Store(true)
+	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	pool.sessions[session.ID] = session
+
+	endWork, ok := session.beginConnWork()
+	if !ok {
+		t.Fatal("beginConnWork failed")
+	}
+	defer endWork()
+	if session.progress.queryActive.Load() {
+		t.Fatal("conn work guard must not mutate queryActive")
+	}
+	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+	assertSessionMutexUnlocked(t, session)
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("active raw SQL transaction connection work must keep drain work open")
+	}
+	if !session.sqlTxActive.Load() {
+		t.Fatal("active raw SQL transaction connection work must keep sqlTxActive")
+	}
+	if session.sqlTxDrain == nil {
+		t.Fatal("active raw SQL transaction connection work must keep sqlTxDrain")
+	}
+	releaseDrainFunc(session.sqlTxDrain)
+}
+
+func TestReapIdleRawSQLTransactionKeepsDrainWorkWhenRollbackCannotRun(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin raw transaction drain work: %v", err)
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+		sqlTxDrain:     finishDrain,
+	}
+	session.sqlTxActive.Store(true)
+	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	pool.sessions[session.ID] = session
+
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+	assertSessionMutexUnlocked(t, session)
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("failed raw SQL transaction rollback must keep drain work open")
+	}
+	if !session.sqlTxActive.Load() {
+		t.Fatal("failed raw SQL transaction rollback must keep sqlTxActive")
+	}
+	if session.sqlTxDrain == nil {
+		t.Fatal("failed raw SQL transaction rollback must keep sqlTxDrain")
+	}
+	releaseDrainFunc(session.sqlTxDrain)
+}
+
+func assertSessionMutexUnlocked(t *testing.T, session *Session) {
+	t.Helper()
+	unlocked := make(chan struct{})
+	go func() {
+		session.mu.Lock()
+		close(unlocked)
+		session.mu.Unlock()
+	}()
+	select {
+	case <-unlocked:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("session mutex remained locked after reapIdle")
+	}
+}
+
+func TestDestroySessionPreventsLateQueryHandleDrainLeak(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin query drain work: %v", err)
+	}
+
+	if err := pool.DestroySession(session.ID); err != nil {
+		t.Fatalf("destroy session: %v", err)
+	}
+	if addQueryHandle(session, "query-1", &QueryHandle{Query: "SELECT 1", finishDrain: finishDrain, createdAt: time.Now()}) {
+		t.Fatal("late query handle registration should fail after DestroySession")
+	}
+	releaseDrainFunc(finishDrain)
+
+	pool.BeginDrain()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("late query handle registration leaked drain work")
+	}
+}
+
+func TestDestroySessionPreventsLateSQLTransactionDrainLeak(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin transaction drain work: %v", err)
+	}
+
+	if err := pool.DestroySession(session.ID); err != nil {
+		t.Fatalf("destroy session: %v", err)
+	}
+	if session.setSQLTransactionDrain(finishDrain) {
+		t.Fatal("late raw SQL transaction drain registration should fail after DestroySession")
+	}
+	releaseDrainFunc(finishDrain)
+
+	pool.BeginDrain()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("late raw SQL transaction drain registration leaked drain work")
+	}
+}
+
+func TestDestroySessionPreventsLateTrackedTransactionDrainLeak(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin transaction drain work: %v", err)
+	}
+
+	if err := pool.DestroySession(session.ID); err != nil {
+		t.Fatalf("destroy session: %v", err)
+	}
+	if addTrackedTransaction(session, "txn-1", &trackedTx{finishDrain: finishDrain}) {
+		t.Fatal("late tracked transaction registration should fail after DestroySession")
+	}
+	releaseDrainFunc(finishDrain)
+
+	pool.BeginDrain()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("late tracked transaction registration leaked drain work")
+	}
+}
+
+func TestDestroySessionWaitsForActiveConnectionWorkBeforeCleanup(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		DB:             db,
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	session.connMu.Lock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- pool.DestroySession(session.ID)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("DestroySession returned before active connection work finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	session.connMu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DestroySession: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DestroySession did not finish after active connection work ended")
+	}
+}
+
+func TestDestroySessionWaitsForAcceptedConnectionWorkBeforeCleanup(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		DB:             db,
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	endWork, ok := session.beginConnWork()
+	if !ok {
+		t.Fatal("beginConnWork failed")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- pool.DestroySession(session.ID)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("DestroySession returned before accepted connection work finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	endWork()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DestroySession: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DestroySession did not finish after accepted connection work ended")
+	}
+}
+
+func TestCloseAllWaitsForActiveConnectionWorkBeforeClose(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		DB:             db,
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	session.connMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		pool.CloseAll()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("CloseAll returned before active connection work finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	session.connMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CloseAll did not finish after active connection work ended")
+	}
+}
+
+func TestCloseAllWaitsForAcceptedConnectionWorkBeforeClose(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		DB:             db,
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	endWork, ok := session.beginConnWork()
+	if !ok {
+		t.Fatal("beginConnWork failed")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		pool.CloseAll()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("CloseAll returned before accepted connection work finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	endWork()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CloseAll did not finish after accepted connection work ended")
 	}
 }
 

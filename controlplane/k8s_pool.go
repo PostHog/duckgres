@@ -2812,6 +2812,15 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						}
 
 						if healthErr != nil {
+							if p.workerLeaseLocallyDraining(lease) {
+								if p.workerLeaseDurablyDrainingOrRepair(lease) {
+									slog.Warn("K8s worker health check failed while worker is draining; waiting for pod exit.",
+										"id", lease.workerID, "error", healthErr)
+									return
+								}
+								slog.Warn("K8s worker health check failed while worker is locally draining but durable state is not draining; treating as health failure.",
+									"id", lease.workerID, "error", healthErr)
+							}
 							mu.Lock()
 							failures[lease]++
 							count := failures[lease]
@@ -3368,27 +3377,14 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 				if p.workerMatchesLease(w, lease) && w.SharedState().NormalizedLifecycle() == WorkerLifecycleDraining {
 					lc := p.ensureLifecycle()
 					if lc != nil {
-						outcome, err := lc.RetireDrained(
-							configstore.NewWorkerLease(lease.workerID, lease.ownerCPInstanceID, lease.ownerEpoch, lease.image),
-							RetireReasonNormal,
-							LifecycleOriginInformerCrash,
-						)
+						retired, err := p.retireLocalDrainingLease(lease, RetireReasonNormal, LifecycleOriginInformerCrash)
 						if err != nil {
 							slog.Warn("Clean dead worker: retire draining CAS failed; leaving cleanup to retry.",
 								"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
 							continue
 						}
-						if !outcome.Transitioned {
-							record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
-							if err != nil {
-								slog.Warn("Clean dead worker: retire draining verification failed; leaving cleanup to retry.",
-									"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
-								continue
-							}
-							if record == nil || record.OwnerCPInstanceID != lease.ownerCPInstanceID ||
-								record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateRetired {
-								continue
-							}
+						if !retired {
+							continue
 						}
 					}
 					p.markWorkerRetiredInMemoryLocked(w)
@@ -3635,6 +3631,59 @@ func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot, 
 	return outcome.Transitioned, nil
 }
 
+func (p *K8sWorkerPool) workerLeaseLocallyDraining(lease workerLeaseSnapshot) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	w, ok := p.workers[lease.workerID]
+	return ok && p.workerMatchesLease(w, lease) && w.SharedState().NormalizedLifecycle() == WorkerLifecycleDraining
+}
+
+func (p *K8sWorkerPool) workerLeaseDurablyDrainingOrRepair(lease workerLeaseSnapshot) bool {
+	if lease.ownerCPInstanceID != p.cpInstanceID {
+		return false
+	}
+	lc := p.ensureLifecycle()
+	if lc == nil {
+		return true
+	}
+	record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+	if err != nil {
+		slog.Warn("K8s worker health check failed while worker is locally draining, but durable worker record could not be verified.",
+			"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+		return false
+	}
+	if record == nil || record.OwnerCPInstanceID != lease.ownerCPInstanceID || record.OwnerEpoch != lease.ownerEpoch {
+		return false
+	}
+	if record.State == configstore.WorkerStateDraining {
+		return true
+	}
+
+	outcome, err := lc.Drain(
+		configstore.NewWorkerLease(lease.workerID, lease.ownerCPInstanceID, lease.ownerEpoch, lease.image),
+		LifecycleOriginWorkerDrain,
+	)
+	if err != nil {
+		slog.Warn("K8s worker health check failed while worker is locally draining, but durable drain repair failed.",
+			"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+		return false
+	}
+	if outcome.Transitioned {
+		return true
+	}
+
+	record, err = p.runtimeStore.GetWorkerRecord(lease.workerID)
+	if err != nil {
+		slog.Warn("K8s worker health check failed while worker is locally draining, but durable worker record could not be verified after repair miss.",
+			"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+		return false
+	}
+	return record != nil &&
+		record.OwnerCPInstanceID == lease.ownerCPInstanceID &&
+		record.OwnerEpoch == lease.ownerEpoch &&
+		record.State == configstore.WorkerStateDraining
+}
+
 func (p *K8sWorkerPool) markWorkerDrainingFromHealth(lease workerLeaseSnapshot) {
 	if lease.ownerCPInstanceID != p.cpInstanceID {
 		return
@@ -3646,24 +3695,28 @@ func (p *K8sWorkerPool) markWorkerDrainingFromHealth(lease workerLeaseSnapshot) 
 		return
 	}
 	previous := w.SharedState()
+	alreadyDraining := false
 	switch previous.NormalizedLifecycle() {
-	case WorkerLifecycleDraining, WorkerLifecycleRetired:
+	case WorkerLifecycleRetired:
 		p.mu.Unlock()
 		return
+	case WorkerLifecycleDraining:
+		alreadyDraining = true
+	default:
+		next, err := previous.Transition(WorkerLifecycleDraining, previous.Assignment)
+		if err != nil {
+			p.mu.Unlock()
+			slog.Warn("Worker reported draining but local lifecycle transition failed.",
+				"worker_id", lease.workerID, "state", previous.NormalizedLifecycle(), "error", err)
+			return
+		}
+		w.sharedState = next
 	}
-	next, err := previous.Transition(WorkerLifecycleDraining, previous.Assignment)
-	if err != nil {
-		p.mu.Unlock()
-		slog.Warn("Worker reported draining but local lifecycle transition failed.",
-			"worker_id", lease.workerID, "state", previous.NormalizedLifecycle(), "error", err)
-		return
-	}
-	w.sharedState = next
 	p.mu.Unlock()
 
 	durableVerified := false
 	defer func() {
-		if durableVerified {
+		if durableVerified || alreadyDraining {
 			return
 		}
 		p.mu.Lock()
@@ -3679,6 +3732,21 @@ func (p *K8sWorkerPool) markWorkerDrainingFromHealth(lease workerLeaseSnapshot) 
 
 	lc := p.ensureLifecycle()
 	if lc != nil {
+		if alreadyDraining {
+			record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+			if err != nil {
+				slog.Warn("Worker reported draining but durable worker record could not be verified.",
+					"worker_id", lease.workerID, "owner_epoch", lease.ownerEpoch, "error", err)
+				return
+			}
+			if record == nil || record.OwnerCPInstanceID != p.cpInstanceID || record.OwnerEpoch != lease.ownerEpoch {
+				return
+			}
+			if record.State == configstore.WorkerStateDraining {
+				durableVerified = true
+				return
+			}
+		}
 		outcome, err := lc.Drain(
 			configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
 			LifecycleOriginWorkerDrain,
@@ -3714,22 +3782,12 @@ func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot,
 
 	lc := p.ensureLifecycle()
 	if lc != nil {
-		outcome, err := lc.RetireDrained(
-			configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
-			RetireReasonNormal,
-			origin,
-		)
+		retired, err := p.retireLocalDrainingLease(lease, RetireReasonNormal, origin)
 		if err != nil {
 			return nil, 0, 0, false, err
 		}
-		if !outcome.Transitioned {
-			record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
-			if err != nil {
-				return nil, 0, 0, false, err
-			}
-			if record == nil || record.OwnerCPInstanceID != p.cpInstanceID || record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateRetired {
-				return nil, 0, 0, false, nil
-			}
+		if !retired {
+			return nil, 0, 0, false, nil
 		}
 	}
 
@@ -3750,6 +3808,62 @@ func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot,
 		shouldReplenish = true
 	}
 	return current, workerCount, replacementID, shouldReplenish, nil
+}
+
+func (p *K8sWorkerPool) retireLocalDrainingLease(lease workerLeaseSnapshot, reason string, origin LifecycleOrigin) (bool, error) {
+	lc := p.ensureLifecycle()
+	if lc == nil {
+		return true, nil
+	}
+	durableLease := configstore.NewWorkerLease(lease.workerID, lease.ownerCPInstanceID, lease.ownerEpoch, lease.image)
+	outcome, err := lc.RetireDrained(durableLease, reason, origin)
+	if err != nil {
+		return false, err
+	}
+	if outcome.Transitioned {
+		return true, nil
+	}
+	record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+	if err != nil {
+		return false, err
+	}
+	if record == nil || record.OwnerCPInstanceID != lease.ownerCPInstanceID || record.OwnerEpoch != lease.ownerEpoch {
+		return false, nil
+	}
+	if record.State == configstore.WorkerStateRetired {
+		return true, nil
+	}
+	if record.State != configstore.WorkerStateDraining {
+		drainOutcome, err := lc.Drain(durableLease, origin)
+		if err != nil {
+			return false, err
+		}
+		if !drainOutcome.Transitioned {
+			record, err = p.runtimeStore.GetWorkerRecord(lease.workerID)
+			if err != nil {
+				return false, err
+			}
+			if record == nil || record.OwnerCPInstanceID != lease.ownerCPInstanceID ||
+				record.OwnerEpoch != lease.ownerEpoch || record.State != configstore.WorkerStateDraining {
+				return false, nil
+			}
+		}
+	}
+	outcome, err = lc.RetireDrained(durableLease, reason, origin)
+	if err != nil {
+		return false, err
+	}
+	if outcome.Transitioned {
+		return true, nil
+	}
+	record, err = p.runtimeStore.GetWorkerRecord(lease.workerID)
+	if err != nil {
+		return false, err
+	}
+	return record != nil &&
+		record.OwnerCPInstanceID == lease.ownerCPInstanceID &&
+		record.OwnerEpoch == lease.ownerEpoch &&
+		record.State == configstore.WorkerStateRetired, nil
 }
 
 func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,6 +82,19 @@ func (f *fakeDoPutStream) Recv() (*flight.FlightData, error) {
 	fd := f.inbound[f.idx]
 	f.idx++
 	return fd, nil
+}
+
+type blockingDoPutStream struct {
+	fakeDoPutStream
+	recvStarted chan struct{}
+	unblock     chan struct{}
+	once        sync.Once
+}
+
+func (b *blockingDoPutStream) Recv() (*flight.FlightData, error) {
+	b.once.Do(func() { close(b.recvStarted) })
+	<-b.unblock
+	return nil, status.Error(codes.Canceled, "test stream canceled")
 }
 
 func newSessionWithInMemoryDuckDB(t *testing.T) (*Session, func()) {
@@ -286,5 +300,67 @@ func TestDoCopyFromStdinAbortsOnStreamCancellation(t *testing.T) {
 	// And the worker did not send a PutResult.
 	if len(stream.outbound) != 0 {
 		t.Errorf("worker should not send PutResult on cancellation, got %d", len(stream.outbound))
+	}
+}
+
+func TestDoCopyFromStdinKeepsRawSQLTransactionDrainOpenWhileReceiving(t *testing.T) {
+	session, cleanup := newSessionWithInMemoryDuckDB(t)
+	defer cleanup()
+
+	pool := &SessionPool{
+		sessions:    map[string]*Session{session.ID: session},
+		stopRefresh: make(map[string]func()),
+	}
+	handler := &FlightSQLHandler{pool: pool}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "BEGIN"}); err != nil {
+		t.Fatalf("raw BEGIN: %v", err)
+	}
+	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+
+	copySQL := "COPY t (a, b) FROM '" + flightclient.CopyFromStdinPathPlaceholder +
+		"' (FORMAT CSV, HEADER false)"
+	first := &flight.FlightData{
+		FlightDescriptor: &flight.FlightDescriptor{
+			Type: flight.DescriptorPATH,
+			Path: []string{flightclient.CopyFromStdinDescriptorPath},
+			Cmd:  []byte(copySQL),
+		},
+	}
+	stream := &blockingDoPutStream{
+		fakeDoPutStream: fakeDoPutStream{ctx: ctx},
+		recvStarted:     make(chan struct{}),
+		unblock:         make(chan struct{}),
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- handler.doCopyFromStdin(ctx, first, stream)
+	}()
+
+	select {
+	case <-stream.recvStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected COPY stream receive to start")
+	}
+	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	drained := pool.WaitForDrain(shortCtx)
+
+	close(stream.unblock)
+	err := <-errCh
+	if err == nil {
+		t.Fatal("expected stream cancellation error")
+	}
+	if drained {
+		t.Fatal("COPY FROM STDIN in a raw SQL transaction must keep drain work open while receiving")
+	}
+
+	if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "ROLLBACK"}); err != nil {
+		t.Fatalf("raw ROLLBACK after canceled COPY: %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -762,6 +763,72 @@ func TestDoGetStatementConsumesHandleBeforeStreaming(t *testing.T) {
 		if chunk.Err != nil {
 			t.Fatalf("first stream error: %v", chunk.Err)
 		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+}
+
+func TestDoGetStatementKeepsRawSQLTransactionDrainOpenBeforeStreamingStarts(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN"); err != nil {
+		t.Fatalf("begin raw transaction: %v", err)
+	}
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin raw transaction drain work: %v", err)
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+		sqlTxDrain:     finishDrain,
+	}
+	session.sqlTxActive.Store(true)
+	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
+	session.queries["query-1"] = &QueryHandle{
+		Query:     "SELECT 1",
+		Schema:    arrow.NewSchema([]arrow.Field{{Name: "x", Type: arrow.PrimitiveTypes.Int32}}, nil),
+		createdAt: time.Now(),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte("query-1")})
+	if err != nil {
+		t.Fatalf("DoGetStatement: %v", err)
+	}
+
+	pool.BeginDrain()
+	pool.reapIdle(time.Now())
+	shortCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("accepted DoGet must keep raw SQL transaction drain work open before its goroutine starts streaming")
+	}
+
+	for chunk := range ch {
 		if chunk.Data != nil {
 			chunk.Data.Release()
 		}
