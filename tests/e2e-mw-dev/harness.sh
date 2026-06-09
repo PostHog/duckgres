@@ -14,7 +14,8 @@
 #                  crash, #715), and a cold burst is absorbed (workers spawn on
 #                  demand; any surplus gets a graceful retry hint) then served.
 #                  jsonb || keeps Postgres concat semantics through
-#                  transpilation (#716).
+#                  transpilation (#716), and a pipelined extended-query error
+#                  discards queued messages until Sync (#718).
 #   activation   : DuckLake + Iceberg catalogs attach and read/write.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
@@ -319,6 +320,51 @@ concurrent_connections() { # org password
     [ -f "${ok}.$i" ] || fail "concurrent connection $1 #$i did not return $i"
     i=$((i + 1))
   done
+}
+
+# Extended-query skip-until-Sync error recovery (#718): after an error while
+# processing any extended-query message, the server must DISCARD subsequent
+# pipelined extended-protocol messages until Sync arrives, then recover.
+# Pipelining clients (libpq pipeline mode, pgx SendBatch, JDBC batch) rely on
+# this; without it a queued statement executes against broken state and the
+# client's response accounting desyncs. Uses psql 18's pipeline meta-commands
+# (\startpipeline / \syncpipeline / \endpipeline) — the reason the harness Job
+# image in run.sh is postgres:18-alpine. Regression test for issue #718.
+pipeline_error_recovery() { # org password
+  log "pipeline skip-until-Sync error recovery on $1"
+  t="e2e_pipe_$(echo "$1" | tr -c 'a-z0-9' _)"
+  pg "$1" "$2" ducklake "DROP TABLE IF EXISTS $t; CREATE TABLE $t(id INT);"
+  # One pipelined batch: statement 1 errors; the INSERT of id=1 is queued
+  # BEFORE the Sync so the server must discard it; the INSERT of id=2 comes
+  # after \syncpipeline so it must execute. No ON_ERROR_STOP — the error is
+  # the point — and psql's exit code is ignored (a desynced libpq may bail);
+  # the SERVER-side outcome is asserted from a fresh session below. The
+  # transient session-create FATALs are retried like _pg_exec: they fire
+  # before any SQL runs, so re-running the whole batch is safe.
+  a=0
+  while [ "$a" -lt 12 ]; do
+    out="$(PGPASSWORD="$2" psql \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" 2>&1 <<EOF || true
+\startpipeline
+SELEC deliberately_broken \bind \g
+INSERT INTO $t VALUES (1) \bind \g
+\syncpipeline
+INSERT INTO $t VALUES (2) \bind \g
+\endpipeline
+EOF
+)"
+    case "$out" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
+        sleep 10; a=$((a + 1)); continue ;;
+    esac
+    break
+  done
+  got="$(pg "$1" "$2" ducklake "SELECT id FROM $t ORDER BY id;")"
+  [ "$got" = "2" ] || fail "$1 pipeline recovery: table has '$got', want only '2' (a pipelined statement queued behind an error executed, or post-Sync work was lost; psql said: $(printf %s "$out" | tr '\n' ' ' | tail -c 200))"
+  pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
 # ---- bundled extension forks ----------------------------------------------
@@ -724,6 +770,7 @@ main() {
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # before more workers exist
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
   rw_iceberg             "$CNPG" "$cnpg_pw"
   assert_worker_pod
@@ -764,7 +811,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"
