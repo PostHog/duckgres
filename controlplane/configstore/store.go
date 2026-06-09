@@ -1040,8 +1040,8 @@ func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	protectedStates := []WorkerState{WorkerStateDraining, WorkerStateRetired, WorkerStateLost}
 	result := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "worker_id"}},
-		// profile_cpu/memory/colocate + ttl_minutes are in the update set so a
-		// sized worker's shape (set after CreateSpawningWorkerSlot inserts the row
+		// profile_cpu/memory + ttl_minutes are in the update set so a sized
+		// worker's shape (set after CreateSpawningWorkerSlot inserts the row
 		// with an empty profile) actually persists. Without them the ON CONFLICT
 		// update silently dropped the profile, so a sized worker's hot-idle row
 		// stayed empty and ClaimHotIdleWorker could never match it (no reuse).
@@ -1592,9 +1592,9 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 //  2. owner_cp_instance_id is empty / NULL and the worker hasn't
 //     heartbeat since `before`. Observed in production: rows whose
 //     owner string was lost end up invisible to (1)'s INNER JOIN and
-//     accumulate forever, blocking warm-pool replenishment because
-//     countNeutralWarmWorkers still counts them. The stale-heartbeat
-//     guard avoids racing the spawn path's create-then-stamp window.
+//     accumulate forever, consuming the org/global worker cap. The
+//     stale-heartbeat guard avoids racing the spawn path's
+//     create-then-stamp window.
 //  3. owner_cp_instance_id is set but no matching cp_instances row
 //     exists at all (hard-deleted somehow), and again the heartbeat
 //     is stale. Same shape as (2), different cause.

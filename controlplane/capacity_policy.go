@@ -45,22 +45,22 @@ func capacityMissPolicyForReason(reason configstore.WorkerClaimMissReason) capac
 func (p capacityMissPolicy) errorString(retryAfter time.Duration) string {
 	switch p.messageKind {
 	case capacityMessageNoIdle:
-		return fmt.Sprintf("warm worker capacity exhausted; retry in about %s", normalizedCapacityRetryAfter(retryAfter).Round(time.Second))
+		return fmt.Sprintf("worker capacity exhausted; retry in about %s", normalizedCapacityRetryAfter(retryAfter).Round(time.Second))
 	case capacityMessageOrgCap:
-		return "warm worker capacity exhausted for organization"
+		return "worker capacity exhausted for organization"
 	case capacityMessageGlobalCap:
-		return "warm worker capacity exhausted by global pool limit"
+		return "worker capacity exhausted by global pool limit"
 	case capacityMessageShuttingDown:
-		return "warm worker capacity unavailable while control plane is shutting down"
+		return "worker capacity unavailable while control plane is shutting down"
 	default:
-		return "warm worker capacity exhausted"
+		return "worker capacity exhausted"
 	}
 }
 
 func (p capacityMissPolicy) sqlMessage(retryAfter time.Duration) string {
 	switch p.messageKind {
 	case capacityMessageNoIdle:
-		return fmt.Sprintf("no warm Duckgres worker is currently available; retry in about %d seconds", capacityRetrySeconds(retryAfter))
+		return fmt.Sprintf("no Duckgres worker is currently available; one is being spawned, retry in about %d seconds", capacityRetrySeconds(retryAfter))
 	case capacityMessageOrgCap:
 		return "your organization has reached its maximum number of concurrent Duckgres workers and they are all busy; retry once a query finishes"
 	case capacityMessageGlobalCap:

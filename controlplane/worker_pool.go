@@ -51,10 +51,11 @@ func NewWorkerCapacityExhaustedErrorForReason(reason configstore.WorkerClaimMiss
 //   - FlightWorkerPool: spawns workers as local child processes (default)
 //   - K8sWorkerPool:    creates workers as Kubernetes pods (build tag: kubernetes)
 type WorkerPool interface {
-	// AcquireWorker returns a worker for a new session. It may reuse an idle
-	// worker, spawn a new one, or assign to the least-loaded worker. profile is
-	// the requested pod shape (nil => the default exclusive profile); only the
-	// multi-tenant OrgReservedPool acts on it — the flat/process pools ignore it.
+	// AcquireWorker returns a worker for a new session. The multi-tenant
+	// OrgReservedPool (k8s/remote) reuses a hot-idle worker of the requested shape
+	// for the org or spawns one on demand; the process FlightWorkerPool reuses an
+	// idle worker / assigns least-loaded. profile is the requested pod shape (nil
+	// => the default shape) and is honored only by OrgReservedPool.
 	AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error)
 
 	// ReleaseWorker decrements the active session count for a worker.
@@ -70,7 +71,9 @@ type WorkerPool interface {
 	// Worker returns a worker by ID, or false if not found.
 	Worker(id int) (*ManagedWorker, bool)
 
-	// SpawnMinWorkers pre-warms the pool with count workers at startup.
+	// SpawnMinWorkers pre-warms the pool with count workers at startup. Only the
+	// process FlightWorkerPool implements this (--process-min-workers); the K8s
+	// pool spawns on demand, so its implementation is a no-op.
 	SpawnMinWorkers(count int) error
 
 	// HealthCheckLoop runs periodic health checks on all workers.

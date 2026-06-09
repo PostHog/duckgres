@@ -132,7 +132,7 @@ _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
       printf %s "$out"; return 0
     fi
     case "$out" in
-      *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
       *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*)
         # The last three cover an on-demand cold spawn that needed a fresh node
@@ -166,7 +166,7 @@ pg_try() { # org password dbname sql
       printf %s "$out"; return 0
     fi
     case "$out" in
-      *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
       *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*)
         sleep 10; a=$((a + 1)); continue ;;
@@ -179,7 +179,7 @@ pg_try() { # org password dbname sql
 # Connect preflight: a warm worker isn't always available the instant a
 # warehouse goes ready (shared_warm_target=0, so the first connection for an
 # org cold-spawns a worker; a second org can find the pool momentarily
-# exhausted). The CP returns a transient "no warm Duckgres worker is currently
+# exhausted). The CP returns a transient "no Duckgres worker is currently
 # available; retry in ~45s" / "still provisioning" / "failed to initialize
 # session". Retry `SELECT 1` through those, bounded, BEFORE the R/W. Auth
 # failures are NOT in this set, so this never feeds the rate limiter.
@@ -195,7 +195,7 @@ wait_worker() { # org password catalog
     sleep 15
     attempt=$((attempt + 1))
   done
-  fail "no warm worker for $1/$3 after retries"
+  fail "no Duckgres worker for $1/$3 after retries"
 }
 
 # ---- wire protocol --------------------------------------------------------
@@ -221,7 +221,7 @@ cold_burst_absorption() { # org password
         "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
         -tAc 'SELECT 1' 2>&1 || true)"
       case "$o" in
-        *"no warm Duckgres worker"*|*"retry in about"*|*"capacity exhausted"*|*"timed out waiting for an available worker"*) echo x >> "$seen" ;;
+        *"no Duckgres worker"*|*"retry in about"*|*"capacity exhausted"*|*"timed out waiting for an available worker"*) echo x >> "$seen" ;;
       esac ) &
     pids="$pids $!"; i=$((i + 1))
   done
@@ -671,14 +671,11 @@ main() {
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
   lifecycle_teardown_cnpg "$CNPG"
 
-  # NOTE: warm-pool-specific behaviors (shared-warm-worker activation, and the
-  # version-mismatch idle-worker reaper) are NOT exercised here: the per-PR CP
-  # runs DUCKGRES_K8S_SHARED_WARM_TARGET=0, so there are no idle warm workers to
-  # assert on. They stay covered by the controlplane/ unit tests; running them
-  # end-to-end would need a warm target >0 in the per-PR CP (see README).
-  log "SKIP shared-warm-activation + version-reaper (CP runs warm-target=0; see README)"
+  # NOTE: the version-mismatch worker reaper is not exercised in-Job (it needs a
+  # mid-run image bump); it stays covered by the controlplane/ unit tests.
+  log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: wire + warm-pool-backpressure + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: wire + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

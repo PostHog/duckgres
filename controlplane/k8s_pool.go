@@ -1962,41 +1962,6 @@ func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podNam
 	return client, nil
 }
 
-func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
-	if claimed == nil {
-		return
-	}
-	current := claimed
-	if p.runtimeStore != nil {
-		// Refresh the row so the snapshot we hand to retireClaimedWorker
-		// (and through it, lifecycle.RetireFromSnapshot) carries the
-		// latest updated_at — without this, an inter-spawn touch could
-		// CAS-miss even though we still own the row at the right epoch.
-		// We could rely solely on the CAS to fence (and it does), but
-		// the extra read is cheap and lets us short-circuit before
-		// scheduling pod cleanup against a moved row.
-		refreshed, err := p.runtimeStore.ObserveWorker(claimed.WorkerID)
-		switch {
-		case err != nil:
-			slog.Warn("Failed to refresh worker runtime row before retirement.",
-				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin, "error", err)
-		case refreshed == nil:
-			slog.Debug("Worker runtime row missing before retirement; skipping cleanup.",
-				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
-			return
-		default:
-			if refreshed.OwnerCPInstanceID() != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch() != claimed.OwnerEpoch {
-				slog.Debug("Worker ownership changed before retirement; skipping cleanup.",
-					"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
-				return
-			}
-			rec := refreshed.Record()
-			current = &rec
-		}
-	}
-	p.retireClaimedWorker(current, reason, origin)
-}
-
 func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
 	if claimed == nil {
 		return

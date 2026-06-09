@@ -110,9 +110,9 @@ func (j *ControlPlaneJanitor) runOnce() {
 	// bug — the only janitor constructor (multitenant.go) sets it
 	// unconditionally. The guard remains as a fail-soft so that
 	// misconfiguration doesn't NPE the entire tick (the rest of
-	// runOnce — flight session expiry, bucket pruning,
-	// warm-capacity reconciliation — still runs); the slog.Error
-	// makes the misconfiguration loud rather than silent.
+	// runOnce — flight session expiry, version-reaper, stranded-pod
+	// cleanup, worker-lifecycle observation — still runs); the
+	// slog.Error makes the misconfiguration loud rather than silent.
 	if j.lifecycle == nil {
 		j.lifecycleNilWarned.Do(func() {
 			slog.Error("Janitor running without a lifecycle service; per-worker reaping disabled. This is a wiring bug — fix the constructor.")

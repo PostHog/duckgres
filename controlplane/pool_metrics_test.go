@@ -284,17 +284,6 @@ func makeTestWorker(lifecycle WorkerLifecycleState, assignment *WorkerAssignment
 	return w
 }
 
-func assertGaugeValue(t *testing.T, gauge prometheus.Gauge, expected float64) {
-	t.Helper()
-	m := &dto.Metric{}
-	if err := gauge.Write(m); err != nil {
-		t.Fatalf("failed to read gauge: %v", err)
-	}
-	if got := m.GetGauge().GetValue(); got != expected {
-		t.Fatalf("expected gauge value %v, got %v", expected, got)
-	}
-}
-
 func metricGaugeFamilyLabelValue(t *testing.T, metricName string, labels map[string]string) (float64, bool) {
 	t.Helper()
 	families, err := prometheus.DefaultGatherer.Gather()
@@ -332,22 +321,6 @@ func metricHasLabels(metric *dto.Metric, labels map[string]string) bool {
 		}
 	}
 	return true
-}
-
-func counterLabelValue(cv *prometheus.CounterVec, label string) float64 {
-	return counterLabelValues(cv, label)
-}
-
-func counterLabelValues(cv *prometheus.CounterVec, labels ...string) float64 {
-	m := &dto.Metric{}
-	counter, err := cv.GetMetricWithLabelValues(labels...)
-	if err != nil {
-		return 0
-	}
-	if err := counter.Write(m); err != nil {
-		return 0
-	}
-	return m.GetCounter().GetValue()
 }
 
 func assertGaugeVecValue(t *testing.T, gv *prometheus.GaugeVec, expected float64, labels ...string) {

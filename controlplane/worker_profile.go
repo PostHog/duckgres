@@ -28,22 +28,18 @@ const (
 // startup options into a *WorkerProfile (a worker size + hot-idle TTL), or nil.
 //
 //   - (nil, nil, nil)  => the DEFAULT profile: gate off, or no sizing GUC set.
-//     nil is the sentinel that matches the neutral/default worker pool (the warm
-//     pool spawns neutral workers with no profile), so default traffic reuses
-//     warm workers exactly as before. The default worker SIZE then comes from the
-//     pool-global WorkerCPURequest/MemoryRequest, not from this profile.
+//     nil is the sentinel for the default worker shape; its size comes from the
+//     pool-global WorkerCPURequest/MemoryRequest (else BestEffort), and it reuses
+//     a hot-idle default-shape worker for the org (MatchKey "|").
 //   - (profile, warns, nil) => the client explicitly requested a size/ttl. cpu/mem
 //     default to the pool-global request (else built-in 8/16Gi) for any field the
 //     client omitted, clamped to [min,max]; ttl to [0,WorkerMaxTTL], default 20m.
 //   - (nil, nil, err) => an unparseable/negative value (rejects the connection).
 //
-// IMPORTANT: a no-sizing request MUST return nil, not a concrete-default profile.
-// Returning concrete here regresses warm-pool reuse — the concrete key (e.g.
-// "8|16Gi|false") never matches a neutral warm worker's key ("||false"), so the
-// request can neither reuse a warm worker nor be served by warm replenishment
-// (which spawns neutral workers), and fails with "no warm worker available".
-// Concrete sizing only becomes fully functional once the warm pool is removed
-// (see docs/design/worker-ttl-pool.md) — until then it is opt-in via the gate.
+// A no-sizing request returns nil (the default shape) rather than a concrete
+// profile, so default traffic and a hot-idle default-shape worker share the same
+// MatchKey ("|") and reuse each other. A sized request spawns/reuses a worker of
+// its exact cpu/memory shape on demand (see docs/design/worker-ttl-pool.md).
 func (cp *ControlPlane) resolveWorkerProfile(opts map[string]string) (*WorkerProfile, []string, error) {
 	k := cp.cfg.K8s
 	if !k.AllowClientWorkerProfile {

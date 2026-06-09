@@ -14,11 +14,6 @@ var orgSessionsActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Number of active sessions per org",
 }, []string{"org"})
 
-var orgWorkerSpawnsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_org_worker_spawns_total",
-	Help: "Total worker spawns per org",
-}, []string{"org"})
-
 var orgWorkerCrashesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_org_worker_crashes_total",
 	Help: "Total worker crashes per org",
@@ -45,10 +40,6 @@ var sniRoutingResolutionsCounter = promauto.NewCounterVec(prometheus.CounterOpts
 
 func observeOrgSessionsActive(org string, count int) {
 	orgSessionsActiveGauge.WithLabelValues(org).Set(float64(count))
-}
-
-func observeOrgWorkerSpawn(org string) {
-	orgWorkerSpawnsCounter.WithLabelValues(org).Inc()
 }
 
 func observeOrgWorkerCrash(org string) {
