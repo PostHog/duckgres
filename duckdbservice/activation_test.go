@@ -412,7 +412,7 @@ func TestHealthCheckFailsAfterCPRollingRestart(t *testing.T) {
 	// CP-new starts fresh after rolling update. It discovers the worker via
 	// K8s informer but hasn't re-activated it. Its in-memory epoch for this
 	// worker is 0 (default). This is exactly what the health check loop at
-	// k8s_pool.go:2270-2278 sends.
+	// k8s_pool_lifecycle.go health check loop sends.
 	err := pool.validateControlMetadata(server.WorkerControlMetadata{
 		WorkerID:     42,
 		OwnerEpoch:   0,

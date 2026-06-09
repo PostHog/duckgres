@@ -33,7 +33,7 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
 
 - **main.go / config_resolution.go**: CLI flags; effective config resolution (CLI > env > YAML > defaults), including env-only K8s knobs.
 - **server/** — PG wire protocol server and DuckDB execution
-  - Wire protocol & connections: `server.go`, `conn.go`, `protocol.go`, `exports.go`
+  - Wire protocol & connections: `server.go`, `conn.go`, `conn_errors.go`, `conn_query_exec.go`, `conn_results.go`, `conn_copy.go`, `conn_extended_query.go`, `conn_pg_stat_activity.go`, `conn_cursor.go`, `protocol.go`, `exports.go`
   - Execution: `executor.go`, `flight_executor.go`, `chsql.go`, `transient.go`
   - Catalog & types: `catalog.go`, `types.go`, `session_database_metadata.go`
   - Auth, TLS, rate limiting: `auth_policy.go`, `ratelimit.go`, `certs.go`, `acme.go`
@@ -45,7 +45,7 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - Core: `control.go`, `session_mgr.go`, `worker_mgr.go`, `worker_pool.go` (process/k8s abstraction), `validation.go`, `sdnotify.go`
   - Flight SQL ingress adapter: `flight_ingress.go`
   - Runtime loops: `janitor.go`, `leader_loop.go`, `memory_rebalancer.go`, `runtime_tracker.go`
-  - K8s / multitenant under build tag `kubernetes` (including: `multitenant.go`, `k8s_pool.go`, `k8s_factory.go`, `org_router.go`, `org_reserved_pool.go`, `sts_broker.go`, `shared_worker_activator.go`, `worker_rpc_security.go`, `janitor_leader_k8s.go`)
+  - K8s / multitenant under build tag `kubernetes` (including: `multitenant.go`, `k8s_pool.go`, `k8s_pool_acquire.go`, `k8s_pool_spawn.go`, `k8s_pool_lifecycle.go`, `k8s_pool_reconcile.go`, `k8s_pool_helpers.go`, `k8s_factory.go`, `org_router.go`, `org_reserved_pool.go`, `sts_broker.go`, `shared_worker_activator.go`, `worker_rpc_security.go`, `janitor_leader_k8s.go`)
   - Subpackages: `admin/` (HTTP admin API, `kubernetes` tag), `provisioner/` (k8s controller, `kubernetes` tag), `provisioning/` (HTTP API), `configstore/` (Postgres-backed config)
 - **duckdbservice/** — DuckDB Arrow Flight SQL service
   - Core: `service.go`, `flight_handler.go`, `arrow_helpers.go`, `auth.go`, `config.go`
