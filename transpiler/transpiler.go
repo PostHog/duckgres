@@ -461,7 +461,7 @@ func Classify(sql string, cfg Config) Classification {
 		"CLOCK_TIMESTAMP(",
 		// Identity functions
 		"SESSION_USER", "USER(",
-		// PostgreSQL builtin-compatibility macros (see docs/pg-builtin-compat-gaps.md)
+		// PostgreSQL builtin-compatibility macros (server/catalog.go initPgCatalog)
 		"SET_CONFIG(", "UUID_GENERATE_V4(", "STATEMENT_TIMESTAMP(",
 		"PG_GET_FUNCTION_ARGUMENTS(", "PG_GET_FUNCTION_RESULT(", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS(",
 		"PG_GET_TRIGGERDEF(", "PG_JIT_AVAILABLE(", "ROW_SECURITY_ACTIVE(", "PG_COLLATION_FOR(",

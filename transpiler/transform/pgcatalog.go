@@ -120,7 +120,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_ident":                     true, // Quote identifier
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
-			// PostgreSQL builtin-compat macros (docs/pg-builtin-compat-gaps.md)
+			// PostgreSQL builtin-compat macros
 			"set_config":                        true, // Session-setting writer (value-returning)
 			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
 			"statement_timestamp":               true, // now() alias
@@ -212,7 +212,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_ident":                     true, // Quote identifier
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
-			// PostgreSQL builtin-compat macros (docs/pg-builtin-compat-gaps.md)
+			// PostgreSQL builtin-compat macros
 			"set_config":                        true, // Session-setting writer (value-returning)
 			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
 			"statement_timestamp":               true, // now() alias

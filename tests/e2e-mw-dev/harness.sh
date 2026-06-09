@@ -211,7 +211,7 @@ basic_query() { # org password
 }
 
 # pg_compat_functions exercises the PostgreSQL builtin-compatibility macros and
-# transforms (docs/pg-builtin-compat-gaps.md) end-to-end in DuckLake mode, where
+# transforms end-to-end in DuckLake mode, where
 # the memory.main qualification matters. Each check is a deterministic value
 # assertion of real PG semantics through the full transpile path on a live
 # worker — not just "it didn't error". A regression here means a real client

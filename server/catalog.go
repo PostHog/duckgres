@@ -1066,7 +1066,11 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			ELSE '''' || REPLACE(CAST(val AS VARCHAR), '''', '''''') || ''''
 			END`,
 
-		// === PostgreSQL builtin-compatibility macros (see docs/pg-builtin-compat-gaps.md) ===
+		// === PostgreSQL builtin-compatibility macros ===
+		// PG builtins that real clients/ORMs/metadata queries call but DuckDB lacks
+		// (or implements with divergent semantics). Wired through the transpiler
+		// Classify list and the pgcatalog.go qualification maps; regression tests
+		// in pg_compat_macros_test.go.
 
 		// set_config - PG drivers/ORMs/poolers emit SELECT set_config('search_path'|..., v, local)
 		// at connection startup so it runs in the data path. Value-returning compat only: this
