@@ -117,8 +117,6 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	if err := db.AutoMigrate(
 		&Org{},
 		&ManagedWarehouse{},
-		&ManagedWarehouseTrino{},
-		&TrinoClusterBootstrap{},
 		&OrgUser{},
 		&GlobalConfig{},
 		&DuckLakeConfig{},
@@ -127,6 +125,21 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		&SchemaMigration{},
 	); err != nil {
 		return nil, fmt.Errorf("auto-migrate config store: %w", err)
+	}
+
+	// Drop the reverted customer-Trino tables. The customer-facing Trino
+	// integration (models, provisioner, OPA bundle) has been removed; these
+	// tables are no longer in AutoMigrate, so on a redeploy they would
+	// otherwise be left orphaned. The explicit IF EXISTS drop is idempotent
+	// and safe to run on stores that never had Trino enabled. Table names
+	// match the deleted models' TableName() methods:
+	//   - ManagedWarehouseTrino -> duckgres_managed_warehouse_trino
+	//   - TrinoClusterBootstrap -> duckgres_trino_cluster_bootstrap
+	if err := db.Exec(`DROP TABLE IF EXISTS duckgres_managed_warehouse_trino`).Error; err != nil {
+		return nil, fmt.Errorf("drop reverted trino table duckgres_managed_warehouse_trino: %w", err)
+	}
+	if err := db.Exec(`DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap`).Error; err != nil {
+		return nil, fmt.Errorf("drop reverted trino table duckgres_trino_cluster_bootstrap: %w", err)
 	}
 
 	// One-shot data migrations (idempotent — tracked in duckgres_schema_migrations).
@@ -624,180 +637,9 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 	return nil
 }
 
-// TrinoSettings carries the per-org Trino options EnableTrino persists. New
-// fields can be added without changing call sites — the zero value matches
-// the existing default (no tier, enabled).
-type TrinoSettings struct {
-	// Tier is the resource-group tier label. Empty == default tier.
-	Tier string
-}
-
-// EnableTrino marks the org as Trino-enabled and stores the per-org Trino
-// settings. Idempotent: re-enabling updates Tier without flipping Enabled
-// back through a disabled state. Safe to call as part of the
-// `POST /orgs/:id/provision` path or the standalone
-// `POST /orgs/:id/trino` endpoint.
-func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
-	if orgID == "" {
-		return errors.New("EnableTrino: orgID is required")
-	}
-	row := ManagedWarehouseTrino{
-		OrgID:   orgID,
-		Enabled: true,
-		Tier:    settings.Tier,
-		State:   ManagedWarehouseStatePending,
-	}
-	// On conflict update Enabled+Tier+UpdatedAt only. Do NOT touch
-	// State / StatusMessage / ReadyAt / FailedAt — those are owned by
-	// the reconcile loop. A re-enable on an already-Ready row stays
-	// Ready; the reconcile loop's next tick will refresh status.
-	if err := cs.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "org_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
-	}).Create(&row).Error; err != nil {
-		return fmt.Errorf("enable trino for %q: %w", orgID, err)
-	}
-	return nil
-}
-
-// TrinoStateUpdate is the small set of columns the reconcile loop
-// writes through UpdateTrinoState. The State + StatusMessage are
-// always set; the timestamp pointers are optional ("nil" == don't
-// touch). Callers that want to clear an existing timestamp can pass a
-// pointer to a zero time.Time, but in practice the next state
-// transition just overwrites.
-type TrinoStateUpdate struct {
-	State         ManagedWarehouseProvisioningState
-	StatusMessage string
-	ReadyAt       *time.Time
-	FailedAt      *time.Time
-}
-
-// UpdateTrinoState writes the reconcile loop's per-tick outcome onto
-// an org's Trino row. Predicates on enabled=true: if DisableTrino
-// raced ahead during the reconcile tick, the row is no longer enabled
-// and any state write is a stale leftover that would mis-represent
-// the org's operational status. Returning nil on RowsAffected==0
-// keeps that race silent (the next reconcile tick won't see the
-// disabled org and won't try again).
-//
-// No CAS on state — the provisioning controller runs single-threaded
-// per pod, so the only race is between reconcile and DisableTrino.
-//
-// StatusMessage is truncated to the column width (1024 chars) so a
-// long joined-error message can't trip a Postgres "value too long"
-// error and silently fail the state record.
-func (cs *ConfigStore) UpdateTrinoState(orgID string, upd TrinoStateUpdate) error {
-	if orgID == "" {
-		return errors.New("UpdateTrinoState: orgID is required")
-	}
-	msg := upd.StatusMessage
-	if len(msg) > 1024 {
-		// Leave a trailing marker so anyone reading the row knows it
-		// was clipped; the full error went to the slog stream.
-		msg = msg[:1021] + "..."
-	}
-	updates := map[string]interface{}{
-		"state":          upd.State,
-		"status_message": msg,
-		"updated_at":     time.Now().UTC(),
-	}
-	// Pointer fields participate only when explicitly set. nil means
-	// "leave the column alone"; a non-nil zero time.Time clears it.
-	if upd.ReadyAt != nil {
-		updates["ready_at"] = upd.ReadyAt
-	}
-	if upd.FailedAt != nil {
-		// Distinguish "clear" (zero value pointer) from "set to a
-		// specific timestamp" by passing nil into the SQL UPDATE when
-		// the pointer points at a zero time.
-		if upd.FailedAt.IsZero() {
-			updates["failed_at"] = nil
-		} else {
-			updates["failed_at"] = upd.FailedAt
-		}
-	}
-	result := cs.db.Model(&ManagedWarehouseTrino{}).
-		Where("org_id = ? AND enabled = ?", orgID, true).
-		Updates(updates)
-	if result.Error != nil {
-		return fmt.Errorf("update trino state for %q: %w", orgID, result.Error)
-	}
-	return nil
-}
-
-// DisableTrino marks the org as no longer Trino-enabled. The row is
-// kept (rather than deleted) so the provisioner can observe the
-// transition and clean up the catalog + password file entry on its
-// next reconcile tick. Returns nil if no row exists — disabling
-// something that was never enabled is a no-op, not an error.
-//
-// State is reset to Pending alongside the enabled flip so operators
-// see the lifecycle restart: the previous Ready/Failed status no
-// longer reflects current reality (the catalog is being torn down).
-// status_message + failed_at are cleared since they belong to the
-// previous enabled lifecycle. The reconcile loop will not advance
-// state for disabled orgs (UpdateTrinoState predicates on enabled),
-// so state stays at Pending until either:
-//   - EnableTrino re-activates the org, OR
-//   - the row is deleted (e.g. via the FK CASCADE when the Org row goes).
-func (cs *ConfigStore) DisableTrino(orgID string) error {
-	if orgID == "" {
-		return errors.New("DisableTrino: orgID is required")
-	}
-	result := cs.db.Model(&ManagedWarehouseTrino{}).
-		Where("org_id = ?", orgID).
-		Updates(map[string]interface{}{
-			"enabled":        false,
-			"state":          ManagedWarehouseStatePending,
-			"status_message": "",
-			"failed_at":      nil,
-			"updated_at":     time.Now().UTC(),
-		})
-	if result.Error != nil {
-		return fmt.Errorf("disable trino for %q: %w", orgID, result.Error)
-	}
-	return nil
-}
-
-// ListTrinoEnabledOrgs returns every org with ManagedWarehouseTrino.Enabled
-// = true joined against its `root` OrgUser row. The provisioner needs the
-// bcrypt hash to project the Trino password file, so this is a single join
-// rather than two round-trips.
-//
-// Orgs that are Trino-enabled but have no `root` OrgUser are skipped — that
-// shape can't legitimately happen via the provisioning API (CreateOrgUser
-// runs in the same handler that toggles Enabled), and silently skipping is
-// safer than projecting a half-built password file.
-func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
-	var out []TrinoEnabledOrg
-	// Inner join with duckgres_org_users on (org_id, username='root') so a
-	// missing OrgUser row drops the org from the result. Then left join with
-	// duckgres_orgs to pick up database_name.
-	err := cs.db.Table("duckgres_managed_warehouse_trino AS t").
-		Select(`t.org_id AS org_id,
-		         COALESCE(o.database_name, '') AS database_name,
-		         t.tier AS tier,
-		         u.password AS root_password_hash,
-		         t.state AS state`).
-		Joins(`INNER JOIN duckgres_org_users AS u
-		        ON u.org_id = t.org_id AND u.username = 'root'`).
-		Joins(`LEFT JOIN duckgres_orgs AS o ON o.name = t.org_id`).
-		Where("t.enabled = ?", true).
-		Order("t.org_id ASC").
-		Scan(&out).Error
-	if err != nil {
-		return nil, fmt.Errorf("list trino-enabled orgs: %w", err)
-	}
-	return out, nil
-}
-
 // GetManagedWarehouseIceberg reads the embedded Iceberg config for an
 // org. Returns (nil, nil) when the org has no warehouse row so callers
-// can distinguish "never provisioned" from a DB error. Used by the
-// Trino provisioner to read LakekeeperEndpoint + LakekeeperWarehouse
-// when building catalog properties — Trino-enabled orgs without an
-// Iceberg row are skipped at the call site (Iceberg isn't ready yet).
+// can distinguish "never provisioned" from a DB error.
 func (cs *ConfigStore) GetManagedWarehouseIceberg(orgID string) (*ManagedWarehouseIceberg, error) {
 	var warehouse ManagedWarehouse
 	err := cs.db.First(&warehouse, "org_id = ?", orgID).Error
@@ -811,20 +653,6 @@ func (cs *ConfigStore) GetManagedWarehouseIceberg(orgID string) (*ManagedWarehou
 	return &ic, nil
 }
 
-// GetManagedWarehouseTrino reads the Trino row for an org. Returns
-// (nil, nil) when no row exists so callers can distinguish "never
-// configured" from a DB error.
-func (cs *ConfigStore) GetManagedWarehouseTrino(orgID string) (*ManagedWarehouseTrino, error) {
-	var row ManagedWarehouseTrino
-	err := cs.db.First(&row, "org_id = ?", orgID).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get trino row for %q: %w", orgID, err)
-	}
-	return &row, nil
-}
 
 // migrateDeltaCatalogDefaultEnabled is a one-shot backfill that flips existing
 // rows where delta_catalog_enabled was stored as false (the old default) to
