@@ -166,37 +166,13 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	copy(out, s.records)
 	return out
 }
-
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int, maxColocatedCPU int, maxColocatedMemBytes uint64) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.claimCalls++
-	s.claimOwnerCPID = ownerCPInstanceID
-	s.claimOrgID = orgID
-	s.claimImage = image
-	s.claimProfileCPU = profileCPU
-	s.claimProfileMemory = profileMemory
-	s.claimProfileColocate = profileColocate
-	s.claimMaxOrgWorkers = maxOrgWorkers
-	s.claimMaxGlobalWorkers = maxGlobalWorkers
-	if s.claimErr != nil {
-		return nil, configstore.WorkerClaimMissReasonNone, s.claimErr
-	}
-	if s.claimed == nil {
-		return nil, s.claimMissReason, nil
-	}
-	claimed := *s.claimed
-	return &claimed, configstore.WorkerClaimMissReasonNone, nil
-}
-
-func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hotIdleClaimCPID = ownerCPInstanceID
 	s.hotIdleClaimOrgID = orgID
 	s.hotIdleClaimProfileCPU = profileCPU
 	s.hotIdleClaimProfileMemory = profileMemory
-	s.hotIdleClaimProfileColocate = profileColocate
 	s.hotIdleClaimMaxOrgWorkers = maxOrgWorkers
 	if s.hotIdleClaimResult != nil {
 		r := *s.hotIdleClaimResult
@@ -204,16 +180,6 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID 
 	}
 	return nil, s.hotIdleClaimMissReason, nil
 }
-
-func (s *captureRuntimeWorkerStore) RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, _ time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.recordMissCalls++
-	s.recordMissScopes = append(s.recordMissScopes, scope)
-	s.recordMissReasons = append(s.recordMissReasons, reason)
-	return s.recordMissErr
-}
-
 func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,67 +201,6 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 	spawned.OwnerEpoch = ownerEpoch
 	return &spawned, nil
 }
-
-func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.neutralSpawnCalls++
-	s.neutralSpawnOwnerCPID = ownerCPInstanceID
-	s.neutralSpawnPodPrefix = podNamePrefix
-	s.neutralSpawnImage = image
-	s.neutralSpawnProfileCPU = profileCPU
-	s.neutralSpawnProfileMemory = profileMemory
-	s.neutralSpawnProfileColocate = profileColocate
-	s.neutralSpawnTarget = targetWarmWorkers
-	s.neutralSpawnMaxGlobal = maxGlobalWorkers
-	if s.neutralSpawnErr != nil {
-		return nil, s.neutralSpawnErr
-	}
-	if s.neutralSpawnedFunc != nil {
-		rec := s.neutralSpawnedFunc()
-		if rec == nil {
-			return nil, nil
-		}
-		copy := *rec
-		return &copy, nil
-	}
-	if s.neutralSpawned == nil {
-		return nil, nil
-	}
-	spawned := *s.neutralSpawned
-	return &spawned, nil
-}
-
-func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.perImageSpawnCalls++
-	s.perImageSpawnOwnerCPID = ownerCPInstanceID
-	s.perImageSpawnPodPrefix = podNamePrefix
-	s.perImageSpawnImage = image
-	s.perImageSpawnTarget = perImageTarget
-	s.perImageSpawnMaxGlobal = maxGlobalWorkers
-	if s.perImageSpawnErr != nil {
-		return nil, s.perImageSpawnErr
-	}
-	if s.perImageSpawnedFunc != nil {
-		rec := s.perImageSpawnedFunc(image)
-		if rec == nil {
-			return nil, nil
-		}
-		copy := *rec
-		return &copy, nil
-	}
-	if s.perImageSpawned == nil {
-		return nil, nil
-	}
-	spawned := *s.perImageSpawned
-	if spawned.Image == "" {
-		spawned.Image = image
-	}
-	return &spawned, nil
-}
-
 func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -988,64 +893,6 @@ func envHasName(env []corev1.EnvVar, name string) bool {
 	}
 	return false
 }
-
-// Colocated workers run on the bin-pack nodepool, which has no cache-proxy
-// DaemonSet. They must not inherit DUCKGRES_CACHE_ENABLED, or they block forever
-// in waitForCacheProxy() and never answer the control plane's gRPC health check.
-func TestK8sPool_SpawnWorker_ColocatedSkipsCacheProxyEnv(t *testing.T) {
-	t.Setenv("DUCKGRES_CACHE_ENABLED", "true")
-
-	cases := []struct {
-		name         string
-		profile      WorkerProfile
-		wantCacheEnv bool
-	}{
-		{"exclusive worker gets cache proxy env", WorkerProfile{}, true},
-		{"colocated worker skips cache proxy env", WorkerProfile{Colocate: true}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			pool, cs := newTestK8sPool(t, 5)
-			workerID := 11
-			podName := pool.podNameForWorker(workerID)
-			secretName := pool.workerRPCSecretName(podName)
-
-			cs.Fake.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
-				ga, ok := action.(k8stesting.GetAction)
-				if !ok || ga.GetName() != podName {
-					return false, nil, nil
-				}
-				return true, &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: pool.namespace},
-					Spec:       corev1.PodSpec{NodeName: "node-a"},
-					Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.11"},
-				}, nil
-			})
-			// Force a failure after the pod is created (we only inspect the pod spec).
-			cs.Fake.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
-				ga, ok := action.(k8stesting.GetAction)
-				if !ok || ga.GetName() != secretName {
-					return false, nil, nil
-				}
-				return true, nil, k8serrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, secretName)
-			})
-
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-
-			_ = pool.spawnWorker(ctx, workerID, "duckgres:test", tc.profile, false)
-
-			env := createdPodEnv(t, cs, podName)
-			gotCache := envHasName(env, "DUCKGRES_CACHE_ENABLED")
-			gotNodeIP := envHasName(env, "NODE_IP")
-			if gotCache != tc.wantCacheEnv || gotNodeIP != tc.wantCacheEnv {
-				t.Fatalf("profile %+v: DUCKGRES_CACHE_ENABLED=%v NODE_IP=%v, want both %v",
-					tc.profile, gotCache, gotNodeIP, tc.wantCacheEnv)
-			}
-		})
-	}
-}
-
 // A warm-pool reconcile spawn does the same waitForPodReady as any spawn, so its
 // context deadline must outlast workerPodReadyTimeout — otherwise a cold spawn
 // (fresh Karpenter node, e.g. an exclusive 46/360 worker on a dedicated large
@@ -1316,39 +1163,6 @@ func TestK8sPool_LiveWorkerCount(t *testing.T) {
 		t.Fatalf("expected 3 live workers, got %d", count)
 	}
 }
-
-// TestK8sPool_LiveExclusiveWorkerCount confirms the exclusive-only live count
-// excludes colocated workers (which are unbounded) while still counting
-// in-flight default-shape background spawns. This is the count the exclusive
-// worker-count cap is charged against.
-func TestK8sPool_LiveExclusiveWorkerCount(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 5)
-
-	alive := make(chan struct{})
-	dead := make(chan struct{})
-	close(dead)
-
-	excl := &ManagedWorker{ID: 1, done: alive}
-	colo := &ManagedWorker{ID: 2, done: alive}
-	colo.profile = WorkerProfile{CPU: "8", Memory: "48Gi", Colocate: true}
-	deadColo := &ManagedWorker{ID: 3, done: dead}
-	deadColo.profile = WorkerProfile{Colocate: true}
-
-	pool.workers[1] = excl
-	pool.workers[2] = colo
-	pool.workers[3] = deadColo
-	pool.spawning = 2 // in-flight default-shape (exclusive) spawns
-
-	// liveWorkerCountLocked counts everything alive + spawning: 1 excl + 1 colo + 2 spawning = 4
-	if got := pool.liveWorkerCountLocked(); got != 4 {
-		t.Fatalf("liveWorkerCountLocked: expected 4, got %d", got)
-	}
-	// Exclusive-only: 1 excl + 2 spawning, colocated excluded = 3
-	if got := pool.liveExclusiveWorkerCountLocked(); got != 3 {
-		t.Fatalf("liveExclusiveWorkerCountLocked: expected 3 (colocated excluded), got %d", got)
-	}
-}
-
 func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 

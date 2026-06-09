@@ -34,51 +34,23 @@ type OrgReservedPool struct {
 	image                  string
 	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
-	// Per-org colocated resource caps. A count-based maxWorkers is insufficient
-	// when colocated pods vary in size, so colocated CPU/memory is also bounded.
-	// 0 = unbounded on that axis. Only colocated workers count against these.
-	maxColocatedCPU      int
-	maxColocatedMemBytes uint64
 	// gate serializes the slow acquisition path (no idle worker → claim/spawn) in
 	// FIFO arrival order, so the next worker to become available goes to the
 	// earliest waiting connection and a later one cannot snatch it.
 	gate *orgAcquireGate
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker, maxColocatedCPU int, maxColocatedMemBytes uint64) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
-		shared:               shared,
-		orgID:                orgID,
-		maxWorkers:           maxWorkers,
-		image:                image,
-		stsBroker:            stsBroker,
-		maxColocatedCPU:      maxColocatedCPU,
-		maxColocatedMemBytes: maxColocatedMemBytes,
-		gate:                 newOrgAcquireGate(),
+		shared:     shared,
+		orgID:      orgID,
+		maxWorkers: maxWorkers,
+		image:      image,
+		stsBroker:  stsBroker,
+		gate:       newOrgAcquireGate(),
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
 	return pool
-}
-
-// assignedColocatedResourcesLocked sums the CPU (cores) and memory (bytes) of
-// this org's currently-assigned colocated workers. Caller holds p.shared.mu.
-func (p *OrgReservedPool) assignedColocatedResourcesLocked() (cpu int, memBytes uint64) {
-	for _, w := range p.shared.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
-			continue
-		}
-		if !p.workerBelongsToOrgLocked(w) || !w.profile.Colocate {
-			continue
-		}
-		cpu += parseK8sCPU(w.profile.CPU)
-		memBytes += parseK8sMemory(w.profile.Memory)
-	}
-	return cpu, memBytes
 }
 
 func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
@@ -123,30 +95,13 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 			p.shared.mu.Unlock()
 			return nil, fmt.Errorf("pool is shutting down")
 		}
-		// Resource-aware quota for colocated workers: a new colocated worker must
-		// not push the org over its colocated CPU/memory budget. (The count cap is
-		// enforced authoritatively, cross-CP, inside ReserveSharedWorker's claim,
-		// which exempts colocated workers; the CPU/mem budget is enforced here.)
-		if profile != nil && profile.Colocate && (p.maxColocatedCPU > 0 || p.maxColocatedMemBytes > 0) {
-			curCPU, curMem := p.assignedColocatedResourcesLocked()
-			reqCPU, reqMem := parseK8sCPU(profile.CPU), parseK8sMemory(profile.Memory)
-			if (p.maxColocatedCPU > 0 && curCPU+reqCPU > p.maxColocatedCPU) ||
-				(p.maxColocatedMemBytes > 0 && curMem+reqMem > p.maxColocatedMemBytes) {
-				p.shared.mu.Unlock()
-				observeOrgColocatedQuotaRejection(p.orgID)
-				return nil, ErrOrgResourceQuotaExceeded
-			}
-		}
 		maxWorkers := p.maxWorkers
 		image := p.image
 		p.shared.mu.Unlock()
 
-		// At the org's max concurrent (exclusive) workers with all busy → fail fast
-		// with the clear org-cap message; waiting cannot help (no new worker will
-		// spawn). Colocated workers bin-pack and are bounded by the CPU/mem budget
-		// checked above, not this count cap.
-		isColocated := profile != nil && profile.Colocate
-		if !isColocated && p.atOrgWorkerCap() {
+		// At the org's max concurrent workers with all busy → fail fast with the
+		// clear org-cap message; waiting cannot help (no new worker will spawn).
+		if p.atOrgWorkerCap() {
 			return nil, NewWarmCapacityExhaustedErrorForReason(
 				configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
 		}
@@ -156,12 +111,10 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 		// (CreateSpawningWorkerSlot, cross-CP) and returns the reason-specific cap
 		// error; an org/global-cap or shutdown error won't resolve by waiting.
 		worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-			OrgID:                p.orgID,
-			MaxWorkers:           maxWorkers,
-			Image:                image,
-			Profile:              profile,
-			MaxColocatedCPU:      p.maxColocatedCPU,
-			MaxColocatedMemBytes: p.maxColocatedMemBytes,
+			OrgID:      p.orgID,
+			MaxWorkers: maxWorkers,
+			Image:      image,
+			Profile:    profile,
 		})
 		if err != nil {
 			return nil, err
@@ -319,11 +272,6 @@ func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 		// against maxWorkers so AcquireWorker can reach ReserveSharedWorker
 		// and ClaimHotIdleWorker.
 		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
-			continue
-		}
-		// Colocated workers are unbounded and must not consume the exclusive
-		// worker budget that maxWorkers governs.
-		if w.profile.Colocate {
 			continue
 		}
 		if p.workerBelongsToOrgLocked(w) {

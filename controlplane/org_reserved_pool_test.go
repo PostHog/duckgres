@@ -33,7 +33,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -84,7 +84,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -118,7 +118,7 @@ func TestOrgReservedPoolReleaseWorkerTransitionsToHotIdleOnLastSession(t *testin
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil)
 	pool.ReleaseWorker(worker.ID)
 
 	w, ok := shared.Worker(worker.ID)
@@ -150,7 +150,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	}
 
 	activated := false
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated = true
 		return nil
@@ -187,7 +187,7 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	activated := 0
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated++
@@ -239,7 +239,7 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 
 	// maxWorkers = 0 — the change under test. AcquireWorker must NOT
 	// reject on max-workers grounds.
-	pool := NewOrgReservedPool(shared, "analytics", 0, shared.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(shared, "analytics", 0, shared.workerImage, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -263,43 +263,6 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 		t.Fatalf("expected at least %d assigned workers, got %d", target, got)
 	}
 }
-
-// TestOrgReservedPoolAssignedCountExcludesColocated confirms the exclusive
-// worker count cap (maxWorkers) does not count an org's colocated workers.
-// Colocated workers bin-pack and are intentionally unbounded, so they must
-// not consume the exclusive budget that gates default/exclusive spawns.
-func TestOrgReservedPoolAssignedCountExcludesColocated(t *testing.T) {
-	shared, _ := newTestK8sPool(t, 5)
-
-	seed := func(id int, colocate bool) {
-		w := &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
-		w.profile = WorkerProfile{Colocate: colocate}
-		if colocate {
-			w.profile.CPU, w.profile.Memory = "8", "48Gi"
-		}
-		if err := w.SetSharedState(SharedWorkerState{
-			Lifecycle:  WorkerLifecycleHot,
-			Assignment: &WorkerAssignment{OrgID: "analytics"},
-		}); err != nil {
-			t.Fatalf("SetSharedState(%d): %v", id, err)
-		}
-		shared.workers[id] = w
-	}
-
-	seed(1, false) // one exclusive worker
-	seed(2, true)  // two colocated workers — must not count
-	seed(3, true)
-
-	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
-
-	shared.mu.Lock()
-	got := pool.assignedWorkerCountLocked()
-	shared.mu.Unlock()
-	if got != 1 {
-		t.Fatalf("expected exclusive-only count of 1, got %d (colocated workers must not count)", got)
-	}
-}
-
 // TestIsRetryableWarmMiss confirms only a transient no-idle warm miss is treated
 // as retryable by the server-side acquire wait — org/global-cap and non-capacity
 // errors are not (waiting won't change them).
@@ -339,7 +302,7 @@ func TestOrgReservedPoolAcquireFailsClearlyAtOrgCap(t *testing.T) {
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil)
 
 	// Generous deadline: the call must return promptly on its own, well before this.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

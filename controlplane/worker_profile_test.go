@@ -26,19 +26,19 @@ func TestResolveWorkerProfileSizing(t *testing.T) {
 		name     string
 		opts     map[string]string
 		wantNil  bool // expect the default (nil) profile — matches the neutral warm pool
-		wantKey  string // CPU|Memory|Colocate (only when !wantNil)
+		wantKey  string // CPU|Memory (only when !wantNil)
 		wantTTL  time.Duration
 		wantErr  bool
 		wantWarn bool
 	}{
 		{name: "no opts -> default (nil)", opts: map[string]string{}, wantNil: true},
 		{name: "unrelated opts -> default (nil)", opts: map[string]string{"search_path": "iceberg.public"}, wantNil: true},
-		{name: "client cpu+mem", opts: map[string]string{gucWorkerCPU: "4", gucWorkerMemory: "32Gi"}, wantKey: "4|32Gi|false", wantTTL: defaultWorkerTTL},
-		{name: "client ttl only -> concrete w/ default size", opts: map[string]string{gucWorkerTTL: "5m"}, wantKey: "8|16Gi|false", wantTTL: 5 * time.Minute},
-		{name: "cpu over max -> clamp+warn", opts: map[string]string{gucWorkerCPU: "64"}, wantKey: "16|16Gi|false", wantTTL: defaultWorkerTTL, wantWarn: true},
-		{name: "mem under min -> clamp+warn", opts: map[string]string{gucWorkerMemory: "1Gi"}, wantKey: "8|4Gi|false", wantTTL: defaultWorkerTTL, wantWarn: true},
-		{name: "ttl over max -> clamp+warn", opts: map[string]string{gucWorkerTTL: "24h"}, wantKey: "8|16Gi|false", wantTTL: time.Hour, wantWarn: true},
-		{name: "cpu normalized", opts: map[string]string{gucWorkerCPU: "4000m"}, wantKey: "4|16Gi|false", wantTTL: defaultWorkerTTL},
+		{name: "client cpu+mem", opts: map[string]string{gucWorkerCPU: "4", gucWorkerMemory: "32Gi"}, wantKey: "4|32Gi", wantTTL: defaultWorkerTTL},
+		{name: "client ttl only -> concrete w/ default size", opts: map[string]string{gucWorkerTTL: "5m"}, wantKey: "8|16Gi", wantTTL: 5 * time.Minute},
+		{name: "cpu over max -> clamp+warn", opts: map[string]string{gucWorkerCPU: "64"}, wantKey: "16|16Gi", wantTTL: defaultWorkerTTL, wantWarn: true},
+		{name: "mem under min -> clamp+warn", opts: map[string]string{gucWorkerMemory: "1Gi"}, wantKey: "8|4Gi", wantTTL: defaultWorkerTTL, wantWarn: true},
+		{name: "ttl over max -> clamp+warn", opts: map[string]string{gucWorkerTTL: "24h"}, wantKey: "8|16Gi", wantTTL: time.Hour, wantWarn: true},
+		{name: "cpu normalized", opts: map[string]string{gucWorkerCPU: "4000m"}, wantKey: "4|16Gi", wantTTL: defaultWorkerTTL},
 		{name: "zero cpu -> error", opts: map[string]string{gucWorkerCPU: "0"}, wantErr: true},
 		{name: "bad mem -> error", opts: map[string]string{gucWorkerMemory: "lots"}, wantErr: true},
 		{name: "bad ttl -> error", opts: map[string]string{gucWorkerTTL: "soon"}, wantErr: true},

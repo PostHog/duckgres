@@ -99,14 +99,6 @@ type K8sWorkerPool struct {
 	placeholderMemory            string
 	placeholderPriorityClassName string
 
-	// Colocated (bin-pack) scheduling for colocate=true worker profiles. When a
-	// spawned worker's profile is colocated, these replace the default
-	// nodeSelector/toleration and the exclusive-node anti-affinity is dropped so
-	// many small pods pack onto a shared node.
-	colocatedWorkerNodeSelector    map[string]string
-	colocatedWorkerTolerationKey   string
-	colocatedWorkerTolerationValue string
-	colocatedWarmShapes            []ColocatedWarmShape                         // colocated shapes to keep warm (each {cpu,memory,target})
 	orgID                          string                                       // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator              func() int                                   // shared ID generator across orgs (nil = internal counter)
 	resolveOrgConfig               func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
@@ -220,11 +212,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		placeholderCPU:               cfg.PlaceholderCPU,
 		placeholderMemory:            cfg.PlaceholderMemory,
 		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
-
-		colocatedWorkerNodeSelector:    cfg.ColocatedNodeSelector,
-		colocatedWorkerTolerationKey:   cfg.ColocatedTolerationKey,
-		colocatedWorkerTolerationValue: cfg.ColocatedTolerationValue,
-		colocatedWarmShapes:            cfg.ColocatedWarmShapes,
 
 		orgID:             cfg.OrgID,
 		workerIDGenerator: cfg.WorkerIDGenerator,
@@ -732,7 +719,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			ServiceAccountName:            p.workerServiceAccountName(),
 			AutomountServiceAccountToken:  boolPtr(false),
 			PriorityClassName:             p.workerPriorityClassName,
-			NodeSelector:                  p.nodeSelectorForProfile(profile),
+			NodeSelector:                  p.workerNodeSelector,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -836,13 +823,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	// DaemonSet proxy on the same node via the node IP + fixed hostPort.
 	// Inject NODE_IP via the Downward API so the worker process can resolve
 	// the proxy address at runtime.
-	//
-	// Colocated workers are exempt: they bin-pack onto the dedicated colocated
-	// nodepool, which runs no cache-proxy DaemonSet (and has no NVMe to back
-	// one). If they inherited DUCKGRES_CACHE_ENABLED they would block forever in
-	// waitForCacheProxy() waiting on a proxy that never comes up, never answer
-	// the control plane's gRPC health check, and churn. They talk to S3 directly.
-	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" && !profile.Colocate {
+	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" {
 		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
 			corev1.EnvVar{
 				Name:  "DUCKGRES_CACHE_ENABLED",
@@ -859,11 +840,8 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		)
 	}
 
-	// Add toleration if configured (colocated profiles use the bin-pack pool's taint)
+	// Add toleration if configured.
 	tolKey, tolValue := p.workerTolerationKey, p.workerTolerationValue
-	if profile.Colocate {
-		tolKey, tolValue = p.colocatedWorkerTolerationKey, p.colocatedWorkerTolerationValue
-	}
 	if tolKey != "" {
 		tol := corev1.Toleration{
 			Key:    tolKey,
@@ -876,9 +854,8 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		pod.Spec.Tolerations = []corev1.Toleration{tol}
 	}
 
-	// One worker per instance (only for exclusive profiles on a dedicated node
-	// pool). Colocated profiles deliberately skip anti-affinity so pods bin-pack.
-	if p.workerExclusiveNode && !profile.Colocate {
+	// One worker per node, on a dedicated node pool.
+	if p.workerExclusiveNode {
 		pod.Spec.Affinity = &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
@@ -949,7 +926,6 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		spawnRecord := p.workerRecordFor(id, nil, 0, configstore.WorkerStateSpawning, "", nil)
 		spawnRecord.ProfileCPU = profile.CPU
 		spawnRecord.ProfileMemory = profile.Memory
-		spawnRecord.ProfileColocate = profile.Colocate
 		spawnRecord.TTLMinutes = int(profile.TTL.Minutes())
 		_ = p.persistWorkerRecord(spawnRecord)
 	}
@@ -1594,8 +1570,8 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			// Try reclaiming a hot-idle worker for the same org first (fast path:
 			// DuckLake is already attached, only needs epoch bump).
 			if assignment.OrgID != "" {
-				hotProfileCPU, hotProfileMem, hotProfileColo := assignment.Profile.Parts()
-				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, hotProfileColo, assignment.MaxWorkers)
+				hotProfileCPU, hotProfileMem := assignment.Profile.Parts()
+				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, assignment.MaxWorkers)
 				if err != nil {
 					return nil, err
 				}
@@ -1793,7 +1769,7 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	if assignment != nil && assignment.Profile != nil && assignment.Profile.TTL > 0 {
 		reuseTTL = assignment.Profile.TTL
 	}
-	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate, TTL: reuseTTL}
+	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, TTL: reuseTTL}
 	if worker.OwnerEpoch() > 0 && claimed.OwnerEpoch < worker.OwnerEpoch() {
 		currentEpoch := worker.OwnerEpoch()
 		p.mu.Unlock()
@@ -1870,9 +1846,9 @@ func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, e
 	if assignment.Image != "" && record.Image != assignment.Image {
 		return nil, fmt.Errorf("worker %d image mismatch (expected %q, got %q)", workerID, assignment.Image, record.Image)
 	}
-	if expCPU, expMem, expColo := assignment.Profile.Parts(); record.ProfileCPU != expCPU || record.ProfileMemory != expMem || record.ProfileColocate != expColo {
-		return nil, fmt.Errorf("worker %d profile mismatch (expected %s/%s/colocate=%v, got %s/%s/colocate=%v)",
-			workerID, expCPU, expMem, expColo, record.ProfileCPU, record.ProfileMemory, record.ProfileColocate)
+	if expCPU, expMem := assignment.Profile.Parts(); record.ProfileCPU != expCPU || record.ProfileMemory != expMem {
+		return nil, fmt.Errorf("worker %d profile mismatch (expected %s/%s, got %s/%s)",
+			workerID, expCPU, expMem, record.ProfileCPU, record.ProfileMemory)
 	}
 
 	return p.reserveClaimedWorker(ctx, record, assignment)
@@ -1915,10 +1891,9 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		// profile to the default and the next hot-idle persist dropped its
 		// cpu/mem/ttl, so a same-size request could no longer reuse it.
 		profile: WorkerProfile{
-			CPU:      claimed.ProfileCPU,
-			Memory:   claimed.ProfileMemory,
-			Colocate: claimed.ProfileColocate,
-			TTL:      time.Duration(claimed.TTLMinutes) * time.Minute,
+			CPU:    claimed.ProfileCPU,
+			Memory: claimed.ProfileMemory,
+			TTL:    time.Duration(claimed.TTLMinutes) * time.Minute,
 		},
 		done: make(chan struct{}),
 	}
@@ -2814,27 +2789,6 @@ func (p *K8sWorkerPool) liveWorkerCountLocked() int {
 	return count
 }
 
-// liveExclusiveWorkerCountLocked counts only the live workers that consume the
-// exclusive worker-count budget: every non-colocated worker plus in-flight
-// background (default-shape) spawns. Colocated workers bin-pack and are
-// intentionally unbounded, so they must not be charged against the cap — this
-// mirrors the exclusive-only count used by the DB-side cap checks.
-func (p *K8sWorkerPool) liveExclusiveWorkerCountLocked() int {
-	count := p.spawning
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if w.profile.Colocate {
-			continue
-		}
-		count++
-	}
-	return count
-}
-
 func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	removedAny := false
 	for id, w := range p.workers {
@@ -2915,16 +2869,6 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 // When set, limits are equal to requests (Guaranteed QoS).
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	return p.workerResourcesForProfile(WorkerProfile{})
-}
-
-// nodeSelectorForProfile returns the node selector a worker of the given profile
-// should schedule onto: the colocated (bin-pack) selector for a colocated
-// profile, otherwise the default pool selector.
-func (p *K8sWorkerPool) nodeSelectorForProfile(profile WorkerProfile) map[string]string {
-	if profile.Colocate {
-		return p.colocatedWorkerNodeSelector
-	}
-	return p.workerNodeSelector
 }
 
 // workerResourcesForProfile builds the pod resource requirements for a worker of
@@ -3484,7 +3428,6 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	}
 	record.ProfileCPU = worker.profile.CPU
 	record.ProfileMemory = worker.profile.Memory
-	record.ProfileColocate = worker.profile.Colocate
 	record.TTLMinutes = int(worker.profile.TTL.Minutes())
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID

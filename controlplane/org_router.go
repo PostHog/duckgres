@@ -115,8 +115,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		tr.sharedPool.SetWorkerResources(cpu, mem)
 	}
 
-	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker,
-		tr.globalCfg.K8s.OrgMaxColocatedCPU, parseK8sMemory(tr.globalCfg.K8s.OrgMaxColocatedMemory))
+	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker)
 	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, tr.globalCfg.DuckLakeDefaultSpecVersion, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {

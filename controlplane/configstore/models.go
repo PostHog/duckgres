@@ -495,28 +495,6 @@ const (
 	WorkerClaimMissReasonShuttingDown WorkerClaimMissReason = "shutting_down"
 )
 
-const WarmCapacityMissBucketSize = 10 * time.Second
-
-// WarmCapacityMissBucket stores foreground warm-capacity misses in coarse time
-// buckets so every control-plane pod contributes to one shared demand signal.
-type WarmCapacityMissBucket struct {
-	Scope       string                `gorm:"primaryKey;type:text" json:"scope"`
-	Reason      WorkerClaimMissReason `gorm:"primaryKey;size:64" json:"reason"`
-	BucketStart time.Time             `gorm:"primaryKey;index" json:"bucket_start"`
-	Count       int64                 `gorm:"not null" json:"count"`
-	UpdatedAt   time.Time             `gorm:"not null;index" json:"updated_at"`
-}
-
-func (WarmCapacityMissBucket) TableName() string { return "warm_capacity_miss_buckets" }
-
-// WarmCapacityMissAggregate is the grouped demand signal read by warm-capacity
-// target computation.
-type WarmCapacityMissAggregate struct {
-	Scope  string                `json:"scope"`
-	Reason WorkerClaimMissReason `json:"reason"`
-	Count  int64                 `json:"count"`
-}
-
 // WorkerLifecycleStats is the grouped worker lifecycle state used for
 // cluster-wide worker observability.
 type WorkerLifecycleStats struct {
@@ -533,13 +511,11 @@ type WorkerRecord struct {
 	PodUID   string `gorm:"size:255" json:"pod_uid"`
 	Image    string `gorm:"size:512;index" json:"image"`
 	// Worker pod-shape profile (connection-string-selected sizing). Empty
-	// CPU/Memory + Colocate=false is the default exclusive profile, so legacy
-	// rows (and warm/neutral workers) read back as the default and stay
-	// claimable by default requests. Matched alongside Image when a session
-	// reserves a worker. AutoMigrate adds these columns; no migration file.
-	ProfileCPU      string `gorm:"size:32;index:idx_worker_profile" json:"profile_cpu"`
-	ProfileMemory   string `gorm:"size:32;index:idx_worker_profile" json:"profile_memory"`
-	ProfileColocate bool   `gorm:"index:idx_worker_profile" json:"profile_colocate"`
+	// CPU/Memory is the default profile, so legacy rows read back as the default
+	// and stay claimable by default requests. Matched alongside Image when a
+	// session reserves a worker. AutoMigrate adds these columns; no migration file.
+	ProfileCPU    string `gorm:"size:32;index:idx_worker_profile" json:"profile_cpu"`
+	ProfileMemory string `gorm:"size:32;index:idx_worker_profile" json:"profile_memory"`
 	// TTLMinutes is how long this worker stays hot-idle after its last query
 	// before the janitor retires it (client-selected duckgres.worker_ttl, rounded
 	// down to whole minutes). 0 = use the deployment's global hot-idle TTL
