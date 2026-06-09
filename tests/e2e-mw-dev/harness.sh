@@ -176,10 +176,10 @@ pg_try() { # org password dbname sql
   printf %s "$out"; return 1
 }
 
-# Connect preflight: a warm worker isn't always available the instant a
-# warehouse goes ready (shared_warm_target=0, so the first connection for an
-# org cold-spawns a worker; a second org can find the pool momentarily
-# exhausted). The CP returns a transient "no Duckgres worker is currently
+# Connect preflight: a worker isn't ready the instant a warehouse goes ready —
+# there is no warm pool, so the first connection for an org cold-spawns a worker
+# (and a burst can momentarily hit the org/global cap). The CP returns a
+# transient "no Duckgres worker is currently
 # available; retry in ~45s" / "still provisioning" / "failed to initialize
 # session". Retry `SELECT 1` through those, bounded, BEFORE the R/W. Auth
 # failures are NOT in this set, so this never feeds the rate limiter.
