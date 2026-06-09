@@ -54,7 +54,7 @@ client-go:
   control-plane → k8s pod spec, not BestEffort. A same-shape reconnect **reuses**
   that hot-idle worker (no respawn — the count of that-shape pods stays 1).
   Asserted on cnpg for **both** the ducklake and iceberg catalogs, with a
-  distinct shape per catalog (2/4Gi vs 3/6Gi) so the catalog-agnostic worker
+  distinct shape per catalog (2/4Gi vs 1/2Gi) so the catalog-agnostic worker
   can't satisfy the second from the first's hot-idle pool. The per-PR CP also
   runs `DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED=false`, so the only workers
   are the ones a request sizes + spawns (no neutral warm-miss-driven workers).

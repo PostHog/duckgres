@@ -134,7 +134,12 @@ _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
     fi
     case "$out" in
       *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
-      *"still provisioning"*|*"failed to initialize session"*)
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*)
+        # The last three cover an on-demand cold spawn that needed a fresh node
+        # (sized worker too big for the warm node): the first connect can hit the
+        # spawn ceiling while the pod is still pulling/booting; by the retry it is
+        # hot-idle and the reconnect reuses it. Same transient class as a cold pool.
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out" >&2; return 1 ;;
     esac
@@ -163,7 +168,8 @@ pg_try() { # org password dbname sql
     fi
     case "$out" in
       *"capacity exhausted"*|*"no warm Duckgres worker"*|*"no warm worker"*|\
-      *"still provisioning"*|*"failed to initialize session"*)
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*)
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out"; return 1 ;;
     esac
@@ -641,14 +647,18 @@ main() {
   one_session_per_worker "$CNPG" "$cnpg_pw"
 
   # ---- worker sizing (TTL-pool model) on cnpg, both catalogs ----
-  # Distinct shapes per catalog (2/4Gi vs 3/6Gi) so the iceberg sized request
+  # Distinct shapes per catalog (2/4Gi vs 1/2Gi) so the iceberg sized request
   # can't reuse the ducklake org's hot-idle 2-CPU worker (workers are
   # catalog-agnostic; only the profile shape gates reuse) — each catalog gets a
-  # verified fresh sized spawn, then a verified same-shape reuse.
+  # verified fresh sized spawn, then a verified same-shape reuse. Both shapes are
+  # small enough to bin-pack onto an already-warm worker node (2+1 CPU), so the
+  # iceberg spawn doesn't force a cold node scale-up that would outrun the CP's
+  # spawn ceiling (the on-demand cold-spawn case is tolerated by _pg_exec's retry
+  # set regardless, but keeping it warm makes the assertion fast + deterministic).
   sized_worker        "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
   reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
-  sized_worker        "$CNPG" "$cnpg_pw" iceberg  3 6Gi 15m
-  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  3 6Gi 15m
+  sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
+  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
 
   # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
   wait_worker "$EXT" "$ext_pw" ducklake
