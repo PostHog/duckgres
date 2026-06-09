@@ -19,7 +19,7 @@ var ErrWarehouseNonTerminal = errors.New("warehouse already exists in non-termin
 
 // ProvisionRequest is the all-or-nothing input the Provision endpoint
 // dispatches into a single configstore transaction. Warehouse + root
-// user are always written; Trino is opt-in (Trino == nil skips it).
+// user are always written.
 //
 // The shape mirrors the public HTTP request: the handler builds it
 // from the validated request body and passes it down so the Store can
@@ -34,9 +34,6 @@ type ProvisionRequest struct {
 	// password. Plaintext stays in the handler (returned to the
 	// caller); only the hash is persisted, same as before.
 	RootUserHash string
-	// Trino, when non-nil, additionally writes a ManagedWarehouseTrino
-	// row inside the same transaction. nil leaves Trino opt-out alone.
-	Trino *configstore.TrinoSettings
 }
 
 // gormStore implements Store using a ConfigStore's GORM DB.
@@ -134,13 +131,13 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, warehouse
 }
 
 // Provision is the all-or-nothing entrypoint for POST /provision: one
-// configstore transaction wrapping warehouse + root-user + optional
-// Trino-opt-in writes. Partial failure rolls back every write so the
-// caller's retry sees the same starting state, not a half-provisioned
-// org with a non-terminal warehouse blocking re-creation.
+// configstore transaction wrapping warehouse + root-user writes.
+// Partial failure rolls back every write so the caller's retry sees the
+// same starting state, not a half-provisioned org with a non-terminal
+// warehouse blocking re-creation.
 //
 // Each individual write is idempotent (OnConflict on the user upsert,
-// FirstOrCreate on the Org row, OnConflict on the Trino row), so a
+// FirstOrCreate on the Org row), so a
 // retry of a successfully-committed transaction returns the same
 // success — but the plaintext password is regenerated on every call
 // and is only readable from the HTTP response. A retry after a dropped
@@ -185,25 +182,6 @@ func (s *gormStore) Provision(req ProvisionRequest) error {
 			return fmt.Errorf("create root user: %w", err)
 		}
 
-		// 3. Optional Trino opt-in. State seeds to Pending so the
-		// reconcile loop sees a fresh row to act on; the OnConflict
-		// columns deliberately exclude State / StatusMessage /
-		// ReadyAt / FailedAt so a re-provision doesn't clobber the
-		// reconcile loop's prior outcome.
-		if req.Trino != nil {
-			trinoRow := configstore.ManagedWarehouseTrino{
-				OrgID:   req.OrgID,
-				Enabled: true,
-				Tier:    req.Trino.Tier,
-				State:   configstore.ManagedWarehouseStatePending,
-			}
-			if err := tx.Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "org_id"}},
-				DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
-			}).Create(&trinoRow).Error; err != nil {
-				return fmt.Errorf("enable trino: %w", err)
-			}
-		}
 		return nil
 	})
 }
@@ -214,20 +192,6 @@ func (s *gormStore) IsDatabaseNameAvailable(name string) (bool, error) {
 		return false, err
 	}
 	return count == 0, nil
-}
-
-// EnableTrino persists the per-org Trino opt-in. Idempotent — the
-// configstore implementation upserts on (org_id) so re-enabling updates
-// the tier without flipping Enabled false-then-true.
-func (s *gormStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
-	return s.cs.EnableTrino(orgID, settings)
-}
-
-// DisableTrino marks the org's Trino row as disabled. The row is kept
-// (with Enabled=false) so the provisioner observes the transition and
-// can clean up downstream state. No-op when no row exists.
-func (s *gormStore) DisableTrino(orgID string) error {
-	return s.cs.DisableTrino(orgID)
 }
 
 // SetWarehouseDeleting atomically transitions a warehouse from expectedState to deleting.

@@ -21,7 +21,6 @@ type Org struct {
 	WorkerMemoryRequest string                 `gorm:"size:32" json:"worker_memory_request"`
 	Users               []OrgUser              `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse           *ManagedWarehouse      `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	Trino               *ManagedWarehouseTrino `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"trino,omitempty"`
 	CreatedAt           time.Time              `json:"created_at"`
 	UpdatedAt           time.Time              `json:"updated_at"`
 }
@@ -223,96 +222,6 @@ type ManagedWarehouseIceberg struct {
 const (
 	IcebergBackendLakekeeper = "lakekeeper"
 )
-
-// ManagedWarehouseTrino captures per-org opt-in for the customer-facing Trino
-// cluster. Trino access is granted at the org level: when Enabled is true, the
-// provisioner extension (controlplane/provisioner/trino_provisioner.go)
-// projects the org's `root` OrgUser bcrypt hash into the Trino file
-// password authenticator, creates a per-org Iceberg catalog via the Trino
-// REST API, and rebuilds the OPA bundle + resource-groups config.
-//
-// v1 is intentionally minimal — Enabled gates the projection, Tier picks
-// resource-group limits. Per-user identity within an org is post-v1.
-//
-// FK'd by OrgID like the other sibling rows; consumed by the Trino
-// provisioner sub-component in controlplane/provisioner/trino_provisioner.go.
-type ManagedWarehouseTrino struct {
-	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
-
-	// Enabled gates inclusion in every projection the Trino provisioner owns
-	// (password file, group file, OPA bundle catalog map, resource-groups
-	// config, REST CREATE CATALOG). Defaults to false so existing
-	// configstore rows never start projecting after a schema migration.
-	Enabled bool `gorm:"not null;default:false" json:"enabled"`
-
-	// Tier picks the resource-group limits applied to the org. Empty string
-	// is treated as the default tier by the resource-groups generator.
-	// Kept as a free-form string for now; refining into an enum is
-	// post-v1 work once tier shape stabilizes.
-	Tier string `gorm:"size:64" json:"tier"`
-
-	// State / StatusMessage / ReadyAt / FailedAt mirror the
-	// ManagedWarehouse lifecycle fields so operators can see what the
-	// Trino reconcile loop is doing. The Trino reconcile is a single
-	// batched output per tick (catalog + auth + resource-groups +
-	// bundle); these fields summarize the most recent tick's outcome.
-	//
-	// State transitions:
-	//   - pending (default after EnableTrino, before first reconcile)
-	//   - provisioning (a reconcile tick is mid-flight or a previous
-	//     tick partially failed and is retrying)
-	//   - ready (the most recent tick succeeded across all four steps)
-	//   - failed (the most recent tick errored — StatusMessage carries
-	//     the per-step detail; ready_at is preserved, failed_at is set)
-	//
-	// On the next successful reconcile after a failed state, the row
-	// flips back to ready and failed_at is cleared. We don't model the
-	// plan's per-step sub-states (CatalogCreating, ProjectionReady,
-	// etc.) — for v1 the four-state summary plus StatusMessage detail
-	// is sufficient observability without growing the model.
-	State         ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
-	StatusMessage string                            `gorm:"size:1024" json:"status_message"`
-	ReadyAt       *time.Time                        `json:"ready_at,omitempty"`
-	FailedAt      *time.Time                        `json:"failed_at,omitempty"`
-
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_warehouse_trino" }
-
-// Customer-Trino CLUSTER-level credential lifecycle:
-//
-// The three cluster credentials (internal-communication shared secret,
-// __admin_provisioner password + bcrypt hash, OPA bundle bearer token)
-// are machine-generated and live ONLY as K8s Secrets in the
-// trino-customer namespace — the K8s Secret is the single source of
-// truth for each value (mirrors controlplane/worker_rpc_security.go).
-// The configstore deliberately stores NO credential bytes and NO
-// SecretRefs for them; the Secret names are a fixed naming contract
-// (constants in the provisioner), so there's nothing to persist except
-// a one-bit "have we ever bootstrapped" sentinel — see
-// TrinoClusterBootstrap in trino_cluster_secrets.go. Credential
-// rotation (version/history/grace-window) is a separate follow-up
-// rotation-API concern and adds its own state then.
-
-// TrinoEnabledOrg is the join shape returned by ListTrinoEnabledOrgs: org +
-// root-user bcrypt hash. The provisioner needs both at once — the password
-// file projection keys org_<team_id> by the password hash — so a single
-// query avoids an N+1 read pattern as the Trino-enabled org count grows.
-//
-// State is the row's CURRENT operational state at the time of the read,
-// so the reconcile loop can decide whether each per-tick write is a
-// transition (set ReadyAt / FailedAt) or a no-op preservation
-// (matches the surrounding ManagedWarehouse pattern in controller.go,
-// which only stamps ready_at on the first transition into ready).
-type TrinoEnabledOrg struct {
-	OrgID            string
-	DatabaseName     string
-	Tier             string
-	RootPasswordHash string                            // bcrypt hash from OrgUser row where Username = "root"
-	State            ManagedWarehouseProvisioningState // current state at read time
-}
 
 // ResolvedBackend returns Backend with the empty-string default applied.
 // Callers should prefer this over reading Backend directly so that rows
