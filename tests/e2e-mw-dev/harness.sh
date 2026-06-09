@@ -10,8 +10,9 @@
 # two real metadata backends cnpg + ext (aurora is retired — out of scope):
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
-#                  and a cold burst is absorbed (workers spawn on demand; any
-#                  surplus gets a graceful retry hint) then served.
+#                  a malformed startup-message length is rejected cleanly (no CP
+#                  crash, #715), and a cold burst is absorbed (workers spawn on
+#                  demand; any surplus gets a graceful retry hint) then served.
 #   activation   : DuckLake + Iceberg catalogs attach and read/write.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
@@ -62,7 +63,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # stdout would land in that capture and make jq choke ("Invalid numeric literal").
 log()  { echo ">>> $*" >&2; }
 
-apk add --no-cache curl jq postgresql-client >/dev/null 2>&1 || true
+apk add --no-cache curl jq postgresql-client openssl >/dev/null 2>&1 || true
 
 # kubectl, for the pod-level assertions the Go suite used to make via client-go.
 # The Job runs as the `duckgres` SA (pods get/list/delete/patch + pods/exec +
@@ -208,6 +209,43 @@ basic_query() { # org password
   log "basic query on $1"
   n="$(pg "$1" "$2" ducklake 'SELECT 1')"
   [ "$n" = "1" ] || fail "$1 SELECT 1 returned '$n'"
+}
+
+# Regression for #715: the CP reads the post-TLS startup message with the shared
+# wire.ReadStartupMessage, which used to make([]byte, length-4) straight from the
+# client-supplied length — a negative or absurd length panicked the (unrecovered)
+# connection goroutine and crashed the WHOLE control plane, dropping every
+# tenant's in-flight session, pre-auth. Drive malformed lengths through a real
+# TLS session and assert the CP neither restarts nor stops serving.
+# `openssl s_client -starttls postgres` performs the pre-TLS SSLRequest dance,
+# then hands us the raw post-TLS stream where the startup message goes.
+malformed_startup_resilience() { # org password
+  log "malformed startup-length resilience on $1 (#715)"
+  cp_pod="$(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[0].metadata.name}')"
+  [ -n "$cp_pod" ] || fail "no control-plane pod found"
+  before="$(k get pod "$cp_pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+
+  # \377…: length -1 (negative makeslice); \177…: length 2^31-1 (~2GiB alloc);
+  # \000\000\000\004: length 4 (remaining[:4] out of range). Each must yield a
+  # clean connection close, never a CP panic.
+  for hdr in '\377\377\377\377' '\177\377\377\377' '\000\000\000\004'; do
+    out="$({ printf "$hdr"; sleep 2; } | openssl s_client \
+        -connect "$CP_IP:5432" -servername "$1$SNI_SUFFIX" \
+        -starttls postgres 2>&1 || true)"
+    # Vacuity guard: the TLS handshake must have completed (server cert seen),
+    # or the garbage never reached the post-TLS startup reader and this test
+    # asserted nothing.
+    case "$out" in
+      *"BEGIN CERTIFICATE"*) : ;;
+      *) fail "s_client did not complete TLS to the CP (header $hdr): $(printf %s "$out" | tr -d '\n' | tail -c 200)" ;;
+    esac
+  done
+
+  sleep 5 # let a hypothetical CP crash surface in pod status
+  after="$(k get pod "$cp_pod" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo gone)"
+  [ "$after" = "$before" ] || fail "CP pod $cp_pod restarted on malformed startup (restarts $before -> $after)"
+  v="$(pg "$1" "$2" ducklake 'SELECT 1')"
+  [ "$v" = "1" ] || fail "CP stopped serving after malformed startup (got '$v')"
 }
 
 # Cold-burst absorption: there is no warm pool — workers are spawned on demand
@@ -638,6 +676,7 @@ main() {
   # ---- cnpg backend (full coverage incl. pod-level + resilience) ----
   wait_worker "$CNPG" "$cnpg_pw" ducklake
   basic_query            "$CNPG" "$cnpg_pw"
+  malformed_startup_resilience "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # before more workers exist
   rw_ducklake            "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
@@ -680,7 +719,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: wire + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: wire + malformed-startup-resilience + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"
