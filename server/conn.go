@@ -5480,6 +5480,14 @@ func (c *clientConn) handleBind(body []byte) {
 		if length == -1 {
 			paramValues[i] = nil // NULL
 		} else {
+			// The length field is client-controlled; bound the allocation by
+			// the remaining bytes of the already-framed Bind message body — a
+			// parameter value can never legitimately exceed it. Without this
+			// check a client could reserve multi-GiB per parameter (#717).
+			if int64(length) > int64(reader.Len()) {
+				c.sendError("ERROR", "08P01", fmt.Sprintf("invalid Bind message: parameter %d length %d exceeds remaining message size %d", i+1, length, reader.Len()))
+				return
+			}
 			paramValues[i] = make([]byte, length)
 			if _, err := io.ReadFull(reader, paramValues[i]); err != nil {
 				c.sendError("ERROR", "08P01", "invalid Bind message")

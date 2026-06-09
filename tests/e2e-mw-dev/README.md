@@ -105,6 +105,12 @@ normal `go test ./...` lane.
   pooler + `lakekeeper:8181` but not a denied destination needs a stable
   exec-into-worker probe; deferred (high flake risk). The policies themselves
   are asserted statically in `tests/manifests/`.
+- **Oversized Bind-parameter rejection (#717)** — rejecting a Bind message whose
+  declared parameter length exceeds the remaining message body requires crafting
+  a malformed wire-protocol packet on a raw socket (through TLS + auth); libpq
+  clients like psql always emit well-formed lengths, and the Job image carries no
+  raw-packet tooling. Covered by the unit regression test in
+  `server/conn_bind_test.go` instead.
 - **Concurrent worker operations on one session** — the worker rejects
   overlapping same-session Flight operations with `FailedPrecondition`, but the
   harness enters through pgwire, where one client connection maps to one worker
