@@ -70,7 +70,7 @@ func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 		t.Fatalf("expected warm capacity error, got %v", err)
 	}
 
-	counter, counterErr := controlPlaneWorkerAcquireFailuresCounter.GetMetricWithLabelValues("warm_capacity_exhausted")
+	counter, counterErr := controlPlaneWorkerAcquireFailuresCounter.GetMetricWithLabelValues("worker_capacity_exhausted")
 	if counterErr != nil {
 		t.Fatalf("failed to read warm capacity counter: %v", counterErr)
 	}

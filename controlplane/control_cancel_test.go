@@ -148,7 +148,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 	})
 }
 
-func TestWarmCapacityMissPolicyForKnownReasons(t *testing.T) {
+func TestCapacityMissPolicyForKnownReasons(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
 		reason       configstore.WorkerClaimMissReason

@@ -278,11 +278,11 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 			var capacityErr *WorkerCapacityExhaustedError
 			if errors.As(err, &capacityErr) {
 				missReason := capacityErr.missReason()
-				observeControlPlaneWorkerAcquireFailure("warm_capacity_exhausted")
-				observeControlPlaneWorkerAcquireFailure("warm_capacity_" + string(missReason))
+				observeControlPlaneWorkerAcquireFailure("worker_capacity_exhausted")
+				observeControlPlaneWorkerAcquireFailure("worker_capacity_" + string(missReason))
 				acquireSpan.SetAttributes(
-					attribute.String("warm_capacity.reason", string(missReason)),
-					attribute.Int("warm_capacity.retry_after_seconds", capacityRetrySeconds(capacityErr.RetryAfter)),
+					attribute.String("worker_capacity.reason", string(missReason)),
+					attribute.Int("worker_capacity.retry_after_seconds", capacityRetrySeconds(capacityErr.RetryAfter)),
 				)
 				slog.Warn("Worker acquisition failed.",
 					"pid", pid,

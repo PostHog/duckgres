@@ -30,16 +30,7 @@ type captureRuntimeWorkerStore struct {
 	records                          []configstore.WorkerRecord
 	upsertErr                        error
 	claimed                          *configstore.WorkerRecord
-	claimErr                         error
-	claimMissReason                  configstore.WorkerClaimMissReason
 	claimCalls                       int
-	claimOwnerCPID                   string
-	claimOrgID                       string
-	claimImage                       string
-	claimProfileCPU                  string
-	claimProfileMemory               string
-	claimMaxOrgWorkers               int
-	claimMaxGlobalWorkers            int
 	spawned                          *configstore.WorkerRecord
 	spawnErr                         error
 	spawnCalls                       int
@@ -50,26 +41,6 @@ type captureRuntimeWorkerStore struct {
 	spawnPodNamePrefix               string
 	spawnMaxOrgWorkers               int
 	spawnMaxGlobalWorks              int
-	neutralSpawned                   *configstore.WorkerRecord
-	neutralSpawnedFunc               func() *configstore.WorkerRecord
-	neutralSpawnErr                  error
-	neutralSpawnCalls                int
-	neutralSpawnOwnerCPID            string
-	neutralSpawnPodPrefix            string
-	neutralSpawnImage                string
-	neutralSpawnProfileCPU           string
-	neutralSpawnProfileMemory        string
-	neutralSpawnTarget               int
-	neutralSpawnMaxGlobal            int
-	perImageSpawned                  *configstore.WorkerRecord
-	perImageSpawnedFunc              func(image string) *configstore.WorkerRecord
-	perImageSpawnErr                 error
-	perImageSpawnCalls               int
-	perImageSpawnOwnerCPID           string
-	perImageSpawnPodPrefix           string
-	perImageSpawnImage               string
-	perImageSpawnTarget              int
-	perImageSpawnMaxGlobal           int
 	hotIdleClaimResult               *configstore.WorkerRecord
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
@@ -78,9 +49,6 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimProfileMemory        string
 	hotIdleClaimMaxOrgWorkers        int
 	recordMissCalls                  int
-	recordMissScopes                 []string
-	recordMissReasons                []configstore.WorkerClaimMissReason
-	recordMissErr                    error
 	takenOver                        *configstore.WorkerRecord
 	takeOverErr                      error
 	takeOverWorkerID                 int
@@ -88,10 +56,6 @@ type captureRuntimeWorkerStore struct {
 	takeOverOrgID                    string
 	takeOverExpectedEpoch            int64
 	retireIdleCalls                  int
-	retireIdleCalledIDs              []int
-	retireIdleCalledReasons          []string
-	retireIdleErr                    error
-	retireIdleMisses                 map[int]bool
 	retireIdleOrHotIdleCalls         int
 	retireIdleOrHotIdleCalledIDs     []int
 	retireIdleOrHotIdleCalledReasons []string
@@ -519,21 +483,6 @@ func podDeleteActionNames(cs *fake.Clientset) []string {
 	}
 	return names
 }
-
-func waitForPodDeleteAction(t *testing.T, cs *fake.Clientset, name string) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		for _, deletedName := range podDeleteActionNames(cs) {
-			if deletedName == name {
-				return
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("expected pod delete action for %q, got %v", name, podDeleteActionNames(cs))
-}
-
 func secretDeleteActionCount(cs *fake.Clientset) int {
 	count := 0
 	for _, action := range cs.Actions() {
@@ -858,39 +807,6 @@ func TestK8sPool_SpawnWorkerCleansUpWhenRPCSecurityReadCancelsContext(t *testing
 		t.Fatalf("secret delete actions = %d, want cleanup delete despite canceled spawn context", secretDeleteActionCount(cs))
 	}
 }
-
-// createdPodEnv returns the container env of the pod created via the fake
-// clientset under the given name. spawnWorker creates the pod before any of its
-// later steps can fail, so this is observable even when spawnWorker errors out.
-func createdPodEnv(t *testing.T, cs *fake.Clientset, podName string) []corev1.EnvVar {
-	t.Helper()
-	for _, action := range cs.Actions() {
-		if !action.Matches("create", "pods") {
-			continue
-		}
-		ca, ok := action.(k8stesting.CreateAction)
-		if !ok {
-			continue
-		}
-		pod, ok := ca.GetObject().(*corev1.Pod)
-		if !ok || pod.Name != podName {
-			continue
-		}
-		return pod.Spec.Containers[0].Env
-	}
-	t.Fatalf("no create pods action for %q; actions=%v", podName, cs.Actions())
-	return nil
-}
-
-func envHasName(env []corev1.EnvVar, name string) bool {
-	for _, e := range env {
-		if e.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
 func TestK8sPool_WorkerLookup(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 

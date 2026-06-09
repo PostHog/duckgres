@@ -995,7 +995,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Resolve the requested worker shape from the connection-string startup
-	// options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
+	// options (duckgres.worker_cpu / worker_memory / worker_ttl).
 	// nil => the default exclusive profile. Gated off by default, so this is a
 	// no-op unless the deployment opts in. A rejected profile fails the connect.
 	workerProfile, profileWarns, profileErr := cp.resolveWorkerProfile(startupOptions)
@@ -1281,7 +1281,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // resources are not configured (DuckDB will then auto-detect on the worker).
 func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit string, threads int) {
 	// A non-default profile sizes DuckDB from the profile's pod shape, not the
-	// pool-global request, so a small colocated worker gets matching limits. An
+	// pool-global request, so a smaller sized worker gets matching limits. An
 	// empty profile field falls back to the pool-global request (today's value).
 	memReq := cp.cfg.K8s.WorkerMemoryRequest
 	cpuReq := cp.cfg.K8s.WorkerCPURequest

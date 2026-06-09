@@ -129,9 +129,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 }
 
 // atOrgWorkerCap reports whether the org has reached its maximum concurrent
-// exclusive workers (count cap). Hot-idle and colocated workers are excluded
-// (they don't consume the count budget), so a true result means every counted
-// worker is actively assigned — a new exclusive worker cannot be added.
+// workers (count cap). Hot-idle workers are excluded (they don't consume the
+// count budget), so a true result means every counted worker is actively
+// assigned — a new worker cannot be added.
 func (p *OrgReservedPool) atOrgWorkerCap() bool {
 	p.shared.mu.Lock()
 	defer p.shared.mu.Unlock()
@@ -234,8 +234,8 @@ func (p *OrgReservedPool) findIdleAssignedWorkerLocked(profile *WorkerProfile) *
 			continue
 		default:
 		}
-		// Only reuse a worker of the requested shape — a colocated request must
-		// not land on a default/exclusive worker (and vice versa).
+		// Only reuse a worker of the requested shape — a differently-sized
+		// request must not land on a worker of another shape (and vice versa).
 		if w.profile.MatchKey() != want {
 			continue
 		}
