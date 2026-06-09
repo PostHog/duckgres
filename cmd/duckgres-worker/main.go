@@ -59,7 +59,7 @@ func main() {
 
 	// --mode is accepted but must be "duckdb-service". The K8s control
 	// plane spawns workers with `--mode duckdb-service` hardcoded
-	// (controlplane/k8s_pool.go), and the all-in-one duckgres binary
+	// (controlplane/k8s_pool_spawn.go), and the all-in-one duckgres binary
 	// uses --mode to route between standalone/control-plane/duckdb-service.
 	// This binary is duckdb-service by definition; we accept the flag so
 	// existing CP pod specs don't crash flag.Parse with "flag provided but

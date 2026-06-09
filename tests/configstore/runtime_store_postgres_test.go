@@ -565,7 +565,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 }
 
 func TestGetWorkerRecordReturnsNilNilForMissingRow(t *testing.T) {
-	// cleanupOrphanedWorkerPods in k8s_pool.go treats (nil, nil) as "no DB
+	// cleanupOrphanedWorkerPods in k8s_pool_reconcile.go treats (nil, nil) as "no DB
 	// row — this pod is fully orphaned and safe to delete" and a non-nil
 	// error as "skip this tick and retry." If GetWorkerRecord wrapped
 	// gorm.ErrRecordNotFound as an error, the missing-row branch of the
