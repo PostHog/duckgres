@@ -762,6 +762,76 @@ func TestEndTransactionRollbackReleasesAbandonedStatementOperation(t *testing.T)
 	}
 }
 
+func TestEndTransactionRollbackReleasesAbandonedMetadataOperation(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	txnID, err := handler.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if _, err := handler.GetFlightInfoSchemas(ctx, testGetDBSchemas{}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get metadata flight info: %v", err)
+	}
+
+	if err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: txnID,
+		action:        flightsql.EndTransactionRollback,
+	}); err != nil {
+		session.mu.Lock()
+		ttx := session.txns[string(txnID)]
+		if ttx != nil {
+			delete(session.txns, string(txnID))
+			delete(session.txnOwner, string(txnID))
+		}
+		session.mu.Unlock()
+		if ttx != nil && ttx.tx != nil {
+			_ = session.rollbackTx(ttx.tx)
+		}
+		if ttx != nil && ttx.finishDrain != nil {
+			ttx.finishDrain()
+		}
+		t.Fatalf("rollback should clean up abandoned in-transaction metadata: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after rollback", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after metadata rollback cleanup")
+	} else {
+		finish()
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	if len(session.metadataDrains) != 0 {
+		t.Fatalf("metadata drains were not consumed: %v", session.metadataDrains)
+	}
+}
+
 func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),

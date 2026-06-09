@@ -186,6 +186,24 @@ func popAbandonedTransactionContinuations(session *Session, txnKey string) ([]fu
 		}
 		handle.pendingDrains = kept
 	}
+	for key, tokens := range session.metadataDrains {
+		kept := tokens[:0]
+		for _, token := range tokens {
+			if token.finishOperation == nil {
+				kept = append(kept, token)
+				continue
+			}
+			if token.finish != nil {
+				drainReleases = append(drainReleases, token.finish)
+			}
+			operationReleases = append(operationReleases, token.finishOperation)
+		}
+		if len(kept) == 0 {
+			delete(session.metadataDrains, key)
+		} else {
+			session.metadataDrains[key] = kept
+		}
+	}
 	session.mu.Unlock()
 	return drainReleases, operationReleases
 }
