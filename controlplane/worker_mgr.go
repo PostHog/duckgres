@@ -141,6 +141,20 @@ func (w *ManagedWorker) PodName() string {
 	return w.podName
 }
 
+// claimSessionLocked records one newly-assigned session on the worker: it
+// increments the active session count and advances the peak-sessions
+// high-water mark. The caller must hold the owning pool's lock (this is the
+// shared session-claim bookkeeping used identically by both
+// FlightWorkerPool.AcquireWorker and K8sWorkerPool.AcquireWorker after a
+// worker is selected). It does not make any scheduling decision — callers
+// remain responsible for choosing which worker to claim.
+func (w *ManagedWorker) claimSessionLocked() {
+	w.activeSessions++
+	if w.activeSessions > w.peakSessions {
+		w.peakSessions = w.activeSessions
+	}
+}
+
 // preboundSocket is a Unix socket pre-bound at startup while the socket
 // directory is verified writable. This avoids EROFS errors that can occur
 // later under systemd's ProtectSystem=strict when the RuntimeDirectory
@@ -682,10 +696,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 	// 1. Try to claim an idle worker before spawning a new one.
 	idle := p.findIdleWorkerLocked()
 	if idle != nil {
-		idle.activeSessions++
-		if idle.activeSessions > idle.peakSessions {
-			idle.peakSessions = idle.activeSessions
-		}
+		idle.claimSessionLocked()
 		p.mu.Unlock()
 		return idle, nil
 	}
@@ -714,10 +725,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 		}
 
 		p.mu.Lock()
-		w.activeSessions++
-		if w.activeSessions > w.peakSessions {
-			w.peakSessions = w.activeSessions
-		}
+		w.claimSessionLocked()
 		p.mu.Unlock()
 		return w, nil
 	}
@@ -725,10 +733,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 	// 3. At capacity — assign to the least-loaded live worker.
 	w := p.leastLoadedWorkerLocked()
 	if w != nil {
-		w.activeSessions++
-		if w.activeSessions > w.peakSessions {
-			w.peakSessions = w.activeSessions
-		}
+		w.claimSessionLocked()
 		p.mu.Unlock()
 		return w, nil
 	}
@@ -764,10 +769,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 	}
 
 	p.mu.Lock()
-	w.activeSessions++
-	if w.activeSessions > w.peakSessions {
-		w.peakSessions = w.activeSessions
-	}
+	w.claimSessionLocked()
 	p.mu.Unlock()
 	return w, nil
 }
