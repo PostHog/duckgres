@@ -9,56 +9,41 @@ import (
 )
 
 const DefaultK8sWorkerServiceAccount = "duckgres-worker"
-const DefaultWarmCapacityRetryAfter = 45 * time.Second
-const DefaultWarmCapacityMissWindow = 2 * time.Minute
-const DefaultWarmCapacityMissesPerWorker = 8
-const DefaultWarmCapacityDemandTTL = 15 * time.Minute
+const DefaultWorkerSpawnRetryAfter = 45 * time.Second
 
-// WarmAcquireRetryInterval is how often a session-acquire that missed the warm
-// pool re-attempts the claim while waiting (within WarmAcquireTimeout) for the
-// warm pool to replenish.
-const WarmAcquireRetryInterval = 2 * time.Second
-
-// WarmMissRecordInterval throttles warm-capacity miss recording (demand signal +
-// metric) while an acquire waits: at most one record per interval per waiting
-// connection, instead of one per WarmAcquireRetryInterval poll. Kept well under
-// DefaultWarmCapacityMissWindow (2m) so the demand signal stays fresh enough to
-// keep driving the warm reconciler.
-const WarmMissRecordInterval = 30 * time.Second
-
-// WarmCapacityExhaustedError is returned when a user request misses the ready
-// warm pool. The caller should fail fast with a retryable capacity response
-// instead of waiting for a foreground cold worker spawn.
-type WarmCapacityExhaustedError struct {
+// WorkerCapacityExhaustedError is returned when a worker can't be acquired
+// because the org or the cluster is at its worker cap (or the pool is shutting
+// down). The caller fails fast with a retryable capacity response.
+type WorkerCapacityExhaustedError struct {
 	// RetryAfter is the client-facing retry hint for protocol-specific error responses.
 	RetryAfter time.Duration
-	// Reason classifies why the warm-capacity claim missed.
+	// Reason classifies why the worker could not be acquired.
 	Reason configstore.WorkerClaimMissReason
 }
 
-func (e *WarmCapacityExhaustedError) Error() string {
-	return warmCapacityMissPolicyForReason(e.missReason()).errorString(e.RetryAfter)
+func (e *WorkerCapacityExhaustedError) Error() string {
+	return capacityMissPolicyForReason(e.missReason()).errorString(e.RetryAfter)
 }
 
-func (e *WarmCapacityExhaustedError) missReason() configstore.WorkerClaimMissReason {
+func (e *WorkerCapacityExhaustedError) missReason() configstore.WorkerClaimMissReason {
 	if e.Reason == configstore.WorkerClaimMissReasonNone {
 		return configstore.WorkerClaimMissReasonNoIdle
 	}
 	return e.Reason
 }
 
-func NewWarmCapacityExhaustedError(retryAfter time.Duration) error {
-	return NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonNoIdle, retryAfter)
+func NewWorkerCapacityExhaustedError(retryAfter time.Duration) error {
+	return NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonNoIdle, retryAfter)
 }
 
-func NewWarmCapacityExhaustedErrorForReason(reason configstore.WorkerClaimMissReason, retryAfter time.Duration) error {
+func NewWorkerCapacityExhaustedErrorForReason(reason configstore.WorkerClaimMissReason, retryAfter time.Duration) error {
 	if retryAfter <= 0 {
-		retryAfter = DefaultWarmCapacityRetryAfter
+		retryAfter = DefaultWorkerSpawnRetryAfter
 	}
 	if reason == configstore.WorkerClaimMissReasonNone {
 		reason = configstore.WorkerClaimMissReasonNoIdle
 	}
-	return &WarmCapacityExhaustedError{RetryAfter: retryAfter, Reason: reason}
+	return &WorkerCapacityExhaustedError{RetryAfter: retryAfter, Reason: reason}
 }
 
 // WorkerPool abstracts the lifecycle and scheduling of Flight SQL workers.
@@ -66,10 +51,11 @@ func NewWarmCapacityExhaustedErrorForReason(reason configstore.WorkerClaimMissRe
 //   - FlightWorkerPool: spawns workers as local child processes (default)
 //   - K8sWorkerPool:    creates workers as Kubernetes pods (build tag: kubernetes)
 type WorkerPool interface {
-	// AcquireWorker returns a worker for a new session. It may reuse an idle
-	// worker, spawn a new one, or assign to the least-loaded worker. profile is
-	// the requested pod shape (nil => the default exclusive profile); only the
-	// multi-tenant OrgReservedPool acts on it — the flat/process pools ignore it.
+	// AcquireWorker returns a worker for a new session. The multi-tenant
+	// OrgReservedPool (k8s/remote) reuses a hot-idle worker of the requested shape
+	// for the org or spawns one on demand; the process FlightWorkerPool reuses an
+	// idle worker / assigns least-loaded. profile is the requested pod shape (nil
+	// => the default shape) and is honored only by OrgReservedPool.
 	AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error)
 
 	// ReleaseWorker decrements the active session count for a worker.
@@ -85,7 +71,9 @@ type WorkerPool interface {
 	// Worker returns a worker by ID, or false if not found.
 	Worker(id int) (*ManagedWorker, bool)
 
-	// SpawnMinWorkers pre-warms the pool with count workers at startup.
+	// SpawnMinWorkers pre-warms the pool with count workers at startup. Only the
+	// process FlightWorkerPool implements this (--process-min-workers); the K8s
+	// pool spawns on demand, so its implementation is a no-op.
 	SpawnMinWorkers(count int) error
 
 	// HealthCheckLoop runs periodic health checks on all workers.
@@ -103,20 +91,14 @@ type WorkerPool interface {
 
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
-	Namespace    string
-	CPID         string // Control plane pod name, used in labels
-	CPInstanceID string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
-	WorkerImage  string
-	WorkerPort   int
-	SecretName   string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
-	ConfigMap    string // ConfigMap name for duckgres.yaml
-	MaxWorkers   int
-	// WarmAcquireTimeout: how long a session-acquire blocks server-side waiting
-	// for a warm worker to become available before returning the retryable
-	// "no warm worker" backpressure. 0 = fail fast (legacy behavior). Bounded
-	// per-request by the client's connection context, so a client with a short
-	// deadline still fails fast.
-	WarmAcquireTimeout           time.Duration
+	Namespace                    string
+	CPID                         string // Control plane pod name, used in labels
+	CPInstanceID                 string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
+	WorkerImage                  string
+	WorkerPort                   int
+	SecretName                   string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	ConfigMap                    string // ConfigMap name for duckgres.yaml
+	MaxWorkers                   int
 	IdleTimeout                  time.Duration
 	ConfigPath                   string                                       // Path inside worker pod where config is mounted
 	ImagePullPolicy              string                                       // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
@@ -133,10 +115,6 @@ type K8sWorkerPoolConfig struct {
 	PlaceholderCPU               string                                       // CPU request per placeholder pod (e.g. "8").
 	PlaceholderMemory            string                                       // Memory request per placeholder pod (e.g. "16Gi").
 	PlaceholderPriorityClassName string                                       // PriorityClass for placeholder pods — MUST be below WorkerPriorityClassName so workers preempt them.
-	ColocatedNodeSelector        map[string]string                            // Node selector for colocate=true (bin-pack) worker pods. Nil = no selector.
-	ColocatedTolerationKey       string                                       // Taint key for colocated worker pods. Empty = no toleration.
-	ColocatedTolerationValue     string                                       // Taint value for colocated worker pods.
-	ColocatedWarmShapes          []ColocatedWarmShape                         // Colocated shapes to keep warm (each {cpu,memory,target}).
 	OrgID                        string                                       // Org ID for pod labels (multi-tenant mode)
 	WorkerIDGenerator            func() int                                   // Shared ID generator across orgs (nil = internal counter)
 	ResolveOrgConfig             func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
@@ -155,12 +133,8 @@ type K8sWorkerPoolConfig struct {
 // satisfies both interfaces.
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
-	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int, maxColocatedCPU int, maxColocatedMemBytes uint64) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
-	ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
-	RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, now time.Time) error
+	ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
-	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
-	CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)

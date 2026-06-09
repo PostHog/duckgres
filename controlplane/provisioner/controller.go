@@ -43,12 +43,6 @@ type Controller struct {
 	// Lakekeeper path), reconcileLakekeeper is skipped silently.
 	lakekeeperProvisioner *LakekeeperProvisioner
 	lakekeeperInputs      LakekeeperInputsResolver
-
-	// Trino-side reconcile dependency. Optional: if nil (the default in
-	// deployments without the customer Trino cluster, or in tests that
-	// don't exercise the Trino path), the Trino reconcile step is
-	// skipped silently. See WithTrinoProvisioner.
-	trinoProvisioner *TrinoProvisioner
 }
 
 // LakekeeperInputsResolver is the function shape the controller uses to
@@ -108,22 +102,6 @@ func (c *Controller) WithLakekeeperProvisioner(p *LakekeeperProvisioner, inputs 
 	return c
 }
 
-// WithTrinoProvisioner enables the customer-Trino reconcile branch.
-// The Trino reconcile runs once per controller tick — it doesn't iterate
-// per-warehouse like the Lakekeeper branch does, because the Trino
-// projection is a single batched output (one Secret + one ConfigMap +
-// one OPA bundle for the whole cluster).
-//
-// Skipped entirely if p is nil so deployments without a customer Trino
-// cluster don't need to know about it.
-func (c *Controller) WithTrinoProvisioner(p *TrinoProvisioner) *Controller {
-	if p == nil {
-		panic("WithTrinoProvisioner: provisioner is nil; call NewTrinoProvisioner first")
-	}
-	c.trinoProvisioner = p
-	return c
-}
-
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
 func (c *Controller) Run(ctx context.Context) {
 	slog.Info("Provisioning controller started.", "poll_interval", c.pollInterval)
@@ -174,16 +152,6 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.reconcileReady(ctx, &w)
 		case configstore.ManagedWarehouseStateDeleting:
 			c.reconcileDeleting(ctx, &w)
-		}
-	}
-
-	// Trino reconcile runs once per tick (not per warehouse) — the
-	// projection is a single batched output for the customer cluster.
-	// Errors are logged but don't block other reconcile branches; the
-	// next tick re-runs everything.
-	if c.trinoProvisioner != nil && ctx.Err() == nil {
-		if err := c.trinoProvisioner.Reconcile(ctx); err != nil {
-			slog.Warn("Trino provisioner reconcile failed.", "error", err)
 		}
 	}
 }

@@ -223,13 +223,6 @@ Run with config file:
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
 | `DUCKGRES_K8S_MAX_WORKERS` | Global cap for shared K8s workers (`0` means Duckgres does not impose a cap) | `0` |
-| `DUCKGRES_K8S_SHARED_WARM_TARGET` | Default-image neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm; subject to `DUCKGRES_K8S_MAX_WORKERS`) | `0` |
-| `DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED` | Enable configstore-driven dynamic warm-capacity target computation from recent no-idle misses | `true` |
-| `DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW` | Recent no-idle miss window used for dynamic warm-capacity demand | `2m` |
-| `DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER` | Recent misses required for one extra dynamic warm worker | `8` |
-| `DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL` | Retention TTL for warm-capacity miss buckets; clamped to at least the miss window | `15m` |
-| `DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING` | Max dynamic extra warm workers per image (`0` means unlimited) | `0` |
-| `DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING` | Max dynamic extra warm workers across images (`0` means unlimited) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
@@ -290,20 +283,6 @@ Options:
   -managed-hostname-suffixes string
                           Comma-separated managed tenant hostname suffixes
   -k8s-max-workers int    Max K8s workers in the shared pool, 0=unbounded
-  -k8s-shared-warm-target int
-                          Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled
-  -k8s-dynamic-warm-capacity-enabled
-                          Enable configstore-driven dynamic warm-capacity target computation (default true)
-  -k8s-warm-capacity-miss-window string
-                          Recent no-idle miss window for dynamic warm-capacity demand (default 2m)
-  -k8s-warm-capacity-misses-per-worker int
-                          Recent misses required for one extra dynamic warm worker (default 8)
-  -k8s-warm-capacity-demand-ttl string
-                          Retention TTL for warm-capacity miss buckets (default 15m)
-  -k8s-warm-capacity-dynamic-image-ceiling int
-                          Max dynamic extra warm workers per image, 0=unlimited
-  -k8s-warm-capacity-dynamic-total-ceiling int
-                          Max dynamic extra warm workers across images, 0=unlimited
 ```
 
 ## DuckDB Extensions
@@ -678,7 +657,7 @@ In Kubernetes environments, `--worker-backend remote` is the multitenant path. I
 
 Managed-hostname routing is controlled by `--sni-routing-mode` and `--managed-hostname-suffixes`. For Postgres, an explicit startup `database`/`dbname` takes priority, but when SNI matches a managed suffix the hostname prefix and requested database must resolve to the same org. If the startup database is empty, the managed SNI prefix is used as the database fallback. Unknown `--sni-routing-mode` values behave like `off`.
 
-When a shared warm-worker target is configured (`--k8s-shared-warm-target`, default `0`), the pool keeps neutral workers ready at startup. On demand, a neutral worker is reserved for an org, activated over the worker control RPC, and becomes hot for that org. When its last session ends, the worker moves to `hot_idle` instead of being retired immediately: it keeps the org assignment and DuckLake attachment so any control-plane replica can reclaim it for the same org without full reactivation. Hot-idle reuse is image/version strict; a worker whose image no longer matches the org target is retired instead of reused. The janitor retires unreclaimed hot-idle workers after 5 minutes. The main lifecycle is: idle → reserved → activating → hot → hot_idle → retired. Workers can also move through `draining` during shutdown, rollout, or cleanup.
+Workers are spawned on demand: when an org opens a session with no reusable worker, the control plane creates a worker pod (sized from the connection's `duckgres.worker_cpu`/`worker_memory` request, or a default), activates it over the worker control RPC, and it becomes hot for that org. When its last session ends, the worker moves to `hot_idle` instead of being retired immediately: it keeps the org assignment and DuckLake attachment so any control-plane replica can reclaim it for the same org (by exact worker shape) without full reactivation, until its `duckgres.worker_ttl` expires. Hot-idle reuse is image/version strict; a worker whose image no longer matches the org target is retired instead of reused. The janitor retires hot-idle workers at their TTL. The main lifecycle is: idle → reserved → activating → hot → hot_idle → retired. Workers can also move through `draining` during shutdown, rollout, or cleanup. (Spawn latency is hidden by the node-headroom controller, which keeps placeholder pods ready for real workers to preempt.)
 
 ```bash
 # Local multitenant K8s workflow

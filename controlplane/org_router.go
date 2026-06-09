@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,8 +90,6 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 		}
 	}
 
-	tr.reconcileWarmCapacity(snap)
-
 	return tr, nil
 }
 
@@ -118,8 +115,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		tr.sharedPool.SetWorkerResources(cpu, mem)
 	}
 
-	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker,
-		tr.globalCfg.K8s.OrgMaxColocatedCPU, parseK8sMemory(tr.globalCfg.K8s.OrgMaxColocatedMemory))
+	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker)
 	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, tr.globalCfg.DuckLakeDefaultSpecVersion, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {
@@ -355,8 +351,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		}
 		tr.mu.Unlock()
 	}
-
-	tr.reconcileWarmCapacity(new)
 }
 
 func workerImageForOrg(tc *configstore.OrgConfig, fallback string) string {
@@ -405,59 +399,6 @@ func (tr *OrgRouter) ShutdownAll() {
 	if tr.sharedPool != nil {
 		tr.sharedPool.ShutdownAll()
 	}
-}
-
-func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
-	if tr.sharedPool == nil || snap == nil {
-		return
-	}
-
-	target := tr.globalCfg.K8s.SharedWarmTarget
-	if target < 0 {
-		target = 0
-	}
-
-	tr.sharedPool.SetWarmCapacityTarget(target)
-	tr.sharedPool.SetPerImageWarmTargets(tr.computeBaseWarmCapacityTargets(snap))
-}
-
-func (tr *OrgRouter) computeBaseWarmCapacityTargets(snap *configstore.Snapshot) map[string]int {
-	return computeBaseWarmCapacityTargets(
-		tr.baseCfg.WorkerImage,
-		tr.globalCfg.K8s.SharedWarmTarget,
-		tr.computePerImageWarmTargets(snap),
-	)
-}
-
-// computePerImageWarmTargets returns "keep at least SharedWarmTarget warm workers
-// for each distinct image" — covering the cluster default plus every pinned
-// Warehouse.Image used by an org that currently has an active stack. With the
-// warm pool torn down (SharedWarmTarget=0) it returns no floors, so no neutral
-// workers are pre-spawned; requests foreground-spawn on demand instead. Orgs
-// without a live stack (e.g. warehouse not yet ready) are skipped.
-func (tr *OrgRouter) computePerImageWarmTargets(snap *configstore.Snapshot) map[string]int {
-	targets := make(map[string]int)
-	floor := tr.globalCfg.K8s.SharedWarmTarget
-	if floor <= 0 {
-		return targets // warm pool disabled — no per-image floor
-	}
-	if defaultImage := strings.TrimSpace(tr.baseCfg.WorkerImage); defaultImage != "" {
-		targets[defaultImage] = floor
-	}
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
-	for orgID := range tr.orgs {
-		tc, ok := snap.Orgs[orgID]
-		if !ok || tc == nil {
-			continue
-		}
-		image := strings.TrimSpace(workerImageForOrg(tc, tr.baseCfg.WorkerImage))
-		if image == "" {
-			continue
-		}
-		targets[image] = floor
-	}
-	return targets
 }
 
 func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {

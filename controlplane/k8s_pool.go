@@ -43,15 +43,6 @@ const defaultActivatingTimeout = 2 * time.Minute
 // generous.
 const workerPodReadyTimeout = 5 * time.Minute
 
-// warmSpawnReconcileTimeout bounds a warm-pool replenish/reconcile spawn. It MUST
-// exceed workerPodReadyTimeout: a warm spawn does the same waitForPodReady, so a
-// shorter deadline cancels every cold spawn before its node can provision. The
-// old 30s value meant the warm reconcile could never refill an exclusive worker
-// that needed a fresh node — after a CP restart the default/exclusive pool would
-// sit empty, churning "context deadline exceeded", while only colocated (small,
-// fast, bin-packed) shapes refilled. See TestWarmSpawnTimeoutExceedsPodReady.
-const warmSpawnReconcileTimeout = 6 * time.Minute
-
 const workerTerminationGracePeriodSeconds int64 = 3600
 
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
@@ -63,17 +54,8 @@ type K8sWorkerPool struct {
 	nextWorkerID int
 	spawning     int
 	maxWorkers   int
-	// warmAcquireTimeout: server-side block window for a session-acquire that
-	// missed the warm pool (0 = fail fast). Read by OrgReservedPool.AcquireWorker.
-	warmAcquireTimeout time.Duration
-	minWorkers         int
-	// perImageWarmTarget is an additive floor on top of minWorkers: for each
-	// image listed, the pool aims to keep at least N warm-idle workers of
-	// that exact image alive so a per-org pin always has a hot pod waiting.
-	// minWorkers still drives the cluster-default warm count separately.
-	perImageWarmTarget map[string]int
-	idleTimeout        time.Duration
-	shuttingDown       bool
+	idleTimeout  time.Duration
+	shuttingDown bool
 	shutdownCh         chan struct{}
 
 	clientset               kubernetes.Interface
@@ -105,14 +87,6 @@ type K8sWorkerPool struct {
 	placeholderMemory            string
 	placeholderPriorityClassName string
 
-	// Colocated (bin-pack) scheduling for colocate=true worker profiles. When a
-	// spawned worker's profile is colocated, these replace the default
-	// nodeSelector/toleration and the exclusive-node anti-affinity is dropped so
-	// many small pods pack onto a shared node.
-	colocatedWorkerNodeSelector    map[string]string
-	colocatedWorkerTolerationKey   string
-	colocatedWorkerTolerationValue string
-	colocatedWarmShapes            []ColocatedWarmShape                         // colocated shapes to keep warm (each {cpu,memory,target})
 	orgID                          string                                       // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator              func() int                                   // shared ID generator across orgs (nil = internal counter)
 	resolveOrgConfig               func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
@@ -129,8 +103,7 @@ type K8sWorkerPool struct {
 	// CPs don't coordinate this (see idleReaper/findIdleWorker).
 	nodeFirstSeen map[string]time.Time
 
-	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
-	spawnWarmWorkerBackgroundFunc func(id int)
+	spawnWorkerFunc               func(ctx context.Context, id int, image string, profile WorkerProfile) error // test seam for stubbing pod creation
 	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
 	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
@@ -189,17 +162,15 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Limit concurrent K8s API calls to avoid overwhelming the API server.
 	// The K8s client above is configured for QPS=50 / Burst=100, so 50 in-flight
 	// pod creates fits comfortably within client-side throttling while letting
-	// the warm-pool reconciler close large demand gaps (e.g. 30-tenant cold
-	// ramp) in one tick instead of creeping up at 3-per-pod-startup. Pod
-	// scheduling latency on the node side is bounded by Karpenter (~30s) and
-	// the kubelet, neither of which cares about how many pods we create
-	// in parallel from the CP.
+	// a large demand burst (e.g. a 30-tenant cold ramp) spawn workers in
+	// parallel rather than serializing. Pod scheduling latency on the node side
+	// is bounded by Karpenter (~30s) and the kubelet, neither of which cares
+	// about how many pods we create in parallel from the CP.
 	spawnConcurrency := 50
 	retireConcurrency := 5
 	pool := &K8sWorkerPool{
 		workers:                 make(map[int]*ManagedWorker),
 		maxWorkers:              cfg.MaxWorkers,
-		warmAcquireTimeout:      cfg.WarmAcquireTimeout,
 		idleTimeout:             cfg.IdleTimeout,
 		shutdownCh:              make(chan struct{}),
 		stopInform:              make(chan struct{}),
@@ -227,11 +198,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		placeholderCPU:               cfg.PlaceholderCPU,
 		placeholderMemory:            cfg.PlaceholderMemory,
 		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
-
-		colocatedWorkerNodeSelector:    cfg.ColocatedNodeSelector,
-		colocatedWorkerTolerationKey:   cfg.ColocatedTolerationKey,
-		colocatedWorkerTolerationValue: cfg.ColocatedTolerationValue,
-		colocatedWarmShapes:            cfg.ColocatedWarmShapes,
 
 		orgID:             cfg.OrgID,
 		workerIDGenerator: cfg.WorkerIDGenerator,
@@ -279,11 +245,10 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 // Deployment ReplicaSet (pod-template-hash) than this CP, atomically marks
 // its idle runtime-store row retired, and deletes the pod.
 //
-// The janitor leader is expected to invoke this once per tick: together with
-// warm-pool replenishment via reconcileWarmCapacity, old-version workers are
-// replaced one at a time with pods spawned from the leader's current binary.
-// This gives gradual rolling worker replacement driven entirely by leader
-// election — no cross-CP sweeps needed.
+// The janitor leader is expected to invoke this once per tick: old-version idle
+// workers are retired one at a time, and the next session for that org spawns a
+// pod from the leader's current binary. This gives gradual rolling worker
+// replacement driven entirely by leader election — no cross-CP sweeps needed.
 //
 // Retirement is limited to workers currently in WorkerStateIdle. Busy or
 // hot-idle workers are left alone so in-flight sessions aren't disturbed;
@@ -686,20 +651,12 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int, image string) e
 	return p.spawnWorker(ctx, id, image, WorkerProfile{}, true)
 }
 
-func (p *K8sWorkerPool) spawnReservedWorker(ctx context.Context, slot *configstore.WorkerRecord) error {
-	if slot == nil {
-		return fmt.Errorf("missing reserved worker slot")
-	}
-	if p.spawnWarmWorkerFunc != nil {
-		return p.spawnWarmWorkerFunc(ctx, slot.WorkerID)
-	}
-	// Reconstruct the pod shape from the persisted slot so a reserved colocated
-	// worker is spawned bin-packed; default/legacy slots yield the zero profile.
-	profile := WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate}
-	return p.spawnWorker(ctx, slot.WorkerID, slot.Image, profile, false)
-}
-
 func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, profile WorkerProfile, publishIdle bool) error {
+	// Test seam: lets unit tests stub pod creation (register the worker in
+	// p.workers themselves) without a real K8s spawn / pod-ready wait.
+	if p.spawnWorkerFunc != nil {
+		return p.spawnWorkerFunc(ctx, id, image, profile)
+	}
 	// Acquire spawn semaphore to limit concurrent pod creates.
 	select {
 	case p.spawnSem <- struct{}{}:
@@ -747,7 +704,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			ServiceAccountName:            p.workerServiceAccountName(),
 			AutomountServiceAccountToken:  boolPtr(false),
 			PriorityClassName:             p.workerPriorityClassName,
-			NodeSelector:                  p.nodeSelectorForProfile(profile),
+			NodeSelector:                  p.workerNodeSelector,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -851,13 +808,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	// DaemonSet proxy on the same node via the node IP + fixed hostPort.
 	// Inject NODE_IP via the Downward API so the worker process can resolve
 	// the proxy address at runtime.
-	//
-	// Colocated workers are exempt: they bin-pack onto the dedicated colocated
-	// nodepool, which runs no cache-proxy DaemonSet (and has no NVMe to back
-	// one). If they inherited DUCKGRES_CACHE_ENABLED they would block forever in
-	// waitForCacheProxy() waiting on a proxy that never comes up, never answer
-	// the control plane's gRPC health check, and churn. They talk to S3 directly.
-	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" && !profile.Colocate {
+	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" {
 		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
 			corev1.EnvVar{
 				Name:  "DUCKGRES_CACHE_ENABLED",
@@ -874,11 +825,8 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		)
 	}
 
-	// Add toleration if configured (colocated profiles use the bin-pack pool's taint)
+	// Add toleration if configured.
 	tolKey, tolValue := p.workerTolerationKey, p.workerTolerationValue
-	if profile.Colocate {
-		tolKey, tolValue = p.colocatedWorkerTolerationKey, p.colocatedWorkerTolerationValue
-	}
 	if tolKey != "" {
 		tol := corev1.Toleration{
 			Key:    tolKey,
@@ -891,9 +839,8 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		pod.Spec.Tolerations = []corev1.Toleration{tol}
 	}
 
-	// One worker per instance (only for exclusive profiles on a dedicated node
-	// pool). Colocated profiles deliberately skip anti-affinity so pods bin-pack.
-	if p.workerExclusiveNode && !profile.Colocate {
+	// One worker per node, on a dedicated node pool.
+	if p.workerExclusiveNode {
 		pod.Spec.Affinity = &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
@@ -964,7 +911,6 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		spawnRecord := p.workerRecordFor(id, nil, 0, configstore.WorkerStateSpawning, "", nil)
 		spawnRecord.ProfileCPU = profile.CPU
 		spawnRecord.ProfileMemory = profile.Memory
-		spawnRecord.ProfileColocate = profile.Colocate
 		spawnRecord.TTLMinutes = int(profile.TTL.Minutes())
 		_ = p.persistWorkerRecord(spawnRecord)
 	}
@@ -1311,7 +1257,7 @@ func (p *K8sWorkerPool) spawnWorkerBackground(id int, image string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	err := p.spawnWarmWorker(ctx, id, image, WorkerProfile{})
+	err := p.spawnWorker(ctx, id, image, WorkerProfile{}, true)
 
 	p.mu.Lock()
 	p.spawning--
@@ -1609,14 +1555,13 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			// Try reclaiming a hot-idle worker for the same org first (fast path:
 			// DuckLake is already attached, only needs epoch bump).
 			if assignment.OrgID != "" {
-				hotProfileCPU, hotProfileMem, hotProfileColo := assignment.Profile.Parts()
-				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, hotProfileColo, assignment.MaxWorkers)
+				hotProfileCPU, hotProfileMem := assignment.Profile.Parts()
+				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, assignment.MaxWorkers)
 				if err != nil {
 					return nil, err
 				}
 				if hotClaimed == nil && hotMissReason != configstore.WorkerClaimMissReasonNone && hotMissReason != configstore.WorkerClaimMissReasonNoIdle {
-					p.recordWarmCapacityMiss(assignment, hotMissReason)
-					return nil, NewWarmCapacityExhaustedErrorForReason(hotMissReason, DefaultWarmCapacityRetryAfter)
+					return nil, NewWorkerCapacityExhaustedErrorForReason(hotMissReason, DefaultWorkerSpawnRetryAfter)
 				}
 				if hotClaimed != nil {
 					// ClaimHotIdleWorker already filters by profile, so a reclaimed
@@ -1644,163 +1589,33 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				}
 			}
 
-			p.mu.Lock()
-			maxGlobalWorkers := p.maxWorkers
-			p.mu.Unlock()
-
-			profileCPU, profileMemory, profileColocate := assignment.Profile.Parts()
-			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, profileCPU, profileMemory, profileColocate, assignment.MaxWorkers, maxGlobalWorkers, assignment.MaxColocatedCPU, assignment.MaxColocatedMemBytes)
-			if err != nil {
-				return nil, err
-			}
-			if claimed != nil {
-				worker, reserveErr := p.reserveClaimedWorker(ctx, claimed, assignment)
-				if reserveErr == nil {
-					p.triggerPerImageReplenish(claimed.Image)
-					if claimed.ProfileColocate {
-						p.triggerColocatedWarmReplenish(WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: true})
-					}
-					return worker, nil
-				}
-				if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
-					slog.Warn("Idle worker claim was stale, retrying.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
-					continue
-				}
-				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
-				p.retireClaimedWorker(claimed, RetireReasonCrash, LifecycleOriginReserveFailure)
-				continue
-			}
-
-			// A sized request foreground-spawns a worker of the requested size here
-			// (the warm pool only ever spawns default/neutral shapes, which can't
-			// satisfy a concrete size). A DEFAULT request returns the no-idle miss;
-			// the no-warm-pool foreground spawn for default requests is driven one
-			// layer up in OrgReservedPool.AcquireWorker, which keeps this method's
-			// contract (and its tests) unchanged. Org/global cap is respected.
-			if assignment.Profile != nil &&
-				(missReason == configstore.WorkerClaimMissReasonNone || missReason == configstore.WorkerClaimMissReasonNoIdle) {
-				worker, spawnErr := p.foregroundSpawnReservedWorker(ctx, assignment)
-				if spawnErr != nil {
-					return nil, spawnErr
-				}
-				return worker, nil
-			}
-
-			p.recordWarmCapacityMiss(assignment, missReason)
-			return nil, NewWarmCapacityExhaustedErrorForReason(missReason, DefaultWarmCapacityRetryAfter)
-		}
-
-		p.mu.Lock()
-		if p.shuttingDown {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("pool is shutting down")
-		}
-
-		p.cleanDeadWorkersLocked()
-
-		// Runtime-store-less K8s mode uses the local worker map as its source
-		// of truth. Filter by assignment.Image so a per-org pin is honored: if
-		// the assignment names a specific image and no in-memory warm worker
-		// matches, fail fast with warm-capacity backpressure. Warm capacity is
-		// supplied by configured warm reconciliation rather than by the
-		// foreground user connection.
-		// Without this filter, a pinned org could be handed a default-image
-		// warm worker, and activation would fail with a DuckLake/extension
-		// version mismatch.
-		idle := p.findReservableWarmWorkerLocked(assignment.Image, assignment.Profile)
-		if idle != nil {
-			nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, assignment)
-			if err != nil {
-				p.mu.Unlock()
-				return nil, err
-			}
-			if err := idle.SetSharedState(nextState); err != nil {
-				p.mu.Unlock()
-				return nil, err
-			}
-			idle.SetOwnerCPInstanceID(p.cpInstanceID)
-			idle.IncrementOwnerEpoch()
-			idle.reservedAt = time.Now()
-			reservedRecord := p.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
-			shouldReplenish := p.shouldReplenishWarmCapacityLocked()
-			var replenishID int
-			if shouldReplenish {
-				replenishID = p.allocateBackgroundSpawnIDLocked()
-				p.spawning++
-			}
-			p.mu.Unlock()
-			_ = p.persistWorkerRecord(reservedRecord)
-
-			if err := p.checkReservedWorkerLiveness(ctx, idle); err != nil {
-				slog.Warn("Reserved warm worker failed liveness recheck.", "worker", idle.ID, "error", err)
-				p.retireWorkerWithReason(idle.ID, RetireReasonCrash, LifecycleOriginReserveFailure)
-				p.mu.Lock()
-				if shouldReplenish {
-					p.spawning--
-				}
-				p.mu.Unlock()
-				continue
-			}
-
-			if shouldReplenish {
-				p.spawnWarmWorkerBackground(replenishID, p.workerImage)
-			}
-			p.triggerPerImageReplenish(idle.image)
-			if idle.profile.Colocate {
-				p.triggerColocatedWarmReplenish(idle.profile)
-			}
-			return idle, nil
-		}
-
-		p.mu.Unlock()
-
-		// The production warm-pool teardown lives in the runtime-store branch above
-		// (it foreground-spawns for every request). This runtime-store-less branch
-		// is non-production (tests / standalone k8s); only a sized request
-		// foreground-spawns here, a default request still surfaces a no-idle miss.
-		if assignment.Profile != nil {
-			worker, spawnErr := p.foregroundSpawnReservedWorker(ctx, assignment)
+			// No reusable hot-idle worker for this org — spawn one on demand,
+			// sized from the request profile (or the pool-global default for a
+			// default request). spawnReservedWorker enforces the per-org + global
+			// caps via CreateSpawningWorkerSlot and returns the cap error at the
+			// ceiling.
+			worker, spawnErr := p.spawnReservedWorker(ctx, assignment)
 			if spawnErr != nil {
 				return nil, spawnErr
 			}
 			return worker, nil
 		}
 
-		p.recordWarmCapacityMiss(assignment, configstore.WorkerClaimMissReasonNoIdle)
-		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
-	}
-}
+		// Runtime-store-less mode (unit tests / standalone k8s): no durable pool,
+		// just spawn a worker on demand.
+		p.mu.Lock()
+		if p.shuttingDown {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("pool is shutting down")
+		}
+		p.cleanDeadWorkersLocked()
+		p.mu.Unlock()
 
-func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, reason configstore.WorkerClaimMissReason) {
-	// A server-side acquire wait polls every WarmAcquireRetryInterval; it sets
-	// this to record demand + the miss metric at most once per throttle interval
-	// rather than on every poll, so one waiting connection doesn't inflate the
-	// demand signal and miss counter ~Nx.
-	if assignment != nil && assignment.SuppressWarmMissRecord {
-		return
-	}
-	policy := warmCapacityMissPolicyForReason(reason)
-	image := ""
-	if assignment != nil {
-		image = strings.TrimSpace(assignment.Image)
-	}
-	if image == "" {
-		image = strings.TrimSpace(p.workerImage)
-	}
-	if image == "" {
-		return
-	}
-
-	observeWarmCapacityMiss(image, policy.reason)
-	if !policy.recordDynamicDemand {
-		return
-	}
-	if p.runtimeStore == nil {
-		return
-	}
-	scope := warmCapacityScopeForImage(image)
-	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
-		slog.Warn("Failed to record warm capacity miss.", "image", image, "reason", policy.reason, "error", err)
+		worker, spawnErr := p.spawnReservedWorker(ctx, assignment)
+		if spawnErr != nil {
+			return nil, spawnErr
+		}
+		return worker, nil
 	}
 }
 
@@ -1811,7 +1626,7 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 // from the request profile, or the pool-global default for a default (nil
 // profile) request (workerResourcesForProfile); the reserved record round-trips
 // the profile + TTL.
-func (p *K8sWorkerPool) foregroundSpawnReservedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
+func (p *K8sWorkerPool) spawnReservedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
 	if assignment == nil {
 		return nil, fmt.Errorf("spawnReservedWorker requires an assignment")
 	}
@@ -1843,7 +1658,7 @@ func (p *K8sWorkerPool) foregroundSpawnReservedWorker(ctx context.Context, assig
 			return nil, err
 		}
 		if slot == nil {
-			return nil, NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
+			return nil, NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
 		}
 		id = slot.WorkerID
 	} else {
@@ -1939,7 +1754,7 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	if assignment != nil && assignment.Profile != nil && assignment.Profile.TTL > 0 {
 		reuseTTL = assignment.Profile.TTL
 	}
-	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, Colocate: claimed.ProfileColocate, TTL: reuseTTL}
+	worker.profile = WorkerProfile{CPU: claimed.ProfileCPU, Memory: claimed.ProfileMemory, TTL: reuseTTL}
 	if worker.OwnerEpoch() > 0 && claimed.OwnerEpoch < worker.OwnerEpoch() {
 		currentEpoch := worker.OwnerEpoch()
 		p.mu.Unlock()
@@ -2016,9 +1831,9 @@ func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, e
 	if assignment.Image != "" && record.Image != assignment.Image {
 		return nil, fmt.Errorf("worker %d image mismatch (expected %q, got %q)", workerID, assignment.Image, record.Image)
 	}
-	if expCPU, expMem, expColo := assignment.Profile.Parts(); record.ProfileCPU != expCPU || record.ProfileMemory != expMem || record.ProfileColocate != expColo {
-		return nil, fmt.Errorf("worker %d profile mismatch (expected %s/%s/colocate=%v, got %s/%s/colocate=%v)",
-			workerID, expCPU, expMem, expColo, record.ProfileCPU, record.ProfileMemory, record.ProfileColocate)
+	if expCPU, expMem := assignment.Profile.Parts(); record.ProfileCPU != expCPU || record.ProfileMemory != expMem {
+		return nil, fmt.Errorf("worker %d profile mismatch (expected %s/%s, got %s/%s)",
+			workerID, expCPU, expMem, record.ProfileCPU, record.ProfileMemory)
 	}
 
 	return p.reserveClaimedWorker(ctx, record, assignment)
@@ -2061,10 +1876,9 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		// profile to the default and the next hot-idle persist dropped its
 		// cpu/mem/ttl, so a same-size request could no longer reuse it.
 		profile: WorkerProfile{
-			CPU:      claimed.ProfileCPU,
-			Memory:   claimed.ProfileMemory,
-			Colocate: claimed.ProfileColocate,
-			TTL:      time.Duration(claimed.TTLMinutes) * time.Minute,
+			CPU:    claimed.ProfileCPU,
+			Memory: claimed.ProfileMemory,
+			TTL:    time.Duration(claimed.TTLMinutes) * time.Minute,
 		},
 		done: make(chan struct{}),
 	}
@@ -2135,41 +1949,6 @@ func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podNam
 		return nil, fmt.Errorf("connect to claimed worker %s: %w", podName, err)
 	}
 	return client, nil
-}
-
-func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
-	if claimed == nil {
-		return
-	}
-	current := claimed
-	if p.runtimeStore != nil {
-		// Refresh the row so the snapshot we hand to retireClaimedWorker
-		// (and through it, lifecycle.RetireFromSnapshot) carries the
-		// latest updated_at — without this, an inter-spawn touch could
-		// CAS-miss even though we still own the row at the right epoch.
-		// We could rely solely on the CAS to fence (and it does), but
-		// the extra read is cheap and lets us short-circuit before
-		// scheduling pod cleanup against a moved row.
-		refreshed, err := p.runtimeStore.ObserveWorker(claimed.WorkerID)
-		switch {
-		case err != nil:
-			slog.Warn("Failed to refresh worker runtime row before retirement.",
-				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin, "error", err)
-		case refreshed == nil:
-			slog.Debug("Worker runtime row missing before retirement; skipping cleanup.",
-				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
-			return
-		default:
-			if refreshed.OwnerCPInstanceID() != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch() != claimed.OwnerEpoch {
-				slog.Debug("Worker ownership changed before retirement; skipping cleanup.",
-					"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
-				return
-			}
-			rec := refreshed.Record()
-			current = &rec
-		}
-	}
-	p.retireClaimedWorker(current, reason, origin)
 }
 
 func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
@@ -2298,373 +2077,12 @@ func validateReservedWorkerHealth(result *healthCheckResult) error {
 	return nil
 }
 
-// SpawnMinWorkers pre-warms the pool with count workers.
+// SpawnMinWorkers is a no-op for the K8s pool: there is no warm pool to
+// pre-spawn. Workers are created on demand per request (ReserveSharedWorker)
+// and reused while hot-idle until their TTL. Present only to satisfy the
+// WorkerPool interface (the process backend uses it for --process-min-workers).
 func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
-	if count <= 0 {
-		return nil
-	}
-
-	if p.runtimeStore != nil {
-		p.mu.Lock()
-		if count > p.minWorkers {
-			p.minWorkers = count
-		}
-		p.mu.Unlock()
-
-		// Claim all slots first, then spawn in parallel.
-		var slots []*configstore.WorkerRecord
-		for i := 0; i < count; i++ {
-			slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
-				p.cpInstanceID,
-				p.workerPodNamePrefix(),
-				p.workerImage,
-				"", "", false,
-				count,
-				p.maxWorkers,
-			)
-			if err != nil {
-				// Retire already-claimed slots so they don't strand
-				// as durable spawning rows with no pod behind them.
-				for _, s := range slots {
-					p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
-				}
-				return err
-			}
-			if slot == nil {
-				break
-			}
-			slots = append(slots, slot)
-		}
-
-		if len(slots) == 0 {
-			return nil
-		}
-
-		p.mu.Lock()
-		p.spawning += len(slots)
-		p.mu.Unlock()
-
-		ctx := context.Background()
-		var wg sync.WaitGroup
-		errs := make([]error, len(slots))
-		for i, slot := range slots {
-			wg.Add(1)
-			go func(i int, slot *configstore.WorkerRecord) {
-				defer wg.Done()
-				err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image, WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate})
-
-				p.mu.Lock()
-				p.spawning--
-				p.mu.Unlock()
-
-				if err != nil {
-					p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
-					errs[i] = err
-				}
-			}(i, slot)
-		}
-		wg.Wait()
-		return stderrors.Join(errs...)
-	}
-
-	p.mu.Lock()
-	if count > p.minWorkers {
-		p.minWorkers = count
-	}
-	p.cleanDeadWorkersLocked()
-
-	idleWarmCount := p.idleWarmWorkerCountLocked()
-	missing := count - idleWarmCount
-	if missing <= 0 {
-		p.mu.Unlock()
-		return nil
-	}
-
-	ids := make([]int, 0, missing)
-	for i := 0; i < missing; i++ {
-		ids = append(ids, p.allocateBackgroundSpawnIDLocked())
-		p.spawning++
-	}
-	p.mu.Unlock()
-
-	ctx := context.Background()
-
-	var wg sync.WaitGroup
-	errs := make([]error, len(ids))
-	for i, id := range ids {
-		wg.Add(1)
-		go func(i int, id int) {
-			defer wg.Done()
-			err := p.spawnWarmWorker(ctx, id, p.workerImage, WorkerProfile{})
-
-			p.mu.Lock()
-			p.spawning--
-			p.mu.Unlock()
-
-			errs[i] = err
-		}(i, id)
-	}
-	wg.Wait()
-	return stderrors.Join(errs...)
-}
-
-// triggerPerImageReplenish kicks off a background spawn for image if the
-// per-image warm floor isn't met. Fire-and-forget; the janitor catches any
-// we miss on its next 5s tick. Cuts the gap between consuming a pinned warm
-// worker and seeing a fresh one in its place from up-to-5s down to ~now.
-func (p *K8sWorkerPool) triggerPerImageReplenish(image string) {
-	if strings.TrimSpace(image) == "" || p.runtimeStore == nil {
-		return
-	}
-	p.mu.RLock()
-	target := p.perImageWarmTarget[image]
-	p.mu.RUnlock()
-	if target <= 0 {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
-		defer cancel()
-		if err := p.SpawnMinWorkersForImage(ctx, image, target); err != nil {
-			slog.Warn("Per-image warm replenish failed.", "image", image, "error", err)
-		}
-	}()
-}
-
-// SpawnMinWorkersForImage ensures at least count warm-idle workers exist for
-// the given image, additive to (and independent of) the cluster-default warm
-// pool managed by SpawnMinWorkers. Per-image floor lets a per-org image pin
-// always find a hot pod waiting instead of paying a cold spawn on first
-// connection.
-//
-// Image-aware DB count and the per-image advisory lock keep this safe for
-// concurrent reconcilers across multiple control planes.
-func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image string, count int) error {
-	if count <= 0 || strings.TrimSpace(image) == "" {
-		return nil
-	}
-	if p.runtimeStore == nil {
-		// Single-CP / no-runtime-store mode is not multi-tenant, so per-image
-		// pinning doesn't apply — caller's image == p.workerImage.
-		return nil
-	}
-
-	p.mu.Lock()
-	if p.shuttingDown {
-		p.mu.Unlock()
-		return nil
-	}
-	p.cleanDeadWorkersLocked()
-	idleByImage := p.idleWarmWorkerCountByImageLocked()
-	missing := count - idleByImage[image]
-	if missing <= 0 {
-		p.mu.Unlock()
-		return nil
-	}
-	// Exclusive-only room: this spawns default-shape (exclusive) warm workers,
-	// so colocated workers must not shrink the budget — consistent with the
-	// exclusive-only DB-side global cap in CreateNeutralWarmWorkerSlotForImage.
-	if p.maxWorkers > 0 {
-		room := p.maxWorkers - p.liveExclusiveWorkerCountLocked()
-		if room <= 0 {
-			p.mu.Unlock()
-			return nil
-		}
-		if missing > room {
-			missing = room
-		}
-	}
-	p.mu.Unlock()
-
-	var slots []*configstore.WorkerRecord
-	for i := 0; i < missing; i++ {
-		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlotForImage(
-			p.cpInstanceID,
-			p.workerPodNamePrefix(),
-			image,
-			count,
-			p.maxWorkers,
-		)
-		if err != nil {
-			for _, s := range slots {
-				p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
-			}
-			return err
-		}
-		if slot == nil {
-			break
-		}
-		slots = append(slots, slot)
-	}
-
-	if len(slots) == 0 {
-		return nil
-	}
-
-	p.mu.Lock()
-	p.spawning += len(slots)
-	p.mu.Unlock()
-
-	var wg sync.WaitGroup
-	errs := make([]error, len(slots))
-	for i, slot := range slots {
-		wg.Add(1)
-		go func(i int, slot *configstore.WorkerRecord) {
-			defer wg.Done()
-			err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image, WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate})
-
-			p.mu.Lock()
-			p.spawning--
-			p.mu.Unlock()
-
-			if err != nil {
-				p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
-				errs[i] = err
-			}
-		}(i, slot)
-	}
-	wg.Wait()
-	return stderrors.Join(errs...)
-}
-
-// idleColocatedWarmWorkerCountLocked counts warm-idle workers matching the given
-// colocated shape. Caller holds p.mu.
-func (p *K8sWorkerPool) idleColocatedWarmWorkerCountLocked(profile WorkerProfile) int {
-	want := profile.MatchKey()
-	count := 0
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if w.profile.MatchKey() != want {
-			continue
-		}
-		if p.isWarmIdleWorkerLocked(w) {
-			count++
-		}
-	}
-	return count
-}
-
-// SpawnMinColocatedWorkers ensures at least `target` warm-idle workers of the
-// given colocated shape (default image) exist, so a matching colocate=true
-// request bursts into a ready pod instead of paying a cold spawn. Mirrors
-// SpawnMinWorkersForImage but for a specific colocated shape; a no-op without a
-// runtime store, an incomplete/non-colocated shape, or target <= 0.
-func (p *K8sWorkerPool) SpawnMinColocatedWorkers(ctx context.Context, profile WorkerProfile, target int) error {
-	if target <= 0 || p.runtimeStore == nil || profile.CPU == "" || profile.Memory == "" || !profile.Colocate {
-		return nil
-	}
-
-	p.mu.Lock()
-	if p.shuttingDown {
-		p.mu.Unlock()
-		return nil
-	}
-	p.cleanDeadWorkersLocked()
-	missing := target - p.idleColocatedWarmWorkerCountLocked(profile)
-	if missing <= 0 {
-		p.mu.Unlock()
-		return nil
-	}
-	// No exclusive worker-count cap here: colocated workers bin-pack and are
-	// intentionally unbounded (the DB-side global cap is exclusive-only and
-	// skips colocated too). `missing` is already bounded by this shape's warm
-	// target, and CreateNeutralWarmWorkerSlot enforces that target per shape,
-	// so the spawn loop self-limits without consulting p.maxWorkers.
-	p.mu.Unlock()
-
-	var slots []*configstore.WorkerRecord
-	for i := 0; i < missing; i++ {
-		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
-			p.cpInstanceID,
-			p.workerPodNamePrefix(),
-			p.workerImage,
-			profile.CPU,
-			profile.Memory,
-			profile.Colocate,
-			target,
-			p.maxWorkers,
-		)
-		if err != nil {
-			for _, s := range slots {
-				p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
-			}
-			return err
-		}
-		if slot == nil {
-			break
-		}
-		slots = append(slots, slot)
-	}
-
-	if len(slots) == 0 {
-		return nil
-	}
-
-	p.mu.Lock()
-	p.spawning += len(slots)
-	p.mu.Unlock()
-
-	var wg sync.WaitGroup
-	errs := make([]error, len(slots))
-	for i, slot := range slots {
-		wg.Add(1)
-		go func(i int, slot *configstore.WorkerRecord) {
-			defer wg.Done()
-			err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image, WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate})
-
-			p.mu.Lock()
-			p.spawning--
-			p.mu.Unlock()
-
-			if err != nil {
-				p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
-				errs[i] = err
-			}
-		}(i, slot)
-	}
-	wg.Wait()
-	return stderrors.Join(errs...)
-}
-
-// reconcileColocatedWarm tops every configured colocated warm shape up to its
-// target. Called from the periodic warm-capacity reconcile.
-func (p *K8sWorkerPool) reconcileColocatedWarm(ctx context.Context) {
-	for _, shape := range p.colocatedWarmShapes {
-		profile := WorkerProfile{CPU: shape.CPU, Memory: shape.Memory, Colocate: true}
-		if err := p.SpawnMinColocatedWorkers(ctx, profile, shape.Target); err != nil {
-			slog.Warn("Colocated warm reconcile failed.", "cpu", shape.CPU, "memory", shape.Memory, "target", shape.Target, "error", err)
-		}
-	}
-}
-
-// triggerColocatedWarmReplenish tops the just-claimed colocated shape's warm pool
-// back up in the background, so the next matching request still finds a ready pod.
-// A no-op if the claimed shape isn't a configured warm shape.
-func (p *K8sWorkerPool) triggerColocatedWarmReplenish(profile WorkerProfile) {
-	if p.runtimeStore == nil {
-		return
-	}
-	target := 0
-	for _, shape := range p.colocatedWarmShapes {
-		if shape.CPU == profile.CPU && shape.Memory == profile.Memory {
-			target = shape.Target
-			break
-		}
-	}
-	if target <= 0 {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
-		defer cancel()
-		if err := p.SpawnMinColocatedWorkers(ctx, profile, target); err != nil {
-			slog.Warn("Colocated warm replenish failed.", "cpu", profile.CPU, "memory", profile.Memory, "error", err)
-		}
-	}()
+	return nil
 }
 
 // HealthCheckLoop periodically checks worker health.
@@ -2715,7 +2133,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						delete(failures, lease)
 						mu.Unlock()
 
-						removedWorker, workerCount, replacementID, shouldReplenish, err := p.removeWorkerAfterDrainedLease(lease, LifecycleOriginWorkerDrain)
+						removedWorker, workerCount, err := p.removeWorkerAfterDrainedLease(lease, LifecycleOriginWorkerDrain)
 						if err != nil {
 							slog.Error("K8s worker terminated after draining but retire CAS failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
 							return
@@ -2725,9 +2143,6 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							slog.Info("K8s worker terminated after draining.", "id", lease.workerID)
 							if removedWorker.client != nil {
 								_ = removedWorker.client.Close()
-							}
-							if shouldReplenish {
-								p.spawnWarmWorkerBackground(replacementID, p.workerImage)
 							}
 							return
 						}
@@ -2757,7 +2172,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						}
 
 						p.mu.Lock()
-						removedWorker, workerCount, replacementID, shouldReplenish = p.removeWorkerAfterLostLeaseLocked(lease)
+						removedWorker, workerCount = p.removeWorkerAfterLostLeaseLocked(lease)
 						p.mu.Unlock()
 						if removedWorker == nil {
 							return
@@ -2777,9 +2192,6 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							GracePeriodSeconds: int64Ptr(0),
 						})
 						delCancel()
-						if shouldReplenish {
-							p.spawnWarmWorkerBackground(replacementID, p.workerImage)
-						}
 					default:
 						// Worker alive, do health check
 						var healthErr error
@@ -2860,7 +2272,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 								}
 
 								p.mu.Lock()
-								removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerAfterLostLeaseLocked(lease)
+								removedWorker, workerCount := p.removeWorkerAfterLostLeaseLocked(lease)
 								p.mu.Unlock()
 								if removedWorker == nil {
 									return
@@ -2878,9 +2290,6 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 								})
 								if removedWorker.client != nil {
 									_ = removedWorker.client.Close()
-								}
-								if shouldReplenish {
-									p.spawnWarmWorkerBackground(replacementID, p.workerImage)
 								}
 							}
 						} else {
@@ -3155,7 +2564,7 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 	})
 
 	for _, c := range candidates {
-		if idleCount <= p.minWorkers {
+		if idleCount <= 0 {
 			break
 		}
 		{
@@ -3218,14 +2627,6 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 		}
 	}
 
-	var spawnIDs []int
-	for range toRetire {
-		if p.shouldReplenishWarmCapacityLocked() {
-			id := p.allocateBackgroundSpawnIDLocked()
-			p.spawning++
-			spawnIDs = append(spawnIDs, id)
-		}
-	}
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 
@@ -3234,9 +2635,6 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 		observeControlPlaneWorkers(workerCount)
 		for _, entry := range toRetire {
 			go p.retireWorkerPod(entry.id, entry.w)
-		}
-		for _, id := range spawnIDs {
-			p.spawnWarmWorkerBackground(id, p.workerImage)
 		}
 	}
 }
@@ -3341,36 +2739,12 @@ func (p *K8sWorkerPool) liveWorkerCountLocked() int {
 	return count
 }
 
-// liveExclusiveWorkerCountLocked counts only the live workers that consume the
-// exclusive worker-count budget: every non-colocated worker plus in-flight
-// background (default-shape) spawns. Colocated workers bin-pack and are
-// intentionally unbounded, so they must not be charged against the cap — this
-// mirrors the exclusive-only count used by the DB-side cap checks.
-func (p *K8sWorkerPool) liveExclusiveWorkerCountLocked() int {
-	count := p.spawning
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if w.profile.Colocate {
-			continue
-		}
-		count++
-	}
-	return count
-}
-
 func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
-	var spawnIDs []int
 	removedAny := false
 	for id, w := range p.workers {
 		select {
 		case <-w.done:
 			var removedWorker *ManagedWorker
-			var replacementID int
-			var shouldReplenish bool
 			deletePod := true
 			if p.runtimeStore != nil {
 				lease := p.workerLeaseSnapshot(w)
@@ -3391,11 +2765,6 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 					delete(p.workers, id)
 					removedWorker = w
 					deletePod = false
-					if p.shouldReplenishWarmCapacityLocked() {
-						replacementID = p.allocateBackgroundSpawnIDLocked()
-						p.spawning++
-						shouldReplenish = true
-					}
 				} else {
 					// cleanDeadWorkersLocked sweeps for pods whose informer
 					// fired w.done — cluster-driven termination (eviction,
@@ -3415,15 +2784,12 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 					}
 				}
 			} else {
-				removedWorker, _, replacementID, shouldReplenish = p.removeWorkerLocked(id)
+				removedWorker, _ = p.removeWorkerLocked(id)
 			}
 			if removedWorker == nil {
 				continue
 			}
 			removedAny = true
-			if shouldReplenish {
-				spawnIDs = append(spawnIDs, replacementID)
-			}
 			if removedWorker.client != nil {
 				go func(c *flightsql.Client) { _ = c.Close() }(removedWorker.client)
 			}
@@ -3444,9 +2810,6 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	}
 	if removedAny {
 		observeControlPlaneWorkers(len(p.workers))
-		for _, id := range spawnIDs {
-			go p.spawnWarmWorkerBackground(id, p.workerImage)
-		}
 	}
 }
 
@@ -3456,16 +2819,6 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 // When set, limits are equal to requests (Guaranteed QoS).
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	return p.workerResourcesForProfile(WorkerProfile{})
-}
-
-// nodeSelectorForProfile returns the node selector a worker of the given profile
-// should schedule onto: the colocated (bin-pack) selector for a colocated
-// profile, otherwise the default pool selector.
-func (p *K8sWorkerPool) nodeSelectorForProfile(profile WorkerProfile) map[string]string {
-	if profile.Colocate {
-		return p.colocatedWorkerNodeSelector
-	}
-	return p.workerNodeSelector
 }
 
 // workerResourcesForProfile builds the pod resource requirements for a worker of
@@ -3521,26 +2874,20 @@ func (p *K8sWorkerPool) allocateBackgroundSpawnIDLocked() int {
 	return p.allocateWorkerIDLocked()
 }
 
-func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bool) {
+func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int) {
 	w, ok := p.workers[id]
 	if !ok {
-		return nil, len(p.workers), 0, false
+		return nil, len(p.workers)
 	}
 	// Reached from cleanDeadWorkersLocked's no-runtime-store fallback
 	// (informer fired w.done). Not the periodic health-check path —
 	// that goes through markWorkerLostForHealthLease above and never
 	// calls into here.
 	if !p.markWorkerRetiredLocked(w, RetireReasonCrash, LifecycleOriginInformerCrash) {
-		return nil, len(p.workers), 0, false
+		return nil, len(p.workers)
 	}
 	delete(p.workers, id)
-	workerCount := len(p.workers)
-	if !p.shouldReplenishWarmCapacityLocked() {
-		return w, workerCount, 0, false
-	}
-	replacementID := p.allocateBackgroundSpawnIDLocked()
-	p.spawning++
-	return w, workerCount, replacementID, true
+	return w, len(p.workers)
 }
 
 type workerLeaseSnapshot struct {
@@ -3771,12 +3118,12 @@ func (p *K8sWorkerPool) markWorkerDrainingFromHealth(lease workerLeaseSnapshot) 
 	durableVerified = true
 }
 
-func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot, origin LifecycleOrigin) (*ManagedWorker, int, int, bool, error) {
+func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot, origin LifecycleOrigin) (*ManagedWorker, int, error) {
 	p.mu.RLock()
 	w, ok := p.workers[lease.workerID]
 	if !ok || !p.workerMatchesLease(w, lease) || w.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
 		p.mu.RUnlock()
-		return nil, 0, 0, false, nil
+		return nil, 0, nil
 	}
 	p.mu.RUnlock()
 
@@ -3784,10 +3131,10 @@ func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot,
 	if lc != nil {
 		retired, err := p.retireLocalDrainingLease(lease, RetireReasonNormal, origin)
 		if err != nil {
-			return nil, 0, 0, false, err
+			return nil, 0, err
 		}
 		if !retired {
-			return nil, 0, 0, false, nil
+			return nil, 0, nil
 		}
 	}
 
@@ -3795,19 +3142,11 @@ func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot,
 	defer p.mu.Unlock()
 	current, ok := p.workers[lease.workerID]
 	if !ok || !p.workerMatchesLease(current, lease) || current.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
-		return nil, 0, 0, false, nil
+		return nil, 0, nil
 	}
 	p.markWorkerRetiredInMemoryLocked(current)
 	delete(p.workers, current.ID)
-	workerCount := len(p.workers)
-	replacementID := 0
-	shouldReplenish := false
-	if p.shouldReplenishWarmCapacityLocked() {
-		replacementID = p.allocateBackgroundSpawnIDLocked()
-		p.spawning++
-		shouldReplenish = true
-	}
-	return current, workerCount, replacementID, shouldReplenish, nil
+	return current, len(p.workers), nil
 }
 
 func (p *K8sWorkerPool) retireLocalDrainingLease(lease workerLeaseSnapshot, reason string, origin LifecycleOrigin) (bool, error) {
@@ -3866,20 +3205,14 @@ func (p *K8sWorkerPool) retireLocalDrainingLease(lease workerLeaseSnapshot, reas
 		record.State == configstore.WorkerStateRetired, nil
 }
 
-func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {
+func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int) {
 	current, ok := p.workers[lease.workerID]
 	if !ok || !p.workerMatchesLease(current, lease) {
-		return nil, len(p.workers), 0, false
+		return nil, len(p.workers)
 	}
 	p.markWorkerRetiredInMemoryLocked(current)
 	delete(p.workers, current.ID)
-	workerCount := len(p.workers)
-	if !p.shouldReplenishWarmCapacityLocked() {
-		return current, workerCount, 0, false
-	}
-	replacementID := p.allocateBackgroundSpawnIDLocked()
-	p.spawning++
-	return current, workerCount, replacementID, true
+	return current, len(p.workers)
 }
 
 func (p *K8sWorkerPool) dropLocalWorkerIfSameLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int) {
@@ -3899,128 +3232,6 @@ func (p *K8sWorkerPool) isWarmIdleWorkerLocked(w *ManagedWorker) bool {
 	return w.activeSessions == 0 && p.isGenericSessionSchedulableWorkerLocked(w)
 }
 
-// findReservableWarmWorkerLocked returns a warm-idle worker that is safe to
-// reserve. When image is non-empty, only workers whose image matches are
-// considered — used by ReserveSharedWorker so per-org image pins aren't
-// silently bypassed when the in-memory map and runtime store disagree.
-// Pass "" to skip the image filter (legacy non-pinned callers). The profile
-// filter always applies: a request only reuses a warm worker of the same shape
-// (nil profile == the default/zero shape, which is what warm workers carry).
-func (p *K8sWorkerPool) findReservableWarmWorkerLocked(image string, profile *WorkerProfile) *ManagedWorker {
-	want := profile.MatchKey()
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if image != "" && w.image != image {
-			continue
-		}
-		if w.profile.MatchKey() != want {
-			continue
-		}
-		if p.isWarmIdleWorkerLocked(w) {
-			return w
-		}
-	}
-	return nil
-}
-
-func (p *K8sWorkerPool) idleWarmWorkerCountLocked() int {
-	count := 0
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if p.isWarmIdleWorkerLocked(w) {
-			count++
-		}
-	}
-	return count
-}
-
-// idleWarmWorkerCountByImageLocked returns warm-idle counts bucketed by the
-// image each worker was spawned with. Used by the per-image warm floor to
-// decide whether to spawn a new worker of a specific pinned image.
-func (p *K8sWorkerPool) idleWarmWorkerCountByImageLocked() map[string]int {
-	// Only DEFAULT-shape workers count toward the per-image warm target. Colocated
-	// workers share p.workerImage but belong to their own warm pool; counting them
-	// here would starve the exclusive per-image pool. Mirrors the SQL filter in
-	// countNeutralWarmWorkersForImage.
-	defaultKey := (&WorkerProfile{}).MatchKey()
-	counts := make(map[string]int)
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if w.profile.MatchKey() != defaultKey {
-			continue
-		}
-		if p.isWarmIdleWorkerLocked(w) {
-			counts[w.image]++
-		}
-	}
-	return counts
-}
-
-func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
-	if p.runtimeStore != nil {
-		return false
-	}
-	if p.minWorkers <= 0 {
-		return false
-	}
-	if p.idleWarmWorkerCountLocked() >= p.minWorkers {
-		return false
-	}
-	liveCount := p.liveWorkerCountLocked()
-	return p.maxWorkers == 0 || liveCount < p.maxWorkers
-}
-
-func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image string, profile WorkerProfile) error {
-	if id <= 0 && p.runtimeStore != nil {
-		if image == "" {
-			image = p.workerImage
-		}
-		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
-			p.cpInstanceID,
-			p.workerPodNamePrefix(),
-			image,
-			profile.CPU,
-			profile.Memory,
-			profile.Colocate,
-			p.minWorkers,
-			p.maxWorkers,
-		)
-		if err != nil {
-			observeSpawnFailure(SpawnFailureReasonRuntimeStore, image)
-			return err
-		}
-		if slot == nil {
-			return nil
-		}
-		id = slot.WorkerID
-		image = slot.Image
-		profile = WorkerProfile{CPU: slot.ProfileCPU, Memory: slot.ProfileMemory, Colocate: slot.ProfileColocate}
-	}
-	if p.spawnWarmWorkerFunc != nil {
-		return p.spawnWarmWorkerFunc(ctx, id)
-	}
-	return p.spawnWorker(ctx, id, image, profile, true)
-}
-
-func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {
-	if p.spawnWarmWorkerBackgroundFunc != nil {
-		p.spawnWarmWorkerBackgroundFunc(id)
-		return
-	}
-	go p.spawnWorkerBackground(id, image)
-}
 
 // markWorkerRetiredLocked is the in-memory retire wrapper for paths
 // that bypass the WorkerLifecycle CAS service: it upserts the durable
@@ -4167,7 +3378,6 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	}
 	record.ProfileCPU = worker.profile.CPU
 	record.ProfileMemory = worker.profile.Memory
-	record.ProfileColocate = worker.profile.Colocate
 	record.TTLMinutes = int(worker.profile.TTL.Minutes())
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
@@ -4264,51 +3474,6 @@ func (p *K8sWorkerPool) SetWorkerResources(cpu, memory string) {
 	p.workerMemoryRequest = memory
 }
 
-// SetWarmCapacityTarget updates the number of neutral idle workers the shared
-// pool should try to keep available. Scale-down is handled lazily by the idle reaper.
-func (p *K8sWorkerPool) SetWarmCapacityTarget(n int) {
-	if n < 0 {
-		n = 0
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.minWorkers = n
-}
-
-func (p *K8sWorkerPool) WarmCapacityTarget() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.minWorkers
-}
-
-// SetPerImageWarmTargets replaces the per-image warm-worker floor. Each entry
-// asks the pool to keep at least N warm-idle workers running with the given
-// image. This is layered on top of SetWarmCapacityTarget — the per-image floor
-// guarantees coverage for pinned org images that wouldn't otherwise be served
-// by the cluster-default warm pool. Pass an empty map to disable.
-func (p *K8sWorkerPool) SetPerImageWarmTargets(targets map[string]int) {
-	clean := make(map[string]int, len(targets))
-	for image, n := range targets {
-		if image == "" || n <= 0 {
-			continue
-		}
-		clean[image] = n
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.perImageWarmTarget = clean
-}
-
-// PerImageWarmTargets returns a snapshot of the per-image warm floor.
-func (p *K8sWorkerPool) PerImageWarmTargets() map[string]int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := make(map[string]int, len(p.perImageWarmTarget))
-	for k, v := range p.perImageWarmTarget {
-		out[k] = v
-	}
-	return out
-}
 
 func boolPtr(b bool) *bool    { return &b }
 func int64Ptr(i int64) *int64 { return &i }

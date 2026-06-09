@@ -4,25 +4,12 @@ package controlplane
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
-
-// isRetryableWarmMiss reports whether a worker-acquire error is a transient
-// "no idle warm worker" miss — the only capacity miss that resolves on its own
-// once the warm pool replenishes. Org/global-cap and shutdown misses are not
-// retried (waiting won't change them).
-func isRetryableWarmMiss(err error) bool {
-	var capErr *WarmCapacityExhaustedError
-	if !errors.As(err, &capErr) {
-		return false
-	}
-	return capErr.missReason() == configstore.WorkerClaimMissReasonNoIdle
-}
 
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
@@ -34,51 +21,23 @@ type OrgReservedPool struct {
 	image                  string
 	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
-	// Per-org colocated resource caps. A count-based maxWorkers is insufficient
-	// when colocated pods vary in size, so colocated CPU/memory is also bounded.
-	// 0 = unbounded on that axis. Only colocated workers count against these.
-	maxColocatedCPU      int
-	maxColocatedMemBytes uint64
 	// gate serializes the slow acquisition path (no idle worker → claim/spawn) in
 	// FIFO arrival order, so the next worker to become available goes to the
 	// earliest waiting connection and a later one cannot snatch it.
 	gate *orgAcquireGate
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker, maxColocatedCPU int, maxColocatedMemBytes uint64) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
-		shared:               shared,
-		orgID:                orgID,
-		maxWorkers:           maxWorkers,
-		image:                image,
-		stsBroker:            stsBroker,
-		maxColocatedCPU:      maxColocatedCPU,
-		maxColocatedMemBytes: maxColocatedMemBytes,
-		gate:                 newOrgAcquireGate(),
+		shared:     shared,
+		orgID:      orgID,
+		maxWorkers: maxWorkers,
+		image:      image,
+		stsBroker:  stsBroker,
+		gate:       newOrgAcquireGate(),
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
 	return pool
-}
-
-// assignedColocatedResourcesLocked sums the CPU (cores) and memory (bytes) of
-// this org's currently-assigned colocated workers. Caller holds p.shared.mu.
-func (p *OrgReservedPool) assignedColocatedResourcesLocked() (cpu int, memBytes uint64) {
-	for _, w := range p.shared.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
-			continue
-		}
-		if !p.workerBelongsToOrgLocked(w) || !w.profile.Colocate {
-			continue
-		}
-		cpu += parseK8sCPU(w.profile.CPU)
-		memBytes += parseK8sMemory(w.profile.Memory)
-	}
-	return cpu, memBytes
 }
 
 func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
@@ -106,9 +65,6 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	}
 	defer p.gate.release()
 
-	// Throttle warm-miss recording (the miss is still recorded for demand metrics
-	// even though we now foreground-spawn rather than wait for a replenish).
-	var lastWarmMissAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -126,79 +82,29 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 			p.shared.mu.Unlock()
 			return nil, fmt.Errorf("pool is shutting down")
 		}
-		// Resource-aware quota for colocated workers: a new colocated worker must
-		// not push the org over its colocated CPU/memory budget. (The count cap is
-		// enforced authoritatively, cross-CP, inside ReserveSharedWorker's claim,
-		// which exempts colocated workers; the CPU/mem budget is enforced here.)
-		if profile != nil && profile.Colocate && (p.maxColocatedCPU > 0 || p.maxColocatedMemBytes > 0) {
-			curCPU, curMem := p.assignedColocatedResourcesLocked()
-			reqCPU, reqMem := parseK8sCPU(profile.CPU), parseK8sMemory(profile.Memory)
-			if (p.maxColocatedCPU > 0 && curCPU+reqCPU > p.maxColocatedCPU) ||
-				(p.maxColocatedMemBytes > 0 && curMem+reqMem > p.maxColocatedMemBytes) {
-				p.shared.mu.Unlock()
-				observeOrgColocatedQuotaRejection(p.orgID)
-				return nil, ErrOrgResourceQuotaExceeded
-			}
-		}
 		maxWorkers := p.maxWorkers
 		image := p.image
 		p.shared.mu.Unlock()
 
-		// While waiting (below) we poll every WarmAcquireRetryInterval, but record
-		// the warm miss (demand + metric) at most once per WarmMissRecordInterval
-		// so one waiting connection doesn't inflate the demand signal / miss counter.
-		recordMiss := lastWarmMissAt.IsZero() || time.Since(lastWarmMissAt) >= WarmMissRecordInterval
+		// At the org's max concurrent workers with all busy → fail fast with the
+		// clear org-cap message; waiting cannot help (no new worker will spawn).
+		if p.atOrgWorkerCap() {
+			return nil, NewWorkerCapacityExhaustedErrorForReason(
+				configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
+		}
 
+		// Under cap: reuse a hot-idle worker for this org, or spawn one on demand.
+		// ReserveSharedWorker re-checks the org/global cap authoritatively
+		// (CreateSpawningWorkerSlot, cross-CP) and returns the reason-specific cap
+		// error; an org/global-cap or shutdown error won't resolve by waiting.
 		worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-			OrgID:                  p.orgID,
-			MaxWorkers:             maxWorkers,
-			Image:                  image,
-			Profile:                profile,
-			MaxColocatedCPU:        p.maxColocatedCPU,
-			MaxColocatedMemBytes:   p.maxColocatedMemBytes,
-			SuppressWarmMissRecord: !recordMiss,
+			OrgID:      p.orgID,
+			MaxWorkers: maxWorkers,
+			Image:      image,
+			Profile:    profile,
 		})
 		if err != nil {
-			if recordMiss {
-				lastWarmMissAt = time.Now()
-			}
-			// An org/global-cap or shutdown miss will NOT resolve by waiting —
-			// surface it immediately with its clear, reason-specific message.
-			if !isRetryableWarmMiss(err) {
-				return nil, err
-			}
-			// A retryable "no idle warm worker" miss: distinguish two cases.
-			//   - At the org's max concurrent (exclusive) workers and all busy →
-			//     waiting cannot help (no new worker will spawn); fail fast with the
-			//     clear org-cap message so the client knows it hit its own limit.
-			//     This also makes the contract hold without a runtime store, whose
-			//     in-memory claim cannot itself classify the miss as org-cap.
-			//   - Under the cap → a worker is (being) spawned, so hold up to
-			//     warmAcquireTimeout for it rather than bouncing the client. Applies
-			//     to default/exclusive requests too, not just colocated.
-			isColocated := profile != nil && profile.Colocate
-			if !isColocated && p.atOrgWorkerCap() {
-				return nil, NewWarmCapacityExhaustedErrorForReason(
-					configstore.WorkerClaimMissReasonOrgCap, DefaultWarmCapacityRetryAfter)
-			}
-			// No warm pool: foreground-spawn a worker for this request instead of
-			// waiting for a warm replenish that will never come. A sized request
-			// already foreground-spawned inside ReserveSharedWorker (so it returned a
-			// worker, not this miss); this path covers default requests. The spawn
-			// re-checks the org/global cap (CreateSpawningWorkerSlot) and reserves the
-			// worker, which then activates below.
-			worker, err = p.shared.foregroundSpawnReservedWorker(ctx, &WorkerAssignment{
-				OrgID:                p.orgID,
-				MaxWorkers:           maxWorkers,
-				Image:                image,
-				Profile:              profile,
-				MaxColocatedCPU:      p.maxColocatedCPU,
-				MaxColocatedMemBytes: p.maxColocatedMemBytes,
-			})
-			if err != nil {
-				return nil, err
-			}
-			// worker is now a freshly reserved worker; fall through to activation.
+			return nil, err
 		}
 
 		if err := p.activateWorkerForOrg(ctx, worker); err != nil {
@@ -223,9 +129,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 }
 
 // atOrgWorkerCap reports whether the org has reached its maximum concurrent
-// exclusive workers (count cap). Hot-idle and colocated workers are excluded
-// (they don't consume the count budget), so a true result means every counted
-// worker is actively assigned — a new exclusive worker cannot be added.
+// workers (count cap). Hot-idle workers are excluded (they don't consume the
+// count budget), so a true result means every counted worker is actively
+// assigned — a new worker cannot be added.
 func (p *OrgReservedPool) atOrgWorkerCap() bool {
 	p.shared.mu.Lock()
 	defer p.shared.mu.Unlock()
@@ -328,8 +234,8 @@ func (p *OrgReservedPool) findIdleAssignedWorkerLocked(profile *WorkerProfile) *
 			continue
 		default:
 		}
-		// Only reuse a worker of the requested shape — a colocated request must
-		// not land on a default/exclusive worker (and vice versa).
+		// Only reuse a worker of the requested shape — a differently-sized
+		// request must not land on a worker of another shape (and vice versa).
 		if w.profile.MatchKey() != want {
 			continue
 		}
@@ -353,11 +259,6 @@ func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 		// against maxWorkers so AcquireWorker can reach ReserveSharedWorker
 		// and ClaimHotIdleWorker.
 		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
-			continue
-		}
-		// Colocated workers are unbounded and must not consume the exclusive
-		// worker budget that maxWorkers governs.
-		if w.profile.Colocate {
 			continue
 		}
 		if p.workerBelongsToOrgLocked(w) {

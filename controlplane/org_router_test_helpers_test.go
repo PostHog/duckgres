@@ -18,5 +18,4 @@ func (m *mockOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig, boo
 }
 
 func (m *mockOrgRouter) IsMigratingForOrg(_ string) bool { return false }
-func (m *mockOrgRouter) SetWarmCapacityTarget(_ int)     {}
 func (m *mockOrgRouter) ShutdownAll()                    {}

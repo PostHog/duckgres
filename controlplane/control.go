@@ -112,14 +112,6 @@ type K8sConfig struct {
 	ImagePullPolicy                 string        // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 	ServiceAccount                  string        // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
 	MaxWorkers                      int           // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
-	SharedWarmTarget                int           // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	DynamicWarmCapacityEnabled      bool          // Enable configstore-driven dynamic warm-capacity target computation
-	WarmCapacityMissWindow          time.Duration // Window of recent no-idle misses that contributes to dynamic targets
-	WarmAcquireTimeout              time.Duration // Server-side block window for a session-acquire that misses the warm pool (0 = fail fast)
-	WarmCapacityMissesPerWorker     int           // Number of recent misses that translate to one extra warm worker
-	WarmCapacityDemandTTL           time.Duration // Retention TTL for warm-capacity miss buckets
-	WarmCapacityDynamicImageCeiling int           // Max dynamic extra warm workers per image (0 = unlimited)
-	WarmCapacityDynamicTotalCeiling int           // Max dynamic extra warm workers across images (0 = unlimited)
 	WorkerCPURequest                string        // CPU request for worker pods (e.g., "500m")
 	WorkerMemoryRequest             string        // Memory request for worker pods (e.g., "1Gi")
 	WorkerNodeSelector              string        // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
@@ -139,47 +131,15 @@ type K8sConfig struct {
 	PlaceholderMemory            string // Memory request per placeholder pod (default: worker default memory)
 	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName
 
-	// Connection-string worker-profile selection (duckgres.colocate / worker_cpu /
-	// worker_memory / worker_tier). All default to the off/empty state, so absent
-	// config = today's exclusive behavior. See docs/design/connection-string-worker-profile.md.
-	AllowClientWorkerProfile       bool                         // Master gate: honor duckgres.* startup options at all
-	AllowClientExclusiveNode       bool                         // Permit a client to request colocate=false (a full exclusive node)
-	ColocatedWorkerCPURequest      string                       // Default CPU for colocate=true with no size (e.g. "4")
-	ColocatedWorkerMemoryRequest   string                       // Default memory for colocate=true with no size (e.g. "16Gi")
-	ColocatedWarmShapes            []ColocatedWarmShape         // Colocated shapes to keep warm (each {cpu,memory,target}); empty = no colocated warm pool
-	ColocatedWorkerNodeSelector    string                       // JSON nodeSelector for colocated (bin-pack) worker pods
-	ColocatedWorkerTolerationKey   string                       // Taint key for colocated worker pod NoSchedule toleration
-	ColocatedWorkerTolerationValue string                       // Taint value for colocated worker pod NoSchedule toleration
-	WorkerProfileMinCPU            string                       // Clamp floor for a client-supplied cpu (e.g. "1")
-	WorkerProfileMaxCPU            string                       // Clamp ceiling for a client-supplied cpu (e.g. "16")
-	WorkerProfileMinMemory         string                       // Clamp floor for a client-supplied memory (e.g. "4Gi")
-	WorkerProfileMaxMemory         string                       // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
-	WorkerMaxTTL                   time.Duration                // Clamp ceiling for a client-supplied duckgres.worker_ttl (0 = unbounded)
-	OrgMaxColocatedCPU             int                          // Per-org cap on summed colocated worker CPU cores (0 = unbounded)
-	OrgMaxColocatedMemory          string                       // Per-org cap on summed colocated worker memory (e.g. "256Gi")
-	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier
-}
-
-// ColocatedWarmShape is one colocated pod shape the control plane keeps warm:
-// `target` idle bin-packed workers of {CPU, Memory}. The warm pool is shape-aware
-// so distinct client shapes (e.g. 4/16 default and 8/48 for Iceberg orgs) each
-// get a ready pod. CPU/Memory must be canonical k8s quantities matching what the
-// resolver normalizes a client request to (e.g. "4", "16Gi"), or the warm worker
-// won't match.
-type ColocatedWarmShape struct {
-	CPU    string `json:"cpu"`
-	Memory string `json:"memory"`
-	Target int    `json:"target"`
-}
-
-// WorkerProfileSpec is a named tier alias: a preset {cpu, memory, colocate} bundle
-// a client can select with `duckgres.worker_tier=<name>` instead of inline sizes.
-// Explicit inline GUCs override a tier's fields. Colocate is a pointer so a tier
-// can pin exclusive (false) distinctly from "unset"; nil inherits the default.
-type WorkerProfileSpec struct {
-	CPU      string `json:"cpu"`
-	Memory   string `json:"memory"`
-	Colocate *bool  `json:"colocate"`
+	// Connection-string worker sizing (duckgres.worker_cpu / worker_memory /
+	// worker_ttl). All default to the off/empty state, so absent config = the
+	// default worker shape. See docs/design/connection-string-worker-profile.md.
+	AllowClientWorkerProfile bool          // Master gate: honor duckgres.* startup options at all
+	WorkerProfileMinCPU      string        // Clamp floor for a client-supplied cpu (e.g. "1")
+	WorkerProfileMaxCPU      string        // Clamp ceiling for a client-supplied cpu (e.g. "16")
+	WorkerProfileMinMemory   string        // Clamp floor for a client-supplied memory (e.g. "4Gi")
+	WorkerProfileMaxMemory   string        // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
+	WorkerMaxTTL             time.Duration // Clamp ceiling for a client-supplied duckgres.worker_ttl (0 = unbounded)
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -251,7 +211,6 @@ type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool)
 	IsMigratingForOrg(orgID string) bool
-	SetWarmCapacityTarget(n int)
 	ShutdownAll()
 }
 
@@ -439,18 +398,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			"process_min_workers", processMinWorkers,
 			"process_max_workers", processMaxWorkers)
 		processMinWorkers = processMaxWorkers
-	}
-
-	k8sSharedWarmTarget := cfg.K8s.SharedWarmTarget
-	// Only cap the warm target if k8sMaxWorkers is an actual upper bound
-	// (>0). When k8sMaxWorkers == 0 the pool is unbounded and the warm
-	// target stands on its own.
-	if isK8s && k8sMaxWorkers > 0 && k8sSharedWarmTarget > k8sMaxWorkers {
-		slog.Warn("k8s.shared_warm_target exceeds k8s.max_workers; capping to k8s.max_workers.",
-			"k8s_shared_warm_target", k8sSharedWarmTarget,
-			"k8s_max_workers", k8sMaxWorkers)
-		k8sSharedWarmTarget = k8sMaxWorkers
-		cfg.K8s.SharedWarmTarget = k8sSharedWarmTarget
 	}
 
 	// In remote (multitenant) mode the global DuckLake.MetadataStore is empty
@@ -666,7 +613,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"process_min_workers", processMinWorkers,
 		"process_max_workers", processMaxWorkers,
 		"k8s_max_workers", k8sMaxWorkers,
-		"k8s_shared_warm_target", k8sSharedWarmTarget,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"session_init_timeout", cfg.SessionInitTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
@@ -739,18 +685,16 @@ func createSessionWithRegisteredCancel(
 }
 
 func sessionCreationErrorResponse(err error) (code string, message string) {
-	var capacityErr *WarmCapacityExhaustedError
+	var capacityErr *WorkerCapacityExhaustedError
 	switch {
 	case errors.As(err, &capacityErr):
-		return "53300", warmCapacityMissPolicyForReason(capacityErr.missReason()).sqlMessage(capacityErr.RetryAfter)
+		return "53300", capacityMissPolicyForReason(capacityErr.missReason()).sqlMessage(capacityErr.RetryAfter)
 	case errors.Is(err, context.Canceled):
 		return "57014", "canceling authentication due to user request"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "53300", "timed out waiting for an available worker"
 	case errors.Is(err, ErrTooManyConnections):
 		return "53300", "too many connections"
-	case errors.Is(err, ErrOrgResourceQuotaExceeded):
-		return "53400", "organization worker resource quota exceeded, please retry shortly"
 	default:
 		return "58000", fmt.Sprintf("failed to create session: %v", err)
 	}
@@ -1051,7 +995,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Resolve the requested worker shape from the connection-string startup
-	// options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
+	// options (duckgres.worker_cpu / worker_memory / worker_ttl).
 	// nil => the default exclusive profile. Gated off by default, so this is a
 	// no-op unless the deployment opts in. A rejected profile fails the connect.
 	workerProfile, profileWarns, profileErr := cp.resolveWorkerProfile(startupOptions)
@@ -1337,7 +1281,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // resources are not configured (DuckDB will then auto-detect on the worker).
 func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit string, threads int) {
 	// A non-default profile sizes DuckDB from the profile's pod shape, not the
-	// pool-global request, so a small colocated worker gets matching limits. An
+	// pool-global request, so a smaller sized worker gets matching limits. An
 	// empty profile field falls back to the pool-global request (today's value).
 	memReq := cp.cfg.K8s.WorkerMemoryRequest
 	cpuReq := cp.cfg.K8s.WorkerCPURequest
@@ -1547,11 +1491,6 @@ func (cp *ControlPlane) shutdown() {
 }
 
 func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
-	// Stop spawning warm workers immediately so we don't create pods that
-	// outlive this CP instance and block scheduling for the replacement.
-	if cp.orgRouter != nil {
-		cp.orgRouter.SetWarmCapacityTarget(0)
-	}
 	cp.stopAcceptingPGConnections()
 	if cp.flight != nil {
 		cp.flight.BeginDrain()

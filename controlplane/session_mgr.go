@@ -19,11 +19,6 @@ import (
 var ErrTooManyConnections = errors.New("too many connections")
 var ErrSessionManagerDraining = errors.New("session manager is draining")
 
-// ErrOrgResourceQuotaExceeded is returned when reserving a new colocated worker
-// would push the org over its colocated CPU/memory budget. Retryable: capacity
-// frees as the org's colocated sessions finish.
-var ErrOrgResourceQuotaExceeded = errors.New("organization colocated worker resource quota exceeded")
-
 const (
 	connectionLeaseReleaseMaxAttempts = 3
 	connectionLeaseReleaseRetryDelay  = 50 * time.Millisecond
@@ -280,14 +275,14 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 		slog.Debug("Acquiring worker for session.", "pid", pid, "user", username, "attempt", attempt)
 		worker, err := sm.pool.AcquireWorker(actx, profile)
 		if err != nil {
-			var capacityErr *WarmCapacityExhaustedError
+			var capacityErr *WorkerCapacityExhaustedError
 			if errors.As(err, &capacityErr) {
 				missReason := capacityErr.missReason()
-				observeControlPlaneWorkerAcquireFailure("warm_capacity_exhausted")
-				observeControlPlaneWorkerAcquireFailure("warm_capacity_" + string(missReason))
+				observeControlPlaneWorkerAcquireFailure("worker_capacity_exhausted")
+				observeControlPlaneWorkerAcquireFailure("worker_capacity_" + string(missReason))
 				acquireSpan.SetAttributes(
-					attribute.String("warm_capacity.reason", string(missReason)),
-					attribute.Int("warm_capacity.retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter)),
+					attribute.String("worker_capacity.reason", string(missReason)),
+					attribute.Int("worker_capacity.retry_after_seconds", capacityRetrySeconds(capacityErr.RetryAfter)),
 				)
 				slog.Warn("Worker acquisition failed.",
 					"pid", pid,
@@ -295,7 +290,7 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 					"duration", time.Since(acquireStart),
 					"reason", missReason,
 					"retry_after", capacityErr.RetryAfter,
-					"retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter),
+					"retry_after_seconds", capacityRetrySeconds(capacityErr.RetryAfter),
 					"error", err,
 				)
 			}

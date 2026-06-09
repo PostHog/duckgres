@@ -93,9 +93,9 @@ crash recovery) but the warm/neutral slot concept is gone.
 ## Headroom reconcile (new janitor hook, not a separate controller)
 
 Implemented as a **janitor reconcile hook** (`reconcileHeadroom`), invoked from
-`janitor.runOnce()` alongside `reconcileWarmCapacity` — it reuses the janitor's
-existing leader-gated tick, so there is no new loop, goroutine, or leader
-election. On each tick (leader CP only) it:
+`janitor.runOnce()` — it reuses the janitor's existing leader-gated tick, so
+there is no new loop, goroutine, or leader election. On each tick (leader CP
+only) it:
 
 - reads node allocatable CPU+memory (k8s API, the worker nodepool) and current
   worker+placeholder usage;
@@ -110,14 +110,15 @@ the two PriorityClass names. Manifests add the PriorityClasses.
 
 ## Config knobs (env-only K8s, per existing convention)
 
-New: `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_SIZING`, `DUCKGRES_K8S_WORKER_DEFAULT_CPU`
-(8), `_DEFAULT_MEMORY` (16Gi), `_DEFAULT_TTL` (20m),
-`_WORKER_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/`_MAX_MEMORY`/`_MAX_TTL`,
-`_HEADROOM_PERCENT`, `_PLACEHOLDER_*`.
+Kept (client sizing + headroom): `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE`
+(master gate for the `duckgres.worker_cpu`/`worker_memory`/`worker_ttl` startup
+options), `DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/
+`_MAX_MEMORY` (clamps), `DUCKGRES_K8S_WORKER_MAX_TTL`,
+`DUCKGRES_K8S_HEADROOM_PERCENT`, `DUCKGRES_K8S_PLACEHOLDER_*`.
 
-Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_PROFILE*`, `*WORKER_TIERS*`,
-`*ALLOW_CLIENT_WORKER_PROFILE*`, `*ALLOW_CLIENT_EXCLUSIVE_NODE*`,
-`*SHARED_WARM_TARGET*`.
+Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_TIERS*`,
+`*ALLOW_CLIENT_EXCLUSIVE_NODE*`, `*SHARED_WARM_TARGET*`,
+`*DYNAMIC_WARM_CAPACITY*`, `*WARM_CAPACITY_*`, `*WARM_ACQUIRE_TIMEOUT*`.
 
 ## Testing
 
