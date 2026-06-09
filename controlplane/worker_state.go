@@ -2,7 +2,6 @@ package controlplane
 
 import (
 	"fmt"
-	"strconv"
 	"time"
 )
 
@@ -26,32 +25,27 @@ const (
 // It is a match dimension on WorkerAssignment, ORTHOGONAL to Image: a reserved or
 // warm worker may only be handed to a request whose profile Equal()s it.
 //
-// The nil/zero profile is the DEFAULT exclusive profile — today's behavior:
-// empty CPU/Memory (the pool-global request applies) and Colocate=false (one pod
-// per node). Normalizing the default to empty strings (rather than the literal
-// 46/360 pool values) is what keeps legacy worker records claimable without a
+// The nil/zero profile is the DEFAULT profile: empty CPU/Memory (the pool-global
+// request applies). Normalizing the default to empty strings (rather than the
+// literal pool values) is what keeps legacy worker records claimable without a
 // data migration.
 //
-// Only these three fields are persisted (WorkerRecord) and matched. Pod
-// scheduling — nodeSelector, toleration, and the one-pod-per-node anti-affinity —
-// is DERIVED from Colocate plus the pool's config at spawn time, so the
-// reserved-spawn path can reconstruct everything it needs from the stored record.
+// Only CPU/Memory are persisted (WorkerRecord) and matched; TTL rides along on
+// the record but is not part of the match identity.
 type WorkerProfile struct {
-	CPU      string        // normalized k8s quantity (e.g. "8"); the worker's CPU size
-	Memory   string        // normalized k8s quantity (e.g. "16Gi"); the worker's memory size
-	Colocate bool          // deprecated: always false; bin-pack/colocate is being removed
-	TTL      time.Duration // how long the worker stays hot-idle after its last query (reset per query); not part of MatchKey
+	CPU    string        // normalized k8s quantity (e.g. "8"); the worker's CPU size
+	Memory string        // normalized k8s quantity (e.g. "16Gi"); the worker's memory size
+	TTL    time.Duration // how long the worker stays hot-idle after its last query (reset per query); not part of MatchKey
 }
 
 // MatchKey is the identity used to decide whether an existing worker can serve a
-// request. NodeSelector is excluded because it is derived from Colocate. A nil
-// profile shares the key of the zero/default profile, so legacy and default
-// requests match the same workers.
+// request. A nil profile shares the key of the zero/default profile, so legacy
+// and default requests match the same workers.
 func (wp *WorkerProfile) MatchKey() string {
 	if wp == nil {
-		return "||false"
+		return "|"
 	}
-	return wp.CPU + "|" + wp.Memory + "|" + strconv.FormatBool(wp.Colocate)
+	return wp.CPU + "|" + wp.Memory
 }
 
 // Equal reports whether two profiles match (nil == zero == default).
@@ -63,11 +57,11 @@ func (wp *WorkerProfile) Equal(other *WorkerProfile) bool {
 // to the default profile. Used to cross the controlplane→configstore package
 // boundary (which cannot reference the WorkerProfile type) without losing the
 // nil==default convention.
-func (wp *WorkerProfile) Parts() (cpu, memory string, colocate bool) {
+func (wp *WorkerProfile) Parts() (cpu, memory string) {
 	if wp == nil {
-		return "", "", false
+		return "", ""
 	}
-	return wp.CPU, wp.Memory, wp.Colocate
+	return wp.CPU, wp.Memory
 }
 
 // WorkerAssignment carries tenant-specific metadata once a shared worker has
@@ -80,17 +74,6 @@ type WorkerAssignment struct {
 	// profile (today's behavior). It is immutable for a reserved worker's life;
 	// enforcement is wired in alongside the scheduling changes (see design doc).
 	Profile *WorkerProfile
-	// MaxColocatedCPU / MaxColocatedMemBytes are the org's colocated resource
-	// budget, enforced authoritatively (cross-CP) inside the claim transaction.
-	// 0 = unbounded on that axis. Only colocated claims count against them.
-	MaxColocatedCPU      int
-	MaxColocatedMemBytes uint64
-	// SuppressWarmMissRecord skips recording a warm-capacity miss (demand signal
-	// + metric) for this acquire attempt. Set by a server-side acquire wait that
-	// polls repeatedly so it records demand at most once per throttle interval
-	// instead of on every retry, keeping the demand signal and miss counter from
-	// being inflated ~Nx by a single waiting connection.
-	SuppressWarmMissRecord bool
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared

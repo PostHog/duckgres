@@ -17,7 +17,6 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
-	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // OrgUserKey is the composite key for org-scoped user lookups.
@@ -913,7 +912,6 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 		{table: runtimeSchema + ".flight_session_records", model: &FlightSessionRecord{}},
 		{table: runtimeSchema + ".org_connection_queue", model: &OrgConnectionQueueEntry{}},
 		{table: runtimeSchema + ".org_connection_leases", model: &OrgConnectionLease{}},
-		{table: runtimeSchema + ".warm_capacity_miss_buckets", model: &WarmCapacityMissBucket{}},
 	} {
 		if err := db.Table(spec.table).AutoMigrate(spec.model); err != nil {
 			return err
@@ -939,90 +937,11 @@ func (cs *ConfigStore) RuntimeSchema() string {
 func (cs *ConfigStore) runtimeTable(base string) string {
 	return cs.runtimeSchema + "." + base
 }
-
-// RecordWarmCapacityMiss increments the shared bucket for a foreground warm
-// capacity miss. The insert/upsert is atomic so concurrent control-plane pods
-// can all contribute to the same scope/reason/bucket row without coordination.
-func (cs *ConfigStore) RecordWarmCapacityMiss(scope string, reason WorkerClaimMissReason, now time.Time) error {
-	scope = strings.TrimSpace(scope)
-	if scope == "" {
-		return fmt.Errorf("record warm capacity miss: scope is required")
-	}
-	if reason == WorkerClaimMissReasonNone {
-		return fmt.Errorf("record warm capacity miss: reason is required")
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	now = now.UTC()
-
-	bucket := WarmCapacityMissBucket{
-		Scope:       scope,
-		Reason:      reason,
-		BucketStart: now.Truncate(WarmCapacityMissBucketSize),
-		Count:       1,
-		UpdatedAt:   now,
-	}
-	if err := cs.db.Table(cs.runtimeTable(bucket.TableName())).Clauses(clause.OnConflict{
-		Columns: []clause.Column{
-			{Name: "scope"},
-			{Name: "reason"},
-			{Name: "bucket_start"},
-		},
-		DoUpdates: clause.Assignments(map[string]any{
-			"count":      gorm.Expr(`"warm_capacity_miss_buckets"."count" + EXCLUDED."count"`),
-			"updated_at": now,
-		}),
-	}).Create(&bucket).Error; err != nil {
-		return fmt.Errorf("record warm capacity miss: %w", err)
-	}
-	return nil
-}
-
-// ListWarmCapacityMissesSince returns aggregated warm-capacity miss counts by
-// scope and reason for buckets at or after the bucket containing since. Passing
-// reasons narrows the aggregation to those miss reasons.
-func (cs *ConfigStore) ListWarmCapacityMissesSince(since time.Time, reasons ...WorkerClaimMissReason) ([]WarmCapacityMissAggregate, error) {
-	reasonFilters := make([]string, 0, len(reasons))
-	for _, reason := range reasons {
-		if reason == WorkerClaimMissReasonNone {
-			continue
-		}
-		reasonFilters = append(reasonFilters, string(reason))
-	}
-
-	sinceBucket := since.UTC().Truncate(WarmCapacityMissBucketSize)
-	query := cs.db.Table(cs.runtimeTable((&WarmCapacityMissBucket{}).TableName())).
-		Select("scope, reason, COALESCE(SUM(count), 0)::bigint AS count").
-		Where("bucket_start >= ?", sinceBucket).
-		Group("scope, reason").
-		Order("scope ASC, reason ASC")
-	if len(reasonFilters) > 0 {
-		query = query.Where("reason IN ?", reasonFilters)
-	}
-
-	var out []WarmCapacityMissAggregate
-	if err := query.Scan(&out).Error; err != nil {
-		return nil, fmt.Errorf("list warm capacity misses: %w", err)
-	}
-	return out, nil
-}
-
-// PruneWarmCapacityMissBuckets removes buckets older than the caller-provided
-// cutoff and returns the number of deleted rows.
-func (cs *ConfigStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {
-	result := cs.db.Table(cs.runtimeTable((&WarmCapacityMissBucket{}).TableName())).
-		Where("bucket_start < ?", before.UTC()).
-		Delete(&WarmCapacityMissBucket{})
-	if result.Error != nil {
-		return 0, fmt.Errorf("prune warm capacity miss buckets: %w", result.Error)
-	}
-	return result.RowsAffected, nil
-}
-
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
 // state by image and tenant binding for Prometheus observability.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
+	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
+	// now (no warm pool); the branch only matches pre-existing/legacy rows.
 	const bindingExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
 	var out []WorkerLifecycleStats
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
@@ -1123,12 +1042,12 @@ func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	protectedStates := []WorkerState{WorkerStateDraining, WorkerStateRetired, WorkerStateLost}
 	result := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "worker_id"}},
-		// profile_cpu/memory/colocate + ttl_minutes are in the update set so a
-		// sized worker's shape (set after CreateSpawningWorkerSlot inserts the row
+		// profile_cpu/memory + ttl_minutes are in the update set so a sized
+		// worker's shape (set after CreateSpawningWorkerSlot inserts the row
 		// with an empty profile) actually persists. Without them the ON CONFLICT
 		// update silently dropped the profile, so a sized worker's hot-idle row
 		// stayed empty and ClaimHotIdleWorker could never match it (no reuse).
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at", "profile_cpu", "profile_memory", "profile_colocate", "ttl_minutes"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at", "profile_cpu", "profile_memory", "ttl_minutes"}),
 		Where: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: `"worker_records"."state" NOT IN ?`, Vars: []any{protectedStates}},
 			clause.Expr{SQL: `(excluded."owner_epoch" > "worker_records"."owner_epoch" OR (excluded."owner_epoch" = "worker_records"."owner_epoch" AND excluded."owner_cp_instance_id" = "worker_records"."owner_cp_instance_id"))`},
@@ -1179,124 +1098,13 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 	}
 	return &record, nil
 }
-
-// ClaimIdleWorker atomically claims one idle worker row for a control-plane instance.
-// The selected row is locked with SKIP LOCKED and transitioned to reserved while
-// incrementing owner_epoch. When maxOrgWorkers is set, org claims are serialized
-// under the same advisory lock used for spawn-slot allocation. maxGlobalWorkers
-// is only used to classify an unfulfilled claim after no suitable idle worker
-// exists; an existing idle worker remains claimable even when the global pool is
-// at capacity.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers, maxGlobalWorkers int, maxColocatedCPU int, maxColocatedMemBytes uint64) (*WorkerRecord, WorkerClaimMissReason, error) {
-	var claimed *WorkerRecord
-	missReason := WorkerClaimMissReasonNone
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		if orgID != "" {
-			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:org:"+orgID)).Error; err != nil {
-				return err
-			}
-		}
-		// The worker-count cap bounds only exclusive workers — each pins a
-		// dedicated node. Colocated workers bin-pack and are intentionally
-		// unbounded: a colocated request never counts toward the cap and is
-		// never refused because the exclusive budget is full.
-		if maxOrgWorkers > 0 && orgID != "" && !profileColocate {
-			count, err := cs.countActiveWorkers(tx, "org_id = ? AND COALESCE(profile_colocate, false) = false", orgID)
-			if err != nil {
-				return err
-			}
-			if count >= int64(maxOrgWorkers) {
-				missReason = WorkerClaimMissReasonOrgCap
-				return nil
-			}
-		}
-
-		var current WorkerRecord
-		query := tx.Table(cs.runtimeTable(current.TableName())).
-			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("state = ?", WorkerStateIdle)
-
-		if image != "" {
-			query = query.Where("image = ?", image)
-		}
-		// Profile is a match dimension orthogonal to image: a request only claims
-		// an idle worker of the same shape. The default request ("","",false)
-		// matches default/legacy/warm rows; a colocated request only matches
-		// colocated rows (and vice versa). Always filtered, including the default.
-		query = query.Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate)
-
-		err := query.Order("worker_id ASC").Take(&current).Error
-		if err != nil {
-			if err == gorm.ErrRecordNotFound {
-				// Exclusive-only global cap, bypassed for colocated requests —
-				// see the org-cap note above.
-				if maxGlobalWorkers > 0 && !profileColocate {
-					count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
-					if err != nil {
-						return err
-					}
-					if count >= int64(maxGlobalWorkers) {
-						missReason = WorkerClaimMissReasonGlobalCap
-						return nil
-					}
-				}
-				missReason = WorkerClaimMissReasonNoIdle
-				return nil
-			}
-			return err
-		}
-
-		// Authoritative per-org colocated resource quota (cross-CP): summed under
-		// the org advisory lock held above, so it can't be raced by another CP.
-		// Only colocated claims count; reusing OrgCap surfaces as retryable
-		// backpressure. The in-process OrgReservedPool check is the fast pre-filter.
-		if profileColocate && orgID != "" && (maxColocatedCPU > 0 || maxColocatedMemBytes > 0) {
-			curCPU, curMem, sErr := cs.sumOrgColocatedResources(tx, orgID)
-			if sErr != nil {
-				return sErr
-			}
-			reqCPU := parseColocatedCPUCores(current.ProfileCPU)
-			reqMem := parseColocatedMemBytes(current.ProfileMemory)
-			if (maxColocatedCPU > 0 && curCPU+reqCPU > maxColocatedCPU) ||
-				(maxColocatedMemBytes > 0 && curMem+reqMem > maxColocatedMemBytes) {
-				missReason = WorkerClaimMissReasonOrgCap
-				return nil
-			}
-		}
-
-		now := time.Now()
-		if err := tx.Table(cs.runtimeTable(current.TableName())).
-			Where("worker_id = ?", current.WorkerID).
-			Updates(map[string]any{
-				"state":                WorkerStateReserved,
-				"org_id":               orgID,
-				"owner_cp_instance_id": ownerCPInstanceID,
-				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
-				"updated_at":           now,
-			}).Error; err != nil {
-			return err
-		}
-
-		if err := tx.Table(cs.runtimeTable(current.TableName())).
-			First(&current, "worker_id = ?", current.WorkerID).Error; err != nil {
-			return err
-		}
-		claimed = &current
-		return nil
-	})
-	if err != nil {
-		return nil, WorkerClaimMissReasonNone, fmt.Errorf("claim idle worker: %w", err)
-	}
-	return claimed, missReason, nil
-}
-
 // ClaimHotIdleWorker atomically claims one hot-idle worker row that was
 // previously activated for the given org. The selected row is locked with
 // SKIP LOCKED and transitioned to reserved while incrementing owner_epoch.
 // When maxOrgWorkers is set, the org cap is checked under the same advisory
 // lock as neutral idle claims, excluding hot-idle rows from the count so a
 // cached worker can be reclaimed as the org's only active slot.
-func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, profileColocate bool, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -1305,10 +1113,8 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 				return err
 			}
 		}
-		// Exclusive-only count cap, bypassed for colocated requests — colocated
-		// workers bin-pack and are intentionally unbounded.
-		if maxOrgWorkers > 0 && orgID != "" && !profileColocate {
-			count, err := cs.countActiveWorkers(tx, "org_id = ? AND state <> ? AND COALESCE(profile_colocate, false) = false", orgID, WorkerStateHotIdle)
+		if maxOrgWorkers > 0 && orgID != "" {
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND state <> ?", orgID, WorkerStateHotIdle)
 			if err != nil {
 				return err
 			}
@@ -1323,10 +1129,10 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("state = ? AND org_id = ?", WorkerStateHotIdle, orgID).
 			// Only reclaim a hot-idle worker of the requested shape, so a
-			// differently-shaped request (e.g. an 8/48 colocated backfill) doesn't
-			// claim-and-retire this org's default-shape hot-idle workers. COALESCE
-			// keeps legacy NULL-profile rows in the default bucket.
-			Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate).
+			// differently-shaped request doesn't claim-and-retire this org's
+			// default-shape hot-idle workers. COALESCE keeps legacy NULL-profile
+			// rows in the default bucket.
+			Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ?", profileCPU, profileMemory).
 			Order("worker_id ASC").
 			Take(&current).Error
 		if err != nil {
@@ -1477,11 +1283,8 @@ func (cs *ConfigStore) RetireOrphanWorker(record *WorkerRecord, reason string) (
 // picked up well before its session token actually goes invalid.
 //
 // NULL s3_credentials_expires_at is treated as "due immediately". This
-// covers two cases: warm-pool rows that haven't been activated yet (these
-// have no creds, so the predicate is irrelevant — they're filtered out by
-// the state set anyway since neutral idle workers shouldn't carry creds),
-// and pre-migration rows that existed before this column was introduced
-// (these get refreshed eagerly so we converge to the new state).
+// mainly covers pre-migration rows that existed before this column was
+// introduced (these get refreshed eagerly so we converge to the new state).
 //
 // Only already-activated states are considered: retired/lost/draining rows
 // don't need creds, and reserved/activating rows must not be refreshed because
@@ -1500,8 +1303,8 @@ func (cs *ConfigStore) ListWorkersDueForCredentialRefresh(ownerCPInstanceID stri
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("owner_cp_instance_id = ?", ownerCPInstanceID).
 		Where("state IN ?", credEligibleStates).
-		// Org-bound rows only: a neutral warm row (org_id='') hasn't been
-		// activated, so it has no STS-brokered creds yet.
+		// Org-bound rows only: a row with no org_id (legacy/unactivated) has no
+		// STS-brokered creds yet.
 		Where("org_id <> ''").
 		Where("s3_credentials_expires_at IS NULL OR s3_credentials_expires_at <= ?", cutoff).
 		Order("s3_credentials_expires_at ASC NULLS FIRST, worker_id ASC").
@@ -1731,9 +1534,8 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 			return err
 		}
 
-		// Exclusive-only count caps: colocated workers bin-pack and are unbounded.
 		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ? AND COALESCE(profile_colocate, false) = false", orgID)
+			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
 			if err != nil {
 				return err
 			}
@@ -1743,7 +1545,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 		}
 
 		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
+			count, err := cs.countActiveWorkers(tx)
 			if err != nil {
 				return err
 			}
@@ -1778,150 +1580,6 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 	}
 	return created, nil
 }
-
-// CreateNeutralWarmWorkerSlotForImage creates a durable spawning worker row
-// for the shared neutral warm pool, but the per-image target is enforced
-// against workers using the same image only — letting the per-image warm
-// floor coexist with the cluster-default warm pool without one starving the
-// other. Same advisory-lock + global-cap protections as the image-blind
-// sibling. A nil result means the per-image target is already met or the
-// global worker cap blocked the spawn.
-func (cs *ConfigStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*WorkerRecord, error) {
-	if strings.TrimSpace(podNamePrefix) == "" {
-		return nil, fmt.Errorf("pod name prefix is required")
-	}
-	if strings.TrimSpace(image) == "" {
-		return nil, fmt.Errorf("image is required for per-image warm slot")
-	}
-
-	var created *WorkerRecord
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:shared-warm-target")).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:global-worker-capacity")).Error; err != nil {
-			return err
-		}
-
-		if perImageTarget > 0 {
-			count, err := cs.countNeutralWarmWorkersForImage(tx, image)
-			if err != nil {
-				return err
-			}
-			if count >= int64(perImageTarget) {
-				return nil
-			}
-		}
-
-		// Exclusive-only global cap: colocated workers are unbounded and must
-		// not block an exclusive warm spawn.
-		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
-			if err != nil {
-				return err
-			}
-			if count >= int64(maxGlobalWorkers) {
-				return nil
-			}
-		}
-
-		var workerID int64
-		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
-			return err
-		}
-		now := time.Now()
-		record := &WorkerRecord{
-			WorkerID:          int(workerID),
-			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
-			Image:             image,
-			State:             WorkerStateSpawning,
-			OrgID:             "",
-			OwnerCPInstanceID: ownerCPInstanceID,
-			OwnerEpoch:        0,
-			LastHeartbeatAt:   now,
-		}
-		if err := tx.Table(cs.runtimeTable(record.TableName())).Create(record).Error; err != nil {
-			return err
-		}
-		created = record
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create neutral warm worker slot for image: %w", err)
-	}
-	return created, nil
-}
-
-// CreateNeutralWarmWorkerSlot creates a durable spawning worker row for the shared
-// neutral warm pool under advisory-lock protected cluster-wide warm-target and
-// global capacity checks. A nil result means capacity already satisfies the target
-// or the global worker cap blocked the spawn.
-func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, profileCPU, profileMemory string, profileColocate bool, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
-	if strings.TrimSpace(podNamePrefix) == "" {
-		return nil, fmt.Errorf("pod name prefix is required")
-	}
-
-	var created *WorkerRecord
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:shared-warm-target")).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:global-worker-capacity")).Error; err != nil {
-			return err
-		}
-
-		if targetWarmWorkers > 0 {
-			count, err := cs.countNeutralWarmWorkers(tx, profileCPU, profileMemory, profileColocate)
-			if err != nil {
-				return err
-			}
-			if count >= int64(targetWarmWorkers) {
-				return nil
-			}
-		}
-
-		// Exclusive-only global cap, bypassed for colocated warm shapes —
-		// colocated workers bin-pack and are intentionally unbounded.
-		if maxGlobalWorkers > 0 && !profileColocate {
-			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
-			if err != nil {
-				return err
-			}
-			if count >= int64(maxGlobalWorkers) {
-				return nil
-			}
-		}
-
-		var workerID int64
-		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
-			return err
-		}
-		now := time.Now()
-		record := &WorkerRecord{
-			WorkerID:          int(workerID),
-			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
-			Image:             image,
-			ProfileCPU:        profileCPU,
-			ProfileMemory:     profileMemory,
-			ProfileColocate:   profileColocate,
-			State:             WorkerStateSpawning,
-			OrgID:             "",
-			OwnerCPInstanceID: ownerCPInstanceID,
-			OwnerEpoch:        0,
-			LastHeartbeatAt:   now,
-		}
-		if err := tx.Table(cs.runtimeTable(record.TableName())).Create(record).Error; err != nil {
-			return err
-		}
-		created = record
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create neutral warm worker slot: %w", err)
-	}
-	return created, nil
-}
-
 // ListOrphanedWorkers returns workers in active states that no live CP
 // is responsible for any longer. Three independent failure modes are
 // covered, joined by OR:
@@ -1933,9 +1591,9 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 //  2. owner_cp_instance_id is empty / NULL and the worker hasn't
 //     heartbeat since `before`. Observed in production: rows whose
 //     owner string was lost end up invisible to (1)'s INNER JOIN and
-//     accumulate forever, blocking warm-pool replenishment because
-//     countNeutralWarmWorkers still counts them. The stale-heartbeat
-//     guard avoids racing the spawn path's create-then-stamp window.
+//     accumulate forever, consuming the org/global worker cap. The
+//     stale-heartbeat guard avoids racing the spawn path's
+//     create-then-stamp window.
 //  3. owner_cp_instance_id is set but no matching cp_instances row
 //     exists at all (hard-deleted somehow), and again the heartbeat
 //     is stale. Same shape as (2), different cause.
@@ -2094,86 +1752,6 @@ func workerTerminalEligibleStates(targetState WorkerState) []WorkerState {
 	}
 	return workerActiveStates()
 }
-
-// countNeutralWarmWorkers counts neutral (unassigned) warm workers of a single
-// profile shape. The warm pool is maintained per shape, so the default
-// ("","",false) and colocated targets are counted independently.
-// sumOrgColocatedResources sums the CPU (whole cores) and memory (bytes) of an
-// org's live colocated workers. Used inside ClaimIdleWorker's advisory-locked txn
-// to enforce the per-org colocated budget authoritatively across CP replicas.
-func (cs *ConfigStore) sumOrgColocatedResources(tx *gorm.DB, orgID string) (cpuCores int, memBytes uint64, err error) {
-	var rows []WorkerRecord
-	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Select("profile_cpu", "profile_memory").
-		Where("org_id = ? AND COALESCE(profile_colocate, false) = true AND state <> ?", orgID, WorkerStateRetired).
-		Find(&rows).Error; err != nil {
-		return 0, 0, err
-	}
-	for _, r := range rows {
-		cpuCores += parseColocatedCPUCores(r.ProfileCPU)
-		memBytes += parseColocatedMemBytes(r.ProfileMemory)
-	}
-	return cpuCores, memBytes, nil
-}
-
-// parseColocatedCPUCores parses a CPU quantity to whole cores (e.g. "4" -> 4).
-func parseColocatedCPUCores(s string) int {
-	if s == "" {
-		return 0
-	}
-	q, err := resource.ParseQuantity(s)
-	if err != nil {
-		return 0
-	}
-	return int(q.Value())
-}
-
-// parseColocatedMemBytes parses a memory quantity to bytes (e.g. "16Gi").
-func parseColocatedMemBytes(s string) uint64 {
-	if s == "" {
-		return 0
-	}
-	q, err := resource.ParseQuantity(s)
-	if err != nil {
-		return 0
-	}
-	if v := q.Value(); v > 0 {
-		return uint64(v)
-	}
-	return 0
-}
-
-func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB, profileCPU, profileMemory string, profileColocate bool) (int64, error) {
-	var count int64
-	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("org_id = ''").
-		Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ? AND COALESCE(profile_colocate, false) = ?", profileCPU, profileMemory, profileColocate).
-		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
-		Count(&count).Error; err != nil {
-		return 0, err
-	}
-	return count, nil
-}
-
-func (cs *ConfigStore) countNeutralWarmWorkersForImage(tx *gorm.DB, image string) (int64, error) {
-	var count int64
-	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("org_id = ''").
-		Where("image = ?", image).
-		// Only the DEFAULT (exclusive) shape counts toward the per-image warm
-		// target — colocated workers share p.workerImage but live in their own
-		// warm pool, so without this filter they'd cross-count and starve the
-		// exclusive pool. COALESCE keeps legacy NULL-profile rows in the default
-		// bucket. Keep in sync with countNeutralWarmWorkers / the default
-		// MatchKey ("","",false).
-		Where("COALESCE(profile_cpu, '') = '' AND COALESCE(profile_memory, '') = '' AND COALESCE(profile_colocate, false) = false").
-		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
-		Count(&count).Error; err != nil {
-		return 0, err
-	}
-	return count, nil
-}
-
 func advisoryLockKey(s string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(s))

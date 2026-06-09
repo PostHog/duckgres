@@ -213,13 +213,9 @@ spec:
             - { name: DUCKGRES_K8S_WORKER_SECRET, value: "duckgres-worker-token" }
             - { name: DUCKGRES_K8S_WORKER_CONFIGMAP, value: "duckgres-config" }
             - { name: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT, value: "duckgres-worker" }
-            - { name: DUCKGRES_K8S_SHARED_WARM_TARGET, value: "0" }
             # Worker-TTL-pool model (docs/design/worker-ttl-pool.md): no warm pool.
-            # With shared-warm-target=0 the configstore-driven dynamic warm-capacity
-            # spawner would still add neutral (org="") workers from warm-miss history,
-            # defeating the on-demand model — disable it so the only workers are the
-            # ones a client request sizes + spawns.
-            - { name: DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED, value: "false" }
+            # Workers are spawned on demand per request and kept hot-idle until their
+            # TTL; there is nothing to pre-warm or reconcile.
             # Honor client-supplied worker shape/TTL startup options
             # (duckgres.worker_cpu/worker_memory/worker_ttl), clamped to a sane band.
             # The harness sized_worker assertion connects with these and verifies the

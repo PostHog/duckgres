@@ -11,8 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -49,13 +47,6 @@ func (a *orgRouterAdapter) IcebergConfigForOrg(orgID string) (server.IcebergConf
 
 func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
-}
-
-func (a *orgRouterAdapter) SetWarmCapacityTarget(n int) {
-	a.router.sharedPool.SetWarmCapacityTarget(n)
-	if n <= 0 {
-		a.router.sharedPool.SetPerImageWarmTargets(nil)
-	}
 }
 
 func (a *orgRouterAdapter) ShutdownAll() {
@@ -176,7 +167,6 @@ func SetupMultiTenant(
 		SecretName:                   cfg.K8s.WorkerSecret,
 		ConfigMap:                    cfg.K8s.WorkerConfigMap,
 		MaxWorkers:                   maxWorkers,
-		WarmAcquireTimeout:           cfg.K8s.WarmAcquireTimeout,
 		IdleTimeout:                  cfg.WorkerIdleTimeout,
 		ConfigPath:                   cfg.ConfigPath,
 		ImagePullPolicy:              cfg.K8s.ImagePullPolicy,
@@ -193,10 +183,6 @@ func SetupMultiTenant(
 		PlaceholderCPU:               cfg.K8s.PlaceholderCPU,
 		PlaceholderMemory:            cfg.K8s.PlaceholderMemory,
 		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,
-		ColocatedNodeSelector:        parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
-		ColocatedTolerationKey:       cfg.K8s.ColocatedWorkerTolerationKey,
-		ColocatedTolerationValue:     cfg.K8s.ColocatedWorkerTolerationValue,
-		ColocatedWarmShapes:          cfg.K8s.ColocatedWarmShapes,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {
@@ -248,7 +234,6 @@ func SetupMultiTenant(
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
 	janitor.hotIdleTTL = defaultHotIdleTTL
-	janitor.warmCapacityMissBucketTTL = cfg.K8s.WarmCapacityDemandTTL
 	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
 	// all flow through this lifecycle service. The legacy retireWorker /
 	// retireOrphanWorker / retireLocalWorker / deleteRetiredWorker
@@ -259,56 +244,19 @@ func SetupMultiTenant(
 	// being the leader, so stale per-image counts from this CP don't
 	// linger in Prometheus while a peer takes over.
 	janitor.onStop = resetLeaderOwnedClusterMetrics
-	lastWarmCapacityTargets := map[string]int{}
 	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
-	var lastWorkerLifecycleTargetImages []string
-	lastWarmCapacityGlobalCapBlocked := false
-	janitor.reconcileWarmCapacity = func() {
-		snap := store.Snapshot()
-		if snap == nil {
+	// Refresh the per-image worker lifecycle gauges (Hot / HotIdle / Draining /
+	// … counts). Workers are spawned on demand and reused while hot-idle until
+	// their TTL — there is no warm pool to reconcile, so this is pure
+	// observability, leader-only.
+	janitor.observeWorkerLifecycle = func() {
+		stats, err := listWorkerLifecycleStats(store)
+		if err != nil {
+			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", err)
 			return
 		}
-		baseTargets := router.computeBaseWarmCapacityTargets(snap)
-		targetSnapshot, err := computeEffectiveWarmCapacityTargetSnapshot(
-			baseTargets,
-			store,
-			cfg.K8s,
-			janitor.now(),
-		)
-		if err != nil {
-			slog.Warn("Janitor failed to read dynamic warm-capacity demand; reconciling base warm targets only.", "error", err)
-		}
-		observeWarmCapacityTargets(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, cfg.K8s.MaxWorkers, lastWarmCapacityTargets)
-		targetImages := warmCapacityTargetImages(targetSnapshot.EffectiveTargets)
-		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
-			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
-		} else {
-			observeWorkerLifecycleStatsForImages(stats, targetImages, lastWorkerLifecycleTargetImages, lastWorkerLifecycleStats)
-			lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
-			lastWorkerLifecycleTargetImages = cloneStringSlice(targetImages)
-		}
-		logWarmCapacityTargetChanges(lastWarmCapacityTargets, targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets)
-		lastWarmCapacityTargets = cloneWarmCapacityTargets(targetSnapshot.EffectiveTargets)
-
-		globalCapBlocked := warmCapacityGlobalCapBlocksDemand(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, targetSnapshot.RecentMisses, cfg.K8s)
-		if globalCapBlocked && !lastWarmCapacityGlobalCapBlocked {
-			slog.Info("Global worker cap prevents dynamic warm capacity.", "max_workers", cfg.K8s.MaxWorkers, "base_target_total", sumIntMap(targetSnapshot.BaseTargets), "effective_target_total", sumIntMap(targetSnapshot.EffectiveTargets))
-		}
-		lastWarmCapacityGlobalCapBlocked = globalCapBlocked
-
-		targets := targetSnapshot.EffectiveTargets
-		router.sharedPool.SetPerImageWarmTargets(targets)
-		reconcileWarmCapacityImageTargets(router.sharedPool, targets)
-
-		// Maintain the shape-aware colocated (bin-pack) warm pool alongside the
-		// default per-image pools, so every configured colocate=true shape (e.g.
-		// 4/16 and 8/48) bursts into a ready pod. Coupled to the master gate so we
-		// don't pre-warm colocated pods that no client can route to.
-		if cfg.K8s.AllowClientWorkerProfile && len(cfg.K8s.ColocatedWarmShapes) > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
-			router.sharedPool.reconcileColocatedWarm(ctx)
-			cancel()
-		}
+		observeWorkerLifecycleStats(stats, lastWorkerLifecycleStats)
+		lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
 	}
 	janitor.retireMismatchedVersionWorker = func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -521,51 +469,8 @@ func SetupMultiTenant(
 	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
 }
 
-type warmCapacityMissAggregateLister interface {
-	ListWarmCapacityMissesSince(since time.Time, reasons ...configstore.WorkerClaimMissReason) ([]configstore.WarmCapacityMissAggregate, error)
-}
-
 type workerLifecycleStatsLister interface {
 	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
-}
-
-type warmCapacityTargetSnapshot struct {
-	BaseTargets      map[string]int
-	EffectiveTargets map[string]int
-	RecentMisses     []configstore.WarmCapacityMissAggregate
-}
-
-func computeEffectiveWarmCapacityTargets(baseTargets map[string]int, lister warmCapacityMissAggregateLister, cfg K8sConfig, now time.Time) (map[string]int, error) {
-	snap, err := computeEffectiveWarmCapacityTargetSnapshot(baseTargets, lister, cfg, now)
-	return snap.EffectiveTargets, err
-}
-
-func computeEffectiveWarmCapacityTargetSnapshot(baseTargets map[string]int, lister warmCapacityMissAggregateLister, cfg K8sConfig, now time.Time) (warmCapacityTargetSnapshot, error) {
-	snap := warmCapacityTargetSnapshot{
-		BaseTargets:      sanitizeWarmCapacityTargets(baseTargets),
-		EffectiveTargets: sanitizeWarmCapacityTargets(baseTargets),
-	}
-	dynamicCfg := dynamicWarmCapacityConfigFromK8s(cfg)
-	if !dynamicCfg.Enabled {
-		return snap, nil
-	}
-	if lister == nil {
-		return snap, nil
-	}
-	window := cfg.WarmCapacityMissWindow
-	if window <= 0 {
-		window = DefaultWarmCapacityMissWindow
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	aggregates, err := lister.ListWarmCapacityMissesSince(now.Add(-window), configstore.WorkerClaimMissReasonNoIdle)
-	if err != nil {
-		return snap, err
-	}
-	snap.RecentMisses = aggregates
-	snap.EffectiveTargets = computeDynamicWarmCapacityTargets(snap.BaseTargets, aggregates, dynamicCfg)
-	return snap, nil
 }
 
 func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
@@ -575,37 +480,6 @@ func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.
 	return lister.ListWorkerLifecycleStats()
 }
 
-func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[string]int) {
-	for _, image := range warmCapacityTargetImages(previous, baseTargets, effectiveTargets) {
-		effective := positiveMapValue(effectiveTargets, image)
-		if positiveMapValue(previous, image) == effective {
-			continue
-		}
-		base := positiveMapValue(baseTargets, image)
-		demand := effective - base
-		if demand < 0 {
-			demand = 0
-		}
-		slog.Info("Warm capacity target changed.",
-			"image", image,
-			"base_target", base,
-			"demand_target", demand,
-			"effective_target", effective,
-		)
-	}
-}
-
-func cloneWarmCapacityTargets(targets map[string]int) map[string]int {
-	out := make(map[string]int, len(targets))
-	for image, target := range targets {
-		if strings.TrimSpace(image) == "" || target <= 0 {
-			continue
-		}
-		out[image] = target
-	}
-	return out
-}
-
 func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {
 	if len(stats) == 0 {
 		return nil
@@ -613,54 +487,6 @@ func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []confi
 	out := make([]configstore.WorkerLifecycleStats, len(stats))
 	copy(out, stats)
 	return out
-}
-
-func cloneStringSlice(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]string, len(values))
-	copy(out, values)
-	return out
-}
-
-func warmCapacityGlobalCapBlocksDemand(baseTargets, effectiveTargets map[string]int, aggregates []configstore.WarmCapacityMissAggregate, cfg K8sConfig) bool {
-	if cfg.MaxWorkers <= 0 || len(aggregates) == 0 {
-		return false
-	}
-	effectiveTotal := sumIntMap(effectiveTargets)
-	if effectiveTotal < cfg.MaxWorkers {
-		return false
-	}
-	dynamicCfg := dynamicWarmCapacityConfigFromK8s(cfg)
-	if !dynamicCfg.Enabled {
-		return false
-	}
-	dynamicCfg.MaxWorkers = 0
-	uncappedTargets := computeDynamicWarmCapacityTargets(baseTargets, aggregates, dynamicCfg)
-	return sumIntMap(uncappedTargets) > effectiveTotal
-}
-
-func reconcileWarmCapacityImageTargets(pool *K8sWorkerPool, targets map[string]int) {
-	if pool == nil || len(targets) == 0 {
-		return
-	}
-	var wg sync.WaitGroup
-	for image, count := range targets {
-		if count <= 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(image string, count int) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
-			defer cancel()
-			if err := pool.SpawnMinWorkersForImage(ctx, image, count); err != nil {
-				slog.Warn("Janitor failed to reconcile image warm capacity.", "image", image, "target", count, "error", err)
-			}
-		}(image, count)
-	}
-	wg.Wait()
 }
 
 func resolveK8sNamespace(namespace string) (string, error) {

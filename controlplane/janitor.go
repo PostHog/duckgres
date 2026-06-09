@@ -12,7 +12,6 @@ import (
 const (
 	janitorRetireReasonOrphaned        = "orphaned"
 	janitorRetireReasonStuckActivating = "stuck_activating"
-	defaultWarmCapacityMissBucketTTL   = 15 * time.Minute
 )
 
 type controlPlaneExpiryStore interface {
@@ -24,10 +23,6 @@ type controlPlaneExpiryStore interface {
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 }
 
-type warmCapacityMissBucketPruner interface {
-	PruneWarmCapacityMissBuckets(before time.Time) (int64, error)
-}
-
 type ControlPlaneJanitor struct {
 	store                         controlPlaneExpiryStore
 	interval                      time.Duration
@@ -37,13 +32,12 @@ type ControlPlaneJanitor struct {
 	activateTimeout               time.Duration
 	maxDrainTimeout               time.Duration
 	hotIdleTTL                    time.Duration
-	warmCapacityMissBucketTTL     time.Duration
 	now                           func() time.Time
 	lifecycle                     *WorkerLifecycle // every per-worker transition flows through this; nil disables per-worker reaping for that tick.
 	lifecycleNilWarned            sync.Once        // one-shot guard so the misconfiguration error doesn't flood at the janitor tick rate.
-	reconcileWarmCapacity         func()
+	observeWorkerLifecycle        func() // refreshes the per-image worker lifecycle gauges (leader-only)
 	onStop                        func()
-	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
+	retireMismatchedVersionWorker func() // reaps one idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured node-headroom % (leader-only)
 }
@@ -63,7 +57,6 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		spawnTimeout:              2 * time.Minute,
 		activateTimeout:           2 * time.Minute,
 		maxDrainTimeout:           15 * time.Minute,
-		warmCapacityMissBucketTTL: DefaultWarmCapacityDemandTTL,
 		now:                       time.Now,
 	}
 }
@@ -117,9 +110,9 @@ func (j *ControlPlaneJanitor) runOnce() {
 	// bug — the only janitor constructor (multitenant.go) sets it
 	// unconditionally. The guard remains as a fail-soft so that
 	// misconfiguration doesn't NPE the entire tick (the rest of
-	// runOnce — flight session expiry, bucket pruning,
-	// warm-capacity reconciliation — still runs); the slog.Error
-	// makes the misconfiguration loud rather than silent.
+	// runOnce — flight session expiry, version-reaper, stranded-pod
+	// cleanup, worker-lifecycle observation — still runs); the
+	// slog.Error makes the misconfiguration loud rather than silent.
 	if j.lifecycle == nil {
 		j.lifecycleNilWarned.Do(func() {
 			slog.Error("Janitor running without a lifecycle service; per-worker reaping disabled. This is a wiring bug — fix the constructor.")
@@ -172,21 +165,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 		slog.Warn("Janitor failed to expire stale Flight sessions.", "error", err)
 	}
 
-	if pruner, ok := j.store.(warmCapacityMissBucketPruner); ok {
-		ttl := j.warmCapacityMissBucketTTL
-		if ttl <= 0 {
-			ttl = defaultWarmCapacityMissBucketTTL
-		}
-		cutoff := j.now().Add(-ttl).UTC().Truncate(configstore.WarmCapacityMissBucketSize)
-		pruned, err := pruner.PruneWarmCapacityMissBuckets(cutoff)
-		if err != nil {
-			slog.Warn("Janitor failed to prune warm capacity miss buckets.", "error", err)
-		} else if pruned > 0 {
-			slog.Info("Janitor pruned warm capacity miss buckets.", "count", pruned, "cutoff", cutoff)
-		}
-	}
-
-	// Gradual rolling replacement of warm workers whose Deployment version
+	// Gradual rolling replacement of workers whose Deployment version
 	// differs from this CP's. Runs only when this CP holds the janitor
 	// leader lease, so at most one CP at a time is retiring workers and the
 	// process stalls until a new-version CP is elected leader.
@@ -202,8 +181,8 @@ func (j *ControlPlaneJanitor) runOnce() {
 		j.cleanupOrphanedWorkerPods()
 	}
 
-	if j.reconcileWarmCapacity != nil {
-		j.reconcileWarmCapacity()
+	if j.observeWorkerLifecycle != nil {
+		j.observeWorkerLifecycle()
 	}
 
 	if j.reconcileHeadroom != nil {

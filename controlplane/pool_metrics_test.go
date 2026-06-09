@@ -91,15 +91,22 @@ func TestReservedAtTracking(t *testing.T) {
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-
-	w := makeTestWorker(WorkerLifecycleIdle, nil)
-	pool.workers[1] = w
+	// Spawn-on-demand: register the spawned worker so ReserveSharedWorker can
+	// reserve it and stamp reservedAt.
+	pool.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
+		w := makeTestWorker(WorkerLifecycleIdle, nil)
+		w.ID = id
+		pool.mu.Lock()
+		pool.workers[id] = w
+		pool.mu.Unlock()
+		return nil
+	}
 
 	before := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	_, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
+	got, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
 		OrgID: "org-1",
 	})
 	if err != nil {
@@ -107,8 +114,8 @@ func TestReservedAtTracking(t *testing.T) {
 	}
 	after := time.Now()
 
-	if w.reservedAt.Before(before) || w.reservedAt.After(after) {
-		t.Fatalf("reservedAt %v not between %v and %v", w.reservedAt, before, after)
+	if got.reservedAt.Before(before) || got.reservedAt.After(after) {
+		t.Fatalf("reservedAt %v not between %v and %v", got.reservedAt, before, after)
 	}
 }
 
@@ -143,7 +150,7 @@ func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *te
 	worker.reservedAt = time.Now().Add(-2 * time.Second)
 	pool.workers[1] = worker
 
-	orgPool := NewOrgReservedPool(pool, "org-1", 1, pool.workerImage, nil, 0, 0)
+	orgPool := NewOrgReservedPool(pool, "org-1", 1, pool.workerImage, nil)
 	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
 		if err != nil {
@@ -165,13 +172,7 @@ func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *te
 
 func TestReapStuckActivatingWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	pool.minWorkers = 2
 	pool.activatingTimeout = 50 * time.Millisecond
-
-	spawnedIDs := make(chan int, 10)
-	pool.spawnWarmWorkerBackgroundFunc = func(id int) {
-		spawnedIDs <- id
-	}
 
 	// One idle worker (healthy), one stuck activating worker
 	idle := makeTestWorker(WorkerLifecycleIdle, nil)
@@ -185,7 +186,8 @@ func TestReapStuckActivatingWorkers(t *testing.T) {
 
 	pool.reapStuckActivatingWorkers()
 
-	// Stuck worker should be removed
+	// Stuck worker should be removed; the healthy idle worker left alone. There
+	// is no warm pool, so nothing is spawned to replace the reaped worker.
 	pool.mu.RLock()
 	_, stuckExists := pool.workers[2]
 	_, idleExists := pool.workers[1]
@@ -196,14 +198,6 @@ func TestReapStuckActivatingWorkers(t *testing.T) {
 	}
 	if !idleExists {
 		t.Fatal("idle worker should not have been reaped")
-	}
-
-	// Should have spawned a replacement since minWorkers=2 and only 1 remains
-	select {
-	case <-spawnedIDs:
-		// good
-	case <-time.After(time.Second):
-		t.Fatal("expected replacement worker to be spawned")
 	}
 }
 
@@ -225,64 +219,6 @@ func TestReapStuckActivatingWorkers_RecentlyReservedNotReaped(t *testing.T) {
 
 	if !exists {
 		t.Fatal("recently reserved worker should not be reaped")
-	}
-}
-
-func TestObserveWarmCapacityMetrics(t *testing.T) {
-	image := "duckgres:metrics-test"
-	warmCapacityMissesCounter.DeleteLabelValues(image, string(configstore.WorkerClaimMissReasonGlobalCap))
-
-	observeWarmCapacityMiss(image, configstore.WorkerClaimMissReasonGlobalCap)
-	if got := counterLabelValues(warmCapacityMissesCounter, image, string(configstore.WorkerClaimMissReasonGlobalCap)); got != 1 {
-		t.Fatalf("expected one global-cap warm capacity miss, got %v", got)
-	}
-
-	observeWarmCapacityTargets(
-		map[string]int{image: 2},
-		map[string]int{image: 5},
-		10,
-	)
-	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 5, image)
-	assertGaugeValue(t, warmCapacityHeadroomGauge, 5)
-
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHot), "org_bound")
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHotIdle), "org_bound")
-	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
-		{Image: image, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
-		{Image: image, State: configstore.WorkerStateHotIdle, Binding: "org_bound", Count: 3},
-	})
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 2, image, string(configstore.WorkerStateIdle), "neutral")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 1, image, string(configstore.WorkerStateHot), "org_bound")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 3, image, string(configstore.WorkerStateHotIdle), "org_bound")
-	observeWorkerLifecycleStats(nil, []configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
-		{Image: image, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
-		{Image: image, State: configstore.WorkerStateHotIdle, Binding: "org_bound", Count: 3},
-	})
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHot), "org_bound")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_bound")
-}
-
-func TestObserveWarmCapacityTargetsDeletesStaleImage(t *testing.T) {
-	oldImage := "duckgres:old-target"
-	newImage := "duckgres:new-target"
-	warmCapacityEffectiveTargetGauge.DeleteLabelValues(oldImage)
-	warmCapacityEffectiveTargetGauge.DeleteLabelValues(newImage)
-
-	observeWarmCapacityTargets(nil, map[string]int{oldImage: 4}, 10)
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": oldImage}); !ok {
-		t.Fatal("expected old target image series to exist after observation")
-	}
-
-	observeWarmCapacityTargets(nil, map[string]int{newImage: 2}, 10, map[string]int{oldImage: 4})
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": oldImage}); ok {
-		t.Fatal("expected stale target image series to be deleted")
-	}
-	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": newImage}); !ok || got != 2 {
-		t.Fatalf("expected current target image series value 2, got value=%v ok=%v", got, ok)
 	}
 }
 
@@ -325,64 +261,16 @@ func TestObserveWorkerLifecycleStatsSeedsZerosAndDeletesStaleImages(t *testing.T
 	}
 }
 
-func TestObserveWorkerLifecycleStatsSeedsTargetImageWithoutRows(t *testing.T) {
-	image := "duckgres:empty-target-lifecycle"
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
-
-	observeWorkerLifecycleStatsForImages(nil, []string{image}, nil)
-
-	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
-		"image":   image,
-		"state":   string(configstore.WorkerStateIdle),
-		"binding": "neutral",
-	}); !ok || got != 0 {
-		t.Fatalf("expected seeded idle/neutral zero series for target image with no rows, got value=%v ok=%v", got, ok)
-	}
-}
-
-func TestObserveWorkerLifecycleStatsDeletesTargetImageWithoutRows(t *testing.T) {
-	image := "duckgres:removed-empty-target-lifecycle"
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
-
-	observeWorkerLifecycleStatsForImages(nil, []string{image}, nil)
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
-		"image":   image,
-		"state":   string(configstore.WorkerStateIdle),
-		"binding": "neutral",
-	}); !ok {
-		t.Fatal("expected target image zero series to exist before target removal")
-	}
-
-	observeWorkerLifecycleStatsForImages(nil, nil, []string{image})
-	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
-		"image":   image,
-		"state":   string(configstore.WorkerStateIdle),
-		"binding": "neutral",
-	}); ok {
-		t.Fatal("expected target image zero series to be deleted after target removal")
-	}
-}
-
 func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 	image := "duckgres:leader-reset-test"
 
-	observeWarmCapacityTargets(
-		map[string]int{image: 2},
-		map[string]int{image: 5},
-		10,
-	)
 	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
+		{Image: image, State: configstore.WorkerStateIdle, Binding: "org_bound", Count: 2},
 	})
 
 	resetLeaderOwnedClusterMetrics()
 
-	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 0, image)
-	// Headroom resets to the unbounded sentinel (-1) on leader
-	// handoff, not 0 — 0 is the alertable capacity-exhausted state
-	// and would page spuriously every rollout if we reset to it.
-	assertGaugeValue(t, warmCapacityHeadroomGauge, -1)
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "org_bound")
 }
 
 // --- Helpers ---
@@ -394,17 +282,6 @@ func makeTestWorker(lifecycle WorkerLifecycleState, assignment *WorkerAssignment
 	state := SharedWorkerState{Lifecycle: lifecycle, Assignment: assignment}
 	_ = w.SetSharedState(state)
 	return w
-}
-
-func assertGaugeValue(t *testing.T, gauge prometheus.Gauge, expected float64) {
-	t.Helper()
-	m := &dto.Metric{}
-	if err := gauge.Write(m); err != nil {
-		t.Fatalf("failed to read gauge: %v", err)
-	}
-	if got := m.GetGauge().GetValue(); got != expected {
-		t.Fatalf("expected gauge value %v, got %v", expected, got)
-	}
 }
 
 func metricGaugeFamilyLabelValue(t *testing.T, metricName string, labels map[string]string) (float64, bool) {
@@ -444,22 +321,6 @@ func metricHasLabels(metric *dto.Metric, labels map[string]string) bool {
 		}
 	}
 	return true
-}
-
-func counterLabelValue(cv *prometheus.CounterVec, label string) float64 {
-	return counterLabelValues(cv, label)
-}
-
-func counterLabelValues(cv *prometheus.CounterVec, labels ...string) float64 {
-	m := &dto.Metric{}
-	counter, err := cv.GetMetricWithLabelValues(labels...)
-	if err != nil {
-		return 0
-	}
-	if err := counter.Write(m); err != nil {
-		return 0
-	}
-	return m.GetCounter().GetValue()
 }
 
 func assertGaugeVecValue(t *testing.T, gv *prometheus.GaugeVec, expected float64, labels ...string) {
