@@ -94,12 +94,12 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("warm capacity exhausted", func(t *testing.T) {
+	t.Run("worker capacity exhausted", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(NewWorkerCapacityExhaustedError(45 * time.Second))
 		if code != "53300" {
 			t.Fatalf("code = %q, want 53300", code)
 		}
-		want := "no warm Duckgres worker is currently available; retry in about 45 seconds"
+		want := "no Duckgres worker is currently available; one is being spawned, retry in about 45 seconds"
 		if message != want {
 			t.Fatalf("message = %q, want %q", message, want)
 		}
