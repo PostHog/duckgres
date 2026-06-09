@@ -145,7 +145,7 @@ func TestStatementFlightInfoHoldsSessionOperationUntilDoGet(t *testing.T) {
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -210,7 +210,7 @@ func TestStatementFlightInfoNonEmptyHoldsSessionOperationUntilDoGet(t *testing.T
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -717,7 +717,7 @@ func TestEndTransactionRollbackReleasesAbandonedStatementOperation(t *testing.T)
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -782,7 +782,7 @@ func TestEndTransactionRollbackReleasesAbandonedMetadataOperation(t *testing.T) 
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -852,7 +852,7 @@ func TestEndTransactionNotFoundDoesNotConsumeMetadataOperation(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -879,8 +879,8 @@ func TestEndTransactionNotFoundDoesNotConsumeMetadataOperation(t *testing.T) {
 			delete(session.txns, id)
 			delete(session.txnOwner, id)
 		}
-		for key, drains := range session.metadataDrains {
-			releaseDrains = appendDrainTokenFuncs(releaseDrains, drains)
+		for key, drain := range session.metadataDrains {
+			releaseDrains = appendDrainTokenFunc(releaseDrains, drain)
 			delete(session.metadataDrains, key)
 		}
 		session.mu.Unlock()
@@ -949,7 +949,7 @@ func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
 				Prepared: true,
 			},
 		},
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns: map[string]*trackedTx{
 			"txn-1": {},
 		},
@@ -999,7 +999,7 @@ func TestRawSQLTransactionKeepsDrainOpenUntilCommit(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1048,7 +1048,7 @@ func TestRawSQLTransactionKeepsDrainOpenAfterFailedCommit(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1124,7 +1124,7 @@ func TestClosePreparedStatementReleasesAbandonedOperation(t *testing.T) {
 		queries: map[string]*QueryHandle{
 			"prep-1": {Query: "", Schema: arrow.NewSchema(nil, nil), Prepared: true},
 		},
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1150,6 +1150,30 @@ func TestClosePreparedStatementReleasesAbandonedOperation(t *testing.T) {
 		t.Fatal("operation gate should release after close prepared")
 	} else {
 		finish()
+	}
+}
+
+func TestDoGetPreparedStatementRequiresPendingFlightInfo(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {Query: "", Schema: arrow.NewSchema(nil, nil), Prepared: true},
+		},
+		metadataDrains: make(map[string]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+	cmd := testPreparedStatementQuery{handle: []byte("prep-1")}
+
+	if _, _, err := handler.DoGetPreparedStatement(ctx, cmd); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected DoGet without GetFlightInfo handoff to fail, got %v", err)
 	}
 }
 
@@ -1258,7 +1282,7 @@ func TestDoGetStatementKeepsRawSQLTransactionDrainOpenBeforeStreamingStarts(t *t
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 		sqlTxDrain:     finishDrain,
@@ -1360,7 +1384,7 @@ func TestMetadataGetFlightInfoRejectsConcurrentSessionOperation(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1411,6 +1435,38 @@ func TestMetadataGetFlightInfoRejectsConcurrentSessionOperation(t *testing.T) {
 	defer session.mu.RUnlock()
 	if len(session.metadataDrains) != 0 {
 		t.Fatalf("metadata drains were not consumed: %v", session.metadataDrains)
+	}
+}
+
+func TestMetadataDoGetRequiresPendingFlightInfo(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	pool.sessions["session-1"] = &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "session-1"))
+
+	if _, _, err := handler.DoGetDBSchemas(ctx, testGetDBSchemas{}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected metadata DoGet without GetFlightInfo handoff to fail, got %v", err)
 	}
 }
 

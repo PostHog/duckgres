@@ -119,7 +119,7 @@ type Session struct {
 	mu             sync.RWMutex
 	connMu         sync.Mutex // serializes operations on Conn and session-owned transactions
 	queries        map[string]*QueryHandle
-	metadataDrains map[string][]drainToken
+	metadataDrains map[string]drainToken
 	txns           map[string]*trackedTx
 	txnOwner       map[string]string
 	closed         bool
@@ -148,16 +148,17 @@ type QueryHandle struct {
 	Query     string
 	Schema    *arrow.Schema
 	TxnID     string
-	Prepared  bool      // prepared statements live until ClosePreparedStatement; the reaper never drops them, only their stale pendingDrains
+	Prepared  bool      // prepared statements live until ClosePreparedStatement; the reaper never drops them, only a stale pendingDrain
 	createdAt time.Time // when registered; the reaper drops a stale ad-hoc handle whose DoGet never arrived (guarded by Session.mu)
 	// finishOperation is the session operation token for an ad-hoc query
 	// awaiting its DoGet.
 	finishOperation func()
 	// finishDrain is the drain token of an ad-hoc query awaiting its DoGet.
 	finishDrain func()
-	// pendingDrains are drain tokens of GetFlightInfo[Prepared] calls awaiting
-	// their DoGet (a prepared handle accumulates one per GetFlightInfo).
-	pendingDrains []drainToken
+	// pendingDrain is the drain token of a GetFlightInfoPrepared call awaiting
+	// its DoGet. The session operation gate allows at most one pending
+	// continuation per session.
+	pendingDrain *drainToken
 }
 
 // drainToken pairs a drain-release closure with the time it was registered, so
@@ -176,14 +177,6 @@ func releaseDrainFunc(release func()) {
 	}
 }
 
-// appendDrainTokenFuncs appends the release closures of tokens to dst.
-func appendDrainTokenFuncs(dst []func(), tokens []drainToken) []func() {
-	for _, t := range tokens {
-		dst = appendDrainTokenFunc(dst, t)
-	}
-	return dst
-}
-
 func appendDrainTokenFunc(dst []func(), t drainToken) []func() {
 	if t.finish != nil {
 		dst = append(dst, t.finish)
@@ -192,6 +185,13 @@ func appendDrainTokenFunc(dst []func(), t drainToken) []func() {
 		dst = append(dst, t.finishOperation)
 	}
 	return dst
+}
+
+func appendOptionalDrainTokenFunc(dst []func(), token *drainToken) []func() {
+	if token == nil {
+		return dst
+	}
+	return appendDrainTokenFunc(dst, *token)
 }
 
 func (s *Session) hasTrackedTxDrain(txnKey string) bool {
@@ -691,16 +691,11 @@ func (p *SessionPool) reapIdle(now time.Time) {
 		for id, h := range s.queries {
 			if h.Prepared {
 				// Long-lived prepared handle: never drop it, only release
-				// pendingDrains (a GetFlightInfoPreparedStatement with no DoGet) gone stale.
-				kept := h.pendingDrains[:0]
-				for _, t := range h.pendingDrains {
-					if now.Sub(t.at) > handleIdleTimeout {
-						releaseDrains = appendDrainTokenFunc(releaseDrains, t)
-						continue
-					}
-					kept = append(kept, t)
+				// pendingDrain (a GetFlightInfoPreparedStatement with no DoGet) gone stale.
+				if h.pendingDrain != nil && now.Sub(h.pendingDrain.at) > handleIdleTimeout {
+					releaseDrains = appendDrainTokenFunc(releaseDrains, *h.pendingDrain)
+					h.pendingDrain = nil
 				}
-				h.pendingDrains = kept
 				continue
 			}
 			// Ad-hoc handle awaiting its DoGetStatement; drop it and release its
@@ -714,27 +709,18 @@ func (p *SessionPool) reapIdle(now time.Time) {
 					releaseDrains = append(releaseDrains, h.finishOperation)
 					h.finishOperation = nil
 				}
-				releaseDrains = appendDrainTokenFuncs(releaseDrains, h.pendingDrains)
-				h.pendingDrains = nil
+				releaseDrains = appendOptionalDrainTokenFunc(releaseDrains, h.pendingDrain)
+				h.pendingDrain = nil
 				slog.Warn("Reaping abandoned query handle (no DoGet).", "user", s.Username, "handle", id)
 				delete(s.queries, id)
 			}
 		}
 		// Drain tokens stranded on metadata streams (GetFlightInfoSchemas/Tables
 		// with no DoGet).
-		for key, tokens := range s.metadataDrains {
-			kept := tokens[:0]
-			for _, t := range tokens {
-				if now.Sub(t.at) > handleIdleTimeout {
-					releaseDrains = appendDrainTokenFunc(releaseDrains, t)
-					continue
-				}
-				kept = append(kept, t)
-			}
-			if len(kept) == 0 {
+		for key, token := range s.metadataDrains {
+			if now.Sub(token.at) > handleIdleTimeout {
+				releaseDrains = appendDrainTokenFunc(releaseDrains, token)
 				delete(s.metadataDrains, key)
-			} else {
-				s.metadataDrains[key] = kept
 			}
 		}
 		s.mu.Unlock()
@@ -1112,7 +1098,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		Username:       username,
 		CreatedAt:      time.Now(),
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 		duckdbConn:     duckConn,
@@ -1203,12 +1189,12 @@ func (p *SessionPool) DestroySession(token string) error {
 			releaseDrains = append(releaseDrains, handle.finishOperation)
 			handle.finishOperation = nil
 		}
-		releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
-		handle.pendingDrains = nil
+		releaseDrains = appendOptionalDrainTokenFunc(releaseDrains, handle.pendingDrain)
+		handle.pendingDrain = nil
 		delete(session.queries, id)
 	}
-	for key, drains := range session.metadataDrains {
-		releaseDrains = appendDrainTokenFuncs(releaseDrains, drains)
+	for key, drain := range session.metadataDrains {
+		releaseDrains = appendDrainTokenFunc(releaseDrains, drain)
 		delete(session.metadataDrains, key)
 	}
 	if session.sqlTxDrain != nil {
@@ -1427,12 +1413,12 @@ func (p *SessionPool) CloseAll() {
 				releaseDrains = append(releaseDrains, handle.finishOperation)
 				handle.finishOperation = nil
 			}
-			releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
-			handle.pendingDrains = nil
+			releaseDrains = appendOptionalDrainTokenFunc(releaseDrains, handle.pendingDrain)
+			handle.pendingDrain = nil
 			delete(session.queries, id)
 		}
-		for key, drains := range session.metadataDrains {
-			releaseDrains = appendDrainTokenFuncs(releaseDrains, drains)
+		for key, drain := range session.metadataDrains {
+			releaseDrains = appendDrainTokenFunc(releaseDrains, drain)
 			delete(session.metadataDrains, key)
 		}
 		if session.sqlTxDrain != nil {

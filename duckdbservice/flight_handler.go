@@ -123,8 +123,8 @@ func releaseQueryHandleValue(handle *QueryHandle) {
 		releaseDrains = append(releaseDrains, handle.finishOperation)
 		handle.finishOperation = nil
 	}
-	releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
-	handle.pendingDrains = nil
+	releaseDrains = appendOptionalDrainTokenFunc(releaseDrains, handle.pendingDrain)
+	handle.pendingDrain = nil
 	for _, release := range releaseDrains {
 		releaseDrainFunc(release)
 	}
@@ -142,15 +142,15 @@ func appendQueryHandleReleaseFuncs(handle *QueryHandle, drainReleases, operation
 		operationReleases = append(operationReleases, handle.finishOperation)
 		handle.finishOperation = nil
 	}
-	for _, token := range handle.pendingDrains {
-		if token.finish != nil {
-			drainReleases = append(drainReleases, token.finish)
+	if handle.pendingDrain != nil {
+		if handle.pendingDrain.finish != nil {
+			drainReleases = append(drainReleases, handle.pendingDrain.finish)
 		}
-		if token.finishOperation != nil {
-			operationReleases = append(operationReleases, token.finishOperation)
+		if handle.pendingDrain.finishOperation != nil {
+			operationReleases = append(operationReleases, handle.pendingDrain.finishOperation)
 		}
+		handle.pendingDrain = nil
 	}
-	handle.pendingDrains = nil
 	return drainReleases, operationReleases
 }
 
@@ -173,36 +173,24 @@ func popAbandonedTransactionContinuations(session *Session, txnKey string) ([]fu
 			drainReleases, operationReleases = appendQueryHandleReleaseFuncs(handle, drainReleases, operationReleases)
 			continue
 		}
-		kept := handle.pendingDrains[:0]
-		for _, token := range handle.pendingDrains {
-			if token.finishOperation == nil {
-				kept = append(kept, token)
-				continue
-			}
-			if token.finish != nil {
-				drainReleases = append(drainReleases, token.finish)
-			}
-			operationReleases = append(operationReleases, token.finishOperation)
+		if handle.pendingDrain == nil || handle.pendingDrain.finishOperation == nil {
+			continue
 		}
-		handle.pendingDrains = kept
+		if handle.pendingDrain.finish != nil {
+			drainReleases = append(drainReleases, handle.pendingDrain.finish)
+		}
+		operationReleases = append(operationReleases, handle.pendingDrain.finishOperation)
+		handle.pendingDrain = nil
 	}
-	for key, tokens := range session.metadataDrains {
-		kept := tokens[:0]
-		for _, token := range tokens {
-			if token.finishOperation == nil || token.txnID != txnKey {
-				kept = append(kept, token)
-				continue
-			}
-			if token.finish != nil {
-				drainReleases = append(drainReleases, token.finish)
-			}
-			operationReleases = append(operationReleases, token.finishOperation)
+	for key, token := range session.metadataDrains {
+		if token.finishOperation == nil || token.txnID != txnKey {
+			continue
 		}
-		if len(kept) == 0 {
-			delete(session.metadataDrains, key)
-		} else {
-			session.metadataDrains[key] = kept
+		if token.finish != nil {
+			drainReleases = append(drainReleases, token.finish)
 		}
+		operationReleases = append(operationReleases, token.finishOperation)
+		delete(session.metadataDrains, key)
 	}
 	session.mu.Unlock()
 	return drainReleases, operationReleases
@@ -256,7 +244,10 @@ func appendPreparedDrain(session *Session, handleID string, finishDrain func(), 
 			ttx.lastUsed.Store(now.UnixNano())
 		}
 	}
-	handle.pendingDrains = append(handle.pendingDrains, drainToken{finish: finishDrain, finishOperation: finishOperation, at: now})
+	if handle.pendingDrain != nil {
+		return false
+	}
+	handle.pendingDrain = &drainToken{finish: finishDrain, finishOperation: finishOperation, txnID: handle.TxnID, at: now}
 	return true
 }
 
@@ -267,12 +258,11 @@ func popPreparedDrain(session *Session, handleID string) (*QueryHandle, func(), 
 	if !ok {
 		return nil, nil, nil, false
 	}
-	if len(handle.pendingDrains) == 0 {
+	if handle.pendingDrain == nil {
 		return handle, nil, nil, true
 	}
-	token := handle.pendingDrains[0]
-	copy(handle.pendingDrains, handle.pendingDrains[1:])
-	handle.pendingDrains = handle.pendingDrains[:len(handle.pendingDrains)-1]
+	token := *handle.pendingDrain
+	handle.pendingDrain = nil
 	return handle, token.finish, token.finishOperation, true
 }
 
@@ -283,29 +273,28 @@ func appendMetadataDrain(session *Session, key string, finishDrain func(), finis
 		return false
 	}
 	if session.metadataDrains == nil {
-		session.metadataDrains = make(map[string][]drainToken)
+		session.metadataDrains = make(map[string]drainToken)
 	}
-	session.metadataDrains[key] = append(session.metadataDrains[key], drainToken{
+	if _, exists := session.metadataDrains[key]; exists {
+		return false
+	}
+	session.metadataDrains[key] = drainToken{
 		finish:          finishDrain,
 		finishOperation: finishOperation,
 		txnID:           txnID,
 		at:              time.Now(),
-	})
+	}
 	return true
 }
 
 func popMetadataDrain(session *Session, key string) (func(), func()) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if len(session.metadataDrains[key]) == 0 {
+	token, ok := session.metadataDrains[key]
+	if !ok {
 		return nil, nil
 	}
-	token := session.metadataDrains[key][0]
-	copy(session.metadataDrains[key], session.metadataDrains[key][1:])
-	session.metadataDrains[key] = session.metadataDrains[key][:len(session.metadataDrains[key])-1]
-	if len(session.metadataDrains[key]) == 0 {
-		delete(session.metadataDrains, key)
-	}
+	delete(session.metadataDrains, key)
 	return token.finish, token.finishOperation
 }
 
@@ -1249,21 +1238,7 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 		return nil, nil, status.Error(codes.NotFound, "prepared statement not found")
 	}
 	if finishDrain == nil {
-		var operationOK bool
-		finishOperation, operationOK = session.beginOperation()
-		if busyErr := sessionBusyStatus(operationOK); busyErr != nil {
-			return nil, nil, busyErr
-		}
-		var err error
-		finishDrain, err = h.pool.beginDrainWork(session.allowsDrainContinuation(handle.TxnID))
-		if drainErr := workerDrainingStatus(err); drainErr != nil {
-			finishOperation()
-			return nil, nil, drainErr
-		}
-		if err != nil {
-			finishOperation()
-			return nil, nil, status.Errorf(codes.Internal, "start prepared query drain tracking: %v", err)
-		}
+		return nil, nil, status.Error(codes.FailedPrecondition, "prepared statement has no pending FlightInfo")
 	}
 	if finishOperation == nil {
 		finishOperation = func() {}
@@ -1402,21 +1377,7 @@ func (h *FlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd flightsql.Get
 	}
 	finishDrain, finishOperation := popMetadataDrain(session, metadataSchemasDrainKey(cmd))
 	if finishDrain == nil {
-		var operationOK bool
-		finishOperation, operationOK = session.beginOperation()
-		if busyErr := sessionBusyStatus(operationOK); busyErr != nil {
-			return nil, nil, busyErr
-		}
-		var err error
-		finishDrain, err = h.pool.beginDrainWork(session.allowsDrainContinuation(""))
-		if drainErr := workerDrainingStatus(err); drainErr != nil {
-			finishOperation()
-			return nil, nil, drainErr
-		}
-		if err != nil {
-			finishOperation()
-			return nil, nil, status.Errorf(codes.Internal, "start schema metadata drain tracking: %v", err)
-		}
+		return nil, nil, status.Error(codes.FailedPrecondition, "schema metadata has no pending FlightInfo")
 	}
 	if finishOperation == nil {
 		finishOperation = func() {}
@@ -1566,21 +1527,7 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 	}
 	finishDrain, finishOperation := popMetadataDrain(session, metadataTablesDrainKey(cmd))
 	if finishDrain == nil {
-		var operationOK bool
-		finishOperation, operationOK = session.beginOperation()
-		if busyErr := sessionBusyStatus(operationOK); busyErr != nil {
-			return nil, nil, busyErr
-		}
-		var err error
-		finishDrain, err = h.pool.beginDrainWork(session.allowsDrainContinuation(""))
-		if drainErr := workerDrainingStatus(err); drainErr != nil {
-			finishOperation()
-			return nil, nil, drainErr
-		}
-		if err != nil {
-			finishOperation()
-			return nil, nil, status.Errorf(codes.Internal, "start table metadata drain tracking: %v", err)
-		}
+		return nil, nil, status.Error(codes.FailedPrecondition, "table metadata has no pending FlightInfo")
 	}
 	if finishOperation == nil {
 		finishOperation = func() {}

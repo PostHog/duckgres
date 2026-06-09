@@ -107,9 +107,10 @@ normal `go test ./...` lane.
   harness enters through pgwire, where one client connection maps to one worker
   session and operations are serialized by the control plane. Driving this
   specific defense-in-depth path end-to-end would need a bespoke concurrent
-  Flight-ingress client, so the rejection contract and abandoned-continuation
-  cleanup are covered by `duckdbservice` unit tests. The harness still asserts
-  the cluster invariant this protects: one active session owns one worker.
+  Flight-ingress client, so the rejection contract, required
+  GetFlightInfo-to-DoGet handoffs, and abandoned-continuation cleanup are covered
+  by `duckdbservice` unit tests. The harness still asserts the cluster invariant
+  this protects: one active session owns one worker.
 
 ## Isolation model
 
