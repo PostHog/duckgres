@@ -134,11 +134,15 @@ _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
     case "$out" in
       *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
-      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*)
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
         # The last three cover an on-demand cold spawn that needed a fresh node
         # (sized worker too big for the warm node): the first connect can hit the
         # spawn ceiling while the pod is still pulling/booting; by the retry it is
         # hot-idle and the reconnect reuses it. Same transient class as a cold pool.
+        # "failed to detect attached catalogs" is the session-init catalog probe
+        # racing a freshly-spawned worker whose ATTACH is still settling — it fires
+        # BEFORE any user SQL runs, so retrying the whole command is safe.
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out" >&2; return 1 ;;
     esac
@@ -168,7 +172,8 @@ pg_try() { # org password dbname sql
     case "$out" in
       *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
-      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*)
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out"; return 1 ;;
     esac
