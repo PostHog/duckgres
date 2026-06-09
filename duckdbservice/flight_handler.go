@@ -154,7 +154,7 @@ func appendQueryHandleReleaseFuncs(handle *QueryHandle, drainReleases, operation
 	return drainReleases, operationReleases
 }
 
-func popTransactionQueryHandles(session *Session, txnKey string) ([]func(), []func()) {
+func popAbandonedTransactionContinuations(session *Session, txnKey string) ([]func(), []func()) {
 	var drainReleases []func()
 	var operationReleases []func()
 	if txnKey == "" {
@@ -165,8 +165,26 @@ func popTransactionQueryHandles(session *Session, txnKey string) ([]func(), []fu
 		if handle.TxnID != txnKey {
 			continue
 		}
-		delete(session.queries, id)
-		drainReleases, operationReleases = appendQueryHandleReleaseFuncs(handle, drainReleases, operationReleases)
+		if !handle.Prepared {
+			if handle.finishOperation == nil {
+				continue
+			}
+			delete(session.queries, id)
+			drainReleases, operationReleases = appendQueryHandleReleaseFuncs(handle, drainReleases, operationReleases)
+			continue
+		}
+		kept := handle.pendingDrains[:0]
+		for _, token := range handle.pendingDrains {
+			if token.finishOperation == nil {
+				kept = append(kept, token)
+				continue
+			}
+			if token.finish != nil {
+				drainReleases = append(drainReleases, token.finish)
+			}
+			operationReleases = append(operationReleases, token.finishOperation)
+		}
+		handle.pendingDrains = kept
 	}
 	session.mu.Unlock()
 	return drainReleases, operationReleases
@@ -995,14 +1013,14 @@ func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 	var handleDrainReleases []func()
 	var handleOperationReleases []func()
 	if !ok {
-		handleDrainReleases, handleOperationReleases = popTransactionQueryHandles(session, txnKey)
+		handleDrainReleases, handleOperationReleases = popAbandonedTransactionContinuations(session, txnKey)
 		if len(handleOperationReleases) == 0 {
 			if busyErr := sessionBusyStatus(false); busyErr != nil {
 				return busyErr
 			}
 		}
 	} else {
-		handleDrainReleases, handleOperationReleases = popTransactionQueryHandles(session, txnKey)
+		handleDrainReleases, handleOperationReleases = popAbandonedTransactionContinuations(session, txnKey)
 		handleOperationReleases = append(handleOperationReleases, finishOperation)
 	}
 	defer func() {

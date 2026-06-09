@@ -762,6 +762,49 @@ func TestEndTransactionRollbackReleasesAbandonedStatementOperation(t *testing.T)
 	}
 }
 
+func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {
+				Query:    "SELECT 1",
+				Schema:   arrow.NewSchema(nil, nil),
+				TxnID:    "txn-1",
+				Prepared: true,
+			},
+		},
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("expected operation to start")
+	}
+	defer finishOperation()
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: []byte("txn-1"),
+		action:        flightsql.EndTransactionRollback,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected EndTransaction to reject busy session, got %v", err)
+	}
+	session.mu.RLock()
+	_, stillPresent := session.queries["prep-1"]
+	session.mu.RUnlock()
+	if !stillPresent {
+		t.Fatal("busy EndTransaction deleted a live prepared handle")
+	}
+}
+
 func TestRawSQLTransactionKeepsDrainOpenUntilCommit(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
