@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 func TestDecimalValueString(t *testing.T) {
@@ -191,8 +193,8 @@ func TestParseDecimalParams(t *testing.T) {
 		{"DECIMAL(10,5)", 10, 5},
 		{"DECIMAL(38,0)", 38, 0},
 		{"NUMERIC(5,3)", 5, 3},
-		{"DECIMAL", 18, 3},   // default fallback
-		{"DECIMAL()", 18, 3}, // empty parens
+		{"DECIMAL", 18, 3},          // default fallback
+		{"DECIMAL()", 18, 3},        // empty parens
 		{"DECIMAL(abc,def)", 18, 3}, // non-numeric
 		{"DECIMAL(18,)", 18, 3},     // missing scale
 		{"DECIMAL(,2)", 18, 3},      // missing precision
@@ -310,6 +312,38 @@ func TestParseStructFieldDef(t *testing.T) {
 			}
 			if gotType != tt.wantType {
 				t.Errorf("parseStructFieldDef(%q) type = %q, want %q", tt.input, gotType, tt.wantType)
+			}
+		})
+	}
+}
+
+// Regression for #716: DuckDB JSON columns map to an Arrow String column, and
+// the database/sql driver decodes JSON values into native Go composites
+// ([]interface{} / map[string]interface{}). AppendValue must serialize those
+// back to JSON text — before the fix it used fmt.Sprintf("%v"), so a jsonb
+// array reached remote-backend clients as "[1 2 3 4]" instead of "[1,2,3,4]".
+// VARCHAR columns never decode to a composite, so plain strings are untouched.
+func TestAppendValueJSONCompositeToString(t *testing.T) {
+	tests := []struct {
+		name string
+		val  any
+		want string
+	}{
+		{"json array", []interface{}{int64(1), int64(2), int64(3), int64(4)}, "[1,2,3,4]"},
+		{"json object", map[string]interface{}{"a": int64(1)}, `{"a":1}`},
+		{"json null-valued key", map[string]interface{}{"a": nil}, `{"a":null}`},
+		{"nested", []interface{}{map[string]interface{}{"a": int64(1)}, int64(2)}, `[{"a":1},2]`},
+		{"plain varchar untouched", "plain text", "plain text"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := array.NewStringBuilder(memory.DefaultAllocator)
+			defer b.Release()
+			AppendValue(b, tc.val)
+			arr := b.NewStringArray()
+			defer arr.Release()
+			if got := arr.Value(0); got != tc.want {
+				t.Fatalf("AppendValue(%v) -> %q, want %q", tc.val, got, tc.want)
 			}
 		})
 	}

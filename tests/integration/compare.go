@@ -330,6 +330,15 @@ func valuesEqual(pg, dg interface{}, opts CompareOptions) bool {
 	pgNorm := normalizeValue(pg)
 	dgNorm := normalizeValue(dg)
 
+	// JSON comparison MUST come before the plain string comparison below:
+	// Postgres jsonb pretty-prints ("[1, 2, 3, 4]", "{\"a\": 1}") while DuckDB
+	// JSON is compact ("[1,2,3,4]", "{\"a\":1}"). They are structurally
+	// identical valid JSON but not byte-equal, so an exact string compare would
+	// spuriously fail (e.g. the #716 jsonb_concat_* cases). Compare structurally.
+	if isJSON(pgNorm) && isJSON(dgNorm) {
+		return jsonEqual(pgNorm, dgNorm)
+	}
+
 	// String comparison
 	if pgStr, ok := pgNorm.(string); ok {
 		if dgStr, ok := dgNorm.(string); ok {
@@ -376,11 +385,6 @@ func valuesEqual(pg, dg interface{}, opts CompareOptions) bool {
 		if dgBool, ok := dgNorm.(bool); ok {
 			return pgBool == dgBool
 		}
-	}
-
-	// JSON comparison
-	if isJSON(pgNorm) && isJSON(dgNorm) {
-		return jsonEqual(pgNorm, dgNorm)
 	}
 
 	// Array/slice comparison
