@@ -55,26 +55,6 @@ func newIsolatedConfigStore(t *testing.T) *cpconfigstore.ConfigStore {
 	return store
 }
 
-func newConfigStoreOnSameSchema(t *testing.T, store *cpconfigstore.ConfigStore) *cpconfigstore.ConfigStore {
-	t.Helper()
-
-	var schema string
-	if err := store.DB().Raw("SELECT current_schema()").Scan(&schema).Error; err != nil {
-		t.Fatalf("current schema: %v", err)
-	}
-	other, err := cpconfigstore.NewConfigStore("host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable search_path="+schema, time.Hour)
-	if err != nil {
-		t.Fatalf("new config store on schema %s: %v", schema, err)
-	}
-	sqlDB, err := other.DB().DB()
-	if err != nil {
-		t.Fatalf("other store sql db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = sqlDB.Close()
-	})
-	return other
-}
 func ensureIntegrationPostgres(t *testing.T) {
 	t.Helper()
 
