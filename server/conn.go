@@ -1269,9 +1269,8 @@ func (c *clientConn) handleStartup() error {
 	// Password is null-terminated
 	password := string(bytes.TrimRight(body, "\x00"))
 
-	// Validate password
-	expectedPassword, ok := c.server.cfg.Users[c.username]
-	if !ok || expectedPassword != password {
+	// Validate password (constant-time; does not leak whether the user exists)
+	if !auth.ValidateUserPassword(c.server.cfg.Users, c.username, password) {
 		// Record failed authentication attempt
 		banned := c.server.rateLimiter.RecordFailedAuth(c.conn.RemoteAddr())
 		if banned {
