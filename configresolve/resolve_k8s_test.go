@@ -1,9 +1,7 @@
 package configresolve
 
 import (
-	"strings"
 	"testing"
-
 )
 
 func TestResolveEffectiveDefaultsK8sWorkerServiceAccountToNeutralWorker(t *testing.T) {
@@ -25,12 +23,4 @@ func TestResolveEffectiveExposesDuckLakeDefaultSpecVersionForControlPlane(t *tes
 	if resolved.DuckLakeDefaultSpecVersion != "1.1" {
 		t.Fatalf("expected DuckLake default spec version 1.1, got %q", resolved.DuckLakeDefaultSpecVersion)
 	}
-}
-func containsWarning(warnings []string, substr string) bool {
-	for _, warning := range warnings {
-		if strings.Contains(warning, substr) {
-			return true
-		}
-	}
-	return false
 }

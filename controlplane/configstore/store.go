@@ -1045,7 +1045,7 @@ func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 		// with an empty profile) actually persists. Without them the ON CONFLICT
 		// update silently dropped the profile, so a sized worker's hot-idle row
 		// stayed empty and ClaimHotIdleWorker could never match it (no reuse).
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at", "profile_cpu", "profile_memory", "profile_colocate", "ttl_minutes"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at", "profile_cpu", "profile_memory", "ttl_minutes"}),
 		Where: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: `"worker_records"."state" NOT IN ?`, Vars: []any{protectedStates}},
 			clause.Expr{SQL: `(excluded."owner_epoch" > "worker_records"."owner_epoch" OR (excluded."owner_epoch" = "worker_records"."owner_epoch" AND excluded."owner_cp_instance_id" = "worker_records"."owner_cp_instance_id"))`},
@@ -1535,9 +1535,8 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 			return err
 		}
 
-		// Exclusive-only count caps: colocated workers bin-pack and are unbounded.
 		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ? AND COALESCE(profile_colocate, false) = false", orgID)
+			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
 			if err != nil {
 				return err
 			}
@@ -1547,7 +1546,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 		}
 
 		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx, "COALESCE(profile_colocate, false) = false")
+			count, err := cs.countActiveWorkers(tx)
 			if err != nil {
 				return err
 			}

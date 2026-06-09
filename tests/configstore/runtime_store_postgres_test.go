@@ -21,7 +21,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatal("expected runtime schema to be configured")
 	}
 
-	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records", "warm_capacity_miss_buckets"} {
+	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records"} {
 		var count int64
 		if err := store.DB().Raw(
 			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",

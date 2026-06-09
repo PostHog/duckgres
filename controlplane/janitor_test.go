@@ -23,9 +23,6 @@ type captureControlPlaneExpiryStore struct {
 	stuckWorkers           []configstore.WorkerRecord
 	expiredSessionsBefore  []time.Time
 	expiredHotIdleWorkers  []configstore.WorkerRecord
-	pruneMissBucketsBefore []time.Time
-	prunedMissBucketCount  int64
-	pruneMissBucketErr     error
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {

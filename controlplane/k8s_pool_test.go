@@ -38,7 +38,6 @@ type captureRuntimeWorkerStore struct {
 	claimImage                       string
 	claimProfileCPU                  string
 	claimProfileMemory               string
-	claimProfileColocate             bool
 	claimMaxOrgWorkers               int
 	claimMaxGlobalWorkers            int
 	spawned                          *configstore.WorkerRecord
@@ -60,7 +59,6 @@ type captureRuntimeWorkerStore struct {
 	neutralSpawnImage                string
 	neutralSpawnProfileCPU           string
 	neutralSpawnProfileMemory        string
-	neutralSpawnProfileColocate      bool
 	neutralSpawnTarget               int
 	neutralSpawnMaxGlobal            int
 	perImageSpawned                  *configstore.WorkerRecord
@@ -78,7 +76,6 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimOrgID                string
 	hotIdleClaimProfileCPU           string
 	hotIdleClaimProfileMemory        string
-	hotIdleClaimProfileColocate      bool
 	hotIdleClaimMaxOrgWorkers        int
 	recordMissCalls                  int
 	recordMissScopes                 []string
