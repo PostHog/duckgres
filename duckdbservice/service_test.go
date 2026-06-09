@@ -134,7 +134,7 @@ func TestReapAbandonedQueryHandleReleasesOperation(t *testing.T) {
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 	}
 	finishOperation, ok := session.beginOperation()
@@ -172,20 +172,20 @@ func TestReapAbandonedPreparedDrainReleasesOperation(t *testing.T) {
 			"prep-1": {
 				Query:    "SELECT 1",
 				Prepared: true,
-				pendingDrains: []drainToken{{
+				pendingDrain: &drainToken{
 					finish: finishDrain,
 					at:     time.Now().Add(-handleIdleTimeout - time.Minute),
-				}},
+				},
 			},
 		},
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 	}
 	finishOperation, ok := session.beginOperation()
 	if !ok {
 		t.Fatal("expected operation to start")
 	}
-	session.queries["prep-1"].pendingDrains[0].finishOperation = finishOperation
+	session.queries["prep-1"].pendingDrain.finishOperation = finishOperation
 	pool.sessions[session.ID] = session
 
 	pool.reapIdle(time.Now())
@@ -212,18 +212,18 @@ func TestReapAbandonedMetadataDrainReleasesOperation(t *testing.T) {
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 	}
 	finishOperation, ok := session.beginOperation()
 	if !ok {
 		t.Fatal("expected operation to start")
 	}
-	session.metadataDrains["schemas|x"] = []drainToken{{
+	session.metadataDrains["schemas|x"] = drainToken{
 		finish:          finishDrain,
 		finishOperation: finishOperation,
 		at:              time.Now().Add(-handleIdleTimeout - time.Minute),
-	}}
+	}
 	pool.sessions[session.ID] = session
 
 	pool.reapIdle(time.Now())
@@ -749,7 +749,7 @@ func TestReapIdleRawSQLTransactionReleasesDrainWork(t *testing.T) {
 		ID:             "session-1",
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 		sqlTxDrain:     finishDrain,
@@ -789,7 +789,7 @@ func TestReapIdleRawSQLTransactionKeepsDrainWorkWhenConnWorkActive(t *testing.T)
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 		sqlTxDrain:     finishDrain,
@@ -838,7 +838,7 @@ func TestReapIdleRawSQLTransactionKeepsDrainWorkWhenRollbackCannotRun(t *testing
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 		sqlTxDrain:     finishDrain,
@@ -888,7 +888,7 @@ func TestDestroySessionPreventsLateQueryHandleDrainLeak(t *testing.T) {
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -922,7 +922,7 @@ func TestDestroySessionPreventsLateSQLTransactionDrainLeak(t *testing.T) {
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -956,7 +956,7 @@ func TestDestroySessionPreventsLateTrackedTransactionDrainLeak(t *testing.T) {
 	session := &Session{
 		ID:             "session-1",
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1002,7 +1002,7 @@ func TestDestroySessionWaitsForActiveConnectionWorkBeforeCleanup(t *testing.T) {
 		DB:             db,
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1051,7 +1051,7 @@ func TestDestroySessionWaitsForAcceptedConnectionWorkBeforeCleanup(t *testing.T)
 		DB:             db,
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1103,7 +1103,7 @@ func TestCloseAllWaitsForActiveConnectionWorkBeforeClose(t *testing.T) {
 		DB:             db,
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1150,7 +1150,7 @@ func TestCloseAllWaitsForAcceptedConnectionWorkBeforeClose(t *testing.T) {
 		DB:             db,
 		Conn:           conn,
 		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string][]drainToken),
+		metadataDrains: make(map[string]drainToken),
 		txns:           make(map[string]*trackedTx),
 		txnOwner:       make(map[string]string),
 	}
@@ -1182,7 +1182,7 @@ func TestCloseAllWaitsForAcceptedConnectionWorkBeforeClose(t *testing.T) {
 
 // A GetFlightInfo whose matching DoGet never arrives must not hold the drain
 // open forever: the reaper releases drain tokens stranded on stale ad-hoc query
-// handles, stale prepared pendingDrains, and stale metadata streams — while
+// handles, stale prepared pendingDrain, and stale metadata streams — while
 // leaving fresh handles and long-lived prepared handles intact.
 func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
 	pool := &SessionPool{
@@ -1209,10 +1209,10 @@ func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
 		queries: map[string]*QueryHandle{
 			"query-1": {Query: "SELECT 1", createdAt: stale, finishDrain: staleAdhoc},
 			"query-2": {Query: "SELECT 2", createdAt: fresh, finishDrain: freshAdhoc},
-			"prep-1":  {Query: "SELECT 3", Prepared: true, createdAt: stale, pendingDrains: []drainToken{{finish: stalePrepared, at: stale}}},
+			"prep-1":  {Query: "SELECT 3", Prepared: true, createdAt: stale, pendingDrain: &drainToken{finish: stalePrepared, at: stale}},
 		},
-		metadataDrains: map[string][]drainToken{
-			"schemas|x": {{finish: staleMeta, at: stale}},
+		metadataDrains: map[string]drainToken{
+			"schemas|x": {finish: staleMeta, at: stale},
 		},
 		txns:     make(map[string]*trackedTx),
 		txnOwner: make(map[string]string),
@@ -1241,8 +1241,8 @@ func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
 	if !ok {
 		t.Fatal("prepared handle prep-1 was wrongly dropped (must outlive a stale pendingDrain)")
 	}
-	if len(prep.pendingDrains) != 0 {
-		t.Errorf("stale prepared pendingDrain not released: %d remain", len(prep.pendingDrains))
+	if prep.pendingDrain != nil {
+		t.Errorf("stale prepared pendingDrain not released: still present")
 	}
 	if _, ok := sess.metadataDrains["schemas|x"]; ok {
 		t.Error("stale metadata drain was not reaped")
