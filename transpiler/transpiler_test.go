@@ -218,8 +218,8 @@ func TestTranspile_InformationSchema(t *testing.T) {
 		},
 		{
 			name:     "unmapped information_schema table passes through",
-			input:    "SELECT * FROM information_schema.routines",
-			contains: "information_schema.routines",
+			input:    "SELECT * FROM information_schema.key_column_usage",
+			contains: "information_schema.key_column_usage",
 		},
 	}
 

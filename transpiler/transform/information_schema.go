@@ -26,10 +26,12 @@ func NewInformationSchemaTransformWithConfig(duckLakeMode bool) *InformationSche
 	return &InformationSchemaTransform{
 		DuckLakeMode: duckLakeMode,
 		ViewMappings: map[string]string{
-			"columns":  "information_schema_columns_compat",
-			"tables":   "information_schema_tables_compat",
-			"schemata": "information_schema_schemata_compat",
-			"views":    "information_schema_views_compat",
+			"columns":   "information_schema_columns_compat",
+			"tables":    "information_schema_tables_compat",
+			"schemata":  "information_schema_schemata_compat",
+			"views":     "information_schema_views_compat",
+			"sequences": "information_schema_sequences_compat",
+			"routines":  "information_schema_routines_compat",
 		},
 	}
 }

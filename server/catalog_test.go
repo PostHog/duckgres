@@ -494,3 +494,72 @@ func TestInformationSchemaCompatViewsUseCurrentDatabaseForCatalogNames(t *testin
 		t.Fatalf("schemata catalog_name = %q, want %q", schemaCatalog, "analytics")
 	}
 }
+
+func TestInformationSchemaSequencesAndRoutinesCompatViews(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := initInformationSchema(db, false); err != nil {
+		t.Fatalf("Failed to init information_schema: %v", err)
+	}
+
+	// sequences: one row per real sequence, none on a fresh DB.
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM memory.main.information_schema_sequences_compat`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query sequences compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("fresh DB: expected 0 sequences, got %d", count)
+	}
+
+	if _, err := db.Exec(`CREATE SEQUENCE s START 5 INCREMENT 2`); err != nil {
+		t.Fatalf("Failed to create sequence: %v", err)
+	}
+
+	var schema, name, dataType, startValue, increment, cycleOption string
+	if err := db.QueryRow(`
+		SELECT sequence_schema, sequence_name, data_type, start_value, increment, cycle_option
+		FROM memory.main.information_schema_sequences_compat
+	`).Scan(&schema, &name, &dataType, &startValue, &increment, &cycleOption); err != nil {
+		t.Fatalf("Failed to query sequences compat view after CREATE SEQUENCE: %v", err)
+	}
+	if schema != "public" || name != "s" || dataType != "bigint" ||
+		startValue != "5" || increment != "2" || cycleOption != "NO" {
+		t.Errorf("unexpected sequence row: schema=%q name=%q data_type=%q start=%q increment=%q cycle=%q",
+			schema, name, dataType, startValue, increment, cycleOption)
+	}
+
+	// routines: typed WHERE-false stub — empty, and column-filtered queries don't error.
+	if err := db.QueryRow(`
+		SELECT count(*) FROM memory.main.information_schema_routines_compat
+		WHERE routine_type = 'FUNCTION' AND routine_schema = 'public'
+	`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query routines compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("routines stub: expected 0 rows, got %d", count)
+	}
+
+	// Neither compat view may leak into the tables/views listings.
+	if err := db.QueryRow(`
+		SELECT count(*) FROM memory.main.information_schema_tables_compat
+		WHERE table_name IN ('information_schema_sequences_compat', 'information_schema_routines_compat')
+	`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query tables compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("compat views leaked into information_schema_tables_compat: %d rows", count)
+	}
+	if err := db.QueryRow(`
+		SELECT count(*) FROM memory.main.information_schema_views_compat
+		WHERE table_name IN ('information_schema_sequences_compat', 'information_schema_routines_compat')
+	`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query views compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("compat views leaked into information_schema_views_compat: %d rows", count)
+	}
+}

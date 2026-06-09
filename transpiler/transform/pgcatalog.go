@@ -71,6 +71,25 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_trigger":              "pg_trigger",
 			"pg_locks":                "pg_locks",
 			"pg_rewrite":              "pg_rewrite",
+			// Stub relations created by initPgCatalog for tool/driver introspection
+			// (server/catalog.go); identity mappings so DuckLake mode resolves them.
+			"pg_user":                 "pg_user",
+			"pg_shadow":               "pg_shadow",
+			"pg_authid":               "pg_authid",
+			"pg_cast":                 "pg_cast",
+			"pg_operator":             "pg_operator",
+			"pg_aggregate":            "pg_aggregate",
+			"pg_event_trigger":        "pg_event_trigger",
+			"pg_available_extensions": "pg_available_extensions",
+			"pg_timezone_names":       "pg_timezone_names",
+			"pg_stat_database":        "pg_stat_database",
+			"pg_stat_all_tables":      "pg_stat_all_tables",
+			"pg_replication_slots":    "pg_replication_slots",
+			"pg_db_role_setting":      "pg_db_role_setting",
+			"pg_default_acl":          "pg_default_acl",
+			"pg_range":                "pg_range",
+			"pg_largeobject":          "pg_largeobject",
+			"pg_cursors":              "pg_cursors",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -173,6 +192,8 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 		// IMPORTANT: Keep in sync with macros defined in server/catalog.go initPgCatalog()
 		CustomMacros: map[string]bool{
 			"pg_get_userbyid":                 true,
+			"pg_table_is_visible":             true, // search-path visibility stub (catalog.go initPgCatalog)
+			"array_to_string":                 true, // dual-arity macro (3-arg nullstr form) in catalog.go
 			"pg_encoding_to_char":             true,
 			"pg_is_in_recovery":               true,
 			"pg_relation_is_publishable":      true,

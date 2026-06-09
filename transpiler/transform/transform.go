@@ -315,6 +315,11 @@ func walkSelectStmt(stmt *pg_query.SelectStmt, fn func(*pg_query.Node) bool) {
 	for _, sort := range stmt.SortClause {
 		walkNode(sort, fn)
 	}
+	// VALUES rows (INSERT ... VALUES, bare VALUES, VALUES in set-ops/CTEs):
+	// each entry wraps a Node_List that walkNode recurses into.
+	for _, vl := range stmt.ValuesLists {
+		walkNode(vl, fn)
+	}
 	walkNode(stmt.LimitCount, fn)
 	walkNode(stmt.LimitOffset, fn)
 	if stmt.WithClause != nil {

@@ -101,7 +101,8 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 			'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+			'information_schema_schemata_compat', 'information_schema_sequences_compat',
+			'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		)
 	`
 	if _, err := db.Exec(pgClassSQL); err != nil {
@@ -844,6 +845,84 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 				NULL::SMALLINT AS objsubid, NULL::VARCHAR AS virtualtransaction,
 				NULL::INTEGER AS pid, NULL::VARCHAR AS mode, false AS granted,
 				false AS fastpath WHERE false`,
+		"pg_shadow": `CREATE OR REPLACE VIEW pg_shadow AS
+			SELECT NULL::VARCHAR AS usename, NULL::BIGINT AS usesysid, false AS usecreatedb,
+				false AS usesuper, false AS userepl, false AS usebypassrls,
+				NULL::VARCHAR AS passwd, NULL::TIMESTAMP AS valuntil,
+				NULL::VARCHAR[] AS useconfig WHERE false`,
+		"pg_authid": `CREATE OR REPLACE VIEW pg_authid AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS rolname, false AS rolsuper,
+				false AS rolinherit, false AS rolcreaterole, false AS rolcreatedb,
+				false AS rolcanlogin, false AS rolreplication, false AS rolbypassrls,
+				NULL::INTEGER AS rolconnlimit, NULL::VARCHAR AS rolpassword,
+				NULL::TIMESTAMP AS rolvaliduntil WHERE false`,
+		"pg_cast": `CREATE OR REPLACE VIEW pg_cast AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS castsource, NULL::BIGINT AS casttarget,
+				NULL::BIGINT AS castfunc, NULL::VARCHAR AS castcontext,
+				NULL::VARCHAR AS castmethod WHERE false`,
+		"pg_operator": `CREATE OR REPLACE VIEW pg_operator AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS oprname, NULL::BIGINT AS oprnamespace,
+				NULL::BIGINT AS oprowner, NULL::VARCHAR AS oprkind, false AS oprcanmerge,
+				false AS oprcanhash, NULL::BIGINT AS oprleft, NULL::BIGINT AS oprright,
+				NULL::BIGINT AS oprresult, NULL::BIGINT AS oprcom, NULL::BIGINT AS oprnegate,
+				NULL::BIGINT AS oprcode, NULL::BIGINT AS oprrest, NULL::BIGINT AS oprjoin WHERE false`,
+		"pg_aggregate": `CREATE OR REPLACE VIEW pg_aggregate AS
+			SELECT NULL::BIGINT AS aggfnoid, NULL::VARCHAR AS aggkind,
+				NULL::SMALLINT AS aggnumdirectargs, NULL::BIGINT AS aggtransfn,
+				NULL::BIGINT AS aggfinalfn, NULL::BIGINT AS aggsortop,
+				NULL::BIGINT AS aggtranstype, NULL::VARCHAR AS agginitval WHERE false`,
+		"pg_event_trigger": `CREATE OR REPLACE VIEW pg_event_trigger AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS evtname, NULL::VARCHAR AS evtevent,
+				NULL::BIGINT AS evtowner, NULL::BIGINT AS evtfoid, NULL::VARCHAR AS evtenabled,
+				NULL::VARCHAR[] AS evttags WHERE false`,
+		"pg_available_extensions": `CREATE OR REPLACE VIEW pg_available_extensions AS
+			SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS default_version,
+				NULL::VARCHAR AS installed_version, NULL::VARCHAR AS comment WHERE false`,
+		"pg_stat_database": `CREATE OR REPLACE VIEW pg_stat_database AS
+			SELECT NULL::BIGINT AS datid, NULL::VARCHAR AS datname, NULL::INTEGER AS numbackends,
+				NULL::BIGINT AS xact_commit, NULL::BIGINT AS xact_rollback,
+				NULL::BIGINT AS blks_read, NULL::BIGINT AS blks_hit,
+				NULL::BIGINT AS tup_returned, NULL::BIGINT AS tup_fetched,
+				NULL::BIGINT AS tup_inserted, NULL::BIGINT AS tup_updated,
+				NULL::BIGINT AS tup_deleted, NULL::BIGINT AS conflicts,
+				NULL::BIGINT AS temp_files, NULL::BIGINT AS temp_bytes,
+				NULL::BIGINT AS deadlocks, NULL::TIMESTAMPTZ AS stats_reset WHERE false`,
+		"pg_stat_all_tables": `CREATE OR REPLACE VIEW pg_stat_all_tables AS
+			SELECT NULL::BIGINT AS relid, NULL::VARCHAR AS schemaname, NULL::VARCHAR AS relname,
+				NULL::BIGINT AS seq_scan, NULL::BIGINT AS seq_tup_read,
+				NULL::BIGINT AS idx_scan, NULL::BIGINT AS idx_tup_fetch,
+				NULL::BIGINT AS n_tup_ins, NULL::BIGINT AS n_tup_upd, NULL::BIGINT AS n_tup_del,
+				NULL::BIGINT AS n_tup_hot_upd, NULL::BIGINT AS n_live_tup,
+				NULL::BIGINT AS n_dead_tup, NULL::TIMESTAMPTZ AS last_vacuum,
+				NULL::TIMESTAMPTZ AS last_autovacuum, NULL::TIMESTAMPTZ AS last_analyze,
+				NULL::TIMESTAMPTZ AS last_autoanalyze, NULL::BIGINT AS vacuum_count,
+				NULL::BIGINT AS autovacuum_count, NULL::BIGINT AS analyze_count,
+				NULL::BIGINT AS autoanalyze_count WHERE false`,
+		"pg_replication_slots": `CREATE OR REPLACE VIEW pg_replication_slots AS
+			SELECT NULL::VARCHAR AS slot_name, NULL::VARCHAR AS plugin,
+				NULL::VARCHAR AS slot_type, NULL::BIGINT AS datoid, NULL::VARCHAR AS database,
+				false AS temporary, false AS active, NULL::INTEGER AS active_pid,
+				NULL::BIGINT AS xmin, NULL::BIGINT AS catalog_xmin,
+				NULL::VARCHAR AS restart_lsn, NULL::VARCHAR AS confirmed_flush_lsn WHERE false`,
+		"pg_db_role_setting": `CREATE OR REPLACE VIEW pg_db_role_setting AS
+			SELECT NULL::BIGINT AS setdatabase, NULL::BIGINT AS setrole,
+				NULL::VARCHAR[] AS setconfig WHERE false`,
+		"pg_default_acl": `CREATE OR REPLACE VIEW pg_default_acl AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS defaclrole,
+				NULL::BIGINT AS defaclnamespace, NULL::VARCHAR AS defaclobjtype,
+				NULL::VARCHAR AS defaclacl WHERE false`,
+		"pg_range": `CREATE OR REPLACE VIEW pg_range AS
+			SELECT NULL::BIGINT AS rngtypid, NULL::BIGINT AS rngsubtype,
+				NULL::BIGINT AS rngmultitypid, NULL::BIGINT AS rngcollation,
+				NULL::BIGINT AS rngsubopc, NULL::BIGINT AS rngcanonical,
+				NULL::BIGINT AS rngsubdiff WHERE false`,
+		"pg_largeobject": `CREATE OR REPLACE VIEW pg_largeobject AS
+			SELECT NULL::BIGINT AS loid, NULL::INTEGER AS pageno,
+				NULL::BLOB AS data WHERE false`,
+		"pg_cursors": `CREATE OR REPLACE VIEW pg_cursors AS
+			SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS statement, false AS is_holdable,
+				false AS is_binary, false AS is_scrollable,
+				NULL::TIMESTAMPTZ AS creation_time WHERE false`,
 	}
 	for name, sql := range stubViews {
 		if _, err := db.Exec(sql); err != nil {
@@ -868,6 +947,37 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 	`
 	if _, err := db.Exec(pgExtensionSQL); err != nil {
 		slog.Warn("Failed to create pg_extension view.", "error", err)
+	}
+
+	// pg_user: derived from the pg_roles view so psql \du fallbacks and BI role
+	// checks see the real connected user (passwd masked, matching PostgreSQL).
+	pgUserSQL := `
+		CREATE OR REPLACE VIEW pg_user AS
+		SELECT
+			rolname AS usename,
+			oid AS usesysid,
+			rolcreatedb AS usecreatedb,
+			rolsuper AS usesuper,
+			rolreplication AS userepl,
+			rolbypassrls AS usebypassrls,
+			'********' AS passwd,
+			rolvaliduntil AS valuntil,
+			rolconfig AS useconfig
+		FROM pg_roles
+		WHERE rolcanlogin
+	`
+	if _, err := db.Exec(pgUserSQL); err != nil {
+		slog.Warn("Failed to create pg_user view.", "error", err)
+	}
+
+	// pg_timezone_names: backed by DuckDB's native pg_timezone_names() table
+	// function (real timezone rows, not an empty stub).
+	pgTimezoneNamesSQL := `
+		CREATE OR REPLACE VIEW pg_timezone_names AS
+		SELECT name, abbrev, utc_offset, is_dst FROM pg_timezone_names()
+	`
+	if _, err := db.Exec(pgTimezoneNamesSQL); err != nil {
+		slog.Warn("Failed to create pg_timezone_names view.", "error", err)
 	}
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
@@ -998,6 +1108,13 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 
 		// array_remove - remove all occurrences of element from array
 		`CREATE OR REPLACE MACRO array_remove(arr, elem) AS list_filter(arr, x -> x != elem)`,
+
+		// array_to_string - DuckDB's builtin only has the 2-arg arity; PG also has
+		// (arr, sep, nullstr) which renders NULL elements as nullstr. A user macro
+		// shadows the builtin entirely, so BOTH arities must be defined here: the
+		// 2-arg body replicates the builtin (NULLs omitted, matching PG).
+		`CREATE OR REPLACE MACRO array_to_string(arr, sep) AS list_aggregate(arr::VARCHAR[], 'string_agg', sep),
+			(arr, sep, nullstr) AS list_aggregate(list_transform(arr, lambda x: coalesce(x::VARCHAR, nullstr)), 'string_agg', sep)`,
 
 		// array_lower - DuckDB lists do not preserve PostgreSQL custom lower-bound
 		// metadata, so return the representable PostgreSQL default for non-empty
@@ -1625,7 +1742,8 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', 'information_schema_views_compat'
+			'information_schema_schemata_compat', 'information_schema_views_compat',
+			'information_schema_sequences_compat', 'information_schema_routines_compat'
 		)
 		AND t.table_name NOT LIKE 'duckdb_%%'
 		AND t.table_name NOT LIKE 'sqlite_%%'
@@ -1694,7 +1812,8 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', 'information_schema_views_compat'
+			'information_schema_schemata_compat', 'information_schema_views_compat',
+			'information_schema_sequences_compat', 'information_schema_routines_compat'
 		)
 		AND v.table_name NOT LIKE 'duckdb_%%'
 		AND v.table_name NOT LIKE 'sqlite_%%'
@@ -1702,6 +1821,56 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	`
 	if _, err := db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix)); err != nil {
 		slog.Warn("Failed to create information_schema_views_compat view.", "error", err)
+	}
+
+	// Create information_schema.sequences wrapper view.
+	// DuckDB has no information_schema.sequences, so build it over duckdb_sequences()
+	// scoped to the session's default catalog (current_database() reports the real
+	// attached catalog — see server/sessionmeta). DuckDB sequences are always
+	// BIGINT-backed; value columns are VARCHAR per PG's character_data domain.
+	sequencesViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_sequences_compat AS
+		SELECT
+			CASE WHEN s.database_name IN ('ducklake', 'memory') THEN current_database() ELSE s.database_name END AS sequence_catalog,
+			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS sequence_schema,
+			s.sequence_name,
+			'bigint' AS data_type,
+			64 AS numeric_precision,
+			2 AS numeric_precision_radix,
+			0 AS numeric_scale,
+			CAST(s.start_value AS VARCHAR) AS start_value,
+			CAST(s.min_value AS VARCHAR) AS minimum_value,
+			CAST(s.max_value AS VARCHAR) AS maximum_value,
+			CAST(s.increment_by AS VARCHAR) AS increment,
+			CASE WHEN s.cycle THEN 'YES' ELSE 'NO' END AS cycle_option
+		FROM duckdb_sequences() s
+		WHERE s.database_name = current_database()
+	`
+	if _, err := db.Exec(sequencesViewSQL); err != nil {
+		slog.Warn("Failed to create information_schema_sequences_compat view.", "error", err)
+	}
+
+	// Create information_schema.routines stub view.
+	// DuckDB has no information_schema.routines and no user-defined SQL routines to
+	// report; a typed WHERE-false stub keeps column-filtered queries from erroring.
+	routinesViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_routines_compat AS
+		SELECT
+			CAST(NULL AS VARCHAR) AS specific_catalog,
+			CAST(NULL AS VARCHAR) AS specific_schema,
+			CAST(NULL AS VARCHAR) AS specific_name,
+			CAST(NULL AS VARCHAR) AS routine_catalog,
+			CAST(NULL AS VARCHAR) AS routine_schema,
+			CAST(NULL AS VARCHAR) AS routine_name,
+			CAST(NULL AS VARCHAR) AS routine_type,
+			CAST(NULL AS VARCHAR) AS data_type,
+			CAST(NULL AS VARCHAR) AS type_udt_name,
+			CAST(NULL AS VARCHAR) AS external_language,
+			CAST(NULL AS VARCHAR) AS routine_definition
+		WHERE false
+	`
+	if _, err := db.Exec(routinesViewSQL); err != nil {
+		slog.Warn("Failed to create information_schema_routines_compat view.", "error", err)
 	}
 
 	return nil
@@ -1762,7 +1931,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
-				'information_schema_schemata_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_schemata_compat', 'information_schema_sequences_compat',
+				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		  )
 		UNION ALL
 		-- Views from ducklake catalog
@@ -1812,7 +1982,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
-				'information_schema_schemata_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_schemata_compat', 'information_schema_sequences_compat',
+				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		  )
 		UNION ALL
 		-- Sequences from ducklake catalog
