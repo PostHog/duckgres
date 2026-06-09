@@ -126,6 +126,13 @@ normal `go test ./...` lane.
   GetFlightInfo-to-DoGet handoffs, and abandoned-continuation cleanup are covered
   by `duckdbservice` unit tests. The harness still asserts the cluster invariant
   this protects: one active session owns one worker.
+- **Malformed Bind message validation (#720)** — negative count/length fields
+  in a Bind message must return a clean `08P01` instead of panicking. Every
+  real client (psql, lib/pq, ...) only emits well-formed Bind messages, so
+  triggering this needs a raw pgwire client that completes TLS + SCRAM auth
+  and then sends crafted bytes — tooling the alpine Job image (psql/curl/jq)
+  doesn't have. Covered by `server/conn_bind_test.go` unit tests
+  feeding malformed payloads directly to `handleBind`.
 
 ## Isolation model
 

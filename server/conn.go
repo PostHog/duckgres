@@ -5493,6 +5493,10 @@ func (c *clientConn) handleBind(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid Bind message")
 		return
 	}
+	if numParamFormats < 0 {
+		c.sendError("ERROR", "08P01", "invalid parameter format count in Bind message")
+		return
+	}
 	paramFormats := make([]int16, numParamFormats)
 	for i := int16(0); i < numParamFormats; i++ {
 		if err := binary.Read(reader, binary.BigEndian, &paramFormats[i]); err != nil {
@@ -5507,6 +5511,10 @@ func (c *clientConn) handleBind(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid Bind message")
 		return
 	}
+	if numParams < 0 {
+		c.sendError("ERROR", "08P01", "invalid parameter count in Bind message")
+		return
+	}
 	paramValues := make([][]byte, numParams)
 	for i := int16(0); i < numParams; i++ {
 		var length int32
@@ -5516,6 +5524,10 @@ func (c *clientConn) handleBind(body []byte) {
 		}
 		if length == -1 {
 			paramValues[i] = nil // NULL
+		} else if length < 0 {
+			// Only -1 (NULL) is a valid negative length.
+			c.sendError("ERROR", "08P01", "invalid parameter length in Bind message")
+			return
 		} else {
 			// The length field is client-controlled; bound the allocation by
 			// the remaining bytes of the already-framed Bind message body — a
@@ -5537,6 +5549,10 @@ func (c *clientConn) handleBind(body []byte) {
 	var numResultFormats int16
 	if err := binary.Read(reader, binary.BigEndian, &numResultFormats); err != nil {
 		c.sendError("ERROR", "08P01", "invalid Bind message")
+		return
+	}
+	if numResultFormats < 0 {
+		c.sendError("ERROR", "08P01", "invalid result format count in Bind message")
 		return
 	}
 	resultFormats := make([]int16, numResultFormats)
