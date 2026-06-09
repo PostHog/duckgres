@@ -7,7 +7,6 @@ import (
 	"embed"
 	"html/template"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -46,10 +45,10 @@ func RegisterDashboard(r *gin.Engine, adminToken string) {
 
 func dashboardPageHandler(templateName, adminToken string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if redirectPath, ok := maybeSetAdminCookieFromQuery(c, adminToken); ok {
-			c.Redirect(http.StatusSeeOther, redirectPath)
-			return
-		}
+		// The admin token is deliberately NOT accepted via URL query parameters:
+		// URL-borne secrets persist in browser history and any future proxy/access
+		// logs. Authenticate via the POST /login form or the
+		// X-Duckgres-Internal-Secret header instead.
 		if !validAdminToken(requestAdminToken(c), adminToken) {
 			renderLoginPage(c, c.Request.URL.RequestURI(), "")
 			return
@@ -109,35 +108,10 @@ func validAdminToken(got, want string) bool {
 }
 
 func setAdminTokenCookie(c *gin.Context, token string) {
-	c.SetSameSite(http.SameSiteLaxMode)
+	// HttpOnly + SameSite=Strict; not Secure because the dashboard is served
+	// plain-HTTP on a network-policy-restricted port reached via port-forward.
+	c.SetSameSite(http.SameSiteStrictMode)
 	c.SetCookie(adminTokenCookieName, token, 7*24*60*60, "/", "", false, true)
-}
-
-func maybeSetAdminCookieFromQuery(c *gin.Context, adminToken string) (string, bool) {
-	token := c.Query("token")
-	if token == "" || !validAdminToken(token, adminToken) {
-		return "", false
-	}
-	setAdminTokenCookie(c, token)
-	q := cloneWithoutToken(c.Request.URL.Query())
-	redirectPath := c.Request.URL.Path
-	if encoded := q.Encode(); encoded != "" {
-		redirectPath += "?" + encoded
-	}
-	return redirectPath, true
-}
-
-func cloneWithoutToken(values url.Values) url.Values {
-	cloned := url.Values{}
-	for k, v := range values {
-		if k == "token" {
-			continue
-		}
-		copied := make([]string, len(v))
-		copy(copied, v)
-		cloned[k] = copied
-	}
-	return cloned
 }
 
 func normalizeNextPath(next string) string {

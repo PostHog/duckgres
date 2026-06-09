@@ -27,6 +27,8 @@
 #                  graceful drain (in-flight query survives a worker SIGTERM, #690);
 #                  one session per worker (concurrent queries land on distinct pods).
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
+#   admin auth   : the dashboard rejects ?token= query-param auth (#721); only
+#                  the internal-secret header / POST login form authenticate.
 #   lifecycle    : deprovision → warehouse deleted → Duckling CR fully gone
 #                  (finalizer cascade that drops the cnpg role+db completed).
 #                  Same-id re-provision is covered across runs by run.sh, not
@@ -597,6 +599,25 @@ concurrent_writers() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
+# ---- admin dashboard auth (#721) -------------------------------------------
+# Regression for #721: the admin dashboard must NOT accept the internal secret
+# via a ?token= URL query parameter (URL-borne secrets persist in browser
+# history and any future proxy access logs). A request carrying the correct
+# token in the query string gets the login page (401) with no auth cookie and
+# no redirect; the X-Duckgres-Internal-Secret header path still authenticates.
+admin_dashboard_no_query_token() {
+  log "admin dashboard rejects ?token= query auth"
+  hdrs=/tmp/admin_qt_hdrs
+  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/?token=$SECRET")"
+  [ "$code" = "401" ] || fail "GET /?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
+  if grep -qi '^set-cookie:' "$hdrs"; then
+    fail "GET /?token=<secret> set a cookie — query-param auth is back"
+  fi
+  # Sanity: the header path (what this harness uses everywhere) still works.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/")"
+  [ "$code" = "200" ] || fail "GET / with internal-secret header returned $code, want 200"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -657,6 +678,9 @@ EXT_BODY='{"database_name":"'"$EXT"'",
 main() {
   bootstrap_kubectl
   resolve_cp_ip
+
+  # No org dependency — assert the admin surface auth contract up front.
+  admin_dashboard_no_query_token
 
   # Use the password returned at provision time — do NOT call reset-password and
   # then retry-connect in a tight loop: the CP rate-limiter bans the source IP
@@ -719,7 +743,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: wire + malformed-startup-resilience + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

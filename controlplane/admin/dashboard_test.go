@@ -45,6 +45,55 @@ func TestAPIMiddlewareAcceptsCookie(t *testing.T) {
 	}
 }
 
+// Regression test for #721: the admin token must never be accepted via a URL
+// query parameter — URL-borne secrets persist in browser history and proxy
+// access logs. A request carrying the correct token in ?token= must get the
+// login page (401), with no Set-Cookie and no redirect.
+func TestDashboardRejectsTokenQueryParam(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterDashboard(r, "secret")
+
+	for _, path := range []string{"/?token=secret", "/workers?token=secret&foo=bar"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s status = %d, want %d", path, rec.Code, http.StatusUnauthorized)
+		}
+		if got := rec.Header().Get("Set-Cookie"); got != "" {
+			t.Errorf("GET %s set a cookie: %q, want none", path, got)
+		}
+		if got := rec.Header().Get("Location"); got != "" {
+			t.Errorf("GET %s redirected to %q, want no redirect", path, got)
+		}
+	}
+}
+
+func TestLoginCookieIsHttpOnlyStrict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterDashboard(r, "secret")
+
+	form := url.Values{"token": {"secret"}, "next": {"/"}}
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != adminTokenCookieName {
+		t.Fatalf("cookies = %v, want exactly one %q cookie", cookies, adminTokenCookieName)
+	}
+	if !cookies[0].HttpOnly {
+		t.Error("cookie is not HttpOnly")
+	}
+	if cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Errorf("cookie SameSite = %v, want %v", cookies[0].SameSite, http.SameSiteStrictMode)
+	}
+}
+
 func TestDashboardRequiresLoginThenSetsCookie(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
