@@ -66,6 +66,7 @@ func TestOrgConnectionLeasesEnforceClusterWideLimit(t *testing.T) {
 	}
 	if lease == nil {
 		t.Fatal("expected first request to acquire a lease")
+		return
 	}
 
 	blocked, err := store.TryAcquireOrgConnectionLease(second.RequestID, 1, now)
@@ -315,6 +316,7 @@ func TestTryAcquireOrgConnectionLeaseRetryReturnsExistingLease(t *testing.T) {
 	}
 	if first == nil {
 		t.Fatal("expected first acquire to grant lease")
+		return
 	}
 
 	retry, err := store.TryAcquireOrgConnectionLease(entry.RequestID, 1, now.Add(time.Second))
@@ -323,6 +325,7 @@ func TestTryAcquireOrgConnectionLeaseRetryReturnsExistingLease(t *testing.T) {
 	}
 	if retry == nil {
 		t.Fatal("expected retry acquire to return existing lease")
+		return
 	}
 	if retry.LeaseID != first.LeaseID {
 		t.Fatalf("expected retry lease id %q, got %q", first.LeaseID, retry.LeaseID)

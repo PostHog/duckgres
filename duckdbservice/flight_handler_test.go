@@ -124,6 +124,144 @@ func (u testStatementUpdate) GetTransactionId() []byte {
 	return u.transactionID
 }
 
+type testStatementQuery struct {
+	query         string
+	transactionID []byte
+}
+
+func (q testStatementQuery) GetQuery() string {
+	return q.query
+}
+
+func (q testStatementQuery) GetTransactionId() []byte {
+	return q.transactionID
+}
+
+func TestStatementFlightInfoHoldsSessionOperationUntilDoGet(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: ""}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("first GetFlightInfoStatement: %v", err)
+	}
+
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: ""}, &flight.FlightDescriptor{}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected second same-session operation to be rejected, got %v", err)
+	}
+
+	var handleID string
+	session.mu.RLock()
+	for id := range session.queries {
+		handleID = id
+		break
+	}
+	session.mu.RUnlock()
+	if handleID == "" {
+		t.Fatal("expected first GetFlightInfoStatement to store a query handle")
+	}
+
+	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte(handleID)})
+	if err != nil {
+		t.Fatalf("DoGetStatement: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: ""}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("operation gate should release after DoGet: %v", err)
+	}
+}
+
+func TestStatementFlightInfoNonEmptyHoldsSessionOperationUntilDoGet(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 1"}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("first GetFlightInfoStatement: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("active drain work=%d want 1 before DoGet", got)
+	}
+
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 2"}, &flight.FlightDescriptor{}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected second same-session operation to be rejected, got %v", err)
+	}
+
+	var handleID string
+	session.mu.RLock()
+	for id := range session.queries {
+		handleID = id
+		break
+	}
+	session.mu.RUnlock()
+	if handleID == "" {
+		t.Fatal("expected first GetFlightInfoStatement to store a query handle")
+	}
+
+	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte(handleID)})
+	if err != nil {
+		t.Fatalf("DoGetStatement: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after DoGet", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after DoGet")
+	} else {
+		finish()
+	}
+}
+
 func TestHealthCheckBlocksUntilWarmup(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
@@ -559,6 +697,288 @@ func TestEndTransactionKeepsDrainOpenForOpenTransaction(t *testing.T) {
 	}
 }
 
+func TestEndTransactionRollbackReleasesAbandonedStatementOperation(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	txnID, err := handler.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 1", transactionID: txnID}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get in-transaction flight info: %v", err)
+	}
+
+	if err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: txnID,
+		action:        flightsql.EndTransactionRollback,
+	}); err != nil {
+		session.mu.Lock()
+		ttx := session.txns[string(txnID)]
+		if ttx != nil {
+			delete(session.txns, string(txnID))
+			delete(session.txnOwner, string(txnID))
+		}
+		session.mu.Unlock()
+		if ttx != nil && ttx.tx != nil {
+			_ = session.rollbackTx(ttx.tx)
+		}
+		if ttx != nil && ttx.finishDrain != nil {
+			ttx.finishDrain()
+		}
+		t.Fatalf("rollback should clean up abandoned in-transaction statement: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after rollback", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after rollback cleanup")
+	} else {
+		finish()
+	}
+}
+
+func TestEndTransactionRollbackReleasesAbandonedMetadataOperation(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	txnID, err := handler.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if _, err := handler.GetFlightInfoSchemas(ctx, testGetDBSchemas{}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get metadata flight info: %v", err)
+	}
+
+	if err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: txnID,
+		action:        flightsql.EndTransactionRollback,
+	}); err != nil {
+		session.mu.Lock()
+		ttx := session.txns[string(txnID)]
+		if ttx != nil {
+			delete(session.txns, string(txnID))
+			delete(session.txnOwner, string(txnID))
+		}
+		session.mu.Unlock()
+		if ttx != nil && ttx.tx != nil {
+			_ = session.rollbackTx(ttx.tx)
+		}
+		if ttx != nil && ttx.finishDrain != nil {
+			ttx.finishDrain()
+		}
+		t.Fatalf("rollback should clean up abandoned in-transaction metadata: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after rollback", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after metadata rollback cleanup")
+	} else {
+		finish()
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	if len(session.metadataDrains) != 0 {
+		t.Fatalf("metadata drains were not consumed: %v", session.metadataDrains)
+	}
+}
+
+func TestEndTransactionNotFoundDoesNotConsumeMetadataOperation(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	txnID, err := handler.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	defer func() {
+		var rollbackTxs []*sql.Tx
+		var releaseDrains []func()
+		session.mu.Lock()
+		for id, ttx := range session.txns {
+			if ttx.tx != nil {
+				rollbackTxs = append(rollbackTxs, ttx.tx)
+			}
+			if ttx.finishDrain != nil {
+				releaseDrains = append(releaseDrains, ttx.finishDrain)
+				ttx.finishDrain = nil
+			}
+			delete(session.txns, id)
+			delete(session.txnOwner, id)
+		}
+		for key, drains := range session.metadataDrains {
+			releaseDrains = appendDrainTokenFuncs(releaseDrains, drains)
+			delete(session.metadataDrains, key)
+		}
+		session.mu.Unlock()
+		for _, tx := range rollbackTxs {
+			_ = session.rollbackTx(tx)
+		}
+		for _, release := range releaseDrains {
+			releaseDrainFunc(release)
+		}
+	}()
+	cmd := testGetDBSchemas{}
+	if _, err := handler.GetFlightInfoSchemas(ctx, cmd, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get metadata flight info: %v", err)
+	}
+
+	err = handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: []byte("txn-does-not-exist"),
+		action:        flightsql.EndTransactionRollback,
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected bogus transaction to be rejected as not found, got %v", err)
+	}
+	session.mu.RLock()
+	metadataDrainCount := len(session.metadataDrains)
+	operationOpen := session.operationOpen
+	session.mu.RUnlock()
+	if metadataDrainCount != 1 {
+		t.Fatalf("bogus rollback consumed metadata drains, got %d entries", metadataDrainCount)
+	}
+	if !operationOpen {
+		t.Fatal("bogus rollback released the pending metadata operation")
+	}
+
+	_, ch, err := handler.DoGetDBSchemas(ctx, cmd)
+	if err != nil {
+		t.Fatalf("metadata DoGet should still consume the original continuation: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("metadata stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+	if err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: txnID,
+		action:        flightsql.EndTransactionRollback,
+	}); err != nil {
+		t.Fatalf("rollback real transaction: %v", err)
+	}
+}
+
+func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {
+				Query:    "SELECT 1",
+				Schema:   arrow.NewSchema(nil, nil),
+				TxnID:    "txn-1",
+				Prepared: true,
+			},
+		},
+		metadataDrains: make(map[string][]drainToken),
+		txns: map[string]*trackedTx{
+			"txn-1": {},
+		},
+		txnOwner: make(map[string]string),
+	}
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("expected operation to start")
+	}
+	defer finishOperation()
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: []byte("txn-1"),
+		action:        flightsql.EndTransactionRollback,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected EndTransaction to reject busy session, got %v", err)
+	}
+	session.mu.RLock()
+	_, stillPresent := session.queries["prep-1"]
+	session.mu.RUnlock()
+	if !stillPresent {
+		t.Fatal("busy EndTransaction deleted a live prepared handle")
+	}
+}
+
 func TestRawSQLTransactionKeepsDrainOpenUntilCommit(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -691,6 +1111,45 @@ func TestPreparedStatementDoGetContinuesAfterDrainStarts(t *testing.T) {
 	defer cancel()
 	if !pool.WaitForDrain(waitCtx) {
 		t.Fatal("expected prepared continuation to release drain work")
+	}
+}
+
+func TestClosePreparedStatementReleasesAbandonedOperation(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID: "session-1",
+		queries: map[string]*QueryHandle{
+			"prep-1": {Query: "", Schema: arrow.NewSchema(nil, nil), Prepared: true},
+		},
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+	cmd := testPreparedStatementQuery{handle: []byte("prep-1")}
+
+	if _, err := handler.GetFlightInfoPreparedStatement(ctx, cmd, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get prepared flight info: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("active drain work=%d want 1 before close", got)
+	}
+
+	if err := handler.ClosePreparedStatement(ctx, cmd); err != nil {
+		t.Fatalf("close prepared should clean up abandoned pending operation: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d want 0 after close", got)
+	}
+	if finish, ok := session.beginOperation(); !ok {
+		t.Fatal("operation gate should release after close prepared")
+	} else {
+		finish()
 	}
 }
 
@@ -881,7 +1340,7 @@ func TestMetadataDoGetContinuesAfterDrainStarts(t *testing.T) {
 	}
 }
 
-func TestMetadataDoGetConsumesMatchingDrainToken(t *testing.T) {
+func TestMetadataGetFlightInfoRejectsConcurrentSessionOperation(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -915,12 +1374,27 @@ func TestMetadataDoGetConsumesMatchingDrainToken(t *testing.T) {
 	if _, err := handler.GetFlightInfoSchemas(ctx, first, &flight.FlightDescriptor{}); err != nil {
 		t.Fatalf("first GetFlightInfoSchemas: %v", err)
 	}
-	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); err != nil {
-		t.Fatalf("second GetFlightInfoSchemas: %v", err)
+	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected concurrent metadata GetFlightInfo to be rejected, got %v", err)
 	}
-	pool.BeginDrain()
 
-	_, ch, err := handler.DoGetDBSchemas(ctx, second)
+	_, ch, err := handler.DoGetDBSchemas(ctx, first)
+	if err != nil {
+		t.Fatalf("first DoGetDBSchemas: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("first stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+
+	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("metadata operation should release after DoGet: %v", err)
+	}
+	_, ch, err = handler.DoGetDBSchemas(ctx, second)
 	if err != nil {
 		t.Fatalf("second DoGetDBSchemas: %v", err)
 	}
@@ -932,20 +1406,12 @@ func TestMetadataDoGetConsumesMatchingDrainToken(t *testing.T) {
 			chunk.Data.Release()
 		}
 	}
-
 	session := pool.sessions["session-1"]
 	session.mu.RLock()
-	firstPending := len(session.metadataDrains[metadataSchemasDrainKey(first)])
-	secondPending := len(session.metadataDrains[metadataSchemasDrainKey(second)])
-	session.mu.RUnlock()
-	if firstPending != 1 {
-		t.Fatalf("expected first metadata token to remain pending, got %d", firstPending)
+	defer session.mu.RUnlock()
+	if len(session.metadataDrains) != 0 {
+		t.Fatalf("metadata drains were not consumed: %v", session.metadataDrains)
 	}
-	if secondPending != 0 {
-		t.Fatalf("expected second metadata token to be consumed, got %d", secondPending)
-	}
-	release := popMetadataDrain(session, metadataSchemasDrainKey(first))
-	releaseDrainFunc(release)
 }
 
 func TestTablesMetadataDoGetContinuesAfterDrainStarts(t *testing.T) {
