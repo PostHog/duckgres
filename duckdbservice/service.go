@@ -123,6 +123,7 @@ type Session struct {
 	txns           map[string]*trackedTx
 	txnOwner       map[string]string
 	closed         bool
+	operationOpen  bool
 	connWork       int
 	connWorkDone   *sync.Cond
 	handleCounter  atomic.Uint64
@@ -149,6 +150,9 @@ type QueryHandle struct {
 	TxnID     string
 	Prepared  bool      // prepared statements live until ClosePreparedStatement; the reaper never drops them, only their stale pendingDrains
 	createdAt time.Time // when registered; the reaper drops a stale ad-hoc handle whose DoGet never arrived (guarded by Session.mu)
+	// finishOperation is the session operation token for an ad-hoc query
+	// awaiting its DoGet.
+	finishOperation func()
 	// finishDrain is the drain token of an ad-hoc query awaiting its DoGet.
 	finishDrain func()
 	// pendingDrains are drain tokens of GetFlightInfo[Prepared] calls awaiting
@@ -160,8 +164,9 @@ type QueryHandle struct {
 // the reaper can release a token stranded by a GetFlightInfo whose matching
 // DoGet never arrived (client cancelled between the two RPCs, session kept).
 type drainToken struct {
-	finish func()
-	at     time.Time
+	finish          func()
+	finishOperation func()
+	at              time.Time
 }
 
 func releaseDrainFunc(release func()) {
@@ -175,6 +180,9 @@ func appendDrainTokenFuncs(dst []func(), tokens []drainToken) []func() {
 	for _, t := range tokens {
 		if t.finish != nil {
 			dst = append(dst, t.finish)
+		}
+		if t.finishOperation != nil {
+			dst = append(dst, t.finishOperation)
 		}
 	}
 	return dst
@@ -244,6 +252,25 @@ func (s *Session) releaseSQLTransactionDrain() {
 	s.sqlTxLastUsed.Store(0)
 	s.mu.Unlock()
 	releaseDrainFunc(release)
+}
+
+func (s *Session) beginOperation() (func(), bool) {
+	s.mu.Lock()
+	if s.closed || s.operationOpen {
+		s.mu.Unlock()
+		return nil, false
+	}
+	s.operationOpen = true
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.operationOpen = false
+			s.mu.Unlock()
+		})
+	}, true
 }
 
 // beginConnWork fences any operation that uses the session connection while a
@@ -572,6 +599,9 @@ func (p *SessionPool) reapIdle(now time.Time) {
 		for id, ttx := range s.txns {
 			last := time.Unix(0, ttx.lastUsed.Load())
 			if now.Sub(last) > txnIdleTimeout {
+				if s.operationOpen {
+					continue
+				}
 				if ttx.activeWork.Load() > 0 {
 					continue
 				}
@@ -598,7 +628,10 @@ func (p *SessionPool) reapIdle(now time.Time) {
 			}
 			last := time.Unix(0, lastNanos)
 			if now.Sub(last) > txnIdleTimeout {
-				if s.connWork > 0 {
+				if s.operationOpen {
+					// A same-session operation is still logically in progress or
+					// awaiting its continuation. Leave the transaction drain active.
+				} else if s.connWork > 0 {
 					// The connection may be executing, streaming, or planning work inside
 					// this raw SQL transaction. Leave the transaction drain token active.
 				} else if s.Conn == nil {
@@ -649,6 +682,10 @@ func (p *SessionPool) reapIdle(now time.Time) {
 				if h.finishDrain != nil {
 					releaseDrains = append(releaseDrains, h.finishDrain)
 					h.finishDrain = nil
+				}
+				if h.finishOperation != nil {
+					releaseDrains = append(releaseDrains, h.finishOperation)
+					h.finishOperation = nil
 				}
 				releaseDrains = appendDrainTokenFuncs(releaseDrains, h.pendingDrains)
 				h.pendingDrains = nil
@@ -1137,6 +1174,10 @@ func (p *SessionPool) DestroySession(token string) error {
 			releaseDrains = append(releaseDrains, handle.finishDrain)
 			handle.finishDrain = nil
 		}
+		if handle.finishOperation != nil {
+			releaseDrains = append(releaseDrains, handle.finishOperation)
+			handle.finishOperation = nil
+		}
 		releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
 		handle.pendingDrains = nil
 		delete(session.queries, id)
@@ -1356,6 +1397,10 @@ func (p *SessionPool) CloseAll() {
 			if handle.finishDrain != nil {
 				releaseDrains = append(releaseDrains, handle.finishDrain)
 				handle.finishDrain = nil
+			}
+			if handle.finishOperation != nil {
+				releaseDrains = append(releaseDrains, handle.finishOperation)
+				handle.finishOperation = nil
 			}
 			releaseDrains = appendDrainTokenFuncs(releaseDrains, handle.pendingDrains)
 			handle.pendingDrains = nil

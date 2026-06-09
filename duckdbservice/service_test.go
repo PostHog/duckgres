@@ -97,6 +97,66 @@ func TestCreateSessionRejectsSecondSessionWhenMaxIsOne(t *testing.T) {
 	}
 }
 
+func TestSessionRejectsConcurrentOperation(t *testing.T) {
+	s := &Session{}
+	finish, ok := s.beginOperation()
+	if !ok {
+		t.Fatal("expected first operation to start")
+	}
+	defer finish()
+
+	if _, ok := s.beginOperation(); ok {
+		t.Fatal("expected concurrent operation to be rejected")
+	}
+}
+
+func TestSessionOperationReleasesOnce(t *testing.T) {
+	s := &Session{}
+	finish, ok := s.beginOperation()
+	if !ok {
+		t.Fatal("expected first operation to start")
+	}
+	finish()
+	finish()
+
+	if finish2, ok := s.beginOperation(); !ok {
+		t.Fatal("expected operation gate to release")
+	} else {
+		finish2()
+	}
+}
+
+func TestReapAbandonedQueryHandleReleasesOperation(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+	}
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("expected operation to start")
+	}
+	session.queries["query-1"] = &QueryHandle{
+		Query:           "SELECT 1",
+		createdAt:       time.Now().Add(-handleIdleTimeout - time.Minute),
+		finishOperation: finishOperation,
+	}
+	pool.sessions[session.ID] = session
+
+	pool.reapIdle(time.Now())
+
+	if finish2, ok := session.beginOperation(); !ok {
+		t.Fatal("expected abandoned handle reaper to release the operation")
+	} else {
+		finish2()
+	}
+}
+
 type exitPanic struct {
 	code int
 }
@@ -562,7 +622,7 @@ func TestAppendPreparedDrainRefreshesTrackedTransaction(t *testing.T) {
 	}
 	pool.sessions[session.ID] = session
 
-	if !appendPreparedDrain(session, "prep-1", pendingFinish) {
+	if !appendPreparedDrain(session, "prep-1", pendingFinish, nil) {
 		t.Fatal("appendPreparedDrain failed")
 	}
 	pool.BeginDrain()
