@@ -42,10 +42,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*M
 		// 1. Try to claim an idle worker
 		idle := p.findIdleWorkerLocked()
 		if idle != nil {
-			idle.activeSessions++
-			if idle.activeSessions > idle.peakSessions {
-				idle.peakSessions = idle.activeSessions
-			}
+			idle.claimSessionLocked()
 			p.mu.Unlock()
 			slog.Debug("Reusing idle worker.", "worker", idle.ID, "active_sessions", idle.activeSessions)
 			return idle, nil
@@ -60,10 +57,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*M
 			// and spawn a new worker in the background if below capacity.
 			w := p.leastLoadedWorkerLocked()
 			if w != nil {
-				w.activeSessions++
-				if w.activeSessions > w.peakSessions {
-					w.peakSessions = w.activeSessions
-				}
+				w.claimSessionLocked()
 				if canSpawn {
 					id := p.allocateBackgroundSpawnIDLocked()
 					p.spawning++
@@ -102,10 +96,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*M
 				return nil, fmt.Errorf("worker %d not found after spawn", id)
 			}
 			p.mu.Lock()
-			w.activeSessions++
-			if w.activeSessions > w.peakSessions {
-				w.peakSessions = w.activeSessions
-			}
+			w.claimSessionLocked()
 			p.mu.Unlock()
 			return w, nil
 		}
