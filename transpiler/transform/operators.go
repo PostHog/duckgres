@@ -510,12 +510,16 @@ func (t *OperatorTransform) createJsonExtractFuncCall(left, right *pg_query.Node
 }
 
 // looksJSON reports whether a node is syntactically JSON: a cast to json/jsonb,
-// or a JSON-returning json* function call (including the json_extract calls this
-// transform produces from -> / ->>). Used to gate the || JSON-concat rewrite so
-// genuine string/array concatenation is left untouched. json*-named functions
-// that return text/numbers/booleans (json_extract_string, json_array_length,
-// json_type, ...) are excluded: `json_extract_string(d,'a') || 'x'` is plain
-// text concat in Postgres and must stay that way.
+// a JSON-returning json* function call (including the json_extract calls this
+// transform produces from -> / ->>), a JSON-producing conversion function
+// (to_json/to_jsonb/row_to_json/array_to_json), or a `->` A_Expr (which this
+// transform deterministically rewrites to json_extract — the || gate runs
+// before the operands' own rewrite, so the raw arrow must count). Used to gate
+// the || JSON-concat rewrite so genuine string/array concatenation is left
+// untouched. json*-named functions that return text/numbers/booleans
+// (json_extract_string, json_array_length, json_type, ...) are excluded:
+// `json_extract_string(d,'a') || 'x'` is plain text concat in Postgres and
+// must stay that way (likewise `->>`, which yields text, does not count).
 func looksJSON(node *pg_query.Node) bool {
 	if node == nil {
 		return false
@@ -534,6 +538,22 @@ func looksJSON(node *pg_query.Node) bool {
 			if strings.HasPrefix(name, "json") && !jsonFuncReturnsNonJSON(name) {
 				return true
 			}
+			// JSON-producing conversions whose names don't start with "json".
+			// FunctionTransform (which runs earlier) maps to_jsonb -> to_json,
+			// but cover the Postgres spellings too for direct/standalone use.
+			switch name {
+			case "to_json", "to_jsonb", "row_to_json", "array_to_json":
+				return true
+			}
+		}
+	}
+	// A bare `d -> 'a'` operand (no cast, not yet rewritten): the arrow always
+	// becomes json_extract, which returns JSON. Without this, `(d->'a') ||
+	// (d->'b')` would fall through to DuckDB string concat of two JSON values.
+	if ae := node.GetAExpr(); ae != nil && ae.Kind == pg_query.A_Expr_Kind_AEXPR_OP &&
+		ae.Lexpr != nil && ae.Rexpr != nil && len(ae.Name) == 1 {
+		if s := ae.Name[0].GetString_(); s != nil && s.Sval == "->" {
+			return true
 		}
 	}
 	return false
@@ -585,8 +605,21 @@ func jsonFuncReturnsNonJSON(name string) bool {
 // values, which is exactly the Postgres shallow-merge behavior (verified
 // against PostgreSQL output for all the cases above; key ORDER may differ —
 // Postgres sorts jsonb keys, DuckDB preserves left-operand order — but jsonb
-// objects are semantically unordered). Operands are cloned per use site so
-// later pipeline transforms never visit a shared node twice.
+// objects are semantically unordered; objects with DUPLICATE keys also differ,
+// but that is duckgres's global jsonb-as-JSON divergence — Postgres dedups at
+// the ::jsonb cast, DuckDB JSON does not — not something this rewrite adds).
+// Operands are cloned per use site so later pipeline transforms never visit a
+// shared node twice.
+//
+// KNOWN COSTS of the per-use-site cloning: each operand appears ~6 times in
+// the emitted CASE, so a chain of N `||` grows the transpiled SQL ~6^N (fine
+// for the realistic 1-3 operand idioms; ~1MB of SQL by 6 chained operands),
+// and a non-trivial operand (scalar subquery, volatile function) is EVALUATED
+// up to that many times — a volatile operand could even dispatch differently
+// between the json_type() probe and the use site. If this ever bites, the fix
+// is linear expansion: register a DuckDB scalar macro (e.g.
+// duckgres_jsonb_concat(l, r)) at session/worker init and emit one call per
+// ||, binding each operand exactly once.
 func (t *OperatorTransform) createJSONConcatExpr(left, right *pg_query.Node) *pg_query.Node {
 	if newLeft := t.transformExpression(left); newLeft != nil {
 		left = newLeft

@@ -113,6 +113,45 @@ func TestOperatorTransform_TextReturningJSONFuncConcatUnchanged(t *testing.T) {
 	}
 }
 
+func TestOperatorTransform_JSONBConcatToJSONFuncOperands(t *testing.T) {
+	// to_json/to_jsonb/row_to_json/array_to_json return JSON but their names
+	// don't start with "json"; without explicit looksJSON coverage
+	// `to_jsonb(a) || to_jsonb(b)` fell through to DuckDB string concat,
+	// producing invalid JSON. (FunctionTransform maps to_jsonb -> to_json
+	// earlier in the pipeline, but this transform must recognize both
+	// spellings since it also runs standalone.)
+	for _, sql := range []string{
+		`SELECT to_jsonb(a) || to_jsonb(b) FROM t`,
+		`SELECT to_json(a) || '[1]'::jsonb FROM t`,
+		`SELECT row_to_json(r) || '{"x":1}'::jsonb FROM t`,
+		`SELECT array_to_json(arr) || '[1]'::jsonb FROM t`,
+	} {
+		assertJSONConcatShape(t, sql)
+	}
+}
+
+func TestOperatorTransform_JSONBConcatBareArrowOperands(t *testing.T) {
+	// Neither side carries a cast: both operands are raw `->` A_Exprs, which
+	// this transform deterministically rewrites to json_extract (JSON-
+	// returning). The || gate runs before the operand rewrite, so the raw
+	// arrow must count as JSON-looking or this would silently become string
+	// concat of two JSON values.
+	assertJSONConcatShape(t, `SELECT (d -> 'a') || (d -> 'b') FROM t`)
+}
+
+func TestOperatorTransform_DoubleArrowConcatUnchanged(t *testing.T) {
+	// ->> yields text, so || on its bare result stays plain text concat.
+	tr := NewOperatorTransform()
+	out := deparseAfter(t, tr, `SELECT (d ->> 'a') || '-x' FROM t`)
+	low := strings.ToLower(out)
+	if strings.Contains(low, "map_concat") || strings.Contains(low, "list_concat") {
+		t.Errorf("->> result concat should stay text concat, got %q", out)
+	}
+	if !strings.Contains(out, "||") {
+		t.Errorf("|| should be preserved, got %q", out)
+	}
+}
+
 func TestOperatorTransform_JSONBConcatDeparses(t *testing.T) {
 	// The emitted CASE must survive a pg_query deparse round-trip for every
 	// shape the issue calls out; deparseAfter fails the test on error.
