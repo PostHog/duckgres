@@ -940,6 +940,8 @@ func (cs *ConfigStore) runtimeTable(base string) string {
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
 // state by image and tenant binding for Prometheus observability.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
+	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
+	// now (no warm pool); the branch only matches pre-existing/legacy rows.
 	const bindingExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
 	var out []WorkerLifecycleStats
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
@@ -1281,11 +1283,8 @@ func (cs *ConfigStore) RetireOrphanWorker(record *WorkerRecord, reason string) (
 // picked up well before its session token actually goes invalid.
 //
 // NULL s3_credentials_expires_at is treated as "due immediately". This
-// covers two cases: warm-pool rows that haven't been activated yet (these
-// have no creds, so the predicate is irrelevant — they're filtered out by
-// the state set anyway since neutral idle workers shouldn't carry creds),
-// and pre-migration rows that existed before this column was introduced
-// (these get refreshed eagerly so we converge to the new state).
+// mainly covers pre-migration rows that existed before this column was
+// introduced (these get refreshed eagerly so we converge to the new state).
 //
 // Only already-activated states are considered: retired/lost/draining rows
 // don't need creds, and reserved/activating rows must not be refreshed because
@@ -1304,8 +1303,8 @@ func (cs *ConfigStore) ListWorkersDueForCredentialRefresh(ownerCPInstanceID stri
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("owner_cp_instance_id = ?", ownerCPInstanceID).
 		Where("state IN ?", credEligibleStates).
-		// Org-bound rows only: a neutral warm row (org_id='') hasn't been
-		// activated, so it has no STS-brokered creds yet.
+		// Org-bound rows only: a row with no org_id (legacy/unactivated) has no
+		// STS-brokered creds yet.
 		Where("org_id <> ''").
 		Where("s3_credentials_expires_at IS NULL OR s3_credentials_expires_at <= ?", cutoff).
 		Order("s3_credentials_expires_at ASC NULLS FIRST, worker_id ASC").

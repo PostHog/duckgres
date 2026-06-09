@@ -18,18 +18,16 @@ const (
 )
 
 type capacityMissPolicy struct {
-	reason              configstore.WorkerClaimMissReason
-	recordDynamicDemand bool
-	messageKind         capacityClientMessageKind
+	reason      configstore.WorkerClaimMissReason
+	messageKind capacityClientMessageKind
 }
 
 func capacityMissPolicyForReason(reason configstore.WorkerClaimMissReason) capacityMissPolicy {
 	switch reason {
 	case configstore.WorkerClaimMissReasonNone, configstore.WorkerClaimMissReasonNoIdle:
 		return capacityMissPolicy{
-			reason:              configstore.WorkerClaimMissReasonNoIdle,
-			recordDynamicDemand: true,
-			messageKind:         capacityMessageNoIdle,
+			reason:      configstore.WorkerClaimMissReasonNoIdle,
+			messageKind: capacityMessageNoIdle,
 		}
 	case configstore.WorkerClaimMissReasonOrgCap:
 		return capacityMissPolicy{reason: reason, messageKind: capacityMessageOrgCap}

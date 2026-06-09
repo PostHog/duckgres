@@ -150,24 +150,20 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 
 func TestWarmCapacityMissPolicyForKnownReasons(t *testing.T) {
 	for _, tt := range []struct {
-		name                string
-		reason              configstore.WorkerClaimMissReason
-		policyReason        configstore.WorkerClaimMissReason
-		recordDynamicDemand bool
+		name         string
+		reason       configstore.WorkerClaimMissReason
+		policyReason configstore.WorkerClaimMissReason
 	}{
-		{name: "none defaults to no_idle", reason: configstore.WorkerClaimMissReasonNone, policyReason: configstore.WorkerClaimMissReasonNoIdle, recordDynamicDemand: true},
-		{name: "no_idle", reason: configstore.WorkerClaimMissReasonNoIdle, policyReason: configstore.WorkerClaimMissReasonNoIdle, recordDynamicDemand: true},
-		{name: "org_cap", reason: configstore.WorkerClaimMissReasonOrgCap, policyReason: configstore.WorkerClaimMissReasonOrgCap, recordDynamicDemand: false},
-		{name: "global_cap", reason: configstore.WorkerClaimMissReasonGlobalCap, policyReason: configstore.WorkerClaimMissReasonGlobalCap, recordDynamicDemand: false},
-		{name: "shutting_down", reason: configstore.WorkerClaimMissReasonShuttingDown, policyReason: configstore.WorkerClaimMissReasonShuttingDown, recordDynamicDemand: false},
+		{name: "none defaults to no_idle", reason: configstore.WorkerClaimMissReasonNone, policyReason: configstore.WorkerClaimMissReasonNoIdle},
+		{name: "no_idle", reason: configstore.WorkerClaimMissReasonNoIdle, policyReason: configstore.WorkerClaimMissReasonNoIdle},
+		{name: "org_cap", reason: configstore.WorkerClaimMissReasonOrgCap, policyReason: configstore.WorkerClaimMissReasonOrgCap},
+		{name: "global_cap", reason: configstore.WorkerClaimMissReasonGlobalCap, policyReason: configstore.WorkerClaimMissReasonGlobalCap},
+		{name: "shutting_down", reason: configstore.WorkerClaimMissReasonShuttingDown, policyReason: configstore.WorkerClaimMissReasonShuttingDown},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			policy := capacityMissPolicyForReason(tt.reason)
 			if policy.reason != tt.policyReason {
 				t.Fatalf("policy reason = %q, want %q", policy.reason, tt.policyReason)
-			}
-			if policy.recordDynamicDemand != tt.recordDynamicDemand {
-				t.Fatalf("recordDynamicDemand = %v, want %v", policy.recordDynamicDemand, tt.recordDynamicDemand)
 			}
 		})
 	}

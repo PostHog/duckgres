@@ -66,6 +66,9 @@ var observedWorkerLifecycleStates = []configstore.WorkerState{
 	configstore.WorkerStateDraining,
 }
 
+// "neutral" is legacy: remote workers are always org-bound from spawn now (no
+// warm pool), so binding="neutral" reports 0 in production. Kept so any
+// pre-existing/legacy rows still surface and old dashboards don't break.
 var observedWorkerLifecycleBindings = []string{"neutral", "org_bound"}
 
 func workerLifecycleImages(stats []configstore.WorkerLifecycleStats) map[string]struct{} {

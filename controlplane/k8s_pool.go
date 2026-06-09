@@ -43,15 +43,6 @@ const defaultActivatingTimeout = 2 * time.Minute
 // generous.
 const workerPodReadyTimeout = 5 * time.Minute
 
-// warmSpawnReconcileTimeout bounds a warm-pool replenish/reconcile spawn. It MUST
-// exceed workerPodReadyTimeout: a warm spawn does the same waitForPodReady, so a
-// shorter deadline cancels every cold spawn before its node can provision. The
-// old 30s value meant the warm reconcile could never refill an exclusive worker
-// that needed a fresh node — after a CP restart the default/exclusive pool would
-// sit empty, churning "context deadline exceeded", while only colocated (small,
-// fast, bin-packed) shapes refilled. See TestWarmSpawnTimeoutExceedsPodReady.
-const warmSpawnReconcileTimeout = 6 * time.Minute
-
 const workerTerminationGracePeriodSeconds int64 = 3600
 
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
@@ -171,11 +162,10 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Limit concurrent K8s API calls to avoid overwhelming the API server.
 	// The K8s client above is configured for QPS=50 / Burst=100, so 50 in-flight
 	// pod creates fits comfortably within client-side throttling while letting
-	// the warm-pool reconciler close large demand gaps (e.g. 30-tenant cold
-	// ramp) in one tick instead of creeping up at 3-per-pod-startup. Pod
-	// scheduling latency on the node side is bounded by Karpenter (~30s) and
-	// the kubelet, neither of which cares about how many pods we create
-	// in parallel from the CP.
+	// a large demand burst (e.g. a 30-tenant cold ramp) spawn workers in
+	// parallel rather than serializing. Pod scheduling latency on the node side
+	// is bounded by Karpenter (~30s) and the kubelet, neither of which cares
+	// about how many pods we create in parallel from the CP.
 	spawnConcurrency := 50
 	retireConcurrency := 5
 	pool := &K8sWorkerPool{
@@ -255,11 +245,10 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 // Deployment ReplicaSet (pod-template-hash) than this CP, atomically marks
 // its idle runtime-store row retired, and deletes the pod.
 //
-// The janitor leader is expected to invoke this once per tick: together with
-// warm-pool replenishment via reconcileWarmCapacity, old-version workers are
-// replaced one at a time with pods spawned from the leader's current binary.
-// This gives gradual rolling worker replacement driven entirely by leader
-// election — no cross-CP sweeps needed.
+// The janitor leader is expected to invoke this once per tick: old-version idle
+// workers are retired one at a time, and the next session for that org spawns a
+// pod from the leader's current binary. This gives gradual rolling worker
+// replacement driven entirely by leader election — no cross-CP sweeps needed.
 //
 // Retirement is limited to workers currently in WorkerStateIdle. Busy or
 // hot-idle workers are left alone so in-flight sessions aren't disturbed;

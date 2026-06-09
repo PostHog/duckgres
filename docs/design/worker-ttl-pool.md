@@ -93,9 +93,9 @@ crash recovery) but the warm/neutral slot concept is gone.
 ## Headroom reconcile (new janitor hook, not a separate controller)
 
 Implemented as a **janitor reconcile hook** (`reconcileHeadroom`), invoked from
-`janitor.runOnce()` alongside `reconcileWarmCapacity` — it reuses the janitor's
-existing leader-gated tick, so there is no new loop, goroutine, or leader
-election. On each tick (leader CP only) it:
+`janitor.runOnce()` — it reuses the janitor's existing leader-gated tick, so
+there is no new loop, goroutine, or leader election. On each tick (leader CP
+only) it:
 
 - reads node allocatable CPU+memory (k8s API, the worker nodepool) and current
   worker+placeholder usage;

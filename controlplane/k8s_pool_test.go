@@ -890,19 +890,6 @@ func envHasName(env []corev1.EnvVar, name string) bool {
 	}
 	return false
 }
-// A warm-pool reconcile spawn does the same waitForPodReady as any spawn, so its
-// context deadline must outlast workerPodReadyTimeout — otherwise a cold spawn
-// (fresh Karpenter node, e.g. an exclusive 46/360 worker on a dedicated large
-// instance) is cancelled before its node can provision. When that happened the
-// default/exclusive warm pool sat empty after a CP restart, churning
-// "context deadline exceeded", while only the small/fast colocated shapes refilled.
-func TestWarmSpawnTimeoutExceedsPodReady(t *testing.T) {
-	if warmSpawnReconcileTimeout <= workerPodReadyTimeout {
-		t.Fatalf("warmSpawnReconcileTimeout (%s) must exceed workerPodReadyTimeout (%s); "+
-			"a shorter warm deadline cancels cold spawns before their node provisions",
-			warmSpawnReconcileTimeout, workerPodReadyTimeout)
-	}
-}
 
 func TestK8sPool_WorkerLookup(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
@@ -1183,11 +1170,6 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	}
 }
 
-// TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRuntimeStore
-// ensures the runtime-store-less warm-pool path honors per-org image pinning.
-// Without the image filter on findReservableWarmWorkerLocked,
-// ReserveSharedWorker would return a default-image warm worker to a pinned org
-// and the subsequent activation would fail with a version-mismatch error.
 func TestK8sPoolReserveClaimedWorkerRejectsDuplicateActivatingClaim(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	assignment := &WorkerAssignment{OrgID: "analytics"}

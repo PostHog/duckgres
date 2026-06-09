@@ -11,23 +11,15 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-func addNeutralWarmWorker(shared *K8sWorkerPool, id int) *ManagedWorker {
-	worker := &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
-	shared.workers[id] = worker
-	return worker
-}
-
 func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	addNeutralWarmWorker(shared, 1)
 	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
-		// Mirror production SpawnWorker behavior: the spawned worker carries
-		// the image it was built from. Required since findReservableWarmWorkerLocked
-		// filters by assignment.Image.
+		// Mirror production SpawnWorker: the spawned worker carries the image it was
+		// built from, so the image-mismatch retire check in reserveClaimedWorker sees it.
 		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
@@ -72,13 +64,11 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 		t.Fatalf("SetSharedState(other): %v", err)
 	}
 	shared.workers[other.ID] = other
-	addNeutralWarmWorker(shared, 2)
 
 	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
-		// Mirror production SpawnWorker behavior: the spawned worker carries
-		// the image it was built from. Required since findReservableWarmWorkerLocked
-		// filters by assignment.Image.
+		// Mirror production SpawnWorker: the spawned worker carries the image it was
+		// built from, so the image-mismatch retire check in reserveClaimedWorker sees it.
 		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
@@ -138,12 +128,10 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	addNeutralWarmWorker(shared, 1)
 	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
-		// Mirror production SpawnWorker behavior: the spawned worker carries
-		// the image it was built from. Required since findReservableWarmWorkerLocked
-		// filters by assignment.Image.
+		// Mirror production SpawnWorker: the spawned worker carries the image it was
+		// built from, so the image-mismatch retire check in reserveClaimedWorker sees it.
 		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
@@ -176,12 +164,10 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	addNeutralWarmWorker(shared, 1)
 	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
-		// Mirror production SpawnWorker behavior: the spawned worker carries
-		// the image it was built from. Required since findReservableWarmWorkerLocked
-		// filters by assignment.Image.
+		// Mirror production SpawnWorker: the spawned worker carries the image it was
+		// built from, so the image-mismatch retire check in reserveClaimedWorker sees it.
 		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
@@ -224,12 +210,7 @@ func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
 	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	// Pre-seed many neutral warm workers so AcquireWorker can reserve
-	// each one in turn without blocking on a real spawn path.
 	const target = 30
-	for i := 1; i <= target; i++ {
-		addNeutralWarmWorker(shared, i)
-	}
 	shared.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		shared.mu.Lock()
 		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
