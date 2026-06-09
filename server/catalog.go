@@ -1201,6 +1201,11 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// statement_timestamp - start time of the current statement; now() is close enough here.
 		`CREATE OR REPLACE MACRO statement_timestamp() AS now()`,
 
+		// timeofday - PG-shaped wall-clock text like
+		// 'Tue Jun 09 13:17:57.627882 2026 America/Los_Angeles'. DuckDB %Z
+		// yields the zone name where PG abbreviates - accepted approximation.
+		`CREATE OR REPLACE MACRO timeofday() AS strftime(now(), '%a %b %d %H:%M:%S.%f %Y %Z')`,
+
 		// pg_get_function_arguments / _result / _identity_arguments - psql \df selects these from
 		// pg_proc; the missing symbols abort the whole query. We have no pg_proc rows to derive a
 		// real signature, so return '' (a valid PG value for a no-arg function) to keep \df working.
@@ -1268,6 +1273,43 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 
 		// jsonb_pretty - indented JSON rendering.
 		`CREATE OR REPLACE MACRO jsonb_pretty(j) AS json_pretty(j)`,
+
+		// json_typeof / jsonb_typeof - translate DuckDB's json_type vocabulary
+		// (UBIGINT/VARCHAR/...) to PG's (number/string/...). No ELSE 'number':
+		// json_type(NULL) is SQL NULL and PG's json_typeof is strict, so an
+		// unmatched CASE must yield NULL. All three numeric tags occur
+		// (UBIGINT for '1', BIGINT for '-1', DOUBLE for '1e30').
+		`CREATE OR REPLACE MACRO json_typeof(j) AS
+			CASE json_type(j)
+				WHEN 'OBJECT' THEN 'object'
+				WHEN 'ARRAY' THEN 'array'
+				WHEN 'VARCHAR' THEN 'string'
+				WHEN 'BOOLEAN' THEN 'boolean'
+				WHEN 'NULL' THEN 'null'
+				WHEN 'UBIGINT' THEN 'number'
+				WHEN 'BIGINT' THEN 'number'
+				WHEN 'DOUBLE' THEN 'number'
+			END`,
+		// Same body, not a json_typeof(j) delegate: a macro-to-macro reference
+		// would have to resolve across catalogs in DuckLake mode.
+		`CREATE OR REPLACE MACRO jsonb_typeof(j) AS
+			CASE json_type(j)
+				WHEN 'OBJECT' THEN 'object'
+				WHEN 'ARRAY' THEN 'array'
+				WHEN 'VARCHAR' THEN 'string'
+				WHEN 'BOOLEAN' THEN 'boolean'
+				WHEN 'NULL' THEN 'null'
+				WHEN 'UBIGINT' THEN 'number'
+				WHEN 'BIGINT' THEN 'number'
+				WHEN 'DOUBLE' THEN 'number'
+			END`,
+
+		// duckgres_string_to_array3 - 3-arg PG string_to_array(s, delim, nullstr):
+		// split elements equal to nullstr become NULL. Distinctly named because a
+		// bare string_to_array macro would shadow DuckDB's native 2-arg builtin.
+		// The transpiler renames 3-arg string_to_array calls to this macro.
+		`CREATE OR REPLACE MACRO duckgres_string_to_array3(s, d, ns) AS
+			list_transform(string_split(s, d), lambda x: nullif(x, ns))`,
 
 		// to_ascii - approximate transliteration to ASCII via accent stripping.
 		`CREATE OR REPLACE MACRO to_ascii(s) AS strip_accents(s)`,

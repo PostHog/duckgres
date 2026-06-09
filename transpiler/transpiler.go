@@ -511,14 +511,14 @@ func Classify(sql string, cfg Config) Classification {
 		// JSON functions
 		"JSON_OBJECT_KEYS(", "JSONB_OBJECT_KEYS(", "TO_JSONB(",
 		// Date/time functions
-		"TIMEOFDAY(", "LOCALTIME(", "LOCALTIMESTAMP(",
 		"CLOCK_TIMESTAMP(",
 		// Identity functions
 		"SESSION_USER", "USER(",
 		// PostgreSQL builtin-compatibility transforms (functions_compat.go)
 		"FORMAT(", "SUBSTR(", "SUBSTRING(", "OVERLAY(", "DATE_TRUNC(", "CARDINALITY(", "ISFINITE(",
 		// PostgreSQL builtin-compatibility macros (server/catalog.go initPgCatalog)
-		"SET_CONFIG(", "UUID_GENERATE_V4(", "STATEMENT_TIMESTAMP(",
+		"SET_CONFIG(", "UUID_GENERATE_V4(", "STATEMENT_TIMESTAMP(", "TIMEOFDAY(",
+		"DUCKGRES_STRING_TO_ARRAY3(",
 		"PG_GET_FUNCTION_ARGUMENTS(", "PG_GET_FUNCTION_RESULT(", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS(",
 		"PG_GET_TRIGGERDEF(", "PG_JIT_AVAILABLE(", "ROW_SECURITY_ACTIVE(", "PG_COLLATION_FOR(",
 		"PG_INPUT_IS_VALID(", "TO_REGCLASS(", "TO_REGTYPE(", "TO_REGPROC(", "JSONB_PRETTY(",
@@ -531,6 +531,7 @@ func Classify(sql string, cfg Config) Classification {
 		"JSON_ARRAY_ELEMENTS(", "JSONB_ARRAY_ELEMENTS(", "JSON_ARRAY_ELEMENTS_TEXT(",
 		"JSONB_EACH(", "JSON_EACH_TEXT(", "PG_OPTIONS_TO_TABLE(", "ACLEXPLODE(",
 		"PG_GET_KEYWORDS(", "PG_IDENTIFY_OBJECT(",
+		"LOCALTIME(", "LOCALTIMESTAMP(", "CURRENT_TIME(", "CURRENT_TIMESTAMP(", // precision-form SQLValueFunctions
 	) {
 		flags |= FlagFunctions
 	}

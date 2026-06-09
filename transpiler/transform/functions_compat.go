@@ -8,7 +8,8 @@ import (
 
 // This file implements the PostgreSQL builtin-compatibility transforms that
 // cannot be expressed as catalog macros (self-recursion, variadic templates, or
-// arg-count-dependent rewrites). See docs/pg-builtin-compat-status.md.
+// arg-count-dependent rewrites). Regression coverage lives in
+// server/pg_compat_transforms_test.go (transpile-and-execute against DuckDB).
 
 // replaceCompatFuncNode handles compat functions that must REPLACE the whole
 // FuncCall node with a different expression (vs an in-place arg edit). It is
@@ -25,8 +26,31 @@ func (t *FunctionTransform) replaceCompatFuncNode(node *pg_query.Node, fc *pg_qu
 		return t.rewriteOverlay(node, fc)
 	case "isfinite":
 		return t.rewriteIsfiniteInterval(node, fc)
+	case "array_position":
+		return t.rewriteArrayPosition3(node, fc)
 	}
 	return false
+}
+
+// rewriteArrayPosition3 rewrites the 3-arg PG array_position(arr, elem, start)
+// into list_position(list_slice(arr, greatest(start,1), len(arr)), elem) +
+// greatest(start,1) - 1. DuckDB's list_position has no start overload. The
+// greatest(start,1) clamp matters: a naive arr[start:] slice mishandles start=0
+// (off-by-one) and negative starts (DuckDB slices from the end). list_position
+// returns NULL on miss and NULL propagates through the arithmetic, matching PG.
+// arr and start are each referenced twice — volatile expressions would be
+// evaluated repeatedly; fine for the common literal/column case. The 2-arg form
+// stays on the plain list_position rename in functionNameMapping.
+func (t *FunctionTransform) rewriteArrayPosition3(node *pg_query.Node, fc *pg_query.FuncCall) bool {
+	if len(fc.Args) != 3 {
+		return false
+	}
+	arr, elem, start := fc.Args[0], fc.Args[1], fc.Args[2]
+	clamped := funcCallNode("greatest", start, intConstNode(1))
+	sliced := funcCallNode("list_slice", arr, clamped, funcCallNode("len", arr))
+	pos := funcCallNode("list_position", sliced, elem)
+	node.Node = binExprNode("-", binExprNode("+", pos, clamped), intConstNode(1)).Node
+	return true
 }
 
 // rewriteFormat rewrites format('...literal template...', args...) with PG
