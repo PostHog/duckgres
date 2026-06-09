@@ -355,6 +355,7 @@ func TestSessionPoolActivateTenantAllowsSameOwnerSameEpochCredentialRetry(t *tes
 	current := pool.currentActivation()
 	if current == nil {
 		t.Fatal("expected activation to remain present")
+		return
 	}
 	if current.payload.DuckLake.S3AccessKey != "NEW_ACCESS_KEY" {
 		t.Fatalf("expected activation payload to be refreshed, got %q", current.payload.DuckLake.S3AccessKey)
