@@ -166,6 +166,7 @@ type QueryHandle struct {
 type drainToken struct {
 	finish          func()
 	finishOperation func()
+	txnID           string
 	at              time.Time
 }
 
@@ -276,6 +277,29 @@ func (s *Session) beginOperation() (func(), bool) {
 			s.mu.Unlock()
 		})
 	}, true
+}
+
+func (s *Session) beginOperationForTransaction(txnKey string) (func(), bool, bool) {
+	s.mu.Lock()
+	if _, exists := s.txns[txnKey]; !exists {
+		s.mu.Unlock()
+		return nil, false, false
+	}
+	if s.closed || s.operationOpen {
+		s.mu.Unlock()
+		return nil, true, false
+	}
+	s.operationOpen = true
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.operationOpen = false
+			s.mu.Unlock()
+		})
+	}, true, true
 }
 
 // beginConnWork fences any operation that uses the session connection while a

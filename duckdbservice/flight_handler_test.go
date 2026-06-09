@@ -832,6 +832,108 @@ func TestEndTransactionRollbackReleasesAbandonedMetadataOperation(t *testing.T) 
 	}
 }
 
+func TestEndTransactionNotFoundDoesNotConsumeMetadataOperation(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+	}
+	session := &Session{
+		ID:             "session-1",
+		Conn:           conn,
+		queries:        make(map[string]*QueryHandle),
+		metadataDrains: make(map[string][]drainToken),
+		txns:           make(map[string]*trackedTx),
+		txnOwner:       make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	txnID, err := handler.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	defer func() {
+		var rollbackTxs []*sql.Tx
+		var releaseDrains []func()
+		session.mu.Lock()
+		for id, ttx := range session.txns {
+			if ttx.tx != nil {
+				rollbackTxs = append(rollbackTxs, ttx.tx)
+			}
+			if ttx.finishDrain != nil {
+				releaseDrains = append(releaseDrains, ttx.finishDrain)
+				ttx.finishDrain = nil
+			}
+			delete(session.txns, id)
+			delete(session.txnOwner, id)
+		}
+		for key, drains := range session.metadataDrains {
+			releaseDrains = appendDrainTokenFuncs(releaseDrains, drains)
+			delete(session.metadataDrains, key)
+		}
+		session.mu.Unlock()
+		for _, tx := range rollbackTxs {
+			_ = session.rollbackTx(tx)
+		}
+		for _, release := range releaseDrains {
+			releaseDrainFunc(release)
+		}
+	}()
+	cmd := testGetDBSchemas{}
+	if _, err := handler.GetFlightInfoSchemas(ctx, cmd, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("get metadata flight info: %v", err)
+	}
+
+	err = handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: []byte("txn-does-not-exist"),
+		action:        flightsql.EndTransactionRollback,
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected bogus transaction to be rejected as not found, got %v", err)
+	}
+	session.mu.RLock()
+	metadataDrainCount := len(session.metadataDrains)
+	operationOpen := session.operationOpen
+	session.mu.RUnlock()
+	if metadataDrainCount != 1 {
+		t.Fatalf("bogus rollback consumed metadata drains, got %d entries", metadataDrainCount)
+	}
+	if !operationOpen {
+		t.Fatal("bogus rollback released the pending metadata operation")
+	}
+
+	_, ch, err := handler.DoGetDBSchemas(ctx, cmd)
+	if err != nil {
+		t.Fatalf("metadata DoGet should still consume the original continuation: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("metadata stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			chunk.Data.Release()
+		}
+	}
+	if err := handler.EndTransaction(ctx, testEndTransactionRequest{
+		transactionID: txnID,
+		action:        flightsql.EndTransactionRollback,
+	}); err != nil {
+		t.Fatalf("rollback real transaction: %v", err)
+	}
+}
+
 func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
@@ -848,8 +950,10 @@ func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
 			},
 		},
 		metadataDrains: make(map[string][]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		txns: map[string]*trackedTx{
+			"txn-1": {},
+		},
+		txnOwner: make(map[string]string),
 	}
 	finishOperation, ok := session.beginOperation()
 	if !ok {

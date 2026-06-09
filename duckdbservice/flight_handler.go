@@ -189,7 +189,7 @@ func popAbandonedTransactionContinuations(session *Session, txnKey string) ([]fu
 	for key, tokens := range session.metadataDrains {
 		kept := tokens[:0]
 		for _, token := range tokens {
-			if token.finishOperation == nil {
+			if token.finishOperation == nil || token.txnID != txnKey {
 				kept = append(kept, token)
 				continue
 			}
@@ -276,7 +276,7 @@ func popPreparedDrain(session *Session, handleID string) (*QueryHandle, func(), 
 	return handle, token.finish, token.finishOperation, true
 }
 
-func appendMetadataDrain(session *Session, key string, finishDrain func(), finishOperation func()) bool {
+func appendMetadataDrain(session *Session, key string, finishDrain func(), finishOperation func(), txnID string) bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.closed {
@@ -285,7 +285,12 @@ func appendMetadataDrain(session *Session, key string, finishDrain func(), finis
 	if session.metadataDrains == nil {
 		session.metadataDrains = make(map[string][]drainToken)
 	}
-	session.metadataDrains[key] = append(session.metadataDrains[key], drainToken{finish: finishDrain, finishOperation: finishOperation, at: time.Now()})
+	session.metadataDrains[key] = append(session.metadataDrains[key], drainToken{
+		finish:          finishDrain,
+		finishOperation: finishOperation,
+		txnID:           txnID,
+		at:              time.Now(),
+	})
 	return true
 }
 
@@ -1027,7 +1032,10 @@ func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 		return status.Error(codes.InvalidArgument, "missing transaction id")
 	}
 
-	finishOperation, ok := session.beginOperation()
+	finishOperation, txnExists, ok := session.beginOperationForTransaction(txnKey)
+	if !txnExists {
+		return status.Error(codes.NotFound, "transaction not found")
+	}
 	var handleDrainReleases []func()
 	var handleOperationReleases []func()
 	if !ok {
@@ -1367,7 +1375,8 @@ func (h *FlightSQLHandler) GetFlightInfoSchemas(ctx context.Context, cmd flights
 			finishDrain()
 		}
 	}()
-	if !appendMetadataDrain(session, metadataSchemasDrainKey(cmd), finishDrain, finishOperation) {
+	metadataTxnKey := session.getActiveTxnKey()
+	if !appendMetadataDrain(session, metadataSchemasDrainKey(cmd), finishDrain, finishOperation, metadataTxnKey) {
 		return nil, status.Error(codes.NotFound, "session closed")
 	}
 	releaseOnReturn = false
@@ -1525,7 +1534,8 @@ func (h *FlightSQLHandler) GetFlightInfoTables(ctx context.Context, cmd flightsq
 			finishDrain()
 		}
 	}()
-	if !appendMetadataDrain(session, metadataTablesDrainKey(cmd), finishDrain, finishOperation) {
+	metadataTxnKey := session.getActiveTxnKey()
+	if !appendMetadataDrain(session, metadataTablesDrainKey(cmd), finishDrain, finishOperation, metadataTxnKey) {
 		return nil, status.Error(codes.NotFound, "session closed")
 	}
 	releaseOnReturn = false
@@ -1778,4 +1788,16 @@ func (s *Session) getActiveTxn() (*sql.Tx, *trackedTx) {
 		}
 	}
 	return nil, nil
+}
+
+func (s *Session) getActiveTxnKey() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for txnKey, ttx := range s.txns {
+		if ttx != nil && ttx.tx != nil {
+			ttx.lastUsed.Store(time.Now().UnixNano())
+			return txnKey
+		}
+	}
+	return ""
 }
