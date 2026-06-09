@@ -1320,7 +1320,14 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 
 	for _, f := range functions {
 		if _, err := db.Exec(f); err != nil {
-			// Log but don't fail - some might already exist or conflict
+			// Don't fail session init over one macro, but a registration failure
+			// means the function silently vanishes for this session (e.g. a typo
+			// in a macro body) — make it visible.
+			head := f
+			if len(head) > 120 {
+				head = head[:120] + "…"
+			}
+			slog.Warn("Failed to register pg_catalog compatibility macro.", "error", err, "macro", head)
 			continue
 		}
 	}

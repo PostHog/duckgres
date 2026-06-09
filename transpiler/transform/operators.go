@@ -605,6 +605,11 @@ func stringConstNode(s string) *pg_query.Node {
 // '{a,0,b}') into a DuckDB JSONPath ('$."a"."b"', '$."a"[0]."b"'). Keys are
 // double-quoted so dotted keys are handled; all-digit elements become array
 // indices. Returns "" for non-literal operands (left untransformed).
+//
+// Divergence: PG resolves each path element against the container's runtime type
+// (a digit element addresses an object key "0" when the container is an object),
+// but this static conversion always treats all-digit elements as array indices —
+// an object with a literal numeric key returns NULL instead of its value.
 func pgPathArrayToJSONPath(node *pg_query.Node) string {
 	if node == nil {
 		return ""

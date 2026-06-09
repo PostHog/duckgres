@@ -140,6 +140,10 @@ func TestTypeCastTransform_ArrayLiteral(t *testing.T) {
 		{"empty_array", `SELECT '{}'::integer[]`, []string{"ARRAY["}, []string{"'{}'"}},
 		{"null_element", `SELECT '{1,NULL,3}'::integer[]`, []string{"ARRAY[", "NULL"}, []string{"{1,NULL,3}"}},
 		{"quoted_embedded_comma", `SELECT '{"a,b",c}'::text[]`, []string{"ARRAY[", "'a,b'", "'c'"}, nil},
+		// Unquoted backslash escapes (PG accepts '{a\,b}' as one element) are NOT
+		// handled — the literal must be left untouched (honest hard error at the
+		// cast) rather than silently mis-split into two elements.
+		{"unquoted_backslash_left_alone", `SELECT e'{a\\,b}'::text[]`, []string{`{a`}, []string{"ARRAY["}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -694,6 +694,12 @@ func parsePGArrayLiteral(s string) ([]pgArrayElem, bool) {
 		}
 		start := i
 		for i < n && inner[i] != ',' {
+			// PG also honors backslash escapes in unquoted elements ('{a\,b}' is one
+			// element "a,b"). We don't implement that; bail so the literal reaches
+			// DuckDB untouched (hard error) instead of silently mis-splitting.
+			if inner[i] == '\\' {
+				return nil, false
+			}
 			i++
 		}
 		tok := strings.TrimSpace(inner[start:i])
