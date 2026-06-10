@@ -211,6 +211,13 @@ spec:
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }
             - { name: CP_PG_HOST, value: "duckgres-control-plane.$NS.svc" }
+          # Real requests/limits: the harness shares the default nodepool with
+          # the bursty per-PR worker pods. A BestEffort pod is the first thing
+          # the kubelet evicts under node memory pressure — observed killing
+          # the harness mid-run with no output.
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 512Mi }
           volumeMounts: [{ name: h, mountPath: /harness }]
       volumes: [{ name: h, configMap: { name: duckgres-harness } }]
 YAML
@@ -241,6 +248,11 @@ YAML
 cmd_diagnostics() {
   echo "::group::namespace state"
   "${KUBECTL[@]}" -n "$NS" get pods,svc,job -o wide || true
+  echo "::endgroup::"
+  echo "::group::harness pod status (eviction / OOM / exit code)"
+  "${KUBECTL[@]}" -n "$NS" get pods -l job-name=duckgres-harness     -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase} reason={.status.reason} msg={.status.message} exit={.status.containerStatuses[0].state.terminated.exitCode} term-reason={.status.containerStatuses[0].state.terminated.reason}{"
+"}{end}' || true
+  "${KUBECTL[@]}" -n "$NS" describe pods -l job-name=duckgres-harness 2>/dev/null | tail -30 || true
   echo "::endgroup::"
   echo "::group::control-plane logs (tail)"
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-control-plane --tail=200 || true

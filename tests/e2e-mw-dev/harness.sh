@@ -60,6 +60,10 @@
 #
 # Env (from run.sh): NAMESPACE, PR_NUMBER, INTERNAL_SECRET, CP_API, CP_PG_HOST
 set -eu
+# Surface ANY exit path in the Job log: set -e can kill the script without a
+# FAIL line, and an evicted pod prints nothing — make the normal/abnormal exit
+# explicit so a silent death is distinguishable from an eviction.
+trap 'rc=$?; [ "$rc" = 0 ] || echo "HARNESS EXIT rc=$rc (no FAIL line above = killed by set -e or external signal)" >&2' EXIT
 
 API="${CP_API:?}"
 PGHOST="${CP_PG_HOST:?}"
