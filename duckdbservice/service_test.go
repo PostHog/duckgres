@@ -105,11 +105,11 @@ func TestSessionAllowsOverlappingProtocolOperations(t *testing.T) {
 	}
 	defer finish()
 
-	if finish2, ok := s.beginOperation(); !ok {
-		t.Fatal("expected second protocol operation to be accepted")
-	} else {
-		finish2()
+	finish2, ok := s.beginOperation()
+	if !ok {
+		t.Fatal("expected overlapping protocol operation to be allowed")
 	}
+	finish2()
 }
 
 func TestSessionOperationFinishIsIdempotent(t *testing.T) {
@@ -122,7 +122,7 @@ func TestSessionOperationFinishIsIdempotent(t *testing.T) {
 	finish()
 
 	if finish2, ok := s.beginOperation(); !ok {
-		t.Fatal("expected operation helper to remain usable")
+		t.Fatal("expected session to still allow operations after idempotent finish")
 	} else {
 		finish2()
 	}
@@ -134,10 +134,9 @@ func TestReapAbandonedQueryHandleDeletesHandle(t *testing.T) {
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
+		ID:      "session-1",
+		queries: make(map[string]*QueryHandle),
+		txns:    make(map[string]*trackedTx),
 	}
 	finishOperation, ok := session.beginOperation()
 	if !ok {
@@ -157,77 +156,6 @@ func TestReapAbandonedQueryHandleDeletesHandle(t *testing.T) {
 	session.mu.RUnlock()
 	if stillPresent {
 		t.Fatal("expected abandoned query handle to be deleted")
-	}
-}
-
-func TestReapAbandonedPreparedDrainReleasesOperation(t *testing.T) {
-	pool := &SessionPool{
-		sessions:    make(map[string]*Session),
-		stopRefresh: make(map[string]func()),
-	}
-	finishDrain, err := pool.beginDrainWork(false)
-	if err != nil {
-		t.Fatalf("begin drain work: %v", err)
-	}
-	session := &Session{
-		ID: "session-1",
-		queries: map[string]*QueryHandle{
-			"prep-1": {
-				Query:    "SELECT 1",
-				Prepared: true,
-				pendingDrain: &drainToken{
-					finish: finishDrain,
-					at:     time.Now().Add(-handleIdleTimeout - time.Minute),
-				},
-			},
-		},
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-	}
-	finishOperation, ok := session.beginOperation()
-	if !ok {
-		t.Fatal("expected operation to start")
-	}
-	session.queries["prep-1"].pendingDrain.finishOperation = finishOperation
-	pool.sessions[session.ID] = session
-
-	pool.reapIdle(time.Now())
-
-	if got := pool.ActiveDrainWork(); got != 0 {
-		t.Fatalf("activeWork=%d want 0 after stale prepared drain reap", got)
-	}
-}
-
-func TestReapAbandonedMetadataDrainReleasesOperation(t *testing.T) {
-	pool := &SessionPool{
-		sessions:    make(map[string]*Session),
-		stopRefresh: make(map[string]func()),
-	}
-	finishDrain, err := pool.beginDrainWork(false)
-	if err != nil {
-		t.Fatalf("begin drain work: %v", err)
-	}
-	session := &Session{
-		ID:             "session-1",
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-	}
-	finishOperation, ok := session.beginOperation()
-	if !ok {
-		t.Fatal("expected operation to start")
-	}
-	session.metadataDrains["schemas|x"] = drainToken{
-		finish:          finishDrain,
-		finishOperation: finishOperation,
-		at:              time.Now().Add(-handleIdleTimeout - time.Minute),
-	}
-	pool.sessions[session.ID] = session
-
-	pool.reapIdle(time.Now())
-
-	if got := pool.ActiveDrainWork(); got != 0 {
-		t.Fatalf("activeWork=%d want 0 after stale metadata drain reap", got)
 	}
 }
 
@@ -671,50 +599,6 @@ func TestReapIdleTransactionsKeepsDrainWorkWhenTransactionActive(t *testing.T) {
 	releaseDrainFunc(finishDrain)
 }
 
-func TestAppendPreparedDrainRefreshesTrackedTransaction(t *testing.T) {
-	pool := &SessionPool{
-		sessions:    make(map[string]*Session),
-		stopRefresh: make(map[string]func()),
-	}
-	txnFinish, err := pool.beginDrainWork(false)
-	if err != nil {
-		t.Fatalf("begin transaction drain work: %v", err)
-	}
-	pendingFinish, err := pool.beginDrainWork(false)
-	if err != nil {
-		t.Fatalf("begin prepared drain work: %v", err)
-	}
-	ttx := &trackedTx{finishDrain: txnFinish}
-	ttx.lastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
-	session := &Session{
-		ID: "session-1",
-		queries: map[string]*QueryHandle{
-			"prep-1": {Query: "SELECT 1", Prepared: true, TxnID: "txn-1"},
-		},
-		txns:     map[string]*trackedTx{"txn-1": ttx},
-		txnOwner: map[string]string{"txn-1": "alice"},
-	}
-	pool.sessions[session.ID] = session
-
-	if !appendPreparedDrain(session, "prep-1", pendingFinish, nil) {
-		t.Fatal("appendPreparedDrain failed")
-	}
-	pool.BeginDrain()
-	pool.reapIdle(time.Now())
-	assertSessionMutexUnlocked(t, session)
-
-	session.mu.RLock()
-	_, stillTracked := session.txns["txn-1"]
-	handle := session.queries["prep-1"]
-	session.mu.RUnlock()
-	if !stillTracked {
-		t.Fatal("prepared continuation should refresh its tracked transaction before idle reap")
-	}
-	releaseDrainFunc(pendingFinish)
-	releaseDrainFunc(txnFinish)
-	releaseQueryHandleValue(handle)
-}
-
 func TestReapIdleRawSQLTransactionReleasesDrainWork(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -739,13 +623,12 @@ func TestReapIdleRawSQLTransactionReleasesDrainWork(t *testing.T) {
 		t.Fatalf("begin raw transaction drain work: %v", err)
 	}
 	session := &Session{
-		ID:             "session-1",
-		Conn:           conn,
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
-		sqlTxDrain:     finishDrain,
+		ID:         "session-1",
+		Conn:       conn,
+		queries:    make(map[string]*QueryHandle),
+		txns:       make(map[string]*trackedTx),
+		txnOwner:   make(map[string]string),
+		sqlTxDrain: finishDrain,
 	}
 	session.sqlTxActive.Store(true)
 	session.lastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
@@ -780,12 +663,11 @@ func TestReapIdleRawSQLTransactionKeepsDrainWorkWhenConnWorkActive(t *testing.T)
 		t.Fatalf("begin raw transaction drain work: %v", err)
 	}
 	session := &Session{
-		ID:             "session-1",
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
-		sqlTxDrain:     finishDrain,
+		ID:         "session-1",
+		queries:    make(map[string]*QueryHandle),
+		txns:       make(map[string]*trackedTx),
+		txnOwner:   make(map[string]string),
+		sqlTxDrain: finishDrain,
 	}
 	session.sqlTxActive.Store(true)
 	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
@@ -829,12 +711,11 @@ func TestReapIdleRawSQLTransactionKeepsDrainWorkWhenRollbackCannotRun(t *testing
 		t.Fatalf("begin raw transaction drain work: %v", err)
 	}
 	session := &Session{
-		ID:             "session-1",
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
-		sqlTxDrain:     finishDrain,
+		ID:         "session-1",
+		queries:    make(map[string]*QueryHandle),
+		txns:       make(map[string]*trackedTx),
+		txnOwner:   make(map[string]string),
+		sqlTxDrain: finishDrain,
 	}
 	session.sqlTxActive.Store(true)
 	session.sqlTxLastUsed.Store(time.Now().Add(-txnIdleTimeout - time.Minute).UnixNano())
@@ -879,11 +760,10 @@ func TestDestroySessionPreventsLateQueryHandleDrainLeak(t *testing.T) {
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		ID:       "session-1",
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
 	}
 	pool.sessions[session.ID] = session
 	finishDrain, err := pool.beginDrainWork(false)
@@ -913,11 +793,10 @@ func TestDestroySessionPreventsLateSQLTransactionDrainLeak(t *testing.T) {
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		ID:       "session-1",
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
 	}
 	pool.sessions[session.ID] = session
 	finishDrain, err := pool.beginDrainWork(false)
@@ -947,11 +826,10 @@ func TestDestroySessionPreventsLateTrackedTransactionDrainLeak(t *testing.T) {
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		ID:       "session-1",
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
 	}
 	pool.sessions[session.ID] = session
 	finishDrain, err := pool.beginDrainWork(false)
@@ -991,13 +869,12 @@ func TestDestroySessionWaitsForActiveConnectionWorkBeforeCleanup(t *testing.T) {
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		DB:             db,
-		Conn:           conn,
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		ID:       "session-1",
+		DB:       db,
+		Conn:     conn,
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
 	}
 	pool.sessions[session.ID] = session
 	session.connMu.Lock()
@@ -1040,13 +917,12 @@ func TestDestroySessionWaitsForAcceptedConnectionWorkBeforeCleanup(t *testing.T)
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		DB:             db,
-		Conn:           conn,
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		ID:       "session-1",
+		DB:       db,
+		Conn:     conn,
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
 	}
 	pool.sessions[session.ID] = session
 	endWork, ok := session.beginConnWork()
@@ -1092,13 +968,12 @@ func TestCloseAllWaitsForActiveConnectionWorkBeforeClose(t *testing.T) {
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		DB:             db,
-		Conn:           conn,
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		ID:       "session-1",
+		DB:       db,
+		Conn:     conn,
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
 	}
 	pool.sessions[session.ID] = session
 	session.connMu.Lock()
@@ -1139,13 +1014,12 @@ func TestCloseAllWaitsForAcceptedConnectionWorkBeforeClose(t *testing.T) {
 		stopRefresh: make(map[string]func()),
 	}
 	session := &Session{
-		ID:             "session-1",
-		DB:             db,
-		Conn:           conn,
-		queries:        make(map[string]*QueryHandle),
-		metadataDrains: make(map[string]drainToken),
-		txns:           make(map[string]*trackedTx),
-		txnOwner:       make(map[string]string),
+		ID:       "session-1",
+		DB:       db,
+		Conn:     conn,
+		queries:  make(map[string]*QueryHandle),
+		txns:     make(map[string]*trackedTx),
+		txnOwner: make(map[string]string),
 	}
 	pool.sessions[session.ID] = session
 	endWork, ok := session.beginConnWork()
@@ -1175,8 +1049,7 @@ func TestCloseAllWaitsForAcceptedConnectionWorkBeforeClose(t *testing.T) {
 
 // A GetFlightInfo whose matching DoGet never arrives must not hold the drain
 // open forever: the reaper releases drain tokens stranded on stale ad-hoc query
-// handles, stale prepared pendingDrain, and stale metadata streams — while
-// leaving fresh handles and long-lived prepared handles intact.
+// handles while leaving fresh handles intact.
 func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
@@ -1194,26 +1067,20 @@ func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
 
 	staleAdhoc := mustToken()
 	freshAdhoc := mustToken()
-	stalePrepared := mustToken()
-	staleMeta := mustToken()
 
 	sess := &Session{
 		ID: "s1",
 		queries: map[string]*QueryHandle{
 			"query-1": {Query: "SELECT 1", createdAt: stale, finishDrain: staleAdhoc},
 			"query-2": {Query: "SELECT 2", createdAt: fresh, finishDrain: freshAdhoc},
-			"prep-1":  {Query: "SELECT 3", Prepared: true, createdAt: stale, pendingDrain: &drainToken{finish: stalePrepared, at: stale}},
-		},
-		metadataDrains: map[string]drainToken{
-			"schemas|x": {finish: staleMeta, at: stale},
 		},
 		txns:     make(map[string]*trackedTx),
 		txnOwner: make(map[string]string),
 	}
 	pool.sessions["s1"] = sess
 
-	if got := pool.ActiveDrainWork(); got != 4 {
-		t.Fatalf("activeWork=%d want 4 before reap", got)
+	if got := pool.ActiveDrainWork(); got != 2 {
+		t.Fatalf("activeWork=%d want 2 before reap", got)
 	}
 
 	pool.reapIdle(time.Now())
@@ -1229,15 +1096,5 @@ func TestReapIdleReleasesAbandonedHandleDrains(t *testing.T) {
 	}
 	if _, ok := sess.queries["query-2"]; !ok {
 		t.Error("fresh ad-hoc handle query-2 was wrongly reaped")
-	}
-	prep, ok := sess.queries["prep-1"]
-	if !ok {
-		t.Fatal("prepared handle prep-1 was wrongly dropped (must outlive a stale pendingDrain)")
-	}
-	if prep.pendingDrain != nil {
-		t.Errorf("stale prepared pendingDrain not released: still present")
-	}
-	if _, ok := sess.metadataDrains["schemas|x"]; ok {
-		t.Error("stale metadata drain was not reaped")
 	}
 }
