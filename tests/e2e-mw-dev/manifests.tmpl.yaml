@@ -234,6 +234,17 @@ spec:
             # The harness sized_worker assertion connects with these and verifies the
             # spawned pod carries the requested CPU+memory.
             - { name: DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE, value: "true" }
+            # Pool-default worker shape for connections that send no sizing GUCs.
+            # Workers are never BestEffort (no pod anti-affinity anymore — resource
+            # requests are the only node-overcommit guard); without this the binary
+            # falls back to its built-in 8/16Gi default, which does not fit the
+            # mw-dev c6gd.xlarge worker nodes and would force a cold bigger node on
+            # every default spawn. Sub-1-CPU so the value collides with no sized
+            # assertion (they count org workers BY CPU: sized tests use 1 and 2)
+            # and several default workers bin-pack onto one warm node — exercising
+            # the post-anti-affinity packing behavior.
+            - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "750m" }
+            - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "1536Mi" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU, value: "1" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }

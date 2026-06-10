@@ -73,7 +73,6 @@ type K8sWorkerPool struct {
 	workerNodeSelector      map[string]string // node selector for worker pods
 	workerTolerationKey     string            // taint key for NoSchedule toleration
 	workerTolerationValue   string            // taint value for NoSchedule toleration
-	workerExclusiveNode     bool              // one worker per node via anti-affinity
 	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
 	// Headroom controller: keep headroomPercent% of worker-nodepool allocatable
@@ -188,7 +187,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerNodeSelector:      cfg.WorkerNodeSelector,
 		workerTolerationKey:     cfg.WorkerTolerationKey,
 		workerTolerationValue:   cfg.WorkerTolerationValue,
-		workerExclusiveNode:     cfg.WorkerExclusiveNode,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
 
 		headroomPercent:              cfg.HeadroomPercent,

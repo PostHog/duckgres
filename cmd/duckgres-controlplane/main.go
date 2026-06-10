@@ -230,7 +230,6 @@ func main() {
 			WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
 			WorkerTolerationKey:          resolved.K8sWorkerTolerationKey,
 			WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
-			WorkerExclusiveNode:          resolved.K8sWorkerExclusiveNode,
 			AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
 			WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
 			HeadroomPercent:              resolved.K8sHeadroomPercent,
