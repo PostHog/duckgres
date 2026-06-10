@@ -5,7 +5,7 @@
 Replay the dev Duckgres PGWire scenario suite against:
 
 ```bash
-psql "host=perfdev.dw.dev.postwh.com port=5432 dbname=perfdev user=bill sslmode=require"
+psql "host=bill-test.dw.dev.postwh.com port=5432 dbname=ducklake user=root sslmode=require"
 ```
 
 The runbook covers:
@@ -31,9 +31,9 @@ aws
 Required access:
 
 ```bash
-export AWS_PROFILE=<managed warehouse prod us profile>
-export PGPASSWORD='<bill-password>'
-export DSN="host=perfdev.dw.dev.postwh.com port=5432 dbname=perfdev user=bill sslmode=require"
+export AWS_PROFILE=managed-warehouse-dev
+export PGPASSWORD='<bill-test-password>'
+export DSN="host=bill-test.dw.dev.postwh.com port=5432 dbname=ducklake user=root sslmode=require"
 ```
 
 Kubernetes context and Loki service:
@@ -50,7 +50,7 @@ Known working Loki selectors:
 {namespace="duckgres"}
 {namespace="duckgres", app="duckgres"}
 {namespace="duckgres", app="duckgres-worker"}
-{namespace="duckgres"} |= "user=bill"
+{namespace="duckgres"} |= "user=root"
 {namespace="duckgres"} |= "<RUN_ID>"
 ```
 
@@ -67,7 +67,7 @@ Run before any scenario:
 
 ```bash
 aws sts get-caller-identity
-nc -vz perfdev.dw.dev.postwh.com 5432
+nc -vz bill-test.dw.dev.postwh.com 5432
 psql "$DSN" -v ON_ERROR_STOP=1 -c "SELECT 1" -c "SELECT current_database(), current_user"
 kubectl --context posthog-mw-dev -n monitoring get svc loki-logs-read
 ```
