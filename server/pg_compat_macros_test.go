@@ -188,9 +188,11 @@ func TestCompatMacros_BatchC(t *testing.T) {
 		{"encode_hex", `SELECT encode('abc'::blob,'hex')`, "616263", false},
 		{"encode_decode_roundtrip", `SELECT encode(decode('YWJj','base64'),'hex')`, "616263", false},
 
-		// inet_server_addr - DuckDB's builtin returns a wrong-typed NULL; macro returns INET NULL.
+		// inet_server_addr - DuckDB's builtin returns a wrong-typed NULL; macro returns a
+		// VARCHAR-typed NULL (NOT INET — that type needs the non-static inet extension,
+		// which would trigger a network autoinstall during worker warmup).
 		{"inet_server_addr_null", `SELECT (inet_server_addr() IS NULL)::VARCHAR`, "true", false},
-		{"inet_server_addr_type", `SELECT typeof(inet_server_addr())`, "INET", false},
+		{"inet_server_addr_type", `SELECT typeof(inet_server_addr())`, "VARCHAR", false},
 	})
 }
 

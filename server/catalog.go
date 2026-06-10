@@ -1425,8 +1425,13 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			END`,
 
 		// inet_server_addr - DuckDB ships a builtin that returns a wrong-typed NULL; shadow it
-		// with an INET-typed NULL so typeof() reports the PG type.
-		`CREATE OR REPLACE MACRO inet_server_addr() AS CAST(NULL AS INET)`,
+		// with a VARCHAR-typed NULL. Deliberately NOT CAST(NULL AS INET): the INET type lives
+		// in the inet extension, which is not statically linked — referencing it here triggers
+		// DuckDB extension autoinstall over plain HTTP during worker warmup, where the egress
+		// policy silently drops port 80 and the fetch hangs long enough for the control plane
+		// to reap the worker (see TestInitPgCatalogIsAirgapSafe). The transpiler maps the PG
+		// inet type to text anyway, so VARCHAR is the consistent shape.
+		`CREATE OR REPLACE MACRO inet_server_addr() AS CAST(NULL AS VARCHAR)`,
 
 		// overlaps - PG's (s1,e1) OVERLAPS (s2,e2) half-open range test. DuckDB parses the
 		// OVERLAPS keyword into an overlaps() call but has no such function. Name must be
