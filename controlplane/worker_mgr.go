@@ -1288,14 +1288,29 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 	}
 
 	var resp struct {
-		SessionToken   string   `json:"session_token"`
-		SecretWarnings []string `json:"secret_warnings"`
+		SessionToken string `json:"session_token"`
+		// Pointer so an old-image worker that omits the field entirely is
+		// distinguishable from a new worker reporting zero warnings.
+		SecretWarnings *[]string `json:"secret_warnings"`
 	}
 	if err := json.Unmarshal(msg.Body, &resp); err != nil {
 		return "", nil, fmt.Errorf("create session unmarshal: %w", err)
 	}
 
-	return resp.SessionToken, resp.SecretWarnings, nil
+	if resp.SecretWarnings == nil {
+		if len(secretStatements) > 0 {
+			// Per-org image pinning means a worker can run an arbitrarily old
+			// image: one that predates secret replay ignores the payload
+			// field (no replay, no create-time wipe) without erroring.
+			// Surface it as a replay warning so it is logged per-session and
+			// can't silently masquerade as "secrets restored".
+			slog.Error("Worker did not acknowledge persistent secret replay; it likely runs an image without user-secret support.",
+				"worker", w.ID, "secrets", len(secretStatements))
+			return resp.SessionToken, []string{"persistent secrets were NOT restored: the assigned worker runs an image without user-secret support"}, nil
+		}
+		return resp.SessionToken, nil, nil
+	}
+	return resp.SessionToken, *resp.SecretWarnings, nil
 }
 
 // ActivateTenant delivers tenant runtime to a shared warm worker before it may serve sessions.

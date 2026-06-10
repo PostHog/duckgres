@@ -228,7 +228,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 			c.sendError("ERROR", "26000", fmt.Sprintf("prepared statement %q does not exist", name))
 			return
 		}
-		slog.Debug("Describe statement.", "user", c.username, "name", name, "query", ps.query)
+		slog.Debug("Describe statement.", "user", c.username, "name", name, "query", usersecrets.RedactForLog(ps.query))
 
 		// Send parameter description based on the number of $N placeholders we found
 		// If the client didn't send explicit types, create them

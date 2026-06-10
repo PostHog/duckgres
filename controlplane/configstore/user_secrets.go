@@ -15,8 +15,10 @@ var ErrTooManyUserSecrets = errors.New("too many persistent secrets for user")
 // UpsertOrgUserSecret stores (or replaces) one sealed user secret. When
 // maxPerUser > 0, creating a NEW secret name is rejected with
 // ErrTooManyUserSecrets once the user already has maxPerUser secrets;
-// replacing an existing name is always allowed.
-func (cs *ConfigStore) UpsertOrgUserSecret(orgID, username, secretName string, ciphertext []byte, maxPerUser int) error {
+// replacing an existing name is always allowed. With createOnly set
+// (CREATE ... IF NOT EXISTS), an existing row is left untouched instead of
+// replaced.
+func (cs *ConfigStore) UpsertOrgUserSecret(orgID, username, secretName string, ciphertext []byte, maxPerUser int, createOnly bool) error {
 	return cs.db.Transaction(func(tx *gorm.DB) error {
 		if maxPerUser > 0 {
 			var existing int64
@@ -43,10 +45,17 @@ func (cs *ConfigStore) UpsertOrgUserSecret(orgID, username, secretName string, c
 			SecretName: secretName,
 			Ciphertext: ciphertext,
 		}
-		return tx.Clauses(clause.OnConflict{
+		conflict := clause.OnConflict{
 			Columns:   []clause.Column{{Name: "org_id"}, {Name: "username"}, {Name: "secret_name"}},
 			DoUpdates: clause.AssignmentColumns([]string{"ciphertext", "updated_at"}),
-		}).Create(&secret).Error
+		}
+		if createOnly {
+			conflict = clause.OnConflict{
+				Columns:   conflict.Columns,
+				DoNothing: true,
+			}
+		}
+		return tx.Clauses(conflict).Create(&secret).Error
 	})
 }
 

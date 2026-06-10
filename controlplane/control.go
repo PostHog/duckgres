@@ -1929,6 +1929,10 @@ func (cp *ControlPlane) startFlightIngress() {
 		HandleIdleTTL:      cp.cfg.FlightHandleIdleTTL,
 		SessionTokenTTL:    cp.cfg.FlightSessionTokenTTL,
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
+		// Persistent-secret DDL is intercepted on the PG wire protocol only;
+		// over Flight it would execute, never persist, and be wiped at the
+		// next session — reject it up front instead.
+		RejectPersistentSecretDDL: cp.srv != nil && cp.srv.UserSecretManager() != nil,
 	}
 
 	var (

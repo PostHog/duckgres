@@ -16,12 +16,12 @@ func TestClassify(t *testing.T) {
 		{
 			name:  "create or replace persistent",
 			query: "create or replace persistent secret My_S3 (TYPE s3)",
-			want:  Statement{Kind: KindCreate, Name: "my_s3", Persistent: true, OrReplace: true},
+			want:  Statement{Kind: KindCreate, Name: "my_s3", Persistent: true},
 		},
 		{
 			name:  "create persistent if not exists",
 			query: "CREATE PERSISTENT SECRET IF NOT EXISTS foo (TYPE s3)",
-			want:  Statement{Kind: KindCreate, Name: "foo", Persistent: true},
+			want:  Statement{Kind: KindCreate, Name: "foo", Persistent: true, IfNotExists: true},
 		},
 		{
 			name:  "create temporary",
@@ -79,9 +79,14 @@ func TestClassify(t *testing.T) {
 			want:  Statement{Kind: KindCreate, Name: "s", Persistent: true},
 		},
 		{
-			name:  "multi-statement refused",
+			name:  "multi-statement flagged",
 			query: "CREATE PERSISTENT SECRET s (TYPE s3); SELECT 1",
-			want:  Statement{},
+			want:  Statement{Kind: KindCreate, Name: "s", Persistent: true, MultiStatement: true},
+		},
+		{
+			name:  "multi-statement drop flagged",
+			query: "DROP PERSISTENT SECRET s; SELECT 1",
+			want:  Statement{Kind: KindDrop, Name: "s", Persistent: true, MultiStatement: true},
 		},
 		{
 			name:  "semicolon inside string literal ok",
@@ -146,7 +151,28 @@ func TestRedactForLog(t *testing.T) {
 		},
 		{
 			query: "-- note\nCREATE SECRET (TYPE s3, SECRET 'x')",
-			want:  "CREATE SECRET (…redacted)",
+			want:  "-- note\nCREATE SECRET (…redacted)",
+		},
+		{
+			// Redaction must track the tokenizer, not a flat prefix list:
+			// extra whitespace between keywords must still redact.
+			query: "CREATE  PERSISTENT\nSECRET s (TYPE s3, SECRET 'hunter2')",
+			want:  "CREATE  PERSISTENT\nSECRET s (…redacted)",
+		},
+		{
+			// ... and comments between keywords.
+			query: "CREATE /*c*/ PERSISTENT SECRET s (TYPE s3, SECRET 'hunter2')",
+			want:  "CREATE /*c*/ PERSISTENT SECRET s (…redacted)",
+		},
+		{
+			// Multi-statement strings with a secret-DDL head drop everything
+			// after the head (the trailing statements go with the options).
+			query: "CREATE PERSISTENT SECRET s (TYPE s3, SECRET 'x'); SELECT 1",
+			want:  "CREATE PERSISTENT SECRET s (…redacted)",
+		},
+		{
+			query: "CREATE SECRET IF NOT EXISTS foo (TYPE s3, SECRET 'x')",
+			want:  "CREATE SECRET IF NOT EXISTS foo (…redacted)",
 		},
 		{
 			query: "DROP PERSISTENT SECRET my_s3",

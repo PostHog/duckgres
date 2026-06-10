@@ -9,19 +9,21 @@ import (
 
 // fakeUserSecretMgr records PutSecret/DeleteSecret calls.
 type fakeUserSecretMgr struct {
-	readyErr error
-	putErr   error
-	delErr   error
-	delExist bool
-	putCalls []string // "org/user/name"
-	putStmts []string
-	delCalls []string
+	readyErr       error
+	putErr         error
+	delErr         error
+	delExist       bool
+	putCalls       []string // "org/user/name"
+	putStmts       []string
+	putIfNotExists []bool
+	delCalls       []string
 }
 
 func (m *fakeUserSecretMgr) Ready() error { return m.readyErr }
-func (m *fakeUserSecretMgr) PutSecret(_ context.Context, orgID, username, name, stmt string) error {
+func (m *fakeUserSecretMgr) PutSecret(_ context.Context, orgID, username, name, stmt string, ifNotExists bool) error {
 	m.putCalls = append(m.putCalls, orgID+"/"+username+"/"+name)
 	m.putStmts = append(m.putStmts, stmt)
+	m.putIfNotExists = append(m.putIfNotExists, ifNotExists)
 	return m.putErr
 }
 func (m *fakeUserSecretMgr) DeleteSecret(_ context.Context, orgID, username, name string) (bool, error) {
@@ -76,6 +78,7 @@ func TestExecUserSecretDDLNotHandledCases(t *testing.T) {
 		{"drop temporary", &fakeUserSecretMgr{}, "DROP TEMPORARY SECRET s"},
 		{"non-secret statement", &fakeUserSecretMgr{}, "SELECT 1"},
 		{"unnamed drop", &fakeUserSecretMgr{}, "DROP SECRET"},
+		{"plain drop in multi-statement batch keeps passthrough", &fakeUserSecretMgr{}, "DROP SECRET s; SELECT 1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -104,6 +107,14 @@ func TestExecUserSecretDDLRejections(t *testing.T) {
 		{"unnamed persistent", &fakeUserSecretMgr{}, "CREATE PERSISTENT SECRET (TYPE s3)", "0A000"},
 		{"reserved name", &fakeUserSecretMgr{}, "CREATE PERSISTENT SECRET ducklake_s3 (TYPE s3)", "42939"},
 		{"oversized statement", &fakeUserSecretMgr{}, "CREATE PERSISTENT SECRET big (TYPE s3, SECRET '" + strings.Repeat("x", maxUserSecretStatementLen) + "')", "54000"},
+		// A persistent variant in a multi-statement batch must be rejected,
+		// not silently fall through: it would execute, never persist, and be
+		// wiped at the next session.
+		{"multi-statement create", &fakeUserSecretMgr{}, "CREATE PERSISTENT SECRET s (TYPE s3); SELECT 1", "0A000"},
+		{"multi-statement drop", &fakeUserSecretMgr{}, "DROP PERSISTENT SECRET s; SELECT 1", "0A000"},
+		// Bound parameters can never be replayed; reject rather than execute
+		// unbound or persist placeholder text.
+		{"parameterized statement", &fakeUserSecretMgr{}, "CREATE PERSISTENT SECRET s (TYPE s3, KEY_ID $1, SECRET $2)", "0A000"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -182,10 +193,16 @@ func TestExecUserSecretDDLDropDeletesFromStore(t *testing.T) {
 }
 
 // A stored secret whose replay failed doesn't exist on the session; DROP must
-// still be able to remove it from the store.
+// still be able to remove it from the store — but ONLY when the session-side
+// failure is DuckDB's not-found error. Any other failure must surface and
+// leave the store untouched: a false "DROP succeeded" is fatal for a
+// credential revocation.
 func TestExecUserSecretDDLDropFallsBackToStore(t *testing.T) {
+	// DuckDB's actual message for dropping a missing secret.
+	notFound := errors.New("Invalid Input Error: Failed to remove non-existent secret with name 'broken_one'")
+
 	mgr := &fakeUserSecretMgr{delExist: true}
-	exec := &lifecycleExecutor{execErr: errors.New("Invalid Input Error: secret not found")}
+	exec := &lifecycleExecutor{execErr: notFound}
 	c, cleanup := newUserSecretTestConn(t, mgr, exec)
 	defer cleanup()
 
@@ -197,12 +214,55 @@ func TestExecUserSecretDDLDropFallsBackToStore(t *testing.T) {
 		t.Errorf("tag = %q, want DROP", tag)
 	}
 
-	// But when the store has nothing either, the DuckDB error wins.
+	// When the store has nothing either, the DuckDB error wins.
 	mgr2 := &fakeUserSecretMgr{delExist: false}
 	c2, cleanup2 := newUserSecretTestConn(t, mgr2, exec)
 	defer cleanup2()
 	handled, _, secErr = c2.execUserSecretDDL("DROP PERSISTENT SECRET nope")
 	if !handled || secErr == nil {
 		t.Fatalf("handled=%v secErr=%v, want the DuckDB error surfaced", handled, secErr)
+	}
+}
+
+// Any session-side DROP failure other than not-found (cancellation, RPC
+// error, aborted transaction, the multiple-storages ambiguity error) must NOT
+// delete the stored secret and must surface the error.
+func TestExecUserSecretDDLDropOtherErrorsDoNotTouchStore(t *testing.T) {
+	for _, execErr := range []error{
+		errors.New("rpc error: code = Unavailable desc = connection reset"),
+		errors.New("Invalid Input Error: Ambiguity found for secret name 'dup', secret occurs in multiple storages"),
+		errors.New("current transaction is aborted"),
+	} {
+		mgr := &fakeUserSecretMgr{delExist: true}
+		exec := &lifecycleExecutor{execErr: execErr}
+		c, cleanup := newUserSecretTestConn(t, mgr, exec)
+		handled, _, secErr := c.execUserSecretDDL("DROP PERSISTENT SECRET my_s3")
+		if !handled || secErr == nil {
+			t.Errorf("%v: handled=%v secErr=%v, want the error surfaced", execErr, handled, secErr)
+		}
+		if len(mgr.delCalls) != 0 {
+			t.Errorf("%v: store delete was attempted on a non-not-found exec error", execErr)
+		}
+		cleanup()
+	}
+}
+
+// IF NOT EXISTS must flow through to the store so an already-stored secret is
+// not silently replaced while DuckDB no-ops the live session.
+func TestExecUserSecretDDLIfNotExistsFlag(t *testing.T) {
+	mgr := &fakeUserSecretMgr{}
+	exec := &lifecycleExecutor{execResult: emptyExecResult{}}
+	c, cleanup := newUserSecretTestConn(t, mgr, exec)
+	defer cleanup()
+
+	if handled, _, secErr := c.execUserSecretDDL("CREATE PERSISTENT SECRET IF NOT EXISTS foo (TYPE s3)"); !handled || secErr != nil {
+		t.Fatalf("handled=%v secErr=%v", handled, secErr)
+	}
+	if handled, _, secErr := c.execUserSecretDDL("CREATE PERSISTENT SECRET bar (TYPE s3)"); !handled || secErr != nil {
+		t.Fatalf("handled=%v secErr=%v", handled, secErr)
+	}
+	want := []bool{true, false}
+	if len(mgr.putIfNotExists) != 2 || mgr.putIfNotExists[0] != want[0] || mgr.putIfNotExists[1] != want[1] {
+		t.Errorf("putIfNotExists = %v, want %v", mgr.putIfNotExists, want)
 	}
 }

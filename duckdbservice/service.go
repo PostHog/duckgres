@@ -911,8 +911,9 @@ func (svc *DuckDBService) WaitForDrain(ctx context.Context) bool {
 
 // CreateSession creates a new DuckDB session for the given username.
 // secretStatements are the user's persistent secrets to replay (shared-warm
-// mode only); replay failures come back as client-facing warnings, not
-// errors.
+// mode only); replay failures come back as warnings — logged on the worker
+// and again by the control plane's session manager, never failing the
+// session — rather than errors.
 func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, secretStatements []string) (*Session, []string, error) {
 	start := time.Now()
 	finishDrain, drainErr := p.beginDrainWork(false)
@@ -1036,7 +1037,20 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 	// plane. Replay failures degrade to warnings; a wipe failure fails the
 	// session because handing user A's secrets to user B is not acceptable.
 	var secretWarnings []string
-	if p.sharedWarmMode {
+	switch {
+	case p.sharedWarmMode && p.maxSessions != 1:
+		// The wipe and replay below are only safe because exactly one session
+		// runs at a time (DuckDB secrets are instance-global; k8s workers are
+		// spawned with DUCKGRES_DUCKDB_MAX_SESSIONS=1). Assert that here, at
+		// the point of reliance, instead of trusting a flag set two layers
+		// away: with any other cap, wiping would delete a concurrent
+		// session's secrets mid-query. Skip hygiene entirely and scream.
+		slog.Error("User persistent secret hygiene requires max_sessions=1 on shared-warm workers; skipping wipe+replay.",
+			"max_sessions", p.maxSessions, "user", username, "secrets", len(secretStatements))
+		if len(secretStatements) > 0 {
+			secretWarnings = []string{"persistent secrets were NOT restored: worker session cap is misconfigured (requires max_sessions=1)"}
+		}
+	case p.sharedWarmMode:
 		secretCtx, secretCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
 		wiped, wipeErr := wipeUserPersistentSecrets(secretCtx, conn)
 		if wipeErr != nil {

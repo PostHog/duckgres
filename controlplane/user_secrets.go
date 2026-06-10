@@ -50,8 +50,10 @@ func (m *CPUserSecretManager) Ready() error {
 	return nil
 }
 
-// PutSecret implements server.UserSecretManager.
-func (m *CPUserSecretManager) PutSecret(_ context.Context, orgID, username, secretName, statement string) error {
+// PutSecret implements server.UserSecretManager. With ifNotExists set, an
+// already-stored name is left untouched (DuckDB no-ops the live session for
+// IF NOT EXISTS, so replacing the stored statement would diverge the two).
+func (m *CPUserSecretManager) PutSecret(_ context.Context, orgID, username, secretName, statement string, ifNotExists bool) error {
 	if err := m.Ready(); err != nil {
 		return err
 	}
@@ -59,7 +61,7 @@ func (m *CPUserSecretManager) PutSecret(_ context.Context, orgID, username, secr
 	if err != nil {
 		return fmt.Errorf("seal secret: %w", err)
 	}
-	if err := m.store.UpsertOrgUserSecret(orgID, username, secretName, sealed, maxUserSecretsPerUser); err != nil {
+	if err := m.store.UpsertOrgUserSecret(orgID, username, secretName, sealed, maxUserSecretsPerUser, ifNotExists); err != nil {
 		if errors.Is(err, configstore.ErrTooManyUserSecrets) {
 			return err
 		}

@@ -35,7 +35,18 @@ type Statement struct {
 	Persistent bool
 	// Temporary is true when the TEMPORARY keyword is present.
 	Temporary bool
-	OrReplace bool
+	// IfNotExists is true for CREATE ... IF NOT EXISTS. The persistence layer
+	// must honor it: when the secret is already stored, DuckDB no-ops on the
+	// live session, so overwriting the stored statement would silently
+	// diverge the two.
+	IfNotExists bool
+	// MultiStatement is true when the secret DDL is followed by further
+	// statements ("CREATE PERSISTENT SECRET ...; SELECT 1"). Persistence side
+	// effects must map 1:1 to a statement, so callers must not persist these —
+	// and must not let persistent variants silently fall through either,
+	// because the statement would execute, never persist, and then be wiped
+	// at the next session.
+	MultiStatement bool
 }
 
 // Reserved secret names/prefixes. These belong to duckgres itself: the
@@ -63,18 +74,32 @@ func IsReservedName(name string) bool {
 	return false
 }
 
-// Classify inspects a single SQL statement and reports whether it is DuckDB
-// secret DDL. It is deliberately conservative: anything it cannot confidently
-// parse as a single secret DDL statement classifies as KindNone, which makes
-// the caller fall back to today's plain passthrough behavior (the statement
-// still executes, it just doesn't persist). A multi-statement string is never
-// classified, since the persistence side effect must map 1:1 to a statement.
+// Classify inspects a SQL statement and reports whether it is DuckDB secret
+// DDL. It is deliberately conservative: anything it cannot confidently parse
+// as secret DDL classifies as KindNone, which makes the caller fall back to
+// today's plain passthrough behavior. Multi-statement strings classify with
+// MultiStatement set so callers can reject (not silently drop) persistent
+// variants.
 func Classify(query string) Statement {
-	rest, ok := skipCommentsAndSpace(query)
+	st, _, ok := parseSecretDDLHead(query)
 	if !ok {
 		return Statement{}
 	}
+	st.MultiStatement = hasTrailingStatement(query)
+	return st
+}
+
+// parseSecretDDLHead parses the statement head (through the optional secret
+// name) and returns the classification plus the byte offset just past the
+// head. The fast path for non-secret statements is two short case-folded
+// keyword comparisons — no allocation — so this is safe on hot paths.
+func parseSecretDDLHead(query string) (Statement, int, bool) {
+	rest, ok := skipCommentsAndSpace(query)
+	if !ok {
+		return Statement{}, 0, false
+	}
 	toks := newTokenizer(rest)
+	headStart := len(query) - len(rest)
 
 	var st Statement
 	switch {
@@ -82,14 +107,13 @@ func Classify(query string) Statement {
 		st.Kind = KindCreate
 		if toks.eatKeyword("OR") {
 			if !toks.eatKeyword("REPLACE") {
-				return Statement{}
+				return Statement{}, 0, false
 			}
-			st.OrReplace = true
 		}
 	case toks.eatKeyword("DROP"):
 		st.Kind = KindDrop
 	default:
-		return Statement{}
+		return Statement{}, 0, false
 	}
 
 	if toks.eatKeyword("PERSISTENT") {
@@ -99,19 +123,20 @@ func Classify(query string) Statement {
 	}
 
 	if !toks.eatKeyword("SECRET") {
-		return Statement{}
+		return Statement{}, 0, false
 	}
 
 	if st.Kind == KindCreate {
 		if toks.eatKeyword("IF") {
 			if !toks.eatKeyword("NOT") || !toks.eatKeyword("EXISTS") {
-				return Statement{}
+				return Statement{}, 0, false
 			}
+			st.IfNotExists = true
 		}
 	} else {
 		if toks.eatKeyword("IF") {
 			if !toks.eatKeyword("EXISTS") {
-				return Statement{}
+				return Statement{}, 0, false
 			}
 		}
 	}
@@ -122,13 +147,7 @@ func Classify(query string) Statement {
 		st.Name = strings.ToLower(name)
 	}
 
-	// A persistence side effect must correspond to exactly one statement.
-	// If anything follows a top-level semicolon, refuse to classify.
-	if hasTrailingStatement(query) {
-		return Statement{}
-	}
-
-	return st
+	return st, headStart + toks.i, true
 }
 
 // skipCommentsAndSpace removes leading whitespace, line comments (--) and

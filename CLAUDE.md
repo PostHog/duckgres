@@ -261,6 +261,15 @@ Invariants for anyone touching this path:
   a store failure after a successful exec is an ERROR telling the user the
   secret will NOT survive the session. Replay failures at session create are
   warnings, never connection refusals.
+- **No silent non-persistence.** Any path where persistent-secret DDL would
+  execute but not persist must REJECT instead: multi-statement batches and
+  parameterized statements (CP interception), and the Flight SQL ingress
+  (`flightsqlingress.Config.RejectPersistentSecretDDL`). Otherwise the secret
+  works for one session and is silently deleted by the next session's wipe.
+- **DROP's store-fallback is gated on DuckDB's not-found error only**
+  (`isSecretNotFoundError`). Any other exec failure (cancel, RPC error,
+  ambiguity, aborted txn) must surface and leave the store untouched — a
+  false "DROP succeeded" is fatal for a credential revocation.
 - **Never log/store secret statement text.** `usersecrets.RedactForLog` guards
   logQueryStarted/Finished/Error, the query log, spans, and pg_stat_activity
   (`currentQuery`); keep new logging of query text behind it.

@@ -244,6 +244,13 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}
 
+	// secret_warnings is always present (empty slice, never null/absent): its
+	// presence is how the control plane distinguishes a worker that processed
+	// the secret replay from an old-image worker that silently ignored the
+	// payload field.
+	if secretWarnings == nil {
+		secretWarnings = []string{}
+	}
 	resp, _ := json.Marshal(map[string]any{
 		"session_token":   session.ID,
 		"secret_warnings": secretWarnings,

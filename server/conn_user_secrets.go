@@ -18,16 +18,26 @@ type UserSecretManager interface {
 	// Ready reports whether secrets can be persisted (e.g. the encryption
 	// key is configured). A non-nil error is shown to the client.
 	Ready() error
-	// PutSecret stores one statement, replacing any prior statement with the
-	// same name. Called only after the statement executed successfully on
-	// the live session.
-	PutSecret(ctx context.Context, orgID, username, secretName, statement string) error
+	// PutSecret stores one statement. With ifNotExists set, an already-stored
+	// name is left untouched (mirroring DuckDB's IF NOT EXISTS no-op on the
+	// live session); otherwise any prior statement with the same name is
+	// replaced. Called only after the statement executed successfully on the
+	// live session.
+	PutSecret(ctx context.Context, orgID, username, secretName, statement string, ifNotExists bool) error
 	// DeleteSecret removes one stored secret, reporting whether it existed.
 	DeleteSecret(ctx context.Context, orgID, username, secretName string) (existed bool, err error)
 }
 
 // maxUserSecretStatementLen bounds a single stored CREATE SECRET statement.
 const maxUserSecretStatementLen = 8 * 1024
+
+// isSecretNotFoundError matches DuckDB's error for dropping a secret that
+// does not exist ("Invalid Input Error: Failed to remove non-existent secret
+// with name '...'"). The DROP store-fallback is gated on exactly this error;
+// see execUserSecretDDL.
+func isSecretNotFoundError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "non-existent secret")
+}
 
 // secretDDLError is a client-facing error from the secret DDL path.
 type secretDDLError struct {
@@ -48,10 +58,10 @@ type secretDDLError struct {
 //     config store for replay on the user's future sessions.
 //   - DROP [PERSISTENT] SECRET <name>: execute on the session, then delete
 //     from the store so it doesn't reappear next session. If the session-side
-//     DROP fails but the store had the secret (e.g. its replay failed because
-//     an extension is missing), the store row is still deleted and the DROP
-//     reported successful — otherwise a broken stored secret could never be
-//     removed.
+//     DROP fails with DuckDB's not-found error (and only that error) but the
+//     store had the secret — e.g. its replay failed because an extension is
+//     missing — the store row is still deleted and the DROP reported
+//     successful, otherwise a broken stored secret could never be removed.
 //
 // DuckDB secrets are not transactional, so the store write is immediate even
 // inside an explicit transaction block; a ROLLBACK does not undo it.
@@ -69,6 +79,24 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 	}
 	if st.Kind == usersecrets.KindDrop && st.Name == "" {
 		return false, "", nil // let DuckDB produce its own parse error
+	}
+
+	// Persistence side effects must map 1:1 to a statement. Letting a
+	// persistent variant fall through inside a multi-statement batch would be
+	// worse than rejecting: the statement executes, never persists, and the
+	// next session's hygiene wipe silently deletes it.
+	if st.MultiStatement {
+		if st.Persistent {
+			return true, "", &secretDDLError{"0A000", "persistent secret DDL must be sent as a single statement; split it out of the multi-statement batch"}
+		}
+		return false, "", nil // plain DROP SECRET in a batch keeps passthrough behavior
+	}
+
+	// The stored statement is replayed verbatim on future sessions, so bound
+	// parameters can never be resolved again — and the executor would run
+	// them unbound here anyway. Require literals.
+	if hasParameterPlaceholders(query) {
+		return true, "", &secretDDLError{"0A000", "persistent secret statements must use literal values, not parameters ($1, ...), so they can be replayed on future sessions"}
 	}
 
 	if st.Kind == usersecrets.KindCreate {
@@ -89,14 +117,14 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	// Lifecycle log pair, like the normal exec paths — but with the
-	// credential-bearing option list redacted.
-	redacted := usersecrets.RedactForLog(query)
+	// Lifecycle log pair, like the normal exec paths. logQueryStarted/
+	// Finished/Error redact secret DDL internally (see usersecrets.
+	// RedactForLog) — they own redaction, callers pass raw text.
 	queryStart := time.Now()
 	var queryFinalErr error
-	c.logQueryStarted(redacted)
+	c.logQueryStarted(query)
 	defer func() {
-		c.logQueryFinished(redacted, queryStart, 0, queryFinalErr)
+		c.logQueryFinished(query, queryStart, 0, queryFinalErr)
 	}()
 
 	upperQuery := strings.ToUpper(query)
@@ -105,10 +133,17 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 	_, execErr := c.executor.ExecContext(ctx, query)
 	if execErr != nil {
 		queryFinalErr = execErr
-		if st.Kind == usersecrets.KindDrop {
+		if st.Kind == usersecrets.KindDrop && isSecretNotFoundError(execErr) {
 			// The stored secret may exist even though the session-side one
-			// doesn't (its replay failed). Deleting the row is the only way
-			// for the user to get rid of it, so prefer that over the error.
+			// doesn't (its replay failed, e.g. a missing extension). Deleting
+			// the row is the only way for the user to get rid of it, so
+			// treat the DROP as successful when the store had it. Gated on
+			// DuckDB's not-found error specifically: any other failure
+			// (cancellation, RPC error, aborted transaction, the
+			// multiple-storages ambiguity error) means the session-side
+			// secret may still exist, and reporting a successful DROP while
+			// deleting only the stored copy would hand the user a false
+			// confirmation — fatal for a credential revocation.
 			if existed, delErr := mgr.DeleteSecret(ctx, c.orgID, c.username, st.Name); delErr == nil && existed {
 				queryFinalErr = nil
 				c.updateTxStatus(cmdType)
@@ -119,7 +154,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 		if c.isCallerCancellation(execErr) {
 			errMsg = "canceling statement due to user request"
 		} else {
-			c.logQueryError(redacted, execErr)
+			c.logQueryError(query, execErr)
 		}
 		c.setTxError()
 		return true, "", &secretDDLError{classifyErrorCode(execErr), errMsg}
@@ -131,7 +166,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 	var storeErr error
 	switch st.Kind {
 	case usersecrets.KindCreate:
-		storeErr = mgr.PutSecret(ctx, c.orgID, c.username, st.Name, query)
+		storeErr = mgr.PutSecret(ctx, c.orgID, c.username, st.Name, query, st.IfNotExists)
 		if storeErr != nil {
 			return true, "", &secretDDLError{"58000", fmt.Sprintf(
 				"secret %q was applied to the current session but could not be persisted (it will NOT survive this session): %v; retry the statement",

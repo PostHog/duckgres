@@ -721,6 +721,12 @@ persistent_user_secret() { # org password
   if pg_try "$org" "$pw" ducklake "CREATE PERSISTENT SECRET (TYPE s3, KEY_ID 'x', SECRET 'y')" >/dev/null; then
     fail "persistent secret: unnamed persistent secret was accepted"
   fi
+  # Multi-statement batches must be rejected, not silently executed-but-never-
+  # persisted (the secret would work for the session, then be wiped).
+  if out="$(pg_try "$org" "$pw" ducklake "CREATE PERSISTENT SECRET batch_ms (TYPE s3, KEY_ID 'x', SECRET 'y'); SELECT 1")"; then
+    fail "persistent secret: multi-statement batch was accepted"
+  fi
+  case "$out" in *"single statement"*) ;; *) fail "persistent secret: multi-statement rejection said '$out'";; esac
 
   # DROP must remove it durably — gone on the NEXT fresh session too (the
   # config-store row is deleted, not just the live worker's copy).
