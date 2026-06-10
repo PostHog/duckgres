@@ -124,11 +124,19 @@ start_kubectl_download() {
   kubectl_dl_pid=$!
 }
 bootstrap_kubectl() {
+  # Best-effort join: the bare `wait` in join_lanes (readiness phase) reaps ALL
+  # background children including this download, after which `wait <pid>`
+  # returns 127 ("not a child") even though the fetch succeeded — so the
+  # artifact file, not wait's exit code, is the success criterion.
   if [ -n "$kubectl_dl_pid" ]; then
-    wait "$kubectl_dl_pid" || fail "kubectl download failed (pinned $KUBECTL_VERSION)"
+    wait "$kubectl_dl_pid" 2>/dev/null || true
     kubectl_dl_pid=""
   fi
-  [ -s "$KUBECTL" ] || fail "kubectl binary missing after download"
+  if ! [ -s "$KUBECTL" ]; then
+    log "kubectl background download missing — fetching synchronously"
+    curl -fsSLo "$KUBECTL" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/arm64/kubectl" \
+      || fail "kubectl download failed (pinned $KUBECTL_VERSION)"
+  fi
   chmod +x "$KUBECTL"
 }
 start_kubectl_download
