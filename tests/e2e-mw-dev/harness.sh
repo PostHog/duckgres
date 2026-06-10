@@ -28,7 +28,9 @@
 #   resilience   : worker-pod kill → crash recovery; DuckLake durability across a
 #                  worker restart; concurrent writers (fork conflict-retry);
 #                  graceful drain (in-flight query survives a worker SIGTERM, #690);
-#                  one session per worker (concurrent queries land on distinct pods).
+#                  one session per worker (concurrent queries land on distinct pods);
+#                  parallel cold-burst ramp (3 cold connections spawn 3 pods
+#                  concurrently — the acquire gate covers only the claim decision).
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
 #   admin auth   : the dashboard rejects ?token= query-param auth (#721); only
 #                  the internal-secret header / POST login form authenticate.
@@ -626,6 +628,78 @@ one_session_per_worker() { # org password
   log "one session per worker: OK (peak $peak pods for $1)"
 }
 
+# Parallel cold-burst spawn ramp (regression net for the doomed-spawn /
+# serialized-cold-burst fix): with NO reusable workers for the org, 3 concurrent
+# connections must (a) ALL be served, on 3 DISTINCT worker pods, and (b) get
+# their pods spawned in PARALLEL. The per-org FIFO acquire gate is held only
+# across the short claim/slot decision, so the 3 pod creates land within seconds
+# of each other; the old gate-held-across-spawn behavior created pod k only
+# after pod k-1's full spawn+activate finished (tens of seconds each), so the
+# creationTimestamp spread of the burst's first 3 pods is the discriminator.
+cold_burst_parallel_spawns() { # org password
+  log "parallel cold-burst spawn ramp on $1"
+  # Start truly cold: drain every worker currently serving the org so each of
+  # the 3 connections below needs its own fresh pod spawn (no hot-idle reuse).
+  k delete pods -l "app=duckgres-worker,duckgres/active-org=$1" --wait=false >/dev/null 2>&1 || true
+  k wait --for=delete pods -l "app=duckgres-worker,duckgres/active-org=$1" --timeout=300s >/dev/null 2>&1 || true
+
+  cb1="$(mktemp)"; cb2="$(mktemp)"; cb3="$(mktemp)"
+  cbr1="$(mktemp)"; cbr2="$(mktemp)"; cbr3="$(mktemp)"
+  # Multi-second query (same shape as one_session_per_worker) so each session
+  # holds its worker while the others activate. Expected = 4e9.
+  cq="SELECT count(*) FROM range(8000000000) t(i) WHERE i % 2 = 0;"
+  ( if pg_try "$1" "$2" ducklake "$cq" >"$cb1" 2>&1; then echo 0 >"$cbr1"; else echo 1 >"$cbr1"; fi ) &
+  cp1=$!
+  ( if pg_try "$1" "$2" ducklake "$cq" >"$cb2" 2>&1; then echo 0 >"$cbr2"; else echo 1 >"$cbr2"; fi ) &
+  cp2=$!
+  ( if pg_try "$1" "$2" ducklake "$cq" >"$cb3" 2>&1; then echo 0 >"$cbr3"; else echo 1 >"$cbr3"; fi ) &
+  cp3=$!
+
+  # While the queries run, the org must reach 3 simultaneous worker pods —
+  # one per cold connection (one session per worker; no sharing).
+  cpeak=0 ca=0
+  while [ "$ca" -lt 300 ]; do
+    kill -0 "$cp1" 2>/dev/null || break
+    kill -0 "$cp2" 2>/dev/null || break
+    kill -0 "$cp3" 2>/dev/null || break
+    cc="$(k get pods -l "duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
+    [ "$cc" -gt "$cpeak" ] && cpeak="$cc"
+    [ "$cpeak" -ge 3 ] && break
+    sleep 1; ca=$((ca + 1))
+  done
+
+  wait "$cp1" 2>/dev/null || true
+  wait "$cp2" 2>/dev/null || true
+  wait "$cp3" 2>/dev/null || true
+  { [ "$(cat "$cbr1")" = 0 ] && [ "$(cat "$cbr2")" = 0 ] && [ "$(cat "$cbr3")" = 0 ]; } \
+    || fail "cold_burst_parallel_spawns: a cold-burst connection failed ($(tr -d '\n' <"$cb1" | tail -c 100) | $(tr -d '\n' <"$cb2" | tail -c 100) | $(tr -d '\n' <"$cb3" | tail -c 100))"
+  for f in "$cb1" "$cb2" "$cb3"; do
+    cn="$(tr -dc '0-9' <"$f")"
+    [ "$cn" = "4000000000" ] || fail "cold_burst_parallel_spawns: wrong result $cn want 4000000000"
+  done
+  [ "$cpeak" -ge 3 ] \
+    || fail "cold_burst_parallel_spawns: org peaked at $cpeak worker pod(s) for 3 concurrent cold connections — burst did not land on distinct workers"
+
+  # Parallelism: the burst's first 3 pods must have been CREATED within a
+  # narrow window. ISO-8601 creationTimestamps sort lexicographically; take the
+  # 3 earliest (pg_try retries could add a later 4th) and bound first→third.
+  # A serialized ramp separates each create by a full pod spawn+activate
+  # (>=~20-60s each on a warm node, minutes on a cold one), far above 30s.
+  cts="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" \
+        -o jsonpath='{.items[*].metadata.creationTimestamp}' 2>/dev/null \
+        | tr ' ' '\n' | grep . | sort | head -3)"
+  [ "$(echo "$cts" | grep -c .)" = "3" ] \
+    || fail "cold_burst_parallel_spawns: expected >=3 org worker pods after the burst, got: $cts"
+  cfirst="$(echo "$cts" | head -1)"; cthird="$(echo "$cts" | tail -1)"
+  ce1="$(date -u -D "%Y-%m-%dT%H:%M:%SZ" -d "$cfirst" +%s 2>/dev/null || date -u -d "$cfirst" +%s)"
+  ce3="$(date -u -D "%Y-%m-%dT%H:%M:%SZ" -d "$cthird" +%s 2>/dev/null || date -u -d "$cthird" +%s)"
+  cspread=$((ce3 - ce1))
+  [ "$cspread" -le 30 ] \
+    || fail "cold_burst_parallel_spawns: pod creation spread ${cspread}s (first=$cfirst third=$cthird) — spawns ramped sequentially, not in parallel"
+  rm -f "$cb1" "$cb2" "$cb3" "$cbr1" "$cbr2" "$cbr3"
+  log "parallel cold-burst spawn ramp: OK (peak $cpeak pods, creation spread ${cspread}s)"
+}
+
 # Data committed to DuckLake survives a worker restart (parquet in object store +
 # metadata snapshot in Postgres are the source of truth).
 # Ported from TestK8sDuckLakeDurabilityAcrossWorkerRestart.
@@ -795,6 +869,10 @@ main() {
   sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
   reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
 
+  # ---- parallel cold-burst ramp (after sizing: drains ALL org workers first,
+  # so it must not run before the hot-idle reuse assertions above) ----
+  cold_burst_parallel_spawns "$CNPG" "$cnpg_pw"
+
   # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
   wait_worker "$EXT" "$ext_pw" ducklake
   basic_query  "$EXT" "$ext_pw"
@@ -811,7 +889,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

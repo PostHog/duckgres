@@ -186,14 +186,24 @@ a heavy query killed by a co-resident one. Do not break the following:
   mode). Do NOT add one, and do not resurrect a `leastLoaded*` helper here.
 - **At org max workers + all busy → fail fast with the clear org-cap message**
   (`WorkerClaimMissReasonOrgCap`, see `capacity_policy.go`). Never busy-wait at cap.
-- **Under cap → spawn a worker on demand** (`spawnReservedWorker`, bounded by the
-  client ctx). There is no warm pool to wait on; the cap is re-checked
-  authoritatively cross-CP in `CreateSpawningWorkerSlot`.
-- **FIFO anti-snatch:** the slow acquisition path is serialized per org by
-  `orgAcquireGate` (`org_acquire_gate.go`) so a worker the CP scaled up for an
-  earlier waiter cannot be snatched by a later connection. Keep the gate
-  cancel-safe (a queued waiter whose ctx is cancelled must be skipped, not
-  deadlock the gate).
+- **Under cap → spawn a worker on demand** (`spawnReservedWorkerForSlot`). There
+  is no warm pool to wait on; the cap is re-checked authoritatively cross-CP in
+  `CreateSpawningWorkerSlot`. The spawn+activate runs DETACHED from the request
+  ctx (`context.WithoutCancel` + `workerSpawnActivateTimeout`): the requester
+  waits for the result or its own ctx, but a requester that gives up must NOT
+  kill the in-flight pod (doomed-spawn thrash). An abandoned spawn that succeeds
+  is parked hot-idle (`ReleaseWorker`/`TransitionToHotIdleIfNoSessions`, record
+  persisted) for the org's next connection; one that fails is retired. Nothing
+  may leak in Reserved/Activating.
+- **FIFO anti-snatch:** the slow acquisition path's DECISION section (idle-reuse
+  re-check → hot-idle claim → spawning-slot creation; `acquireDecision` in
+  `org_reserved_pool.go`) is serialized per org by `orgAcquireGate`
+  (`org_acquire_gate.go`) so a worker the CP scaled up for an earlier waiter
+  cannot be snatched by a later connection. The multi-minute spawn+activate runs
+  OUTSIDE the gate — each waiter is 1:1 bound to the claim/slot it owns and the
+  session is pre-claimed before the worker becomes Hot, so a cold burst ramps N
+  spawns in parallel without breaking anti-snatch. Keep the gate cancel-safe (a
+  queued waiter whose ctx is cancelled must be skipped, not deadlock the gate).
 - **Destroy-before-reuse ordering:** `SessionManager.DestroySession`
   (`session_mgr.go`) MUST await the worker-side `DestroySession` RPC *before*
   `ReleaseWorker`, so a reused (hot-idle) worker's prior session is gone before
@@ -212,8 +222,8 @@ Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
 `k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`, or
 `duckdbservice` session counting → update the unit tests
 (`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
-`duckdbservice/service_test.go`) AND the `one_session_per_worker` assertion in
-`tests/e2e-mw-dev/harness.sh`.
+`duckdbservice/service_test.go`) AND the `one_session_per_worker` +
+`cold_burst_parallel_spawns` assertions in `tests/e2e-mw-dev/harness.sh`.
 
 ## Worker Drain Protocol (graceful shutdown, #690)
 

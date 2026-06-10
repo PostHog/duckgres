@@ -124,6 +124,8 @@ type Resolved struct {
 	K8sWorkerProfileMaxCPU          string
 	K8sWorkerProfileMinMemory       string
 	K8sWorkerProfileMaxMemory       string
+	K8sWorkerMaxTTL                 time.Duration
+	K8sHotIdleTTL                   time.Duration
 	AWSRegion                       string
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
@@ -195,6 +197,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	// Connection-string worker-sizing config (all default to off/empty).
 	var k8sAllowClientWorkerProfile bool
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
+	var k8sWorkerMaxTTL, k8sHotIdleTTL time.Duration
 	var k8sWorkerPriorityClassName string
 	var k8sHeadroomPercent int
 	var k8sPlaceholderImage, k8sPlaceholderCPU, k8sPlaceholderMemory, k8sPlaceholderPriorityClassName string
@@ -855,6 +858,20 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY"); v != "" {
 		k8sWorkerProfileMaxMemory = v
 	}
+	if v := getenv("DUCKGRES_K8S_WORKER_MAX_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			k8sWorkerMaxTTL = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_MAX_TTL: " + v)
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_HOT_IDLE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			k8sHotIdleTTL = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_HOT_IDLE_TTL: " + v)
+		}
+	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
 		k8sWorkerPriorityClassName = v
 	}
@@ -1215,6 +1232,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerProfileMaxCPU:          k8sWorkerProfileMaxCPU,
 		K8sWorkerProfileMinMemory:       k8sWorkerProfileMinMemory,
 		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
+		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
+		K8sHotIdleTTL:                   k8sHotIdleTTL,
 		AWSRegion:                       awsRegion,
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,
