@@ -51,3 +51,11 @@ type WorkerHealthCheckPayload struct {
 type WorkerWaitSessionIdlePayload struct {
 	WorkerControlMetadata
 }
+
+// WorkerReleaseQueryHandlePayload asks a worker to release a statement query
+// handle that was created by GetFlightInfo but abandoned before DoGet could
+// consume it.
+type WorkerReleaseQueryHandlePayload struct {
+	WorkerControlMetadata
+	Ticket []byte `json:"ticket"`
+}

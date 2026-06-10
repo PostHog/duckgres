@@ -58,7 +58,11 @@ type closeWaitFlightServer struct {
 	doGetDone            chan struct{}
 	doActionCalled       chan struct{}
 	doActionOnce         sync.Once
+	releaseActionCalled  chan struct{}
+	releaseActionOnce    sync.Once
+	releaseTicket        []byte
 	closeAfterFirstBatch bool
+	doGetErr             error
 	doActionErr          error
 }
 
@@ -70,20 +74,29 @@ func newCloseWaitFlightServer() *closeWaitFlightServer {
 		allowDoGetReturn:     make(chan struct{}),
 		doGetDone:            make(chan struct{}),
 		doActionCalled:       make(chan struct{}),
+		releaseActionCalled:  make(chan struct{}),
 	}
 }
 
 func (s *closeWaitFlightServer) GetFlightInfo(context.Context, *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	ticket, err := flightsql.CreateStatementQueryTicket([]byte("query-1"))
+	if err != nil {
+		return nil, err
+	}
 	return &flight.FlightInfo{
 		Schema: flight.SerializeSchema(s.schema, memory.DefaultAllocator),
 		Endpoint: []*flight.FlightEndpoint{{
-			Ticket: &flight.Ticket{Ticket: []byte("query-1")},
+			Ticket: &flight.Ticket{Ticket: ticket},
 		}},
 	}, nil
 }
 
 func (s *closeWaitFlightServer) DoGet(_ *flight.Ticket, stream pb.FlightService_DoGetServer) error {
 	close(s.doGetStarted)
+	if s.doGetErr != nil {
+		close(s.doGetDone)
+		return s.doGetErr
+	}
 
 	builder := array.NewInt64Builder(memory.DefaultAllocator)
 	builder.Append(1)
@@ -111,7 +124,19 @@ func (s *closeWaitFlightServer) DoGet(_ *flight.Ticket, stream pb.FlightService_
 }
 
 func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.FlightService_DoActionServer) error {
-	if action.Type != waitSessionIdleAction {
+	switch action.Type {
+	case releaseQueryHandleAction:
+		s.releaseActionOnce.Do(func() {
+			close(s.releaseActionCalled)
+		})
+		var payload wire.WorkerReleaseQueryHandlePayload
+		if err := json.Unmarshal(action.Body, &payload); err != nil {
+			return err
+		}
+		s.releaseTicket = payload.Ticket
+		return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
+	case waitSessionIdleAction:
+	default:
 		return s.UnimplementedFlightServiceServer.DoAction(action, stream)
 	}
 	s.doActionOnce.Do(func() {
@@ -294,4 +319,37 @@ func TestFlightRowSetCloseTreatsTerminalWaitFailureAsBestEffort(t *testing.T) {
 		t.Fatal("Close did not return after terminal WaitSessionIdle failure")
 	}
 	close(srv.allowDoGetReturn)
+}
+
+func TestQueryContextReleasesHandleWhenDoGetFails(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+	srv.doGetErr = status.Error(codes.Canceled, "context canceled")
+	exec, ctx := newCloseWaitExecutor(t, srv)
+
+	rows, err := exec.QueryContext(ctx, "SELECT 1")
+	if err == nil {
+		if rows != nil {
+			_ = rows.Close()
+		}
+		t.Fatal("expected QueryContext to return DoGet error")
+	}
+
+	select {
+	case <-srv.releaseActionCalled:
+	case <-time.After(time.Second):
+		t.Fatal("QueryContext did not release the abandoned query handle")
+	}
+	ticket, err := flightsql.GetStatementQueryTicket(&flight.Ticket{Ticket: srv.releaseTicket})
+	if err != nil {
+		t.Fatalf("release ticket did not decode: %v", err)
+	}
+	if got := string(ticket.GetStatementHandle()); got != "query-1" {
+		t.Fatalf("released handle %q, want query-1", got)
+	}
+
+	select {
+	case <-srv.doActionCalled:
+	case <-time.After(time.Second):
+		t.Fatal("QueryContext did not wait for the session to become idle after handle release")
+	}
 }

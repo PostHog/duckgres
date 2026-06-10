@@ -36,8 +36,9 @@ import (
 const MaxGRPCMessageSize = 1 << 30 // 1GB
 
 const (
-	waitSessionIdleAction = "WaitSessionIdle"
-	queryCloseWaitTimeout = 30 * time.Second
+	waitSessionIdleAction    = "WaitSessionIdle"
+	releaseQueryHandleAction = "ReleaseQueryHandle"
+	queryCloseWaitTimeout    = 30 * time.Second
 )
 
 // ErrWorkerDead is returned when the backing worker process has crashed.
@@ -212,19 +213,28 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return &emptyRowSet{}, nil
 	}
 
-	reader, err := e.client.DoGet(reqCtx, info.Endpoint[0].Ticket)
+	ticket := info.Endpoint[0].Ticket
+	if err := reqCtx.Err(); err != nil {
+		_ = e.releaseQueryHandle(ticket)
+		_ = e.waitForSessionIdle()
+		return nil, err
+	}
+
+	reader, err := e.client.DoGet(reqCtx, ticket)
 	if err != nil {
 		// If cancellation lands after Execute has registered a worker-side
-		// handle but before DoGet succeeds, no RowSet exists to Close and
-		// acknowledge. That pre-existing split-phase gap is bounded by the
-		// worker's abandoned-handle reaper; the close wait below covers
-		// cancellations after DoGet starts streaming.
+		// handle but before DoGet returns a RowSet, there is no Close call to
+		// acknowledge the abandoned split-phase operation. Release the handle
+		// explicitly, then wait in case DoGet consumed it and is still unwinding.
+		_ = e.releaseQueryHandle(ticket)
+		_ = e.waitForSessionIdle()
 		return nil, fmt.Errorf("flight doget: %w", err)
 	}
 
 	schema, err := flight.DeserializeSchema(info.Schema, e.alloc)
 	if err != nil {
 		reader.Release()
+		_ = e.waitForSessionIdle()
 		return nil, fmt.Errorf("flight deserialize schema: %w", err)
 	}
 
@@ -375,6 +385,68 @@ func (e *FlightExecutor) waitForSessionIdle() (err error) {
 	stream, err := e.client.Client.DoAction(
 		e.withSession(ctx),
 		&flight.Action{Type: waitSessionIdleAction, Body: payload},
+	)
+	if err != nil {
+		if isTerminalSessionIdleWaitError(err) {
+			return nil
+		}
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			if isTerminalSessionIdleWaitError(err) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (e *FlightExecutor) releaseQueryHandle(ticket *flight.Ticket) (err error) {
+	if e.dead.Load() {
+		return nil
+	}
+	if e.client == nil || e.client.Client == nil || ticket == nil || len(ticket.Ticket) == 0 {
+		return nil
+	}
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil && isTerminalSessionIdleWaitError(err) {
+			err = nil
+		}
+	}()
+
+	payload, err := json.Marshal(wire.WorkerReleaseQueryHandlePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Ticket: ticket.Ticket,
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryCloseWaitTimeout)
+	defer cancel()
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(ctx),
+		&flight.Action{Type: releaseQueryHandleAction, Body: payload},
 	)
 	if err != nil {
 		if isTerminalSessionIdleWaitError(err) {

@@ -1628,6 +1628,8 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 		return s.handler.doHealthCheck(cmd.Body, stream)
 	case "WaitSessionIdle":
 		return s.handler.doWaitSessionIdle(cmd.Body, stream)
+	case "ReleaseQueryHandle":
+		return s.handler.doReleaseQueryHandle(cmd.Body, stream)
 	default:
 		// Fall through to standard flightsql action router (BeginTransaction, etc.)
 		return s.FlightServer.DoAction(cmd, stream)

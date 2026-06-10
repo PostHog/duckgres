@@ -460,6 +460,31 @@ func (h *FlightSQLHandler) doWaitSessionIdle(body []byte, stream flight.FlightSe
 	return sendActionResult(stream, &flight.Result{Body: resp})
 }
 
+func (h *FlightSQLHandler) doReleaseQueryHandle(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerReleaseQueryHandlePayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid ReleaseQueryHandle request: %v", err)
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+	session, err := h.sessionFromContext(stream.Context())
+	if err != nil {
+		return err
+	}
+	ticket, err := flightsql.GetStatementQueryTicket(&flight.Ticket{Ticket: req.Ticket})
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid statement ticket: %v", err)
+	}
+	handleID := string(ticket.GetStatementHandle())
+	if handle, ok := popQueryHandle(session, handleID); ok {
+		releaseQueryHandleValue(handle)
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
+	return sendActionResult(stream, &flight.Result{Body: resp})
+}
+
 // Flight SQL method implementations
 
 func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery,
