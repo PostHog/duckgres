@@ -1213,9 +1213,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// the bind with `Schema with name "" not found` until the instance settles.
 		// Best-effort: if the prime errors, the real failure (if any) surfaces from
 		// InitSessionDatabaseMetadata with its full context.
-		if prime := icebergCatalogPrimeCommand(effectiveCatalog); prime != "" {
+		if icebergAttached {
 			primeCtx, primeCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-			if _, err := executor.ExecContext(primeCtx, prime); err != nil {
+			if err := sessionmeta.PrimeIcebergCatalog(primeCtx, executor, physicalIcebergCatalog); err != nil {
 				slog.Warn("Failed to prime Iceberg catalog before session metadata init.", "user", username, "org", orgID, "error", err, "worker", workerID, "worker_pod", workerPod)
 			}
 			primeCancel()

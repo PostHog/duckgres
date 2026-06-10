@@ -98,19 +98,3 @@ func TestResolveEffectiveCatalog(t *testing.T) {
 	}
 }
 
-func TestIcebergCatalogPrimeCommand(t *testing.T) {
-	// Iceberg sessions get a synchronous `USE iceberg.<schema>` prime before the
-	// compat-view bind so a cold worker's first session doesn't fail on an
-	// unmaterialized REST catalog ("Schema with name \"\" not found").
-	if got := icebergCatalogPrimeCommand("iceberg"); got != "USE iceberg.public" {
-		t.Fatalf("iceberg prime = %q, want %q", got, "USE iceberg.public")
-	}
-	// DuckLake has no REST catalog, so no prime.
-	if got := icebergCatalogPrimeCommand("ducklake"); got != "" {
-		t.Fatalf("ducklake prime = %q, want empty", got)
-	}
-	// Unknown/empty catalog → no prime.
-	if got := icebergCatalogPrimeCommand(""); got != "" {
-		t.Fatalf("empty prime = %q, want empty", got)
-	}
-}

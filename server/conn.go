@@ -805,9 +805,8 @@ func (c *clientConn) serve() error {
 		// Iceberg catalog otherwise surfaces a schema with an empty name, failing the
 		// bind with `Schema with name "" not found`. Best-effort: a real failure
 		// still surfaces from InitSessionDatabaseMetadata below.
-		if catalog == iceberg.CatalogName {
-			primeStmt := fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
-			if _, err := c.executor.ExecContext(initCtx, primeStmt); err != nil {
+		if icebergAttached {
+			if err := sessionmeta.PrimeIcebergCatalog(initCtx, c.executor, iceberg.CatalogName); err != nil {
 				slog.Warn("Failed to prime Iceberg catalog before session metadata init.", "error", err)
 			}
 		}

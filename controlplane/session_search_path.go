@@ -62,31 +62,6 @@ func effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog string) (
 	}
 }
 
-// icebergCatalogPrimeCommand returns a command to run on the session connection
-// BEFORE InitSessionDatabaseMetadata binds the pg_catalog compat views, or "" if
-// the session's catalog needs no priming (DuckLake has no REST catalog).
-//
-// On the first session of a freshly-spawned worker the Iceberg REST catalog is
-// attached but its schema list has not yet been materialized on the new session
-// connection. InitSessionDatabaseMetadata binds compat views that enumerate
-// EVERY attached catalog (via information_schema / duckdb_* functions); an
-// Iceberg catalog whose schemas aren't loaded yet surfaces a schema with an
-// empty name, so the bind fails with `Catalog Error: Schema with name "" not
-// found` and the connection is rejected. A reconnect succeeds only because the
-// instance has since settled — exactly the cold-start flakiness we must avoid
-// now that there is no warm pool to absorb the first session per worker.
-//
-// Issuing `USE iceberg.<schema>` first forces a synchronous, targeted schema
-// resolve (the same call worker activation already makes successfully on a cold
-// worker), priming the catalog so the subsequent enumeration is clean. It is a
-// no-op on a session that has already touched Iceberg.
-func icebergCatalogPrimeCommand(effectiveCatalog string) string {
-	if effectiveCatalog == iceberg.CatalogName {
-		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
-	}
-	return ""
-}
-
 // passthroughSessionDefaultCatalogCommand returns the connect-time command that
 // points a passthrough session at the catalog it selected (effectiveCatalog).
 // Passthrough users skip InitSessionDatabaseMetadata (whose defer issues the

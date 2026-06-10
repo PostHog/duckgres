@@ -15,10 +15,48 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
+
+// PrimeIcebergCatalog forces the attached Iceberg REST catalog's schema list to
+// materialize on this session's DuckDB instance BEFORE the pg_catalog compat
+// views are bound. On the first session of a freshly-spawned (cold) worker the
+// catalog is attached but its schema list hasn't been loaded yet; the bind's
+// catalog enumeration then surfaces a schema with an empty name and fails with
+// `Catalog Error: Schema with name "" not found`. This probe runs that same
+// enumeration as a harmless SELECT, retrying until it succeeds (the failed
+// enumeration itself completes the load), bounded by ctx. Best-effort: callers
+// log a failure and proceed — the load-bearing error still comes from
+// InitSessionDatabaseMetadata with full context.
+func PrimeIcebergCatalog(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) error {
+	if executor == nil {
+		return fmt.Errorf("session executor is required")
+	}
+	probe := fmt.Sprintf(
+		"SELECT count(*) FROM duckdb_schemas() WHERE database_name = %s",
+		quoteSQLStringLiteral(catalog),
+	)
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("prime %s catalog: %w (last probe error: %v)", catalog, ctx.Err(), lastErr)
+			case <-time.After(catalogSettleRetryDelay):
+			}
+		}
+		rows, err := executor.QueryContext(ctx, probe)
+		if err == nil {
+			_ = rows.Close()
+			return nil
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("prime %s catalog: %w", catalog, lastErr)
+}
 
 // InitSessionDatabaseMetadata installs session-local overrides for metadata
 // surfaces (current_database, pg_database, information_schema views) so they
@@ -63,10 +101,41 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 	}()
 
 	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog)); err != nil {
-		return fmt.Errorf("apply session metadata override: %w", err)
+		if !isCatalogSettlingError(err) {
+			return fmt.Errorf("apply session metadata override: %w", err)
+		}
+		// First session on a cold worker: an attached Iceberg REST catalog whose
+		// schema list isn't materialized on this DuckDB instance yet surfaces a
+		// schema with an empty name during the bind's catalog enumeration. The
+		// failed enumeration itself completes the load (observed: a second attempt
+		// on the same instance always succeeds), so retry the batch once.
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("apply session metadata override: %w", ctx.Err())
+		case <-time.After(catalogSettleRetryDelay):
+		}
+		if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog)); err != nil {
+			return fmt.Errorf("apply session metadata override (after catalog-settle retry): %w", err)
+		}
 	}
 
 	return nil
+}
+
+// catalogSettleRetryDelay is the pause before retrying the metadata batch when
+// the first attempt failed on an unsettled (cold) attached catalog.
+const catalogSettleRetryDelay = 300 * time.Millisecond
+
+// isCatalogSettlingError reports whether err matches the bind failure produced
+// by enumerating an attached-but-not-yet-materialized Iceberg REST catalog on a
+// cold DuckDB instance (`Catalog Error: Schema with name "" not found`). Scoped
+// to the empty-name schema lookup so genuine missing-schema errors still fail
+// the session immediately.
+func isCatalogSettlingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), `Schema with name "" not found`)
 }
 
 func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) (bool, error) {

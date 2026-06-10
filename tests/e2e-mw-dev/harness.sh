@@ -425,8 +425,9 @@ rw_iceberg() { # org password
 # not found` and the connection was rejected with `failed to initialize session
 # database metadata`; only a reconnect (instance since settled) masked it. With
 # the warm pool gone, every org's first connect lands the literal first session
-# on its worker, so this fired in practice. The CP now primes the catalog
-# (`USE iceberg.<schema>`) before the bind. This forces a cold worker and asserts
+# on its worker, so this fired in practice. The CP now primes the catalog with a
+# retried schema-enumeration probe before the bind, and the bind itself retries
+# once on the settle signature. This forces a cold worker and asserts
 # the first connect succeeds: cold-spawn backpressure is still tolerated, but the
 # metadata-init bind error fails the test immediately instead of being retried
 # away (which is exactly how a live reconnect would mask it).
