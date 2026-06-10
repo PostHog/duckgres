@@ -25,8 +25,10 @@ import (
 	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/wire"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // MaxGRPCMessageSize is the max gRPC message size for Flight SQL communication.
@@ -212,6 +214,11 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 
 	reader, err := e.client.DoGet(reqCtx, info.Endpoint[0].Ticket)
 	if err != nil {
+		// If cancellation lands after Execute has registered a worker-side
+		// handle but before DoGet succeeds, no RowSet exists to Close and
+		// acknowledge. That pre-existing split-phase gap is bounded by the
+		// worker's abandoned-handle reaper; the close wait below covers
+		// cancellations after DoGet starts streaming.
 		return nil, fmt.Errorf("flight doget: %w", err)
 	}
 
@@ -316,6 +323,15 @@ func (e *FlightExecutor) Close() error {
 	return nil
 }
 
+func isTerminalSessionIdleWaitError(err error) bool {
+	switch status.Code(err) {
+	case codes.Canceled, codes.Unavailable, codes.FailedPrecondition, codes.NotFound:
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *FlightExecutor) waitForSessionIdle() (err error) {
 	if e.dead.Load() {
 		return nil
@@ -353,6 +369,9 @@ func (e *FlightExecutor) waitForSessionIdle() (err error) {
 		&flight.Action{Type: waitSessionIdleAction, Body: payload},
 	)
 	if err != nil {
+		if isTerminalSessionIdleWaitError(err) {
+			return nil
+		}
 		return err
 	}
 	for {
@@ -361,6 +380,9 @@ func (e *FlightExecutor) waitForSessionIdle() (err error) {
 			return nil
 		}
 		if err != nil {
+			if isTerminalSessionIdleWaitError(err) {
+				return nil
+			}
 			return err
 		}
 	}

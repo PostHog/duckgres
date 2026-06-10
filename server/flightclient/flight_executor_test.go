@@ -17,8 +17,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server/wire"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func TestFlightExecutorWithSessionAddsOwnerEpochHeader(t *testing.T) {
@@ -57,6 +59,7 @@ type closeWaitFlightServer struct {
 	doActionCalled       chan struct{}
 	doActionOnce         sync.Once
 	closeAfterFirstBatch bool
+	doActionErr          error
 }
 
 func newCloseWaitFlightServer() *closeWaitFlightServer {
@@ -117,6 +120,9 @@ func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.Flight
 	var payload wire.WorkerWaitSessionIdlePayload
 	if err := json.Unmarshal(action.Body, &payload); err != nil {
 		return err
+	}
+	if s.doActionErr != nil {
+		return s.doActionErr
 	}
 	<-s.doGetDone
 	return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
@@ -256,4 +262,36 @@ func TestFlightRowSetCloseSkipsWaitAfterExecutorMarkedDead(t *testing.T) {
 		t.Fatal("Close called WaitSessionIdle after executor was marked dead")
 	default:
 	}
+	close(srv.allowDoGetReturn)
+}
+
+func TestFlightRowSetCloseTreatsTerminalWaitFailureAsBestEffort(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+	srv.doActionErr = status.Error(codes.Unavailable, "worker is gone")
+	exec, ctx := newCloseWaitExecutor(t, srv)
+
+	rows, err := exec.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	select {
+	case <-srv.doGetStarted:
+	case <-time.After(time.Second):
+		t.Fatal("DoGet did not start")
+	}
+
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- rows.Close()
+	}()
+	select {
+	case err := <-closeReturned:
+		if err != nil {
+			t.Fatalf("Close returned terminal wait failure: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(srv.allowDoGetReturn)
+		t.Fatal("Close did not return after terminal WaitSessionIdle failure")
+	}
+	close(srv.allowDoGetReturn)
 }

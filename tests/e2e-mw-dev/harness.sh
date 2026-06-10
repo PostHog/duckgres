@@ -24,7 +24,8 @@
 #                  demand; any surplus gets a graceful retry hint) then served.
 #                  jsonb || keeps Postgres concat semantics through
 #                  transpilation (#716), and a pipelined extended-query error
-#                  discards queued messages until Sync (#718).
+#                  discards queued messages until Sync (#718). A same pgwire
+#                  session remains usable immediately after CancelRequest.
 #   activation   : DuckLake + Iceberg catalogs attach and read/write. The FIRST
 #                  session on a cold Iceberg worker must not fail the pg_catalog
 #                  compat-view bind (the CP primes the REST catalog's schema list
@@ -401,6 +402,74 @@ EOF
   got="$(pg "$1" "$2" ducklake "SELECT id FROM $t ORDER BY id;")"
   [ "$got" = "2" ] || fail "$1 pipeline recovery: table has '$got', want only '2' (a pipelined statement queued behind an error executed, or post-Sync work was lost; psql said: $(printf %s "$out" | tr '\n' ' ' | tail -c 200))"
   pg "$1" "$2" ducklake "DROP TABLE $t;"
+}
+
+# Black-box regression for async cancel cleanup: psql handles SIGINT by sending
+# a PostgreSQL CancelRequest and keeping the same connection open. The next query
+# is written immediately to that same stdin stream; if the control plane reuses
+# the session before the worker has released its cancelled DoGet operation, this
+# can fail with "session already has an active operation".
+cancel_then_reuse_same_session() { # org password
+  log "cancel then immediate same-session reuse on $1"
+  in="$(mktemp)"; out="$(mktemp)"
+  rm -f "$in"
+  mkfifo "$in"
+
+  ( trap - INT
+    export PGPASSWORD="$2"
+    exec psql \
+      "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=0 -q -tA <"$in" >"$out" 2>&1
+  ) &
+  psql_pid=$!
+
+  exec 9>"$in"
+  set +e
+  printf '%s\n' "$HEAVY_Q" >&9
+  write_rc=$?
+  set -e
+  [ "$write_rc" = 0 ] || {
+    exec 9>&-
+    wait "$psql_pid" 2>/dev/null || true
+    text="$(tr '\n' ' ' <"$out" | tail -c 400)"
+    rm -f "$in" "$out"
+    fail "cancel_then_reuse_same_session: failed to send heavy query to psql: $text"
+  }
+  sleep 3
+  kill -0 "$psql_pid" 2>/dev/null || {
+    exec 9>&-
+    fail "cancel_then_reuse_same_session: psql exited before cancel: $(tr '\n' ' ' <"$out" | tail -c 200)"
+  }
+  kill -INT "$psql_pid" 2>/dev/null || true
+  # Same connection proof: a TEMP table survives only if the post-cancel query
+  # runs on the original session.
+  set +e
+  printf '%s\n' "CREATE TEMP TABLE cancel_reuse_marker(v INT); INSERT INTO cancel_reuse_marker VALUES (42); SELECT v FROM cancel_reuse_marker;" >&9
+  reuse_write_rc=$?
+  printf '\\q\n' >&9
+  quit_write_rc=$?
+  exec 9>&-
+  set -e
+
+  rc=0
+  wait "$psql_pid" || rc=$?
+  text="$(tr '\n' ' ' <"$out" | tail -c 400)"
+  rm -f "$in" "$out"
+  [ "$reuse_write_rc" = 0 ] || fail "cancel_then_reuse_same_session: failed to send reuse query after cancel: $text"
+  [ "$quit_write_rc" = 0 ] || fail "cancel_then_reuse_same_session: failed to send quit after cancel: $text"
+  [ "$rc" = 0 ] || fail "cancel_then_reuse_same_session: psql rc=$rc output=$text"
+  case "$text" in
+    *"session already has an active operation"*)
+      fail "cancel_then_reuse_same_session: session reused before worker cancel cleanup completed: $text" ;;
+  esac
+  case "$text" in
+    *"canceling statement"*|*"Query was cancelled"*|*"context canceled"*|*"Cancel request sent"*) ;;
+    *) fail "cancel_then_reuse_same_session: heavy query did not appear to be cancelled: $text" ;;
+  esac
+  case "$text" in
+    *"42"*) ;;
+    *) fail "cancel_then_reuse_same_session: same-session marker query did not succeed: $text" ;;
+  esac
 }
 
 # ---- bundled extension forks ----------------------------------------------
@@ -1053,6 +1122,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
   pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
+  cancel_then_reuse_same_session "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
   iceberg_cold_first_connect "$CNPG" "$cnpg_pw"  # cold first session must not fail the metadata-init bind
   rw_iceberg             "$CNPG" "$cnpg_pw"
@@ -1159,7 +1229,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
