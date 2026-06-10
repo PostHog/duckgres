@@ -240,15 +240,12 @@ type tokenizer struct {
 func newTokenizer(s string) *tokenizer { return &tokenizer{s: s} }
 
 func (t *tokenizer) skipSpace() {
-	for {
-		rest, ok := skipCommentsAndSpace(t.s[t.i:])
-		if !ok {
-			t.i = len(t.s)
-			return
-		}
-		t.i = len(t.s) - len(rest)
+	rest, ok := skipCommentsAndSpace(t.s[t.i:])
+	if !ok {
+		t.i = len(t.s)
 		return
 	}
+	t.i = len(t.s) - len(rest)
 }
 
 // eatKeyword consumes the given keyword (case-insensitive, word-bounded).

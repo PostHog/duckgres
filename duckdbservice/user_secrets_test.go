@@ -32,7 +32,7 @@ func secretNames(t *testing.T, db *sql.DB, where string) map[string]bool {
 	if err != nil {
 		t.Fatalf("duckdb_secrets: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	names := map[string]bool{}
 	for rows.Next() {
 		var name string
