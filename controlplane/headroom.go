@@ -161,7 +161,12 @@ func (p *K8sWorkerPool) createPlaceholderPod(ctx context.Context, cpu, mem resou
 			// GenerateName lets the API server assign a unique suffix per pod —
 			// the controller creates N placeholders per reconcile and does not
 			// track ids, so a fixed/derived name would collide ("already exists").
-			GenerateName: fmt.Sprintf("%s-%s-", headroomPodLabel, p.cpID),
+			// "duckgres-placeholder-<cp-replicaset-hash>-<rand>": the RS hash
+			// identifies the owning CP build without embedding the whole CP pod
+			// name (whose own random suffix is noise). The app label stays
+			// `duckgres-headroom`, so selectors keep matching pods created
+			// under the old name across a rollout.
+			GenerateName: fmt.Sprintf("duckgres-placeholder-%s-", cpReplicaSetHash(p.cpID)),
 			Namespace:    p.namespace,
 			Labels: map[string]string{
 				"app":                    headroomPodLabel,
