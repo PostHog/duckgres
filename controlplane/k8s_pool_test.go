@@ -1166,7 +1166,7 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 	})
 	var capacityErr *WorkerCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
-		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+		t.Fatalf("expected worker capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
 	if capacityErr.Reason != configstore.WorkerClaimMissReasonOrgCap {
 		t.Fatalf("expected org-cap miss reason, got %q", capacityErr.Reason)
@@ -1175,7 +1175,7 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
 	if store.claimCalls != 0 {
-		t.Fatalf("expected hot-idle org cap to skip neutral idle claim, got %d idle claims", store.claimCalls)
+		t.Fatalf("expected hot-idle org cap to prevent on-demand spawn, got %d idle claims", store.claimCalls)
 	}
 	if store.recordMissCalls != 0 {
 		t.Fatalf("expected no recorded miss for org-cap, got %d", store.recordMissCalls)
@@ -1345,18 +1345,18 @@ func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *t
 }
 
 // TestK8sPoolWorkerRecordForIdleStampsOwnerCPInstanceID guards against the
-// warm-pool churn loop. workerRecordFor used to clear OwnerCPInstanceID
-// whenever state==Idle, which left every freshly-spawned warm worker
+// idle worker churn loop. workerRecordFor used to clear OwnerCPInstanceID
+// whenever state==Idle, which left every freshly-spawned idle worker
 // matching ListOrphanedWorkers case (2) (NULLIF(owner_cp_instance_id, ”) IS
 // NULL AND last_heartbeat_at <= before) the moment it crossed the orphan
-// grace. The janitor then retired it, the warm pool replenished, and the
-// loop repeated indefinitely. Stamping warm workers with the creating CP's
+// grace. The janitor then retired it, the idle worker replenished, and the
+// loop repeated indefinitely. Stamping idle workers with the creating CP's
 // id makes case (1) handle them via the existing CP heartbeat instead.
 func TestK8sPoolWorkerRecordForIdleStampsOwnerCPInstanceID(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
 	// worker == nil branch: spawn path before the in-memory ManagedWorker
-	// exists. Used by the warm-slot creation flow.
+	// exists. Used by the idle worker creation flow.
 	rec := pool.workerRecordFor(11, nil, 0, configstore.WorkerStateIdle, "", nil)
 	if rec.OwnerCPInstanceID != pool.cpInstanceID {
 		t.Fatalf("worker==nil idle: expected OwnerCPInstanceID %q, got %q", pool.cpInstanceID, rec.OwnerCPInstanceID)
@@ -1577,7 +1577,7 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 		preloadedRecords: map[int]*configstore.WorkerRecord{
 			13: {
 				WorkerID:          13,
-				PodName:           "test-cp-worker-13",
+				PodName:           "duckgres-worker-test-cp-13",
 				State:             configstore.WorkerStateLost,
 				OwnerCPInstanceID: pool.cpInstanceID,
 				OwnerEpoch:        4,
@@ -1593,7 +1593,7 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 	pool.workers[worker.ID] = worker
 
 	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-13", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "duckgres-worker-test-cp-13", Namespace: "default"},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.13"},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create worker pod: %v", err)
@@ -1617,8 +1617,18 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 	if _, ok := pool.Worker(worker.ID); ok {
 		t.Fatal("expected already-lost current lease to remove local worker")
 	}
-	if got := podDeleteActionNames(cs); len(got) != 1 || got[0] != "test-cp-worker-13" {
-		t.Fatalf("expected already-lost current lease to delete pod, got %v", got)
+	// The pod delete runs on a background goroutine after the crash
+	// notification; poll for it (pre-existing flake under -race).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := podDeleteActionNames(cs)
+		if len(got) == 1 && got[0] == "duckgres-worker-test-cp-13" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected already-lost current lease to delete pod, got %v", got)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -2586,17 +2596,17 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 		t.Fatalf("expected owner-epoch label 0, got %s", pod.Labels["duckgres/owner-epoch"])
 	}
 	if _, ok := pod.Labels["duckgres/org"]; ok {
-		t.Fatalf("expected shared warm worker startup to stay org-neutral, got labels %#v", pod.Labels)
+		t.Fatalf("expected shared worker startup to stay org-neutral, got labels %#v", pod.Labels)
 	}
 
 	if len(pod.OwnerReferences) != 0 {
 		t.Fatalf("expected no owner references, got %d", len(pod.OwnerReferences))
 	}
 	if pod.Spec.ServiceAccountName != "duckgres-worker" {
-		t.Fatalf("expected neutral worker service account duckgres-worker, got %q", pod.Spec.ServiceAccountName)
+		t.Fatalf("expected shared worker service account duckgres-worker, got %q", pod.Spec.ServiceAccountName)
 	}
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
-		t.Fatal("expected automountServiceAccountToken=false for shared warm worker pods")
+		t.Fatal("expected automountServiceAccountToken=false for shared worker pods")
 	}
 	if pod.Spec.TerminationGracePeriodSeconds == nil || *pod.Spec.TerminationGracePeriodSeconds != workerTerminationGracePeriodSeconds {
 		t.Fatalf("expected terminationGracePeriodSeconds=%d, got %v", workerTerminationGracePeriodSeconds, pod.Spec.TerminationGracePeriodSeconds)
@@ -2622,7 +2632,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	for _, env := range c.Env {
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
-			env.ValueFrom.SecretKeyRef.Name == "test-secret-test-cp-worker-0" {
+			env.ValueFrom.SecretKeyRef.Name == "test-secret-duckgres-worker-test-cp-0" {
 			foundEnv = true
 		}
 		if env.Name == "DUCKGRES_SHARED_WARM_WORKER" && env.Value == "true" {
@@ -2642,7 +2652,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 		t.Fatal("bearer token env var not found or incorrect")
 	}
 	if !foundSharedWarmWorkerEnv {
-		t.Fatal("expected shared warm worker startup env to be present")
+		t.Fatal("expected shared worker startup env to be present")
 	}
 	if !foundTLSCertEnv || !foundTLSKeyEnv {
 		t.Fatal("expected worker RPC TLS env vars to be present")
@@ -2657,7 +2667,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	foundWorkerRPCSecret := false
 	for _, volume := range pod.Spec.Volumes {
 		if volume.Name == "worker-rpc-tls" && volume.Secret != nil &&
-			volume.Secret.SecretName == "test-secret-test-cp-worker-0" {
+			volume.Secret.SecretName == "test-secret-duckgres-worker-test-cp-0" {
 			foundWorkerRPCSecret = true
 		}
 	}
@@ -2809,21 +2819,35 @@ func TestK8sPoolRetireWorkerUsesTrackedPodName(t *testing.T) {
 	}
 	pool.workers[worker.ID] = worker
 
+	// The pod delete happens on retireWorkerWithReason's background goroutine, so
+	// the captured name must be read under a lock (pre-existing -race flake).
+	var mu sync.Mutex
 	var deletedPodName string
 	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction, ok := action.(k8stesting.DeleteAction)
 		if !ok {
 			return false, nil, nil
 		}
+		mu.Lock()
 		deletedPodName = deleteAction.GetName()
+		mu.Unlock()
 		return false, nil, nil
 	})
 
 	pool.RetireWorker(worker.ID)
-	time.Sleep(100 * time.Millisecond)
 
-	if deletedPodName != "duckgres-worker-other-cp-11" {
-		t.Fatalf("expected retire to delete tracked pod name duckgres-worker-other-cp-11, got %q", deletedPodName)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := deletedPodName
+		mu.Unlock()
+		if got == "duckgres-worker-other-cp-11" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected retire to delete tracked pod name duckgres-worker-other-cp-11, got %q", got)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -2916,51 +2940,61 @@ func TestWorkerResources_BothSet(t *testing.T) {
 }
 
 func TestWorkerResources_CPUOnly(t *testing.T) {
+	// Memory falls back to the built-in default: workers are never BestEffort
+	// (resource requests are the only node-overcommit guard without pod
+	// anti-affinity).
 	pool := &K8sWorkerPool{
 		workerCPURequest: "1",
 	}
 	res := pool.workerResources()
-	if _, ok := res.Requests[corev1.ResourceCPU]; !ok {
-		t.Fatal("expected CPU request")
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != "1" {
+		t.Fatalf("expected CPU request 1, got %s", cpu.String())
 	}
-	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
-		t.Fatal("expected no memory request")
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != defaultWorkerMemory {
+		t.Fatalf("expected default memory request %s, got %s", defaultWorkerMemory, mem.String())
 	}
 	if _, ok := res.Limits[corev1.ResourceCPU]; !ok {
 		t.Fatal("expected CPU limit (Guaranteed QoS)")
 	}
-	if _, ok := res.Limits[corev1.ResourceMemory]; ok {
-		t.Fatal("expected no memory limit")
+	if _, ok := res.Limits[corev1.ResourceMemory]; !ok {
+		t.Fatal("expected memory limit (Guaranteed QoS)")
 	}
 }
 
 func TestWorkerResources_MemoryOnly(t *testing.T) {
+	// CPU falls back to the built-in default (never BestEffort).
 	pool := &K8sWorkerPool{
 		workerMemoryRequest: "4Gi",
 	}
 	res := pool.workerResources()
-	if _, ok := res.Requests[corev1.ResourceMemory]; !ok {
-		t.Fatal("expected memory request")
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != "4Gi" {
+		t.Fatalf("expected memory request 4Gi, got %s", mem.String())
 	}
-	if _, ok := res.Requests[corev1.ResourceCPU]; ok {
-		t.Fatal("expected no CPU request")
-	}
-	if _, ok := res.Limits[corev1.ResourceMemory]; !ok {
-		t.Fatal("expected memory limit (Guaranteed QoS)")
-	}
-	if _, ok := res.Limits[corev1.ResourceCPU]; ok {
-		t.Fatal("expected no CPU limit")
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != defaultWorkerCPU {
+		t.Fatalf("expected default CPU request %s, got %s", defaultWorkerCPU, cpu.String())
 	}
 }
 
 func TestWorkerResources_NeitherSet(t *testing.T) {
+	// No pool-global requests configured: the built-in default shape applies.
+	// Workers must never be BestEffort — without pod anti-affinity, requests
+	// are the only thing keeping two workers from overcommitting a node.
 	pool := &K8sWorkerPool{}
 	res := pool.workerResources()
-	if res.Requests != nil {
-		t.Fatal("expected empty requests (BestEffort)")
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != defaultWorkerCPU {
+		t.Fatalf("expected default CPU request %s, got %s", defaultWorkerCPU, cpu.String())
 	}
-	if res.Limits != nil {
-		t.Fatal("expected empty limits")
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != defaultWorkerMemory {
+		t.Fatalf("expected default memory request %s, got %s", defaultWorkerMemory, mem.String())
+	}
+	if len(res.Limits) != 2 {
+		t.Fatalf("expected cpu+memory limits (Guaranteed QoS), got %v", res.Limits)
 	}
 }
 
@@ -3998,7 +4032,7 @@ func TestShutdownAll_TreatsPodNotFoundAsDeleteSuccess(t *testing.T) {
 // query sessions land on cache-warm nodes and Karpenter can consolidate the
 // newest nodes first.
 
-// addIdleWorker inserts a ready warm-idle worker on nodeName with a matching
+// addIdleWorker inserts a ready idle worker on nodeName with a matching
 // nodeFirstSeen entry. idleFor controls how far in the past lastUsed is —
 // must exceed idleTimeout for the reaper to consider it.
 func addIdleWorker(t *testing.T, p *K8sWorkerPool, id int, nodeName string, nodeSeenAt time.Time, idleFor time.Duration) {
@@ -4092,5 +4126,37 @@ func TestFindIdleWorkerLockedUnknownNodeSortsLast(t *testing.T) {
 	chosen := pool.findIdleWorkerLocked()
 	if chosen == nil || chosen.ID != 1 {
 		t.Errorf("expected worker on node-old (id=1), got %+v", chosen)
+	}
+}
+
+func TestWorkerPodNaming(t *testing.T) {
+	// "duckgres-worker[-<org>]-<cp-replicaset-hash>-<id>": fixed head so worker
+	// pods scan together, RS hash identifying the spawning CP build.
+	p := &K8sWorkerPool{cpID: "duckgres-control-plane-6f877c7779-abcde"}
+	if got := p.podNameForWorker(15); got != "duckgres-worker-6f877c7779-15" {
+		t.Fatalf("pod name = %q, want duckgres-worker-6f877c7779-15", got)
+	}
+	p.orgID = "acme"
+	if got := p.podNameForWorker(7); got != "duckgres-worker-acme-6f877c7779-7" {
+		t.Fatalf("org pod name = %q, want duckgres-worker-acme-6f877c7779-7", got)
+	}
+	// A cpID without a recognizable pod-hash suffix (local/test runs) is used
+	// whole, keeping the prefix unique per CP instance.
+	p = &K8sWorkerPool{cpID: "test-cp"}
+	if got := p.podNameForWorker(3); got != "duckgres-worker-test-cp-3" {
+		t.Fatalf("hashless pod name = %q, want duckgres-worker-test-cp-3", got)
+	}
+}
+
+func TestCPReplicaSetHash(t *testing.T) {
+	for in, want := range map[string]string{
+		"duckgres-control-plane-6f877c7779-abcde": "6f877c7779",
+		"duckgres-7c6c5769bb-mdnw7":               "7c6c5769bb",
+		"test-cp":                                 "test-cp",
+		"":                                        "",
+	} {
+		if got := cpReplicaSetHash(in); got != want {
+			t.Fatalf("cpReplicaSetHash(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

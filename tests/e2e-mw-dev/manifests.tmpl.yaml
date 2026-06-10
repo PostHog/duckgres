@@ -44,6 +44,11 @@ spec:
   template:
     metadata:
       labels: { app: duckgres-config-store }
+      annotations:
+        # Same consolidation pinning as the control plane below: a mid-run
+        # config-store reschedule forces the CP through a pod restart + PVC
+        # reattach pause the harness has no retry budget for.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       containers:
         - name: postgres
@@ -196,6 +201,14 @@ spec:
   template:
     metadata:
       labels: { app: duckgres-control-plane }
+      annotations:
+        # The harness asserts against this single-replica CP for ~10 minutes.
+        # Worker churn from the cold-burst / sized-worker assertions empties
+        # nodes mid-run, and a Karpenter consolidation sweep that disrupts the
+        # CP's node kills the run at whatever assertion happens to be next
+        # (observed as "control plane is draining" / connection-refused at the
+        # sized-reuse step). Pin the pod for the run's lifetime.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: duckgres
       containers:
@@ -221,18 +234,50 @@ spec:
             # The harness sized_worker assertion connects with these and verifies the
             # spawned pod carries the requested CPU+memory.
             - { name: DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE, value: "true" }
+            # Pool-default worker shape for connections that send no sizing GUCs.
+            # Workers are never BestEffort (no pod anti-affinity anymore — resource
+            # requests are the only node-overcommit guard); without this the binary
+            # falls back to its built-in 8/16Gi default, which does not fit the
+            # mw-dev c6gd.xlarge worker nodes and would force a cold bigger node on
+            # every default spawn. Sub-1-CPU so the value collides with no sized
+            # assertion (they count org workers BY CPU: sized tests use 1 and 2)
+            # and several default workers bin-pack onto one warm node — exercising
+            # the post-anti-affinity packing behavior.
+            - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "750m" }
+            - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "1536Mi" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU, value: "1" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY, value: "16Gi" }
-            - { name: DUCKGRES_K8S_WORKER_MAX_TTL, value: "24h" }
+            # Prod-logic parity (sizes differ, the knobs match prod-us):
+            # - workerQueueTimeout bounds how long a connection waits for its
+            #   on-demand cold spawn (binary default 60s is too tight for a
+            #   fresh Karpenter node — observed flaking the sized assertions).
+            # - an explicit worker cap, like prod's maxWorkers (unset = unbounded
+            #   for the k8s backend; the nodepool is the only ceiling).
+            # Deliberately NOT aligned with prod:
+            # - DUCKGRES_K8S_WORKER_PRIORITY_CLASS: e2e workers run on the
+            #   shared default nodepool — prod's 1000000 PriorityClass would let
+            #   per-PR worker bursts preempt unrelated workloads there.
+            # - DUCKGRES_CACHE_ENABLED: the cache-proxy DaemonSet only runs on
+            #   duckgres-workers nodes; default-pool workers would dial a
+            #   nonexistent hostPort proxy.
+            # - DUCKGRES_CERT/_KEY (wildcard TLS) and DUCKGRES_TRINO_*: need
+            #   cert-manager / a Trino cluster in the per-PR namespace; the CP
+            #   serves its self-signed cert and Trino is not under e2e.
+            - { name: DUCKGRES_WORKER_QUEUE_TIMEOUT, value: "5m" }
+            - { name: DUCKGRES_K8S_MAX_WORKERS, value: "50" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             - { name: DUCKGRES_AWS_REGION, value: "us-east-1" }
-            # Land workers on the dedicated worker nodepool (mw-dev arm64).
-            - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"posthog.com/nodepool":"duckgres-workers"}' }
-            - { name: DUCKGRES_K8S_WORKER_TOLERATION_KEY, value: "posthog.com/nodepool" }
-            - { name: DUCKGRES_K8S_WORKER_TOLERATION_VALUE, value: "duckgres-workers" }
+            # Land e2e workers on the DEFAULT (untainted) nodepool, NOT the real
+            # deployment's duckgres-workers pool: per-PR worker churn must not
+            # fight the dev deployment's headroom placeholders / Karpenter
+            # consolidation on the production-shaped pool, and the harness Job /
+            # per-PR CP / config-store already run on the default pool. The
+            # worker image is arm64-only and the default pool is mixed-arch, so
+            # pin the arch (no toleration needed — the default pool is untainted).
+            - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"kubernetes.io/arch":"arm64"}' }
             # Provision real per-org Lakekeeper instances (iceberg path).
             - { name: DUCKGRES_LAKEKEEPER_PROVISIONER_ENABLED, value: "true" }
             # Org identity is resolved from the TLS SNI hostname

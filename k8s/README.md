@@ -43,16 +43,16 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | File | Description |
 |------|-------------|
 | `namespace.yaml` | `duckgres` namespace |
-| `rbac.yaml` | Control-plane and neutral worker ServiceAccounts, Role (pods + secrets), RoleBinding |
+| `rbac.yaml` | Control-plane and shared worker ServiceAccounts, Role (pods + secrets), RoleBinding |
 | `configmap.yaml` | Shared duckgres config (users, extensions, data dir) |
 | `secret.yaml` | Bearer token secret (auto-populated by CP if empty) |
 | `managed-warehouse-secrets.yaml` | Local secret payloads referenced by the seeded managed-warehouse contract |
 | `worker-identity.yaml` | Local worker ServiceAccount referenced by the seeded managed-warehouse contract |
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
-| `control-plane-multitenant-local.yaml` | Optional OrbStack-oriented shared warm-worker control-plane manifest |
+| `control-plane-multitenant-local.yaml` | Optional OrbStack-oriented shared-worker control-plane manifest |
 | `kind/config-store.overlay.yaml` | Compose overlay that attaches local dependency containers to the external Docker `kind` network |
-| `kind/config-store.seed.sql` | Kind-oriented managed-warehouse seed for the shared warm-worker flow |
-| `kind/control-plane.yaml` | Kind-first shared warm-worker control-plane manifest used by local dev and CI |
+| `kind/config-store-seed.sql` | Kind-oriented managed-warehouse seed for the shared-worker flow |
+| `kind/control-plane.yaml` | Kind-first shared-worker control-plane manifest used by local dev and CI |
 | `orbstack/dependency-ports.overlay.yaml` | Optional OrbStack overlay that publishes local DuckLake and MinIO dependency ports on the host |
 
 ## Configuration
@@ -69,13 +69,13 @@ Key flags for Kubernetes multitenant mode:
 | `--managed-hostname-suffixes` | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.test.local` |
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
-| `--k8s-worker-service-account` | `DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT` | Neutral ServiceAccount name for worker pods (`duckgres-worker` default) |
+| `--k8s-worker-service-account` | `DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT` | Shared ServiceAccount name for worker pods (`duckgres-worker` default) |
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
 | `--k8s-worker-configmap` | `DUCKGRES_K8S_WORKER_CONFIGMAP` | ConfigMap name for worker config |
 
 The worker Secret setting is a base name for per-worker RPC Secrets. Each worker pod gets its own derived Secret containing its RPC bearer token and TLS material. If the derived Secret does not exist, the control plane creates it before spawning the pod.
 
-Shared warm workers should use the neutral `duckgres-worker` ServiceAccount with `automountServiceAccountToken: false`. Tenant authority must arrive only through activation-time scoped credentials.
+Shared workers should use the shared `duckgres-worker` ServiceAccount with `automountServiceAccountToken: false`. Tenant authority must arrive only through activation-time scoped credentials.
 
 For managed-hostname routing, `passthrough` logs legacy/non-managed callers while allowing them to route by requested dbname. `enforce` rejects Postgres clients whose TLS SNI does not match a configured managed suffix. In both managed modes, when SNI does match a suffix, the hostname prefix and requested Postgres database must resolve to the same org; if the client omits the startup database, the SNI prefix is used as the fallback database source. Unknown routing-mode values behave like `off`.
 
@@ -90,7 +90,7 @@ That gives the old replica time to fail readiness, stop taking new pgwire sessio
 
 ## Local Development with kind
 
-The primary shared warm-worker workflow now uses [`kind`](https://kind.sigs.k8s.io/). Prerequisites: Docker, `kubectl`, `kind`, and `just`.
+The primary shared-worker workflow now uses [`kind`](https://kind.sigs.k8s.io/). Prerequisites: Docker, `kubectl`, `kind`, and `just`.
 
 ```bash
 just run-multitenant-kind
@@ -101,7 +101,7 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres dbname=duckgres
 
 `just multitenant-port-forward-pg` forwards both pgwire on `5432` and Flight SQL on `8815`.
 
-`just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and MinIO backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared warm-worker control plane.
+`just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and MinIO backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared-worker control plane.
 
 Default login: `postgres / postgres`
 

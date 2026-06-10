@@ -12,7 +12,7 @@ import "flag"
 //
 // A handful of CLIInputs fields (the K8s pod-scheduling knobs:
 // K8sWorkerCPURequest, K8sWorkerMemoryRequest, K8sWorkerNodeSelector,
-// K8sWorkerTolerationKey, K8sWorkerTolerationValue, K8sWorkerExclusiveNode)
+// K8sWorkerTolerationKey, K8sWorkerTolerationValue)
 // are env-only by design — see CLAUDE.md "K8s pod scheduling knobs are
 // env-only." They stay zero in the harvested CLIInputs and ResolveEffective
 // reads them directly from os.Getenv. Adding a flag for any of them is a

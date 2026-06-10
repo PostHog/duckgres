@@ -46,6 +46,15 @@ options=-c duckgres.worker_cpu=8 -c duckgres.worker_memory=16Gi -c duckgres.work
   to `[min,max]` and ttl to `[0,maxTTL]` per deployment (out-of-range → clamp +
   warn). Gate off → every request uses the defaults.
 
+TTL resolution, per request (the same chain whether the request is sized or
+not — there is exactly ONE default TTL however a worker comes to have no
+explicit one):
+
+1. client GUC `duckgres.worker_ttl` (gated, clamped to `WORKER_MAX_TTL`)
+2. org default `default_worker_ttl` (admin API `PUT /orgs/:id`, #742)
+3. deployment default `DUCKGRES_K8S_WORKER_DEFAULT_TTL`
+4. built-in **20m**
+
 `duckgres.colocate` / `worker_tier` are removed (unknown GUCs are ignored, so old
 clients that still send them degrade to defaults rather than erroring).
 
@@ -113,12 +122,19 @@ the two PriorityClass names. Manifests add the PriorityClasses.
 Kept (client sizing + headroom): `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE`
 (master gate for the `duckgres.worker_cpu`/`worker_memory`/`worker_ttl` startup
 options), `DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/
-`_MAX_MEMORY` (clamps), `DUCKGRES_K8S_WORKER_MAX_TTL`,
+`_MAX_MEMORY` (clamps), `DUCKGRES_K8S_WORKER_MAX_TTL` (clamp ceiling) and
+`DUCKGRES_K8S_WORKER_DEFAULT_TTL` (the default for requests that specify no
+ttl — see the TTL resolution chain above),
 `DUCKGRES_K8S_HEADROOM_PERCENT`, `DUCKGRES_K8S_PLACEHOLDER_*`.
 
 Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_TIERS*`,
 `*ALLOW_CLIENT_EXCLUSIVE_NODE*`, `*SHARED_WARM_TARGET*`,
-`*DYNAMIC_WARM_CAPACITY*`, `*WARM_CAPACITY_*`, `*WARM_ACQUIRE_TIMEOUT*`.
+`*DYNAMIC_WARM_CAPACITY*`, `*WARM_CAPACITY_*`, `*WARM_ACQUIRE_TIMEOUT*`,
+`*WORKER_EXCLUSIVE_NODE*` (the one-worker-per-node pod anti-affinity is gone;
+isolation comes from resource requests — workers are never BestEffort, falling
+back to the built-in default shape (8/16Gi) when neither the profile nor
+`DUCKGRES_K8S_WORKER_CPU_REQUEST`/`_MEMORY_REQUEST` set one, so co-scheduled
+workers cannot overcommit a node).
 
 ## Testing
 

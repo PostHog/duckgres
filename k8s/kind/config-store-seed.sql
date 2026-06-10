@@ -93,7 +93,7 @@ VALUES (
     'local-runtime',
     'duckgres.yaml',
     'ready',
-    'kind shared warm-worker metadata',
+    'kind shared-worker metadata',
     'ready',
     'kind warehouse db metadata seeded',
     'ready',

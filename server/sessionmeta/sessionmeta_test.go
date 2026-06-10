@@ -237,3 +237,89 @@ func TestInformationSchemaColumnsCompatSuppressesNativeIcebergDuplicatesExplicit
 		t.Fatalf("columns compat SQL should not rely on hidden source_priority ranking in:\n%s", got)
 	}
 }
+
+func TestIsCatalogSettlingError(t *testing.T) {
+	if !isCatalogSettlingError(errors.New(`flight execute update: rpc error: code = InvalidArgument desc = failed to execute update: Catalog Error: Schema with name "" not found`)) {
+		t.Fatal("cold-catalog empty-name schema error not recognized as settling")
+	}
+	// A genuine missing schema must NOT be retried.
+	if isCatalogSettlingError(errors.New(`Catalog Error: Schema with name "analytics" not found`)) {
+		t.Fatal("named-schema error misclassified as settling")
+	}
+	if isCatalogSettlingError(nil) {
+		t.Fatal("nil misclassified")
+	}
+}
+
+// settleExecutor fails the metadata batch with the cold-catalog signature N
+// times, then succeeds — modeling an Iceberg REST catalog that materializes
+// after the first failed enumeration.
+type settleExecutor struct {
+	countingExecutor
+	batchFailures int
+}
+
+func (e *settleExecutor) ExecContext(ctx context.Context, query string, args ...any) (sqlcore.ExecResult, error) {
+	if strings.Contains(query, "pg_database") && e.batchFailures > 0 {
+		e.batchFailures--
+		e.execCalls++
+		return nil, errors.New(`failed to execute update: Catalog Error: Schema with name "" not found`)
+	}
+	return e.countingExecutor.ExecContext(ctx, query, args...)
+}
+
+func TestInitSessionDatabaseMetadataRetriesOnceOnSettlingCatalog(t *testing.T) {
+	e := &settleExecutor{batchFailures: 1}
+	e.queryRows = &singleIntRow{v: 0} // ducklake-attachment probe -> not attached
+	if err := InitSessionDatabaseMetadata(context.Background(), e, "iceberg"); err != nil {
+		t.Fatalf("init with one settling failure should succeed via retry, got %v", err)
+	}
+}
+
+func TestInitSessionDatabaseMetadataDoesNotRetryTwice(t *testing.T) {
+	e := &settleExecutor{batchFailures: 2}
+	e.queryRows = &singleIntRow{v: 0}
+	err := InitSessionDatabaseMetadata(context.Background(), e, "iceberg")
+	if err == nil {
+		t.Fatal("init with two settling failures must fail (single retry only)")
+	}
+	if !strings.Contains(err.Error(), "after catalog-settle retry") {
+		t.Fatalf("error should mark the exhausted retry, got %v", err)
+	}
+}
+
+// primeExecutor fails the schema-enumeration probe N times then succeeds.
+type primeExecutor struct {
+	countingExecutor
+	probeFailures int
+	probeCalls    int
+}
+
+func (e *primeExecutor) QueryContext(ctx context.Context, query string, args ...any) (sqlcore.RowSet, error) {
+	e.probeCalls++
+	if e.probeFailures > 0 {
+		e.probeFailures--
+		return nil, errors.New(`Catalog Error: Schema with name "" not found`)
+	}
+	return &singleIntRow{v: 1}, nil
+}
+
+func TestPrimeIcebergCatalogRetriesUntilEnumerationSucceeds(t *testing.T) {
+	e := &primeExecutor{probeFailures: 2}
+	if err := PrimeIcebergCatalog(context.Background(), e, "iceberg"); err != nil {
+		t.Fatalf("prime should succeed after settling, got %v", err)
+	}
+	if e.probeCalls != 3 {
+		t.Fatalf("probe calls = %d, want 3 (2 failures + 1 success)", e.probeCalls)
+	}
+}
+
+func TestPrimeIcebergCatalogGivesUpAfterBoundedAttempts(t *testing.T) {
+	e := &primeExecutor{probeFailures: 99}
+	if err := PrimeIcebergCatalog(context.Background(), e, "iceberg"); err == nil {
+		t.Fatal("prime must give up after bounded attempts")
+	}
+	if e.probeCalls != 5 {
+		t.Fatalf("probe calls = %d, want 5", e.probeCalls)
+	}
+}

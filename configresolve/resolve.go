@@ -83,7 +83,6 @@ type CLIInputs struct {
 	K8sWorkerNodeSelector       string
 	K8sWorkerTolerationKey      string
 	K8sWorkerTolerationValue    string
-	K8sWorkerExclusiveNode      bool
 	AWSRegion                   string
 	QueryLog                    bool
 }
@@ -112,7 +111,6 @@ type Resolved struct {
 	K8sWorkerNodeSelector           string
 	K8sWorkerTolerationKey          string
 	K8sWorkerTolerationValue        string
-	K8sWorkerExclusiveNode          bool
 	K8sAllowClientWorkerProfile     bool
 	K8sWorkerPriorityClassName      string
 	K8sHeadroomPercent              int
@@ -124,6 +122,8 @@ type Resolved struct {
 	K8sWorkerProfileMaxCPU          string
 	K8sWorkerProfileMinMemory       string
 	K8sWorkerProfileMaxMemory       string
+	K8sWorkerMaxTTL                 time.Duration
+	K8sWorkerDefaultTTL                   time.Duration
 	AWSRegion                       string
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
@@ -195,6 +195,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	// Connection-string worker-sizing config (all default to off/empty).
 	var k8sAllowClientWorkerProfile bool
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
+	var k8sWorkerMaxTTL, k8sWorkerDefaultTTL time.Duration
 	var k8sWorkerPriorityClassName string
 	var k8sHeadroomPercent int
 	var k8sPlaceholderImage, k8sPlaceholderCPU, k8sPlaceholderMemory, k8sPlaceholderPriorityClassName string
@@ -205,7 +206,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sMaxWorkers int
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
-	var k8sWorkerExclusiveNode bool
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -829,11 +829,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_TOLERATION_VALUE"); v != "" {
 		k8sWorkerTolerationValue = v
 	}
-	if v := getenv("DUCKGRES_K8S_WORKER_EXCLUSIVE_NODE"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			k8sWorkerExclusiveNode = b
-		}
-	}
 
 	// Connection-string worker-profile config.
 	if v := getenv("DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE"); v != "" {
@@ -854,6 +849,20 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY"); v != "" {
 		k8sWorkerProfileMaxMemory = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_MAX_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			k8sWorkerMaxTTL = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_MAX_TTL: " + v)
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_DEFAULT_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			k8sWorkerDefaultTTL = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_DEFAULT_TTL: " + v)
+		}
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
 		k8sWorkerPriorityClassName = v
@@ -1203,7 +1212,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerNodeSelector:           k8sWorkerNodeSelector,
 		K8sWorkerTolerationKey:          k8sWorkerTolerationKey,
 		K8sWorkerTolerationValue:        k8sWorkerTolerationValue,
-		K8sWorkerExclusiveNode:          k8sWorkerExclusiveNode,
 		K8sAllowClientWorkerProfile:     k8sAllowClientWorkerProfile,
 		K8sWorkerPriorityClassName:      k8sWorkerPriorityClassName,
 		K8sHeadroomPercent:              k8sHeadroomPercent,
@@ -1215,6 +1223,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerProfileMaxCPU:          k8sWorkerProfileMaxCPU,
 		K8sWorkerProfileMinMemory:       k8sWorkerProfileMinMemory,
 		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
+		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
+		K8sWorkerDefaultTTL:                   k8sWorkerDefaultTTL,
 		AWSRegion:                       awsRegion,
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,

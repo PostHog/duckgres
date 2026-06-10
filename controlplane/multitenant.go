@@ -27,10 +27,19 @@ type orgRouterAdapter struct {
 	router *OrgRouter
 }
 
-// defaultHotIdleTTL is how long a hot-idle worker retains its org assignment
-// before being retired. During this window, any CP pod can reclaim it for the
-// same org without re-activation.
-const defaultHotIdleTTL = 5 * time.Minute
+// effectiveDefaultWorkerTTL resolves the janitor's hot-idle retention: the
+// operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
+// K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
+// defaultWorkerTTL (20m — the same fallback sized-but-no-ttl requests get at
+// profile resolution, so there is exactly ONE default TTL however a worker
+// came to have no explicit one). The full per-request precedence is:
+// client GUC > org default > deployment default TTL > built-in 20m.
+func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return defaultWorkerTTL
+}
 
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
@@ -175,7 +184,6 @@ func SetupMultiTenant(
 		WorkerNodeSelector:           parseNodeSelector(cfg.K8s.WorkerNodeSelector),
 		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:          cfg.K8s.WorkerExclusiveNode,
 		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
 		HeadroomPercent:              cfg.K8s.HeadroomPercent,
 		PlaceholderImage:             cfg.K8s.PlaceholderImage,
@@ -232,7 +240,7 @@ func SetupMultiTenant(
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
-	janitor.hotIdleTTL = defaultHotIdleTTL
+	janitor.hotIdleTTL = effectiveDefaultWorkerTTL(cfg.K8s.WorkerDefaultTTL)
 	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
 	// all flow through this lifecycle service. The legacy retireWorker /
 	// retireOrphanWorker / retireLocalWorker / deleteRetiredWorker

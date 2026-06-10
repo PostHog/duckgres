@@ -58,7 +58,7 @@ func (p *acquireErrorPool) SetMaxWorkers(n int) {}
 
 func (p *acquireErrorPool) ShutdownAll() {}
 
-func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
+func TestCreateSessionObservesWorkerCapacityExhaustion(t *testing.T) {
 	controlPlaneWorkerAcquireFailuresCounter.Reset()
 	sm := NewSessionManager(&acquireErrorPool{
 		err: NewWorkerCapacityExhaustedError(30 * time.Second),
@@ -67,19 +67,19 @@ func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0, nil)
 	var capacityErr *WorkerCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
-		t.Fatalf("expected warm capacity error, got %v", err)
+		t.Fatalf("expected worker capacity error, got %v", err)
 	}
 
 	counter, counterErr := controlPlaneWorkerAcquireFailuresCounter.GetMetricWithLabelValues("worker_capacity_exhausted")
 	if counterErr != nil {
-		t.Fatalf("failed to read warm capacity counter: %v", counterErr)
+		t.Fatalf("failed to read worker capacity counter: %v", counterErr)
 	}
 	metric := &dto.Metric{}
 	if err := counter.Write(metric); err != nil {
-		t.Fatalf("failed to write warm capacity counter: %v", err)
+		t.Fatalf("failed to write worker capacity counter: %v", err)
 	}
 	if got := metric.GetCounter().GetValue(); got != 1 {
-		t.Fatalf("expected one warm capacity acquisition failure, got %v", got)
+		t.Fatalf("expected one worker capacity acquisition failure, got %v", got)
 	}
 }
 

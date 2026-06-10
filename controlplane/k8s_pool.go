@@ -30,6 +30,17 @@ const defaultActivatingTimeout = 2 * time.Minute
 // generous.
 const workerPodReadyTimeout = 5 * time.Minute
 
+// workerSpawnActivateTimeout bounds the DETACHED background spawn+activate run
+// for an org cold acquisition (OrgReservedPool.AcquireWorker slow path). The
+// spawn and activation deliberately do NOT run on the requester's ctx: if node
+// provisioning reliably exceeds the client's worker-queue budget, cancelling
+// the wait would delete the in-flight pod and every retry would spawn-wait-
+// delete a fresh one without ever converging (doomed-spawn thrash). Budget =
+// pod-ready wait (workerPodReadyTimeout, may include a Karpenter node
+// provision) + gRPC connect (up to 90s) + tenant activation (ATTACH against
+// cloud storage, defaultActivatingTimeout-scale).
+const workerSpawnActivateTimeout = workerPodReadyTimeout + 3*time.Minute
+
 const workerTerminationGracePeriodSeconds int64 = 3600
 
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
@@ -62,7 +73,6 @@ type K8sWorkerPool struct {
 	workerNodeSelector      map[string]string // node selector for worker pods
 	workerTolerationKey     string            // taint key for NoSchedule toleration
 	workerTolerationValue   string            // taint value for NoSchedule toleration
-	workerExclusiveNode     bool              // one worker per node via anti-affinity
 	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
 	// Headroom controller: keep headroomPercent% of worker-nodepool allocatable
@@ -85,7 +95,7 @@ type K8sWorkerPool struct {
 
 	// nodeFirstSeen tracks the first time this CP observed a worker on each
 	// node. Used to prefer reaping workers on the newest-seen nodes and
-	// claiming idle workers on the oldest-seen nodes, so warm parquet pages
+	// claiming idle workers on the oldest-seen nodes, so cached parquet pages
 	// on the local NVMe cache-proxy stay useful for longer. Per-CP state;
 	// CPs don't coordinate this (see idleReaper/findIdleWorker).
 	nodeFirstSeen map[string]time.Time
@@ -177,7 +187,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerNodeSelector:      cfg.WorkerNodeSelector,
 		workerTolerationKey:     cfg.WorkerTolerationKey,
 		workerTolerationValue:   cfg.WorkerTolerationValue,
-		workerExclusiveNode:     cfg.WorkerExclusiveNode,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
 
 		headroomPercent:              cfg.HeadroomPercent,

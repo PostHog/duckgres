@@ -218,12 +218,11 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	return nil
 }
 
-// ReserveSharedWorker reserves a neutral warm worker for later tenant activation.
+// ReserveSharedWorker claims a hot-idle worker or spawns one on demand.
+// Composition of the gateable decision (reserveSharedWorkerDecision) and the slow
+// completion (completeSharedWorkerReservation); OrgReservedPool calls the two
+// halves separately so the per-org FIFO gate covers only the decision.
 func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
-	if err := validateWorkerAssignment(assignment); err != nil {
-		return nil, err
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -231,72 +230,135 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		default:
 		}
 
-		if p.runtimeStore != nil {
-			// Try reclaiming a hot-idle worker for the same org first (fast path:
-			// DuckLake is already attached, only needs epoch bump).
-			if assignment.OrgID != "" {
-				hotProfileCPU, hotProfileMem := assignment.Profile.Parts()
-				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, assignment.MaxWorkers)
-				if err != nil {
-					return nil, err
-				}
-				if hotClaimed == nil && hotMissReason != configstore.WorkerClaimMissReasonNone && hotMissReason != configstore.WorkerClaimMissReasonNoIdle {
-					return nil, NewWorkerCapacityExhaustedErrorForReason(hotMissReason, DefaultWorkerSpawnRetryAfter)
-				}
-				if hotClaimed != nil {
-					// ClaimHotIdleWorker already filters by profile, so a reclaimed
-					// hot-idle worker always matches the requested shape. It is NOT
-					// filtered by image, so still retire on a version mismatch (e.g.
-					// after an image bump) rather than serve a stale-version worker.
-					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
-						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
-						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
-						// Fall through to neutral idle claim or capacity backpressure.
-					} else {
-						worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
-						if reserveErr == nil {
-							worker.hotIdleReclaimed = true
-							return worker, nil
-						}
-						if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
-							slog.Warn("Hot-idle worker claim was stale, retrying.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
-							continue
-						}
-						slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
-						p.retireClaimedWorker(hotClaimed, RetireReasonCrash, LifecycleOriginReserveFailure)
-						// Fall through to neutral idle claim.
-					}
-				}
-			}
-
-			// No reusable hot-idle worker for this org — spawn one on demand,
-			// sized from the request profile (or the pool-global default for a
-			// default request). spawnReservedWorker enforces the per-org + global
-			// caps via CreateSpawningWorkerSlot and returns the cap error at the
-			// ceiling.
-			worker, spawnErr := p.spawnReservedWorker(ctx, assignment)
-			if spawnErr != nil {
-				return nil, spawnErr
-			}
-			return worker, nil
+		claim, err := p.reserveSharedWorkerDecision(assignment)
+		if err != nil {
+			return nil, err
 		}
-
-		// Runtime-store-less mode (unit tests / standalone k8s): no durable pool,
-		// just spawn a worker on demand.
-		p.mu.Lock()
-		if p.shuttingDown {
-			p.mu.Unlock()
-			return nil, fmt.Errorf("pool is shutting down")
+		worker, retry, err := p.completeSharedWorkerReservation(ctx, claim, assignment)
+		if retry {
+			continue
 		}
-		p.cleanDeadWorkersLocked()
-		p.mu.Unlock()
-
-		worker, spawnErr := p.spawnReservedWorker(ctx, assignment)
-		if spawnErr != nil {
-			return nil, spawnErr
+		if err != nil {
+			return nil, err
 		}
 		return worker, nil
 	}
+}
+
+// sharedWorkerClaim is the outcome of the short reservation decision: either a
+// hot-idle worker claimed in the runtime store (hotClaimed != nil) or a freshly
+// created spawning slot id (hotClaimed == nil). Either way the claim/slot is
+// already bound to the caller in the durable store (or locally allocated in
+// runtime-store-less mode), so the caller may finish the multi-minute
+// completion without holding any per-org serialization.
+type sharedWorkerClaim struct {
+	hotClaimed *configstore.WorkerRecord
+	slotID     int
+}
+
+// reserveSharedWorkerDecision is the short, DB-only half of ReserveSharedWorker:
+// claim a hot-idle worker for the org (fast path: DuckLake is already attached,
+// only needs an epoch bump) or create a spawning worker slot.
+// CreateSpawningWorkerSlot re-checks the per-org and global caps transactionally
+// cross-CP (authoritative) and yields the reason-specific cap error at the
+// ceiling. No pod I/O happens here — OrgReservedPool holds its FIFO acquire gate
+// across exactly this call.
+func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment) (*sharedWorkerClaim, error) {
+	if err := validateWorkerAssignment(assignment); err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+	p.cleanDeadWorkersLocked()
+	maxGlobal := p.maxWorkers
+	p.mu.Unlock()
+
+	if p.runtimeStore != nil && assignment.OrgID != "" {
+		hotProfileCPU, hotProfileMem := assignment.Profile.Parts()
+		hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, assignment.MaxWorkers)
+		if err != nil {
+			return nil, err
+		}
+		if hotClaimed == nil && hotMissReason != configstore.WorkerClaimMissReasonNone && hotMissReason != configstore.WorkerClaimMissReasonNoIdle {
+			return nil, NewWorkerCapacityExhaustedErrorForReason(hotMissReason, DefaultWorkerSpawnRetryAfter)
+		}
+		if hotClaimed != nil {
+			// ClaimHotIdleWorker already filters by profile, so a reclaimed
+			// hot-idle worker always matches the requested shape. It is NOT
+			// filtered by image, so still retire on a version mismatch (e.g.
+			// after an image bump) rather than serve a stale-version worker.
+			if assignment.Image != "" && hotClaimed.Image != assignment.Image {
+				slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
+				p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
+				// Fall through to the spawning-slot decision or capacity backpressure.
+			} else {
+				return &sharedWorkerClaim{hotClaimed: hotClaimed}, nil
+			}
+		}
+	}
+
+	// No reusable hot-idle worker for this org — spawn one on demand, sized from
+	// the request profile (or the pool-global default for a default request).
+	// Allocate a real, unique worker id. In the runtime-store path this MUST come
+	// from the DB via CreateSpawningWorkerSlot (which also enforces the per-org and
+	// global worker caps cross-CP and returns a nil slot when capped) — the
+	// background id allocator returns a placeholder 0 that collides across spawns.
+	if p.runtimeStore != nil {
+		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+			p.cpInstanceID, assignment.OrgID, assignment.Image, 0,
+			p.workerPodNamePrefix(), assignment.MaxWorkers, maxGlobal)
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			return nil, NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
+		}
+		return &sharedWorkerClaim{slotID: slot.WorkerID}, nil
+	}
+
+	// Runtime-store-less mode (unit tests / standalone k8s): no durable pool,
+	// just allocate a local id and spawn a worker on demand.
+	p.mu.Lock()
+	id := p.allocateWorkerIDLocked()
+	p.mu.Unlock()
+	return &sharedWorkerClaim{slotID: id}, nil
+}
+
+// completeSharedWorkerReservation is the slow half of ReserveSharedWorker:
+// adopt/health-check a claimed hot-idle worker, or spawn the slot's pod and
+// reserve it. Runs without any per-org serialization — the claim/slot already
+// belongs to this caller. retry=true means the claim went stale or the hot-idle
+// worker was unusable (and has been retired); the caller should re-run the
+// decision (which will typically create a spawning slot).
+func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, claim *sharedWorkerClaim, assignment *WorkerAssignment) (worker *ManagedWorker, retry bool, err error) {
+	if claim.hotClaimed != nil {
+		// hot_idle_claim covers the adopt/health-check I/O for a claimed
+		// hot-idle worker (the DB claim itself happened in the gated decision
+		// and is microseconds). Stale-claim retries observe as error per
+		// attempt.
+		hotClaimStart := time.Now()
+		worker, reserveErr := p.reserveClaimedWorker(ctx, claim.hotClaimed, assignment)
+		observeAcquirePhase("hot_idle_claim", time.Since(hotClaimStart), reserveErr)
+		if reserveErr == nil {
+			worker.hotIdleReclaimed = true
+			return worker, false, nil
+		}
+		if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
+			slog.Warn("Hot-idle worker claim was stale, retrying.", "worker_id", claim.hotClaimed.WorkerID, "error", reserveErr)
+			return nil, true, reserveErr
+		}
+		slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", claim.hotClaimed.WorkerID, "error", reserveErr)
+		p.retireClaimedWorker(claim.hotClaimed, RetireReasonCrash, LifecycleOriginReserveFailure)
+		// Pre-split ReserveSharedWorker fell through to a fresh spawn here; the
+		// retry re-runs the decision, which lands on the spawning-slot path.
+		return nil, true, reserveErr
+	}
+	worker, err = p.spawnReservedWorkerForSlot(ctx, claim.slotID, assignment)
+	return worker, false, err
 }
 
 func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) (*ManagedWorker, error) {
@@ -446,7 +508,7 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	// already bumped the epoch in the DB. The health check requires exact epoch
 	// match, so neither the old epoch (worker has N, we'd send N+1) nor the new
 	// CP instance ID will pass. ActivateTenant validates the epoch properly
-	// (accepts > current). For fresh neutral workers (epoch 0), use the normal
+	// (accepts > current). For freshly spawned workers (epoch 0), use the normal
 	// health-checked path.
 	var client *flightsql.Client
 	if claimed.OwnerEpoch > 1 {
@@ -575,7 +637,7 @@ func validateReservedWorkerHealth(result *healthCheckResult) error {
 	return nil
 }
 
-// SpawnMinWorkers is a no-op for the K8s pool: there is no warm pool to
+// SpawnMinWorkers is a no-op for the K8s pool: workers are created on demand.
 // pre-spawn. Workers are created on demand per request (ReserveSharedWorker)
 // and reused while hot-idle until their TTL. Present only to satisfy the
 // WorkerPool interface (the process backend uses it for --process-min-workers).
@@ -640,7 +702,7 @@ func (p *K8sWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 			continue
 		default:
 		}
-		if !p.isWarmIdleWorkerLocked(w) {
+		if !p.isIdleWorkerLocked(w) {
 			continue
 		}
 		seen := p.nodeSeenAtLocked(w.nodeName, now)
@@ -687,6 +749,6 @@ func (p *K8sWorkerPool) isGenericSessionSchedulableWorkerLocked(w *ManagedWorker
 	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleIdle
 }
 
-func (p *K8sWorkerPool) isWarmIdleWorkerLocked(w *ManagedWorker) bool {
+func (p *K8sWorkerPool) isIdleWorkerLocked(w *ManagedWorker) bool {
 	return w.activeSessions == 0 && p.isGenericSessionSchedulableWorkerLocked(w)
 }

@@ -6,8 +6,17 @@
 # This is the SUCCESSOR to the kind-based tests/k8s/ Go suite: every behavior
 # that suite asserted against a fake kind cluster is re-asserted here against the
 # REAL posthog-mw-dev cluster (real Cilium, real Crossplane ducklings, real
-# cnpg-shard + external-RDS metadata, real per-org Lakekeeper). Covers, per the
-# two real metadata backends cnpg + ext (aurora is retired — out of scope):
+# cnpg-shard + external-RDS metadata, real per-org Lakekeeper). Covers the two
+# real metadata backends cnpg + ext (aurora is retired — out of scope).
+#
+# STRUCTURE: assertions run in four PARALLEL per-org lanes (see main() and the
+# lane_* functions) — cnpg (wire/catalog/concurrency/sizing), res1 (worker-kill
+# resilience), res2 (scheduling-shape resilience), ext (external-RDS backend +
+# org defaults). All worker churn is org-scoped, so lanes can't interfere, and
+# the wall-clock is the slowest lane instead of the sum (~halves the runtime).
+# Anything that kills/drains/counts worker pods MUST stay inside its org's lane
+# and select pods via the org label (newest_org_worker), never globally.
+#
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
 #                  a malformed startup-message length is rejected cleanly (no CP
@@ -16,11 +25,19 @@
 #                  jsonb || keeps Postgres concat semantics through
 #                  transpilation (#716), and a pipelined extended-query error
 #                  discards queued messages until Sync (#718).
-#   activation   : DuckLake + Iceberg catalogs attach and read/write.
+#   activation   : DuckLake + Iceberg catalogs attach and read/write. The FIRST
+#                  session on a cold Iceberg worker must not fail the pg_catalog
+#                  compat-view bind (the CP primes the REST catalog's schema list
+#                  first); asserted on cnpg + ext.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
 #                  — asserted on cnpg for BOTH the ducklake and iceberg catalogs.
+#   org default  : an operator-set org default worker profile (admin PUT
+#                  /orgs/:id default_worker_cpu/memory/ttl) sizes a PLAIN
+#                  connection's worker pod (no client GUCs); garbage values are
+#                  rejected with 400 at the API boundary; clearing the default
+#                  restores the deployment default shape — asserted on ext.
 #   ext forks    : the bundled ducklake/httpfs extensions are the PostHog forks,
 #                  not upstream (detects an accidental upstream swap in the image).
 #   worker pods  : labels, securityContext (non-root, no priv-esc), Downward-API
@@ -28,7 +45,9 @@
 #   resilience   : worker-pod kill → crash recovery; DuckLake durability across a
 #                  worker restart; concurrent writers (fork conflict-retry);
 #                  graceful drain (in-flight query survives a worker SIGTERM, #690);
-#                  one session per worker (concurrent queries land on distinct pods).
+#                  one session per worker (concurrent queries land on distinct pods);
+#                  parallel cold-burst ramp (3 cold connections spawn 3 pods
+#                  concurrently — the acquire gate covers only the claim decision).
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
 #   admin auth   : the dashboard rejects ?token= query-param auth (#721); only
 #                  the internal-secret header / POST login form authenticate.
@@ -41,6 +60,10 @@
 #
 # Env (from run.sh): NAMESPACE, PR_NUMBER, INTERNAL_SECRET, CP_API, CP_PG_HOST
 set -eu
+# Surface ANY exit path in the Job log: set -e can kill the script without a
+# FAIL line, and an evicted pod prints nothing — make the normal/abnormal exit
+# explicit so a silent death is distinguishable from an eviction.
+trap 'rc=$?; [ "$rc" = 0 ] || echo "HARNESS EXIT rc=$rc (no FAIL line above = killed by set -e or external signal)" >&2' EXIT
 
 API="${CP_API:?}"
 PGHOST="${CP_PG_HOST:?}"
@@ -49,6 +72,11 @@ NS="${NAMESPACE:?}"
 H="X-Duckgres-Internal-Secret: $SECRET"
 CNPG="ci-pr-${PR_NUMBER}-cnpg"
 EXT="ci-pr-${PR_NUMBER}-ext"
+# Two extra cnpg-shard/ducklake-only orgs so the heavyweight resilience
+# assertions get their OWN org each and run in parallel lanes (see main()):
+# worker-kill/drain/spawn churn is org-scoped, so lanes never interfere.
+RES1="ci-pr-${PR_NUMBER}-res1"
+RES2="ci-pr-${PR_NUMBER}-res2"
 
 # The bundled extensions MUST be the PostHog forks. These are the short commit
 # SHAs duckdb_extensions() reports for the tags the image pins
@@ -63,6 +91,14 @@ EXT_RDS_ENDPOINT="duckling-example-managed-warehouse-dev-us-east-1.c8jy2c68kipq.
 EXT_RDS_SECRET="duckling-example-managed-warehouse-dev-us-east-1-rds-password"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# Multi-second worker-pinning query used by the resilience assertions. range()
+# is lazy and count over it is metadata-fast, so the modulo filter forces real
+# per-row work. 3e9 rows ≈ 30-60s on a default (750m) worker — 5-10x the
+# overlap window each assertion needs (SIGTERM-mid-flight, concurrent-pod peak,
+# parallel-spawn hold), without the ~2min/test the old 8e9 burned.
+HEAVY_Q="SELECT count(*) FROM range(3000000000) t(i) WHERE i % 2 = 0;"
+HEAVY_EXPECT=1500000000
 # stderr, NOT stdout: log() is called inside functions whose stdout is captured
 # in $(...) and piped to jq (e.g. provision | jq -r .password). A log line on
 # stdout would land in that capture and make jq choke ("Invalid numeric literal").
@@ -439,16 +475,73 @@ rw_iceberg() { # org password
   pg "$1" "$2" iceberg "DROP TABLE iceberg.public.$t;"
 }
 
+# Regression for the Iceberg cold-start session-init bug: the FIRST session on a
+# freshly-spawned (cold) worker must not fail the pg_catalog compat-view bind.
+# Before the fix, InitSessionDatabaseMetadata enumerated every attached catalog
+# before anything had materialized the Iceberg REST catalog's schema list on the
+# new session connection, so the bind hit `Catalog Error: Schema with name ""
+# not found` and the connection was rejected with `failed to initialize session
+# database metadata`; only a reconnect (instance since settled) masked it. With
+# the warm pool gone, every org's first connect lands the literal first session
+# on its worker, so this fired in practice. The CP now primes the catalog with a
+# retried schema-enumeration probe before the bind, and the bind itself retries
+# once on the settle signature. This forces a cold worker and asserts
+# the first connect succeeds: cold-spawn backpressure is still tolerated, but the
+# metadata-init bind error fails the test immediately instead of being retried
+# away (which is exactly how a live reconnect would mask it).
+iceberg_cold_first_connect() { # org password
+  log "iceberg cold first-connect (metadata-init regression) on $1"
+  # Force cold: delete every worker for the org and wait until none remain, so
+  # the next connect cold-spawns a brand-new worker whose first session is the
+  # client's — the precise condition that triggered the bug.
+  for p in $(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" -o name 2>/dev/null); do
+    k delete "$p" --grace-period=0 --force >/dev/null 2>&1 || true
+  done
+  i=0
+  while [ "$i" -lt 45 ]; do
+    n="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
+    [ "$n" = "0" ] && break
+    sleep 2; i=$((i + 1))
+  done
+  # First connect. Tolerate cold-spawn backpressure (worker still booting), but
+  # treat the session-metadata-init bind failure as a hard regression — do NOT
+  # retry it, or the bug would be masked exactly as a live reconnect masks it.
+  # The metadata-init clause is listed first so it wins over the broader
+  # "failed to initialize session" transient it is a prefix-superset of.
+  a=0 out=""
+  while [ "$a" -lt 12 ]; do
+    if out="$(PGPASSWORD="$2" psql \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=iceberg" \
+        -v ON_ERROR_STOP=1 -tAc "SELECT 1" 2>&1)"; then
+      [ "$out" = "1" ] || fail "iceberg_cold_first_connect: $1 returned '$out' want 1"
+      return
+    fi
+    case "$out" in
+      *"failed to initialize session database metadata"*|*'Schema with name "" not found'*)
+        fail "iceberg_cold_first_connect: cold first session hit the metadata-init bind bug on $1 (prime regressed): $out" ;;
+      *"capacity exhausted"*|*"no Duckgres worker"*|*"still provisioning"*|\
+      *"failed to initialize session"*|*"timed out waiting for an available worker"*|\
+      *"failed to start"*|*"spawn sized worker"*|*"failed to detect attached catalogs"*)
+        sleep 10; a=$((a + 1)); continue ;;
+      *) fail "iceberg_cold_first_connect: unexpected error on $1: $out" ;;
+    esac
+  done
+  fail "iceberg_cold_first_connect: exhausted retries waiting for a cold worker on $1"
+}
+
 # ---- worker pod assertions (via the K8s API) ------------------------------
-newest_worker() {
-  k get pods -l app=duckgres-worker \
+# Org-scoped on purpose: lanes for different orgs run in PARALLEL, so "the
+# newest worker in the namespace" could belong to another lane (wrong shape,
+# or about to be killed by that lane). Always select within the caller's org.
+newest_org_worker() { # org
+  k get pods -l "app=duckgres-worker,duckgres/active-org=$1" \
     --sort-by=.metadata.creationTimestamp \
     -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
 }
 
-assert_worker_pod() {
+assert_worker_pod() { # org
   log "worker pod labels / securityContext / downward-env / SA-token"
-  pod="$(newest_worker)"; [ -n "$pod" ] || fail "no worker pod found"
+  pod="$(newest_org_worker "$1")"; [ -n "$pod" ] || fail "no worker pod found for $1"
 
   # Labels: app + non-empty control-plane + worker-id (TestK8sWorkerPodCreation).
   [ "$(k get pod "$pod" -o jsonpath='{.metadata.labels.app}')" = "duckgres-worker" ] \
@@ -482,6 +575,15 @@ assert_worker_pod() {
   if echo "$mounts" | grep -q '/var/run/secrets/kubernetes.io/serviceaccount'; then
     fail "worker $pod mounts a kubernetes.io/serviceaccount token"
   fi
+
+  # Never-BestEffort: a DEFAULT-shape worker (no client sizing) must still carry
+  # the pool-default resource requests. With the exclusive-node pod anti-affinity
+  # removed, requests are the ONLY thing keeping co-scheduled workers from
+  # overcommitting a node — a BestEffort default worker is a regression.
+  dcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
+  dmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  [ "$dcpu" = "750m" ] || fail "default worker $pod requests.cpu='$dcpu' want '750m' (pool default; BestEffort regression?)"
+  [ "$dmem" = "1536Mi" ] || fail "default worker $pod requests.memory='$dmem' want '1536Mi'"
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------
@@ -549,12 +651,88 @@ reuse_sized_worker() { # org password catalog cpu memory ttl
   log "sized worker reuse OK: 1 pod of cpu=$cpu (reused, no respawn)"
 }
 
+# ---- org default worker profile --------------------------------------------
+# Operators can give a tenant a server-side default worker shape + hot-idle TTL
+# (config-store columns default_worker_cpu/memory/ttl, set via the admin API).
+# External customers send plain connection strings — no duckgres.worker_* GUCs —
+# so the org default is the only way to size them. Assert end-to-end:
+#   1. PUT /orgs/:id with the three fields persists and round-trips on GET;
+#      garbage values are rejected with 400 (they must never enter the store).
+#   2. After the CP's config-store poll, a connection with NO sizing options
+#      gets a worker pod whose requests AND limits equal the org default.
+#   3. Clearing the default (explicit empty strings) restores the deployment
+#      default shape: a fresh plain connection must NOT produce another
+#      org-default-shaped pod (a default/nil profile can never exact-match the
+#      sized shape, so reuse/spawn goes back to default-profile workers).
+# Uses a shape (2/8Gi) no other test on this org uses, so the newest worker pod
+# after the connect is unambiguously ours (same technique as sized_worker; the
+# ext org runs no client-sized assertions).
+put_org() { # org json -> prints http code; body in /tmp/put_org_out
+  curl -s -o /tmp/put_org_out -w '%{http_code}' -X PUT -H "$H" \
+    -H 'Content-Type: application/json' -d "$2" "$API/api/v1/orgs/$1"
+}
+get_org_default_profile() { # org -> prints "cpu|mem|ttl" ("||" when unset)
+  curl -fsS -H "$H" "$API/api/v1/orgs/$1" \
+    | jq -r '"\(.default_worker_cpu)|\(.default_worker_memory)|\(.default_worker_ttl)"'
+}
+org_default_profile() { # org password catalog
+  org="$1"; pw="$2"; cat="$3"; cpu=2; mem=8Gi; ttl=10m
+  log "org default worker profile on $org/$cat: cpu=$cpu memory=$mem ttl=$ttl"
+
+  code="$(put_org "$org" "{\"default_worker_cpu\":\"$cpu\",\"default_worker_memory\":\"$mem\",\"default_worker_ttl\":\"$ttl\"}")"
+  [ "$code" = "200" ] || fail "org default: PUT /orgs/$org -> HTTP $code: $(cat /tmp/put_org_out)"
+  got="$(get_org_default_profile "$org")"
+  [ "$got" = "$cpu|$mem|$ttl" ] || fail "org default: GET round-trip '$got' want '$cpu|$mem|$ttl'"
+
+  # Garbage must be rejected at the API boundary, never stored.
+  code="$(put_org "$org" '{"default_worker_ttl":"whenever"}')"
+  [ "$code" = "400" ] || fail "org default: invalid ttl accepted (HTTP $code, want 400)"
+  code="$(put_org "$org" '{"default_worker_cpu":"-2"}')"
+  [ "$code" = "400" ] || fail "org default: negative cpu accepted (HTTP $code, want 400)"
+  got="$(get_org_default_profile "$org")"
+  [ "$got" = "$cpu|$mem|$ttl" ] || fail "org default: rejected PUT mutated the org: '$got'"
+
+  # Wait out the CP's config-store poll so its snapshot carries the default.
+  sleep "${CONFIG_POLL_SETTLE:-40}"
+
+  # PLAIN connection: no PGOPTIONS / duckgres.* startup options at all.
+  pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
+  pod="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" \
+        --sort-by=.metadata.creationTimestamp \
+        -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)"
+  [ -n "$pod" ] || fail "org default: no worker pod for $org"
+  rcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
+  rmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  lcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.cpu}")"
+  lmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.memory}")"
+  [ "$rcpu" = "$cpu" ] || fail "org default: $pod requests.cpu='$rcpu' want '$cpu' (org default not applied to a plain connection)"
+  [ "$rmem" = "$mem" ] || fail "org default: $pod requests.memory='$rmem' want '$mem'"
+  [ "$lcpu" = "$cpu" ] || fail "org default: $pod limits.cpu='$lcpu' want '$cpu'"
+  [ "$lmem" = "$mem" ] || fail "org default: $pod limits.memory='$lmem' want '$mem'"
+  log "org default OK: plain connection got $pod cpu=$rcpu mem=$rmem"
+
+  # Clear and assert a fresh plain connection is back on the deployment default
+  # shape: the count of org-default-shaped pods must not grow (a nil/default
+  # profile can never exact-match the 2-CPU shape, so a regrow means the org
+  # default is still being applied).
+  code="$(put_org "$org" '{"default_worker_cpu":"","default_worker_memory":"","default_worker_ttl":""}')"
+  [ "$code" = "200" ] || fail "org default: clear PUT -> HTTP $code: $(cat /tmp/put_org_out)"
+  got="$(get_org_default_profile "$org")"
+  [ "$got" = "||" ] || fail "org default: not cleared on GET: '$got'"
+  sleep "${CONFIG_POLL_SETTLE:-40}"
+  before="$(count_org_workers_of_cpu "$org" "$cpu")"
+  pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
+  after="$(count_org_workers_of_cpu "$org" "$cpu")"
+  [ "$after" -le "$before" ] || fail "org default: cleared default still spawns $cpu-cpu workers ($before -> $after)"
+  log "org default OK: cleared; plain connection back on the deployment default shape"
+}
+
 # ---- resilience -----------------------------------------------------------
 # Worker pod killed mid-life → CP refills and a fresh query succeeds.
 # Ported from TestK8sWorkerCrashRecovery.
 crash_recovery() { # org password
   log "crash recovery on $1"
-  pod="$(newest_worker)"; [ -n "$pod" ] || fail "no worker pod to kill"
+  pod="$(newest_org_worker "$1")"; [ -n "$pod" ] || fail "no worker pod to kill for $1"
   k delete pod "$pod" --wait=false >/dev/null 2>&1 || true
   k wait --for=delete "pod/$pod" --timeout=90s >/dev/null 2>&1 || true
   wait_worker "$1" "$2" ducklake
@@ -571,12 +749,10 @@ crash_recovery() { # org password
 graceful_drain() { # org password
   log "graceful drain: in-flight query survives worker SIGTERM on $1"
   out="$(mktemp)"; rc="$(mktemp)"
-  # range() is lazy and count over it is metadata-fast, so the modulo filter
-  # forces real per-row work; 8e9 rows reliably outlast the few seconds before
-  # the delete. Expected = count of even i in [0, 8e9) = 4e9. The `if` keeps the
-  # query's failure from tripping `set -e` inside the subshell before we record rc.
-  ( if pg_try "$1" "$2" ducklake \
-        "SELECT count(*) FROM range(8000000000) t(i) WHERE i % 2 = 0;" >"$out" 2>&1
+  # HEAVY_Q reliably outlasts the few seconds before the delete. The `if` keeps
+  # the query's failure from tripping `set -e` inside the subshell before we
+  # record rc.
+  ( if pg_try "$1" "$2" ducklake "$HEAVY_Q" >"$out" 2>&1
     then echo 0 >"$rc"; else echo 1 >"$rc"; fi ) &
   qpid=$!
 
@@ -584,7 +760,7 @@ graceful_drain() { # org password
   # serving it and gracefully delete it (SIGTERM → drain; the pod's
   # terminationGracePeriodSeconds=3600 keeps it alive long enough to finish).
   sleep 6
-  pod="$(newest_worker)"
+  pod="$(newest_org_worker "$1")"
   [ -n "$pod" ] || { kill "$qpid" 2>/dev/null || true; fail "graceful_drain: no worker pod serving the query"; }
   k delete pod "$pod" --wait=false >/dev/null 2>&1 || true
 
@@ -601,8 +777,8 @@ graceful_drain() { # org password
   [ "$(cat "$rc")" = 0 ] \
     || fail "graceful_drain: in-flight query died on worker SIGTERM: $(tr -d '\n' <"$out" | tail -c 200)"
   n="$(tr -dc '0-9' <"$out")"
-  [ "$n" = "4000000000" ] \
-    || fail "graceful_drain: in-flight result=$n want 4000000000 (drain corrupted the query)"
+  [ "$n" = "$HEAVY_EXPECT" ] \
+    || fail "graceful_drain: in-flight result=$n want $HEAVY_EXPECT (drain corrupted the query)"
   rm -f "$out" "$rc"
 
   # Once drained the worker must retire cleanly — the pod exits on its own and
@@ -619,14 +795,21 @@ graceful_drain() { # org password
 # whole pod's resources and a heavy query can't be starved by a co-resident one.
 # Regression net: if a worker were ever shared (pre-change least-loaded sharing),
 # the org would peak at a single active-org-labeled pod for both queries.
-# Assumes the worker nodepool is already warm (prior resilience steps spawned
+# Assumes the default nodepool already has warm capacity (prior resilience steps spawned
 # pods), so the second pod schedules within the queries' runtime.
 one_session_per_worker() { # org password
   log "one session per worker: concurrent queries land on distinct pods on $1"
   o1="$(mktemp)"; o2="$(mktemp)"; r1="$(mktemp)"; r2="$(mktemp)"
-  # Deterministic, multi-second query (range() is lazy; the modulo filter forces
-  # real per-row work). Expected = count of even i in [0, 8e9) = 4e9.
+  # This assertion's PRECONDITION is overlap: both queries must be executing
+  # at the same time, or "peak pods" measures nothing. On a cold org a single
+  # transient on one connection (10s pg_try backoff) can let the sibling's
+  # query FINISH first — its worker goes hot-idle and the retry REUSES it,
+  # serializing the two queries (legit behavior, peak=1, false fail). So this
+  # one test keeps the old long query (~2min on a default worker), which
+  # absorbs any retry/spawn desync; the other resilience tests use the shorter
+  # HEAVY_Q because their assertions don't require cross-connection overlap.
   q="SELECT count(*) FROM range(8000000000) t(i) WHERE i % 2 = 0;"
+  want=4000000000
   ( if pg_try "$1" "$2" ducklake "$q" >"$o1" 2>&1; then echo 0 >"$r1"; else echo 1 >"$r1"; fi ) &
   p1=$!
   ( if pg_try "$1" "$2" ducklake "$q" >"$o2" 2>&1; then echo 0 >"$r2"; else echo 1 >"$r2"; fi ) &
@@ -650,12 +833,85 @@ one_session_per_worker() { # org password
   { [ "$(cat "$r1")" = 0 ] && [ "$(cat "$r2")" = 0 ]; } \
     || fail "one_session_per_worker: a concurrent query errored ($(tr -d '\n' <"$o1" | tail -c 120) | $(tr -d '\n' <"$o2" | tail -c 120))"
   n1="$(tr -dc '0-9' <"$o1")"; n2="$(tr -dc '0-9' <"$o2")"
-  { [ "$n1" = "4000000000" ] && [ "$n2" = "4000000000" ]; } \
-    || fail "one_session_per_worker: wrong results n1=$n1 n2=$n2 want 4000000000"
+  { [ "$n1" = "$want" ] && [ "$n2" = "$want" ]; } \
+    || fail "one_session_per_worker: wrong results n1=$n1 n2=$n2 want $want"
   [ "$peak" -ge 2 ] \
     || fail "one_session_per_worker: org peaked at $peak worker pod(s) for 2 concurrent queries — sessions shared a worker"
   rm -f "$o1" "$o2" "$r1" "$r2"
   log "one session per worker: OK (peak $peak pods for $1)"
+}
+
+# Parallel cold-burst spawn ramp (regression net for the doomed-spawn /
+# serialized-cold-burst fix): with NO reusable workers for the org, 3 concurrent
+# connections must (a) ALL be served, on 3 DISTINCT worker pods, and (b) get
+# their pods spawned in PARALLEL. The per-org FIFO acquire gate is held only
+# across the short claim/slot decision, so the 3 pod creates land within seconds
+# of each other; the old gate-held-across-spawn behavior created pod k only
+# after pod k-1's full spawn+activate finished (tens of seconds each), so the
+# creationTimestamp spread of the burst's first 3 pods is the discriminator.
+cold_burst_parallel_spawns() { # org password
+  log "parallel cold-burst spawn ramp on $1"
+  # Start truly cold: drain every worker currently serving the org so each of
+  # the 3 connections below needs its own fresh pod spawn (no hot-idle reuse).
+  k delete pods -l "app=duckgres-worker,duckgres/active-org=$1" --wait=false >/dev/null 2>&1 || true
+  k wait --for=delete pods -l "app=duckgres-worker,duckgres/active-org=$1" --timeout=300s >/dev/null 2>&1 || true
+
+  cb1="$(mktemp)"; cb2="$(mktemp)"; cb3="$(mktemp)"
+  cbr1="$(mktemp)"; cbr2="$(mktemp)"; cbr3="$(mktemp)"
+  # Multi-second query (HEAVY_Q) so each session holds its worker while the
+  # others activate (the 3 spawns run in parallel, so the hold window is the
+  # slowest sibling's spawn, not the sum).
+  cq="$HEAVY_Q"
+  ( if pg_try "$1" "$2" ducklake "$cq" >"$cb1" 2>&1; then echo 0 >"$cbr1"; else echo 1 >"$cbr1"; fi ) &
+  cp1=$!
+  ( if pg_try "$1" "$2" ducklake "$cq" >"$cb2" 2>&1; then echo 0 >"$cbr2"; else echo 1 >"$cbr2"; fi ) &
+  cp2=$!
+  ( if pg_try "$1" "$2" ducklake "$cq" >"$cb3" 2>&1; then echo 0 >"$cbr3"; else echo 1 >"$cbr3"; fi ) &
+  cp3=$!
+
+  # While the queries run, the org must reach 3 simultaneous worker pods —
+  # one per cold connection (one session per worker; no sharing).
+  cpeak=0 ca=0
+  while [ "$ca" -lt 300 ]; do
+    kill -0 "$cp1" 2>/dev/null || break
+    kill -0 "$cp2" 2>/dev/null || break
+    kill -0 "$cp3" 2>/dev/null || break
+    cc="$(k get pods -l "duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
+    [ "$cc" -gt "$cpeak" ] && cpeak="$cc"
+    [ "$cpeak" -ge 3 ] && break
+    sleep 1; ca=$((ca + 1))
+  done
+
+  wait "$cp1" 2>/dev/null || true
+  wait "$cp2" 2>/dev/null || true
+  wait "$cp3" 2>/dev/null || true
+  { [ "$(cat "$cbr1")" = 0 ] && [ "$(cat "$cbr2")" = 0 ] && [ "$(cat "$cbr3")" = 0 ]; } \
+    || fail "cold_burst_parallel_spawns: a cold-burst connection failed ($(tr -d '\n' <"$cb1" | tail -c 100) | $(tr -d '\n' <"$cb2" | tail -c 100) | $(tr -d '\n' <"$cb3" | tail -c 100))"
+  for f in "$cb1" "$cb2" "$cb3"; do
+    cn="$(tr -dc '0-9' <"$f")"
+    [ "$cn" = "$HEAVY_EXPECT" ] || fail "cold_burst_parallel_spawns: wrong result $cn want $HEAVY_EXPECT"
+  done
+  [ "$cpeak" -ge 3 ] \
+    || fail "cold_burst_parallel_spawns: org peaked at $cpeak worker pod(s) for 3 concurrent cold connections — burst did not land on distinct workers"
+
+  # Parallelism: the burst's first 3 pods must have been CREATED within a
+  # narrow window. ISO-8601 creationTimestamps sort lexicographically; take the
+  # 3 earliest (pg_try retries could add a later 4th) and bound first→third.
+  # A serialized ramp separates each create by a full pod spawn+activate
+  # (>=~20-60s each on a warm node, minutes on a cold one), far above 30s.
+  cts="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" \
+        -o jsonpath='{.items[*].metadata.creationTimestamp}' 2>/dev/null \
+        | tr ' ' '\n' | grep . | sort | head -3)"
+  [ "$(echo "$cts" | grep -c .)" = "3" ] \
+    || fail "cold_burst_parallel_spawns: expected >=3 org worker pods after the burst, got: $cts"
+  cfirst="$(echo "$cts" | head -1)"; cthird="$(echo "$cts" | tail -1)"
+  ce1="$(date -u -D "%Y-%m-%dT%H:%M:%SZ" -d "$cfirst" +%s 2>/dev/null || date -u -d "$cfirst" +%s)"
+  ce3="$(date -u -D "%Y-%m-%dT%H:%M:%SZ" -d "$cthird" +%s 2>/dev/null || date -u -d "$cthird" +%s)"
+  cspread=$((ce3 - ce1))
+  [ "$cspread" -le 30 ] \
+    || fail "cold_burst_parallel_spawns: pod creation spread ${cspread}s (first=$cfirst third=$cthird) — spawns ramped sequentially, not in parallel"
+  rm -f "$cb1" "$cb2" "$cb3" "$cbr1" "$cbr2" "$cbr3"
+  log "parallel cold-burst spawn ramp: OK (peak $cpeak pods, creation spread ${cspread}s)"
 }
 
 # Data committed to DuckLake survives a worker restart (parquet in object store +
@@ -665,7 +921,7 @@ durability_across_restart() { # org password
   log "DuckLake durability across worker restart on $1"
   t="e2e_dur_$(echo "$1" | tr -c 'a-z0-9' _)"
   pg "$1" "$2" ducklake "CREATE OR REPLACE TABLE $t AS SELECT i AS id FROM generate_series(1,200) t(i);"
-  pod="$(newest_worker)"; [ -n "$pod" ] || fail "no worker pod serving the write"
+  pod="$(newest_org_worker "$1")"; [ -n "$pod" ] || fail "no worker pod serving the write for $1"
   k delete pod "$pod" --wait=false >/dev/null 2>&1 || true
   k wait --for=delete "pod/$pod" --timeout=120s >/dev/null 2>&1 || true
   wait_worker "$1" "$2" ducklake
@@ -773,6 +1029,104 @@ EXT_BODY='{"database_name":"'"$EXT"'",
   "data_store":{"type":"external","bucket_name":"posthog-duckling-example-managed-warehouse-dev","region":"us-east-1"},
   "ducklake":{"enabled":true},"iceberg":{"enabled":true,"namespace":"main"}}'
 
+# ---- resilience ducklings: cnpg-shard metadata + DuckLake only -------------
+# No iceberg (no per-org Lakekeeper) — these orgs exist purely to host the
+# worker-churn-heavy resilience lanes, so keep their provision footprint small.
+res_body() { # org
+  printf '{"database_name":"%s","metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
+}
+
+# ---- parallel lane machinery ------------------------------------------------
+# The assertions are grouped into per-org LANES that run concurrently: all
+# worker churn (kills, drains, cold spawns, TTL reaps) is org-scoped, so lanes
+# for different orgs cannot interfere — and the wall-clock becomes the slowest
+# lane instead of the sum. Each lane runs in a background subshell with its
+# output captured to a file; the parent prints a heartbeat while lanes run and
+# replays each lane's log (prefixed) when it finishes. A lane's failure
+# (missing/nonzero rc file) fails the harness after all lanes settle, so one
+# broken lane doesn't hide another's result.
+LANE_DIR=/tmp/lanes
+run_lane() { # name fn args...
+  name="$1"; shift
+  # The inner ( "$@" ) subshell contains fail()'s explicit `exit 1` — without
+  # it the exit would unwind past the if/else and the rc file would never be
+  # written (join_lanes would only notice at its deadline).
+  ( if ( "$@" ) >"$LANE_DIR/$name.log" 2>&1; then echo 0 >"$LANE_DIR/$name.rc"; else echo 1 >"$LANE_DIR/$name.rc"; fi ) &
+}
+join_lanes() { # name...
+  deadline=$(( $(date +%s) + 900 ))
+  while :; do
+    pending=""
+    for n in "$@"; do [ -f "$LANE_DIR/$n.rc" ] || pending="$pending $n"; done
+    [ -z "$pending" ] && break
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    for n in $pending; do
+      last="$(tail -1 "$LANE_DIR/$n.log" 2>/dev/null | tail -c 120)"
+      log "lane $n running… $last"
+    done
+    sleep 20
+  done
+  wait
+  rc=0
+  for n in "$@"; do
+    sed "s/^/[$n] /" "$LANE_DIR/$n.log" >&2 2>/dev/null || true
+    lrc="$(cat "$LANE_DIR/$n.rc" 2>/dev/null || echo timeout)"
+    if [ "$lrc" != "0" ]; then echo "FAIL: lane $n rc=$lrc" >&2; rc=1; fi
+  done
+  [ "$rc" = 0 ] || fail "one or more lanes failed (see prefixed lane logs above)"
+}
+
+# ---- lanes -------------------------------------------------------------------
+lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
+  wait_worker "$CNPG" "$cnpg_pw" ducklake
+  basic_query            "$CNPG" "$cnpg_pw"
+  pg_compat_functions    "$CNPG" "$cnpg_pw"
+  malformed_startup_resilience "$CNPG" "$cnpg_pw"
+  jsonb_concat_semantics "$CNPG" "$cnpg_pw"
+  cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
+  rw_ducklake            "$CNPG" "$cnpg_pw"
+  pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
+  assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
+  iceberg_cold_first_connect "$CNPG" "$cnpg_pw"  # cold first session must not fail the metadata-init bind
+  rw_iceberg             "$CNPG" "$cnpg_pw"
+  assert_worker_pod      "$CNPG"   # newest org pod = the default-shape iceberg worker above
+  concurrent_connections "$CNPG" "$cnpg_pw"
+  concurrent_writers     "$CNPG" "$cnpg_pw"
+  # Worker sizing, both catalogs. Distinct shapes per catalog (2/4Gi vs 1/2Gi)
+  # so the iceberg sized request can't reuse the ducklake hot-idle 2-CPU worker
+  # — each catalog gets a verified fresh sized spawn + a same-shape reuse.
+  sized_worker        "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
+  reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
+  sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
+  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
+}
+
+lane_res1() { # worker-kill resilience on its own org (heavy, churns workers)
+  wait_worker "$RES1" "$res1_pw" ducklake
+  durability_across_restart "$RES1" "$res1_pw"
+  crash_recovery         "$RES1" "$res1_pw"
+  graceful_drain         "$RES1" "$res1_pw"
+}
+
+lane_res2() { # scheduling-shape resilience on its own org (heavy, cold spawns)
+  # Both assertions tolerate a cold org: their connections spawn workers in
+  # parallel and the heavy query holds each worker well past the others' spawn.
+  one_session_per_worker     "$RES2" "$res2_pw"
+  cold_burst_parallel_spawns "$RES2" "$res2_pw"
+}
+
+lane_ext() { # external-RDS metadata backend + org default profile
+  wait_worker "$EXT" "$ext_pw" ducklake
+  basic_query  "$EXT" "$ext_pw"
+  pg_compat_functions "$EXT" "$ext_pw"
+  rw_ducklake  "$EXT" "$ext_pw"
+  iceberg_cold_first_connect "$EXT" "$ext_pw"  # cold first session must not fail the metadata-init bind (ext backend)
+  rw_iceberg   "$EXT" "$ext_pw"
+  # Org default profile on ext: no client-sized assertions run on this org, so
+  # the 2-CPU shape is unambiguously the org default's.
+  org_default_profile "$EXT" "$ext_pw" ducklake
+}
+
 main() {
   bootstrap_kubectl
   resolve_cp_ip
@@ -780,72 +1134,66 @@ main() {
   # No org dependency — assert the admin surface auth contract up front.
   admin_dashboard_no_query_token
 
+  mkdir -p "$LANE_DIR"
+
   # Use the password returned at provision time — do NOT call reset-password and
   # then retry-connect in a tight loop: the CP rate-limiter bans the source IP
   # after a handful of failed auths, and a fresh password isn't live until the
   # next config-store poll. Provision returns the live password directly.
-  cnpg_pw="$(provision "$CNPG" "$CNPG_BODY" | jq -r .password)"
-  ext_pw="$(provision "$EXT" "$EXT_BODY" | jq -r .password)"
-  wait_state "$CNPG" ready 600
-  wait_state "$EXT" ready 600
+  # All four orgs provision CONCURRENTLY (independent ducklings), then all four
+  # readiness waits run concurrently too — provisioning cost is paid once, not
+  # per org.
+  provision "$CNPG" "$CNPG_BODY"        > "$LANE_DIR/prov_cnpg.json" &
+  prov1=$!
+  provision "$EXT"  "$EXT_BODY"         > "$LANE_DIR/prov_ext.json" &
+  prov2=$!
+  provision "$RES1" "$(res_body "$RES1")" > "$LANE_DIR/prov_res1.json" &
+  prov3=$!
+  provision "$RES2" "$(res_body "$RES2")" > "$LANE_DIR/prov_res2.json" &
+  prov4=$!
+  wait "$prov1" || fail "provision $CNPG failed"
+  wait "$prov2" || fail "provision $EXT failed"
+  wait "$prov3" || fail "provision $RES1 failed"
+  wait "$prov4" || fail "provision $RES2 failed"
+  cnpg_pw="$(jq -r .password "$LANE_DIR/prov_cnpg.json")"
+  ext_pw="$(jq -r .password "$LANE_DIR/prov_ext.json")"
+  res1_pw="$(jq -r .password "$LANE_DIR/prov_res1.json")"
+  res2_pw="$(jq -r .password "$LANE_DIR/prov_res2.json")"
+  for v in "$cnpg_pw" "$ext_pw" "$res1_pw" "$res2_pw"; do
+    case "$v" in ""|null) fail "a provision call returned no password" ;; esac
+  done
+  run_lane ready_cnpg wait_state "$CNPG" ready 600
+  run_lane ready_ext  wait_state "$EXT"  ready 600
+  run_lane ready_res1 wait_state "$RES1" ready 600
+  run_lane ready_res2 wait_state "$RES2" ready 600
+  join_lanes ready_cnpg ready_ext ready_res1 ready_res2
 
-  # Settle: let the CP's config-store poll pick up the provisioned org/users
+  # Settle: let the CP's config-store poll pick up the provisioned orgs/users
   # before the first connection, so we don't burn failed-auth attempts against
   # the rate limiter while the auth cache catches up.
   log "settling ${CONFIG_POLL_SETTLE:-40}s for CP auth cache…"
   sleep "${CONFIG_POLL_SETTLE:-40}"
 
-  # ---- cnpg backend (full coverage incl. pod-level + resilience) ----
-  wait_worker "$CNPG" "$cnpg_pw" ducklake
-  basic_query            "$CNPG" "$cnpg_pw"
-  pg_compat_functions    "$CNPG" "$cnpg_pw"
-  malformed_startup_resilience "$CNPG" "$cnpg_pw"
-  jsonb_concat_semantics "$CNPG" "$cnpg_pw"
-  cold_burst_absorption  "$CNPG" "$cnpg_pw"   # before more workers exist
-  rw_ducklake            "$CNPG" "$cnpg_pw"
-  pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
-  assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
-  rw_iceberg             "$CNPG" "$cnpg_pw"
-  assert_worker_pod
-  concurrent_connections "$CNPG" "$cnpg_pw"
-  concurrent_writers     "$CNPG" "$cnpg_pw"
-  durability_across_restart "$CNPG" "$cnpg_pw"
-  crash_recovery         "$CNPG" "$cnpg_pw"
-  graceful_drain         "$CNPG" "$cnpg_pw"
-  one_session_per_worker "$CNPG" "$cnpg_pw"
+  # ---- the four parallel assertion lanes (see lane_* above) ----
+  run_lane cnpg lane_cnpg
+  run_lane res1 lane_res1
+  run_lane res2 lane_res2
+  run_lane ext  lane_ext
+  join_lanes cnpg res1 res2 ext
 
-  # ---- worker sizing (TTL-pool model) on cnpg, both catalogs ----
-  # Distinct shapes per catalog (2/4Gi vs 1/2Gi) so the iceberg sized request
-  # can't reuse the ducklake org's hot-idle 2-CPU worker (workers are
-  # catalog-agnostic; only the profile shape gates reuse) — each catalog gets a
-  # verified fresh sized spawn, then a verified same-shape reuse. Both shapes are
-  # small enough to bin-pack onto an already-warm worker node (2+1 CPU), so the
-  # iceberg spawn doesn't force a cold node scale-up that would outrun the CP's
-  # spawn ceiling (the on-demand cold-spawn case is tolerated by _pg_exec's retry
-  # set regardless, but keeping it warm makes the assertion fast + deterministic).
-  sized_worker        "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
-  reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
-  sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
-  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
-
-  # ---- ext backend (activation + R/W on the external-RDS metadata path) ----
-  wait_worker "$EXT" "$ext_pw" ducklake
-  basic_query  "$EXT" "$ext_pw"
-  pg_compat_functions "$EXT" "$ext_pw"
-  rw_ducklake  "$EXT" "$ext_pw"
-  rw_iceberg   "$EXT" "$ext_pw"
-
-  # ---- cross-tenant isolation (cnpg vs ext) ----
+  # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
 
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
+  # (res1/res2/ext are deprovisioned by run.sh teardown; the cascade assertion
+  # only needs one cnpg-shard org.)
   lifecycle_teardown_cnpg "$CNPG"
 
   # NOTE: the version-mismatch worker reaper is not exercised in-Job (it needs a
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

@@ -162,6 +162,11 @@ func (f *fakeConfigStore) OrgWarehouseStatus(string) (string, bool) {
 	// SNI tests don't exercise the warehouse-status connection-error path.
 	return "", false
 }
+func (f *fakeConfigStore) OrgDefaultWorkerProfile(string) (string, string, string) {
+	// SNI tests don't exercise worker-profile resolution; "not set" keeps the
+	// default (nil) profile semantics.
+	return "", "", ""
+}
 func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	panic("UpsertFlightSessionRecord should not be called from SNI tests")
 }

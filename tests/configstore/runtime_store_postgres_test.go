@@ -944,11 +944,10 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 }
 
 // TestListOrphanedWorkersIncludesOwnerlessIdleWorkers seeds a row that
-// reproduces the mw-dev incident: a neutral idle worker whose
+// reproduces the mw-dev incident: an unassigned idle worker whose
 // owner_cp_instance_id is the empty string. Today's INNER JOIN against
 // the cp_instances table excludes such rows, so the orphan janitor never
-// retires them, the warm-target check counts them as live capacity, and
-// no new warm workers ever spawn. The fix LEFT JOINs and adds an explicit
+// retires them. The fix LEFT JOINs and adds an explicit
 // "ownerless and stale" branch.
 func TestListOrphanedWorkersIncludesOwnerlessIdleWorkers(t *testing.T) {
 	store := newIsolatedConfigStore(t)
@@ -1297,12 +1296,12 @@ func TestListWorkersDueForCredentialRefreshSkipsReservedAndActivatingRows(t *tes
 	}
 }
 
-// TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral:
+// TestListWorkersDueForCredentialRefreshSkipsHealthyAndUnassigned:
 //   - Healthy row (expiry comfortably in the future): not returned.
-//   - Neutral warm row (org_id=”): not returned regardless of expiry.
+//   - Unassigned row (org_id=”): not returned regardless of expiry.
 //     A pre-activation worker has no STS creds to refresh.
 //   - Terminal row (retired): not returned.
-func TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral(t *testing.T) {
+func TestListWorkersDueForCredentialRefreshSkipsHealthyAndUnassigned(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
 	farFuture := now.Add(2 * time.Hour)
@@ -1340,7 +1339,7 @@ func TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral(t *testing.T) 
 		t.Fatalf("ListWorkersDueForCredentialRefresh: %v", err)
 	}
 	if len(due) != 0 {
-		t.Fatalf("expected no rows returned (healthy / neutral / terminal), got %#v", due)
+		t.Fatalf("expected no rows returned (healthy / unassigned / terminal), got %#v", due)
 	}
 }
 

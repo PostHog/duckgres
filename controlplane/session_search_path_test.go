@@ -97,3 +97,4 @@ func TestResolveEffectiveCatalog(t *testing.T) {
 		})
 	}
 }
+

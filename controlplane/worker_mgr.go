@@ -28,9 +28,9 @@ import (
 type ManagedWorker struct {
 	ID             int
 	podName        string
-	nodeName       string        //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
-	image          string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
-	profile        WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
+	nodeName       string        //nolint:unused // only set in kubernetes remote backend; drives cache-locality-aware scheduling
+	image          string        //nolint:unused // only set in kubernetes remote backend; carried through runtime store records
+	profile        WorkerProfile //nolint:unused // only set in kubernetes remote backend; pod-shape this worker was spawned with (zero = default exclusive)
 	cmd            *exec.Cmd
 	socketPath     string
 	bearerToken    string
@@ -43,7 +43,7 @@ type ManagedWorker struct {
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
 	sharedState    SharedWorkerState
-	reservedAt     time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
+	reservedAt     time.Time //nolint:unused // only set in kubernetes remote backend reservation path
 	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
 	// ownerEpoch is guarded by epochMu so cred-refresh's
 	// "RefreshLease then SetOwnerEpoch" sequence appears atomic to
@@ -58,13 +58,13 @@ type ManagedWorker struct {
 	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
 }
 
-// SharedState returns the additive shared warm-worker lifecycle metadata for
+// SharedState returns the additive shared worker lifecycle metadata for
 // this worker. The zero value normalizes to an idle, unassigned worker.
 func (w *ManagedWorker) SharedState() SharedWorkerState {
 	return cloneSharedWorkerState(w.sharedState)
 }
 
-// SetSharedState updates the additive shared warm-worker lifecycle metadata
+// SetSharedState updates the additive shared worker lifecycle metadata
 // without changing existing session scheduling behavior.
 func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
 	if err := state.Validate(); err != nil {

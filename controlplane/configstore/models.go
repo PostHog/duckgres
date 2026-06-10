@@ -10,19 +10,30 @@ import "time"
 // alias", multiple orgs can share the NULL state, but any non-NULL alias must
 // be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
-	Name                string                 `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName        string                 `gorm:"size:255;uniqueIndex" json:"database_name"`
-	HostnameAlias       *string                `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
-	MaxWorkers          int                    `gorm:"default:0" json:"max_workers"`
-	MaxConnections      int                    `gorm:"default:0" json:"max_connections"`
-	MemoryBudget        string                 `gorm:"size:32" json:"memory_budget"`
-	IdleTimeoutS        int                    `gorm:"default:0" json:"idle_timeout_s"`
-	WorkerCPURequest    string                 `gorm:"size:32" json:"worker_cpu_request"`
-	WorkerMemoryRequest string                 `gorm:"size:32" json:"worker_memory_request"`
-	Users               []OrgUser              `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse           *ManagedWarehouse      `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt           time.Time              `json:"created_at"`
-	UpdatedAt           time.Time              `json:"updated_at"`
+	Name                string  `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName        string  `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias       *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
+	MaxWorkers          int     `gorm:"default:0" json:"max_workers"`
+	MaxConnections      int     `gorm:"default:0" json:"max_connections"`
+	MemoryBudget        string  `gorm:"size:32" json:"memory_budget"`
+	IdleTimeoutS        int     `gorm:"default:0" json:"idle_timeout_s"`
+	WorkerCPURequest    string  `gorm:"size:32" json:"worker_cpu_request"`
+	WorkerMemoryRequest string  `gorm:"size:32" json:"worker_memory_request"`
+	// DefaultWorkerCPU/Memory/TTL are the org's operator-set default worker
+	// profile: the pod shape (k8s resource quantities, e.g. "2"/"8Gi") and
+	// hot-idle TTL (Go duration string, e.g. "75m" — stored as a string for
+	// human editability) applied to connections that don't size themselves via
+	// the duckgres.worker_* startup options. Distinct from WorkerCPURequest/
+	// WorkerMemoryRequest above, which mutate the GLOBAL pool default (a known
+	// last-org-wins footgun). Empty = unset. AutoMigrate adds these columns;
+	// no migration file.
+	DefaultWorkerCPU    string            `gorm:"size:32" json:"default_worker_cpu"`
+	DefaultWorkerMemory string            `gorm:"size:32" json:"default_worker_memory"`
+	DefaultWorkerTTL    string            `gorm:"size:32" json:"default_worker_ttl"`
+	Users               []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse           *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	CreatedAt           time.Time         `json:"created_at"`
+	UpdatedAt           time.Time         `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -428,7 +439,7 @@ type WorkerRecord struct {
 	// TTLMinutes is how long this worker stays hot-idle after its last query
 	// before the janitor retires it (client-selected duckgres.worker_ttl, rounded
 	// down to whole minutes). 0 = use the deployment's global hot-idle TTL
-	// (default/warm/neutral workers and legacy rows). AutoMigrate adds this
+	// (default/legacy workers and legacy rows). AutoMigrate adds this
 	// column; no migration file.
 	TTLMinutes          int         `gorm:"default:0" json:"ttl_minutes"`
 	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
@@ -443,7 +454,7 @@ type WorkerRecord struct {
 	// will expire. Stamped when the control plane mints creds (initial
 	// activation, takeover, scheduled refresh) and consulted by the
 	// credential refresh scheduler to pick workers nearing expiry. NULL on
-	// workers that haven't had creds issued yet (warm pool) and on legacy
+	// workers that haven't had creds issued yet and on legacy
 	// rows from before this column existed — both are treated as "due now"
 	// by the scheduler so they get refreshed eagerly.
 	S3CredentialsExpiresAt *time.Time `gorm:"index" json:"s3_credentials_expires_at,omitempty"`
@@ -531,6 +542,9 @@ type OrgConfig struct {
 	IdleTimeoutS        int
 	WorkerCPURequest    string
 	WorkerMemoryRequest string
+	DefaultWorkerCPU    string            // org default worker profile: pod cpu quantity ("" = unset)
+	DefaultWorkerMemory string            // org default worker profile: pod memory quantity ("" = unset)
+	DefaultWorkerTTL    string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
 	Users               map[string]string // username -> password
 	Warehouse           *ManagedWarehouseConfig
 }
