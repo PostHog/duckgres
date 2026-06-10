@@ -3,15 +3,17 @@ package flightclient
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"strconv"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -21,14 +23,23 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/sqlcore"
+	"github.com/posthog/duckgres/server/wire"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // MaxGRPCMessageSize is the max gRPC message size for Flight SQL communication.
 // DuckDB query results can easily exceed the default 4MB limit.
 const MaxGRPCMessageSize = 1 << 30 // 1GB
+
+const (
+	waitSessionIdleAction    = "WaitSessionIdle"
+	releaseQueryHandleAction = "ReleaseQueryHandle"
+	queryCloseWaitTimeout    = 30 * time.Second
+)
 
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
@@ -202,22 +213,38 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return &emptyRowSet{}, nil
 	}
 
-	reader, err := e.client.DoGet(reqCtx, info.Endpoint[0].Ticket)
+	ticket := info.Endpoint[0].Ticket
+	if err := reqCtx.Err(); err != nil {
+		_ = e.releaseQueryHandle(ticket)
+		_ = e.waitForSessionIdle()
+		return nil, err
+	}
+
+	reader, err := e.client.DoGet(reqCtx, ticket)
 	if err != nil {
+		// If cancellation lands after Execute has registered a worker-side
+		// handle but before DoGet returns a RowSet, there is no Close call to
+		// acknowledge the abandoned split-phase operation. Release the handle
+		// explicitly, then wait in case DoGet consumed it and is still unwinding.
+		_ = e.releaseQueryHandle(ticket)
+		_ = e.waitForSessionIdle()
 		return nil, fmt.Errorf("flight doget: %w", err)
 	}
 
 	schema, err := flight.DeserializeSchema(info.Schema, e.alloc)
 	if err != nil {
+		cancel()
 		reader.Release()
+		_ = e.waitForSessionIdle()
 		return nil, fmt.Errorf("flight deserialize schema: %w", err)
 	}
 
 	success = true
 	return &FlightRowSet{
-		reader: reader,
-		schema: schema,
-		cancel: cancel,
+		reader:        reader,
+		schema:        schema,
+		cancel:        cancel,
+		waitForClosed: e.waitForSessionIdle,
 	}, nil
 }
 
@@ -307,6 +334,141 @@ func (e *FlightExecutor) Close() error {
 	return nil
 }
 
+func isTerminalSessionIdleWaitError(err error) bool {
+	if strings.Contains(err.Error(), "flight client panic") {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Canceled, codes.Unavailable, codes.FailedPrecondition, codes.NotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *FlightExecutor) waitForSessionIdle() (err error) {
+	if e.dead.Load() {
+		return nil
+	}
+	if e.client == nil || e.client.Client == nil {
+		return nil
+	}
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil && isTerminalSessionIdleWaitError(err) {
+			err = nil
+		}
+	}()
+
+	payload, err := json.Marshal(wire.WorkerWaitSessionIdlePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryCloseWaitTimeout)
+	defer cancel()
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(ctx),
+		&flight.Action{Type: waitSessionIdleAction, Body: payload},
+	)
+	if err != nil {
+		if isTerminalSessionIdleWaitError(err) {
+			return nil
+		}
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			if isTerminalSessionIdleWaitError(err) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (e *FlightExecutor) releaseQueryHandle(ticket *flight.Ticket) (err error) {
+	if e.dead.Load() {
+		return nil
+	}
+	if e.client == nil || e.client.Client == nil || ticket == nil || len(ticket.Ticket) == 0 {
+		return nil
+	}
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil && isTerminalSessionIdleWaitError(err) {
+			err = nil
+		}
+	}()
+
+	payload, err := json.Marshal(wire.WorkerReleaseQueryHandlePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Ticket: ticket.Ticket,
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryCloseWaitTimeout)
+	defer cancel()
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(ctx),
+		&flight.Action{Type: releaseQueryHandleAction, Body: payload},
+	)
+	if err != nil {
+		if isTerminalSessionIdleWaitError(err) {
+			return nil
+		}
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			if isTerminalSessionIdleWaitError(err) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
 func (e *FlightExecutor) LastProfilingOutput() string {
 	v := e.lastProfiling.Load()
 	if v == nil {
@@ -331,12 +493,14 @@ type FlightRowSet struct {
 	schema *arrow.Schema
 
 	// Current batch state
-	currentBatch arrow.RecordBatch
-	batchRow     int // current row index within currentBatch
-	done         bool
-	err          error
-	closeOnce    sync.Once
-	cancel       context.CancelFunc
+	currentBatch  arrow.RecordBatch
+	batchRow      int // current row index within currentBatch
+	done          bool
+	err           error
+	closeOnce     sync.Once
+	closeErr      error
+	cancel        context.CancelFunc
+	waitForClosed func() error
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -422,8 +586,11 @@ func (r *FlightRowSet) Close() error {
 			r.currentBatch = nil
 		}
 		r.reader.Release()
+		if r.waitForClosed != nil && (!r.done || r.err != nil) {
+			r.closeErr = r.waitForClosed()
+		}
 	})
-	return nil
+	return r.closeErr
 }
 
 func (r *FlightRowSet) Err() error {
@@ -433,12 +600,12 @@ func (r *FlightRowSet) Err() error {
 // emptyRowSet is returned when a query produces no endpoints and no schema.
 type emptyRowSet struct{}
 
-func (e *emptyRowSet) Columns() ([]string, error)          { return nil, nil }
+func (e *emptyRowSet) Columns() ([]string, error)                  { return nil, nil }
 func (e *emptyRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) { return nil, nil }
-func (e *emptyRowSet) Next() bool                          { return false }
-func (e *emptyRowSet) Scan(dest ...any) error              { return fmt.Errorf("no rows") }
-func (e *emptyRowSet) Close() error                        { return nil }
-func (e *emptyRowSet) Err() error                          { return nil }
+func (e *emptyRowSet) Next() bool                                  { return false }
+func (e *emptyRowSet) Scan(dest ...any) error                      { return fmt.Errorf("no rows") }
+func (e *emptyRowSet) Close() error                                { return nil }
+func (e *emptyRowSet) Err() error                                  { return nil }
 
 // emptySchemaRowSet is returned when a query produces no data rows but does
 // have schema information (e.g., SELECT ... LIMIT 0). This preserves column
@@ -464,10 +631,10 @@ func (e *emptySchemaRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
 	return types, nil
 }
 
-func (e *emptySchemaRowSet) Next() bool      { return false }
+func (e *emptySchemaRowSet) Next() bool        { return false }
 func (e *emptySchemaRowSet) Scan(...any) error { return fmt.Errorf("no rows") }
-func (e *emptySchemaRowSet) Close() error    { return nil }
-func (e *emptySchemaRowSet) Err() error      { return nil }
+func (e *emptySchemaRowSet) Close() error      { return nil }
+func (e *emptySchemaRowSet) Err() error        { return nil }
 
 // flightExecResult implements ExecResult for Flight SQL updates.
 type flightExecResult struct {

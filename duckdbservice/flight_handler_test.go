@@ -473,6 +473,124 @@ func TestCreateSessionRejectsWhileDraining(t *testing.T) {
 	}
 }
 
+func TestWaitSessionIdleBlocksUntilOperationReleases(t *testing.T) {
+	session := &Session{
+		ID:        "session-1",
+		Username:  "alice",
+		CreatedAt: time.Now(),
+		queries:   make(map[string]*QueryHandle),
+		txns:      make(map[string]*trackedTx),
+		txnOwner:  make(map[string]string),
+	}
+	pool := &SessionPool{
+		sessions:    map[string]*Session{session.ID: session},
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+	}
+	close(pool.warmupDone)
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("beginOperation rejected test session")
+	}
+
+	body, err := json.Marshal(server.WorkerWaitSessionIdlePayload{})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+	stream := &mockDoActionStream{ctx: ctx}
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.doWaitSessionIdle(body, stream)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("WaitSessionIdle returned before operation released: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	finishOperation()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitSessionIdle returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitSessionIdle did not return after operation released")
+	}
+	if len(stream.results) != 1 {
+		t.Fatalf("expected one action result, got %d", len(stream.results))
+	}
+}
+
+func TestReleaseQueryHandleReleasesAbandonedOperation(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+	}
+	close(pool.warmupDone)
+	session := &Session{
+		ID:        "session-1",
+		Username:  "alice",
+		CreatedAt: time.Now(),
+		queries:   make(map[string]*QueryHandle),
+		txns:      make(map[string]*trackedTx),
+		txnOwner:  make(map[string]string),
+	}
+	pool.sessions[session.ID] = session
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("beginOperation rejected test session")
+	}
+	finishDrain, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("beginDrainWork: %v", err)
+	}
+	session.queries["query-1"] = &QueryHandle{
+		Query:           "SELECT 1",
+		createdAt:       time.Now(),
+		finishDrain:     finishDrain,
+		finishOperation: finishOperation,
+	}
+
+	ticket, err := flightsql.CreateStatementQueryTicket([]byte("query-1"))
+	if err != nil {
+		t.Fatalf("create ticket: %v", err)
+	}
+	body, err := json.Marshal(server.WorkerReleaseQueryHandlePayload{Ticket: ticket})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+	stream := &mockDoActionStream{ctx: ctx}
+
+	if err := handler.doReleaseQueryHandle(body, stream); err != nil {
+		t.Fatalf("ReleaseQueryHandle: %v", err)
+	}
+	if _, ok := session.queries["query-1"]; ok {
+		t.Fatal("query handle was not removed")
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work=%d, want 0", got)
+	}
+	finishOperation2, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("operation gate was not released")
+	}
+	finishOperation2()
+	if len(stream.results) != 1 {
+		t.Fatalf("expected one action result, got %d", len(stream.results))
+	}
+}
+
 func TestCreateSessionSendFailureDestroysSession(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),

@@ -123,6 +123,7 @@ type Session struct {
 	txnOwner      map[string]string
 	closed        bool
 	operationOpen bool
+	operationIdle chan struct{}
 	connWork      int
 	connWorkDone  *sync.Cond
 	handleCounter atomic.Uint64
@@ -234,6 +235,7 @@ func (s *Session) beginOperation() (func(), bool) {
 		return nil, false
 	}
 	s.operationOpen = true
+	s.operationIdle = make(chan struct{})
 	s.mu.Unlock()
 
 	var once sync.Once
@@ -241,6 +243,10 @@ func (s *Session) beginOperation() (func(), bool) {
 		once.Do(func() {
 			s.mu.Lock()
 			s.operationOpen = false
+			if s.operationIdle != nil {
+				close(s.operationIdle)
+				s.operationIdle = nil
+			}
 			s.mu.Unlock()
 		})
 	}, true
@@ -257,6 +263,7 @@ func (s *Session) beginOperationForTransaction(txnKey string) (func(), bool, boo
 		return nil, true, false
 	}
 	s.operationOpen = true
+	s.operationIdle = make(chan struct{})
 	s.mu.Unlock()
 
 	var once sync.Once
@@ -264,9 +271,35 @@ func (s *Session) beginOperationForTransaction(txnKey string) (func(), bool, boo
 		once.Do(func() {
 			s.mu.Lock()
 			s.operationOpen = false
+			if s.operationIdle != nil {
+				close(s.operationIdle)
+				s.operationIdle = nil
+			}
 			s.mu.Unlock()
 		})
 	}, true, true
+}
+
+func (s *Session) waitOperationIdle(ctx context.Context) error {
+	for {
+		s.mu.RLock()
+		if !s.operationOpen {
+			s.mu.RUnlock()
+			return nil
+		}
+		idle := s.operationIdle
+		s.mu.RUnlock()
+
+		if idle == nil {
+			return errors.New("session operation idle signal missing")
+		}
+		select {
+		case <-idle:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // beginConnWork fences any operation that uses the session connection while a
@@ -1651,6 +1684,10 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 		return s.handler.doDestroySession(cmd.Body, stream)
 	case "HealthCheck":
 		return s.handler.doHealthCheck(cmd.Body, stream)
+	case "WaitSessionIdle":
+		return s.handler.doWaitSessionIdle(cmd.Body, stream)
+	case "ReleaseQueryHandle":
+		return s.handler.doReleaseQueryHandle(cmd.Body, stream)
 	default:
 		// Fall through to standard flightsql action router (BeginTransaction, etc.)
 		return s.FlightServer.DoAction(cmd, stream)

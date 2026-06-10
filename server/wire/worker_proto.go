@@ -51,3 +51,17 @@ type WorkerDestroySessionPayload struct {
 type WorkerHealthCheckPayload struct {
 	WorkerControlMetadata
 }
+
+// WorkerWaitSessionIdlePayload asks a worker to acknowledge that the session's
+// current Flight SQL operation has released its worker-side lifecycle state.
+type WorkerWaitSessionIdlePayload struct {
+	WorkerControlMetadata
+}
+
+// WorkerReleaseQueryHandlePayload asks a worker to release a statement query
+// handle that was created by GetFlightInfo but abandoned before DoGet could
+// consume it.
+type WorkerReleaseQueryHandlePayload struct {
+	WorkerControlMetadata
+	Ticket []byte `json:"ticket"`
+}

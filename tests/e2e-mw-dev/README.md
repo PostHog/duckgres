@@ -49,7 +49,8 @@ client-go:
   statements **discarded until Sync** (the queued INSERT must not execute);
   the statement after `\syncpipeline` must execute normally. This is why the
   harness Job image is `postgres:18-alpine` (pipeline meta-commands are
-  psql 18+).
+  psql 18+). The same wire lane also asserts that a pgwire CancelRequest leaves
+  the same session immediately reusable.
 - **cold-burst absorption** — there is no warm pool, so a burst of cold sessions
   spawns workers on demand; if it outruns the org/global cap the surplus gets a
   graceful client-visible hint (`no Duckgres worker … retry in about 45 seconds`
@@ -148,6 +149,12 @@ normal `go test ./...` lane.
   GetFlightInfo-to-DoGet handoffs, and abandoned-continuation cleanup are covered
   by `duckdbservice` unit tests. The harness still asserts the cluster invariant
   this protects: one active session owns one worker.
+- **Worker DoGet close acknowledgement internals** — the harness covers the
+  black-box pgwire behavior (CancelRequest then immediate same-session reuse),
+  but not the exact internal wait point. Pausing the worker exactly after it
+  observes gRPC cancellation but before it releases the session operation token
+  would need a bespoke worker/Flight fault-injection client. Covered by
+  `server/flightclient` and `duckdbservice` unit tests instead.
 - **Malformed Bind message validation (#720)** — negative count/length fields
   in a Bind message must return a clean `08P01` instead of panicking. Every
   real client (psql, lib/pq, ...) only emits well-formed Bind messages, so
