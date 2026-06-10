@@ -33,6 +33,13 @@ func TestIsTransientDuckLakeError(t *testing.T) {
 		{"auth error", errors.New("password authentication failed for user"), false},
 		{"table not found", errors.New("Table with name foo does not exist"), false},
 		{"transaction conflict is not transient", errors.New(`Transaction conflict - attempting to insert into table with index "29784"`), false},
+		// Two workers cold-activating the same fresh org race the DuckLake
+		// metadata-store schema init; the loser's ATTACH fails on a catalog
+		// unique constraint and succeeds on retry (schema now exists).
+		{"first-attach schema-init race", errors.New(`duplicate key value violates unique constraint "pg_type_typname_nsp_index" DETAIL: Key (typname, typnamespace)=(ducklake_metadata, 2200) already exists.`), true},
+		{"first-attach race on a ducklake relation", errors.New(`duplicate key value violates unique constraint "pg_class_relname_nsp_index" DETAIL: Key (relname, relnamespace)=(ducklake_snapshot, 2200) already exists.`), true},
+		// A duplicate-key on a non-ducklake object must NOT be treated as transient.
+		{"user duplicate key is not transient", errors.New(`duplicate key value violates unique constraint "users_pkey" DETAIL: Key (id)=(1) already exists.`), false},
 	}
 
 	for _, tt := range tests {
