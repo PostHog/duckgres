@@ -63,24 +63,7 @@ func TestLiteralTransform_NonLiteralUnchanged(t *testing.T) {
 	}
 }
 
-func TestOperatorTransform_JSONBMerge(t *testing.T) {
-	tr := NewOperatorTransform()
-	out := deparseAfter(t, tr, `SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb`)
-	if !strings.Contains(strings.ToLower(out), "json_merge_patch") {
-		t.Errorf("expected json_merge_patch, got %q", out)
-	}
-}
-
-func TestOperatorTransform_StringConcatUnchanged(t *testing.T) {
-	tr := NewOperatorTransform()
-	out := deparseAfter(t, tr, `SELECT 'a' || 'b'`)
-	if strings.Contains(strings.ToLower(out), "json_merge_patch") {
-		t.Errorf("plain string concat should not become json_merge_patch, got %q", out)
-	}
-	if !strings.Contains(out, "||") {
-		t.Errorf("string concat || should be preserved, got %q", out)
-	}
-}
+// jsonb || rewrite coverage lives in operators_jsonb_concat_test.go.
 
 func TestOperatorTransform_JSONBContains(t *testing.T) {
 	tr := NewOperatorTransform()

@@ -582,7 +582,7 @@ func (t *DDLTransform) warnDroppedAlterCommand(result *Result, cmd *pg_query.Alt
 }
 
 // warnDropColumn records a WARNING that DROP COLUMN may make existing data
-// unreadable on the Iceberg catalog (see the runtime guard in server/conn.go).
+// unreadable on the Iceberg catalog (see the runtime guard in server/conn_errors.go).
 func (t *DDLTransform) warnDropColumn(result *Result) {
 	if !t.policy.WarnOnStrippedConstraints || result == nil {
 		return

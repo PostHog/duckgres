@@ -186,6 +186,32 @@ func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
 	}
 }
 
+func TestDoCopyFromStdinRejectsConcurrentSessionOperation(t *testing.T) {
+	session, cleanup := newSessionWithInMemoryDuckDB(t)
+	defer cleanup()
+	finishOperation, ok := session.beginOperation()
+	if !ok {
+		t.Fatal("expected operation to start")
+	}
+	defer finishOperation()
+
+	pool := &SessionPool{sessions: map[string]*Session{session.ID: session}}
+	handler := &FlightSQLHandler{pool: pool}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	first := &flight.FlightData{
+		FlightDescriptor: &flight.FlightDescriptor{
+			Type: flight.DescriptorPATH,
+			Path: []string{flightclient.CopyFromStdinDescriptorPath},
+			Cmd:  []byte("COPY t FROM '" + flightclient.CopyFromStdinPathPlaceholder + "' (FORMAT CSV)"),
+		},
+	}
+	err := handler.doCopyFromStdin(ctx, first, &fakeDoPutStream{ctx: ctx})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected concurrent COPY to be rejected, got %v", err)
+	}
+}
+
 func TestDoCopyFromStdinRejectsMissingPlaceholder(t *testing.T) {
 	session, cleanup := newSessionWithInMemoryDuckDB(t)
 	defer cleanup()

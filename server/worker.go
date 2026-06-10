@@ -127,6 +127,58 @@ func RunChildMode() {
 	os.Exit(exitCode)
 }
 
+// authenticateChildClient runs the cleartext-password handshake for a child
+// worker connection. The password is always requested before any credential
+// check, and validation is constant-time via auth.ValidateUserPassword, so an
+// unknown user and a wrong password are indistinguishable to the client in
+// both protocol flow and error shape. Returns ExitSuccess after sending
+// AuthOK, or the exit code to terminate with on failure.
+func authenticateChildClient(reader *bufio.Reader, writer *bufio.Writer, users map[string]string, username, remoteAddr string) int {
+	// Request password
+	if err := wire.WriteAuthCleartextPassword(writer); err != nil {
+		slog.Error("Failed to request password", "error", err)
+		return ExitError
+	}
+	if err := writer.Flush(); err != nil {
+		slog.Error("Failed to flush writer", "error", err)
+		return ExitError
+	}
+
+	// Read password response
+	msgType, body, err := wire.ReadMessage(reader)
+	if err != nil {
+		slog.Error("Failed to read password message", "error", err)
+		return ExitError
+	}
+
+	if msgType != wire.MsgPassword {
+		slog.Error("Expected password message", "got", string(msgType))
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
+		_ = writer.Flush()
+		return ExitError
+	}
+
+	// Password is null-terminated
+	password := string(bytes.TrimRight(body, "\x00"))
+
+	// Validate password (constant-time; does not leak whether the user exists)
+	if !auth.ValidateUserPassword(users, username, password) {
+		slog.Warn("Authentication failed", "user", username, "remote_addr", remoteAddr)
+		auth.AuthFailuresCounter.Inc()
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+		_ = writer.Flush()
+		return ExitAuthFailure
+	}
+
+	// Send auth OK
+	if err := wire.WriteAuthOK(writer); err != nil {
+		slog.Error("Failed to send auth OK", "error", err)
+		return ExitError
+	}
+
+	return ExitSuccess
+}
+
 // runChildWorker handles a single client connection in a child process.
 // Returns the appropriate exit code.
 func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
@@ -220,54 +272,8 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		return ExitError
 	}
 
-	// Look up expected password for this user
-	expectedPassword, ok := cfg.Users[username]
-	if !ok {
-		slog.Warn("Unknown user", "user", username, "remote_addr", cfg.RemoteAddr)
-		auth.AuthFailuresCounter.Inc()
-		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
-		_ = writer.Flush()
-		return ExitAuthFailure
-	}
-
-	// Request password
-	if err := wire.WriteAuthCleartextPassword(writer); err != nil {
-		slog.Error("Failed to request password", "error", err)
-		return ExitError
-	}
-	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush writer", "error", err)
-		return ExitError
-	}
-
-	// Read password response
-	msgType, body, err := wire.ReadMessage(reader)
-	if err != nil {
-		slog.Error("Failed to read password message", "error", err)
-		return ExitError
-	}
-
-	if msgType != wire.MsgPassword {
-		slog.Error("Expected password message", "got", string(msgType))
-		_ = wire.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
-		_ = writer.Flush()
-		return ExitError
-	}
-
-	// Password is null-terminated
-	password := string(bytes.TrimRight(body, "\x00"))
-	if password != expectedPassword {
-		slog.Warn("Authentication failed", "user", username, "remote_addr", cfg.RemoteAddr)
-		auth.AuthFailuresCounter.Inc()
-		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
-		_ = writer.Flush()
-		return ExitAuthFailure
-	}
-
-	// Send auth OK
-	if err := wire.WriteAuthOK(writer); err != nil {
-		slog.Error("Failed to send auth OK", "error", err)
-		return ExitError
+	if exitCode := authenticateChildClient(reader, writer, cfg.Users, username, cfg.RemoteAddr); exitCode != ExitSuccess {
+		return exitCode
 	}
 
 	slog.Info("User authenticated", "user", username, "remote_addr", cfg.RemoteAddr)

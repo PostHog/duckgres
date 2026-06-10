@@ -565,7 +565,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 }
 
 func TestGetWorkerRecordReturnsNilNilForMissingRow(t *testing.T) {
-	// cleanupOrphanedWorkerPods in k8s_pool.go treats (nil, nil) as "no DB
+	// cleanupOrphanedWorkerPods in k8s_pool_reconcile.go treats (nil, nil) as "no DB
 	// row — this pod is fully orphaned and safe to delete" and a non-nil
 	// error as "skip this tick and retry." If GetWorkerRecord wrapped
 	// gorm.ErrRecordNotFound as an error, the missing-row branch of the
@@ -1999,6 +1999,7 @@ func TestRetireOrphanWorkerRejectsStaleListSnapshotAfterTakeoverPostgres(t *test
 	}
 	if taken == nil {
 		t.Fatal("expected takeover to succeed")
+		return
 	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          3601,
@@ -2061,6 +2062,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 	}
 	if claimed == nil {
 		t.Fatal("expected hot-idle reclaim to succeed")
+		return
 	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          3602,
@@ -2227,6 +2229,7 @@ func assertWorkerStateAndReason(t *testing.T, store *configstore.ConfigStore, wo
 	}
 	if record == nil {
 		t.Fatalf("expected worker %d to exist", workerID)
+		return
 	}
 	if record.State != wantState || record.RetireReason != wantReason {
 		t.Fatalf("worker %d = state %q reason %q, want state %q reason %q", workerID, record.State, record.RetireReason, wantState, wantReason)

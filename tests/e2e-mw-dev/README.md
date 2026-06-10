@@ -37,7 +37,16 @@ from its mounted SA token) for the pod-level checks the Go suite made via
 client-go:
 
 - **wire/query** — `SELECT 1` round-trips; 5 concurrent connections stay
-  distinct (ported from `TestK8sMultipleConcurrentConnections`).
+  distinct (ported from `TestK8sMultipleConcurrentConnections`); a malformed
+  post-TLS startup-message length (negative / ~2GiB / truncated, injected via
+  `openssl s_client -starttls postgres`) gets a clean connection close — the CP
+  pod must not restart and must keep serving (regression for #715).
+- **pipeline error recovery** (#718) — a pipelined extended-query batch (psql
+  18 `\startpipeline`) whose first statement errors must have its queued
+  statements **discarded until Sync** (the queued INSERT must not execute);
+  the statement after `\syncpipeline` must execute normally. This is why the
+  harness Job image is `postgres:18-alpine` (pipeline meta-commands are
+  psql 18+).
 - **cold-burst absorption** — there is no warm pool, so a burst of cold sessions
   spawns workers on demand; if it outruns the org/global cap the surplus gets a
   graceful client-visible hint (`no Duckgres worker … retry in about 45 seconds`
@@ -102,6 +111,28 @@ normal `go test ./...` lane.
   pooler + `lakekeeper:8181` but not a denied destination needs a stable
   exec-into-worker probe; deferred (high flake risk). The policies themselves
   are asserted statically in `tests/manifests/`.
+- **Oversized Bind-parameter rejection (#717)** — rejecting a Bind message whose
+  declared parameter length exceeds the remaining message body requires crafting
+  a malformed wire-protocol packet on a raw socket (through TLS + auth); libpq
+  clients like psql always emit well-formed lengths, and the Job image carries no
+  raw-packet tooling. Covered by the unit regression test in
+  `server/conn_bind_test.go` instead.
+- **Concurrent worker operations on one session** — the worker rejects
+  overlapping same-session Flight operations with `FailedPrecondition`, but the
+  harness enters through pgwire, where one client connection maps to one worker
+  session and operations are serialized by the control plane. Driving this
+  specific defense-in-depth path end-to-end would need a bespoke concurrent
+  Flight-ingress client, so the rejection contract, required
+  GetFlightInfo-to-DoGet handoffs, and abandoned-continuation cleanup are covered
+  by `duckdbservice` unit tests. The harness still asserts the cluster invariant
+  this protects: one active session owns one worker.
+- **Malformed Bind message validation (#720)** — negative count/length fields
+  in a Bind message must return a clean `08P01` instead of panicking. Every
+  real client (psql, lib/pq, ...) only emits well-formed Bind messages, so
+  triggering this needs a raw pgwire client that completes TLS + SCRAM auth
+  and then sends crafted bytes — tooling the alpine Job image (psql/curl/jq)
+  doesn't have. Covered by `server/conn_bind_test.go` unit tests
+  feeding malformed payloads directly to `handleBind`.
 
 ## Isolation model
 

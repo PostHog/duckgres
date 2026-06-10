@@ -155,7 +155,6 @@ var knownFailures = map[string]string{
 	"json_typeof_number":      "DuckDB: json_typeof differs",
 	"json_array_length":       "DuckDB: json_array_length differs",
 	"jsonb_set":               "DuckDB: jsonb_set not available",
-	"jsonb_concat":            "DuckDB: jsonb concat differs",
 	"jsonb_delete_key":        "DuckDB: jsonb delete differs",
 	"json_each":               "DuckDB: json_each not available",
 	"jsonb_each":              "DuckDB: jsonb_each not available",

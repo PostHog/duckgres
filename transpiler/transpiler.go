@@ -505,6 +505,9 @@ func Classify(sql string, cfg Config) Classification {
 		// Type/conversion functions
 		"PG_TYPEOF(", "TO_CHAR(", "TO_DATE(", "TO_NUMBER(",
 		"TO_TIMESTAMP(",
+		// TO_JSON( also covers ROW_TO_JSON( / ARRAY_TO_JSON( (substring match);
+		// TO_JSONB( needs its own entry (the trailing paren breaks the overlap).
+		"TO_JSON(", "TO_JSONB(",
 		// JSON functions
 		"JSON_OBJECT_KEYS(", "JSONB_OBJECT_KEYS(", "TO_JSONB(",
 		// Date/time functions

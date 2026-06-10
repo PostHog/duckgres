@@ -79,7 +79,7 @@ func TestArrowTypeToDuckDB_ListOfStruct(t *testing.T) {
 // extracted from Arrow arrays. STRUCT and MAP currently fall through to
 // the string fallback (ValueStr).
 //
-// Expected return types (matching what conn.go formatValue consumes):
+// Expected return types (matching what conn_results.go formatValue consumes):
 //   STRUCT → map[string]interface{}
 //   MAP    → arrowmap.OrderedMapValue (keys preserve original Arrow types and insertion order)
 

@@ -10,8 +10,12 @@
 # two real metadata backends cnpg + ext (aurora is retired — out of scope):
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
-#                  and a cold burst is absorbed (workers spawn on demand; any
-#                  surplus gets a graceful retry hint) then served.
+#                  a malformed startup-message length is rejected cleanly (no CP
+#                  crash, #715), and a cold burst is absorbed (workers spawn on
+#                  demand; any surplus gets a graceful retry hint) then served.
+#                  jsonb || keeps Postgres concat semantics through
+#                  transpilation (#716), and a pipelined extended-query error
+#                  discards queued messages until Sync (#718).
 #   activation   : DuckLake + Iceberg catalogs attach and read/write.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
@@ -26,6 +30,8 @@
 #                  graceful drain (in-flight query survives a worker SIGTERM, #690);
 #                  one session per worker (concurrent queries land on distinct pods).
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
+#   admin auth   : the dashboard rejects ?token= query-param auth (#721); only
+#                  the internal-secret header / POST login form authenticate.
 #   lifecycle    : deprovision → warehouse deleted → Duckling CR fully gone
 #                  (finalizer cascade that drops the cnpg role+db completed).
 #                  Same-id re-provision is covered across runs by run.sh, not
@@ -62,7 +68,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # stdout would land in that capture and make jq choke ("Invalid numeric literal").
 log()  { echo ">>> $*" >&2; }
 
-apk add --no-cache curl jq postgresql-client >/dev/null 2>&1 || true
+apk add --no-cache curl jq postgresql-client openssl >/dev/null 2>&1 || true
 
 # kubectl, for the pod-level assertions the Go suite used to make via client-go.
 # The Job runs as the `duckgres` SA (pods get/list/delete/patch + pods/exec +
@@ -242,6 +248,61 @@ pg_compat_functions() { # org password
   assert_compat "$1" "$2" ducklake "SELECT make_interval(days=>2)::text" "2 days" "make_interval"
 }
 
+# Regression for #715: the CP reads the post-TLS startup message with the shared
+# wire.ReadStartupMessage, which used to make([]byte, length-4) straight from the
+# client-supplied length — a negative or absurd length panicked the (unrecovered)
+# connection goroutine and crashed the WHOLE control plane, dropping every
+# tenant's in-flight session, pre-auth. Drive malformed lengths through a real
+# TLS session and assert the CP neither restarts nor stops serving.
+# `openssl s_client -starttls postgres` performs the pre-TLS SSLRequest dance,
+# then hands us the raw post-TLS stream where the startup message goes.
+malformed_startup_resilience() { # org password
+  log "malformed startup-length resilience on $1 (#715)"
+  cp_pod="$(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[0].metadata.name}')"
+  [ -n "$cp_pod" ] || fail "no control-plane pod found"
+  before="$(k get pod "$cp_pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+
+  # \377…: length -1 (negative makeslice); \177…: length 2^31-1 (~2GiB alloc);
+  # \000\000\000\004: length 4 (remaining[:4] out of range). Each must yield a
+  # clean connection close, never a CP panic.
+  for hdr in '\377\377\377\377' '\177\377\377\377' '\000\000\000\004'; do
+    out="$({ printf "$hdr"; sleep 2; } | openssl s_client \
+        -connect "$CP_IP:5432" -servername "$1$SNI_SUFFIX" \
+        -starttls postgres 2>&1 || true)"
+    # Vacuity guard: the TLS handshake must have completed (server cert seen),
+    # or the garbage never reached the post-TLS startup reader and this test
+    # asserted nothing.
+    case "$out" in
+      *"BEGIN CERTIFICATE"*) : ;;
+      *) fail "s_client did not complete TLS to the CP (header $hdr): $(printf %s "$out" | tr -d '\n' | tail -c 200)" ;;
+    esac
+  done
+
+  sleep 5 # let a hypothetical CP crash surface in pod status
+  after="$(k get pod "$cp_pod" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo gone)"
+  [ "$after" = "$before" ] || fail "CP pod $cp_pod restarted on malformed startup (restarts $before -> $after)"
+  v="$(pg "$1" "$2" ducklake 'SELECT 1')"
+  [ "$v" = "1" ] || fail "CP stopped serving after malformed startup (got '$v')"
+}
+
+# jsonb || must keep Postgres concatenation semantics through the full CP
+# transpile → worker DuckDB execute path (regression for #716: the transpiler
+# used to rewrite it to json_merge_patch, which REPLACED arrays instead of
+# concatenating them — silently corrupting the common `col || '["x"]'::jsonb`
+# append idiom — and deleted null-valued keys instead of keeping them).
+# Backend-independent (no metadata touched), so cnpg-only is sufficient.
+jsonb_concat_semantics() { # org password
+  log "jsonb || semantics on $1"
+  v="$(pg "$1" "$2" ducklake "SELECT '[1,2]'::jsonb || '[3,4]'::jsonb")"
+  [ "$v" = '[1,2,3,4]' ] || fail "jsonb array concat returned '$v' (want [1,2,3,4])"
+  v="$(pg "$1" "$2" ducklake "SELECT '{\"a\":1}'::jsonb || '{\"a\":null}'::jsonb")"
+  [ "$v" = '{"a":null}' ] || fail "jsonb null-value merge returned '$v' (want {\"a\":null})"
+  v="$(pg "$1" "$2" ducklake "SELECT '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb")"
+  [ "$v" = '{"a":1,"b":2}' ] || fail "jsonb object merge returned '$v' (want {\"a\":1,\"b\":2})"
+  v="$(pg "$1" "$2" ducklake "SELECT '[1,2]'::jsonb || '3'::jsonb")"
+  [ "$v" = '[1,2,3]' ] || fail "jsonb array append returned '$v' (want [1,2,3])"
+}
+
 # Cold-burst absorption: there is no warm pool — workers are spawned on demand
 # per request — so a burst of cold sessions either all spawn (under the org/global
 # cap) or the surplus gets a graceful, client-visible cap/backpressure hint
@@ -291,6 +352,51 @@ concurrent_connections() { # org password
     [ -f "${ok}.$i" ] || fail "concurrent connection $1 #$i did not return $i"
     i=$((i + 1))
   done
+}
+
+# Extended-query skip-until-Sync error recovery (#718): after an error while
+# processing any extended-query message, the server must DISCARD subsequent
+# pipelined extended-protocol messages until Sync arrives, then recover.
+# Pipelining clients (libpq pipeline mode, pgx SendBatch, JDBC batch) rely on
+# this; without it a queued statement executes against broken state and the
+# client's response accounting desyncs. Uses psql 18's pipeline meta-commands
+# (\startpipeline / \syncpipeline / \endpipeline) — the reason the harness Job
+# image in run.sh is postgres:18-alpine. Regression test for issue #718.
+pipeline_error_recovery() { # org password
+  log "pipeline skip-until-Sync error recovery on $1"
+  t="e2e_pipe_$(echo "$1" | tr -c 'a-z0-9' _)"
+  pg "$1" "$2" ducklake "DROP TABLE IF EXISTS $t; CREATE TABLE $t(id INT);"
+  # One pipelined batch: statement 1 errors; the INSERT of id=1 is queued
+  # BEFORE the Sync so the server must discard it; the INSERT of id=2 comes
+  # after \syncpipeline so it must execute. No ON_ERROR_STOP — the error is
+  # the point — and psql's exit code is ignored (a desynced libpq may bail);
+  # the SERVER-side outcome is asserted from a fresh session below. The
+  # transient session-create FATALs are retried like _pg_exec: they fire
+  # before any SQL runs, so re-running the whole batch is safe.
+  a=0
+  while [ "$a" -lt 12 ]; do
+    out="$(PGPASSWORD="$2" psql \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" 2>&1 <<EOF || true
+\startpipeline
+SELEC deliberately_broken \bind \sendpipeline
+INSERT INTO $t VALUES (1) \bind \sendpipeline
+\syncpipeline
+INSERT INTO $t VALUES (2) \bind \sendpipeline
+\endpipeline
+EOF
+)"
+    case "$out" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
+        sleep 10; a=$((a + 1)); continue ;;
+    esac
+    break
+  done
+  got="$(pg "$1" "$2" ducklake "SELECT id FROM $t ORDER BY id;")"
+  [ "$got" = "2" ] || fail "$1 pipeline recovery: table has '$got', want only '2' (a pipelined statement queued behind an error executed, or post-Sync work was lost; psql said: $(printf %s "$out" | tr '\n' ' ' | tail -c 200))"
+  pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
 # ---- bundled extension forks ----------------------------------------------
@@ -591,6 +697,25 @@ concurrent_writers() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
+# ---- admin dashboard auth (#721) -------------------------------------------
+# Regression for #721: the admin dashboard must NOT accept the internal secret
+# via a ?token= URL query parameter (URL-borne secrets persist in browser
+# history and any future proxy access logs). A request carrying the correct
+# token in the query string gets the login page (401) with no auth cookie and
+# no redirect; the X-Duckgres-Internal-Secret header path still authenticates.
+admin_dashboard_no_query_token() {
+  log "admin dashboard rejects ?token= query auth"
+  hdrs=/tmp/admin_qt_hdrs
+  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/?token=$SECRET")"
+  [ "$code" = "401" ] || fail "GET /?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
+  if grep -qi '^set-cookie:' "$hdrs"; then
+    fail "GET /?token=<secret> set a cookie — query-param auth is back"
+  fi
+  # Sanity: the header path (what this harness uses everywhere) still works.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/")"
+  [ "$code" = "200" ] || fail "GET / with internal-secret header returned $code, want 200"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -652,6 +777,9 @@ main() {
   bootstrap_kubectl
   resolve_cp_ip
 
+  # No org dependency — assert the admin surface auth contract up front.
+  admin_dashboard_no_query_token
+
   # Use the password returned at provision time — do NOT call reset-password and
   # then retry-connect in a tight loop: the CP rate-limiter bans the source IP
   # after a handful of failed auths, and a fresh password isn't live until the
@@ -671,8 +799,11 @@ main() {
   wait_worker "$CNPG" "$cnpg_pw" ducklake
   basic_query            "$CNPG" "$cnpg_pw"
   pg_compat_functions    "$CNPG" "$cnpg_pw"
+  malformed_startup_resilience "$CNPG" "$cnpg_pw"
+  jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # before more workers exist
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
   rw_iceberg             "$CNPG" "$cnpg_pw"
   assert_worker_pod
@@ -714,7 +845,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: wire + cold-burst-absorption + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

@@ -511,6 +511,7 @@ func TestProvisionCnpgShard(t *testing.T) {
 	w := store.warehouses["shardco"]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
+		return
 	}
 	if w.MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
 		t.Errorf("metadata store kind = %q, want cnpg-shard", w.MetadataStore.Kind)
@@ -545,6 +546,7 @@ func TestProvisionIcebergExternal(t *testing.T) {
 	w := store.warehouses["extice"]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
+		return
 	}
 	if w.MetadataStore.Kind != configstore.MetadataStoreKindExternal {
 		t.Errorf("metadata store kind = %q, want external", w.MetadataStore.Kind)
@@ -632,6 +634,7 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 	w := store.warehouses["extdl"]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
+		return
 	}
 	if w.MetadataStore.Kind != configstore.MetadataStoreKindExternal {
 		t.Errorf("metadata store kind = %q, want external", w.MetadataStore.Kind)

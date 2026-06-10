@@ -48,6 +48,11 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	if err != nil {
 		return err
 	}
+	finishOperation, ok := session.beginOperation()
+	if busyErr := sessionBusyStatus(ok); busyErr != nil {
+		return busyErr
+	}
+	defer finishOperation()
 	endConnWork, ok := session.beginConnWork()
 	if !ok {
 		return status.Error(codes.NotFound, "session closed")

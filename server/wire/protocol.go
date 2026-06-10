@@ -9,16 +9,16 @@ import (
 // PostgreSQL message types
 const (
 	// Frontend (client) messages
-	MsgQuery       = 'Q'
-	MsgTerminate   = 'X'
-	MsgPassword    = 'p'
-	MsgParse       = 'P'
-	MsgBind        = 'B'
-	MsgDescribe    = 'D'
-	MsgExecute     = 'E'
-	MsgSync        = 'S'
-	MsgClose       = 'C'
-	MsgFlush       = 'H'
+	MsgQuery     = 'Q'
+	MsgTerminate = 'X'
+	MsgPassword  = 'p'
+	MsgParse     = 'P'
+	MsgBind      = 'B'
+	MsgDescribe  = 'D'
+	MsgExecute   = 'E'
+	MsgSync      = 'S'
+	MsgClose     = 'C'
+	MsgFlush     = 'H'
 
 	// Backend (server) messages
 	MsgAuth            = 'R'
@@ -46,9 +46,22 @@ const (
 
 // Authentication types
 const (
-	authOK              = 0
-	authCleartextPwd    = 3
-	authMD5Pwd          = 5
+	authOK           = 0
+	authCleartextPwd = 3
+	authMD5Pwd       = 5
+)
+
+// Message length bounds. Lengths are client-supplied (and read pre-auth for
+// startup messages), so they MUST be validated before allocation: a negative
+// or absurd length would otherwise panic in make() and crash the process.
+const (
+	// maxStartupMessageLength caps the startup packet. Matches PostgreSQL's
+	// MAX_STARTUP_PACKET_LENGTH and controlplane's readStartupFromRaw guard.
+	maxStartupMessageLength = 10000
+
+	// maxMessageLength caps regular protocol messages (1 GiB). Generous enough
+	// for large COPY data and bind parameters while bounding allocations.
+	maxMessageLength = 1 << 30
 )
 
 // readStartupMessage reads the initial startup message from the client
@@ -57,6 +70,12 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 	var length int32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 		return nil, fmt.Errorf("failed to read startup message length: %w", err)
+	}
+
+	// Validate before allocating: minimum 8 = length field (4) + protocol
+	// version (4), which also guarantees remaining[:4] below is in range.
+	if length < 8 || length > maxStartupMessageLength {
+		return nil, fmt.Errorf("invalid startup message length: %d", length)
 	}
 
 	// Read remaining bytes
@@ -142,6 +161,11 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 	var length int32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 		return 0, nil, fmt.Errorf("failed to read message length: %w", err)
+	}
+
+	// Validate before allocating: minimum 4 = the length field itself.
+	if length < 4 || length > maxMessageLength {
+		return 0, nil, fmt.Errorf("invalid message length: %d", length)
 	}
 
 	// Read message body

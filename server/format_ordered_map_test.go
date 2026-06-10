@@ -7,7 +7,7 @@ import (
 )
 
 // formatOrderedMapValue tests. Live here in package server because the
-// function under test calls formatValue (defined in conn.go) which switches
+// function under test calls formatValue (defined in conn_results.go) which switches
 // on the duckdb-go driver's value types — it can't move to a duckdb-free
 // subpackage.
 

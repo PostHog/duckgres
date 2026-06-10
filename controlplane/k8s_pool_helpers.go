@@ -1,0 +1,163 @@
+//go:build kubernetes
+
+package controlplane
+
+import (
+	stderrors "errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server"
+)
+
+// --- Helpers ---
+
+// allocateWorkerID returns the next worker ID, using the shared generator
+// if configured (multi-tenant mode) or the pool's internal counter.
+// Must be called with p.mu held.
+func (p *K8sWorkerPool) allocateWorkerIDLocked() int {
+	if p.workerIDGenerator != nil {
+		return p.workerIDGenerator()
+	}
+	id := p.nextWorkerID
+	p.nextWorkerID++
+	return id
+}
+
+func (p *K8sWorkerPool) allocateBackgroundSpawnIDLocked() int {
+	if p.runtimeStore != nil {
+		return 0
+	}
+	return p.allocateWorkerIDLocked()
+}
+
+// persistWorkerRecord upserts the record and returns the underlying
+// error (including ErrWorkerRecordUpsertFenceMiss when the CP no longer
+// owns the lease). Callers that don't care about the result discard it
+// with `_ =`; markWorkerRetiredLocked uses it to gate metric emission
+// so retire_local samples reflect transitions that actually persisted.
+func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) error {
+	if p.runtimeStore == nil || record == nil {
+		return nil
+	}
+	err := p.runtimeStore.UpsertWorkerRecord(record)
+	if err == nil {
+		return nil
+	}
+	// Fence misses are expected when a peer CP has already advanced the
+	// worker's lease (terminal state, newer owner_epoch, or different
+	// owner at the same epoch). They prove the fence is doing its job —
+	// log at Debug so they don't masquerade as persistence failures.
+	if stderrors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+		slog.Debug("Worker runtime upsert fenced by newer lease.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+		return err
+	}
+	slog.Warn("Persisting worker runtime record failed.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+	return err
+}
+
+func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoch int64, state configstore.WorkerState, retireReason string, activationStartedAt *time.Time) *configstore.WorkerRecord {
+	record := &configstore.WorkerRecord{
+		WorkerID:          id,
+		PodName:           p.podNameForWorker(id),
+		Image:             p.workerImage,
+		State:             state,
+		OwnerCPInstanceID: p.cpInstanceID,
+		OwnerEpoch:        ownerEpoch,
+		LastHeartbeatAt:   time.Now(),
+		RetireReason:      retireReason,
+	}
+	if activationStartedAt != nil {
+		startedAt := *activationStartedAt
+		record.ActivationStartedAt = &startedAt
+	}
+	if worker == nil {
+		// OwnerCPInstanceID is already this CP's id from the struct literal
+		// above. Stamping warm/idle workers with the creating CP keeps
+		// last_heartbeat_at fresh via the CP heartbeat — without it, the
+		// orphan reconciler matches case (2) (NULLIF(owner_cp_instance_id,
+		// '') IS NULL AND last_heartbeat_at <= before) the moment the row
+		// crosses orphanGrace, so warm workers get reaped on a ~30s loop.
+		return record
+	}
+	record.PodName = p.workerPodName(worker)
+	if owner := worker.OwnerCPInstanceID(); owner != "" {
+		record.OwnerCPInstanceID = owner
+	}
+	if worker.image != "" {
+		record.Image = worker.image
+	}
+	record.ProfileCPU = worker.profile.CPU
+	record.ProfileMemory = worker.profile.Memory
+	record.TTLMinutes = int(worker.profile.TTL.Minutes())
+	if assignment := worker.SharedState().Assignment; assignment != nil {
+		record.OrgID = assignment.OrgID
+	}
+	if state == configstore.WorkerStateIdle {
+		record.OrgID = ""
+	}
+	return record
+}
+
+func (p *K8sWorkerPool) healthCheckPayloadForWorker(worker *ManagedWorker) server.WorkerHealthCheckPayload {
+	return p.healthCheckPayloadForLease(p.workerLeaseSnapshot(worker))
+}
+
+func (p *K8sWorkerPool) healthCheckPayloadForLease(lease workerLeaseSnapshot) server.WorkerHealthCheckPayload {
+	payload := server.WorkerHealthCheckPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			WorkerID:     lease.workerID,
+			OwnerEpoch:   lease.ownerEpoch,
+			CPInstanceID: lease.ownerCPInstanceID,
+		},
+	}
+	return payload
+}
+
+// podNameForWorker returns the pod name for a given worker ID,
+// including the org ID if set (multi-tenant mode).
+func (p *K8sWorkerPool) podNameForWorker(id int) string {
+	return fmt.Sprintf("%s-%d", p.workerPodNamePrefix(), id)
+}
+
+func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
+	if worker != nil && worker.PodName() != "" {
+		return worker.PodName()
+	}
+	if worker == nil {
+		return ""
+	}
+	return p.podNameForWorker(worker.ID)
+}
+
+func (p *K8sWorkerPool) workerPodNamePrefix() string {
+	base := trimK8sPodHashSuffix(p.cpID)
+	if p.orgID != "" {
+		return fmt.Sprintf("%s-worker-%s", base, p.orgID)
+	}
+	return fmt.Sprintf("%s-worker", base)
+}
+
+// trimK8sPodHashSuffix removes the trailing 5-character random pod-hash
+// segment from a K8s deployment pod name (e.g. "duckgres-7b667c7bfd-7745x"
+// → "duckgres-7b667c7bfd"). Names that don't end in a plausible pod-hash
+// segment are returned unchanged.
+func trimK8sPodHashSuffix(name string) string {
+	idx := strings.LastIndex(name, "-")
+	if idx <= 0 {
+		return name
+	}
+	suffix := name[idx+1:]
+	if len(suffix) != 5 {
+		return name
+	}
+	for _, r := range suffix {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return name
+		}
+	}
+	return name[:idx]
+}
