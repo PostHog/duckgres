@@ -3346,10 +3346,13 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 			excludes: []string{`"extract"(`},        // should NOT be quoted function call format
 		},
 		{
-			name:     "SUBSTRING preserves SQL syntax with FROM FOR keywords",
+			// Positional SUBSTRING gets the PG window clamp (functions_compat.go)
+			// and deparses as an explicit call; the quoted "substring"( form is
+			// verified to execute in DuckDB by TestCompatTransforms_BatchE.
+			name:     "SUBSTRING positional form gets the window clamp",
 			input:    "SELECT SUBSTRING('hello' FROM 2 FOR 3)",
-			contains: []string{"substring", " from ", " for "}, // SQL syntax uses FROM...FOR
-			excludes: []string{`"substring"(`},                 // should NOT be quoted function call
+			contains: []string{"substring", "greatest"},
+			excludes: []string{" from ", " for "},
 		},
 		{
 			name:     "EXTRACT with different field",
@@ -3366,10 +3369,12 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 			excludes: []string{`"position"(`},
 		},
 		{
-			name:     "OVERLAY preserves SQL syntax with PLACING FROM FOR keywords",
+			// DuckDB has no overlay(); the compat transform rewrites it to a
+			// substr(...) || repl || substr(...) expression (functions_compat.go).
+			name:     "OVERLAY rewritten to substr concatenation",
 			input:    "SELECT OVERLAY('hello' PLACING 'XX' FROM 2 FOR 3)",
-			contains: []string{"overlay", " placing ", " from "},
-			excludes: []string{`"overlay"(`},
+			contains: []string{"substr(", "||"},
+			excludes: []string{" placing ", "overlay"},
 		},
 
 		// Renamed SQL syntax functions - btrim->trim strips prefix, uses function call
@@ -3402,10 +3407,12 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 			excludes: []string{`"extract"(`},
 		},
 		{
+			// EXTRACT keeps its SQL keyword syntax; SUBSTRING's positional form
+			// gets the window clamp and becomes an explicit call.
 			name:     "Multiple SQL syntax functions",
 			input:    "SELECT EXTRACT(year FROM d), SUBSTRING(s FROM 1 FOR 5) FROM t",
-			contains: []string{"extract", "substring", " from d"},
-			excludes: []string{`"extract"(`, `"substring"(`},
+			contains: []string{"extract", "substring", " from d", "greatest"},
+			excludes: []string{`"extract"(`},
 		},
 	}
 

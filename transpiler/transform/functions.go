@@ -28,14 +28,20 @@ var functionNameMapping = map[string]string{
 	"array_cat":     "list_concat",
 	"array_append":  "list_append",
 	"array_prepend": "list_prepend",
+	// array_position 2-arg maps to list_position; the 3-arg (start) form is
+	// rewritten in functions_compat.go before this mapping is consulted.
 	"array_position": "list_position",
-	"unnest":        "unnest", // same name, but semantics differ slightly
+	"unnest":         "unnest", // same name, but semantics differ slightly
+	// PG cardinality counts elements (array-only). DuckDB's builtin cardinality
+	// is MAP-only; len() gives the (outer-dimension) element count, which matches
+	// PG for the common flat-array case.
+	"cardinality": "len",
 
 	// String functions
-	"strpos":       "strpos",    // same
-	"substr":       "substr",    // same
-	"substring":    "substring", // same
-	"btrim":        "trim",
+	"strpos": "strpos", // same
+	// substr/substring are handled as special functions (PG window / regex
+	// semantics differ from DuckDB) — see handleSpecialFunction.
+	"btrim": "trim",
 	"ltrim":        "ltrim", // same
 	"rtrim":        "rtrim", // same
 	"lpad":         "lpad",  // same
@@ -45,7 +51,7 @@ var functionNameMapping = map[string]string{
 	"repeat":       "repeat", // same
 	"reverse":      "reverse", // same
 	"split_part":   "split_part", // same
-	"string_to_array": "string_split",
+	// string_to_array is a special function (3-arg nullstr form needs a macro).
 	"array_to_string": "array_to_string", // DuckDB has this
 
 	// Math functions
@@ -63,10 +69,11 @@ var functionNameMapping = map[string]string{
 	"current_date": "current_date",
 	"current_time": "current_time",
 	"current_timestamp": "current_timestamp",
-	"localtime":   "current_time",
-	"localtimestamp": "current_timestamp",
-	"timeofday":       "current_timestamp", // approximate
-	"clock_timestamp":  "now",              // wall-clock time (close enough)
+	// localtime/localtimestamp/timeofday are intentionally NOT mapped here:
+	// the first two parse as SQLValueFunction (never FuncCall — handled in
+	// transformSQLValueFunction), and timeofday() resolves to a PG-shaped
+	// text macro in server/catalog.go initPgCatalog.
+	"clock_timestamp": "now", // wall-clock time (close enough)
 	"make_date":   "make_date",   // same
 	"make_time":   "make_time",   // same
 	"make_timestamp": "make_timestamp", // same
@@ -91,12 +98,10 @@ var functionNameMapping = map[string]string{
 	"jsonb_object_agg":   "json_group_object",
 	"json_array_length":  "json_array_length",
 	"jsonb_array_length": "json_array_length",
-	"json_typeof":        "json_type",
-	"jsonb_typeof":       "json_type",
-	"json_extract_path":  "json_extract",
-	"jsonb_extract_path": "json_extract",
-	"json_extract_path_text": "json_extract_string",
-	"jsonb_extract_path_text": "json_extract_string",
+	// json_typeof/jsonb_typeof are intentionally NOT mapped to json_type:
+	// they resolve to macros in server/catalog.go initPgCatalog that translate
+	// DuckDB's type vocabulary (UBIGINT/VARCHAR/...) to PG's (number/string/...).
+	// json_extract_path(_text) variants are special functions (variadic paths).
 	"json_object_keys":  "json_keys",
 	"jsonb_object_keys": "json_keys",
 
@@ -104,10 +109,9 @@ var functionNameMapping = map[string]string{
 	"to_json":   "to_json",
 	"to_jsonb":  "to_json",
 
-	// Regex functions
-	"regexp_match":   "regexp_extract",    // returns first match
-	"regexp_matches": "regexp_extract_all", // returns all matches
-	"regexp_replace": "regexp_replace",    // same
+	// Regex functions (regexp_match/regexp_matches are special functions —
+	// a PG flags argument must be shifted past DuckDB's group-index slot)
+	"regexp_replace": "regexp_replace", // same
 	"regexp_split_to_array": "regexp_split_to_array",
 	"regexp_split_to_table": "regexp_split_to_table",
 
@@ -148,21 +152,42 @@ var specialFunctions = map[string]bool{
 	"to_char":        true, // format string conversion PG→strftime/format
 	"to_date":        true, // format string conversion PG→strptime
 	"to_timestamp":   true, // format string conversion for 2-arg form
-	"regexp_matches": true, // return type differs
+	"regexp_match":   true, // flags arg must shift past DuckDB's group slot
+	"regexp_matches": true, // return type differs; flags arg handling
 	"array_agg":      true, // becomes list()
-	"string_to_array": true, // argument order
+	"string_to_array": true, // 3-arg nullstr form -> duckgres_string_to_array3 macro
 	"log":             true, // 1-arg -> log10, 2-arg -> ln(value)/ln(base)
+	"substr":          true, // PG negative/zero-start window clamping
+	"substring":       true, // SQL regex FROM-pattern form -> regexp_extract
+	// json_extract_path family: >1 path element becomes a nested 2-arg chain
+	"json_extract_path":       true,
+	"jsonb_extract_path":      true,
+	"json_extract_path_text":  true,
+	"jsonb_extract_path_text": true,
 }
 
 func (t *FunctionTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
 	changed := false
 
 	WalkFunc(tree, func(node *pg_query.Node) bool {
+		if svf := node.GetSqlvalueFunction(); svf != nil {
+			if t.transformSQLValueFunction(svf) {
+				changed = true
+			}
+			return true
+		}
 		if fc := node.GetFuncCall(); fc != nil {
 			// 2-arg log(base, value) -> ln(value) / ln(base)
 			// Must happen here because it replaces the FuncCall node with an A_Expr
 			if t.isLogTwoArg(fc) {
 				t.replaceLogWithLnDivision(node, fc)
+				changed = true
+				return true
+			}
+			// Compat rewrites that replace the whole FuncCall node (format, 3-arg
+			// date_trunc, overlay, isfinite-interval) must run here, where node is
+			// available. See functions_compat.go.
+			if t.replaceCompatFuncNode(node, fc) {
 				changed = true
 				return true
 			}
@@ -174,6 +199,31 @@ func (t *FunctionTransform) Transform(tree *pg_query.ParseResult, result *Result
 	})
 
 	return changed, nil
+}
+
+// transformSQLValueFunction rewrites the precision forms LOCALTIME(p),
+// LOCALTIMESTAMP(p), CURRENT_TIME(p) and CURRENT_TIMESTAMP(p) to their bare
+// same-family keywords, which DuckDB executes natively. DuckDB has no TIME(p)
+// typmod, so the fractional precision is dropped (unavoidable). Same-family
+// only — LOCALTIME* and CURRENT_TIME* are typed differently (TIME vs TIME WITH
+// TIME ZONE). Bare keyword forms are left untouched.
+func (t *FunctionTransform) transformSQLValueFunction(svf *pg_query.SQLValueFunction) bool {
+	var op pg_query.SQLValueFunctionOp
+	switch svf.Op {
+	case pg_query.SQLValueFunctionOp_SVFOP_LOCALTIME_N:
+		op = pg_query.SQLValueFunctionOp_SVFOP_LOCALTIME
+	case pg_query.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N:
+		op = pg_query.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP
+	case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIME_N:
+		op = pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIME
+	case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N:
+		op = pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP
+	default:
+		return false
+	}
+	svf.Op = op
+	svf.Typmod = -1
+	return true
 }
 
 func (t *FunctionTransform) transformFuncCall(fc *pg_query.FuncCall) bool {
@@ -248,12 +298,24 @@ func (t *FunctionTransform) handleSpecialFunction(fc *pg_query.FuncCall, funcNam
 
 	case "string_to_array":
 		// PostgreSQL string_to_array(string, delimiter)
-		// -> DuckDB string_split(string, delimiter)
-		if str := fc.Funcname[funcNameIdx].GetString_(); str != nil {
-			str.Sval = "string_split"
+		// -> DuckDB string_split(string, delimiter).
+		// The 3-arg (nullstr) form has no string_split equivalent; it routes
+		// to the duckgres_string_to_array3 macro (server/catalog.go).
+		if len(fc.Args) == 3 {
+			renameFuncAndStripPrefix(fc, funcNameIdx, "duckgres_string_to_array3")
+			return true
 		}
-		if len(fc.Funcname) > 1 {
-			fc.Funcname = fc.Funcname[funcNameIdx:]
+		renameFuncAndStripPrefix(fc, funcNameIdx, "string_split")
+		return true
+
+	case "regexp_match":
+		// PostgreSQL regexp_match(s, p[, flags]) -> regexp_extract(s, p[, 0, flags]).
+		// DuckDB's 3rd positional slot is the group index, so a PG flags string
+		// must shift to the 4th slot with an explicit group 0.
+		renameFuncAndStripPrefix(fc, funcNameIdx, "regexp_extract")
+		if len(fc.Args) == 3 {
+			flags := fc.Args[2]
+			fc.Args = append(fc.Args[:2], intConstNode(0), flags)
 		}
 		return true
 
@@ -261,11 +323,50 @@ func (t *FunctionTransform) handleSpecialFunction(fc *pg_query.FuncCall, funcNam
 		// PostgreSQL regexp_matches returns setof text[]
 		// DuckDB regexp_extract_all returns list
 		// For simple cases, this mapping works
-		if str := fc.Funcname[funcNameIdx].GetString_(); str != nil {
-			str.Sval = "regexp_extract_all"
+		renameFuncAndStripPrefix(fc, funcNameIdx, "regexp_extract_all")
+		if len(fc.Args) == 3 {
+			// Strip 'g' from the flags: regexp_extract_all is already global
+			// and DuckDB rejects 'g' outside regexp_replace. The remaining
+			// flags shift past the group-index slot (explicit group 0).
+			if ac := fc.Args[2].GetAConst(); ac != nil && ac.GetSval() != nil {
+				rest := strings.ReplaceAll(ac.GetSval().Sval, "g", "")
+				if rest == "" {
+					fc.Args = fc.Args[:2]
+				} else {
+					flags := fc.Args[2]
+					setStringConstant(flags, rest)
+					fc.Args = append(fc.Args[:2], intConstNode(0), flags)
+				}
+			} else {
+				// Non-literal flags: strip 'g' at runtime. DuckDB constant-folds
+				// the replace(); truly non-constant flags fail with its clear
+				// "Regex options field must be a constant" error.
+				flags := fc.Args[2]
+				fc.Args = append(fc.Args[:2], intConstNode(0),
+					funcCallNode("replace", flags, strConstNode("g"), strConstNode("")))
+			}
 		}
-		if len(fc.Funcname) > 1 {
-			fc.Funcname = fc.Funcname[funcNameIdx:]
+		return true
+
+	case "json_extract_path", "jsonb_extract_path", "json_extract_path_text", "jsonb_extract_path_text":
+		// The _text variants extract text (json_extract_string), the others
+		// JSON (json_extract). With >1 path element, build a left-nested chain
+		// of 2-arg calls — DuckDB has no variadic path overload, and the
+		// VARCHAR[] list overload returns independent lookups (wrong shape).
+		// Inner steps are always json_extract (each must return JSON).
+		// NOTE (pre-existing caveat): digit-string path elements are key
+		// lookups in DuckDB's VARCHAR path form, not array indexes.
+		target := "json_extract"
+		if strings.HasSuffix(funcName, "_text") {
+			target = "json_extract_string"
+		}
+		renameFuncAndStripPrefix(fc, funcNameIdx, target)
+		if len(fc.Args) > 2 {
+			inner := funcCallNode("json_extract", fc.Args[0], fc.Args[1])
+			for _, pathElem := range fc.Args[2 : len(fc.Args)-1] {
+				inner = funcCallNode("json_extract", inner, pathElem)
+			}
+			fc.Args = []*pg_query.Node{inner, fc.Args[len(fc.Args)-1]}
 		}
 		return true
 
@@ -282,6 +383,12 @@ func (t *FunctionTransform) handleSpecialFunction(fc *pg_query.FuncCall, funcNam
 
 	case "to_timestamp":
 		return t.handleToTimestamp(fc, funcNameIdx)
+
+	case "substr":
+		return t.handleSubstrClamp(fc)
+
+	case "substring":
+		return t.handleSubstring(fc, funcNameIdx)
 
 	default:
 		return false

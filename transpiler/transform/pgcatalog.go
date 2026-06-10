@@ -143,6 +143,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"set_config":                        true, // Session-setting writer (value-returning)
 			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
 			"statement_timestamp":               true, // now() alias
+			"timeofday":                         true, // PG-shaped wall-clock text
 			"pg_get_function_arguments":         true, // \df signature stub
 			"pg_get_function_result":            true, // \df result-type stub
 			"pg_get_function_identity_arguments": true, // identity-arg stub
@@ -155,6 +156,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"to_regtype":                        true, // Type-name->oid probe
 			"to_regproc":                        true, // Function-name->oid probe
 			"jsonb_pretty":                      true, // Indented JSON
+			"json_typeof":                       true, // PG-vocabulary JSON type name
+			"jsonb_typeof":                      true, // PG-vocabulary JSON type name
+			"duckgres_string_to_array3":         true, // 3-arg string_to_array (nullstr)
 			"to_ascii":                          true, // Accent-stripping transliteration
 			"convert_from":                      true, // bytea->text (UTF8)
 			"width_bucket":                      true, // Equi-width histogram bucketing
@@ -237,6 +241,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"set_config":                        true, // Session-setting writer (value-returning)
 			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
 			"statement_timestamp":               true, // now() alias
+			"timeofday":                         true, // PG-shaped wall-clock text
 			"pg_get_function_arguments":         true, // \df signature stub
 			"pg_get_function_result":            true, // \df result-type stub
 			"pg_get_function_identity_arguments": true, // identity-arg stub
@@ -249,6 +254,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"to_regtype":                        true, // Type-name->oid probe
 			"to_regproc":                        true, // Function-name->oid probe
 			"jsonb_pretty":                      true, // Indented JSON
+			"json_typeof":                       true, // PG-vocabulary JSON type name
+			"jsonb_typeof":                      true, // PG-vocabulary JSON type name
+			"duckgres_string_to_array3":         true, // 3-arg string_to_array (nullstr)
 			"to_ascii":                          true, // Accent-stripping transliteration
 			"convert_from":                      true, // bytea->text (UTF8)
 			"width_bucket":                      true, // Equi-width histogram bucketing
