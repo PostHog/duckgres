@@ -222,20 +222,6 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		pod.Spec.Tolerations = []corev1.Toleration{tol}
 	}
 
-	// One worker per node, on a dedicated node pool.
-	if p.workerExclusiveNode {
-		pod.Spec.Affinity = &corev1.Affinity{
-			PodAntiAffinity: &corev1.PodAntiAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-					LabelSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"app": "duckgres-worker"},
-					},
-					TopologyKey: "kubernetes.io/hostname",
-				}},
-			},
-		}
-	}
-
 	// Add writable data directory for DuckDB databases
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 		Name: "data",
@@ -638,23 +624,29 @@ func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 // profile always carries non-empty CPU/Memory (resolver-enforced), so it never
 // degrades to BestEffort.
 func (p *K8sWorkerPool) workerResourcesForProfile(profile WorkerProfile) corev1.ResourceRequirements {
+	// Workers must never be BestEffort: with no pod anti-affinity, resource
+	// requests are the ONLY thing keeping two workers from overcommitting a
+	// node (each worker's single session sizes itself off the whole pod —
+	// workerDuckDBLimits — so co-resident requestless workers would each
+	// believe they own the node's RAM). Fall back to the built-in default
+	// shape when neither the profile nor the pool-global request sets one.
 	cpuReq := profile.CPU
 	if cpuReq == "" {
 		cpuReq = p.workerCPURequest
+	}
+	if cpuReq == "" {
+		cpuReq = defaultWorkerCPU
 	}
 	memReq := profile.Memory
 	if memReq == "" {
 		memReq = p.workerMemoryRequest
 	}
-	requests := corev1.ResourceList{}
-	if cpuReq != "" {
-		requests[corev1.ResourceCPU] = resource.MustParse(cpuReq)
+	if memReq == "" {
+		memReq = defaultWorkerMemory
 	}
-	if memReq != "" {
-		requests[corev1.ResourceMemory] = resource.MustParse(memReq)
-	}
-	if len(requests) == 0 {
-		return corev1.ResourceRequirements{}
+	requests := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpuReq),
+		corev1.ResourceMemory: resource.MustParse(memReq),
 	}
 	limits := make(corev1.ResourceList, len(requests))
 	for k, v := range requests {

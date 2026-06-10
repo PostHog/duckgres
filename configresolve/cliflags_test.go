@@ -16,7 +16,6 @@ var nonFlagCLIInputsFields = map[string]bool{
 	"K8sWorkerNodeSelector":    true,
 	"K8sWorkerTolerationKey":   true,
 	"K8sWorkerTolerationValue": true,
-	"K8sWorkerExclusiveNode":   true,
 }
 
 // fieldNameToFlagName converts a CLIInputs Go field name (PascalCase) into

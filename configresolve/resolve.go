@@ -83,7 +83,6 @@ type CLIInputs struct {
 	K8sWorkerNodeSelector       string
 	K8sWorkerTolerationKey      string
 	K8sWorkerTolerationValue    string
-	K8sWorkerExclusiveNode      bool
 	AWSRegion                   string
 	QueryLog                    bool
 }
@@ -112,7 +111,6 @@ type Resolved struct {
 	K8sWorkerNodeSelector           string
 	K8sWorkerTolerationKey          string
 	K8sWorkerTolerationValue        string
-	K8sWorkerExclusiveNode          bool
 	K8sAllowClientWorkerProfile     bool
 	K8sWorkerPriorityClassName      string
 	K8sHeadroomPercent              int
@@ -208,7 +206,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sMaxWorkers int
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
-	var k8sWorkerExclusiveNode bool
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -832,11 +829,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_TOLERATION_VALUE"); v != "" {
 		k8sWorkerTolerationValue = v
 	}
-	if v := getenv("DUCKGRES_K8S_WORKER_EXCLUSIVE_NODE"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			k8sWorkerExclusiveNode = b
-		}
-	}
 
 	// Connection-string worker-profile config.
 	if v := getenv("DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE"); v != "" {
@@ -1220,7 +1212,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerNodeSelector:           k8sWorkerNodeSelector,
 		K8sWorkerTolerationKey:          k8sWorkerTolerationKey,
 		K8sWorkerTolerationValue:        k8sWorkerTolerationValue,
-		K8sWorkerExclusiveNode:          k8sWorkerExclusiveNode,
 		K8sAllowClientWorkerProfile:     k8sAllowClientWorkerProfile,
 		K8sWorkerPriorityClassName:      k8sWorkerPriorityClassName,
 		K8sHeadroomPercent:              k8sHeadroomPercent,

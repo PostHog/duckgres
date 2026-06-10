@@ -514,6 +514,15 @@ assert_worker_pod() {
   if echo "$mounts" | grep -q '/var/run/secrets/kubernetes.io/serviceaccount'; then
     fail "worker $pod mounts a kubernetes.io/serviceaccount token"
   fi
+
+  # Never-BestEffort: a DEFAULT-shape worker (no client sizing) must still carry
+  # the pool-default resource requests. With the exclusive-node pod anti-affinity
+  # removed, requests are the ONLY thing keeping co-scheduled workers from
+  # overcommitting a node — a BestEffort default worker is a regression.
+  dcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
+  dmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  [ "$dcpu" = "750m" ] || fail "default worker $pod requests.cpu='$dcpu' want '750m' (pool default; BestEffort regression?)"
+  [ "$dmem" = "1536Mi" ] || fail "default worker $pod requests.memory='$dmem' want '1536Mi'"
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------

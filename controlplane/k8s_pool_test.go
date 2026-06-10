@@ -2940,51 +2940,61 @@ func TestWorkerResources_BothSet(t *testing.T) {
 }
 
 func TestWorkerResources_CPUOnly(t *testing.T) {
+	// Memory falls back to the built-in default: workers are never BestEffort
+	// (resource requests are the only node-overcommit guard without pod
+	// anti-affinity).
 	pool := &K8sWorkerPool{
 		workerCPURequest: "1",
 	}
 	res := pool.workerResources()
-	if _, ok := res.Requests[corev1.ResourceCPU]; !ok {
-		t.Fatal("expected CPU request")
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != "1" {
+		t.Fatalf("expected CPU request 1, got %s", cpu.String())
 	}
-	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
-		t.Fatal("expected no memory request")
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != defaultWorkerMemory {
+		t.Fatalf("expected default memory request %s, got %s", defaultWorkerMemory, mem.String())
 	}
 	if _, ok := res.Limits[corev1.ResourceCPU]; !ok {
 		t.Fatal("expected CPU limit (Guaranteed QoS)")
 	}
-	if _, ok := res.Limits[corev1.ResourceMemory]; ok {
-		t.Fatal("expected no memory limit")
+	if _, ok := res.Limits[corev1.ResourceMemory]; !ok {
+		t.Fatal("expected memory limit (Guaranteed QoS)")
 	}
 }
 
 func TestWorkerResources_MemoryOnly(t *testing.T) {
+	// CPU falls back to the built-in default (never BestEffort).
 	pool := &K8sWorkerPool{
 		workerMemoryRequest: "4Gi",
 	}
 	res := pool.workerResources()
-	if _, ok := res.Requests[corev1.ResourceMemory]; !ok {
-		t.Fatal("expected memory request")
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != "4Gi" {
+		t.Fatalf("expected memory request 4Gi, got %s", mem.String())
 	}
-	if _, ok := res.Requests[corev1.ResourceCPU]; ok {
-		t.Fatal("expected no CPU request")
-	}
-	if _, ok := res.Limits[corev1.ResourceMemory]; !ok {
-		t.Fatal("expected memory limit (Guaranteed QoS)")
-	}
-	if _, ok := res.Limits[corev1.ResourceCPU]; ok {
-		t.Fatal("expected no CPU limit")
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != defaultWorkerCPU {
+		t.Fatalf("expected default CPU request %s, got %s", defaultWorkerCPU, cpu.String())
 	}
 }
 
 func TestWorkerResources_NeitherSet(t *testing.T) {
+	// No pool-global requests configured: the built-in default shape applies.
+	// Workers must never be BestEffort — without pod anti-affinity, requests
+	// are the only thing keeping two workers from overcommitting a node.
 	pool := &K8sWorkerPool{}
 	res := pool.workerResources()
-	if res.Requests != nil {
-		t.Fatal("expected empty requests (BestEffort)")
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != defaultWorkerCPU {
+		t.Fatalf("expected default CPU request %s, got %s", defaultWorkerCPU, cpu.String())
 	}
-	if res.Limits != nil {
-		t.Fatal("expected empty limits")
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != defaultWorkerMemory {
+		t.Fatalf("expected default memory request %s, got %s", defaultWorkerMemory, mem.String())
+	}
+	if len(res.Limits) != 2 {
+		t.Fatalf("expected cpu+memory limits (Guaranteed QoS), got %v", res.Limits)
 	}
 }
 

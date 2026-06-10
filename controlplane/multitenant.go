@@ -187,7 +187,6 @@ func SetupMultiTenant(
 		WorkerNodeSelector:           parseNodeSelector(cfg.K8s.WorkerNodeSelector),
 		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:          cfg.K8s.WorkerExclusiveNode,
 		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
 		HeadroomPercent:              cfg.K8s.HeadroomPercent,
 		PlaceholderImage:             cfg.K8s.PlaceholderImage,

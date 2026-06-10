@@ -118,7 +118,12 @@ options), `DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/
 
 Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_TIERS*`,
 `*ALLOW_CLIENT_EXCLUSIVE_NODE*`, `*SHARED_WARM_TARGET*`,
-`*DYNAMIC_WARM_CAPACITY*`, `*WARM_CAPACITY_*`, `*WARM_ACQUIRE_TIMEOUT*`.
+`*DYNAMIC_WARM_CAPACITY*`, `*WARM_CAPACITY_*`, `*WARM_ACQUIRE_TIMEOUT*`,
+`*WORKER_EXCLUSIVE_NODE*` (the one-worker-per-node pod anti-affinity is gone;
+isolation comes from resource requests — workers are never BestEffort, falling
+back to the built-in default shape (8/16Gi) when neither the profile nor
+`DUCKGRES_K8S_WORKER_CPU_REQUEST`/`_MEMORY_REQUEST` set one, so co-scheduled
+workers cannot overcommit a node).
 
 ## Testing
 
