@@ -253,10 +253,14 @@ spec:
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             - { name: DUCKGRES_AWS_REGION, value: "us-east-1" }
-            # Land workers on the dedicated worker nodepool (mw-dev arm64).
-            - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"posthog.com/nodepool":"duckgres-workers"}' }
-            - { name: DUCKGRES_K8S_WORKER_TOLERATION_KEY, value: "posthog.com/nodepool" }
-            - { name: DUCKGRES_K8S_WORKER_TOLERATION_VALUE, value: "duckgres-workers" }
+            # Land e2e workers on the DEFAULT (untainted) nodepool, NOT the real
+            # deployment's duckgres-workers pool: per-PR worker churn must not
+            # fight the dev deployment's headroom placeholders / Karpenter
+            # consolidation on the production-shaped pool, and the harness Job /
+            # per-PR CP / config-store already run on the default pool. The
+            # worker image is arm64-only and the default pool is mixed-arch, so
+            # pin the arch (no toleration needed — the default pool is untainted).
+            - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"kubernetes.io/arch":"arm64"}' }
             # Provision real per-org Lakekeeper instances (iceberg path).
             - { name: DUCKGRES_LAKEKEEPER_PROVISIONER_ENABLED, value: "true" }
             # Org identity is resolved from the TLS SNI hostname

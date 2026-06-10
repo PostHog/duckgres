@@ -736,7 +736,7 @@ graceful_drain() { # org password
 # whole pod's resources and a heavy query can't be starved by a co-resident one.
 # Regression net: if a worker were ever shared (pre-change least-loaded sharing),
 # the org would peak at a single active-org-labeled pod for both queries.
-# Assumes the worker nodepool is already warm (prior resilience steps spawned
+# Assumes the default nodepool already has warm capacity (prior resilience steps spawned
 # pods), so the second pod schedules within the queries' runtime.
 one_session_per_worker() { # org password
   log "one session per worker: concurrent queries land on distinct pods on $1"
