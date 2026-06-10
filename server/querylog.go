@@ -15,6 +15,7 @@ import (
 
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/usersecrets"
 )
 
 // QueryLogEntry represents a single entry in the query log.
@@ -493,6 +494,11 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	if isQueryLogSelfReferential(query) {
 		return
 	}
+
+	// CREATE SECRET option lists carry credential material; never persist
+	// them to the query log.
+	query = usersecrets.RedactForLog(query)
+	transpiledQuery = usersecrets.RedactForLog(transpiledQuery)
 
 	entryType := "QueryFinish"
 	if errCode != "" {

@@ -61,6 +61,12 @@ type SessionManager struct {
 	activeSlots    int
 	waiters        []*connectionWaiter
 	limiter        connectionLimiter
+
+	// userSecretLoader returns the user's persistent CREATE SECRET statements
+	// (decrypted) to replay on a worker at session creation. nil outside the
+	// multitenant/remote backend. A loader error must not block the session:
+	// callers log and continue without secrets.
+	userSecretLoader func(ctx context.Context, username string) ([]string, error)
 }
 
 type flightReconnectPool interface {
@@ -92,6 +98,12 @@ func (sm *SessionManager) SetMaxConnections(n int) {
 	defer sm.mu.Unlock()
 	sm.maxConnections = n
 	sm.grantWaitersLocked()
+}
+
+// SetUserSecretLoader installs the per-user persistent-secret loader used at
+// session creation (multitenant/remote backend only).
+func (sm *SessionManager) SetUserSecretLoader(loader func(ctx context.Context, username string) ([]string, error)) {
+	sm.userSecretLoader = loader
 }
 
 // SetConnectionLimiter replaces the local process limiter with a cluster-wide
@@ -407,7 +419,21 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		"owner_cp_instance_id", worker.OwnerCPInstanceID(),
 		"owner_epoch", worker.OwnerEpoch(),
 	)
-	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
+	// Load the user's persistent secrets for replay. Failure to load degrades
+	// to a session without user secrets (logged loudly) rather than a refused
+	// connection: the config store being briefly unavailable must not lock
+	// every returning user out of their warehouse.
+	var secretStatements []string
+	if sm.userSecretLoader != nil {
+		var secretErr error
+		secretStatements, secretErr = sm.userSecretLoader(ctx, username)
+		if secretErr != nil {
+			slog.Error("Failed to load user persistent secrets; session starts without them.",
+				"pid", pid, "worker", worker.ID, "user", username, "error", secretErr)
+		}
+	}
+
+	sessionToken, secretWarnings, err := worker.CreateSession(ctx, username, memoryLimit, threads, secretStatements)
 	if err != nil {
 		slog.Warn("Failed to create session on worker.",
 			"pid", pid,
@@ -422,6 +448,11 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 			sm.pool.RetireWorkerIfNoSessions(worker.ID)
 		}
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
+	}
+
+	for _, w := range secretWarnings {
+		slog.Warn("User persistent secret replay warning.",
+			"pid", pid, "worker", worker.ID, "user", username, "warning", w)
 	}
 
 	executor := flightclient.NewFlightExecutorFromClient(worker.client, sessionToken)

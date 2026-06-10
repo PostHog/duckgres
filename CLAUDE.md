@@ -238,6 +238,46 @@ release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
 `GetFlightInfo` whose `DoGet` never arrived. `terminationGracePeriodSeconds=3600`
 (`k8s_pool.go`) must stay above `workerShutdownDrainTime` (55m).
 
+## User Persistent Secrets (multitenant remote backend)
+
+`CREATE PERSISTENT SECRET` from a client survives across sessions and worker
+pods: the CP intercepts it (`server/conn_user_secrets.go`, classification in
+`server/usersecrets/`), executes it on the live session first (DuckDB
+validates), then stores the statement AES-GCM-encrypted in the config store
+(`duckgres_org_user_secrets`, keyed org/user/name) and replays it in the
+`CreateSession` payload on the user's future sessions
+(`duckdbservice/user_secrets.go`). Enabled by the env-only
+`DUCKGRES_USER_SECRET_KEY` (base64 32-byte AES key); unset → clear 0A000
+error. Plain/TEMPORARY `CREATE SECRET` stays session-scoped passthrough.
+Invariants for anyone touching this path:
+
+- **Cross-user isolation is the wipe at session create, not the destroy-time
+  cleanup.** DuckDB secrets are instance-global, and a hot-idle worker is
+  reused across users of an org: `wipeUserPersistentSecrets` (persistent
+  storage only — system secrets `ducklake_s3`/`iceberg_sigv4`/`iceberg_oauth`
+  are in-memory and untouched) MUST run before replay on every CreateSession
+  in shared-warm mode, and a wipe failure MUST fail the session.
+- **Execute-then-persist ordering.** Persist only statements DuckDB accepted;
+  a store failure after a successful exec is an ERROR telling the user the
+  secret will NOT survive the session. Replay failures at session create are
+  warnings, never connection refusals.
+- **No silent non-persistence.** Any path where persistent-secret DDL would
+  execute but not persist must REJECT instead: multi-statement batches and
+  parameterized statements (CP interception), and the Flight SQL ingress
+  (`flightsqlingress.Config.RejectPersistentSecretDDL`). Otherwise the secret
+  works for one session and is silently deleted by the next session's wipe.
+- **DROP's store-fallback is gated on DuckDB's not-found error only**
+  (`isSecretNotFoundError`). Any other exec failure (cancel, RPC error,
+  ambiguity, aborted txn) must surface and leave the store untouched — a
+  false "DROP succeeded" is fatal for a credential revocation.
+- **Never log/store secret statement text.** `usersecrets.RedactForLog` guards
+  logQueryStarted/Finished/Error, the query log, spans, and pg_stat_activity
+  (`currentQuery`); keep new logging of query text behind it.
+- Touching the interception, wipe/replay, or payload shape → update
+  `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
+  and the `persistent_user_secret`(+`_isolation`) assertions in
+  `tests/e2e-mw-dev/harness.sh`.
+
 ## TODO Reference
 
 See `TODO.md` for the full feature roadmap and known issues.

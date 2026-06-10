@@ -34,6 +34,7 @@ type OrgRouter struct {
 	globalCfg             ControlPlaneConfig
 	srv                   *server.Server
 	stsBroker             *STSBroker
+	userSecrets           *CPUserSecretManager
 	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
 	nextWorkerID          atomic.Int32
 	sharedCancel          context.CancelFunc
@@ -45,7 +46,7 @@ type OrgRouter struct {
 }
 
 // NewOrgRouter creates an OrgRouter from the initial config snapshot.
-func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker, resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)) (*OrgRouter, error) {
+func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker, userSecrets *CPUserSecretManager, resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)) (*OrgRouter, error) {
 	tr := &OrgRouter{
 		orgs:                  make(map[string]*OrgStack),
 		configStore:           store,
@@ -53,6 +54,7 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 		globalCfg:             globalCfg,
 		srv:                   srv,
 		stsBroker:             stsBroker,
+		userSecrets:           userSecrets,
 		resolveDucklingStatus: resolveDucklingStatus,
 	}
 
@@ -135,6 +137,9 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	// Pass 0/false to disable budget-based rebalancing.
 	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
 	sessions := NewSessionManager(pool, rebalancer)
+	if tr.userSecrets != nil {
+		sessions.SetUserSecretLoader(tr.userSecrets.SessionSecretLoader(tc.Name))
+	}
 	sessions.SetMaxConnections(tc.MaxConnections)
 	sessions.SetConnectionLimiter(NewRuntimeOrgConnectionLimiter(tr.configStore, tc.Name, tr.baseCfg.CPInstanceID, tr.globalCfg.WorkerQueueTimeout))
 	rebalancer.SetSessionLister(sessions)

@@ -68,6 +68,13 @@ type ControlPlaneConfig struct {
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
 
+	// UserSecretKey is the base64-encoded 32-byte AES key for encrypting
+	// user persistent secrets in the config store (env-only:
+	// DUCKGRES_USER_SECRET_KEY). Empty disables the persistent secret
+	// manager: CREATE PERSISTENT SECRET is rejected with a clear error.
+	// Only used in multitenant remote mode.
+	UserSecretKey string
+
 	// SNIRoutingMode controls hostname-based org routing. Values:
 	//   "" or "off"   - SNI is ignored; legacy database-param routing only
 	//                   (default).
@@ -1922,6 +1929,10 @@ func (cp *ControlPlane) startFlightIngress() {
 		HandleIdleTTL:      cp.cfg.FlightHandleIdleTTL,
 		SessionTokenTTL:    cp.cfg.FlightSessionTokenTTL,
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
+		// Persistent-secret DDL is intercepted on the PG wire protocol only;
+		// over Flight it would execute, never persist, and be wiped at the
+		// next session — reject it up front instead.
+		RejectPersistentSecretDDL: cp.srv != nil && cp.srv.UserSecretManager() != nil,
 	}
 
 	var (

@@ -171,6 +171,19 @@ func SetQueryLogger(s *Server, ql *QueryLogger) {
 	s.queryLogger = ql
 }
 
+// SetUserSecretManager installs the per-user persistent secret manager on a
+// Server. Used by the multitenant control plane after the config store is up.
+// Must be called before the server starts accepting connections.
+func SetUserSecretManager(s *Server, mgr UserSecretManager) {
+	s.cfg.UserSecrets = mgr
+}
+
+// UserSecretManager returns the installed per-user persistent secret manager
+// (nil when the feature is not configured).
+func (s *Server) UserSecretManager() UserSecretManager {
+	return s.cfg.UserSecrets
+}
+
 // QueryLogger returns the server's query logger (may be nil).
 func (s *Server) QueryLogger() *QueryLogger {
 	return s.queryLogger

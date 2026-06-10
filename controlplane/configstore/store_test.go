@@ -448,6 +448,7 @@ func TestTableNames(t *testing.T) {
 	}{
 		{Org{}, "duckgres_orgs"},
 		{OrgUser{}, "duckgres_org_users"},
+		{OrgUserSecret{}, "duckgres_org_user_secrets"},
 		{ManagedWarehouse{}, "duckgres_managed_warehouses"},
 		{GlobalConfig{}, "duckgres_global_config"},
 		{DuckLakeConfig{}, "duckgres_ducklake_config"},
