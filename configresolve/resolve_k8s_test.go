@@ -38,24 +38,24 @@ func TestResolveEffectiveParsesK8sWorkerMaxTTL(t *testing.T) {
 	}
 }
 
-func TestResolveEffectiveParsesK8sHotIdleTTL(t *testing.T) {
+func TestResolveEffectiveParsesK8sWorkerDefaultTTL(t *testing.T) {
 	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
-		if key == "DUCKGRES_K8S_HOT_IDLE_TTL" {
+		if key == "DUCKGRES_K8S_WORKER_DEFAULT_TTL" {
 			return "70m"
 		}
 		return ""
 	}, nil)
 
-	if resolved.K8sHotIdleTTL.String() != "1h10m0s" {
-		t.Fatalf("expected K8s hot-idle TTL 70m, got %s", resolved.K8sHotIdleTTL)
+	if resolved.K8sWorkerDefaultTTL.String() != "1h10m0s" {
+		t.Fatalf("expected K8s hot-idle TTL 70m, got %s", resolved.K8sWorkerDefaultTTL)
 	}
 }
 
-func TestResolveEffectiveRejectsInvalidK8sHotIdleTTL(t *testing.T) {
+func TestResolveEffectiveRejectsInvalidK8sWorkerDefaultTTL(t *testing.T) {
 	var warned []string
 	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
 		switch key {
-		case "DUCKGRES_K8S_HOT_IDLE_TTL":
+		case "DUCKGRES_K8S_WORKER_DEFAULT_TTL":
 			return "soon"
 		case "DUCKGRES_K8S_WORKER_MAX_TTL":
 			return "-5m"
@@ -63,8 +63,8 @@ func TestResolveEffectiveRejectsInvalidK8sHotIdleTTL(t *testing.T) {
 		return ""
 	}, func(msg string) { warned = append(warned, msg) })
 
-	if resolved.K8sHotIdleTTL != 0 {
-		t.Fatalf("expected invalid hot-idle TTL to resolve to 0, got %s", resolved.K8sHotIdleTTL)
+	if resolved.K8sWorkerDefaultTTL != 0 {
+		t.Fatalf("expected invalid hot-idle TTL to resolve to 0, got %s", resolved.K8sWorkerDefaultTTL)
 	}
 	if resolved.K8sWorkerMaxTTL != 0 {
 		t.Fatalf("expected negative worker max TTL to resolve to 0, got %s", resolved.K8sWorkerMaxTTL)

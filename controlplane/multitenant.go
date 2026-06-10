@@ -27,21 +27,18 @@ type orgRouterAdapter struct {
 	router *OrgRouter
 }
 
-// defaultHotIdleTTL is how long a hot-idle worker retains its org assignment
-// before being retired. During this window, any CP pod can reclaim it for the
-// same org without re-activation.
-const defaultHotIdleTTL = 5 * time.Minute
-
-// effectiveHotIdleTTL resolves the janitor's hot-idle retention: the operator
-// override (DUCKGRES_K8S_HOT_IDLE_TTL → K8sConfig.HotIdleTTL) when set,
-// otherwise defaultHotIdleTTL. This is the fallback TTL for workers without a
-// per-worker ttl_minutes (default-profile workers); sized profiles carry their
-// own client-supplied duckgres.worker_ttl and are unaffected.
-func effectiveHotIdleTTL(configured time.Duration) time.Duration {
+// effectiveDefaultWorkerTTL resolves the janitor's hot-idle retention: the
+// operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
+// K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
+// defaultWorkerTTL (20m — the same fallback sized-but-no-ttl requests get at
+// profile resolution, so there is exactly ONE default TTL however a worker
+// came to have no explicit one). The full per-request precedence is:
+// client GUC > org default > deployment default TTL > built-in 20m.
+func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
 	if configured > 0 {
 		return configured
 	}
-	return defaultHotIdleTTL
+	return defaultWorkerTTL
 }
 
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
@@ -243,7 +240,7 @@ func SetupMultiTenant(
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
-	janitor.hotIdleTTL = effectiveHotIdleTTL(cfg.K8s.HotIdleTTL)
+	janitor.hotIdleTTL = effectiveDefaultWorkerTTL(cfg.K8s.WorkerDefaultTTL)
 	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
 	// all flow through this lifecycle service. The legacy retireWorker /
 	// retireOrphanWorker / retireLocalWorker / deleteRetiredWorker

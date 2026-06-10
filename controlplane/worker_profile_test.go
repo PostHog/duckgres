@@ -331,3 +331,37 @@ func TestResolveWorkerProfileOrgDefaults_BuiltinFallback(t *testing.T) {
 		t.Fatal("orgApplied must be true")
 	}
 }
+
+func TestResolveWorkerProfileSizedNoTTLUsesWorkerDefaultTTL(t *testing.T) {
+	// DUCKGRES_K8S_WORKER_DEFAULT_TTL is THE default TTL: a sized request that
+	// omits duckgres.worker_ttl gets the deployment default, not the built-in
+	// 20m. Precedence stays client GUC > org default > deployment default.
+	cp := newSizingTestCP()
+	cp.cfg.K8s.WorkerDefaultTTL = 70 * time.Minute
+
+	p, _, _, err := cp.resolveWorkerProfile(map[string]string{"duckgres.worker_cpu": "4"}, orgWorkerProfileDefaults{})
+	if err != nil || p == nil {
+		t.Fatalf("sized request failed: p=%v err=%v", p, err)
+	}
+	if p.TTL != 70*time.Minute {
+		t.Fatalf("sized-no-ttl TTL = %v, want 70m (deployment default)", p.TTL)
+	}
+
+	// Client GUC still wins over the deployment default.
+	p, _, _, err = cp.resolveWorkerProfile(map[string]string{"duckgres.worker_cpu": "4", "duckgres.worker_ttl": "10m"}, orgWorkerProfileDefaults{})
+	if err != nil || p == nil {
+		t.Fatalf("sized+ttl request failed: p=%v err=%v", p, err)
+	}
+	if p.TTL != 10*time.Minute {
+		t.Fatalf("client ttl = %v, want 10m (GUC beats deployment default)", p.TTL)
+	}
+
+	// Org default beats the deployment default too.
+	p, _, _, err = cp.resolveWorkerProfile(map[string]string{"duckgres.worker_cpu": "4"}, orgWorkerProfileDefaults{TTL: "30m"})
+	if err != nil || p == nil {
+		t.Fatalf("sized+orgttl request failed: p=%v err=%v", p, err)
+	}
+	if p.TTL != 30*time.Minute {
+		t.Fatalf("org ttl = %v, want 30m (org default beats deployment default)", p.TTL)
+	}
+}

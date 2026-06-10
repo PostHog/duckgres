@@ -18,6 +18,10 @@ const (
 
 // Built-in defaults when a request omits a field (or client sizing is gated off)
 // and the deployment did not configure its own default size/TTL.
+// defaultWorkerTTL is the SINGLE built-in TTL: it backs both sized-but-no-ttl
+// requests here and default-shape workers in the janitor
+// (effectiveDefaultWorkerTTL), so "no TTL anywhere" means 20m regardless of
+// how the worker was requested.
 const (
 	defaultWorkerCPU    = "8"
 	defaultWorkerMemory = "16Gi"
@@ -49,7 +53,7 @@ type orgWorkerProfileDefaults struct {
 //     ignored with a warning — a bad config-store row must not break
 //     connections.
 //  3. pool-global WorkerCPURequest/MemoryRequest (else built-in 8/16Gi); TTL
-//     defaults to 20m.
+//     defaults to the deployment WorkerDefaultTTL (else built-in 20m).
 //
 // Returns:
 //   - (nil, warns, false, nil)  => the DEFAULT profile: no client sizing and no
@@ -119,7 +123,13 @@ func (cp *ControlPlane) resolveWorkerProfile(opts map[string]string, org orgWork
 	// Base layer per field: org default, else pool-global request, else built-in.
 	cpu := firstNonEmpty(orgCPU, firstNonEmpty(strings.TrimSpace(k.WorkerCPURequest), defaultWorkerCPU))
 	mem := firstNonEmpty(orgMem, firstNonEmpty(strings.TrimSpace(k.WorkerMemoryRequest), defaultWorkerMemory))
+	// TTL base layer mirrors cpu/mem: org default, else the deployment default
+	// TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL — the same knob that governs
+	// default-shape workers via the janitor), else the built-in 20m.
 	ttl := defaultWorkerTTL
+	if k.WorkerDefaultTTL > 0 {
+		ttl = k.WorkerDefaultTTL
+	}
 	if orgTTLSet {
 		ttl = orgTTL
 	}

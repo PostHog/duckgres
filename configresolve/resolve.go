@@ -123,7 +123,7 @@ type Resolved struct {
 	K8sWorkerProfileMinMemory       string
 	K8sWorkerProfileMaxMemory       string
 	K8sWorkerMaxTTL                 time.Duration
-	K8sHotIdleTTL                   time.Duration
+	K8sWorkerDefaultTTL                   time.Duration
 	AWSRegion                       string
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
@@ -195,7 +195,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	// Connection-string worker-sizing config (all default to off/empty).
 	var k8sAllowClientWorkerProfile bool
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
-	var k8sWorkerMaxTTL, k8sHotIdleTTL time.Duration
+	var k8sWorkerMaxTTL, k8sWorkerDefaultTTL time.Duration
 	var k8sWorkerPriorityClassName string
 	var k8sHeadroomPercent int
 	var k8sPlaceholderImage, k8sPlaceholderCPU, k8sPlaceholderMemory, k8sPlaceholderPriorityClassName string
@@ -857,11 +857,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_K8S_WORKER_MAX_TTL: " + v)
 		}
 	}
-	if v := getenv("DUCKGRES_K8S_HOT_IDLE_TTL"); v != "" {
+	if v := getenv("DUCKGRES_K8S_WORKER_DEFAULT_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			k8sHotIdleTTL = d
+			k8sWorkerDefaultTTL = d
 		} else {
-			warn("Invalid DUCKGRES_K8S_HOT_IDLE_TTL: " + v)
+			warn("Invalid DUCKGRES_K8S_WORKER_DEFAULT_TTL: " + v)
 		}
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
@@ -1224,7 +1224,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerProfileMinMemory:       k8sWorkerProfileMinMemory,
 		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
 		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
-		K8sHotIdleTTL:                   k8sHotIdleTTL,
+		K8sWorkerDefaultTTL:                   k8sWorkerDefaultTTL,
 		AWSRegion:                       awsRegion,
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,
