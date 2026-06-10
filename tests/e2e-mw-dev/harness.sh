@@ -105,7 +105,7 @@ HEAVY_EXPECT=1500000000
 # stdout would land in that capture and make jq choke ("Invalid numeric literal").
 log()  { echo ">>> $*" >&2; }
 
-apk add --no-cache curl jq postgresql-client openssl >/dev/null 2>&1 || true
+apk add --no-cache curl jq postgresql-client openssl python3 py3-psycopg2 >/dev/null 2>&1 || true
 
 # kubectl, for the pod-level assertions the Go suite used to make via client-go.
 # The Job runs as the `duckgres` SA (pods get/list/delete/patch + pods/exec +
@@ -404,71 +404,78 @@ EOF
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
-# Black-box regression for async cancel cleanup: psql handles SIGINT by sending
-# a PostgreSQL CancelRequest and keeping the same connection open. The next query
-# is written immediately to that same stdin stream; if the control plane reuses
-# the session before the worker has released its cancelled DoGet operation, this
-# can fail with "session already has an active operation".
+# Black-box regression for async cancel cleanup: libpq's cancel path sends a
+# PostgreSQL CancelRequest while keeping the same connection open. The next
+# query runs immediately on that same session; if the control plane reuses the
+# session before the worker has released its cancelled DoGet operation, this can
+# fail with "session already has an active operation".
 cancel_then_reuse_same_session() { # org password
   log "cancel then immediate same-session reuse on $1"
-  in="$(mktemp)"; out="$(mktemp)"
-  rm -f "$in"
-  mkfifo "$in"
+  out="$(mktemp)"
+  if ! python3 - "$1" "$2" "$CP_IP" "$SNI_SUFFIX" "$HEAVY_Q" >"$out" 2>&1 <<'PY'
+import sys
+import threading
+import time
 
-  ( trap - INT
-    export PGPASSWORD="$2"
-    exec psql \
-      "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
-      -v ON_ERROR_STOP=0 -q -tA <"$in" >"$out" 2>&1
-  ) &
-  psql_pid=$!
+import psycopg2
 
-  exec 9>"$in"
-  set +e
-  printf '%s\n' "$HEAVY_Q" >&9
-  write_rc=$?
-  set -e
-  [ "$write_rc" = 0 ] || {
-    exec 9>&-
-    wait "$psql_pid" 2>/dev/null || true
+org, password, hostaddr, sni_suffix, heavy_q = sys.argv[1:]
+conn = psycopg2.connect(
+    dbname="ducklake",
+    user="root",
+    password=password,
+    host=org + sni_suffix,
+    hostaddr=hostaddr,
+    port=5432,
+    sslmode="require",
+    connect_timeout=30,
+)
+conn.autocommit = True
+try:
+    cur = conn.cursor()
+    timer = threading.Timer(3.0, conn.cancel)
+    timer.start()
+    cancelled = False
+    try:
+        cur.execute(heavy_q)
+        print("heavy query completed before cancel")
+    except Exception as exc:
+        cancelled = True
+        msg = str(exc)
+        if "cancel" not in msg.lower():
+            raise SystemExit(f"heavy query failed without cancellation: {msg}")
+        print(f"cancel_error={msg}")
+    finally:
+        timer.cancel()
+    if not cancelled:
+        raise SystemExit("heavy query did not get cancelled")
+
+    cur.execute(
+        "CREATE TEMP TABLE cancel_reuse_marker(v INT); "
+        "INSERT INTO cancel_reuse_marker VALUES (42); "
+        "SELECT v FROM cancel_reuse_marker;"
+    )
+    marker = cur.fetchone()[0]
+    if marker != 42:
+        raise SystemExit(f"marker query returned {marker}, want 42")
+    print("marker=42")
+finally:
+    conn.close()
+PY
+  then
     text="$(tr '\n' ' ' <"$out" | tail -c 400)"
-    rm -f "$in" "$out"
-    fail "cancel_then_reuse_same_session: failed to send heavy query to psql: $text"
-  }
-  sleep 3
-  kill -0 "$psql_pid" 2>/dev/null || {
-    exec 9>&-
-    fail "cancel_then_reuse_same_session: psql exited before cancel: $(tr '\n' ' ' <"$out" | tail -c 200)"
-  }
-  kill -INT "$psql_pid" 2>/dev/null || true
-  # Same connection proof: a TEMP table survives only if the post-cancel query
-  # runs on the original session.
-  set +e
-  printf '%s\n' "CREATE TEMP TABLE cancel_reuse_marker(v INT); INSERT INTO cancel_reuse_marker VALUES (42); SELECT v FROM cancel_reuse_marker;" >&9
-  reuse_write_rc=$?
-  printf '\\q\n' >&9
-  quit_write_rc=$?
-  exec 9>&-
-  set -e
-
-  rc=0
-  wait "$psql_pid" || rc=$?
+    rm -f "$out"
+    case "$text" in
+      *"session already has an active operation"*)
+        fail "cancel_then_reuse_same_session: session reused before worker cancel cleanup completed: $text" ;;
+      *) fail "cancel_then_reuse_same_session: cancel/reuse client failed: $text" ;;
+    esac
+  fi
   text="$(tr '\n' ' ' <"$out" | tail -c 400)"
-  rm -f "$in" "$out"
-  [ "$reuse_write_rc" = 0 ] || fail "cancel_then_reuse_same_session: failed to send reuse query after cancel: $text"
-  [ "$quit_write_rc" = 0 ] || fail "cancel_then_reuse_same_session: failed to send quit after cancel: $text"
-  [ "$rc" = 0 ] || fail "cancel_then_reuse_same_session: psql rc=$rc output=$text"
+  rm -f "$out"
   case "$text" in
-    *"session already has an active operation"*)
-      fail "cancel_then_reuse_same_session: session reused before worker cancel cleanup completed: $text" ;;
-  esac
-  case "$text" in
-    *"canceling statement"*|*"Query was cancelled"*|*"context canceled"*|*"Cancel request sent"*) ;;
-    *) fail "cancel_then_reuse_same_session: heavy query did not appear to be cancelled: $text" ;;
-  esac
-  case "$text" in
-    *"42"*) ;;
-    *) fail "cancel_then_reuse_same_session: same-session marker query did not succeed: $text" ;;
+    *"cancel_error="*"marker=42"*) ;;
+    *) fail "cancel_then_reuse_same_session: expected cancel and same-session marker success, got: $text" ;;
   esac
 }
 

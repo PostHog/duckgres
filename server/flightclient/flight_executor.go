@@ -324,6 +324,9 @@ func (e *FlightExecutor) Close() error {
 }
 
 func isTerminalSessionIdleWaitError(err error) bool {
+	if strings.Contains(err.Error(), "flight client panic") {
+		return true
+	}
 	switch status.Code(err) {
 	case codes.Canceled, codes.Unavailable, codes.FailedPrecondition, codes.NotFound:
 		return true
@@ -339,7 +342,12 @@ func (e *FlightExecutor) waitForSessionIdle() (err error) {
 	if e.client == nil || e.client.Client == nil {
 		return nil
 	}
-	defer recoverClientPanic(&err)
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil && isTerminalSessionIdleWaitError(err) {
+			err = nil
+		}
+	}()
 
 	payload, err := json.Marshal(wire.WorkerWaitSessionIdlePayload{
 		WorkerControlMetadata: wire.WorkerControlMetadata{
@@ -867,7 +875,7 @@ func interpolateArgs(query string, args []any) string {
 }
 
 // scanQuoted returns the index just past a quoted region starting at start
-// (query[start] == quote), treating a doubled quote (” or "") as an escape.
+// (query[start] == quote), treating a doubled quote ('' or "") as an escape.
 func scanQuoted(query string, start int, quote byte) int {
 	for i := start + 1; i < len(query); i++ {
 		if query[i] != quote {
