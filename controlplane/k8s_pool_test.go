@@ -1617,8 +1617,18 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 	if _, ok := pool.Worker(worker.ID); ok {
 		t.Fatal("expected already-lost current lease to remove local worker")
 	}
-	if got := podDeleteActionNames(cs); len(got) != 1 || got[0] != "test-cp-worker-13" {
-		t.Fatalf("expected already-lost current lease to delete pod, got %v", got)
+	// The pod delete runs on a background goroutine after the crash
+	// notification; poll for it (pre-existing flake under -race).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := podDeleteActionNames(cs)
+		if len(got) == 1 && got[0] == "test-cp-worker-13" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected already-lost current lease to delete pod, got %v", got)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -2809,21 +2819,35 @@ func TestK8sPoolRetireWorkerUsesTrackedPodName(t *testing.T) {
 	}
 	pool.workers[worker.ID] = worker
 
+	// The pod delete happens on retireWorkerWithReason's background goroutine, so
+	// the captured name must be read under a lock (pre-existing -race flake).
+	var mu sync.Mutex
 	var deletedPodName string
 	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		deleteAction, ok := action.(k8stesting.DeleteAction)
 		if !ok {
 			return false, nil, nil
 		}
+		mu.Lock()
 		deletedPodName = deleteAction.GetName()
+		mu.Unlock()
 		return false, nil, nil
 	})
 
 	pool.RetireWorker(worker.ID)
-	time.Sleep(100 * time.Millisecond)
 
-	if deletedPodName != "duckgres-worker-other-cp-11" {
-		t.Fatalf("expected retire to delete tracked pod name duckgres-worker-other-cp-11, got %q", deletedPodName)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := deletedPodName
+		mu.Unlock()
+		if got == "duckgres-worker-other-cp-11" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected retire to delete tracked pod name duckgres-worker-other-cp-11, got %q", got)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
