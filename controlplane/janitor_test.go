@@ -435,11 +435,11 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
 
 	var mu sync.Mutex
-	reconciled := 0
+	lifecycleObserved := 0
 	janitor.observeWorkerLifecycle = func() {
 		mu.Lock()
 		defer mu.Unlock()
-		reconciled++
+		lifecycleObserved++
 	}
 
 	janitor.runOnce()
@@ -462,7 +462,7 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if reconciled != 1 {
-		t.Fatalf("expected warm capacity reconciliation despite expiry error, got %d", reconciled)
+	if lifecycleObserved != 1 {
+		t.Fatalf("expected worker lifecycle observation despite expiry error, got %d", lifecycleObserved)
 	}
 }

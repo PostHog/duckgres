@@ -76,11 +76,11 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	}
 	if worker == nil {
 		// OwnerCPInstanceID is already this CP's id from the struct literal
-		// above. Stamping warm/idle workers with the creating CP keeps
+		// above. Stamping idle workers with the creating CP keeps
 		// last_heartbeat_at fresh via the CP heartbeat — without it, the
 		// orphan reconciler matches case (2) (NULLIF(owner_cp_instance_id,
 		// '') IS NULL AND last_heartbeat_at <= before) the moment the row
-		// crosses orphanGrace, so warm workers get reaped on a ~30s loop.
+		// crosses orphanGrace, so idle workers get reaped on a ~30s loop.
 		return record
 	}
 	record.PodName = p.workerPodName(worker)

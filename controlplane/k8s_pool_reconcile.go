@@ -17,7 +17,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// RetireOneMismatchedVersionWorker scans all shared warm-worker pods in the
+// RetireOneMismatchedVersionWorker scans all shared worker pods in the
 // namespace for one whose duckgres/control-plane label identifies a different
 // Deployment ReplicaSet (pod-template-hash) than this CP, atomically marks
 // its idle runtime-store row retired, and deletes the pod.
@@ -77,7 +77,7 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		}
 
 		// Resolve the target version for this specific pod.
-		// For neutral workers, the target is the global binary version.
+		// For unassigned workers, the target is the global binary version.
 		// For assigned workers, the target is the tenant's configured image.
 		var isMismatched bool
 		podOrgID := pod.Labels["duckgres/org"]

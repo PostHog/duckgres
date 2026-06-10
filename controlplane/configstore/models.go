@@ -439,7 +439,7 @@ type WorkerRecord struct {
 	// TTLMinutes is how long this worker stays hot-idle after its last query
 	// before the janitor retires it (client-selected duckgres.worker_ttl, rounded
 	// down to whole minutes). 0 = use the deployment's global hot-idle TTL
-	// (default/warm/neutral workers and legacy rows). AutoMigrate adds this
+	// (default/legacy workers and legacy rows). AutoMigrate adds this
 	// column; no migration file.
 	TTLMinutes          int         `gorm:"default:0" json:"ttl_minutes"`
 	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
@@ -454,7 +454,7 @@ type WorkerRecord struct {
 	// will expire. Stamped when the control plane mints creds (initial
 	// activation, takeover, scheduled refresh) and consulted by the
 	// credential refresh scheduler to pick workers nearing expiry. NULL on
-	// workers that haven't had creds issued yet (warm pool) and on legacy
+	// workers that haven't had creds issued yet and on legacy
 	// rows from before this column existed — both are treated as "due now"
 	// by the scheduler so they get refreshed eagerly.
 	S3CredentialsExpiresAt *time.Time `gorm:"index" json:"s3_credentials_expires_at,omitempty"`

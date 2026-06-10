@@ -11,7 +11,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-// OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
+// OrgReservedPool presents one org's reserved slice of a shared K8s pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
 // workers are reserved to a single org for their lifetime and retired after use.
 type OrgReservedPool struct {
@@ -55,7 +55,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	// Fast path: reuse an already-assigned, idle (Hot) worker of the requested
 	// shape. Such a worker is already this org's and free, so reusing it
 	// concurrently is safe and needs no FIFO ordering — it is not a freshly
-	// spawned/neutral worker that a queued waiter is owed (those are claimed only
+	// spawned worker that a queued waiter is owed (those are claimed only
 	// via the gated slow path below).
 	if w := p.tryReuseIdleAssigned(profile); w != nil {
 		return w, nil

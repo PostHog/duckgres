@@ -39,7 +39,7 @@ func TestControlPlaneRBACIncludesSharedWorkerConfigMapRead(t *testing.T) {
 	}
 }
 
-func TestControlPlaneRBACDefinesNeutralWorkerServiceAccount(t *testing.T) {
+func TestControlPlaneRBACDefinesSharedWorkerServiceAccount(t *testing.T) {
 	content := readManifest(t, "k8s", "rbac.yaml")
 	for _, want := range []string{
 		"kind: ServiceAccount",
@@ -51,7 +51,7 @@ func TestControlPlaneRBACDefinesNeutralWorkerServiceAccount(t *testing.T) {
 		}
 	}
 	if strings.Contains(content, "subjects:\n  - kind: ServiceAccount\n    name: duckgres-worker") {
-		t.Fatal("expected neutral worker service account to have no RoleBinding in k8s/rbac.yaml")
+		t.Fatal("expected shared worker service account to have no RoleBinding in k8s/rbac.yaml")
 	}
 }
 
