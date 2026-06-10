@@ -799,6 +799,18 @@ func (c *clientConn) serve() error {
 		case icebergAttached:
 			catalog = iceberg.CatalogName
 		}
+		// Prime the Iceberg REST catalog's schema list on this connection before the
+		// compat-view bind in InitSessionDatabaseMetadata enumerates every attached
+		// catalog. On the first session of a cold backing instance an unmaterialized
+		// Iceberg catalog otherwise surfaces a schema with an empty name, failing the
+		// bind with `Schema with name "" not found`. Best-effort: a real failure
+		// still surfaces from InitSessionDatabaseMetadata below.
+		if catalog == iceberg.CatalogName {
+			primeStmt := fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
+			if _, err := c.executor.ExecContext(initCtx, primeStmt); err != nil {
+				slog.Warn("Failed to prime Iceberg catalog before session metadata init.", "error", err)
+			}
+		}
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))

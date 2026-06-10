@@ -16,7 +16,10 @@
 #                  jsonb || keeps Postgres concat semantics through
 #                  transpilation (#716), and a pipelined extended-query error
 #                  discards queued messages until Sync (#718).
-#   activation   : DuckLake + Iceberg catalogs attach and read/write.
+#   activation   : DuckLake + Iceberg catalogs attach and read/write. The FIRST
+#                  session on a cold Iceberg worker must not fail the pg_catalog
+#                  compat-view bind (the CP primes the REST catalog's schema list
+#                  first); asserted on cnpg + ext.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
@@ -412,6 +415,59 @@ rw_iceberg() { # org password
   n="$(pg "$1" "$2" iceberg "SELECT COUNT(*) FROM iceberg.public.$t;")"
   [ "$n" = "2" ] || fail "$1 Iceberg rowcount=$n want 2"
   pg "$1" "$2" iceberg "DROP TABLE iceberg.public.$t;"
+}
+
+# Regression for the Iceberg cold-start session-init bug: the FIRST session on a
+# freshly-spawned (cold) worker must not fail the pg_catalog compat-view bind.
+# Before the fix, InitSessionDatabaseMetadata enumerated every attached catalog
+# before anything had materialized the Iceberg REST catalog's schema list on the
+# new session connection, so the bind hit `Catalog Error: Schema with name ""
+# not found` and the connection was rejected with `failed to initialize session
+# database metadata`; only a reconnect (instance since settled) masked it. With
+# the warm pool gone, every org's first connect lands the literal first session
+# on its worker, so this fired in practice. The CP now primes the catalog
+# (`USE iceberg.<schema>`) before the bind. This forces a cold worker and asserts
+# the first connect succeeds: cold-spawn backpressure is still tolerated, but the
+# metadata-init bind error fails the test immediately instead of being retried
+# away (which is exactly how a live reconnect would mask it).
+iceberg_cold_first_connect() { # org password
+  log "iceberg cold first-connect (metadata-init regression) on $1"
+  # Force cold: delete every worker for the org and wait until none remain, so
+  # the next connect cold-spawns a brand-new worker whose first session is the
+  # client's — the precise condition that triggered the bug.
+  for p in $(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" -o name 2>/dev/null); do
+    k delete "$p" --grace-period=0 --force >/dev/null 2>&1 || true
+  done
+  i=0
+  while [ "$i" -lt 45 ]; do
+    n="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
+    [ "$n" = "0" ] && break
+    sleep 2; i=$((i + 1))
+  done
+  # First connect. Tolerate cold-spawn backpressure (worker still booting), but
+  # treat the session-metadata-init bind failure as a hard regression — do NOT
+  # retry it, or the bug would be masked exactly as a live reconnect masks it.
+  # The metadata-init clause is listed first so it wins over the broader
+  # "failed to initialize session" transient it is a prefix-superset of.
+  a=0 out=""
+  while [ "$a" -lt 12 ]; do
+    if out="$(PGPASSWORD="$2" psql \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=iceberg" \
+        -v ON_ERROR_STOP=1 -tAc "SELECT 1" 2>&1)"; then
+      [ "$out" = "1" ] || fail "iceberg_cold_first_connect: $1 returned '$out' want 1"
+      return
+    fi
+    case "$out" in
+      *"failed to initialize session database metadata"*|*'Schema with name "" not found'*)
+        fail "iceberg_cold_first_connect: cold first session hit the metadata-init bind bug on $1 (prime regressed): $out" ;;
+      *"capacity exhausted"*|*"no Duckgres worker"*|*"still provisioning"*|\
+      *"failed to initialize session"*|*"timed out waiting for an available worker"*|\
+      *"failed to start"*|*"spawn sized worker"*|*"failed to detect attached catalogs"*)
+        sleep 10; a=$((a + 1)); continue ;;
+      *) fail "iceberg_cold_first_connect: unexpected error on $1: $out" ;;
+    esac
+  done
+  fail "iceberg_cold_first_connect: exhausted retries waiting for a cold worker on $1"
 }
 
 # ---- worker pod assertions (via the K8s API) ------------------------------
@@ -927,6 +983,7 @@ main() {
   rw_ducklake            "$CNPG" "$cnpg_pw"
   pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
+  iceberg_cold_first_connect "$CNPG" "$cnpg_pw"  # cold first session must not fail the metadata-init bind
   rw_iceberg             "$CNPG" "$cnpg_pw"
   assert_worker_pod
   concurrent_connections "$CNPG" "$cnpg_pw"
@@ -958,6 +1015,7 @@ main() {
   wait_worker "$EXT" "$ext_pw" ducklake
   basic_query  "$EXT" "$ext_pw"
   rw_ducklake  "$EXT" "$ext_pw"
+  iceberg_cold_first_connect "$EXT" "$ext_pw"  # cold first session must not fail the metadata-init bind (ext backend)
   rw_iceberg   "$EXT" "$ext_pw"
 
   # ---- org default worker profile (server-side sizing, no client GUCs) ----
@@ -974,7 +1032,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"
