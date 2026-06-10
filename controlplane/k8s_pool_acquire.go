@@ -336,7 +336,13 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 // decision (which will typically create a spawning slot).
 func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, claim *sharedWorkerClaim, assignment *WorkerAssignment) (worker *ManagedWorker, retry bool, err error) {
 	if claim.hotClaimed != nil {
+		// hot_idle_claim covers the adopt/health-check I/O for a claimed
+		// hot-idle worker (the DB claim itself happened in the gated decision
+		// and is microseconds). Stale-claim retries observe as error per
+		// attempt.
+		hotClaimStart := time.Now()
 		worker, reserveErr := p.reserveClaimedWorker(ctx, claim.hotClaimed, assignment)
+		observeAcquirePhase("hot_idle_claim", time.Since(hotClaimStart), reserveErr)
 		if reserveErr == nil {
 			worker.hotIdleReclaimed = true
 			return worker, false, nil
