@@ -177,7 +177,7 @@ _pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
       *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
       *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
-      *"failed to detect attached catalogs"*)
+      *"failed to detect attached catalogs"*|*"failed to obtain connection from pool"*)
         # The last three cover an on-demand cold spawn that needed a fresh node
         # (sized worker too big for the warm node): the first connect can hit the
         # spawn ceiling while the pod is still pulling/booting; by the retry it is
@@ -215,7 +215,7 @@ pg_try() { # org password dbname sql
       *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
       *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
-      *"failed to detect attached catalogs"*)
+      *"failed to detect attached catalogs"*|*"failed to obtain connection from pool"*)
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out"; return 1 ;;
     esac
@@ -393,7 +393,7 @@ EOF
       *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
       *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
-      *"failed to detect attached catalogs"*)
+      *"failed to detect attached catalogs"*|*"failed to obtain connection from pool"*)
         sleep 10; a=$((a + 1)); continue ;;
     esac
     break
@@ -489,7 +489,7 @@ iceberg_cold_first_connect() { # org password
         fail "iceberg_cold_first_connect: cold first session hit the metadata-init bind bug on $1 (prime regressed): $out" ;;
       *"capacity exhausted"*|*"no Duckgres worker"*|*"still provisioning"*|\
       *"failed to initialize session"*|*"timed out waiting for an available worker"*|\
-      *"failed to start"*|*"spawn sized worker"*|*"failed to detect attached catalogs"*)
+      *"failed to start"*|*"spawn sized worker"*|*"failed to detect attached catalogs"*|*"failed to obtain connection from pool"*)
         sleep 10; a=$((a + 1)); continue ;;
       *) fail "iceberg_cold_first_connect: unexpected error on $1: $out" ;;
     esac
