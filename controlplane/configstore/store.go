@@ -260,6 +260,9 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			IdleTimeoutS:        o.IdleTimeoutS,
 			WorkerCPURequest:    o.WorkerCPURequest,
 			WorkerMemoryRequest: o.WorkerMemoryRequest,
+			DefaultWorkerCPU:    o.DefaultWorkerCPU,
+			DefaultWorkerMemory: o.DefaultWorkerMemory,
+			DefaultWorkerTTL:    o.DefaultWorkerTTL,
 			Users:               make(map[string]string),
 			Warehouse:           copyManagedWarehouseConfig(o.Warehouse),
 		}
@@ -469,6 +472,25 @@ func (cs *ConfigStore) OrgWarehouseStatus(orgID string) (string, bool) {
 	return string(oc.Warehouse.State), true
 }
 
+// OrgDefaultWorkerProfile returns the org's operator-set default worker
+// profile from the current snapshot: cpu/memory as k8s resource-quantity
+// strings and ttl as a Go duration string. Empty strings mean "not set"
+// (including unknown orgs and a not-yet-loaded snapshot). Values are stored
+// as entered by the operator; validation/normalization happens at resolution
+// time in the control plane (a bad row must never break connections).
+func (cs *ConfigStore) OrgDefaultWorkerProfile(orgID string) (cpu, memory, ttl string) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return "", "", ""
+	}
+	oc, ok := cs.snapshot.Orgs[orgID]
+	if !ok {
+		return "", "", ""
+	}
+	return oc.DefaultWorkerCPU, oc.DefaultWorkerMemory, oc.DefaultWorkerTTL
+}
+
 // ValidateOrgUser checks username/password scoped to a specific org.
 func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 	cs.mu.RLock()
@@ -653,7 +675,6 @@ func (cs *ConfigStore) GetManagedWarehouseIceberg(orgID string) (*ManagedWarehou
 	return &ic, nil
 }
 
-
 // migrateDeltaCatalogDefaultEnabled is a one-shot backfill that flips existing
 // rows where delta_catalog_enabled was stored as false (the old default) to
 // true. New rows get true automatically via the gorm:"default:true" column
@@ -765,6 +786,7 @@ func (cs *ConfigStore) RuntimeSchema() string {
 func (cs *ConfigStore) runtimeTable(base string) string {
 	return cs.runtimeSchema + "." + base
 }
+
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
 // state by image and tenant binding for Prometheus observability.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
@@ -926,6 +948,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 	}
 	return &record, nil
 }
+
 // ClaimHotIdleWorker atomically claims one hot-idle worker row that was
 // previously activated for the given org. The selected row is locked with
 // SKIP LOCKED and transitioned to reserved while incrementing owner_epoch.
@@ -1408,6 +1431,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 	}
 	return created, nil
 }
+
 // ListOrphanedWorkers returns workers in active states that no live CP
 // is responsible for any longer. Three independent failure modes are
 // covered, joined by OR:

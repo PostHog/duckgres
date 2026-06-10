@@ -66,6 +66,18 @@ client-go:
   can't satisfy the second from the first's hot-idle pool. There is no warm pool,
   so the only workers are the ones a request sizes + spawns on demand.
   Clamp enforcement itself is unit-covered (`controlplane/worker_profile_test.go`).
+- **org default worker profile** — an operator-set per-org default worker shape
+  + hot-idle TTL (config-store columns `default_worker_cpu`/`memory`/`ttl`, set
+  via the admin API `PUT /orgs/:id`) must size a **plain** connection — one that
+  sends no `duckgres.worker_*` startup options at all (the external-customer
+  case). The harness sets `2/8Gi/10m` on the ext org, asserts the admin API
+  round-trips the fields and 400s garbage values, then connects without
+  `PGOPTIONS` and asserts the worker pod carries the org default on requests
+  **and** limits; finally it clears the default (explicit empty strings) and
+  asserts a fresh plain connection no longer produces org-default-shaped pods.
+  Per-field client-GUC-over-org-default precedence and the
+  AllowClientWorkerProfile-independence of org defaults are unit-covered
+  (`controlplane/worker_profile_test.go`).
 - **extension forks** — the bundled `ducklake`/`httpfs` extensions are the
   PostHog forks, not upstream (ported from the `*IsBundledFork` tests).
 - **worker pods** — labels (`app`, `duckgres/control-plane`,

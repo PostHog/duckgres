@@ -67,6 +67,11 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.MemoryBudget = updates.MemoryBudget
 	org.IdleTimeoutS = updates.IdleTimeoutS
 	org.MaxConnections = updates.MaxConnections
+	// Mirrors gormAPIStore: written unconditionally so "" clears (the handler
+	// presence-merge already preserved omitted fields).
+	org.DefaultWorkerCPU = updates.DefaultWorkerCPU
+	org.DefaultWorkerMemory = updates.DefaultWorkerMemory
+	org.DefaultWorkerTTL = updates.DefaultWorkerTTL
 	if updates.WorkerCPURequest != "" {
 		org.WorkerCPURequest = updates.WorkerCPURequest
 	}
@@ -1480,5 +1485,156 @@ func TestUpdateOrgMaxConnections(t *testing.T) {
 	}
 	if store.orgs["analytics"].IdleTimeoutS != 30 {
 		t.Fatalf("expected idle_timeout_s to be preserved, got %d", store.orgs["analytics"].IdleTimeoutS)
+	}
+}
+
+// --- Org default worker profile (default_worker_cpu/memory/ttl) ---
+
+func TestUpdateOrgSetsDefaultWorkerProfile(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"default_worker_cpu":"2","default_worker_memory":"8Gi","default_worker_ttl":"10m"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "2" || stored.DefaultWorkerMemory != "8Gi" || stored.DefaultWorkerTTL != "10m" {
+		t.Fatalf("stored default profile = %q/%q/%q, want 2/8Gi/10m",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+	// The fields must round-trip in the response JSON so operators can read
+	// back what they set (GET uses the same model serialization).
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["default_worker_cpu"] != "2" || resp["default_worker_memory"] != "8Gi" || resp["default_worker_ttl"] != "10m" {
+		t.Fatalf("response JSON missing default worker profile fields: %s", rec.Body.String())
+	}
+}
+
+func TestUpdateOrgClearsDefaultWorkerProfileWithEmptyStrings(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name: "acme", DatabaseName: "acme",
+		DefaultWorkerCPU: "2", DefaultWorkerMemory: "8Gi", DefaultWorkerTTL: "10m",
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"default_worker_cpu":"","default_worker_memory":"","default_worker_ttl":""}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "" || stored.DefaultWorkerMemory != "" || stored.DefaultWorkerTTL != "" {
+		t.Fatalf("default profile not cleared: %q/%q/%q",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+}
+
+func TestUpdateOrgOmittingDefaultWorkerProfilePreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name: "acme", DatabaseName: "acme",
+		DefaultWorkerCPU: "2", DefaultWorkerMemory: "8Gi", DefaultWorkerTTL: "10m",
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"max_workers":4}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "2" || stored.DefaultWorkerMemory != "8Gi" || stored.DefaultWorkerTTL != "10m" {
+		t.Fatalf("default profile not preserved: %q/%q/%q",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+}
+
+func TestUpdateOrgRejectsInvalidDefaultWorkerProfile(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"garbage cpu quantity", `{"default_worker_cpu":"lots"}`},
+		{"zero cpu", `{"default_worker_cpu":"0"}`},
+		{"negative memory", `{"default_worker_memory":"-8Gi"}`},
+		{"garbage memory quantity", `{"default_worker_memory":"big"}`},
+		{"garbage ttl duration", `{"default_worker_ttl":"whenever"}`},
+		{"negative ttl", `{"default_worker_ttl":"-5m"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme", DefaultWorkerCPU: "2"}
+			router := newTestAPIRouter(store)
+
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if store.orgs["acme"].DefaultWorkerCPU != "2" {
+				t.Fatal("invalid payload must not mutate the stored org")
+			}
+		})
+	}
+}
+
+func TestCreateOrgAcceptsDefaultWorkerProfile(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_cpu":"2","default_worker_memory":"8Gi","default_worker_ttl":"75m"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "2" || stored.DefaultWorkerMemory != "8Gi" || stored.DefaultWorkerTTL != "75m" {
+		t.Fatalf("stored default profile = %q/%q/%q, want 2/8Gi/75m",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+}
+
+func TestCreateOrgRejectsInvalidDefaultWorkerTTL(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_ttl":"10 minutes"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.orgs["acme"]; ok {
+		t.Fatal("org should NOT have been created")
 	}
 }

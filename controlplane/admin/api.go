@@ -15,6 +15,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
@@ -188,6 +189,12 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		"memory_budget":   updates.MemoryBudget,
 		"idle_timeout_s":  updates.IdleTimeoutS,
 		"max_connections": updates.MaxConnections,
+		// Org default worker profile: written unconditionally so an explicit
+		// empty string CLEARS the default (the handler's presence-merge keeps
+		// omitted fields at their stored values before this runs).
+		"default_worker_cpu":    updates.DefaultWorkerCPU,
+		"default_worker_memory": updates.DefaultWorkerMemory,
+		"default_worker_ttl":    updates.DefaultWorkerTTL,
 	}
 	// Only update resource fields when explicitly provided to avoid clearing
 	// previously-set values when the caller omits them from the JSON payload.
@@ -658,6 +665,17 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["worker_memory_request"]; ok {
 		merged.WorkerMemoryRequest = updates.WorkerMemoryRequest
 	}
+	// Org default worker profile: present-in-payload wins, including an
+	// explicit "" which clears the default.
+	if _, ok := fields["default_worker_cpu"]; ok {
+		merged.DefaultWorkerCPU = updates.DefaultWorkerCPU
+	}
+	if _, ok := fields["default_worker_memory"]; ok {
+		merged.DefaultWorkerMemory = updates.DefaultWorkerMemory
+	}
+	if _, ok := fields["default_worker_ttl"]; ok {
+		merged.DefaultWorkerTTL = updates.DefaultWorkerTTL
+	}
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
@@ -697,6 +715,42 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	if org.HostnameAlias != nil {
 		if err := validateHostnameAlias(*org.HostnameAlias); err != nil {
 			return err
+		}
+	}
+	if err := validateOrgDefaultWorkerProfile(org); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateOrgDefaultWorkerProfile rejects garbage default-worker-profile
+// values at the API boundary so they can never enter the config store (the
+// control plane tolerates bad rows by ignoring them, but a 400 here surfaces
+// the typo to the operator instead of a silently-ignored default). Empty
+// strings are allowed: they mean "unset" on create / "clear" on update.
+func validateOrgDefaultWorkerProfile(org *configstore.Org) error {
+	for _, f := range []struct{ name, raw string }{
+		{"default_worker_cpu", org.DefaultWorkerCPU},
+		{"default_worker_memory", org.DefaultWorkerMemory},
+	} {
+		if f.raw == "" {
+			continue
+		}
+		q, err := resource.ParseQuantity(f.raw)
+		if err != nil {
+			return fmt.Errorf("%s: invalid quantity %q", f.name, f.raw)
+		}
+		if q.Sign() <= 0 {
+			return fmt.Errorf("%s: quantity %q must be positive", f.name, f.raw)
+		}
+	}
+	if raw := org.DefaultWorkerTTL; raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("default_worker_ttl: invalid duration %q (use a Go duration like \"30m\")", raw)
+		}
+		if d < 0 {
+			return fmt.Errorf("default_worker_ttl: duration %q must be >= 0", raw)
 		}
 	}
 	return nil
