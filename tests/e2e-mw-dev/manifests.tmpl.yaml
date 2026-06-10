@@ -253,8 +253,8 @@ spec:
             # - workerQueueTimeout bounds how long a connection waits for its
             #   on-demand cold spawn (binary default 60s is too tight for a
             #   fresh Karpenter node — observed flaking the sized assertions).
-            # - an explicit worker cap, like prod's maxWorkers; without it the
-            #   binary derives one from the CP pod's (tiny, 1Gi) memory.
+            # - an explicit worker cap, like prod's maxWorkers (unset = unbounded
+            #   for the k8s backend; the nodepool is the only ceiling).
             # Deliberately NOT aligned with prod:
             # - DUCKGRES_K8S_WORKER_PRIORITY_CLASS: e2e workers run on the
             #   shared default nodepool — prod's 1000000 PriorityClass would let
