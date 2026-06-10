@@ -96,7 +96,7 @@ type K8sWorkerPool struct {
 
 	// nodeFirstSeen tracks the first time this CP observed a worker on each
 	// node. Used to prefer reaping workers on the newest-seen nodes and
-	// claiming idle workers on the oldest-seen nodes, so warm parquet pages
+	// claiming idle workers on the oldest-seen nodes, so cached parquet pages
 	// on the local NVMe cache-proxy stay useful for longer. Per-CP state;
 	// CPs don't coordinate this (see idleReaper/findIdleWorker).
 	nodeFirstSeen map[string]time.Time

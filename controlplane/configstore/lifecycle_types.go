@@ -53,7 +53,7 @@ func (s WorkerSnapshot) PodName() string { return s.record.PodName }
 func (s WorkerSnapshot) Image() string { return s.record.Image }
 
 // OrgID returns the org id the worker was assigned to at observation time.
-// Empty for neutral warm workers.
+// Empty for unassigned workers.
 func (s WorkerSnapshot) OrgID() string { return s.record.OrgID }
 
 // OwnerCPInstanceID returns the control-plane id that owned the worker at

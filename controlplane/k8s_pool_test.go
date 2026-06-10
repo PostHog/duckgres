@@ -1166,7 +1166,7 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 	})
 	var capacityErr *WorkerCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
-		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+		t.Fatalf("expected worker capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
 	if capacityErr.Reason != configstore.WorkerClaimMissReasonOrgCap {
 		t.Fatalf("expected org-cap miss reason, got %q", capacityErr.Reason)
@@ -1175,7 +1175,7 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
 	if store.claimCalls != 0 {
-		t.Fatalf("expected hot-idle org cap to skip neutral idle claim, got %d idle claims", store.claimCalls)
+		t.Fatalf("expected hot-idle org cap to prevent on-demand spawn, got %d idle claims", store.claimCalls)
 	}
 	if store.recordMissCalls != 0 {
 		t.Fatalf("expected no recorded miss for org-cap, got %d", store.recordMissCalls)
@@ -1345,18 +1345,18 @@ func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *t
 }
 
 // TestK8sPoolWorkerRecordForIdleStampsOwnerCPInstanceID guards against the
-// warm-pool churn loop. workerRecordFor used to clear OwnerCPInstanceID
-// whenever state==Idle, which left every freshly-spawned warm worker
+// idle worker churn loop. workerRecordFor used to clear OwnerCPInstanceID
+// whenever state==Idle, which left every freshly-spawned idle worker
 // matching ListOrphanedWorkers case (2) (NULLIF(owner_cp_instance_id, ”) IS
 // NULL AND last_heartbeat_at <= before) the moment it crossed the orphan
-// grace. The janitor then retired it, the warm pool replenished, and the
-// loop repeated indefinitely. Stamping warm workers with the creating CP's
+// grace. The janitor then retired it, the idle worker replenished, and the
+// loop repeated indefinitely. Stamping idle workers with the creating CP's
 // id makes case (1) handle them via the existing CP heartbeat instead.
 func TestK8sPoolWorkerRecordForIdleStampsOwnerCPInstanceID(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
 	// worker == nil branch: spawn path before the in-memory ManagedWorker
-	// exists. Used by the warm-slot creation flow.
+	// exists. Used by the idle worker creation flow.
 	rec := pool.workerRecordFor(11, nil, 0, configstore.WorkerStateIdle, "", nil)
 	if rec.OwnerCPInstanceID != pool.cpInstanceID {
 		t.Fatalf("worker==nil idle: expected OwnerCPInstanceID %q, got %q", pool.cpInstanceID, rec.OwnerCPInstanceID)
@@ -2596,17 +2596,17 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 		t.Fatalf("expected owner-epoch label 0, got %s", pod.Labels["duckgres/owner-epoch"])
 	}
 	if _, ok := pod.Labels["duckgres/org"]; ok {
-		t.Fatalf("expected shared warm worker startup to stay org-neutral, got labels %#v", pod.Labels)
+		t.Fatalf("expected shared worker startup to stay org-neutral, got labels %#v", pod.Labels)
 	}
 
 	if len(pod.OwnerReferences) != 0 {
 		t.Fatalf("expected no owner references, got %d", len(pod.OwnerReferences))
 	}
 	if pod.Spec.ServiceAccountName != "duckgres-worker" {
-		t.Fatalf("expected neutral worker service account duckgres-worker, got %q", pod.Spec.ServiceAccountName)
+		t.Fatalf("expected shared worker service account duckgres-worker, got %q", pod.Spec.ServiceAccountName)
 	}
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
-		t.Fatal("expected automountServiceAccountToken=false for shared warm worker pods")
+		t.Fatal("expected automountServiceAccountToken=false for shared worker pods")
 	}
 	if pod.Spec.TerminationGracePeriodSeconds == nil || *pod.Spec.TerminationGracePeriodSeconds != workerTerminationGracePeriodSeconds {
 		t.Fatalf("expected terminationGracePeriodSeconds=%d, got %v", workerTerminationGracePeriodSeconds, pod.Spec.TerminationGracePeriodSeconds)
@@ -2652,7 +2652,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 		t.Fatal("bearer token env var not found or incorrect")
 	}
 	if !foundSharedWarmWorkerEnv {
-		t.Fatal("expected shared warm worker startup env to be present")
+		t.Fatal("expected shared worker startup env to be present")
 	}
 	if !foundTLSCertEnv || !foundTLSKeyEnv {
 		t.Fatal("expected worker RPC TLS env vars to be present")
@@ -4022,7 +4022,7 @@ func TestShutdownAll_TreatsPodNotFoundAsDeleteSuccess(t *testing.T) {
 // query sessions land on cache-warm nodes and Karpenter can consolidate the
 // newest nodes first.
 
-// addIdleWorker inserts a ready warm-idle worker on nodeName with a matching
+// addIdleWorker inserts a ready idle worker on nodeName with a matching
 // nodeFirstSeen entry. idleFor controls how far in the past lastUsed is —
 // must exceed idleTimeout for the reaper to consider it.
 func addIdleWorker(t *testing.T, p *K8sWorkerPool, id int, nodeName string, nodeSeenAt time.Time, idleFor time.Duration) {

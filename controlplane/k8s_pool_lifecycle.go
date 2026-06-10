@@ -697,14 +697,14 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 	now := time.Now()
 	idleCount := 0
 	for _, w := range p.workers {
-		if p.isWarmIdleWorkerLocked(w) {
+		if p.isIdleWorkerLocked(w) {
 			idleCount++
 		}
 	}
 
 	// Build the list of reap-eligible workers and sort by the first time
 	// this CP saw their node — newest node first. We prefer evicting workers
-	// on nodes we only just started using so older nodes keep their warm
+	// on nodes we only just started using so older nodes keep their cached
 	// NVMe parquet cache for longer. Workers with no known nodeName sort as
 	// "new" (they're reaped first) to avoid stalling on stale state.
 	type candidate struct {
@@ -714,7 +714,7 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 	}
 	var candidates []candidate
 	for id, w := range p.workers {
-		if p.isWarmIdleWorkerLocked(w) && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
+		if p.isIdleWorkerLocked(w) && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
 			candidates = append(candidates, candidate{id: id, w: w, seenAt: p.nodeSeenAtLocked(w.nodeName, now)})
 		}
 	}

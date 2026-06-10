@@ -110,7 +110,7 @@ type K8sConfig struct {
 	WorkerSecret            string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
 	WorkerConfigMap         string // ConfigMap name for duckgres.yaml
 	ImagePullPolicy         string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount          string // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
+	ServiceAccount          string // ServiceAccount name for worker pods (default: "duckgres-worker")
 	MaxWorkers              int    // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
 	WorkerCPURequest        string // CPU request for worker pods (e.g., "500m")
 	WorkerMemoryRequest     string // Memory request for worker pods (e.g., "1Gi")
@@ -145,7 +145,7 @@ type K8sConfig struct {
 	// default-profile worker — sized profiles carry their own duckgres.worker_ttl)
 	// retains its org assignment before the janitor retires it. 0 = the built-in
 	// default (defaultHotIdleTTL, 5m). Raise this above a tenant's job cadence
-	// (e.g. 70m for hourly jobs) so scheduled workloads reclaim warm workers
+	// (e.g. 70m for hourly jobs) so scheduled workloads reuse hot-idle workers
 	// instead of cold-spawning every run — at the cost of idle worker nodes.
 	HotIdleTTL time.Duration
 }

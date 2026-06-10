@@ -791,7 +791,7 @@ func (cs *ConfigStore) runtimeTable(base string) string {
 // state by image and tenant binding for Prometheus observability.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
 	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
-	// now (no warm pool); the branch only matches pre-existing/legacy rows.
+	// now; the branch only matches pre-existing/legacy rows or single-tenant mode.
 	const bindingExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
 	var out []WorkerLifecycleStats
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
@@ -953,7 +953,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // previously activated for the given org. The selected row is locked with
 // SKIP LOCKED and transitioned to reserved while incrementing owner_epoch.
 // When maxOrgWorkers is set, the org cap is checked under the same advisory
-// lock as neutral idle claims, excluding hot-idle rows from the count so a
+// lock as on-demand claims, excluding hot-idle rows from the count so a
 // cached worker can be reclaimed as the org's only active slot.
 func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
@@ -1024,8 +1024,8 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 // ListExpiredHotIdleWorkers returns hot-idle workers whose per-worker TTL has
 // elapsed since they last became idle (updated_at, bumped on the hot->hot_idle
 // transition at session end, so the TTL resets on each query). A worker's
-// ttl_seconds governs it; 0 falls back to defaultTTL (default/warm/neutral and
-// legacy rows).
+// ttl_seconds governs it; 0 falls back to defaultTTL (default/legacy and
+// unassigned rows).
 func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
 	defMins := int64(defaultTTL.Minutes())
 	if defMins < 0 {

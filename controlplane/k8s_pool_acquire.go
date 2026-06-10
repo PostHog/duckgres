@@ -218,7 +218,7 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	return nil
 }
 
-// ReserveSharedWorker reserves a neutral warm worker for later tenant activation.
+// ReserveSharedWorker claims a hot-idle worker or spawns one on demand.
 // Composition of the gateable decision (reserveSharedWorkerDecision) and the slow
 // completion (completeSharedWorkerReservation); OrgReservedPool calls the two
 // halves separately so the per-org FIFO gate covers only the decision.
@@ -508,7 +508,7 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	// already bumped the epoch in the DB. The health check requires exact epoch
 	// match, so neither the old epoch (worker has N, we'd send N+1) nor the new
 	// CP instance ID will pass. ActivateTenant validates the epoch properly
-	// (accepts > current). For fresh neutral workers (epoch 0), use the normal
+	// (accepts > current). For freshly spawned workers (epoch 0), use the normal
 	// health-checked path.
 	var client *flightsql.Client
 	if claimed.OwnerEpoch > 1 {
@@ -637,7 +637,7 @@ func validateReservedWorkerHealth(result *healthCheckResult) error {
 	return nil
 }
 
-// SpawnMinWorkers is a no-op for the K8s pool: there is no warm pool to
+// SpawnMinWorkers is a no-op for the K8s pool: workers are created on demand.
 // pre-spawn. Workers are created on demand per request (ReserveSharedWorker)
 // and reused while hot-idle until their TTL. Present only to satisfy the
 // WorkerPool interface (the process backend uses it for --process-min-workers).
@@ -702,7 +702,7 @@ func (p *K8sWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 			continue
 		default:
 		}
-		if !p.isWarmIdleWorkerLocked(w) {
+		if !p.isIdleWorkerLocked(w) {
 			continue
 		}
 		seen := p.nodeSeenAtLocked(w.nodeName, now)
@@ -749,6 +749,6 @@ func (p *K8sWorkerPool) isGenericSessionSchedulableWorkerLocked(w *ManagedWorker
 	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleIdle
 }
 
-func (p *K8sWorkerPool) isWarmIdleWorkerLocked(w *ManagedWorker) bool {
+func (p *K8sWorkerPool) isIdleWorkerLocked(w *ManagedWorker) bool {
 	return w.activeSessions == 0 && p.isGenericSessionSchedulableWorkerLocked(w)
 }

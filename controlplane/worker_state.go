@@ -5,9 +5,8 @@ import (
 	"time"
 )
 
-// WorkerLifecycleState models the shared warm-worker lifecycle introduced for
-// late tenant binding. The current production worker pools do not act on this
-// state yet; this is scaffolding for later shared-pool work.
+// WorkerLifecycleState models the shared worker lifecycle used for late
+// tenant binding (spawn → reserve → activate → hot → hot-idle → drain/retire).
 type WorkerLifecycleState string
 
 const (
@@ -21,9 +20,9 @@ const (
 )
 
 // WorkerProfile describes the pod shape a session asked for via connection-string
-// startup options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
+// startup options (duckgres.worker_cpu / worker_memory / worker_ttl).
 // It is a match dimension on WorkerAssignment, ORTHOGONAL to Image: a reserved or
-// warm worker may only be handed to a request whose profile Equal()s it.
+// hot-idle worker may only be handed to a request whose profile Equal()s it.
 //
 // The nil/zero profile is the DEFAULT profile: empty CPU/Memory (the pool-global
 // request applies). Normalizing the default to empty strings (rather than the
@@ -77,8 +76,7 @@ type WorkerAssignment struct {
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared
-// warm workers. Existing worker pools can keep using their current session
-// counters until later PRs wire this state into scheduling decisions.
+// workers.
 type SharedWorkerState struct {
 	Lifecycle  WorkerLifecycleState
 	Assignment *WorkerAssignment

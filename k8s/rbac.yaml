@@ -21,7 +21,7 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch"]
-  # Validate the shared neutral worker startup config before spawn
+  # Validate the shared worker startup config before spawn
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]

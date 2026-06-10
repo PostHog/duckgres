@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-func TestResolveEffectiveDefaultsK8sWorkerServiceAccountToNeutralWorker(t *testing.T) {
+func TestResolveEffectiveDefaultsK8sWorkerServiceAccountToDefaultWorker(t *testing.T) {
 	resolved := ResolveEffective(nil, CLIInputs{}, nil, nil)
 
 	if resolved.K8sWorkerServiceAccount != "duckgres-worker" {
