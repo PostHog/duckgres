@@ -49,8 +49,8 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 		return err
 	}
 	finishOperation, ok := session.beginOperation()
-	if busyErr := sessionBusyStatus(ok); busyErr != nil {
-		return busyErr
+	if openErr := sessionOpenStatus(ok); openErr != nil {
+		return openErr
 	}
 	defer finishOperation()
 	endConnWork, ok := session.beginConnWork()

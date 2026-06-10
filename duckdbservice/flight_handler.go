@@ -37,7 +37,7 @@ func workerDrainingStatus(err error) error {
 	return nil
 }
 
-func sessionBusyStatus(ok bool) error {
+func sessionOpenStatus(ok bool) error {
 	if ok {
 		return nil
 	}
@@ -443,8 +443,8 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		return nil, err
 	}
 	finishOperation, ok := session.beginOperation()
-	if busyErr := sessionBusyStatus(ok); busyErr != nil {
-		return nil, busyErr
+	if openErr := sessionOpenStatus(ok); openErr != nil {
+		return nil, openErr
 	}
 	releaseOperationOnReturn := true
 	defer func() {
@@ -709,8 +709,8 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		return 0, err
 	}
 	finishOperation, ok := session.beginOperation()
-	if busyErr := sessionBusyStatus(ok); busyErr != nil {
-		return 0, busyErr
+	if openErr := sessionOpenStatus(ok); openErr != nil {
+		return 0, openErr
 	}
 	defer finishOperation()
 
@@ -830,8 +830,8 @@ func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,
 		return nil, err
 	}
 	finishOperation, ok := session.beginOperation()
-	if busyErr := sessionBusyStatus(ok); busyErr != nil {
-		return nil, busyErr
+	if openErr := sessionOpenStatus(ok); openErr != nil {
+		return nil, openErr
 	}
 	defer finishOperation()
 	finishDrain, err := h.pool.beginDrainWork(false)
@@ -887,8 +887,8 @@ func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 	if !ok {
 		handleDrainReleases, handleOperationReleases = popAbandonedTransactionContinuations(session, txnKey)
 		if len(handleOperationReleases) == 0 {
-			if busyErr := sessionBusyStatus(false); busyErr != nil {
-				return busyErr
+			if openErr := sessionOpenStatus(false); openErr != nil {
+				return openErr
 			}
 		}
 	} else {
