@@ -32,6 +32,18 @@ type orgRouterAdapter struct {
 // same org without re-activation.
 const defaultHotIdleTTL = 5 * time.Minute
 
+// effectiveHotIdleTTL resolves the janitor's hot-idle retention: the operator
+// override (DUCKGRES_K8S_HOT_IDLE_TTL → K8sConfig.HotIdleTTL) when set,
+// otherwise defaultHotIdleTTL. This is the fallback TTL for workers without a
+// per-worker ttl_minutes (default-profile workers); sized profiles carry their
+// own client-supplied duckgres.worker_ttl and are unaffected.
+func effectiveHotIdleTTL(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return defaultHotIdleTTL
+}
+
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
 	if !ok {
@@ -232,7 +244,7 @@ func SetupMultiTenant(
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
-	janitor.hotIdleTTL = defaultHotIdleTTL
+	janitor.hotIdleTTL = effectiveHotIdleTTL(cfg.K8s.HotIdleTTL)
 	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
 	// all flow through this lifecycle service. The legacy retireWorker /
 	// retireOrphanWorker / retireLocalWorker / deleteRetiredWorker

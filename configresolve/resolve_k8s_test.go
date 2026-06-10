@@ -24,3 +24,52 @@ func TestResolveEffectiveExposesDuckLakeDefaultSpecVersionForControlPlane(t *tes
 		t.Fatalf("expected DuckLake default spec version 1.1, got %q", resolved.DuckLakeDefaultSpecVersion)
 	}
 }
+
+func TestResolveEffectiveParsesK8sWorkerMaxTTL(t *testing.T) {
+	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
+		if key == "DUCKGRES_K8S_WORKER_MAX_TTL" {
+			return "1h"
+		}
+		return ""
+	}, nil)
+
+	if resolved.K8sWorkerMaxTTL.String() != "1h0m0s" {
+		t.Fatalf("expected K8s worker max TTL 1h, got %s", resolved.K8sWorkerMaxTTL)
+	}
+}
+
+func TestResolveEffectiveParsesK8sHotIdleTTL(t *testing.T) {
+	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
+		if key == "DUCKGRES_K8S_HOT_IDLE_TTL" {
+			return "70m"
+		}
+		return ""
+	}, nil)
+
+	if resolved.K8sHotIdleTTL.String() != "1h10m0s" {
+		t.Fatalf("expected K8s hot-idle TTL 70m, got %s", resolved.K8sHotIdleTTL)
+	}
+}
+
+func TestResolveEffectiveRejectsInvalidK8sHotIdleTTL(t *testing.T) {
+	var warned []string
+	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
+		switch key {
+		case "DUCKGRES_K8S_HOT_IDLE_TTL":
+			return "soon"
+		case "DUCKGRES_K8S_WORKER_MAX_TTL":
+			return "-5m"
+		}
+		return ""
+	}, func(msg string) { warned = append(warned, msg) })
+
+	if resolved.K8sHotIdleTTL != 0 {
+		t.Fatalf("expected invalid hot-idle TTL to resolve to 0, got %s", resolved.K8sHotIdleTTL)
+	}
+	if resolved.K8sWorkerMaxTTL != 0 {
+		t.Fatalf("expected negative worker max TTL to resolve to 0, got %s", resolved.K8sWorkerMaxTTL)
+	}
+	if len(warned) != 2 {
+		t.Fatalf("expected 2 warnings for invalid TTL values, got %d: %v", len(warned), warned)
+	}
+}
