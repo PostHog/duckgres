@@ -141,6 +141,13 @@ normal `go test ./...` lane.
   GetFlightInfo-to-DoGet handoffs, and abandoned-continuation cleanup are covered
   by `duckdbservice` unit tests. The harness still asserts the cluster invariant
   this protects: one active session owns one worker.
+- **Worker DoGet close acknowledgement** — asserting that an early client
+  close waits for worker-side DoGet cleanup requires pausing the worker exactly
+  after it observes gRPC cancellation but before it releases the session
+  operation token. The in-cluster harness only has normal clients, so it cannot
+  deterministically hold that cleanup window without a bespoke worker/Flight
+  fault-injection client. Covered by `server/flightclient` and `duckdbservice`
+  unit tests instead.
 - **Malformed Bind message validation (#720)** — negative count/length fields
   in a Bind message must return a clean `08P01` instead of panicking. Every
   real client (psql, lib/pq, ...) only emits well-formed Bind messages, so

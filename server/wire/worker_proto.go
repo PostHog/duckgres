@@ -45,3 +45,9 @@ type WorkerDestroySessionPayload struct {
 type WorkerHealthCheckPayload struct {
 	WorkerControlMetadata
 }
+
+// WorkerWaitSessionIdlePayload asks a worker to acknowledge that the session's
+// current Flight SQL operation has released its worker-side lifecycle state.
+type WorkerWaitSessionIdlePayload struct {
+	WorkerControlMetadata
+}

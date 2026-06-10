@@ -9,8 +9,9 @@ import "github.com/posthog/duckgres/server/wire"
 // wire.X directly.
 
 type (
-	WorkerControlMetadata       = wire.WorkerControlMetadata
-	WorkerCreateSessionPayload  = wire.WorkerCreateSessionPayload
-	WorkerDestroySessionPayload = wire.WorkerDestroySessionPayload
-	WorkerHealthCheckPayload    = wire.WorkerHealthCheckPayload
+	WorkerControlMetadata        = wire.WorkerControlMetadata
+	WorkerCreateSessionPayload   = wire.WorkerCreateSessionPayload
+	WorkerDestroySessionPayload  = wire.WorkerDestroySessionPayload
+	WorkerHealthCheckPayload     = wire.WorkerHealthCheckPayload
+	WorkerWaitSessionIdlePayload = wire.WorkerWaitSessionIdlePayload
 )

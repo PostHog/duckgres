@@ -433,6 +433,33 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 	return sendActionResult(stream, &flight.Result{Body: resp})
 }
 
+func (h *FlightSQLHandler) doWaitSessionIdle(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerWaitSessionIdlePayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid WaitSessionIdle request: %v", err)
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+	session, err := h.sessionFromContext(stream.Context())
+	if err != nil {
+		return err
+	}
+	if err := session.waitOperationIdle(stream.Context()); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			return status.Errorf(codes.Canceled, "wait for session idle: %v", err)
+		case errors.Is(err, context.DeadlineExceeded):
+			return status.Errorf(codes.DeadlineExceeded, "wait for session idle: %v", err)
+		default:
+			return status.Errorf(codes.Internal, "wait for session idle: %v", err)
+		}
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
+	return sendActionResult(stream, &flight.Result{Body: resp})
+}
+
 // Flight SQL method implementations
 
 func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery,
