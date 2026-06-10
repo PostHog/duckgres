@@ -249,7 +249,24 @@ spec:
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY, value: "16Gi" }
-            - { name: DUCKGRES_K8S_WORKER_MAX_TTL, value: "24h" }
+            # Prod-logic parity (sizes differ, the knobs match prod-us):
+            # - workerQueueTimeout bounds how long a connection waits for its
+            #   on-demand cold spawn (binary default 60s is too tight for a
+            #   fresh Karpenter node — observed flaking the sized assertions).
+            # - an explicit worker cap, like prod's maxWorkers; without it the
+            #   binary derives one from the CP pod's (tiny, 1Gi) memory.
+            # Deliberately NOT aligned with prod:
+            # - DUCKGRES_K8S_WORKER_PRIORITY_CLASS: e2e workers run on the
+            #   shared default nodepool — prod's 1000000 PriorityClass would let
+            #   per-PR worker bursts preempt unrelated workloads there.
+            # - DUCKGRES_CACHE_ENABLED: the cache-proxy DaemonSet only runs on
+            #   duckgres-workers nodes; default-pool workers would dial a
+            #   nonexistent hostPort proxy.
+            # - DUCKGRES_CERT/_KEY (wildcard TLS) and DUCKGRES_TRINO_*: need
+            #   cert-manager / a Trino cluster in the per-PR namespace; the CP
+            #   serves its self-signed cert and Trino is not under e2e.
+            - { name: DUCKGRES_WORKER_QUEUE_TIMEOUT, value: "5m" }
+            - { name: DUCKGRES_K8S_MAX_WORKERS, value: "50" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             - { name: DUCKGRES_AWS_REGION, value: "us-east-1" }
