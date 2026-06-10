@@ -1577,7 +1577,7 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 		preloadedRecords: map[int]*configstore.WorkerRecord{
 			13: {
 				WorkerID:          13,
-				PodName:           "test-cp-worker-13",
+				PodName:           "duckgres-worker-test-cp-13",
 				State:             configstore.WorkerStateLost,
 				OwnerCPInstanceID: pool.cpInstanceID,
 				OwnerEpoch:        4,
@@ -1593,7 +1593,7 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 	pool.workers[worker.ID] = worker
 
 	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-13", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "duckgres-worker-test-cp-13", Namespace: "default"},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.13"},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create worker pod: %v", err)
@@ -1622,7 +1622,7 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		got := podDeleteActionNames(cs)
-		if len(got) == 1 && got[0] == "test-cp-worker-13" {
+		if len(got) == 1 && got[0] == "duckgres-worker-test-cp-13" {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -2632,7 +2632,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	for _, env := range c.Env {
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
-			env.ValueFrom.SecretKeyRef.Name == "test-secret-test-cp-worker-0" {
+			env.ValueFrom.SecretKeyRef.Name == "test-secret-duckgres-worker-test-cp-0" {
 			foundEnv = true
 		}
 		if env.Name == "DUCKGRES_SHARED_WARM_WORKER" && env.Value == "true" {
@@ -2667,7 +2667,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	foundWorkerRPCSecret := false
 	for _, volume := range pod.Spec.Volumes {
 		if volume.Name == "worker-rpc-tls" && volume.Secret != nil &&
-			volume.Secret.SecretName == "test-secret-test-cp-worker-0" {
+			volume.Secret.SecretName == "test-secret-duckgres-worker-test-cp-0" {
 			foundWorkerRPCSecret = true
 		}
 	}
@@ -4126,5 +4126,37 @@ func TestFindIdleWorkerLockedUnknownNodeSortsLast(t *testing.T) {
 	chosen := pool.findIdleWorkerLocked()
 	if chosen == nil || chosen.ID != 1 {
 		t.Errorf("expected worker on node-old (id=1), got %+v", chosen)
+	}
+}
+
+func TestWorkerPodNaming(t *testing.T) {
+	// "duckgres-worker[-<org>]-<cp-replicaset-hash>-<id>": fixed head so worker
+	// pods scan together, RS hash identifying the spawning CP build.
+	p := &K8sWorkerPool{cpID: "duckgres-control-plane-6f877c7779-abcde"}
+	if got := p.podNameForWorker(15); got != "duckgres-worker-6f877c7779-15" {
+		t.Fatalf("pod name = %q, want duckgres-worker-6f877c7779-15", got)
+	}
+	p.orgID = "acme"
+	if got := p.podNameForWorker(7); got != "duckgres-worker-acme-6f877c7779-7" {
+		t.Fatalf("org pod name = %q, want duckgres-worker-acme-6f877c7779-7", got)
+	}
+	// A cpID without a recognizable pod-hash suffix (local/test runs) is used
+	// whole, keeping the prefix unique per CP instance.
+	p = &K8sWorkerPool{cpID: "test-cp"}
+	if got := p.podNameForWorker(3); got != "duckgres-worker-test-cp-3" {
+		t.Fatalf("hashless pod name = %q, want duckgres-worker-test-cp-3", got)
+	}
+}
+
+func TestCPReplicaSetHash(t *testing.T) {
+	for in, want := range map[string]string{
+		"duckgres-control-plane-6f877c7779-abcde": "6f877c7779",
+		"duckgres-7c6c5769bb-mdnw7":               "7c6c5769bb",
+		"test-cp":                                 "test-cp",
+		"":                                        "",
+	} {
+		if got := cpReplicaSetHash(in); got != want {
+			t.Fatalf("cpReplicaSetHash(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

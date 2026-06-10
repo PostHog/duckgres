@@ -133,12 +133,35 @@ func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
 	return p.podNameForWorker(worker.ID)
 }
 
+// workerPodNamePrefix builds the worker pod name prefix:
+// "duckgres-worker[-<org>]-<cp-replicaset-hash>". A fixed "duckgres-worker"
+// head makes worker pods sort/scan together in `kubectl get pods`; the CP
+// ReplicaSet hash identifies which control-plane build spawned the worker
+// (useful mid-rollout, when the version-mismatch reaper is churning the
+// fleet). Uniqueness across CP replicas rides on worker IDs, which are
+// cluster-unique (config-store issued) — the hash is shared by all replicas
+// of one Deployment revision, exactly like the old <cp-pod-minus-suffix>
+// prefix was.
 func (p *K8sWorkerPool) workerPodNamePrefix() string {
-	base := trimK8sPodHashSuffix(p.cpID)
 	if p.orgID != "" {
-		return fmt.Sprintf("%s-worker-%s", base, p.orgID)
+		return fmt.Sprintf("duckgres-worker-%s-%s", p.orgID, cpReplicaSetHash(p.cpID))
 	}
-	return fmt.Sprintf("%s-worker", base)
+	return fmt.Sprintf("duckgres-worker-%s", cpReplicaSetHash(p.cpID))
+}
+
+// cpReplicaSetHash extracts the Deployment ReplicaSet hash segment from a CP
+// pod name ("duckgres-control-plane-6f877c7779-abcde" -> "6f877c7779"). A
+// name without a recognizable random pod-hash suffix (local runs, tests) is
+// returned whole so the prefix stays unique per CP instance.
+func cpReplicaSetHash(cpID string) string {
+	base := trimK8sPodHashSuffix(cpID)
+	if base == cpID {
+		return cpID
+	}
+	if i := strings.LastIndex(base, "-"); i > 0 {
+		return base[i+1:]
+	}
+	return base
 }
 
 // trimK8sPodHashSuffix removes the trailing 5-character random pod-hash

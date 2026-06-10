@@ -2,7 +2,14 @@
 
 package controlplane
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+)
 
 func TestHeadroomPlaceholdersNeeded(t *testing.T) {
 	const (
@@ -48,5 +55,34 @@ func TestLabelSelectorStringDeterministic(t *testing.T) {
 	}
 	if labelSelectorString(nil) != "" {
 		t.Fatal("nil selector must render empty")
+	}
+}
+
+func TestPlaceholderPodGenerateName(t *testing.T) {
+	// "duckgres-placeholder-<cp-replicaset-hash>-<apiserver-rand>": the RS hash
+	// identifies the owning CP build; the CP pod's own random suffix is NOT
+	// embedded (it was pure noise in the old
+	// duckgres-headroom-<full-cp-pod-name>-<rand> shape).
+	cs := fake.NewSimpleClientset()
+	p := &K8sWorkerPool{
+		clientset: cs,
+		namespace: "default",
+		cpID:      "duckgres-5ff4d85bdb-zshgq",
+	}
+	if err := p.createPlaceholderPod(context.Background(), resource.MustParse("1"), resource.MustParse("2Gi")); err != nil {
+		t.Fatalf("createPlaceholderPod: %v", err)
+	}
+	pods, err := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(pods.Items) != 1 {
+		t.Fatalf("expected 1 placeholder pod, got %d (err=%v)", len(pods.Items), err)
+	}
+	pod := pods.Items[0]
+	if pod.GenerateName != "duckgres-placeholder-5ff4d85bdb-" {
+		t.Fatalf("GenerateName = %q, want duckgres-placeholder-5ff4d85bdb-", pod.GenerateName)
+	}
+	// Selector continuity: the app label keeps the legacy value so pods created
+	// under the old name stay managed across a rollout.
+	if pod.Labels["app"] != "duckgres-headroom" {
+		t.Fatalf("app label = %q, want duckgres-headroom", pod.Labels["app"])
 	}
 }
