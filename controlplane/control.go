@@ -140,13 +140,16 @@ type K8sConfig struct {
 	WorkerProfileMaxMemory   string        // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
 	WorkerMaxTTL             time.Duration // Clamp ceiling for a client-supplied duckgres.worker_ttl (0 = unbounded)
 
-	// HotIdleTTL is how long a hot-idle worker with no per-worker TTL (i.e. a
-	// default-profile worker — sized profiles carry their own duckgres.worker_ttl)
-	// retains its org assignment before the janitor retires it. 0 = the built-in
-	// default (defaultHotIdleTTL, 5m). Raise this above a tenant's job cadence
-	// (e.g. 70m for hourly jobs) so scheduled workloads reuse hot-idle workers
-	// instead of cold-spawning every run — at the cost of idle worker nodes.
-	HotIdleTTL time.Duration
+	// WorkerDefaultTTL is the hot-idle TTL applied when a request does not
+	// specify duckgres.worker_ttl (and no org default does either) — the
+	// "default TTL", pairing with WorkerMaxTTL (the clamp). It governs both
+	// no-ttl paths the same way: default-shape workers (reaped by the janitor)
+	// and sized-but-no-ttl workers (stamped at profile resolution). Per-request
+	// precedence: client GUC > org default > this > built-in (20m,
+	// defaultWorkerTTL). Raise it above a tenant's job cadence (e.g. 70m for
+	// hourly jobs) so scheduled workloads reuse hot-idle workers instead of
+	// cold-spawning every run — at the cost of idle worker nodes.
+	WorkerDefaultTTL time.Duration
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.

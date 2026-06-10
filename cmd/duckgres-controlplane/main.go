@@ -242,7 +242,7 @@ func main() {
 			WorkerProfileMinMemory:       resolved.K8sWorkerProfileMinMemory,
 			WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
 			WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
-			HotIdleTTL:                   resolved.K8sHotIdleTTL,
+			WorkerDefaultTTL:                   resolved.K8sWorkerDefaultTTL,
 			AWSRegion:                    resolved.AWSRegion,
 		},
 	}
