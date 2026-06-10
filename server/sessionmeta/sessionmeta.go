@@ -319,6 +319,7 @@ func internalCompatRelationNamesSQL() string {
 		'pg_tables', 'pg_views', 'pg_sequences',
 		'information_schema_columns_compat', 'information_schema_tables_compat',
 		'information_schema_schemata_compat', 'information_schema_views_compat',
+		'information_schema_sequences_compat', 'information_schema_routines_compat',
 		'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 	`
 }
@@ -1001,7 +1002,8 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			'pg_tables', 'pg_views', 'pg_sequences',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', 'information_schema_views_compat'
+			'information_schema_schemata_compat', 'information_schema_views_compat',
+			'information_schema_sequences_compat', 'information_schema_routines_compat'
 		)
 		AND (
 			t.table_catalog = current_database()
@@ -1075,7 +1077,8 @@ func buildSessionInformationSchemaViewsViewSQL() string {
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			'pg_tables', 'pg_views', 'pg_sequences',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', 'information_schema_views_compat'
+			'information_schema_schemata_compat', 'information_schema_views_compat',
+			'information_schema_sequences_compat', 'information_schema_routines_compat'
 		)
 		AND (
 			v.table_catalog = current_database()

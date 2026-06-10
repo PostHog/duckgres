@@ -101,7 +101,8 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 			'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+			'information_schema_schemata_compat', 'information_schema_sequences_compat',
+			'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		)
 	`
 	if _, err := db.Exec(pgClassSQL); err != nil {
@@ -844,6 +845,84 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 				NULL::SMALLINT AS objsubid, NULL::VARCHAR AS virtualtransaction,
 				NULL::INTEGER AS pid, NULL::VARCHAR AS mode, false AS granted,
 				false AS fastpath WHERE false`,
+		"pg_shadow": `CREATE OR REPLACE VIEW pg_shadow AS
+			SELECT NULL::VARCHAR AS usename, NULL::BIGINT AS usesysid, false AS usecreatedb,
+				false AS usesuper, false AS userepl, false AS usebypassrls,
+				NULL::VARCHAR AS passwd, NULL::TIMESTAMP AS valuntil,
+				NULL::VARCHAR[] AS useconfig WHERE false`,
+		"pg_authid": `CREATE OR REPLACE VIEW pg_authid AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS rolname, false AS rolsuper,
+				false AS rolinherit, false AS rolcreaterole, false AS rolcreatedb,
+				false AS rolcanlogin, false AS rolreplication, false AS rolbypassrls,
+				NULL::INTEGER AS rolconnlimit, NULL::VARCHAR AS rolpassword,
+				NULL::TIMESTAMP AS rolvaliduntil WHERE false`,
+		"pg_cast": `CREATE OR REPLACE VIEW pg_cast AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS castsource, NULL::BIGINT AS casttarget,
+				NULL::BIGINT AS castfunc, NULL::VARCHAR AS castcontext,
+				NULL::VARCHAR AS castmethod WHERE false`,
+		"pg_operator": `CREATE OR REPLACE VIEW pg_operator AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS oprname, NULL::BIGINT AS oprnamespace,
+				NULL::BIGINT AS oprowner, NULL::VARCHAR AS oprkind, false AS oprcanmerge,
+				false AS oprcanhash, NULL::BIGINT AS oprleft, NULL::BIGINT AS oprright,
+				NULL::BIGINT AS oprresult, NULL::BIGINT AS oprcom, NULL::BIGINT AS oprnegate,
+				NULL::BIGINT AS oprcode, NULL::BIGINT AS oprrest, NULL::BIGINT AS oprjoin WHERE false`,
+		"pg_aggregate": `CREATE OR REPLACE VIEW pg_aggregate AS
+			SELECT NULL::BIGINT AS aggfnoid, NULL::VARCHAR AS aggkind,
+				NULL::SMALLINT AS aggnumdirectargs, NULL::BIGINT AS aggtransfn,
+				NULL::BIGINT AS aggfinalfn, NULL::BIGINT AS aggsortop,
+				NULL::BIGINT AS aggtranstype, NULL::VARCHAR AS agginitval WHERE false`,
+		"pg_event_trigger": `CREATE OR REPLACE VIEW pg_event_trigger AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS evtname, NULL::VARCHAR AS evtevent,
+				NULL::BIGINT AS evtowner, NULL::BIGINT AS evtfoid, NULL::VARCHAR AS evtenabled,
+				NULL::VARCHAR[] AS evttags WHERE false`,
+		"pg_available_extensions": `CREATE OR REPLACE VIEW pg_available_extensions AS
+			SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS default_version,
+				NULL::VARCHAR AS installed_version, NULL::VARCHAR AS comment WHERE false`,
+		"pg_stat_database": `CREATE OR REPLACE VIEW pg_stat_database AS
+			SELECT NULL::BIGINT AS datid, NULL::VARCHAR AS datname, NULL::INTEGER AS numbackends,
+				NULL::BIGINT AS xact_commit, NULL::BIGINT AS xact_rollback,
+				NULL::BIGINT AS blks_read, NULL::BIGINT AS blks_hit,
+				NULL::BIGINT AS tup_returned, NULL::BIGINT AS tup_fetched,
+				NULL::BIGINT AS tup_inserted, NULL::BIGINT AS tup_updated,
+				NULL::BIGINT AS tup_deleted, NULL::BIGINT AS conflicts,
+				NULL::BIGINT AS temp_files, NULL::BIGINT AS temp_bytes,
+				NULL::BIGINT AS deadlocks, NULL::TIMESTAMPTZ AS stats_reset WHERE false`,
+		"pg_stat_all_tables": `CREATE OR REPLACE VIEW pg_stat_all_tables AS
+			SELECT NULL::BIGINT AS relid, NULL::VARCHAR AS schemaname, NULL::VARCHAR AS relname,
+				NULL::BIGINT AS seq_scan, NULL::BIGINT AS seq_tup_read,
+				NULL::BIGINT AS idx_scan, NULL::BIGINT AS idx_tup_fetch,
+				NULL::BIGINT AS n_tup_ins, NULL::BIGINT AS n_tup_upd, NULL::BIGINT AS n_tup_del,
+				NULL::BIGINT AS n_tup_hot_upd, NULL::BIGINT AS n_live_tup,
+				NULL::BIGINT AS n_dead_tup, NULL::TIMESTAMPTZ AS last_vacuum,
+				NULL::TIMESTAMPTZ AS last_autovacuum, NULL::TIMESTAMPTZ AS last_analyze,
+				NULL::TIMESTAMPTZ AS last_autoanalyze, NULL::BIGINT AS vacuum_count,
+				NULL::BIGINT AS autovacuum_count, NULL::BIGINT AS analyze_count,
+				NULL::BIGINT AS autoanalyze_count WHERE false`,
+		"pg_replication_slots": `CREATE OR REPLACE VIEW pg_replication_slots AS
+			SELECT NULL::VARCHAR AS slot_name, NULL::VARCHAR AS plugin,
+				NULL::VARCHAR AS slot_type, NULL::BIGINT AS datoid, NULL::VARCHAR AS database,
+				false AS temporary, false AS active, NULL::INTEGER AS active_pid,
+				NULL::BIGINT AS xmin, NULL::BIGINT AS catalog_xmin,
+				NULL::VARCHAR AS restart_lsn, NULL::VARCHAR AS confirmed_flush_lsn WHERE false`,
+		"pg_db_role_setting": `CREATE OR REPLACE VIEW pg_db_role_setting AS
+			SELECT NULL::BIGINT AS setdatabase, NULL::BIGINT AS setrole,
+				NULL::VARCHAR[] AS setconfig WHERE false`,
+		"pg_default_acl": `CREATE OR REPLACE VIEW pg_default_acl AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS defaclrole,
+				NULL::BIGINT AS defaclnamespace, NULL::VARCHAR AS defaclobjtype,
+				NULL::VARCHAR AS defaclacl WHERE false`,
+		"pg_range": `CREATE OR REPLACE VIEW pg_range AS
+			SELECT NULL::BIGINT AS rngtypid, NULL::BIGINT AS rngsubtype,
+				NULL::BIGINT AS rngmultitypid, NULL::BIGINT AS rngcollation,
+				NULL::BIGINT AS rngsubopc, NULL::BIGINT AS rngcanonical,
+				NULL::BIGINT AS rngsubdiff WHERE false`,
+		"pg_largeobject": `CREATE OR REPLACE VIEW pg_largeobject AS
+			SELECT NULL::BIGINT AS loid, NULL::INTEGER AS pageno,
+				NULL::BLOB AS data WHERE false`,
+		"pg_cursors": `CREATE OR REPLACE VIEW pg_cursors AS
+			SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS statement, false AS is_holdable,
+				false AS is_binary, false AS is_scrollable,
+				NULL::TIMESTAMPTZ AS creation_time WHERE false`,
 	}
 	for name, sql := range stubViews {
 		if _, err := db.Exec(sql); err != nil {
@@ -868,6 +947,37 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 	`
 	if _, err := db.Exec(pgExtensionSQL); err != nil {
 		slog.Warn("Failed to create pg_extension view.", "error", err)
+	}
+
+	// pg_user: derived from the pg_roles view so psql \du fallbacks and BI role
+	// checks see the real connected user (passwd masked, matching PostgreSQL).
+	pgUserSQL := `
+		CREATE OR REPLACE VIEW pg_user AS
+		SELECT
+			rolname AS usename,
+			oid AS usesysid,
+			rolcreatedb AS usecreatedb,
+			rolsuper AS usesuper,
+			rolreplication AS userepl,
+			rolbypassrls AS usebypassrls,
+			'********' AS passwd,
+			rolvaliduntil AS valuntil,
+			rolconfig AS useconfig
+		FROM pg_roles
+		WHERE rolcanlogin
+	`
+	if _, err := db.Exec(pgUserSQL); err != nil {
+		slog.Warn("Failed to create pg_user view.", "error", err)
+	}
+
+	// pg_timezone_names: backed by DuckDB's native pg_timezone_names() table
+	// function (real timezone rows, not an empty stub).
+	pgTimezoneNamesSQL := `
+		CREATE OR REPLACE VIEW pg_timezone_names AS
+		SELECT name, abbrev, utc_offset, is_dst FROM pg_timezone_names()
+	`
+	if _, err := db.Exec(pgTimezoneNamesSQL); err != nil {
+		slog.Warn("Failed to create pg_timezone_names view.", "error", err)
 	}
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
@@ -999,6 +1109,13 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// array_remove - remove all occurrences of element from array
 		`CREATE OR REPLACE MACRO array_remove(arr, elem) AS list_filter(arr, x -> x != elem)`,
 
+		// array_to_string - DuckDB's builtin only has the 2-arg arity; PG also has
+		// (arr, sep, nullstr) which renders NULL elements as nullstr. A user macro
+		// shadows the builtin entirely, so BOTH arities must be defined here: the
+		// 2-arg body replicates the builtin (NULLs omitted, matching PG).
+		`CREATE OR REPLACE MACRO array_to_string(arr, sep) AS list_aggregate(arr::VARCHAR[], 'string_agg', sep),
+			(arr, sep, nullstr) AS list_aggregate(list_transform(arr, lambda x: coalesce(x::VARCHAR, nullstr)), 'string_agg', sep)`,
+
 		// array_lower - DuckDB lists do not preserve PostgreSQL custom lower-bound
 		// metadata, so return the representable PostgreSQL default for non-empty
 		// one-dimensional arrays and NULL for null, empty, or unsupported dimensions.
@@ -1065,11 +1182,278 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			CASE WHEN val IS NULL THEN 'NULL'
 			ELSE '''' || REPLACE(CAST(val AS VARCHAR), '''', '''''') || ''''
 			END`,
+
+		// === PostgreSQL builtin-compatibility macros ===
+		// PG builtins that real clients/ORMs/metadata queries call but DuckDB lacks
+		// (or implements with divergent semantics). Wired through the transpiler
+		// Classify list and the pgcatalog.go qualification maps; regression tests
+		// in pg_compat_macros_test.go.
+
+		// set_config - PG drivers/ORMs/poolers emit SELECT set_config('search_path'|..., v, local)
+		// at connection startup so it runs in the data path. Value-returning compat only: this
+		// does NOT mutate the session GUC (a true side effect would need a setshow transform); it
+		// returns new_value so the SELECT succeeds and the client proceeds. is_local is ignored.
+		`CREATE OR REPLACE MACRO set_config(setting_name, new_value, is_local) AS new_value`,
+
+		// uuid_generate_v4 - uuid-ossp v4 generator alias; DuckDB uuid() emits RFC-4122 v4 UUIDs.
+		`CREATE OR REPLACE MACRO uuid_generate_v4() AS uuid()`,
+
+		// statement_timestamp - start time of the current statement; now() is close enough here.
+		`CREATE OR REPLACE MACRO statement_timestamp() AS now()`,
+
+		// pg_get_function_arguments / _result / _identity_arguments - psql \df selects these from
+		// pg_proc; the missing symbols abort the whole query. We have no pg_proc rows to derive a
+		// real signature, so return '' (a valid PG value for a no-arg function) to keep \df working.
+		`CREATE OR REPLACE MACRO pg_get_function_arguments(func_oid) AS ''`,
+		`CREATE OR REPLACE MACRO pg_get_function_result(func_oid) AS ''`,
+		`CREATE OR REPLACE MACRO pg_get_function_identity_arguments(func_oid) AS ''`,
+
+		// pg_get_triggerdef - DuckDB has no triggers; always NULL (1-arg and 2-arg pretty forms).
+		`CREATE OR REPLACE MACRO pg_get_triggerdef(trigger_oid, pretty := false) AS CAST(NULL AS VARCHAR)`,
+
+		// pg_jit_available / row_security_active - capability stubs (no JIT, no RLS).
+		`CREATE OR REPLACE MACRO pg_jit_available() AS false`,
+		`CREATE OR REPLACE MACRO row_security_active(rel) AS false`,
+
+		// pg_collation_for - effective collation of an expression; we report the default collation.
+		`CREATE OR REPLACE MACRO pg_collation_for(x) AS '"default"'`,
+
+		// pg_input_is_valid - PG15 input validator over a bounded set of types via try_cast.
+		`CREATE OR REPLACE MACRO pg_input_is_valid(s, t) AS
+			CASE lower(t)
+				WHEN 'integer' THEN try_cast(s AS INTEGER) IS NOT NULL
+				WHEN 'int' THEN try_cast(s AS INTEGER) IS NOT NULL
+				WHEN 'int4' THEN try_cast(s AS INTEGER) IS NOT NULL
+				WHEN 'smallint' THEN try_cast(s AS SMALLINT) IS NOT NULL
+				WHEN 'int2' THEN try_cast(s AS SMALLINT) IS NOT NULL
+				WHEN 'bigint' THEN try_cast(s AS BIGINT) IS NOT NULL
+				WHEN 'int8' THEN try_cast(s AS BIGINT) IS NOT NULL
+				WHEN 'numeric' THEN try_cast(s AS DECIMAL(38,10)) IS NOT NULL
+				WHEN 'decimal' THEN try_cast(s AS DECIMAL(38,10)) IS NOT NULL
+				WHEN 'real' THEN try_cast(s AS REAL) IS NOT NULL
+				WHEN 'float4' THEN try_cast(s AS REAL) IS NOT NULL
+				WHEN 'double precision' THEN try_cast(s AS DOUBLE) IS NOT NULL
+				WHEN 'float8' THEN try_cast(s AS DOUBLE) IS NOT NULL
+				WHEN 'boolean' THEN try_cast(s AS BOOLEAN) IS NOT NULL
+				WHEN 'bool' THEN try_cast(s AS BOOLEAN) IS NOT NULL
+				WHEN 'date' THEN try_cast(s AS DATE) IS NOT NULL
+				WHEN 'timestamp' THEN try_cast(s AS TIMESTAMP) IS NOT NULL
+				WHEN 'time' THEN try_cast(s AS TIME) IS NOT NULL
+				WHEN 'uuid' THEN try_cast(s AS UUID) IS NOT NULL
+				ELSE NULL
+			END`,
+
+		// to_regclass / to_regtype / to_regproc - NULL-safe name->oid probes. PG returns NULL (not
+		// an error) when the object is absent; clients use them as existence checks.
+		`CREATE OR REPLACE MACRO to_regclass(rel) AS (
+			SELECT oid FROM pg_catalog.pg_class
+			WHERE relname = CASE WHEN position('.' IN rel) > 0 THEN split_part(rel, '.', -1) ELSE rel END
+			LIMIT 1)`,
+		`CREATE OR REPLACE MACRO to_regtype(name) AS (
+			SELECT oid FROM pg_type WHERE typname = (CASE lower(trim(name))
+				WHEN 'integer' THEN 'int4' WHEN 'int' THEN 'int4'
+				WHEN 'bigint' THEN 'int8' WHEN 'smallint' THEN 'int2'
+				WHEN 'boolean' THEN 'bool' WHEN 'real' THEN 'float4'
+				WHEN 'double precision' THEN 'float8'
+				WHEN 'character varying' THEN 'varchar'
+				WHEN 'character' THEN 'bpchar' WHEN 'char' THEN 'bpchar'
+				WHEN 'decimal' THEN 'numeric'
+				WHEN 'timestamp without time zone' THEN 'timestamp'
+				WHEN 'timestamp with time zone' THEN 'timestamptz'
+				WHEN 'time without time zone' THEN 'time'
+				ELSE lower(trim(name)) END)
+			LIMIT 1)`,
+		`CREATE OR REPLACE MACRO to_regproc(name) AS (
+			SELECT function_oid FROM duckdb_functions() WHERE function_name = lower(name) LIMIT 1)`,
+
+		// jsonb_pretty - indented JSON rendering.
+		`CREATE OR REPLACE MACRO jsonb_pretty(j) AS json_pretty(j)`,
+
+		// to_ascii - approximate transliteration to ASCII via accent stripping.
+		`CREATE OR REPLACE MACRO to_ascii(s) AS strip_accents(s)`,
+
+		// convert_from - decode bytea to text in a source encoding (UTF8 supported).
+		`CREATE OR REPLACE MACRO convert_from(b, enc) AS
+			CASE WHEN upper(replace(enc,'-','')) IN ('UTF8','UTF') THEN CAST(b AS VARCHAR)
+			ELSE error('unsupported source encoding: ' || enc) END`,
+
+		// width_bucket - SQL-standard equi-width histogram bucketing (below-range -> 0,
+		// at/above high -> count+1). DuckDB lacks the 4-arg numeric form.
+		`CREATE OR REPLACE MACRO width_bucket(operand, low, high, cnt) AS
+			CASE
+				WHEN operand < low THEN 0
+				WHEN operand >= high THEN cnt + 1
+				ELSE CAST(floor((operand - low) / ((high - low) / cnt)) AS INTEGER) + 1
+			END`,
+
+		// scale / min_scale - fractional-digit counts of a numeric (string-based).
+		`CREATE OR REPLACE MACRO scale(n) AS
+			CASE WHEN position('.' IN CAST(n AS VARCHAR)) = 0 THEN 0
+			ELSE length(split_part(CAST(n AS VARCHAR),'.',2)) END`,
+		`CREATE OR REPLACE MACRO min_scale(n) AS
+			CASE WHEN position('.' IN CAST(n AS VARCHAR)) = 0 THEN 0
+			ELSE length(rtrim(split_part(CAST(n AS VARCHAR),'.',2),'0')) END`,
+
+		// inet helpers - text-based. The transpiler maps the PG inet type to text
+		// (DuckDB's INET type is not preserved through the pipeline), so these operate
+		// on the textual CIDR form rather than family()/host()/INET. IPv6 is detected
+		// by the presence of ':'; the IPv4 prefix/host math uses the mask length only.
+		`CREATE OR REPLACE MACRO masklen(a) AS (
+			CASE
+				WHEN contains(CAST(a AS VARCHAR), '/') THEN CAST(split_part(CAST(a AS VARCHAR), '/', 2) AS INTEGER)
+				WHEN contains(CAST(a AS VARCHAR), ':') THEN 128
+				ELSE 32
+			END)`,
+		`CREATE OR REPLACE MACRO hostmask(a) AS (
+			CASE WHEN contains(CAST(a AS VARCHAR), ':') THEN NULL
+			ELSE ((((1::BIGINT << (32 - masklen(a))) - 1) >> 24 & 255) || '.' ||
+				  ((((1::BIGINT << (32 - masklen(a))) - 1) >> 16 & 255)) || '.' ||
+				  ((((1::BIGINT << (32 - masklen(a))) - 1) >> 8 & 255)) || '.' ||
+				  (((1::BIGINT << (32 - masklen(a))) - 1) & 255))
+			END)`,
+		`CREATE OR REPLACE MACRO set_masklen(a, len) AS (split_part(CAST(a AS VARCHAR), '/', 1) || '/' || CAST(len AS VARCHAR))`,
+		`CREATE OR REPLACE MACRO inet_same_family(a, b) AS (contains(CAST(a AS VARCHAR), ':') = contains(CAST(b AS VARCHAR), ':'))`,
+
+		// array_positions - indices (1-based) of all elements equal to elem; empty array (not NULL)
+		// when none match. IS NOT DISTINCT FROM gives PG's NULL-element matching.
+		`CREATE OR REPLACE MACRO array_positions(arr, elem) AS
+			list_transform(list_filter(range(1, len(arr)+1), i -> arr[i] IS NOT DISTINCT FROM elem), i -> i)`,
+
+		// array_replace - replace every element equal to from_elem (NULL-aware) with to_elem.
+		`CREATE OR REPLACE MACRO array_replace(arr, from_elem, to_elem) AS
+			list_transform(arr, x -> CASE WHEN x IS NOT DISTINCT FROM from_elem THEN to_elem ELSE x END)`,
+
+		// array_fill - 1-D array of val repeated dims[1] times (the common PG usage).
+		`CREATE OR REPLACE MACRO array_fill(val, dims) AS list_transform(range(1, dims[1] + 1), x -> val)`,
+
+		// trim_array - array with the last n elements removed.
+		`CREATE OR REPLACE MACRO trim_array(arr, n) AS arr[1:len(arr)-n]`,
+
+		// array_dims - 1-D bounds string '[1:N]'; NULL for empty/NULL arrays.
+		`CREATE OR REPLACE MACRO array_dims(arr) AS
+			CASE WHEN arr IS NULL OR len(arr)=0 THEN NULL ELSE '[1:' || len(arr) || ']' END`,
+
+		// date_bin - bin a timestamp into stride-width buckets anchored at origin (PG14).
+		`CREATE OR REPLACE MACRO date_bin(stride, source, origin) AS time_bucket(stride, source, origin)`,
+
+		// make_interval - build an interval from named components; DuckDB lacks make_interval.
+		// Named defaults support both positional and named (days => N) call forms, matching PG.
+		`CREATE OR REPLACE MACRO make_interval(years := 0, months := 0, weeks := 0, days := 0, hours := 0, mins := 0, secs := 0) AS
+			to_years(years) + to_months(months) + to_days(weeks*7 + days) + to_hours(hours) + to_minutes(mins) + to_seconds(secs)`,
+
+		// justify_hours / justify_days / justify_interval - roll 24h periods into days and/or
+		// 30-day periods into months. DuckDB lacks these. Microsecond-based time math preserves
+		// fractional seconds (datepart('second') would truncate them).
+		`CREATE OR REPLACE MACRO justify_hours(i) AS
+			to_months(datepart('year',i)*12 + datepart('month',i))
+			+ to_days(datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000)
+			+ to_microseconds(((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) % 86400000000)`,
+		`CREATE OR REPLACE MACRO justify_days(i) AS
+			to_months(datepart('year',i)*12 + datepart('month',i) + datepart('day',i) // 30)
+			+ to_days(datepart('day',i) % 30)
+			+ to_microseconds((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i))`,
+		`CREATE OR REPLACE MACRO justify_interval(i) AS
+			to_months(datepart('year',i)*12 + datepart('month',i) + (datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000) // 30)
+			+ to_days((datepart('day',i) + ((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) // 86400000000) % 30)
+			+ to_microseconds(((datepart('hour',i)*3600 + datepart('minute',i)*60)*1000000 + datepart('microsecond',i)) % 86400000000)`,
+
+		// === Set-returning table macros (used in FROM position) ===
+
+		// json_array_elements / jsonb_array_elements - one row per array element (value json).
+		`CREATE OR REPLACE MACRO json_array_elements(j) AS TABLE SELECT unnest(json_extract(j, '$[*]')) AS value`,
+		`CREATE OR REPLACE MACRO jsonb_array_elements(j) AS TABLE SELECT unnest(json_extract(j, '$[*]')) AS value`,
+
+		// json_array_elements_text - SETOF text; values unquoted, JSON null -> SQL NULL.
+		`CREATE OR REPLACE MACRO json_array_elements_text(j) AS TABLE SELECT unnest(j ->> '$[*]') AS value`,
+
+		// jsonb_each - (key text, value json). Keys are JSONPath-quoted so dotted keys work.
+		`CREATE OR REPLACE MACRO jsonb_each(j) AS TABLE
+			SELECT k AS key, json_extract(j, '$."' || k || '"') AS value FROM (SELECT unnest(json_keys(j)) AS k)`,
+
+		// json_each_text - (key text, value text); values unquoted via ->>.
+		`CREATE OR REPLACE MACRO json_each_text(j) AS TABLE
+			SELECT k AS key, j ->> ('$."' || k || '"') AS value FROM (SELECT unnest(json_keys(j)) AS k)`,
+
+		// pg_options_to_table - split reloptions ['name=value'] into (option_name, option_value).
+		`CREATE OR REPLACE MACRO pg_options_to_table(opts) AS TABLE
+			SELECT split_part(o,'=',1) AS option_name, split_part(o,'=',2) AS option_value
+			FROM unnest(COALESCE(opts, [])) AS t(o)`,
+
+		// aclexplode - duckgres exposes no real ACLs; zero rows for any input (correct columns).
+		`CREATE OR REPLACE MACRO aclexplode(acl) AS TABLE
+			SELECT NULL::BIGINT AS grantor, NULL::BIGINT AS grantee, NULL::VARCHAR AS privilege_type, NULL::BOOLEAN AS is_grantable WHERE false`,
+
+		// pg_get_keywords - SQL keyword catalog (word, catcode, barelabel, catdesc, baredesc).
+		`CREATE OR REPLACE MACRO pg_get_keywords() AS TABLE
+			SELECT keyword_name AS word,
+				CASE keyword_category
+					WHEN 'reserved' THEN 'R' WHEN 'unreserved' THEN 'U'
+					WHEN 'type_function' THEN 'T' WHEN 'column_name' THEN 'C' ELSE 'U'
+				END AS catcode,
+				true AS barelabel, '' AS catdesc, '' AS baredesc
+			FROM duckdb_keywords()`,
+
+		// pg_identify_object - single-row (type, schema, name, identity) for an object address.
+		// Only relations (classid 1259) are resolvable here; everything else yields NULLs.
+		`CREATE OR REPLACE MACRO pg_identify_object(classid, objid, objsubid) AS TABLE
+			SELECT CASE WHEN classid = 1259 AND c.relname IS NOT NULL THEN 'table' ELSE NULL END::VARCHAR AS type,
+				n.nspname::VARCHAR AS schema, c.relname::VARCHAR AS name, c.relname::VARCHAR AS identity
+			FROM (SELECT classid AS cid, objid AS oid) p
+			LEFT JOIN pg_catalog.pg_class c ON p.cid = 1259 AND c.oid = p.oid
+			LEFT JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid`,
+
+		// decode(text, format) -> bytea. DuckDB's builtin decode is single-arg and points the
+		// wrong way (returns the input unchanged for the 2-arg call). This 2-arg macro shadows it
+		// and returns correct bytes. 'escape' maps text straight to its byte representation.
+		`CREATE OR REPLACE MACRO decode(s, fmt) AS
+			CASE lower(fmt)
+				WHEN 'base64' THEN from_base64(s)
+				WHEN 'hex' THEN unhex(s)
+				WHEN 'escape' THEN s::blob
+				ELSE error('unsupported decode format: ' || fmt)
+			END`,
+
+		// encode(bytea, format) -> text. DuckDB's builtin encode is single-arg (varchar->blob);
+		// this 2-arg macro shadows it for the PG direction (bytea->text). DuckDB lacks macro
+		// overloading, so internal callers needing the old varchar->blob cast must use ::blob.
+		`CREATE OR REPLACE MACRO encode(data, fmt) AS
+			CASE lower(fmt)
+				WHEN 'base64' THEN to_base64(data)
+				WHEN 'hex' THEN lower(hex(data))
+				WHEN 'escape' THEN CAST(data AS VARCHAR)
+				ELSE error('unsupported encode format: ' || fmt)
+			END`,
+
+		// inet_server_addr - DuckDB ships a builtin that returns a wrong-typed NULL; shadow it
+		// with a VARCHAR-typed NULL. Deliberately NOT CAST(NULL AS INET): the INET type lives
+		// in the inet extension, which is not statically linked — referencing it here triggers
+		// DuckDB extension autoinstall over plain HTTP during worker warmup, where the egress
+		// policy silently drops port 80 and the fetch hangs long enough for the control plane
+		// to reap the worker (see TestInitPgCatalogIsAirgapSafe). The transpiler maps the PG
+		// inet type to text anyway, so VARCHAR is the consistent shape.
+		`CREATE OR REPLACE MACRO inet_server_addr() AS CAST(NULL AS VARCHAR)`,
+
+		// overlaps - PG's (s1,e1) OVERLAPS (s2,e2) half-open range test. DuckDB parses the
+		// OVERLAPS keyword into an overlaps() call but has no such function. Name must be
+		// double-quoted: OVERLAPS is a reserved keyword.
+		`CREATE OR REPLACE MACRO "overlaps"(s1, e1, s2, e2) AS
+			CASE
+				WHEN least(s1, e1) > least(s2, e2) THEN least(s1, e1) < greatest(s2, e2)
+				WHEN least(s1, e1) < least(s2, e2) THEN least(s2, e2) < greatest(s1, e1)
+				ELSE TRUE
+			END`,
 	}
 
 	for _, f := range functions {
 		if _, err := db.Exec(f); err != nil {
-			// Log but don't fail - some might already exist or conflict
+			// Don't fail session init over one macro, but a registration failure
+			// means the function silently vanishes for this session (e.g. a typo
+			// in a macro body) — make it visible.
+			head := f
+			if len(head) > 120 {
+				head = head[:120] + "…"
+			}
+			slog.Warn("Failed to register pg_catalog compatibility macro.", "error", err, "macro", head)
 			continue
 		}
 	}
@@ -1363,7 +1747,8 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', 'information_schema_views_compat'
+			'information_schema_schemata_compat', 'information_schema_views_compat',
+			'information_schema_sequences_compat', 'information_schema_routines_compat'
 		)
 		AND t.table_name NOT LIKE 'duckdb_%%'
 		AND t.table_name NOT LIKE 'sqlite_%%'
@@ -1432,7 +1817,8 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', 'information_schema_views_compat'
+			'information_schema_schemata_compat', 'information_schema_views_compat',
+			'information_schema_sequences_compat', 'information_schema_routines_compat'
 		)
 		AND v.table_name NOT LIKE 'duckdb_%%'
 		AND v.table_name NOT LIKE 'sqlite_%%'
@@ -1440,6 +1826,56 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	`
 	if _, err := db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix)); err != nil {
 		slog.Warn("Failed to create information_schema_views_compat view.", "error", err)
+	}
+
+	// Create information_schema.sequences wrapper view.
+	// DuckDB has no information_schema.sequences, so build it over duckdb_sequences()
+	// scoped to the session's default catalog (current_database() reports the real
+	// attached catalog — see server/sessionmeta). DuckDB sequences are always
+	// BIGINT-backed; value columns are VARCHAR per PG's character_data domain.
+	sequencesViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_sequences_compat AS
+		SELECT
+			CASE WHEN s.database_name IN ('ducklake', 'memory') THEN current_database() ELSE s.database_name END AS sequence_catalog,
+			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS sequence_schema,
+			s.sequence_name,
+			'bigint' AS data_type,
+			64 AS numeric_precision,
+			2 AS numeric_precision_radix,
+			0 AS numeric_scale,
+			CAST(s.start_value AS VARCHAR) AS start_value,
+			CAST(s.min_value AS VARCHAR) AS minimum_value,
+			CAST(s.max_value AS VARCHAR) AS maximum_value,
+			CAST(s.increment_by AS VARCHAR) AS increment,
+			CASE WHEN s.cycle THEN 'YES' ELSE 'NO' END AS cycle_option
+		FROM duckdb_sequences() s
+		WHERE s.database_name = current_database()
+	`
+	if _, err := db.Exec(sequencesViewSQL); err != nil {
+		slog.Warn("Failed to create information_schema_sequences_compat view.", "error", err)
+	}
+
+	// Create information_schema.routines stub view.
+	// DuckDB has no information_schema.routines and no user-defined SQL routines to
+	// report; a typed WHERE-false stub keeps column-filtered queries from erroring.
+	routinesViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_routines_compat AS
+		SELECT
+			CAST(NULL AS VARCHAR) AS specific_catalog,
+			CAST(NULL AS VARCHAR) AS specific_schema,
+			CAST(NULL AS VARCHAR) AS specific_name,
+			CAST(NULL AS VARCHAR) AS routine_catalog,
+			CAST(NULL AS VARCHAR) AS routine_schema,
+			CAST(NULL AS VARCHAR) AS routine_name,
+			CAST(NULL AS VARCHAR) AS routine_type,
+			CAST(NULL AS VARCHAR) AS data_type,
+			CAST(NULL AS VARCHAR) AS type_udt_name,
+			CAST(NULL AS VARCHAR) AS external_language,
+			CAST(NULL AS VARCHAR) AS routine_definition
+		WHERE false
+	`
+	if _, err := db.Exec(routinesViewSQL); err != nil {
+		slog.Warn("Failed to create information_schema_routines_compat view.", "error", err)
 	}
 
 	return nil
@@ -1500,7 +1936,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
-				'information_schema_schemata_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_schemata_compat', 'information_schema_sequences_compat',
+				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		  )
 		UNION ALL
 		-- Views from ducklake catalog
@@ -1550,7 +1987,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
-				'information_schema_schemata_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_schemata_compat', 'information_schema_sequences_compat',
+				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		  )
 		UNION ALL
 		-- Sequences from ducklake catalog

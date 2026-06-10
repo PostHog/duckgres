@@ -83,6 +83,10 @@ var typeMapping = map[string]string{
 	"daterange":   "text",
 	"int4multirange": "text",
 	"int8multirange": "text",
+	"nummultirange":  "text",
+	"tsmultirange":   "text",
+	"tstzmultirange": "text",
+	"datemultirange": "text",
 }
 
 func (t *TypeMappingTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {

@@ -63,6 +63,12 @@ type Transpiler struct {
 
 var threePartIdentPattern = regexp.MustCompile(`(?i)(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*(?:"[^"]+"|[a-z_][a-z0-9_$]*)`)
 
+// braceLiteralCastPattern matches the CAST spelling of a brace-literal array
+// cast: '{1,2,3}' AS int[] (whitespace-robust, also covers AS int ARRAY).
+// Only consulted when a CAST keyword is present so brace-literal column
+// aliases (SELECT '{"a":1}' AS j) stay Tier-0.
+var braceLiteralCastPattern = regexp.MustCompile(`(?i)\}'\s+AS\s`)
+
 // New creates a Transpiler with the given configuration.
 // It registers all transforms appropriate for the config.
 func New(cfg Config) *Transpiler {
@@ -326,20 +332,35 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 // Conservative: false positives (unnecessary transforms) are fine; false negatives are bugs.
 func Classify(sql string, cfg Config) Classification {
 	upper := strings.ToUpper(sql)
+	// upperNorm collapses every whitespace run into a single space so multi-word
+	// tokens ("FOR UPDATE") and trailing-space tokens ("DEFAULT ") match
+	// newline/tab/multi-space spellings. Collapsing whitespace can only ADD
+	// matches for those tokens, which is safe (false positives just run an
+	// AST-gated transform). Residual gap: a comment between keywords
+	// ("FOR /* c */ UPDATE") still escapes — comments are not stripped here.
+	upperNorm := normalizeWhitespace(upper)
+	// upperNoParenWS deletes whitespace runs immediately before '(' so
+	// paren-suffixed tokens ("EVERY(") match "every (true)". Only used for
+	// token lists whose entries contain no whitespace: deleting whitespace can
+	// never destroy a match of a whitespace-free token, only add matches.
+	// Residual gap: a comment between name and '(' (every/*c*/(true)) escapes.
+	upperNoParenWS := removeWhitespaceBeforeParen(upper)
 	profile := cfg.profile()
 	catalogPolicy := profile.Catalog()
 	ddlPolicy := profile.DDL()
 
 	var flags TransformFlags
 
-	// SET/SHOW/RESET/DISCARD/BEGIN/START TRANSACTION — always process these
-	// because they produce IsIgnoredSet/IsNoOp/Error side effects that conn.go depends on
-	if hasAnyPrefix(upper, "SET ", "SHOW ", "RESET ", "DISCARD ", "BEGIN", "START TRANSACTION", "START ") {
+	// SET/SHOW/RESET/DISCARD/BEGIN/START — always process these because they
+	// produce IsIgnoredSet/IsNoOp/Error side effects that conn.go depends on.
+	// hasAnyPrefix uses word-boundary matching, so any whitespace (or '('/';')
+	// after the keyword counts — "SET\nparam" matches like "SET param".
+	if hasAnyPrefix(upper, "SET", "SHOW", "RESET", "DISCARD", "BEGIN", "START") {
 		flags |= FlagSetShow
 	}
 
 	// pg_catalog references (tables, functions, types)
-	if containsAny(upper,
+	if containsAny(upperNoParenWS,
 		"PG_CATALOG", "PG_CLASS", "PG_TYPE", "PG_ATTRIBUTE", "PG_NAMESPACE",
 		"PG_INDEX", "PG_CONSTRAINT", "PG_DATABASE", "PG_ROLES", "PG_STAT",
 		"PG_STATIO", "PG_COLLATION", "PG_POLICY", "PG_PUBLICATION",
@@ -348,6 +369,13 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_ATTRDEF", "PG_AM", "PG_DESCRIPTION", "PG_DEPEND",
 		"PG_SHDESCRIPTION", "PG_PROC", "PG_EXTENSION",
 		"PG_AVAILABLE_EXTENSIONS", "PG_SETTINGS",
+		// Stub relations created by initPgCatalog (PG_STAT covers pg_stat_database
+		// and pg_stat_all_tables; PG_CAST also matches the unrelated word "cast"
+		// only when prefixed pg_, so it stays precise)
+		"PG_USER", "PG_SHADOW", "PG_AUTHID", "PG_CAST", "PG_OPERATOR",
+		"PG_AGGREGATE", "PG_EVENT_TRIGGER", "PG_TIMEZONE_NAMES",
+		"PG_REPLICATION_SLOTS", "PG_DB_ROLE_SETTING", "PG_DEFAULT_ACL",
+		"PG_RANGE", "PG_LARGEOBJECT", "PG_CURSORS",
 		"FORMAT_TYPE", "OBJ_DESCRIPTION", "COL_DESCRIPTION",
 		"PG_GET_EXPR", "PG_GET_USERBYID", "PG_TABLE_IS_VISIBLE",
 		"PG_GET_VIEWDEF", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_SERIAL_SEQUENCE",
@@ -388,7 +416,7 @@ func Classify(sql string, cfg Config) Classification {
 	}
 
 	// version() function
-	if strings.Contains(upper, "VERSION(") {
+	if strings.Contains(upperNoParenWS, "VERSION(") {
 		flags |= FlagVersion | FlagPgCatalog
 	}
 
@@ -397,6 +425,20 @@ func Classify(sql string, cfg Config) Classification {
 		"JSONB", "BYTEA", "INET", "CIDR", "MACADDR",
 		"MONEY", "BPCHAR", "TSVECTOR", "TSQUERY",
 		"REGPROC", "REGTYPE", "REGCLASS", "REGNAMESPACE",
+		// Geometric types. POINT/LINE/BOX/PATH false-positive on common words
+		// (SAVEPOINT, CHECKPOINT, search_path, lineitem) — a deliberate
+		// Tier-0-perf-only cost; TypeMappingTransform is AST-gated and a no-op
+		// when no such type appears.
+		"POINT", "LINE", "LSEG", "BOX", "PATH", "POLYGON", "CIRCLE",
+		// Range types: all 7 explicit tokens are required (TSRANGE is not a
+		// substring of TSTZRANGE; int4/int8range are not substrings of their
+		// multirange forms); MULTIRANGE covers all six multirange names.
+		// Deliberately NOT a single bare "RANGE" token — that would match
+		// window-frame RANGE BETWEEN, DuckDB's range() table function, and
+		// identifiers, needlessly evicting common analytics queries from Tier-0.
+		"INT4RANGE", "INT8RANGE", "NUMRANGE", "TSRANGE", "TSTZRANGE",
+		"DATERANGE", "MULTIRANGE",
+		"TIMESTAMPNTZ", "ROWVERSION",
 		"PG_CATALOG.INT", "PG_CATALOG.VARCHAR", "PG_CATALOG.TEXT",
 		"PG_CATALOG.BOOL", "PG_CATALOG.FLOAT", "PG_CATALOG.JSON",
 		"PG_CATALOG.\"DEFAULT\"",
@@ -405,15 +447,31 @@ func Classify(sql string, cfg Config) Classification {
 	}
 
 	// Literal rewrites: bytea \x hex literals and B'..' bit-string literals.
-	// Over-triggering is safe — LiteralTransform is a no-op when nothing matches —
-	// but we must not match B' inside an identifier (e.g. "my.db'") or it would
-	// pull plain DuckDB statements out of the Tier-0 direct path.
-	if strings.Contains(upper, `'\X`) || containsBitStringLiteral(upper) {
+	// The bare \X marker deliberately covers all three bytea hex spellings:
+	// '\x...', E'\\x...', and dollar-quoted $$\x...$$. Over-triggering is safe —
+	// LiteralTransform is a no-op when nothing matches — but we must not match
+	// B' inside an identifier (e.g. "my.db'") or it would pull plain DuckDB
+	// statements out of the Tier-0 direct path.
+	if strings.Contains(upper, `\X`) || containsBitStringLiteral(upper) {
 		flags |= FlagLiterals
 	}
 
-	// Type casts that need rewriting
-	if containsAny(upper, "::REGTYPE", "::REGCLASS", "::REGNAMESPACE", "::REGPROC", "::OID") {
+	// Type casts that need rewriting. Bare reg* tokens (not just ::-prefixed)
+	// so the CAST(x AS regclass) and CAST(x AS pg_catalog.regclass) spellings
+	// reach TypeCastTransform too; REGOPER also covers REGOPERATOR as a
+	// substring. Note: CAST(x AS oid) remains uncovered — only "::OID" triggers.
+	if containsAny(upper, "REGTYPE", "REGCLASS", "REGNAMESPACE", "REGPROC",
+		"REGOPER", "REGCONFIG", "REGDICTIONARY", "::OID") {
+		flags |= FlagTypeCast
+	}
+	// PG curly-brace array literal casts like '{1,2,3}'::int[] — the '}''::' signature
+	// marks a brace-terminated string literal immediately cast (rewritten to ARRAY[...]
+	// in TypeCastTransform). The CAST spelling — CAST('{1,2,3}' AS int[]) — is matched
+	// by the whitespace-robust "}' AS" pattern, gated on a CAST keyword so plain
+	// brace-literal column aliases (SELECT '{"a":1}' AS j) stay Tier-0. Over-triggers
+	// harmlessly on object casts like '{...}'::json (no array bounds -> left untouched).
+	if strings.Contains(upper, "}'::") ||
+		(strings.Contains(upper, "CAST") && braceLiteralCastPattern.MatchString(sql)) {
 		flags |= FlagTypeCast
 	}
 	// Also catch pg_catalog. qualified casts
@@ -422,7 +480,7 @@ func Classify(sql string, cfg Config) Classification {
 	}
 
 	// PostgreSQL functions that need mapping
-	if containsAny(upper,
+	if containsAny(upperNoParenWS,
 		// Array functions
 		"ARRAY_AGG(", "ARRAY_LENGTH(", "ARRAY_UPPER(", "ARRAY_LOWER(", "ARRAY_TO_STRING(",
 		"ARRAY_CAT(", "ARRAY_APPEND(", "ARRAY_PREPEND(", "ARRAY_REMOVE(", "ARRAY_POSITION(",
@@ -451,20 +509,39 @@ func Classify(sql string, cfg Config) Classification {
 		// TO_JSONB( needs its own entry (the trailing paren breaks the overlap).
 		"TO_JSON(", "TO_JSONB(",
 		// JSON functions
-		"JSON_OBJECT_KEYS(", "JSONB_OBJECT_KEYS(",
+		"JSON_OBJECT_KEYS(", "JSONB_OBJECT_KEYS(", "TO_JSONB(",
 		// Date/time functions
 		"TIMEOFDAY(", "LOCALTIME(", "LOCALTIMESTAMP(",
 		"CLOCK_TIMESTAMP(",
 		// Identity functions
 		"SESSION_USER", "USER(",
+		// PostgreSQL builtin-compatibility macros (server/catalog.go initPgCatalog)
+		"SET_CONFIG(", "UUID_GENERATE_V4(", "STATEMENT_TIMESTAMP(",
+		"PG_GET_FUNCTION_ARGUMENTS(", "PG_GET_FUNCTION_RESULT(", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS(",
+		"PG_GET_TRIGGERDEF(", "PG_JIT_AVAILABLE(", "ROW_SECURITY_ACTIVE(", "PG_COLLATION_FOR(",
+		"PG_INPUT_IS_VALID(", "TO_REGCLASS(", "TO_REGTYPE(", "TO_REGPROC(", "JSONB_PRETTY(",
+		"TO_ASCII(", "CONVERT_FROM(", "WIDTH_BUCKET(", "SCALE(", "MIN_SCALE(",
+		"MASKLEN(", "HOSTMASK(", "SET_MASKLEN(", "INET_SAME_FAMILY(",
+		"ARRAY_POSITIONS(", "ARRAY_REPLACE(", "ARRAY_FILL(", "TRIM_ARRAY(", "ARRAY_DIMS(",
+		"DATE_BIN(", "MAKE_INTERVAL(", "JUSTIFY_HOURS(", "JUSTIFY_DAYS(", "JUSTIFY_INTERVAL(",
+		"DECODE(", "ENCODE(", "INET_SERVER_ADDR(",
+		// Set-returning table macros (FROM-clause)
+		"JSON_ARRAY_ELEMENTS(", "JSONB_ARRAY_ELEMENTS(", "JSON_ARRAY_ELEMENTS_TEXT(",
+		"JSONB_EACH(", "JSON_EACH_TEXT(", "PG_OPTIONS_TO_TABLE(", "ACLEXPLODE(",
+		"PG_GET_KEYWORDS(", "PG_IDENTIFY_OBJECT(",
 	) {
 		flags |= FlagFunctions
 	}
 
-	// Function alias normalization
-	if containsAny(upper,
-		"CURRENT_DATABASE(", "CURRENT_SCHEMA(", "CURRENT_SCHEMAS(",
-		"CURRENT_USER", "CURRENT_CATALOG(", "SESSION_USER",
+	// Function alias normalization. CURRENT_SCHEMA / CURRENT_CATALOG are bare
+	// tokens (no paren) so the PG keyword forms — SELECT CURRENT_CATALOG — are
+	// flagged too: the parse/deparse pass lowercases the SQLValueFunction so
+	// the result column name matches PostgreSQL (same mechanism that already
+	// handles CURRENT_USER/SESSION_USER). The bare tokens subsume the
+	// CURRENT_SCHEMA()/CURRENT_SCHEMAS()/CURRENT_CATALOG() forms as substrings.
+	if containsAny(upperNoParenWS,
+		"CURRENT_DATABASE(", "CURRENT_SCHEMA",
+		"CURRENT_USER", "CURRENT_CATALOG", "SESSION_USER",
 	) {
 		flags |= FlagFuncAlias
 	}
@@ -478,11 +555,11 @@ func Classify(sql string, cfg Config) Classification {
 	// This is acceptable: false positive just runs the operator transform (cheap),
 	// while a false negative would break PostgreSQL regex queries that DuckDB
 	// handles via regexp_matches rewrite.
-	if containsAny(upper, "->", "~", "||") {
+	if containsAny(upper, "->", "~", "||", "@>", "#>>") {
 		flags |= FlagOperators
 	}
 	// Also check for SIMILAR TO which gets transformed through operators
-	if strings.Contains(upper, "SIMILAR TO") {
+	if strings.Contains(upperNorm, "SIMILAR TO") {
 		flags |= FlagOperators | FlagPgCatalog
 	}
 	// COLLATE pg_catalog."default" is handled by operators/pgcatalog
@@ -490,8 +567,9 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagOperators | FlagPgCatalog
 	}
 
-	// FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE locking clauses
-	if containsAny(upper, "FOR UPDATE", "FOR SHARE", "FOR NO KEY UPDATE", "FOR KEY SHARE") {
+	// FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE locking clauses (upperNorm so
+	// newline/tab-separated spellings like "FOR\nUPDATE" are caught too)
+	if containsAny(upperNorm, "FOR UPDATE", "FOR SHARE", "FOR NO KEY UPDATE", "FOR KEY SHARE") {
 		flags |= FlagLocking
 	}
 
@@ -507,8 +585,12 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagExpandArray
 	}
 
-	// ON CONFLICT (DuckLake mode only, but always flag it so the transform can decide)
-	if strings.Contains(upper, "ON CONFLICT") {
+	// ON CONFLICT (DuckLake mode only, but always flag it so the transform can
+	// decide). Match bare CONFLICT so any whitespace/comments between ON and
+	// CONFLICT still flag it (also covers ON CONFLICT ON CONSTRAINT name);
+	// OnConflictTransform is AST-gated on InsertStmt.OnConflictClause so false
+	// positives are no-ops.
+	if strings.Contains(upper, "CONFLICT") {
 		flags |= FlagOnConflict
 	}
 
@@ -517,7 +599,7 @@ func Classify(sql string, cfg Config) Classification {
 	// SELECT ... WHERE col = 'UNIQUE'), but the DDL transform only acts on
 	// CREATE TABLE / ALTER TABLE AST nodes, so false positives are harmless.
 	if ddlPolicy.NeedsTransform() {
-		if containsAny(upper, "CREATE INDEX", "DROP INDEX", "VACUUM", "ANALYZE", "GRANT ", "REVOKE ",
+		if containsAny(upperNorm, "CREATE INDEX", "DROP INDEX", "VACUUM", "ANALYZE", "GRANT ", "REVOKE ",
 			"PRIMARY KEY", "UNIQUE", "REFERENCES", "SERIAL", "BIGSERIAL",
 			"DEFAULT ", "GENERATED", "FOREIGN KEY", "ALTER TABLE", "CASCADE",
 			"CHECK ", "CHECK(",
@@ -529,7 +611,7 @@ func Classify(sql string, cfg Config) Classification {
 	// ClickHouse SQL macros (only when custom macros need qualification).
 	// These are created in memory.main and need explicit qualification.
 	if catalogPolicy.QualifyMacros {
-		if containsAny(upper,
+		if containsAny(upperNoParenWS,
 			"TOSTRING(", "TOINT32(", "TOINT64(", "TOFLOAT(",
 			"TOINT32ORNULL(", "TOINT32ORZERO(",
 			"INTDIV(", "MODULO(",
@@ -549,13 +631,14 @@ func Classify(sql string, cfg Config) Classification {
 	}
 
 	// Writable CTEs: WITH ... (INSERT|UPDATE|DELETE).
+	// Bare keywords (no trailing space): each may be followed by any whitespace,
+	// a comment, or a quoted identifier (DELETE\nFROM, minified WITH"d"AS(...)).
 	// This can false-positive on read-only queries containing these keywords
-	// (e.g., WHERE action = 'UPDATE'), but the writable CTE transform checks
-	// the actual AST and is a no-op for non-writable CTEs.
-	if strings.Contains(upper, "WITH ") {
-		if containsAny(upper, "INSERT ", "UPDATE ", "DELETE ") {
-			flags |= FlagWritableCTE
-		}
+	// (e.g., WHERE action = 'UPDATE' or updated_at/deleted_at columns) — only a
+	// Tier-1 parse cost, since the writable CTE transform checks the actual AST
+	// and is a no-op for non-writable CTEs.
+	if strings.Contains(upper, "WITH") && containsAny(upper, "INSERT", "UPDATE", "DELETE") {
+		flags |= FlagWritableCTE
 	}
 
 	// Parameter placeholders
@@ -586,6 +669,63 @@ func containsAny(s string, substrs ...string) bool {
 	return false
 }
 
+// isSQLWhitespace reports whether b is a PostgreSQL lexer whitespace byte
+// (space, tab, newline, carriage return, form feed, vertical tab).
+func isSQLWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f' || b == '\v'
+}
+
+// normalizeWhitespace collapses every whitespace run into a single space (and
+// trims leading/trailing whitespace) in a single pass, so Classify's multi-word
+// and trailing-space tokens match newline/tab/multi-space spellings.
+func normalizeWhitespace(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	pendingSpace := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if isSQLWhitespace(c) {
+			pendingSpace = true
+			continue
+		}
+		if pendingSpace && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		pendingSpace = false
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// removeWhitespaceBeforeParen deletes whitespace runs immediately preceding a
+// '(' in a single pass, so Classify's paren-suffixed tokens like "EVERY("
+// match spellings with whitespace before the argument list ("every (true)").
+func removeWhitespaceBeforeParen(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	runStart := -1 // start of the current whitespace run, -1 if none
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if isSQLWhitespace(c) {
+			if runStart < 0 {
+				runStart = i
+			}
+			continue
+		}
+		if runStart >= 0 {
+			if c != '(' {
+				b.WriteString(s[runStart:i])
+			}
+			runStart = -1
+		}
+		b.WriteByte(c)
+	}
+	if runStart >= 0 {
+		b.WriteString(s[runStart:])
+	}
+	return b.String()
+}
+
 // containsBitStringLiteral reports whether the (upper-cased) SQL contains a
 // bit-string literal B'..'. The B must be a standalone token (not preceded by an
 // identifier character) so it doesn't match B' inside names like "my.db'".
@@ -607,7 +747,10 @@ func isIdentChar(b byte) bool {
 		(b >= '0' && b <= '9')
 }
 
-// hasAnyPrefix returns true if s starts with any of the given prefixes.
+// hasAnyPrefix returns true if s starts with any of the given keyword prefixes
+// at a word boundary: the prefix must be followed by end-of-string or a
+// non-identifier byte (whitespace, '(', ';', ...), so "SET\nparam" matches
+// "SET" while "SETTINGS_DUMP" does not.
 // The check is performed after trimming leading whitespace, line comments (-- ...),
 // and block comments (/* ... */).
 func hasAnyPrefix(s string, prefixes ...string) bool {
@@ -635,7 +778,8 @@ func hasAnyPrefix(s string, prefixes ...string) bool {
 	}
 
 	for _, prefix := range prefixes {
-		if strings.HasPrefix(trimmed, prefix) {
+		if strings.HasPrefix(trimmed, prefix) &&
+			(len(trimmed) == len(prefix) || !isIdentChar(trimmed[len(prefix)])) {
 			return true
 		}
 	}

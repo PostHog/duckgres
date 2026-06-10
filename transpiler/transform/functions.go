@@ -119,8 +119,9 @@ var functionNameMapping = map[string]string{
 	"least":           "least",           // same
 	"md5":             "md5",             // same
 	"sha256":          "sha256",          // same (DuckDB extension)
-	"encode":          "encode",          // same
-	"decode":          "decode",          // same
+	// NOTE: encode/decode are intentionally NOT mapped here. DuckDB's builtins have
+	// incompatible 2-arg PostgreSQL semantics (silently-wrong / binder errors); they are
+	// emulated by 2-arg shadowing macros in server/catalog.go initPgCatalog.
 	"pg_typeof":       "typeof",          // DuckDB equivalent
 
 	// Information functions (mostly stubs or approximations)

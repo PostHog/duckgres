@@ -111,6 +111,27 @@ func (t *OperatorTransform) transformSelectStmt(stmt *pg_query.SelectStmt) bool 
 		}
 	}
 
+	// Transform VALUES lists (e.g. INSERT INTO t VALUES ('abc' ~ 'b'))
+	for _, valuesList := range stmt.ValuesLists {
+		if list := valuesList.GetList(); list != nil {
+			for i, item := range list.Items {
+				if newItem := t.transformExpression(item); newItem != nil {
+					list.Items[i] = newItem
+					changed = true
+				}
+			}
+		}
+	}
+
+	// Transform DISTINCT ON expressions. Plain DISTINCT is represented as a
+	// single empty node, which transformExpression leaves untouched.
+	for i, distinct := range stmt.DistinctClause {
+		if newDistinct := t.transformExpression(distinct); newDistinct != nil {
+			stmt.DistinctClause[i] = newDistinct
+			changed = true
+		}
+	}
+
 	// Transform GROUP BY expressions (e.g. GROUP BY data->>'type')
 	for i, group := range stmt.GroupClause {
 		if newGroup := t.transformExpression(group); newGroup != nil {
@@ -121,12 +142,15 @@ func (t *OperatorTransform) transformSelectStmt(stmt *pg_query.SelectStmt) bool 
 
 	// Transform ORDER BY expressions. Each SortClause element is a SortBy node
 	// wrapping the sort expression, so descend into its Node.
-	for _, sort := range stmt.SortClause {
-		if sortBy := sort.GetSortBy(); sortBy != nil && sortBy.Node != nil {
-			if newNode := t.transformExpression(sortBy.Node); newNode != nil {
-				sortBy.Node = newNode
-				changed = true
-			}
+	if t.transformSortClause(stmt.SortClause) {
+		changed = true
+	}
+
+	// Transform named WINDOW definitions (SELECT ... WINDOW w AS (...)).
+	// `OVER w` partitioning/ordering expressions live here, not on the FuncCall.
+	for _, window := range stmt.WindowClause {
+		if t.transformWindowDef(window.GetWindowDef()) {
+			changed = true
 		}
 	}
 
@@ -165,6 +189,54 @@ func (t *OperatorTransform) transformSelectStmt(stmt *pg_query.SelectStmt) bool 
 	return changed
 }
 
+// transformSortClause transforms the sort expressions in a list of SortBy
+// nodes (SELECT ORDER BY, aggregate ORDER BY, window ORDER BY).
+func (t *OperatorTransform) transformSortClause(sortClause []*pg_query.Node) bool {
+	changed := false
+	for _, sort := range sortClause {
+		if sortBy := sort.GetSortBy(); sortBy != nil && sortBy.Node != nil {
+			if newNode := t.transformExpression(sortBy.Node); newNode != nil {
+				sortBy.Node = newNode
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// transformWindowDef transforms the PARTITION BY / ORDER BY expressions of a
+// window definition (inline OVER (...) or a named WINDOW clause entry).
+func (t *OperatorTransform) transformWindowDef(def *pg_query.WindowDef) bool {
+	if def == nil {
+		return false
+	}
+	changed := false
+	for i, part := range def.PartitionClause {
+		if newPart := t.transformExpression(part); newPart != nil {
+			def.PartitionClause[i] = newPart
+			changed = true
+		}
+	}
+	if t.transformSortClause(def.OrderClause) {
+		changed = true
+	}
+	return changed
+}
+
+// transformReturningList transforms RETURNING expressions of INSERT/UPDATE/DELETE.
+func (t *OperatorTransform) transformReturningList(returningList []*pg_query.Node) bool {
+	changed := false
+	for _, target := range returningList {
+		if resTarget := target.GetResTarget(); resTarget != nil && resTarget.Val != nil {
+			if newVal := t.transformExpression(resTarget.Val); newVal != nil {
+				resTarget.Val = newVal
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
 func (t *OperatorTransform) transformInsertStmt(stmt *pg_query.InsertStmt) bool {
 	if stmt == nil {
 		return false
@@ -178,6 +250,10 @@ func (t *OperatorTransform) transformInsertStmt(stmt *pg_query.InsertStmt) bool 
 				changed = true
 			}
 		}
+	}
+
+	if t.transformReturningList(stmt.ReturningList) {
+		changed = true
 	}
 
 	return changed
@@ -215,6 +291,10 @@ func (t *OperatorTransform) transformUpdateStmt(stmt *pg_query.UpdateStmt) bool 
 		}
 	}
 
+	if t.transformReturningList(stmt.ReturningList) {
+		changed = true
+	}
+
 	return changed
 }
 
@@ -231,6 +311,17 @@ func (t *OperatorTransform) transformDeleteStmt(stmt *pg_query.DeleteStmt) bool 
 			stmt.WhereClause = newWhere
 			changed = true
 		}
+	}
+
+	// Transform USING clause (joined/subselect sources)
+	for _, using := range stmt.UsingClause {
+		if t.transformFromItem(using) {
+			changed = true
+		}
+	}
+
+	if t.transformReturningList(stmt.ReturningList) {
+		changed = true
 	}
 
 	return changed
@@ -301,6 +392,20 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 			if looksJSON(aexpr.Lexpr) || looksJSON(aexpr.Rexpr) {
 				return t.createJSONConcatExpr(aexpr.Lexpr, aexpr.Rexpr)
 			}
+		// jsonb @> jsonb is containment in Postgres; DuckDB has no @>(JSON,JSON) but does
+		// have json_contains(). Only rewrite when an operand is clearly JSON — array @> array
+		// is native in DuckDB and must be left alone.
+		case "@>":
+			if looksJSON(aexpr.Lexpr) || looksJSON(aexpr.Rexpr) {
+				return t.createJSONContainsFuncCall(aexpr.Lexpr, aexpr.Rexpr)
+			}
+		// json #>> '{a,b}' extracts the value at a text[] path as text. DuckDB lacks #>> but
+		// json_extract_string(j, '$."a"."b"') is equivalent. Only literal path arrays can be
+		// converted at transpile time; a non-literal path is left as-is.
+		case "#>>":
+			if jsonPath := pgPathArrayToJSONPath(aexpr.Rexpr); jsonPath != "" {
+				return t.createJsonExtractFuncCall(aexpr.Lexpr, stringConstNode(jsonPath), true)
+			}
 		// Regex operators — only match binary ~ (both operands present).
 		// Unary ~ (bitwise NOT, e.g. ~id) has Lexpr=nil and must be left as-is;
 		// DuckDB supports ~ as bitwise NOT natively. Passing nil into
@@ -355,12 +460,40 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 		return nil
 	}
 
-	// Handle function calls (recurse into arguments)
+	// Handle function calls (recurse into arguments, FILTER, aggregate
+	// ORDER BY, and inline OVER (...) definitions)
 	if funcCall := node.GetFuncCall(); funcCall != nil {
 		anyChanged := false
 		for i, arg := range funcCall.Args {
 			if newArg := t.transformExpression(arg); newArg != nil {
 				funcCall.Args[i] = newArg
+				anyChanged = true
+			}
+		}
+		if funcCall.AggFilter != nil {
+			if newFilter := t.transformExpression(funcCall.AggFilter); newFilter != nil {
+				funcCall.AggFilter = newFilter
+				anyChanged = true
+			}
+		}
+		if t.transformSortClause(funcCall.AggOrder) {
+			anyChanged = true
+		}
+		if t.transformWindowDef(funcCall.Over) {
+			anyChanged = true
+		}
+		if anyChanged {
+			return node
+		}
+		return nil
+	}
+
+	// Handle ARRAY[...] constructors
+	if arrayExpr := node.GetAArrayExpr(); arrayExpr != nil {
+		anyChanged := false
+		for i, elem := range arrayExpr.Elements {
+			if newElem := t.transformExpression(elem); newElem != nil {
+				arrayExpr.Elements[i] = newElem
 				anyChanged = true
 			}
 		}
@@ -723,6 +856,97 @@ func castToJSON(operand *pg_query.Node) *pg_query.Node {
 // positions in the emitted expression without sharing mutable state.
 func cloneNode(node *pg_query.Node) *pg_query.Node {
 	return proto.Clone(node).(*pg_query.Node)
+}
+
+// createJSONContainsFuncCall rewrites `a @> b` to json_contains(a, b), matching
+// Postgres jsonb containment for the common object/array cases.
+func (t *OperatorTransform) createJSONContainsFuncCall(left, right *pg_query.Node) *pg_query.Node {
+	if newLeft := t.transformExpression(left); newLeft != nil {
+		left = newLeft
+	}
+	if newRight := t.transformExpression(right); newRight != nil {
+		right = newRight
+	}
+	return &pg_query.Node{
+		Node: &pg_query.Node_FuncCall{
+			FuncCall: &pg_query.FuncCall{
+				Funcname: []*pg_query.Node{
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "json_contains"}}},
+				},
+				Args: []*pg_query.Node{left, right},
+			},
+		},
+	}
+}
+
+// stringConstNode builds an A_Const string node carrying the given value.
+func stringConstNode(s string) *pg_query.Node {
+	return &pg_query.Node{
+		Node: &pg_query.Node_AConst{
+			AConst: &pg_query.A_Const{
+				Val: &pg_query.A_Const_Sval{Sval: &pg_query.String{Sval: s}},
+			},
+		},
+	}
+}
+
+// pgPathArrayToJSONPath converts a literal Postgres text[] path (e.g. '{a,b}' or
+// '{a,0,b}') into a DuckDB JSONPath ('$."a"."b"', '$."a"[0]."b"'). Keys are
+// double-quoted so dotted keys are handled; all-digit elements become array
+// indices. Returns "" for non-literal operands (left untransformed).
+//
+// Divergence: PG resolves each path element against the container's runtime type
+// (a digit element addresses an object key "0" when the container is an object),
+// but this static conversion always treats all-digit elements as array indices —
+// an object with a literal numeric key returns NULL instead of its value.
+func pgPathArrayToJSONPath(node *pg_query.Node) string {
+	if node == nil {
+		return ""
+	}
+	// Unwrap an explicit cast like '{a,b}'::text[].
+	if tc := node.GetTypeCast(); tc != nil {
+		node = tc.Arg
+	}
+	ac := node.GetAConst()
+	if ac == nil {
+		return ""
+	}
+	sval := ac.GetSval()
+	if sval == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(sval.Sval)
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
+		return ""
+	}
+	inner := raw[1 : len(raw)-1]
+	if strings.TrimSpace(inner) == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("$")
+	for _, part := range strings.Split(inner, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && isAllDigits(part) {
+			b.WriteString("[")
+			b.WriteString(part)
+			b.WriteString("]")
+			continue
+		}
+		b.WriteString(`."`)
+		b.WriteString(strings.ReplaceAll(part, `"`, `""`))
+		b.WriteString(`"`)
+	}
+	return b.String()
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // createRegexFuncCall creates a regexp_matches function call node

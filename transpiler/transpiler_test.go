@@ -218,8 +218,8 @@ func TestTranspile_InformationSchema(t *testing.T) {
 		},
 		{
 			name:     "unmapped information_schema table passes through",
-			input:    "SELECT * FROM information_schema.routines",
-			contains: "information_schema.routines",
+			input:    "SELECT * FROM information_schema.key_column_usage",
+			contains: "information_schema.key_column_usage",
 		},
 	}
 
@@ -4350,6 +4350,31 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			contains: "memory.main.format_type",
 		},
 		{
+			name:     "width_bucket gets memory.main prefix",
+			input:    "SELECT width_bucket(v, 0, 10, 5) FROM t",
+			contains: "memory.main.width_bucket",
+		},
+		{
+			name:     "uuid_generate_v4 gets memory.main prefix",
+			input:    "SELECT uuid_generate_v4()",
+			contains: "memory.main.uuid_generate_v4",
+		},
+		{
+			name:     "set_config gets memory.main prefix",
+			input:    "SELECT set_config('search_path', 'main', false)",
+			contains: "memory.main.set_config",
+		},
+		{
+			name:     "decode gets memory.main prefix",
+			input:    "SELECT decode('YWJj', 'base64')",
+			contains: "memory.main.decode",
+		},
+		{
+			name:     "json_array_elements (FROM-clause SRF) gets memory.main prefix",
+			input:    "SELECT value FROM json_array_elements('[1,2,3]'::json)",
+			contains: "memory.main.json_array_elements",
+		},
+		{
 			name:     "array_lower gets memory.main prefix",
 			input:    "SELECT array_lower(conkey, 1) FROM pg_constraint",
 			contains: "memory.main.array_lower",
@@ -4461,6 +4486,37 @@ func TestClassify_Direct(t *testing.T) {
 			cls := Classify(tt.input, cfg)
 			if !cls.Direct {
 				t.Errorf("Classify(%q) = {Direct: false, Flags: %d}, want Direct", tt.input, cls.Flags)
+			}
+		})
+	}
+}
+
+// Functions in functionNameMapping must each have a Classify token: a query
+// whose ONLY PG-ism is that function must still be rewritten. Regression for
+// the to_jsonb gap (mapped since long ago, but never fired when it was the
+// only classified token in the query — e.g. SELECT to_jsonb(metadata) FROM t).
+func TestTranspile_MappedFunctionsFireAlone(t *testing.T) {
+	tr := New(DefaultConfig())
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{"to_jsonb alone", "SELECT to_jsonb(metadata) AS m FROM stripe.customer", "to_json(", "to_jsonb("},
+		{"jsonb_array_length alone", "SELECT jsonb_array_length(data) FROM t", "json_array_length(", "jsonb_array_length("},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
 			}
 		})
 	}
