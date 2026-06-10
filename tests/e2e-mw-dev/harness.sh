@@ -111,14 +111,27 @@ apk add --no-cache curl jq postgresql-client openssl python3 py3-psycopg2 >/dev/
 # The Job runs as the `duckgres` SA (pods get/list/delete/patch + pods/exec +
 # pods/log in-namespace, and ducklings get/list/watch cross-namespace), and
 # kubectl auto-detects in-cluster config from that mounted SA token. arm64:
-# mw-dev worker nodes are arm64.
+# mw-dev worker nodes are arm64. The version is pinned (no stable.txt lookup —
+# one fewer network round-trip, no surprise version bump mid-suite) and the
+# download starts in the BACKGROUND right below so it overlaps the provisioning
+# phase instead of serializing in front of it; bootstrap_kubectl joins it.
 KUBECTL=/tmp/kubectl
-bootstrap_kubectl() {
+KUBECTL_VERSION=v1.33.1
+kubectl_dl_pid=""
+start_kubectl_download() {
   [ -x "$KUBECTL" ] && return 0
-  kver="$(curl -fsSL https://dl.k8s.io/release/stable.txt 2>/dev/null || echo v1.30.5)"
-  curl -fsSLo "$KUBECTL" "https://dl.k8s.io/release/${kver}/bin/linux/arm64/kubectl"
+  curl -fsSLo "$KUBECTL" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/arm64/kubectl" &
+  kubectl_dl_pid=$!
+}
+bootstrap_kubectl() {
+  if [ -n "$kubectl_dl_pid" ]; then
+    wait "$kubectl_dl_pid" || fail "kubectl download failed (pinned $KUBECTL_VERSION)"
+    kubectl_dl_pid=""
+  fi
+  [ -s "$KUBECTL" ] || fail "kubectl binary missing after download"
   chmod +x "$KUBECTL"
 }
+start_kubectl_download
 k() { "$KUBECTL" -n "$NS" "$@"; }
 
 api_post() { curl -fsS -X POST -H "$H" "$API/api/v1/orgs/$1/$2"; }
@@ -769,7 +782,7 @@ org_default_profile() { # org password catalog
   [ "$got" = "$cpu|$mem|$ttl" ] || fail "org default: rejected PUT mutated the org: '$got'"
 
   # Wait out the CP's config-store poll so its snapshot carries the default.
-  sleep "${CONFIG_POLL_SETTLE:-40}"
+  sleep "${CONFIG_POLL_SETTLE:-12}"
 
   # PLAIN connection: no PGOPTIONS / duckgres.* startup options at all.
   pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
@@ -795,7 +808,7 @@ org_default_profile() { # org password catalog
   [ "$code" = "200" ] || fail "org default: clear PUT -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_profile "$org")"
   [ "$got" = "||" ] || fail "org default: not cleared on GET: '$got'"
-  sleep "${CONFIG_POLL_SETTLE:-40}"
+  sleep "${CONFIG_POLL_SETTLE:-12}"
   before="$(count_org_workers_of_cpu "$org" "$cpu")"
   pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
   after="$(count_org_workers_of_cpu "$org" "$cpu")"
@@ -862,7 +875,7 @@ persistent_user_secret_isolation() { # org rootpw
   case "$code" in 200|201) ;; *) fail "persistent secret: create user $u2 -> HTTP $code: $(cat /tmp/create_user_out)";; esac
   # New-user auth is config-snapshot-driven; wait out one poll before the
   # first login so we don't burn failed auths against the rate limiter.
-  sleep "${CONFIG_POLL_SETTLE:-40}"
+  sleep "${CONFIG_POLL_SETTLE:-12}"
 
   n="$(pg "$org" "$u2pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'" "$u2")"
   [ "$n" = "0" ] || fail "persistent secret: user $u2 sees root's secret (count=$n)"
@@ -943,8 +956,11 @@ graceful_drain() { # org password
 # the org would peak at a single active-org-labeled pod for both queries.
 # Assumes the default nodepool already has warm capacity (prior resilience steps spawned
 # pods), so the second pod schedules within the queries' runtime.
-one_session_per_worker() { # org password
-  log "one session per worker: concurrent queries land on distinct pods on $1"
+# One attempt of the one-session-per-worker probe. Hard failures (a query
+# errored / wrong results) fail() immediately — those are real bugs. Returns 1
+# only for the soft outcome peak<2 with both queries CORRECT, which the wrapper
+# below retries once (see its comment).
+one_session_per_worker_attempt() { # org password
   o1="$(mktemp)"; o2="$(mktemp)"; r1="$(mktemp)"; r2="$(mktemp)"
   # This assertion's PRECONDITION is overlap: both queries must be executing
   # at the same time, or "peak pods" measures nothing. On a cold org a single
@@ -981,10 +997,28 @@ one_session_per_worker() { # org password
   n1="$(tr -dc '0-9' <"$o1")"; n2="$(tr -dc '0-9' <"$o2")"
   { [ "$n1" = "$want" ] && [ "$n2" = "$want" ]; } \
     || fail "one_session_per_worker: wrong results n1=$n1 n2=$n2 want $want"
-  [ "$peak" -ge 2 ] \
-    || fail "one_session_per_worker: org peaked at $peak worker pod(s) for 2 concurrent queries — sessions shared a worker"
   rm -f "$o1" "$o2" "$r1" "$r2"
+  if [ "$peak" -lt 2 ]; then
+    return 1
+  fi
   log "one session per worker: OK (peak $peak pods for $1)"
+}
+
+one_session_per_worker() { # org password
+  log "one session per worker: concurrent queries land on distinct pods on $1"
+  # peak<2 with both queries returning CORRECT results is ambiguous: either a
+  # real co-assignment regression, or the documented serialization false-fail
+  # (one query's transient retry let the sibling finish; its hot-idle worker
+  # was then legitimately reused). True co-residence cannot be silent — workers
+  # run MaxSessions=1, and a CP/worker accounting drift is loudly surfaced via
+  # the session-cap-drift ERROR + metric — so a single retry preserves the
+  # regression net (a deterministic sharing bug fails both attempts) while
+  # absorbing the transient (observed: 2026-06-10 run 27304575868 attempt 1).
+  if ! one_session_per_worker_attempt "$1" "$2"; then
+    log "one session per worker: queries serialized (peak<2, results correct) — retrying once"
+    one_session_per_worker_attempt "$1" "$2" \
+      || fail "one_session_per_worker: org peaked at <2 worker pods for 2 concurrent queries on BOTH attempts — sessions shared a worker"
+  fi
 }
 
 # Parallel cold-burst spawn ramp (regression net for the doomed-spawn /
@@ -1278,7 +1312,6 @@ lane_ext() { # external-RDS metadata backend + org default profile
 }
 
 main() {
-  bootstrap_kubectl
   resolve_cp_ip
 
   # No org dependency — assert the admin surface auth contract up front.
@@ -1320,9 +1353,15 @@ main() {
 
   # Settle: let the CP's config-store poll pick up the provisioned orgs/users
   # before the first connection, so we don't burn failed-auth attempts against
-  # the rate limiter while the auth cache catches up.
-  log "settling ${CONFIG_POLL_SETTLE:-40}s for CP auth cache…"
-  sleep "${CONFIG_POLL_SETTLE:-40}"
+  # the rate limiter while the auth cache catches up. The CI control plane polls
+  # every 5s (DUCKGRES_CONFIG_POLL_INTERVAL in manifests.tmpl.yaml), so 12s
+  # covers two full poll cycles; CONFIG_POLL_SETTLE overrides if that drifts.
+  log "settling ${CONFIG_POLL_SETTLE:-12}s for CP auth cache…"
+  sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  # Join the kubectl background download started at script load — first k use
+  # is inside the lanes, so the fetch overlapped the whole provisioning phase.
+  bootstrap_kubectl
 
   # ---- the four parallel assertion lanes (see lane_* above) ----
   run_lane cnpg lane_cnpg

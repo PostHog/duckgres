@@ -273,7 +273,15 @@ cmd_teardown() {
   # before we delete it. Best-effort — the namespace delete + e2e-cleanup are the
   # backstop. Uses the CP admin API via a short-lived port-forward.
   if "${KUBECTL[@]}" -n "$NS" get deploy/duckgres-control-plane >/dev/null 2>&1; then
+    # Teardown may run on a different runner than deploy (it's a separate
+    # always() job so the gating e2e check finishes sooner), so the secret file
+    # written at deploy time may not exist — recover it from the in-cluster
+    # Secret the deploy templated it into.
     secret="$(cat "$internal_secret_file" 2>/dev/null || true)"
+    if [ -z "$secret" ]; then
+      secret="$("${KUBECTL[@]}" -n "$NS" get secret duckgres-tokens \
+        -o jsonpath='{.data.internal-secret}' 2>/dev/null | base64 -d || true)"
+    fi
     if [ -n "$secret" ]; then
       "${KUBECTL[@]}" -n "$NS" port-forward svc/duckgres-control-plane 18080:8080 >/dev/null 2>&1 &
       pf=$!; sleep 4
