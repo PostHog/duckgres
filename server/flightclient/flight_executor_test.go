@@ -122,9 +122,8 @@ func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.Flight
 	return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
 }
 
-func TestFlightRowSetCloseWaitsForWorkerDoGetCleanup(t *testing.T) {
-	srv := newCloseWaitFlightServer()
-
+func newCloseWaitExecutor(t *testing.T, srv *closeWaitFlightServer) (*FlightExecutor, context.Context) {
+	t.Helper()
 	grpcSrv := grpc.NewServer()
 	pb.RegisterFlightServiceServer(grpcSrv, srv)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -132,10 +131,10 @@ func TestFlightRowSetCloseWaitsForWorkerDoGetCleanup(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	go func() { _ = grpcSrv.Serve(lis) }()
-	defer grpcSrv.Stop()
+	t.Cleanup(grpcSrv.Stop)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	flightCli, err := flight.NewClientWithMiddlewareCtx(
 		ctx, lis.Addr().String(), nil, nil,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -143,10 +142,16 @@ func TestFlightRowSetCloseWaitsForWorkerDoGetCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("flight client: %v", err)
 	}
-	defer func() { _ = flightCli.Close() }()
+	t.Cleanup(func() { _ = flightCli.Close() })
 
 	exec := NewFlightExecutorFromClient(&flightsql.Client{Client: flightCli}, "session-1")
-	defer func() { _ = exec.Close() }()
+	t.Cleanup(func() { _ = exec.Close() })
+	return exec, ctx
+}
+
+func TestFlightRowSetCloseWaitsForWorkerDoGetCleanup(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+	exec, ctx := newCloseWaitExecutor(t, srv)
 
 	rows, err := exec.QueryContext(ctx, "SELECT 1")
 	if err != nil {
@@ -191,29 +196,7 @@ func TestFlightRowSetCloseWaitsForWorkerDoGetCleanup(t *testing.T) {
 func TestFlightRowSetCloseSkipsWaitAfterCleanEOF(t *testing.T) {
 	srv := newCloseWaitFlightServer()
 	srv.closeAfterFirstBatch = true
-
-	grpcSrv := grpc.NewServer()
-	pb.RegisterFlightServiceServer(grpcSrv, srv)
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	go func() { _ = grpcSrv.Serve(lis) }()
-	defer grpcSrv.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	flightCli, err := flight.NewClientWithMiddlewareCtx(
-		ctx, lis.Addr().String(), nil, nil,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("flight client: %v", err)
-	}
-	defer func() { _ = flightCli.Close() }()
-
-	exec := NewFlightExecutorFromClient(&flightsql.Client{Client: flightCli}, "session-1")
-	defer func() { _ = exec.Close() }()
+	exec, ctx := newCloseWaitExecutor(t, srv)
 
 	rows, err := exec.QueryContext(ctx, "SELECT 1")
 	if err != nil {
@@ -241,29 +224,7 @@ func TestFlightRowSetCloseSkipsWaitAfterCleanEOF(t *testing.T) {
 
 func TestFlightRowSetCloseSkipsWaitAfterExecutorMarkedDead(t *testing.T) {
 	srv := newCloseWaitFlightServer()
-
-	grpcSrv := grpc.NewServer()
-	pb.RegisterFlightServiceServer(grpcSrv, srv)
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	go func() { _ = grpcSrv.Serve(lis) }()
-	defer grpcSrv.Stop()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	flightCli, err := flight.NewClientWithMiddlewareCtx(
-		ctx, lis.Addr().String(), nil, nil,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("flight client: %v", err)
-	}
-	defer func() { _ = flightCli.Close() }()
-
-	exec := NewFlightExecutorFromClient(&flightsql.Client{Client: flightCli}, "session-1")
-	defer func() { _ = exec.Close() }()
+	exec, ctx := newCloseWaitExecutor(t, srv)
 
 	rows, err := exec.QueryContext(ctx, "SELECT 1")
 	if err != nil {
