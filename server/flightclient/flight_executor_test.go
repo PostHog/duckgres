@@ -52,18 +52,21 @@ type closeWaitFlightServer struct {
 
 	schema *arrow.Schema
 
-	doGetStarted         chan struct{}
-	doGetContextCanceled chan struct{}
-	allowDoGetReturn     chan struct{}
-	doGetDone            chan struct{}
-	doActionCalled       chan struct{}
-	doActionOnce         sync.Once
-	releaseActionCalled  chan struct{}
-	releaseActionOnce    sync.Once
-	releaseTicket        []byte
-	closeAfterFirstBatch bool
-	doGetErr             error
-	doActionErr          error
+	doGetStarted          chan struct{}
+	doGetContextCanceled  chan struct{}
+	allowDoGetReturn      chan struct{}
+	doGetDone             chan struct{}
+	doActionCalled        chan struct{}
+	doActionOnce          sync.Once
+	releaseActionCalled   chan struct{}
+	releaseActionOnce     sync.Once
+	releaseTicket         []byte
+	waitBeforeDoGetCancel chan struct{}
+	waitBeforeOnce        sync.Once
+	closeAfterFirstBatch  bool
+	invalidInfoSchema     bool
+	doGetErr              error
+	doActionErr           error
 }
 
 func newCloseWaitFlightServer() *closeWaitFlightServer {
@@ -83,8 +86,12 @@ func (s *closeWaitFlightServer) GetFlightInfo(context.Context, *flight.FlightDes
 	if err != nil {
 		return nil, err
 	}
+	schema := flight.SerializeSchema(s.schema, memory.DefaultAllocator)
+	if s.invalidInfoSchema {
+		schema = []byte("not an arrow schema")
+	}
 	return &flight.FlightInfo{
-		Schema: flight.SerializeSchema(s.schema, memory.DefaultAllocator),
+		Schema: schema,
 		Endpoint: []*flight.FlightEndpoint{{
 			Ticket: &flight.Ticket{Ticket: ticket},
 		}},
@@ -148,6 +155,16 @@ func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.Flight
 	}
 	if s.doActionErr != nil {
 		return s.doActionErr
+	}
+	if s.waitBeforeDoGetCancel != nil {
+		select {
+		case <-s.doGetContextCanceled:
+		case <-time.After(200 * time.Millisecond):
+			s.waitBeforeOnce.Do(func() {
+				close(s.waitBeforeDoGetCancel)
+			})
+			return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
+		}
 	}
 	<-s.doGetDone
 	return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
@@ -351,5 +368,37 @@ func TestQueryContextReleasesHandleWhenDoGetFails(t *testing.T) {
 	case <-srv.doActionCalled:
 	case <-time.After(time.Second):
 		t.Fatal("QueryContext did not wait for the session to become idle after handle release")
+	}
+}
+
+func TestQueryContextCancelsDoGetBeforeWaitingAfterSchemaError(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+	srv.invalidInfoSchema = true
+	srv.waitBeforeDoGetCancel = make(chan struct{})
+	close(srv.allowDoGetReturn)
+	exec, ctx := newCloseWaitExecutor(t, srv)
+
+	rows, err := exec.QueryContext(ctx, "SELECT 1")
+	if err == nil {
+		if rows != nil {
+			_ = rows.Close()
+		}
+		t.Fatal("expected QueryContext to return schema error")
+	}
+
+	select {
+	case <-srv.doGetContextCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("DoGet did not observe cancellation")
+	}
+	select {
+	case <-srv.doActionCalled:
+	case <-time.After(time.Second):
+		t.Fatal("QueryContext did not wait for the session to become idle")
+	}
+	select {
+	case <-srv.waitBeforeDoGetCancel:
+		t.Fatal("QueryContext waited for session idle before canceling DoGet")
+	default:
 	}
 }

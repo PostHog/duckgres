@@ -233,6 +233,7 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 
 	schema, err := flight.DeserializeSchema(info.Schema, e.alloc)
 	if err != nil {
+		cancel()
 		reader.Release()
 		_ = e.waitForSessionIdle()
 		return nil, fmt.Errorf("flight deserialize schema: %w", err)
