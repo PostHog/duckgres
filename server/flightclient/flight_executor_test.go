@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +54,9 @@ type closeWaitFlightServer struct {
 	doGetContextCanceled chan struct{}
 	allowDoGetReturn     chan struct{}
 	doGetDone            chan struct{}
+	doActionCalled       chan struct{}
+	doActionOnce         sync.Once
+	closeAfterFirstBatch bool
 }
 
 func newCloseWaitFlightServer() *closeWaitFlightServer {
@@ -62,6 +66,7 @@ func newCloseWaitFlightServer() *closeWaitFlightServer {
 		doGetContextCanceled: make(chan struct{}),
 		allowDoGetReturn:     make(chan struct{}),
 		doGetDone:            make(chan struct{}),
+		doActionCalled:       make(chan struct{}),
 	}
 }
 
@@ -90,6 +95,10 @@ func (s *closeWaitFlightServer) DoGet(_ *flight.Ticket, stream pb.FlightService_
 	if err := writer.Write(record); err != nil {
 		return err
 	}
+	if s.closeAfterFirstBatch {
+		close(s.doGetDone)
+		return nil
+	}
 
 	<-stream.Context().Done()
 	close(s.doGetContextCanceled)
@@ -102,6 +111,9 @@ func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.Flight
 	if action.Type != waitSessionIdleAction {
 		return s.UnimplementedFlightServiceServer.DoAction(action, stream)
 	}
+	s.doActionOnce.Do(func() {
+		close(s.doActionCalled)
+	})
 	var payload wire.WorkerWaitSessionIdlePayload
 	if err := json.Unmarshal(action.Body, &payload); err != nil {
 		return err
@@ -173,5 +185,114 @@ func TestFlightRowSetCloseWaitsForWorkerDoGetCleanup(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Close did not return after worker DoGet cleanup completed")
+	}
+}
+
+func TestFlightRowSetCloseSkipsWaitAfterCleanEOF(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+	srv.closeAfterFirstBatch = true
+
+	grpcSrv := grpc.NewServer()
+	pb.RegisterFlightServiceServer(grpcSrv, srv)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = grpcSrv.Serve(lis) }()
+	defer grpcSrv.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	flightCli, err := flight.NewClientWithMiddlewareCtx(
+		ctx, lis.Addr().String(), nil, nil,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("flight client: %v", err)
+	}
+	defer func() { _ = flightCli.Close() }()
+
+	exec := NewFlightExecutorFromClient(&flightsql.Client{Client: flightCli}, "session-1")
+	defer func() { _ = exec.Close() }()
+
+	rows, err := exec.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("expected first row, err=%v", rows.Err())
+	}
+	if rows.Next() {
+		t.Fatal("expected EOF after first row")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rowset error: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case <-srv.doActionCalled:
+		t.Fatal("Close called WaitSessionIdle after a clean EOF")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestFlightRowSetCloseSkipsWaitAfterExecutorMarkedDead(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+
+	grpcSrv := grpc.NewServer()
+	pb.RegisterFlightServiceServer(grpcSrv, srv)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = grpcSrv.Serve(lis) }()
+	defer grpcSrv.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	flightCli, err := flight.NewClientWithMiddlewareCtx(
+		ctx, lis.Addr().String(), nil, nil,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("flight client: %v", err)
+	}
+	defer func() { _ = flightCli.Close() }()
+
+	exec := NewFlightExecutorFromClient(&flightsql.Client{Client: flightCli}, "session-1")
+	defer func() { _ = exec.Close() }()
+
+	rows, err := exec.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	select {
+	case <-srv.doGetStarted:
+	case <-time.After(time.Second):
+		t.Fatal("DoGet did not start")
+	}
+
+	exec.MarkDead()
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- rows.Close()
+	}()
+
+	select {
+	case err := <-closeReturned:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(srv.allowDoGetReturn)
+		t.Fatal("Close waited for worker idle after executor was marked dead")
+	}
+	select {
+	case <-srv.doActionCalled:
+		t.Fatal("Close called WaitSessionIdle after executor was marked dead")
+	default:
 	}
 }

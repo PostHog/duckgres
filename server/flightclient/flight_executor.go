@@ -316,10 +316,14 @@ func (e *FlightExecutor) Close() error {
 	return nil
 }
 
-func (e *FlightExecutor) waitForSessionIdle() error {
+func (e *FlightExecutor) waitForSessionIdle() (err error) {
+	if e.dead.Load() {
+		return nil
+	}
 	if e.client == nil || e.client.Client == nil {
 		return nil
 	}
+	defer recoverClientPanic(&err)
 
 	payload, err := json.Marshal(wire.WorkerWaitSessionIdlePayload{
 		WorkerControlMetadata: wire.WorkerControlMetadata{
@@ -479,7 +483,7 @@ func (r *FlightRowSet) Close() error {
 			r.currentBatch = nil
 		}
 		r.reader.Release()
-		if r.waitForClosed != nil {
+		if r.waitForClosed != nil && (!r.done || r.err != nil) {
 			r.closeErr = r.waitForClosed()
 		}
 	})
