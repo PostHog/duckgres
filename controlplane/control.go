@@ -1207,6 +1207,19 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// worker session stays in DuckDB's empty in-memory catalog (see the
 	// passthrough branch below).
 	if !passthroughUser {
+		// Prime the Iceberg REST catalog's schema list on this session connection
+		// before the compat-view bind below enumerates every attached catalog.
+		// Without this, the first session on a freshly-spawned (cold) worker fails
+		// the bind with `Schema with name "" not found` until the instance settles.
+		// Best-effort: if the prime errors, the real failure (if any) surfaces from
+		// InitSessionDatabaseMetadata with its full context.
+		if icebergAttached {
+			primeCtx, primeCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+			if err := sessionmeta.PrimeIcebergCatalog(primeCtx, executor, physicalIcebergCatalog); err != nil {
+				slog.Warn("Failed to prime Iceberg catalog before session metadata init.", "user", username, "org", orgID, "error", err, "worker", workerID, "worker_pod", workerPod)
+			}
+			primeCancel()
+		}
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, effectiveCatalog); err != nil {
 			initCancel()
