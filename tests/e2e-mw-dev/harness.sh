@@ -21,6 +21,11 @@
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
 #                  — asserted on cnpg for BOTH the ducklake and iceberg catalogs.
+#   org default  : an operator-set org default worker profile (admin PUT
+#                  /orgs/:id default_worker_cpu/memory/ttl) sizes a PLAIN
+#                  connection's worker pod (no client GUCs); garbage values are
+#                  rejected with 400 at the API boundary; clearing the default
+#                  restores the deployment default shape — asserted on ext.
 #   ext forks    : the bundled ducklake/httpfs extensions are the PostHog forks,
 #                  not upstream (detects an accidental upstream swap in the image).
 #   worker pods  : labels, securityContext (non-root, no priv-esc), Downward-API
@@ -519,6 +524,82 @@ reuse_sized_worker() { # org password catalog cpu memory ttl
   log "sized worker reuse OK: 1 pod of cpu=$cpu (reused, no respawn)"
 }
 
+# ---- org default worker profile --------------------------------------------
+# Operators can give a tenant a server-side default worker shape + hot-idle TTL
+# (config-store columns default_worker_cpu/memory/ttl, set via the admin API).
+# External customers send plain connection strings — no duckgres.worker_* GUCs —
+# so the org default is the only way to size them. Assert end-to-end:
+#   1. PUT /orgs/:id with the three fields persists and round-trips on GET;
+#      garbage values are rejected with 400 (they must never enter the store).
+#   2. After the CP's config-store poll, a connection with NO sizing options
+#      gets a worker pod whose requests AND limits equal the org default.
+#   3. Clearing the default (explicit empty strings) restores the deployment
+#      default shape: a fresh plain connection must NOT produce another
+#      org-default-shaped pod (a default/nil profile can never exact-match the
+#      sized shape, so reuse/spawn goes back to default-profile workers).
+# Uses a shape (2/8Gi) no other test on this org uses, so the newest worker pod
+# after the connect is unambiguously ours (same technique as sized_worker; the
+# ext org runs no client-sized assertions).
+put_org() { # org json -> prints http code; body in /tmp/put_org_out
+  curl -s -o /tmp/put_org_out -w '%{http_code}' -X PUT -H "$H" \
+    -H 'Content-Type: application/json' -d "$2" "$API/api/v1/orgs/$1"
+}
+get_org_default_profile() { # org -> prints "cpu|mem|ttl" ("||" when unset)
+  curl -fsS -H "$H" "$API/api/v1/orgs/$1" \
+    | jq -r '"\(.default_worker_cpu)|\(.default_worker_memory)|\(.default_worker_ttl)"'
+}
+org_default_profile() { # org password catalog
+  org="$1"; pw="$2"; cat="$3"; cpu=2; mem=8Gi; ttl=10m
+  log "org default worker profile on $org/$cat: cpu=$cpu memory=$mem ttl=$ttl"
+
+  code="$(put_org "$org" "{\"default_worker_cpu\":\"$cpu\",\"default_worker_memory\":\"$mem\",\"default_worker_ttl\":\"$ttl\"}")"
+  [ "$code" = "200" ] || fail "org default: PUT /orgs/$org -> HTTP $code: $(cat /tmp/put_org_out)"
+  got="$(get_org_default_profile "$org")"
+  [ "$got" = "$cpu|$mem|$ttl" ] || fail "org default: GET round-trip '$got' want '$cpu|$mem|$ttl'"
+
+  # Garbage must be rejected at the API boundary, never stored.
+  code="$(put_org "$org" '{"default_worker_ttl":"whenever"}')"
+  [ "$code" = "400" ] || fail "org default: invalid ttl accepted (HTTP $code, want 400)"
+  code="$(put_org "$org" '{"default_worker_cpu":"-2"}')"
+  [ "$code" = "400" ] || fail "org default: negative cpu accepted (HTTP $code, want 400)"
+  got="$(get_org_default_profile "$org")"
+  [ "$got" = "$cpu|$mem|$ttl" ] || fail "org default: rejected PUT mutated the org: '$got'"
+
+  # Wait out the CP's config-store poll so its snapshot carries the default.
+  sleep "${CONFIG_POLL_SETTLE:-40}"
+
+  # PLAIN connection: no PGOPTIONS / duckgres.* startup options at all.
+  pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
+  pod="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" \
+        --sort-by=.metadata.creationTimestamp \
+        -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)"
+  [ -n "$pod" ] || fail "org default: no worker pod for $org"
+  rcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
+  rmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  lcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.cpu}")"
+  lmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.memory}")"
+  [ "$rcpu" = "$cpu" ] || fail "org default: $pod requests.cpu='$rcpu' want '$cpu' (org default not applied to a plain connection)"
+  [ "$rmem" = "$mem" ] || fail "org default: $pod requests.memory='$rmem' want '$mem'"
+  [ "$lcpu" = "$cpu" ] || fail "org default: $pod limits.cpu='$lcpu' want '$cpu'"
+  [ "$lmem" = "$mem" ] || fail "org default: $pod limits.memory='$lmem' want '$mem'"
+  log "org default OK: plain connection got $pod cpu=$rcpu mem=$rmem"
+
+  # Clear and assert a fresh plain connection is back on the deployment default
+  # shape: the count of org-default-shaped pods must not grow (a nil/default
+  # profile can never exact-match the 2-CPU shape, so a regrow means the org
+  # default is still being applied).
+  code="$(put_org "$org" '{"default_worker_cpu":"","default_worker_memory":"","default_worker_ttl":""}')"
+  [ "$code" = "200" ] || fail "org default: clear PUT -> HTTP $code: $(cat /tmp/put_org_out)"
+  got="$(get_org_default_profile "$org")"
+  [ "$got" = "||" ] || fail "org default: not cleared on GET: '$got'"
+  sleep "${CONFIG_POLL_SETTLE:-40}"
+  before="$(count_org_workers_of_cpu "$org" "$cpu")"
+  pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
+  after="$(count_org_workers_of_cpu "$org" "$cpu")"
+  [ "$after" -le "$before" ] || fail "org default: cleared default still spawns $cpu-cpu workers ($before -> $after)"
+  log "org default OK: cleared; plain connection back on the deployment default shape"
+}
+
 # ---- resilience -----------------------------------------------------------
 # Worker pod killed mid-life → CP refills and a fresh query succeeds.
 # Ported from TestK8sWorkerCrashRecovery.
@@ -879,6 +960,10 @@ main() {
   rw_ducklake  "$EXT" "$ext_pw"
   rw_iceberg   "$EXT" "$ext_pw"
 
+  # ---- org default worker profile (server-side sizing, no client GUCs) ----
+  # On ext (no client-sized assertions there, so the 2-CPU shape is unique).
+  org_default_profile "$EXT" "$ext_pw" ducklake
+
   # ---- cross-tenant isolation (cnpg vs ext) ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
 
@@ -889,7 +974,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + isolation + lifecycle-teardown, on cnpg & ext"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + activation(DuckLake/Iceberg) + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + isolation + lifecycle-teardown, on cnpg & ext"
 }
 
 main "$@"

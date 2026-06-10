@@ -461,3 +461,43 @@ func TestTableNames(t *testing.T) {
 		}
 	}
 }
+
+func TestOrgDefaultWorkerProfile(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"unset": {Name: "unset"},
+				"full": {
+					Name:                "full",
+					DefaultWorkerCPU:    "2",
+					DefaultWorkerMemory: "8Gi",
+					DefaultWorkerTTL:    "75m",
+				},
+				"partial": {Name: "partial", DefaultWorkerTTL: "10m"},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID                     string
+		wantCPU, wantMem, wantTTL string
+	}{
+		{"unknown", "", "", ""},
+		{"unset", "", "", ""},
+		{"full", "2", "8Gi", "75m"},
+		{"partial", "", "", "10m"},
+	}
+	for _, tt := range tests {
+		cpu, mem, ttl := cs.OrgDefaultWorkerProfile(tt.orgID)
+		if cpu != tt.wantCPU || mem != tt.wantMem || ttl != tt.wantTTL {
+			t.Errorf("OrgDefaultWorkerProfile(%q) = (%q,%q,%q); want (%q,%q,%q)",
+				tt.orgID, cpu, mem, ttl, tt.wantCPU, tt.wantMem, tt.wantTTL)
+		}
+	}
+
+	// Nil snapshot (store not yet loaded) must read as "not set", not panic.
+	empty := &ConfigStore{}
+	if cpu, mem, ttl := empty.OrgDefaultWorkerProfile("full"); cpu != "" || mem != "" || ttl != "" {
+		t.Errorf("nil-snapshot OrgDefaultWorkerProfile = (%q,%q,%q); want all empty", cpu, mem, ttl)
+	}
+}

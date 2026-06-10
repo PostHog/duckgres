@@ -208,6 +208,12 @@ type ConfigStoreInterface interface {
 	// warehouse row (legacy single-tenant orgs); otherwise it is the lifecycle
 	// string (pending/provisioning/ready/failed/deleting/deleted).
 	OrgWarehouseStatus(orgID string) (state string, orgExists bool)
+	// OrgDefaultWorkerProfile returns the org's operator-set default worker
+	// profile (config-store columns default_worker_cpu/memory/ttl): cpu and
+	// memory as k8s resource-quantity strings, ttl as a Go duration string.
+	// Empty strings mean "not set" (including unknown orgs). Raw stored
+	// values — validation happens in resolveWorkerProfile.
+	OrgDefaultWorkerProfile(orgID string) (cpu, memory, ttl string)
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
@@ -1003,10 +1009,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Resolve the requested worker shape from the connection-string startup
-	// options (duckgres.worker_cpu / worker_memory / worker_ttl).
-	// nil => the default exclusive profile. Gated off by default, so this is a
-	// no-op unless the deployment opts in. A rejected profile fails the connect.
-	workerProfile, profileWarns, profileErr := cp.resolveWorkerProfile(startupOptions)
+	// options (duckgres.worker_cpu / worker_memory / worker_ttl), layered on
+	// top of the org's operator-set default profile (multi-tenant only).
+	// nil => the default exclusive profile. Client sizing is gated off by
+	// default; org defaults apply regardless of that gate (they are operator
+	// config, not client input). A rejected client profile fails the connect.
+	var orgProfileDefaults orgWorkerProfileDefaults
+	if cp.configStore != nil && orgID != "" {
+		c, m, t := cp.configStore.OrgDefaultWorkerProfile(orgID)
+		orgProfileDefaults = orgWorkerProfileDefaults{CPU: c, Memory: m, TTL: t}
+	}
+	workerProfile, profileWarns, orgProfileApplied, profileErr := cp.resolveWorkerProfile(startupOptions, orgProfileDefaults)
 	if profileErr != nil {
 		slog.Warn("Rejected worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", profileErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "22023", profileErr.Error())
@@ -1015,6 +1028,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	for _, w := range profileWarns {
 		slog.Warn("Adjusted worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "detail", w)
+	}
+	if orgProfileApplied && workerProfile != nil {
+		// Once per connection so support can see which shape a tenant got.
+		slog.Info("Applied org default worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr,
+			"cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
 
 	// Resolve the session manager and rebalancer for this connection.
