@@ -132,15 +132,15 @@ normal `go test ./...` lane.
   clients like psql always emit well-formed lengths, and the Job image carries no
   raw-packet tooling. Covered by the unit regression test in
   `server/conn_bind_test.go` instead.
-- **Concurrent worker operations on one session** — the worker rejects
-  overlapping same-session Flight operations with `FailedPrecondition`, but the
-  harness enters through pgwire, where one client connection maps to one worker
-  session and operations are serialized by the control plane. Driving this
-  specific defense-in-depth path end-to-end would need a bespoke concurrent
-  Flight-ingress client, so the rejection contract, required
-  GetFlightInfo-to-DoGet handoffs, and abandoned-continuation cleanup are covered
-  by `duckdbservice` unit tests. The harness still asserts the cluster invariant
-  this protects: one active session owns one worker.
+- **Same-session worker Flight overlap** — the worker accepts protocol-level
+  overlap from one session by convention, because pgwire has no happy-path way
+  to run concurrent user queries on a single connection. Actual `*sql.Conn` /
+  `*sql.Tx` access is still serialized by worker connection guards. Driving this
+  specific Flight-ingress overlap end-to-end would need a bespoke concurrent
+  Flight client, so the GetFlightInfo-to-DoGet handoffs, connection guards, and
+  abandoned-continuation cleanup are covered by `duckdbservice` unit tests. The
+  harness still asserts the cluster invariant this depends on: one active
+  session owns one worker.
 - **Malformed Bind message validation (#720)** — negative count/length fields
   in a Bind message must return a clean `08P01` instead of panicking. Every
   real client (psql, lib/pq, ...) only emits well-formed Bind messages, so

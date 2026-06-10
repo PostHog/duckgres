@@ -137,7 +137,7 @@ func (q testStatementQuery) GetTransactionId() []byte {
 	return q.transactionID
 }
 
-func TestStatementFlightInfoHoldsSessionOperationUntilDoGet(t *testing.T) {
+func TestStatementFlightInfoAllowsNextQueryBeforePriorDoGet(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
 		stopRefresh: make(map[string]func()),
@@ -157,40 +157,37 @@ func TestStatementFlightInfoHoldsSessionOperationUntilDoGet(t *testing.T) {
 		t.Fatalf("first GetFlightInfoStatement: %v", err)
 	}
 
-	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: ""}, &flight.FlightDescriptor{}); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected second same-session operation to be rejected, got %v", err)
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: ""}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("second GetFlightInfoStatement should not be blocked by pending DoGet: %v", err)
 	}
 
-	var handleID string
+	var handleIDs []string
 	session.mu.RLock()
 	for id := range session.queries {
-		handleID = id
-		break
+		handleIDs = append(handleIDs, id)
 	}
 	session.mu.RUnlock()
-	if handleID == "" {
-		t.Fatal("expected first GetFlightInfoStatement to store a query handle")
+	if len(handleIDs) != 2 {
+		t.Fatalf("expected two query handles, got %d", len(handleIDs))
 	}
 
-	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte(handleID)})
-	if err != nil {
-		t.Fatalf("DoGetStatement: %v", err)
-	}
-	for chunk := range ch {
-		if chunk.Err != nil {
-			t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+	for _, handleID := range handleIDs {
+		_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte(handleID)})
+		if err != nil {
+			t.Fatalf("DoGetStatement %s: %v", handleID, err)
 		}
-		if chunk.Data != nil {
-			chunk.Data.Release()
+		for chunk := range ch {
+			if chunk.Err != nil {
+				t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+			}
+			if chunk.Data != nil {
+				chunk.Data.Release()
+			}
 		}
-	}
-
-	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: ""}, &flight.FlightDescriptor{}); err != nil {
-		t.Fatalf("operation gate should release after DoGet: %v", err)
 	}
 }
 
-func TestStatementFlightInfoNonEmptyHoldsSessionOperationUntilDoGet(t *testing.T) {
+func TestStatementFlightInfoNonEmptyAllowsNextQueryBeforePriorDoGet(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -225,40 +222,39 @@ func TestStatementFlightInfoNonEmptyHoldsSessionOperationUntilDoGet(t *testing.T
 		t.Fatalf("active drain work=%d want 1 before DoGet", got)
 	}
 
-	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 2"}, &flight.FlightDescriptor{}); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected second same-session operation to be rejected, got %v", err)
+	if _, err := handler.GetFlightInfoStatement(ctx, testStatementQuery{query: "SELECT 2"}, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("second GetFlightInfoStatement should not be blocked by pending DoGet: %v", err)
+	}
+	if got := pool.ActiveDrainWork(); got != 2 {
+		t.Fatalf("active drain work=%d want 2 before DoGet", got)
 	}
 
-	var handleID string
+	var handleIDs []string
 	session.mu.RLock()
 	for id := range session.queries {
-		handleID = id
-		break
+		handleIDs = append(handleIDs, id)
 	}
 	session.mu.RUnlock()
-	if handleID == "" {
-		t.Fatal("expected first GetFlightInfoStatement to store a query handle")
+	if len(handleIDs) != 2 {
+		t.Fatalf("expected two query handles, got %d", len(handleIDs))
 	}
 
-	_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte(handleID)})
-	if err != nil {
-		t.Fatalf("DoGetStatement: %v", err)
-	}
-	for chunk := range ch {
-		if chunk.Err != nil {
-			t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+	for _, handleID := range handleIDs {
+		_, ch, err := handler.DoGetStatement(ctx, testStatementQueryTicket{handle: []byte(handleID)})
+		if err != nil {
+			t.Fatalf("DoGetStatement %s: %v", handleID, err)
 		}
-		if chunk.Data != nil {
-			chunk.Data.Release()
+		for chunk := range ch {
+			if chunk.Err != nil {
+				t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+			}
+			if chunk.Data != nil {
+				chunk.Data.Release()
+			}
 		}
 	}
 	if got := pool.ActiveDrainWork(); got != 0 {
 		t.Fatalf("active drain work=%d want 0 after DoGet", got)
-	}
-	if finish, ok := session.beginOperation(); !ok {
-		t.Fatal("operation gate should release after DoGet")
-	} else {
-		finish()
 	}
 }
 
@@ -755,11 +751,6 @@ func TestEndTransactionRollbackReleasesAbandonedStatementOperation(t *testing.T)
 	if got := pool.ActiveDrainWork(); got != 0 {
 		t.Fatalf("active drain work=%d want 0 after rollback", got)
 	}
-	if finish, ok := session.beginOperation(); !ok {
-		t.Fatal("operation gate should release after rollback cleanup")
-	} else {
-		finish()
-	}
 }
 
 func TestEndTransactionRollbackReleasesAbandonedMetadataOperation(t *testing.T) {
@@ -819,11 +810,6 @@ func TestEndTransactionRollbackReleasesAbandonedMetadataOperation(t *testing.T) 
 	}
 	if got := pool.ActiveDrainWork(); got != 0 {
 		t.Fatalf("active drain work=%d want 0 after rollback", got)
-	}
-	if finish, ok := session.beginOperation(); !ok {
-		t.Fatal("operation gate should release after metadata rollback cleanup")
-	} else {
-		finish()
 	}
 	session.mu.RLock()
 	defer session.mu.RUnlock()
@@ -905,13 +891,9 @@ func TestEndTransactionNotFoundDoesNotConsumeMetadataOperation(t *testing.T) {
 	}
 	session.mu.RLock()
 	metadataDrainCount := len(session.metadataDrains)
-	operationOpen := session.operationOpen
 	session.mu.RUnlock()
 	if metadataDrainCount != 1 {
 		t.Fatalf("bogus rollback consumed metadata drains, got %d entries", metadataDrainCount)
-	}
-	if !operationOpen {
-		t.Fatal("bogus rollback released the pending metadata operation")
 	}
 
 	_, ch, err := handler.DoGetDBSchemas(ctx, cmd)
@@ -934,7 +916,7 @@ func TestEndTransactionNotFoundDoesNotConsumeMetadataOperation(t *testing.T) {
 	}
 }
 
-func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
+func TestEndTransactionNotFoundDoesNotDeleteLivePreparedHandle(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
 		stopRefresh: make(map[string]func()),
@@ -955,11 +937,6 @@ func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
 		},
 		txnOwner: make(map[string]string),
 	}
-	finishOperation, ok := session.beginOperation()
-	if !ok {
-		t.Fatal("expected operation to start")
-	}
-	defer finishOperation()
 	pool.sessions[session.ID] = session
 	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
@@ -968,8 +945,8 @@ func TestEndTransactionBusyDoesNotDeleteLivePreparedHandle(t *testing.T) {
 		transactionID: []byte("txn-1"),
 		action:        flightsql.EndTransactionRollback,
 	})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected EndTransaction to reject busy session, got %v", err)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected EndTransaction to report missing transaction body, got %v", err)
 	}
 	session.mu.RLock()
 	_, stillPresent := session.queries["prep-1"]
@@ -1145,11 +1122,6 @@ func TestClosePreparedStatementReleasesAbandonedOperation(t *testing.T) {
 	}
 	if got := pool.ActiveDrainWork(); got != 0 {
 		t.Fatalf("active drain work=%d want 0 after close", got)
-	}
-	if finish, ok := session.beginOperation(); !ok {
-		t.Fatal("operation gate should release after close prepared")
-	} else {
-		finish()
 	}
 }
 
@@ -1364,7 +1336,7 @@ func TestMetadataDoGetContinuesAfterDrainStarts(t *testing.T) {
 	}
 }
 
-func TestMetadataGetFlightInfoRejectsConcurrentSessionOperation(t *testing.T) {
+func TestMetadataGetFlightInfoAllowsMultiplePendingDescriptors(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -1398,8 +1370,8 @@ func TestMetadataGetFlightInfoRejectsConcurrentSessionOperation(t *testing.T) {
 	if _, err := handler.GetFlightInfoSchemas(ctx, first, &flight.FlightDescriptor{}); err != nil {
 		t.Fatalf("first GetFlightInfoSchemas: %v", err)
 	}
-	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected concurrent metadata GetFlightInfo to be rejected, got %v", err)
+	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); err != nil {
+		t.Fatalf("second GetFlightInfoSchemas should not be blocked by pending metadata DoGet: %v", err)
 	}
 
 	_, ch, err := handler.DoGetDBSchemas(ctx, first)
@@ -1415,9 +1387,6 @@ func TestMetadataGetFlightInfoRejectsConcurrentSessionOperation(t *testing.T) {
 		}
 	}
 
-	if _, err := handler.GetFlightInfoSchemas(ctx, second, &flight.FlightDescriptor{}); err != nil {
-		t.Fatalf("metadata operation should release after DoGet: %v", err)
-	}
 	_, ch, err = handler.DoGetDBSchemas(ctx, second)
 	if err != nil {
 		t.Fatalf("second DoGetDBSchemas: %v", err)

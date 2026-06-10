@@ -186,7 +186,7 @@ func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
 	}
 }
 
-func TestDoCopyFromStdinRejectsConcurrentSessionOperation(t *testing.T) {
+func TestDoCopyFromStdinDoesNotUseSessionOperationGate(t *testing.T) {
 	session, cleanup := newSessionWithInMemoryDuckDB(t)
 	defer cleanup()
 	finishOperation, ok := session.beginOperation()
@@ -199,16 +199,19 @@ func TestDoCopyFromStdinRejectsConcurrentSessionOperation(t *testing.T) {
 	handler := &FlightSQLHandler{pool: pool}
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
 
+	copySQL := "COPY t (a, b) FROM '" + flightclient.CopyFromStdinPathPlaceholder +
+		"' (FORMAT CSV, HEADER false)"
 	first := &flight.FlightData{
 		FlightDescriptor: &flight.FlightDescriptor{
 			Type: flight.DescriptorPATH,
 			Path: []string{flightclient.CopyFromStdinDescriptorPath},
-			Cmd:  []byte("COPY t FROM '" + flightclient.CopyFromStdinPathPlaceholder + "' (FORMAT CSV)"),
+			Cmd:  []byte(copySQL),
 		},
+		DataBody: []byte("1,one\n"),
 	}
 	err := handler.doCopyFromStdin(ctx, first, &fakeDoPutStream{ctx: ctx})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected concurrent COPY to be rejected, got %v", err)
+	if err != nil {
+		t.Fatalf("expected COPY to rely on connection guards instead of session admission, got %v", err)
 	}
 }
 

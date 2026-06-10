@@ -123,7 +123,6 @@ type Session struct {
 	txns           map[string]*trackedTx
 	txnOwner       map[string]string
 	closed         bool
-	operationOpen  bool
 	connWork       int
 	connWorkDone   *sync.Cond
 	handleCounter  atomic.Uint64
@@ -150,14 +149,13 @@ type QueryHandle struct {
 	TxnID     string
 	Prepared  bool      // prepared statements live until ClosePreparedStatement; the reaper never drops them, only a stale pendingDrain
 	createdAt time.Time // when registered; the reaper drops a stale ad-hoc handle whose DoGet never arrived (guarded by Session.mu)
-	// finishOperation is the session operation token for an ad-hoc query
-	// awaiting its DoGet.
+	// finishOperation is a legacy continuation cleanup hook. Session admission
+	// is convention-based; connection safety is enforced by connMu/connWork.
 	finishOperation func()
 	// finishDrain is the drain token of an ad-hoc query awaiting its DoGet.
 	finishDrain func()
 	// pendingDrain is the drain token of a GetFlightInfoPrepared call awaiting
-	// its DoGet. The session operation gate allows at most one pending
-	// continuation per session.
+	// its DoGet.
 	pendingDrain *drainToken
 }
 
@@ -262,21 +260,13 @@ func (s *Session) releaseSQLTransactionDrain() {
 
 func (s *Session) beginOperation() (func(), bool) {
 	s.mu.Lock()
-	if s.closed || s.operationOpen {
+	if s.closed {
 		s.mu.Unlock()
 		return nil, false
 	}
-	s.operationOpen = true
 	s.mu.Unlock()
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			s.mu.Lock()
-			s.operationOpen = false
-			s.mu.Unlock()
-		})
-	}, true
+	return func() {}, true
 }
 
 func (s *Session) beginOperationForTransaction(txnKey string) (func(), bool, bool) {
@@ -285,21 +275,13 @@ func (s *Session) beginOperationForTransaction(txnKey string) (func(), bool, boo
 		s.mu.Unlock()
 		return nil, false, false
 	}
-	if s.closed || s.operationOpen {
+	if s.closed {
 		s.mu.Unlock()
 		return nil, true, false
 	}
-	s.operationOpen = true
 	s.mu.Unlock()
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			s.mu.Lock()
-			s.operationOpen = false
-			s.mu.Unlock()
-		})
-	}, true, true
+	return func() {}, true, true
 }
 
 // beginConnWork fences any operation that uses the session connection while a
@@ -628,9 +610,6 @@ func (p *SessionPool) reapIdle(now time.Time) {
 		for id, ttx := range s.txns {
 			last := time.Unix(0, ttx.lastUsed.Load())
 			if now.Sub(last) > txnIdleTimeout {
-				if s.operationOpen {
-					continue
-				}
 				if ttx.activeWork.Load() > 0 {
 					continue
 				}
@@ -657,10 +636,7 @@ func (p *SessionPool) reapIdle(now time.Time) {
 			}
 			last := time.Unix(0, lastNanos)
 			if now.Sub(last) > txnIdleTimeout {
-				if s.operationOpen {
-					// A same-session operation is still logically in progress or
-					// awaiting its continuation. Leave the transaction drain active.
-				} else if s.connWork > 0 {
+				if s.connWork > 0 {
 					// The connection may be executing, streaming, or planning work inside
 					// this raw SQL transaction. Leave the transaction drain token active.
 				} else if s.Conn == nil {

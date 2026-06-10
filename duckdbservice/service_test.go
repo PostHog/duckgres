@@ -97,7 +97,7 @@ func TestCreateSessionRejectsSecondSessionWhenMaxIsOne(t *testing.T) {
 	}
 }
 
-func TestSessionRejectsConcurrentOperation(t *testing.T) {
+func TestSessionAllowsOverlappingProtocolOperations(t *testing.T) {
 	s := &Session{}
 	finish, ok := s.beginOperation()
 	if !ok {
@@ -105,12 +105,14 @@ func TestSessionRejectsConcurrentOperation(t *testing.T) {
 	}
 	defer finish()
 
-	if _, ok := s.beginOperation(); ok {
-		t.Fatal("expected concurrent operation to be rejected")
+	if finish2, ok := s.beginOperation(); !ok {
+		t.Fatal("expected second protocol operation to be accepted")
+	} else {
+		finish2()
 	}
 }
 
-func TestSessionOperationReleasesOnce(t *testing.T) {
+func TestSessionOperationFinishIsIdempotent(t *testing.T) {
 	s := &Session{}
 	finish, ok := s.beginOperation()
 	if !ok {
@@ -120,13 +122,13 @@ func TestSessionOperationReleasesOnce(t *testing.T) {
 	finish()
 
 	if finish2, ok := s.beginOperation(); !ok {
-		t.Fatal("expected operation gate to release")
+		t.Fatal("expected operation helper to remain usable")
 	} else {
 		finish2()
 	}
 }
 
-func TestReapAbandonedQueryHandleReleasesOperation(t *testing.T) {
+func TestReapAbandonedQueryHandleDeletesHandle(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),
 		stopRefresh: make(map[string]func()),
@@ -150,10 +152,11 @@ func TestReapAbandonedQueryHandleReleasesOperation(t *testing.T) {
 
 	pool.reapIdle(time.Now())
 
-	if finish2, ok := session.beginOperation(); !ok {
-		t.Fatal("expected abandoned handle reaper to release the operation")
-	} else {
-		finish2()
+	session.mu.RLock()
+	_, stillPresent := session.queries["query-1"]
+	session.mu.RUnlock()
+	if stillPresent {
+		t.Fatal("expected abandoned query handle to be deleted")
 	}
 }
 
@@ -193,11 +196,6 @@ func TestReapAbandonedPreparedDrainReleasesOperation(t *testing.T) {
 	if got := pool.ActiveDrainWork(); got != 0 {
 		t.Fatalf("activeWork=%d want 0 after stale prepared drain reap", got)
 	}
-	if finish2, ok := session.beginOperation(); !ok {
-		t.Fatal("expected stale prepared drain reaper to release the operation")
-	} else {
-		finish2()
-	}
 }
 
 func TestReapAbandonedMetadataDrainReleasesOperation(t *testing.T) {
@@ -230,11 +228,6 @@ func TestReapAbandonedMetadataDrainReleasesOperation(t *testing.T) {
 
 	if got := pool.ActiveDrainWork(); got != 0 {
 		t.Fatalf("activeWork=%d want 0 after stale metadata drain reap", got)
-	}
-	if finish2, ok := session.beginOperation(); !ok {
-		t.Fatal("expected stale metadata drain reaper to release the operation")
-	} else {
-		finish2()
 	}
 }
 

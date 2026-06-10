@@ -43,7 +43,7 @@ func sessionBusyStatus(ok bool) error {
 	if ok {
 		return nil
 	}
-	return status.Error(codes.FailedPrecondition, "session already has an active operation")
+	return status.Error(codes.NotFound, "session closed")
 }
 
 func sessionClosedStatus(err error) error {
