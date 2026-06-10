@@ -128,6 +128,7 @@ type Resolved struct {
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
 	InternalSecret                  string
+	UserSecretKey                   string
 	SNIRoutingMode                  string
 	ManagedHostnameSuffixes         []string
 	DuckLakeDefaultSpecVersion      string
@@ -210,6 +211,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var internalSecret string
+	var userSecretKey string
 	var sniRoutingMode string
 	var managedHostnameSuffixes []string
 
@@ -770,6 +772,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_INTERNAL_SECRET"); v != "" {
 		internalSecret = v
 	}
+	// Env-only (no CLI flag, no YAML): the AES key for user persistent
+	// secrets should only arrive via a mounted K8s Secret.
+	if v := getenv("DUCKGRES_USER_SECRET_KEY"); v != "" {
+		userSecretKey = v
+	}
 	if v := getenv("DUCKGRES_SNI_ROUTING_MODE"); v != "" {
 		sniRoutingMode = v
 	}
@@ -1229,6 +1236,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,
 		InternalSecret:                  internalSecret,
+		UserSecretKey:                   userSecretKey,
 		SNIRoutingMode:                  sniRoutingMode,
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,
 		DuckLakeDefaultSpecVersion:      cfg.DuckLake.SpecVersion,

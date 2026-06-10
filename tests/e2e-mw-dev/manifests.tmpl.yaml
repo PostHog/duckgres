@@ -84,6 +84,8 @@ metadata:
   namespace: ${NAMESPACE}
 stringData:
   internal-secret: "${INTERNAL_SECRET}"
+  # AES key for the user persistent secret manager (CREATE PERSISTENT SECRET).
+  user-secret-key: "${USER_SECRET_KEY}"
 ---
 # Worker mTLS bearer token (the CP mints per-worker secrets at runtime; this is
 # the shared seed the chart references via DUCKGRES_K8S_WORKER_SECRET).
@@ -269,6 +271,10 @@ spec:
             - { name: DUCKGRES_K8S_MAX_WORKERS, value: "50" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
+            # Enables the user persistent secret manager; the harness
+            # persistent_user_secret assertion exercises it end-to-end.
+            - name: DUCKGRES_USER_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: duckgres-tokens, key: user-secret-key } }
             - { name: DUCKGRES_AWS_REGION, value: "us-east-1" }
             # Land e2e workers on the DEFAULT (untainted) nodepool, NOT the real
             # deployment's duckgres-workers pool: per-PR worker churn must not

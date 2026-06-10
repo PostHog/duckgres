@@ -24,6 +24,7 @@ import (
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
+	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/wire"
 	"github.com/posthog/duckgres/transpiler"
 	"go.opentelemetry.io/otel/attribute"
@@ -379,6 +380,7 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 // worker incident (e.g. the one in the worker-40761 postmortem) can
 // filter to just that worker's queries without joining across logs.
 func (c *clientConn) logQueryStarted(query string) {
+	query = usersecrets.RedactForLog(query)
 	slog.Info("Query started.",
 		"user", c.username,
 		"query", query,
@@ -398,6 +400,7 @@ func (c *clientConn) logQueryStarted(query string) {
 // "started" and a "finished" line, and can look at the separate error
 // line for severity context.
 func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64, err error) {
+	query = usersecrets.RedactForLog(query)
 	attrs := []any{
 		"user", c.username,
 		"query", query,
@@ -420,6 +423,7 @@ func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64,
 // (worker crash, IO failure, internal panic, infra unreachable), not
 // "user typo'd a column name."
 func (c *clientConn) logQueryError(query string, err error) {
+	query = usersecrets.RedactForLog(query)
 	attrs := []any{"user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod}
 	if isDuckLakeTransactionConflict(err) {
 		slog.Warn("DuckLake transaction conflict.", attrs...)
@@ -1105,7 +1109,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
-	c.currentQuery.Store(query)
+	// Redacted form for everything observable (pg_stat_activity, spans,
+	// logs): CREATE SECRET option lists carry credential material.
+	loggableQuery := usersecrets.RedactForLog(query)
+
+	c.currentQuery.Store(loggableQuery)
 	c.queryStart.Store(time.Now())
 	defer func() {
 		c.currentQuery.Store("")
@@ -1120,7 +1128,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			attribute.String("duckgres.protocol", "simple"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),
-			attribute.String("db.statement", observe.TruncateForSpan(query)),
+			attribute.String("db.statement", observe.TruncateForSpan(loggableQuery)),
 		),
 	)
 	defer span.End()
@@ -1130,7 +1138,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	c.ctx = ctx
 	defer func() { c.ctx = prevCtx }()
 
-	slog.Debug("Query received.", "user", c.username, "query", query)
+	slog.Debug("Query received.", "user", c.username, "query", loggableQuery)
 
 	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
 	// or transpilation. DuckDB doesn't support these natively, so cursor
@@ -1158,6 +1166,15 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Intercept pg_stat_activity queries. Return synthetic results from the connection registry.
 	if matchPgStatActivityQuery(query) {
 		return c.handlePgStatActivity()
+	}
+
+	// Intercept persistent-secret DDL (CREATE PERSISTENT SECRET / DROP
+	// SECRET) when a user secret manager is configured (multitenant remote
+	// backend), so customer secrets survive across sessions and worker pods.
+	// Must run before the passthrough branch: passthrough users get
+	// persistence too.
+	if c.handleUserSecretDDLSimple(query) {
+		return nil
 	}
 
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
@@ -1216,7 +1233,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			_ = c.writer.Flush()
 			return nil
 		}
-		slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", query)
+		slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", loggableQuery)
 	}
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)

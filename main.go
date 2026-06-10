@@ -339,6 +339,7 @@ func main() {
 			ConfigStoreConn:            resolved.ConfigStoreConn,
 			ConfigPollInterval:         resolved.ConfigPollInterval,
 			InternalSecret:             resolved.InternalSecret,
+			UserSecretKey:              resolved.UserSecretKey,
 			SNIRoutingMode:             resolved.SNIRoutingMode,
 			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 			DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,

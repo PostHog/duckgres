@@ -100,6 +100,13 @@ client-go:
   (controlplane/org_reserved_pool_test.go, org_acquire_gate_test.go) — exercising
   them in-Job would need a dedicated max_workers=1 org and deterministic cold-spawn
   timing the shared cluster can't guarantee.
+- **persistent user secrets** — `CREATE PERSISTENT SECRET` survives across
+  sessions on both metadata-backend orgs (the CP stores the statement encrypted
+  in the config store and replays it at session creation — worker pods are
+  ephemeral); reserved system names (`ducklake_s3`, …) and unnamed persistent
+  secrets are rejected; `DROP PERSISTENT SECRET` removes it durably; and a
+  second user of the same org never sees the first user's secret, even on a
+  reused hot-idle worker (cnpg lane).
 - **isolation** — two tenants (cnpg vs ext) see distinct catalogs; a
   cross-tenant read is denied.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling

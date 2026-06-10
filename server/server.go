@@ -282,6 +282,12 @@ type Config struct {
 	// recycle wipe is how workers stay clean.
 	PinSecretDirectory bool
 
+	// UserSecrets persists per-user CREATE PERSISTENT SECRET statements
+	// across sessions and worker pods. Set by the multitenant control plane
+	// (remote backend, config-store-backed); nil everywhere else, in which
+	// case secret DDL passes through to DuckDB untouched.
+	UserSecrets UserSecretManager
+
 	// MemoryLimit is the DuckDB memory_limit per session (e.g., "4GB").
 	// If empty, auto-detected from system memory.
 	MemoryLimit string

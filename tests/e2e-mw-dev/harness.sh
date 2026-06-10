@@ -166,11 +166,11 @@ resolve_cp_ip() {
 # query tolerates it via bounded retry. Auth failures and real SQL errors are NOT
 # retried — they surface immediately, so this never feeds the rate limiter or
 # masks a genuine failure. (The behavior is exercised in cold_burst_absorption.)
-_pg_exec() { # org password dbname sql  -> prints output; rc 0 ok / 1 real error
+_pg_exec() { # org password dbname sql [user=root]  -> prints output; rc 0 ok / 1 real error
   a=0 out=""
   while [ "$a" -lt 12 ]; do
     if out="$(PGPASSWORD="$2" psql \
-        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=$3" \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=${5:-root} dbname=$3" \
         -v ON_ERROR_STOP=1 -tAc "$4" 2>&1)"; then
       printf %s "$out"; return 0
     fi
@@ -204,11 +204,11 @@ pgc() { _pg_exec "$@"; }
 # backpressure so the test evaluates the REAL outcome, then prints the final
 # output to stdout and returns the psql rc (0 = query succeeded, 1 = SQL error)
 # for the caller to inspect — never aborts the harness itself.
-pg_try() { # org password dbname sql
+pg_try() { # org password dbname sql [user=root]
   a=0 out=""
   while [ "$a" -lt 12 ]; do
     if out="$(PGPASSWORD="$2" psql \
-        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=$3" \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=${5:-root} dbname=$3" \
         -v ON_ERROR_STOP=1 -tAc "$4" 2>&1)"; then
       printf %s "$out"; return 0
     fi
@@ -771,6 +771,76 @@ org_default_profile() { # org password catalog
   log "org default OK: cleared; plain connection back on the deployment default shape"
 }
 
+# ---- user persistent secrets ------------------------------------------------
+# CREATE PERSISTENT SECRET must survive across sessions: worker pods are
+# ephemeral, so the CP intercepts the statement, stores it encrypted in the
+# config store keyed (org, user, name), and replays it at session creation.
+# Each psql invocation below is a fresh session (often a reused hot-idle
+# worker, whose persistent secrets are wiped at session create) — a secret
+# visible on the SECOND connection proves config-store replay, not worker-disk
+# luck. The dummy secret is SCOPEd to a nonexistent bucket so its bogus creds
+# can never shadow the org's real ducklake_s3 secret for actual queries.
+persistent_user_secret() { # org password
+  org="$1"; pw="$2"; sname="e2e_user_secret"
+  log "persistent user secret on $org"
+
+  pg "$org" "$pw" ducklake "CREATE PERSISTENT SECRET $sname (TYPE s3, KEY_ID 'AKIAE2EDUMMY', SECRET 'e2e-dummy', REGION 'us-east-1', SCOPE 's3://duckgres-e2e-nonexistent-$org')" >/dev/null
+
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'")"
+  [ "$n" = "1" ] || fail "persistent secret: not replayed on a fresh session (count=$n)"
+
+  # Reserved (system) names and unnamed persistent secrets must be rejected.
+  if out="$(pg_try "$org" "$pw" ducklake "CREATE PERSISTENT SECRET ducklake_s3 (TYPE s3, KEY_ID 'x', SECRET 'y')")"; then
+    fail "persistent secret: reserved name ducklake_s3 was accepted"
+  fi
+  case "$out" in *reserved*) ;; *) fail "persistent secret: reserved-name rejection said '$out'";; esac
+  if pg_try "$org" "$pw" ducklake "CREATE PERSISTENT SECRET (TYPE s3, KEY_ID 'x', SECRET 'y')" >/dev/null; then
+    fail "persistent secret: unnamed persistent secret was accepted"
+  fi
+  # Multi-statement batches must be rejected, not silently executed-but-never-
+  # persisted (the secret would work for the session, then be wiped).
+  if out="$(pg_try "$org" "$pw" ducklake "CREATE PERSISTENT SECRET batch_ms (TYPE s3, KEY_ID 'x', SECRET 'y'); SELECT 1")"; then
+    fail "persistent secret: multi-statement batch was accepted"
+  fi
+  case "$out" in *"single statement"*) ;; *) fail "persistent secret: multi-statement rejection said '$out'";; esac
+
+  # DROP must remove it durably — gone on the NEXT fresh session too (the
+  # config-store row is deleted, not just the live worker's copy).
+  pg "$org" "$pw" ducklake "DROP PERSISTENT SECRET $sname" >/dev/null
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'")"
+  [ "$n" = "0" ] || fail "persistent secret: still present on a fresh session after DROP (count=$n)"
+  log "persistent secret OK on $org (create → cross-session replay → reserved/unnamed rejected → durable drop)"
+}
+
+# Cross-user isolation within one org: user B must never see user A's
+# persistent secret. B's session typically reuses A's hot-idle worker (one org,
+# cap permitting), which is exactly the leak path: the worker wipes persistent
+# secrets at session create and replays only the connecting user's.
+persistent_user_secret_isolation() { # org rootpw
+  org="$1"; pw="$2"; sname="e2e_root_secret"; u2="e2esecuser"
+  u2pw="e2e-$(openssl rand -hex 12)"
+  log "persistent secret cross-user isolation on $org"
+
+  pg "$org" "$pw" ducklake "CREATE PERSISTENT SECRET $sname (TYPE s3, KEY_ID 'AKIAE2EDUMMY', SECRET 'root-dummy', REGION 'us-east-1', SCOPE 's3://duckgres-e2e-nonexistent-root-$org')" >/dev/null
+
+  code="$(curl -s -o /tmp/create_user_out -w '%{http_code}' -X POST -H "$H" \
+    -H 'Content-Type: application/json' \
+    -d "{\"org_id\":\"$org\",\"username\":\"$u2\",\"password\":\"$u2pw\"}" \
+    "$API/api/v1/users")"
+  case "$code" in 200|201) ;; *) fail "persistent secret: create user $u2 -> HTTP $code: $(cat /tmp/create_user_out)";; esac
+  # New-user auth is config-snapshot-driven; wait out one poll before the
+  # first login so we don't burn failed auths against the rate limiter.
+  sleep "${CONFIG_POLL_SETTLE:-40}"
+
+  n="$(pg "$org" "$u2pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'" "$u2")"
+  [ "$n" = "0" ] || fail "persistent secret: user $u2 sees root's secret (count=$n)"
+  # Root's stored copy must be unaffected by $u2's session-create wipe.
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'")"
+  [ "$n" = "1" ] || fail "persistent secret: root's secret lost after $u2's session (count=$n)"
+  pg "$org" "$pw" ducklake "DROP PERSISTENT SECRET $sname" >/dev/null
+  log "persistent secret isolation OK on $org ($u2 blind to root's secret; root's copy intact)"
+}
+
 # ---- resilience -----------------------------------------------------------
 # Worker pod killed mid-life → CP refills and a fresh query succeeds.
 # Ported from TestK8sWorkerCrashRecovery.
@@ -1128,6 +1198,8 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
+  persistent_user_secret_isolation "$CNPG" "$cnpg_pw"
   pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
   cancel_then_reuse_same_session "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
@@ -1163,6 +1235,7 @@ lane_ext() { # external-RDS metadata backend + org default profile
   wait_worker "$EXT" "$ext_pw" ducklake
   basic_query  "$EXT" "$ext_pw"
   rw_ducklake  "$EXT" "$ext_pw"
+  persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
   iceberg_cold_first_connect "$EXT" "$ext_pw"  # cold first session must not fail the metadata-init bind (ext backend)
   rw_iceberg   "$EXT" "$ext_pw"
   # Org default profile on ext: no client-sized assertions run on this org, so
@@ -1236,7 +1309,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

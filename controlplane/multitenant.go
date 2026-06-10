@@ -143,6 +143,20 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, err
 	}
 
+	// Per-user persistent secret manager (CREATE PERSISTENT SECRET). With no
+	// key configured the manager still loads so DROP can clean up stale rows,
+	// but persistence is disabled with a clear client-facing error.
+	userSecrets, err := NewCPUserSecretManager(store, cfg.UserSecretKey)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	server.SetUserSecretManager(srv, userSecrets)
+	if cfg.UserSecretKey == "" {
+		slog.Info("User persistent secrets disabled (DUCKGRES_USER_SECRET_KEY not set).")
+	} else {
+		slog.Info("User persistent secrets enabled.")
+	}
+
 	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
@@ -224,7 +238,7 @@ func SetupMultiTenant(
 		}
 	}
 
-	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, resolveDucklingStatus)
+	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, userSecrets, resolveDucklingStatus)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}

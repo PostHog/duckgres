@@ -24,6 +24,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -62,6 +63,15 @@ type Config struct {
 	HandleIdleTTL      time.Duration
 	SessionTokenTTL    time.Duration
 	WorkerQueueTimeout time.Duration // applied to CreateSession calls; 0 = use request context as-is
+
+	// RejectPersistentSecretDDL rejects CREATE/DROP PERSISTENT SECRET with a
+	// clear error. Set when the deployment runs the user persistent secret
+	// manager: that manager intercepts secret DDL on the PG wire protocol
+	// only, so a persistent secret created via Flight would execute, never be
+	// stored, and then be silently deleted by the next session's hygiene wipe
+	// — rejecting up front is the honest behavior until Flight gets its own
+	// interception.
+	RejectPersistentSecretDDL bool
 }
 
 type SessionProvider interface {
@@ -224,6 +234,7 @@ func NewFlightIngressFromListener(baseListener net.Listener, tlsConfig *tls.Conf
 		return nil, err
 	}
 	handler.rateLimiter = opts.RateLimiter
+	handler.rejectPersistentSecretDDL = cfg.RejectPersistentSecretDDL
 
 	grpcOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
@@ -305,10 +316,27 @@ func (fi *FlightIngress) Shutdown() {
 // ControlPlaneFlightSQLHandler implements Flight SQL over control-plane sessions.
 type ControlPlaneFlightSQLHandler struct {
 	flightsql.BaseServer
-	validator   CredentialValidator
-	sessions    *flightAuthSessionStore
-	rateLimiter *server.RateLimiter
-	alloc       memory.Allocator
+	validator                 CredentialValidator
+	sessions                  *flightAuthSessionStore
+	rateLimiter               *server.RateLimiter
+	alloc                     memory.Allocator
+	rejectPersistentSecretDDL bool
+}
+
+// checkUserSecretDDL rejects persistent-secret DDL when the deployment
+// manages user secrets via the PG protocol (see Config.
+// RejectPersistentSecretDDL). Plain/TEMPORARY secret DDL passes through —
+// it is genuinely session-scoped on every path.
+func (h *ControlPlaneFlightSQLHandler) checkUserSecretDDL(query string) error {
+	if !h.rejectPersistentSecretDDL {
+		return nil
+	}
+	st := usersecrets.Classify(query)
+	if st.Kind != usersecrets.KindNone && st.Persistent {
+		return status.Error(codes.InvalidArgument,
+			"persistent secrets are managed via the PostgreSQL protocol on this deployment; CREATE/DROP PERSISTENT SECRET is not supported over Flight SQL (a secret created here would not survive the session)")
+	}
+	return nil
 }
 
 func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, validator CredentialValidator) (*ControlPlaneFlightSQLHandler, error) {
@@ -521,6 +549,10 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoStatement(ctx context.Contex
 		}, nil
 	}
 
+	if err := h.checkUserSecretDDL(query); err != nil {
+		return nil, err
+	}
+
 	schema, err := getQuerySchema(ctx, s, query)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
@@ -616,6 +648,10 @@ func (h *ControlPlaneFlightSQLHandler) DoPutCommandStatementUpdate(ctx context.C
 	query := cmd.GetQuery()
 	if server.IsEmptyQuery(query) {
 		return 0, nil
+	}
+
+	if err := h.checkUserSecretDDL(query); err != nil {
+		return 0, err
 	}
 
 	res, err := s.exec(ctx, query)
@@ -719,6 +755,10 @@ func (h *ControlPlaneFlightSQLHandler) CreatePreparedStatement(ctx context.Conte
 			Handle:        []byte(handleID),
 			DatasetSchema: emptySchema,
 		}, nil
+	}
+
+	if err := h.checkUserSecretDDL(query); err != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
 
 	schema, err := getQuerySchema(ctx, s, query)
