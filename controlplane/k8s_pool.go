@@ -30,16 +30,35 @@ const defaultActivatingTimeout = 2 * time.Minute
 // generous.
 const workerPodReadyTimeout = 5 * time.Minute
 
+// workerSpawnConnectTimeout bounds the gRPC connect-and-health-check to a
+// freshly-spawned worker (waitForWorkerTCP). It must cover the worker's whole
+// warmup, not just a TCP dial: the worker's health handler deliberately blocks
+// on warmupDone (duckdbservice FlightSQLHandler.doHealthCheck) until extension
+// load + the DuckLake ATTACH (httpfs/S3 + metadata) complete, so the CP can't
+// route to a not-yet-attached worker. waitForPodReady returns the instant the
+// pod is Running+IP (~1.5s) — there is no readiness probe gating on warmup — so
+// this connect budget, NOT workerPodReadyTimeout, is what absorbs the attach.
+//
+// 90s was too tight: under a burst of concurrent cold spawns (e.g. the e2e
+// harness's parallel per-org lanes) the DuckLake ATTACH contends on S3/metadata
+// and routinely exceeds 90s, so the CP reaped healthy-but-still-attaching
+// workers, failing the session. 3m gives comfortable headroom over a
+// contended-but-progressing attach while staying well under the engine-side
+// attach cap (attachMigrateStatementTimeout, 15m). A genuinely dead/crashed
+// worker is detected independently by the pod informer / PodFailed path, so the
+// longer budget does not weaken crash detection.
+const workerSpawnConnectTimeout = 3 * time.Minute
+
 // workerSpawnActivateTimeout bounds the DETACHED background spawn+activate run
 // for an org cold acquisition (OrgReservedPool.AcquireWorker slow path). The
 // spawn and activation deliberately do NOT run on the requester's ctx: if node
 // provisioning reliably exceeds the client's worker-queue budget, cancelling
 // the wait would delete the in-flight pod and every retry would spawn-wait-
-// delete a fresh one without ever converging (doomed-spawn thrash). Budget =
-// pod-ready wait (workerPodReadyTimeout, may include a Karpenter node
-// provision) + gRPC connect (up to 90s) + tenant activation (ATTACH against
-// cloud storage, defaultActivatingTimeout-scale).
-const workerSpawnActivateTimeout = workerPodReadyTimeout + 3*time.Minute
+// delete a fresh one without ever converging (doomed-spawn thrash). Budget is
+// the sum of its phases — pod-ready wait (may include a Karpenter node
+// provision) + gRPC connect (covers worker warmup) + tenant activation (ATTACH
+// against cloud storage) — so the three deadlines can't drift out of sync.
+const workerSpawnActivateTimeout = workerPodReadyTimeout + workerSpawnConnectTimeout + defaultActivatingTimeout
 
 const workerTerminationGracePeriodSeconds int64 = 3600
 

@@ -315,7 +315,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		observeSpawnFailure(SpawnFailureReasonSecretRead, image)
 		return fmt.Errorf("read worker RPC security: %w", err)
 	}
-	client, err := waitForWorkerTCP(addr, token, serverCertPEM, 90*time.Second)
+	client, err := waitForWorkerTCP(addr, token, serverCertPEM, workerSpawnConnectTimeout)
 	if err != nil {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
