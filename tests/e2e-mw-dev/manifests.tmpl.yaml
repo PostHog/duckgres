@@ -44,6 +44,11 @@ spec:
   template:
     metadata:
       labels: { app: duckgres-config-store }
+      annotations:
+        # Same consolidation pinning as the control plane below: a mid-run
+        # config-store reschedule forces the CP through a pod restart + PVC
+        # reattach pause the harness has no retry budget for.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       containers:
         - name: postgres
@@ -196,6 +201,14 @@ spec:
   template:
     metadata:
       labels: { app: duckgres-control-plane }
+      annotations:
+        # The harness asserts against this single-replica CP for ~10 minutes.
+        # Worker churn from the cold-burst / sized-worker assertions empties
+        # nodes mid-run, and a Karpenter consolidation sweep that disrupts the
+        # CP's node kills the run at whatever assertion happens to be next
+        # (observed as "control plane is draining" / connection-refused at the
+        # sized-reuse step). Pin the pod for the run's lifetime.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: duckgres
       containers:

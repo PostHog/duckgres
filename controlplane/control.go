@@ -103,23 +103,23 @@ type ProcessConfig struct {
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage                     string        // Container image for worker pods (required)
-	WorkerNamespace                 string        // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID                  string        // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort                      int           // gRPC port on worker pods (default: 8816)
-	WorkerSecret                    string        // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
-	WorkerConfigMap                 string        // ConfigMap name for duckgres.yaml
-	ImagePullPolicy                 string        // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount                  string        // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
-	MaxWorkers                      int           // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
-	WorkerCPURequest                string        // CPU request for worker pods (e.g., "500m")
-	WorkerMemoryRequest             string        // Memory request for worker pods (e.g., "1Gi")
-	WorkerNodeSelector              string        // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
-	WorkerTolerationKey             string        // Taint key for worker pod NoSchedule toleration
-	WorkerTolerationValue           string        // Taint value for worker pod NoSchedule toleration
-	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
-	WorkerPriorityClassName         string        // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
-	AWSRegion                       string        // AWS region for STS client
+	WorkerImage             string // Container image for worker pods (required)
+	WorkerNamespace         string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID          string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort              int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret            string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	WorkerConfigMap         string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy         string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount          string // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
+	MaxWorkers              int    // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
+	WorkerCPURequest        string // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest     string // Memory request for worker pods (e.g., "1Gi")
+	WorkerNodeSelector      string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
+	WorkerTolerationKey     string // Taint key for worker pod NoSchedule toleration
+	WorkerTolerationValue   string // Taint value for worker pod NoSchedule toleration
+	WorkerExclusiveNode     bool   // One worker per node via pod anti-affinity
+	WorkerPriorityClassName string // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
+	AWSRegion               string // AWS region for STS client
 
 	// Node-headroom controller: keep HeadroomPercent% of the worker nodepool's
 	// allocatable CPU+memory free via low-priority placeholder pods, so a worker
@@ -140,6 +140,14 @@ type K8sConfig struct {
 	WorkerProfileMinMemory   string        // Clamp floor for a client-supplied memory (e.g. "4Gi")
 	WorkerProfileMaxMemory   string        // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
 	WorkerMaxTTL             time.Duration // Clamp ceiling for a client-supplied duckgres.worker_ttl (0 = unbounded)
+
+	// HotIdleTTL is how long a hot-idle worker with no per-worker TTL (i.e. a
+	// default-profile worker — sized profiles carry their own duckgres.worker_ttl)
+	// retains its org assignment before the janitor retires it. 0 = the built-in
+	// default (defaultHotIdleTTL, 5m). Raise this above a tenant's job cadence
+	// (e.g. 70m for hourly jobs) so scheduled workloads reclaim warm workers
+	// instead of cold-spawning every run — at the cost of idle worker nodes.
+	HotIdleTTL time.Duration
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -200,6 +208,12 @@ type ConfigStoreInterface interface {
 	// warehouse row (legacy single-tenant orgs); otherwise it is the lifecycle
 	// string (pending/provisioning/ready/failed/deleting/deleted).
 	OrgWarehouseStatus(orgID string) (state string, orgExists bool)
+	// OrgDefaultWorkerProfile returns the org's operator-set default worker
+	// profile (config-store columns default_worker_cpu/memory/ttl): cpu and
+	// memory as k8s resource-quantity strings, ttl as a Go duration string.
+	// Empty strings mean "not set" (including unknown orgs). Raw stored
+	// values — validation happens in resolveWorkerProfile.
+	OrgDefaultWorkerProfile(orgID string) (cpu, memory, ttl string)
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
@@ -995,10 +1009,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Resolve the requested worker shape from the connection-string startup
-	// options (duckgres.worker_cpu / worker_memory / worker_ttl).
-	// nil => the default exclusive profile. Gated off by default, so this is a
-	// no-op unless the deployment opts in. A rejected profile fails the connect.
-	workerProfile, profileWarns, profileErr := cp.resolveWorkerProfile(startupOptions)
+	// options (duckgres.worker_cpu / worker_memory / worker_ttl), layered on
+	// top of the org's operator-set default profile (multi-tenant only).
+	// nil => the default exclusive profile. Client sizing is gated off by
+	// default; org defaults apply regardless of that gate (they are operator
+	// config, not client input). A rejected client profile fails the connect.
+	var orgProfileDefaults orgWorkerProfileDefaults
+	if cp.configStore != nil && orgID != "" {
+		c, m, t := cp.configStore.OrgDefaultWorkerProfile(orgID)
+		orgProfileDefaults = orgWorkerProfileDefaults{CPU: c, Memory: m, TTL: t}
+	}
+	workerProfile, profileWarns, orgProfileApplied, profileErr := cp.resolveWorkerProfile(startupOptions, orgProfileDefaults)
 	if profileErr != nil {
 		slog.Warn("Rejected worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", profileErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "22023", profileErr.Error())
@@ -1007,6 +1028,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	for _, w := range profileWarns {
 		slog.Warn("Adjusted worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "detail", w)
+	}
+	if orgProfileApplied && workerProfile != nil {
+		// Once per connection so support can see which shape a tenant got.
+		slog.Info("Applied org default worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr,
+			"cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
 
 	// Resolve the session manager and rebalancer for this connection.
