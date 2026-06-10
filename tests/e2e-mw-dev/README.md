@@ -18,7 +18,10 @@ layers where this quarter's production bugs lived.
    config-store Postgres + a control-plane Deployment on the PR image, spawning
    worker pods in the same namespace.
 4. **Test** via an in-cluster Job hitting the CP ClusterIP service. Covers
-   the **cnpg + ext** metadata backends.
+   the **cnpg + ext** metadata backends. Assertions run in four **parallel
+   per-org lanes** (cnpg core suite, two resilience orgs, ext) — worker churn
+   is org-scoped, so lanes can't interfere and the wall-clock is the slowest
+   lane, not the sum.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
 
@@ -149,7 +152,8 @@ normal `go test ./...` lane.
 ## Isolation model
 
 Dedicated CP + throwaway config-store **per PR**, provisioning **real**
-ducklings (org IDs `ci-pr-<N>-cnpg`, `ci-pr-<N>-ext`) through the **shared**
+ducklings (org IDs `ci-pr-<N>-cnpg`, `ci-pr-<N>-ext`, plus the
+ducklake-only resilience-lane orgs `ci-pr-<N>-res1`/`-res2`) through the **shared**
 Crossplane / cnpg-shards / external RDS / Lakekeeper operator. The config-store
 uses a namespace-scoped PVC so a pod recreation during the harness does not
 erase provisioned org rows. Everything PR-specific lives in the namespace and
