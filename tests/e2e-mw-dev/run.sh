@@ -25,14 +25,19 @@ SA_NAME="duckgres"
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
 internal_secret_file="/tmp/duckgres-ci-internal-secret"
+# AES key for user persistent secrets (DUCKGRES_USER_SECRET_KEY). Random per
+# run: stored user secrets only need to outlive the run's sessions.
+user_secret_key_file="/tmp/duckgres-ci-user-secret-key"
 
 render() {
   : "${WORKER_IMAGE:?}" "${CONTROLPLANE_IMAGE:?}" "${PR_NUMBER:?}"
   [ -f "$internal_secret_file" ] || openssl rand -hex 16 > "$internal_secret_file"
+  [ -f "$user_secret_key_file" ] || openssl rand -base64 32 > "$user_secret_key_file"
   INTERNAL_SECRET="$(cat "$internal_secret_file")" \
+  USER_SECRET_KEY="$(cat "$user_secret_key_file")" \
   NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
   WORKER_IMAGE="$WORKER_IMAGE" CONTROLPLANE_IMAGE="$CONTROLPLANE_IMAGE" \
-    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET' \
+    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $USER_SECRET_KEY' \
     < "$HERE/manifests.tmpl.yaml"
 }
 

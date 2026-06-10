@@ -68,6 +68,13 @@ type ControlPlaneConfig struct {
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
 
+	// UserSecretKey is the base64-encoded 32-byte AES key for encrypting
+	// user persistent secrets in the config store (env-only:
+	// DUCKGRES_USER_SECRET_KEY). Empty disables the persistent secret
+	// manager: CREATE PERSISTENT SECRET is rejected with a clear error.
+	// Only used in multitenant remote mode.
+	UserSecretKey string
+
 	// SNIRoutingMode controls hostname-based org routing. Values:
 	//   "" or "off"   - SNI is ignored; legacy database-param routing only
 	//                   (default).

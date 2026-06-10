@@ -910,11 +910,14 @@ func (svc *DuckDBService) WaitForDrain(ctx context.Context) bool {
 }
 
 // CreateSession creates a new DuckDB session for the given username.
-func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (*Session, error) {
+// secretStatements are the user's persistent secrets to replay (shared-warm
+// mode only); replay failures come back as client-facing warnings, not
+// errors.
+func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, secretStatements []string) (*Session, []string, error) {
 	start := time.Now()
 	finishDrain, drainErr := p.beginDrainWork(false)
 	if drainErr != nil {
-		return nil, drainErr
+		return nil, nil, drainErr
 	}
 	defer finishDrain()
 
@@ -922,7 +925,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	p.mu.Lock()
 	if p.maxSessions > 0 && len(p.sessions)+p.reserved >= p.maxSessions {
 		p.mu.Unlock()
-		return nil, fmt.Errorf("max sessions reached (%d)", p.maxSessions)
+		return nil, nil, fmt.Errorf("max sessions reached (%d)", p.maxSessions)
 	}
 	p.reserved++
 	p.mu.Unlock()
@@ -958,7 +961,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 			p.mu.Lock()
 			p.reserved--
 			p.mu.Unlock()
-			return nil, cfgErr
+			return nil, nil, cfgErr
 		}
 
 		// Fallback: create a shared DB if warmup failed or wasn't run.
@@ -979,7 +982,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 			p.mu.Lock()
 			p.reserved--
 			p.mu.Unlock()
-			return nil, fmt.Errorf("create session db: %w", p.fallbackErr)
+			return nil, nil, fmt.Errorf("create session db: %w", p.fallbackErr)
 		}
 		db = p.fallbackDB
 		slog.Info("Using fallback DB (warmup failed).", "duration", time.Since(fallbackStart))
@@ -997,7 +1000,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		p.mu.Lock()
 		p.reserved--
 		p.mu.Unlock()
-		return nil, fmt.Errorf("failed to obtain connection from pool (timeout after 30s): %w", err)
+		return nil, nil, fmt.Errorf("failed to obtain connection from pool (timeout after 30s): %w", err)
 	}
 	slog.Debug("Acquired DB connection from pool.", "user", username, "duration", time.Since(start))
 
@@ -1023,6 +1026,32 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET threads = %d", threads)); err != nil {
 			slog.Warn("Failed to set initial threads.", "user", username, "error", err)
 		}
+	}
+
+	// Persistent user-secret hygiene + replay (shared-warm / k8s mode only).
+	// DuckDB secrets are instance-global, so a hot-idle worker reused by a
+	// different user of the same org would otherwise see the previous user's
+	// persistent secrets. Wipe first (mandatory — this is the cross-user
+	// isolation step), then replay this user's secrets from the control
+	// plane. Replay failures degrade to warnings; a wipe failure fails the
+	// session because handing user A's secrets to user B is not acceptable.
+	var secretWarnings []string
+	if p.sharedWarmMode {
+		secretCtx, secretCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
+		wiped, wipeErr := wipeUserPersistentSecrets(secretCtx, conn)
+		if wipeErr != nil {
+			secretCancel()
+			_ = conn.Close()
+			p.mu.Lock()
+			p.reserved--
+			p.mu.Unlock()
+			return nil, nil, fmt.Errorf("wipe persistent secrets before session start: %w", wipeErr)
+		}
+		if len(wiped) > 0 {
+			slog.Info("Wiped persistent secrets left by previous session.", "user", username, "count", len(wiped))
+		}
+		secretWarnings = replayUserSecrets(secretCtx, conn, username, secretStatements)
+		secretCancel()
 	}
 
 	// Extract the raw DuckDB connection handle for progress polling.
@@ -1055,7 +1084,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		p.mu.Lock()
 		p.reserved--
 		p.mu.Unlock()
-		return nil, cfgErr
+		return nil, nil, cfgErr
 	}
 
 	// In shared-warm (multi-tenant) mode the control plane drives credential
@@ -1092,7 +1121,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	p.mu.Unlock()
 
 	slog.Debug("Created DuckDB session", "user", username, "duration", time.Since(start))
-	return session, nil
+	return session, secretWarnings, nil
 }
 
 // GetSession returns a session by token.
@@ -1209,6 +1238,21 @@ func (p *SessionPool) DestroySession(token string) error {
 			"evicted", evicted)
 		session.connMu.Unlock()
 	}
+
+	// Best-effort persistent-secret wipe so user credentials don't sit on a
+	// hot-idle worker between sessions. The mandatory cross-user isolation
+	// wipe happens at the next CreateSession; this one just narrows the
+	// window. Only safe when this worker serves one session at a time
+	// (secrets are instance-global), which is how k8s workers are deployed
+	// (DUCKGRES_DUCKDB_MAX_SESSIONS=1).
+	if p.sharedWarmMode && p.maxSessions == 1 && session.DB != nil {
+		wipeCtx, wipeCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
+		if _, err := wipeUserPersistentSecrets(wipeCtx, session.DB); err != nil {
+			slog.Warn("Failed to wipe persistent secrets on session destroy.", "user", session.Username, "error", err)
+		}
+		wipeCancel()
+	}
+
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
 	isShared := session.DB == p.warmupDB || session.DB == p.fallbackDB

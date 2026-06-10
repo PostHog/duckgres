@@ -12,6 +12,7 @@ import (
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/wire"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -178,7 +179,7 @@ func (c *clientConn) handleParse(body []byte) {
 			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
 			return
 		}
-		slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", query)
+		slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", usersecrets.RedactForLog(query))
 	}
 
 	// Close existing statement with same name
@@ -197,11 +198,11 @@ func (c *clientConn) handleParse(body []byte) {
 		warnings:          result.Warnings,          // Surfaced as NoticeResponse at Execute
 	}
 
-	slog.Debug("Prepared statement.", "user", c.username, "name", stmtName, "query", query)
+	slog.Debug("Prepared statement.", "user", c.username, "name", stmtName, "query", usersecrets.RedactForLog(query))
 	if len(result.Statements) > 0 {
 		slog.Debug("Prepared statement multi-statement.", "user", c.username, "name", stmtName, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
 	} else if result.SQL != query {
-		slog.Debug("Prepared statement transpiled.", "user", c.username, "name", stmtName, "transpiled", result.SQL)
+		slog.Debug("Prepared statement transpiled.", "user", c.username, "name", stmtName, "transpiled", usersecrets.RedactForLog(result.SQL))
 	}
 	_ = wire.WriteParseComplete(c.writer)
 }
@@ -488,7 +489,11 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	c.currentQuery.Store(p.stmt.query)
+	// Redacted form for everything observable (pg_stat_activity, spans,
+	// logs): CREATE SECRET option lists carry credential material.
+	loggableQuery := usersecrets.RedactForLog(p.stmt.query)
+
+	c.currentQuery.Store(loggableQuery)
 	c.queryStart.Store(time.Now())
 	defer func() {
 		c.currentQuery.Store("")
@@ -529,7 +534,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			attribute.String("duckgres.protocol", "extended"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),
-			attribute.String("db.statement", observe.TruncateForSpan(p.stmt.query)),
+			attribute.String("db.statement", observe.TruncateForSpan(loggableQuery)),
 		),
 	)
 	defer span.End()
@@ -546,7 +551,15 @@ func (c *clientConn) handleExecute(body []byte) {
 	cmdType := c.getCommandType(upperQuery)
 	returnsResults := queryReturnsResults(p.stmt.query)
 
-	slog.Debug("Execute portal.", "user", c.username, "portal", portalName, "params", len(args), "query", p.stmt.query)
+	// Intercept persistent-secret DDL (multitenant remote backend): persist /
+	// delete the user's stored secret alongside the session-side DDL. Uses
+	// the original (untranspiled) text — secret DDL is DuckDB-native and
+	// always falls back unmodified. ReadyForQuery is sent by Sync.
+	if c.handleUserSecretDDLExtended(p.stmt.query) {
+		return
+	}
+
+	slog.Debug("Execute portal.", "user", c.username, "portal", portalName, "params", len(args), "query", loggableQuery)
 
 	// Surface any transpiler warnings (e.g. an unenforced constraint stripped on a
 	// lake catalog) as NoticeResponse before the command result.

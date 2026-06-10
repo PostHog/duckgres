@@ -236,7 +236,7 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 		}
 	}
 
-	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads)
+	session, secretWarnings, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads, req.SecretStatements)
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
 		return drainErr
 	}
@@ -244,8 +244,9 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}
 
-	resp, _ := json.Marshal(map[string]string{
-		"session_token": session.ID,
+	resp, _ := json.Marshal(map[string]any{
+		"session_token":   session.ID,
+		"secret_warnings": secretWarnings,
 	})
 	if err := sendActionResult(stream, &flight.Result{Body: resp}); err != nil {
 		_ = h.pool.DestroySession(session.ID)

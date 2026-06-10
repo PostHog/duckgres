@@ -57,6 +57,25 @@ type OrgUser struct {
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }
 
+// OrgUserSecret is one customer-set persistent DuckDB secret, scoped to
+// (org, user) and replayed onto the user's worker at session creation. The
+// row stores the AES-GCM-sealed CREATE SECRET statement (see
+// server/usersecrets); the config store never sees plaintext credential
+// material. Rows are written/deleted inline when the control plane intercepts
+// CREATE/DROP PERSISTENT SECRET and read directly (not via the snapshot
+// poller) at session creation, so a secret set through one CP replica is
+// immediately visible to all replicas.
+type OrgUserSecret struct {
+	OrgID      string    `gorm:"primaryKey;size:255" json:"org_id"`
+	Username   string    `gorm:"primaryKey;size:255" json:"username"`
+	SecretName string    `gorm:"primaryKey;size:255" json:"secret_name"`
+	Ciphertext []byte    `gorm:"not null" json:"-"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+func (OrgUserSecret) TableName() string { return "duckgres_org_user_secrets" }
+
 // ManagedWarehouseProvisioningState is an open string used for warehouse lifecycle status.
 // The constants below are the canonical values used by current tooling, but callers may
 // persist other states while provisioning workflows evolve.

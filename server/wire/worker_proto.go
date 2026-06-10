@@ -31,6 +31,12 @@ type WorkerCreateSessionPayload struct {
 	Username    string `json:"username"`
 	MemoryLimit string `json:"memory_limit"`
 	Threads     int    `json:"threads"`
+	// SecretStatements are the user's persistent CREATE SECRET statements
+	// (decrypted by the control plane from the config store) to replay on the
+	// worker before the session is handed to the client. Worker pods are
+	// ephemeral, so this is the only way a user secret survives across
+	// sessions. Carries credential material: never log this payload.
+	SecretStatements []string `json:"secret_statements,omitempty"`
 }
 
 // WorkerDestroySessionPayload is the control plane request body for

@@ -88,7 +88,7 @@ func TestCreateSessionRejectsSecondSessionWhenMaxIsOne(t *testing.T) {
 	}
 	pool.sessions["existing"] = &Session{ID: "existing"}
 
-	_, err := pool.CreateSession("u", "", 0)
+	_, _, err := pool.CreateSession("u", "", 0, nil)
 	if err == nil {
 		t.Fatal("expected second CreateSession to be rejected at MaxSessions=1")
 	}
