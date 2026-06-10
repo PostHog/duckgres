@@ -768,8 +768,16 @@ graceful_drain() { # org password
 one_session_per_worker() { # org password
   log "one session per worker: concurrent queries land on distinct pods on $1"
   o1="$(mktemp)"; o2="$(mktemp)"; r1="$(mktemp)"; r2="$(mktemp)"
-  # Deterministic, multi-second query holding each worker (HEAVY_Q).
-  q="$HEAVY_Q"
+  # This assertion's PRECONDITION is overlap: both queries must be executing
+  # at the same time, or "peak pods" measures nothing. On a cold org a single
+  # transient on one connection (10s pg_try backoff) can let the sibling's
+  # query FINISH first — its worker goes hot-idle and the retry REUSES it,
+  # serializing the two queries (legit behavior, peak=1, false fail). So this
+  # one test keeps the old long query (~2min on a default worker), which
+  # absorbs any retry/spawn desync; the other resilience tests use the shorter
+  # HEAVY_Q because their assertions don't require cross-connection overlap.
+  q="SELECT count(*) FROM range(8000000000) t(i) WHERE i % 2 = 0;"
+  want=4000000000
   ( if pg_try "$1" "$2" ducklake "$q" >"$o1" 2>&1; then echo 0 >"$r1"; else echo 1 >"$r1"; fi ) &
   p1=$!
   ( if pg_try "$1" "$2" ducklake "$q" >"$o2" 2>&1; then echo 0 >"$r2"; else echo 1 >"$r2"; fi ) &
@@ -793,8 +801,8 @@ one_session_per_worker() { # org password
   { [ "$(cat "$r1")" = 0 ] && [ "$(cat "$r2")" = 0 ]; } \
     || fail "one_session_per_worker: a concurrent query errored ($(tr -d '\n' <"$o1" | tail -c 120) | $(tr -d '\n' <"$o2" | tail -c 120))"
   n1="$(tr -dc '0-9' <"$o1")"; n2="$(tr -dc '0-9' <"$o2")"
-  { [ "$n1" = "$HEAVY_EXPECT" ] && [ "$n2" = "$HEAVY_EXPECT" ]; } \
-    || fail "one_session_per_worker: wrong results n1=$n1 n2=$n2 want $HEAVY_EXPECT"
+  { [ "$n1" = "$want" ] && [ "$n2" = "$want" ]; } \
+    || fail "one_session_per_worker: wrong results n1=$n1 n2=$n2 want $want"
   [ "$peak" -ge 2 ] \
     || fail "one_session_per_worker: org peaked at $peak worker pod(s) for 2 concurrent queries — sessions shared a worker"
   rm -f "$o1" "$o2" "$r1" "$r2"
