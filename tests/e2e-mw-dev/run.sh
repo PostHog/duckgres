@@ -114,16 +114,30 @@ drop_cnpg_role() { # org-id
     psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
 }
 
+# Every duckling org a harness run provisions for a PR (harness.sh main()):
+# cnpg + ext (full coverage) and res1 + res2 (cnpg-shard/ducklake-only orgs
+# hosting the parallel resilience lanes). Keep in sync with harness.sh.
+ci_orgs() { # pr-number
+  local pr="$1"
+  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-ext ci-pr-${pr}-res1 ci-pr-${pr}-res2"
+}
+# The cnpg-shard-backed orgs (everything except ext) — these own a
+# lakekeeper_<org> role+db on the shard that drop_cnpg_role must clean.
+ci_cnpg_orgs() { # pr-number
+  local pr="$1"
+  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2"
+}
+
 delete_ci_ducklings() { # pr-number
   local pr="$1" org
-  for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
+  for org in $(ci_orgs "$pr"); do
     "${KUBECTL[@]}" -n ducklings delete "duckling/$org" --ignore-not-found --wait=false 2>/dev/null || true
   done
 }
 
 wait_ci_ducklings_deleted() { # pr-number timeout
   local pr="$1" timeout="$2" org
-  for org in "ci-pr-${pr}-cnpg" "ci-pr-${pr}-ext"; do
+  for org in $(ci_orgs "$pr"); do
     "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout="$timeout" 2>/dev/null || true
   done
 }
@@ -140,7 +154,7 @@ reset_pr_stack() {
   # so apply never reuses stale network policies, services, or tenant state.
   delete_ci_ducklings "$PR_NUMBER"
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
-  drop_cnpg_role "ci-pr-${PR_NUMBER}-cnpg"
+  for org in $(ci_cnpg_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
   delete_pod_identity
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=300s
@@ -197,6 +211,13 @@ spec:
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }
             - { name: CP_PG_HOST, value: "duckgres-control-plane.$NS.svc" }
+          # Real requests/limits: the harness shares the default nodepool with
+          # the bursty per-PR worker pods. A BestEffort pod is the first thing
+          # the kubelet evicts under node memory pressure — observed killing
+          # the harness mid-run with no output.
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 512Mi }
           volumeMounts: [{ name: h, mountPath: /harness }]
       volumes: [{ name: h, configMap: { name: duckgres-harness } }]
 YAML
@@ -228,6 +249,11 @@ cmd_diagnostics() {
   echo "::group::namespace state"
   "${KUBECTL[@]}" -n "$NS" get pods,svc,job -o wide || true
   echo "::endgroup::"
+  echo "::group::harness pod status (eviction / OOM / exit code)"
+  "${KUBECTL[@]}" -n "$NS" get pods -l job-name=duckgres-harness     -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase} reason={.status.reason} msg={.status.message} exit={.status.containerStatuses[0].state.terminated.exitCode} term-reason={.status.containerStatuses[0].state.terminated.reason}{"
+"}{end}' || true
+  "${KUBECTL[@]}" -n "$NS" describe pods -l job-name=duckgres-harness 2>/dev/null | tail -30 || true
+  echo "::endgroup::"
   echo "::group::control-plane logs (tail)"
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-control-plane --tail=200 || true
   echo "::endgroup::"
@@ -246,14 +272,14 @@ cmd_teardown() {
     if [ -n "$secret" ]; then
       "${KUBECTL[@]}" -n "$NS" port-forward svc/duckgres-control-plane 18080:8080 >/dev/null 2>&1 &
       pf=$!; sleep 4
-      for org in "ci-pr-${PR_NUMBER}-cnpg" "ci-pr-${PR_NUMBER}-ext"; do
+      for org in $(ci_orgs "$PR_NUMBER"); do
         curl -fsS -X POST -H "X-Duckgres-Internal-Secret: $secret" \
           "http://localhost:18080/api/v1/orgs/$org/deprovision" >/dev/null 2>&1 || true
       done
       # Give the provisioner a moment to drive the duckling deletes.
       for _ in $(seq 1 30); do
         gone=1
-        for org in "ci-pr-${PR_NUMBER}-cnpg" "ci-pr-${PR_NUMBER}-ext"; do
+        for org in $(ci_orgs "$PR_NUMBER"); do
           st="$(curl -fsS -H "X-Duckgres-Internal-Secret: $secret" \
             "http://localhost:18080/api/v1/orgs/$org/warehouse/status" 2>/dev/null \
             | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
@@ -279,7 +305,7 @@ cmd_teardown() {
 
   # Deterministically drop the cnpg role+db in case the composition's async
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
-  drop_cnpg_role "ci-pr-${PR_NUMBER}-cnpg"
+  for org in $(ci_cnpg_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
 
   # Drop the Pod Identity association (it's an EKS resource, not in the ns).
   delete_pod_identity
@@ -315,7 +341,7 @@ cmd_e2e_cleanup() {
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
       delete_ci_ducklings "$pr"
       wait_ci_ducklings_deleted "$pr" 300s
-      drop_cnpg_role "ci-pr-${pr}-cnpg"
+      for org in $(ci_cnpg_orgs "$pr"); do drop_cnpg_role "$org"; done
       NS="$ns" delete_pod_identity
       delete_ci_bindings "$pr"
       "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false
