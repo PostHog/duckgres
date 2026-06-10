@@ -230,9 +230,16 @@ func (p *OrgReservedPool) executeAcquire(ctx context.Context, claim *sharedWorke
 
 	p.shared.mu.Lock()
 	owned := p.workerBelongsToOrgLocked(worker)
+	if !owned {
+		// Worker is no longer ours (raced with retirement/reclaim). Undo the
+		// pre-claim before re-deciding: if this CP still tracks the worker, a
+		// stranded activeSessions=1 would make findIdleAssignedWorkerLocked and
+		// TransitionToHotIdleIfNoSessions skip it forever (fail-safe direction,
+		// but the worker leaks until a TTL reaper retires it).
+		worker.activeSessions--
+	}
 	p.shared.mu.Unlock()
 	if !owned {
-		// Worker is no longer ours (raced with retirement/reclaim); re-decide.
 		return orgAcquireOutcome{retry: true}
 	}
 	return orgAcquireOutcome{worker: worker}
