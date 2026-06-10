@@ -30,6 +30,17 @@ const defaultActivatingTimeout = 2 * time.Minute
 // generous.
 const workerPodReadyTimeout = 5 * time.Minute
 
+// workerSpawnActivateTimeout bounds the DETACHED background spawn+activate run
+// for an org cold acquisition (OrgReservedPool.AcquireWorker slow path). The
+// spawn and activation deliberately do NOT run on the requester's ctx: if node
+// provisioning reliably exceeds the client's worker-queue budget, cancelling
+// the wait would delete the in-flight pod and every retry would spawn-wait-
+// delete a fresh one without ever converging (doomed-spawn thrash). Budget =
+// pod-ready wait (workerPodReadyTimeout, may include a Karpenter node
+// provision) + gRPC connect (up to 90s) + tenant activation (ATTACH against
+// cloud storage, defaultActivatingTimeout-scale).
+const workerSpawnActivateTimeout = workerPodReadyTimeout + 3*time.Minute
+
 const workerTerminationGracePeriodSeconds int64 = 3600
 
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
