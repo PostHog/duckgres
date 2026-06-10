@@ -560,10 +560,16 @@ func (p *K8sWorkerPool) spawnWorkerBackground(id int, image string) {
 // from the request profile, or the pool-global default for a default (nil
 // profile) request (workerResourcesForProfile); the reserved record round-trips
 // the profile + TTL.
-func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, assignment *WorkerAssignment) (*ManagedWorker, error) {
+func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, assignment *WorkerAssignment) (_ *ManagedWorker, err error) {
 	if assignment == nil {
 		return nil, fmt.Errorf("spawnReservedWorkerForSlot requires an assignment")
 	}
+	// spawn covers pod create → pod-ready (incl. node provisioning) → gRPC
+	// connect → reserve. Named-return defer so every failure stage observes.
+	spawnStart := time.Now()
+	defer func() {
+		observeAcquirePhase("spawn", time.Since(spawnStart), err)
+	}()
 	// A default (nil profile) request spawns a default-sized worker: the zero
 	// profile makes workerResourcesForProfile fall back to the pool-global request.
 	var profile WorkerProfile
@@ -580,7 +586,7 @@ func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, 
 	}
 	p.spawning++
 	p.mu.Unlock()
-	err := p.spawnWorker(ctx, id, assignment.Image, profile, false)
+	err = p.spawnWorker(ctx, id, assignment.Image, profile, false)
 	p.mu.Lock()
 	p.spawning--
 	p.mu.Unlock()

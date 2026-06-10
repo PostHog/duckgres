@@ -43,7 +43,15 @@ func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, ima
 	return pool
 }
 
-func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
+func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (worker *ManagedWorker, err error) {
+	// End-to-end acquire latency (fast path included), observed via a named-
+	// return defer so every exit — reuse, capacity error, ctx cancel — lands in
+	// the same histogram with an outcome label.
+	acquireStart := time.Now()
+	defer func() {
+		observeAcquireTotal(time.Since(acquireStart), acquireTotalOutcome(err))
+	}()
+
 	// Fast path: reuse an already-assigned, idle (Hot) worker of the requested
 	// shape. Such a worker is already this org's and free, so reusing it
 	// concurrently is safe and needs no FIFO ordering — it is not a freshly
@@ -104,9 +112,12 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 // which queued waiters reach in FIFO order — the earliest waiter still gets
 // the next available worker.
 func (p *OrgReservedPool) acquireDecision(ctx context.Context, profile *WorkerProfile) (*sharedWorkerClaim, *WorkerAssignment, *ManagedWorker, error) {
+	gateStart := time.Now()
 	if err := p.gate.acquire(ctx); err != nil {
+		observeAcquireGateWait(time.Since(gateStart), "canceled")
 		return nil, nil, nil, err
 	}
+	observeAcquireGateWait(time.Since(gateStart), "acquired")
 	defer p.gate.release()
 
 	// A worker may have freed while we waited for our FIFO turn.
@@ -398,7 +409,12 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 	return lifecycle == WorkerLifecycleHot
 }
 
-func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) error {
+func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) (err error) {
+	activateStart := time.Now()
+	defer func() {
+		observeAcquirePhase("activate", time.Since(activateStart), err)
+	}()
+
 	p.shared.mu.Lock()
 	state := worker.SharedState().NormalizedLifecycle()
 	if state == WorkerLifecycleReserved {
