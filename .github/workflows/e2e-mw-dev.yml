@@ -155,15 +155,55 @@ jobs:
       - name: Run e2e harness (in-cluster Job)
         run: bash tests/e2e-mw-dev/run.sh test
 
+      # Diagnostics are only worth collecting (and only get read) when the
+      # harness failed — on green runs this step just added ~15s to the gating
+      # check. failure() also covers a failed deploy step.
       - name: Collect diagnostics
-        if: always()
+        if: failure()
         run: bash tests/e2e-mw-dev/run.sh diagnostics
 
-      # Always tear down — deprovision the ci-pr ducklings (so no S3 / cnpg
-      # role+db / lakekeeper CR leaks on shared infra) then delete the
-      # namespace. Runs even on cancel/failure.
+  # Teardown runs as its OWN job so the gating `e2e` check completes the moment
+  # the harness verdict is known instead of waiting ~1min for deprovision +
+  # namespace delete. cmd_teardown recovers the internal secret from the
+  # in-cluster duckgres-tokens Secret, so it doesn't need the deploy runner's
+  # disk. Trade-off vs the old in-job always() step: a run cancelled by
+  # concurrency (new push) also cancels this queued job — but the new push's
+  # deploy cleans the stale namespace first thing, and the 6h e2e-cleanup sweep
+  # is the backstop for namespaces with no follow-up push.
+  e2e-teardown:
+    needs: [e2e]
+    # Run on e2e success OR failure (not when e2e was skipped because build
+    # failed — nothing was deployed). Scheduled trigger never reaches here.
+    if: ${{ always() && github.event_name != 'schedule' && contains(fromJSON('["success","failure"]'), needs.e2e.result) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      NAMESPACE: duckgres-ci-pr-${{ github.event.pull_request.number }}
+      KUBE_CONTEXT: posthog-mw-dev
+      CLUSTER_NAME: posthog-mw-dev
+      EKS_CLUSTER_NAME: posthog-mw-dev
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
+          aws-region: us-east-1
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
+        with:
+          oauth-client-id: ${{ vars.TS_WIF_CLIENT_ID_MW_DEV }}
+          audience: ${{ vars.TS_WIF_AUDIENCE_MW_DEV }}
+          tags: tag:github-runner
+      - name: Install kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
+      # Deprovision the ci-pr ducklings (so no S3 / cnpg role+db / lakekeeper CR
+      # leaks on shared infra) then delete the namespace.
       - name: Teardown
-        if: always()
         run: bash tests/e2e-mw-dev/run.sh teardown
 
   # Backstop sweep of orphaned per-PR namespaces. Scheduled-trigger only (the

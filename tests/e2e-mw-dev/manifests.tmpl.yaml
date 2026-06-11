@@ -269,6 +269,11 @@ spec:
             #   serves its self-signed cert and Trino is not under e2e.
             - { name: DUCKGRES_WORKER_QUEUE_TIMEOUT, value: "5m" }
             - { name: DUCKGRES_K8S_MAX_WORKERS, value: "50" }
+            # Fast config-store poll for CI only (default 30s). The harness has
+            # three waits bounded by this interval — the post-provision auth-cache
+            # settle and two org-default-profile propagation waits — which drop
+            # from 40s each to CONFIG_POLL_SETTLE (12s) on the back of it.
+            - { name: DUCKGRES_CONFIG_POLL_INTERVAL, value: "5s" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             # Enables the user persistent secret manager; the harness
