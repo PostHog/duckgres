@@ -113,10 +113,20 @@ only) it:
 - placeholder pods use a PriorityClass **below** the worker PriorityClass, so a
   real worker spawn preempts them and schedules immediately; the evicted
   placeholder triggers Karpenter to add a node in the background.
-- the placeholder target is sized against the **non-placeholder** allocatable
-  (floor: one placeholder while enabled). Sizing against raw allocatable is
-  self-referential and ratchets: placeholders pin nodes, pinned nodes inflate
-  allocatable, the inflated total raises the target.
+- the placeholder target is sized against **current worker demand** (the
+  summed requests of live worker pods), floor one placeholder while enabled.
+  Node allocatable is the wrong baseline in any form: even with the
+  placeholders' own share subtracted it counts FREE node capacity as
+  "capacity needing headroom" (free capacity IS headroom), so one stray
+  oversized node inflates the target and the placeholders pin it alive.
+  Keyed to worker demand the target tracks load by construction and node
+  geometry drops out entirely.
+- placeholders are sized to the pool's **default worker shape**
+  (`DUCKGRES_K8S_WORKER_CPU_REQUEST`/`_MEMORY_REQUEST`, else the built-in
+  default) — there is no separate placeholder sizing knob
+  (`DUCKGRES_K8S_PLACEHOLDER_CPU`/`_MEMORY` are removed). One preempted
+  placeholder always frees exactly one default-worker slot, identically in
+  every environment.
 - workers carry `karpenter.sh/do-not-disrupt` **only while busy** (set at pod
   create — covering spawn/activate and the first session — re-added per
   session, removed when parked hot-idle). With the worker nodepool on
@@ -136,7 +146,9 @@ options), `DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/
 `_MAX_MEMORY` (clamps), `DUCKGRES_K8S_WORKER_MAX_TTL` (clamp ceiling) and
 `DUCKGRES_K8S_WORKER_DEFAULT_TTL` (the default for requests that specify no
 ttl — see the TTL resolution chain above),
-`DUCKGRES_K8S_HEADROOM_PERCENT`, `DUCKGRES_K8S_PLACEHOLDER_*`.
+`DUCKGRES_K8S_HEADROOM_PERCENT`, `DUCKGRES_K8S_PLACEHOLDER_IMAGE`/`_PRIORITY_CLASS`
+(`_PLACEHOLDER_CPU`/`_MEMORY` are removed — placeholders take the default
+worker shape).
 
 Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_TIERS*`,
 `*ALLOW_CLIENT_EXCLUSIVE_NODE*`, `*SHARED_WARM_TARGET*`,

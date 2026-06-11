@@ -115,8 +115,6 @@ type Resolved struct {
 	K8sWorkerPriorityClassName      string
 	K8sHeadroomPercent              int
 	K8sPlaceholderImage             string
-	K8sPlaceholderCPU               string
-	K8sPlaceholderMemory            string
 	K8sPlaceholderPriorityClassName string
 	K8sWorkerProfileMinCPU          string
 	K8sWorkerProfileMaxCPU          string
@@ -199,7 +197,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerMaxTTL, k8sWorkerDefaultTTL time.Duration
 	var k8sWorkerPriorityClassName string
 	var k8sHeadroomPercent int
-	var k8sPlaceholderImage, k8sPlaceholderCPU, k8sPlaceholderMemory, k8sPlaceholderPriorityClassName string
+	var k8sPlaceholderImage, k8sPlaceholderPriorityClassName string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
@@ -882,12 +880,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_IMAGE"); v != "" {
 		k8sPlaceholderImage = v
 	}
-	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_CPU"); v != "" {
-		k8sPlaceholderCPU = v
-	}
-	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_MEMORY"); v != "" {
-		k8sPlaceholderMemory = v
-	}
 	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_PRIORITY_CLASS"); v != "" {
 		k8sPlaceholderPriorityClassName = v
 	}
@@ -1223,8 +1215,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerPriorityClassName:      k8sWorkerPriorityClassName,
 		K8sHeadroomPercent:              k8sHeadroomPercent,
 		K8sPlaceholderImage:             k8sPlaceholderImage,
-		K8sPlaceholderCPU:               k8sPlaceholderCPU,
-		K8sPlaceholderMemory:            k8sPlaceholderMemory,
 		K8sPlaceholderPriorityClassName: k8sPlaceholderPriorityClassName,
 		K8sWorkerProfileMinCPU:          k8sWorkerProfileMinCPU,
 		K8sWorkerProfileMaxCPU:          k8sWorkerProfileMaxCPU,

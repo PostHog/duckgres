@@ -80,8 +80,6 @@ type K8sWorkerPool struct {
 	// immediately (preempting placeholders) instead of waiting on a fresh node.
 	headroomPercent              int
 	placeholderImage             string
-	placeholderCPU               string
-	placeholderMemory            string
 	placeholderPriorityClassName string
 
 	orgID             string                                       // org ID for pod labels (multi-tenant mode)
@@ -191,8 +189,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 
 		headroomPercent:              cfg.HeadroomPercent,
 		placeholderImage:             cfg.PlaceholderImage,
-		placeholderCPU:               cfg.PlaceholderCPU,
-		placeholderMemory:            cfg.PlaceholderMemory,
 		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
 
 		orgID:             cfg.OrgID,
