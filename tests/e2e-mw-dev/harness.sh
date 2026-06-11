@@ -470,6 +470,49 @@ EOF
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
+# Server-side cursor emulation (server/conn_cursor.go) on a live worker:
+# DECLARE → FETCH n → MOVE n (advances WITHOUT returning rows) → FETCH ALL
+# (remaining rows only) → CLOSE, with exact value assertions. The second
+# cursor is deliberately left PARTIALLY READ when ROLLBACK runs: an open
+# cursor rowset pins the worker session's single DuckDB connection, and
+# transaction end must release it BEFORE the COMMIT/ROLLBACK statement needs
+# the connection — the pre-fix behavior deadlocked the session forever
+# (closeCursorsAtTxEnd; regression also in tests/integration/cursor_test.go).
+# The trailing SELECT 1 proves the same session is alive after the rollback.
+# Each -c is its own simple-Query message on ONE connection (cursors are
+# session state). `timeout` turns a deadlock regression into a crisp fail
+# instead of hanging the Job to its deadline.
+server_side_cursors() { # org password
+  log "server-side cursors (DECLARE/FETCH/MOVE/CLOSE + tx-end liveness) on $1"
+  a=0
+  while :; do
+    out="$(PGPASSWORD="$2" timeout 120 psql \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+        -v ON_ERROR_STOP=1 -tA \
+        -c 'BEGIN' \
+        -c 'DECLARE e2e_cur CURSOR FOR SELECT * FROM generate_series(1,10) ORDER BY 1' \
+        -c 'FETCH 3 FROM e2e_cur' \
+        -c 'MOVE 2 FROM e2e_cur' \
+        -c 'FETCH ALL FROM e2e_cur' \
+        -c 'CLOSE e2e_cur' \
+        -c 'DECLARE e2e_cur2 CURSOR FOR SELECT * FROM generate_series(1,10) ORDER BY 1' \
+        -c 'FETCH 2 FROM e2e_cur2' \
+        -c 'ROLLBACK' \
+        -c 'SELECT 1' 2>&1)" && break
+    case "$out" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
+        [ "$a" -lt 12 ] || fail "$1 cursors: backpressure never cleared ($(printf %s "$out" | tr '\n' ' ' | tail -c 120))"
+        sleep 10; a=$((a + 1)); continue ;;
+      *) fail "$1 cursors: lifecycle failed or hung ($(printf %s "$out" | tr '\n' ' ' | tail -c 300))" ;;
+    esac
+  done
+  want="$(printf 'BEGIN\nDECLARE CURSOR\n1\n2\n3\nMOVE 2\n6\n7\n8\n9\n10\nCLOSE CURSOR\nDECLARE CURSOR\n1\n2\nROLLBACK\n1')"
+  [ "$out" = "$want" ] || fail "$1 cursors: got '$(printf %s "$out" | tr '\n' ' ')', want '$(printf %s "$want" | tr '\n' ' ')'"
+}
+
 # Black-box regression for async cancel cleanup: libpq's cancel path sends a
 # PostgreSQL CancelRequest while keeping the same connection open. The next
 # query runs immediately on that same session; if the control plane reuses the
@@ -1289,6 +1332,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
   persistent_user_secret_isolation "$CNPG" "$cnpg_pw"
   pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
+  server_side_cursors    "$CNPG" "$cnpg_pw"
   cancel_then_reuse_same_session "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
   iceberg_cold_first_connect "$CNPG" "$cnpg_pw"  # cold first session must not fail the metadata-init bind

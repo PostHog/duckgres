@@ -94,6 +94,7 @@ func (c *clientConn) handleParse(body []byte) {
 				cursorOp:       cursorOpFetch,
 				cursorName:     s.FetchStmt.Portalname,
 				fetchCount:     s.FetchStmt.HowMany,
+				cursorIsMove:   s.FetchStmt.Ismove,
 			}
 			_ = wire.WriteParseComplete(c.writer)
 			return
@@ -248,6 +249,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 			_ = wire.WriteNoData(c.writer)
 			return
 		case cursorOpFetch:
+			// MOVE advances the cursor without returning rows — NoData.
+			if ps.cursorIsMove {
+				_ = wire.WriteNoData(c.writer)
+				return
+			}
 			// FETCH returns rows — look up cursor to get schema
 			cols, colTypes, err := c.getCursorSchema(ps.cursorName)
 			if err != nil || len(cols) == 0 {
@@ -367,6 +373,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 			_ = wire.WriteNoData(c.writer)
 			return
 		case cursorOpFetch:
+			// MOVE advances the cursor without returning rows — NoData.
+			if p.stmt.cursorIsMove {
+				_ = wire.WriteNoData(c.writer)
+				return
+			}
 			cols, colTypes, err := c.getCursorSchema(p.stmt.cursorName)
 			if err != nil || len(cols) == 0 {
 				_ = wire.WriteNoData(c.writer)
@@ -617,6 +628,10 @@ func (c *clientConn) handleExecute(body []byte) {
 			_ = wire.WriteCommandComplete(c.writer, "BEGIN")
 			return
 		}
+
+		// Open cursors pin the session's single DuckDB connection — release
+		// them before a transaction-end statement needs it.
+		c.closeCursorsAtTxEnd(cmdType)
 
 		// Non-result-returning query: use Exec with converted query
 		runExec := func() (ExecResult, error) {

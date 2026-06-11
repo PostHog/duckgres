@@ -164,8 +164,8 @@ why.
 | Error / notice + recovery (in & out of txn) | ✅ | `protocol_test.go::TestProtocolErrors`, `edge_cases_test.go::TestErrorRecovery` | |
 | Empty / comment-only queries | ✅ | `edge_cases_test.go::TestEmptyQuery`, `::TestPgxPing` | |
 | Multi-statement simple query | ✅ | `protocol_test.go::TestProtocolMultipleStatements`, `edge_cases_test.go::TestMultiStatementBehavior` | |
-| **Cursors: DECLARE / FETCH / MOVE** | ⚠️ | server `conn_querylog_feedback_test.go::TestHandleFetchCursorLogsMissingCursorError` (error path only) | **Gap.** Implemented in `server/conn_cursor.go` (FETCH is forward-only); no differential DECLARE→FETCH happy-path test |
-| Cursor CLOSE | 🟡 | `conn_test.go` (CLOSE detection) | |
+| **Cursors: DECLARE / FETCH / MOVE** | ✅ | `cursor_test.go::TestCursorSimpleQuery` + `::TestCursorPostgresParity` (differential), `::TestCursorExtendedQuery` (pgx, extended protocol); server `conn_querylog_feedback_test.go::TestHandleFetchCursorLogsMissingCursorError` (error path) | Emulated in `server/conn_cursor.go`. Forward-only: backward fetch → `0A000` (PostgreSQL uses `55000` for non-SCROLL cursors, same message). Re-DECLARE of an open cursor replaces it (PostgreSQL raises `42P03`). Cursors close at transaction end, before COMMIT/ROLLBACK executes (also a liveness requirement: an open cursor rowset pins the session's single DuckDB connection — `server/conn_cursor_test.go::TestCloseCursorsAtTxEnd`) |
+| Cursor CLOSE | ✅ | `cursor_test.go::TestCursorSimpleQuery/lifecycle_fetch_close` + parity, `::TestCursorExtendedQuery/declare_fetch_close`; server `conn_test.go` (CLOSE detection) | FETCH after CLOSE → clean `34000` missing-cursor error |
 | Auth: cleartext password | ✅ | server `worker_auth_test.go`; integration via connection params | |
 | Auth: MD5 | ❌ | — | Current startup path requests cleartext password auth over TLS |
 | Auth: SCRAM-SHA-256 | ❌ | — | not tested |
@@ -251,27 +251,21 @@ must route them to native DuckDB execution rather than the PG transpiler.
 
 Sorted by what's worth acting on first.
 
-1. **⚠️ Cursors (DECLARE/FETCH/MOVE) — implemented but no happy-path test.** The only
-   coverage is the missing-cursor *error* path
-   (`conn_querylog_feedback_test.go::TestHandleFetchCursorLogsMissingCursorError`).
-   This is live, client-reachable code (`server/conn_cursor.go`) with no differential
-   assertion. **Highest-priority gap.**
-
-2. **🟡 Stale `skipIfKnown` skips.** Differential RETURNING
+1. **🟡 Stale `skipIfKnown` skips.** Differential RETURNING
    (`TestDML{Insert,Update,Delete}Returning`) and `COPY TO STDOUT`
    (`TestCopyToStdout`) are skipped in `tests/integration/` though the behavior is
    covered at unit/client level. Re-enable or document why they must stay skipped.
 
-3. **🟡 Transpiler-only, no differential assertion:** generated columns, `SELECT FOR
+2. **🟡 Transpiler-only, no differential assertion:** generated columns, `SELECT FOR
    UPDATE/SHARE` (stripped). Add differential cases if these matter to clients.
 
-4. **❌ Unsupported or untested but plausibly reachable — undefined behavior today:** MD5/SCRAM auth,
+3. **❌ Unsupported or untested but plausibly reachable — undefined behavior today:** MD5/SCRAM auth,
    enum/domain/composite/xml types, advisory locks, `LOCK TABLE`,
    GRANT/REVOKE/roles, `information_schema.{key_column_usage,table_constraints,
    referential_constraints}` (ORM FK discovery), `TABLESAMPLE`. Asserting these
    (even as "errors cleanly") would pin the compatibility boundary.
 
-5. **⛔ Out of scope by design (correctly skipped):** SAVEPOINT, MERGE,
+4. **⛔ Out of scope by design (correctly skipped):** SAVEPOINT, MERGE,
    sequences/SERIAL, materialized views, partitioning/inheritance,
    triggers/PL-pgSQL/rules/LISTEN-NOTIFY, RLS, and the network/geometric/range/
    text-search/money types. These are DuckDB or OLTP limitations.
