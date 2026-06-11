@@ -68,6 +68,12 @@ type ControlPlaneConfig struct {
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
 
+	// InternalSecretFallbacks are previous internal secrets still accepted
+	// for API authentication during a rotation (newest first). Clients always
+	// send the primary InternalSecret; the server accepts any of
+	// {primary ∪ fallbacks}. Mirrors posthog's SECRET_KEY_FALLBACKS.
+	InternalSecretFallbacks []string
+
 	// UserSecretKey is the base64-encoded 32-byte AES key for encrypting
 	// user persistent secrets in the config store (env-only:
 	// DUCKGRES_USER_SECRET_KEY). Empty disables the persistent secret

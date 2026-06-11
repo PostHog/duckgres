@@ -1,6 +1,6 @@
 # Per-PR isolated duckgres stack for the mw-dev e2e harness. Rendered by
 # run.sh via envsubst with: NAMESPACE, PR_NUMBER, CONTROLPLANE_IMAGE,
-# WORKER_IMAGE, INTERNAL_SECRET.
+# WORKER_IMAGE, INTERNAL_SECRET, INTERNAL_SECRET_FALLBACK, USER_SECRET_KEY.
 #
 # Isolation model (decided with the design): a DEDICATED control plane +
 # throwaway config-store per PR, provisioning REAL ducklings (PR-prefixed org
@@ -84,6 +84,9 @@ metadata:
   namespace: ${NAMESPACE}
 stringData:
   internal-secret: "${INTERNAL_SECRET}"
+  # Rotation fallback the CP must ALSO accept (mirrors the prod chart's
+  # internal-secret-fallbacks key); asserted by internal_secret_fallback_auth.
+  internal-secret-fallbacks: "${INTERNAL_SECRET_FALLBACK}"
   # AES key for the user persistent secret manager (CREATE PERSISTENT SECRET).
   user-secret-key: "${USER_SECRET_KEY}"
 ---
@@ -284,6 +287,10 @@ spec:
             - { name: DUCKGRES_CONFIG_POLL_INTERVAL, value: "5s" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
+            # Previous internal secrets still accepted during rotation; the
+            # harness asserts the fallback authenticates (and garbage doesn't).
+            - name: DUCKGRES_INTERNAL_SECRET_FALLBACKS
+              valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret-fallbacks } }
             # Enables the user persistent secret manager; the harness
             # persistent_user_secret assertion exercises it end-to-end.
             - name: DUCKGRES_USER_SECRET_KEY

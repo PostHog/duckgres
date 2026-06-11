@@ -66,6 +66,7 @@ type CLIInputs struct {
 	ConfigStoreConn             string
 	ConfigPollInterval          string
 	InternalSecret              string
+	InternalSecretFallbacks     string
 	SNIRoutingMode              string
 	ManagedHostnameSuffixes     string
 	WorkerBackend               string
@@ -126,6 +127,7 @@ type Resolved struct {
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
 	InternalSecret                  string
+	InternalSecretFallbacks         []string
 	UserSecretKey                   string
 	SNIRoutingMode                  string
 	ManagedHostnameSuffixes         []string
@@ -209,6 +211,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var internalSecret string
+	var internalSecretFallbacks []string
 	var userSecretKey string
 	var sniRoutingMode string
 	var managedHostnameSuffixes []string
@@ -770,6 +773,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_INTERNAL_SECRET"); v != "" {
 		internalSecret = v
 	}
+	if v := getenv("DUCKGRES_INTERNAL_SECRET_FALLBACKS"); v != "" {
+		internalSecretFallbacks = splitAndTrim(v, ",")
+	}
 	// Env-only (no CLI flag, no YAML): the AES key for user persistent
 	// secrets should only arrive via a mounted K8s Secret.
 	if v := getenv("DUCKGRES_USER_SECRET_KEY"); v != "" {
@@ -1082,6 +1088,12 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cli.Set["internal-secret"] {
 		internalSecret = cli.InternalSecret
 	}
+	if cli.Set["internal-secret-fallbacks"] {
+		// An explicitly-set empty flag clears env-provided fallbacks
+		// (splitAndTrim("") == nil), same semantics as posthog's
+		// JWT_SIGNING_KEY_FALLBACKS.
+		internalSecretFallbacks = splitAndTrim(cli.InternalSecretFallbacks, ",")
+	}
 	if cli.Set["sni-routing-mode"] {
 		sniRoutingMode = cli.SNIRoutingMode
 	}
@@ -1226,6 +1238,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,
 		InternalSecret:                  internalSecret,
+		InternalSecretFallbacks:         internalSecretFallbacks,
 		UserSecretKey:                   userSecretKey,
 		SNIRoutingMode:                  sniRoutingMode,
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,

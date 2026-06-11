@@ -59,7 +59,8 @@
 #
 # Exit non-zero on any failure → the Job fails → the workflow step fails.
 #
-# Env (from run.sh): NAMESPACE, PR_NUMBER, INTERNAL_SECRET, CP_API, CP_PG_HOST
+# Env (from run.sh): NAMESPACE, PR_NUMBER, INTERNAL_SECRET,
+# INTERNAL_SECRET_FALLBACK, CP_API, CP_PG_HOST
 set -eu
 # Surface ANY exit path in the Job log: set -e can kill the script without a
 # FAIL line, and an evicted pod prints nothing — make the normal/abnormal exit
@@ -1173,6 +1174,26 @@ admin_dashboard_no_query_token() {
   [ "$code" = "200" ] || fail "GET / with internal-secret header returned $code, want 200"
 }
 
+# ---- internal secret rotation fallback --------------------------------------
+# The CP accepts {primary ∪ DUCKGRES_INTERNAL_SECRET_FALLBACKS} so a secret
+# rotation is a phased roll with no auth-mismatch window. The deployment
+# configures INTERNAL_SECRET_FALLBACK as a fallback; it must authenticate both
+# the service-to-service API path and the dashboard, and the accept-list must
+# not have opened the door to arbitrary tokens.
+internal_secret_fallback_auth() {
+  log "internal secret rotation fallback authenticates"
+  fb="${INTERNAL_SECRET_FALLBACK:?}"
+  code="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "X-Duckgres-Internal-Secret: $fb" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "GET /api/v1/orgs with fallback secret returned $code, want 200 (rotation overlap broken)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "X-Duckgres-Internal-Secret: $fb" "$API/")"
+  [ "$code" = "200" ] || fail "GET / (dashboard) with fallback secret returned $code, want 200"
+  code="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "X-Duckgres-Internal-Secret: definitely-not-a-secret" "$API/api/v1/orgs")"
+  [ "$code" = "401" ] || fail "GET /api/v1/orgs with garbage secret returned $code, want 401 (accept-list must stay closed)"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -1372,6 +1393,7 @@ main() {
 
   # No org dependency — assert the admin surface auth contract up front.
   admin_dashboard_no_query_token
+  internal_secret_fallback_auth
 
   mkdir -p "$LANE_DIR"
 

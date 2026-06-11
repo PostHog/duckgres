@@ -57,6 +57,7 @@ func fieldNameToFlagName(name string) string {
 		{"ManagedHostnameSuffixes", "managed-hostname-suffixes"},
 		{"ConfigStoreConn", "config-store"},
 		{"ConfigPollInterval", "config-poll-interval"},
+		{"InternalSecretFallbacks", "internal-secret-fallbacks"},
 		{"InternalSecret", "internal-secret"},
 		{"WorkerBackend", "worker-backend"},
 		{"WorkerQueueTimeout", "worker-queue-timeout"},
