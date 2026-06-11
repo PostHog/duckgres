@@ -331,23 +331,40 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 			success = true
 			return newPID, exec, nil
 		}
-		if !isWorkerSessionCapError(err) {
+		switch {
+		case isWorkerSessionCapError(err):
+			// One-session-per-worker invariant violated: the CP scheduled this
+			// worker believing it idle, but the worker still holds a session.
+			// Loud ERROR + metric so we can find and fix the drift.
+			observeWorkerSessionCapDrift()
+			sm.log.Error("Worker rejected a CP-scheduled session at its session cap — one-session-per-worker accounting drift; recycling worker and re-acquiring.",
+				"pid", pid,
+				"user", username,
+				"worker", worker.ID,
+				"attempt", attempt,
+				"error", err,
+			)
+		case isWorkerConnPoolTimeoutError(err):
+			// The worker's single session connection never returned to its pool
+			// (a previous session's cleanup is stuck) — the worker is WEDGED, and
+			// because it still looks hot-idle, plain client retries deterministically
+			// reuse it and fail again (observed live: 12 straight failures against
+			// one worker). Recycle it and re-acquire a fresh one.
+			observeWorkerConnPoolWedge()
+			sm.log.Error("Worker session-create timed out acquiring its DB connection — wedged worker; recycling and re-acquiring.",
+				"pid", pid,
+				"user", username,
+				"worker", worker.ID,
+				"attempt", attempt,
+				"error", err,
+			)
+		default:
 			return 0, nil, err
 		}
 
-		// One-session-per-worker invariant violated: the CP scheduled this worker
-		// believing it idle, but the worker still holds a session. Recycle it
-		// (graceful drain via retire) so it leaves the schedulable pool, and retry
-		// with a fresh worker. Loud ERROR + metric so we can find and fix the drift.
+		// Recycle (graceful drain via retire) so the worker leaves the
+		// schedulable pool, and retry with a fresh worker.
 		lastCapDriftErr = err
-		observeWorkerSessionCapDrift()
-		sm.log.Error("Worker rejected a CP-scheduled session at its session cap — one-session-per-worker accounting drift; recycling worker and re-acquiring.",
-			"pid", pid,
-			"user", username,
-			"worker", worker.ID,
-			"attempt", attempt,
-			"error", err,
-		)
 		sm.pool.RetireWorker(worker.ID)
 	}
 
@@ -368,6 +385,17 @@ const maxWorkerSessionCapDriftRetries = 2
 // "max sessions reached (N)", which propagates through the wrapped error chain.
 func isWorkerSessionCapError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "max sessions reached")
+}
+
+// isWorkerConnPoolTimeoutError reports whether err is the worker-side
+// "failed to obtain connection from pool" session-create failure
+// (duckdbservice acquires the single-session DB connection with a 30s
+// timeout; see the MaxOpenConns=1 isolation contract). A worker returning
+// this is wedged — its connection never came back from the previous
+// session's cleanup — and because it parks hot-idle afterwards, plain
+// client retries deterministically reuse it; it must be recycled instead.
+func isWorkerConnPoolTimeoutError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed to obtain connection from pool")
 }
 
 func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) (string, int) {

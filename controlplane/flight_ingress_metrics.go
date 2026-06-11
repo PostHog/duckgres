@@ -98,8 +98,21 @@ var controlPlaneWorkerSessionCapDriftCounter = promauto.NewCounter(prometheus.Co
 	Help: "Times a worker rejected a CP-scheduled CreateSession at its session cap (CP↔worker accounting drift; recovered by recycling the worker and retrying).",
 })
 
+// controlPlaneWorkerConnPoolWedgeCounter counts sessions rejected by a worker
+// whose single DB connection never returned to its pool (wedged worker). The
+// CP recycles the worker and re-acquires; a nonzero rate means worker-side
+// session cleanup is hanging — find the leak, don't lean on the recycle.
+var controlPlaneWorkerConnPoolWedgeCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_control_plane_worker_conn_pool_wedge_total",
+	Help: "Sessions rejected by a wedged worker (DB connection pool timeout); the worker is recycled and the session retried on a fresh one.",
+})
+
 func observeWorkerSessionCapDrift() {
 	controlPlaneWorkerSessionCapDriftCounter.Inc()
+}
+
+func observeWorkerConnPoolWedge() {
+	controlPlaneWorkerConnPoolWedgeCounter.Inc()
 }
 
 func observeFlightSessionsReaped(trigger string, count int) {

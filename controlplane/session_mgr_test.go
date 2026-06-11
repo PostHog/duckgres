@@ -639,3 +639,22 @@ func TestSessionManager_ConnectionLimits_WorkerCrashGrantsQueuedWaiter(t *testin
 		t.Fatal("timed out waiting for queued waiter after OnWorkerCrash")
 	}
 }
+
+func TestIsWorkerConnPoolTimeoutError(t *testing.T) {
+	// The exact wedged-worker signature observed live (e2e ci-pr-759, worker 26:
+	// 12 straight client retries deterministically reused the same hot-idle
+	// wedged worker). The CP must classify it for recycle-and-reacquire.
+	err := fmt.Errorf("create session: %w",
+		fmt.Errorf("create session on worker 26: create session recv: %w",
+			errors.New("rpc error: code = ResourceExhausted desc = create session: failed to obtain connection from pool (timeout after 30s): context deadline exceeded")))
+	if !isWorkerConnPoolTimeoutError(err) {
+		t.Fatal("wedged-worker pool-timeout error not classified for recycle")
+	}
+	// Cap errors and unrelated errors must not match.
+	if isWorkerConnPoolTimeoutError(errors.New("max sessions reached (1)")) {
+		t.Fatal("cap error misclassified as pool timeout")
+	}
+	if isWorkerConnPoolTimeoutError(nil) {
+		t.Fatal("nil misclassified")
+	}
+}
