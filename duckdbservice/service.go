@@ -1062,13 +1062,15 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 		}
 	}
 
-	// Persistent user-secret hygiene + replay (shared-warm / k8s mode only).
-	// DuckDB secrets are instance-global, so a hot-idle worker reused by a
-	// different user of the same org would otherwise see the previous user's
-	// persistent secrets. Wipe first (mandatory — this is the cross-user
-	// isolation step), then replay this user's secrets from the control
-	// plane. Replay failures degrade to warnings; a wipe failure fails the
-	// session because handing user A's secrets to user B is not acceptable.
+	// User-secret hygiene + replay (shared-warm / k8s mode only). DuckDB
+	// secrets are instance-global, so a hot-idle worker reused by a different
+	// user of the same org would otherwise see the previous user's secrets —
+	// both persistent ones and non-persistent (plain/TEMPORARY CREATE SECRET)
+	// ones that pass through to the worker. Wipe ALL user secrets first
+	// (mandatory — this is the cross-user isolation step), then replay this
+	// user's secrets from the control plane. Replay failures degrade to
+	// warnings; a wipe failure fails the session because handing user A's
+	// secrets to user B is not acceptable.
 	var secretWarnings []string
 	switch {
 	case p.sharedWarmMode && p.maxSessions != 1:
@@ -1078,24 +1080,24 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 		// the point of reliance, instead of trusting a flag set two layers
 		// away: with any other cap, wiping would delete a concurrent
 		// session's secrets mid-query. Skip hygiene entirely and scream.
-		slog.Error("User persistent secret hygiene requires max_sessions=1 on shared-warm workers; skipping wipe+replay.",
+		slog.Error("User secret hygiene requires max_sessions=1 on shared-warm workers; skipping wipe+replay.",
 			"max_sessions", p.maxSessions, "user", username, "secrets", len(secretStatements))
 		if len(secretStatements) > 0 {
 			secretWarnings = []string{"persistent secrets were NOT restored: worker session cap is misconfigured (requires max_sessions=1)"}
 		}
 	case p.sharedWarmMode:
 		secretCtx, secretCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
-		wiped, wipeErr := wipeUserPersistentSecrets(secretCtx, conn)
+		wiped, wipeErr := wipeUserSecrets(secretCtx, conn)
 		if wipeErr != nil {
 			secretCancel()
 			_ = conn.Close()
 			p.mu.Lock()
 			p.reserved--
 			p.mu.Unlock()
-			return nil, nil, fmt.Errorf("wipe persistent secrets before session start: %w", wipeErr)
+			return nil, nil, fmt.Errorf("wipe user secrets before session start: %w", wipeErr)
 		}
 		if len(wiped) > 0 {
-			slog.Info("Wiped persistent secrets left by previous session.", "user", username, "count", len(wiped))
+			slog.Info("Wiped user secrets left by previous session.", "user", username, "count", len(wiped))
 		}
 		secretWarnings = replayUserSecrets(secretCtx, conn, username, secretStatements)
 		secretCancel()
@@ -1286,16 +1288,16 @@ func (p *SessionPool) DestroySession(token string) error {
 		session.connMu.Unlock()
 	}
 
-	// Best-effort persistent-secret wipe so user credentials don't sit on a
-	// hot-idle worker between sessions. The mandatory cross-user isolation
-	// wipe happens at the next CreateSession; this one just narrows the
-	// window. Only safe when this worker serves one session at a time
-	// (secrets are instance-global), which is how k8s workers are deployed
-	// (DUCKGRES_DUCKDB_MAX_SESSIONS=1).
+	// Best-effort user-secret wipe (persistent + temporary) so user
+	// credentials don't sit on a hot-idle worker between sessions. The
+	// mandatory cross-user isolation wipe happens at the next CreateSession;
+	// this one just narrows the window. Only safe when this worker serves one
+	// session at a time (secrets are instance-global), which is how k8s
+	// workers are deployed (DUCKGRES_DUCKDB_MAX_SESSIONS=1).
 	if p.sharedWarmMode && p.maxSessions == 1 && session.DB != nil {
 		wipeCtx, wipeCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
-		if _, err := wipeUserPersistentSecrets(wipeCtx, session.DB); err != nil {
-			slog.Warn("Failed to wipe persistent secrets on session destroy.", "user", session.Username, "error", err)
+		if _, err := wipeUserSecrets(wipeCtx, session.DB); err != nil {
+			slog.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
 		}
 		wipeCancel()
 	}
