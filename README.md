@@ -42,7 +42,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 ## Features
 
-- **PostgreSQL Wire Protocol**: Full compatibility with PostgreSQL clients
+- **PostgreSQL Wire Protocol**: Compatibility with PostgreSQL clients for analytical workloads
 - **Two-Tier Query Processing**: Transparently handles both PostgreSQL and DuckDB-specific syntax
 - **TLS Encryption**: Required TLS connections with auto-generated self-signed certificates
 - **Per-User Databases**: Each authenticated user gets their own isolated DuckDB database file
@@ -734,7 +734,7 @@ The following DuckDB features work transparently through the fallback mechanism:
 ### PostgreSQL Compatibility
 - Extended query protocol (prepared statements)
 - Binary and text result formats
-- MD5 password authentication
+- Cleartext password authentication over TLS
 - Basic `pg_catalog` system tables for client compatibility
 - `\dt`, `\d`, and other psql meta-commands
 

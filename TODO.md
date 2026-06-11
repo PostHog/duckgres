@@ -1,82 +1,46 @@
-# TODO - Future Enhancements
+# Backlog / Ideas
 
-## High Priority
+This file is a lightweight, non-canonical backlog for project ideas that do not
+yet have a better home. It is not the PostgreSQL compatibility source of truth;
+use [docs/postgres-compatibility.md](docs/postgres-compatibility.md) for
+feature-by-feature compatibility status, test citations, and known gaps.
 
-### Security
-- [x] **TLS/SSL Support**: Add encrypted connections for production use
-- [ ] **MD5 Password Authentication**: Support PostgreSQL's MD5-based auth for better security
-- [ ] **SCRAM-SHA-256 Authentication**: Modern PostgreSQL authentication method
-- [x] **Connection Rate Limiting**: Prevent brute-force attacks
+Prefer GitHub issues for committed work. Keep this file short: remove items once
+they move to issues, docs, or implementation.
 
-### Configuration
-- [x] **Config File Support**: Load configuration from YAML/TOML file instead of hardcoding
-- [x] **Environment Variables**: Support `DUCKGRES_PORT`, `DUCKGRES_DATA_DIR`, etc.
-- [x] **Command Line Flags**: `--port`, `--data-dir`, `--config` options
-- [ ] **Dynamic User Management**: Add/remove users without restart
+## Authentication & Users
 
-### Protocol Compatibility
-- [ ] **Binary Format Support**: Encode results in binary format for better performance with some clients
-- [x] **COPY Protocol**: Support `COPY FROM`/`COPY TO` for bulk data loading
-- [x] **Cancel Request Handling**: Properly cancel long-running queries ([protocol.go](server/protocol.go), [cancel_test.go](tests/integration/cancel_test.go))
+- Support PostgreSQL MD5 password authentication.
+- Support SCRAM-SHA-256 authentication.
+- Add dynamic user management without restart.
 
-### Compatibility
-- [x] **System Catalog Emulation**: Basic `pg_catalog` compatibility for psql
-  - [x] `\dt` (list tables) - working
-  - [x] `\l` (list databases) - working
-  - [x] `\d <table>` (describe table) - working
-- [x] **Information Schema**: Emulate PostgreSQL's `information_schema` ([information_schema.go](transpiler/transform/information_schema.go))
-- [x] **Session Variables**: Support `SET` commands (timezone, search_path, etc.) ([setshow.go](transpiler/transform/setshow.go))
-- [x] **Type OID Mapping**: Proper PostgreSQL OID mapping for all DuckDB types ([types.go](server/types.go))
+## Configuration & Operations
 
-### Features
-- [x] **Extensions**: Load DuckDB extensions on startup
+- Support hot-reloading config without restart.
+- Add admin commands such as `\duckgres status` and `\duckgres users`.
+- Add a health check endpoint for load balancers.
 
-### Operations
-- [ ] **Hot Reload**: Reload config without restart
-- [ ] **Admin Commands**: `\duckgres status`, `\duckgres users`, etc.
-- [x] **Docker Image**: Official container image ([Dockerfile](Dockerfile))
-- [x] **Graceful Shutdown**: Finish in-flight queries before shutdown
+## Observability
 
-## Medium Priority
+- Add slow query logging for queries exceeding a configurable threshold.
 
-### Performance
-- [ ] **DuckDB Per Connection**: each connection for each user is a separate duckdb instance 
-- [x] **Connection Limits**: Max connections per user and globally ([ratelimit.go](server/ratelimit.go))
+## Architecture & Storage
 
-### Monitoring
-- [x] **Prometheus Metrics**: Export query count, latency, connection stats ([metrics.go](server/flightsqlingress/metrics.go), [flight_ingress_metrics.go](controlplane/flight_ingress_metrics.go))
-- [x] **Query Logging**: Configurable query logging to file/stdout ([querylog.go](server/querylog.go))
-- [ ] **Slow Query Log**: Log queries exceeding threshold
-- [ ] **Health Check Endpoint**: HTTP endpoint for load balancer health checks
+- Review whether each connection should own a separate DuckDB instance.
+- Support read-only replicas using DuckDB `ATTACH`.
+- Support multiple named databases per user.
+- Define remaining schema support beyond the compatibility surfaces documented in
+  [docs/postgres-compatibility.md](docs/postgres-compatibility.md).
 
-## Low Priority
+## Research
 
-### Features
-- [ ] **Read Replicas**: Support read-only replicas using DuckDB's `ATTACH`
-- [ ] **Multi-Database**: Support multiple named databases per user
-- [ ] **Schema Support**: PostgreSQL schema emulation
-
-### Testing
-- [x] **Unit Tests**: Test wire protocol parsing/encoding ([protocol_test.go](server/protocol_test.go), [types_test.go](server/types_test.go), [conn_test.go](server/conn_test.go))
-- [x] **Integration Tests**: Test with various PostgreSQL clients ([tests/integration/](tests/integration/README.md))
-- [x] **Compatibility Tests**: Run PostgreSQL regression tests ([clients_test.go](tests/integration/clients/clients_test.go), [jdbc_test.go](tests/integration/jdbc_test.go))
-- [x] **Benchmark Suite**: Performance comparison with native PostgreSQL ([tests/perf/](tests/perf/README.md))
-
-## Ideas / Research
-
-- **Federation**: Query multiple DuckDB files in single query
-- **Caching Layer**: Redis/memcached for query results
-- **Query Rewriting**: Translate PostgreSQL-specific syntax to DuckDB
-- **MotherDuck Integration**: Support MotherDuck cloud backend
-- **Parquet Direct Query**: `SELECT * FROM 's3://bucket/file.parquet'`
-
-## Known Issues
-
-- [x] Some PostgreSQL drivers may fail with unsupported OIDs — unknown types fall back to `OidText` ([types.go](server/types.go))
-- [x] `\d` commands in psql don't work (need system catalog) - fixed
-- [x] Transaction isolation may differ from PostgreSQL behavior — documented in [README](README.md#transaction-isolation)
-- [x] Large result sets may cause memory issues (no streaming) — results are streamed row-by-row via `rows.Next()` + server-side cursor emulation ([conn_cursor.go](server/conn_cursor.go))
+- Federation: query multiple DuckDB files in a single query.
+- Caching layer: Redis/memcached for query results.
+- Query rewriting: translate PostgreSQL-specific syntax to DuckDB.
+- MotherDuck integration.
+- Parquet direct query: `SELECT * FROM 's3://bucket/file.parquet'`.
 
 ## Contributing
 
-Pick an item from this list and submit a PR! Issues labeled [`good first issue`](https://github.com/PostHog/duckgres/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are great starting points.
+Issues labeled [`good first issue`](https://github.com/PostHog/duckgres/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+are a good place to start.

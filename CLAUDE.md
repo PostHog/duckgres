@@ -280,4 +280,7 @@ Invariants for anyone touching this path:
 
 ## TODO Reference
 
-See `TODO.md` for the full feature roadmap and known issues.
+`TODO.md` is a lightweight backlog for ideas that do not yet have a better
+home. It is not the PostgreSQL compatibility source of truth; use
+`docs/postgres-compatibility.md` for compatibility status, test citations, and
+known gaps.
