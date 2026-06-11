@@ -108,6 +108,20 @@ func TestRedactingHandler(t *testing.T) {
 			notWant: "topSecret",
 			want:    "[REDACTED]",
 		},
+		{
+			name:    "token attr key is scrubbed by key, not value pattern",
+			msg:     "reconnect failed",
+			attrs:   []slog.Attr{slog.String("token", "live-bearer-credential-xyz")},
+			notWant: "live-bearer-credential-xyz",
+			want:    "[REDACTED]",
+		},
+		{
+			name:    "token_fp fingerprint attr is preserved",
+			msg:     "reconnect failed",
+			attrs:   []slog.Attr{slog.String("token_fp", "deadbeef")},
+			notWant: "[REDACTED]",
+			want:    "deadbeef",
+		},
 	}
 
 	for _, tt := range tests {

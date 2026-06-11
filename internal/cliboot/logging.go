@@ -141,7 +141,19 @@ func (h *RedactingHandler) WithGroup(name string) slog.Handler {
 	return &RedactingHandler{Inner: h.Inner.WithGroup(name)}
 }
 
+// redactedKeys are slog attribute keys whose values are bearer credentials and
+// must never be logged in the clear, regardless of value shape. The value-based
+// RedactSecrets only scrubs password=<value> patterns, so a bare token value
+// would otherwise pass through verbatim. Defense-in-depth on top of callers that
+// should already be logging a fingerprint instead of the raw token.
+var redactedKeys = map[string]bool{
+	"token": true,
+}
+
 func redactAttr(a slog.Attr) slog.Attr {
+	if redactedKeys[strings.ToLower(a.Key)] {
+		return slog.String(a.Key, "[REDACTED]")
+	}
 	switch a.Value.Kind() {
 	case slog.KindString:
 		a.Value = slog.StringValue(server.RedactSecrets(a.Value.String()))
