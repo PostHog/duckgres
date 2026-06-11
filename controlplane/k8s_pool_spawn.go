@@ -350,7 +350,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	}
 	observeControlPlaneWorkers(workerCount)
 
-	slog.Info("K8s worker spawned.", "id", id, "worker_pod", podName, "addr", addr)
+	p.logw(id).Info("K8s worker spawned.", "addr", addr)
 	return nil
 }
 
@@ -537,7 +537,7 @@ func (p *K8sWorkerPool) spawnWorkerBackground(id int, image string) {
 	p.mu.Unlock()
 
 	if err != nil {
-		slog.Warn("Background worker spawn failed.", "worker", id, "error", err)
+		p.logw(id).Warn("Background worker spawn failed.", "error", err)
 	}
 }
 

@@ -72,7 +72,7 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			var err error
 			snap, err = p.runtimeStore.ObserveWorker(workerID)
 			if err != nil {
-				slog.Warn("Version-aware reaper failed to observe worker.", "worker_id", workerID, "error", err)
+				slog.Warn("Version-aware reaper failed to observe worker.", "worker", workerID, "worker_pod", pod.Name, "org", pod.Labels["duckgres/active-org"], "error", err)
 			}
 		}
 
@@ -123,7 +123,7 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		}
 		outcome, err := lifecycle.RetireIdleVariantFromSnapshot(*snap, RetireReasonMismatchedVersion, LifecycleOriginMismatchedVersionReaper)
 		if err != nil {
-			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
+			slog.Warn("Version-aware reaper failed to retire idle row.", "worker", workerID, "worker_pod", pod.Name, "org", pod.Labels["duckgres/active-org"], "error", err)
 			continue
 		}
 		if !outcome.Transitioned {
@@ -215,7 +215,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 		}
 		rec, err := p.runtimeStore.GetWorkerRecord(workerID)
 		if err != nil {
-			slog.Warn("Stranded-pod reconciler failed to load worker record.", "worker_id", workerID, "error", err)
+			slog.Warn("Stranded-pod reconciler failed to load worker record.", "worker", workerID, "worker_pod", pod.Name, "org", pod.Labels["duckgres/active-org"], "error", err)
 			continue
 		}
 		dbState := "missing"
@@ -236,12 +236,12 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 		}); err != nil && !errors.IsNotFound(err) {
-			slog.Warn("Stranded-pod reconciler failed to delete pod.", "worker_pod", pod.Name, "worker_id", workerID, "error", err)
+			slog.Warn("Stranded-pod reconciler failed to delete pod.", "worker", workerID, "worker_pod", pod.Name, "org", pod.Labels["duckgres/active-org"], "error", err)
 			observeStrandedPodReconciled(StrandedOutcomeDeleteFailed)
 			continue
 		}
 		_ = p.deleteWorkerRPCSecret(ctx, pod.Name)
-		slog.Info("Stranded worker pod reconciled.", "worker_pod", pod.Name, "worker_id", workerID, "db_state", dbState)
+		slog.Info("Stranded worker pod reconciled.", "worker", workerID, "worker_pod", pod.Name, "org", pod.Labels["duckgres/active-org"], "db_state", dbState)
 		observeStrandedPodReconciled(outcome)
 		deleted++
 	}
@@ -400,7 +400,7 @@ func (p *K8sWorkerPool) onPodTerminated(pod *corev1.Pod) {
 	case <-w.done:
 		// Already closed
 	default:
-		slog.Warn("Worker pod terminated.", "id", id, "worker_pod", pod.Name, "phase", pod.Status.Phase)
+		slog.Warn("Worker pod terminated.", "worker", id, "worker_pod", pod.Name, "org", pod.Labels["duckgres/active-org"], "phase", pod.Status.Phase)
 		close(w.done)
 	}
 }

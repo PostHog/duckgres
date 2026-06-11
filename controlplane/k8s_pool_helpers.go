@@ -184,3 +184,31 @@ func trimK8sPodHashSuffix(name string) string {
 	}
 	return name[:idx]
 }
+
+// workerLogAttrs returns the standard identity attrs for a worker log line:
+// worker id, pod name, and the assigned org (when tenant-bound). Every log
+// line in a worker's lifecycle should carry these so the full history of one
+// worker — or one org's workers — is filterable without joins.
+func workerLogAttrs(w *ManagedWorker) []any {
+	if w == nil {
+		return nil
+	}
+	attrs := []any{"worker", w.ID}
+	if pod := w.PodName(); pod != "" {
+		attrs = append(attrs, "worker_pod", pod)
+	}
+	if a := w.SharedState().Assignment; a != nil && a.OrgID != "" {
+		attrs = append(attrs, "org", a.OrgID)
+	}
+	return attrs
+}
+
+// logw returns a logger pre-scoped with the worker's identity attrs (see
+// workerLogAttrs), resolved by id. For workers no longer tracked locally it
+// still carries the id, so the line stays attributable.
+func (p *K8sWorkerPool) logw(id int) *slog.Logger {
+	if w, ok := p.Worker(id); ok {
+		return slog.With(workerLogAttrs(w)...)
+	}
+	return slog.With("worker", id)
+}

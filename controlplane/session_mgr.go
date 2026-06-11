@@ -54,6 +54,9 @@ type SessionManager struct {
 	pool       WorkerPool
 	rebalancer *MemoryRebalancer
 	lifecycle  *sessionLifecycle
+	// log carries the manager's org identity (multi-tenant: one manager per
+	// org stack) so every session/worker lifecycle line is org-filterable.
+	log *slog.Logger
 
 	nextPID atomic.Int32
 
@@ -81,12 +84,23 @@ type connectionWaiter struct {
 
 // NewSessionManager creates a new session manager.
 func NewSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer) *SessionManager {
+	return NewOrgSessionManager(pool, rebalancer, "")
+}
+
+// NewOrgSessionManager builds a SessionManager whose log lines all carry the
+// owning org (multi-tenant remote backend: one manager per org stack).
+func NewOrgSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer, orgID string) *SessionManager {
+	log := slog.Default()
+	if orgID != "" {
+		log = log.With("org", orgID)
+	}
 	sm := &SessionManager{
 		sessions:   make(map[int32]*ManagedSession),
 		byWorker:   make(map[int][]int32),
 		pool:       pool,
 		rebalancer: rebalancer,
 		lifecycle:  newSessionLifecycle(),
+		log:        log,
 	}
 	sm.nextPID.Store(1000) // Start PIDs above typical OS PIDs
 	return sm
@@ -284,7 +298,7 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 
 		acquireStart := time.Now()
 		actx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
-		slog.Debug("Acquiring worker for session.", "pid", pid, "user", username, "attempt", attempt)
+		sm.log.Debug("Acquiring worker for session.", "pid", pid, "user", username, "attempt", attempt)
 		worker, err := sm.pool.AcquireWorker(actx, profile)
 		if err != nil {
 			var capacityErr *WorkerCapacityExhaustedError
@@ -296,7 +310,7 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 					attribute.String("worker_capacity.reason", string(missReason)),
 					attribute.Int("worker_capacity.retry_after_seconds", capacityRetrySeconds(capacityErr.RetryAfter)),
 				)
-				slog.Warn("Worker acquisition failed.",
+				sm.log.Warn("Worker acquisition failed.",
 					"pid", pid,
 					"user", username,
 					"duration", time.Since(acquireStart),
@@ -310,7 +324,7 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 			return 0, nil, fmt.Errorf("acquire worker: %w", err)
 		}
 		acquireSpan.End()
-		slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
+		sm.log.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
 		newPID, exec, err := sm.createSessionOnWorker(actx, username, pid, memoryLimit, threads, worker, protocol, true, lease)
 		if err == nil {
@@ -327,7 +341,7 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 		// with a fresh worker. Loud ERROR + metric so we can find and fix the drift.
 		lastCapDriftErr = err
 		observeWorkerSessionCapDrift()
-		slog.Error("Worker rejected a CP-scheduled session at its session cap — one-session-per-worker accounting drift; recycling worker and re-acquiring.",
+		sm.log.Error("Worker rejected a CP-scheduled session at its session cap — one-session-per-worker accounting drift; recycling worker and re-acquiring.",
 			"pid", pid,
 			"user", username,
 			"worker", worker.ID,
@@ -409,7 +423,7 @@ func (sm *SessionManager) beginSessionCreation(ctx context.Context) (context.Con
 
 func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool, lease connectionLease) (int32, *flightclient.FlightExecutor, error) {
 	createStart := time.Now()
-	slog.Info("Creating session on worker.",
+	sm.log.Info("Creating session on worker.",
 		"pid", pid,
 		"worker", worker.ID,
 		"user", username,
@@ -428,14 +442,14 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		var secretErr error
 		secretStatements, secretErr = sm.userSecretLoader(ctx, username)
 		if secretErr != nil {
-			slog.Error("Failed to load user persistent secrets; session starts without them.",
+			sm.log.Error("Failed to load user persistent secrets; session starts without them.",
 				"pid", pid, "worker", worker.ID, "user", username, "error", secretErr)
 		}
 	}
 
 	sessionToken, secretWarnings, err := worker.CreateSession(ctx, username, memoryLimit, threads, secretStatements)
 	if err != nil {
-		slog.Warn("Failed to create session on worker.",
+		sm.log.Warn("Failed to create session on worker.",
 			"pid", pid,
 			"worker", worker.ID,
 			"user", username,
@@ -451,7 +465,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	}
 
 	for _, w := range secretWarnings {
-		slog.Warn("User persistent secret replay warning.",
+		sm.log.Warn("User persistent secret replay warning.",
 			"pid", pid, "worker", worker.ID, "user", username, "warning", w)
 	}
 
@@ -483,7 +497,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	workerSessionCount := len(sm.byWorker[worker.ID])
 	sm.mu.Unlock()
 
-	slog.Info("Session created on worker.",
+	sm.log.Info("Session created on worker.",
 		"pid", pid,
 		"worker", worker.ID,
 		"user", username,
@@ -507,7 +521,7 @@ func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker
 		default:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err := worker.DestroySession(ctx, sessionToken); err != nil {
-				slog.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", err)
+				sm.log.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", err)
 			}
 			cancel()
 		}
@@ -523,14 +537,14 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	session, sessionCount, workerSessionCount, ok := sm.detachSessionLocked(pid)
 	if !ok {
 		sm.mu.Unlock()
-		slog.Warn("DestroySession called for unknown session.", "pid", pid)
+		sm.log.Warn("DestroySession called for unknown session.", "pid", pid)
 		return
 	}
 	finishCleanup := sm.lifecycle.beginCleanup()
 	sm.mu.Unlock()
 	defer finishCleanup()
 
-	slog.Info("Destroying session.",
+	sm.log.Info("Destroying session.",
 		"pid", pid,
 		"worker", session.WorkerID,
 		"protocol", session.Protocol,
@@ -563,7 +577,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			workerDestroyErr = worker.DestroySession(ctx, session.SessionToken)
 			cancel()
-			slog.Info("Worker session destroy RPC completed.",
+			sm.log.Info("Worker session destroy RPC completed.",
 				"pid", pid,
 				"worker", session.WorkerID,
 				"protocol", session.Protocol,
@@ -577,7 +591,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	sm.pool.ReleaseWorker(session.WorkerID)
 	sm.releaseSessionLease(session, "pid", pid)
 
-	slog.Info("Session destroyed.",
+	sm.log.Info("Session destroyed.",
 		"pid", pid,
 		"worker", session.WorkerID,
 		"protocol", session.Protocol,
@@ -691,7 +705,7 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	}
 	sm.mu.Unlock()
 
-	slog.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids), "pids", pids)
+	sm.log.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids), "pids", pids)
 
 	for _, pid := range pids {
 		cleanupStart := time.Now()
@@ -722,7 +736,7 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			_ = connCloser.Close()
 		}
 		sm.releaseSessionLease(session, "pid", pid)
-		slog.Info("Worker crash session cleanup completed.",
+		sm.log.Info("Worker crash session cleanup completed.",
 			"pid", pid,
 			"worker", workerID,
 			"session_found", ok,

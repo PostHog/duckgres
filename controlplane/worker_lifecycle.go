@@ -103,14 +103,14 @@ func (l *WorkerLifecycle) RetireFromSnapshot(snap configstore.WorkerSnapshot, ta
 	transitioned, err := l.store.MarkWorkerTerminalIfCurrent(&record, target, reason)
 	if err != nil {
 		slog.Warn("Lifecycle retire CAS failed.",
-			"worker_id", snap.WorkerID(), "target", target, "reason", reason, "origin", origin, "error", err)
+			"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "target", target, "reason", reason, "origin", origin, "error", err)
 		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
 		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
 		return outcome, err
 	}
 	if !transitioned {
 		slog.Debug("Lifecycle retire CAS missed; pod cleanup skipped.",
-			"worker_id", snap.WorkerID(), "target", target, "reason", reason, "origin", origin)
+			"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "target", target, "reason", reason, "origin", origin)
 		outcome := configstore.TransitionOutcome{Reason: classifySnapshotMiss(snap)}
 		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
 		return outcome, nil
@@ -145,7 +145,7 @@ func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapsh
 	transitioned, err := l.store.RetireOrphanWorker(&record, reason)
 	if err != nil {
 		slog.Warn("Lifecycle orphan retire CAS failed.",
-			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "error", err)
+			"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "reason", reason, "origin", origin, "error", err)
 		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
 		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
 		return outcome, err
@@ -159,7 +159,7 @@ func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapsh
 		// finer dimensions.
 		miss := classifySnapshotMiss(snap)
 		slog.Debug("Lifecycle orphan retire CAS missed; pod cleanup skipped.",
-			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "miss", miss)
+			"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "reason", reason, "origin", origin, "miss", miss)
 		outcome := configstore.TransitionOutcome{Reason: miss}
 		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
 		return outcome, nil
@@ -196,7 +196,7 @@ func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerS
 	transitioned, err := l.store.RetireIdleOrHotIdleWorker(&record, reason)
 	if err != nil {
 		slog.Warn("Lifecycle idle-variant retire CAS failed.",
-			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "error", err)
+			"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "reason", reason, "origin", origin, "error", err)
 		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
 		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
 		return outcome, err
@@ -209,7 +209,7 @@ func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerS
 			miss = configstore.TransitionOutcomeFenceMissState
 		}
 		slog.Debug("Lifecycle idle-variant retire CAS missed; pod cleanup skipped.",
-			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "miss", miss)
+			"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "reason", reason, "origin", origin, "miss", miss)
 		outcome := configstore.TransitionOutcome{Reason: miss}
 		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
 		return outcome, nil

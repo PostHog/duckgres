@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -276,7 +275,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	rows, err := c.executor.Query(selectQuery)
 	if err != nil {
 		copyFinalErr = err
-		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("COPY TO query failed.", "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
@@ -288,7 +287,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		slog.Error("COPY TO failed to get columns.", "user", c.username, "query", selectQuery, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("COPY TO failed to get columns.", "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
@@ -533,7 +532,7 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 // handleCopyIn handles COPY ... FROM STDIN
 func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	copyStartTime := time.Now()
-	slog.Debug("COPY FROM STDIN starting.", "user", c.username, "query", query)
+	c.logger().Debug("COPY FROM STDIN starting.", "query", query)
 
 	// Parse COPY options using the helper function
 	opts, err := ParseCopyFromOptions(query)
@@ -548,7 +547,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 	tableName := opts.TableName
 	columnList := opts.ColumnList
-	slog.Debug("COPY FROM STDIN parsed.", "user", c.username, "table", tableName, "columns", columnList, "binary", opts.IsBinary)
+	c.logger().Debug("COPY FROM STDIN parsed.", "table", tableName, "columns", columnList, "binary", opts.IsBinary)
 
 	// Get column info. If a column list is specified, query only those columns
 	// in the specified order to match the binary data field order.
@@ -561,7 +560,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	}
 	testRows, err := c.executor.Query(colQuery)
 	if err != nil {
-		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("COPY FROM table check failed.", "table", tableName, "error", err)
 		errMsg := fmt.Sprintf("relation \"%s\" does not exist", tableName)
 		c.sendError("ERROR", "42P01", errMsg)
 		c.setTxError()
@@ -589,7 +588,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		}
 	}
 	if len(blobColIndices) > 0 {
-		slog.Debug("COPY FROM STDIN: table has BLOB columns, using CSV parse fallback.", "user", c.username, "blob_columns", len(blobColIndices))
+		c.logger().Debug("COPY FROM STDIN: table has BLOB columns, using CSV parse fallback.", "blob_columns", len(blobColIndices))
 		return c.handleCopyInCSVWithBlob(query, opts, cols, colTypes, blobColIndices)
 	}
 
@@ -598,7 +597,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return err
 	}
 	_ = c.writer.Flush()
-	slog.Debug("COPY FROM STDIN sent CopyInResponse, waiting for data.", "user", c.username)
+	c.logger().Debug("COPY FROM STDIN sent CopyInResponse, waiting for data.")
 
 	// Remote-worker (Flight) executors implement CopyFromStdinExecutor so the
 	// CSV bytes are streamed to the worker pod via DoPut and spooled to the
@@ -614,7 +613,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	// type conversions automatically and can load millions of rows in seconds.
 	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
 	if err != nil {
-		slog.Error("COPY FROM STDIN failed to create temp file.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("COPY FROM STDIN failed to create temp file.", "error", err)
 		errMsg := fmt.Sprintf("failed to create temp file: %v", err)
 		c.sendError("ERROR", "58000", errMsg)
 		c.setTxError()
@@ -635,7 +634,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	for {
 		msgType, body, err := wire.ReadMessage(c.reader)
 		if err != nil {
-			slog.Error("COPY FROM STDIN error reading message.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("COPY FROM STDIN error reading message.", "error", err)
 			_ = tmpFile.Close()
 			return err
 		}
@@ -650,7 +649,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			}
 			n, err := tmpFile.Write(body)
 			if err != nil {
-				slog.Error("COPY FROM STDIN failed to write to temp file.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+				c.logger().Error("COPY FROM STDIN failed to write to temp file.", "error", err)
 				_ = tmpFile.Close()
 				errMsg := fmt.Sprintf("failed to write to temp file: %v", err)
 				c.sendError("ERROR", "58000", errMsg)
@@ -663,18 +662,18 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			bytesWritten += int64(n)
 			copyDataMessages++
 			if copyDataMessages%10000 == 0 {
-				slog.Debug("COPY FROM STDIN progress.", "user", c.username, "messages", copyDataMessages, "bytes", bytesWritten)
+				c.logger().Debug("COPY FROM STDIN progress.", "messages", copyDataMessages, "bytes", bytesWritten)
 			}
 
 		case wire.MsgCopyDone:
 			_ = tmpFile.Close()
 			dataReceiveElapsed := time.Since(dataReceiveStart)
-			slog.Debug("COPY FROM STDIN CopyDone received.", "user", c.username, "messages", copyDataMessages, "bytes", bytesWritten, "duration", dataReceiveElapsed)
+			c.logger().Debug("COPY FROM STDIN CopyDone received.", "messages", copyDataMessages, "bytes", bytesWritten, "duration", dataReceiveElapsed)
 
 			// Build DuckDB COPY FROM statement using the helper function
 			copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, tmpPath, opts)
 
-			slog.Debug("COPY FROM STDIN executing native DuckDB COPY.", "user", c.username, "sql", copySQL)
+			c.logger().Debug("COPY FROM STDIN executing native DuckDB COPY.", "sql", copySQL)
 			loadStart := time.Now()
 
 			// Lifecycle log pair (PR #519): the native DuckDB COPY FROM is
@@ -688,7 +687,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			}
 			c.logQueryFinished(copySQL, loadStart, copyRowsAffected, err)
 			if err != nil {
-				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+				c.logger().Error("COPY FROM STDIN DuckDB COPY failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -702,7 +701,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 			totalElapsed := time.Since(copyStartTime)
 			loadElapsed := time.Since(loadStart)
-			slog.Info("COPY FROM STDIN completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
+			c.logger().Info("COPY FROM STDIN completed.", "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
 			_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
@@ -752,8 +751,7 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 	// Build the COPY SQL with the path placeholder; the worker substitutes
 	// in its own tempfile path before executing.
 	copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
-	slog.Debug("COPY FROM STDIN streaming to remote worker.",
-		"user", c.username, "sql", copySQL, "worker", c.workerID, "worker_pod", c.workerPod)
+	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "sql", copySQL)
 
 	r := &copyDataWireReader{c: c}
 
@@ -785,8 +783,7 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 		return nil
 	}
 	if err != nil {
-		slog.Error("COPY FROM STDIN remote streaming failed.",
-			"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("COPY FROM STDIN remote streaming failed.", "error", err)
 		errMsg := fmt.Sprintf("COPY failed: %v", err)
 		c.sendError("ERROR", "22P02", errMsg)
 		c.setTxError()
@@ -798,10 +795,8 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 
 	totalElapsed := time.Since(copyStartTime)
 	loadElapsed := time.Since(loadStart)
-	slog.Info("COPY FROM STDIN completed (remote streaming).",
-		"user", c.username, "rows", rowCount, "bytes", r.bytesRead,
-		"total_duration", totalElapsed, "load_duration", loadElapsed,
-		"worker", c.workerID, "worker_pod", c.workerPod)
+	c.logger().Info("COPY FROM STDIN completed (remote streaming).", "rows", rowCount, "bytes", r.bytesRead,
+		"total_duration", totalElapsed, "load_duration", loadElapsed)
 
 	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
 	c.logQuery(copyStartTime, query, query, "COPY", 0, rowCount, "", "", "simple")
@@ -921,7 +916,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 
 		case wire.MsgCopyDone:
 			dataReceiveElapsed := time.Since(copyStartTime)
-			slog.Debug("COPY FROM STDIN (BLOB fallback) CopyDone received.", "user", c.username, "bytes", buf.Len(), "duration", dataReceiveElapsed)
+			c.logger().Debug("COPY FROM STDIN (BLOB fallback) CopyDone received.", "bytes", buf.Len(), "duration", dataReceiveElapsed)
 
 			// Parse CSV from the buffered data
 			csvReader := csv.NewReader(&buf)
@@ -949,7 +944,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 					break // EOF or error — stop reading
 				}
 				if len(record) != len(cols) {
-					slog.Warn("COPY FROM STDIN (BLOB fallback) skipping row with wrong field count.", "expected", len(cols), "got", len(record))
+					c.logger().Warn("COPY FROM STDIN (BLOB fallback) skipping row with wrong field count.", "expected", len(cols), "got", len(record))
 					continue
 				}
 				row := make([]interface{}, len(cols))
@@ -976,7 +971,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			loadStart := time.Now()
 			rowCount, err := c.batchInsertRows(opts.TableName, opts.ColumnList, cols, rows)
 			if err != nil {
-				slog.Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+				c.logger().Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -988,7 +983,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 
 			totalElapsed := time.Since(copyStartTime)
 			loadElapsed := time.Since(loadStart)
-			slog.Info("COPY FROM STDIN (BLOB fallback) completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
+			c.logger().Info("COPY FROM STDIN (BLOB fallback) completed.", "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
 			_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
@@ -1034,14 +1029,14 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 		return err
 	}
 	_ = c.writer.Flush()
-	slog.Debug("COPY FROM STDIN binary: sent CopyInResponse.", "user", c.username)
+	c.logger().Debug("COPY FROM STDIN binary: sent CopyInResponse.")
 
 	// Collect all CopyData messages into a buffer
 	var buf bytes.Buffer
 	for {
 		msgType, body, err := wire.ReadMessage(c.reader)
 		if err != nil {
-			slog.Error("COPY FROM STDIN binary: error reading message.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("COPY FROM STDIN binary: error reading message.", "error", err)
 			return err
 		}
 
@@ -1054,7 +1049,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			data := buf.Bytes()
 			rowCount, err := c.parseBinaryCopyAndInsert(data, opts.TableName, opts.ColumnList, cols, typeOIDs)
 			if err != nil {
-				slog.Error("COPY FROM STDIN binary: parse/insert failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+				c.logger().Error("COPY FROM STDIN binary: parse/insert failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -1065,7 +1060,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			}
 
 			elapsed := time.Since(copyStartTime)
-			slog.Info("COPY FROM STDIN binary completed.", "user", c.username, "rows", rowCount, "bytes", buf.Len(), "duration", elapsed)
+			c.logger().Info("COPY FROM STDIN binary completed.", "rows", rowCount, "bytes", buf.Len(), "duration", elapsed)
 
 			_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
@@ -1258,7 +1253,7 @@ func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList
 		if err == nil {
 			return count, nil
 		}
-		slog.Warn("Appender failed, falling back to batched INSERT.", "table", tableName, "error", err)
+		c.logger().Warn("Appender failed, falling back to batched INSERT.", "table", tableName, "error", err)
 	}
 
 	// Fallback: batched multi-row INSERT

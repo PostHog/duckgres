@@ -219,6 +219,14 @@ spec:
           imagePullPolicy: IfNotPresent
           args: ["--mode", "control-plane", "--worker-backend", "remote", "--flight-port", "8815"]
           env:
+            # Pod identity for log stamping: the shared logging handler attaches
+            # pod=/node= to every line when these are set (workers get them via
+            # the Downward API at spawn; the CP needs them too so its log lines
+            # carry the control-plane identity for cross-CP correlation).
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
             - name: DUCKGRES_CONFIG_STORE
               value: "postgres://duckgres:duckgres@duckgres-config-store.${NAMESPACE}.svc:5432/duckgres?sslmode=disable"
             - { name: DUCKGRES_K8S_WORKER_IMAGE, value: "${WORKER_IMAGE}" }

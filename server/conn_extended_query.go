@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -179,7 +178,7 @@ func (c *clientConn) handleParse(body []byte) {
 			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
 			return
 		}
-		slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", usersecrets.RedactForLog(query))
+		c.logger().Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "query", usersecrets.RedactForLog(query))
 	}
 
 	// Close existing statement with same name
@@ -198,11 +197,11 @@ func (c *clientConn) handleParse(body []byte) {
 		warnings:          result.Warnings,          // Surfaced as NoticeResponse at Execute
 	}
 
-	slog.Debug("Prepared statement.", "user", c.username, "name", stmtName, "query", usersecrets.RedactForLog(query))
+	c.logger().Debug("Prepared statement.", "name", stmtName, "query", usersecrets.RedactForLog(query))
 	if len(result.Statements) > 0 {
-		slog.Debug("Prepared statement multi-statement.", "user", c.username, "name", stmtName, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
+		c.logger().Debug("Prepared statement multi-statement.", "name", stmtName, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
 	} else if result.SQL != query {
-		slog.Debug("Prepared statement transpiled.", "user", c.username, "name", stmtName, "transpiled", usersecrets.RedactForLog(result.SQL))
+		c.logger().Debug("Prepared statement transpiled.", "name", stmtName, "transpiled", usersecrets.RedactForLog(result.SQL))
 	}
 	_ = wire.WriteParseComplete(c.writer)
 }
@@ -228,7 +227,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 			c.sendError("ERROR", "26000", fmt.Sprintf("prepared statement %q does not exist", name))
 			return
 		}
-		slog.Debug("Describe statement.", "user", c.username, "name", name, "query", usersecrets.RedactForLog(ps.query))
+		c.logger().Debug("Describe statement.", "name", name, "query", usersecrets.RedactForLog(ps.query))
 
 		// Send parameter description based on the number of $N placeholders we found
 		// If the client didn't send explicit types, create them
@@ -271,7 +270,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// For queries that return results, we need to send RowDescription
 		// For other queries, send NoData
 		returnsResults := queryReturnsResults(ps.query)
-		slog.Debug("Describe statement returns results check.", "user", c.username, "name", name, "returns_results", returnsResults)
+		c.logger().Debug("Describe statement returns results check.", "name", name, "returns_results", returnsResults)
 		if !returnsResults {
 			_ = wire.WriteNoData(c.writer)
 			return
@@ -323,7 +322,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		rows, err := c.executor.Query(describeQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
-			slog.Debug("Describe failed to get columns.", "user", c.username, "error", err)
+			c.logger().Debug("Describe failed to get columns.", "error", err)
 			_ = wire.WriteNoData(c.writer)
 			return
 		}
@@ -337,7 +336,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		slog.Debug("Describe statement sending RowDescription.", "user", c.username, "columns", len(cols))
+		c.logger().Debug("Describe statement sending RowDescription.", "columns", len(cols))
 		_ = c.sendRowDescription(cols, colTypes)
 		ps.described = true
 
@@ -351,7 +350,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 			if _, cursorOk := c.cursors[name]; cursorOk {
 				cols, colTypes, err := c.getCursorSchema(name)
 				if err != nil {
-					slog.Debug("Describe cursor-as-portal failed to open.", "user", c.username, "cursor", name, "error", err)
+					c.logger().Debug("Describe cursor-as-portal failed to open.", "cursor", name, "error", err)
 					_ = wire.WriteNoData(c.writer)
 					return
 				}
@@ -559,7 +558,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	slog.Debug("Execute portal.", "user", c.username, "portal", portalName, "params", len(args), "query", loggableQuery)
+	c.logger().Debug("Execute portal.", "portal", portalName, "params", len(args), "query", loggableQuery)
 
 	// Surface any transpiler warnings (e.g. an unenforced constraint stripped on a
 	// lake catalog) as NoticeResponse before the command result.
@@ -570,7 +569,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Check if this is a PostgreSQL-specific SET command that should be ignored
 	// (determined by transpiler during Parse)
 	if p.stmt.isIgnoredSet {
-		slog.Debug("Ignoring PostgreSQL-specific SET.", "user", c.username, "query", p.stmt.query)
+		c.logger().Debug("Ignoring PostgreSQL-specific SET.", "query", p.stmt.query)
 		_ = wire.WriteCommandComplete(c.writer, "SET")
 		return
 	}
@@ -578,14 +577,14 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Handle no-op commands (CREATE INDEX, VACUUM, etc.) - DuckLake doesn't support these
 	// (determined by transpiler during Parse)
 	if p.stmt.isNoOp {
-		slog.Debug("No-op command (DuckLake limitation).", "user", c.username, "query", p.stmt.query)
+		c.logger().Debug("No-op command (DuckLake limitation).", "query", p.stmt.query)
 		_ = wire.WriteCommandComplete(c.writer, p.stmt.noOpTag)
 		return
 	}
 
 	// Handle multi-statement results (e.g., writable CTE rewrites)
 	if len(p.stmt.statements) > 0 {
-		slog.Debug("Execute multi-statement.", "user", c.username, "statements", len(p.stmt.statements), "cleanup", len(p.stmt.cleanupStatements))
+		c.logger().Debug("Execute multi-statement.", "statements", len(p.stmt.statements), "cleanup", len(p.stmt.cleanupStatements))
 		c.executeMultiStatementExtended(p.stmt.statements, p.stmt.cleanupStatements, args, p.resultFormats, p.described)
 		return
 	}
@@ -724,7 +723,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	cols, err := rows.Columns()
 	if err != nil {
 		queryFinalErr = err
-		slog.Error("Columns error.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("Columns error.", "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -788,7 +787,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Row iteration error.", "error", err)
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
