@@ -3,7 +3,7 @@
 This is the canonical, feature-by-feature record of **what PostgreSQL functionality
 Duckgres supports and which tests prove it.** It exists so that "is feature X
 supported?" and "where's the test / where's the gap?" have one answer instead of
-being smeared across the README, `tests/integration/README.md`, and `TODO.md`.
+being smeared across the README and test docs.
 
 Duckgres speaks the PostgreSQL wire protocol but executes on **DuckDB**, an OLAP
 engine. So the compatibility target is "PostgreSQL semantics for analytical
@@ -394,5 +394,5 @@ deliberate stubs sized to satisfy client introspection, not real implementations
 
 - [README.md](../README.md) → "SQL Client Compatibility" — short user-facing summary that links here.
 - [tests/integration/README.md](../tests/integration/README.md) — test-suite architecture, category counts, and the skip-reason table.
-- [TODO.md](../TODO.md) — forward-looking compatibility/protocol gaps.
+- [TODO.md](../TODO.md) — lightweight backlog for project ideas that do not yet have a better home.
 - [scripts/client-compat/README.md](../scripts/client-compat/README.md) — real-driver compatibility harness and `queries.yaml`.
