@@ -496,7 +496,10 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	}
 
 	// CREATE SECRET option lists carry credential material; never persist
-	// them to the query log.
+	// them to the query log. The engine's error text echoes the offending SQL,
+	// so a failed CREATE SECRET leaks the credential via Exception unless the
+	// error is redacted too — classify against the original query first.
+	errMsg = usersecrets.RedactErrorForLog(query, errMsg)
 	query = usersecrets.RedactForLog(query)
 	transpiledQuery = usersecrets.RedactForLog(transpiledQuery)
 

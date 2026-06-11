@@ -94,6 +94,67 @@ func TestRedactForLogNonLeadingSecretDDL(t *testing.T) {
 	}
 }
 
+func TestRedactErrorForLog(t *testing.T) {
+	// A DuckDB-style error that echoes the offending SQL verbatim, including
+	// the credential literal — the exact leak this guards.
+	secretErr := "Parser Error: syntax error at or near \"BOGUS\"\n" +
+		"LINE 1: ... (TYPE s3, KEY_ID 'AKIABAD', SECRET '" + secretLiteral + "' BOGUS)"
+
+	tests := []struct {
+		name   string
+		query  string
+		errMsg string
+		// want is the exact output; if empty, only assert the literal is gone.
+		want string
+	}{
+		{
+			name:   "empty error passes through",
+			query:  "CREATE SECRET foo (TYPE s3, SECRET '" + secretLiteral + "')",
+			errMsg: "",
+			want:   "",
+		},
+		{
+			name:   "non-secret query keeps its error verbatim",
+			query:  "SELECT * FROM missing",
+			errMsg: "Catalog Error: Table with name missing does not exist",
+			want:   "Catalog Error: Table with name missing does not exist",
+		},
+		{
+			name:   "secret-head query redacts error echoing the literal",
+			query:  "CREATE SECRET foo (TYPE s3, KEY_ID 'AKIABAD', SECRET '" + secretLiteral + "' BOGUS)",
+			errMsg: secretErr,
+			want:   redactedErrorPlaceholder,
+		},
+		{
+			name:   "non-leading secret DDL redacts error",
+			query:  "SELECT 1; CREATE PERSISTENT SECRET foo (TYPE s3, SECRET '" + secretLiteral + "')",
+			errMsg: secretErr,
+			want:   redactedErrorPlaceholder,
+		},
+		{
+			name:   "drop secret error passes through (no credential material)",
+			query:  "DROP PERSISTENT SECRET foo",
+			errMsg: "Invalid Input Error: secret foo not found",
+			want:   "Invalid Input Error: secret foo not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RedactErrorForLog(tt.query, tt.errMsg)
+			if tt.want != "" && got != tt.want {
+				t.Fatalf("RedactErrorForLog(%q, %q) = %q, want %q", tt.query, tt.errMsg, got, tt.want)
+			}
+			if tt.want == "" && got != "" {
+				t.Fatalf("RedactErrorForLog(%q, \"\") = %q, want empty", tt.query, got)
+			}
+			if strings.Contains(got, secretLiteral) {
+				t.Fatalf("secret literal leaked in redacted error: %q", got)
+			}
+		})
+	}
+}
+
 func TestContainsPersistentSecretDDL(t *testing.T) {
 	tests := []struct {
 		query string

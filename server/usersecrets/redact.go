@@ -38,13 +38,58 @@ func RedactForLog(query string) string {
 	// handled it (and DROP / non-secret pass through unchanged). Only when
 	// there are multiple top-level statements must we scan for secret DDL
 	// hiding behind a leading statement.
+	if queryHasCreateSecret(query) {
+		return redactedPlaceholder
+	}
+	return query
+}
+
+// redactedErrorPlaceholder replaces an error message that may echo the text of
+// a CREATE SECRET statement. Engines surface parser/binder/execution errors
+// with the offending SQL inlined (DuckDB emits e.g. `LINE 1: ... SECRET
+// 'literal'`), so an error raised by secret DDL can carry the credential even
+// though the query attribute itself was already redacted by RedactForLog.
+// Logging that error verbatim leaks the secret on every failed CREATE SECRET.
+const redactedErrorPlaceholder = "(error redacted: statement carries secret DDL)"
+
+// RedactErrorForLog returns an error message safe to log/store alongside query.
+// When query carries CREATE SECRET DDL anywhere (head or a later top-level
+// statement), the engine's error text may echo the secret literal, so the whole
+// message is replaced with a fixed placeholder. Over-redaction only costs
+// diagnostic detail, never credential exposure; errors from non-secret queries
+// (and empty errors) pass through unchanged.
+//
+// Callers MUST pass the original, un-redacted query — classification needs the
+// real statement text. Pair this with RedactForLog at every query log site that
+// also emits an error: RedactForLog scrubs the query attribute, RedactErrorForLog
+// scrubs the error attribute.
+func RedactErrorForLog(query, errMsg string) string {
+	if errMsg == "" {
+		return errMsg
+	}
+	if queryHasCreateSecret(query) {
+		return redactedErrorPlaceholder
+	}
+	return errMsg
+}
+
+// queryHasCreateSecret reports whether query contains a CREATE SECRET at its
+// head or in any top-level statement. It shares the tokenizer with RedactForLog
+// (parseSecretDDLHead / splitTopLevel) so the query and error redactors can
+// never drift apart. DROP SECRET (which carries only a name) is not a match.
+func queryHasCreateSecret(query string) bool {
+	if st, _, ok := parseSecretDDLHead(query); ok && st.Kind == KindCreate {
+		return true
+	}
+	// A single top-level statement whose head is not CREATE SECRET cannot hide
+	// secret DDL; only multi-statement strings need the per-segment scan.
 	if !hasTrailingStatement(query) {
-		return query
+		return false
 	}
 	for _, seg := range splitTopLevel(query) {
 		if st, _, ok := parseSecretDDLHead(seg); ok && st.Kind == KindCreate {
-			return redactedPlaceholder
+			return true
 		}
 	}
-	return query
+	return false
 }
