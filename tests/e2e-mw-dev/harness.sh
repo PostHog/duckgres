@@ -1305,8 +1305,43 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
 }
 
+# Busy-only Karpenter disruption protection: a worker pod must carry
+# karpenter.sh/do-not-disrupt while a session runs (its node must not be
+# consolidation/drift-evicted mid-query) and must DROP it when parked hot-idle
+# (so WhenEmptyOrUnderutilized can reclaim idle nodes — without the removal the
+# headroom ratchet returns: annotated idle workers pin nodes forever).
+worker_disruption_annotation() { # org password
+  log "busy-only do-not-disrupt annotation on $1"
+  out="$(mktemp)"
+  ( pg_try "$1" "$2" ducklake "$HEAVY_Q" >"$out" 2>&1 ) &
+  qpid=$!
+  # While the query runs, the serving worker must be protected.
+  ann="" a=0
+  while [ "$a" -lt 90 ]; do
+    kill -0 "$qpid" 2>/dev/null || break
+    pod="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$1"           -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+    if [ -n "$pod" ]; then
+      ann="$(k get pod "$pod" -o jsonpath='{.metadata.annotations.karpenter\.sh/do-not-disrupt}' 2>/dev/null)"
+      [ "$ann" = "true" ] && break
+    fi
+    sleep 1; a=$((a + 1))
+  done
+  [ "$ann" = "true" ] || { kill "$qpid" 2>/dev/null || true; fail "worker_disruption_annotation: busy worker $pod not protected (annotation '$ann')"; }
+  wait "$qpid" 2>/dev/null || true
+
+  # Session ended -> worker parks hot-idle -> annotation must be removed.
+  a=0
+  while [ "$a" -lt 30 ]; do
+    ann="$(k get pod "$pod" -o jsonpath='{.metadata.annotations.karpenter\.sh/do-not-disrupt}' 2>/dev/null)"
+    [ -z "$ann" ] && { rm -f "$out"; log "busy-only do-not-disrupt OK on $pod"; return; }
+    sleep 2; a=$((a + 1))
+  done
+  fail "worker_disruption_annotation: hot-idle worker $pod still annotated after 60s (consolidation pinned)"
+}
+
 lane_res1() { # worker-kill resilience on its own org (heavy, churns workers)
   wait_worker "$RES1" "$res1_pw" ducklake
+  worker_disruption_annotation "$RES1" "$res1_pw"
   durability_across_restart "$RES1" "$res1_pw"
   crash_recovery         "$RES1" "$res1_pw"
   graceful_drain         "$RES1" "$res1_pw"
@@ -1403,7 +1438,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

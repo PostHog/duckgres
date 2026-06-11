@@ -19,25 +19,43 @@ const headroomPodLabel = "duckgres-headroom"
 
 // headroomPlaceholdersNeeded returns how many placeholder pods of size
 // (phCPUMillis, phMemBytes) are required to hold `percent`% of the worker
-// nodepool's allocatable (allocCPUMillis, allocMemBytes) free. It's the max of
-// the count needed to cover the CPU headroom and the count needed to cover the
-// memory headroom, so both axes are satisfied. Pure (no I/O) for testability.
-func headroomPlaceholdersNeeded(allocCPUMillis, allocMemBytes, phCPUMillis, phMemBytes int64, percent int) int {
+// nodepool's NON-PLACEHOLDER allocatable free. It's the max of the count
+// needed to cover the CPU headroom and the count needed to cover the memory
+// headroom, so both axes are satisfied. Pure (no I/O) for testability.
+//
+// The capacity held by the already-SCHEDULED placeholders is subtracted
+// from allocatable before taking the percentage. Without the subtraction the
+// target is self-referential and RATCHETS: placeholders pin nodes (a node
+// hosting one is never "Empty", so WhenEmpty consolidation can't reclaim it),
+// pinned nodes inflate allocatable, inflated allocatable raises the target,
+// which creates more placeholders — observed holding ~57% of the nodepool at
+// a configured 20%. Sizing against the non-placeholder baseline makes the
+// target track real (worker) usage: as workers finish, the target falls, the
+// reconciler deletes the excess, emptied nodes consolidate, and allocatable
+// follows it down.
+//
+// Floors at 1 while headroom is enabled: a pure percentage hits zero on an
+// idle pool, which would leave no preemptible slot at all and make the first
+// spawn after an idle period fully cold — one warm slot is the point of the
+// feature.
+func headroomPlaceholdersNeeded(allocCPUMillis, allocMemBytes, phCPUMillis, phMemBytes int64, percent, scheduledPlaceholders int) int {
 	if percent <= 0 {
 		return 0
 	}
 	if phCPUMillis <= 0 && phMemBytes <= 0 {
 		return 0
 	}
-	n := 0
+	baseCPU := allocCPUMillis - int64(scheduledPlaceholders)*phCPUMillis
+	baseMem := allocMemBytes - int64(scheduledPlaceholders)*phMemBytes
+	n := 1 // floor: always keep one preemptible slot while enabled
 	if phCPUMillis > 0 {
-		cpuTarget := allocCPUMillis * int64(percent) / 100
+		cpuTarget := baseCPU * int64(percent) / 100
 		if c := ceilDiv(cpuTarget, phCPUMillis); c > n {
 			n = c
 		}
 	}
 	if phMemBytes > 0 {
-		memTarget := allocMemBytes * int64(percent) / 100
+		memTarget := baseMem * int64(percent) / 100
 		if c := ceilDiv(memTarget, phMemBytes); c > n {
 			n = c
 		}
@@ -87,13 +105,13 @@ func (p *K8sWorkerPool) reconcileHeadroom(ctx context.Context) {
 		return
 	}
 
-	desired := headroomPlaceholdersNeeded(allocCPU, allocMem, phCPU.MilliValue(), phMem.Value(), p.headroomPercent)
-
-	existing, err := p.listPlaceholderPods(ctx)
+	existing, scheduled, err := p.listPlaceholderPods(ctx)
 	if err != nil {
 		slog.Warn("Headroom: failed to list placeholder pods.", "error", err)
 		return
 	}
+
+	desired := headroomPlaceholdersNeeded(allocCPU, allocMem, phCPU.MilliValue(), phMem.Value(), p.headroomPercent, scheduled)
 
 	switch {
 	case len(existing) < desired:
@@ -137,22 +155,31 @@ func (p *K8sWorkerPool) workerNodepoolAllocatable(ctx context.Context) (cpuMilli
 	return cpuMillis, memBytes, nil
 }
 
-func (p *K8sWorkerPool) listPlaceholderPods(ctx context.Context) ([]string, error) {
+// listPlaceholderPods returns the live placeholder pod names plus how many of
+// them are SCHEDULED (assigned to a node). Only scheduled placeholders occupy
+// node allocatable, so only they are subtracted from the sizing baseline —
+// subtracting Pending ones (created but not yet backed by a Karpenter node)
+// would shrink the baseline below reality and make the target flap down while
+// capacity is still arriving.
+func (p *K8sWorkerPool) listPlaceholderPods(ctx context.Context) (names []string, scheduled int, err error) {
 	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=" + headroomPodLabel,
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	names := make([]string, 0, len(pods.Items))
+	names = make([]string, 0, len(pods.Items))
 	for i := range pods.Items {
 		// Skip pods already terminating.
 		if pods.Items[i].DeletionTimestamp != nil {
 			continue
 		}
 		names = append(names, pods.Items[i].Name)
+		if pods.Items[i].Spec.NodeName != "" {
+			scheduled++
+		}
 	}
-	return names, nil
+	return names, scheduled, nil
 }
 
 func (p *K8sWorkerPool) createPlaceholderPod(ctx context.Context, cpu, mem resource.Quantity) error {

@@ -20,6 +20,7 @@ func TestHeadroomPlaceholdersNeeded(t *testing.T) {
 		allocCPUMillis, allocMemBytes int64
 		phCPUMillis, phMemBytes       int64
 		percent                       int
+		scheduled                     int
 		want                          int
 	}{
 		{name: "disabled (0%)", allocCPUMillis: 100000, allocMemBytes: 1000 * gi, phCPUMillis: 8000, phMemBytes: 16 * gi, percent: 0, want: 0},
@@ -32,14 +33,23 @@ func TestHeadroomPlaceholdersNeeded(t *testing.T) {
 		{name: "cpu bound", allocCPUMillis: 1000000, allocMemBytes: 100 * gi, phCPUMillis: 8000, phMemBytes: 16 * gi, percent: 20, want: 25},
 		// tiny cluster, headroom rounds up to 1 placeholder.
 		{name: "rounds up to one", allocCPUMillis: 8000, allocMemBytes: 16 * gi, phCPUMillis: 8000, phMemBytes: 16 * gi, percent: 10, want: 1},
-		// zero allocatable => none.
-		{name: "no nodes", allocCPUMillis: 0, allocMemBytes: 0, phCPUMillis: 8000, phMemBytes: 16 * gi, percent: 25, want: 0},
+		// zero allocatable: the floor still asks for one placeholder — it goes
+		// Pending and pulls the first node, so an idle pool keeps a warm slot.
+		{name: "no nodes -> floor", allocCPUMillis: 0, allocMemBytes: 0, phCPUMillis: 8000, phMemBytes: 16 * gi, percent: 25, want: 1},
 		// placeholder with no size => none (guards a misconfig).
 		{name: "no placeholder size", allocCPUMillis: 100000, allocMemBytes: 200 * gi, phCPUMillis: 0, phMemBytes: 0, percent: 25, want: 0},
+		// RATCHET REGRESSION: 10 scheduled placeholders (80c/160Gi) pin nodes
+		// that inflate allocatable to 200c/400Gi. Sizing must target the
+		// non-placeholder baseline (120c/240Gi): 15% => 18c/36Gi => 3 — NOT
+		// 15% of the inflated total (=> 4, which would never shrink).
+		{name: "scheduled placeholders excluded from baseline", allocCPUMillis: 200000, allocMemBytes: 400 * gi, phCPUMillis: 8000, phMemBytes: 16 * gi, percent: 15, scheduled: 10, want: 3},
+		// Idle pool: allocatable is ONLY placeholder-held capacity => baseline
+		// 0 => floor of one warm slot (the old formula self-sustained all 10).
+		{name: "idle pool converges to floor", allocCPUMillis: 80000, allocMemBytes: 160 * gi, phCPUMillis: 8000, phMemBytes: 16 * gi, percent: 20, scheduled: 10, want: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := headroomPlaceholdersNeeded(tt.allocCPUMillis, tt.allocMemBytes, tt.phCPUMillis, tt.phMemBytes, tt.percent)
+			got := headroomPlaceholdersNeeded(tt.allocCPUMillis, tt.allocMemBytes, tt.phCPUMillis, tt.phMemBytes, tt.percent, tt.scheduled)
 			if got != tt.want {
 				t.Fatalf("headroomPlaceholdersNeeded = %d, want %d", got, tt.want)
 			}
