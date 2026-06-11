@@ -133,8 +133,6 @@ type K8sConfig struct {
 	// on a fresh Karpenter node. 0 = disabled.
 	HeadroomPercent              int    // % of worker-nodepool allocatable to hold free (0 = disabled)
 	PlaceholderImage             string // Image for placeholder pods (a pause image)
-	PlaceholderCPU               string // CPU request per placeholder pod (default: worker default cpu)
-	PlaceholderMemory            string // Memory request per placeholder pod (default: worker default memory)
 	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName
 
 	// Connection-string worker sizing (duckgres.worker_cpu / worker_memory /

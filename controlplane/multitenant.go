@@ -201,8 +201,6 @@ func SetupMultiTenant(
 		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
 		HeadroomPercent:              cfg.K8s.HeadroomPercent,
 		PlaceholderImage:             cfg.K8s.PlaceholderImage,
-		PlaceholderCPU:               cfg.K8s.PlaceholderCPU,
-		PlaceholderMemory:            cfg.K8s.PlaceholderMemory,
 		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()

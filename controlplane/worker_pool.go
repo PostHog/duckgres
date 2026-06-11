@@ -111,8 +111,6 @@ type K8sWorkerPoolConfig struct {
 	WorkerPriorityClassName      string                                       // PriorityClass for worker pods (so they preempt overprovision pause pods). Empty = none.
 	HeadroomPercent              int                                          // Keep this % of worker-nodepool allocatable CPU+mem free via low-priority placeholder pods (0 = disabled).
 	PlaceholderImage             string                                       // Image for headroom placeholder pods (a pause image).
-	PlaceholderCPU               string                                       // CPU request per placeholder pod (e.g. "8").
-	PlaceholderMemory            string                                       // Memory request per placeholder pod (e.g. "16Gi").
 	PlaceholderPriorityClassName string                                       // PriorityClass for placeholder pods — MUST be below WorkerPriorityClassName so workers preempt them.
 	OrgID                        string                                       // Org ID for pod labels (multi-tenant mode)
 	WorkerIDGenerator            func() int                                   // Shared ID generator across orgs (nil = internal counter)

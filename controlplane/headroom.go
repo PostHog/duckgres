@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -18,44 +17,41 @@ import (
 const headroomPodLabel = "duckgres-headroom"
 
 // headroomPlaceholdersNeeded returns how many placeholder pods of size
-// (phCPUMillis, phMemBytes) are required to hold `percent`% of the worker
-// nodepool's NON-PLACEHOLDER allocatable free. It's the max of the count
-// needed to cover the CPU headroom and the count needed to cover the memory
-// headroom, so both axes are satisfied. Pure (no I/O) for testability.
+// (phCPUMillis, phMemBytes) are required to hold `percent`% of the CURRENT
+// WORKER DEMAND (workerCPUMillis/workerMemBytes — the summed resource requests
+// of live worker pods) as preemptible spare capacity. It's the max of the
+// CPU-axis and memory-axis counts, so both are satisfied. Pure (no I/O).
 //
-// The capacity held by the already-SCHEDULED placeholders is subtracted
-// from allocatable before taking the percentage. Without the subtraction the
-// target is self-referential and RATCHETS: placeholders pin nodes (a node
-// hosting one is never "Empty", so WhenEmpty consolidation can't reclaim it),
-// pinned nodes inflate allocatable, inflated allocatable raises the target,
-// which creates more placeholders — observed holding ~57% of the nodepool at
-// a configured 20%. Sizing against the non-placeholder baseline makes the
-// target track real (worker) usage: as workers finish, the target falls, the
-// reconciler deletes the excess, emptied nodes consolidate, and allocatable
-// follows it down.
+// Worker demand is the only sane baseline. Sizing against node allocatable —
+// even with the placeholders' own share subtracted — still counts the FREE
+// space on nodes as "capacity that needs headroom", which is backwards: free
+// capacity IS headroom. Observed failure mode: a single over-sized node (one
+// 192-CPU consolidation artifact) demanded 11 placeholders at 5% with ZERO
+// workers running, and those placeholders then pinned the node alive. Keyed to
+// worker demand, the target tracks load by construction: zero workers -> the
+// floor; N busy CPUs -> percent of N; node geometry drops out entirely and
+// the placeholders can never feed their own target.
 //
 // Floors at 1 while headroom is enabled: a pure percentage hits zero on an
 // idle pool, which would leave no preemptible slot at all and make the first
 // spawn after an idle period fully cold — one warm slot is the point of the
 // feature.
-func headroomPlaceholdersNeeded(allocCPUMillis, allocMemBytes, phCPUMillis, phMemBytes int64, percent, scheduledPlaceholders int) int {
+func headroomPlaceholdersNeeded(workerCPUMillis, workerMemBytes, phCPUMillis, phMemBytes int64, percent int) int {
 	if percent <= 0 {
 		return 0
 	}
 	if phCPUMillis <= 0 && phMemBytes <= 0 {
 		return 0
 	}
-	baseCPU := allocCPUMillis - int64(scheduledPlaceholders)*phCPUMillis
-	baseMem := allocMemBytes - int64(scheduledPlaceholders)*phMemBytes
 	n := 1 // floor: always keep one preemptible slot while enabled
 	if phCPUMillis > 0 {
-		cpuTarget := baseCPU * int64(percent) / 100
+		cpuTarget := workerCPUMillis * int64(percent) / 100
 		if c := ceilDiv(cpuTarget, phCPUMillis); c > n {
 			n = c
 		}
 	}
 	if phMemBytes > 0 {
-		memTarget := baseMem * int64(percent) / 100
+		memTarget := workerMemBytes * int64(percent) / 100
 		if c := ceilDiv(memTarget, phMemBytes); c > n {
 			n = c
 		}
@@ -74,44 +70,47 @@ func ceilDiv(a, b int64) int {
 }
 
 // reconcileHeadroom drives the number of placeholder pods toward the configured
-// percentage of worker-nodepool allocatable. Leader-gated (called from the
-// janitor, which runs only on the elected CP). A no-op when headroomPercent<=0.
+// percentage of CURRENT WORKER DEMAND (summed live worker pod requests).
+// Leader-gated (called from the janitor, which runs only on the elected CP).
+// A no-op when headroomPercent<=0.
 //
-// Placeholders are default-worker-sized and carry a PriorityClass BELOW the
-// worker PriorityClass, so the scheduler preempts them to fit a real worker. A
-// worker larger than one placeholder preempts AS MANY placeholders as it needs
-// (standard k8s priority preemption) — e.g. a 32-core worker evicts ~4 of the
-// 8-core placeholders. The reconcile then recreates placeholders back toward the
-// target on the next tick, which makes Karpenter add node capacity in the
+// Placeholders are sized to the pool's DEFAULT WORKER SHAPE (WorkerCPURequest/
+// WorkerMemoryRequest, else the built-in defaults) — no separate sizing knob:
+// one preempted placeholder always frees exactly one default-worker slot, in
+// every environment. They carry a PriorityClass BELOW the worker
+// PriorityClass, so the scheduler preempts them to fit a real worker; a worker
+// larger than one placeholder preempts AS MANY as it needs (standard k8s
+// priority preemption). The reconcile then recreates placeholders back toward
+// the target on the next tick, which makes Karpenter add node capacity in the
 // background. So headroom self-heals after any size of spawn.
 func (p *K8sWorkerPool) reconcileHeadroom(ctx context.Context) {
 	if p.headroomPercent <= 0 {
 		return
 	}
-	phCPU, err := resource.ParseQuantity(firstNonEmpty(p.placeholderCPU, defaultWorkerCPU))
+	phCPU, err := resource.ParseQuantity(firstNonEmpty(p.workerCPURequest, defaultWorkerCPU))
 	if err != nil {
-		slog.Warn("Headroom: invalid placeholder cpu.", "value", p.placeholderCPU, "error", err)
+		slog.Warn("Headroom: invalid default worker cpu for placeholder sizing.", "value", p.workerCPURequest, "error", err)
 		return
 	}
-	phMem, err := resource.ParseQuantity(firstNonEmpty(p.placeholderMemory, defaultWorkerMemory))
+	phMem, err := resource.ParseQuantity(firstNonEmpty(p.workerMemoryRequest, defaultWorkerMemory))
 	if err != nil {
-		slog.Warn("Headroom: invalid placeholder memory.", "value", p.placeholderMemory, "error", err)
-		return
-	}
-
-	allocCPU, allocMem, err := p.workerNodepoolAllocatable(ctx)
-	if err != nil {
-		slog.Warn("Headroom: failed to read worker nodepool allocatable.", "error", err)
+		slog.Warn("Headroom: invalid default worker memory for placeholder sizing.", "value", p.workerMemoryRequest, "error", err)
 		return
 	}
 
-	existing, scheduled, err := p.listPlaceholderPods(ctx)
+	workerCPU, workerMem, err := p.activeWorkerDemand(ctx)
+	if err != nil {
+		slog.Warn("Headroom: failed to sum worker demand.", "error", err)
+		return
+	}
+
+	existing, _, err := p.listPlaceholderPods(ctx)
 	if err != nil {
 		slog.Warn("Headroom: failed to list placeholder pods.", "error", err)
 		return
 	}
 
-	desired := headroomPlaceholdersNeeded(allocCPU, allocMem, phCPU.MilliValue(), phMem.Value(), p.headroomPercent, scheduled)
+	desired := headroomPlaceholdersNeeded(workerCPU, workerMem, phCPU.MilliValue(), phMem.Value(), p.headroomPercent)
 
 	switch {
 	case len(existing) < desired:
@@ -132,25 +131,28 @@ func (p *K8sWorkerPool) reconcileHeadroom(ctx context.Context) {
 	}
 }
 
-// workerNodepoolAllocatable sums allocatable CPU (millicores) and memory (bytes)
-// across Ready nodes matching the worker nodeSelector. An empty selector means
-// all nodes (callers should configure a selector in multi-nodepool clusters).
-func (p *K8sWorkerPool) workerNodepoolAllocatable(ctx context.Context) (cpuMillis, memBytes int64, err error) {
-	opts := metav1.ListOptions{}
-	if sel := labelSelectorString(p.workerNodeSelector); sel != "" {
-		opts.LabelSelector = sel
-	}
-	nodes, err := p.clientset.CoreV1().Nodes().List(ctx, opts)
+// activeWorkerDemand sums the resource REQUESTS of live (non-terminating)
+// worker pods in the namespace — the demand baseline the headroom percentage
+// applies to. Worker pods are never BestEffort (every one carries requests),
+// so the sum is faithful. Listing by label covers all CP replicas' workers,
+// which is what the leader-only reconcile needs.
+func (p *K8sWorkerPool) activeWorkerDemand(ctx context.Context) (cpuMillis, memBytes int64, err error) {
+	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
 	if err != nil {
 		return 0, 0, err
 	}
-	for i := range nodes.Items {
-		n := &nodes.Items[i]
-		if !nodeIsReady(n) || n.Spec.Unschedulable {
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		cpuMillis += n.Status.Allocatable.Cpu().MilliValue()
-		memBytes += n.Status.Allocatable.Memory().Value()
+		for c := range pod.Spec.Containers {
+			req := pod.Spec.Containers[c].Resources.Requests
+			cpuMillis += req.Cpu().MilliValue()
+			memBytes += req.Memory().Value()
+		}
 	}
 	return cpuMillis, memBytes, nil
 }
@@ -239,31 +241,4 @@ func (p *K8sWorkerPool) createPlaceholderPod(ctx context.Context, cpu, mem resou
 	}
 	_, err := p.clientset.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{})
 	return err
-}
-
-func nodeIsReady(n *corev1.Node) bool {
-	for _, c := range n.Status.Conditions {
-		if c.Type == corev1.NodeReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
-}
-
-// labelSelectorString renders a node selector map as a comma-joined equality
-// selector ("k1=v1,k2=v2"), deterministically ordered.
-func labelSelectorString(sel map[string]string) string {
-	if len(sel) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(sel))
-	for k := range sel {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, k+"="+sel[k])
-	}
-	return strings.Join(parts, ",")
 }

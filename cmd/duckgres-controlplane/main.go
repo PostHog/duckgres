@@ -234,8 +234,6 @@ func main() {
 			WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
 			HeadroomPercent:              resolved.K8sHeadroomPercent,
 			PlaceholderImage:             resolved.K8sPlaceholderImage,
-			PlaceholderCPU:               resolved.K8sPlaceholderCPU,
-			PlaceholderMemory:            resolved.K8sPlaceholderMemory,
 			PlaceholderPriorityClassName: resolved.K8sPlaceholderPriorityClassName,
 			WorkerProfileMinCPU:          resolved.K8sWorkerProfileMinCPU,
 			WorkerProfileMaxCPU:          resolved.K8sWorkerProfileMaxCPU,
