@@ -278,9 +278,121 @@ Sorted by what's worth acting on first.
 
 ---
 
+---
+
+## Appendix A — Catalog object, function & startup-parameter reference
+
+This is the emulation-internals view that previously lived in the README: which
+`pg_catalog`/`information_schema` objects and compatibility macros Duckgres
+provides, and what each returns. "Implemented" = Duckgres-provided wrapper;
+"Native (DuckDB)" = works through DuckDB's own `pg_catalog` with no Duckgres
+wrapper; "Stub" = present but intentionally empty/constant; "Missing" = neither
+wrapper nor native support. Behavior values (returns NULL / 0 / always true) are
+deliberate stubs sized to satisfy client introspection, not real implementations.
+
+### pg_catalog views
+
+| View | Status | Notes |
+|------|--------|-------|
+| `pg_class` | Implemented | `pg_class_full` wrapper adding `relforcerowsecurity`; DuckLake variant sources from `duckdb_tables()`/`duckdb_views()` |
+| `pg_namespace` | Implemented | Maps `main` → `public`; DuckLake variant derives from `duckdb_tables()`/`duckdb_views()` |
+| `pg_attribute` | Implemented | Maps DuckDB internal type OIDs to PG OIDs via `duckdb_columns()` JOIN; fixes `atttypmod` for NUMERIC |
+| `pg_type` | Implemented | Fixes NULLs + adds synthetic entries for missing OIDs (json, jsonb, bpchar, text, record, array types) |
+| `pg_database` | Implemented | Hardcoded: postgres, template0, template1, testdb |
+| `pg_stat_user_tables` | Implemented | Uses `reltuples` from pg_class; zeros for scan/tuple stats |
+| `pg_roles` | Minimal view | Single hardcoded superuser row (not empty) |
+| `pg_settings` | Native (DuckDB) | `pg_catalog.pg_settings` is queryable via DuckDB; the `current_setting()` macro only special-cases `server_version`/`server_encoding` |
+| `pg_stat_activity` | Stub (empty) | Static view is empty; intercepted at query time for live data |
+| `pg_constraint` | Stub (empty) | |
+| `pg_enum` | Stub (empty) | |
+| `pg_collation` | Stub (empty) | |
+| `pg_policy` | Stub (empty) | |
+| `pg_inherits` | Stub (empty) | |
+| `pg_statistic_ext` | Stub (empty) | |
+| `pg_publication` | Stub (empty) | |
+| `pg_publication_rel` | Stub (empty) | |
+| `pg_publication_tables` | Stub (empty) | |
+| `pg_rules` | Stub (empty) | |
+| `pg_matviews` | Stub (empty) | |
+| `pg_partitioned_table` | Stub (empty) | |
+| `pg_statio_user_tables` | Stub (empty) | |
+| `pg_stat_statements` | Stub (empty) | |
+| `pg_indexes` | Stub (empty) | |
+| `pg_proc` | Native (DuckDB) | DuckDB has native `pg_catalog.pg_proc`; no Duckgres wrapper |
+| `pg_description` | Missing | Handled via `obj_description()`/`col_description()` macros returning NULL |
+| `pg_depend` | Missing | |
+| `pg_am` | Missing | |
+| `pg_attrdef` | Missing | |
+| `pg_tablespace` | Missing | |
+
+### information_schema views
+
+| View | Status | Notes |
+|------|--------|-------|
+| `tables` | Implemented | Filters internal views, normalizes `main` → `public` |
+| `columns` | Implemented | DuckDB → PG type name normalization, optional metadata overlay |
+| `schemata` | Implemented | Adds synthetic entries for `pg_catalog`, `information_schema`, `pg_toast` |
+| `views` | Implemented | Filters internal views |
+| `key_column_usage` | Missing | Used by ORMs for relationship discovery |
+| `table_constraints` | Missing | Used by ORMs for relationship discovery |
+| `referential_constraints` | Missing | Used by ORMs for FK introspection |
+
+### Functions & macros
+
+| Function | Status | Notes |
+|----------|--------|-------|
+| `format_type(oid, int)` | Implemented | Comprehensive OID → name mapping |
+| `pg_get_expr(text, oid)` | Implemented | Returns NULL |
+| `pg_get_indexdef(oid)` | Implemented | Returns empty string |
+| `pg_get_constraintdef(oid)` | Implemented | Returns empty string |
+| `pg_get_serial_sequence(text, text)` | Implemented | Returns NULL (no sequence support) |
+| `pg_table_is_visible(oid)` | Implemented | Always true |
+| `pg_get_userbyid(oid)` | Implemented | Maps OID 10 → `postgres`, 6171 → `pg_database_owner` |
+| `obj_description(oid, text)` | Implemented | Returns NULL |
+| `col_description(oid, int)` | Implemented | Returns NULL |
+| `shobj_description(oid, text)` | Implemented | Returns NULL |
+| `has_table_privilege(text, text)` | Implemented | Always true |
+| `has_schema_privilege(text, text)` | Implemented | Always true |
+| `pg_encoding_to_char(int)` | Implemented | Always `UTF8` |
+| `version()` | Implemented | Returns `PostgreSQL 15.0 … (Duckgres/DuckDB)` |
+| `current_setting(text)` | Implemented | Special-cases `server_version`, `server_encoding` |
+| `current_schema()` | Native (DuckDB) | Works via DuckDB; no Duckgres wrapper |
+| `current_schemas(bool)` | Missing | |
+| `pg_is_in_recovery()` | Implemented | Always false |
+| `pg_backend_pid()` | Implemented | Returns 0 |
+| `pg_size_pretty(bigint)` | Implemented | Full human-readable formatting |
+| `pg_total_relation_size(oid)` | Implemented | Returns 0 |
+| `pg_relation_size(oid)` | Implemented | Returns 0 |
+| `pg_table_size(oid)` | Implemented | Returns 0 |
+| `pg_indexes_size(oid)` | Implemented | Returns 0 |
+| `pg_database_size(text)` | Implemented | Returns 0 |
+| `quote_ident(text)` | Implemented | |
+| `quote_literal(text)` | Implemented | |
+| `quote_nullable(text)` | Implemented | |
+| `txid_current()` | Implemented | Epoch-based pseudo ID |
+
+### Startup parameters
+
+| Parameter | Value |
+|-----------|-------|
+| `server_version` | `15.0 (Duckgres)` |
+| `server_encoding` | `UTF8` |
+| `client_encoding` | `UTF8` |
+| `DateStyle` | `ISO, MDY` |
+| `TimeZone` | `UTC` |
+| `integer_datetimes` | `on` |
+| `standard_conforming_strings` | `on` |
+| `IntervalStyle` | Missing |
+
+> Duckgres advertises **PostgreSQL 15.0** on the wire (`server/catalog.go`,
+> `server/conn.go`). The differential test suite compares results against a real
+> PostgreSQL 16 server, but the emulated version string is intentionally 15.0.
+
+---
+
 ## Related docs
 
-- [README.md](../README.md) → "SQL Client Compatibility" — user-facing catalog/function status tables.
+- [README.md](../README.md) → "SQL Client Compatibility" — short user-facing summary that links here.
 - [tests/integration/README.md](../tests/integration/README.md) — test-suite architecture, category counts, and the skip-reason table.
 - [TODO.md](../TODO.md) — forward-looking compatibility/protocol gaps.
 - [scripts/client-compat/README.md](../scripts/client-compat/README.md) — real-driver compatibility harness and `queries.yaml`.
