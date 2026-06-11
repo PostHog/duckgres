@@ -134,7 +134,11 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 		for valEnd < len(data) && data[valEnd] != 0 {
 			valEnd++
 		}
-		if valEnd > len(data) {
+		// An unterminated value (no trailing NUL) means a malformed/truncated
+		// packet. Break instead of re-slicing past the end: with valEnd ==
+		// len(data), data[valEnd+1:] would be data[len(data)+1:] and panic
+		// with "slice bounds out of range". Mirrors the key-scan guard above.
+		if valEnd >= len(data) {
 			break
 		}
 		value := string(data[:valEnd])

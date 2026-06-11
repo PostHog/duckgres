@@ -104,6 +104,29 @@ func TestReadStartupMessageMaxLengthAccepted(t *testing.T) {
 	}
 }
 
+// Regression test: a startup parameter whose final value lacks a trailing NUL
+// must NOT panic. The value-scan guard used `valEnd > len(data)`, so an
+// unterminated final value left valEnd == len(data), fell through to
+// data[valEnd+1:] == data[len(data)+1:], and panicked with "slice bounds out
+// of range". This is parsed PRE-AUTH on attacker-controlled bytes, so a panic
+// crashes the whole shared control-plane process. The fix (`valEnd >=`) breaks
+// out, returning the parameters parsed so far without error.
+func TestReadStartupMessageUnterminatedValue(t *testing.T) {
+	// v3.0 protocol version (196608 = 0x00030000) + "user\0X" with no trailing NUL.
+	body := append([]byte{0x00, 0x03, 0x00, 0x00}, []byte("user\x00X")...)
+	msg := buildRawStartup(int32(len(body)+4), body)
+
+	// Must not panic.
+	params, err := ReadStartupMessage(bytes.NewReader(msg))
+	if err != nil {
+		t.Fatalf("ReadStartupMessage on unterminated value: %v", err)
+	}
+	// The truncated final pair is dropped (break before assignment).
+	if _, ok := params["user"]; ok {
+		t.Fatalf("expected truncated final pair to be dropped, got: %v", params)
+	}
+}
+
 func TestReadMessageValid(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteMessage(&buf, MsgQuery, []byte("SELECT 1\x00")); err != nil {
