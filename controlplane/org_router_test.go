@@ -211,6 +211,61 @@ func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
 	}
 }
 
+func TestOrgRouterHandleConfigChangeRefreshesDefaultWorkerMinHotIdle(t *testing.T) {
+	pool := &recordingFloorConfigPool{}
+
+	oldTC := &configstore.OrgConfig{Name: "analytics", DefaultWorkerMinHotIdle: 1}
+	newTC := &configstore.OrgConfig{Name: "analytics", DefaultWorkerMinHotIdle: 3}
+
+	tr := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {
+				Config: oldTC,
+				Pool:   pool,
+			},
+		},
+		baseCfg: K8sWorkerPoolConfig{MaxWorkers: 2},
+	}
+
+	tr.HandleConfigChange(
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": oldTC}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": newTC}},
+	)
+
+	if pool.floorUpdates != 0 {
+		t.Fatalf("retention-only floor should not update pool state, got %d calls", pool.floorUpdates)
+	}
+}
+
+type recordingFloorConfigPool struct {
+	floorUpdates int
+}
+
+func (p *recordingFloorConfigPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
+	return nil, nil
+}
+
+func (p *recordingFloorConfigPool) ReleaseWorker(id int) {}
+
+func (p *recordingFloorConfigPool) RetireWorker(id int) {}
+
+func (p *recordingFloorConfigPool) RetireWorkerIfNoSessions(id int) bool { return false }
+
+func (p *recordingFloorConfigPool) Worker(id int) (*ManagedWorker, bool) { return nil, false }
+
+func (p *recordingFloorConfigPool) SpawnMinWorkers(count int) error { return nil }
+
+func (p *recordingFloorConfigPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
+}
+
+func (p *recordingFloorConfigPool) SetMaxWorkers(n int) {}
+
+func (p *recordingFloorConfigPool) ShutdownAll() {}
+
+func (p *recordingFloorConfigPool) SetDefaultWorkerMinHotIdle(n int) {
+	p.floorUpdates++
+}
+
 func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerActivator(t *testing.T) {
 	sharedPool, cs := newTestK8sPool(t, 10)
 	sharedPool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
@@ -402,4 +457,3 @@ func TestWorkerImageForOrg(t *testing.T) {
 		})
 	}
 }
-

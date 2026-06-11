@@ -45,9 +45,12 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
+	hotIdleClaimImage                string
 	hotIdleClaimProfileCPU           string
 	hotIdleClaimProfileMemory        string
 	hotIdleClaimMaxOrgWorkers        int
+	spawnProfileCPU                  string
+	spawnProfileMemory               string
 	recordMissCalls                  int
 	takenOver                        *configstore.WorkerRecord
 	takeOverErr                      error
@@ -127,11 +130,12 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	copy(out, s.records)
 	return out
 }
-func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hotIdleClaimCPID = ownerCPInstanceID
 	s.hotIdleClaimOrgID = orgID
+	s.hotIdleClaimImage = image
 	s.hotIdleClaimProfileCPU = profileCPU
 	s.hotIdleClaimProfileMemory = profileMemory
 	s.hotIdleClaimMaxOrgWorkers = maxOrgWorkers
@@ -141,13 +145,15 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID 
 	}
 	return nil, s.hotIdleClaimMissReason, nil
 }
-func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.spawnCalls++
 	s.spawnOwnerCPID = ownerCPInstanceID
 	s.spawnOrgID = orgID
 	s.spawnImage = image
+	s.spawnProfileCPU = profileCPU
+	s.spawnProfileMemory = profileMemory
 	s.spawnOwnerEpoch = ownerEpoch
 	s.spawnPodNamePrefix = podNamePrefix
 	s.spawnMaxOrgWorkers = maxOrgWorkers
@@ -161,6 +167,33 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 	spawned := *s.spawned
 	spawned.OwnerEpoch = ownerEpoch
 	return &spawned, nil
+}
+func (s *captureRuntimeWorkerStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	latest := make(map[int]configstore.WorkerRecord)
+	for id, rec := range s.preloadedRecords {
+		if rec != nil {
+			latest[id] = *rec
+		}
+	}
+	for _, rec := range s.records {
+		latest[rec.WorkerID] = rec
+	}
+	count := 0
+	for _, rec := range latest {
+		if rec.State != configstore.WorkerStateHotIdle {
+			continue
+		}
+		if rec.OrgID != orgID || rec.Image != image {
+			continue
+		}
+		if rec.ProfileCPU != profileCPU || rec.ProfileMemory != profileMemory {
+			continue
+		}
+		count++
+	}
+	return count, nil
 }
 func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
@@ -1179,6 +1212,30 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 	}
 	if store.recordMissCalls != 0 {
 		t.Fatalf("expected no recorded miss for org-cap, got %d", store.recordMissCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerDecisionDoesNotReplaceIncompatibleHotIdleOnGlobalCapMiss(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 1)
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimMissReason: configstore.WorkerClaimMissReasonNoIdle,
+	}
+	pool.runtimeStore = store
+
+	claim, err := pool.reserveSharedWorkerDecision(&WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+		Image:      "duckgres:new",
+	})
+	var capacityErr *WorkerCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected capacity error, got claim=%#v err=%v", claim, err)
+	}
+	if claim != nil {
+		t.Fatalf("expected no claim on capacity miss, got %#v", claim)
+	}
+	if store.spawnCalls != 1 {
+		t.Fatalf("expected direct spawn attempt to enforce global cap, got %d spawn calls", store.spawnCalls)
 	}
 }
 

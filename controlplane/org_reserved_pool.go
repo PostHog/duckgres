@@ -426,7 +426,9 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) (err error) {
 	activateStart := time.Now()
 	defer func() {
-		observeAcquirePhase("activate", time.Since(activateStart), err)
+		if worker != nil {
+			observeAcquirePhase("activate", time.Since(activateStart), err)
+		}
 	}()
 
 	p.shared.mu.Lock()

@@ -252,20 +252,21 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			alias = *o.HostnameAlias
 		}
 		oc := &OrgConfig{
-			Name:                o.Name,
-			DatabaseName:        o.DatabaseName,
-			HostnameAlias:       alias,
-			MaxWorkers:          o.MaxWorkers,
-			MaxConnections:      o.MaxConnections,
-			MemoryBudget:        o.MemoryBudget,
-			IdleTimeoutS:        o.IdleTimeoutS,
-			WorkerCPURequest:    o.WorkerCPURequest,
-			WorkerMemoryRequest: o.WorkerMemoryRequest,
-			DefaultWorkerCPU:    o.DefaultWorkerCPU,
-			DefaultWorkerMemory: o.DefaultWorkerMemory,
-			DefaultWorkerTTL:    o.DefaultWorkerTTL,
-			Users:               make(map[string]string),
-			Warehouse:           copyManagedWarehouseConfig(o.Warehouse),
+			Name:                    o.Name,
+			DatabaseName:            o.DatabaseName,
+			HostnameAlias:           alias,
+			MaxWorkers:              o.MaxWorkers,
+			MaxConnections:          o.MaxConnections,
+			MemoryBudget:            o.MemoryBudget,
+			IdleTimeoutS:            o.IdleTimeoutS,
+			WorkerCPURequest:        o.WorkerCPURequest,
+			WorkerMemoryRequest:     o.WorkerMemoryRequest,
+			DefaultWorkerCPU:        o.DefaultWorkerCPU,
+			DefaultWorkerMemory:     o.DefaultWorkerMemory,
+			DefaultWorkerTTL:        o.DefaultWorkerTTL,
+			DefaultWorkerMinHotIdle: o.DefaultWorkerMinHotIdle,
+			Users:                   make(map[string]string),
+			Warehouse:               copyManagedWarehouseConfig(o.Warehouse),
 		}
 		if o.DatabaseName != "" {
 			snap.DatabaseOrg[o.DatabaseName] = o.Name
@@ -490,6 +491,24 @@ func (cs *ConfigStore) OrgDefaultWorkerProfile(orgID string) (cpu, memory, ttl s
 		return "", "", ""
 	}
 	return oc.DefaultWorkerCPU, oc.DefaultWorkerMemory, oc.DefaultWorkerTTL
+}
+
+// OrgDefaultWorkerMinHotIdle returns the org's operator-set default-profile
+// hot-idle floor. 0 means disabled, including unknown orgs and a nil snapshot.
+func (cs *ConfigStore) OrgDefaultWorkerMinHotIdle(orgID string) int {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return 0
+	}
+	oc, ok := cs.snapshot.Orgs[orgID]
+	if !ok {
+		return 0
+	}
+	if oc.DefaultWorkerMinHotIdle < 0 {
+		return 0
+	}
+	return oc.DefaultWorkerMinHotIdle
 }
 
 // ValidateOrgUser checks username/password scoped to a specific org.
@@ -956,7 +975,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // When maxOrgWorkers is set, the org cap is checked under the same advisory
 // lock as on-demand claims, excluding hot-idle rows from the count so a
 // cached worker can be reclaimed as the org's only active slot.
-func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -980,6 +999,7 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profi
 		err := tx.Table(cs.runtimeTable(current.TableName())).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("state = ? AND org_id = ?", WorkerStateHotIdle, orgID).
+			Where("image = ?", image).
 			// Only reclaim a hot-idle worker of the requested shape, so a
 			// differently-shaped request doesn't claim-and-retire this org's
 			// default-shape hot-idle workers. COALESCE keeps legacy NULL-profile
@@ -1041,6 +1061,21 @@ func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.
 		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)
 	}
 	return workers, nil
+}
+
+// CountHotIdleWorkers returns the number of compatible hot-idle workers for an
+// org/profile/image bucket. Empty profile CPU/memory is the default profile.
+func (cs *ConfigStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {
+	var count int64
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("state = ? AND org_id = ?", WorkerStateHotIdle, orgID).
+		Where("image = ?", image).
+		Where("COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ?", profileCPU, profileMemory).
+		Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("count hot-idle workers: %w", err)
+	}
+	return int(count), nil
 }
 
 // MarkWorkerTerminalIfCurrent moves an observed active worker row to a terminal
@@ -1370,7 +1405,7 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 
 // CreateSpawningWorkerSlot creates a durable spawning worker row under advisory-lock
 // protected org/global capacity checks. A nil result means capacity blocked the spawn.
-func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
 	if strings.TrimSpace(podNamePrefix) == "" {
 		return nil, fmt.Errorf("pod name prefix is required")
 	}
@@ -1387,7 +1422,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 		}
 
 		if maxOrgWorkers > 0 && orgID != "" {
-			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
+			count, err := cs.countOrgAdmittingWorkers(tx, orgID, image, profileCPU, profileMemory)
 			if err != nil {
 				return err
 			}
@@ -1415,6 +1450,8 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 			WorkerID:          int(workerID),
 			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
 			Image:             image,
+			ProfileCPU:        profileCPU,
+			ProfileMemory:     profileMemory,
 			State:             WorkerStateSpawning,
 			OrgID:             orgID,
 			OwnerCPInstanceID: ownerCPInstanceID,
@@ -1431,6 +1468,12 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 		return nil, fmt.Errorf("create spawning worker slot: %w", err)
 	}
 	return created, nil
+}
+
+func (cs *ConfigStore) countOrgAdmittingWorkers(tx *gorm.DB, orgID, image, profileCPU, profileMemory string) (int64, error) {
+	return cs.countActiveWorkers(tx,
+		"org_id = ? AND (state <> ? OR (image = ? AND COALESCE(profile_cpu, '') = ? AND COALESCE(profile_memory, '') = ?))",
+		orgID, WorkerStateHotIdle, image, profileCPU, profileMemory)
 }
 
 // ListOrphanedWorkers returns workers in active states that no live CP

@@ -52,6 +52,12 @@ func (s WorkerSnapshot) PodName() string { return s.record.PodName }
 // Image returns the container image recorded for this worker.
 func (s WorkerSnapshot) Image() string { return s.record.Image }
 
+// ProfileCPU returns the worker profile CPU recorded at observation time.
+func (s WorkerSnapshot) ProfileCPU() string { return s.record.ProfileCPU }
+
+// ProfileMemory returns the worker profile memory recorded at observation time.
+func (s WorkerSnapshot) ProfileMemory() string { return s.record.ProfileMemory }
+
 // OrgID returns the org id the worker was assigned to at observation time.
 // Empty for unassigned workers.
 func (s WorkerSnapshot) OrgID() string { return s.record.OrgID }

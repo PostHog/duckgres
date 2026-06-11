@@ -302,7 +302,28 @@ func SetupMultiTenant(
 		}
 		secretCancel()
 	}
-
+	janitor.hotIdleFloor = func(snap configstore.WorkerSnapshot) int {
+		snapshot := store.Snapshot()
+		if snapshot == nil {
+			return 0
+		}
+		org, ok := snapshot.Orgs[snap.OrgID()]
+		if !ok || org == nil {
+			return 0
+		}
+		if snap.Image() != workerImageForOrg(org, baseCfg.WorkerImage) {
+			return 0
+		}
+		profile, _, err := resolveOrgDefaultWorkerProfile(cfg.K8s, org)
+		if err != nil {
+			return 0
+		}
+		profileCPU, profileMemory := profile.Parts()
+		if snap.ProfileCPU() != profileCPU || snap.ProfileMemory() != profileMemory {
+			return 0
+		}
+		return org.DefaultWorkerMinHotIdle
+	}
 	// Node-headroom controller: keep low-priority placeholder pods holding the
 	// configured % of worker-nodepool allocatable free so worker spawns schedule
 	// immediately. Leader-only (runs on the janitor tick). No-op when disabled.

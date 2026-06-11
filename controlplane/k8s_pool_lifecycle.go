@@ -178,13 +178,13 @@ func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	return true
 }
 
-func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
+func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
 	if claimed == nil {
-		return
+		return configstore.TransitionOutcome{}, nil
 	}
 	lifecycle := p.ensureLifecycle()
 	if lifecycle == nil {
-		return
+		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, stderrors.New("worker lifecycle service not configured")
 	}
 	terminalState := configstore.WorkerStateRetired
 	if reason == RetireReasonCrash {
@@ -196,10 +196,12 @@ func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, r
 	// Pod cleanup is scheduled by the lifecycle on a successful CAS via
 	// the WorkerPhysicalCleanup (this pool's DeleteWorkerArtifacts).
 	snap := configstore.NewWorkerSnapshot(*claimed)
-	if _, err := lifecycle.RetireFromSnapshot(snap, terminalState, reason, origin); err != nil {
+	outcome, err := lifecycle.RetireFromSnapshot(snap, terminalState, reason, origin)
+	if err != nil {
 		p.logw(claimed.WorkerID).Warn("Failed to retire claimed worker.",
 			"reason", reason, "origin", origin, "error", err)
 	}
+	return outcome, err
 }
 
 // DeleteWorkerArtifacts implements WorkerPhysicalCleanup. Schedules pod

@@ -27,13 +27,14 @@ type Org struct {
 	// WorkerMemoryRequest above, which mutate the GLOBAL pool default (a known
 	// last-org-wins footgun). Empty = unset. AutoMigrate adds these columns;
 	// no migration file.
-	DefaultWorkerCPU    string            `gorm:"size:32" json:"default_worker_cpu"`
-	DefaultWorkerMemory string            `gorm:"size:32" json:"default_worker_memory"`
-	DefaultWorkerTTL    string            `gorm:"size:32" json:"default_worker_ttl"`
-	Users               []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse           *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt           time.Time         `json:"created_at"`
-	UpdatedAt           time.Time         `json:"updated_at"`
+	DefaultWorkerCPU        string            `gorm:"size:32" json:"default_worker_cpu"`
+	DefaultWorkerMemory     string            `gorm:"size:32" json:"default_worker_memory"`
+	DefaultWorkerTTL        string            `gorm:"size:32" json:"default_worker_ttl"`
+	DefaultWorkerMinHotIdle int               `gorm:"default:0" json:"default_worker_min_hot_idle"`
+	Users                   []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse               *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	CreatedAt               time.Time         `json:"created_at"`
+	UpdatedAt               time.Time         `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -552,20 +553,21 @@ func (OrgConnectionLease) TableName() string { return "org_connection_leases" }
 // *string to drive sparse-unique semantics in the underlying table; that
 // pointer-ness is irrelevant once the data is loaded into the snapshot.
 type OrgConfig struct {
-	Name                string
-	DatabaseName        string
-	HostnameAlias       string // empty when no alias is configured
-	MaxWorkers          int
-	MaxConnections      int
-	MemoryBudget        string
-	IdleTimeoutS        int
-	WorkerCPURequest    string
-	WorkerMemoryRequest string
-	DefaultWorkerCPU    string            // org default worker profile: pod cpu quantity ("" = unset)
-	DefaultWorkerMemory string            // org default worker profile: pod memory quantity ("" = unset)
-	DefaultWorkerTTL    string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
-	Users               map[string]string // username -> password
-	Warehouse           *ManagedWarehouseConfig
+	Name                    string
+	DatabaseName            string
+	HostnameAlias           string // empty when no alias is configured
+	MaxWorkers              int
+	MaxConnections          int
+	MemoryBudget            string
+	IdleTimeoutS            int
+	WorkerCPURequest        string
+	WorkerMemoryRequest     string
+	DefaultWorkerCPU        string            // org default worker profile: pod cpu quantity ("" = unset)
+	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
+	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
+	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
+	Users                   map[string]string // username -> password
+	Warehouse               *ManagedWarehouseConfig
 }
 
 // ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.

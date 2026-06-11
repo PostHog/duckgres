@@ -73,8 +73,10 @@ type orgWorkerProfileDefaults struct {
 // MatchKey ("|") and reuse each other. A sized request spawns/reuses a worker of
 // its exact cpu/memory shape on demand (see docs/design/worker-ttl-pool.md).
 func (cp *ControlPlane) resolveWorkerProfile(opts map[string]string, org orgWorkerProfileDefaults) (*WorkerProfile, []string, bool, error) {
-	k := cp.cfg.K8s
+	return resolveWorkerProfileWithConfig(cp.cfg.K8s, opts, org)
+}
 
+func resolveWorkerProfileWithConfig(k K8sConfig, opts map[string]string, org orgWorkerProfileDefaults) (*WorkerProfile, []string, bool, error) {
 	// Validate/normalize the org defaults first so they can act as the base
 	// layer underneath any client GUCs. Invalid fields warn and fall back as
 	// if unset.
