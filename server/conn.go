@@ -379,13 +379,32 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 // Includes worker_id and worker_pod so an operator chasing a specific
 // worker incident (e.g. the one in the worker-40761 postmortem) can
 // filter to just that worker's queries without joining across logs.
+// logger returns the connection-scoped logger: every line carries the session
+// identity (user, org, worker, worker_pod) so the full request/query lifecycle
+// is filterable by org or worker without joining log streams. Built per call —
+// the identity fields settle at different times (username after auth, worker
+// after assignment), so caching would freeze a half-built identity.
+func (c *clientConn) logger() *slog.Logger {
+	attrs := make([]any, 0, 8)
+	if c.username != "" {
+		attrs = append(attrs, "user", c.username)
+	}
+	if c.orgID != "" {
+		attrs = append(attrs, "org", c.orgID)
+	}
+	if c.workerID > 0 {
+		attrs = append(attrs, "worker", c.workerID)
+	}
+	if c.workerPod != "" {
+		attrs = append(attrs, "worker_pod", c.workerPod)
+	}
+	return slog.With(attrs...)
+}
+
 func (c *clientConn) logQueryStarted(query string) {
 	query = usersecrets.RedactForLog(query)
-	slog.Info("Query started.",
-		"user", c.username,
+	c.logger().Info("Query started.",
 		"query", query,
-		"worker", c.workerID,
-		"worker_pod", c.workerPod,
 		"trace_id", observe.TraceIDFromContext(c.ctx))
 }
 
@@ -402,18 +421,15 @@ func (c *clientConn) logQueryStarted(query string) {
 func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64, err error) {
 	query = usersecrets.RedactForLog(query)
 	attrs := []any{
-		"user", c.username,
 		"query", query,
 		"duration_ms", time.Since(start).Milliseconds(),
 		"rows", rows,
-		"worker", c.workerID,
-		"worker_pod", c.workerPod,
 		"trace_id", observe.TraceIDFromContext(c.ctx),
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())
 	}
-	slog.Info("Query finished.", attrs...)
+	c.logger().Info("Query finished.", attrs...)
 }
 
 // logQueryError logs a query execution failure. DuckLake-specific
@@ -424,20 +440,20 @@ func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64,
 // "user typo'd a column name."
 func (c *clientConn) logQueryError(query string, err error) {
 	query = usersecrets.RedactForLog(query)
-	attrs := []any{"user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod}
+	attrs := []any{"query", query, "error", err}
 	if isDuckLakeTransactionConflict(err) {
-		slog.Warn("DuckLake transaction conflict.", attrs...)
+		c.logger().Warn("DuckLake transaction conflict.", attrs...)
 		return
 	}
 	if isDuckLakeMetadataConnectionLost(err) {
-		slog.Warn("DuckLake metadata connection lost during transaction.", attrs...)
+		c.logger().Warn("DuckLake metadata connection lost during transaction.", attrs...)
 		return
 	}
 	if isUserQueryError(err) {
-		slog.Info("Query execution failed.", attrs...)
+		c.logger().Info("Query execution failed.", attrs...)
 		return
 	}
-	slog.Error("Query execution errored.", attrs...)
+	c.logger().Error("Query execution errored.", attrs...)
 }
 
 // safeCleanupDB safely closes the database connection, handling the case where
@@ -457,8 +473,7 @@ func (c *clientConn) safeCleanupDB() {
 	// caught by recover() — process isolation mode is needed to survive those.
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("Recovered from panic during database cleanup.",
-				"user", c.username, "panic", r)
+			c.logger().Error("Recovered from panic during database cleanup.", "panic", r)
 		}
 	}()
 
@@ -473,13 +488,12 @@ func (c *clientConn) safeCleanupDB() {
 			_, err := c.executor.ExecContext(ctx, "ROLLBACK")
 			cancel()
 			if err != nil {
-				slog.Warn("Failed to rollback transaction during cleanup.",
-					"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+				c.logger().Warn("Failed to rollback transaction during cleanup.", "error", err)
 			}
 		}
 		// Close returns the pinned *sql.Conn to the pool (does not close the DB).
 		if err := c.executor.Close(); err != nil {
-			slog.Warn("Failed to return connection to pool.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Warn("Failed to return connection to pool.", "error", err)
 		}
 		c.server.releaseFileDB(c.username)
 		return
@@ -496,14 +510,12 @@ func (c *clientConn) safeCleanupDB() {
 		// catalog that can be referenced as ducklake.information_schema.*.
 		_, err := c.executor.ExecContext(ctx, "SELECT 1 FROM duckdb_tables() WHERE database_name = 'ducklake' LIMIT 1")
 		if err != nil {
-			slog.Warn("DuckLake connection unhealthy during cleanup, skipping SQL cleanup.",
-				"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Warn("DuckLake connection unhealthy during cleanup, skipping SQL cleanup.", "error", err)
 			connHealthy = false
 		}
 	} else {
 		if err := c.executor.PingContext(ctx); err != nil {
-			slog.Warn("Database connection unhealthy during cleanup, skipping SQL cleanup.",
-				"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Warn("Database connection unhealthy during cleanup, skipping SQL cleanup.", "error", err)
 			connHealthy = false
 		}
 	}
@@ -517,8 +529,7 @@ func (c *clientConn) safeCleanupDB() {
 		_, err := c.executor.ExecContext(ctx2, "ROLLBACK")
 		cancel2()
 		if err != nil {
-			slog.Warn("Failed to rollback transaction during cleanup.",
-				"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Warn("Failed to rollback transaction during cleanup.", "error", err)
 			if isConnectionBroken(err) {
 				connHealthy = false
 			}
@@ -534,7 +545,7 @@ func (c *clientConn) safeCleanupDB() {
 		_, err := c.executor.ExecContext(ctx3, "USE memory")
 		cancel3()
 		if err != nil {
-			slog.Warn("Failed to switch to memory.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Warn("Failed to switch to memory.", "error", err)
 			if isConnectionBroken(err) {
 				connHealthy = false
 			}
@@ -551,7 +562,7 @@ func (c *clientConn) safeCleanupDB() {
 				_, err := c.executor.ExecContext(ctxIce, "DETACH "+iceberg.CatalogName)
 				cancelIce()
 				if err != nil {
-					slog.Warn("Failed to detach Iceberg catalog.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+					c.logger().Warn("Failed to detach Iceberg catalog.", "error", err)
 				}
 			}
 			if c.server.cfg.DuckLake.DeltaCatalogEnabled {
@@ -559,7 +570,7 @@ func (c *clientConn) safeCleanupDB() {
 				_, err := c.executor.ExecContext(ctxDelta, "DETACH delta")
 				cancelDelta()
 				if err != nil {
-					slog.Warn("Failed to detach Delta catalog.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+					c.logger().Warn("Failed to detach Delta catalog.", "error", err)
 				}
 			}
 
@@ -568,7 +579,7 @@ func (c *clientConn) safeCleanupDB() {
 				_, err := c.executor.ExecContext(ctx4, "DETACH ducklake")
 				cancel4()
 				if err != nil {
-					slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+					c.logger().Warn("Failed to detach DuckLake.", "error", err)
 				}
 			}
 		}
@@ -578,7 +589,7 @@ func (c *clientConn) safeCleanupDB() {
 	// If the connection is broken, this may still throw, but we've done our best
 	// to clean up the transaction state first.
 	if err := c.executor.Close(); err != nil {
-		slog.Warn("Failed to close database.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Warn("Failed to close database.", "error", err)
 	}
 }
 
@@ -720,7 +731,7 @@ func (c *clientConn) serve() error {
 	// Check if this is a passthrough user (skip transpiler + pg_catalog)
 	c.passthrough = c.server.cfg.PassthroughUsers[c.username]
 	if c.passthrough {
-		slog.Info("Passthrough mode enabled.", "user", c.username)
+		c.logger().Info("Passthrough mode enabled.")
 	}
 
 	// Create a DuckDB connection for this client session (unless pre-created by caller)
@@ -811,7 +822,7 @@ func (c *clientConn) serve() error {
 		// still surfaces from InitSessionDatabaseMetadata below.
 		if icebergAttached {
 			if err := sessionmeta.PrimeIcebergCatalog(initCtx, c.executor, iceberg.CatalogName); err != nil {
-				slog.Warn("Failed to prime Iceberg catalog before session metadata init.", "error", err)
+				c.logger().Warn("Failed to prime Iceberg catalog before session metadata init.", "error", err)
 			}
 		}
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
@@ -874,7 +885,7 @@ func (c *clientConn) handleStartup() error {
 
 		// Handle GSSENCRequest - decline and let client retry with SSL
 		if params["__gssenc_request"] == "true" {
-			slog.Debug("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
+			c.logger().Debug("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
 			if _, err := c.conn.Write([]byte("N")); err != nil {
 				return err
 			}
@@ -910,7 +921,7 @@ func (c *clientConn) handleStartup() error {
 			c.writer = bufio.NewWriter(tlsConn)
 			tlsUpgraded = true
 
-			slog.Info("TLS connection established.", "remote_addr", c.conn.RemoteAddr())
+			c.logger().Info("TLS connection established.", "remote_addr", c.conn.RemoteAddr())
 			continue
 		}
 
@@ -938,7 +949,7 @@ func (c *clientConn) handleStartup() error {
 		c.database = params["database"]
 		c.applicationName = params["application_name"]
 
-		slog.Info("Client startup.", "user", c.username, "database", c.database,
+		c.logger().Info("Client startup.", "database", c.database,
 			"application_name", c.applicationName, "remote_addr", c.conn.RemoteAddr())
 
 		if c.username == "" {
@@ -976,7 +987,7 @@ func (c *clientConn) handleStartup() error {
 		// Record failed authentication attempt
 		banned := c.server.rateLimiter.RecordFailedAuth(c.conn.RemoteAddr())
 		if banned {
-			slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", c.conn.RemoteAddr())
+			c.logger().Warn("IP banned after too many failed auth attempts.", "remote_addr", c.conn.RemoteAddr())
 		}
 		c.sendError("FATAL", "28P01", "password authentication failed")
 		return fmt.Errorf("authentication failed for user %q", c.username)
@@ -990,7 +1001,7 @@ func (c *clientConn) handleStartup() error {
 		return err
 	}
 
-	slog.Info("User authenticated.", "user", c.username, "remote_addr", c.conn.RemoteAddr())
+	c.logger().Info("User authenticated.", "remote_addr", c.conn.RemoteAddr())
 	return nil
 }
 
@@ -1007,13 +1018,13 @@ func (c *clientConn) sendInitialParams() {
 
 	for name, value := range params {
 		if err := wire.WriteParameterStatus(c.writer, name, value); err != nil {
-			slog.Warn("Failed to write parameter.", "param", name, "error", err)
+			c.logger().Warn("Failed to write parameter.", "param", name, "error", err)
 		}
 	}
 
 	// Send backend key data (pid and secret key for cancel requests)
 	if err := wire.WriteBackendKeyData(c.writer, c.pid, c.secretKey); err != nil {
-		slog.Warn("Failed to write backend key data.", "error", err)
+		c.logger().Warn("Failed to write backend key data.", "error", err)
 	}
 }
 
@@ -1031,7 +1042,7 @@ func (c *clientConn) messageLoop() error {
 			}
 			// Check if this is a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				slog.Info("Connection idle timeout, closing.", "user", c.username)
+				c.logger().Info("Connection idle timeout, closing.")
 				return nil
 			}
 			return err
@@ -1045,10 +1056,10 @@ func (c *clientConn) messageLoop() error {
 			c.ignoreTillSync = false
 			if err := c.handleQuery(body); err != nil {
 				if isConnectionBroken(err) {
-					slog.Info("Client connection lost during query.", "user", c.username, "error", err)
+					c.logger().Info("Client connection lost during query.", "error", err)
 					return nil
 				}
-				slog.Error("Query error.", "error", err)
+				c.logger().Error("Query error.", "error", err)
 			}
 
 		case wire.MsgParse:
@@ -1091,7 +1102,7 @@ func (c *clientConn) messageLoop() error {
 			return nil
 
 		default:
-			slog.Warn("Unknown message type.", "type", string(msgType))
+			c.logger().Warn("Unknown message type.", "type", string(msgType))
 		}
 	}
 }
@@ -1138,7 +1149,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	c.ctx = ctx
 	defer func() { c.ctx = prevCtx }()
 
-	slog.Debug("Query received.", "user", c.username, "query", loggableQuery)
+	c.logger().Debug("Query received.", "query", loggableQuery)
 
 	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
 	// or transpilation. DuckDB doesn't support these natively, so cursor
@@ -1233,7 +1244,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			_ = c.writer.Flush()
 			return nil
 		}
-		slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", loggableQuery)
+		c.logger().Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "query", loggableQuery)
 	}
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
@@ -1252,7 +1263,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle ignored SET parameters
 	if result.IsIgnoredSet {
-		slog.Debug("Ignoring PostgreSQL-specific SET.", "user", c.username, "query", query)
+		c.logger().Debug("Ignoring PostgreSQL-specific SET.", "query", query)
 		_ = wire.WriteCommandComplete(c.writer, "SET")
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
@@ -1261,7 +1272,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle no-op commands (CREATE INDEX, VACUUM, etc.)
 	if result.IsNoOp {
-		slog.Debug("No-op command (DuckLake limitation).", "user", c.username, "query", query)
+		c.logger().Debug("No-op command (DuckLake limitation).", "query", query)
 		_ = wire.WriteCommandComplete(c.writer, result.NoOpTag)
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
@@ -1270,7 +1281,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle multi-statement results (writable CTE rewrites)
 	if len(result.Statements) > 0 {
-		slog.Debug("Multi-statement query.", "user", c.username, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
+		c.logger().Debug("Multi-statement query.", "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
 		return c.executeMultiStatement(result.Statements, result.CleanupStatements)
 	}
 
@@ -1280,7 +1291,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
-		slog.Debug("Query transpiled.", "user", c.username, "executed", query)
+		c.logger().Debug("Query transpiled.", "executed", query)
 	}
 
 	// Determine command type for proper response

@@ -128,7 +128,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 			}
 			for _, snap := range orphaned {
 				if _, err := j.lifecycle.RetireOrphanFromSnapshot(snap, janitorRetireReasonOrphaned, LifecycleOriginJanitorOrphan); err != nil {
-					slog.Warn("Janitor failed to retire orphan worker.", "worker_id", snap.WorkerID(), "error", err)
+					slog.Warn("Janitor failed to retire orphan worker.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
 				}
 			}
 		}
@@ -141,7 +141,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 		} else {
 			for _, snap := range stuckWorkers {
 				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, janitorRetireReasonStuckActivating, LifecycleOriginJanitorStuckActivating); err != nil {
-					slog.Warn("Janitor failed to retire stuck worker.", "worker_id", snap.WorkerID(), "error", err)
+					slog.Warn("Janitor failed to retire stuck worker.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
 				}
 			}
 		}
@@ -155,7 +155,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 			}
 			for _, snap := range expired {
 				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired", LifecycleOriginJanitorHotIdleTTL); err != nil {
-					slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", snap.WorkerID(), "error", err)
+					slog.Warn("Janitor failed to retire hot-idle worker.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
 				}
 			}
 		}

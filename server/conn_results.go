@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -20,7 +19,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("Failed to get column info.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -28,7 +27,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("Failed to get column types.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -57,7 +56,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Failed to scan row.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			return
@@ -73,7 +72,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Row iteration error.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 		}
 		c.setTxError()
@@ -91,7 +90,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("Failed to get column info.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -101,7 +100,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		c.logger().Error("Failed to get column types.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -130,7 +129,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Failed to scan row.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -148,7 +147,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Row iteration error.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 		}
 		c.setTxError()
@@ -509,7 +508,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	} else if severity == "ERROR" {
 		queryErrorsCounter.WithLabelValues(c.orgID).Inc()
 	}
-	slog.Debug("Sending error to client.", "user", c.username, "severity", severity, "code", code, "message", message)
+	c.logger().Debug("Sending error to client.", "severity", severity, "code", code, "message", message)
 	c.errorResponsesSent++
 	_ = wire.WriteErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()

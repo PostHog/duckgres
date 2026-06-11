@@ -136,7 +136,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	// In K8s mode, DuckDB auto-detects memory from the container's cgroup limits.
 	// Pass 0/false to disable budget-based rebalancing.
 	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
-	sessions := NewSessionManager(pool, rebalancer)
+	sessions := NewOrgSessionManager(pool, rebalancer, tc.Name)
 	if tr.userSecrets != nil {
 		sessions.SetUserSecretLoader(tr.userSecrets.SessionSecretLoader(tc.Name))
 	}

@@ -44,7 +44,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*M
 		if idle != nil {
 			idle.claimSessionLocked()
 			p.mu.Unlock()
-			slog.Debug("Reusing idle worker.", "worker", idle.ID, "active_sessions", idle.activeSessions)
+			slog.Debug("Reusing idle worker.", append(workerLogAttrs(idle), "active_sessions", idle.activeSessions)...)
 			return idle, nil
 		}
 
@@ -80,7 +80,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*M
 			p.spawning++
 			p.mu.Unlock()
 
-			slog.Info("No live workers, blocking on spawn.", "worker", id)
+			p.logw(id).Info("No live workers, blocking on spawn.")
 			err := p.SpawnWorker(ctx, id, p.workerImage)
 
 			p.mu.Lock()
@@ -292,7 +292,7 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 			// filtered by image, so still retire on a version mismatch (e.g.
 			// after an image bump) rather than serve a stale-version worker.
 			if assignment.Image != "" && hotClaimed.Image != assignment.Image {
-				slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
+				slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker", hotClaimed.WorkerID, "worker_pod", hotClaimed.PodName, "org", assignment.OrgID, "expected", assignment.Image, "got", hotClaimed.Image)
 				p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
 				// Fall through to the spawning-slot decision or capacity backpressure.
 			} else {
@@ -348,10 +348,10 @@ func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, cla
 			return worker, false, nil
 		}
 		if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
-			slog.Warn("Hot-idle worker claim was stale, retrying.", "worker_id", claim.hotClaimed.WorkerID, "error", reserveErr)
+			slog.Warn("Hot-idle worker claim was stale, retrying.", "worker", claim.hotClaimed.WorkerID, "worker_pod", claim.hotClaimed.PodName, "org", claim.hotClaimed.OrgID, "error", reserveErr)
 			return nil, true, reserveErr
 		}
-		slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", claim.hotClaimed.WorkerID, "error", reserveErr)
+		slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker", claim.hotClaimed.WorkerID, "worker_pod", claim.hotClaimed.PodName, "org", claim.hotClaimed.OrgID, "error", reserveErr)
 		p.retireClaimedWorker(claim.hotClaimed, RetireReasonCrash, LifecycleOriginReserveFailure)
 		// Pre-split ReserveSharedWorker fell through to a fresh spawn here; the
 		// retry re-runs the decision, which lands on the spawning-slot path.
@@ -438,7 +438,7 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 		_ = p.persistWorkerRecord(reservedRecord)
 	}
 	if err := p.checkReservedWorkerLiveness(ctx, worker); err != nil {
-		slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "worker_pod", worker.PodName(), "error", err)
+		slog.Warn("Claimed worker failed liveness recheck.", append(workerLogAttrs(worker), "error", err)...)
 		p.retireWorkerWithReason(worker.ID, RetireReasonCrash, LifecycleOriginReserveFailure)
 		return nil, err
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/posthog/duckgres/server"
 )
@@ -156,7 +157,32 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	p.ownerEpoch = payload.OwnerEpoch
 	p.ownerCPInstanceID = payload.CPInstanceID
 	p.workerID = payload.WorkerID
+	stampWorkerLogIdentity(payload.OrgID, payload.WorkerID)
 	return nil
+}
+
+// workerLogIdentityOnce guards the one-time default-logger stamp: takeovers
+// and credential refreshes re-activate with the same identity, and stamping
+// again would duplicate the attrs on every line.
+var workerLogIdentityOnce sync.Once
+
+// stampWorkerLogIdentity attaches the worker's tenant identity to the default
+// logger, so EVERY worker log line — session create/destroy, query execution,
+// drain — carries org= and worker= alongside the pod=/node= stamps, matching
+// the control plane's per-connection identity attrs.
+func stampWorkerLogIdentity(orgID string, workerID int) {
+	workerLogIdentityOnce.Do(func() {
+		attrs := make([]any, 0, 4)
+		if orgID != "" {
+			attrs = append(attrs, "org", orgID)
+		}
+		if workerID > 0 {
+			attrs = append(attrs, "worker", workerID)
+		}
+		if len(attrs) > 0 {
+			slog.SetDefault(slog.Default().With(attrs...))
+		}
+	})
 }
 
 func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {

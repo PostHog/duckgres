@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -405,7 +404,7 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 		_ = c.writer.Flush()
 		return nil
 	}
-	slog.Debug("Multi-statement simple query.", "user", c.username, "count", len(tree.Stmts))
+	c.logger().Debug("Multi-statement simple query.", "count", len(tree.Stmts))
 
 	for _, stmt := range tree.Stmts {
 		// Deparse individual statement back to SQL
@@ -594,7 +593,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
 			return true, nil
 		}
-		slog.Debug("Fallback to native DuckDB.", "user", c.username, "query", query)
+		c.logger().Debug("Fallback to native DuckDB.", "query", query)
 	}
 
 	if result.Error != nil {
@@ -620,7 +619,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	executedQuery := c.rewriteDirectQuery(result.SQL)
 	if executedQuery != query {
-		slog.Debug("Query transpiled.", "user", c.username, "executed", executedQuery)
+		c.logger().Debug("Query transpiled.", "executed", executedQuery)
 	}
 
 	upperQuery := strings.ToUpper(executedQuery)
@@ -842,7 +841,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	// logQueryFinished pair (PR #519).
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		slog.Debug("Multi-stmt setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
+		c.logger().Debug("Multi-stmt setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		setupStart := time.Now()
 		c.logQueryStarted(stmt)
 		result, err := c.executor.Exec(stmt)
@@ -852,7 +851,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		}
 		c.logQueryFinished(stmt, setupStart, setupRows, err)
 		if err != nil {
-			slog.Error("Multi-stmt setup error.", "user", c.username, "query", stmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Multi-stmt setup error.", "query", stmt, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -867,7 +866,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	finalStmt := statements[len(statements)-1]
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	slog.Debug("Multi-stmt final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
+	c.logger().Debug("Multi-stmt final.", "stmt", finalStmt, "cmd_type", cmdType)
 
 	finalStart := time.Now()
 	var finalRowsAff int64
@@ -882,7 +881,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
 			finalErr = err
-			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Multi-stmt final query error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -912,7 +911,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
 			finalErr = err
-			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Multi-stmt final exec error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -939,11 +938,11 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 // This is used to clean up temp tables after a multi-statement query.
 func (c *clientConn) executeCleanup(cleanup []string) {
 	for _, stmt := range cleanup {
-		slog.Debug("Multi-stmt cleanup.", "user", c.username, "stmt", stmt)
+		c.logger().Debug("Multi-stmt cleanup.", "stmt", stmt)
 		_, err := c.executor.Exec(stmt)
 		if err != nil {
 			// Log but don't fail - cleanup is best effort
-			slog.Warn("Multi-stmt cleanup error (ignored).", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Warn("Multi-stmt cleanup error (ignored).", "error", err)
 		}
 	}
 }
@@ -974,7 +973,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	// setup work is observable per statement, not just per outer query.
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		slog.Debug("Multi-stmt-ext setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
+		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		setupStart := time.Now()
 		c.logQueryStarted(stmt)
 		result, err := c.executor.Exec(stmt, args...)
@@ -984,7 +983,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		}
 		c.logQueryFinished(stmt, setupStart, setupRows, err)
 		if err != nil {
-			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "query", stmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Multi-stmt-ext setup error.", "query", stmt, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -997,7 +996,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	finalStmt := statements[len(statements)-1]
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	slog.Debug("Multi-stmt-ext final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
+	c.logger().Debug("Multi-stmt-ext final.", "stmt", finalStmt, "cmd_type", cmdType)
 
 	finalStart := time.Now()
 	var finalRowsAff int64
@@ -1012,7 +1011,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
 			finalErr = err
-			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Multi-stmt-ext final query error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -1034,7 +1033,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
 			finalErr = err
-			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())

@@ -770,13 +770,17 @@ func (cp *ControlPlane) managedHostnameHint() string {
 
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
-	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
+	// Connection-scoped logger: grows identity attrs as they resolve
+	// (remote_addr -> user -> org -> worker), so every line in the request
+	// lifecycle is filterable without joining log streams.
+	clog := slog.With("remote_addr", remoteAddr)
+	clog.Info("Connection accepted.")
 	server.IncrementOpenConnections()
 	defer server.DecrementOpenConnections()
 
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
-		slog.Warn("Connection rejected.", "remote_addr", remoteAddr, "reason", msg)
+		clog.Warn("Connection rejected.", "reason", msg)
 		_ = conn.Close()
 		return
 	}
@@ -785,7 +789,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Set a startup read timeout to prevent goroutine leaks from clients
 	// that connect but never send data (e.g., load balancer TCP health checks).
 	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		slog.Error("Failed to set startup deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to set startup deadline.", "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -795,9 +799,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	params, err := readStartupFromRaw(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
-			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
+			clog.Debug("Client closed connection before sending startup message.")
 		} else {
-			slog.Error("Failed to read startup.", "remote_addr", remoteAddr, "error", err)
+			clog.Error("Failed to read startup.", "error", err)
 		}
 		_ = conn.Close()
 		return
@@ -813,7 +817,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Clear the startup read deadline before proceeding to TLS (which sets its own).
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to clear startup deadline.", "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -825,14 +829,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// Send a PostgreSQL error so the client sees a clear message.
 			_ = server.WriteErrorResponse(conn, "FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
 		}
-		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
+		clog.Warn("Connection rejected: SSL required.")
 		_ = conn.Close()
 		return
 	}
 
 	// Send 'S' to indicate SSL support
 	if _, err := conn.Write([]byte("S")); err != nil {
-		slog.Error("Failed to send SSL response.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to send SSL response.", "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -843,20 +847,20 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// TLS handshake
 	tlsConn := tls.Server(conn, cp.tlsConfig)
 	if err := tlsConn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		slog.Error("Failed to set TLS deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to set TLS deadline.", "error", err)
 		_ = conn.Close()
 		return
 	}
 	if err := tlsConn.Handshake(); err != nil {
-		slog.Error("TLS handshake failed.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("TLS handshake failed.", "error", err)
 		_ = tlsConn.Close()
 		return
 	}
-	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
+	clog.Info("TLS connection established.")
 	defer func() { _ = tlsConn.Close() }()
 
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-		slog.Error("Failed to clear TLS deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to clear TLS deadline.", "error", err)
 		return
 	}
 
@@ -866,13 +870,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Read startup message (user/database)
 	startupParams, err := server.ReadStartupMessage(reader)
 	if err != nil {
-		slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to read startup message.", "error", err)
 		return
 	}
 
 	username := startupParams["user"]
 	database := startupParams["database"]
 	applicationName := startupParams["application_name"]
+	clog = clog.With("user", username)
 
 	// Honor a client-supplied connect-time search_path from the startup
 	// `options` parameter (libpq `options=-c search_path=...`, PGOPTIONS, or
@@ -885,7 +890,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if sp, ok := server.SanitizeSearchPath(raw); ok {
 			clientSearchPath = sp
 		} else {
-			slog.Warn("Ignoring unsafe client search_path option.", "remote_addr", remoteAddr, "search_path", raw)
+			clog.Warn("Ignoring unsafe client search_path option.", "search_path", raw)
 		}
 	}
 
@@ -898,18 +903,18 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Request password
 	if err := server.WriteAuthCleartextPassword(writer); err != nil {
-		slog.Error("Failed to request password.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to request password.", "error", err)
 		return
 	}
 	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to flush writer.", "error", err)
 		return
 	}
 
 	// Read password response
 	msgType, body, err := server.ReadMessage(reader)
 	if err != nil {
-		slog.Error("Failed to read password message.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to read password message.", "error", err)
 		return
 	}
 
@@ -940,13 +945,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// Identity now comes solely from the managed hostname. The legacy
 			// database→org routing is gone, so an org cannot be resolved without
 			// SNI routing enabled. Warn loudly — this is a misconfiguration.
-			slog.Warn("Postgres connection: SNI routing disabled but identity now requires a managed hostname; set sni_routing_mode=enforce.",
-				"mode", cp.cfg.SNIRoutingMode, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			clog.Warn("Postgres connection: SNI routing disabled but identity now requires a managed hostname; set sni_routing_mode=enforce.",
+				"mode", cp.cfg.SNIRoutingMode, "application_name", applicationName)
 		}
 		if !sniResolution.isManaged {
 			hint := cp.managedHostnameHint()
-			slog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
-				"sni", sni, "expected", hint, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			clog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
+				"sni", sni, "expected", hint, "application_name", applicationName)
 			_ = server.WriteErrorResponse(writer, "FATAL", "08006",
 				fmt.Sprintf("this server requires connecting via %s", hint))
 			_ = writer.Flush()
@@ -958,8 +963,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			observeSNIRoutingResolution("postgres", resolution.SNIAliasUsed)
 		}
 		if !resolution.SNIResolved {
-			slog.Warn("Postgres connection rejected: managed hostname does not resolve to a known organization.",
-				"sni", sni, "sni_prefix", sniResolution.sniPrefix, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			clog.Warn("Postgres connection rejected: managed hostname does not resolve to a known organization.",
+				"sni", sni, "sni_prefix", sniResolution.sniPrefix, "application_name", applicationName)
 			_ = server.WriteErrorResponse(writer, "FATAL", "08006",
 				fmt.Sprintf("this server requires connecting via %s", cp.managedHostnameHint()))
 			_ = writer.Flush()
@@ -968,24 +973,25 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if !resolution.CatalogValid {
 			// The startup `database` is now a catalog selector; only
 			// "ducklake"/"iceberg"/empty are valid. No logical-name masking.
-			slog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
-				"database", database, "org", resolution.OrgID, "remote_addr", remoteAddr, "user", username)
+			clog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
+				"database", database, "org", resolution.OrgID)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000",
 				fmt.Sprintf("database %q does not exist (connect with \"ducklake\" or \"iceberg\")", database))
 			_ = writer.Flush()
 			return
 		}
 		if !resolution.Valid {
-			slog.Warn("Authentication failed.", "user", username, "org", resolution.OrgID, "database", database, "remote_addr", remoteAddr)
+			clog.Warn("Authentication failed.", "org", resolution.OrgID, "database", database)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
-				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+				clog.Warn("IP banned after too many failed auth attempts.")
 			}
 			_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 			_ = writer.Flush()
 			return
 		}
 		orgID = resolution.OrgID
+		clog = clog.With("org", orgID)
 		passthroughUser = resolution.Passthrough
 		defaultCatalog = resolution.DefaultCatalog
 		requestedCatalog = resolution.EffectiveCatalog
@@ -995,10 +1001,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	} else {
 		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
-			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
+			clog.Warn("Authentication failed.")
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
-				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+				clog.Warn("IP banned after too many failed auth attempts.")
 			}
 			_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 			_ = writer.Flush()
@@ -1008,12 +1014,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Send auth OK
 	if err := server.WriteAuthOK(writer); err != nil {
-		slog.Error("Failed to send auth OK.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to send auth OK.", "error", err)
 		return
 	}
 
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
-	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
+	clog.Info("User authenticated.")
 
 	// Resolve the requested worker shape from the connection-string startup
 	// options (duckgres.worker_cpu / worker_memory / worker_ttl), layered on
@@ -1028,18 +1034,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	workerProfile, profileWarns, orgProfileApplied, profileErr := cp.resolveWorkerProfile(startupOptions, orgProfileDefaults)
 	if profileErr != nil {
-		slog.Warn("Rejected worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", profileErr)
+		clog.Warn("Rejected worker profile.", "error", profileErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "22023", profileErr.Error())
 		_ = writer.Flush()
 		return
 	}
 	for _, w := range profileWarns {
-		slog.Warn("Adjusted worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "detail", w)
+		clog.Warn("Adjusted worker profile.", "detail", w)
 	}
 	if orgProfileApplied && workerProfile != nil {
 		// Once per connection so support can see which shape a tenant got.
-		slog.Info("Applied org default worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr,
-			"cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
+		clog.Info("Applied org default worker profile.", 			"cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
 
 	// Resolve the session manager and rebalancer for this connection.
@@ -1051,7 +1056,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// hitting a partially-migrated catalog. The client gets a clear error
 		// and can retry after the migration completes.
 		if cp.orgRouter.IsMigratingForOrg(orgID) {
-			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", orgID, "remote_addr", remoteAddr)
+			clog.Info("Connection rejected during DuckLake migration.")
 			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
 			_ = writer.Flush()
@@ -1110,7 +1115,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	defer server.CancelClientConn(tmpCC)
 	server.SendInitialParams(tmpCC)
 	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush initial params.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to flush initial params.", "error", err)
 		return
 	}
 
@@ -1138,7 +1143,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		},
 	)
 	if err != nil {
-		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to create session.", "error", err)
 		code, message := sessionCreationErrorResponse(err)
 		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
 		_ = writer.Flush()
@@ -1147,6 +1152,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Worker is now assigned — capture identity for log correlation.
 	workerID := sessions.WorkerIDForPID(pid)
 	workerPod := sessions.WorkerPodNameForPID(pid)
+	clog = clog.With("worker", workerID, "worker_pod", workerPod)
 	if orgID != "" {
 		observeOrgSessionsActive(orgID, sessions.SessionCount())
 	}
@@ -1170,7 +1176,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		probeErr = icErr
 	}
 	if probeErr != nil {
-		slog.Error("Failed to detect attached catalogs.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", probeErr, "worker", workerID, "worker_pod", workerPod)
+		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
 		_ = writer.Flush()
 		return
@@ -1180,8 +1186,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		var ok bool
 		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, defaultCatalog, duckLakeAttached, icebergAttached)
 		if !ok {
-			slog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
-				"requested", requestedCatalog, "org", orgID, "ducklake_attached", duckLakeAttached, "iceberg_attached", icebergAttached, "remote_addr", remoteAddr, "user", username)
+			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
+				"requested", requestedCatalog, "ducklake_attached", duckLakeAttached, "iceberg_attached", icebergAttached)
 			msg := "no catalog is available for this connection"
 			if requestedCatalog != "" {
 				msg = fmt.Sprintf("database %q does not exist", requestedCatalog)
@@ -1223,14 +1229,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if icebergAttached {
 			primeCtx, primeCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			if err := sessionmeta.PrimeIcebergCatalog(primeCtx, executor, physicalIcebergCatalog); err != nil {
-				slog.Warn("Failed to prime Iceberg catalog before session metadata init.", "user", username, "org", orgID, "error", err, "worker", workerID, "worker_pod", workerPod)
+				clog.Warn("Failed to prime Iceberg catalog before session metadata init.", "error", err)
 			}
 			primeCancel()
 		}
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, effectiveCatalog); err != nil {
 			initCancel()
-			slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+			clog.Error("Failed to initialize session database metadata.", "database", database, "error", err)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
 			_ = writer.Flush()
 			return
@@ -1249,12 +1255,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			spCancel()
 			if err != nil {
 				if source == sessionDefaultSourceConfiguredCatalog {
-					slog.Error("Failed to apply session default catalog.", "user", username, "org", orgID, "catalog", effectiveCatalog, "error", err)
+					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
 					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 					_ = writer.Flush()
 					return
 				}
-				slog.Warn("Failed to apply client connect-time search_path; using default.", "user", username, "org", orgID, "search_path", clientSearchPath, "error", err)
+				clog.Warn("Failed to apply client connect-time search_path; using default.", "search_path", clientSearchPath, "error", err)
 			}
 		}
 	} else {
@@ -1263,14 +1269,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// Standalone passthrough does this via server.setDuckLakeDefault/
 		// setIcebergDefault; the remote-worker path issues the equivalent here.
 		if clientSearchPath != "" {
-			slog.Warn("Ignoring client connect-time search_path for passthrough session.", "user", username, "org", orgID, "search_path", clientSearchPath, "remote_addr", remoteAddr)
+			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", clientSearchPath)
 		}
 		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
 			initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(initCtx, cmd)
 			initCancel()
 			if err != nil {
-				slog.Error("Failed to apply passthrough session default catalog.", "user", username, "org", orgID, "command", cmd, "error", err, "worker", workerID, "worker_pod", workerPod)
+				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
 				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 				_ = writer.Flush()
 				return
@@ -1304,21 +1310,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
-		slog.Error("Failed to send ReadyForQuery.", "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+		clog.Error("Failed to send ReadyForQuery.", "error", err)
 		return
 	}
 	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+		clog.Error("Failed to flush writer.", "error", err)
 		return
 	}
 
 	// Run message loop
 	if err := server.RunMessageLoop(cc); err != nil {
-		slog.Error("Message loop error.", "user", username, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+		clog.Error("Message loop error.", "error", err)
 		return
 	}
 
-	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr, "worker", workerID, "worker_pod", workerPod)
+	clog.Info("Client disconnected.")
 }
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker

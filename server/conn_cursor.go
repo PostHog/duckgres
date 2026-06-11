@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -258,7 +257,7 @@ func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCur
 	c.closeCursor(stmt.Portalname)
 
 	c.cursors[stmt.Portalname] = &cursorState{query: transpiledSQL}
-	slog.Debug("Cursor declared.", "user", c.username, "cursor", stmt.Portalname, "query", transpiledSQL)
+	c.logger().Debug("Cursor declared.", "cursor", stmt.Portalname, "query", transpiledSQL)
 
 	_ = wire.WriteCommandComplete(c.writer, "DECLARE CURSOR")
 	c.logQuery(start, query, query, "DECLARE", 0, 0, "", "", "simple")
@@ -406,7 +405,7 @@ func (c *clientConn) handleCloseCursor(query string, stmt *pg_query.ClosePortalS
 		c.closeCursor(stmt.Portalname)
 	}
 
-	slog.Debug("Cursor closed.", "user", c.username, "cursor", stmt.Portalname)
+	c.logger().Debug("Cursor closed.", "cursor", stmt.Portalname)
 	_ = wire.WriteCommandComplete(c.writer, "CLOSE CURSOR")
 	c.logQuery(start, query, query, "CLOSE", 0, 0, "", "", "simple")
 	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -420,7 +419,7 @@ func (c *clientConn) handleDeclareCursorExtended(p *portal) {
 	c.closeCursor(p.stmt.cursorName)
 
 	c.cursors[p.stmt.cursorName] = &cursorState{query: p.stmt.cursorQuery}
-	slog.Debug("Cursor declared (extended).", "user", c.username, "cursor", p.stmt.cursorName, "query", p.stmt.cursorQuery)
+	c.logger().Debug("Cursor declared (extended).", "cursor", p.stmt.cursorName, "query", p.stmt.cursorQuery)
 
 	_ = wire.WriteCommandComplete(c.writer, "DECLARE CURSOR")
 }
@@ -501,6 +500,6 @@ func (c *clientConn) handleCloseCursorExtended(p *portal) {
 		c.closeCursor(p.stmt.cursorName)
 	}
 
-	slog.Debug("Cursor closed (extended).", "user", c.username, "cursor", p.stmt.cursorName)
+	c.logger().Debug("Cursor closed (extended).", "cursor", p.stmt.cursorName)
 	_ = wire.WriteCommandComplete(c.writer, "CLOSE CURSOR")
 }
