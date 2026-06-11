@@ -4160,3 +4160,46 @@ func TestCPReplicaSetHash(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerDoNotDisruptLifecycle(t *testing.T) {
+	// Busy-only protection: born protected (spawn sets the annotation on the
+	// pod spec), disruptable when parked hot-idle, protected again on reuse.
+	cs := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "duckgres-worker-test-cp-7",
+			Namespace:   "default",
+			Annotations: map[string]string{doNotDisruptAnnotation: "true"},
+		},
+	})
+	pool := &K8sWorkerPool{clientset: cs, namespace: "default", cpID: "test-cp"}
+	w := &ManagedWorker{ID: 7}
+
+	annotation := func() (string, bool) {
+		pod, err := cs.CoreV1().Pods("default").Get(context.Background(), "duckgres-worker-test-cp-7", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get pod: %v", err)
+		}
+		v, ok := pod.Annotations[doNotDisruptAnnotation]
+		return v, ok
+	}
+
+	// Parked hot-idle: annotation must go away so consolidation can reclaim
+	// the node. markWorkerDisruptable patches async — poll briefly.
+	pool.markWorkerDisruptable(w)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := annotation(); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("do-not-disrupt annotation not removed for hot-idle worker")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Reused for a session: protected again (synchronous).
+	pool.markWorkerProtected(w)
+	if v, ok := annotation(); !ok || v != "true" {
+		t.Fatalf("do-not-disrupt annotation = %q,%v after protect, want \"true\"", v, ok)
+	}
+}

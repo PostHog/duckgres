@@ -50,6 +50,14 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	acquireStart := time.Now()
 	defer func() {
 		observeAcquireTotal(time.Since(acquireStart), acquireTotalOutcome(err))
+		if worker != nil {
+			// Session assigned: veto voluntary disruption (consolidation/drift)
+			// of the worker's node until release. Freshly spawned pods are
+			// already born with the annotation; this covers hot-idle reuse and
+			// cross-CP claims. Synchronous so it cannot reorder after a later
+			// release's removal.
+			p.shared.markWorkerProtected(worker)
+		}
 	}()
 
 	// Fast path: reuse an already-assigned, idle (Hot) worker of the requested
@@ -288,6 +296,12 @@ func (p *OrgReservedPool) tryReuseIdleAssigned(profile *WorkerProfile) *ManagedW
 
 func (p *OrgReservedPool) ReleaseWorker(id int) {
 	if p.shared.TransitionToHotIdleIfNoSessions(id) {
+		// Parked hot-idle: drop the do-not-disrupt veto so Karpenter may
+		// consolidate a node holding only idle workers/placeholders. The next
+		// acquire re-adds it before the session starts.
+		if w, ok := p.shared.Worker(id); ok {
+			p.shared.markWorkerDisruptable(w)
+		}
 		return
 	}
 	// TransitionToHotIdleIfNoSessions already decremented activeSessions.

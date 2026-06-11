@@ -80,6 +80,10 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			Name:      podName,
 			Namespace: p.namespace,
 			Labels:    podLabels,
+			// Born protected: the spawn+activate window and the first session
+			// must not be consolidation-evicted. Removed when the worker first
+			// parks hot-idle, re-added per session (see k8s_pool_disruption.go).
+			Annotations: map[string]string{doNotDisruptAnnotation: "true"},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                 corev1.RestartPolicyNever,

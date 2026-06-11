@@ -113,6 +113,17 @@ only) it:
 - placeholder pods use a PriorityClass **below** the worker PriorityClass, so a
   real worker spawn preempts them and schedules immediately; the evicted
   placeholder triggers Karpenter to add a node in the background.
+- the placeholder target is sized against the **non-placeholder** allocatable
+  (floor: one placeholder while enabled). Sizing against raw allocatable is
+  self-referential and ratchets: placeholders pin nodes, pinned nodes inflate
+  allocatable, the inflated total raises the target.
+- workers carry `karpenter.sh/do-not-disrupt` **only while busy** (set at pod
+  create — covering spawn/activate and the first session — re-added per
+  session, removed when parked hot-idle). With the worker nodepool on
+  `WhenEmptyOrUnderutilized`, Karpenter can consolidate nodes holding only
+  idle workers/placeholders, while a node running a query is never voluntarily
+  disrupted; pinning is bounded by query lifetime, not the worker TTL (which
+  would stall drift rollouts).
 
 Config: `DUCKGRES_K8S_HEADROOM_PERCENT` (0 = disabled), placeholder pod size,
 the two PriorityClass names. Manifests add the PriorityClasses.
