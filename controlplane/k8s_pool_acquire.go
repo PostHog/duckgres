@@ -245,16 +245,14 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 	}
 }
 
-// sharedWorkerClaim is the outcome of the short reservation decision: a
-// compatible hot-idle worker claimed in the runtime store, an incompatible
-// hot-idle worker to retire before retrying, or a freshly created spawning slot.
-// Any claim/slot is already bound to the caller in the durable store (or locally
-// allocated in runtime-store-less mode), so the caller may finish multi-minute
-// completion without holding any per-org serialization.
+// sharedWorkerClaim is the outcome of the short reservation decision: either a
+// compatible hot-idle worker claimed in the runtime store or a freshly created
+// spawning slot. Any claim/slot is already bound to the caller in the durable
+// store (or locally allocated in runtime-store-less mode), so the caller may
+// finish multi-minute completion without holding any per-org serialization.
 type sharedWorkerClaim struct {
-	hotClaimed    *configstore.WorkerRecord
-	retireHotIdle *configstore.WorkerRecord
-	slotID        int
+	hotClaimed *configstore.WorkerRecord
+	slotID     int
 }
 
 // reserveSharedWorkerDecision is the short, DB-only half of ReserveSharedWorker:
@@ -289,16 +287,6 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 		}
 		if hotClaimed != nil {
 			return &sharedWorkerClaim{hotClaimed: hotClaimed}, nil
-		}
-
-		replaceHotIdle, err := p.runtimeStore.FindIncompatibleHotIdleWorkerForReplacement(
-			assignment.OrgID, assignment.Image, hotProfileCPU, hotProfileMem,
-			assignment.MaxWorkers, maxGlobal)
-		if err != nil {
-			return nil, err
-		}
-		if replaceHotIdle != nil {
-			return &sharedWorkerClaim{retireHotIdle: replaceHotIdle}, nil
 		}
 	}
 
@@ -358,24 +346,6 @@ func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, cla
 		// Pre-split ReserveSharedWorker fell through to a fresh spawn here; the
 		// retry re-runs the decision, which lands on the spawning-slot path.
 		return nil, true, reserveErr
-	}
-	if claim.retireHotIdle != nil {
-		slog.Info("Retiring incompatible hot-idle worker before spawning replacement.",
-			"worker", claim.retireHotIdle.WorkerID,
-			"worker_pod", claim.retireHotIdle.PodName,
-			"org", claim.retireHotIdle.OrgID,
-			"worker_image", claim.retireHotIdle.Image,
-			"requested_image", assignment.Image,
-			"worker_profile_cpu", claim.retireHotIdle.ProfileCPU,
-			"worker_profile_memory", claim.retireHotIdle.ProfileMemory)
-		outcome, retireErr := p.retireClaimedWorker(claim.retireHotIdle, RetireReasonIncompatibleHotIdle, LifecycleOriginReserveIncompatibleHotIdle)
-		if retireErr != nil {
-			return nil, false, retireErr
-		}
-		if !outcome.Transitioned {
-			return nil, false, NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonGlobalCap, DefaultWorkerSpawnRetryAfter)
-		}
-		return nil, true, nil
 	}
 	worker, err = p.spawnReservedWorkerForSlot(ctx, claim.slotID, assignment)
 	return worker, false, err
