@@ -502,3 +502,33 @@ func TestOrgDefaultWorkerProfile(t *testing.T) {
 		t.Errorf("nil-snapshot OrgDefaultWorkerProfile = (%q,%q,%q); want all empty", cpu, mem, ttl)
 	}
 }
+
+func TestOrgDefaultWorkerMinHotIdle(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"unset": {Name: "unset"},
+				"full":  {Name: "full", DefaultWorkerMinHotIdle: 2},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID string
+		want  int
+	}{
+		{"unknown", 0},
+		{"unset", 0},
+		{"full", 2},
+	}
+	for _, tt := range tests {
+		if got := cs.OrgDefaultWorkerMinHotIdle(tt.orgID); got != tt.want {
+			t.Errorf("OrgDefaultWorkerMinHotIdle(%q) = %d; want %d", tt.orgID, got, tt.want)
+		}
+	}
+
+	empty := &ConfigStore{}
+	if got := empty.OrgDefaultWorkerMinHotIdle("full"); got != 0 {
+		t.Errorf("nil-snapshot OrgDefaultWorkerMinHotIdle = %d; want 0", got)
+	}
+}

@@ -312,6 +312,7 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		}
 		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers
 		connLimitChanged := oldTC.MaxConnections != newTC.MaxConnections
+		floorChanged := oldTC.DefaultWorkerMinHotIdle != newTC.DefaultWorkerMinHotIdle
 		imageChanged := workerImageForOrg(oldTC, tr.baseCfg.WorkerImage) != workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
 		resourcesChanged := oldTC.WorkerCPURequest != newTC.WorkerCPURequest ||
 			oldTC.WorkerMemoryRequest != newTC.WorkerMemoryRequest
@@ -332,6 +333,11 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 					maxWorkers = tr.baseCfg.MaxWorkers
 				}
 				stack.Pool.SetMaxWorkers(maxWorkers)
+			}
+			if floorChanged {
+				slog.Info("Org default hot-idle floor changed.", "org", name,
+					"old_default_worker_min_hot_idle", oldTC.DefaultWorkerMinHotIdle,
+					"new_default_worker_min_hot_idle", newTC.DefaultWorkerMinHotIdle)
 			}
 			if imageChanged {
 				image := workerImageForOrg(newTC, tr.baseCfg.WorkerImage)

@@ -30,8 +30,12 @@ Removed concepts: warm pool / neutral pool / shared-warm-target, worker
 **profiles** and **tiers**, the **colocate** flag and the colocated nodepool /
 quota / warm-shapes, per-image warm reconcilers.
 
-Out of scope (future): per-org reserved minimum capacity (e.g. "portola always
-wants 10×46cpu/360GB warm"). Hooks left where it would slot in.
+Implemented follow-up: orgs may set `default_worker_min_hot_idle` through the
+admin API to retain a minimum number of default-profile hot-idle workers for
+small/default traffic. The default is `0` (disabled). This is a retention floor:
+the janitor skips TTL retirement when retiring an expired compatible worker would
+drop the org below the floor. It does not proactively spawn workers. Arbitrary
+per-profile reserved capacity remains future work.
 
 ## Request grammar (libpq `options`, parsed like the existing GUCs)
 
@@ -98,6 +102,23 @@ machinery and the neutral-warm DB rows collapse to: "is there a reusable hot-idl
 worker for this org of sufficient size?" (in-memory + runtime-store query), else
 spawn. The runtime store keeps tracking workers (for cross-CP visibility and
 crash recovery) but the warm/neutral slot concept is gone.
+
+## Default hot-idle retention floor
+
+`default_worker_min_hot_idle` is enforced inside the janitor's hot-idle TTL
+cleanup path. It protects naturally-created hot-idle workers from expiry; it does
+not create new capacity.
+
+When the janitor considers an expired hot-idle worker, it:
+
+- resolves the org's current default worker profile and image;
+- counts compatible `hot_idle` workers for that org/image/profile bucket;
+- skips retiring the candidate when the compatible count is at or below the
+  configured floor.
+
+Because there is no background floor spawn, cold orgs still start cold and a
+burst can consume the retained hot-idle workers. The floor only preserves idle
+capacity that prior sessions have already created.
 
 ## Headroom reconcile (new janitor hook, not a separate controller)
 

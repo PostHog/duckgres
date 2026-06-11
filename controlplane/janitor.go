@@ -20,6 +20,7 @@ type controlPlaneExpiryStore interface {
 	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 	ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error)
 	ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
+	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 }
 
@@ -35,11 +36,12 @@ type ControlPlaneJanitor struct {
 	now                           func() time.Time
 	lifecycle                     *WorkerLifecycle // every per-worker transition flows through this; nil disables per-worker reaping for that tick.
 	lifecycleNilWarned            sync.Once        // one-shot guard so the misconfiguration error doesn't flood at the janitor tick rate.
-	observeWorkerLifecycle        func() // refreshes the per-image worker lifecycle gauges (leader-only)
+	observeWorkerLifecycle        func()           // refreshes the per-image worker lifecycle gauges (leader-only)
 	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured node-headroom % (leader-only)
+	hotIdleFloor                  func(configstore.WorkerSnapshot) int
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -50,14 +52,14 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		expiryTimeout = 20 * time.Second
 	}
 	return &ControlPlaneJanitor{
-		store:                     store,
-		interval:                  interval,
-		expiryTimeout:             expiryTimeout,
-		orphanGrace:               30 * time.Second,
-		spawnTimeout:              2 * time.Minute,
-		activateTimeout:           2 * time.Minute,
-		maxDrainTimeout:           15 * time.Minute,
-		now:                       time.Now,
+		store:           store,
+		interval:        interval,
+		expiryTimeout:   expiryTimeout,
+		orphanGrace:     30 * time.Second,
+		spawnTimeout:    2 * time.Minute,
+		activateTimeout: 2 * time.Minute,
+		maxDrainTimeout: 15 * time.Minute,
+		now:             time.Now,
 	}
 }
 
@@ -154,6 +156,20 @@ func (j *ControlPlaneJanitor) runOnce() {
 				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 			}
 			for _, snap := range expired {
+				if j.hotIdleFloor != nil {
+					floor := j.hotIdleFloor(snap)
+					if floor > 0 {
+						count, err := j.store.CountHotIdleWorkers(snap.OrgID(), snap.Image(), snap.ProfileCPU(), snap.ProfileMemory())
+						if err != nil {
+							slog.Warn("Janitor failed to count compatible hot-idle workers.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
+							continue
+						}
+						if count <= floor {
+							slog.Debug("Janitor skipping hot-idle TTL because worker is protected by floor.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "floor", floor, "compatible_hot_idle", count)
+							continue
+						}
+					}
+				}
 				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired", LifecycleOriginJanitorHotIdleTTL); err != nil {
 					slog.Warn("Janitor failed to retire hot-idle worker.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
 				}
@@ -188,4 +204,5 @@ func (j *ControlPlaneJanitor) runOnce() {
 	if j.reconcileHeadroom != nil {
 		j.reconcileHeadroom()
 	}
+
 }

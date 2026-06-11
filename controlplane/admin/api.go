@@ -192,9 +192,10 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		// Org default worker profile: written unconditionally so an explicit
 		// empty string CLEARS the default (the handler's presence-merge keeps
 		// omitted fields at their stored values before this runs).
-		"default_worker_cpu":    updates.DefaultWorkerCPU,
-		"default_worker_memory": updates.DefaultWorkerMemory,
-		"default_worker_ttl":    updates.DefaultWorkerTTL,
+		"default_worker_cpu":          updates.DefaultWorkerCPU,
+		"default_worker_memory":       updates.DefaultWorkerMemory,
+		"default_worker_ttl":          updates.DefaultWorkerTTL,
+		"default_worker_min_hot_idle": updates.DefaultWorkerMinHotIdle,
 	}
 	// Only update resource fields when explicitly provided to avoid clearing
 	// previously-set values when the caller omits them from the JSON payload.
@@ -676,6 +677,9 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["default_worker_ttl"]; ok {
 		merged.DefaultWorkerTTL = updates.DefaultWorkerTTL
 	}
+	if _, ok := fields["default_worker_min_hot_idle"]; ok {
+		merged.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
+	}
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
@@ -719,6 +723,9 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	if err := validateOrgDefaultWorkerProfile(org); err != nil {
 		return err
+	}
+	if org.DefaultWorkerMinHotIdle < 0 {
+		return fmt.Errorf("default_worker_min_hot_idle: value %d must be >= 0", org.DefaultWorkerMinHotIdle)
 	}
 	return nil
 }

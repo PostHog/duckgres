@@ -45,9 +45,21 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
+	hotIdleClaimImage                string
 	hotIdleClaimProfileCPU           string
 	hotIdleClaimProfileMemory        string
 	hotIdleClaimMaxOrgWorkers        int
+	spawnProfileCPU                  string
+	spawnProfileMemory               string
+	replaceHotIdleResult             *configstore.WorkerRecord
+	replaceHotIdleCalls              int
+	replaceHotIdleOrgID              string
+	replaceHotIdleImage              string
+	replaceHotIdleProfileCPU         string
+	replaceHotIdleProfileMemory      string
+	replaceHotIdleMaxOrgWorkers      int
+	replaceHotIdleMaxGlobalWorkers   int
+	replaceHotIdleResultOnce         bool
 	recordMissCalls                  int
 	takenOver                        *configstore.WorkerRecord
 	takeOverErr                      error
@@ -127,11 +139,12 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	copy(out, s.records)
 	return out
 }
-func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, profileCPU, profileMemory string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hotIdleClaimCPID = ownerCPInstanceID
 	s.hotIdleClaimOrgID = orgID
+	s.hotIdleClaimImage = image
 	s.hotIdleClaimProfileCPU = profileCPU
 	s.hotIdleClaimProfileMemory = profileMemory
 	s.hotIdleClaimMaxOrgWorkers = maxOrgWorkers
@@ -141,13 +154,15 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID 
 	}
 	return nil, s.hotIdleClaimMissReason, nil
 }
-func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.spawnCalls++
 	s.spawnOwnerCPID = ownerCPInstanceID
 	s.spawnOrgID = orgID
 	s.spawnImage = image
+	s.spawnProfileCPU = profileCPU
+	s.spawnProfileMemory = profileMemory
 	s.spawnOwnerEpoch = ownerEpoch
 	s.spawnPodNamePrefix = podNamePrefix
 	s.spawnMaxOrgWorkers = maxOrgWorkers
@@ -161,6 +176,52 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 	spawned := *s.spawned
 	spawned.OwnerEpoch = ownerEpoch
 	return &spawned, nil
+}
+func (s *captureRuntimeWorkerStore) FindIncompatibleHotIdleWorkerForReplacement(orgID, image, profileCPU, profileMemory string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replaceHotIdleCalls++
+	s.replaceHotIdleOrgID = orgID
+	s.replaceHotIdleImage = image
+	s.replaceHotIdleProfileCPU = profileCPU
+	s.replaceHotIdleProfileMemory = profileMemory
+	s.replaceHotIdleMaxOrgWorkers = maxOrgWorkers
+	s.replaceHotIdleMaxGlobalWorkers = maxGlobalWorkers
+	if s.replaceHotIdleResult == nil {
+		return nil, nil
+	}
+	record := *s.replaceHotIdleResult
+	if s.replaceHotIdleResultOnce {
+		s.replaceHotIdleResult = nil
+	}
+	return &record, nil
+}
+func (s *captureRuntimeWorkerStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	latest := make(map[int]configstore.WorkerRecord)
+	for id, rec := range s.preloadedRecords {
+		if rec != nil {
+			latest[id] = *rec
+		}
+	}
+	for _, rec := range s.records {
+		latest[rec.WorkerID] = rec
+	}
+	count := 0
+	for _, rec := range latest {
+		if rec.State != configstore.WorkerStateHotIdle {
+			continue
+		}
+		if rec.OrgID != orgID || rec.Image != image {
+			continue
+		}
+		if rec.ProfileCPU != profileCPU || rec.ProfileMemory != profileMemory {
+			continue
+		}
+		count++
+	}
+	return count, nil
 }
 func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
@@ -1179,6 +1240,215 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 	}
 	if store.recordMissCalls != 0 {
 		t.Fatalf("expected no recorded miss for org-cap, got %d", store.recordMissCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerDecisionReturnsIncompatibleHotIdleReplacementBeforeGlobalCapSpawn(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 1)
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimMissReason: configstore.WorkerClaimMissReasonNoIdle,
+		replaceHotIdleResult: &configstore.WorkerRecord{
+			WorkerID:          17,
+			PodName:           "duckgres-worker-test-cp-17",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:old",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+		},
+		spawned: &configstore.WorkerRecord{
+			WorkerID: 18,
+			PodName:  "duckgres-worker-test-cp-18",
+			State:    configstore.WorkerStateSpawning,
+		},
+	}
+	pool.runtimeStore = store
+
+	claim, err := pool.reserveSharedWorkerDecision(&WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+		Image:      "duckgres:new",
+	})
+	if err != nil {
+		t.Fatalf("reserveSharedWorkerDecision: %v", err)
+	}
+	if claim == nil || claim.retireHotIdle == nil || claim.retireHotIdle.WorkerID != 17 {
+		t.Fatalf("expected incompatible hot-idle replacement candidate 17, got %#v", claim)
+	}
+	if claim.hotClaimed != nil || claim.slotID != 0 {
+		t.Fatalf("expected replacement-only claim, got %#v", claim)
+	}
+	if store.spawnCalls != 0 {
+		t.Fatalf("expected replacement candidate to be retired before spawning, got %d spawn calls", store.spawnCalls)
+	}
+	if store.replaceHotIdleCalls != 1 {
+		t.Fatalf("expected one replacement lookup, got %d", store.replaceHotIdleCalls)
+	}
+	if store.replaceHotIdleOrgID != "analytics" || store.replaceHotIdleImage != "duckgres:new" {
+		t.Fatalf("replacement lookup scoped to org/image = %q/%q", store.replaceHotIdleOrgID, store.replaceHotIdleImage)
+	}
+	if store.replaceHotIdleMaxOrgWorkers != 1 || store.replaceHotIdleMaxGlobalWorkers != 1 {
+		t.Fatalf("replacement lookup caps = org %d global %d", store.replaceHotIdleMaxOrgWorkers, store.replaceHotIdleMaxGlobalWorkers)
+	}
+}
+
+func TestK8sPoolCompleteSharedWorkerReservationRetiresReplacementAndRetries(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			17: {
+				WorkerID:          17,
+				PodName:           "duckgres-worker-test-cp-17",
+				State:             configstore.WorkerStateHotIdle,
+				OrgID:             "analytics",
+				Image:             "duckgres:old",
+				OwnerCPInstanceID: "cp-old:boot-a",
+				OwnerEpoch:        2,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	worker, retry, err := pool.completeSharedWorkerReservation(context.Background(), &sharedWorkerClaim{
+		retireHotIdle: &configstore.WorkerRecord{
+			WorkerID:          17,
+			PodName:           "duckgres-worker-test-cp-17",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:old",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+		},
+	}, &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+		Image:      "duckgres:new",
+	})
+	if err != nil {
+		t.Fatalf("completeSharedWorkerReservation: %v", err)
+	}
+	if worker != nil || !retry {
+		t.Fatalf("expected replacement retire to request retry without worker, got worker=%#v retry=%v", worker, retry)
+	}
+	if got := store.markTerminalCalledIDs; len(got) != 1 || got[0] != 17 {
+		t.Fatalf("expected replacement candidate 17 to be retired, got %#v", got)
+	}
+	if got := store.markTerminalReasons; len(got) != 1 || got[0] != RetireReasonIncompatibleHotIdle {
+		t.Fatalf("expected retire reason %q, got %#v", RetireReasonIncompatibleHotIdle, got)
+	}
+}
+
+func TestK8sPoolCompleteSharedWorkerReservationDoesNotRetryReplacementOnCASMiss(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		markTerminalMisses: map[int]bool{17: true},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			17: {
+				WorkerID:          17,
+				PodName:           "duckgres-worker-test-cp-17",
+				State:             configstore.WorkerStateHotIdle,
+				OrgID:             "analytics",
+				Image:             "duckgres:old",
+				OwnerCPInstanceID: "cp-old:boot-a",
+				OwnerEpoch:        2,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	worker, retry, err := pool.completeSharedWorkerReservation(context.Background(), &sharedWorkerClaim{
+		retireHotIdle: &configstore.WorkerRecord{
+			WorkerID:          17,
+			PodName:           "duckgres-worker-test-cp-17",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:old",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+		},
+	}, &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+		Image:      "duckgres:new",
+	})
+	if worker != nil || retry {
+		t.Fatalf("expected CAS miss to stop immediate retry, got worker=%#v retry=%v", worker, retry)
+	}
+	var capacityErr *WorkerCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected capacity error on CAS miss, got %v", err)
+	}
+	if capacityErr.Reason != configstore.WorkerClaimMissReasonGlobalCap {
+		t.Fatalf("capacity reason = %q, want global cap", capacityErr.Reason)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerRetiresGlobalCapBlockingIncompatibleHotIdleThenSpawns(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 1)
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimMissReason:   configstore.WorkerClaimMissReasonNoIdle,
+		replaceHotIdleResultOnce: true,
+		replaceHotIdleResult: &configstore.WorkerRecord{
+			WorkerID:          17,
+			PodName:           "duckgres-worker-test-cp-17",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:old",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+		},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			17: {
+				WorkerID:          17,
+				PodName:           "duckgres-worker-test-cp-17",
+				State:             configstore.WorkerStateHotIdle,
+				OrgID:             "analytics",
+				Image:             "duckgres:old",
+				OwnerCPInstanceID: "cp-old:boot-a",
+				OwnerEpoch:        2,
+			},
+		},
+		spawned: &configstore.WorkerRecord{
+			WorkerID: 18,
+			PodName:  "duckgres-worker-test-cp-18",
+			State:    configstore.WorkerStateSpawning,
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		pool.workers[id] = &ManagedWorker{
+			ID:      id,
+			podName: pool.podNameForWorker(id),
+			image:   image,
+			done:    make(chan struct{}),
+		}
+		return nil
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+		Image:      "duckgres:new",
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker == nil || worker.ID != 18 {
+		t.Fatalf("expected spawned replacement worker 18, got %#v", worker)
+	}
+	if store.replaceHotIdleCalls != 2 {
+		t.Fatalf("expected replacement lookup before first and second decisions, got %d", store.replaceHotIdleCalls)
+	}
+	if got := store.markTerminalCalledIDs; len(got) != 1 || got[0] != 17 {
+		t.Fatalf("expected incompatible hot-idle worker 17 retired, got %#v", got)
+	}
+	if store.spawnCalls != 1 {
+		t.Fatalf("expected one replacement spawn after retire, got %d", store.spawnCalls)
+	}
+	if store.spawnImage != "duckgres:new" {
+		t.Fatalf("expected replacement spawn image duckgres:new, got %q", store.spawnImage)
 	}
 }
 

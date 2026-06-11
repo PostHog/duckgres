@@ -229,7 +229,7 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(second): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "duckgres:v2", "", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -265,6 +265,185 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 	}
 	if unclaimed.State != configstore.WorkerStateHotIdle {
 		t.Fatalf("expected later hot-idle worker to remain hot_idle, got %q", unclaimed.State)
+	}
+}
+
+func TestCountHotIdleWorkersPostgresFiltersCompatibleWorkers(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+
+	records := []configstore.WorkerRecord{
+		{WorkerID: 1, PodName: "duckgres-worker-1", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 2, PodName: "duckgres-worker-2", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 3, PodName: "duckgres-worker-3", State: configstore.WorkerStateReserved, OrgID: "analytics", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 4, PodName: "duckgres-worker-4", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:old", LastHeartbeatAt: now},
+		{WorkerID: 5, PodName: "duckgres-worker-5", State: configstore.WorkerStateHotIdle, OrgID: "billing", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 6, PodName: "duckgres-worker-6", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:v2", ProfileCPU: "4", ProfileMemory: "8Gi", LastHeartbeatAt: now},
+	}
+	for _, record := range records {
+		record.OwnerCPInstanceID = "cp-old:boot-a"
+		record.OwnerEpoch = 1
+		if err := store.UpsertWorkerRecord(&record); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", record.WorkerID, err)
+		}
+	}
+
+	defaultCount, err := store.CountHotIdleWorkers("analytics", "duckgres:v2", "", "")
+	if err != nil {
+		t.Fatalf("CountHotIdleWorkers(default): %v", err)
+	}
+	if defaultCount != 2 {
+		t.Fatalf("default-profile compatible hot-idle count = %d, want 2", defaultCount)
+	}
+
+	sizedCount, err := store.CountHotIdleWorkers("analytics", "duckgres:v2", "4", "8Gi")
+	if err != nil {
+		t.Fatalf("CountHotIdleWorkers(sized): %v", err)
+	}
+	if sizedCount != 1 {
+		t.Fatalf("sized compatible hot-idle count = %d, want 1", sizedCount)
+	}
+}
+
+func TestClaimHotIdleWorkerPostgresFiltersImage(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+
+	for _, record := range []configstore.WorkerRecord{
+		{WorkerID: 1, PodName: "duckgres-worker-old", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:old", LastHeartbeatAt: now},
+		{WorkerID: 2, PodName: "duckgres-worker-new", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:new", LastHeartbeatAt: now},
+	} {
+		record.OwnerCPInstanceID = "cp-old:boot-a"
+		record.OwnerEpoch = 1
+		if err := store.UpsertWorkerRecord(&record); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", record.WorkerID, err)
+		}
+	}
+
+	claimed, miss, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "duckgres:new", "", "", 0)
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker: %v", err)
+	}
+	if miss != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("miss reason = %q, want none", miss)
+	}
+	if claimed == nil || claimed.WorkerID != 2 {
+		t.Fatalf("claimed worker = %#v, want worker 2", claimed)
+	}
+}
+
+func TestFindIncompatibleHotIdleWorkerForReplacementPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 11, 12, 10, 0, 0, time.UTC)
+
+	oldImage := configstore.WorkerRecord{
+		WorkerID:          31,
+		PodName:           "duckgres-worker-old-image",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:old",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+	}
+	if err := store.UpsertWorkerRecord(&oldImage); err != nil {
+		t.Fatalf("UpsertWorkerRecord(old image): %v", err)
+	}
+
+	replacement, err := store.FindIncompatibleHotIdleWorkerForReplacement("analytics", "duckgres:new", "", "", 1, 0)
+	if err != nil {
+		t.Fatalf("FindIncompatibleHotIdleWorkerForReplacement: %v", err)
+	}
+	if replacement != nil {
+		t.Fatalf("org-cap-only replacement candidate = %#v, want nil", replacement)
+	}
+	persisted, err := store.GetWorkerRecord(31)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHotIdle {
+		t.Fatalf("replacement lookup should not mutate worker state, got %q", persisted.State)
+	}
+
+	globalReplacement, err := store.FindIncompatibleHotIdleWorkerForReplacement("analytics", "duckgres:new", "", "", 0, 1)
+	if err != nil {
+		t.Fatalf("FindIncompatibleHotIdleWorkerForReplacement(global cap): %v", err)
+	}
+	if globalReplacement == nil || globalReplacement.WorkerID != 31 {
+		t.Fatalf("global replacement candidate = %#v, want worker 31", globalReplacement)
+	}
+
+	wrongProfileOnly := configstore.WorkerRecord{
+		WorkerID:          34,
+		PodName:           "duckgres-worker-wrong-profile-only",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "marketing",
+		Image:             "duckgres:new",
+		ProfileCPU:        "4",
+		ProfileMemory:     "8Gi",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+	}
+	if err := store.UpsertWorkerRecord(&wrongProfileOnly); err != nil {
+		t.Fatalf("UpsertWorkerRecord(wrong profile only): %v", err)
+	}
+	profileReplacement, err := store.FindIncompatibleHotIdleWorkerForReplacement("marketing", "duckgres:new", "", "", 1, 0)
+	if err != nil {
+		t.Fatalf("FindIncompatibleHotIdleWorkerForReplacement(profile): %v", err)
+	}
+	if profileReplacement != nil {
+		t.Fatalf("org-cap-only profile replacement candidate = %#v, want nil", profileReplacement)
+	}
+	globalProfileReplacement, err := store.FindIncompatibleHotIdleWorkerForReplacement("marketing", "duckgres:new", "", "", 0, 1)
+	if err != nil {
+		t.Fatalf("FindIncompatibleHotIdleWorkerForReplacement(profile global): %v", err)
+	}
+	if globalProfileReplacement == nil || globalProfileReplacement.WorkerID != 34 {
+		t.Fatalf("global profile replacement candidate = %#v, want worker 34", globalProfileReplacement)
+	}
+
+	active := configstore.WorkerRecord{
+		WorkerID:          32,
+		PodName:           "duckgres-worker-active",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "sales",
+		Image:             "duckgres:new",
+		OwnerCPInstanceID: "cp-active:boot-a",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+	}
+	wrongProfile := configstore.WorkerRecord{
+		WorkerID:          33,
+		PodName:           "duckgres-worker-wrong-profile",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "sales",
+		Image:             "duckgres:new",
+		ProfileCPU:        "4",
+		ProfileMemory:     "8Gi",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+	}
+	if err := store.UpsertWorkerRecord(&active); err != nil {
+		t.Fatalf("UpsertWorkerRecord(active): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&wrongProfile); err != nil {
+		t.Fatalf("UpsertWorkerRecord(wrong profile): %v", err)
+	}
+	blocked, err := store.FindIncompatibleHotIdleWorkerForReplacement("sales", "duckgres:new", "", "", 1, 0)
+	if err != nil {
+		t.Fatalf("FindIncompatibleHotIdleWorkerForReplacement(non-idle cap): %v", err)
+	}
+	if blocked != nil {
+		t.Fatalf("expected no replacement when non-hot-idle work already fills org cap, got %#v", blocked)
+	}
+	blockedByOrgUnderGlobalPressure, err := store.FindIncompatibleHotIdleWorkerForReplacement("sales", "duckgres:new", "", "", 1, 2)
+	if err != nil {
+		t.Fatalf("FindIncompatibleHotIdleWorkerForReplacement(non-idle org cap under global pressure): %v", err)
+	}
+	if blockedByOrgUnderGlobalPressure != nil {
+		t.Fatalf("expected no global-cap replacement when non-hot-idle work already fills org cap, got %#v", blockedByOrgUnderGlobalPressure)
 	}
 }
 
@@ -408,7 +587,7 @@ func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) 
 		}
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -460,7 +639,7 @@ func TestClaimHotIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -499,7 +678,7 @@ func TestClaimHotIdleWorkerAllowsOnlyHotIdleAtCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -533,7 +712,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		}
 	}
 
-	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", 1)
+	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(first): %v", err)
 	}
@@ -544,7 +723,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		t.Fatalf("expected first claim to have no miss reason, got %q", missReason)
 	}
 
-	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", "", "", 1)
+	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(second): %v", err)
 	}
@@ -771,7 +950,7 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", 1, "duckgres-worker-test-cp", 3, 5)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 3, 5)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
 	}
@@ -796,6 +975,9 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	}
 	if slot.OrgID != "analytics" {
 		t.Fatalf("expected org analytics, got %q", slot.OrgID)
+	}
+	if slot.ProfileCPU != "" || slot.ProfileMemory != "" {
+		t.Fatalf("expected default profile on slot, got cpu=%q memory=%q", slot.ProfileCPU, slot.ProfileMemory)
 	}
 
 	persisted, err := store.GetWorkerRecord(slot.WorkerID)
@@ -823,7 +1005,7 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(existing): %v", err)
 	}
 
-	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", 1, "duckgres-worker-test-cp", 1, 5)
+	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 1, 5)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(org cap): %v", err)
 	}
@@ -831,7 +1013,7 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("expected org cap to block spawning, got %#v", orgLimited)
 	}
 
-	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", "duckgres:test", 1, "duckgres-worker-test-cp", 2, 1)
+	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 2, 1)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(global cap): %v", err)
 	}
@@ -839,6 +1021,82 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("expected global cap to block spawning, got %#v", globalLimited)
 	}
 }
+
+func TestCreateSpawningWorkerSlotIgnoresIncompatibleHotIdleForOrgCapPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 11, 13, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          19,
+		PodName:           "duckgres-worker-old-hot-idle",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:old",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(old hot-idle): %v", err)
+	}
+
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
+	}
+	if slot == nil {
+		t.Fatal("expected incompatible hot-idle worker not to block org-cap spawn")
+	}
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          21,
+		PodName:           "duckgres-worker-sized-hot-idle",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "marketing",
+		Image:             "duckgres:new",
+		ProfileCPU:        "4",
+		ProfileMemory:     "8Gi",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(sized hot-idle): %v", err)
+	}
+
+	profileSlot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "marketing", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateSpawningWorkerSlot(profile): %v", err)
+	}
+	if profileSlot == nil {
+		t.Fatal("expected wrong-profile hot-idle worker not to block org-cap spawn")
+	}
+}
+
+func TestCreateSpawningWorkerSlotCountsIncompatibleHotIdleForGlobalCapPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 11, 13, 5, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          23,
+		PodName:           "duckgres-worker-old-global-hot-idle",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:old",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(old hot-idle): %v", err)
+	}
+
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 5, 1)
+	if err != nil {
+		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
+	}
+	if slot != nil {
+		t.Fatalf("expected incompatible hot-idle worker to block global-cap spawn, got %#v", slot)
+	}
+}
+
 func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
@@ -2055,7 +2313,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		t.Fatalf("expected worker 3602 hot-idle snapshot, got %#v", expired)
 	}
 
-	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", 0)
+	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}

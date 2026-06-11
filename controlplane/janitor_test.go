@@ -11,18 +11,20 @@ import (
 )
 
 type captureControlPlaneExpiryStore struct {
-	mu                     sync.Mutex
-	cutoffs                []time.Time
-	count                  int64
-	expireErr              error
-	drainingCutoffs        []time.Time
-	drainingCount          int64
-	orphanedWorkers        []configstore.WorkerRecord
-	stuckSpawningBefore    []time.Time
-	stuckActivatingBefore  []time.Time
-	stuckWorkers           []configstore.WorkerRecord
-	expiredSessionsBefore  []time.Time
-	expiredHotIdleWorkers  []configstore.WorkerRecord
+	mu                    sync.Mutex
+	cutoffs               []time.Time
+	count                 int64
+	expireErr             error
+	drainingCutoffs       []time.Time
+	drainingCount         int64
+	orphanedWorkers       []configstore.WorkerRecord
+	stuckSpawningBefore   []time.Time
+	stuckActivatingBefore []time.Time
+	stuckWorkers          []configstore.WorkerRecord
+	expiredSessionsBefore []time.Time
+	expiredHotIdleWorkers []configstore.WorkerRecord
+	hotIdleCounts         map[string]int
+	hotIdleCountCalls     []string
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
@@ -102,6 +104,17 @@ func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(now time.Ti
 		out = append(out, configstore.NewWorkerSnapshot(rec))
 	}
 	return out, nil
+}
+
+func (s *captureControlPlaneExpiryStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := orgID + "|" + image + "|" + profileCPU + "|" + profileMemory
+	s.hotIdleCountCalls = append(s.hotIdleCountCalls, key)
+	if s.hotIdleCounts == nil {
+		return 0, nil
+	}
+	return s.hotIdleCounts[key], nil
 }
 
 func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
@@ -296,6 +309,55 @@ func TestControlPlaneJanitorHotIdleGoesThroughLifecycleWhenWired(t *testing.T) {
 	}
 	if got := cleanup.snapshot(); len(got) != 1 || got[0].workerID != 21 || got[0].reason != "hot_idle_ttl_expired" {
 		t.Fatalf("expected lifecycle cleanup for worker 21, got %#v", got)
+	}
+}
+
+func TestControlPlaneJanitorSkipsExpiredHotIdleWorkersProtectedByFloor(t *testing.T) {
+	now := time.Date(2026, time.May, 22, 14, 20, 0, 0, time.UTC)
+	protected := configstore.WorkerRecord{
+		WorkerID:          22,
+		PodName:           "duckgres-worker-22",
+		Image:             "duckgres:test",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	excess := configstore.WorkerRecord{
+		WorkerID:          23,
+		PodName:           "duckgres-worker-23",
+		Image:             "duckgres:test",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "billing",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{protected, excess},
+		hotIdleCounts: map[string]int{
+			"analytics|duckgres:test||": 1,
+			"billing|duckgres:test||":   2,
+		},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.hotIdleTTL = time.Minute
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+	janitor.hotIdleFloor = func(snap configstore.WorkerSnapshot) int {
+		return 1
+	}
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 23 {
+		t.Fatalf("expected only excess hot-idle worker 23 to be retired, got %#v", got)
+	}
+	if got := store.hotIdleCountCalls; len(got) != 2 {
+		t.Fatalf("expected compatible hot-idle count check for each expired worker, got %#v", got)
 	}
 }
 

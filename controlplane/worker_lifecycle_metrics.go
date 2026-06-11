@@ -44,16 +44,17 @@ const (
 type LifecycleOrigin string
 
 const (
-	LifecycleOriginJanitorOrphan           LifecycleOrigin = "janitor_orphan"
-	LifecycleOriginJanitorHotIdleTTL       LifecycleOrigin = "janitor_hot_idle_ttl"
-	LifecycleOriginJanitorStuckActivating  LifecycleOrigin = "janitor_stuck_activating"
-	LifecycleOriginMismatchedVersionReaper LifecycleOrigin = "mismatched_version_reaper"
-	LifecycleOriginShutdownAll             LifecycleOrigin = "shutdown_all"
-	LifecycleOriginHealthCheckCrash        LifecycleOrigin = "health_check_crash"
-	LifecycleOriginWorkerDrain             LifecycleOrigin = "worker_drain"
-	LifecycleOriginSpawnFailure            LifecycleOrigin = "spawn_failure"
-	LifecycleOriginReserveImageMismatch    LifecycleOrigin = "reserve_image_mismatch"
-	LifecycleOriginCredRefresh             LifecycleOrigin = "cred_refresh"
+	LifecycleOriginJanitorOrphan              LifecycleOrigin = "janitor_orphan"
+	LifecycleOriginJanitorHotIdleTTL          LifecycleOrigin = "janitor_hot_idle_ttl"
+	LifecycleOriginJanitorStuckActivating     LifecycleOrigin = "janitor_stuck_activating"
+	LifecycleOriginMismatchedVersionReaper    LifecycleOrigin = "mismatched_version_reaper"
+	LifecycleOriginShutdownAll                LifecycleOrigin = "shutdown_all"
+	LifecycleOriginHealthCheckCrash           LifecycleOrigin = "health_check_crash"
+	LifecycleOriginWorkerDrain                LifecycleOrigin = "worker_drain"
+	LifecycleOriginSpawnFailure               LifecycleOrigin = "spawn_failure"
+	LifecycleOriginReserveImageMismatch       LifecycleOrigin = "reserve_image_mismatch"
+	LifecycleOriginReserveIncompatibleHotIdle LifecycleOrigin = "reserve_incompatible_hot_idle"
+	LifecycleOriginCredRefresh                LifecycleOrigin = "cred_refresh"
 	// LifecycleOriginReserveFailure marks retire paths that fire when
 	// ReserveSharedWorker observes a claim that cannot be activated
 	// (stale-claim retries excepted) and falls back to retire-and-retry.
@@ -152,14 +153,15 @@ const (
 // warm_pool_metrics.go (kubernetes-tagged) so the no-tag lifecycle
 // observation helpers can reference them.
 const (
-	RetireReasonNormal            = "normal"
-	RetireReasonActivationFailure = "activation_failure"
-	RetireReasonOrphaned          = "orphaned"
-	RetireReasonCrash             = "crash"
-	RetireReasonShutdown          = "shutdown"
-	RetireReasonIdleTimeout       = "idle_timeout"
-	RetireReasonStuckActivating   = "stuck_activating"
-	RetireReasonMismatchedVersion = "mismatched_version"
+	RetireReasonNormal              = "normal"
+	RetireReasonActivationFailure   = "activation_failure"
+	RetireReasonOrphaned            = "orphaned"
+	RetireReasonCrash               = "crash"
+	RetireReasonShutdown            = "shutdown"
+	RetireReasonIdleTimeout         = "idle_timeout"
+	RetireReasonStuckActivating     = "stuck_activating"
+	RetireReasonMismatchedVersion   = "mismatched_version"
+	RetireReasonIncompatibleHotIdle = "incompatible_hot_idle"
 )
 
 // --- Metric definitions ---

@@ -245,15 +245,16 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 	}
 }
 
-// sharedWorkerClaim is the outcome of the short reservation decision: either a
-// hot-idle worker claimed in the runtime store (hotClaimed != nil) or a freshly
-// created spawning slot id (hotClaimed == nil). Either way the claim/slot is
-// already bound to the caller in the durable store (or locally allocated in
-// runtime-store-less mode), so the caller may finish the multi-minute
+// sharedWorkerClaim is the outcome of the short reservation decision: a
+// compatible hot-idle worker claimed in the runtime store, an incompatible
+// hot-idle worker to retire before retrying, or a freshly created spawning slot.
+// Any claim/slot is already bound to the caller in the durable store (or locally
+// allocated in runtime-store-less mode), so the caller may finish multi-minute
 // completion without holding any per-org serialization.
 type sharedWorkerClaim struct {
-	hotClaimed *configstore.WorkerRecord
-	slotID     int
+	hotClaimed    *configstore.WorkerRecord
+	retireHotIdle *configstore.WorkerRecord
+	slotID        int
 }
 
 // reserveSharedWorkerDecision is the short, DB-only half of ReserveSharedWorker:
@@ -279,7 +280,7 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 
 	if p.runtimeStore != nil && assignment.OrgID != "" {
 		hotProfileCPU, hotProfileMem := assignment.Profile.Parts()
-		hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, hotProfileCPU, hotProfileMem, assignment.MaxWorkers)
+		hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, hotProfileCPU, hotProfileMem, assignment.MaxWorkers)
 		if err != nil {
 			return nil, err
 		}
@@ -287,17 +288,17 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 			return nil, NewWorkerCapacityExhaustedErrorForReason(hotMissReason, DefaultWorkerSpawnRetryAfter)
 		}
 		if hotClaimed != nil {
-			// ClaimHotIdleWorker already filters by profile, so a reclaimed
-			// hot-idle worker always matches the requested shape. It is NOT
-			// filtered by image, so still retire on a version mismatch (e.g.
-			// after an image bump) rather than serve a stale-version worker.
-			if assignment.Image != "" && hotClaimed.Image != assignment.Image {
-				slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker", hotClaimed.WorkerID, "worker_pod", hotClaimed.PodName, "org", assignment.OrgID, "expected", assignment.Image, "got", hotClaimed.Image)
-				p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
-				// Fall through to the spawning-slot decision or capacity backpressure.
-			} else {
-				return &sharedWorkerClaim{hotClaimed: hotClaimed}, nil
-			}
+			return &sharedWorkerClaim{hotClaimed: hotClaimed}, nil
+		}
+
+		replaceHotIdle, err := p.runtimeStore.FindIncompatibleHotIdleWorkerForReplacement(
+			assignment.OrgID, assignment.Image, hotProfileCPU, hotProfileMem,
+			assignment.MaxWorkers, maxGlobal)
+		if err != nil {
+			return nil, err
+		}
+		if replaceHotIdle != nil {
+			return &sharedWorkerClaim{retireHotIdle: replaceHotIdle}, nil
 		}
 	}
 
@@ -308,8 +309,9 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 	// global worker caps cross-CP and returns a nil slot when capped) — the
 	// background id allocator returns a placeholder 0 that collides across spawns.
 	if p.runtimeStore != nil {
+		spawnProfileCPU, spawnProfileMem := assignment.Profile.Parts()
 		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
-			p.cpInstanceID, assignment.OrgID, assignment.Image, 0,
+			p.cpInstanceID, assignment.OrgID, assignment.Image, spawnProfileCPU, spawnProfileMem, 0,
 			p.workerPodNamePrefix(), assignment.MaxWorkers, maxGlobal)
 		if err != nil {
 			return nil, err
@@ -356,6 +358,24 @@ func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, cla
 		// Pre-split ReserveSharedWorker fell through to a fresh spawn here; the
 		// retry re-runs the decision, which lands on the spawning-slot path.
 		return nil, true, reserveErr
+	}
+	if claim.retireHotIdle != nil {
+		slog.Info("Retiring incompatible hot-idle worker before spawning replacement.",
+			"worker", claim.retireHotIdle.WorkerID,
+			"worker_pod", claim.retireHotIdle.PodName,
+			"org", claim.retireHotIdle.OrgID,
+			"worker_image", claim.retireHotIdle.Image,
+			"requested_image", assignment.Image,
+			"worker_profile_cpu", claim.retireHotIdle.ProfileCPU,
+			"worker_profile_memory", claim.retireHotIdle.ProfileMemory)
+		outcome, retireErr := p.retireClaimedWorker(claim.retireHotIdle, RetireReasonIncompatibleHotIdle, LifecycleOriginReserveIncompatibleHotIdle)
+		if retireErr != nil {
+			return nil, false, retireErr
+		}
+		if !outcome.Transitioned {
+			return nil, false, NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonGlobalCap, DefaultWorkerSpawnRetryAfter)
+		}
+		return nil, true, nil
 	}
 	worker, err = p.spawnReservedWorkerForSlot(ctx, claim.slotID, assignment)
 	return worker, false, err

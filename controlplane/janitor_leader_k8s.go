@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
-	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	"k8s.io/client-go/kubernetes"
+	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -84,12 +84,12 @@ func newJanitorLeaderManagerFromClients(
 
 	leaderLoop := newLeaderOnlyLoop(janitor.Run)
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:          lock,
-		LeaseDuration: 20 * time.Second,
-		RenewDeadline: 15 * time.Second,
-		RetryPeriod:   5 * time.Second,
+		Lock:            lock,
+		LeaseDuration:   20 * time.Second,
+		RenewDeadline:   15 * time.Second,
+		RetryPeriod:     5 * time.Second,
 		ReleaseOnCancel: true,
-		Name:          "duckgres-janitor",
+		Name:            "duckgres-janitor",
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: leaderLoop.onStartedLeading,
 			OnStoppedLeading: func() {

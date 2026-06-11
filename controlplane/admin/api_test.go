@@ -72,6 +72,7 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.DefaultWorkerCPU = updates.DefaultWorkerCPU
 	org.DefaultWorkerMemory = updates.DefaultWorkerMemory
 	org.DefaultWorkerTTL = updates.DefaultWorkerTTL
+	org.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
 	if updates.WorkerCPURequest != "" {
 		org.WorkerCPURequest = updates.WorkerCPURequest
 	}
@@ -1568,6 +1569,72 @@ func TestUpdateOrgOmittingDefaultWorkerProfilePreservesIt(t *testing.T) {
 	}
 }
 
+func TestUpdateOrgSetsDefaultWorkerMinHotIdle(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"default_worker_min_hot_idle":2}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerMinHotIdle != 2 {
+		t.Fatalf("stored default_worker_min_hot_idle = %d, want 2", stored.DefaultWorkerMinHotIdle)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["default_worker_min_hot_idle"] != float64(2) {
+		t.Fatalf("response JSON missing default_worker_min_hot_idle: %s", rec.Body.String())
+	}
+}
+
+func TestUpdateOrgOmittingDefaultWorkerMinHotIdlePreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name: "acme", DatabaseName: "acme", DefaultWorkerMinHotIdle: 2,
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"max_workers":4}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["acme"].DefaultWorkerMinHotIdle; got != 2 {
+		t.Fatalf("default_worker_min_hot_idle not preserved: got %d, want 2", got)
+	}
+}
+
+func TestUpdateOrgRejectsNegativeDefaultWorkerMinHotIdle(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme", DefaultWorkerMinHotIdle: 2}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(`{"default_worker_min_hot_idle":-1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := store.orgs["acme"].DefaultWorkerMinHotIdle; got != 2 {
+		t.Fatalf("invalid payload mutated default_worker_min_hot_idle: got %d", got)
+	}
+}
+
 func TestUpdateOrgRejectsInvalidDefaultWorkerProfile(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1618,6 +1685,24 @@ func TestCreateOrgAcceptsDefaultWorkerProfile(t *testing.T) {
 	if stored.DefaultWorkerCPU != "2" || stored.DefaultWorkerMemory != "8Gi" || stored.DefaultWorkerTTL != "75m" {
 		t.Fatalf("stored default profile = %q/%q/%q, want 2/8Gi/75m",
 			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+}
+
+func TestCreateOrgAcceptsDefaultWorkerMinHotIdle(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_min_hot_idle":1}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if got := store.orgs["acme"].DefaultWorkerMinHotIdle; got != 1 {
+		t.Fatalf("stored default_worker_min_hot_idle = %d, want 1", got)
 	}
 }
 
