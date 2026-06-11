@@ -15,7 +15,7 @@
 - [ ] **Dynamic User Management**: Add/remove users without restart
 
 ### Protocol Compatibility
-- [ ] **Binary Format Support**: Encode results in binary format for better performance with some clients
+- [x] **Binary Result Format Support**: Encode common result types in PostgreSQL binary format for clients that request it ([conn_results.go](server/conn_results.go), [types.go](server/types.go), [clients_test.go](tests/integration/clients/clients_test.go))
 - [x] **COPY Protocol**: Support `COPY FROM`/`COPY TO` for bulk data loading
 - [x] **Cancel Request Handling**: Properly cancel long-running queries ([protocol.go](server/protocol.go), [cancel_test.go](tests/integration/cancel_test.go))
 

@@ -167,7 +167,7 @@ why.
 | **Cursors: DECLARE / FETCH / MOVE** | ⚠️ | server `conn_querylog_feedback_test.go::TestHandleFetchCursorLogsMissingCursorError` (error path only) | **Gap.** Implemented in `server/conn_cursor.go` (FETCH is forward-only); no differential DECLARE→FETCH happy-path test |
 | Cursor CLOSE | 🟡 | `conn_test.go` (CLOSE detection) | |
 | Auth: cleartext password | ✅ | server `worker_auth_test.go`; integration via connection params | |
-| Auth: MD5 | 🟡 | — | README claims MD5; no direct test |
+| Auth: MD5 | ❌ | — | Current startup path requests cleartext password auth over TLS |
 | Auth: SCRAM-SHA-256 | ❌ | — | not tested |
 | TLS / SSL (`sslmode=require`) | ✅ | `edge_cases_test.go::TestConnectionParameters` | |
 
@@ -265,7 +265,7 @@ Sorted by what's worth acting on first.
 3. **🟡 Transpiler-only, no differential assertion:** generated columns, `SELECT FOR
    UPDATE/SHARE` (stripped). Add differential cases if these matter to clients.
 
-4. **❌ Untested but plausibly reachable — undefined behavior today:** MD5/SCRAM auth,
+4. **❌ Unsupported or untested but plausibly reachable — undefined behavior today:** MD5/SCRAM auth,
    enum/domain/composite/xml types, advisory locks, `LOCK TABLE`,
    GRANT/REVOKE/roles, `information_schema.{key_column_usage,table_constraints,
    referential_constraints}` (ORM FK discovery), `TABLESAMPLE`. Asserting these
