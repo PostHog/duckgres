@@ -162,6 +162,24 @@ normal `go test ./...` lane.
   and then sends crafted bytes — tooling the alpine Job image (psql/curl/jq)
   doesn't have. Covered by `server/conn_bind_test.go` unit tests
   feeding malformed payloads directly to `handleBind`.
+- **STS credential freshness floor** (`stsCacheSafetyMargin` /
+  `credentialRefreshLookahead`, `controlplane/sts_broker.go`) — the guarantee
+  is temporal: every statement starts with ≥35min of STS token validity (at
+  the default 1h session), and the refresh scheduler re-pushes worker secrets
+  30min ahead of expiry. Asserting it in-Job would mean holding a query open
+  across a real token-expiry boundary: even time-compressed via the env-only
+  `DUCKGRES_STS_SESSION_DURATION` knob, AWS's 900s AssumeRole floor puts the
+  shortest meaningful wait far past the Job budget, and the shared cluster
+  gives no deterministic control over when the scheduler tick lands. Covered
+  by `controlplane/sts_broker_test.go` +
+  `shared_worker_activator_credentials_test.go` (cache margin, lookahead
+  invariant, expiry surfacing on both activation paths) and — load-bearing —
+  the integration pin `tests/integration/credential_rotation_pin_test.go`,
+  which proves against a real MinIO that an in-flight scan does NOT survive
+  credential rotation (DuckDB resolves secrets through the statement's MVCC
+  snapshot, and scan-workload file opens skip the HEAD that could trigger
+  httpfs' refresh-on-403), i.e. the floor is the *only* protection and a
+  statement longer than its starting runway still dies with ExpiredToken.
 
 ## Isolation model
 

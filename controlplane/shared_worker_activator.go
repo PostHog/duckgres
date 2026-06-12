@@ -371,9 +371,11 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		}
 	}
 	if a.resolveDucklingStatus == nil || err != nil {
-		// Config-store warehouses use static creds (no STS), so expiresAt
-		// stays nil and the credential refresh scheduler skips them.
-		dl, err = a.buildDuckLakeConfigFromConfigStore(ctx, org.Warehouse)
+		// Static-cred config-store warehouses (secret-ref S3 credentials)
+		// return a nil expiresAt and the credential refresh scheduler skips
+		// them; the "aws" provider path brokers STS creds and returns their
+		// expiration so the scheduler keeps those workers fresh.
+		dl, expiresAt, err = a.buildDuckLakeConfigFromConfigStore(ctx, org.Warehouse)
 	}
 	if err != nil {
 		return TenantActivationPayload{}, err
@@ -505,10 +507,10 @@ func ducklingMetadataStoreAddress(status *provisioner.DucklingStatus, orgID stri
 
 // buildDuckLakeConfigFromConfigStore reads infrastructure details from the config store
 // and K8s Secrets. Used for non-Crossplane warehouses (manual seed, MinIO, etc.).
-func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.Context, warehouse *configstore.ManagedWarehouseConfig) (server.DuckLakeConfig, error) {
+func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.Context, warehouse *configstore.ManagedWarehouseConfig) (server.DuckLakeConfig, *time.Time, error) {
 	metadataPassword, err := a.readSecretValue(ctx, warehouse.MetadataStoreCredentials)
 	if err != nil {
-		return server.DuckLakeConfig{}, fmt.Errorf("metadata store credentials: %w", err)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("metadata store credentials: %w", err)
 	}
 
 	dl := server.DuckLakeConfig{
@@ -532,7 +534,7 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 	case warehouse.S3Credentials.Name != "":
 		accessKey, secretKey, sessionToken, err := a.readS3Credentials(ctx, warehouse.S3Credentials)
 		if err != nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("s3 credentials: %w", err)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("s3 credentials: %w", err)
 		}
 		dl.S3Provider = "config"
 		dl.S3AccessKey = accessKey
@@ -548,22 +550,29 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 	case strings.EqualFold(warehouse.S3.Provider, "aws"):
 		roleARN := warehouse.WorkerIdentity.IAMRoleARN
 		if roleARN == "" {
-			return server.DuckLakeConfig{}, fmt.Errorf("managed warehouse %q requires worker_identity.iam_role_arn for worker activation", warehouse.OrgID)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("managed warehouse %q requires worker_identity.iam_role_arn for worker activation", warehouse.OrgID)
 		}
 		if a.stsBroker == nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("STS broker is required for worker activation for org %q", warehouse.OrgID)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("STS broker is required for worker activation for org %q", warehouse.OrgID)
 		}
 		creds, err := a.stsBroker.AssumeRole(ctx, roleARN)
 		if err != nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", warehouse.OrgID, err)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("STS AssumeRole for org %q: %w", warehouse.OrgID, err)
 		}
 		dl.S3Provider = "config"
 		dl.S3AccessKey = creds.AccessKeyID
 		dl.S3SecretKey = creds.SecretAccessKey
 		dl.S3SessionToken = creds.SessionToken
+		// STS-vended creds expire: surface the expiration so the
+		// credential-refresh scheduler keeps this worker's secret fresh.
+		// Without it the worker record's expiry stays NULL, the scheduler
+		// never lists the worker as due, and any session outliving the
+		// 1h token dies with ExpiredToken.
+		expiresAt := creds.Expiration
+		return dl, &expiresAt, nil
 	}
 
-	return dl, nil
+	return dl, nil, nil
 }
 
 func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Interface, defaultNamespace string, org *configstore.OrgConfig, stsBroker *STSBroker) (TenantActivationPayload, error) {

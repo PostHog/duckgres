@@ -54,8 +54,9 @@ func TestSTSBrokerCacheHitWithinValidity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first AssumeRole: %v", err)
 	}
-	// Well within validity: 1h creds, 10m margin → cached until +50m.
-	clock.Advance(49 * time.Minute)
+	// Well within validity: 1h creds with the safety margin → cached until
+	// expiration minus the margin; stop one minute short of that boundary.
+	clock.Advance(stsSessionDuration - stsCacheSafetyMargin - time.Minute)
 	second, err := b.AssumeRole(context.Background(), "arn:aws:iam::123:role/org-a")
 	if err != nil {
 		t.Fatalf("second AssumeRole: %v", err)
@@ -116,8 +117,8 @@ func TestSTSBrokerRefreshesAfterExpiryMargin(t *testing.T) {
 	if _, err := b.AssumeRole(context.Background(), "arn:aws:iam::123:role/org-a"); err != nil {
 		t.Fatalf("first AssumeRole: %v", err)
 	}
-	// 1h creds with a 10m safety margin: at +50m the cached creds are no
-	// longer served even though they have not truly expired yet.
+	// 1h creds with the safety margin: once inside the margin the cached
+	// creds are no longer served even though they have not truly expired yet.
 	clock.Advance(stsSessionDuration - stsCacheSafetyMargin)
 	refreshed, err := b.AssumeRole(context.Background(), "arn:aws:iam::123:role/org-a")
 	if err != nil {
@@ -255,5 +256,49 @@ func TestSTSBrokerWaiterRespectsContextCancellation(t *testing.T) {
 	close(release)
 	if err := <-leaderDone; err != nil {
 		t.Fatalf("leader AssumeRole failed: %v", err)
+	}
+}
+
+// DUCKGRES_STS_SESSION_DURATION is env-only and exists to let a soak test
+// shorten tokens to AWS's 900s AssumeRole floor (proving real in-statement
+// expiry needs a token shorter than the harness budget allows at 1h).
+func TestResolveSTSSessionDuration(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", defaultSTSSessionDuration},
+		{"garbage", defaultSTSSessionDuration},
+		{"30m", 30 * time.Minute},
+		{"900s", 15 * time.Minute},
+		{"1h", time.Hour},
+		// Below AWS's AssumeRole minimum → clamped up, never rejected.
+		{"5m", minSTSSessionDuration},
+		{"1s", minSTSSessionDuration},
+		// Above the role-chaining ceiling → clamped down: STS would REJECT an
+		// AssumeRole with DurationSeconds > 3600 under role chaining (and every
+		// duckling role has MaxSessionDuration=3600), breaking all activations.
+		{"2h", maxSTSSessionDuration},
+		{"24h", maxSTSSessionDuration},
+	}
+	for _, c := range cases {
+		if got := resolveSTSSessionDuration(c.raw); got != c.want {
+			t.Errorf("resolveSTSSessionDuration(%q) = %v, want %v", c.raw, got, c.want)
+		}
+	}
+}
+
+// The former compile-time guard, now a unit invariant: the broker's cache
+// safety margin must stay strictly greater than the scheduler's lookahead or
+// a refresh push stamps an expiry already inside the "due" window and the
+// scheduler re-pushes identical cached creds every tick.
+func TestSTSCacheSafetyMarginExceedsLookahead(t *testing.T) {
+	if stsCacheSafetyMargin <= credentialRefreshLookahead {
+		t.Fatalf("stsCacheSafetyMargin (%v) must exceed credentialRefreshLookahead (%v)",
+			stsCacheSafetyMargin, credentialRefreshLookahead)
+	}
+	// And the historical 35m floor holds at the default session duration.
+	if stsSessionDuration == defaultSTSSessionDuration && stsCacheSafetyMargin != 35*time.Minute {
+		t.Fatalf("default-session safety margin = %v, want the historical 35m floor", stsCacheSafetyMargin)
 	}
 }

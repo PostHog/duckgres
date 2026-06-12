@@ -5,6 +5,9 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,20 +18,119 @@ import (
 )
 
 const (
-	stsSessionDuration = 1 * time.Hour
-	stsSessionName     = "duckgres-cp"
+	stsSessionName = "duckgres-cp"
 
-	// stsCacheSafetyMargin is how long before the credentials' true expiration
-	// we stop serving them from cache and mint a fresh session instead. It must
-	// leave enough room for a worker activation that receives cached creds to
-	// complete its DuckLake/Iceberg attach before the creds lapse.
-	stsCacheSafetyMargin = 10 * time.Minute
+	// defaultSTSSessionDuration is the AssumeRole DurationSeconds used unless
+	// overridden by the env-only DUCKGRES_STS_SESSION_DURATION knob.
+	defaultSTSSessionDuration = 1 * time.Hour
+
+	// minSTSSessionDuration is AWS's hard AssumeRole minimum (900s). The env
+	// knob is clamped up to this so a typo can't make AssumeRole reject every
+	// activation.
+	minSTSSessionDuration = 15 * time.Minute
+
+	// maxSTSSessionDuration is the effective AssumeRole ceiling in our
+	// deployment: the CP's own credentials come from EKS Pod Identity (a role
+	// session), so the per-org AssumeRole is role chaining, which STS
+	// hard-caps at 1h — and every duckling-* role's MaxSessionDuration is
+	// 3600s anyway. A DurationSeconds above that is not silently truncated:
+	// STS REJECTS the AssumeRole call, which would break activation for every
+	// org. The env knob is clamped down to this for the same reason it is
+	// clamped up to the minimum. Raising it for real requires de-chaining the
+	// assume AND raising MaxSessionDuration on every duckling role (12h
+	// absolute AWS max).
+	maxSTSSessionDuration = 1 * time.Hour
 
 	// stsAssumeRoleTimeout bounds the underlying AWS AssumeRole call. The call
 	// is detached from the triggering caller's context (other callers may be
 	// waiting on its result via singleflight), so it needs its own deadline.
 	stsAssumeRoleTimeout = 1 * time.Minute
 )
+
+// stsSessionDuration is the STS AssumeRole session duration. Env-overridable
+// (DUCKGRES_STS_SESSION_DURATION, e.g. "900s" / "15m" / "1h", clamped to
+// [minSTSSessionDuration, maxSTSSessionDuration]) so a soak test can shorten
+// tokens enough to exercise real in-statement expiry — with the production 1h
+// tokens, proving "a statement outlives its STS token" needs a >25min query
+// even with the refresh scheduler running. Only shortening is supported:
+// values above 1h would make AssumeRole itself fail (see
+// maxSTSSessionDuration).
+var stsSessionDuration = resolveSTSSessionDuration(os.Getenv("DUCKGRES_STS_SESSION_DURATION"))
+
+// credentialRefreshLookahead is how far ahead of a worker's recorded
+// credential expiry the scheduler refreshes it. Half the STS session
+// duration: a worker due for refresh gets picked up well before its current
+// session token actually goes stale, with a full half-life of slack to retry
+// transient STS / RPC failures on subsequent ticks.
+var credentialRefreshLookahead = stsSessionDuration / 2
+
+// stsCacheSafetyMargin is how long before the credentials' true expiration
+// we stop serving them from cache and mint a fresh session instead.
+//
+// This is the freshness floor for every credential capture point: all
+// AssumeRole callers bake the result into a worker's DuckDB secret, and a
+// DuckDB statement captures those credentials when it starts executing — a
+// later CREATE OR REPLACE SECRET (the credential-refresh scheduler's push)
+// does not re-credential an already-running statement (DuckDB resolves
+// secrets through the statement's MVCC snapshot). Stock httpfs has NO
+// mid-statement recovery path for scan workloads: its refresh-on-403 hook
+// only runs at file open AND only when the open performs a network request,
+// but DuckLake, Iceberg, and S3-glob scans all pre-populate file
+// size/etag/last-modified so opens skip the HEAD entirely and the first auth
+// failure surfaces on a range GET, which is not retried (verified against
+// httpfs v1.5.3 / ducklake / duckdb-iceberg sources; pinned by
+// TestInFlightScanDiesOnCredentialRotation in tests/integration). A
+// statement on stock httpfs therefore lives or dies on its starting runway:
+// this margin guarantees every statement at least lookahead+5m of token
+// validity at start; statements longer than that can still die with
+// ExpiredToken.
+//
+// The PostHog httpfs fork (PostHog/duckdb-httpfs, branch
+// cred-refresh-read-path) FIXES this: on an auth failure in any S3 request
+// path it re-resolves the latest committed secret — picking up this
+// scheduler's rotation pushes — and retries (proven by
+// TestInFlightScanSurvivesRotationWithPatchedHTTPFS in tests/integration).
+// Once a fork release with that patch is pinned via HTTPFS_EXTENSION_TAG in
+// Dockerfile.worker, this margin becomes defense-in-depth (a statement's
+// first credentials still want a healthy runway so recovery stays rare)
+// rather than the only thing standing between a long statement and
+// ExpiredToken.
+//
+// Defined as lookahead + 5m so it stays strictly greater than
+// credentialRefreshLookahead by construction (at the default 1h session:
+// 30m + 5m = 35m, the historical floor). If the margin were <= the
+// lookahead, a refresh push could stamp an expiry already inside the
+// scheduler's lookahead window, leaving the worker perpetually "due" and
+// re-pushing identical cached creds every tick until the margin finally
+// forces a fresh mint.
+var stsCacheSafetyMargin = credentialRefreshLookahead + 5*time.Minute
+
+// resolveSTSSessionDuration parses the env override, falling back to the
+// default on empty/garbage and clamping to AWS's AssumeRole minimum.
+func resolveSTSSessionDuration(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultSTSSessionDuration
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("Invalid DUCKGRES_STS_SESSION_DURATION; using default.",
+			"value", raw, "default", defaultSTSSessionDuration, "error", err)
+		return defaultSTSSessionDuration
+	}
+	if d < minSTSSessionDuration {
+		slog.Warn("DUCKGRES_STS_SESSION_DURATION below AWS AssumeRole minimum; clamping.",
+			"value", d, "minimum", minSTSSessionDuration)
+		return minSTSSessionDuration
+	}
+	if d > maxSTSSessionDuration {
+		slog.Warn("DUCKGRES_STS_SESSION_DURATION above the role-chaining AssumeRole ceiling; clamping. "+
+			"A larger DurationSeconds would make STS reject every per-org AssumeRole and break activation.",
+			"value", d, "maximum", maxSTSSessionDuration)
+		return maxSTSSessionDuration
+	}
+	return d
+}
 
 // assumeRoleFunc mints fresh credentials for a role ARN. It is a field on
 // STSBroker so tests can substitute a fake without an AWS client.
