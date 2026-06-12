@@ -533,6 +533,24 @@ func wipePersistedSecrets(cfg server.Config) {
 	}
 }
 
+// sizeMainForSessions matches the Main DB's connection capacity to the
+// worker's session admission. Every admitted session pins one *sql.Conn for
+// its whole lifetime (CreateSession), so a Main pool smaller than the session
+// cap starves the (cap+1)th concurrent session for the full conn-acquire
+// timeout — which the control plane classifies as a WEDGED worker
+// (isWorkerConnPoolTimeoutError) and answers by retiring the worker, killing
+// its co-resident live sessions. The process backend co-assigns sessions at
+// pool capacity (least-loaded worker) with the default unlimited admission,
+// so its Main pool must be unlimited too; maxSessions==0 maps to
+// database/sql's 0 == unlimited. The k8s shape (maxSessions==1) keeps the
+// single-conn isolation OpenDuckDBPair sets up.
+func (p *SessionPool) sizeMainForSessions(pair *DuckDBPair) {
+	if pair == nil || pair.Main == nil || p.maxSessions == 1 {
+		return
+	}
+	pair.Main.SetMaxOpenConns(p.maxSessions)
+}
+
 // Warmup performs one-time initialization of the shared DuckDB instance.
 // This loads extensions and attaches catalogs so that subsequent session
 // creations are nearly instantaneous.
@@ -571,6 +589,7 @@ func (p *SessionPool) Warmup() error {
 	if err != nil {
 		return fmt.Errorf("warmup failed after %v: %w", time.Since(start), err)
 	}
+	p.sizeMainForSessions(pair)
 
 	p.mu.Lock()
 	p.warmupDB = pair.Main
@@ -1008,6 +1027,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 				p.fallbackErr = err
 				return
 			}
+			p.sizeMainForSessions(pair)
 			p.fallbackDB = pair.Main
 			p.activePair = pair
 			p.controlDB = pair.Control
