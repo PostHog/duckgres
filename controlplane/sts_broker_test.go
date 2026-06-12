@@ -258,3 +258,42 @@ func TestSTSBrokerWaiterRespectsContextCancellation(t *testing.T) {
 		t.Fatalf("leader AssumeRole failed: %v", err)
 	}
 }
+
+// DUCKGRES_STS_SESSION_DURATION is env-only and exists to let a soak test
+// shorten tokens to AWS's 900s AssumeRole floor (proving real in-statement
+// expiry needs a token shorter than the harness budget allows at 1h).
+func TestResolveSTSSessionDuration(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", defaultSTSSessionDuration},
+		{"garbage", defaultSTSSessionDuration},
+		{"30m", 30 * time.Minute},
+		{"900s", 15 * time.Minute},
+		{"1h", time.Hour},
+		// Below AWS's AssumeRole minimum → clamped up, never rejected.
+		{"5m", minSTSSessionDuration},
+		{"1s", minSTSSessionDuration},
+	}
+	for _, c := range cases {
+		if got := resolveSTSSessionDuration(c.raw); got != c.want {
+			t.Errorf("resolveSTSSessionDuration(%q) = %v, want %v", c.raw, got, c.want)
+		}
+	}
+}
+
+// The former compile-time guard, now a unit invariant: the broker's cache
+// safety margin must stay strictly greater than the scheduler's lookahead or
+// a refresh push stamps an expiry already inside the "due" window and the
+// scheduler re-pushes identical cached creds every tick.
+func TestSTSCacheSafetyMarginExceedsLookahead(t *testing.T) {
+	if stsCacheSafetyMargin <= credentialRefreshLookahead {
+		t.Fatalf("stsCacheSafetyMargin (%v) must exceed credentialRefreshLookahead (%v)",
+			stsCacheSafetyMargin, credentialRefreshLookahead)
+	}
+	// And the historical 35m floor holds at the default session duration.
+	if stsSessionDuration == defaultSTSSessionDuration && stsCacheSafetyMargin != 35*time.Minute {
+		t.Fatalf("default-session safety margin = %v, want the historical 35m floor", stsCacheSafetyMargin)
+	}
+}

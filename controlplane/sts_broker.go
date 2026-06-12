@@ -5,6 +5,9 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,34 +18,88 @@ import (
 )
 
 const (
-	stsSessionDuration = 1 * time.Hour
-	stsSessionName     = "duckgres-cp"
+	stsSessionName = "duckgres-cp"
 
-	// stsCacheSafetyMargin is how long before the credentials' true expiration
-	// we stop serving them from cache and mint a fresh session instead.
-	//
-	// This is the freshness floor for every credential capture point: all
-	// AssumeRole callers bake the result into a worker's DuckDB secret, and a
-	// DuckDB statement captures those credentials when it starts executing —
-	// a later CREATE OR REPLACE SECRET (the credential-refresh scheduler's
-	// push) does not re-credential an already-running statement. A statement
-	// that begins on near-expiry cached creds therefore fails with
-	// ExpiredToken once it outruns them, no matter how diligently the secret
-	// is rotated underneath it. The margin is what guarantees every
-	// statement starts with at least this much runway.
-	//
-	// It must also stay strictly greater than credentialRefreshLookahead
-	// (compile-time guard in credential_refresh_scheduler.go): a refresh push
-	// that stamps an expiry already inside the scheduler's lookahead window
-	// leaves the worker perpetually "due", re-pushing identical cached creds
-	// every tick until the margin finally forces a fresh mint.
-	stsCacheSafetyMargin = 35 * time.Minute
+	// defaultSTSSessionDuration is the AssumeRole DurationSeconds used unless
+	// overridden by the env-only DUCKGRES_STS_SESSION_DURATION knob.
+	defaultSTSSessionDuration = 1 * time.Hour
+
+	// minSTSSessionDuration is AWS's hard AssumeRole minimum (900s). The env
+	// knob is clamped up to this so a typo can't make AssumeRole reject every
+	// activation.
+	minSTSSessionDuration = 15 * time.Minute
 
 	// stsAssumeRoleTimeout bounds the underlying AWS AssumeRole call. The call
 	// is detached from the triggering caller's context (other callers may be
 	// waiting on its result via singleflight), so it needs its own deadline.
 	stsAssumeRoleTimeout = 1 * time.Minute
 )
+
+// stsSessionDuration is the STS AssumeRole session duration. Env-overridable
+// (DUCKGRES_STS_SESSION_DURATION, e.g. "900s" / "15m" / "1h", min-clamped to
+// AWS's 900s AssumeRole floor) so a soak test can shorten tokens enough to
+// exercise real in-statement expiry — with the production 1h tokens, proving
+// "a statement outlives its STS token" needs a >25min query even with the
+// refresh scheduler running.
+var stsSessionDuration = resolveSTSSessionDuration(os.Getenv("DUCKGRES_STS_SESSION_DURATION"))
+
+// credentialRefreshLookahead is how far ahead of a worker's recorded
+// credential expiry the scheduler refreshes it. Half the STS session
+// duration: a worker due for refresh gets picked up well before its current
+// session token actually goes stale, with a full half-life of slack to retry
+// transient STS / RPC failures on subsequent ticks.
+var credentialRefreshLookahead = stsSessionDuration / 2
+
+// stsCacheSafetyMargin is how long before the credentials' true expiration
+// we stop serving them from cache and mint a fresh session instead.
+//
+// This is the freshness floor for every credential capture point: all
+// AssumeRole callers bake the result into a worker's DuckDB secret, and a
+// DuckDB statement captures those credentials when it starts executing — a
+// later CREATE OR REPLACE SECRET (the credential-refresh scheduler's push)
+// does not re-credential an already-running statement (DuckDB resolves
+// secrets through the statement's MVCC snapshot). There is NO mid-statement
+// recovery path for scan workloads: httpfs' refresh-on-403 hook only runs at
+// file open AND only when the open performs a network request, but DuckLake,
+// Iceberg, and S3-glob scans all pre-populate file size/etag/last-modified
+// so opens skip the HEAD entirely and the first auth failure surfaces on a
+// range GET, which is not retried (verified against httpfs v1.5.3 /
+// ducklake / duckdb-iceberg sources; pinned by
+// TestInFlightScanDiesOnCredentialRotation in tests/integration). A
+// statement therefore lives or dies on its starting runway: this margin is
+// the ONLY guarantee, giving every statement at least lookahead+5m of token
+// validity at start. Statements longer than that can still die with
+// ExpiredToken.
+//
+// Defined as lookahead + 5m so it stays strictly greater than
+// credentialRefreshLookahead by construction (at the default 1h session:
+// 30m + 5m = 35m, the historical floor). If the margin were <= the
+// lookahead, a refresh push could stamp an expiry already inside the
+// scheduler's lookahead window, leaving the worker perpetually "due" and
+// re-pushing identical cached creds every tick until the margin finally
+// forces a fresh mint.
+var stsCacheSafetyMargin = credentialRefreshLookahead + 5*time.Minute
+
+// resolveSTSSessionDuration parses the env override, falling back to the
+// default on empty/garbage and clamping to AWS's AssumeRole minimum.
+func resolveSTSSessionDuration(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultSTSSessionDuration
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("Invalid DUCKGRES_STS_SESSION_DURATION; using default.",
+			"value", raw, "default", defaultSTSSessionDuration, "error", err)
+		return defaultSTSSessionDuration
+	}
+	if d < minSTSSessionDuration {
+		slog.Warn("DUCKGRES_STS_SESSION_DURATION below AWS AssumeRole minimum; clamping.",
+			"value", d, "minimum", minSTSSessionDuration)
+		return minSTSSessionDuration
+	}
+	return d
+}
 
 // assumeRoleFunc mints fresh credentials for a role ARN. It is a field on
 // STSBroker so tests can substitute a fake without an AWS client.

@@ -2343,9 +2343,14 @@ func buildConfigSecret(dlCfg DuckLakeConfig) string {
 		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
 	}
 
-	if dlCfg.S3SessionToken != "" {
-		secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", dlCfg.S3SessionToken)
-	}
+	// SESSION_TOKEN is ALWAYS emitted, even when empty: httpfs copies a host
+	// AWS_SESSION_TOKEN env var into the global s3_session_token setting at
+	// extension load (AWSEnvironmentCredentialsProvider::SetAll), and a secret
+	// that omits the key falls back to that setting at request-signing time
+	// (S3KeyValueReader::TryGetSecretKeyOrSetting) — signing with a mismatched
+	// (key, token) pair. An explicit empty token pins "no token". (Verified
+	// against httpfs v1.5.3 source.)
+	secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", dlCfg.S3SessionToken)
 
 	secret += "\n\t\t)"
 	return secret
