@@ -283,9 +283,17 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 
-	// If there's an external cancel channel (child worker mode), set up a goroutine
-	// to cancel the context when the channel is closed
+	// If there's an external cancel channel (child worker mode), set up a
+	// goroutine to cancel the context when a cancel token arrives. Each
+	// SIGUSR1 sends one token (worker.go notifyQueryCancel); discard a token
+	// that arrived while no query was in flight — like Postgres, a cancel
+	// request targets only the query running when it is delivered, so a stale
+	// one must not kill the next query.
 	if c.server.externalCancelCh != nil {
+		select {
+		case <-c.server.externalCancelCh:
+		default:
+		}
 		go func() {
 			select {
 			case <-c.server.externalCancelCh:

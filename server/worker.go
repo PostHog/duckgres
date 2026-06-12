@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 
 	"github.com/posthog/duckgres/server/wire"
-	"sync"
 	"syscall"
 	"time"
 
@@ -179,6 +178,16 @@ func authenticateChildClient(reader *bufio.Reader, writer *bufio.Writer, users m
 	return ExitSuccess
 }
 
+// notifyQueryCancel delivers one query-cancel request, coalescing bursts: if
+// a cancel is already pending (buffer full), the new one is dropped — the
+// pending token will cancel the same in-flight query.
+func notifyQueryCancel(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
 // runChildWorker handles a single client connection in a child process.
 // Returns the appropriate exit code.
 func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
@@ -190,10 +199,14 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	defer shutdownCancel()
 
-	// Create a channel to signal query cancellation (SIGUSR1)
-	// This is separate from shutdown so we can cancel queries without closing the connection
-	queryCancelCh := make(chan struct{})
-	var queryCancelOnce sync.Once
+	// Create a channel to signal query cancellation (SIGUSR1).
+	// This is separate from shutdown so we can cancel queries without closing
+	// the connection. Each SIGUSR1 delivers ONE cancel token (coalescing
+	// bursts) that the in-flight query's context goroutine consumes — the
+	// channel must never be closed: a closed channel is permanently readable,
+	// so a single cancel would instantly cancel every subsequent query on the
+	// connection (the session could never run another statement).
+	queryCancelCh := make(chan struct{}, 1)
 
 	// Handle signals in a goroutine
 	go func() {
@@ -204,10 +217,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 				shutdownCancel()
 			case syscall.SIGUSR1:
 				slog.Info("Received query cancel signal")
-				// Signal query cancellation (can be called multiple times safely)
-				queryCancelOnce.Do(func() {
-					close(queryCancelCh)
-				})
+				notifyQueryCancel(queryCancelCh)
 			}
 		}
 	}()
