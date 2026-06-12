@@ -107,45 +107,8 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		return nil, fmt.Errorf("connect to config store: %w", err)
 	}
 
-	// Migrate OrgUser PK from (username) to (org_id, username) if needed.
-	// GORM AutoMigrate cannot alter primary keys, so we do it manually.
-	if err := migrateOrgUserPK(db); err != nil {
-		return nil, fmt.Errorf("migrate org user PK: %w", err)
-	}
-
-	// Auto-migrate all models
-	if err := db.AutoMigrate(
-		&Org{},
-		&ManagedWarehouse{},
-		&OrgUser{},
-		&OrgUserSecret{},
-		&GlobalConfig{},
-		&DuckLakeConfig{},
-		&RateLimitConfig{},
-		&QueryLogConfig{},
-		&SchemaMigration{},
-	); err != nil {
-		return nil, fmt.Errorf("auto-migrate config store: %w", err)
-	}
-
-	// Drop the reverted customer-Trino tables. The customer-facing Trino
-	// integration (models, provisioner, OPA bundle) has been removed; these
-	// tables are no longer in AutoMigrate, so on a redeploy they would
-	// otherwise be left orphaned. The explicit IF EXISTS drop is idempotent
-	// and safe to run on stores that never had Trino enabled. Table names
-	// match the deleted models' TableName() methods:
-	//   - ManagedWarehouseTrino -> duckgres_managed_warehouse_trino
-	//   - TrinoClusterBootstrap -> duckgres_trino_cluster_bootstrap
-	if err := db.Exec(`DROP TABLE IF EXISTS duckgres_managed_warehouse_trino`).Error; err != nil {
-		return nil, fmt.Errorf("drop reverted trino table duckgres_managed_warehouse_trino: %w", err)
-	}
-	if err := db.Exec(`DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap`).Error; err != nil {
-		return nil, fmt.Errorf("drop reverted trino table duckgres_trino_cluster_bootstrap: %w", err)
-	}
-
-	// One-shot data migrations (idempotent — tracked in duckgres_schema_migrations).
-	if err := migrateDeltaCatalogDefaultEnabled(db); err != nil {
-		return nil, fmt.Errorf("migrate delta catalog default: %w", err)
+	if err := runConfigStoreMigrations(db); err != nil {
+		return nil, fmt.Errorf("migrate config store: %w", err)
 	}
 	runtimeSchema, err := resolveRuntimeSchema(db)
 	if err != nil {
@@ -693,67 +656,6 @@ func (cs *ConfigStore) GetManagedWarehouseIceberg(orgID string) (*ManagedWarehou
 	}
 	ic := warehouse.Iceberg
 	return &ic, nil
-}
-
-// migrateDeltaCatalogDefaultEnabled is a one-shot backfill that flips existing
-// rows where delta_catalog_enabled was stored as false (the old default) to
-// true. New rows get true automatically via the gorm:"default:true" column
-// default. Tracked in duckgres_schema_migrations so it runs exactly once;
-// admins can disable per-warehouse via the admin API after the backfill
-// without it being re-flipped on subsequent restarts.
-const deltaCatalogDefaultMigrationName = "2026_05_delta_catalog_default_enabled"
-
-func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
-	var existing SchemaMigration
-	err := db.Where("name = ?", deltaCatalogDefaultMigrationName).First(&existing).Error
-	if err == nil {
-		return nil // already applied
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return fmt.Errorf("check schema migration: %w", err)
-	}
-
-	return db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(
-			`UPDATE duckgres_ducklake_config SET delta_catalog_enabled = TRUE WHERE delta_catalog_enabled IS DISTINCT FROM TRUE`,
-		).Error; err != nil {
-			return fmt.Errorf("backfill ducklake config: %w", err)
-		}
-		if err := tx.Exec(
-			`UPDATE duckgres_managed_warehouses SET s3_delta_catalog_enabled = TRUE WHERE s3_delta_catalog_enabled IS DISTINCT FROM TRUE`,
-		).Error; err != nil {
-			return fmt.Errorf("backfill managed warehouses: %w", err)
-		}
-		if err := tx.Create(&SchemaMigration{
-			Name:      deltaCatalogDefaultMigrationName,
-			AppliedAt: time.Now().UTC(),
-		}).Error; err != nil {
-			return fmt.Errorf("record schema migration: %w", err)
-		}
-		slog.Info("Backfilled delta_catalog_enabled=true on existing config rows.")
-		return nil
-	})
-}
-
-func migrateOrgUserPK(db *gorm.DB) error {
-	// Check if the PK already has 2 columns (idempotent)
-	var count int64
-	db.Raw(`
-		SELECT COUNT(*) FROM information_schema.key_column_usage
-		WHERE table_name = 'duckgres_org_users'
-		AND constraint_name = 'duckgres_org_users_pkey'
-	`).Scan(&count)
-	if count >= 2 {
-		return nil // Already migrated
-	}
-	if count == 0 {
-		return nil // Table doesn't exist yet, AutoMigrate will create it
-	}
-	// Migrate: drop old single-column PK, add composite PK
-	return db.Exec(`
-		ALTER TABLE duckgres_org_users DROP CONSTRAINT duckgres_org_users_pkey;
-		ALTER TABLE duckgres_org_users ADD PRIMARY KEY (org_id, username);
-	`).Error
 }
 
 func resolveRuntimeSchema(db *gorm.DB) (string, error) {
