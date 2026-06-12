@@ -489,6 +489,19 @@ func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID in
 	if err != nil {
 		return nil, err
 	}
+
+	// Pre-claim the reconnected session while the worker is still Reserved,
+	// exactly like executeAcquire: a reconnected Flight session is a live
+	// session like any other. Without the claim the worker becomes Hot with
+	// activeSessions==0 — findIdleAssignedWorkerLocked then co-assigns the
+	// org's next connection onto it, the worker-side MaxSessions=1 cap
+	// rejects that, and the cap-drift recovery retires the worker out from
+	// under the live reconnected query (ShutdownAll's active-session
+	// preservation also wouldn't protect it).
+	p.shared.mu.Lock()
+	worker.claimSessionLocked()
+	p.shared.mu.Unlock()
+
 	if err := p.activateWorkerForOrg(ctx, worker); err != nil {
 		p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure, LifecycleOriginActivationFailure)
 		return nil, err

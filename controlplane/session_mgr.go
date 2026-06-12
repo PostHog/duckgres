@@ -439,6 +439,10 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	}
 	pid, exec, err := sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false, lease)
 	if err != nil {
+		// ReconnectFlightWorker pre-claimed the session on the worker; undo
+		// the claim so the worker parks hot-idle instead of looking busy
+		// forever with no session on it.
+		sm.pool.ReleaseWorker(worker.ID)
 		return 0, nil, err
 	}
 	success = true
