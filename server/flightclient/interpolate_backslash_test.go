@@ -25,7 +25,7 @@ func TestFormatArgValueBackslashRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	for _, in := range []string{
 		`C:\Users\alice`,
