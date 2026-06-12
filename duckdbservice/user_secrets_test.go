@@ -44,9 +44,11 @@ func secretNames(t *testing.T, db *sql.DB, where string) map[string]bool {
 	return names
 }
 
-// Wipe must drop persistent secrets (user-created) and leave in-memory
-// secrets (how the system catalog secrets are created) untouched.
-func TestWipeUserPersistentSecrets(t *testing.T) {
+// Wipe must drop ALL user-created secrets — persistent AND non-persistent
+// (plain/TEMPORARY CREATE SECRET) — while leaving the system-managed catalog
+// secrets (ducklake_s3 / iceberg_sigv4 / iceberg_oauth, plus the reserved
+// __default_*/duckgres_* prefixes) untouched.
+func TestWipeUserSecrets(t *testing.T) {
 	db := openSecretTestDB(t)
 	mustExec := func(q string) {
 		t.Helper()
@@ -54,22 +56,58 @@ func TestWipeUserPersistentSecrets(t *testing.T) {
 			t.Fatalf("exec %q: %v", q, err)
 		}
 	}
+	// System-managed secrets (created with plain CREATE OR REPLACE SECRET, so
+	// they land in in-memory/temporary storage). These must survive the wipe.
 	mustExec("CREATE OR REPLACE SECRET ducklake_s3 (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
+	mustExec("CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
+	// User secrets: a persistent one and a temporary one. Both must be dropped.
 	mustExec("CREATE PERSISTENT SECRET user_a (TYPE s3, KEY_ID 'a', SECRET 'a')")
 	mustExec(`CREATE PERSISTENT SECRET "user_b" (TYPE gcs, KEY_ID 'b', SECRET 'b')`)
+	mustExec("CREATE TEMPORARY SECRET user_temp (TYPE s3, KEY_ID 't', SECRET 't')")
 
-	dropped, err := wipeUserPersistentSecrets(context.Background(), db)
+	dropped, err := wipeUserSecrets(context.Background(), db)
 	if err != nil {
-		t.Fatalf("wipeUserPersistentSecrets: %v", err)
+		t.Fatalf("wipeUserSecrets: %v", err)
 	}
-	if len(dropped) != 2 {
-		t.Errorf("dropped = %v, want 2 names", dropped)
+	if len(dropped) != 3 {
+		t.Errorf("dropped = %v, want 3 names (user_a, user_b, user_temp)", dropped)
 	}
-	if names := secretNames(t, db, "WHERE persistent"); len(names) != 0 {
-		t.Errorf("persistent secrets remain after wipe: %v", names)
+	remaining := secretNames(t, db, "")
+	for _, leaked := range []string{"user_a", "user_b", "user_temp"} {
+		if remaining[leaked] {
+			t.Errorf("user secret %q remains after wipe; remaining: %v", leaked, remaining)
+		}
 	}
-	if names := secretNames(t, db, ""); !names["ducklake_s3"] {
-		t.Errorf("system in-memory secret was wiped; remaining: %v", names)
+	for _, sys := range []string{"ducklake_s3", "iceberg_sigv4"} {
+		if !remaining[sys] {
+			t.Errorf("system secret %q was wiped; remaining: %v", sys, remaining)
+		}
+	}
+}
+
+// Regression for the cross-user isolation leak: a non-persistent (TEMPORARY /
+// plain) secret created by one user lingers on the instance-global DuckDB and
+// would be inherited by the next user of the same org. The wipe must remove it.
+func TestWipeUserSecretsDropsTemporary(t *testing.T) {
+	db := openSecretTestDB(t)
+	// Plain CREATE SECRET is non-persistent in DuckDB — the exact passthrough
+	// path the control plane allows for session-scoped secrets.
+	if _, err := db.Exec("CREATE SECRET leaky (TYPE s3, KEY_ID 'private', SECRET 'private')"); err != nil {
+		t.Fatalf("create temporary secret: %v", err)
+	}
+	if names := secretNames(t, db, ""); !names["leaky"] {
+		t.Fatalf("temporary secret not present before wipe; have %v", names)
+	}
+
+	dropped, err := wipeUserSecrets(context.Background(), db)
+	if err != nil {
+		t.Fatalf("wipeUserSecrets: %v", err)
+	}
+	if len(dropped) != 1 || dropped[0] != "leaky" {
+		t.Errorf("dropped = %v, want [leaky]", dropped)
+	}
+	if names := secretNames(t, db, ""); names["leaky"] {
+		t.Errorf("temporary secret leaked across wipe (cross-user isolation bug); remaining: %v", names)
 	}
 }
 

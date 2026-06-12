@@ -878,33 +878,45 @@ persistent_user_secret() { # org password
   log "persistent secret OK on $org (create → cross-session replay → reserved/unnamed rejected → durable drop)"
 }
 
-# Cross-user isolation within one org: user B must never see user A's
-# persistent secret. B's session typically reuses A's hot-idle worker (one org,
-# cap permitting), which is exactly the leak path: the worker wipes persistent
-# secrets at session create and replays only the connecting user's.
+# Cross-user isolation within one org: user B must never see user A's secrets,
+# whether PERSISTENT or non-persistent (plain/TEMPORARY CREATE SECRET). B's
+# session typically reuses A's hot-idle worker (one org, cap permitting), which
+# is exactly the leak path. DuckDB secrets are instance-global, so a temporary
+# secret created by A would survive on the worker and be visible to B unless the
+# session-create wipe drops non-persistent secrets too. The worker wipes ALL
+# user secrets at session create and replays only the connecting user's stored
+# (persistent) ones.
 persistent_user_secret_isolation() { # org rootpw
-  org="$1"; pw="$2"; sname="e2e_root_secret"; u2="e2esecuser"
+  org="$1"; pw="$2"; sname="e2e_root_secret"; tname="e2e_root_temp_secret"; u2="e2esecuser"
   u2pw="e2e-$(openssl rand -hex 12)"
-  log "persistent secret cross-user isolation on $org"
+  log "user secret cross-user isolation on $org (persistent + temporary)"
 
   pg "$org" "$pw" ducklake "CREATE PERSISTENT SECRET $sname (TYPE s3, KEY_ID 'AKIAE2EDUMMY', SECRET 'root-dummy', REGION 'us-east-1', SCOPE 's3://duckgres-e2e-nonexistent-root-$org')" >/dev/null
+  # A non-persistent (TEMPORARY) secret is passed through to the worker and is
+  # NOT stored/replayed. It lives only on the instance-global DuckDB — the exact
+  # state that must be wiped before another user of the org connects.
+  pg "$org" "$pw" ducklake "CREATE TEMPORARY SECRET $tname (TYPE s3, KEY_ID 'AKIAE2ETMP', SECRET 'root-temp', REGION 'us-east-1', SCOPE 's3://duckgres-e2e-nonexistent-temp-$org')" >/dev/null
 
   code="$(curl -s -o /tmp/create_user_out -w '%{http_code}' -X POST -H "$H" \
     -H 'Content-Type: application/json' \
     -d "{\"org_id\":\"$org\",\"username\":\"$u2\",\"password\":\"$u2pw\"}" \
     "$API/api/v1/users")"
-  case "$code" in 200|201) ;; *) fail "persistent secret: create user $u2 -> HTTP $code: $(cat /tmp/create_user_out)";; esac
+  case "$code" in 200|201) ;; *) fail "user secret: create user $u2 -> HTTP $code: $(cat /tmp/create_user_out)";; esac
   # New-user auth is config-snapshot-driven; wait out one poll before the
   # first login so we don't burn failed auths against the rate limiter.
   sleep "${CONFIG_POLL_SETTLE:-12}"
 
   n="$(pg "$org" "$u2pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'" "$u2")"
-  [ "$n" = "0" ] || fail "persistent secret: user $u2 sees root's secret (count=$n)"
-  # Root's stored copy must be unaffected by $u2's session-create wipe.
+  [ "$n" = "0" ] || fail "user secret: user $u2 sees root's persistent secret (count=$n)"
+  # Regression for the cross-user secret leak: $u2 must not inherit root's
+  # TEMPORARY secret left behind on the instance-global worker DuckDB.
+  n="$(pg "$org" "$u2pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$tname'" "$u2")"
+  [ "$n" = "0" ] || fail "user secret: user $u2 sees root's TEMPORARY secret — cross-user leak (count=$n)"
+  # Root's stored (persistent) copy must be unaffected by $u2's session-create wipe.
   n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'")"
-  [ "$n" = "1" ] || fail "persistent secret: root's secret lost after $u2's session (count=$n)"
+  [ "$n" = "1" ] || fail "user secret: root's persistent secret lost after $u2's session (count=$n)"
   pg "$org" "$pw" ducklake "DROP PERSISTENT SECRET $sname" >/dev/null
-  log "persistent secret isolation OK on $org ($u2 blind to root's secret; root's copy intact)"
+  log "user secret isolation OK on $org ($u2 blind to root's persistent AND temporary secrets; root's stored copy intact)"
 }
 
 # ---- resilience -----------------------------------------------------------

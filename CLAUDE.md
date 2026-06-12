@@ -253,10 +253,14 @@ Invariants for anyone touching this path:
 
 - **Cross-user isolation is the wipe at session create, not the destroy-time
   cleanup.** DuckDB secrets are instance-global, and a hot-idle worker is
-  reused across users of an org: `wipeUserPersistentSecrets` (persistent
-  storage only — system secrets `ducklake_s3`/`iceberg_sigv4`/`iceberg_oauth`
-  are in-memory and untouched) MUST run before replay on every CreateSession
-  in shared-warm mode, and a wipe failure MUST fail the session.
+  reused across users of an org: `wipeUserSecrets` drops ALL user-created
+  secrets — persistent ones AND non-persistent (plain/TEMPORARY `CREATE
+  SECRET`) ones, which pass through to the worker and would otherwise leak to
+  the next user. It preserves only the system-managed allowlist
+  (`usersecrets.IsReservedName`: `ducklake_s3`/`iceberg_sigv4`/`iceberg_oauth`
+  + the `__default_*`/`duckgres_*` prefixes, which activation re-creates). It
+  MUST run before replay on every CreateSession in shared-warm mode, and a
+  wipe failure MUST fail the session.
 - **Execute-then-persist ordering.** Persist only statements DuckDB accepted;
   a store failure after a successful exec is an ERROR telling the user the
   secret will NOT survive the session. Replay failures at session create are
