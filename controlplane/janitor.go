@@ -52,12 +52,23 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		expiryTimeout = 20 * time.Second
 	}
 	return &ControlPlaneJanitor{
-		store:           store,
-		interval:        interval,
-		expiryTimeout:   expiryTimeout,
-		orphanGrace:     30 * time.Second,
-		spawnTimeout:    2 * time.Minute,
-		activateTimeout: 2 * time.Minute,
+		store:         store,
+		interval:      interval,
+		expiryTimeout: expiryTimeout,
+		orphanGrace:   30 * time.Second,
+		// The stuck-worker cutoffs must exceed the detached spawn+activate
+		// budget (workerSpawnActivateTimeout, 8m: pod-ready incl. Karpenter
+		// node provisioning + gRPC connect + activation). A spawning row's
+		// updated_at is not touched between CreateSpawningWorkerSlot and the
+		// Reserved transition, and ListStuckWorkers does not exclude rows
+		// whose owner CP is alive — so a cutoff below the budget makes the
+		// janitor leader delete legitimately in-flight pods mid-spawn
+		// (doomed-spawn thrash on every cold-node spawn slower than the
+		// cutoff). Reserved/Activating rows get their updated_at bumped at
+		// each lifecycle transition, so activateTimeout only needs to cover
+		// the connect+activate tail, with slack for clock/poll skew.
+		spawnTimeout:    10 * time.Minute,
+		activateTimeout: 5 * time.Minute,
 		maxDrainTimeout: 15 * time.Minute,
 		now:             time.Now,
 	}
