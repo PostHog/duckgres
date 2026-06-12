@@ -58,17 +58,28 @@ var credentialRefreshLookahead = stsSessionDuration / 2
 // DuckDB statement captures those credentials when it starts executing — a
 // later CREATE OR REPLACE SECRET (the credential-refresh scheduler's push)
 // does not re-credential an already-running statement (DuckDB resolves
-// secrets through the statement's MVCC snapshot). There is NO mid-statement
-// recovery path for scan workloads: httpfs' refresh-on-403 hook only runs at
-// file open AND only when the open performs a network request, but DuckLake,
-// Iceberg, and S3-glob scans all pre-populate file size/etag/last-modified
-// so opens skip the HEAD entirely and the first auth failure surfaces on a
-// range GET, which is not retried (verified against httpfs v1.5.3 /
-// ducklake / duckdb-iceberg sources; pinned by
+// secrets through the statement's MVCC snapshot). Stock httpfs has NO
+// mid-statement recovery path for scan workloads: its refresh-on-403 hook
+// only runs at file open AND only when the open performs a network request,
+// but DuckLake, Iceberg, and S3-glob scans all pre-populate file
+// size/etag/last-modified so opens skip the HEAD entirely and the first auth
+// failure surfaces on a range GET, which is not retried (verified against
+// httpfs v1.5.3 / ducklake / duckdb-iceberg sources; pinned by
 // TestInFlightScanDiesOnCredentialRotation in tests/integration). A
-// statement therefore lives or dies on its starting runway: this margin is
-// the ONLY guarantee, giving every statement at least lookahead+5m of token
-// validity at start. Statements longer than that can still die with
+// statement on stock httpfs therefore lives or dies on its starting runway:
+// this margin guarantees every statement at least lookahead+5m of token
+// validity at start; statements longer than that can still die with
+// ExpiredToken.
+//
+// The PostHog httpfs fork (PostHog/duckdb-httpfs, branch
+// cred-refresh-read-path) FIXES this: on an auth failure in any S3 request
+// path it re-resolves the latest committed secret — picking up this
+// scheduler's rotation pushes — and retries (proven by
+// TestInFlightScanSurvivesRotationWithPatchedHTTPFS in tests/integration).
+// Once a fork release with that patch is pinned via HTTPFS_EXTENSION_TAG in
+// Dockerfile.worker, this margin becomes defense-in-depth (a statement's
+// first credentials still want a healthy runway so recovery stays rare)
+// rather than the only thing standing between a long statement and
 // ExpiredToken.
 //
 // Defined as lookahead + 5m so it stays strictly greater than
