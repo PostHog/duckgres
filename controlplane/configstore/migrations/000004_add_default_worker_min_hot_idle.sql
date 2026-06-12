@@ -1,3 +1,5 @@
+-- +goose Up
+
 ALTER TABLE duckgres_orgs
     ADD COLUMN IF NOT EXISTS default_worker_min_hot_idle BIGINT DEFAULT 0;
 

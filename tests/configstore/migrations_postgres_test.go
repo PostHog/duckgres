@@ -21,8 +21,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	db := storeDB(t, store)
 
-	requireMigrationRecorded(t, db, "000001_initial_config_schema")
-	requireMigrationRecorded(t, db, "000004_add_default_worker_min_hot_idle")
+	requireGooseMigrationRecorded(t, db, 1)
+	requireGooseMigrationRecorded(t, db, 4)
 	requireMigrationRowExists(t, db, legacyDeltaCatalogDefaultMigrationName)
 
 	var columnCount int
@@ -91,7 +91,7 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	if floor != 0 {
 		t.Fatalf("default_worker_min_hot_idle after migration = %d, want 0", floor)
 	}
-	requireMigrationRecorded(t, sqlDB, "000004_add_default_worker_min_hot_idle")
+	requireGooseMigrationRecorded(t, sqlDB, 4)
 }
 
 func TestConfigStoreSQLMigrationsUpgradeLegacyOrgUsersUsernamePK(t *testing.T) {
@@ -224,15 +224,20 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 	}
 }
 
-func requireMigrationRecorded(t *testing.T, db *sql.DB, name string) {
+func requireGooseMigrationRecorded(t *testing.T, db *sql.DB, version int64) {
 	t.Helper()
 
-	var checksum string
-	if err := db.QueryRow(`SELECT checksum FROM duckgres_schema_migrations WHERE name = $1`, name).Scan(&checksum); err != nil {
-		t.Fatalf("migration %q not recorded with checksum: %v", name, err)
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM goose_db_version
+		WHERE version_id = $1
+		  AND is_applied
+	`, version).Scan(&count); err != nil {
+		t.Fatalf("count goose migration version %d: %v", version, err)
 	}
-	if checksum == "" {
-		t.Fatalf("migration %q recorded empty checksum", name)
+	if count != 1 {
+		t.Fatalf("goose migration version %d row count = %d, want 1", version, count)
 	}
 }
 

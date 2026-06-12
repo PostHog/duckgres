@@ -1,3 +1,17 @@
+-- +goose Up
+
+CREATE TABLE IF NOT EXISTS duckgres_schema_migrations (
+    name VARCHAR(128) PRIMARY KEY,
+    checksum TEXT NOT NULL DEFAULT '',
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE duckgres_schema_migrations
+    ADD COLUMN IF NOT EXISTS checksum TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE duckgres_schema_migrations
+    ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
 CREATE TABLE IF NOT EXISTS duckgres_orgs (
     name VARCHAR(255) PRIMARY KEY,
     database_name VARCHAR(255),
@@ -57,6 +71,7 @@ WHERE org_id IS NULL;
 ALTER TABLE duckgres_org_users ALTER COLUMN org_id DROP DEFAULT;
 ALTER TABLE duckgres_org_users ALTER COLUMN password SET NOT NULL;
 
+-- +goose StatementBegin
 DO $$
 DECLARE
     existing_pk TEXT;
@@ -92,7 +107,9 @@ BEGIN
         ALTER TABLE duckgres_org_users ADD PRIMARY KEY (org_id, username);
     END IF;
 END $$;
+-- +goose StatementEnd
 
+-- +goose StatementBegin
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -115,6 +132,7 @@ BEGIN
             FOREIGN KEY (org_id) REFERENCES duckgres_orgs(name);
     END IF;
 END $$;
+-- +goose StatementEnd
 
 CREATE TABLE IF NOT EXISTS duckgres_org_user_secrets (
     org_id VARCHAR(255),
@@ -135,6 +153,7 @@ ALTER TABLE duckgres_org_user_secrets ADD COLUMN IF NOT EXISTS updated_at TIMEST
 
 ALTER TABLE duckgres_org_user_secrets ALTER COLUMN ciphertext SET NOT NULL;
 
+-- +goose StatementBegin
 DO $$
 DECLARE
     existing_pk TEXT;
@@ -170,6 +189,7 @@ BEGIN
         ALTER TABLE duckgres_org_user_secrets ADD PRIMARY KEY (org_id, username, secret_name);
     END IF;
 END $$;
+-- +goose StatementEnd
 
 CREATE TABLE IF NOT EXISTS duckgres_managed_warehouses (
     org_id VARCHAR(255) PRIMARY KEY,
@@ -324,6 +344,7 @@ ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS failed_at TIMES
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 
+-- +goose StatementBegin
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -347,6 +368,7 @@ BEGIN
             ON DELETE CASCADE;
     END IF;
 END $$;
+-- +goose StatementEnd
 
 CREATE TABLE IF NOT EXISTS duckgres_global_config (
     id BIGINT PRIMARY KEY,

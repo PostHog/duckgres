@@ -1,3 +1,6 @@
+-- +goose Up
+
+-- +goose StatementBegin
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -14,6 +17,7 @@ BEGIN
         WHERE s3_delta_catalog_enabled IS DISTINCT FROM true;
     END IF;
 END $$;
+-- +goose StatementEnd
 
 INSERT INTO duckgres_schema_migrations (name, checksum, applied_at)
 VALUES ('2026_05_delta_catalog_default_enabled', '', now())
