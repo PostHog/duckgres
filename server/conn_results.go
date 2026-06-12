@@ -81,7 +81,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 	// Send completion (no ReadyForQuery - that's done by Sync)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
-	_ = wire.WriteCommandComplete(c.writer, tag)
+	_ = c.writeCommandComplete(tag)
 }
 
 // streamRowsToClient sends result rows over the wire protocol.
@@ -93,8 +93,8 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		c.logger().Error("Failed to get column info.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -103,8 +103,8 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		c.logger().Error("Failed to get column types.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -132,8 +132,8 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 			c.logger().Error("Failed to scan row.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 
@@ -151,16 +151,16 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 			c.sendError("ERROR", "42000", err.Error())
 		}
 		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
 	// Send completion
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
-	_ = wire.WriteCommandComplete(c.writer, tag)
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	return c.writer.Flush()
+	_ = c.writeCommandComplete(tag)
+	_ = c.writeReadyForQuery(c.txStatus)
+	return c.flushWriter()
 }
 
 func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) error {
@@ -217,7 +217,11 @@ func (c *clientConn) sendRowDescriptionWithFormats(cols []string, colTypes []Col
 		_ = binary.Write(&buf, binary.BigEndian, format)
 	}
 
-	return wire.WriteMessage(c.writer, wire.MsgRowDescription, buf.Bytes())
+	if err := wire.WriteMessage(c.writer, wire.MsgRowDescription, buf.Bytes()); err != nil {
+		c.markActiveQueryMetricsError(err)
+		return err
+	}
+	return nil
 }
 
 func (c *clientConn) mapTypeOIDWithColumnName(colName string, colType ColumnTyper) int32 {
@@ -297,7 +301,11 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 		}
 	}
 
-	return wire.WriteMessage(c.writer, wire.MsgDataRow, buf.Bytes())
+	if err := wire.WriteMessage(c.writer, wire.MsgDataRow, buf.Bytes()); err != nil {
+		c.markActiveQueryMetricsError(err)
+		return err
+	}
+	return nil
 }
 
 // formatValue converts a value to its PostgreSQL text representation
@@ -497,6 +505,33 @@ func formatOrderedMapValue(m arrowmap.OrderedMapValue) string {
 	return buf.String()
 }
 
+func (c *clientConn) writeCommandComplete(tag string) error {
+	if err := wire.WriteCommandComplete(c.writer, tag); err != nil {
+		c.markActiveQueryMetricsError(err)
+		return err
+	}
+	if c.activeQueryMetrics != nil {
+		return c.flushWriter()
+	}
+	return nil
+}
+
+func (c *clientConn) writeReadyForQuery(txStatus byte) error {
+	if err := wire.WriteReadyForQuery(c.writer, txStatus); err != nil {
+		c.markActiveQueryMetricsError(err)
+		return err
+	}
+	return nil
+}
+
+func (c *clientConn) flushWriter() error {
+	if err := c.writer.Flush(); err != nil {
+		c.markActiveQueryMetricsError(err)
+		return err
+	}
+	return nil
+}
+
 func (c *clientConn) sendError(severity, code, message string) {
 	// Class 28 = "Invalid Authorization Specification" (auth failures).
 	// All current FATAL errors use class 28, so this covers both auth
@@ -505,13 +540,14 @@ func (c *clientConn) sendError(severity, code, message string) {
 	// a metric for it here.
 	if strings.HasPrefix(code, "28") {
 		auth.AuthFailuresCounter.Inc()
-	} else if severity == "ERROR" {
-		queryErrorsCounter.WithLabelValues(c.orgID).Inc()
+	}
+	if severity != "" {
+		c.lastErrorCode = code
 	}
 	c.logger().Debug("Sending error to client.", "severity", severity, "code", code, "message", message)
 	c.errorResponsesSent++
 	_ = wire.WriteErrorResponse(c.writer, severity, code, message)
-	_ = c.writer.Flush()
+	_ = c.flushWriter()
 }
 
 func (c *clientConn) sendNotice(severity, code, message string) {

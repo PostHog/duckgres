@@ -22,9 +22,9 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		// Handle nested BEGIN
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			_ = wire.WriteCommandComplete(c.writer, "BEGIN")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeCommandComplete("BEGIN")
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 
@@ -75,8 +75,8 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			}
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 
@@ -85,9 +85,9 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
-		_ = wire.WriteCommandComplete(c.writer, tag)
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeCommandComplete(tag)
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -269,8 +269,8 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return 0, errCode, errMsg, nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -285,8 +285,8 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return 0, errCode, errMsg, nil
 	}
 
@@ -300,8 +300,8 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return 0, errCode, errMsg, nil
 	}
 
@@ -345,8 +345,8 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			}
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return 0, errCode, errMsg, nil
 		}
 
@@ -373,16 +373,16 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return 0, errCode, errMsg, nil
 	}
 
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
-	_ = wire.WriteCommandComplete(c.writer, tag)
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeCommandComplete(tag)
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return int64(rowCount), "", "", nil
 }
 
@@ -400,8 +400,8 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 	tree, err := pg_query.Parse(parseSQL)
 	if err != nil {
 		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 	c.logger().Debug("Multi-statement simple query.", "count", len(tree.Stmts))
@@ -427,8 +427,8 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 		}
 	}
 
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -465,7 +465,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			}
 			c.closeCursor(s.DeclareCursorStmt.Portalname)
 			c.cursors[s.DeclareCursorStmt.Portalname] = &cursorState{query: transpiledSQL}
-			_ = wire.WriteCommandComplete(c.writer, "DECLARE CURSOR")
+			_ = c.writeCommandComplete("DECLARE CURSOR")
 			return false, nil
 
 		case *pg_query.Node_FetchStmt:
@@ -505,7 +505,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 					_ = cursor.rows.Scan(valuePtrs...)
 					moveCount++
 				}
-				_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("MOVE %d", moveCount))
+				_ = c.writeCommandComplete(fmt.Sprintf("MOVE %d", moveCount))
 				return false, nil
 			}
 			if err := c.sendRowDescription(cursor.cols, cursor.colTypes); err != nil {
@@ -537,7 +537,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				c.setTxError()
 				return true, nil
 			}
-			_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
+			_ = c.writeCommandComplete(fmt.Sprintf("FETCH %d", rowCount))
 			return false, nil
 
 		case *pg_query.Node_ClosePortalStmt:
@@ -550,7 +550,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				}
 				c.closeCursor(s.ClosePortalStmt.Portalname)
 			}
-			_ = wire.WriteCommandComplete(c.writer, "CLOSE CURSOR")
+			_ = c.writeCommandComplete("CLOSE CURSOR")
 			return false, nil
 		}
 	}
@@ -564,7 +564,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			_ = c.sendDataRowWithFormats([]interface{}{int64(1)}, nil, []int32{23})
 			rowCount = 1
 		}
-		_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("SELECT %d", rowCount))
+		_ = c.writeCommandComplete(fmt.Sprintf("SELECT %d", rowCount))
 		return false, nil
 	}
 
@@ -576,7 +576,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		for _, conn := range conns {
 			_ = c.sendPgStatActivityDataRow(conn, nil)
 		}
-		_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("SELECT %d", len(conns)))
+		_ = c.writeCommandComplete(fmt.Sprintf("SELECT %d", len(conns)))
 		return false, nil
 	}
 
@@ -602,12 +602,12 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	}
 
 	if result.IsIgnoredSet {
-		_ = wire.WriteCommandComplete(c.writer, "SET")
+		_ = c.writeCommandComplete("SET")
 		return false, nil
 	}
 
 	if result.IsNoOp {
-		_ = wire.WriteCommandComplete(c.writer, result.NoOpTag)
+		_ = c.writeCommandComplete(result.NoOpTag)
 		return false, nil
 	}
 
@@ -646,7 +646,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	if !queryReturnsResults(executedQuery) {
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			_ = wire.WriteCommandComplete(c.writer, "BEGIN")
+			_ = c.writeCommandComplete("BEGIN")
 			return false, nil
 		}
 
@@ -706,7 +706,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		queryRowsAff = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
-		_ = wire.WriteCommandComplete(c.writer, tag)
+		_ = c.writeCommandComplete(tag)
 		c.logQuery(start, query, executedQuery, cmdType, 0, writtenRows, "", "", "simple-batch")
 		return false, nil
 	}
@@ -802,7 +802,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
-	_ = wire.WriteCommandComplete(c.writer, tag)
+	_ = c.writeCommandComplete(tag)
 	c.logQuery(start, query, executedQuery, cmdType, int64(rowCount), 0, "", "", "simple-batch")
 	return false, nil
 }
@@ -819,8 +819,8 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 func (c *clientConn) executeMultiStatement(statements []string, cleanup []string) error {
 	if len(statements) == 0 {
 		_ = wire.WriteEmptyQueryResponse(c.writer)
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -856,8 +856,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 	}
@@ -885,8 +885,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 		defer func() { _ = rows.Close() }()
@@ -915,8 +915,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 		if result != nil {
@@ -928,9 +928,9 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 		// Send completion
 		tag := c.buildCommandTag(cmdType, result)
-		_ = wire.WriteCommandComplete(c.writer, tag)
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		return c.writer.Flush()
+		_ = c.writeCommandComplete(tag)
+		_ = c.writeReadyForQuery(c.txStatus)
+		return c.flushWriter()
 	}
 }
 
@@ -1048,6 +1048,6 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 		// Send completion (no ReadyForQuery - that's done by Sync)
 		tag := c.buildCommandTag(cmdType, result)
-		_ = wire.WriteCommandComplete(c.writer, tag)
+		_ = c.writeCommandComplete(tag)
 	}
 }

@@ -84,7 +84,7 @@ func (c *clientConn) handleParse(body []byte) {
 
 		case *pg_query.Node_FetchStmt:
 			if !isFetchForwardOnly(s.FetchStmt.Direction) || s.FetchStmt.HowMany < 0 {
-				c.sendError("ERROR", "0A000", "cursor can only scan forward")
+				c.observeExtendedParseQueryError("0A000", "cursor can only scan forward")
 				return
 			}
 			delete(c.stmts, stmtName)
@@ -161,13 +161,13 @@ func (c *clientConn) handleParse(body []byte) {
 	tr := c.newTranspiler(true) // Enable placeholder conversion for prepared statements
 	result, err := tr.Transpile(query)
 	if err != nil {
-		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		c.observeExtendedParseQueryError("42601", fmt.Sprintf("syntax error: %v", err))
 		return
 	}
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
 	if result.Error != nil {
-		c.sendError("ERROR", transformErrorSQLState(result.Error), result.Error.Error())
+		c.observeExtendedParseQueryError(transformErrorSQLState(result.Error), result.Error.Error())
 		return
 	}
 
@@ -175,7 +175,7 @@ func (c *clientConn) handleParse(body []byte) {
 	if result.FallbackToNative {
 		if err := c.validateWithDuckDB(query); err != nil {
 			// Neither PostgreSQL nor DuckDB can parse this query
-			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			c.observeExtendedParseQueryError("42601", fmt.Sprintf("syntax error: %v", err))
 			return
 		}
 		c.logger().Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "query", usersecrets.RedactForLog(query))
@@ -499,6 +499,17 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.queryStart.Store(time.Time{})
 	}()
 
+	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
+	trimmedQuery := strings.TrimSpace(p.stmt.query)
+	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
+		_ = wire.WriteEmptyQueryResponse(c.writer)
+		return
+	}
+
+	start := time.Now()
+	queryMetrics := c.beginQueryMetrics(start)
+	defer c.finishQueryMetrics(queryMetrics)
+
 	// Handle cursor operations before normal execution
 	switch p.stmt.cursorOp {
 	case cursorOpDeclare:
@@ -517,16 +528,6 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.handlePgStatActivityExtended(p)
 		return
 	}
-
-	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
-	trimmedQuery := strings.TrimSpace(p.stmt.query)
-	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
-		_ = wire.WriteEmptyQueryResponse(c.writer)
-		return
-	}
-
-	start := time.Now()
-	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
 
 	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
@@ -570,7 +571,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// (determined by transpiler during Parse)
 	if p.stmt.isIgnoredSet {
 		c.logger().Debug("Ignoring PostgreSQL-specific SET.", "query", p.stmt.query)
-		_ = wire.WriteCommandComplete(c.writer, "SET")
+		_ = c.writeCommandComplete("SET")
 		return
 	}
 
@@ -578,7 +579,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// (determined by transpiler during Parse)
 	if p.stmt.isNoOp {
 		c.logger().Debug("No-op command (DuckLake limitation).", "query", p.stmt.query)
-		_ = wire.WriteCommandComplete(c.writer, p.stmt.noOpTag)
+		_ = c.writeCommandComplete(p.stmt.noOpTag)
 		return
 	}
 
@@ -614,7 +615,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		// while DuckDB throws an error. Match PostgreSQL behavior.
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			_ = wire.WriteCommandComplete(c.writer, "BEGIN")
+			_ = c.writeCommandComplete("BEGIN")
 			return
 		}
 
@@ -674,7 +675,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		queryRowsAff = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
-		_ = wire.WriteCommandComplete(c.writer, tag)
+		_ = c.writeCommandComplete(tag)
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, writtenRows, "", "", "extended")
 		return
 	}
@@ -797,7 +798,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
-	_ = wire.WriteCommandComplete(c.writer, tag)
+	_ = c.writeCommandComplete(tag)
 	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
 }
 

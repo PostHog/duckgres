@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server/usersecrets"
-	"github.com/posthog/duckgres/server/wire"
 )
 
 // UserSecretManager persists per-user CREATE PERSISTENT SECRET statements so
@@ -195,10 +194,10 @@ func (c *clientConn) handleUserSecretDDLSimple(query string) bool {
 	if secErr != nil {
 		c.sendError("ERROR", secErr.code, secErr.msg)
 	} else {
-		_ = wire.WriteCommandComplete(c.writer, tag)
+		_ = c.writeCommandComplete(tag)
 	}
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return true
 }
 
@@ -213,7 +212,7 @@ func (c *clientConn) handleUserSecretDDLExtended(query string) bool {
 	if secErr != nil {
 		c.sendError("ERROR", secErr.code, secErr.msg)
 	} else {
-		_ = wire.WriteCommandComplete(c.writer, tag)
+		_ = c.writeCommandComplete(tag)
 	}
 	return true
 }
