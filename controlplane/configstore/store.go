@@ -673,6 +673,10 @@ func ensureRuntimeSchema(db *gorm.DB, runtimeSchema string) error {
 	return db.Exec(`CREATE SCHEMA IF NOT EXISTS "` + quoteIdentifier(runtimeSchema) + `"`).Error
 }
 
+// These runtime coordination tables are CP-owned, so AutoMigrate is acceptable
+// while changes stay additive and the state remains safely rebuildable or expirable.
+// Move them to Goose when a change needs ordered data movement, renames,
+// primary-key or constraint rewrites, or upgrade-sensitive state transitions.
 func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 	for _, spec := range []struct {
 		table string
