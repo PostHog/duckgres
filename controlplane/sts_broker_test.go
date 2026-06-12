@@ -275,6 +275,11 @@ func TestResolveSTSSessionDuration(t *testing.T) {
 		// Below AWS's AssumeRole minimum → clamped up, never rejected.
 		{"5m", minSTSSessionDuration},
 		{"1s", minSTSSessionDuration},
+		// Above the role-chaining ceiling → clamped down: STS would REJECT an
+		// AssumeRole with DurationSeconds > 3600 under role chaining (and every
+		// duckling role has MaxSessionDuration=3600), breaking all activations.
+		{"2h", maxSTSSessionDuration},
+		{"24h", maxSTSSessionDuration},
 	}
 	for _, c := range cases {
 		if got := resolveSTSSessionDuration(c.raw); got != c.want {

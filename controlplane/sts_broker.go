@@ -29,6 +29,18 @@ const (
 	// activation.
 	minSTSSessionDuration = 15 * time.Minute
 
+	// maxSTSSessionDuration is the effective AssumeRole ceiling in our
+	// deployment: the CP's own credentials come from EKS Pod Identity (a role
+	// session), so the per-org AssumeRole is role chaining, which STS
+	// hard-caps at 1h — and every duckling-* role's MaxSessionDuration is
+	// 3600s anyway. A DurationSeconds above that is not silently truncated:
+	// STS REJECTS the AssumeRole call, which would break activation for every
+	// org. The env knob is clamped down to this for the same reason it is
+	// clamped up to the minimum. Raising it for real requires de-chaining the
+	// assume AND raising MaxSessionDuration on every duckling role (12h
+	// absolute AWS max).
+	maxSTSSessionDuration = 1 * time.Hour
+
 	// stsAssumeRoleTimeout bounds the underlying AWS AssumeRole call. The call
 	// is detached from the triggering caller's context (other callers may be
 	// waiting on its result via singleflight), so it needs its own deadline.
@@ -36,11 +48,13 @@ const (
 )
 
 // stsSessionDuration is the STS AssumeRole session duration. Env-overridable
-// (DUCKGRES_STS_SESSION_DURATION, e.g. "900s" / "15m" / "1h", min-clamped to
-// AWS's 900s AssumeRole floor) so a soak test can shorten tokens enough to
-// exercise real in-statement expiry — with the production 1h tokens, proving
-// "a statement outlives its STS token" needs a >25min query even with the
-// refresh scheduler running.
+// (DUCKGRES_STS_SESSION_DURATION, e.g. "900s" / "15m" / "1h", clamped to
+// [minSTSSessionDuration, maxSTSSessionDuration]) so a soak test can shorten
+// tokens enough to exercise real in-statement expiry — with the production 1h
+// tokens, proving "a statement outlives its STS token" needs a >25min query
+// even with the refresh scheduler running. Only shortening is supported:
+// values above 1h would make AssumeRole itself fail (see
+// maxSTSSessionDuration).
 var stsSessionDuration = resolveSTSSessionDuration(os.Getenv("DUCKGRES_STS_SESSION_DURATION"))
 
 // credentialRefreshLookahead is how far ahead of a worker's recorded
@@ -108,6 +122,12 @@ func resolveSTSSessionDuration(raw string) time.Duration {
 		slog.Warn("DUCKGRES_STS_SESSION_DURATION below AWS AssumeRole minimum; clamping.",
 			"value", d, "minimum", minSTSSessionDuration)
 		return minSTSSessionDuration
+	}
+	if d > maxSTSSessionDuration {
+		slog.Warn("DUCKGRES_STS_SESSION_DURATION above the role-chaining AssumeRole ceiling; clamping. "+
+			"A larger DurationSeconds would make STS reject every per-org AssumeRole and break activation.",
+			"value", d, "maximum", maxSTSSessionDuration)
+		return maxSTSSessionDuration
 	}
 	return d
 }
