@@ -105,6 +105,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 				p.mu.Unlock()
 				return fmt.Errorf("create activation-ready runtime: %w", err)
 			}
+			p.sizeMainForSessions(pair)
 			p.fallbackDB = pair.Main
 			p.activePair = pair
 			p.controlDB = pair.Control
