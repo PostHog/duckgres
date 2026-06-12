@@ -135,11 +135,6 @@ var queryDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 18000, 36000},
 }, []string{"org"})
 
-var queryErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_query_errors_total",
-	Help: "Total number of failed queries",
-}, []string{"org"})
-
 var queryCancellationsCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_query_cancellations_total",
 	Help: "Total number of queries cancelled via cancel request",

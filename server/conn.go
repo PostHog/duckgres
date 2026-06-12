@@ -167,6 +167,8 @@ type clientConn struct {
 	txStatus               byte                     // current transaction status ('I', 'T', or 'E')
 	ignoreTillSync         bool                     // discard extended-query messages until Sync after an error; see runExtendedQueryMessage
 	errorResponsesSent     uint64                   // ErrorResponses sent via sendError; observed by runExtendedQueryMessage
+	lastErrorCode          string                   // most recent SQLSTATE sent via sendError; observed by query metrics
+	activeQueryMetrics     *queryMetricsScope       // active query attempt metrics scope for non-ErrorResponse failures
 	passthrough            bool                     // true for passthrough users (skip transpiler + pg_catalog)
 	cursors                map[string]*cursorState  // server-side cursor emulation
 	catalogUseRewrite      bool                     // true when bare `USE ducklake`/`USE iceberg` should expand to the reliable two-part target
@@ -873,10 +875,10 @@ func (c *clientConn) serve() error {
 	c.sendInitialParams()
 
 	// Send ready for query
-	if err := wire.WriteReadyForQuery(c.writer, c.txStatus); err != nil {
+	if err := c.writeReadyForQuery(c.txStatus); err != nil {
 		return err
 	}
-	if err := c.writer.Flush(); err != nil {
+	if err := c.flushWriter(); err != nil {
 		return fmt.Errorf("failed to flush writer: %w", err)
 	}
 
@@ -978,7 +980,7 @@ func (c *clientConn) handleStartup() error {
 	if err := wire.WriteAuthCleartextPassword(c.writer); err != nil {
 		return err
 	}
-	if err := c.writer.Flush(); err != nil {
+	if err := c.flushWriter(); err != nil {
 		return fmt.Errorf("failed to flush writer: %w", err)
 	}
 
@@ -1096,10 +1098,10 @@ func (c *clientConn) messageLoop() error {
 			// Extended query protocol - Sync: ends any skip-until-Sync error
 			// recovery, then reports readiness.
 			c.ignoreTillSync = false
-			if err := wire.WriteReadyForQuery(c.writer, c.txStatus); err != nil {
+			if err := c.writeReadyForQuery(c.txStatus); err != nil {
 				return err
 			}
-			_ = c.writer.Flush()
+			_ = c.flushWriter()
 
 		case wire.MsgClose:
 			// Extended query protocol - Close
@@ -1109,7 +1111,7 @@ func (c *clientConn) messageLoop() error {
 			// Discarded during skip-until-Sync error recovery, like real
 			// PostgreSQL (the ErrorResponse was already flushed by sendError).
 			if !c.ignoreTillSync {
-				_ = c.writer.Flush()
+				_ = c.flushWriter()
 			}
 
 		case wire.MsgTerminate:
@@ -1121,7 +1123,7 @@ func (c *clientConn) messageLoop() error {
 	}
 }
 
-func (c *clientConn) handleQuery(body []byte) error {
+func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	query := string(bytes.TrimRight(body, "\x00"))
 	query = strings.TrimSpace(query)
 
@@ -1129,8 +1131,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// PostgreSQL returns EmptyQueryResponse for queries like "" or ";" or ";;;"
 	if query == "" || isEmptyQuery(query) {
 		_ = wire.WriteEmptyQueryResponse(c.writer)
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -1146,7 +1148,13 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}()
 
 	start := time.Now()
-	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
+	queryMetrics := c.beginQueryMetrics(start)
+	defer func() {
+		if retErr != nil {
+			queryMetrics.markError(retErr)
+		}
+		c.finishQueryMetrics(queryMetrics)
+	}()
 
 	ctx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
@@ -1244,8 +1252,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 	if err != nil {
 		// Transform error - send error to client
 		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -1254,8 +1262,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 		if err := c.validateWithDuckDB(query); err != nil {
 			// Neither PostgreSQL nor DuckDB can parse this query
 			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 		c.logger().Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "query", loggableQuery)
@@ -1264,8 +1272,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
 	if result.Error != nil {
 		c.sendError("ERROR", transformErrorSQLState(result.Error), result.Error.Error())
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -1278,18 +1286,18 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Handle ignored SET parameters
 	if result.IsIgnoredSet {
 		c.logger().Debug("Ignoring PostgreSQL-specific SET.", "query", query)
-		_ = wire.WriteCommandComplete(c.writer, "SET")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeCommandComplete("SET")
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
 	// Handle no-op commands (CREATE INDEX, VACUUM, etc.)
 	if result.IsNoOp {
 		c.logger().Debug("No-op command (DuckLake limitation).", "query", query)
-		_ = wire.WriteCommandComplete(c.writer, result.NoOpTag)
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeCommandComplete(result.NoOpTag)
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -1323,9 +1331,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 		// while DuckDB throws an error. Match PostgreSQL behavior.
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			_ = wire.WriteCommandComplete(c.writer, "BEGIN")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeCommandComplete("BEGIN")
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 
@@ -1377,8 +1385,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
 				c.logQuery(start, originalQuery, query, cmdType, 0, 0, errCode, errMsg, "simple")
-				_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-				_ = c.writer.Flush()
+				_ = c.writeReadyForQuery(c.txStatus)
+				_ = c.flushWriter()
 				return nil
 			}
 		}
@@ -1389,10 +1397,10 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
-		_ = wire.WriteCommandComplete(c.writer, tag)
+		_ = c.writeCommandComplete(tag)
 		c.logQuery(start, originalQuery, query, cmdType, 0, writtenRows, "", "", "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 

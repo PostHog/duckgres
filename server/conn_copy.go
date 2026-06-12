@@ -216,15 +216,15 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
+	_ = c.writeCommandComplete(fmt.Sprintf("COPY %d", rowsAffected))
 	c.logQuery(start, query, query, "COPY", 0, rowsAffected, "", "", "simple")
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -236,8 +236,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		c.sendError("ERROR", "42601", "Invalid COPY TO STDOUT syntax")
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42601", "Invalid COPY TO STDOUT syntax", "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -279,8 +279,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -291,8 +291,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -309,8 +309,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 	typeOIDs := make([]int32, len(colTypes))
@@ -330,7 +330,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if err := wire.WriteCopyOutResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
 	}
-	_ = c.writer.Flush()
+	_ = c.flushWriter()
 
 	// Send header if CSV with HEADER
 	if copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery) {
@@ -379,8 +379,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -390,10 +390,10 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		return err
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	_ = c.writeCommandComplete(fmt.Sprintf("COPY %d", rowCount))
 	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -409,8 +409,8 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -424,7 +424,7 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 	if err := wire.WriteCopyOutResponse(c.writer, int16(len(cols)), false); err != nil {
 		return err
 	}
-	_ = c.writer.Flush()
+	_ = c.flushWriter()
 
 	// Binary COPY header (19 bytes)
 	binaryHeader := []byte{
@@ -468,8 +468,8 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 
@@ -496,8 +496,8 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -522,10 +522,10 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 		return err
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	_ = c.writeCommandComplete(fmt.Sprintf("COPY %d", rowCount))
 	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -540,8 +540,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
 		c.setTxError()
 		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42601", "Invalid COPY FROM STDIN syntax", "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -565,8 +565,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		c.sendError("ERROR", "42P01", errMsg)
 		c.setTxError()
 		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42P01", errMsg, "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 	cols, _ := testRows.Columns()
@@ -596,7 +596,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if err := wire.WriteCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
 	}
-	_ = c.writer.Flush()
+	_ = c.flushWriter()
 	c.logger().Debug("COPY FROM STDIN sent CopyInResponse, waiting for data.")
 
 	// Remote-worker (Flight) executors implement CopyFromStdinExecutor so the
@@ -618,8 +618,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		c.sendError("ERROR", "58000", errMsg)
 		c.setTxError()
 		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "58000", errMsg, "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 	tmpPath := tmpFile.Name()
@@ -655,8 +655,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				c.sendError("ERROR", "58000", errMsg)
 				c.setTxError()
 				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "58000", errMsg, "simple")
-				_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-				_ = c.writer.Flush()
+				_ = c.writeReadyForQuery(c.txStatus)
+				_ = c.flushWriter()
 				return nil
 			}
 			bytesWritten += int64(n)
@@ -692,8 +692,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
 				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
-				_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-				_ = c.writer.Flush()
+				_ = c.writeReadyForQuery(c.txStatus)
+				_ = c.flushWriter()
 				return nil
 			}
 
@@ -703,10 +703,10 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			loadElapsed := time.Since(loadStart)
 			c.logger().Info("COPY FROM STDIN completed.", "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
-			_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			_ = c.writeCommandComplete(fmt.Sprintf("COPY %d", rowCount))
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 
 		case wire.MsgCopyFail:
@@ -716,8 +716,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "57014", exception, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 
 		default:
@@ -725,8 +725,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "08P01", errMsg, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 	}
@@ -770,16 +770,16 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 		c.sendError("ERROR", "57014", exception)
 		c.setTxError()
 		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 	if r.protoErr != "" {
 		c.sendError("ERROR", "08P01", r.protoErr)
 		c.setTxError()
 		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", r.protoErr, "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 	if err != nil {
@@ -788,8 +788,8 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 		c.sendError("ERROR", "22P02", errMsg)
 		c.setTxError()
 		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -798,10 +798,10 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 	c.logger().Info("COPY FROM STDIN completed (remote streaming).", "rows", rowCount, "bytes", r.bytesRead,
 		"total_duration", totalElapsed, "load_duration", loadElapsed)
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	_ = c.writeCommandComplete(fmt.Sprintf("COPY %d", rowCount))
 	c.logQuery(copyStartTime, query, query, "COPY", 0, rowCount, "", "", "simple")
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -895,7 +895,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 	if err := wire.WriteCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
 	}
-	_ = c.writer.Flush()
+	_ = c.flushWriter()
 
 	// Buffer all CopyData messages into memory (we need to parse CSV, not stream to file)
 	var buf bytes.Buffer
@@ -930,8 +930,8 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 					c.sendError("ERROR", "22P02", errMsg)
 					c.setTxError()
 					c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
-					_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-					_ = c.writer.Flush()
+					_ = c.writeReadyForQuery(c.txStatus)
+					_ = c.flushWriter()
 					return nil
 				}
 			}
@@ -961,10 +961,10 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			}
 
 			if len(rows) == 0 {
-				_ = wire.WriteCommandComplete(c.writer, "COPY 0")
+				_ = c.writeCommandComplete("COPY 0")
 				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "", "", "simple")
-				_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-				_ = c.writer.Flush()
+				_ = c.writeReadyForQuery(c.txStatus)
+				_ = c.flushWriter()
 				return nil
 			}
 
@@ -976,8 +976,8 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
 				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
-				_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-				_ = c.writer.Flush()
+				_ = c.writeReadyForQuery(c.txStatus)
+				_ = c.flushWriter()
 				return nil
 			}
 
@@ -985,10 +985,10 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			loadElapsed := time.Since(loadStart)
 			c.logger().Info("COPY FROM STDIN (BLOB fallback) completed.", "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
-			_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			_ = c.writeCommandComplete(fmt.Sprintf("COPY %d", rowCount))
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 
 		case wire.MsgCopyFail:
@@ -997,8 +997,8 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 
 		default:
@@ -1006,8 +1006,8 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 	}
@@ -1028,7 +1028,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 	if err := wire.WriteCopyInResponse(c.writer, int16(len(cols)), false); err != nil {
 		return err
 	}
-	_ = c.writer.Flush()
+	_ = c.flushWriter()
 	c.logger().Debug("COPY FROM STDIN binary: sent CopyInResponse.")
 
 	// Collect all CopyData messages into a buffer
@@ -1054,18 +1054,18 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
 				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
-				_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-				_ = c.writer.Flush()
+				_ = c.writeReadyForQuery(c.txStatus)
+				_ = c.flushWriter()
 				return nil
 			}
 
 			elapsed := time.Since(copyStartTime)
 			c.logger().Info("COPY FROM STDIN binary completed.", "rows", rowCount, "bytes", buf.Len(), "duration", elapsed)
 
-			_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			_ = c.writeCommandComplete(fmt.Sprintf("COPY %d", rowCount))
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 
 		case wire.MsgCopyFail:
@@ -1074,8 +1074,8 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 
 		default:
@@ -1083,8 +1083,8 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 	}

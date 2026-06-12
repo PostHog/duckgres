@@ -90,9 +90,9 @@ func (c *clientConn) handlePgStatActivity() error {
 		}
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("SELECT %d", len(conns)))
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeCommandComplete(fmt.Sprintf("SELECT %d", len(conns)))
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -109,7 +109,7 @@ func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 		_ = c.sendPgStatActivityDataRow(conn, p.resultFormats)
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("SELECT %d", len(conns)))
+	_ = c.writeCommandComplete(fmt.Sprintf("SELECT %d", len(conns)))
 }
 
 // sendPgStatActivityRowDescription sends a RowDescription for pg_stat_activity.

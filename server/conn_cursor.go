@@ -172,9 +172,9 @@ func (c *clientConn) handlePgCursorsQuery(cursorName string) error {
 		rowCount = 1
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("SELECT %d", rowCount))
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeCommandComplete(fmt.Sprintf("SELECT %d", rowCount))
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -198,7 +198,7 @@ func (c *clientConn) handlePgCursorsQueryExtended(p *portal) {
 		rowCount = 1
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("SELECT %d", rowCount))
+	_ = c.writeCommandComplete(fmt.Sprintf("SELECT %d", rowCount))
 }
 
 // sendPgCursorsRowDescription sends a RowDescription for a pg_cursors query result (single int4 column).
@@ -229,8 +229,8 @@ func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCur
 	if innerSQL == "" {
 		c.sendError("ERROR", "42601", "could not deparse cursor query")
 		c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", "could not deparse cursor query", "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -243,8 +243,8 @@ func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCur
 			errMsg := fmt.Sprintf("syntax error in cursor query: %v", err)
 			c.sendError("ERROR", "42601", errMsg)
 			c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", errMsg, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 		transpiledSQL = result.SQL
@@ -259,10 +259,10 @@ func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCur
 	c.cursors[stmt.Portalname] = &cursorState{query: transpiledSQL}
 	c.logger().Debug("Cursor declared.", "cursor", stmt.Portalname, "query", transpiledSQL)
 
-	_ = wire.WriteCommandComplete(c.writer, "DECLARE CURSOR")
+	_ = c.writeCommandComplete("DECLARE CURSOR")
 	c.logQuery(start, query, query, "DECLARE", 0, 0, "", "", "simple")
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -273,8 +273,8 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	if !isFetchForwardOnly(stmt.Direction) {
 		c.sendError("ERROR", "0A000", "cursor can only scan forward")
 		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -283,8 +283,8 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 		errMsg := fmt.Sprintf("cursor %q does not exist", stmt.Portalname)
 		c.sendError("ERROR", "34000", errMsg)
 		c.logQuery(start, query, query, "FETCH", 0, 0, "34000", errMsg, "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -300,8 +300,8 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
 			c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 	}
@@ -311,8 +311,8 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	if howMany < 0 {
 		c.sendError("ERROR", "0A000", "cursor can only scan forward")
 		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -329,10 +329,10 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 			_ = cursor.rows.Scan(valuePtrs...)
 			moveCount++
 		}
-		_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("MOVE %d", moveCount))
+		_ = c.writeCommandComplete(fmt.Sprintf("MOVE %d", moveCount))
 		c.logQuery(start, query, query, "FETCH", moveCount, 0, "", "", "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
@@ -354,8 +354,8 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			c.logQuery(start, query, query, "FETCH", 0, 0, "42000", err.Error(), "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 
@@ -375,15 +375,15 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
 		return nil
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
+	_ = c.writeCommandComplete(fmt.Sprintf("FETCH %d", rowCount))
 	c.logQuery(start, query, query, "FETCH", rowCount, 0, "", "", "simple")
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -398,18 +398,18 @@ func (c *clientConn) handleCloseCursor(query string, stmt *pg_query.ClosePortalS
 			errMsg := fmt.Sprintf("cursor %q does not exist", stmt.Portalname)
 			c.sendError("ERROR", "34000", errMsg)
 			c.logQuery(start, query, query, "CLOSE", 0, 0, "34000", errMsg, "simple")
-			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-			_ = c.writer.Flush()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
 			return nil
 		}
 		c.closeCursor(stmt.Portalname)
 	}
 
 	c.logger().Debug("Cursor closed.", "cursor", stmt.Portalname)
-	_ = wire.WriteCommandComplete(c.writer, "CLOSE CURSOR")
+	_ = c.writeCommandComplete("CLOSE CURSOR")
 	c.logQuery(start, query, query, "CLOSE", 0, 0, "", "", "simple")
-	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-	_ = c.writer.Flush()
+	_ = c.writeReadyForQuery(c.txStatus)
+	_ = c.flushWriter()
 	return nil
 }
 
@@ -421,7 +421,7 @@ func (c *clientConn) handleDeclareCursorExtended(p *portal) {
 	c.cursors[p.stmt.cursorName] = &cursorState{query: p.stmt.cursorQuery}
 	c.logger().Debug("Cursor declared (extended).", "cursor", p.stmt.cursorName, "query", p.stmt.cursorQuery)
 
-	_ = wire.WriteCommandComplete(c.writer, "DECLARE CURSOR")
+	_ = c.writeCommandComplete("DECLARE CURSOR")
 }
 
 // handleFetchCursorExtended handles FETCH in the Extended Query protocol.
@@ -485,7 +485,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 		return
 	}
 
-	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
+	_ = c.writeCommandComplete(fmt.Sprintf("FETCH %d", rowCount))
 }
 
 // handleCloseCursorExtended handles CLOSE cursor in the Extended Query protocol.
@@ -501,5 +501,5 @@ func (c *clientConn) handleCloseCursorExtended(p *portal) {
 	}
 
 	c.logger().Debug("Cursor closed (extended).", "cursor", p.stmt.cursorName)
-	_ = wire.WriteCommandComplete(c.writer, "CLOSE CURSOR")
+	_ = c.writeCommandComplete("CLOSE CURSOR")
 }

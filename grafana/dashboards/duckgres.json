@@ -229,7 +229,7 @@
       },
       "targets": [
         {
-          "expr": "rate(duckgres_query_duration_seconds_count[5m])",
+          "expr": "sum(rate(duckgres_query_total[5m]))",
           "legendFormat": "Queries/s",
           "refId": "A"
         }
@@ -261,7 +261,7 @@
       },
       "targets": [
         {
-          "expr": "rate(duckgres_query_errors_total[5m])",
+          "expr": "sum(rate(duckgres_query_total{outcome=\"error\"}[5m]))",
           "legendFormat": "Errors/s",
           "refId": "A"
         }
