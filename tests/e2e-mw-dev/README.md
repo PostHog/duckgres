@@ -124,6 +124,18 @@ normal `go test ./...` lane.
 
 ### Deliberately not covered here
 
+- **Mid-statement STS credential recovery (httpfs `v1.5.3-cred-refresh`)** —
+  the worker image bundles the PostHog httpfs fork patch that re-resolves the
+  latest committed `ducklake_s3` secret and retries on an auth failure, letting
+  a statement outlive the STS token it started with. Proving real in-statement
+  expiry in-Job needs a statement longer than the shortest AssumeRole token
+  (900s AWS floor), which blows the Job time budget. The behavior is
+  deterministically covered by the MinIO rotation tests in
+  `tests/integration/credential_rotation_pin_test.go` (stock httpfs dies /
+  patched httpfs survives rotation + revocation mid-scan); the harness's
+  `assert_fork_extensions` pins that workers actually run the patched build
+  (`EXPECT_HTTPFS_SHA`), and every DuckLake/Iceberg assertion here exercises
+  the patched request paths against real S3.
 - **Version-mismatch worker reaper** — needs a mid-run image bump, so it stays
   covered by `controlplane/` unit tests rather than in-Job.
 - **Physical object-store-prefix isolation** — the Go suite listed the MinIO
@@ -173,13 +185,14 @@ normal `go test ./...` lane.
   gives no deterministic control over when the scheduler tick lands. Covered
   by `controlplane/sts_broker_test.go` +
   `shared_worker_activator_credentials_test.go` (cache margin, lookahead
-  invariant, expiry surfacing on both activation paths) and — load-bearing —
-  the integration pin `tests/integration/credential_rotation_pin_test.go`,
-  which proves against a real MinIO that an in-flight scan does NOT survive
-  credential rotation (DuckDB resolves secrets through the statement's MVCC
-  snapshot, and scan-workload file opens skip the HEAD that could trigger
-  httpfs' refresh-on-403), i.e. the floor is the *only* protection and a
-  statement longer than its starting runway still dies with ExpiredToken.
+  invariant, expiry surfacing on both activation paths) and the integration
+  pin `tests/integration/credential_rotation_pin_test.go`, which proves
+  against a real MinIO that on STOCK httpfs an in-flight scan does NOT
+  survive credential rotation (DuckDB resolves secrets through the
+  statement's MVCC snapshot, and scan-workload file opens skip the HEAD that
+  could trigger httpfs' refresh-on-403). With the bundled
+  `v1.5.3-cred-refresh` fork build the floor is defense-in-depth rather than
+  the only protection — see the mid-statement recovery bullet above.
 
 ## Isolation model
 
