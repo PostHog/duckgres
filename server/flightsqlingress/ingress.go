@@ -3,6 +3,7 @@ package flightsqlingress
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
@@ -1925,13 +1926,27 @@ func (s *flightAuthSessionStore) persistSession(session *flightClientSession, us
 	}
 }
 
+// tokenFingerprint returns a short, non-reversible fingerprint of a session
+// token for safe logging. The x-duckgres-session token is a standalone bearer
+// credential (token-only auth grants full session access), so the raw value
+// must never be logged — anyone with log read access could replay it to hijack
+// the victim's session. The fingerprint (first 8 hex chars of sha256) is enough
+// to correlate log lines for the same token without exposing it.
+func tokenFingerprint(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
 func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token string) (*flightClientSession, bool) {
 	if s == nil || s.durableStore == nil || s.reconnector == nil {
 		return nil, false
 	}
 	record, err := s.durableStore.GetSession(token)
 	if err != nil {
-		slog.Warn("Loading durable Flight session record failed.", "token", token, "error", err)
+		slog.Warn("Loading durable Flight session record failed.", "token_fp", tokenFingerprint(token), "error", err)
 		return nil, false
 	}
 	if record == nil {
@@ -1946,7 +1961,7 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	}
 	pid, executor, err := s.reconnector.ReconnectSession(ctx, *record)
 	if err != nil {
-		slog.Warn("Reconnecting durable Flight session failed.", "token", token, "error", err)
+		slog.Warn("Reconnecting durable Flight session failed.", "token_fp", tokenFingerprint(token), "error", err)
 		if errors.Is(err, ErrDurableReconnectTerminal) {
 			_ = s.durableStore.CloseSession(token, time.Now())
 		}

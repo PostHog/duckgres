@@ -1720,3 +1720,31 @@ func TestFlightAuthSessionStoreReapStaleHandleAllowsSessionReap(t *testing.T) {
 		t.Fatalf("expected session 1234 to be destroyed, got %v", destroyed)
 	}
 }
+
+// TestTokenFingerprint verifies the session-token fingerprint used for logging
+// is deterministic, non-reversible (never equal to the input), and fixed-length,
+// so raw bearer tokens never reach the logs.
+func TestTokenFingerprint(t *testing.T) {
+	const token = "live-bearer-credential-xyz"
+
+	fp := tokenFingerprint(token)
+
+	if fp == token {
+		t.Fatalf("fingerprint must not equal the raw token")
+	}
+	if len(fp) != 8 {
+		t.Fatalf("expected 8-char fingerprint, got %d (%q)", len(fp), fp)
+	}
+	if got := tokenFingerprint(token); got != fp {
+		t.Fatalf("fingerprint not deterministic: %q != %q", got, fp)
+	}
+	if other := tokenFingerprint(token + "!"); other == fp {
+		t.Fatalf("different tokens produced the same fingerprint %q", fp)
+	}
+	if strings.Contains(token, fp) {
+		t.Fatalf("fingerprint %q is a substring of the raw token", fp)
+	}
+	if empty := tokenFingerprint(""); empty != "" {
+		t.Fatalf("empty token must yield empty fingerprint, got %q", empty)
+	}
+}
