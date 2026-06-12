@@ -419,15 +419,16 @@ func (c *clientConn) logQueryStarted(query string) {
 // "started" and a "finished" line, and can look at the separate error
 // line for severity context.
 func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64, err error) {
-	query = usersecrets.RedactForLog(query)
 	attrs := []any{
-		"query", query,
+		"query", usersecrets.RedactForLog(query),
 		"duration_ms", time.Since(start).Milliseconds(),
 		"rows", rows,
 		"trace_id", observe.TraceIDFromContext(c.ctx),
 	}
 	if err != nil {
-		attrs = append(attrs, "error", err.Error())
+		// Engine errors echo the offending SQL, so a failed CREATE SECRET
+		// leaks the credential here unless the error is redacted too.
+		attrs = append(attrs, "error", usersecrets.RedactErrorForLog(query, err.Error()))
 	}
 	c.logger().Info("Query finished.", attrs...)
 }
@@ -439,8 +440,13 @@ func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64,
 // (worker crash, IO failure, internal panic, infra unreachable), not
 // "user typo'd a column name."
 func (c *clientConn) logQueryError(query string, err error) {
-	query = usersecrets.RedactForLog(query)
-	attrs := []any{"query", query, "error", err}
+	// Engine errors echo the offending SQL, so a failed CREATE SECRET leaks the
+	// credential via the error attribute unless it is redacted too. Classify
+	// against the original query before it is replaced with the redacted form.
+	attrs := []any{
+		"query", usersecrets.RedactForLog(query),
+		"error", usersecrets.RedactErrorForLog(query, err.Error()),
+	}
 	if isDuckLakeTransactionConflict(err) {
 		c.logger().Warn("DuckLake transaction conflict.", attrs...)
 		return

@@ -331,8 +331,7 @@ func (h *ControlPlaneFlightSQLHandler) checkUserSecretDDL(query string) error {
 	if !h.rejectPersistentSecretDDL {
 		return nil
 	}
-	st := usersecrets.Classify(query)
-	if st.Kind != usersecrets.KindNone && st.Persistent {
+	if usersecrets.ContainsPersistentSecretDDL(query) {
 		return status.Error(codes.InvalidArgument,
 			"persistent secrets are managed via the PostgreSQL protocol on this deployment; CREATE/DROP PERSISTENT SECRET is not supported over Flight SQL (a secret created here would not survive the session)")
 	}

@@ -272,7 +272,13 @@ Invariants for anyone touching this path:
   false "DROP succeeded" is fatal for a credential revocation.
 - **Never log/store secret statement text.** `usersecrets.RedactForLog` guards
   logQueryStarted/Finished/Error, the query log, spans, and pg_stat_activity
-  (`currentQuery`); keep new logging of query text behind it.
+  (`currentQuery`); keep new logging of query text behind it. Engine **error
+  messages echo the offending SQL** (DuckDB emits `LINE 1: ... SECRET '...'`),
+  so a failed CREATE SECRET leaks the credential via the `error` attribute /
+  query-log `Exception` even when the query attribute is redacted —
+  `usersecrets.RedactErrorForLog(query, errMsg)` guards those error sinks
+  (logQueryError/logQueryFinished, `logQuery`); keep new error logging behind it
+  too, and pass the original (un-redacted) query so it can classify.
 - Touching the interception, wipe/replay, or payload shape → update
   `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
   and the `persistent_user_secret`(+`_isolation`) assertions in

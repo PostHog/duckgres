@@ -89,6 +89,27 @@ func Classify(query string) Statement {
 	return st
 }
 
+// ContainsPersistentSecretDDL reports whether any top-level statement in query
+// is CREATE/DROP PERSISTENT SECRET. Unlike Classify (which inspects only the
+// statement head), this scans every top-level statement, so a persistent-secret
+// DDL hidden behind a leading statement ("SELECT 1; CREATE PERSISTENT SECRET
+// ...") is still caught. Used to reject persistent-secret DDL on the Flight SQL
+// ingress, where it would execute but never persist.
+func ContainsPersistentSecretDDL(query string) bool {
+	if st, _, ok := parseSecretDDLHead(query); ok && st.Persistent {
+		return true
+	}
+	if !hasTrailingStatement(query) {
+		return false
+	}
+	for _, seg := range splitTopLevel(query) {
+		if st, _, ok := parseSecretDDLHead(seg); ok && st.Persistent {
+			return true
+		}
+	}
+	return false
+}
+
 // parseSecretDDLHead parses the statement head (through the optional secret
 // name) and returns the classification plus the byte offset just past the
 // head. The fast path for non-secret statements is two short case-folded
@@ -232,6 +253,58 @@ func hasTrailingStatement(query string) bool {
 		}
 	}
 	return false
+}
+
+// splitTopLevel splits query on top-level semicolons (outside string literals,
+// quoted identifiers, and comments), using the same scanning rules as
+// hasTrailingStatement so it stays in sync with the rest of this package. The
+// returned segments do NOT include the separating semicolons; a trailing empty
+// segment (query ending in ';') is omitted.
+func splitTopLevel(query string) []string {
+	var segments []string
+	start := 0
+	i := 0
+	for i < len(query) {
+		c := query[i]
+		switch {
+		case c == '\'':
+			i = skipQuoted(query, i, '\'')
+		case c == '"':
+			i = skipQuoted(query, i, '"')
+		case c == '-' && strings.HasPrefix(query[i:], "--"):
+			idx := strings.IndexByte(query[i:], '\n')
+			if idx < 0 {
+				i = len(query)
+			} else {
+				i += idx + 1
+			}
+		case c == '/' && strings.HasPrefix(query[i:], "/*"):
+			depth := 1
+			i += 2
+			for i < len(query) && depth > 0 {
+				switch {
+				case strings.HasPrefix(query[i:], "/*"):
+					depth++
+					i += 2
+				case strings.HasPrefix(query[i:], "*/"):
+					depth--
+					i += 2
+				default:
+					i++
+				}
+			}
+		case c == ';':
+			segments = append(segments, query[start:i])
+			i++
+			start = i
+		default:
+			i++
+		}
+	}
+	if start < len(query) {
+		segments = append(segments, query[start:])
+	}
+	return segments
 }
 
 // skipQuoted returns the index just past a quoted region starting at start
