@@ -778,6 +778,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.IncrementOpenConnections()
 	defer server.DecrementOpenConnections()
 
+	// Defense-in-depth: a panic in the pre-auth parsing path (e.g. a malformed
+	// startup packet) must degrade to a single dropped connection, never crash
+	// the shared multitenant control-plane process. Mirrors the standalone
+	// server's connection-handler recover. Won't catch C++ fatal signals.
+	defer func() {
+		if r := recover(); r != nil {
+			clog.Error("Recovered from panic in control-plane connection handler.", "panic", r)
+			_ = conn.Close()
+		}
+	}()
+
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
 		clog.Warn("Connection rejected.", "reason", msg)
