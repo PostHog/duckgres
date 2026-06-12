@@ -19,10 +19,24 @@ const (
 	stsSessionName     = "duckgres-cp"
 
 	// stsCacheSafetyMargin is how long before the credentials' true expiration
-	// we stop serving them from cache and mint a fresh session instead. It must
-	// leave enough room for a worker activation that receives cached creds to
-	// complete its DuckLake/Iceberg attach before the creds lapse.
-	stsCacheSafetyMargin = 10 * time.Minute
+	// we stop serving them from cache and mint a fresh session instead.
+	//
+	// This is the freshness floor for every credential capture point: all
+	// AssumeRole callers bake the result into a worker's DuckDB secret, and a
+	// DuckDB statement captures those credentials when it starts executing —
+	// a later CREATE OR REPLACE SECRET (the credential-refresh scheduler's
+	// push) does not re-credential an already-running statement. A statement
+	// that begins on near-expiry cached creds therefore fails with
+	// ExpiredToken once it outruns them, no matter how diligently the secret
+	// is rotated underneath it. The margin is what guarantees every
+	// statement starts with at least this much runway.
+	//
+	// It must also stay strictly greater than credentialRefreshLookahead
+	// (compile-time guard in credential_refresh_scheduler.go): a refresh push
+	// that stamps an expiry already inside the scheduler's lookahead window
+	// leaves the worker perpetually "due", re-pushing identical cached creds
+	// every tick until the margin finally forces a fresh mint.
+	stsCacheSafetyMargin = 35 * time.Minute
 
 	// stsAssumeRoleTimeout bounds the underlying AWS AssumeRole call. The call
 	// is detached from the triggering caller's context (other callers may be

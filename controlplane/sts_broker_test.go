@@ -54,8 +54,9 @@ func TestSTSBrokerCacheHitWithinValidity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first AssumeRole: %v", err)
 	}
-	// Well within validity: 1h creds, 10m margin → cached until +50m.
-	clock.Advance(49 * time.Minute)
+	// Well within validity: 1h creds with the safety margin → cached until
+	// expiration minus the margin; stop one minute short of that boundary.
+	clock.Advance(stsSessionDuration - stsCacheSafetyMargin - time.Minute)
 	second, err := b.AssumeRole(context.Background(), "arn:aws:iam::123:role/org-a")
 	if err != nil {
 		t.Fatalf("second AssumeRole: %v", err)
@@ -116,8 +117,8 @@ func TestSTSBrokerRefreshesAfterExpiryMargin(t *testing.T) {
 	if _, err := b.AssumeRole(context.Background(), "arn:aws:iam::123:role/org-a"); err != nil {
 		t.Fatalf("first AssumeRole: %v", err)
 	}
-	// 1h creds with a 10m safety margin: at +50m the cached creds are no
-	// longer served even though they have not truly expired yet.
+	// 1h creds with the safety margin: once inside the margin the cached
+	// creds are no longer served even though they have not truly expired yet.
 	clock.Advance(stsSessionDuration - stsCacheSafetyMargin)
 	refreshed, err := b.AssumeRole(context.Background(), "arn:aws:iam::123:role/org-a")
 	if err != nil {

@@ -360,12 +360,6 @@ func SetupMultiTenant(
 		refreshActivator.resolveDucklingStatus = resolveDucklingStatus
 	}
 
-	// Half the configured STS session duration: a worker due for refresh
-	// gets picked up well before its current session token actually goes
-	// stale, with a full half-life of slack to retry transient STS / RPC
-	// failures on subsequent ticks.
-	const credentialRefreshLookahead = stsSessionDuration / 2
-
 	// Per-CP scheduler — runs on every CP regardless of leader status, since
 	// each CP refreshes only the workers it owns (filtered by cpInstanceID in
 	// the SQL). Running this on the janitor leader only would leave workers

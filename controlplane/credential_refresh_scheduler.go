@@ -10,6 +10,22 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
+// credentialRefreshLookahead is how far ahead of a worker's recorded
+// credential expiry the scheduler refreshes it. Half the STS session
+// duration: a worker due for refresh gets picked up well before its current
+// session token actually goes stale, with a full half-life of slack to retry
+// transient STS / RPC failures on subsequent ticks.
+const credentialRefreshLookahead = stsSessionDuration / 2
+
+// Compile-time guard: the broker's cache safety margin (the freshness floor
+// on every minted/served credential) must be strictly greater than the
+// scheduler's lookahead. If it weren't, a refresh push could stamp an expiry
+// that is already inside the lookahead window, leaving the worker perpetually
+// "due" and re-pushing identical cached creds every tick (5s churn) until
+// the margin finally forces a fresh mint. The expression overflows uint64 at
+// compile time when the invariant is violated.
+const _ = uint64(stsCacheSafetyMargin - credentialRefreshLookahead - 1)
+
 // credentialRefreshScheduleStore is the slice of the runtime store the
 // scheduler depends on. Defined narrowly so unit tests can fake it without
 // pulling in the full store.
