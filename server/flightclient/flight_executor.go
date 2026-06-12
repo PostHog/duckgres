@@ -983,8 +983,11 @@ func formatArgValue(v any) string {
 	}
 	switch val := v.(type) {
 	case string:
-		escaped := strings.ReplaceAll(val, `\`, `\\`)
-		escaped = strings.ReplaceAll(escaped, "'", "''")
+		// DuckDB standard '...' literals (like standard-conforming PostgreSQL)
+		// treat backslash as a literal character — only the single quote needs
+		// doubling. Doubling backslashes here corrupts the value: '\\' is the
+		// two-character string \\, not an escape for \.
+		escaped := strings.ReplaceAll(val, "'", "''")
 		return "'" + escaped + "'"
 	case []byte:
 		return `'\x` + hex.EncodeToString(val) + `'::BLOB`
@@ -1012,9 +1015,9 @@ func formatArgValue(v any) string {
 	case float64:
 		return fmt.Sprintf("%g", val)
 	default:
-		// Treat unknown types as strings to avoid injection via Stringer
+		// Treat unknown types as strings to avoid injection via Stringer.
+		// Same literal semantics as the string case: quote-double only.
 		s := fmt.Sprintf("%v", val)
-		s = strings.ReplaceAll(s, `\`, `\\`)
 		s = strings.ReplaceAll(s, "'", "''")
 		return "'" + s + "'"
 	}
