@@ -397,6 +397,13 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
+	// Metadata-store flavor (Postgres vs CockroachDB) lives only on the
+	// config-store row, not on the Duckling CR, so set it here regardless of
+	// which buildDuckLakeConfigFrom*() path resolved the infrastructure.
+	// The worker uses this to emit the right postgres_scanner GLOBAL
+	// settings before ATTACH — see server.buildDuckLakePreAttachStatements.
+	dl.MetadataStoreFlavor = string(org.Warehouse.MetadataStore.Flavor)
+
 	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, &org.Warehouse.Iceberg)
 	if err != nil {
 		return TenantActivationPayload{}, err

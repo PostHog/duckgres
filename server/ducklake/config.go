@@ -101,4 +101,16 @@ type Config struct {
 	// non-"postgres:" metadata stores. If empty, no application_name is
 	// injected (libpq picks its own default, usually "psql").
 	ApplicationName string `json:"application_name,omitempty" yaml:"-"`
+
+	// MetadataStoreFlavor identifies the Postgres wire-protocol dialect of
+	// the metadata store. Empty (the default) means stock PostgreSQL.
+	// "cockroachdb" makes the worker emit
+	//   SET GLOBAL pg_use_text_protocol = true
+	//   SET GLOBAL pg_use_ctid_scan     = false
+	// before ATTACH so postgres_scanner runs in CRDB-compatible mode
+	// (CRDB lacks binary COPY and ctid row addressing — CRDB #96590).
+	// These SET GLOBALs are process-wide on the worker's DuckDB instance,
+	// so the control plane is expected to pin a tenant to workers of one
+	// flavor for its lifetime (no flavor flips on the same worker).
+	MetadataStoreFlavor string `json:"metadata_store_flavor,omitempty" yaml:"-"`
 }

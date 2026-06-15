@@ -241,6 +241,38 @@ func TestBuildDuckLakePreAttachStatements(t *testing.T) {
 				"SET GLOBAL pg_pool_max_connections = 0",
 			},
 		},
+		{
+			name: "cockroachdb flavor emits text-protocol + ctid-disable globals",
+			cfg: DuckLakeConfig{
+				DisableMetadataThreadLocalCache: boolPtr(false),
+				MetadataStoreFlavor:             "cockroachdb",
+			},
+			want: []string{
+				"SET GLOBAL pg_use_text_protocol = true",
+				"SET GLOBAL pg_use_ctid_scan = false",
+			},
+		},
+		{
+			name: "cockroachdb flavor composes with other settings in stable order",
+			cfg: DuckLakeConfig{
+				ViaPgBouncer:        true,
+				MetadataStoreFlavor: "cockroachdb",
+			},
+			want: []string{
+				"SET GLOBAL pg_pool_enable_thread_local_cache = false",
+				"SET GLOBAL pg_pool_max_connections = 0",
+				"SET GLOBAL pg_use_text_protocol = true",
+				"SET GLOBAL pg_use_ctid_scan = false",
+			},
+		},
+		{
+			name: "unknown flavor is treated as plain postgres (no extra globals)",
+			cfg: DuckLakeConfig{
+				DisableMetadataThreadLocalCache: boolPtr(false),
+				MetadataStoreFlavor:             "postgres",
+			},
+			want: nil,
+		},
 	}
 
 	for _, tt := range tests {

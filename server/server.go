@@ -1398,6 +1398,28 @@ func buildDuckLakePreAttachStatements(dlCfg DuckLakeConfig) []string {
 	if dlCfg.ViaPgBouncer {
 		statements = append(statements, "SET GLOBAL pg_pool_max_connections = 0")
 	}
+	if dlCfg.MetadataStoreFlavor == "cockroachdb" {
+		// CockroachDB has not implemented the binary COPY wire format
+		// (cockroachdb#96590) and does not expose ctid row addressing, so
+		// postgres_scanner's default scan path fails on the first metadata
+		// ATTACH with "syntax error: unimplemented" or
+		// "column \"ctid\" does not exist". These two GLOBALs swap the
+		// scanner onto the text protocol and disable ctid scans, which is
+		// CRDB-compatible at the cost of ~2x slower metadata reads on the
+		// scanner. Session-level SET doesn't help here — DuckLake holds an
+		// internal metadata connection that doesn't see session-local
+		// state — so the settings have to be GLOBAL.
+		//
+		// These GLOBALs are process-wide on the worker's DuckDB instance,
+		// so duckgres assumes a tenant is pinned to workers of one flavor
+		// for its lifetime; flipping flavors on the same worker would
+		// taint the other tenants' postgres_scanner behaviour. See
+		// PostHog/ducklake#24 for the upstream support report.
+		statements = append(statements,
+			"SET GLOBAL pg_use_text_protocol = true",
+			"SET GLOBAL pg_use_ctid_scan = false",
+		)
+	}
 	return statements
 }
 

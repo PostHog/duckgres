@@ -119,12 +119,17 @@ type provisionDuckLakeReq struct {
 // provisionExternalReq describes a pre-existing (external) Postgres metadata
 // store. Endpoint (RDS host) and PasswordAWSSecret (the AWS Secrets Manager
 // secret NAME holding the password) are required; User/Database default to
-// "postgres" when omitted.
+// "postgres" when omitted. Flavor selects the Postgres dialect: empty (or
+// "postgres") for stock PostgreSQL, "cockroachdb" for CockroachDB —
+// recorded on the config-store row so the worker can emit the
+// postgres_scanner GLOBALs CRDB needs before ATTACH (see
+// server.buildDuckLakePreAttachStatements).
 type provisionExternalReq struct {
 	Endpoint          string `json:"endpoint"`
 	PasswordAWSSecret string `json:"password_aws_secret"`
 	User              string `json:"user,omitempty"`
 	Database          string `json:"database,omitempty"`
+	Flavor            string `json:"flavor,omitempty"`
 }
 
 // provisionDataStoreReq selects the object store. Type "s3bucket" (or omitted)
@@ -151,6 +156,26 @@ func icebergNamespace(req *provisionIcebergReq) string {
 		return ""
 	}
 	return req.Namespace
+}
+
+// resolveMetadataStoreFlavor maps the optional external.flavor field on a
+// provision request into the typed configstore enum. Empty (the default) and
+// "postgres" both map to stock PostgreSQL; "cockroachdb" makes the worker
+// emit the postgres_scanner GLOBAL settings CRDB needs before ATTACH.
+// Unknown values reject the request rather than silently degrading to
+// "postgres" — a mis-typed flavor that goes through would only surface as
+// "DuckLake migration check failed: read DuckLake spec version" at first
+// activation, long after the provision call returned 202.
+func resolveMetadataStoreFlavor(raw string) (configstore.MetadataStoreFlavor, error) {
+	switch raw {
+	case "", "postgres":
+		return configstore.MetadataStoreFlavorPostgres, nil
+	case string(configstore.MetadataStoreFlavorCockroachDB):
+		return configstore.MetadataStoreFlavorCockroachDB, nil
+	default:
+		return "", fmt.Errorf("metadata_store.external.flavor must be empty, %q, or %q (got %q)",
+			"postgres", string(configstore.MetadataStoreFlavorCockroachDB), raw)
+	}
 }
 
 // resolveDataStore validates and normalizes the data-store request into the
@@ -244,12 +269,18 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.type 'external' requires metadata_store.external.endpoint and metadata_store.external.password_aws_secret"})
 			return
 		}
+		flavor, err := resolveMetadataStoreFlavor(ext.Flavor)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		warehouse.MetadataStore = configstore.ManagedWarehouseMetadataStore{
 			Kind:              configstore.MetadataStoreKindExternal,
 			Endpoint:          ext.Endpoint,
 			Username:          ext.User,
 			DatabaseName:      ext.Database,
 			PasswordAWSSecret: ext.PasswordAWSSecret,
+			Flavor:            flavor,
 		}
 
 	default:

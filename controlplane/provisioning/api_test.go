@@ -644,6 +644,56 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 	}
 }
 
+func TestProvisionExternalFlavor(t *testing.T) {
+	cases := []struct {
+		name       string
+		bodyFlavor string
+		wantStatus int
+		wantFlavor configstore.MetadataStoreFlavor
+	}{
+		{name: "omitted defaults to postgres", bodyFlavor: ``, wantStatus: http.StatusAccepted, wantFlavor: configstore.MetadataStoreFlavorPostgres},
+		{name: "explicit postgres", bodyFlavor: `, "flavor":"postgres"`, wantStatus: http.StatusAccepted, wantFlavor: configstore.MetadataStoreFlavorPostgres},
+		{name: "cockroachdb stored verbatim", bodyFlavor: `, "flavor":"cockroachdb"`, wantStatus: http.StatusAccepted, wantFlavor: configstore.MetadataStoreFlavorCockroachDB},
+		{name: "unknown flavor rejected", bodyFlavor: `, "flavor":"yugabytedb"`, wantStatus: http.StatusBadRequest, wantFlavor: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			router := newTestRouter(store)
+			body := []byte(`{
+				"database_name": "extdl-db",
+				"metadata_store": {"type": "external", "external": {
+					"endpoint": "rds.example.us-east-1.rds.amazonaws.com",
+					"password_aws_secret": "duckling-example-rds-password"` + tc.bodyFlavor + `
+				}},
+				"data_store": {"type": "external", "bucket_name": "posthog-duckling-example", "region": "us-east-1"},
+				"ducklake": {"enabled": true}
+			}`)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extdl/provision", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantStatus != http.StatusAccepted {
+				if _, ok := store.warehouses["extdl"]; ok {
+					t.Error("warehouse must not be created when flavor is rejected")
+				}
+				return
+			}
+			w := store.warehouses["extdl"]
+			if w == nil {
+				t.Fatal("expected warehouse to be created")
+				return
+			}
+			if w.MetadataStore.Flavor != tc.wantFlavor {
+				t.Errorf("flavor = %q, want %q", w.MetadataStore.Flavor, tc.wantFlavor)
+			}
+		})
+	}
+}
+
 func TestProvisionExternalRequiresEndpointAndSecret(t *testing.T) {
 	for name, body := range map[string]string{
 		"missing external block": `{"database_name":"e-db","ducklake":{"enabled":true},"metadata_store":{"type":"external"}}`,

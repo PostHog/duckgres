@@ -139,7 +139,32 @@ type ManagedWarehouseMetadataStore struct {
 	// status password the worker activator reads. Empty for cnpg-shard
 	// (which mints its own credentials).
 	PasswordAWSSecret string `gorm:"size:255" json:"password_aws_secret,omitempty"`
+
+	// Flavor is the metadata store's Postgres wire-protocol dialect.
+	// Empty (the default) means stock PostgreSQL — postgres_scanner runs
+	// with its native binary COPY + ctid scan path. "cockroachdb" makes
+	// the worker emit two SET GLOBALs before ATTACH so the scanner uses
+	// the text protocol and disables ctid scans, which CockroachDB
+	// doesn't implement (CRDB #96590). See server/server.go's
+	// buildDuckLakePreAttachStatements. The control plane is expected to
+	// pin a tenant to workers of one flavor for its lifetime — these
+	// settings are process-global on the worker's DuckDB instance, so
+	// flipping between flavors on the same worker would taint the other
+	// tenants' postgres_scanner behaviour.
+	Flavor MetadataStoreFlavor `gorm:"size:32" json:"flavor,omitempty"`
 }
+
+// MetadataStoreFlavor identifies the Postgres wire-protocol dialect of the
+// metadata store, so the worker can emit the right postgres_scanner GLOBAL
+// settings before ATTACH. Keep the zero value mapped to PostgreSQL — older
+// rows in the config store predate this field and must continue to behave
+// exactly as before.
+type MetadataStoreFlavor string
+
+const (
+	MetadataStoreFlavorPostgres    MetadataStoreFlavor = ""
+	MetadataStoreFlavorCockroachDB MetadataStoreFlavor = "cockroachdb"
+)
 
 // ManagedWarehouseDataStore captures the org's object-store provisioning
 // intent — the shape the Duckling CR's spec.dataStore takes. Distinct from
