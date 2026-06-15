@@ -15,15 +15,14 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-const legacyDeltaCatalogDefaultMigrationName = "2026_05_delta_catalog_default_enabled"
-
 func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	db := storeDB(t, store)
 
 	requireGooseMigrationRecorded(t, db, 1)
-	requireGooseMigrationRecorded(t, db, 4)
-	requireMigrationRowExists(t, db, legacyDeltaCatalogDefaultMigrationName)
+	requireGooseMigrationRecorded(t, db, 3)
+	requireGooseLatestVersion(t, db, 3)
+	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	var columnCount int
 	if err := store.DB().Raw(`
@@ -91,7 +90,7 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	if floor != 0 {
 		t.Fatalf("default_worker_min_hot_idle after migration = %d, want 0", floor)
 	}
-	requireGooseMigrationRecorded(t, sqlDB, 4)
+	requireGooseMigrationRecorded(t, sqlDB, 3)
 }
 
 func TestConfigStoreSQLMigrationsUpgradeLegacyOrgUsersUsernamePK(t *testing.T) {
@@ -241,15 +240,39 @@ func requireGooseMigrationRecorded(t *testing.T, db *sql.DB, version int64) {
 	}
 }
 
-func requireMigrationRowExists(t *testing.T, db *sql.DB, name string) {
+func requireGooseLatestVersion(t *testing.T, db *sql.DB, version int64) {
 	t.Helper()
 
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM duckgres_schema_migrations WHERE name = $1`, name).Scan(&count); err != nil {
-		t.Fatalf("count migration %q: %v", name, err)
+	var latest sql.NullInt64
+	if err := db.QueryRow(`
+		SELECT MAX(version_id)
+		FROM goose_db_version
+		WHERE is_applied
+		  AND version_id > 0
+	`).Scan(&latest); err != nil {
+		t.Fatalf("read latest goose migration version: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("migration %q row count = %d, want 1", name, count)
+	if !latest.Valid || latest.Int64 != version {
+		t.Fatalf("latest goose migration version = %v, want %d", latest, version)
+	}
+}
+
+func requireTableAbsent(t *testing.T, db *sql.DB, tableName string) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+		)
+	`, tableName).Scan(&exists); err != nil {
+		t.Fatalf("check table %q absence: %v", tableName, err)
+	}
+	if exists {
+		t.Fatalf("table %q exists, want absent", tableName)
 	}
 }
 

@@ -1,17 +1,5 @@
 -- +goose Up
 
-CREATE TABLE IF NOT EXISTS duckgres_schema_migrations (
-    name VARCHAR(128) PRIMARY KEY,
-    checksum TEXT NOT NULL DEFAULT '',
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-ALTER TABLE duckgres_schema_migrations
-    ADD COLUMN IF NOT EXISTS checksum TEXT NOT NULL DEFAULT '';
-
-ALTER TABLE duckgres_schema_migrations
-    ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
 CREATE TABLE IF NOT EXISTS duckgres_orgs (
     name VARCHAR(255) PRIMARY KEY,
     database_name VARCHAR(255),

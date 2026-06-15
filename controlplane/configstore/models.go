@@ -371,17 +371,6 @@ type QueryLogConfig struct {
 
 func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
 
-// SchemaMigration is the legacy config-store migration marker table. Goose owns
-// current migration tracking in goose_db_version; this table remains for older
-// compatibility guards such as 2026_05_delta_catalog_default_enabled.
-type SchemaMigration struct {
-	Name      string    `gorm:"primaryKey;size:128" json:"name"`
-	Checksum  string    `gorm:"not null" json:"checksum"`
-	AppliedAt time.Time `json:"applied_at"`
-}
-
-func (SchemaMigration) TableName() string { return "duckgres_schema_migrations" }
-
 // ControlPlaneInstanceState describes the liveness state of a control-plane instance.
 type ControlPlaneInstanceState string
 
