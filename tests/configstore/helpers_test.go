@@ -21,6 +21,27 @@ var ensureIntegrationPostgresOnce sync.Once
 func newIsolatedConfigStore(t *testing.T) *cpconfigstore.ConfigStore {
 	t.Helper()
 
+	_, connStr := newIsolatedConfigStoreSchema(t)
+
+	store, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("new config store: %v", err)
+	}
+
+	sqlDB, err := store.DB().DB()
+	if err != nil {
+		t.Fatalf("store sql db: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	return store
+}
+
+func newIsolatedConfigStoreSchema(t *testing.T) (*sql.DB, string) {
+	t.Helper()
+
 	ensureIntegrationPostgres(t)
 
 	schema := fmt.Sprintf("managed_warehouse_%d", time.Now().UnixNano())
@@ -39,20 +60,12 @@ func newIsolatedConfigStore(t *testing.T) *cpconfigstore.ConfigStore {
 		_, _ = adminDB.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
 	})
 
-	store, err := cpconfigstore.NewConfigStore("host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable search_path="+schema, time.Hour)
-	if err != nil {
-		t.Fatalf("new config store: %v", err)
-	}
+	connStr := "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable search_path=" + schema
+	return adminDB, connStr
+}
 
-	sqlDB, err := store.DB().DB()
-	if err != nil {
-		t.Fatalf("store sql db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = sqlDB.Close()
-	})
-
-	return store
+func cpconfigStoreNew(connStr string) (*cpconfigstore.ConfigStore, error) {
+	return cpconfigstore.NewConfigStore(connStr, time.Hour)
 }
 
 func ensureIntegrationPostgres(t *testing.T) {

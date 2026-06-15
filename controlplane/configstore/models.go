@@ -25,8 +25,8 @@ type Org struct {
 	// human editability) applied to connections that don't size themselves via
 	// the duckgres.worker_* startup options. Distinct from WorkerCPURequest/
 	// WorkerMemoryRequest above, which mutate the GLOBAL pool default (a known
-	// last-org-wins footgun). Empty = unset. AutoMigrate adds these columns;
-	// no migration file.
+	// last-org-wins footgun). Empty = unset. Versioned SQL migrations add
+	// these columns.
 	DefaultWorkerCPU        string            `gorm:"size:32" json:"default_worker_cpu"`
 	DefaultWorkerMemory     string            `gorm:"size:32" json:"default_worker_memory"`
 	DefaultWorkerTTL        string            `gorm:"size:32" json:"default_worker_ttl"`
@@ -163,7 +163,7 @@ type ManagedWarehouseDataStore struct {
 // is driven by status.metadataStore.pgbouncerEndpoint (populated by the
 // composition once the pooler Service is up).
 type ManagedWarehousePgBouncer struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `gorm:"default:false" json:"enabled"`
 }
 
 // ManagedWarehouseS3 stores object-store metadata for an org's warehouse.
@@ -173,7 +173,7 @@ type ManagedWarehouseS3 struct {
 	Bucket              string `gorm:"size:255" json:"bucket"`
 	PathPrefix          string `gorm:"size:1024" json:"path_prefix"`
 	Endpoint            string `gorm:"size:512" json:"endpoint"`
-	UseSSL              bool   `json:"use_ssl"`
+	UseSSL              bool   `gorm:"default:false" json:"use_ssl"`
 	URLStyle            string `gorm:"size:16" json:"url_style"`
 	DeltaCatalogEnabled bool   `gorm:"default:true" json:"delta_catalog_enabled"`
 	DeltaCatalogPath    string `gorm:"size:1024" json:"delta_catalog_path"`
@@ -197,7 +197,7 @@ type ManagedWarehouseWorkerIdentity struct {
 // CR's spec.ducklake.enabled (present/absent) so legacy ducklings keep their
 // implied behavior (external ⇒ DuckLake, cnpg ⇒ none).
 type ManagedWarehouseDuckLake struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `gorm:"default:false" json:"enabled"`
 }
 
 // ManagedWarehouseIceberg captures per-org Iceberg catalog config. The
@@ -212,7 +212,7 @@ type ManagedWarehouseDuckLake struct {
 // The Backend column is retained for forward-compat / observability; the
 // legacy "s3_tables" value is no longer honored anywhere in the code path.
 type ManagedWarehouseIceberg struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `gorm:"default:false" json:"enabled"`
 
 	// Backend is retained for schema compat. Empty/unset is treated as
 	// "lakekeeper" by callers; any other value is also treated as
@@ -310,13 +310,13 @@ func (ManagedWarehouse) TableName() string { return "duckgres_managed_warehouses
 
 // GlobalConfig is a singleton row (ID=1) for cluster-wide settings.
 type GlobalConfig struct {
-	ID                  uint      `gorm:"primaryKey" json:"-"`
+	ID                  uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
 	MemoryBudget        string    `gorm:"size:32" json:"memory_budget"`
-	MemoryRebalance     bool      `json:"memory_rebalance"`
-	MaxConnections      int       `json:"max_connections"`
-	IdleTimeoutS        int       `json:"idle_timeout_s"`
-	WorkerQueueTimeoutS int       `json:"worker_queue_timeout_s"`
-	WorkerIdleTimeoutS  int       `json:"worker_idle_timeout_s"`
+	MemoryRebalance     bool      `gorm:"default:false" json:"memory_rebalance"`
+	MaxConnections      int       `gorm:"default:0" json:"max_connections"`
+	IdleTimeoutS        int       `gorm:"default:0" json:"idle_timeout_s"`
+	WorkerQueueTimeoutS int       `gorm:"default:0" json:"worker_queue_timeout_s"`
+	WorkerIdleTimeoutS  int       `gorm:"default:0" json:"worker_idle_timeout_s"`
 	Extensions          string    `gorm:"size:1024" json:"extensions"`
 	UpdatedAt           time.Time `json:"updated_at"`
 }
@@ -326,7 +326,7 @@ func (GlobalConfig) TableName() string { return "duckgres_global_config" }
 // DuckLakeConfig is a singleton row (ID=1) for legacy cluster-wide DuckLake settings.
 // In multi-tenant mode, the managed-warehouse contract is the intended per-org source of truth.
 type DuckLakeConfig struct {
-	ID                  uint      `gorm:"primaryKey" json:"-"`
+	ID                  uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
 	MetadataStore       string    `gorm:"size:1024" json:"metadata_store"`
 	ObjectStore         string    `gorm:"size:1024" json:"object_store"`
 	DataPath            string    `gorm:"size:1024" json:"data_path"`
@@ -335,7 +335,7 @@ type DuckLakeConfig struct {
 	S3AccessKey         string    `gorm:"size:255" json:"s3_access_key"`
 	S3SecretKey         string    `gorm:"size:255" json:"-"`
 	S3Region            string    `gorm:"size:64" json:"s3_region"`
-	S3UseSSL            bool      `json:"s3_use_ssl"`
+	S3UseSSL            bool      `gorm:"default:false" json:"s3_use_ssl"`
 	S3URLStyle          string    `gorm:"size:16" json:"s3_url_style"`
 	S3Chain             string    `gorm:"size:255" json:"s3_chain"`
 	S3Profile           string    `gorm:"size:255" json:"s3_profile"`
@@ -348,11 +348,11 @@ func (DuckLakeConfig) TableName() string { return "duckgres_ducklake_config" }
 
 // RateLimitConfig is a singleton row (ID=1) for rate limiting.
 type RateLimitConfig struct {
-	ID                   uint      `gorm:"primaryKey" json:"-"`
-	MaxFailedAttempts    int       `json:"max_failed_attempts"`
-	FailedAttemptWindowS int       `json:"failed_attempt_window_s"`
-	BanDurationS         int       `json:"ban_duration_s"`
-	MaxConnectionsPerIP  int       `json:"max_connections_per_ip"`
+	ID                   uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
+	MaxFailedAttempts    int       `gorm:"default:0" json:"max_failed_attempts"`
+	FailedAttemptWindowS int       `gorm:"default:0" json:"failed_attempt_window_s"`
+	BanDurationS         int       `gorm:"default:0" json:"ban_duration_s"`
+	MaxConnectionsPerIP  int       `gorm:"default:0" json:"max_connections_per_ip"`
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 
@@ -360,26 +360,16 @@ func (RateLimitConfig) TableName() string { return "duckgres_rate_limit_config" 
 
 // QueryLogConfig is a singleton row (ID=1) for query logging.
 type QueryLogConfig struct {
-	ID                   uint      `gorm:"primaryKey" json:"-"`
-	Enabled              bool      `json:"enabled"`
-	FlushIntervalS       int       `json:"flush_interval_s"`
-	BatchSize            int       `json:"batch_size"`
-	CompactIntervalS     int       `json:"compact_interval_s"`
-	DataInliningRowLimit int       `json:"data_inlining_row_limit"`
+	ID                   uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
+	Enabled              bool      `gorm:"default:false" json:"enabled"`
+	FlushIntervalS       int       `gorm:"default:0" json:"flush_interval_s"`
+	BatchSize            int       `gorm:"default:0" json:"batch_size"`
+	CompactIntervalS     int       `gorm:"default:0" json:"compact_interval_s"`
+	DataInliningRowLimit int       `gorm:"default:0" json:"data_inlining_row_limit"`
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
-
-// SchemaMigration tracks one-shot data migrations that aren't expressible
-// through GORM's AutoMigrate (e.g., backfills of new column defaults onto
-// existing rows). One row per migration name, inserted exactly once.
-type SchemaMigration struct {
-	Name      string    `gorm:"primaryKey;size:128" json:"name"`
-	AppliedAt time.Time `json:"applied_at"`
-}
-
-func (SchemaMigration) TableName() string { return "duckgres_schema_migrations" }
 
 // ControlPlaneInstanceState describes the liveness state of a control-plane instance.
 type ControlPlaneInstanceState string
