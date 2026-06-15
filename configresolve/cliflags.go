@@ -61,6 +61,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	configStoreConn := fs.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := fs.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
 	internalSecret := fs.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
+	internalSecretFallbacks := fs.String("internal-secret-fallbacks", "", "Comma-separated previous internal secrets still accepted for API authentication during rotation, newest first (env: DUCKGRES_INTERNAL_SECRET_FALLBACKS)")
 	sniRoutingMode := fs.String("sni-routing-mode", "", "Hostname-based org routing: 'enforce' (default; require a managed SNI hostname that resolves to an org — the database name selects the catalog, not the org), 'passthrough' (warn on legacy hostnames), 'off' (no SNI handling; identity can no longer be resolved). Multi-tenant only. (env: DUCKGRES_SNI_ROUTING_MODE)")
 	managedHostnameSuffixes := fs.String("managed-hostname-suffixes", "", "Comma-separated DNS suffixes (each starting with '.') for managed tenant hostnames, e.g. '.dw.us.postwh.com'. (env: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES)")
 	workerBackend := fs.String("worker-backend", "", "Worker backend: process (default) or remote for config-store-backed K8s multitenant mode (env: DUCKGRES_WORKER_BACKEND)")
@@ -120,6 +121,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.ConfigStoreConn = *configStoreConn
 		cli.ConfigPollInterval = *configPollInterval
 		cli.InternalSecret = *internalSecret
+		cli.InternalSecretFallbacks = *internalSecretFallbacks
 		cli.SNIRoutingMode = *sniRoutingMode
 		cli.ManagedHostnameSuffixes = *managedHostnameSuffixes
 		cli.WorkerBackend = *workerBackend

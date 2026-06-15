@@ -25,6 +25,10 @@ SA_NAME="duckgres"
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
 internal_secret_file="/tmp/duckgres-ci-internal-secret"
+# Rotation fallback secret (DUCKGRES_INTERNAL_SECRET_FALLBACKS): a second
+# random value the CP must also accept, so the harness can assert the
+# rotation-overlap path (internal_secret_fallback_auth).
+internal_secret_fallback_file="/tmp/duckgres-ci-internal-secret-fallback"
 # AES key for user persistent secrets (DUCKGRES_USER_SECRET_KEY). Random per
 # run: stored user secrets only need to outlive the run's sessions.
 user_secret_key_file="/tmp/duckgres-ci-user-secret-key"
@@ -32,12 +36,14 @@ user_secret_key_file="/tmp/duckgres-ci-user-secret-key"
 render() {
   : "${WORKER_IMAGE:?}" "${CONTROLPLANE_IMAGE:?}" "${PR_NUMBER:?}"
   [ -f "$internal_secret_file" ] || openssl rand -hex 16 > "$internal_secret_file"
+  [ -f "$internal_secret_fallback_file" ] || openssl rand -hex 16 > "$internal_secret_fallback_file"
   [ -f "$user_secret_key_file" ] || openssl rand -base64 32 > "$user_secret_key_file"
   INTERNAL_SECRET="$(cat "$internal_secret_file")" \
+  INTERNAL_SECRET_FALLBACK="$(cat "$internal_secret_fallback_file")" \
   USER_SECRET_KEY="$(cat "$user_secret_key_file")" \
   NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
   WORKER_IMAGE="$WORKER_IMAGE" CONTROLPLANE_IMAGE="$CONTROLPLANE_IMAGE" \
-    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $USER_SECRET_KEY' \
+    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY' \
     < "$HERE/manifests.tmpl.yaml"
 }
 
@@ -189,6 +195,7 @@ cmd_test() {
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
+  INTERNAL_SECRET_FALLBACK="$(cat "$internal_secret_fallback_file")"
   "${KUBECTL[@]}" -n "$NS" delete job duckgres-harness --ignore-not-found
   cat <<YAML | "${KUBECTL[@]}" apply -f -
 apiVersion: batch/v1
@@ -214,6 +221,7 @@ spec:
             - { name: NAMESPACE, value: "$NS" }
             - { name: PR_NUMBER, value: "$PR_NUMBER" }
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
+            - { name: INTERNAL_SECRET_FALLBACK, value: "$INTERNAL_SECRET_FALLBACK" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }
             - { name: CP_PG_HOST, value: "duckgres-control-plane.$NS.svc" }
           # Real requests/limits: the harness shares the default nodepool with

@@ -418,6 +418,11 @@ func SetupMultiTenant(
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret; set --internal-secret or DUCKGRES_INTERNAL_SECRET explicitly to avoid rotation on restart.")
 	}
+	adminTokens := admin.NewTokenSet(internalSecret, cfg.InternalSecretFallbacks)
+	if n := len(cfg.InternalSecretFallbacks); n > 0 {
+		// Count only — never log the secret values.
+		slog.Info("Internal secret rotation fallbacks active.", "fallback_count", n)
+	}
 
 	// Set up API server (admin + provisioning + dashboard on :8080).
 	// The existing metrics server on :9090 stays running separately.
@@ -429,12 +434,12 @@ func SetupMultiTenant(
 	engine.GET("/health", newHealthHandler(isHealthy))
 
 	// Authenticated API
-	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
+	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminTokens))
 	admin.RegisterAPI(api, store, adpt)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store))
 
 	// Dashboard
-	admin.RegisterDashboard(engine, internalSecret)
+	admin.RegisterDashboard(engine, adminTokens)
 
 	apiServer := &http.Server{
 		Addr:    ":8080",
