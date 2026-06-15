@@ -28,6 +28,10 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			return nil
 		}
 
+		// Open cursors pin the session's single DuckDB connection — release
+		// them before a transaction-end statement needs it.
+		c.closeCursorsAtTxEnd(cmdType)
+
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
@@ -649,6 +653,10 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			_ = c.writeCommandComplete("BEGIN")
 			return false, nil
 		}
+
+		// Open cursors pin the session's single DuckDB connection — release
+		// them before a transaction-end statement needs it.
+		c.closeCursorsAtTxEnd(cmdType)
 
 		ctx, cleanup := c.queryContext()
 		defer cleanup()

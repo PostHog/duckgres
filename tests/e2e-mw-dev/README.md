@@ -51,6 +51,12 @@ client-go:
   harness Job image is `postgres:18-alpine` (pipeline meta-commands are
   psql 18+). The same wire lane also asserts that a pgwire CancelRequest leaves
   the same session immediately reusable.
+- **server-side cursors** — DECLARE → `FETCH n` → `MOVE n` (advances without
+  returning rows) → `FETCH ALL` (remaining rows only) → CLOSE, with exact value
+  assertions on a live worker; then ROLLBACK while a second cursor is still
+  partially read must return promptly and leave the session usable (an open
+  cursor rowset pins the worker session's single DuckDB connection — the
+  pre-fix behavior deadlocked the session at transaction end).
 - **cold-burst absorption** — there is no warm pool, so a burst of cold sessions
   spawns workers on demand; if it outruns the org/global cap the surplus gets a
   graceful client-visible hint (`no Duckgres worker … retry in about 45 seconds`

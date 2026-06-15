@@ -103,6 +103,21 @@ func (c *clientConn) closeAllCursors() {
 	}
 }
 
+// closeCursorsAtTxEnd closes all open cursors before a COMMIT/ROLLBACK
+// statement executes. PostgreSQL destroys non-holdable cursors at transaction
+// end; doing it BEFORE the statement runs (rather than after, in
+// updateTxStatus) is required for liveness, not just compatibility: the
+// session's DuckDB pool is capped at one connection (openBaseDB), so a
+// partially-read cursor's open rowset holds the only connection and the
+// COMMIT/ROLLBACK would block on it forever. updateTxStatus keeps its
+// post-exec close as a backstop for paths that don't call this hook.
+func (c *clientConn) closeCursorsAtTxEnd(cmdType string) {
+	if cmdType != "COMMIT" && cmdType != "ROLLBACK" {
+		return
+	}
+	c.closeAllCursors()
+}
+
 // getCursorSchema opens the cursor if needed to retrieve column metadata,
 // then returns the schema information. Used by handleDescribe for FETCH statements.
 func (c *clientConn) getCursorSchema(cursorName string) ([]string, []ColumnTyper, error) {
@@ -446,6 +461,24 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 	}
 
 	howMany := p.stmt.fetchCount
+
+	// MOVE: advance position without returning rows (mirrors the
+	// simple-protocol path in handleFetchCursor).
+	if p.stmt.cursorIsMove {
+		moveCount := int64(0)
+		for moveCount < howMany && cursor.rows.Next() {
+			// Read the row to advance position, but don't send it
+			values := make([]interface{}, len(cursor.cols))
+			valuePtrs := make([]interface{}, len(cursor.cols))
+			for i := range values {
+				valuePtrs[i] = &values[i]
+			}
+			_ = cursor.rows.Scan(valuePtrs...)
+			moveCount++
+		}
+		_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("MOVE %d", moveCount))
+		return
+	}
 
 	// Send RowDescription if Describe wasn't already called
 	if !p.described && len(cursor.cols) > 0 {

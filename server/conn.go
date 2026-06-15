@@ -88,6 +88,7 @@ type preparedStmt struct {
 	cursorName        string   // Cursor name
 	cursorQuery       string   // Transpiled inner SELECT (for DECLARE)
 	fetchCount        int64    // FETCH row count
+	cursorIsMove      bool     // FETCH is a MOVE: advance position without returning rows
 	warnings          []string // Transpiler warnings to surface as NoticeResponse at Execute
 }
 
@@ -1336,6 +1337,10 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 			_ = c.flushWriter()
 			return nil
 		}
+
+		// Open cursors pin the session's single DuckDB connection — release
+		// them before a transaction-end statement needs it.
+		c.closeCursorsAtTxEnd(cmdType)
 
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
