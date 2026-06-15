@@ -371,8 +371,9 @@ type QueryLogConfig struct {
 
 func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
 
-// SchemaMigration tracks versioned config-store SQL migrations. One row per
-// embedded migration file, inserted exactly once after the migration applies.
+// SchemaMigration is the legacy config-store migration marker table. Goose owns
+// current migration tracking in goose_db_version; this table remains for older
+// compatibility guards such as 2026_05_delta_catalog_default_enabled.
 type SchemaMigration struct {
 	Name      string    `gorm:"primaryKey;size:128" json:"name"`
 	Checksum  string    `gorm:"not null" json:"checksum"`
