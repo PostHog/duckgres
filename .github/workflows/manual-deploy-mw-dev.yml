@@ -1,0 +1,197 @@
+name: Manual Deploy to mw-dev
+
+# Manually-triggered build + push of the controlplane and/or worker images
+# from the dispatched ref, tagged for posthog-mw-dev only. Mirrors the shape
+# of container-image-controlplane-cd.yml and container-image-worker-cd.yml but
+# never promotes to `:latest` — that tag stays reserved for main → prod.
+#
+# Image tags pushed:
+#   - <image>:mw-dev-<short-sha>   immutable, points at the dispatched commit
+#   - <image>:mw-dev-latest        mutable convenience tag for tracking
+#
+# mw-dev is arm64-only, so this is arm64-only (no multi-arch manifest needed —
+# saves the ~5 min the amd64 leg would cost and the manifest job entirely).
+#
+# Use when you want to validate a branch on real mw-dev infra (cnpg-shards,
+# external RDS, Lakekeeper, Crossplane) before merging. For prod, merge to
+# main and let container-image-{worker,controlplane}-cd.yml do its normal CD.
+
+on:
+    workflow_dispatch:
+        inputs:
+            components:
+                description: "Which images to build."
+                required: true
+                default: both
+                type: choice
+                options:
+                    - both
+                    - controlplane
+                    - worker
+
+env:
+    ECR_REGISTRY: 795637471508.dkr.ecr.us-east-1.amazonaws.com
+    GHCR_REGISTRY: ghcr.io
+    # Pin to the same default DuckDB row as container-image-worker-cd.yml's
+    # matrix `default: true` entry. If that matrix moves, bump these too.
+    DUCKDB_VERSION: "1.5.3"
+    DUCKDB_GO_VERSION: "v2.10503.0"
+    DUCKDB_BINDINGS_VERSION: "v0.10503.0"
+    HTTPFS_EXTENSION_TAG: "v1.5.3-cred-refresh"
+    DUCKLAKE_EXTENSION_TAG: "v1.0-posthog.4"
+    POSTGRES_SCANNER_REPOSITORY: "https://extensions.duckdb.org"
+
+jobs:
+    compute-tag:
+        name: Compute mw-dev tag
+        if: github.repository == 'PostHog/duckgres'
+        runs-on: ubuntu-24.04
+        outputs:
+            short-sha: ${{ steps.tag.outputs.short-sha }}
+        steps:
+            - name: Short SHA
+              id: tag
+              env:
+                  FULL_SHA: ${{ github.sha }}
+              run: echo "short-sha=${FULL_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+    controlplane:
+        name: Build controlplane (mw-dev)
+        needs: compute-tag
+        if: ${{ github.repository == 'PostHog/duckgres' && (inputs.components == 'both' || inputs.components == 'controlplane') }}
+        runs-on: ubuntu-24.04-arm
+        permissions:
+            id-token: write
+            contents: read
+            packages: write
+        env:
+            IMAGE_NAME: duckgres-controlplane
+            SHORT_SHA: ${{ needs.compute-tag.outputs.short-sha }}
+
+        steps:
+            - name: Check out
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+              with:
+                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+            - name: Login to GHCR
+              uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+              with:
+                  registry: ${{ env.GHCR_REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push controlplane (arm64)
+              uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+              with:
+                  context: .
+                  file: Dockerfile.controlplane
+                  push: true
+                  platforms: linux/arm64
+                  tags: |
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-${{ env.SHORT_SHA }}
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-latest
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:mw-dev-${{ env.SHORT_SHA }}
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:mw-dev-latest
+                  build-args: |
+                      VERSION=mw-dev-${{ env.SHORT_SHA }}
+                      COMMIT=${{ github.sha }}
+                      BUILD_TAGS=kubernetes
+                  cache-from: type=gha,scope=cp-mw-dev-arm64
+                  cache-to: type=gha,mode=max,scope=cp-mw-dev-arm64
+
+            - name: Summary
+              env:
+                  IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-${{ env.SHORT_SHA }}
+              run: |
+                  {
+                      echo "## controlplane image pushed"
+                      echo ""
+                      echo "- ECR: \`$IMAGE_REF\`"
+                      echo "- Floating tag: \`${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-latest\`"
+                      echo "- Ref: \`${{ github.ref }}\` @ \`${{ github.sha }}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+    worker:
+        name: Build worker (mw-dev)
+        needs: compute-tag
+        if: ${{ github.repository == 'PostHog/duckgres' && (inputs.components == 'both' || inputs.components == 'worker') }}
+        runs-on: ubuntu-24.04-arm
+        permissions:
+            id-token: write
+            contents: read
+            packages: write
+        env:
+            IMAGE_NAME: duckgres
+            SHORT_SHA: ${{ needs.compute-tag.outputs.short-sha }}
+
+        steps:
+            - name: Check out
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+              with:
+                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+            - name: Login to GHCR
+              uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+              with:
+                  registry: ${{ env.GHCR_REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push worker (arm64, default DuckDB row)
+              uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+              with:
+                  context: .
+                  file: Dockerfile.worker
+                  push: true
+                  platforms: linux/arm64
+                  tags: |
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-${{ env.SHORT_SHA }}
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-latest
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:mw-dev-${{ env.SHORT_SHA }}
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:mw-dev-latest
+                  build-args: |
+                      VERSION=mw-dev-${{ env.SHORT_SHA }}
+                      COMMIT=${{ github.sha }}
+                      BUILD_TAGS=kubernetes
+                      DUCKDB_GO_VERSION=${{ env.DUCKDB_GO_VERSION }}
+                      DUCKDB_BINDINGS_VERSION=${{ env.DUCKDB_BINDINGS_VERSION }}
+                      DUCKDB_EXTENSION_VERSION=${{ env.DUCKDB_VERSION }}
+                      HTTPFS_EXTENSION_TAG=${{ env.HTTPFS_EXTENSION_TAG }}
+                      DUCKLAKE_EXTENSION_TAG=${{ env.DUCKLAKE_EXTENSION_TAG }}
+                      POSTGRES_SCANNER_REPOSITORY=${{ env.POSTGRES_SCANNER_REPOSITORY }}
+                  cache-from: type=gha,scope=worker-mw-dev-arm64
+                  cache-to: type=gha,mode=max,scope=worker-mw-dev-arm64
+
+            - name: Summary
+              env:
+                  IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-${{ env.SHORT_SHA }}
+              run: |
+                  {
+                      echo "## worker image pushed"
+                      echo ""
+                      echo "- ECR: \`$IMAGE_REF\`"
+                      echo "- Floating tag: \`${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:mw-dev-latest\`"
+                      echo "- DuckDB: \`${{ env.DUCKDB_VERSION }}\` (go ${{ env.DUCKDB_GO_VERSION }})"
+                      echo "- Ref: \`${{ github.ref }}\` @ \`${{ github.sha }}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
