@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -24,6 +25,11 @@ type CacheProxy struct {
 	client  *http.Client
 	flights singleFlight
 
+	originTimeout             time.Duration
+	originRetryMaxAttempts    int
+	originRetryInitialBackoff time.Duration
+	originRetryMaxBackoff     time.Duration
+
 	// cacheHostSuffixes are the Host substrings that identify DuckLake bucket
 	// traffic worth caching. Requests whose Host doesn't contain any of these
 	// are passed through without caching.
@@ -39,6 +45,13 @@ type fetchResult struct {
 	contentType string // origin Content-Type ("" for peer fetches and hits)
 	source      string // "peer" or "miss"
 }
+
+const (
+	defaultOriginTimeout             = 60 * time.Second
+	defaultOriginRetryMaxAttempts    = 4
+	defaultOriginRetryInitialBackoff = 100 * time.Millisecond
+	defaultOriginRetryMaxBackoff     = 1 * time.Second
+)
 
 type singleFlight struct {
 	mu sync.Mutex
@@ -78,10 +91,14 @@ func (sf *singleFlight) Do(key string, fn func() (fetchResult, error)) (fetchRes
 
 func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []string) *CacheProxy {
 	return &CacheProxy{
-		store:             store,
-		peers:             peers,
-		client:            &http.Client{Timeout: 60 * time.Second},
-		cacheHostSuffixes: cacheHostSuffixes,
+		store:                     store,
+		peers:                     peers,
+		client:                    &http.Client{Timeout: defaultOriginTimeout},
+		originTimeout:             defaultOriginTimeout,
+		originRetryMaxAttempts:    defaultOriginRetryMaxAttempts,
+		originRetryInitialBackoff: defaultOriginRetryInitialBackoff,
+		originRetryMaxBackoff:     defaultOriginRetryMaxBackoff,
+		cacheHostSuffixes:         cacheHostSuffixes,
 	}
 }
 
@@ -308,7 +325,59 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 // large range reads. A non-2xx response is NOT cached — its (capped) error body
 // is captured and returned as an originStatusError for verbatim forwarding.
 func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, string, error) {
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	attempts := p.originRetryMaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	backoff := p.originRetryInitialBackoff
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		size, contentType, err := p.fetchOriginOnce(cacheKey, r)
+		if err == nil {
+			return size, contentType, nil
+		}
+		lastErr = err
+		if attempt == attempts || r.Context().Err() != nil || !isRetriableOriginFetchError(err) {
+			return 0, "", err
+		}
+
+		delay := jitteredOriginRetryDelay(backoff, p.originRetryMaxBackoff)
+		slog.Warn("Origin fetch failed with retriable error, retrying.",
+			"url", r.URL.String(),
+			"range", r.Header.Get("Range"),
+			"attempt", attempt,
+			"max_attempts", attempts,
+			"backoff", delay,
+			"error", err)
+		if !sleepContext(r.Context(), delay) {
+			return 0, "", r.Context().Err()
+		}
+		if backoff > 0 {
+			backoff *= 2
+			if p.originRetryMaxBackoff > 0 && backoff > p.originRetryMaxBackoff {
+				backoff = p.originRetryMaxBackoff
+			}
+		}
+	}
+	return 0, "", lastErr
+}
+
+func jitteredOriginRetryDelay(backoff, maxBackoff time.Duration) time.Duration {
+	if backoff <= 0 {
+		return 0
+	}
+	if maxBackoff > 0 && backoff > maxBackoff {
+		backoff = maxBackoff
+	}
+	return time.Duration(float64(backoff) * (0.5 + rand.Float64()*0.5))
+}
+
+func (p *CacheProxy) fetchOriginOnce(cacheKey string, r *http.Request) (int64, string, error) {
+	timeout := p.originTimeout
+	if timeout <= 0 {
+		timeout = defaultOriginTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, r.URL.String(), nil)
@@ -348,6 +417,55 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 		return 0, "", err
 	}
 	return size, resp.Header.Get("Content-Type"), nil
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func isRetriableOriginFetchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var oe *originStatusError
+	if errors.As(err, &oe) {
+		switch oe.status {
+		case http.StatusRequestTimeout,
+			http.StatusTooManyRequests,
+			http.StatusInternalServerError,
+			http.StatusBadGateway,
+			http.StatusServiceUnavailable,
+			http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "timeout")
 }
 
 // originErrorBodyCap is the maximum number of bytes we'll buffer from a
