@@ -28,9 +28,9 @@ func isUniqueViolation(err error) bool {
 }
 
 // ducklingOrgIDPattern constrains org IDs that get a provisioned warehouse to a
-// canonical lowercase hyphenated UUID. The provisioner compacts this ID for the
-// Duckling CR name so the composed S3 bucket fits AWS's 63-character limit; the
-// strict source shape keeps that compaction collision-free.
+// canonical lowercase hyphenated UUID. The Crossplane composition may compact
+// this ID for bucket-specific names; the strict source shape keeps that
+// compaction collision-free.
 var ducklingOrgIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // Store defines the config store operations needed by the provisioning API.

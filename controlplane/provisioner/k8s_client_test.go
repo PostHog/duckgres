@@ -133,40 +133,6 @@ func TestDucklingCreateExternalDataStoreRequiresBucket(t *testing.T) {
 	}
 }
 
-func TestDucklingGetFallsBackToHyphenatedUUIDName(t *testing.T) {
-	dc, fakeK8s := newFakeDucklingClient()
-	ctx := context.Background()
-
-	org := "018d351a-9ff7-0000-eaff-4628875ad045"
-	fallbackName := hyphenPreservingDucklingName(org)
-	if ducklingName(org) == fallbackName {
-		t.Fatal("test premise: UUID org id must compact to a different current name")
-	}
-
-	cr := ducklingCR(fallbackName, map[string]interface{}{"iamRoleArn": "arn:aws:iam::123:role/duckling-" + fallbackName})
-	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed fallback CR: %v", err)
-	}
-
-	st, err := dc.Get(ctx, org)
-	if err != nil {
-		t.Fatalf("Get must fall back to the hyphenated UUID name, got: %v", err)
-	}
-	if st.IAMRoleARN == "" {
-		t.Error("expected to parse the fallback CR's status")
-	}
-
-	if _, err := dc.GetIcebergEnabled(ctx, org); err != nil {
-		t.Errorf("GetIcebergEnabled fallback: %v", err)
-	}
-	if err := dc.Delete(ctx, org); err != nil {
-		t.Errorf("Delete fallback: %v", err)
-	}
-	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, fallbackName, metav1.GetOptions{}); getErr == nil {
-		t.Error("fallback CR should have been deleted")
-	}
-}
-
 func TestDucklingGetDoesNotInspectComposedBucketReadiness(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	ctx := context.Background()

@@ -80,9 +80,8 @@ func lakekeeperPodMetadata() map[string]interface{} {
 // the duckgres/active-org label.
 //
 // It deliberately does NOT recompute the CR name from the orgID. Looking up by
-// label patches whatever name actually exists, including compact UUID-derived
-// resources and historical hyphenated resources, instead of minting a duplicate
-// CR under a name that has no matching Secret/SA/pod-identity.
+// label patches whatever name actually exists instead of minting a duplicate CR
+// under a name that has no matching Secret/SA/pod-identity.
 //
 // Uses a JSON merge patch, which carries no resourceVersion, so it never races
 // the operator's frequent status writes (the "object has been modified"
@@ -164,7 +163,7 @@ func NewLakekeeperK8sClientWithClients(dc dynamic.Interface, kc kubernetes.Inter
 // LakekeeperResourceName derives the K8s resource name (CR + Secret + SA) for
 // an org.
 func LakekeeperResourceName(orgID string) string {
-	return "lakekeeper-" + hyphenPreservingDucklingName(orgID)
+	return "lakekeeper-" + ducklingName(orgID)
 }
 
 // LakekeeperSecretData is the strongly-typed contents of the per-org Secret

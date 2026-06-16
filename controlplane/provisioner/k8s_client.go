@@ -124,18 +124,9 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 	return &DucklingClient{client: client}
 }
 
-var hyphenatedUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-
-// ducklingName is the k8s/AWS resource name derived from an org ID for the
-// Duckling CR and Crossplane-composed resources. Canonical hyphenated UUID org
-// IDs use a compact dehyphenated form so the composed S3 bucket name stays
-// under AWS's 63-character limit in prod.
+// ducklingName is the Kubernetes Duckling CR name derived from an org ID.
 func ducklingName(orgID string) string {
-	name := strings.ToLower(orgID)
-	if hyphenatedUUIDRe.MatchString(name) {
-		return strings.ReplaceAll(name, "-", "")
-	}
-	return name
+	return strings.ToLower(orgID)
 }
 
 // pgIdentSanitizeRe matches characters not allowed in an unquoted Postgres
@@ -152,51 +143,6 @@ var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
 // [a-z0-9-], which the provision-time validation guarantees.
 func pgIdentSuffix(orgID string) string {
 	return pgIdentSanitizeRe.ReplaceAllString(strings.ToLower(orgID), "_")
-}
-
-func hyphenPreservingDucklingName(orgID string) string {
-	return strings.ToLower(orgID)
-}
-
-type ducklingNamePolicy struct {
-	current              string
-	legacyHyphenatedUUID string
-}
-
-func resourceNamePolicy(orgID string) ducklingNamePolicy {
-	policy := ducklingNamePolicy{current: ducklingName(orgID)}
-	if hyphenatedUUIDRe.MatchString(strings.ToLower(orgID)) {
-		policy.legacyHyphenatedUUID = hyphenPreservingDucklingName(orgID)
-	}
-	return policy
-}
-
-func ducklingNameCandidates(orgID string) []string {
-	policy := resourceNamePolicy(orgID)
-	return uniqueDucklingNames([]string{
-		policy.current,
-		policy.legacyHyphenatedUUID,
-	})
-}
-
-func uniqueDucklingNames(names []string) []string {
-	candidates := []string{}
-	for _, name := range names {
-		if name == "" {
-			continue
-		}
-		seen := false
-		for _, candidate := range candidates {
-			if candidate == name {
-				seen = true
-				break
-			}
-		}
-		if !seen {
-			candidates = append(candidates, name)
-		}
-	}
-	return candidates
 }
 
 // CreateOptions carries per-org knobs that shape the generated Duckling CR.
@@ -343,26 +289,13 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	return nil
 }
 
-// getCR fetches the org's Duckling CR, trying the current name first and then
-// compatible historical spellings. That lets UUID-shaped orgs move to the
-// compact dehyphenated name while still resolving already-created hyphenated CRs.
+// getCR fetches the org's Duckling CR.
 // Returns the CR and the name it was found under (callers that mutate need the
-// actual name). When neither exists, returns the current-name NotFound error.
+// actual name).
 func (d *DucklingClient) getCR(ctx context.Context, orgID string) (*unstructured.Unstructured, string, error) {
-	var firstNotFound error
-	for _, name := range ducklingNameCandidates(orgID) {
-		cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
-		if err == nil {
-			return cr, name, nil
-		}
-		if !apierrors.IsNotFound(err) {
-			return nil, name, err
-		}
-		if firstNotFound == nil {
-			firstNotFound = err
-		}
-	}
-	return nil, ducklingName(orgID), firstNotFound
+	name := ducklingName(orgID)
+	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	return cr, name, err
 }
 
 // Get fetches the Duckling CR and parses its status.
