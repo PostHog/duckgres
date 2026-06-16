@@ -372,10 +372,14 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 				return fetchResult{size: n, source: "peer"}, nil
 			}
 		}
+		originFetchInFlight.Inc()
+		defer originFetchInFlight.Dec()
 		size, ct, err := p.fetchOrigin(cacheKey, r)
 		if err != nil {
+			originFetchesTotal.WithLabelValues(originFetchOutcome(err)).Inc()
 			return fetchResult{}, err
 		}
+		originFetchesTotal.WithLabelValues("success").Inc()
 		cacheBytesServed.WithLabelValues("s3").Add(float64(size))
 		return fetchResult{size: size, contentType: ct, source: "miss"}, nil
 	})
@@ -410,7 +414,11 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 		if errors.As(err, &oe) {
 			originSpan.SetAttributes(attribute.Int("http.response.status_code", oe.status))
 		}
-		if attempt == attempts || r.Context().Err() != nil || !isRetriableOriginFetchError(err) {
+		if err := r.Context().Err(); err != nil {
+			originSpan.SetStatus(codes.Error, err.Error())
+			return 0, "", err
+		}
+		if attempt == attempts || !isRetriableOriginFetchError(err) {
 			originSpan.SetStatus(codes.Error, err.Error())
 			return 0, "", err
 		}
@@ -424,8 +432,18 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 			"backoff", delay,
 			"error", err)
 		if !sleepContext(r.Context(), delay) {
-			return 0, "", r.Context().Err()
+			err := r.Context().Err()
+			if err == nil {
+				err = context.Canceled
+			}
+			originSpan.SetStatus(codes.Error, err.Error())
+			return 0, "", err
 		}
+		if err := r.Context().Err(); err != nil {
+			originSpan.SetStatus(codes.Error, err.Error())
+			return 0, "", err
+		}
+		originFetchRetriesTotal.WithLabelValues(originRetryReason(err)).Inc()
 		if backoff > 0 {
 			backoff *= 2
 			if p.originRetryMaxBackoff > 0 && backoff > p.originRetryMaxBackoff {
@@ -543,6 +561,54 @@ func isRetriableOriginFetchError(err error) bool {
 		strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "unexpected eof") ||
 		strings.Contains(msg, "timeout")
+}
+
+func originFetchOutcome(err error) string {
+	if err == nil {
+		return "success"
+	}
+	var oe *originStatusError
+	if errors.As(err, &oe) {
+		return "http_error"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	return "error"
+}
+
+func originRetryReason(err error) string {
+	var oe *originStatusError
+	if errors.As(err, &oe) {
+		return fmt.Sprintf("http_%d", oe.status)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection reset by peer"):
+		return "connection_reset"
+	case strings.Contains(msg, "connection refused"):
+		return "connection_refused"
+	case strings.Contains(msg, "unexpected eof"):
+		return "unexpected_eof"
+	case strings.Contains(msg, "timeout"):
+		return "timeout"
+	default:
+		return "transport_error"
+	}
 }
 
 // originErrorBodyCap is the maximum number of bytes we'll buffer from a
