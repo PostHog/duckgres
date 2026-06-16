@@ -14,6 +14,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const testOrgID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+
 type fakeStore struct {
 	orgs                  map[string]*configstore.Org
 	users                 map[configstore.OrgUserKey]string
@@ -178,7 +180,7 @@ func newTestRouter(store Store) *gin.Engine {
 // cnpg-shard and external.
 func TestProvisionRejectsAurora(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.orgs[testOrgID] = &configstore.Org{Name: testOrgID}
 	router := newTestRouter(store)
 
 	body := []byte(`{
@@ -186,7 +188,7 @@ func TestProvisionRejectsAurora(t *testing.T) {
 		"metadata_store": {"type": "aurora"},
 		"ducklake": {"enabled": true}
 	}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -194,7 +196,7 @@ func TestProvisionRejectsAurora(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (aurora removed): %s", rec.Code, rec.Body.String())
 	}
-	if store.warehouses["analytics"] != nil {
+	if store.warehouses[testOrgID] != nil {
 		t.Fatal("aurora request must not create a warehouse")
 	}
 }
@@ -204,7 +206,7 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -212,10 +214,10 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	if _, ok := store.orgs["new-org"]; !ok {
+	if _, ok := store.orgs[testOrgID]; !ok {
 		t.Fatal("expected org to be auto-created")
 	}
-	if store.warehouses["new-org"] == nil {
+	if store.warehouses[testOrgID] == nil {
 		t.Fatal("expected warehouse to be created")
 	}
 }
@@ -225,7 +227,7 @@ func TestProvisionRejectsEmptyBody(t *testing.T) {
 	router := newTestRouter(store)
 
 	body := []byte(`{}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -237,15 +239,15 @@ func TestProvisionRejectsEmptyBody(t *testing.T) {
 
 func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
-		OrgID: "analytics",
+	store.orgs[testOrgID] = &configstore.Org{Name: testOrgID}
+	store.warehouses[testOrgID] = &configstore.ManagedWarehouse{
+		OrgID: testOrgID,
 		State: configstore.ManagedWarehouseStateProvisioning,
 	}
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -257,16 +259,16 @@ func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 
 func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.users[configstore.OrgUserKey{OrgID: "analytics", Username: "root"}] = "old-hash"
-	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
-		OrgID: "analytics",
+	store.orgs[testOrgID] = &configstore.Org{Name: testOrgID}
+	store.users[configstore.OrgUserKey{OrgID: testOrgID, Username: "root"}] = "old-hash"
+	store.warehouses[testOrgID] = &configstore.ManagedWarehouse{
+		OrgID: testOrgID,
 		State: configstore.ManagedWarehouseStateFailed,
 	}
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -274,23 +276,23 @@ func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	if store.warehouses["analytics"].MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
-		t.Fatalf("expected cnpg-shard warehouse after retry, got kind %q", store.warehouses["analytics"].MetadataStore.Kind)
+	if store.warehouses[testOrgID].MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
+		t.Fatalf("expected cnpg-shard warehouse after retry, got kind %q", store.warehouses[testOrgID].MetadataStore.Kind)
 	}
 }
 
 func TestProvisionAllowsRetryAfterDeleted(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.users[configstore.OrgUserKey{OrgID: "analytics", Username: "root"}] = "old-hash"
-	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
-		OrgID: "analytics",
+	store.orgs[testOrgID] = &configstore.Org{Name: testOrgID}
+	store.users[configstore.OrgUserKey{OrgID: testOrgID, Username: "root"}] = "old-hash"
+	store.warehouses[testOrgID] = &configstore.ManagedWarehouse{
+		OrgID: testOrgID,
 		State: configstore.ManagedWarehouseStateDeleted,
 	}
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -436,7 +438,7 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "team-7-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/7/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -447,14 +449,14 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 
 	// After rollback: no warehouse row, no user row, no Org row.
 	// Retry would treat this as a brand-new provision.
-	if _, ok := store.warehouses["7"]; ok {
-		t.Errorf("expected warehouse to be rolled back, got %+v", store.warehouses["7"])
+	if _, ok := store.warehouses[testOrgID]; ok {
+		t.Errorf("expected warehouse to be rolled back, got %+v", store.warehouses[testOrgID])
 	}
-	if _, ok := store.users[configstore.OrgUserKey{OrgID: "7", Username: "root"}]; ok {
+	if _, ok := store.users[configstore.OrgUserKey{OrgID: testOrgID, Username: "root"}]; ok {
 		t.Errorf("expected user row to be absent after rollback")
 	}
-	if _, ok := store.orgs["7"]; ok {
-		t.Errorf("expected org row to be rolled back, got %+v", store.orgs["7"])
+	if _, ok := store.orgs[testOrgID]; ok {
+		t.Errorf("expected org row to be rolled back, got %+v", store.orgs[testOrgID])
 	}
 
 	// Now clear the hook and retry — should succeed with a clean
@@ -462,14 +464,14 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	// retry).
 	store.setProvisionUserFailHook(nil)
 	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/7/provision", bytes.NewReader(body))
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req2.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec2, req2)
 
 	if rec2.Code != http.StatusAccepted {
 		t.Fatalf("retry status = %d, want 202: %s", rec2.Code, rec2.Body.String())
 	}
-	if _, ok := store.warehouses["7"]; !ok {
+	if _, ok := store.warehouses[testOrgID]; !ok {
 		t.Errorf("expected warehouse to be created on retry")
 	}
 }
@@ -495,12 +497,12 @@ func TestResetPasswordRequiresReadyWarehouse(t *testing.T) {
 
 func TestProvisionCnpgShard(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["shardco"] = &configstore.Org{Name: "shardco"}
+	store.orgs[testOrgID] = &configstore.Org{Name: testOrgID}
 	router := newTestRouter(store)
 
 	// cnpg-shard takes no sizing and auto-enables iceberg.
 	body := []byte(`{"database_name": "shardco-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/shardco/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -508,7 +510,7 @@ func TestProvisionCnpgShard(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	w := store.warehouses["shardco"]
+	w := store.warehouses[testOrgID]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
 		return
@@ -535,7 +537,7 @@ func TestProvisionIcebergExternal(t *testing.T) {
 		"data_store": {"type": "external", "bucket_name": "posthog-duckling-example", "region": "us-east-1"},
 		"iceberg": {"enabled": true}
 	}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extice/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -543,7 +545,7 @@ func TestProvisionIcebergExternal(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	w := store.warehouses["extice"]
+	w := store.warehouses[testOrgID]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
 		return
@@ -575,14 +577,14 @@ func TestProvisionRejectsNoCatalog(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 	body := []byte(`{"database_name":"nc-db","metadata_store":{"type":"cnpg-shard"}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ncco/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
-	if _, ok := store.warehouses["ncco"]; ok {
+	if _, ok := store.warehouses[testOrgID]; ok {
 		t.Error("warehouse must not be created with no catalog enabled")
 	}
 }
@@ -593,14 +595,14 @@ func TestProvisionCnpgDuckLakeAndIceberg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 	body := []byte(`{"database_name":"both-db","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"iceberg":{"enabled":true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/bothco/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
 	}
-	w := store.warehouses["bothco"]
+	w := store.warehouses[testOrgID]
 	if w == nil || w.MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
 		t.Fatalf("expected cnpg-shard warehouse, got %+v", w)
 	}
@@ -623,7 +625,7 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 		"data_store": {"type": "external", "bucket_name": "posthog-duckling-example", "region": "us-east-1"},
 		"ducklake": {"enabled": true}
 	}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extdl/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -631,7 +633,7 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	w := store.warehouses["extdl"]
+	w := store.warehouses[testOrgID]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
 		return
@@ -653,14 +655,14 @@ func TestProvisionExternalRequiresEndpointAndSecret(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := newFakeStore()
 			router := newTestRouter(store)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/eco/provision", bytes.NewReader([]byte(body)))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader([]byte(body)))
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 			}
-			if _, ok := store.warehouses["eco"]; ok {
+			if _, ok := store.warehouses[testOrgID]; ok {
 				t.Error("warehouse must not be created when required external fields are missing")
 			}
 		})
@@ -672,7 +674,7 @@ func TestProvisionExternalDataStoreRequiresBucket(t *testing.T) {
 	router := newTestRouter(store)
 	// data_store.type=external without bucket_name → 400.
 	body := []byte(`{"database_name":"e-db","ducklake":{"enabled":true},"metadata_store":{"type":"external","external":{"endpoint":"h","password_aws_secret":"s"}},"data_store":{"type":"external"}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/eco/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -686,7 +688,7 @@ func TestProvisionRejectsUnsupportedMetadataStore(t *testing.T) {
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "x-db", "metadata_store": {"type": "neon"}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/xco/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -697,7 +699,16 @@ func TestProvisionRejectsUnsupportedMetadataStore(t *testing.T) {
 }
 
 func TestProvisionRejectsInvalidOrgID(t *testing.T) {
-	for _, bad := range []string{"ben.iceberg", "Ben-Iceberg", "ben_iceberg", "-bad", "bad-"} {
+	for _, bad := range []string{
+		"analytics",
+		"ben.iceberg",
+		"Ben-Iceberg",
+		"ben_iceberg",
+		"-bad",
+		"bad-",
+		"f47ac10b58cc4372a5670e02b2c3d479",
+		"f47ac10b-58cc-4372-a567-0e02b2c3d47z",
+	} {
 		t.Run(bad, func(t *testing.T) {
 			store := newFakeStore()
 			router := newTestRouter(store)
@@ -716,15 +727,15 @@ func TestProvisionRejectsInvalidOrgID(t *testing.T) {
 	}
 }
 
-func TestProvisionAcceptsHyphenatedOrgID(t *testing.T) {
+func TestProvisionAcceptsCanonicalHyphenatedUUIDOrgID(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 	body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"},"iceberg":{"enabled":true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-iceberg-cnpg/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+testOrgID+"/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
-		t.Fatalf("hyphenated org id should be accepted, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("canonical hyphenated UUID org id should be accepted, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

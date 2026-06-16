@@ -128,13 +128,13 @@ var hyphenatedUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-
 
 // ducklingName is the k8s/AWS resource name derived from an org ID, used for
 // the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, the
-// Lakekeeper CR/SA/Secret, etc. UUID-shaped org IDs use a compact u-prefixed
-// form so the composed S3 bucket name stays under AWS's 63-character limit in
-// prod while remaining distinct from 32-character hex org IDs.
+// Lakekeeper CR/SA/Secret, etc. Canonical hyphenated UUID org IDs use a compact
+// dehyphenated form so the composed S3 bucket name stays under AWS's
+// 63-character limit in prod.
 func ducklingName(orgID string) string {
 	name := strings.ToLower(orgID)
 	if hyphenatedUUIDRe.MatchString(name) {
-		return "u" + strings.ReplaceAll(name, "-", "")
+		return strings.ReplaceAll(name, "-", "")
 	}
 	return name
 }
@@ -159,20 +159,14 @@ func hyphenPreservingDucklingName(orgID string) string {
 	return strings.ToLower(orgID)
 }
 
-func dehyphenatedDucklingName(orgID string) string {
-	return strings.ReplaceAll(strings.ToLower(orgID), "-", "")
-}
-
 type ducklingNamePolicy struct {
 	current              string
-	legacyDehyphenated   string
 	legacyHyphenatedUUID string
 }
 
 func resourceNamePolicy(orgID string) ducklingNamePolicy {
 	policy := ducklingNamePolicy{current: ducklingName(orgID)}
 	if hyphenatedUUIDRe.MatchString(strings.ToLower(orgID)) {
-		policy.legacyDehyphenated = dehyphenatedDucklingName(orgID)
 		policy.legacyHyphenatedUUID = hyphenPreservingDucklingName(orgID)
 	}
 	return policy
@@ -182,7 +176,6 @@ func ducklingNameCandidates(orgID string) []string {
 	policy := resourceNamePolicy(orgID)
 	return uniqueDucklingNames([]string{
 		policy.current,
-		policy.legacyDehyphenated,
 		policy.legacyHyphenatedUUID,
 	})
 }
@@ -353,7 +346,7 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 
 // getCR fetches the org's Duckling CR, trying the current name first and then
 // compatible historical spellings. That lets UUID-shaped orgs move to the
-// compact u-prefixed name while still resolving already-created hyphenated CRs.
+// compact dehyphenated name while still resolving already-created hyphenated CRs.
 // Returns the CR and the name it was found under (callers that mutate need the
 // actual name). When neither exists, returns the current-name NotFound error.
 func (d *DucklingClient) getCR(ctx context.Context, orgID string) (*unstructured.Unstructured, string, error) {

@@ -35,7 +35,7 @@ func TestLakekeeperResourceName(t *testing.T) {
 	cases := map[string]string{
 		"acme":                                 "lakekeeper-acme",
 		"019e417b-18c4-7a41":                   "lakekeeper-019e417b-18c4-7a41",
-		"00000000-0000-0000-0000-000000000000": "lakekeeper-u00000000000000000000000000000000",
+		"00000000-0000-0000-0000-000000000000": "lakekeeper-00000000000000000000000000000000",
 	}
 	for in, want := range cases {
 		if got := LakekeeperResourceName(in); got != want {

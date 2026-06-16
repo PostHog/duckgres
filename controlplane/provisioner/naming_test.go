@@ -4,12 +4,12 @@ package provisioner
 
 import "testing"
 
-func TestDucklingNameCompactsUUIDsWithPrefix(t *testing.T) {
+func TestDucklingNameCompactsHyphenatedUUIDs(t *testing.T) {
 	for in, want := range map[string]string{
 		"ben-iceberg-cnpg":                     "ben-iceberg-cnpg",
 		"Ben-Iceberg":                          "ben-iceberg",
 		"team123":                              "team123",
-		"f47ac10b-58cc-4372-a567-0e02b2c3d479": "uf47ac10b58cc4372a5670e02b2c3d479",
+		"f47ac10b-58cc-4372-a567-0e02b2c3d479": "f47ac10b58cc4372a5670e02b2c3d479",
 		"f47ac10b58cc4372a5670e02b2c3d479":     "f47ac10b58cc4372a5670e02b2c3d479",
 	} {
 		if got := ducklingName(in); got != want {
@@ -20,15 +20,11 @@ func TestDucklingNameCompactsUUIDsWithPrefix(t *testing.T) {
 	if ducklingName("a-b") == ducklingName("ab") {
 		t.Error("ducklingName must not collide \"a-b\" with \"ab\"")
 	}
-	if ducklingName("f47ac10b-58cc-4372-a567-0e02b2c3d479") == ducklingName("f47ac10b58cc4372a5670e02b2c3d479") {
-		t.Error("UUID compaction must not collide with a 32-character hex org ID")
-	}
 }
 
 func TestDucklingNameCandidatesModelCurrentAndLegacyNames(t *testing.T) {
 	got := ducklingNameCandidates("f47ac10b-58cc-4372-a567-0e02b2c3d479")
 	want := []string{
-		"uf47ac10b58cc4372a5670e02b2c3d479",
 		"f47ac10b58cc4372a5670e02b2c3d479",
 		"f47ac10b-58cc-4372-a567-0e02b2c3d479",
 	}
