@@ -162,10 +162,9 @@ func NewLakekeeperK8sClientWithClients(dc dynamic.Interface, kc kubernetes.Inter
 }
 
 // LakekeeperResourceName derives the K8s resource name (CR + Secret + SA) for
-// an org. Uses ducklingName so it matches the Duckling CR and the rest of the
-// in-cluster resources.
+// an org.
 func LakekeeperResourceName(orgID string) string {
-	return "lakekeeper-" + ducklingName(orgID)
+	return "lakekeeper-" + hyphenPreservingDucklingName(orgID)
 }
 
 // LakekeeperSecretData is the strongly-typed contents of the per-org Secret

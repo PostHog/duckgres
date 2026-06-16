@@ -531,14 +531,14 @@ func lakekeeperDBName(orgID string) string {
 	return "lakekeeper_" + pgIdentSuffix(orgID)
 }
 
-// lakekeeperWarehouseName and oauthClientID follow the Duckling-derived
-// resource suffix so the Lakekeeper stack stays aligned with the CR/Secret/SA.
+// lakekeeperWarehouseName and oauthClientID preserve the org ID suffix used by
+// the Lakekeeper CR/Secret/SA.
 func lakekeeperWarehouseName(orgID string) string {
-	return "org-" + ducklingName(orgID)
+	return "org-" + hyphenPreservingDucklingName(orgID)
 }
 
 func oauthClientID(orgID string) string {
-	return "duckling-" + ducklingName(orgID)
+	return "duckling-" + hyphenPreservingDucklingName(orgID)
 }
 
 func mustRandomHex(byteLen int) string {

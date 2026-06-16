@@ -126,11 +126,10 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 
 var hyphenatedUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-// ducklingName is the k8s/AWS resource name derived from an org ID, used for
-// the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, the
-// Lakekeeper CR/SA/Secret, etc. Canonical hyphenated UUID org IDs use a compact
-// dehyphenated form so the composed S3 bucket name stays under AWS's
-// 63-character limit in prod.
+// ducklingName is the k8s/AWS resource name derived from an org ID for the
+// Duckling CR and Crossplane-composed resources. Canonical hyphenated UUID org
+// IDs use a compact dehyphenated form so the composed S3 bucket name stays
+// under AWS's 63-character limit in prod.
 func ducklingName(orgID string) string {
 	name := strings.ToLower(orgID)
 	if hyphenatedUUIDRe.MatchString(name) {

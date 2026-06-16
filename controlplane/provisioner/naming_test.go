@@ -70,3 +70,16 @@ func TestLakekeeperNamesForHyphenatedOrg(t *testing.T) {
 		t.Errorf("oauthClientID = %q", got)
 	}
 }
+
+func TestLakekeeperNamesPreserveUUIDHyphens(t *testing.T) {
+	const org = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+	if got := LakekeeperResourceName(org); got != "lakekeeper-f47ac10b-58cc-4372-a567-0e02b2c3d479" {
+		t.Errorf("LakekeeperResourceName = %q", got)
+	}
+	if got := lakekeeperWarehouseName(org); got != "org-f47ac10b-58cc-4372-a567-0e02b2c3d479" {
+		t.Errorf("lakekeeperWarehouseName = %q", got)
+	}
+	if got := oauthClientID(org); got != "duckling-f47ac10b-58cc-4372-a567-0e02b2c3d479" {
+		t.Errorf("oauthClientID = %q", got)
+	}
+}
