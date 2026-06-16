@@ -619,12 +619,14 @@ rw_ducklake() { # org password
 # Regression for the S3-throttling backfill failure: a sustained HTTP 503
 # SlowDown during a DuckLake DELETE used to outlast httpfs's tiny default retry
 # budget (http_retries=3, ~0.5s cumulative backoff) and surface as a fatal
-# XX000, failing the duckling events backfill. ConfigureMainDB now widens the
-# budget per worker (SET GLOBAL http_retries/http_retry_wait_ms/
-# http_retry_backoff). Assert the activated worker carries the raised values, so
-# this fails the test if the SET is dropped or regressed. (Forcing a real S3 503
-# in-cluster isn't deterministic; the wider budget is what we can assert, and it
-# is the actual fix — see the ConfigureMainDB comment.)
+# XX000, failing the duckling events backfill. applyHTTPFSRetryBudget (called
+# at the end of ConfigureDBConnection / ActivateDBConnection, after the ATTACH
+# calls that load httpfs) now widens the budget per worker (SET GLOBAL
+# http_retries/http_retry_wait_ms/http_retry_backoff). Assert the activated
+# worker carries the raised values, so this fails the test if the SET is dropped
+# or regressed. (Forcing a real S3 503 in-cluster isn't deterministic; the wider
+# budget is what we can assert, and it is the actual fix — see the
+# applyHTTPFSRetryBudget comment.)
 #
 # Read the live values from duckdb_settings(), NOT current_setting(): duckgres
 # overrides current_setting with a PG-compat macro that returns '' for any
@@ -1386,7 +1388,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
-  httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (ConfigureMainDB)
+  httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
   persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
   persistent_user_secret_isolation "$CNPG" "$cnpg_pw"
   pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)

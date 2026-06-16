@@ -989,48 +989,55 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 		}
 	}
 
-	// Widen httpfs's retry budget for transient S3 throttling.
-	//
-	// S3 answers a sustained request burst with HTTP 503 SlowDown ("please
-	// reduce your request rate"). That's pure throttling — transient and safe to
-	// retry — and httpfs DOES retry 503 (http_util.cpp ShouldRetry), but its
-	// defaults are tiny: http_retries=3, http_retry_wait_ms=100,
-	// http_retry_backoff=4 → a cumulative backoff of only ~0.5s. A throttle that
-	// outlasts ~0.5s exhausts all 3 attempts and httpfs throws fatally; the error
-	// then surfaces all the way out as a fatal XX000 (no upper layer reclassifies
-	// an HTTP 503 as retryable), failing e.g. a DuckLake events DELETE that
-	// range-GETs parquet data files. Raising the budget to retries=10,
-	// wait=500ms, backoff=2 widens the cumulative backoff substantially. DuckDB's
-	// retry loop (RunRequestWithRetry in http_util.cpp) sleeps
-	// retry_wait_ms * retry_backoff^(tries-2) ms before each retry from the 2nd
-	// onward (the 1st is immediate): waits 0, 500, 1k, 2k, 4k, 8k, 16k, 32k, 64k,
-	// 128k ms — ~255s (~4.3min) cumulative, ~128s on the final single wait. That
-	// rides out a typical SlowDown burst (which clears in seconds to low minutes);
-	// the tradeoff is a single throttled request can block ~2min on its last retry
-	// (~4.3min worst case) — acceptable for a backfill, where retrying beats failing
-	// the partition, and well under the 55m worker drain timeout / 3600s pod grace.
-	//
-	// This lives in ConfigureMainDB (not the DuckLake attach path) so it is
-	// catalog-agnostic: DuckLake, Iceberg, and Delta all range-GET S3 parquet and
-	// all benefit. SET GLOBAL because workers recycle connections between sessions
-	// (see ProfilingSettings note above / duckdbservice.evictConnFromPool) — a
-	// session-scoped SET would not survive to the next session's connection.
-	// http_retries/http_retry_wait_ms/http_retry_backoff are httpfs-registered
-	// options (httpfs_extension.cpp), so they're only settable once httpfs is
-	// loaded; gate on it being configured (LoadExtensions ran above). Warn-only:
-	// a failure must not fail worker setup; httpfs keeps its defaults.
-	if usesHTTPFS(cfg.Extensions) {
-		for _, stmt := range []string{
-			"SET GLOBAL http_retries = 10",
-			"SET GLOBAL http_retry_wait_ms = 500",
-			"SET GLOBAL http_retry_backoff = 2",
-		} {
-			if _, err := db.Exec(stmt); err != nil {
-				slog.Warn("Failed to set httpfs retry config.", "stmt", stmt, "error", err)
-			}
+	return nil
+}
+
+// applyHTTPFSRetryBudget widens httpfs's retry budget for transient S3 throttling.
+//
+// S3 answers a sustained request burst with HTTP 503 SlowDown ("please reduce
+// your request rate"). That's pure throttling — transient and safe to retry —
+// and httpfs DOES retry 503 (RunRequestWithRetry → ShouldRetry in duckdb's
+// http_util.cpp includes ServiceUnavailable_503), but its defaults are tiny:
+// http_retries=3, http_retry_wait_ms=100, http_retry_backoff=4 → a cumulative
+// backoff of only ~0.5s. A throttle that outlasts ~0.5s exhausts all 3 attempts
+// and httpfs throws fatally; the error then surfaces all the way out as a fatal
+// XX000 (no upper layer reclassifies an HTTP 503 as retryable — classifyErrorCode
+// falls through to XX000), failing e.g. a DuckLake events DELETE that range-GETs
+// parquet data files.
+//
+// Raising the budget to retries=10, wait=500ms, backoff=2 widens the cumulative
+// backoff substantially. DuckDB's retry loop sleeps
+// retry_wait_ms * retry_backoff^(tries-2) ms before each retry from the 2nd
+// onward (the 1st is immediate): waits 0, 500, 1k, 2k, 4k, 8k, 16k, 32k, 64k,
+// 128k ms — ~255s (~4.3min) cumulative, ~128s on the final single wait. That rides
+// out a typical SlowDown burst (which clears in seconds to low minutes); the
+// tradeoff is a single throttled request can block ~2min on its last retry
+// (~4.3min worst case) — acceptable for a backfill, where retrying beats failing
+// the partition, and well under the 55m worker drain timeout / 3600s pod grace.
+//
+// This MUST run after the catalog ATTACH calls (AttachDuckLake / AttachIceberg),
+// not in ConfigureMainDB. httpfs is auto-loaded by DuckLake's ATTACH on the first
+// S3 touch (and explicitly loaded by the iceberg-only path), so it is NOT in
+// cfg.Extensions — a gate on cfg.Extensions would never fire. By the time the
+// ATTACH calls return, httpfs is loaded and the extension-registered options
+// (http_retries/http_retry_wait_ms/http_retry_backoff in httpfs_extension.cpp)
+// are settable. Warn-only: a SET failure (e.g. httpfs not loaded because no
+// S3-backed catalog is configured) must not fail the connection; httpfs keeps
+// its defaults.
+//
+// SET GLOBAL because workers recycle connections between sessions (see
+// ProfilingSettings note in ConfigureMainDB / duckdbservice.evictConnFromPool)
+// — a session-scoped SET would not survive to the next session's connection.
+func applyHTTPFSRetryBudget(db *sql.DB) {
+	for _, stmt := range []string{
+		"SET GLOBAL http_retries = 10",
+		"SET GLOBAL http_retry_wait_ms = 500",
+		"SET GLOBAL http_retry_backoff = 2",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to set httpfs retry config.", "stmt", stmt, "error", err)
 		}
 	}
-	return nil
 }
 
 func seedBundledExtensions(srcRoot, dstRoot string) error {
@@ -1238,6 +1245,11 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		}
 	}
 
+	// Widen httpfs's retry budget now that the ATTACH calls above have loaded
+	// httpfs (DuckLake auto-loads it, iceberg loads it explicitly). See
+	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
+	applyHTTPFSRetryBudget(db)
+
 	return nil
 }
 
@@ -1282,6 +1294,11 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 	} else if err := setDuckLakeDefault(db); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default: %w", err)
 	}
+
+	// Widen httpfs's retry budget now that the ATTACH calls above have loaded
+	// httpfs (DuckLake auto-loads it, iceberg loads it explicitly). See
+	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
+	applyHTTPFSRetryBudget(db)
 
 	return nil
 }
@@ -1329,6 +1346,11 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 		}
 		slog.Warn("Failed to attach Iceberg catalog.", "user", username, "error", err)
 	}
+
+	// Widen httpfs's retry budget now that the ATTACH calls above have loaded
+	// httpfs (DuckLake auto-loads it, iceberg loads it explicitly). See
+	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
+	applyHTTPFSRetryBudget(db)
 
 	return db, nil
 }
@@ -1514,20 +1536,6 @@ func hasCacheHTTPFS(extensions []string) bool {
 	for _, ext := range extensions {
 		name, _ := parseExtensionName(ext)
 		if name == "cache_httpfs" {
-			return true
-		}
-	}
-	return false
-}
-
-// usesHTTPFS reports whether httpfs is in play — directly, or via cache_httpfs,
-// which wraps and loads it. Used to gate httpfs-registered global settings (e.g.
-// the http_retry_* budget) so they're only set when the extension that registers
-// them is loaded.
-func usesHTTPFS(extensions []string) bool {
-	for _, ext := range extensions {
-		name, _ := parseExtensionName(ext)
-		if name == "httpfs" || name == "cache_httpfs" {
 			return true
 		}
 	}

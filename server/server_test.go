@@ -677,33 +677,6 @@ func TestHasCacheHTTPFS(t *testing.T) {
 	}
 }
 
-func TestUsesHTTPFS(t *testing.T) {
-	tests := []struct {
-		name       string
-		extensions []string
-		want       bool
-	}{
-		{"httpfs bare", []string{"ducklake", "httpfs"}, true},
-		{"httpfs with source", []string{"httpfs FROM core_nightly"}, true},
-		{"cache_httpfs implies httpfs", []string{"ducklake", "cache_httpfs"}, true},
-		{"cache_httpfs with source", []string{"cache_httpfs FROM community"}, true},
-		{"neither", []string{"ducklake", "iceberg"}, false},
-		{"empty list", []string{}, false},
-		{"nil list", nil, false},
-		{"similar name", []string{"not_httpfs"}, false},
-		{"substring match", []string{"httpfs_v2 FROM community"}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := usesHTTPFS(tt.extensions)
-			if got != tt.want {
-				t.Errorf("usesHTTPFS(%v) = %v, want %v", tt.extensions, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestOpenBaseDBFilePersistenceRejectsPathTraversal(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := Config{
