@@ -95,6 +95,20 @@ Configuration is resolved in `config_resolution.go` with the following precedenc
 
 Note: `--mode` is CLI-only (not loadable from YAML/env). A handful of K8s pod-scheduling knobs are env-only (no CLI flag).
 
+## Keep docs in sync with behavior
+
+When you change a behavior, default, flag, or invariant that is documented
+anywhere in the repo, **update that documentation in the same PR.** Stale docs
+are worse than no docs — they actively mislead the next reader (human or agent).
+This applies to, at least: this `CLAUDE.md`, `README.md`, `docs/`, CLI flag help
+text (`main.go` / `cliflags.go`), and any design/plan docs that pin the changed
+behavior. Concretely: if you change a default value, a flag's meaning, a drain or
+shutdown semantic, an activation/routing/teardown order, or any of the
+LOAD-BEARING CONTRACT sections below, grep for the old value/term across `*.md`
+and help strings and fix every mention. A behavior change that leaves a doc
+asserting the old behavior is incomplete, the same way a behavior change without
+a test is incomplete.
+
 ## Development
 
 The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes for building, testing, running, metrics, and scripts.
