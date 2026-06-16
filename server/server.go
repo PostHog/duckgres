@@ -1000,8 +1000,15 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	// then surfaces all the way out as a fatal XX000 (no upper layer reclassifies
 	// an HTTP 503 as retryable), failing e.g. a DuckLake events DELETE that
 	// range-GETs parquet data files. Raising the budget to retries=10,
-	// wait=500ms, backoff=2 stretches the cumulative backoff to tens of seconds —
-	// enough to ride out a typical SlowDown burst.
+	// wait=500ms, backoff=2 widens the cumulative backoff substantially. DuckDB's
+	// retry loop (RunRequestWithRetry in http_util.cpp) sleeps
+	// retry_wait_ms * retry_backoff^(tries-2) ms before each retry from the 2nd
+	// onward (the 1st is immediate): waits 0, 500, 1k, 2k, 4k, 8k, 16k, 32k, 64k,
+	// 128k ms — ~255s (~4.3min) cumulative, ~128s on the final single wait. That
+	// rides out a typical SlowDown burst (which clears in seconds to low minutes);
+	// the tradeoff is a single throttled request can block ~2min on its last retry
+	// (~4.3min worst case) — acceptable for a backfill, where retrying beats failing
+	// the partition, and well under the 55m worker drain timeout / 3600s pod grace.
 	//
 	// This lives in ConfigureMainDB (not the DuckLake attach path) so it is
 	// catalog-agnostic: DuckLake, Iceberg, and Delta all range-GET S3 parquet and
