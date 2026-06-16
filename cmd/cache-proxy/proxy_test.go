@@ -30,7 +30,10 @@ func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
 // newTestProxy wires a CacheProxy with no peers and a tempdir-backed store.
 func newTestProxy(t *testing.T) *CacheProxy {
 	t.Helper()
-	return NewCacheProxy(newTestCache(t), nil, nil)
+	proxy := NewCacheProxy(newTestCache(t), nil, nil)
+	proxy.originRetryInitialBackoff = 0
+	proxy.originRetryMaxBackoff = 0
+	return proxy
 }
 
 // newTestServer returns an httptest origin plus a proxy that rewrites inbound
@@ -135,10 +138,10 @@ func TestHandleProxyRejectsNonAbsoluteURL(t *testing.T) {
 	}
 }
 
-// TestHandleProxyForwardsOrigin5xxVerbatim: any non-2xx the origin returns
-// must be passed back to DuckDB unchanged. Translating a 500 into a 502
-// (the old behaviour) made DuckDB's httpfs retry transient-class errors that
-// were really terminal, and hid the real status from logs and the client.
+// TestHandleProxyForwardsOrigin5xxVerbatim: a transient 5xx that keeps failing
+// must eventually be passed back to DuckDB unchanged. Translating a 500 into a
+// 502 (the old behaviour) made DuckDB's httpfs retry transient-class errors
+// that were really terminal, and hid the real status from logs and the client.
 func TestHandleProxyForwardsOrigin5xxVerbatim(t *testing.T) {
 	proxy := newTestProxy(t)
 	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -150,6 +153,108 @@ func TestHandleProxyForwardsOrigin5xxVerbatim(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "boom") {
 		t.Errorf("body = %q, want it to contain origin body 'boom'", rec.Body.String())
+	}
+}
+
+func TestHandleProxyRetriesOrigin503ThenCachesSuccess(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	var calls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			w.Header().Set("Content-Type", "application/xml")
+			w.Header().Set("X-Amz-Request-Id", "retry-me")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code></Error>`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-after-retry"))
+	})
+
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/flaky-503.parquet", http.Header{"Range": []string{"bytes=0-13"}})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206 after retry", rec.Code)
+	}
+	if got := rec.Body.String(); got != "ok-after-retry" {
+		t.Fatalf("body = %q, want successful retry body", got)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("origin calls = %d, want 2 (initial 503 + retry success)", calls)
+	}
+
+	rec = doForwardProxyRequest(proxy, "GET", originURL+"/bucket/flaky-503.parquet", http.Header{"Range": []string{"bytes=0-13"}})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("cache hit status = %d, want 206", rec.Code)
+	}
+	if got := rec.Body.String(); got != "ok-after-retry" {
+		t.Fatalf("cache hit body = %q, want successful retry body", got)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("origin calls after cache hit = %d, want still 2", calls)
+	}
+}
+
+func TestHandleProxyRetriesOrigin503AndForwardsFinalFailure(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	var calls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("X-Amz-Request-Id", fmt.Sprintf("attempt-%d", n))
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `<Error><Code>SlowDown</Code><Attempt>%d</Attempt></Error>`, n)
+	})
+
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/still-503.parquet", http.Header{"Range": []string{"bytes=0-7"}})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want final 503 forwarded", rec.Code)
+	}
+	totalCalls := atomic.LoadInt32(&calls)
+	if totalCalls != int32(defaultOriginRetryMaxAttempts) {
+		t.Fatalf("origin calls = %d, want %d attempts before forwarding final failure", totalCalls, defaultOriginRetryMaxAttempts)
+	}
+	if rid := rec.Header().Get("X-Amz-Request-Id"); rid != fmt.Sprintf("attempt-%d", totalCalls) {
+		t.Fatalf("X-Amz-Request-Id = %q, want final attempt header", rid)
+	}
+	wantBody := fmt.Sprintf(`<Error><Code>SlowDown</Code><Attempt>%d</Attempt></Error>`, totalCalls)
+	if got := rec.Body.String(); got != wantBody {
+		t.Fatalf("body = %q, want final attempt body %q", got, wantBody)
+	}
+}
+
+func TestHandleProxyDoesNotRetryTerminalOriginStatuses(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{"bad-request", http.StatusBadRequest},
+		{"forbidden", http.StatusForbidden},
+		{"not-found", http.StatusNotFound},
+		{"range-not-satisfiable", http.StatusRequestedRangeNotSatisfiable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := newTestProxy(t)
+			var calls int32
+			_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				w.WriteHeader(tt.status)
+				_, _ = fmt.Fprintf(w, "status=%d", tt.status)
+			})
+
+			rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/terminal.parquet", http.Header{"Range": []string{"bytes=0-1"}})
+			if rec.Code != tt.status {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.status)
+			}
+			if atomic.LoadInt32(&calls) != 1 {
+				t.Fatalf("origin calls = %d, want 1 for terminal status %d", calls, tt.status)
+			}
+		})
 	}
 }
 
