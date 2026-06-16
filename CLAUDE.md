@@ -70,7 +70,7 @@ Key CLI flags for control-plane mode:
 - `--worker-queue-timeout DURATION` / `--worker-idle-timeout DURATION`
 - `--memory-budget SIZE` (default 75% RAM) / `--memory-rebalance`
 - `--socket-dir /path` (process backend)
-- `--handover-drain-timeout DURATION` (default `24h` process / `15m` remote; uses cloudflare/tableflip for FD passing)
+- `--handover-drain-timeout DURATION` (default `24h` process; **remote default is `0` = unbounded** — the CP waits for active sessions for as long as it takes and the pod's k8s `terminationGracePeriodSeconds` is the only hard wall. cloudflare/tableflip FD passing applies to process/standalone single-host upgrades, not k8s pod replacement.)
 - `--flight-port N` (Arrow Flight SQL ingress) plus `--flight-session-idle-ttl`, `--flight-session-reap-interval`, `--flight-handle-idle-ttl`, `--flight-session-token-ttl`
 - `--ducklake-delta-catalog-enabled` / `--ducklake-delta-catalog-path`
 - Remote backend (requires `--config-store`; `-tags kubernetes` for K8s pool):
@@ -94,6 +94,20 @@ Configuration is resolved in `config_resolution.go` with the following precedenc
 4. Built-in defaults
 
 Note: `--mode` is CLI-only (not loadable from YAML/env). A handful of K8s pod-scheduling knobs are env-only (no CLI flag).
+
+## Keep docs in sync with behavior
+
+When you change a behavior, default, flag, or invariant that is documented
+anywhere in the repo, **update that documentation in the same PR.** Stale docs
+are worse than no docs — they actively mislead the next reader (human or agent).
+This applies to, at least: this `CLAUDE.md`, `README.md`, `docs/`, CLI flag help
+text (`main.go` / `cliflags.go`), and any design/plan docs that pin the changed
+behavior. Concretely: if you change a default value, a flag's meaning, a drain or
+shutdown semantic, an activation/routing/teardown order, or any of the
+LOAD-BEARING CONTRACT sections below, grep for the old value/term across `*.md`
+and help strings and fix every mention. A behavior change that leaves a doc
+asserting the old behavior is incomplete, the same way a behavior change without
+a test is incomplete.
 
 ## Development
 
