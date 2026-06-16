@@ -988,6 +988,41 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 			slog.Debug("Set cache_httpfs cache directory.", "cache_directory", cacheDir)
 		}
 	}
+
+	// Widen httpfs's retry budget for transient S3 throttling.
+	//
+	// S3 answers a sustained request burst with HTTP 503 SlowDown ("please
+	// reduce your request rate"). That's pure throttling — transient and safe to
+	// retry — and httpfs DOES retry 503 (http_util.cpp ShouldRetry), but its
+	// defaults are tiny: http_retries=3, http_retry_wait_ms=100,
+	// http_retry_backoff=4 → a cumulative backoff of only ~0.5s. A throttle that
+	// outlasts ~0.5s exhausts all 3 attempts and httpfs throws fatally; the error
+	// then surfaces all the way out as a fatal XX000 (no upper layer reclassifies
+	// an HTTP 503 as retryable), failing e.g. a DuckLake events DELETE that
+	// range-GETs parquet data files. Raising the budget to retries=10,
+	// wait=500ms, backoff=2 stretches the cumulative backoff to tens of seconds —
+	// enough to ride out a typical SlowDown burst.
+	//
+	// This lives in ConfigureMainDB (not the DuckLake attach path) so it is
+	// catalog-agnostic: DuckLake, Iceberg, and Delta all range-GET S3 parquet and
+	// all benefit. SET GLOBAL because workers recycle connections between sessions
+	// (see ProfilingSettings note above / duckdbservice.evictConnFromPool) — a
+	// session-scoped SET would not survive to the next session's connection.
+	// http_retries/http_retry_wait_ms/http_retry_backoff are httpfs-registered
+	// options (httpfs_extension.cpp), so they're only settable once httpfs is
+	// loaded; gate on it being configured (LoadExtensions ran above). Warn-only:
+	// a failure must not fail worker setup; httpfs keeps its defaults.
+	if usesHTTPFS(cfg.Extensions) {
+		for _, stmt := range []string{
+			"SET GLOBAL http_retries = 10",
+			"SET GLOBAL http_retry_wait_ms = 500",
+			"SET GLOBAL http_retry_backoff = 2",
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				slog.Warn("Failed to set httpfs retry config.", "stmt", stmt, "error", err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1478,6 +1513,20 @@ func hasCacheHTTPFS(extensions []string) bool {
 	return false
 }
 
+// usesHTTPFS reports whether httpfs is in play — directly, or via cache_httpfs,
+// which wraps and loads it. Used to gate httpfs-registered global settings (e.g.
+// the http_retry_* budget) so they're only set when the extension that registers
+// them is loaded.
+func usesHTTPFS(extensions []string) bool {
+	for _, ext := range extensions {
+		name, _ := parseExtensionName(ext)
+		if name == "httpfs" || name == "cache_httpfs" {
+			return true
+		}
+	}
+	return false
+}
+
 // AttachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
 // Call setDuckLakeDefault after creating per-connection views in memory.main.
 // This is a standalone function so it can be reused by control plane workers.
@@ -1539,38 +1588,6 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		if needsSecret {
 			if err := createS3SecretWith(ae, dlCfg); err != nil {
 				return fmt.Errorf("failed to create S3 secret: %w", err)
-			}
-		}
-
-		// Widen httpfs's retry budget for transient S3 throttling.
-		//
-		// S3 answers a sustained request burst with HTTP 503 SlowDown ("please
-		// reduce your request rate"). That's pure throttling — transient and safe
-		// to retry — and httpfs DOES retry 503 (http_util.cpp ShouldRetry), but
-		// its defaults are tiny: http_retries=3, http_retry_wait_ms=100,
-		// http_retry_backoff=4 → a cumulative backoff of only ~0.5s. A throttle
-		// that outlasts ~0.5s exhausts all 3 attempts and httpfs throws fatally;
-		// the error then surfaces all the way out as a fatal XX000 (no upper
-		// layer reclassifies an HTTP 503 as retryable), failing e.g. a DuckLake
-		// events DELETE that range-GETs parquet data files. Raising the budget to
-		// retries=10, wait=500ms, backoff=2 stretches the cumulative backoff to
-		// tens of seconds — enough to ride out a typical SlowDown burst — and
-		// helps every S3 read, not just the DELETE path.
-		//
-		// These are httpfs-registered options (httpfs_extension.cpp), so they're
-		// only settable once httpfs is loaded — which it is by here, since the S3
-		// secret above requires it. Set GLOBAL so the budget applies to the whole
-		// instance (DuckLake catalog reads + every later query on this worker).
-		// Run AFTER the secret and BEFORE the ATTACH, alongside http_proxy, so the
-		// initial catalog read already gets the wider budget. Warn-only: a failure
-		// here must not block the attach, and httpfs falls back to its defaults.
-		for _, stmt := range []string{
-			"SET GLOBAL http_retries = 10",
-			"SET GLOBAL http_retry_wait_ms = 500",
-			"SET GLOBAL http_retry_backoff = 2",
-		} {
-			if _, err := ae.Exec(stmt); err != nil {
-				slog.Warn("Failed to set httpfs retry config.", "stmt", stmt, "error", err)
 			}
 		}
 	}
