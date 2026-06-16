@@ -1541,6 +1541,38 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 				return fmt.Errorf("failed to create S3 secret: %w", err)
 			}
 		}
+
+		// Widen httpfs's retry budget for transient S3 throttling.
+		//
+		// S3 answers a sustained request burst with HTTP 503 SlowDown ("please
+		// reduce your request rate"). That's pure throttling — transient and safe
+		// to retry — and httpfs DOES retry 503 (http_util.cpp ShouldRetry), but
+		// its defaults are tiny: http_retries=3, http_retry_wait_ms=100,
+		// http_retry_backoff=4 → a cumulative backoff of only ~0.5s. A throttle
+		// that outlasts ~0.5s exhausts all 3 attempts and httpfs throws fatally;
+		// the error then surfaces all the way out as a fatal XX000 (no upper
+		// layer reclassifies an HTTP 503 as retryable), failing e.g. a DuckLake
+		// events DELETE that range-GETs parquet data files. Raising the budget to
+		// retries=10, wait=500ms, backoff=2 stretches the cumulative backoff to
+		// tens of seconds — enough to ride out a typical SlowDown burst — and
+		// helps every S3 read, not just the DELETE path.
+		//
+		// These are httpfs-registered options (httpfs_extension.cpp), so they're
+		// only settable once httpfs is loaded — which it is by here, since the S3
+		// secret above requires it. Set GLOBAL so the budget applies to the whole
+		// instance (DuckLake catalog reads + every later query on this worker).
+		// Run AFTER the secret and BEFORE the ATTACH, alongside http_proxy, so the
+		// initial catalog read already gets the wider budget. Warn-only: a failure
+		// here must not block the attach, and httpfs falls back to its defaults.
+		for _, stmt := range []string{
+			"SET GLOBAL http_retries = 10",
+			"SET GLOBAL http_retry_wait_ms = 500",
+			"SET GLOBAL http_retry_backoff = 2",
+		} {
+			if _, err := ae.Exec(stmt); err != nil {
+				slog.Warn("Failed to set httpfs retry config.", "stmt", stmt, "error", err)
+			}
+		}
 	}
 
 	// Route httpfs traffic through a forward HTTP proxy (cache proxy DaemonSet).
