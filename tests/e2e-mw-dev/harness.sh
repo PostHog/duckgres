@@ -616,6 +616,32 @@ rw_ducklake() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
+# Regression for the S3-throttling backfill failure: a sustained HTTP 503
+# SlowDown during a DuckLake DELETE used to outlast httpfs's tiny default retry
+# budget (http_retries=3, ~0.5s cumulative backoff) and surface as a fatal
+# XX000, failing the duckling events backfill. applyHTTPFSRetryBudget (called
+# at the end of ConfigureDBConnection / ActivateDBConnection, after the ATTACH
+# calls that load httpfs) now widens the budget per worker (SET GLOBAL
+# http_retries/http_retry_wait_ms/http_retry_backoff). Assert the activated
+# worker carries the raised values, so this fails the test if the SET is dropped
+# or regressed. (Forcing a real S3 503 in-cluster isn't deterministic; the wider
+# budget is what we can assert, and it is the actual fix — see the
+# applyHTTPFSRetryBudget comment.)
+#
+# Read the live values from duckdb_settings(), NOT current_setting(): duckgres
+# overrides current_setting with a PG-compat macro that returns '' for any
+# setting other than server_version/server_encoding (server/catalog.go), so
+# current_setting('http_retries')::BIGINT would cast '' and error. duckdb_settings
+# is DuckDB's own (un-shadowed) settings table; its `value` column is text.
+httpfs_retry_budget() { # org password
+  log "httpfs retry budget on $1"
+  # Compare numerically (cast → boolean 'true') so a float's string format
+  # (http_retry_backoff is a FLOAT: "2.0" vs "2.000000") can't make this flaky.
+  assert_compat "$1" "$2" ducklake "SELECT (value::BIGINT = 10)::text  FROM duckdb_settings() WHERE name='http_retries'"       "true" "http_retries"
+  assert_compat "$1" "$2" ducklake "SELECT (value::BIGINT = 500)::text FROM duckdb_settings() WHERE name='http_retry_wait_ms'" "true" "http_retry_wait_ms"
+  assert_compat "$1" "$2" ducklake "SELECT (value::DOUBLE = 2.0)::text FROM duckdb_settings() WHERE name='http_retry_backoff'" "true" "http_retry_backoff"
+}
+
 rw_iceberg() { # org password
   log "Iceberg R/W on $1"
   c="$(pg "$1" "$2" iceberg "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name='iceberg'")"
@@ -1362,6 +1388,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
   persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
   persistent_user_secret_isolation "$CNPG" "$cnpg_pw"
   pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
@@ -1436,6 +1463,7 @@ lane_ext() { # external-RDS metadata backend + org default profile
   basic_query  "$EXT" "$ext_pw"
   pg_compat_functions "$EXT" "$ext_pw"
   rw_ducklake  "$EXT" "$ext_pw"
+  httpfs_retry_budget "$EXT" "$ext_pw"      # S3-503 retry budget per worker, ext-metadata backend too
   persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
   iceberg_cold_first_connect "$EXT" "$ext_pw"  # cold first session must not fail the metadata-init bind (ext backend)
   rw_iceberg   "$EXT" "$ext_pw"
