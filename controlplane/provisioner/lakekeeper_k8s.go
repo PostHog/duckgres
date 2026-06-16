@@ -79,13 +79,10 @@ func lakekeeperPodMetadata() map[string]interface{} {
 // scrape annotations) onto every existing Lakekeeper CR for the org, matched by
 // the duckgres/active-org label.
 //
-// It deliberately does NOT recompute the CR name from the orgID. Post-#632,
-// LakekeeperResourceName preserves hyphens, but a legacy org's CR — and its
-// Secret, ServiceAccount, and EKS pod-identity, all derived from the no-hyphen
-// Duckling XR name — keeps the de-hyphenated name. Looking up by label patches
-// whatever name actually exists (no-dash for legacy orgs, hyphenated for new
-// ones) instead of minting a duplicate CR under a name that has no matching
-// Secret/SA/pod-identity.
+// It deliberately does NOT recompute the CR name from the orgID. Looking up by
+// label patches whatever name actually exists, including compact UUID-derived
+// resources and historical hyphenated resources, instead of minting a duplicate
+// CR under a name that has no matching Secret/SA/pod-identity.
 //
 // Uses a JSON merge patch, which carries no resourceVersion, so it never races
 // the operator's frequent status writes (the "object has been modified"
@@ -165,8 +162,8 @@ func NewLakekeeperK8sClientWithClients(dc dynamic.Interface, kc kubernetes.Inter
 }
 
 // LakekeeperResourceName derives the K8s resource name (CR + Secret + SA) for
-// an org. Uses ducklingName so it preserves hyphens, matching the Duckling CR
-// and the rest of the in-cluster resources.
+// an org. Uses ducklingName so it matches the Duckling CR and the rest of the
+// in-cluster resources.
 func LakekeeperResourceName(orgID string) string {
 	return "lakekeeper-" + ducklingName(orgID)
 }
