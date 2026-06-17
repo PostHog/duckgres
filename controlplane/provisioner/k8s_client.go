@@ -322,8 +322,7 @@ func (d *DucklingClient) GetProvisioningStatus(ctx context.Context, orgID string
 	}, nil
 }
 
-// Delete removes the Duckling CR for the given org. Resolves the legacy name so
-// pre-rename CRs are still deletable.
+// Delete removes the Duckling CR for the given org.
 func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
 	_, name, err := d.getCR(ctx, orgID)
 	if apierrors.IsNotFound(err) {
