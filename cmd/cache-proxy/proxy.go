@@ -12,7 +12,27 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// requestSpanAttrs returns the attributes common to every proxied request,
+// chosen to be the cross-reference anchors for correlating a cache-proxy trace
+// back to a duckgres query trace by hand: the worker pod IP (client.address),
+// the S3 object (server.address + url.path + range), and the HTTP method.
+// org_id is deliberately absent — the proxy has no per-request tenant identity;
+// map client.address → org via Kubernetes when correlating.
+func requestSpanAttrs(r *http.Request) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String("http.request.method", r.Method),
+		attribute.String("server.address", r.URL.Host),
+		attribute.String("url.path", r.URL.Path),
+		attribute.String("duckgres.s3.range", r.Header.Get("Range")),
+		attribute.String("client.address", r.RemoteAddr),
+	}
+}
 
 // CacheProxy is a forward HTTP proxy that caches responses on local NVMe.
 // DuckDB httpfs sends each S3 request as a signed plain-HTTP request to the
@@ -140,8 +160,14 @@ func (p *CacheProxy) shouldCache(r *http.Request) bool {
 func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	connectStart := time.Now()
 	target := r.Host
+	_, span := proxyTracer.Start(r.Context(), "cache.connect", trace.WithAttributes(
+		attribute.String("server.address", target),
+		attribute.String("client.address", r.RemoteAddr),
+	))
 	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
 		slog.Warn("Forward-proxy CONNECT dial failed.", "target", target, "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -149,6 +175,8 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		_ = upstream.Close()
+		span.SetStatus(codes.Error, "hijacking not supported")
+		span.End()
 		slog.Error("Forward-proxy CONNECT hijack unsupported.", "target", target)
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
@@ -156,6 +184,8 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	client, _, err := hijacker.Hijack()
 	if err != nil {
 		_ = upstream.Close()
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
 		slog.Warn("Forward-proxy CONNECT hijack failed.", "target", target, "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -163,6 +193,8 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		_ = upstream.Close()
 		_ = client.Close()
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
 		slog.Warn("Forward-proxy CONNECT 200 write failed.", "target", target, "error", err)
 		return
 	}
@@ -194,6 +226,11 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		<-upstreamDone
 		<-clientDone
+		span.SetAttributes(
+			attribute.Int64("duckgres.connect.sent_bytes", sentToUpstream),
+			attribute.Int64("duckgres.connect.recv_bytes", recvFromUpstream),
+		)
+		span.End()
 		slog.Info("Forward-proxy CONNECT closed.",
 			"target", target,
 			"sent_bytes", sentToUpstream,
@@ -247,17 +284,32 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	rangeHeader := r.Header.Get("Range")
 	cacheKey := CacheKey(r.URL.String(), rangeHeader)
 
+	// Root span for this cacheable GET. DuckDB httpfs sends no traceparent, so
+	// this starts a fresh trace (service.name=duckgres-cache-proxy). Thread its
+	// context into r so the origin/peer fetch spans nest underneath.
+	ctx, span := proxyTracer.Start(r.Context(), "cache.get", trace.WithAttributes(requestSpanAttrs(r)...))
+	defer span.End()
+	span.SetAttributes(attribute.String("duckgres.cache.key", cacheKey))
+	r = r.WithContext(ctx)
+
 	if reader, size, ok := p.store.Open(cacheKey); ok {
 		cacheBytesServed.WithLabelValues("local").Add(float64(size))
+		span.SetAttributes(
+			attribute.String("duckgres.cache.source", "hit"),
+			attribute.Bool("duckgres.cache.hit", true),
+			attribute.Int64("duckgres.bytes", size),
+		)
 		slog.Info("Served.", "source", "hit", "url", r.URL.String(), "range", rangeHeader, "bytes", size)
 		p.serveStream(w, reader, size, rangeHeader, "")
 		_ = reader.Close()
 		return
 	}
 	cacheMissesTotal.Inc()
+	span.SetAttributes(attribute.Bool("duckgres.cache.hit", false))
 
 	res, err := p.fetchDedup(cacheKey, r, rangeHeader)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		// An origin that responded with a non-2xx (e.g. S3 returning a 400 with
 		// <Code>ExpiredToken</Code> in an XML envelope) is forwarded back to
 		// DuckDB verbatim — same status code, same body, same headers minus
@@ -266,6 +318,7 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		// raw S3 error body it knows how to parse.
 		var oe *originStatusError
 		if errors.As(err, &oe) {
+			span.SetAttributes(attribute.Int("http.response.status_code", oe.status))
 			slog.Warn("Origin returned non-2xx; forwarding verbatim.",
 				"url", r.URL.String(), "range", rangeHeader, "status", oe.status, "body_preview", previewBody(oe.body))
 			oe.writeTo(w)
@@ -291,6 +344,10 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = reader.Close() }()
+	span.SetAttributes(
+		attribute.String("duckgres.cache.source", res.source),
+		attribute.Int64("duckgres.bytes", size),
+	)
 	slog.Info("Served.", "source", res.source, "url", r.URL.String(), "range", rangeHeader, "bytes", size)
 	p.serveStream(w, reader, size, rangeHeader, res.contentType)
 }
@@ -301,9 +358,16 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) (fetchResult, error) {
 	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
-			if _, n, ok := p.peers.FetchFromPeers(cacheKey, func(body io.Reader) (int64, error) {
+			_, peerSpan := proxyTracer.Start(r.Context(), "cache.peer_fetch")
+			_, n, ok := p.peers.FetchFromPeers(cacheKey, func(body io.Reader) (int64, error) {
 				return p.store.PutStream(cacheKey, body)
-			}); ok {
+			})
+			peerSpan.SetAttributes(attribute.Bool("duckgres.cache.peer_hit", ok))
+			if ok {
+				peerSpan.SetAttributes(attribute.Int64("duckgres.bytes", n))
+			}
+			peerSpan.End()
+			if ok {
 				cacheBytesServed.WithLabelValues("peer").Add(float64(n))
 				return fetchResult{size: n, source: "peer"}, nil
 			}
@@ -325,6 +389,9 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 // large range reads. A non-2xx response is NOT cached — its (capped) error body
 // is captured and returned as an originStatusError for verbatim forwarding.
 func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, string, error) {
+	_, originSpan := proxyTracer.Start(r.Context(), "cache.origin_fetch")
+	defer originSpan.End()
+
 	attempts := p.originRetryMaxAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -333,11 +400,18 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		size, contentType, err := p.fetchOriginOnce(cacheKey, r)
+		originSpan.SetAttributes(attribute.Int("duckgres.origin.attempts", attempt))
 		if err == nil {
+			originSpan.SetAttributes(attribute.Int64("duckgres.bytes", size))
 			return size, contentType, nil
 		}
 		lastErr = err
+		var oe *originStatusError
+		if errors.As(err, &oe) {
+			originSpan.SetAttributes(attribute.Int("http.response.status_code", oe.status))
+		}
 		if attempt == attempts || r.Context().Err() != nil || !isRetriableOriginFetchError(err) {
+			originSpan.SetStatus(codes.Error, err.Error())
 			return 0, "", err
 		}
 
@@ -358,6 +432,9 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 				backoff = p.originRetryMaxBackoff
 			}
 		}
+	}
+	if lastErr != nil {
+		originSpan.SetStatus(codes.Error, lastErr.Error())
 	}
 	return 0, "", lastErr
 }
@@ -557,8 +634,13 @@ func (p *CacheProxy) serveStream(w http.ResponseWriter, r io.Reader, size int64,
 // S3 rejected it. The fix is to mirror ContentLength + TransferEncoding +
 // Trailer from the inbound request so the proxy is wire-shape-transparent.
 func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
+	ctx, span := proxyTracer.Start(r.Context(), "cache.forward", trace.WithAttributes(requestSpanAttrs(r)...))
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		slog.Warn("Forward-proxy request build failed.",
 			"method", r.Method, "url", r.URL.String(), "error", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -581,12 +663,14 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		slog.Warn("Forward-proxy origin transport failed.",
 			"method", r.Method, "url", r.URL.String(), "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+	span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
 
 	for k, vv := range resp.Header {
 		if hopByHop[strings.ToLower(k)] {
@@ -605,12 +689,14 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		w.WriteHeader(resp.StatusCode)
 		n, _ := io.Copy(w, resp.Body)
+		span.SetAttributes(attribute.Int64("duckgres.bytes", n))
 		slog.Info("Forward-proxy served.",
 			"method", r.Method, "url", r.URL.String(),
 			"status", resp.StatusCode, "bytes", n)
 		return
 	}
 
+	span.SetStatus(codes.Error, fmt.Sprintf("origin %d", resp.StatusCode))
 	body, _ := io.ReadAll(resp.Body)
 	slog.Warn("Forward-proxy origin returned non-2xx.",
 		"method", r.Method, "url", r.URL.String(),
