@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 func TestProfilingOutputToFile(t *testing.T) {
@@ -152,6 +154,66 @@ func TestProfilingCoverageAllCoversNonSelect(t *testing.T) {
 			t.Errorf("expected positive latency, got %f", m.Latency)
 		}
 	})
+}
+
+type profilingOutputExecutor struct {
+	output string
+}
+
+func (e profilingOutputExecutor) QueryContext(context.Context, string, ...any) (sqlcore.RowSet, error) {
+	return nil, nil
+}
+
+func (e profilingOutputExecutor) ExecContext(context.Context, string, ...any) (sqlcore.ExecResult, error) {
+	return nil, nil
+}
+
+func (e profilingOutputExecutor) Query(string, ...any) (sqlcore.RowSet, error) {
+	return nil, nil
+}
+
+func (e profilingOutputExecutor) Exec(string, ...any) (sqlcore.ExecResult, error) {
+	return nil, nil
+}
+
+func (e profilingOutputExecutor) ConnContext(context.Context) (sqlcore.RawConn, error) {
+	return nil, nil
+}
+
+func (e profilingOutputExecutor) PingContext(context.Context) error {
+	return nil
+}
+
+func (e profilingOutputExecutor) Close() error {
+	return nil
+}
+
+func (e profilingOutputExecutor) LastProfilingOutput() string {
+	return e.output
+}
+
+func TestEnrichSpanWithProfilingSummaryIncludesResourceUsage(t *testing.T) {
+	ctx := context.Background()
+	ctx, span := observe.Tracer().Start(ctx, "test")
+	defer span.End()
+
+	summary := observe.EnrichSpanWithProfiling(ctx, span, time.Now(), profilingOutputExecutor{output: `{
+		"latency": 2.5,
+		"cpu_time": 4.25,
+		"rows_returned": 3,
+		"result_set_size": 128,
+		"total_memory_allocated": 1024,
+		"system_peak_buffer_memory": 2048,
+		"total_bytes_read": 4096,
+		"children": []
+	}`}, "org-a")
+
+	if summary.CPUTimeSeconds != 4.25 {
+		t.Fatalf("expected CPUTimeSeconds 4.25, got %f", summary.CPUTimeSeconds)
+	}
+	if summary.PeakBufferMemoryBytes != 2048 {
+		t.Fatalf("expected PeakBufferMemoryBytes 2048, got %d", summary.PeakBufferMemoryBytes)
+	}
 }
 
 // TestProfilingSettingsArePerConnection reproduces the cluster-mode bug:

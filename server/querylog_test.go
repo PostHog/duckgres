@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"testing"
 	"time"
+
+	"github.com/posthog/duckgres/server/observe"
 )
 
 func TestClassifyQuery(t *testing.T) {
@@ -370,6 +372,53 @@ func TestEscapeSQLStringLiteral(t *testing.T) {
 	}
 }
 
+func TestEnsureQueryLogTableCreatesResourceUsageColumns(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
+		t.Fatalf("ensureQueryLogTable: %v", err)
+	}
+
+	tests := []struct {
+		column string
+		want   string
+	}{
+		{column: "cpu_time_s", want: "DOUBLE"},
+		{column: "peak_buffer_memory_bytes", want: "BIGINT"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.column, func(t *testing.T) {
+			got, err := queryLogColumnType(db, "query_log", "", "query_log", tt.column)
+			if err != nil {
+				t.Fatalf("queryLogColumnType(%s): %v", tt.column, err)
+			}
+			if got != tt.want {
+				t.Fatalf("expected %s type %s, got %s", tt.column, tt.want, got)
+			}
+		})
+	}
+
+	if _, err := db.Exec(`INSERT INTO query_log (event_time, query_duration_ms, type, query, user_name)
+		VALUES (?, ?, ?, ?, ?)`, time.Unix(1700000000, 0).UTC(), int64(1), "QueryFinish", "SELECT 1", "alice"); err != nil {
+		t.Fatalf("insert without resource usage columns: %v", err)
+	}
+	var cpuTimeS sql.NullFloat64
+	var peakBufferMemoryBytes sql.NullInt64
+	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log").Scan(&cpuTimeS, &peakBufferMemoryBytes); err != nil {
+		t.Fatalf("query default resource usage columns: %v", err)
+	}
+	if !cpuTimeS.Valid || cpuTimeS.Float64 != 0 {
+		t.Fatalf("expected cpu_time_s default 0, got valid=%t value=%f", cpuTimeS.Valid, cpuTimeS.Float64)
+	}
+	if !peakBufferMemoryBytes.Valid || peakBufferMemoryBytes.Int64 != 0 {
+		t.Fatalf("expected peak_buffer_memory_bytes default 0, got valid=%t value=%d", peakBufferMemoryBytes.Valid, peakBufferMemoryBytes.Int64)
+	}
+}
+
 func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
@@ -401,7 +450,9 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 		protocol VARCHAR,
 		trace_id VARCHAR,
 		span_id VARCHAR,
-		postgres_scan_ms BIGINT
+		postgres_scan_ms BIGINT,
+		cpu_time_s DOUBLE,
+		peak_buffer_memory_bytes BIGINT
 	)`)
 	if err != nil {
 		t.Fatalf("create table: %v", err)
@@ -409,27 +460,29 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 
 	ql := &QueryLogger{db: db}
 	ql.flushBatch([]QueryLogEntry{{
-		EventTime:       time.Unix(1700000000, 0).UTC(),
-		QueryDurationMs: 42,
-		Type:            "QueryFinish",
-		Query:           "SELECT 1",
-		QueryKind:       "Select",
-		NormalizedHash:  17,
-		ResultRows:      1,
-		UserName:        "alice",
-		OrgID:           "analytics",
-		CurrentDatabase: "analytics_db",
-		ClientAddress:   "127.0.0.1",
-		ClientPort:      5432,
-		ApplicationName: "psql",
-		PID:             99,
-		WorkerID:        7,
-		Protocol:        "simple",
-		PostgresScanMs:  123,
+		EventTime:             time.Unix(1700000000, 0).UTC(),
+		QueryDurationMs:       42,
+		Type:                  "QueryFinish",
+		Query:                 "SELECT 1",
+		QueryKind:             "Select",
+		NormalizedHash:        17,
+		ResultRows:            1,
+		UserName:              "alice",
+		OrgID:                 "analytics",
+		CurrentDatabase:       "analytics_db",
+		ClientAddress:         "127.0.0.1",
+		ClientPort:            5432,
+		ApplicationName:       "psql",
+		PID:                   99,
+		WorkerID:              7,
+		Protocol:              "simple",
+		PostgresScanMs:        123,
+		CPUTimeSeconds:        4.25,
+		PeakBufferMemoryBytes: 2048,
 	}})
 
 	var got string
-	err = db.QueryRow("SELECT org_id FROM query_log").Scan(&got)
+	err = db.QueryRow("SELECT org_id FROM query_log WHERE query = 'SELECT 1'").Scan(&got)
 	if err != nil {
 		t.Fatalf("query org_id: %v", err)
 	}
@@ -443,6 +496,18 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	}
 	if pgScanMs != 123 {
 		t.Fatalf("expected postgres_scan_ms 123, got %d", pgScanMs)
+	}
+
+	var cpuTimeS float64
+	var peakBufferMemoryBytes int64
+	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log").Scan(&cpuTimeS, &peakBufferMemoryBytes); err != nil {
+		t.Fatalf("query resource usage columns: %v", err)
+	}
+	if cpuTimeS != 4.25 {
+		t.Fatalf("expected cpu_time_s 4.25, got %f", cpuTimeS)
+	}
+	if peakBufferMemoryBytes != 2048 {
+		t.Fatalf("expected peak_buffer_memory_bytes 2048, got %d", peakBufferMemoryBytes)
 	}
 }
 
@@ -480,37 +545,122 @@ func TestEnsureQueryLogTableAddsOrgIDToExistingTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create table: %v", err)
 	}
+	if _, err := db.Exec(`INSERT INTO query_log (event_time, query_duration_ms, type, query, user_name)
+		VALUES (?, ?, ?, ?, ?)`, time.Unix(1699999999, 0).UTC(), int64(1), "QueryFinish", "SELECT old", "bob"); err != nil {
+		t.Fatalf("insert existing row before migration: %v", err)
+	}
 
 	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
 		t.Fatalf("ensureQueryLogTable: %v", err)
 	}
+	for _, col := range []string{"org_id", "postgres_scan_ms", "cpu_time_s", "peak_buffer_memory_bytes"} {
+		exists, err := queryLogColumnExists(db, "query_log", "", "query_log", col)
+		if err != nil {
+			t.Fatalf("inspect %s: %v", col, err)
+		}
+		if !exists {
+			t.Fatalf("expected %s column to be added", col)
+		}
+	}
+	var existingCPU sql.NullFloat64
+	var existingPeak sql.NullInt64
+	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log WHERE query = 'SELECT old'").Scan(&existingCPU, &existingPeak); err != nil {
+		t.Fatalf("query migrated existing row resource usage: %v", err)
+	}
+	if !existingCPU.Valid || existingCPU.Float64 != 0 {
+		t.Fatalf("expected migrated existing cpu_time_s 0, got valid=%t value=%f", existingCPU.Valid, existingCPU.Float64)
+	}
+	if !existingPeak.Valid || existingPeak.Int64 != 0 {
+		t.Fatalf("expected migrated existing peak_buffer_memory_bytes 0, got valid=%t value=%d", existingPeak.Valid, existingPeak.Int64)
+	}
+	if _, err := db.Exec(`INSERT INTO query_log (event_time, query_duration_ms, type, query, user_name)
+		VALUES (?, ?, ?, ?, ?)`, time.Unix(1700000001, 0).UTC(), int64(1), "QueryFinish", "SELECT legacy insert", "carol"); err != nil {
+		t.Fatalf("insert old-style row after migration: %v", err)
+	}
+	var defaultCPU sql.NullFloat64
+	var defaultPeak sql.NullInt64
+	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log WHERE query = 'SELECT legacy insert'").Scan(&defaultCPU, &defaultPeak); err != nil {
+		t.Fatalf("query old-style insert resource usage: %v", err)
+	}
+	if !defaultCPU.Valid || defaultCPU.Float64 != 0 {
+		t.Fatalf("expected old-style insert cpu_time_s default 0, got valid=%t value=%f", defaultCPU.Valid, defaultCPU.Float64)
+	}
+	if !defaultPeak.Valid || defaultPeak.Int64 != 0 {
+		t.Fatalf("expected old-style insert peak_buffer_memory_bytes default 0, got valid=%t value=%d", defaultPeak.Valid, defaultPeak.Int64)
+	}
 
 	ql := &QueryLogger{db: db}
 	ql.flushBatch([]QueryLogEntry{{
-		EventTime:       time.Unix(1700000000, 0).UTC(),
-		QueryDurationMs: 42,
-		Type:            "QueryFinish",
-		Query:           "SELECT 1",
-		QueryKind:       "Select",
-		NormalizedHash:  17,
-		ResultRows:      1,
-		UserName:        "alice",
-		OrgID:           "analytics",
-		CurrentDatabase: "analytics_db",
-		ClientAddress:   "127.0.0.1",
-		ClientPort:      5432,
-		ApplicationName: "psql",
-		PID:             99,
-		WorkerID:        7,
-		Protocol:        "simple",
+		EventTime:             time.Unix(1700000000, 0).UTC(),
+		QueryDurationMs:       42,
+		Type:                  "QueryFinish",
+		Query:                 "SELECT 1",
+		QueryKind:             "Select",
+		NormalizedHash:        17,
+		ResultRows:            1,
+		UserName:              "alice",
+		OrgID:                 "analytics",
+		CurrentDatabase:       "analytics_db",
+		ClientAddress:         "127.0.0.1",
+		ClientPort:            5432,
+		ApplicationName:       "psql",
+		PID:                   99,
+		WorkerID:              7,
+		Protocol:              "simple",
+		CPUTimeSeconds:        1.5,
+		PeakBufferMemoryBytes: 4096,
 	}})
 
 	var got string
-	err = db.QueryRow("SELECT org_id FROM query_log").Scan(&got)
+	err = db.QueryRow("SELECT org_id FROM query_log WHERE query = 'SELECT 1'").Scan(&got)
 	if err != nil {
 		t.Fatalf("query org_id: %v", err)
 	}
 	if got != "analytics" {
 		t.Fatalf("expected org_id analytics, got %q", got)
+	}
+
+	var cpuTimeS float64
+	var peakBufferMemoryBytes int64
+	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log WHERE query = 'SELECT 1'").Scan(&cpuTimeS, &peakBufferMemoryBytes); err != nil {
+		t.Fatalf("query backfilled resource usage columns: %v", err)
+	}
+	if cpuTimeS != 1.5 {
+		t.Fatalf("expected cpu_time_s 1.5, got %f", cpuTimeS)
+	}
+	if peakBufferMemoryBytes != 4096 {
+		t.Fatalf("expected peak_buffer_memory_bytes 4096, got %d", peakBufferMemoryBytes)
+	}
+}
+
+func TestLogQueryCopiesProfilingSummaryToQueryLogEntry(t *testing.T) {
+	c, ql, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+
+	c.lastProfilingSummary = observe.QueryProfilingSummary{
+		CPUTimeSeconds:        2.75,
+		PeakBufferMemoryBytes: 8192,
+		PostgresScanSeconds:   0.456,
+	}
+
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+
+	select {
+	case entry := <-ql.ch:
+		if entry.CPUTimeSeconds != 2.75 {
+			t.Fatalf("expected CPUTimeSeconds 2.75, got %f", entry.CPUTimeSeconds)
+		}
+		if entry.PeakBufferMemoryBytes != 8192 {
+			t.Fatalf("expected PeakBufferMemoryBytes 8192, got %d", entry.PeakBufferMemoryBytes)
+		}
+		if entry.PostgresScanMs != 456 {
+			t.Fatalf("expected PostgresScanMs 456, got %d", entry.PostgresScanMs)
+		}
+	default:
+		t.Fatal("expected query log entry")
+	}
+
+	if c.lastProfilingSummary != (observe.QueryProfilingSummary{}) {
+		t.Fatalf("expected profiling summary to be reset, got %#v", c.lastProfilingSummary)
 	}
 }
