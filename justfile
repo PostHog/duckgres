@@ -262,6 +262,11 @@ test:
 test-unit:
     go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/...
 
+# Run cache-proxy tests
+[group('test')]
+test-cache-proxy:
+    go test -v ./cmd/cache-proxy/...
+
 # Run integration tests
 [group('test')]
 test-integration:
@@ -355,7 +360,7 @@ lint:
 
 # Run what CI runs locally (excluding kind-backed K8s integration)
 [group('test')]
-ci: lint test-unit test-integration test-controlplane test-configstore-integration test-controlplane-k8s
+ci: lint test-unit test-cache-proxy test-integration test-controlplane test-configstore-integration test-controlplane-k8s
 
 # === Metrics ===
 
