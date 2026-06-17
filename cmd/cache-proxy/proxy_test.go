@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type timeoutNetError struct{}
@@ -73,6 +75,18 @@ func waitForRecorder(t *testing.T, ch <-chan *httptest.ResponseRecorder, msg str
 	}
 }
 
+func waitForGaugeValue(t *testing.T, g prometheus.Gauge, want float64, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := gaugeValue(t, g); got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s: got %v, want %v", msg, gaugeValue(t, g), want)
+}
+
 // captureSlog redirects slog.Default to a buffer for the duration of a test
 // and returns the buffer + a restore function. Used by the forward-uncached
 // logging tests to assert presence of the request/response log lines that
@@ -92,6 +106,16 @@ func newTestProxy(t *testing.T) *CacheProxy {
 	proxy.originRetryInitialBackoff = 0
 	proxy.originRetryMaxBackoff = 0
 	return proxy
+}
+
+func TestNewCacheProxyOriginBackpressureDefaultsDisabled(t *testing.T) {
+	proxy := newTestProxy(t)
+	if proxy.originMaxInFlight != 0 {
+		t.Fatalf("originMaxInFlight = %d, want 0 so production rollout is metrics-first", proxy.originMaxInFlight)
+	}
+	if proxy.originSlots != nil {
+		t.Fatal("originSlots is non-nil, want nil when default backpressure is disabled")
+	}
 }
 
 // newTestServer returns an httptest origin plus a proxy that rewrites inbound
@@ -153,6 +177,52 @@ func TestHandleProxyGETMissThenHit(t *testing.T) {
 	if atomic.LoadInt32(&originCalls) != 1 {
 		t.Errorf("origin calls = %d after hit, want 1", originCalls)
 	}
+}
+
+func TestNonNegativeIntEnvOrDefault(t *testing.T) {
+	const key = "DUCKGRES_TEST_NON_NEGATIVE_INT"
+	t.Run("default", func(t *testing.T) {
+		t.Setenv(key, "")
+		got, err := nonNegativeIntEnvOrDefault(key, 64)
+		if err != nil {
+			t.Fatalf("nonNegativeIntEnvOrDefault returned error: %v", err)
+		}
+		if got != 64 {
+			t.Fatalf("value = %d, want 64", got)
+		}
+	})
+	t.Run("custom", func(t *testing.T) {
+		t.Setenv(key, "17")
+		got, err := nonNegativeIntEnvOrDefault(key, 64)
+		if err != nil {
+			t.Fatalf("nonNegativeIntEnvOrDefault returned error: %v", err)
+		}
+		if got != 17 {
+			t.Fatalf("value = %d, want 17", got)
+		}
+	})
+	t.Run("zero disables", func(t *testing.T) {
+		t.Setenv(key, "0")
+		got, err := nonNegativeIntEnvOrDefault(key, 64)
+		if err != nil {
+			t.Fatalf("nonNegativeIntEnvOrDefault returned error: %v", err)
+		}
+		if got != 0 {
+			t.Fatalf("value = %d, want 0", got)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		t.Setenv(key, "nope")
+		if _, err := nonNegativeIntEnvOrDefault(key, 64); err == nil {
+			t.Fatal("nonNegativeIntEnvOrDefault returned nil error, want parse error")
+		}
+	})
+	t.Run("negative", func(t *testing.T) {
+		t.Setenv(key, "-1")
+		if _, err := nonNegativeIntEnvOrDefault(key, 64); err == nil {
+			t.Fatal("nonNegativeIntEnvOrDefault returned nil error, want validation error")
+		}
+	})
 }
 
 func TestHandleProxyHEADForwardedUncached(t *testing.T) {
@@ -541,8 +611,214 @@ func TestOriginFetchMetricLabels(t *testing.T) {
 	}
 }
 
-func TestHandleProxyMetricsOnlyDoesNotRejectConcurrentOriginMisses(t *testing.T) {
+func TestHandleProxyOriginBackpressureQueuesDistinctMisses(t *testing.T) {
 	proxy := newTestProxy(t)
+	proxy.setOriginMaxInFlight(1)
+
+	queuedBefore := gaugeValue(t, originFetchQueued)
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFirst) })
+	}
+	defer release()
+	var originCalls int32
+	var activeOriginCalls int32
+	var maxActiveOriginCalls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&activeOriginCalls, 1)
+		defer atomic.AddInt32(&activeOriginCalls, -1)
+		for {
+			maxActive := atomic.LoadInt32(&maxActiveOriginCalls)
+			if current <= maxActive || atomic.CompareAndSwapInt32(&maxActiveOriginCalls, maxActive, current) {
+				break
+			}
+		}
+		switch atomic.AddInt32(&originCalls, 1) {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+		case 2:
+			close(secondStarted)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	results := make(chan *httptest.ResponseRecorder, 2)
+	go func() {
+		results <- doForwardProxyRequest(proxy, "GET", originURL+"/bucket/queued-first.parquet", http.Header{"Range": []string{"bytes=0-1"}})
+	}()
+	waitForSignal(t, firstStarted, "timed out waiting for first origin fetch")
+	cachedURL := originURL + "/bucket/already-cached.parquet"
+	cachedRange := "bytes=0-5"
+	if err := proxy.store.Put(CacheKey(cachedURL, cachedRange), []byte("cached")); err != nil {
+		t.Fatalf("seed cached object: %v", err)
+	}
+	cachedRec := doForwardProxyRequest(proxy, "GET", cachedURL, http.Header{"Range": []string{cachedRange}})
+	if cachedRec.Code != http.StatusPartialContent {
+		t.Fatalf("cache hit while origin slot is full: status = %d, want 206", cachedRec.Code)
+	}
+	if body := cachedRec.Body.String(); body != "cached" {
+		t.Fatalf("cache hit while origin slot is full: body = %q, want cached", body)
+	}
+	go func() {
+		results <- doForwardProxyRequest(proxy, "GET", originURL+"/bucket/queued-second.parquet", http.Header{"Range": []string{"bytes=2-3"}})
+	}()
+	waitForGaugeValue(t, originFetchQueued, queuedBefore+1, "queued origin fetches while first request holds the only slot")
+	select {
+	case <-secondStarted:
+		t.Fatal("second origin fetch started before the first fetch released its origin slot")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	waitForSignal(t, secondStarted, "timed out waiting for queued origin fetch to start")
+	for i := 0; i < 2; i++ {
+		rec := waitForRecorder(t, results, "timed out waiting for queued proxy response")
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("response %d status = %d, want 206", i+1, rec.Code)
+		}
+	}
+	if got := atomic.LoadInt32(&originCalls); got != 2 {
+		t.Fatalf("origin calls = %d, want 2", got)
+	}
+	if got := atomic.LoadInt32(&maxActiveOriginCalls); got > 1 {
+		t.Fatalf("simultaneous origin calls = %d, want at most 1", got)
+	}
+	if got := gaugeValue(t, originFetchQueued); got != queuedBefore {
+		t.Fatalf("queued origin fetches after requests = %v, want %v", got, queuedBefore)
+	}
+}
+
+func TestHandleProxyOriginBackpressureCanceledWhileQueued(t *testing.T) {
+	proxy := newTestProxy(t)
+	proxy.setOriginMaxInFlight(1)
+
+	queuedBefore := gaugeValue(t, originFetchQueued)
+	canceledBefore := counterValue(t, originFetchesTotal.WithLabelValues("canceled"))
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFirst) })
+	}
+	defer release()
+	var originCalls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&originCalls, 1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- doForwardProxyRequest(proxy, "GET", originURL+"/bucket/cancel-queued-first.parquet", http.Header{"Range": []string{"bytes=0-1"}})
+	}()
+	waitForSignal(t, firstStarted, "timed out waiting for first origin fetch")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("GET", originURL+"/bucket/cancel-queued-second.parquet", nil).WithContext(ctx)
+	req.Host = req.URL.Host
+	req.Header.Set("Range", "bytes=2-3")
+	secondRec := httptest.NewRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		proxy.HandleProxy(secondRec, req)
+	}()
+	waitForGaugeValue(t, originFetchQueued, queuedBefore+1, "queued origin fetches before cancellation")
+	cancel()
+	waitForSignal(t, secondDone, "timed out waiting for queued request cancellation")
+	if secondRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("queued cancellation status = %d, want 503", secondRec.Code)
+	}
+	if got := secondRec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+	if got := counterValue(t, originFetchesTotal.WithLabelValues("canceled")); got != canceledBefore {
+		t.Fatalf("origin canceled metric = %v, want unchanged %v because no origin fetch started", got, canceledBefore)
+	}
+	if got := atomic.LoadInt32(&originCalls); got != 1 {
+		t.Fatalf("origin calls before releasing first request = %d, want 1", got)
+	}
+	if got := gaugeValue(t, originFetchQueued); got != queuedBefore {
+		t.Fatalf("queued origin fetches after cancellation = %v, want %v", got, queuedBefore)
+	}
+
+	release()
+	rec := waitForRecorder(t, firstDone, "timed out waiting for first proxy response")
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("first response status = %d, want 206", rec.Code)
+	}
+}
+
+func TestHandleProxyOriginBackpressureSingleFlightWaitersDoNotConsumeSlots(t *testing.T) {
+	proxy := newTestProxy(t)
+	proxy.setOriginMaxInFlight(1)
+
+	queuedBefore := gaugeValue(t, originFetchQueued)
+	firstStarted := make(chan struct{})
+	releaseOrigin := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseOrigin) })
+	}
+	defer release()
+	var originCalls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&originCalls, 1) == 1 {
+			close(firstStarted)
+			<-releaseOrigin
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("same-key-body"))
+	})
+
+	const requests = 5
+	results := make(chan *httptest.ResponseRecorder, requests)
+	url := originURL + "/bucket/same-key.parquet"
+	headers := http.Header{"Range": []string{"bytes=0-12"}}
+	go func() {
+		results <- doForwardProxyRequest(proxy, "GET", url, headers)
+	}()
+	waitForSignal(t, firstStarted, "timed out waiting for first same-key origin fetch")
+	for i := 1; i < requests; i++ {
+		go func() {
+			results <- doForwardProxyRequest(proxy, "GET", url, headers)
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt32(&originCalls); got != 1 {
+		t.Fatalf("origin calls while same-key waiters are blocked = %d, want 1", got)
+	}
+	if got := gaugeValue(t, originFetchQueued); got != queuedBefore {
+		t.Fatalf("queued origin fetches for same-key waiters = %v, want %v", got, queuedBefore)
+	}
+
+	release()
+	for i := 0; i < requests; i++ {
+		rec := waitForRecorder(t, results, "timed out waiting for same-key proxy response")
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("response %d status = %d, want 206", i+1, rec.Code)
+		}
+		if body := rec.Body.String(); body != "same-key-body" {
+			t.Fatalf("response %d body = %q, want same-key-body", i+1, body)
+		}
+	}
+	if got := atomic.LoadInt32(&originCalls); got != 1 {
+		t.Fatalf("origin calls after same-key waiters completed = %d, want 1", got)
+	}
+}
+
+func TestHandleProxyOriginBackpressureCanBeDisabled(t *testing.T) {
+	proxy := newTestProxy(t)
+	proxy.setOriginMaxInFlight(0)
 
 	const requests = 65
 	var originCalls int32
@@ -586,11 +862,11 @@ func TestHandleProxyMetricsOnlyDoesNotRejectConcurrentOriginMisses(t *testing.T)
 	}
 	if got := atomic.LoadInt32(&originCalls); got != requests {
 		release()
-		t.Fatalf("origin calls before release = %d, want %d; metrics-only PR must not limit origin concurrency", got, requests)
+		t.Fatalf("origin calls before release = %d, want %d; disabled backpressure must not limit origin concurrency", got, requests)
 	}
 	if got := atomic.LoadInt32(&maxActiveOriginCalls); got != requests {
 		release()
-		t.Fatalf("simultaneous origin calls before release = %d, want %d; metrics-only PR must not queue origin concurrency", got, requests)
+		t.Fatalf("simultaneous origin calls before release = %d, want %d; disabled backpressure must not queue origin concurrency", got, requests)
 	}
 	release()
 
@@ -602,10 +878,10 @@ func TestHandleProxyMetricsOnlyDoesNotRejectConcurrentOriginMisses(t *testing.T)
 		}
 	}
 	if len(failed) > 0 {
-		t.Fatalf("metrics-only PR must not add local rejection behavior: %s", strings.Join(failed, ", "))
+		t.Fatalf("disabled backpressure must not add local rejection behavior: %s", strings.Join(failed, ", "))
 	}
 	if got := atomic.LoadInt32(&originCalls); got != requests {
-		t.Fatalf("origin calls = %d, want %d; metrics-only PR must not limit origin concurrency", got, requests)
+		t.Fatalf("origin calls = %d, want %d; disabled backpressure must not limit origin concurrency", got, requests)
 	}
 }
 

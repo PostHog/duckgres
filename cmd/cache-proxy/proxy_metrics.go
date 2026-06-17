@@ -18,4 +18,13 @@ var (
 		Name: "cache_proxy_origin_fetches_in_flight",
 		Help: "Current number of origin fetches filling the local cache",
 	})
+	originFetchQueued = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_origin_fetches_queued",
+		Help: "Current number of cacheable origin fetch leaders waiting for an origin concurrency slot",
+	})
+	originFetchQueueWaitSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "cache_proxy_origin_fetch_queue_wait_seconds",
+		Help:    "Seconds cacheable origin fetch leaders spend waiting for an origin concurrency slot after the limit is saturated",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"outcome"})
 )
