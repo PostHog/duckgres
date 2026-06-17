@@ -17,6 +17,7 @@ import (
 type WarehouseStore interface {
 	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
 	UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error
+	FinalizeWarehouseDeletion(orgID string) error
 	// UpdateIcebergConfig writes per-org Iceberg/Lakekeeper config without
 	// CAS'ing on the top-level warehouse state. The Lakekeeper provisioner
 	// uses this because Iceberg provisioning runs in parallel with the
@@ -515,10 +516,7 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 		}
 	}
 
-	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateDeleting, map[string]interface{}{
-		"state":          configstore.ManagedWarehouseStateDeleted,
-		"status_message": "Resources deleted",
-	}); err != nil {
-		log.Warn("Failed to update state to deleted.", "error", err)
+	if err := c.store.FinalizeWarehouseDeletion(w.OrgID); err != nil {
+		log.Warn("Failed to finalize warehouse deletion.", "error", err)
 	}
 }

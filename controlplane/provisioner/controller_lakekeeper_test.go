@@ -65,8 +65,8 @@ func TestReconcileDeleting_TearsDownLakekeeper(t *testing.T) {
 	if _, err := kc.CoreV1().ServiceAccounts(k8sClient.namespace).Get(ctx, LakekeeperServiceAccountName(orgID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Errorf("Lakekeeper ServiceAccount not torn down: err=%v", err)
 	}
-	if fs.warehouses[orgID].State != configstore.ManagedWarehouseStateDeleted {
-		t.Errorf("warehouse state = %q, want deleted", fs.warehouses[orgID].State)
+	if _, ok := fs.warehouses[orgID]; ok {
+		t.Error("warehouse row was not removed")
 	}
 }
 

@@ -22,10 +22,14 @@ import (
 // fakeStore implements WarehouseStore for unit tests.
 type fakeStore struct {
 	warehouses map[string]*configstore.ManagedWarehouse
+	orgs       map[string]bool
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{warehouses: make(map[string]*configstore.ManagedWarehouse)}
+	return &fakeStore{
+		warehouses: make(map[string]*configstore.ManagedWarehouse),
+		orgs:       make(map[string]bool),
+	}
 }
 
 func (s *fakeStore) ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error) {
@@ -118,6 +122,19 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
 		}
 	}
+	return nil
+}
+
+func (s *fakeStore) FinalizeWarehouseDeletion(orgID string) error {
+	w, ok := s.warehouses[orgID]
+	if !ok {
+		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseStateMismatch)
+	}
+	if w.State != configstore.ManagedWarehouseStateDeleting {
+		return fmt.Errorf("warehouse %q expected deleting got %q: %w", orgID, w.State, configstore.ErrWarehouseStateMismatch)
+	}
+	delete(s.orgs, orgID)
+	delete(s.warehouses, orgID)
 	return nil
 }
 
@@ -748,6 +765,7 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 func TestReconcileDeletingDeletesCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
+	fs.orgs["org-c"] = true
 	fs.warehouses["org-c"] = &configstore.ManagedWarehouse{
 		OrgID: "org-c",
 		State: configstore.ManagedWarehouseStateDeleting,
@@ -780,9 +798,11 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 		return
 	}
 
-	// Verify state transitioned to deleted
-	if fs.warehouses["org-c"].State != configstore.ManagedWarehouseStateDeleted {
-		t.Fatalf("expected deleted state, got %q", fs.warehouses["org-c"].State)
+	if _, ok := fs.warehouses["org-c"]; ok {
+		t.Fatal("expected warehouse row to be removed")
+	}
+	if fs.orgs["org-c"] {
+		t.Fatal("expected org row to be removed")
 	}
 }
 
@@ -791,6 +811,7 @@ func TestReconcileDeletingRetriesOnNonNotFoundError(t *testing.T) {
 	// When it's a different error, it should NOT transition to deleted.
 	dc, _ := newFakeDucklingClient()
 	fs := newFakeStore()
+	fs.orgs["org-d"] = true
 	fs.warehouses["org-d"] = &configstore.ManagedWarehouse{
 		OrgID: "org-d",
 		State: configstore.ManagedWarehouseStateDeleting,
@@ -801,9 +822,11 @@ func TestReconcileDeletingRetriesOnNonNotFoundError(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctrl.reconcile(ctx)
 
-	// NotFound on delete is fine — should still transition to deleted
-	if fs.warehouses["org-d"].State != configstore.ManagedWarehouseStateDeleted {
-		t.Fatalf("expected deleted state on NotFound, got %q", fs.warehouses["org-d"].State)
+	if _, ok := fs.warehouses["org-d"]; ok {
+		t.Fatal("expected warehouse row to be removed on NotFound")
+	}
+	if fs.orgs["org-d"] {
+		t.Fatal("expected org row to be removed on NotFound")
 	}
 }
 

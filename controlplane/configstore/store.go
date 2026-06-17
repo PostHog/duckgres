@@ -642,6 +642,40 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 	return nil
 }
 
+// FinalizeWarehouseDeletion removes the config-store rows for a fully torn-down
+// managed warehouse. It only succeeds while the warehouse is still in deleting
+// state so cleanup remains retryable if the transaction fails.
+func (cs *ConfigStore) FinalizeWarehouseDeletion(orgID string) error {
+	return cs.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&ManagedWarehouse{}).
+			Where("org_id = ? AND state = ?", orgID, ManagedWarehouseStateDeleting).
+			Updates(map[string]interface{}{
+				"state":          ManagedWarehouseStateDeleted,
+				"status_message": "Resources deleted",
+			})
+		if result.Error != nil {
+			return fmt.Errorf("finalize warehouse deletion: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("warehouse %q expected state %q: %w", orgID, ManagedWarehouseStateDeleting, ErrWarehouseStateMismatch)
+		}
+
+		if err := tx.Where("org_id = ?", orgID).Delete(&OrgUserSecret{}).Error; err != nil {
+			return fmt.Errorf("delete org user secrets: %w", err)
+		}
+		if err := tx.Where("org_id = ?", orgID).Delete(&OrgUser{}).Error; err != nil {
+			return fmt.Errorf("delete org users: %w", err)
+		}
+		if err := tx.Where("org_id = ?", orgID).Delete(&ManagedWarehouse{}).Error; err != nil {
+			return fmt.Errorf("delete managed warehouse: %w", err)
+		}
+		if err := tx.Where("name = ?", orgID).Delete(&Org{}).Error; err != nil {
+			return fmt.Errorf("delete org: %w", err)
+		}
+		return nil
+	})
+}
+
 // GetManagedWarehouseIceberg reads the embedded Iceberg config for an
 // org. Returns (nil, nil) when the org has no warehouse row so callers
 // can distinguish "never provisioned" from a DB error.

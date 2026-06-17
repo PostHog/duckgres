@@ -3,6 +3,7 @@
 package configstore_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -105,5 +106,77 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected warehouse to be deleted via cascade, count=%d", count)
+	}
+}
+
+func TestFinalizeWarehouseDeletionRemovesOrgConfigRows(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if err := store.DB().Create(&configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "root",
+		Password: "hash",
+	}).Error; err != nil {
+		t.Fatalf("create org user: %v", err)
+	}
+	if err := store.DB().Create(&configstore.OrgUserSecret{
+		OrgID:      "analytics",
+		Username:   "root",
+		SecretName: "persisted_secret",
+		Ciphertext: []byte("sealed"),
+	}).Error; err != nil {
+		t.Fatalf("create org user secret: %v", err)
+	}
+	if err := store.DB().Create(&configstore.ManagedWarehouse{
+		OrgID: "analytics",
+		State: configstore.ManagedWarehouseStateDeleting,
+	}).Error; err != nil {
+		t.Fatalf("create warehouse: %v", err)
+	}
+
+	if err := store.FinalizeWarehouseDeletion("analytics"); err != nil {
+		t.Fatalf("finalize deletion: %v", err)
+	}
+
+	assertRowCount(t, store, &configstore.Org{}, "name = ?", "analytics", 0)
+	assertRowCount(t, store, &configstore.ManagedWarehouse{}, "org_id = ?", "analytics", 0)
+	assertRowCount(t, store, &configstore.OrgUser{}, "org_id = ?", "analytics", 0)
+	assertRowCount(t, store, &configstore.OrgUserSecret{}, "org_id = ?", "analytics", 0)
+}
+
+func TestFinalizeWarehouseDeletionRequiresDeletingState(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if err := store.DB().Create(&configstore.ManagedWarehouse{
+		OrgID: "analytics",
+		State: configstore.ManagedWarehouseStateReady,
+	}).Error; err != nil {
+		t.Fatalf("create warehouse: %v", err)
+	}
+
+	err := store.FinalizeWarehouseDeletion("analytics")
+	if !errors.Is(err, configstore.ErrWarehouseStateMismatch) {
+		t.Fatalf("expected ErrWarehouseStateMismatch, got %v", err)
+	}
+
+	assertRowCount(t, store, &configstore.Org{}, "name = ?", "analytics", 1)
+	assertRowCount(t, store, &configstore.ManagedWarehouse{}, "org_id = ?", "analytics", 1)
+}
+
+func assertRowCount(t *testing.T, store *configstore.ConfigStore, model any, query string, arg any, want int64) {
+	t.Helper()
+
+	var count int64
+	if err := store.DB().Model(model).Where(query, arg).Count(&count).Error; err != nil {
+		t.Fatalf("count %T: %v", model, err)
+	}
+	if count != want {
+		t.Fatalf("count %T = %d, want %d", model, count, want)
 	}
 }
