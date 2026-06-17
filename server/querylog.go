@@ -49,6 +49,12 @@ type QueryLogEntry struct {
 	// profiling disabled). Lets us answer "which query shape pounds the
 	// metadata DB?" against `system.query_log` without re-parsing profiling.
 	PostgresScanMs int64
+	// CPUTimeSeconds is DuckDB's cumulative query CPU/thread time in seconds.
+	// Zero when DuckDB returned no profiling output.
+	CPUTimeSeconds float64
+	// PeakBufferMemoryBytes is DuckDB's system_peak_buffer_memory value in
+	// bytes. This is DuckDB buffer memory, not process RSS.
+	PeakBufferMemoryBytes int64
 }
 
 // QueryLogger batches query log entries and writes them to a DuckLake table.
@@ -232,18 +238,18 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 	}
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
-	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms) VALUES ")
+	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms, cpu_time_s, peak_buffer_memory_bytes) VALUES ")
 
-	const colsPerRow = 24
+	const colsPerRow = 26
 	args := make([]any, 0, len(batch)*colsPerRow)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
 		base := i * colsPerRow
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23, base+24)
+			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23, base+24, base+25, base+26)
 
 		args = append(args,
 			e.EventTime,
@@ -270,6 +276,8 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			e.TraceID,
 			e.SpanID,
 			e.PostgresScanMs,
+			e.CPUTimeSeconds,
+			e.PeakBufferMemoryBytes,
 		)
 	}
 
@@ -339,15 +347,27 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 		}
 	}
 
-	// Backfill postgres_scan_ms column on tables created before metadata-DB
-	// observability landed. New tables already get it from CREATE TABLE.
-	hasPgScan, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, "postgres_scan_ms")
-	if err != nil {
-		return fmt.Errorf("inspect postgres_scan_ms column: %w", err)
-	}
-	if !hasPgScan {
-		if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN postgres_scan_ms BIGINT"); err != nil {
-			return fmt.Errorf("add postgres_scan_ms column: %w", err)
+	// Backfill profiling-derived columns on tables created before these
+	// observability fields landed. New tables already get them from CREATE TABLE.
+	for _, col := range []struct {
+		name string
+		typ  string
+	}{
+		{name: "postgres_scan_ms", typ: "BIGINT"},
+		{name: "cpu_time_s", typ: "DOUBLE"},
+		{name: "peak_buffer_memory_bytes", typ: "BIGINT"},
+	} {
+		hasCol, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, col.name)
+		if err != nil {
+			return fmt.Errorf("inspect %s column: %w", col.name, err)
+		}
+		if !hasCol {
+			if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN " + col.name + " " + col.typ + " DEFAULT 0"); err != nil {
+				return fmt.Errorf("add %s column: %w", col.name, err)
+			}
+		}
+		if _, err := db.Exec("UPDATE " + fullTableName + " SET " + col.name + " = 0 WHERE " + col.name + " IS NULL"); err != nil {
+			return fmt.Errorf("backfill %s column: %w", col.name, err)
 		}
 	}
 
@@ -379,7 +399,9 @@ func queryLogCreateTableSQL(fullTableName string) string {
 		protocol            VARCHAR,
 		trace_id            VARCHAR,
 		span_id             VARCHAR,
-		postgres_scan_ms    BIGINT
+		postgres_scan_ms    BIGINT DEFAULT 0,
+		cpu_time_s          DOUBLE DEFAULT 0,
+		peak_buffer_memory_bytes BIGINT DEFAULT 0
 	)`, fullTableName)
 }
 
@@ -491,6 +513,8 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	if ql == nil {
 		return
 	}
+	profilingSummary := c.lastProfilingSummary
+	c.lastProfilingSummary = observe.QueryProfilingSummary{}
 	if isQueryLogSelfReferential(query) {
 		return
 	}
@@ -532,34 +556,35 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	// EnrichSpanWithProfiling on this connection and reset it so a later
 	// logQuery without a fresh exec (e.g. parse-failure path) doesn't
 	// reuse stale timings from a previous query.
-	pgScanMs := int64(c.lastProfilingSummary.PostgresScanSeconds * 1000)
-	c.lastProfilingSummary = observe.QueryProfilingSummary{}
+	pgScanMs := int64(profilingSummary.PostgresScanSeconds * 1000)
 
 	ql.Log(QueryLogEntry{
-		EventTime:       start,
-		QueryDurationMs: time.Since(start).Milliseconds(),
-		Type:            entryType,
-		Query:           query,
-		TranspiledQuery: transpiled,
-		QueryKind:       classifyQuery(cmdType),
-		NormalizedHash:  normalizeQueryHash(query),
-		ResultRows:      resultRows,
-		WrittenRows:     writtenRows,
-		ExceptionCode:   errCode,
-		Exception:       errMsg,
-		UserName:        c.username,
-		OrgID:           c.orgID,
-		CurrentDatabase: c.database,
-		ClientAddress:   clientAddr,
-		ClientPort:      clientPort,
-		ApplicationName: c.applicationName,
-		PID:             c.pid,
-		WorkerID:        c.workerID,
-		IsTranspiled:    transpiled != nil,
-		Protocol:        protocol,
-		TraceID:         observe.TraceIDFromContext(c.ctx),
-		SpanID:          observe.SpanIDFromContext(c.ctx),
-		PostgresScanMs:  pgScanMs,
+		EventTime:             start,
+		QueryDurationMs:       time.Since(start).Milliseconds(),
+		Type:                  entryType,
+		Query:                 query,
+		TranspiledQuery:       transpiled,
+		QueryKind:             classifyQuery(cmdType),
+		NormalizedHash:        normalizeQueryHash(query),
+		ResultRows:            resultRows,
+		WrittenRows:           writtenRows,
+		ExceptionCode:         errCode,
+		Exception:             errMsg,
+		UserName:              c.username,
+		OrgID:                 c.orgID,
+		CurrentDatabase:       c.database,
+		ClientAddress:         clientAddr,
+		ClientPort:            clientPort,
+		ApplicationName:       c.applicationName,
+		PID:                   c.pid,
+		WorkerID:              c.workerID,
+		IsTranspiled:          transpiled != nil,
+		Protocol:              protocol,
+		TraceID:               observe.TraceIDFromContext(c.ctx),
+		SpanID:                observe.SpanIDFromContext(c.ctx),
+		PostgresScanMs:        pgScanMs,
+		CPUTimeSeconds:        profilingSummary.CPUTimeSeconds,
+		PeakBufferMemoryBytes: profilingSummary.PeakBufferMemoryBytes,
 	})
 }
 

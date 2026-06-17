@@ -87,6 +87,23 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 - `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact publisher
 - `metrics-compose.yml` - Starts Prometheus and Grafana locally for metrics (Prometheus at http://localhost:9091, Grafana at http://localhost:3000)
 
+### Query Log
+
+When DuckLake is configured, Duckgres writes a durable per-query history to
+`ducklake.system.query_log` by default. The query log records SQL user
+(`user_name`), org, query text, duration, row counts, errors, trace/span IDs,
+and profiling-derived resource usage. `cpu_time_s` is DuckDB cumulative
+CPU/thread time in seconds, and `peak_buffer_memory_bytes` is DuckDB's
+`system_peak_buffer_memory` in bytes, not process RSS.
+
+```sql
+SELECT event_time, user_name, org_id, query_duration_ms, cpu_time_s,
+       peak_buffer_memory_bytes, postgres_scan_ms, query
+FROM ducklake.system.query_log
+ORDER BY cpu_time_s DESC, peak_buffer_memory_bytes DESC
+LIMIT 20;
+```
+
 ## Runbooks
 
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
