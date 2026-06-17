@@ -301,9 +301,9 @@ cmd_teardown() {
       for _ in $(seq 1 30); do
         gone=1
         for org in $(ci_orgs "$PR_NUMBER"); do
-          st="$(curl -fsS -H "X-Duckgres-Internal-Secret: $secret" \
+          st="$(curl -sS -H "X-Duckgres-Internal-Secret: $secret" \
             "http://localhost:18080/api/v1/orgs/$org/warehouse/status" 2>/dev/null \
-            | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+            | sed -n 's/.*"state":"\([^"]*\)".*/\1/p' || true)"
           [ "$st" = "deleted" ] || [ -z "$st" ] || gone=0
         done
         [ "$gone" = 1 ] && break

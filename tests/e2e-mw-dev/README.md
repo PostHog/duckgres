@@ -115,9 +115,9 @@ client-go:
   reused hot-idle worker (cnpg lane).
 - **isolation** — two tenants (cnpg vs ext) see distinct catalogs; a
   cross-tenant read is denied.
-- **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling
-  CR **fully** deletes (`kubectl wait --for=delete`, asserting the finalizer
-  cascade that drops the cnpg role+db completed). Same-id **re-provision** is
+- **lifecycle** — deprovision → warehouse config row removed → the Crossplane
+  Duckling CR **fully** deletes (`kubectl wait --for=delete`, asserting the
+  finalizer cascade that drops the cnpg role+db completed). Same-id **re-provision** is
   *not* done in-Job: a clean slate needs DROPping a possibly-stranded cnpg role,
   which only `run.sh` (on the runner, with cnpg-shards exec) can do — so the
   stranded-cnpg-role regression (#649/#650/#11518/#11522) is covered **across
