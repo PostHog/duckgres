@@ -288,6 +288,11 @@ test-configstore-integration:
 test-controlplane-k8s:
     go test -v -count=1 -tags kubernetes ./controlplane ./controlplane/admin ./controlplane/provisioner
 
+# Print the test impact plan for the current branch
+[group('test')]
+test-impact-plan base="origin/main" head="HEAD":
+    python3 scripts/test_impact_plan.py --base {{base}} --head {{head}}
+
 # Run Kubernetes integration tests against the default kind-backed multitenant setup
 [group('test')]
 test-k8s-integration:

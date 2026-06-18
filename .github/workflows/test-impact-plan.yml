@@ -1,0 +1,29 @@
+name: test-impact-plan
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Generate test impact plan
+        run: |
+          set -euo pipefail
+          python3 scripts/test_impact_plan.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head HEAD \
+            --markdown-output /tmp/test-impact-plan.md \
+            --json-output /tmp/test-impact-plan.json
+
+          cat /tmp/test-impact-plan.md >> "$GITHUB_STEP_SUMMARY"
