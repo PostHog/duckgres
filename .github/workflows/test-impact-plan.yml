@@ -1,29 +1,76 @@
 name: test-impact-plan
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: read
 
 jobs:
   plan:
     runs-on: ubuntu-24.04-arm
     steps:
-      - name: Checkout pull request
+      # This workflow can write PR comments, so it must not checkout or execute
+      # code from the PR branch. It runs trusted base code and treats PR changes
+      # as passive API data.
+      - name: Checkout trusted base
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch pull request file data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/files" \
+            --paginate \
+            --slurp \
+            > /tmp/test-impact-pr-files.json
 
       - name: Generate test impact plan
         run: |
           set -euo pipefail
           python3 scripts/test_impact_plan.py \
-            --base "${{ github.event.pull_request.base.sha }}" \
-            --head HEAD \
+            --github-pr-files-json /tmp/test-impact-pr-files.json \
             --markdown-output /tmp/test-impact-plan.md \
             --json-output /tmp/test-impact-plan.json
 
           cat /tmp/test-impact-plan.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          marker="<!-- test-impact-plan -->"
+          body_file=/tmp/test-impact-plan-comment.md
+          {
+            echo "$marker"
+            cat /tmp/test-impact-plan.md
+          } > "$body_file"
+
+          existing_id="$(
+            gh api "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+              --jq '.[] | select(.body | contains("<!-- test-impact-plan -->")) | .id' \
+              | tail -n 1
+          )"
+
+          if [ -n "$existing_id" ]; then
+            gh api "repos/$REPOSITORY/issues/comments/$existing_id" \
+              -X PATCH \
+              -F "body=@$body_file" >/dev/null
+          else
+            gh api "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+              -F "body=@$body_file" >/dev/null
+          fi

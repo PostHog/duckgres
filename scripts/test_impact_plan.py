@@ -8,6 +8,7 @@ rule-based so reviewers can audit why a warning appeared.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -69,6 +70,7 @@ class TestImpactPlan:
     retry_lines_added: int = 0
     workflow_jobs_removed: int = 0
     test_commands_removed: int = 0
+    missing_patch_files: list[str] = field(default_factory=list)
     warnings: list[Warning] = field(default_factory=list)
 
     @property
@@ -222,6 +224,56 @@ def analyze_diff(name_status_lines: Iterable[str], patch_lines: Iterable[str]) -
     return plan
 
 
+def normalize_pr_files_payload(payload: object) -> list[dict[str, object]]:
+    """Flatten GitHub API file payloads from a single page or gh --slurp pages."""
+    if not isinstance(payload, list):
+        raise ValueError("GitHub PR files payload must be a JSON array")
+
+    files: list[dict[str, object]] = []
+    for item in payload:
+        if isinstance(item, list):
+            files.extend(normalize_pr_files_payload(item))
+            continue
+        if not isinstance(item, dict):
+            raise ValueError("GitHub PR files payload entries must be objects")
+        files.append(item)
+    return files
+
+
+def github_status_to_name_status(status: str) -> str:
+    return {
+        "added": "A",
+        "removed": "D",
+        "modified": "M",
+        "renamed": "R",
+        "copied": "C",
+        "changed": "M",
+        "unchanged": "M",
+    }.get(status, "M")
+
+
+def analyze_github_pr_files(files_payload: object) -> TestImpactPlan:
+    plan = TestImpactPlan()
+
+    for file_info in normalize_pr_files_payload(files_payload):
+        filename = file_info.get("filename")
+        if not isinstance(filename, str) or not filename:
+            continue
+
+        status = github_status_to_name_status(str(file_info.get("status", "modified")))
+        add_file_delta(plan, status, filename)
+
+        patch = file_info.get("patch")
+        if not isinstance(patch, str):
+            plan.missing_patch_files.append(filename)
+            continue
+        for line in patch.splitlines():
+            analyze_patch_line(plan, filename, line)
+
+    add_warnings(plan)
+    return plan
+
+
 def add_warnings(plan: TestImpactPlan) -> None:
     if plan.deleted_test_files:
         plan.warnings.append(
@@ -299,6 +351,15 @@ def add_warnings(plan: TestImpactPlan) -> None:
             )
         )
 
+    if plan.missing_patch_files:
+        plan.warnings.append(
+            Warning(
+                title="Files without patch data",
+                severity="needs_review",
+                details=sorted(set(plan.missing_patch_files)),
+            )
+        )
+
     if plan.changed_e2e_files and not plan.retry_lines_added:
         plan.warnings.append(
             Warning(
@@ -309,10 +370,15 @@ def add_warnings(plan: TestImpactPlan) -> None:
         )
 
 
+def code_detail(value: str) -> str:
+    text = value.replace("\r", "\\r").replace("\n", "\\n")
+    return f"<code>{html.escape(text)}</code>"
+
+
 def bullet_list(items: Iterable[str], limit: int = 8) -> list[str]:
     values = list(items)
     visible = values[:limit]
-    bullets = [f"  - `{item}`" for item in visible]
+    bullets = [f"  - {code_detail(item)}" for item in visible]
     if len(values) > limit:
         bullets.append(f"  - ... and {len(values) - limit} more")
     return bullets
@@ -371,6 +437,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=".", help="repository path")
     parser.add_argument("--base", default="origin/main", help="base ref")
     parser.add_argument("--head", default="HEAD", help="head ref")
+    parser.add_argument(
+        "--github-pr-files-json",
+        help="analyze GitHub pull request files API JSON instead of running git diff",
+    )
     parser.add_argument("--markdown-output", help="write Markdown report here")
     parser.add_argument("--json-output", help="write JSON report here")
     parser.add_argument(
@@ -380,11 +450,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    repo = Path(args.repo)
-    diff_range = f"{args.base}...{args.head}"
-    name_status = run_git(repo, ["diff", "--name-status", diff_range])
-    patch = run_git(repo, ["diff", "--unified=0", diff_range])
-    plan = analyze_diff(name_status, patch)
+    if args.github_pr_files_json:
+        with Path(args.github_pr_files_json).open() as handle:
+            plan = analyze_github_pr_files(json.load(handle))
+    else:
+        repo = Path(args.repo)
+        diff_range = f"{args.base}...{args.head}"
+        name_status = run_git(repo, ["diff", "--name-status", diff_range])
+        patch = run_git(repo, ["diff", "--unified=0", diff_range])
+        plan = analyze_diff(name_status, patch)
 
     markdown = render_markdown(plan)
     payload = json.dumps(asdict(plan), indent=2, sort_keys=True)
