@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a deterministic test-impact summary for a git diff.
+"""Generate a deterministic test-impact summary for a PR diff.
 
 The goal is PR review visibility, not a merge gate. The classifier is deliberately
 rule-based so reviewers can audit why a warning appeared.
@@ -71,6 +71,8 @@ class TestImpactPlan:
     workflow_jobs_removed: int = 0
     test_commands_removed: int = 0
     missing_patch_files: list[str] = field(default_factory=list)
+    expected_file_count: int | None = None
+    observed_file_count: int = 0
     warnings: list[Warning] = field(default_factory=list)
 
     @property
@@ -108,7 +110,7 @@ def is_runner_file(path: str) -> bool:
     return path == "justfile" or is_workflow_file(path)
 
 
-def parse_name_status(line: str) -> tuple[str, str] | None:
+def parse_name_status(line: str) -> tuple[str, str, str | None] | None:
     if not line.strip():
         return None
     parts = line.split("\t")
@@ -116,10 +118,10 @@ def parse_name_status(line: str) -> tuple[str, str] | None:
     if status.startswith("R") or status.startswith("C"):
         if len(parts) < 3:
             return None
-        return status[0], parts[2]
+        return status[0], parts[2], parts[1]
     if len(parts) < 2:
         return None
-    return status[0], parts[1]
+    return status[0], parts[1], None
 
 
 def add_file_delta(plan: TestImpactPlan, status: str, path: str) -> None:
@@ -152,6 +154,78 @@ def add_file_delta(plan: TestImpactPlan, status: str, path: str) -> None:
             plan.file_deltas.workflow_changed += 1
 
     if is_runner_file(path) and status != "A":
+        plan.file_deltas.runner_changed += 1
+
+
+def account_rename(
+    plan: TestImpactPlan,
+    previous_path: str,
+    path: str,
+    matcher,
+    added_attr: str,
+    changed_attr: str,
+    deleted_attr: str,
+    changed_paths: list[str] | None = None,
+    deleted_paths: list[str] | None = None,
+) -> None:
+    previous_matches = matcher(previous_path)
+    current_matches = matcher(path)
+    if not previous_matches and not current_matches:
+        return
+
+    if previous_matches and current_matches:
+        setattr(plan.file_deltas, changed_attr, getattr(plan.file_deltas, changed_attr) + 1)
+        if changed_paths is not None:
+            changed_paths.append(path)
+        return
+
+    if current_matches:
+        setattr(plan.file_deltas, added_attr, getattr(plan.file_deltas, added_attr) + 1)
+        if changed_paths is not None:
+            changed_paths.append(path)
+        return
+
+    setattr(plan.file_deltas, deleted_attr, getattr(plan.file_deltas, deleted_attr) + 1)
+    if deleted_paths is not None:
+        deleted_paths.append(previous_path)
+    if changed_paths is not None:
+        changed_paths.append(f"{previous_path} -> {path}")
+
+
+def add_rename_delta(plan: TestImpactPlan, previous_path: str, path: str) -> None:
+    account_rename(
+        plan,
+        previous_path,
+        path,
+        is_test_file,
+        "test_added",
+        "test_changed",
+        "test_deleted",
+        plan.changed_test_files,
+        plan.deleted_test_files,
+    )
+    account_rename(
+        plan,
+        previous_path,
+        path,
+        is_e2e_or_journey_file,
+        "e2e_added",
+        "e2e_changed",
+        "e2e_deleted",
+        plan.changed_e2e_files,
+    )
+    account_rename(
+        plan,
+        previous_path,
+        path,
+        is_workflow_file,
+        "workflow_added",
+        "workflow_changed",
+        "workflow_deleted",
+        plan.changed_workflow_files,
+    )
+
+    if is_runner_file(previous_path) or is_runner_file(path):
         plan.file_deltas.runner_changed += 1
 
 
@@ -208,8 +282,11 @@ def analyze_diff(name_status_lines: Iterable[str], patch_lines: Iterable[str]) -
         parsed = parse_name_status(line)
         if parsed is None:
             continue
-        status, path = parsed
-        add_file_delta(plan, status, path)
+        status, path, previous_path = parsed
+        if status == "R" and previous_path:
+            add_rename_delta(plan, previous_path, path)
+        else:
+            add_file_delta(plan, status, path)
 
     current_path = ""
     for line in patch_lines:
@@ -252,16 +329,27 @@ def github_status_to_name_status(status: str) -> str:
     }.get(status, "M")
 
 
-def analyze_github_pr_files(files_payload: object) -> TestImpactPlan:
+def analyze_github_pr_files(
+    files_payload: object,
+    expected_file_count: int | None = None,
+) -> TestImpactPlan:
     plan = TestImpactPlan()
+    plan.expected_file_count = expected_file_count
+    files = normalize_pr_files_payload(files_payload)
+    plan.observed_file_count = len(files)
 
-    for file_info in normalize_pr_files_payload(files_payload):
+    for file_info in files:
         filename = file_info.get("filename")
         if not isinstance(filename, str) or not filename:
             continue
 
-        status = github_status_to_name_status(str(file_info.get("status", "modified")))
-        add_file_delta(plan, status, filename)
+        raw_status = str(file_info.get("status", "modified"))
+        status = github_status_to_name_status(raw_status)
+        previous_filename = file_info.get("previous_filename")
+        if raw_status == "renamed" and isinstance(previous_filename, str) and previous_filename:
+            add_rename_delta(plan, previous_filename, filename)
+        else:
+            add_file_delta(plan, status, filename)
 
         patch = file_info.get("patch")
         if not isinstance(patch, str):
@@ -360,6 +448,23 @@ def add_warnings(plan: TestImpactPlan) -> None:
             )
         )
 
+    if (
+        plan.expected_file_count is not None
+        and plan.expected_file_count > plan.observed_file_count
+    ):
+        plan.warnings.append(
+            Warning(
+                title="PR file list may be incomplete",
+                severity="needs_review",
+                details=[
+                    (
+                        f"GitHub reported {plan.expected_file_count} changed file(s), "
+                        f"but {plan.observed_file_count} file record(s) were analyzed"
+                    )
+                ],
+            )
+        )
+
     if plan.changed_e2e_files and not plan.retry_lines_added:
         plan.warnings.append(
             Warning(
@@ -441,6 +546,11 @@ def main(argv: list[str] | None = None) -> int:
         "--github-pr-files-json",
         help="analyze GitHub pull request files API JSON instead of running git diff",
     )
+    parser.add_argument(
+        "--expected-file-count",
+        type=int,
+        help="warn when GitHub reports more changed files than were provided",
+    )
     parser.add_argument("--markdown-output", help="write Markdown report here")
     parser.add_argument("--json-output", help="write JSON report here")
     parser.add_argument(
@@ -452,7 +562,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.github_pr_files_json:
         with Path(args.github_pr_files_json).open() as handle:
-            plan = analyze_github_pr_files(json.load(handle))
+            plan = analyze_github_pr_files(
+                json.load(handle),
+                expected_file_count=args.expected_file_count,
+            )
     else:
         repo = Path(args.repo)
         diff_range = f"{args.base}...{args.head}"
