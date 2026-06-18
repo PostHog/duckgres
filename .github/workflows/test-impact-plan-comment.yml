@@ -1,0 +1,133 @@
+name: test-impact-plan-comment
+
+on:
+  workflow_run:
+    workflows: ["test-impact-plan"]
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: test-impact-plan-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve pull request context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          pr_count="$(jq -r '.workflow_run.pull_requests | length' "$GITHUB_EVENT_PATH")"
+          if [ "$pr_count" != "1" ]; then
+            echo "Expected one pull request context, found $pr_count."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pr_number="$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")"
+          if [ -z "$pr_number" ]; then
+            echo "No pull request context found for workflow run."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pr_json=/tmp/test-impact-pr.json
+          gh api "repos/$REPOSITORY/pulls/$pr_number" > "$pr_json"
+          head_sha="$(jq -r '.head.sha' "$pr_json")"
+          state="$(jq -r '.state' "$pr_json")"
+          base_repo="$(jq -r '.base.repo.full_name' "$pr_json")"
+          base_ref="$(jq -r '.base.ref' "$pr_json")"
+          changed_files="$(jq -r '.changed_files' "$pr_json")"
+
+          if [ "$state" != "open" ]; then
+            echo "Skipping PR #$pr_number because it is $state."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$base_repo" != "$REPOSITORY" ] || [ "$base_ref" != "$TARGET_BRANCH" ]; then
+            echo "Skipping PR #$pr_number targeting $base_repo:$base_ref."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$head_sha" != "$RUN_HEAD_SHA" ]; then
+            echo "Skipping stale workflow run for $RUN_HEAD_SHA; current PR head is $head_sha."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "current=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "changed_files=$changed_files" >> "$GITHUB_OUTPUT"
+
+      - name: Generate test impact plan
+        if: steps.context.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+          CHANGED_FILES: ${{ steps.context.outputs.changed_files }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            --paginate \
+            --slurp \
+            > /tmp/test-impact-pr-files.json
+
+          python3 scripts/test_impact_plan.py \
+            --github-pr-files-json /tmp/test-impact-pr-files.json \
+            --expected-file-count "$CHANGED_FILES" \
+            --markdown-output /tmp/test-impact-plan.md \
+            --json-output /tmp/test-impact-plan.json
+
+          cat /tmp/test-impact-plan.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on pull request
+        if: steps.context.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          marker="<!-- test-impact-plan -->"
+          body_file=/tmp/test-impact-plan-comment.md
+          {
+            echo "$marker"
+            cat /tmp/test-impact-plan.md
+          } > "$body_file"
+
+          existing_id="$(
+            gh api "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- test-impact-plan -->"))) | .id' \
+              | tail -n 1
+          )"
+
+          if [ -n "$existing_id" ]; then
+            gh api "repos/$REPOSITORY/issues/comments/$existing_id" \
+              -X PATCH \
+              -F "body=@$body_file" >/dev/null
+          else
+            gh api "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+              -F "body=@$body_file" >/dev/null
+          fi

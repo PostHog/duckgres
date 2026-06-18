@@ -1,0 +1,26 @@
+name: test-impact-plan
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-impact-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  trigger:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Record trigger
+        run: |
+          {
+            echo "## Test Impact Plan"
+            echo
+            echo "A follow-up workflow posts the sticky PR comment after this run completes."
+          } >> "$GITHUB_STEP_SUMMARY"
