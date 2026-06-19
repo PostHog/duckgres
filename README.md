@@ -19,6 +19,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
   - [Environment Variables](#environment-variables)
   - [CLI Flags](#cli-flags)
   - [PostHog Logging](#posthog-logging)
+  - [PostHog Product-Analytics Events](#posthog-product-analytics-events)
 - [DuckDB Extensions](#duckdb-extensions)
 - [DuckLake Integration](#ducklake-integration)
   - [Quick Start with Docker](#quick-start-with-docker)
@@ -243,7 +244,7 @@ Run with config file:
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
-| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
+| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
 | `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` in PostHog logs (e.g., `duckgres-acme`); only used when `POSTHOG_API_KEY` is set | - |
@@ -266,6 +267,33 @@ export POSTHOG_API_KEY=phc_your_project_api_key
 export POSTHOG_HOST=eu.i.posthog.com
 ./duckgres
 ```
+
+### PostHog Product-Analytics Events
+
+The same `POSTHOG_API_KEY` (and `POSTHOG_HOST`) also enables product-analytics
+event capture via the PostHog capture API. This is separate from log export:
+logs go to PostHog Logs, these are discrete events you can build insights and
+dashboards on. When `POSTHOG_API_KEY` is unset, no events are sent.
+
+Events are attributed to an org using [PostHog group analytics](https://posthog.com/docs/product-analytics/group-analytics):
+the `distinct_id` is the org name and each event carries a group of type
+`organization`, so dashboards can break down and aggregate by org. In
+single-tenant standalone mode (no org) the `distinct_id` is `standalone` and no
+group is attached.
+
+Events never include SQL text, credentials, or secret values — only metadata.
+
+| Event | Fires when | Properties |
+| --- | --- | --- |
+| `warehouse_provisioned` | A managed warehouse is provisioned (admin API) | `database_name`, `metadata_store`, `ducklake_enabled`, `iceberg_enabled` |
+| `warehouse_deprovisioned` | A managed warehouse is deprovisioned (admin API) | — |
+| `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
+| `query_initiated` | A client query begins execution | `user`, `trace_id` |
+| `query_failed` | A query errors | `user`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
+
+> Note: `query_initiated` fires once per query with no sampling, so its volume
+> scales 1:1 with query throughput. Capture is asynchronous and batched, so it
+> stays off the query latency path.
 
 ### CLI Flags
 

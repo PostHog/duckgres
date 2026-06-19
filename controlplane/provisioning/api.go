@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/internal/analytics"
 	"gorm.io/gorm"
 )
 
@@ -301,6 +302,13 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
+	analytics.Default().Capture("warehouse_provisioned", orgID, map[string]any{
+		"database_name":    req.DatabaseName,
+		"metadata_store":   string(req.MetadataStore.Type),
+		"ducklake_enabled": ducklakeEnabled,
+		"iceberg_enabled":  icebergEnabled,
+	})
+
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":   "provisioning started",
 		"org":      orgID,
@@ -323,6 +331,7 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 	var err error
 	for _, state := range deprovisionableStates {
 		if err = h.store.SetWarehouseDeleting(orgID, state); err == nil {
+			analytics.Default().Capture("warehouse_deprovisioned", orgID, nil)
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}
@@ -406,6 +415,10 @@ func (h *handler) resetPassword(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "root user not found"})
 		return
 	}
+
+	analytics.Default().Capture("warehouse_password_reset", orgID, map[string]any{
+		"username": "root",
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"username": "root",
