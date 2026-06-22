@@ -1261,8 +1261,16 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Handle fallback to native DuckDB: PostgreSQL parsing failed, try DuckDB directly
 	if result.FallbackToNative {
 		if err := c.validateWithDuckDB(query); err != nil {
-			// Neither PostgreSQL nor DuckDB can parse this query
-			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			// validateWithDuckDB runs `EXPLAIN <query>` on DuckDB, which fails for
+			// BOTH a genuinely-unparseable query AND a parseable query that hits a
+			// real catalog/binder error (e.g. `DESCRIBE x.y.z` against a missing
+			// schema — DESCRIBE isn't valid PostgreSQL so it always lands here).
+			// Don't blanket these as 42601: classifyErrorCode unwraps the DuckDB
+			// prefix and yields the right SQLSTATE (a true Parser Error still maps
+			// to 42601, but "Catalog Error: schema … does not exist" maps to 3F000
+			// / 42P01), so postgres-protocol clients see the same error class real
+			// Postgres would and can branch on it (UndefinedTable/InvalidSchemaName).
+			c.sendError("ERROR", classifyErrorCode(err), unwrapFlightError(err.Error()))
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil

@@ -594,7 +594,12 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	if result.FallbackToNative {
 		if err := c.validateWithDuckDB(query); err != nil {
-			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			// Not necessarily a syntax error: a parseable native query (e.g.
+			// `DESCRIBE x.y.z`) can fail validation with a real catalog/binder
+			// error. classifyErrorCode keeps true Parser Errors at 42601 but maps
+			// "Catalog Error: schema … does not exist" to 3F000 / 42P01 so clients
+			// see the Postgres-equivalent class. See the matching site in conn.go.
+			c.sendError("ERROR", classifyErrorCode(err), unwrapFlightError(err.Error()))
 			return true, nil
 		}
 		c.logger().Debug("Fallback to native DuckDB.", "query", query)
