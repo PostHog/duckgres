@@ -25,8 +25,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server"
-	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/usersecrets"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -213,8 +213,6 @@ func NewFlightIngressFromListener(baseListener net.Listener, tlsConfig *tls.Conf
 		flightTLSConfig.NextProtos = append(flightTLSConfig.NextProtos, "h2")
 	}
 
-	ln := tls.NewListener(baseListener, flightTLSConfig)
-
 	if cfg.SessionIdleTTL <= 0 {
 		cfg.SessionIdleTTL = defaultFlightSessionIdleTTL
 	}
@@ -231,26 +229,27 @@ func NewFlightIngressFromListener(baseListener net.Listener, tlsConfig *tls.Conf
 	store := newFlightAuthSessionStore(provider, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL, cfg.SessionTokenTTL, cfg.WorkerQueueTimeout, opts)
 	handler, err := NewControlPlaneFlightSQLHandler(store, validator)
 	if err != nil {
-		_ = ln.Close()
+		_ = baseListener.Close()
 		return nil, err
 	}
 	handler.rateLimiter = opts.RateLimiter
 	handler.rejectPersistentSecretDDL = cfg.RejectPersistentSecretDDL
 
 	grpcOpts := []grpc.ServerOption{
+		grpc.Creds(credentials.NewTLS(flightTLSConfig)),
 		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(flightclient.MaxGRPCMessageSize),
 	}
 
 	srv := flight.NewServerWithMiddleware(nil, grpcOpts...)
 	srv.RegisterFlightService(flightsql.NewFlightServer(handler))
-	srv.InitListener(ln)
+	srv.InitListener(baseListener)
 
 	return &FlightIngress{
 		flightSrv:    srv,
-		listener:     ln,
+		listener:     baseListener,
 		sessionStore: store,
-		listenerAddr: ln.Addr().String(),
+		listenerAddr: baseListener.Addr().String(),
 	}, nil
 }
 
