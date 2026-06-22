@@ -215,6 +215,7 @@ func main() {
 		InternalSecretFallbacks:    resolved.InternalSecretFallbacks,
 		SNIRoutingMode:             resolved.SNIRoutingMode,
 		ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
+		DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 		DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
 		K8s: controlplane.K8sConfig{
 			WorkerImage:                  resolved.K8sWorkerImage,

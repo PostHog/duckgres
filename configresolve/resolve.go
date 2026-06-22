@@ -131,6 +131,7 @@ type Resolved struct {
 	UserSecretKey                   string
 	SNIRoutingMode                  string
 	ManagedHostnameSuffixes         []string
+	DucklingBucketSuffix            string
 	DuckLakeDefaultSpecVersion      string
 }
 
@@ -215,6 +216,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var userSecretKey string
 	var sniRoutingMode string
 	var managedHostnameSuffixes []string
+	var ducklingBucketSuffix string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -787,6 +789,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_MANAGED_HOSTNAME_SUFFIXES"); v != "" {
 		managedHostnameSuffixes = splitAndTrim(v, ",")
 	}
+	// Env-only (set by the duckgres Helm chart per environment). The env suffix
+	// the control plane uses to name a type=s3bucket Duckling's per-org bucket:
+	// posthog-duckling-<compact-org>-<suffix>. Must equal crossplane-config's
+	// envSuffix. Empty ⇒ CP does not name buckets (composition derives).
+	if v := getenv("DUCKGRES_DUCKLING_BUCKET_SUFFIX"); v != "" {
+		ducklingBucketSuffix = v
+	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -1242,6 +1251,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		UserSecretKey:                   userSecretKey,
 		SNIRoutingMode:                  sniRoutingMode,
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,
+		DucklingBucketSuffix:            ducklingBucketSuffix,
 		DuckLakeDefaultSpecVersion:      cfg.DuckLake.SpecVersion,
 	}
 }

@@ -386,6 +386,10 @@ func SetupMultiTenant(
 	if err != nil {
 		slog.Warn("Provisioning controller unavailable.", "error", err)
 	} else {
+		// Env suffix for CP-owned s3bucket naming: drives the backfill of
+		// spec.dataStore.bucketName onto existing ready ducklings. Empty leaves
+		// it disabled (composition keeps deriving).
+		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
 		// Opt-in: enable the per-org Lakekeeper provisioning branch. Off by
 		// default so existing deploys are unaffected. Best-effort — if the
 		// K8s client can't be built we log and leave the controller running
@@ -436,7 +440,7 @@ func SetupMultiTenant(
 	// Authenticated API
 	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminTokens))
 	admin.RegisterAPI(api, store, adpt)
-	provisioning.RegisterAPI(api, provisioning.NewGormStore(store))
+	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
 
 	// Dashboard
 	admin.RegisterDashboard(engine, adminTokens)

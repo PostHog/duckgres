@@ -344,6 +344,7 @@ func main() {
 			UserSecretKey:              resolved.UserSecretKey,
 			SNIRoutingMode:             resolved.SNIRoutingMode,
 			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
+			DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 			DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:                  resolved.K8sWorkerImage,

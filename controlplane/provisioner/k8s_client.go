@@ -231,6 +231,14 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		dataStore = map[string]interface{}{"type": "external", "external": external}
 	case "", "s3bucket":
 		dataStore = map[string]interface{}{"type": "s3bucket"}
+		// When the control plane supplies the bucket name (CP-owned naming),
+		// pin it on the CR so the composition provisions exactly that bucket
+		// instead of deriving one. Empty ⇒ omit the field and let the
+		// composition derive (legacy ducklings + deployments without
+		// DUCKGRES_DUCKLING_BUCKET_SUFFIX).
+		if opts.DataStoreBucket != "" {
+			dataStore["bucketName"] = opts.DataStoreBucket
+		}
 	default:
 		return fmt.Errorf("create duckling CR %q: unsupported data store type %q", name, opts.DataStoreType)
 	}
@@ -416,6 +424,59 @@ func (d *DucklingClient) SetIcebergEnabled(ctx context.Context, orgID string, en
 	)
 	if err != nil {
 		return fmt.Errorf("patch duckling CR %q iceberg: %w", name, err)
+	}
+	return nil
+}
+
+// GetDataStoreBucketName reads spec.dataStore.bucketName from the Duckling CR.
+// Empty (missing block / missing key) means the CR predates CP-owned naming
+// and the composition is still deriving the name — the signal the backfill in
+// reconcileReady uses to decide whether to patch.
+func (d *DucklingClient) GetDataStoreBucketName(ctx context.Context, orgID string) (string, error) {
+	cr, name, err := d.getCR(ctx, orgID)
+	if err != nil {
+		return "", fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return "", nil
+	}
+	ds, ok := spec["dataStore"].(map[string]interface{})
+	if !ok {
+		return "", nil
+	}
+	bucket, _ := ds["bucketName"].(string)
+	return bucket, nil
+}
+
+// SetDataStoreBucketName patches spec.dataStore.bucketName on the Duckling CR.
+// JSON merge patch (RFC 7396) so it's idempotent and only touches dataStore —
+// the type field and any sibling under spec are left untouched. Used to backfill
+// the CP-owned name onto ducklings created before this field existed (their
+// spec.dataStore carries only {type: s3bucket}); the name supplied here is the
+// same string the composition was already deriving into status, so the patch
+// causes no bucket churn — it just moves the name from a derived output into a
+// durable input so the composition stops deriving.
+func (d *DucklingClient) SetDataStoreBucketName(ctx context.Context, orgID, bucket string) error {
+	_, name, err := d.getCR(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"dataStore": map[string]interface{}{
+				"bucketName": bucket,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal dataStore bucket patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q dataStore bucketName: %w", name, err)
 	}
 	return nil
 }
