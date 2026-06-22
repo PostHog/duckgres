@@ -51,7 +51,7 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
 | `control-plane-multitenant-local.yaml` | Optional OrbStack-oriented shared-worker control-plane manifest |
 | `kind/config-store.overlay.yaml` | Compose overlay that attaches local dependency containers to the external Docker `kind` network |
-| `kind/config-store-seed.sql` | Kind-oriented managed-warehouse seed for the shared-worker flow |
+| `kind/config-store.seed.sql` | Kind-oriented managed-warehouse seed for the shared-worker flow |
 | `kind/control-plane.yaml` | Kind-first shared-worker control-plane manifest used by local dev and CI |
 | `orbstack/dependency-ports.overlay.yaml` | Optional OrbStack overlay that publishes local DuckLake and MinIO dependency ports on the host |
 
@@ -72,6 +72,8 @@ Key flags for Kubernetes multitenant mode:
 | `--k8s-worker-service-account` | `DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT` | Shared ServiceAccount name for worker pods (`duckgres-worker` default) |
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
 | `--k8s-worker-configmap` | `DUCKGRES_K8S_WORKER_CONFIGMAP` | ConfigMap name for worker config |
+| - | `DUCKGRES_K8S_WORKER_CPU_REQUEST` | Default worker pod CPU request/limit. Local manifests set `500m`; production should override for workload needs. |
+| - | `DUCKGRES_K8S_WORKER_MEMORY_REQUEST` | Default worker pod memory request/limit. Local manifests set `512Mi`; production should override for workload needs. |
 
 The worker Secret setting is a base name for per-worker RPC Secrets. Each worker pod gets its own derived Secret containing its RPC bearer token and TLS material. If the derived Secret does not exist, the control plane creates it before spawning the pod.
 
@@ -104,6 +106,8 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres dbname=duckgres
 `just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and MinIO backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared-worker control plane.
 
 Default login: `postgres / postgres`
+
+The local manifests default worker pods to `500m` CPU and `512Mi` memory so a single-node developer cluster can schedule workers. Override `DUCKGRES_K8S_WORKER_CPU_REQUEST` and `DUCKGRES_K8S_WORKER_MEMORY_REQUEST` when testing larger worker shapes.
 
 ## Optional OrbStack Workflow
 
