@@ -167,9 +167,13 @@ func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore
 }
 
 func newTestRouter(store Store) *gin.Engine {
+	return newTestRouterWithBucketSuffix(store, "")
+}
+
+func newTestRouterWithBucketSuffix(store Store, bucketSuffix string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterAPI(r.Group("/api/v1"), store)
+	RegisterAPI(r.Group("/api/v1"), store, bucketSuffix)
 	return r
 }
 
@@ -641,6 +645,78 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 	}
 	if !w.DuckLake.Enabled || w.Iceberg.Enabled {
 		t.Errorf("ducklake-only+external: want ducklake on, iceberg off; got ducklake=%v iceberg=%v", w.DuckLake.Enabled, w.Iceberg.Enabled)
+	}
+}
+
+// When a bucket suffix is configured, a fresh per-org s3bucket gets the
+// CP-owned name pinned on the warehouse (→ Duckling CR spec.dataStore.bucketName)
+// and returned in the provision response, so callers persist it instead of
+// re-deriving. UUID org IDs are hyphen-compacted to fit the S3 63-char cap.
+func TestProvisionComputesS3BucketName(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouterWithBucketSuffix(store, "mw-prod-us")
+
+	org := "0194d640-5db4-0000-6cde-48d6114c0f99"
+	wantBucket := "posthog-duckling-0194d6405db400006cde48d6114c0f99-mw-prod-us"
+	body := []byte(`{
+		"database_name": "db",
+		"metadata_store": {"type": "cnpg-shard"},
+		"data_store": {"type": "s3bucket"},
+		"ducklake": {"enabled": true}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+org+"/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	w := store.warehouses[org]
+	if w == nil {
+		t.Fatal("expected warehouse to be created")
+		return
+	}
+	if w.DataStore.BucketName != wantBucket {
+		t.Errorf("warehouse DataStore.BucketName = %q, want %q", w.DataStore.BucketName, wantBucket)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["bucket"] != wantBucket {
+		t.Errorf("response bucket = %v, want %q", resp["bucket"], wantBucket)
+	}
+}
+
+// Without a configured suffix the CP doesn't name buckets — the warehouse keeps
+// an empty bucket name and the composition derives it (legacy behavior).
+func TestProvisionNoBucketSuffixLeavesNameEmpty(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store) // empty suffix
+
+	body := []byte(`{
+		"database_name": "db",
+		"metadata_store": {"type": "cnpg-shard"},
+		"data_store": {"type": "s3bucket"},
+		"ducklake": {"enabled": true}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/someorg/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if w := store.warehouses["someorg"]; w == nil || w.DataStore.BucketName != "" {
+		t.Errorf("want empty DataStore.BucketName, got %+v", w)
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if _, ok := resp["bucket"]; ok {
+		t.Errorf("response should omit bucket when CP naming is disabled, got %v", resp["bucket"])
 	}
 }
 

@@ -57,8 +57,11 @@ type Store interface {
 }
 
 // RegisterAPI registers provisioning endpoints on the given router group.
-func RegisterAPI(r *gin.RouterGroup, store Store) {
-	h := &handler{store: store}
+// bucketSuffix is the env suffix used to compute the control-plane-owned
+// per-org s3bucket name at provision time (empty ⇒ the CP doesn't name buckets
+// and the composition derives).
+func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
+	h := &handler{store: store, bucketSuffix: bucketSuffix}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
@@ -68,6 +71,10 @@ func RegisterAPI(r *gin.RouterGroup, store Store) {
 
 type handler struct {
 	store Store
+	// bucketSuffix is the env suffix (e.g. "mw-prod-us") used to compute the
+	// CP-owned s3bucket name; empty disables CP naming. See
+	// configstore.DucklingBucketName.
+	bucketSuffix string
 }
 
 // warehouseStatusResponse is the public-facing view of warehouse state.
@@ -83,6 +90,10 @@ type warehouseStatusResponse struct {
 	ReadyAt            *time.Time                                    `json:"ready_at,omitempty"`
 	FailedAt           *time.Time                                    `json:"failed_at,omitempty"`
 	Connection         *connectionDetails                            `json:"connection,omitempty"`
+	// Bucket is the authoritative per-org S3 bucket name the CP provisioned.
+	// Empty for external data stores or ducklings provisioned before CP-owned
+	// naming whose row hasn't been backfilled yet.
+	Bucket string `json:"bucket,omitempty"`
 }
 
 // connectionDetails is returned in status (without password) and in provision/reset-password (with password).
@@ -214,6 +225,17 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
+	// Control-plane-owned bucket naming: for a fresh per-org bucket (s3bucket
+	// with no caller-supplied name) compute the name here, once, and pin it on
+	// the warehouse. It flows to the Duckling CR's spec.dataStore.bucketName
+	// (so the composition provisions exactly this bucket instead of deriving
+	// one) and back to the caller in the response below — so nothing downstream
+	// re-derives the name. No-op when bucketSuffix is unset (the composition
+	// derives, legacy behavior) or when the caller passed an explicit name.
+	if ds.Kind == "s3bucket" && ds.BucketName == "" {
+		ds.BucketName = configstore.DucklingBucketName(orgID, h.bucketSuffix)
+	}
+
 	warehouse := &configstore.ManagedWarehouse{
 		DataStore: ds,
 		DuckLake:  configstore.ManagedWarehouseDuckLake{Enabled: ducklakeEnabled},
@@ -301,12 +323,19 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusAccepted, gin.H{
+	resp := gin.H{
 		"status":   "provisioning started",
 		"org":      orgID,
 		"username": "root",
 		"password": plainPassword,
-	})
+	}
+	// Return the authoritative bucket name synchronously with the password, so
+	// callers persist the name the CP provisioned instead of re-deriving it.
+	// Empty (CP naming disabled, or external data store) is omitted.
+	if warehouse.DataStore.BucketName != "" {
+		resp["bucket"] = warehouse.DataStore.BucketName
+	}
+	c.JSON(http.StatusAccepted, resp)
 }
 
 func (h *handler) deprovisionWarehouse(c *gin.Context) {
@@ -358,6 +387,7 @@ func (h *handler) getWarehouseStatus(c *gin.Context) {
 		SecretsState:       warehouse.SecretsState,
 		ReadyAt:            warehouse.ReadyAt,
 		FailedAt:           warehouse.FailedAt,
+		Bucket:             warehouse.DataStore.BucketName,
 	}
 
 	if warehouse.State == configstore.ManagedWarehouseStateReady {
