@@ -28,16 +28,10 @@ func isUniqueViolation(err error) bool {
 }
 
 // ducklingOrgIDPattern constrains org IDs that get a provisioned warehouse to a
-// single DNS-1123 label (lowercase alphanumerics + hyphens, start/end
-// alphanumeric). This is the shape every derived name needs:
-//   - the SNI prefix <org>.<managed-suffix> is a single DNS label already;
-//   - the Duckling CR / IAM role / S3 bucket / Lakekeeper CR names use the org
-//     ID verbatim (lowercased), so it must be a valid k8s/AWS name;
-//   - the Postgres identifier maps any non-[a-z0-9_] char to '_', which is only
-//     injective when the source charset excludes everything but hyphens.
-//
-// Validating here keeps the org ID → resource-name mappings collision-free.
-var ducklingOrgIDPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+// canonical lowercase hyphenated UUID. The Crossplane composition may compact
+// this ID for bucket-specific names; the strict source shape keeps that
+// compaction collision-free.
+var ducklingOrgIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // Store defines the config store operations needed by the provisioning API.
 type Store interface {
@@ -183,7 +177,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	}
 
 	if !ducklingOrgIDPattern.MatchString(orgID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be a DNS-1123 label (lowercase alphanumerics and hyphens, starting and ending alphanumeric) so the derived resource names are valid and collision-free"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be a canonical lowercase hyphenated UUID so derived resource names are valid and collision-free"})
 		return
 	}
 

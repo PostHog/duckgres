@@ -233,21 +233,26 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		return
 	}
 
-	status, err := c.duckling.Get(ctx, w.OrgID)
+	provisioningStatus, err := c.duckling.GetProvisioningStatus(ctx, w.OrgID)
 	if err != nil {
 		log.Warn("Failed to get Duckling CR status.", "error", err)
 		return
 	}
+	status := provisioningStatus.DucklingStatus
 
 	// Check for Crossplane failure — only fail on persistent sync errors.
 	// Crossplane resources commonly flap Synced=False transiently (e.g., IAM
 	// eventual consistency, metadata-store endpoint DNS propagation), so we only transition
 	// to failed if 10+ minutes have passed, giving transient errors time to resolve.
-	if status.SyncedFalseMessage != "" && time.Since(startedAt) > 10*time.Minute {
-		log.Warn("Crossplane sync failure.", "message", status.SyncedFalseMessage)
+	if (status.SyncedFalseMessage != "" || provisioningStatus.DataStoreReadiness.Message != "") && time.Since(startedAt) > 10*time.Minute {
+		message := status.SyncedFalseMessage
+		if message == "" {
+			message = provisioningStatus.DataStoreReadiness.Message
+		}
+		log.Warn("Crossplane sync failure.", "message", message)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
-			"status_message": fmt.Sprintf("Crossplane error: %s", status.SyncedFalseMessage),
+			"status_message": fmt.Sprintf("Crossplane error: %s", message),
 			"failed_at":      time.Now().UTC(),
 		})
 		return
@@ -259,7 +264,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	// state transitions are stored in the config store.
 	updates := map[string]interface{}{}
 
-	if status.DataStore.BucketName != "" && w.S3State != configstore.ManagedWarehouseStateReady {
+	if provisioningStatus.DataStoreReadiness.Ready && w.S3State != configstore.ManagedWarehouseStateReady {
 		updates["s3_state"] = configstore.ManagedWarehouseStateReady
 	}
 
@@ -488,14 +493,10 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 	}
 
 	log.Info("Deleting Duckling CR.")
-	if err := c.duckling.Delete(ctx, w.OrgID); err != nil {
-		// Only proceed if the CR is already gone (NotFound). For other errors
-		// (network, RBAC, etc.) we retry on the next reconcile pass to avoid
-		// marking as deleted while AWS resources still exist.
-		if !apierrors.IsNotFound(err) {
-			log.Warn("Failed to delete Duckling CR, will retry.", "error", err)
-			return
-		}
+	gone, err := c.duckling.EnsureDeleted(ctx, w.OrgID)
+	if err != nil {
+		log.Warn("Failed to delete Duckling CR, will retry.", "error", err)
+		return
 	}
 
 	// Tear down the per-org Lakekeeper instance the control plane provisioned
@@ -513,6 +514,11 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 			log.Warn("Failed to tear down Lakekeeper resources, will retry.", "error", err)
 			return
 		}
+	}
+
+	if !gone {
+		log.Info("Duckling CR delete requested; waiting for Kubernetes finalizers to finish.")
+		return
 	}
 
 	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateDeleting, map[string]interface{}{

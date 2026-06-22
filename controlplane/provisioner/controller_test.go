@@ -12,9 +12,6 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
@@ -161,23 +158,6 @@ func (s *fakeStore) UpdateIcebergConfig(orgID string, updates map[string]interfa
 
 // Compile-time check that fakeStore satisfies WarehouseStore.
 var _ WarehouseStore = (*fakeStore)(nil)
-
-func newFakeDucklingClient() (*DucklingClient, *dynamicfake.FakeDynamicClient) {
-	scheme := runtime.NewScheme()
-	scheme.AddKnownTypeWithName(schema.GroupVersionKind{
-		Group:   "k8s.posthog.com",
-		Version: "v1alpha1",
-		Kind:    "Duckling",
-	}, &unstructured.Unstructured{})
-	scheme.AddKnownTypeWithName(schema.GroupVersionKind{
-		Group:   "k8s.posthog.com",
-		Version: "v1alpha1",
-		Kind:    "DucklingList",
-	}, &unstructured.UnstructuredList{})
-
-	fakeClient := dynamicfake.NewSimpleDynamicClient(scheme)
-	return NewDucklingClientWithDynamic(fakeClient), fakeClient
-}
 
 func TestReconcilePendingCreatesCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
@@ -520,6 +500,25 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	}
 
 	// Create a Duckling CR with all status fields populated
+	status := map[string]interface{}{
+		"metadataStore": map[string]interface{}{
+			"type":     "external",
+			"endpoint": "org-b.cluster.us-east-1.rds.amazonaws.com",
+			"password": "supersecret123",
+			"user":     "postgres",
+			"database": "postgres",
+		},
+		"dataStore": map[string]interface{}{
+			"type":       "s3bucket",
+			"bucketName": "org-b-bucket",
+		},
+		"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-b",
+		"conditions": []interface{}{
+			map[string]interface{}{"type": "Ready", "status": "True"},
+			map[string]interface{}{"type": "Synced", "status": "True"},
+		},
+	}
+	addS3BucketRef(status, "org-b-bucket")
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
@@ -528,34 +527,12 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 				"name":      ducklingName("org-b"),
 				"namespace": ducklingNamespace,
 			},
-			"status": map[string]interface{}{
-				"metadataStore": map[string]interface{}{
-					"type":     "external",
-					"endpoint": "org-b.cluster.us-east-1.rds.amazonaws.com",
-					"password": "supersecret123",
-					"user":     "postgres",
-					"database": "postgres",
-				},
-				"dataStore": map[string]interface{}{
-					"type":       "s3bucket",
-					"bucketName": "org-b-bucket",
-				},
-				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-b",
-				"conditions": []interface{}{
-					map[string]interface{}{
-						"type":   "Ready",
-						"status": "True",
-					},
-					map[string]interface{}{
-						"type":   "Synced",
-						"status": "True",
-					},
-				},
-			},
+			"status": status,
 		},
 	}
 
 	ctx := context.Background()
+	seedReadyS3Bucket(t, fakeK8s, ctx, "org-b-bucket")
 	_, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("failed to create test CR: %v", err)
@@ -604,6 +581,26 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 		CreatedAt: time.Now(),
 	}
 
+	status := map[string]interface{}{
+		"metadataStore": map[string]interface{}{
+			"type":              "external",
+			"endpoint":          "org-probe.cluster.us-east-1.rds.amazonaws.com",
+			"pgbouncerEndpoint": "pgbouncer-duckling-org-probe.ducklings.svc.cluster.local:6543",
+			"password":          "supersecret123",
+			"user":              "postgres",
+			"database":          "postgres",
+		},
+		"dataStore": map[string]interface{}{
+			"type":       "s3bucket",
+			"bucketName": "org-probe-bucket",
+		},
+		"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-probe",
+		"conditions": []interface{}{
+			map[string]interface{}{"type": "Ready", "status": "True"},
+			map[string]interface{}{"type": "Synced", "status": "True"},
+		},
+	}
+	addS3BucketRef(status, "org-probe-bucket")
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
@@ -612,29 +609,12 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 				"name":      ducklingName("org-probe"),
 				"namespace": ducklingNamespace,
 			},
-			"status": map[string]interface{}{
-				"metadataStore": map[string]interface{}{
-					"type":              "external",
-					"endpoint":          "org-probe.cluster.us-east-1.rds.amazonaws.com",
-					"pgbouncerEndpoint": "pgbouncer-duckling-org-probe.ducklings.svc.cluster.local:6543",
-					"password":          "supersecret123",
-					"user":              "postgres",
-					"database":          "postgres",
-				},
-				"dataStore": map[string]interface{}{
-					"type":       "s3bucket",
-					"bucketName": "org-probe-bucket",
-				},
-				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-probe",
-				"conditions": []interface{}{
-					map[string]interface{}{"type": "Ready", "status": "True"},
-					map[string]interface{}{"type": "Synced", "status": "True"},
-				},
-			},
+			"status": status,
 		},
 	}
 
 	ctx := context.Background()
+	seedReadyS3Bucket(t, fakeK8s, ctx, "org-probe-bucket")
 	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to create test CR: %v", err)
 	}
@@ -694,6 +674,23 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 		CreatedAt: time.Now(),
 	}
 
+	status := map[string]interface{}{
+		"metadataStore": map[string]interface{}{
+			"type":              "external",
+			"endpoint":          "org-pgb.cluster.us-east-1.rds.amazonaws.com",
+			"pgbouncerEndpoint": "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543",
+			"password":          "supersecret123",
+			"user":              "postgres",
+			"database":          "postgres",
+		},
+		"dataStore":  map[string]interface{}{"type": "s3bucket", "bucketName": "org-pgb-bucket"},
+		"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-pgb",
+		"conditions": []interface{}{
+			map[string]interface{}{"type": "Ready", "status": "True"},
+			map[string]interface{}{"type": "Synced", "status": "True"},
+		},
+	}
+	addS3BucketRef(status, "org-pgb-bucket")
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
@@ -702,26 +699,12 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 				"name":      ducklingName("org-pgb"),
 				"namespace": ducklingNamespace,
 			},
-			"status": map[string]interface{}{
-				"metadataStore": map[string]interface{}{
-					"type":              "external",
-					"endpoint":          "org-pgb.cluster.us-east-1.rds.amazonaws.com",
-					"pgbouncerEndpoint": "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543",
-					"password":          "supersecret123",
-					"user":              "postgres",
-					"database":          "postgres",
-				},
-				"dataStore":  map[string]interface{}{"type": "s3bucket", "bucketName": "org-pgb-bucket"},
-				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-pgb",
-				"conditions": []interface{}{
-					map[string]interface{}{"type": "Ready", "status": "True"},
-					map[string]interface{}{"type": "Synced", "status": "True"},
-				},
-			},
+			"status": status,
 		},
 	}
 
 	ctx := context.Background()
+	seedReadyS3Bucket(t, fakeK8s, ctx, "org-pgb-bucket")
 	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to create test CR: %v", err)
 	}
@@ -745,7 +728,7 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestReconcileDeletingDeletesCR(t *testing.T) {
+func TestReconcileDeletingWaitsForCRToDisappear(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-c"] = &configstore.ManagedWarehouse{
@@ -780,9 +763,13 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 		return
 	}
 
-	// Verify state transitioned to deleted
+	if fs.warehouses["org-c"].State != configstore.ManagedWarehouseStateDeleting {
+		t.Fatalf("expected deleting state after delete request, got %q", fs.warehouses["org-c"].State)
+	}
+
+	ctrl.reconcile(ctx)
 	if fs.warehouses["org-c"].State != configstore.ManagedWarehouseStateDeleted {
-		t.Fatalf("expected deleted state, got %q", fs.warehouses["org-c"].State)
+		t.Fatalf("expected deleted state after CR disappeared, got %q", fs.warehouses["org-c"].State)
 	}
 }
 
@@ -1042,6 +1029,25 @@ func TestReconcileProvisioningCnpgShardGatedOnIceberg(t *testing.T) {
 		},
 	}
 
+	status := map[string]interface{}{
+		"metadataStore": map[string]interface{}{
+			"type":     configstore.MetadataStoreKindCnpgShard,
+			"endpoint": "shard-001-pooler.cnpg-shards.svc.cluster.local",
+			"password": "from-provider-sql",
+			"user":     "lakekeeper_org_cs",
+			"database": "lakekeeper_org_cs",
+		},
+		"dataStore": map[string]interface{}{
+			"type":       "s3bucket",
+			"bucketName": "org-cs-bucket",
+		},
+		"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-cs",
+		"conditions": []interface{}{
+			map[string]interface{}{"type": "Ready", "status": "True"},
+			map[string]interface{}{"type": "Synced", "status": "True"},
+		},
+	}
+	addS3BucketRef(status, "org-cs-bucket")
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
@@ -1050,27 +1056,11 @@ func TestReconcileProvisioningCnpgShardGatedOnIceberg(t *testing.T) {
 				"name":      ducklingName("org-cs"),
 				"namespace": ducklingNamespace,
 			},
-			"status": map[string]interface{}{
-				"metadataStore": map[string]interface{}{
-					"type":     configstore.MetadataStoreKindCnpgShard,
-					"endpoint": "shard-001-pooler.cnpg-shards.svc.cluster.local",
-					"password": "from-provider-sql",
-					"user":     "lakekeeper_org_cs",
-					"database": "lakekeeper_org_cs",
-				},
-				"dataStore": map[string]interface{}{
-					"type":       "s3bucket",
-					"bucketName": "org-cs-bucket",
-				},
-				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-cs",
-				"conditions": []interface{}{
-					map[string]interface{}{"type": "Ready", "status": "True"},
-					map[string]interface{}{"type": "Synced", "status": "True"},
-				},
-			},
+			"status": status,
 		},
 	}
 	ctx := context.Background()
+	seedReadyS3Bucket(t, fakeK8s, ctx, "org-cs-bucket")
 	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create CR: %v", err)
 	}
@@ -1206,77 +1196,37 @@ func TestReconcilePendingCreatesDuckLakeExternalCR(t *testing.T) {
 	}
 }
 
-// TestDucklingCreateExternalRequiresFields verifies the Create guard: an
-// external CR is rejected without endpoint + passwordAwsSecret.
-func TestDucklingCreateExternalRequiresFields(t *testing.T) {
+func TestReconcileProvisioningDoesNotMarkS3ReadyWhenBucketRefNotReady(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
-	ctx := context.Background()
-	if err := dc.Create(ctx, "ext-bad", CreateOptions{MetadataStoreType: configstore.MetadataStoreKindExternal}); err == nil {
-		t.Fatal("expected error creating external CR without endpoint/passwordAwsSecret")
+	fs := newFakeStore()
+	fs.warehouses["org-bucket"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-bucket",
+		State:     configstore.ManagedWarehouseStateProvisioning,
+		CreatedAt: time.Now(),
 	}
-	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("ext-bad"), metav1.GetOptions{}); getErr == nil {
-		t.Error("CR should not have been created when external validation failed")
-	}
-}
-
-// TestDucklingCreateExternalDataStoreRequiresBucket verifies the dataStore
-// guard: an external dataStore needs a bucket name.
-func TestDucklingCreateExternalDataStoreRequiresBucket(t *testing.T) {
-	dc, _ := newFakeDucklingClient()
-	err := dc.Create(context.Background(), "ext-nobucket", CreateOptions{
-		MetadataStoreType:         configstore.MetadataStoreKindExternal,
-		ExternalEndpoint:          "h",
-		ExternalPasswordAWSSecret: "s",
-		DataStoreType:             "external",
-	})
-	if err == nil {
-		t.Fatal("expected error: external dataStore without a bucket name")
-	}
-}
-
-// TestDucklingGetFallsBackToLegacyName verifies the backward-compat path: a CR
-// created before ducklingName preserved hyphens (i.e. named with hyphens
-// stripped) is still found when looked up by its hyphenated org ID. Without
-// this, switching ducklingName to keep hyphens would orphan existing prod
-// ducklings whose org IDs contain hyphens (e.g. UUID-named tenants).
-func TestDucklingGetFallsBackToLegacyName(t *testing.T) {
-	dc, fakeK8s := newFakeDucklingClient()
 	ctx := context.Background()
 
-	org := "018d351a-9ff7-0000-eaff-4628875ad045"
-	legacy := legacyDucklingName(org) // "018d351a9ff70000eaff4628875ad045"
-	if ducklingName(org) == legacy {
-		t.Fatal("test premise: hyphenated org id must differ from its legacy de-hyphenated name")
-	}
-
-	// Seed a CR under the legacy (de-hyphenated) name, as the old code would have.
-	cr := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "k8s.posthog.com/v1alpha1",
-		"kind":       "Duckling",
-		"metadata":   map[string]interface{}{"name": legacy, "namespace": ducklingNamespace},
-		"status":     map[string]interface{}{"iamRoleArn": "arn:aws:iam::123:role/duckling-" + legacy},
-	}}
+	bucketName := "posthog-duckling-org-bucket-mw-prod-us"
+	status := readyDucklingStatus(bucketName)
+	addS3BucketRef(status, bucketName)
+	cr := ducklingCR(ducklingName("org-bucket"), status)
 	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed legacy CR: %v", err)
+		t.Fatalf("seed Duckling CR: %v", err)
+	}
+	if _, err := fakeK8s.Resource(s3BucketGVR).Create(ctx, bucketCR(bucketName, false, "InvalidBucketName"), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed Bucket CR: %v", err)
 	}
 
-	st, err := dc.Get(ctx, org)
-	if err != nil {
-		t.Fatalf("Get must fall back to the legacy de-hyphenated name, got: %v", err)
-	}
-	if st.IAMRoleARN == "" {
-		t.Error("expected to parse the legacy CR's status")
-	}
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
+	ctrl.reconcile(ctx)
 
-	// And iceberg/pgbouncer reads + delete must resolve it too.
-	if _, err := dc.GetIcebergEnabled(ctx, org); err != nil {
-		t.Errorf("GetIcebergEnabled fallback: %v", err)
+	w := fs.warehouses["org-bucket"]
+	if w.S3State == configstore.ManagedWarehouseStateReady {
+		t.Fatalf("s3_state should not be ready while Bucket is not ready")
 	}
-	if err := dc.Delete(ctx, org); err != nil {
-		t.Errorf("Delete fallback: %v", err)
-	}
-	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); getErr == nil {
-		t.Error("legacy CR should have been deleted via the fallback")
+	if w.State == configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse should not be ready while Bucket is not ready")
 	}
 }
 

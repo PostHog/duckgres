@@ -25,7 +25,44 @@ var ducklingGVR = schema.GroupVersionResource{
 	Resource: "ducklings",
 }
 
+var s3BucketGVR = schema.GroupVersionResource{
+	Group:    "s3.aws.upbound.io",
+	Version:  "v1beta1",
+	Resource: "buckets",
+}
+
 const ducklingNamespace = "ducklings"
+const statusField = "status"
+const specField = "spec"
+const crossplaneSpecField = "crossplane"
+const crossplaneResourceRefsField = "resourceRefs"
+const s3BucketAPIVersion = "s3.aws.upbound.io/v1beta1"
+const crossplaneBucketKind = "Bucket"
+
+var crossplaneResourceRefBlockPaths = [][]string{
+	{statusField},
+	{specField},
+	{specField, crossplaneSpecField},
+}
+
+type DataStoreReadinessSource string
+
+const (
+	DataStoreReadinessSourceDucklingStatus DataStoreReadinessSource = "duckling_status"
+	DataStoreReadinessSourceComposedBucket DataStoreReadinessSource = "composed_bucket"
+	DataStoreReadinessSourceComposedError  DataStoreReadinessSource = "composed_resource_error"
+)
+
+type DataStoreReadiness struct {
+	Ready   bool
+	Source  DataStoreReadinessSource
+	Message string
+}
+
+type DucklingProvisioningStatus struct {
+	*DucklingStatus
+	DataStoreReadiness DataStoreReadiness
+}
 
 // DucklingStatus holds the parsed status from a Duckling CR.
 // The Duckling composition provisions AWS infrastructure (S3, IAM) and the
@@ -87,16 +124,7 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 	return &DucklingClient{client: client}
 }
 
-// ducklingName is the k8s/AWS resource name derived from an org ID, used for
-// the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, the
-// Lakekeeper CR/SA/Secret, etc. Org IDs are validated as DNS-1123 labels at
-// provision time (lowercase alphanumerics + hyphens), so this only lowercases:
-// hyphens are preserved, keeping in-cluster names human-readable and injective
-// with the org ID.
-//
-// (It used to strip hyphens to keep per-org Aurora RDS cluster identifiers
-// short, but the control plane no longer provisions per-org Aurora clusters,
-// and stripping was lossy — "a-b" and "ab" collided.)
+// ducklingName is the Kubernetes Duckling CR name derived from an org ID.
 func ducklingName(orgID string) string {
 	return strings.ToLower(orgID)
 }
@@ -115,15 +143,6 @@ var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
 // [a-z0-9-], which the provision-time validation guarantees.
 func pgIdentSuffix(orgID string) string {
 	return pgIdentSanitizeRe.ReplaceAllString(strings.ToLower(orgID), "_")
-}
-
-// legacyDucklingName is the pre-hyphen-preservation transform (hyphens
-// stripped). Retained ONLY so lookups can still find Duckling CRs created
-// before ducklingName started preserving hyphens — e.g. a CR named
-// "018d351a9ff70000eaff4628875ad045" for org "018d351a-9ff7-0000-eaff-...".
-// New CRs are always created under ducklingName (hyphen-preserving).
-func legacyDucklingName(orgID string) string {
-	return strings.ReplaceAll(strings.ToLower(orgID), "-", "")
 }
 
 // CreateOptions carries per-org knobs that shape the generated Duckling CR.
@@ -270,23 +289,13 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	return nil
 }
 
-// getCR fetches the org's Duckling CR, trying the current hyphen-preserving
-// name first and falling back to the legacy de-hyphenated name for CRs created
-// before ducklingName preserved hyphens. Returns the CR and the name it was
-// found under (callers that mutate need the actual name). When neither exists,
-// returns the current-name NotFound error so callers see the new scheme.
+// getCR fetches the org's Duckling CR.
+// Returns the CR and the name it was found under (callers that mutate need the
+// actual name).
 func (d *DucklingClient) getCR(ctx context.Context, orgID string) (*unstructured.Unstructured, string, error) {
 	name := ducklingName(orgID)
 	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
-	if err == nil {
-		return cr, name, nil
-	}
-	if legacy := legacyDucklingName(orgID); legacy != name && apierrors.IsNotFound(err) {
-		if lcr, lerr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); lerr == nil {
-			return lcr, legacy, nil
-		}
-	}
-	return nil, name, err
+	return cr, name, err
 }
 
 // Get fetches the Duckling CR and parses its status.
@@ -298,8 +307,22 @@ func (d *DucklingClient) Get(ctx context.Context, orgID string) (*DucklingStatus
 	return parseDucklingStatus(cr)
 }
 
-// Delete removes the Duckling CR for the given org. Resolves the legacy name so
-// pre-rename CRs are still deletable.
+func (d *DucklingClient) GetProvisioningStatus(ctx context.Context, orgID string) (*DucklingProvisioningStatus, error) {
+	cr, name, err := d.getCR(ctx, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	status, err := parseDucklingStatus(cr)
+	if err != nil {
+		return nil, err
+	}
+	return &DucklingProvisioningStatus{
+		DucklingStatus:     status,
+		DataStoreReadiness: d.dataStoreReadiness(ctx, cr, status),
+	}, nil
+}
+
+// Delete removes the Duckling CR for the given org.
 func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
 	_, name, err := d.getCR(ctx, orgID)
 	if apierrors.IsNotFound(err) {
@@ -310,6 +333,23 @@ func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
 		return fmt.Errorf("delete duckling CR %q: %w", name, derr)
 	}
 	return nil
+}
+
+func (d *DucklingClient) EnsureDeleted(ctx context.Context, orgID string) (bool, error) {
+	_, name, err := d.getCR(ctx, orgID)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("resolve duckling CR for delete %q: %w", name, err)
+	}
+	if err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("delete duckling CR %q: %w", name, err)
+	}
+	return false, nil
 }
 
 // GetPgBouncerEnabled reads spec.metadataStore.pgbouncer.enabled from the
@@ -499,6 +539,101 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 	}
 
 	return ds, nil
+}
+
+func (d *DucklingClient) dataStoreReadiness(ctx context.Context, cr *unstructured.Unstructured, status *DucklingStatus) DataStoreReadiness {
+	if status == nil || status.DataStore.BucketName == "" {
+		return DataStoreReadiness{
+			Ready:   false,
+			Source:  DataStoreReadinessSourceDucklingStatus,
+			Message: "Duckling status does not include a data store bucket name",
+		}
+	}
+	if status.DataStore.Type == "external" {
+		return DataStoreReadiness{Ready: true, Source: DataStoreReadinessSourceDucklingStatus}
+	}
+	refName := bucketResourceRefName(cr)
+	if refName == "" {
+		return DataStoreReadiness{
+			Ready:   false,
+			Source:  DataStoreReadinessSourceDucklingStatus,
+			Message: "Duckling status has a bucket name but no composed Bucket resourceRef",
+		}
+	}
+	bucket, err := d.client.Resource(s3BucketGVR).Get(ctx, refName, metav1.GetOptions{})
+	if err != nil {
+		return DataStoreReadiness{
+			Ready:   false,
+			Source:  DataStoreReadinessSourceComposedError,
+			Message: fmt.Sprintf("read composed S3 bucket %q: %v", refName, err),
+		}
+	}
+	ready, message := crossplaneReady(bucket)
+	if !ready && message == "" {
+		message = fmt.Sprintf("S3 bucket %q is not ready", refName)
+	}
+	return DataStoreReadiness{Ready: ready, Source: DataStoreReadinessSourceComposedBucket, Message: message}
+}
+
+func bucketResourceRefName(cr *unstructured.Unstructured) string {
+	return composedResourceRefName(cr, s3BucketAPIVersion, crossplaneBucketKind)
+}
+
+func composedResourceRefName(cr *unstructured.Unstructured, apiVersion string, kind string) string {
+	for _, path := range crossplaneResourceRefBlockPaths {
+		block, ok, _ := unstructured.NestedMap(cr.Object, path...)
+		if !ok {
+			continue
+		}
+		if name := resourceRefNameFromBlock(block, apiVersion, kind); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func resourceRefNameFromBlock(block map[string]interface{}, apiVersion string, kind string) string {
+	refs, _ := block[crossplaneResourceRefsField].([]interface{})
+	for _, ref := range refs {
+		refMap, ok := ref.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if getNestedString(refMap, "apiVersion") == apiVersion && getNestedString(refMap, "kind") == kind {
+			return getNestedString(refMap, "name")
+		}
+	}
+	return ""
+}
+
+func crossplaneReady(obj *unstructured.Unstructured) (bool, string) {
+	status, ok := obj.Object["status"].(map[string]interface{})
+	if !ok {
+		return false, ""
+	}
+	conditions, _ := status["conditions"].([]interface{})
+	ready := false
+	var message string
+	for _, cond := range conditions {
+		condMap, ok := cond.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		condType := getNestedString(condMap, "type")
+		condStatus := getNestedString(condMap, "status")
+		if condType == "Ready" {
+			ready = condStatus == "True"
+			if !ready {
+				message = getNestedString(condMap, "message")
+			}
+		}
+		if condType == "Synced" && condStatus == "False" {
+			if syncMessage := getNestedString(condMap, "message"); syncMessage != "" {
+				message = syncMessage
+			}
+		}
+	}
+	return ready, message
 }
 
 func getNestedString(obj map[string]interface{}, key string) string {

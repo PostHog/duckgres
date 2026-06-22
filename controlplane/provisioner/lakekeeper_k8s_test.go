@@ -32,7 +32,6 @@ func newFakeLakekeeperClient() (*LakekeeperK8sClient, *dynamicfake.FakeDynamicCl
 }
 
 func TestLakekeeperResourceName(t *testing.T) {
-	// k8s resource names preserve hyphens (only lowercasing is applied).
 	cases := map[string]string{
 		"acme":                                 "lakekeeper-acme",
 		"019e417b-18c4-7a41":                   "lakekeeper-019e417b-18c4-7a41",
@@ -254,8 +253,8 @@ func TestEnsureCR_CreateAndShape(t *testing.T) {
 func TestPatchPodShape_LabelMatchedStripsLimits(t *testing.T) {
 	c, dc, _ := newFakeLakekeeperClient()
 	ctx := context.Background()
-	// Two CRs for one org under different names (legacy de-hyphenated + new
-	// hyphenated), both label-tagged; the first carries a stale limits block.
+	// Two CRs for one org under different historical names, both label-tagged;
+	// the first carries a stale limits block.
 	names := []string{"lakekeeper-acme", "lakekeeper-a-c-m-e"}
 	for i, name := range names {
 		spec := map[string]interface{}{"replicas": int64(1)}

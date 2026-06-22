@@ -119,7 +119,7 @@ kubectl --context "$TARGET_CONTEXT" get managed -A | grep "$CR_NAME" || true
 
 ## Legacy Hyphenated CRs
 
-Older Duckling CRs may have hyphens in `metadata.name`; current controller code strips hyphens for newer CRs to keep AWS resource names under length limits. If only the hyphenated CR exists, normal deprovisioning may miss it. For urgent cleanup, snapshot and delete the exact existing CR:
+UUID-shaped Duckling CRs may render compact dehyphenated bucket names so composed S3 buckets fit AWS length limits. Manual cleanup should still snapshot and delete the exact existing Duckling CR:
 
 ```bash
 kubectl --context "$TARGET_CONTEXT" -n ducklings get ducklings.k8s.posthog.com "$CR_NAME" -o yaml > "/tmp/$ORG-duckling.yaml"

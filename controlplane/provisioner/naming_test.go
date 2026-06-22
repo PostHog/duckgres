@@ -4,23 +4,17 @@ package provisioner
 
 import "testing"
 
-// TestDucklingNamePreservesHyphens locks in the post-fix behavior: k8s/AWS
-// resource names keep hyphens (only lowercasing is applied), and the transform
-// is injective — the regression being the old de-hyphenation where "a-b" and
-// "ab" both collapsed to "ab".
-func TestDucklingNamePreservesHyphens(t *testing.T) {
+func TestDucklingNamePreservesOrgID(t *testing.T) {
 	for in, want := range map[string]string{
 		"ben-iceberg-cnpg":                     "ben-iceberg-cnpg",
 		"Ben-Iceberg":                          "ben-iceberg",
 		"team123":                              "team123",
 		"f47ac10b-58cc-4372-a567-0e02b2c3d479": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+		"f47ac10b58cc4372a5670e02b2c3d479":     "f47ac10b58cc4372a5670e02b2c3d479",
 	} {
 		if got := ducklingName(in); got != want {
 			t.Errorf("ducklingName(%q) = %q, want %q", in, got, want)
 		}
-	}
-	if ducklingName("a-b") == ducklingName("ab") {
-		t.Error("ducklingName must not collide \"a-b\" with \"ab\" (the old de-hyphenation bug)")
 	}
 }
 
@@ -53,6 +47,19 @@ func TestLakekeeperNamesForHyphenatedOrg(t *testing.T) {
 		t.Errorf("lakekeeperWarehouseName = %q", got)
 	}
 	if got := oauthClientID(org); got != "duckling-ben-iceberg-external" {
+		t.Errorf("oauthClientID = %q", got)
+	}
+}
+
+func TestLakekeeperNamesPreserveUUIDHyphens(t *testing.T) {
+	const org = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+	if got := LakekeeperResourceName(org); got != "lakekeeper-f47ac10b-58cc-4372-a567-0e02b2c3d479" {
+		t.Errorf("LakekeeperResourceName = %q", got)
+	}
+	if got := lakekeeperWarehouseName(org); got != "org-f47ac10b-58cc-4372-a567-0e02b2c3d479" {
+		t.Errorf("lakekeeperWarehouseName = %q", got)
+	}
+	if got := oauthClientID(org); got != "duckling-f47ac10b-58cc-4372-a567-0e02b2c3d479" {
 		t.Errorf("oauthClientID = %q", got)
 	}
 }

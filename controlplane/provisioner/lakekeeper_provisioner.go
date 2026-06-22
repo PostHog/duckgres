@@ -354,9 +354,7 @@ func (p *LakekeeperProvisioner) buildCRSpec(w *configstore.ManagedWarehouse, in 
 // database / Secret / REST-warehouse pipeline and without resolving inputs.
 //
 // It matches CRs by the duckgres/active-org label rather than recomputing the
-// name, so it patches whatever CR actually exists — important because a legacy
-// org's CR keeps the de-hyphenated name (derived from the no-hyphen Duckling XR)
-// while LakekeeperResourceName now preserves hyphens. See
+// name, so it patches whatever CR actually exists. See
 // LakekeeperK8sClient.PatchPodShape for the merge-patch (conflict-free) details.
 func (p *LakekeeperProvisioner) PatchPodShape(ctx context.Context, orgID string) error {
 	return p.k8s.PatchPodShape(ctx, orgID)
@@ -532,8 +530,8 @@ func lakekeeperDBName(orgID string) string {
 	return "lakekeeper_" + pgIdentSuffix(orgID)
 }
 
-// lakekeeperWarehouseName and oauthClientID are free-form strings (the Iceberg
-// REST warehouse name and the OAuth2 client_id), so they preserve hyphens.
+// lakekeeperWarehouseName and oauthClientID preserve the org ID suffix used by
+// the Lakekeeper CR/Secret/SA.
 func lakekeeperWarehouseName(orgID string) string {
 	return "org-" + ducklingName(orgID)
 }

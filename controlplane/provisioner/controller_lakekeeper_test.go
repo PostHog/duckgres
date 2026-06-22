@@ -117,14 +117,14 @@ func TestReconcileLakekeeper_DriftCorrectsWhenAlreadyProvisioned(t *testing.T) {
 	k8sClient, dyn, _ := newFakeLakekeeperClient()
 	p := NewLakekeeperProvisioner(newFakeStore(), k8sClient)
 
-	// Seed a legacy-named CR carrying the org label. Its name intentionally
-	// differs from LakekeeperResourceName("acme") to prove the patch is matched
-	// by label, not by a recomputed name (the post-#632 hyphenation bug).
+	// Seed an existing CR carrying the org label. Its name intentionally differs
+	// from LakekeeperResourceName("acme") to prove the patch is matched by label,
+	// not by a recomputed name.
 	seed := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "lakekeeper.k8s.lakekeeper.io/v1alpha1",
 		"kind":       "Lakekeeper",
 		"metadata": map[string]interface{}{
-			"name":      "lakekeeper-acme-legacy",
+			"name":      "lakekeeper-acme-existing",
 			"namespace": k8sClient.namespace,
 			"labels":    map[string]interface{}{"duckgres/active-org": "acme"},
 		},
@@ -156,8 +156,8 @@ func TestReconcileLakekeeper_DriftCorrectsWhenAlreadyProvisioned(t *testing.T) {
 	if called {
 		t.Errorf("inputs resolver should NOT be called for pod-shape drift correction")
 	}
-	// The existing legacy-named CR was patched in place by label.
-	got, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), "lakekeeper-acme-legacy", metav1.GetOptions{})
+	// The existing differently named CR was patched in place by label.
+	got, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(context.Background(), "lakekeeper-acme-existing", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get patched CR: %v", err)
 	}
