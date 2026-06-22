@@ -145,7 +145,16 @@ k() { "$KUBECTL" -n "$NS" "$@"; }
 
 api_post() { curl -fsS -X POST -H "$H" "$API/api/v1/orgs/$1/$2"; }
 api_get()  { curl -fsS -H "$H" "$API/api/v1/orgs/$1/$2"; }
-state_of() { api_get "$1" warehouse/status 2>/dev/null | jq -r '.state // "missing"'; }
+state_of() {
+  org="$1"
+  tmp="/tmp/duckgres-status-$org.json"
+  code="$(curl -sS -o "$tmp" -w '%{http_code}' -H "$H" "$API/api/v1/orgs/$org/warehouse/status" 2>/dev/null || true)"
+  case "$code" in
+    200) jq -r '.state // "missing"' "$tmp" ;;
+    404) echo missing ;;
+    *) echo "http_$code" ;;
+  esac
+}
 
 provision() { # org metadata_json
   log "provision $1"
@@ -1293,10 +1302,10 @@ tenant_isolation() { # orgA pwA orgB pwB
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
-# ---- lifecycle: deprovision → warehouse deleted → Duckling CR fully gone ----
-# Proves the teardown path works end to end: warehouse marked deleted, the
-# Crossplane Duckling CR removed, and its finalizer cascade (which drops the
-# cnpg lakekeeper_<org> role+db) completed.
+# ---- lifecycle: deprovision → config row removed → Duckling CR fully gone ----
+# Proves the teardown path works end to end: warehouse config removed after the
+# Crossplane Duckling CR is deleted, and the CR finalizer cascade (which drops
+# the cnpg lakekeeper_<org> role+db) completed.
 #
 # NOTE: same-org-id *re-provision* in the SAME run is intentionally NOT done
 # here. It is the regression net for the stranded-cnpg-role bugs
@@ -1313,7 +1322,7 @@ tenant_isolation() { # orgA pwA orgB pwB
 lifecycle_teardown_cnpg() { # org
   log "lifecycle: deprovision $1 + assert Duckling CR fully deleted"
   api_post "$1" deprovision >/dev/null
-  wait_state "$1" deleted 600
+  wait_state "$1" missing 600
   if ! "$KUBECTL" -n ducklings wait --for=delete "duckling/$1" --timeout=420s >/dev/null 2>&1; then
     fail "Duckling CR $1 did not fully delete within 420s (finalizer/cnpg cascade stuck)"
   fi

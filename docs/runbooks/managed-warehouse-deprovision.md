@@ -1,6 +1,6 @@
 # Runbook: Managed Warehouse Deprovision
 
-Use this runbook to delete a managed warehouse and then remove the org from the control-plane config store. This is destructive: confirm the org ID, cluster, AWS account, and data-retention expectations before starting.
+Use this runbook to delete a managed warehouse and verify the org has been removed from the control-plane config store. This is destructive: confirm the org ID, cluster, AWS account, and data-retention expectations before starting.
 
 ## Setup
 
@@ -98,7 +98,16 @@ while true; do
 done
 ```
 
-5. Delete the org row only after the Duckling CR and managed resources are gone.
+5. Verify the org row was removed after the Duckling CR and managed resources are gone.
+
+```bash
+curl -sS "$API_BASE/api/v1/orgs" \
+  -H "X-Duckgres-Internal-Secret: $DUCKGRES_INTERNAL_SECRET" \
+  | jq -r '.[] | [.name, .database_name] | @tsv' \
+  | grep -F "$ORG" || echo "org row removed"
+```
+
+If the org row is still present after resource cleanup is complete, remove it manually:
 
 ```bash
 curl -sS -X DELETE "$API_BASE/api/v1/orgs/$ORG" \
@@ -111,7 +120,8 @@ curl -sS -X DELETE "$API_BASE/api/v1/orgs/$ORG" \
 ```bash
 curl -sS "$API_BASE/api/v1/orgs" \
   -H "X-Duckgres-Internal-Secret: $DUCKGRES_INTERNAL_SECRET" \
-  | jq -r '.[] | [.name, .database_name] | @tsv'
+  | jq -r '.[] | [.name, .database_name] | @tsv' \
+  | grep -F "$ORG" || echo "org row removed"
 
 kubectl --context "$TARGET_CONTEXT" -n ducklings get ducklings.k8s.posthog.com "$CR_NAME" || true
 kubectl --context "$TARGET_CONTEXT" get managed -A | grep "$CR_NAME" || true
