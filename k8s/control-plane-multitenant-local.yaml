@@ -38,6 +38,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: DUCKGRES_K8S_WORKER_CPU_REQUEST
+              value: "500m"
+            - name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST
+              value: "512Mi"
           args:
             - "--mode"
             - "control-plane"
