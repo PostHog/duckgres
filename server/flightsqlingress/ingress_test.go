@@ -2,10 +2,12 @@ package flightsqlingress
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,10 +18,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/tlscert"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -43,6 +47,19 @@ type serializingRecoveryFlightExecutor struct {
 type testStatementUpdate struct {
 	query         string
 	transactionID []byte
+}
+
+type captureSNIValidator struct {
+	sni string
+}
+
+func (v *captureSNIValidator) ValidateCredentials(username, password string) bool {
+	return false
+}
+
+func (v *captureSNIValidator) ValidateCredentialsForSNI(sni, username, password string) bool {
+	v.sni = sni
+	return false
 }
 
 func (u testStatementUpdate) GetQuery() string {
@@ -221,6 +238,65 @@ func (s *testServerTransportStream) SetTrailer(md metadata.MD) error {
 
 func (r testExecResult) RowsAffected() (int64, error) {
 	return r.affected, r.err
+}
+
+func outgoingAuthContext(username, password string) context.Context {
+	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	return metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Basic "+token))
+}
+
+func TestFlightIngressPassesClientSNIToValidator(t *testing.T) {
+	certFile := filepath.Join(t.TempDir(), "server.crt")
+	keyFile := filepath.Join(t.TempDir(), "server.key")
+	if err := tlscert.GenerateSelfSignedCert(certFile, keyFile); err != nil {
+		t.Fatalf("generate test certificate: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("load test certificate: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	validator := &captureSNIValidator{}
+	ingress, err := NewFlightIngressFromListener(
+		listener,
+		&tls.Config{Certificates: []tls.Certificate{cert}},
+		validator,
+		&testDurableSessionProvider{},
+		Config{},
+		Options{},
+	)
+	if err != nil {
+		t.Fatalf("create flight ingress: %v", err)
+	}
+	ingress.Start()
+	defer ingress.Shutdown()
+
+	const wantSNI = "tenant.dw.test.local"
+	client, err := flightsql.NewClient(
+		listener.Addr().String(),
+		nil,
+		nil,
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         wantSNI,
+		})),
+	)
+	if err != nil {
+		t.Fatalf("create Flight SQL client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	_, err = client.GetTables(outgoingAuthContext("postgres", "postgres"), &flightsql.GetTablesOpts{})
+	if err == nil {
+		t.Fatalf("expected auth failure from capture validator")
+	}
+	if validator.sni != wantSNI {
+		t.Fatalf("validator saw SNI %q, want %q", validator.sni, wantSNI)
+	}
 }
 
 func metricCounterValue(t *testing.T, metricName string) float64 {
