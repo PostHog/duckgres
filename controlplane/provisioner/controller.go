@@ -69,6 +69,13 @@ type Controller struct {
 	// Lakekeeper path), reconcileLakekeeper is skipped silently.
 	lakekeeperProvisioner *LakekeeperProvisioner
 	lakekeeperInputs      LakekeeperInputsResolver
+
+	// bucketSuffix is the env suffix for CP-owned s3bucket naming
+	// (DUCKGRES_DUCKLING_BUCKET_SUFFIX, e.g. "mw-prod-us"). When set, the
+	// controller backfills spec.dataStore.bucketName onto ready s3bucket
+	// ducklings that predate CP-owned naming. Empty ⇒ backfill is a no-op and
+	// the composition keeps deriving the name.
+	bucketSuffix string
 }
 
 // LakekeeperInputsResolver is the function shape the controller uses to
@@ -125,6 +132,15 @@ func (c *Controller) WithLakekeeperProvisioner(p *LakekeeperProvisioner, inputs 
 	}
 	c.lakekeeperProvisioner = p
 	c.lakekeeperInputs = inputs
+	return c
+}
+
+// WithBucketSuffix sets the env suffix used to compute and backfill the
+// CP-owned per-org s3bucket name onto existing ready ducklings. Empty leaves
+// backfill disabled (composition keeps deriving). Returns the controller for
+// chaining.
+func (c *Controller) WithBucketSuffix(suffix string) *Controller {
+	c.bucketSuffix = suffix
 	return c
 }
 
@@ -440,10 +456,71 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 		}
 	}
 
+	// Backfill the CP-owned s3bucket name onto ducklings provisioned before the
+	// control plane started supplying it (spec.dataStore carries only
+	// {type: s3bucket}). The name computed here is exactly what the composition
+	// has been deriving into status, so the patch moves it from a derived output
+	// into a durable input without changing the actual bucket. No-op once set.
+	c.reconcileBucketName(ctx, w, log)
+
 	// Lakekeeper reconcile is independent of the Duckling state machine —
 	// provisioning a Lakekeeper for an org doesn't depend on, and doesn't
 	// block, the warehouse top-level state.
 	c.reconcileLakekeeper(ctx, w)
+}
+
+// reconcileBucketName backfills spec.dataStore.bucketName (and the config-store
+// row) with the control-plane-owned per-org bucket name for ready s3bucket
+// ducklings. Idempotent and self-limiting: a no-op when no suffix is
+// configured, when the data store isn't s3bucket, or once the CR already
+// carries the (matching) name. Never overwrites a CR that already has a
+// DIFFERENT explicit name — that would be an operator-set override we must not
+// stomp.
+func (c *Controller) reconcileBucketName(ctx context.Context, w *configstore.ManagedWarehouse, log *slog.Logger) {
+	if c.bucketSuffix == "" {
+		return
+	}
+	// Empty Kind is the historical default for the s3bucket path; "external"
+	// carries its own bucket name and must be left alone.
+	if w.DataStore.Kind != "" && w.DataStore.Kind != "s3bucket" {
+		return
+	}
+	desired := configstore.DucklingBucketName(w.OrgID, c.bucketSuffix)
+	if desired == "" {
+		return
+	}
+
+	current, err := c.duckling.GetDataStoreBucketName(ctx, w.OrgID)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		log.Warn("Failed to read Duckling CR dataStore.bucketName for backfill.", "error", err)
+		return
+	}
+	if current != "" && current != desired {
+		log.Warn("Duckling CR dataStore.bucketName differs from the computed name; leaving it.",
+			"cr", current, "computed", desired)
+		return
+	}
+
+	if current == "" {
+		log.Info("Backfilling CP-owned bucket name onto Duckling CR.", "bucket", desired)
+		if err := c.duckling.SetDataStoreBucketName(ctx, w.OrgID, desired); err != nil {
+			log.Warn("Failed to patch Duckling CR dataStore.bucketName.", "error", err)
+			return
+		}
+	}
+
+	// Mirror the authoritative name onto the config-store row so the provision
+	// response and warehouse status surface it without re-deriving.
+	if w.DataStore.BucketName != desired {
+		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateReady, map[string]interface{}{
+			"data_store_bucket_name": desired,
+		}); err != nil {
+			log.Warn("Failed to persist dataStore bucket name to config store.", "error", err)
+		}
+	}
 }
 
 // reconcileLakekeeper provisions a per-org Lakekeeper instance when the

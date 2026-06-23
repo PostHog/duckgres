@@ -104,6 +104,16 @@ type ControlPlaneConfig struct {
 	// resolves to the same org as the managed hostname.
 	ManagedHostnameSuffixes []string
 
+	// DucklingBucketSuffix is the env suffix the control plane uses to name a
+	// type=s3bucket Duckling's per-org S3 bucket
+	// (posthog-duckling-<compact-org>-<suffix>). It MUST equal the
+	// crossplane-config chart's envSuffix for this environment so the name the
+	// CP writes onto the Duckling CR's spec.dataStore.bucketName is exactly what
+	// the composition provisions. Empty ⇒ the CP does not name buckets and the
+	// composition derives the name (legacy behavior). See
+	// configstore.DucklingBucketName.
+	DucklingBucketSuffix string
+
 	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
 	// used for migration checks when an org doesn't specify an override.
 	DuckLakeDefaultSpecVersion string

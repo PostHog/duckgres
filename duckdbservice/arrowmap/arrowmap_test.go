@@ -83,15 +83,19 @@ func TestDuckDBTypeToArrow(t *testing.T) {
 
 		// Time
 		{"TIME", arrow.FixedWidthTypes.Time64us},
+		{"TIME WITHOUT TIME ZONE", arrow.FixedWidthTypes.Time64us},
 		{"TIMETZ", arrow.FixedWidthTypes.Time64us},
+		{"TIME WITH TIME ZONE", arrow.FixedWidthTypes.Time64us},
 
 		// Timestamps — plain TIMESTAMP must NOT have timezone
 		{"TIMESTAMP", &arrow.TimestampType{Unit: arrow.Microsecond}},
+		{"TIMESTAMP WITHOUT TIME ZONE", &arrow.TimestampType{Unit: arrow.Microsecond}},
 		{"TIMESTAMP_S", &arrow.TimestampType{Unit: arrow.Second}},
 		{"TIMESTAMP_MS", &arrow.TimestampType{Unit: arrow.Millisecond}},
 		{"TIMESTAMP_NS", &arrow.TimestampType{Unit: arrow.Nanosecond}},
 		// TIMESTAMPTZ must have UTC timezone
 		{"TIMESTAMPTZ", &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
+		{"TIMESTAMP WITH TIME ZONE", &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
 
 		// Interval
 		{"INTERVAL", arrow.FixedWidthTypes.MonthDayNanoInterval},
