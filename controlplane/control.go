@@ -1071,7 +1071,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	if orgProfileApplied && workerProfile != nil {
 		// Once per connection so support can see which shape a tenant got.
-		clog.Info("Applied org default worker profile.", 			"cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
+		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
 
 	// Resolve the session manager and rebalancer for this connection.
@@ -1693,8 +1693,8 @@ func (cp *ControlPlane) healthReady() bool {
 }
 
 func (cp *ControlPlane) stopQueryLogger() {
-	if cp.srv != nil && cp.srv.QueryLogger() != nil {
-		cp.srv.QueryLogger().Stop()
+	if cp.srv != nil {
+		cp.srv.StopQueryLogging()
 	}
 }
 

@@ -250,6 +250,64 @@ func SetupMultiTenant(
 		bootIDHex,
 		5*time.Second,
 	)
+	queryLogActivator := NewSharedWorkerActivator(
+		router.sharedPool,
+		stsBroker,
+		cfg.DuckLakeDefaultSpecVersion,
+		func(orgID string) (*configstore.OrgConfig, error) {
+			snap := store.Snapshot()
+			if snap == nil {
+				return nil, fmt.Errorf("config snapshot unavailable for org %s", orgID)
+			}
+			org, ok := snap.Orgs[orgID]
+			if !ok {
+				return nil, fmt.Errorf("org %s not found in config snapshot", orgID)
+			}
+			return org, nil
+		},
+	)
+	var queryLogManager *tenantQueryLogManager
+	if queryLogActivator != nil {
+		queryLogActivator.resolveDucklingStatus = resolveDucklingStatus
+		queryLogManager = newTenantQueryLogManager(
+			cfg.Config,
+			func() configstore.QueryLogConfig {
+				snap := store.Snapshot()
+				if snap == nil {
+					return configstore.QueryLogConfig{}
+				}
+				return snap.QueryLog
+			},
+			func() []string {
+				snap := store.Snapshot()
+				if snap == nil {
+					return nil
+				}
+				orgIDs := make([]string, 0, len(snap.Orgs))
+				for orgID, org := range snap.Orgs {
+					if org != nil && org.Warehouse != nil && org.Warehouse.State == configstore.ManagedWarehouseStateReady {
+						orgIDs = append(orgIDs, orgID)
+					}
+				}
+				return orgIDs
+			},
+			func(ctx context.Context, orgID string) (tenantQueryLogRuntime, error) {
+				org, err := queryLogActivator.lookupOrgConfig(orgID)
+				if err != nil {
+					return tenantQueryLogRuntime{}, err
+				}
+				payload, err := queryLogActivator.BuildActivationRequest(ctx, org, &WorkerAssignment{OrgID: orgID})
+				if err != nil {
+					return tenantQueryLogRuntime{}, err
+				}
+				return tenantQueryLogRuntime{
+					DuckLake:  payload.DuckLake,
+					ExpiresAt: payload.S3CredentialsExpiresAt,
+				}, nil
+			},
+		)
+		server.SetQueryLogProvider(srv, queryLogManager)
+	}
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
 	janitor.hotIdleTTL = effectiveDefaultWorkerTTL(cfg.K8s.WorkerDefaultTTL)
@@ -281,6 +339,9 @@ func SetupMultiTenant(
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
+	}
+	if queryLogManager != nil {
+		janitor.queryLogRetention = queryLogManager.RunRetention
 	}
 	janitor.cleanupOrphanedWorkerPods = func() {
 		// Pods and secrets each get their own 30s deadline so a slow

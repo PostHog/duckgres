@@ -361,8 +361,11 @@ type Server struct {
 	connsMu sync.RWMutex
 	conns   map[int32]*clientConn
 
-	// Query logger for DuckLake system.query_log
-	queryLogger *QueryLogger
+	// Query logger for DuckLake system.query_log. Standalone/single-tenant
+	// processes use queryLogger; multitenant control planes install a provider
+	// that selects the tenant logger by org.
+	queryLogger         *QueryLogger
+	queryLoggerProvider QueryLogProvider
 
 	// Per-user shared DB pool for file persistence mode.
 	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
@@ -593,10 +596,8 @@ func (s *Server) Close() error {
 		}
 	}
 
-	// Stop query logger (drains remaining entries)
-	if s.queryLogger != nil {
-		s.queryLogger.Stop()
-	}
+	// Stop query logging (drains remaining entries)
+	s.StopQueryLogging()
 
 	// Stop DuckLake checkpoint scheduler
 	if s.checkpointer != nil {

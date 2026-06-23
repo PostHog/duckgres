@@ -21,7 +21,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 
 	requireGooseMigrationRecorded(t, db, 1)
 	requireGooseMigrationRecorded(t, db, 3)
-	requireGooseLatestVersion(t, db, 3)
+	requireGooseMigrationRecorded(t, db, 4)
+	requireGooseLatestVersion(t, db, 4)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	var columnCount int
@@ -36,6 +37,22 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	}
 	if columnCount != 1 {
 		t.Fatalf("default_worker_min_hot_idle column count = %d, want 1", columnCount)
+	}
+
+	for _, columnName := range []string{"retention_period_s", "retention_interval_s"} {
+		var queryLogColumnCount int
+		if err := store.DB().Raw(`
+			SELECT COUNT(*)
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = 'duckgres_query_log_config'
+			  AND column_name = ?
+		`, columnName).Scan(&queryLogColumnCount).Error; err != nil {
+			t.Fatalf("query %s column: %v", columnName, err)
+		}
+		if queryLogColumnCount != 1 {
+			t.Fatalf("%s column count = %d, want 1", columnName, queryLogColumnCount)
+		}
 	}
 }
 

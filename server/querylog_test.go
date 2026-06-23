@@ -664,3 +664,187 @@ func TestLogQueryCopiesProfilingSummaryToQueryLogEntry(t *testing.T) {
 		t.Fatalf("expected profiling summary to be reset, got %#v", c.lastProfilingSummary)
 	}
 }
+
+type captureQueryLogSink struct {
+	ch chan QueryLogEntry
+}
+
+func (s *captureQueryLogSink) Log(entry QueryLogEntry) {
+	s.ch <- entry
+}
+
+type captureQueryLogProvider struct {
+	orgID string
+	sink  *captureQueryLogSink
+}
+
+func (p *captureQueryLogProvider) QueryLogSinkForOrg(orgID string) QueryLogSink {
+	p.orgID = orgID
+	return p.sink
+}
+
+func TestLogQueryUsesProviderWhenInstalled(t *testing.T) {
+	c, globalQL, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+
+	providerSink := &captureQueryLogSink{ch: make(chan QueryLogEntry, 1)}
+	provider := &captureQueryLogProvider{sink: providerSink}
+	SetQueryLogProvider(c.server, provider)
+	c.orgID = "org-a"
+	c.username = "alice"
+
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+
+	select {
+	case entry := <-providerSink.ch:
+		if entry.OrgID != "org-a" {
+			t.Fatalf("expected provider entry org_id org-a, got %q", entry.OrgID)
+		}
+		if entry.UserName != "alice" {
+			t.Fatalf("expected provider entry user_name alice, got %q", entry.UserName)
+		}
+	default:
+		t.Fatal("expected query log entry through provider")
+	}
+
+	select {
+	case entry := <-globalQL.ch:
+		t.Fatalf("expected provider to replace global query logger, got global entry %#v", entry)
+	default:
+	}
+	if provider.orgID != "org-a" {
+		t.Fatalf("expected provider lookup for org-a, got %q", provider.orgID)
+	}
+}
+
+type typedNilQueryLogProvider struct{}
+
+func (p typedNilQueryLogProvider) QueryLogSinkForOrg(string) QueryLogSink {
+	var ql *QueryLogger
+	return ql
+}
+
+func TestQueryLogSinkTreatsTypedNilProviderResultAsNil(t *testing.T) {
+	srv := &Server{queryLoggerProvider: typedNilQueryLogProvider{}}
+	if sink := srv.queryLogSink("org-a"); sink != nil {
+		t.Fatalf("expected typed nil provider result to normalize to nil, got %#v", sink)
+	}
+}
+
+type nilQueryLogProvider struct{}
+
+func (p nilQueryLogProvider) QueryLogSinkForOrg(string) QueryLogSink {
+	return nil
+}
+
+func TestLogQueryClearsProfilingSummaryWhenProviderHasNoSink(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+
+	SetQueryLogProvider(c.server, nilQueryLogProvider{})
+	c.lastProfilingSummary = observe.QueryProfilingSummary{
+		CPUTimeSeconds:        2.75,
+		PeakBufferMemoryBytes: 8192,
+		PostgresScanSeconds:   0.456,
+	}
+
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+
+	if c.lastProfilingSummary != (observe.QueryProfilingSummary{}) {
+		t.Fatalf("expected profiling summary to be reset, got %#v", c.lastProfilingSummary)
+	}
+}
+
+type countingQueryLogProvider struct {
+	calls int
+}
+
+func (p *countingQueryLogProvider) QueryLogSinkForOrg(string) QueryLogSink {
+	p.calls++
+	return nil
+}
+
+func TestLogQuerySkipsProviderForSelfReferentialQuery(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+
+	provider := &countingQueryLogProvider{}
+	SetQueryLogProvider(c.server, provider)
+	c.lastProfilingSummary = observe.QueryProfilingSummary{CPUTimeSeconds: 1.25}
+
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT * FROM ducklake.system.query_log", "", "SELECT", 1, 0, "", "", "simple")
+
+	if provider.calls != 0 {
+		t.Fatalf("expected self-referential query to skip provider lookup, got %d calls", provider.calls)
+	}
+	if c.lastProfilingSummary != (observe.QueryProfilingSummary{}) {
+		t.Fatalf("expected profiling summary to be reset, got %#v", c.lastProfilingSummary)
+	}
+}
+
+func TestConfigureQueryLoggerDBPinsSingleConnection(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	configureQueryLoggerDB(db)
+
+	stats := db.Stats()
+	if stats.MaxOpenConnections != 1 {
+		t.Fatalf("expected query logger DB to be pinned to 1 connection, got %d", stats.MaxOpenConnections)
+	}
+}
+
+func TestQueryLoggerDeleteBeforeScopesToOrgAndLegacyRows(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
+		t.Fatalf("ensureQueryLogTable: %v", err)
+	}
+
+	old := time.Unix(1700000000, 0).UTC()
+	newer := old.Add(2 * time.Hour)
+	rows := []struct {
+		query string
+		orgID *string
+		when  time.Time
+	}{
+		{query: "old org", orgID: stringPtr("org-a"), when: old},
+		{query: "old legacy null", orgID: nil, when: old},
+		{query: "old other org", orgID: stringPtr("org-b"), when: old},
+		{query: "new org", orgID: stringPtr("org-a"), when: newer},
+	}
+	for _, row := range rows {
+		if _, err := db.Exec(`INSERT INTO query_log (event_time, query_duration_ms, type, query, user_name, org_id)
+			VALUES ($1, 1, 'QueryFinish', $2, 'alice', $3)`, row.when, row.query, row.orgID); err != nil {
+			t.Fatalf("insert %q: %v", row.query, err)
+		}
+	}
+
+	ql := &QueryLogger{db: db, table: "query_log"}
+	deleted, err := ql.DeleteBefore(old.Add(time.Hour), "org-a")
+	if err != nil {
+		t.Fatalf("DeleteBefore: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 deleted rows, got %d", deleted)
+	}
+
+	var remaining int
+	if err := db.QueryRow("SELECT COUNT(*) FROM query_log").Scan(&remaining); err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if remaining != 2 {
+		t.Fatalf("expected 2 remaining rows, got %d", remaining)
+	}
+}
+
+func stringPtr(s string) *string {
+	return &s
+}

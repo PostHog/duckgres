@@ -436,6 +436,8 @@ CREATE TABLE IF NOT EXISTS duckgres_query_log_config (
     batch_size BIGINT DEFAULT 0,
     compact_interval_s BIGINT DEFAULT 0,
     data_inlining_row_limit BIGINT DEFAULT 0,
+    retention_period_s BIGINT DEFAULT 0,
+    retention_interval_s BIGINT DEFAULT 0,
     updated_at TIMESTAMPTZ
 );
 
@@ -444,4 +446,6 @@ ALTER TABLE duckgres_query_log_config ADD COLUMN IF NOT EXISTS flush_interval_s 
 ALTER TABLE duckgres_query_log_config ADD COLUMN IF NOT EXISTS batch_size BIGINT DEFAULT 0;
 ALTER TABLE duckgres_query_log_config ADD COLUMN IF NOT EXISTS compact_interval_s BIGINT DEFAULT 0;
 ALTER TABLE duckgres_query_log_config ADD COLUMN IF NOT EXISTS data_inlining_row_limit BIGINT DEFAULT 0;
+ALTER TABLE duckgres_query_log_config ADD COLUMN IF NOT EXISTS retention_period_s BIGINT DEFAULT 0;
+ALTER TABLE duckgres_query_log_config ADD COLUMN IF NOT EXISTS retention_interval_s BIGINT DEFAULT 0;
 ALTER TABLE duckgres_query_log_config ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;

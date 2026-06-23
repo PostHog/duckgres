@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -67,6 +68,18 @@ type QueryLogger struct {
 	stopOnce sync.Once
 }
 
+// QueryLogSink is implemented by types that can accept query log entries.
+type QueryLogSink interface {
+	Log(QueryLogEntry)
+}
+
+// QueryLogProvider selects a query-log sink for an org. Multitenant control
+// planes use this to route each connection to the org's DuckLake-backed
+// system.query_log table.
+type QueryLogProvider interface {
+	QueryLogSinkForOrg(orgID string) QueryLogSink
+}
+
 const (
 	queryLogChannelSize = 10000
 	maxQueryLength      = 4096
@@ -75,7 +88,26 @@ const (
 // NewQueryLogger opens a dedicated :memory: DuckDB, attaches DuckLake,
 // creates the system.query_log table, and starts the background flush goroutine.
 func NewQueryLogger(cfg Config) (*QueryLogger, error) {
-	if !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
+	if !cfg.QueryLog.Enabled {
+		return nil, nil
+	}
+	if cfg.DuckLake.MetadataStore == "" {
+		slog.Info("querylog: enabled but DuckLake metadata store is empty; skipping startup query logger.")
+		return nil, nil
+	}
+	return NewQueryLoggerForDuckLake(cfg, cfg.DuckLake)
+}
+
+func configureQueryLoggerDB(db *sql.DB) {
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+}
+
+// NewQueryLoggerForDuckLake is NewQueryLogger with an explicit DuckLake
+// runtime. Multitenant control planes call this with the tenant DuckLake config
+// resolved at activation time instead of the legacy process-global config.
+func NewQueryLoggerForDuckLake(cfg Config, dlCfg DuckLakeConfig) (*QueryLogger, error) {
+	if !cfg.QueryLog.Enabled || dlCfg.MetadataStore == "" {
 		return nil, nil
 	}
 
@@ -83,6 +115,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("querylog: open duckdb: %w", err)
 	}
+	configureQueryLoggerDB(db)
 
 	if err := setExtensionDirectory(db, cfg.DataDir); err != nil {
 		_ = db.Close()
@@ -95,7 +128,6 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	}
 
 	// Create S3 secret if needed (reuse the same logic as AttachDuckLake)
-	dlCfg := cfg.DuckLake
 	if dlCfg.ObjectStore != "" {
 		needsSecret := dlCfg.S3Endpoint != "" ||
 			dlCfg.S3AccessKey != "" ||
@@ -159,10 +191,48 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 
 // Log sends an entry to the query log. Non-blocking; drops if channel is full.
 func (ql *QueryLogger) Log(entry QueryLogEntry) {
+	if ql == nil || ql.ch == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("querylog: logger stopped while writing entry; dropping entry.")
+		}
+	}()
 	select {
 	case ql.ch <- entry:
 	default:
 		slog.Warn("querylog: channel full, dropping entry.")
+	}
+}
+
+func (s *Server) queryLogSink(orgID string) QueryLogSink {
+	if s == nil {
+		return nil
+	}
+	if s.queryLoggerProvider != nil {
+		sink := s.queryLoggerProvider.QueryLogSinkForOrg(orgID)
+		if isNilQueryLogSink(sink) {
+			return nil
+		}
+		return sink
+	}
+	if s.queryLogger != nil {
+		return s.queryLogger
+	}
+	return nil
+}
+
+func isNilQueryLogSink(sink QueryLogSink) bool {
+	if sink == nil {
+		return true
+	}
+	value := reflect.ValueOf(sink)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
 	}
 }
 
@@ -291,6 +361,42 @@ func (ql *QueryLogger) compactParquet() {
 	if err != nil {
 		slog.Warn("querylog: compact failed.", "error", err)
 	}
+}
+
+// Compact flushes DuckLake-inlined query-log data to data files.
+func (ql *QueryLogger) Compact() {
+	if ql == nil {
+		return
+	}
+	ql.compactParquet()
+}
+
+// DeleteBefore removes query-log rows older than cutoff. When orgID is set,
+// the delete is additionally scoped to that org_id, which keeps retention safe
+// for legacy/shared query-log tables.
+func (ql *QueryLogger) DeleteBefore(cutoff time.Time, orgID string) (int64, error) {
+	if ql == nil {
+		return 0, nil
+	}
+	table := ql.table
+	if table == "" {
+		table = "query_log"
+	}
+	query := "DELETE FROM " + table + " WHERE event_time < $1"
+	args := []any{cutoff}
+	if orgID != "" {
+		query += " AND (org_id = $2 OR org_id IS NULL OR org_id = '')"
+		args = append(args, orgID)
+	}
+	result, err := ql.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return rows, nil
 }
 
 // truncateQuery truncates a query string to maxQueryLength.
@@ -509,13 +615,15 @@ func isQueryLogSelfReferential(query string) bool {
 func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType string,
 	resultRows, writtenRows int64, errCode, errMsg, protocol string) {
 
-	ql := c.server.queryLogger
-	if ql == nil {
-		return
-	}
 	profilingSummary := c.lastProfilingSummary
 	c.lastProfilingSummary = observe.QueryProfilingSummary{}
+
 	if isQueryLogSelfReferential(query) {
+		return
+	}
+
+	ql := c.server.queryLogSink(c.orgID)
+	if ql == nil {
 		return
 	}
 

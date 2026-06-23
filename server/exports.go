@@ -171,6 +171,15 @@ func SetQueryLogger(s *Server, ql *QueryLogger) {
 	s.queryLogger = ql
 }
 
+// SetQueryLogProvider installs a provider that selects query-log sinks by org.
+// When set, it replaces the process-global queryLogger lookup. This is used by
+// multitenant control planes where DuckLake metadata stores are tenant-specific.
+func SetQueryLogProvider(s *Server, provider QueryLogProvider) {
+	if s != nil {
+		s.queryLoggerProvider = provider
+	}
+}
+
 // SetUserSecretManager installs the per-user persistent secret manager on a
 // Server. Used by the multitenant control plane after the config store is up.
 // Must be called before the server starts accepting connections.
@@ -187,6 +196,21 @@ func (s *Server) UserSecretManager() UserSecretManager {
 // QueryLogger returns the server's query logger (may be nil).
 func (s *Server) QueryLogger() *QueryLogger {
 	return s.queryLogger
+}
+
+// StopQueryLogging drains and closes all installed query-log sinks.
+func (s *Server) StopQueryLogging() {
+	if s == nil {
+		return
+	}
+	if s.queryLogger != nil {
+		s.queryLogger.Stop()
+		s.queryLogger = nil
+	}
+	if p, ok := s.queryLoggerProvider.(interface{ Stop() }); ok {
+		p.Stop()
+	}
+	s.queryLoggerProvider = nil
 }
 
 // SetProgressFn sets the progress lookup function on a Server.

@@ -366,6 +366,8 @@ type QueryLogConfig struct {
 	BatchSize            int       `gorm:"default:0" json:"batch_size"`
 	CompactIntervalS     int       `gorm:"default:0" json:"compact_interval_s"`
 	DataInliningRowLimit int       `gorm:"default:0" json:"data_inlining_row_limit"`
+	RetentionPeriodS     int       `gorm:"default:0" json:"retention_period_s"`
+	RetentionIntervalS   int       `gorm:"default:0" json:"retention_interval_s"`
 	UpdatedAt            time.Time `json:"updated_at"`
 }
 

@@ -463,6 +463,16 @@ func TestTableNames(t *testing.T) {
 	}
 }
 
+func TestQueryLogConfigRetentionDefaults(t *testing.T) {
+	cfg := QueryLogConfig{ID: 1}
+	if cfg.RetentionPeriodS != 0 {
+		t.Fatalf("expected retention period default 0, got %d", cfg.RetentionPeriodS)
+	}
+	if cfg.RetentionIntervalS != 0 {
+		t.Fatalf("expected retention interval default 0, got %d", cfg.RetentionIntervalS)
+	}
+}
+
 func TestOrgDefaultWorkerProfile(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{

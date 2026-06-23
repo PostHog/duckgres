@@ -96,6 +96,21 @@ and profiling-derived resource usage. `cpu_time_s` is DuckDB cumulative
 CPU/thread time in seconds, and `peak_buffer_memory_bytes` is DuckDB's
 `system_peak_buffer_memory` in bytes, not process RSS.
 
+Standalone deployments use `query_log.enabled` / `DUCKGRES_QUERY_LOG_ENABLED`
+and the process DuckLake metadata store. Remote multitenant deployments use the
+config-store `duckgres_query_log_config` singleton as the capture policy and
+create a per-org logger against the same DuckLake metadata store used by that
+org's worker activation. Existing tenant `ducklake.system.query_log` tables are
+reused and migrated in place.
+
+Multitenant retention is configured on `duckgres_query_log_config`:
+
+- `retention_period_s = 0` keeps rows forever.
+- `retention_period_s > 0` deletes rows older than that period.
+- `retention_interval_s = 0` uses the default retention sweep interval of 1h.
+
+Retention runs from the janitor leader, not from every control-plane replica.
+
 ```sql
 SELECT event_time, user_name, org_id, query_duration_ms, cpu_time_s,
        peak_buffer_memory_bytes, postgres_scan_ms, query
