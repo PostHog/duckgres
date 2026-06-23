@@ -199,6 +199,21 @@ normal `go test ./...` lane.
   could trigger httpfs' refresh-on-403). With the bundled
   `v1.5.3-cred-refresh` fork build the floor is defense-in-depth rather than
   the only protection — see the mid-statement recovery bullet above.
+- **PostHog product-analytics events** (`internal/analytics`,
+  `warehouse_provision_begin`/`_success`/`_failed`,
+  `warehouse_deprovision_begin`/`_success`/`_failed`, `warehouse_password_reset`,
+  `query_initiated`/`query_failed`) — the harness already drives every path that
+  fires these (it provisions, deprovisions, resets, and runs queries on both
+  metadata backends), but the events are sent asynchronously to PostHog's
+  external capture API and the in-cluster Job holds no PostHog query-API creds
+  to read them back, so ingestion cannot be asserted in-Job. The emission logic
+  (event name, org group-analytics attribution, properties, failure-category
+  classification, and "no event on handler failure") is covered by
+  `internal/analytics/analytics_test.go`,
+  `controlplane/provisioning/analytics_events_test.go` (the `_begin` admin-API
+  events), `controlplane/provisioner/controller_analytics_test.go` (the
+  terminal `_success`/`_failed` events the provisioner controller emits on the
+  Ready/Failed/Deleted transitions), and `server/conn_analytics_test.go`.
 
 ## Isolation model
 

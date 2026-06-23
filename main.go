@@ -186,6 +186,9 @@ func main() {
 	loggingShutdown := cliboot.InitLogging()
 	defer loggingShutdown()
 
+	analyticsShutdown := cliboot.InitAnalytics()
+	defer analyticsShutdown()
+
 	tracingShutdown := cliboot.InitTracing()
 	defer tracingShutdown()
 

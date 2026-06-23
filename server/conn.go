@@ -19,6 +19,7 @@ import (
 	"time"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/posthog/duckgres/internal/analytics"
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/observe"
@@ -417,6 +418,12 @@ func (c *clientConn) logQueryStarted(query string) {
 	c.logger().Info("Query started.",
 		"query", query,
 		"trace_id", observe.TraceIDFromContext(c.ctx))
+	// Per-org product analytics. No SQL text or secrets are sent — only
+	// metadata — so this is unaffected by the secret-redaction concerns above.
+	analytics.Default().Capture("query_initiated", c.orgID, map[string]any{
+		"user":     c.username,
+		"trace_id": observe.TraceIDFromContext(c.ctx),
+	})
 }
 
 // logQueryFinished records a query terminating on the worker. Counter-
@@ -458,19 +465,38 @@ func (c *clientConn) logQueryError(query string, err error) {
 		"query", usersecrets.RedactForLog(query),
 		"error", usersecrets.RedactErrorForLog(query, err.Error()),
 	}
-	if isDuckLakeTransactionConflict(err) {
+	// category mirrors the severity routing below so the dashboard can split
+	// user-attributable failures from genuine system errors per org.
+	var category string
+	switch {
+	case isDuckLakeTransactionConflict(err):
+		category = "conflict"
+	case isDuckLakeMetadataConnectionLost(err):
+		category = "metadata_connection_lost"
+	case isUserQueryError(err):
+		category = "user"
+	default:
+		category = "system"
+	}
+	// Per-org product analytics. No SQL text or secrets are sent — only the
+	// SQLSTATE and category — so this is unaffected by the redaction above.
+	analytics.Default().Capture("query_failed", c.orgID, map[string]any{
+		"user":           c.username,
+		"trace_id":       observe.TraceIDFromContext(c.ctx),
+		"error_code":     classifyErrorCode(err),
+		"error_category": category,
+	})
+
+	switch category {
+	case "conflict":
 		c.logger().Warn("DuckLake transaction conflict.", attrs...)
-		return
-	}
-	if isDuckLakeMetadataConnectionLost(err) {
+	case "metadata_connection_lost":
 		c.logger().Warn("DuckLake metadata connection lost during transaction.", attrs...)
-		return
-	}
-	if isUserQueryError(err) {
+	case "user":
 		c.logger().Info("Query execution failed.", attrs...)
-		return
+	default:
+		c.logger().Error("Query execution errored.", attrs...)
 	}
-	c.logger().Error("Query execution errored.", attrs...)
 }
 
 // safeCleanupDB safely closes the database connection, handling the case where
