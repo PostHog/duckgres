@@ -97,9 +97,9 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return arrow.FixedWidthTypes.Date32
 
 	// Time
-	case "TIME":
+	case "TIME", "TIME WITHOUT TIME ZONE":
 		return arrow.FixedWidthTypes.Time64us
-	case "TIMETZ":
+	case "TIMETZ", "TIME WITH TIME ZONE":
 		// The Go driver converts TIMETZ to UTC (see duckdb-go getTimeTZ),
 		// discarding the original timezone offset before we see the value.
 		// Time64us preserves the UTC time-of-day correctly; the offset is
@@ -107,7 +107,7 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return arrow.FixedWidthTypes.Time64us
 
 	// Timestamps (no timezone → empty TimeZone string)
-	case "TIMESTAMP":
+	case "TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE":
 		return &arrow.TimestampType{Unit: arrow.Microsecond}
 	case "TIMESTAMP_S":
 		return &arrow.TimestampType{Unit: arrow.Second}
@@ -115,7 +115,7 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return &arrow.TimestampType{Unit: arrow.Millisecond}
 	case "TIMESTAMP_NS":
 		return &arrow.TimestampType{Unit: arrow.Nanosecond}
-	case "TIMESTAMPTZ":
+	case "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE":
 		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
 
 	// Interval
