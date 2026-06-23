@@ -10,8 +10,34 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/internal/analytics"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
+
+// provisionEventProps builds the common property set for warehouse provision
+// lifecycle events from a warehouse record. Mirrors the properties the admin
+// API attaches to warehouse_provision_begin so success/failed can be broken
+// down the same way. Only metadata — never credentials or secret values.
+func provisionEventProps(w *configstore.ManagedWarehouse) map[string]any {
+	return map[string]any{
+		"metadata_store":   string(w.MetadataStore.Kind),
+		"ducklake_enabled": w.DuckLake.Enabled,
+		"iceberg_enabled":  w.Iceberg.Enabled,
+	}
+}
+
+// captureProvisionFailed emits warehouse_provision_failed with a stable reason
+// category, but only when the terminal Failed transition actually landed
+// (updateErr == nil). Emitting on a failed CAS would let a stuck warehouse
+// re-fire the event every reconcile tick.
+func captureProvisionFailed(w *configstore.ManagedWarehouse, reason string, updateErr error) {
+	if updateErr != nil {
+		return
+	}
+	props := provisionEventProps(w)
+	props["reason"] = reason
+	analytics.Default().Capture("warehouse_provision_failed", w.OrgID, props)
+}
 
 // WarehouseStore is the subset of configstore.ConfigStore that the controller needs.
 type WarehouseStore interface {
@@ -225,11 +251,12 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	// Check for timeout (30 minutes)
 	if time.Since(startedAt) > 30*time.Minute {
 		log.Warn("Provisioning timed out.")
-		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
+		err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
 			"status_message": "Provisioning timed out after 30 minutes",
 			"failed_at":      time.Now().UTC(),
 		})
+		captureProvisionFailed(w, "provisioning_timeout", err)
 		return
 	}
 
@@ -245,11 +272,12 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	// to failed if 10+ minutes have passed, giving transient errors time to resolve.
 	if status.SyncedFalseMessage != "" && time.Since(startedAt) > 10*time.Minute {
 		log.Warn("Crossplane sync failure.", "message", status.SyncedFalseMessage)
-		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
+		err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
 			"status_message": fmt.Sprintf("Crossplane error: %s", status.SyncedFalseMessage),
 			"failed_at":      time.Now().UTC(),
 		})
+		captureProvisionFailed(w, "crossplane_sync_failure", err)
 		return
 	}
 
@@ -341,6 +369,12 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	if len(updates) > 0 {
 		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, updates); err != nil {
 			log.Warn("Failed to update warehouse state.", "error", err)
+		} else if updates["state"] == configstore.ManagedWarehouseStateReady {
+			// Terminal success: the warehouse just flipped to Ready and is now
+			// usable. Guarded on a successful CAS from Provisioning, so this
+			// fires exactly once — the next tick routes a Ready warehouse to
+			// reconcileReady, not here.
+			analytics.Default().Capture("warehouse_provision_success", w.OrgID, provisionEventProps(w))
 		}
 	}
 
@@ -494,6 +528,14 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 		// marking as deleted while AWS resources still exist.
 		if !apierrors.IsNotFound(err) {
 			log.Warn("Failed to delete Duckling CR, will retry.", "error", err)
+			// Deletion has no terminal Failed state (unlike provisioning) — the
+			// controller retries indefinitely. So warehouse_deprovision_failed
+			// signals "a teardown attempt failed, will retry", and may fire once
+			// per reconcile pass until the teardown succeeds. See the README
+			// events table.
+			analytics.Default().Capture("warehouse_deprovision_failed", w.OrgID, map[string]any{
+				"reason": "duckling_delete_failed",
+			})
 			return
 		}
 	}
@@ -511,6 +553,9 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 	if c.lakekeeperProvisioner != nil {
 		if err := c.lakekeeperProvisioner.DeleteForOrg(ctx, w.OrgID, lkInputs); err != nil {
 			log.Warn("Failed to tear down Lakekeeper resources, will retry.", "error", err)
+			analytics.Default().Capture("warehouse_deprovision_failed", w.OrgID, map[string]any{
+				"reason": "lakekeeper_teardown_failed",
+			})
 			return
 		}
 	}
@@ -520,5 +565,9 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 		"status_message": "Resources deleted",
 	}); err != nil {
 		log.Warn("Failed to update state to deleted.", "error", err)
+	} else {
+		// Terminal success: all underlying resources are gone. Guarded on a
+		// successful CAS from Deleting, so this fires exactly once.
+		analytics.Default().Capture("warehouse_deprovision_success", w.OrgID, nil)
 	}
 }

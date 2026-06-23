@@ -65,7 +65,7 @@ func TestProvisionEmitsAnalyticsEvent(t *testing.T) {
 		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
 	}
 
-	e := fake.only(t, "warehouse_provisioned")
+	e := fake.only(t, "warehouse_provision_begin")
 	if e.orgID != "acme" {
 		t.Errorf("orgID = %q, want acme", e.orgID)
 	}
@@ -120,7 +120,7 @@ func TestDeprovisionEmitsAnalyticsEvent(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
 	}
-	if e := fake.only(t, "warehouse_deprovisioned"); e.orgID != "acme" {
+	if e := fake.only(t, "warehouse_deprovision_begin"); e.orgID != "acme" {
 		t.Errorf("orgID = %q, want acme", e.orgID)
 	}
 }

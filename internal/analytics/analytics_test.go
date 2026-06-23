@@ -26,7 +26,7 @@ func TestCaptureUsesGroupAnalyticsForOrg(t *testing.T) {
 	fake := &fakeEnqueuer{}
 	tr := &posthogTracker{client: fake}
 
-	tr.Capture("warehouse_provisioned", "acme", map[string]any{"database_name": "acme_db"})
+	tr.Capture("warehouse_provision_begin", "acme", map[string]any{"database_name": "acme_db"})
 
 	if len(fake.messages) != 1 {
 		t.Fatalf("expected 1 enqueued message, got %d", len(fake.messages))
@@ -35,8 +35,8 @@ func TestCaptureUsesGroupAnalyticsForOrg(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected posthog.Capture, got %T", fake.messages[0])
 	}
-	if capture.Event != "warehouse_provisioned" {
-		t.Errorf("event = %q, want warehouse_provisioned", capture.Event)
+	if capture.Event != "warehouse_provision_begin" {
+		t.Errorf("event = %q, want warehouse_provision_begin", capture.Event)
 	}
 	if capture.DistinctId != "acme" {
 		t.Errorf("distinct_id = %q, want acme", capture.DistinctId)

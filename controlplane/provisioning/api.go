@@ -302,7 +302,11 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	analytics.Default().Capture("warehouse_provisioned", orgID, map[string]any{
+	// The handler only kicks off provisioning (the response is 202 Accepted);
+	// the warehouse is not usable yet. The terminal outcome —
+	// warehouse_provision_success / warehouse_provision_failed — is emitted by
+	// the async provisioner controller when the warehouse reaches Ready / Failed.
+	analytics.Default().Capture("warehouse_provision_begin", orgID, map[string]any{
 		"database_name":    req.DatabaseName,
 		"metadata_store":   string(req.MetadataStore.Type),
 		"ducklake_enabled": ducklakeEnabled,
@@ -331,7 +335,11 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 	var err error
 	for _, state := range deprovisionableStates {
 		if err = h.store.SetWarehouseDeleting(orgID, state); err == nil {
-			analytics.Default().Capture("warehouse_deprovisioned", orgID, nil)
+			// As with provisioning, this only starts the teardown. The terminal
+			// warehouse_deprovision_success / warehouse_deprovision_failed events
+			// are emitted by the async provisioner controller as it deletes the
+			// underlying resources.
+			analytics.Default().Capture("warehouse_deprovision_begin", orgID, nil)
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}

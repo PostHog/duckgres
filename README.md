@@ -283,13 +283,35 @@ group is attached.
 
 Events never include SQL text, credentials, or secret values — only metadata.
 
+Provisioning and deprovisioning are asynchronous: the admin API returns `202
+Accepted` and the per-org provisioner controller drives the warehouse to its
+terminal state. The lifecycle is therefore split into a `_begin` event (the
+admin API accepted the request) and a terminal `_success` / `_failed` event (the
+controller observed the warehouse reach Ready / Failed, or finish / fail
+teardown), so you can build a provisioning funnel and alert on failures.
+
 | Event | Fires when | Properties |
 | --- | --- | --- |
-| `warehouse_provisioned` | A managed warehouse is provisioned (admin API) | `database_name`, `metadata_store`, `ducklake_enabled`, `iceberg_enabled` |
-| `warehouse_deprovisioned` | A managed warehouse is deprovisioned (admin API) | — |
+| `warehouse_provision_begin` | Provisioning accepted by the admin API (warehouse not usable yet) | `database_name`, `metadata_store`, `ducklake_enabled`, `iceberg_enabled` |
+| `warehouse_provision_success` | Warehouse reaches Ready and is usable (provisioner controller) | `metadata_store`, `ducklake_enabled`, `iceberg_enabled` |
+| `warehouse_provision_failed` | Warehouse reaches Failed (provisioner controller) | `metadata_store`, `ducklake_enabled`, `iceberg_enabled`, `reason` (`provisioning_timeout`/`crossplane_sync_failure`) |
+| `warehouse_deprovision_begin` | Deprovisioning accepted by the admin API (teardown not finished yet) | — |
+| `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
+| `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`/`lakekeeper_teardown_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
 | `query_initiated` | A client query begins execution | `user`, `trace_id` |
 | `query_failed` | A query errors | `user`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
+
+> Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
+> are terminal and fire exactly once per warehouse (guarded on the state
+> transition). Deletion has no terminal Failed state — the controller retries
+> indefinitely — so `warehouse_deprovision_failed` represents a failed teardown
+> *attempt* and may fire once per reconcile pass until teardown succeeds.
+
+> The `_success` / `_failed` events are emitted by the Kubernetes provisioner
+> controller, so they only fire in the remote/multitenant backend (built with
+> `-tags kubernetes`). The `_begin` events fire wherever the admin provisioning
+> API runs.
 
 > Note: `query_initiated` fires once per query with no sampling, so its volume
 > scales 1:1 with query throughput. Capture is asynchronous and batched, so it
