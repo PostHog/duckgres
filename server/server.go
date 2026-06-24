@@ -313,10 +313,19 @@ type Config struct {
 // QueryLogConfig configures the query log feature.
 type QueryLogConfig struct {
 	Enabled              bool
+	Sink                 string
 	FlushInterval        time.Duration
 	BatchSize            int
 	CompactInterval      time.Duration
 	DataInliningRowLimit int
+	Kafka                QueryLogKafkaConfig
+}
+
+// QueryLogKafkaConfig configures Kafka publishing for query log events.
+type QueryLogKafkaConfig struct {
+	Brokers  []string
+	Topic    string
+	ClientID string
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
@@ -361,8 +370,12 @@ type Server struct {
 	connsMu sync.RWMutex
 	conns   map[int32]*clientConn
 
-	// Query logger for DuckLake system.query_log
+	// Query logger for DuckLake system.query_log. Kept for existing control
+	// plane call sites that install or inspect the direct DuckLake logger.
 	queryLogger *QueryLogger
+	// Query-log sink used by query execution. Defaults to queryLogger for the
+	// direct DuckLake path, or a Kafka sink when configured.
+	queryLogSink QueryLogSink
 
 	// Per-user shared DB pool for file persistence mode.
 	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
@@ -487,10 +500,13 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	// Initialize query logger (non-fatal on error)
-	if ql, err := NewQueryLogger(cfg); err != nil {
+	if sink, err := NewQueryLogSink(cfg); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
-	} else if ql != nil {
-		s.queryLogger = ql
+	} else if sink != nil {
+		s.queryLogSink = sink
+		if ql, ok := sink.(*QueryLogger); ok {
+			s.queryLogger = ql
+		}
 	}
 
 	// Initialize DuckLake checkpoint scheduler (non-fatal on error)
@@ -594,9 +610,15 @@ func (s *Server) Close() error {
 	}
 
 	// Stop query logger (drains remaining entries)
-	if s.queryLogger != nil {
-		s.queryLogger.Stop()
+	queryLogTimeout := s.cfg.ShutdownTimeout
+	if queryLogTimeout <= 0 {
+		queryLogTimeout = 30 * time.Second
 	}
+	queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogTimeout)
+	if err := s.StopQueryLogging(queryLogCtx); err != nil {
+		slog.Warn("Query log shutdown deadline exceeded.", "error", err)
+	}
+	queryLogCancel()
 
 	// Stop DuckLake checkpoint scheduler
 	if s.checkpointer != nil {
@@ -666,6 +688,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if err := s.acmeDNSManager.Close(); err != nil {
 			slog.Warn("ACME DNS manager shutdown error.", "error", err)
 		}
+	}
+
+	// Stop query logger (drains remaining entries)
+	if err := s.StopQueryLogging(ctx); err != nil {
+		slog.Warn("Query log shutdown deadline exceeded.", "error", err)
 	}
 
 	// Database connections are now closed by each clientConn when it terminates

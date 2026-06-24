@@ -451,10 +451,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	server.InitMinimalServer(srv, cfg.Config, nil)
 
 	// Initialize query logger (non-fatal on error)
-	if ql, err := server.NewQueryLogger(cfg.Config); err != nil {
+	if sink, err := server.NewQueryLogSink(cfg.Config); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
-	} else if ql != nil {
-		server.SetQueryLogger(srv, ql)
+	} else if sink != nil {
+		server.SetQueryLogSink(srv, sink)
 	}
 
 	cp := &ControlPlane{
@@ -1071,7 +1071,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	if orgProfileApplied && workerProfile != nil {
 		// Once per connection so support can see which shape a tenant got.
-		clog.Info("Applied org default worker profile.", 			"cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
+		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
 
 	// Resolve the session manager and rebalancer for this connection.
@@ -1693,8 +1693,16 @@ func (cp *ControlPlane) healthReady() bool {
 }
 
 func (cp *ControlPlane) stopQueryLogger() {
-	if cp.srv != nil && cp.srv.QueryLogger() != nil {
-		cp.srv.QueryLogger().Stop()
+	if cp.srv != nil {
+		timeout := cp.cfg.ShutdownTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := cp.srv.StopQueryLogging(ctx); err != nil {
+			slog.Warn("Query log shutdown deadline exceeded.", "error", err)
+		}
 	}
 }
 

@@ -169,6 +169,38 @@ var GenerateSecretKey = wire.GenerateSecretKey
 // to attach a query logger to the minimal server after creation.
 func SetQueryLogger(s *Server, ql *QueryLogger) {
 	s.queryLogger = ql
+	s.queryLogSink = ql
+}
+
+// SetQueryLogSink sets the active query-log sink on a Server.
+func SetQueryLogSink(s *Server, sink QueryLogSink) {
+	s.queryLogSink = sink
+	if ql, ok := sink.(*QueryLogger); ok {
+		s.queryLogger = ql
+	} else {
+		s.queryLogger = nil
+	}
+}
+
+// StopQueryLogging drains and stops the active query-log sink, if any.
+func (s *Server) StopQueryLogging(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	ctx, cancel := queryLogStopContext(ctx, 30*time.Second)
+	defer cancel()
+	if s.queryLogSink != nil {
+		err := s.queryLogSink.StopContext(ctx)
+		s.queryLogSink = nil
+		s.queryLogger = nil
+		return err
+	}
+	if s.queryLogger != nil {
+		err := s.queryLogger.StopContext(ctx)
+		s.queryLogger = nil
+		return err
+	}
+	return nil
 }
 
 // SetUserSecretManager installs the per-user persistent secret manager on a
