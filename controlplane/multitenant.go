@@ -278,19 +278,6 @@ func SetupMultiTenant(
 				}
 				return snap.QueryLog
 			},
-			func() []string {
-				snap := store.Snapshot()
-				if snap == nil {
-					return nil
-				}
-				orgIDs := make([]string, 0, len(snap.Orgs))
-				for orgID, org := range snap.Orgs {
-					if org != nil && org.Warehouse != nil && org.Warehouse.State == configstore.ManagedWarehouseStateReady {
-						orgIDs = append(orgIDs, orgID)
-					}
-				}
-				return orgIDs
-			},
 			func(ctx context.Context, orgID string) (tenantQueryLogRuntime, error) {
 				org, err := queryLogActivator.lookupOrgConfig(orgID)
 				if err != nil {
@@ -339,9 +326,6 @@ func SetupMultiTenant(
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
-	}
-	if queryLogManager != nil {
-		janitor.queryLogRetention = queryLogManager.RunRetention
 	}
 	janitor.cleanupOrphanedWorkerPods = func() {
 		// Pods and secrets each get their own 30s deadline so a slow

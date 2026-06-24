@@ -14,21 +14,10 @@ import (
 )
 
 type fakeTenantQueryLogStore struct {
-	deletedRows int64
-	deleteErr   error
-	stopCount   int
-	compactRows int
+	stopCount int
 }
 
 func (s *fakeTenantQueryLogStore) Log(server.QueryLogEntry) {}
-
-func (s *fakeTenantQueryLogStore) DeleteBefore(time.Time, string) (int64, error) {
-	return s.deletedRows, s.deleteErr
-}
-
-func (s *fakeTenantQueryLogStore) Compact() {
-	s.compactRows++
-}
 
 func (s *fakeTenantQueryLogStore) Stop() {
 	s.stopCount++
@@ -41,8 +30,6 @@ func enabledTenantQueryLogConfig() configstore.QueryLogConfig {
 		BatchSize:            1,
 		CompactIntervalS:     60,
 		DataInliningRowLimit: 1000,
-		RetentionPeriodS:     3600,
-		RetentionIntervalS:   3600,
 	}
 }
 
@@ -55,7 +42,6 @@ func TestTenantQueryLogProviderResolvesCacheMissInBackground(t *testing.T) {
 	m := newTenantQueryLogManager(
 		server.Config{},
 		enabledTenantQueryLogConfig,
-		nil,
 		func(ctx context.Context, orgID string) (tenantQueryLogRuntime, error) {
 			if orgID != "org-a" {
 				t.Fatalf("expected org-a, got %q", orgID)
@@ -110,7 +96,6 @@ func TestTenantQueryLogProviderBacksOffResolverFailures(t *testing.T) {
 	m := newTenantQueryLogManager(
 		server.Config{},
 		enabledTenantQueryLogConfig,
-		nil,
 		func(context.Context, string) (tenantQueryLogRuntime, error) {
 			calls++
 			close(resolved)
@@ -132,29 +117,6 @@ func TestTenantQueryLogProviderBacksOffResolverFailures(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected resolver to be called once during backoff, got %d", calls)
-	}
-}
-
-func TestTenantQueryLogRetentionRetriesAfterResolverFailure(t *testing.T) {
-	now := time.Unix(1700000000, 0).UTC()
-	calls := 0
-
-	m := newTenantQueryLogManager(
-		server.Config{},
-		enabledTenantQueryLogConfig,
-		func() []string { return []string{"org-a"} },
-		func(context.Context, string) (tenantQueryLogRuntime, error) {
-			calls++
-			return tenantQueryLogRuntime{}, errors.New("resolver down")
-		},
-	)
-	m.now = func() time.Time { return now }
-
-	m.RunRetention(context.Background())
-	m.RunRetention(context.Background())
-
-	if calls != 2 {
-		t.Fatalf("expected failed retention to retry next pass, got %d resolver calls", calls)
 	}
 }
 

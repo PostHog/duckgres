@@ -41,7 +41,6 @@ type ControlPlaneJanitor struct {
 	retireMismatchedVersionWorker func() // reaps one idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured node-headroom % (leader-only)
-	queryLogRetention             func(context.Context)
 	hotIdleFloor                  func(configstore.WorkerSnapshot) int
 }
 
@@ -199,12 +198,6 @@ func (j *ControlPlaneJanitor) runOnce() {
 	// process stalls until a new-version CP is elected leader.
 	if j.retireMismatchedVersionWorker != nil {
 		j.retireMismatchedVersionWorker()
-	}
-
-	if j.queryLogRetention != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), j.expiryTimeout)
-		j.queryLogRetention(ctx)
-		cancel()
 	}
 
 	// Reconcile K8s pods against the DB state store: delete any worker pod

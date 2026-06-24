@@ -363,42 +363,6 @@ func (ql *QueryLogger) compactParquet() {
 	}
 }
 
-// Compact flushes DuckLake-inlined query-log data to data files.
-func (ql *QueryLogger) Compact() {
-	if ql == nil {
-		return
-	}
-	ql.compactParquet()
-}
-
-// DeleteBefore removes query-log rows older than cutoff. When orgID is set,
-// the delete is additionally scoped to that org_id, which keeps retention safe
-// for legacy/shared query-log tables.
-func (ql *QueryLogger) DeleteBefore(cutoff time.Time, orgID string) (int64, error) {
-	if ql == nil {
-		return 0, nil
-	}
-	table := ql.table
-	if table == "" {
-		table = "query_log"
-	}
-	query := "DELETE FROM " + table + " WHERE event_time < $1"
-	args := []any{cutoff}
-	if orgID != "" {
-		query += " AND (org_id = $2 OR org_id IS NULL OR org_id = '')"
-		args = append(args, orgID)
-	}
-	result, err := ql.db.Exec(query, args...)
-	if err != nil {
-		return 0, err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return 0, nil
-	}
-	return rows, nil
-}
-
 // truncateQuery truncates a query string to maxQueryLength.
 func truncateQuery(q string) string {
 	if len(q) > maxQueryLength {

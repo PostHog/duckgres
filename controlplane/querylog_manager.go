@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"sort"
 	"sync"
 	"time"
 
@@ -18,10 +17,8 @@ import (
 )
 
 const (
-	defaultTenantQueryLogRetentionInterval = time.Hour
-	queryLogManagerResolveTimeout          = 30 * time.Second
-	queryLogResolveRetryInterval           = 30 * time.Second
-	queryLogRetentionOrgTimeout            = 30 * time.Second
+	queryLogManagerResolveTimeout = 30 * time.Second
+	queryLogResolveRetryInterval  = 30 * time.Second
 )
 
 type tenantQueryLogRuntime struct {
@@ -32,7 +29,6 @@ type tenantQueryLogRuntime struct {
 type tenantQueryLogManager struct {
 	base    server.Config
 	config  func() configstore.QueryLogConfig
-	orgIDs  func() []string
 	resolve func(context.Context, string) (tenantQueryLogRuntime, error)
 	newLog  func(server.Config, server.DuckLakeConfig) (tenantQueryLogStore, error)
 	now     func() time.Time
@@ -43,11 +39,9 @@ type tenantQueryLogManager struct {
 	nextResolve map[string]time.Time
 	configSig   string
 
-	lastRetention      time.Time
-	retentionInProcess bool
-	stopped            bool
-	stopOnce           sync.Once
-	mu                 sync.Mutex
+	stopped  bool
+	stopOnce sync.Once
+	mu       sync.Mutex
 }
 
 type tenantQueryLogState struct {
@@ -58,21 +52,17 @@ type tenantQueryLogState struct {
 
 type tenantQueryLogStore interface {
 	server.QueryLogSink
-	DeleteBefore(time.Time, string) (int64, error)
-	Compact()
 	Stop()
 }
 
 func newTenantQueryLogManager(
 	base server.Config,
 	config func() configstore.QueryLogConfig,
-	orgIDs func() []string,
 	resolve func(context.Context, string) (tenantQueryLogRuntime, error),
 ) *tenantQueryLogManager {
 	return &tenantQueryLogManager{
 		base:    base,
 		config:  config,
-		orgIDs:  orgIDs,
 		resolve: resolve,
 		newLog: func(cfg server.Config, dlCfg server.DuckLakeConfig) (tenantQueryLogStore, error) {
 			return server.NewQueryLoggerForDuckLake(cfg, dlCfg)
@@ -107,82 +97,6 @@ func (m *tenantQueryLogManager) Stop() {
 		m.mu.Unlock()
 		stopTenantQueryLogStores(stale)
 	})
-}
-
-func (m *tenantQueryLogManager) RunRetention(ctx context.Context) {
-	if m == nil {
-		return
-	}
-	cfg := m.currentConfig()
-	if !cfg.Enabled || cfg.RetentionPeriodS <= 0 {
-		return
-	}
-
-	interval := time.Duration(cfg.RetentionIntervalS) * time.Second
-	if interval <= 0 {
-		interval = defaultTenantQueryLogRetentionInterval
-	}
-	now := m.now()
-
-	m.mu.Lock()
-	if m.stopped || m.retentionInProcess || (!m.lastRetention.IsZero() && now.Sub(m.lastRetention) < interval) {
-		m.mu.Unlock()
-		return
-	}
-	m.retentionInProcess = true
-	m.mu.Unlock()
-
-	hadError := false
-	completed := false
-	defer func() {
-		m.mu.Lock()
-		m.retentionInProcess = false
-		if completed && !hadError {
-			m.lastRetention = now
-		}
-		m.mu.Unlock()
-	}()
-
-	cutoff := now.Add(-time.Duration(cfg.RetentionPeriodS) * time.Second)
-	orgIDs := m.currentOrgIDs()
-	for _, orgID := range orgIDs {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		orgCtx, cancel := context.WithTimeout(ctx, queryLogRetentionOrgTimeout)
-		logger, err := m.loggerForOrg(orgCtx, orgID)
-		if err != nil {
-			cancel()
-			hadError = true
-			slog.Warn("querylog: retention skipped for org; logger unavailable.", "org", orgID, "error", err)
-			continue
-		}
-		if logger == nil {
-			cancel()
-			hadError = true
-			slog.Warn("querylog: retention skipped for org; logger unavailable.", "org", orgID)
-			continue
-		}
-		deleted, err := logger.DeleteBefore(cutoff, orgID)
-		if err != nil {
-			cancel()
-			hadError = true
-			slog.Warn("querylog: retention delete failed.", "org", orgID, "error", err)
-			continue
-		}
-		cancel()
-		if deleted > 0 {
-			logger.Compact()
-			slog.Info("querylog: retention deleted old rows.", "org", orgID, "rows", deleted, "cutoff", cutoff)
-		}
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	completed = true
 }
 
 func (m *tenantQueryLogManager) loggerForOrg(ctx context.Context, orgID string) (tenantQueryLogStore, error) {
@@ -385,15 +299,6 @@ func (m *tenantQueryLogManager) currentConfig() configstore.QueryLogConfig {
 		return configstore.QueryLogConfig{}
 	}
 	return m.config()
-}
-
-func (m *tenantQueryLogManager) currentOrgIDs() []string {
-	if m.orgIDs == nil {
-		return nil
-	}
-	orgIDs := m.orgIDs()
-	sort.Strings(orgIDs)
-	return orgIDs
 }
 
 func serverQueryLogConfig(base server.QueryLogConfig, cfg configstore.QueryLogConfig) server.QueryLogConfig {

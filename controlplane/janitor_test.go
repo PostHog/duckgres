@@ -117,25 +117,6 @@ func (s *captureControlPlaneExpiryStore) CountHotIdleWorkers(orgID, image, profi
 	return s.hotIdleCounts[key], nil
 }
 
-func TestJanitorRunsQueryLogRetentionHook(t *testing.T) {
-	store := &captureControlPlaneExpiryStore{}
-	janitor := NewControlPlaneJanitor(store, time.Hour, time.Hour)
-
-	called := false
-	janitor.queryLogRetention = func(ctx context.Context) {
-		called = true
-		if err := ctx.Err(); err != nil {
-			t.Fatalf("retention context unexpectedly done: %v", err)
-		}
-	}
-
-	janitor.runOnce()
-
-	if !called {
-		t.Fatal("expected query log retention hook to run")
-	}
-}
-
 func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{}
 	now := time.Date(2026, time.March, 26, 15, 0, 0, 0, time.UTC)
