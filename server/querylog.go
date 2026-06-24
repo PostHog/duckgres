@@ -382,9 +382,8 @@ func truncateNullableQuery(q *string) *string {
 func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName string) error {
 	colType, err := queryLogColumnType(db, fullTableName, tableSchema, tableName, "normalized_query_hash")
 	if err == nil && strings.ToUpper(colType) != "BIGINT" {
-		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
-		if _, dropErr := db.Exec("DROP TABLE " + fullTableName); dropErr != nil {
-			return fmt.Errorf("drop query_log for normalized_query_hash migration: %w", dropErr)
+		if err := migrateQueryLogNormalizedHashToBigint(db, fullTableName, colType); err != nil {
+			return err
 		}
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("inspect normalized_query_hash column: %w", err)
@@ -441,6 +440,24 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 		}
 	}
 
+	return nil
+}
+
+func migrateQueryLogNormalizedHashToBigint(db *sql.DB, fullTableName, colType string) error {
+	normalizedColType := strings.ToUpper(colType)
+	expr := "CAST(normalized_query_hash AS BIGINT)"
+	if normalizedColType == "UBIGINT" {
+		expr = `CASE
+			WHEN normalized_query_hash IS NULL THEN NULL
+			WHEN normalized_query_hash <= 9223372036854775807 THEN CAST(normalized_query_hash AS BIGINT)
+			ELSE CAST(CAST(normalized_query_hash AS HUGEINT) - 18446744073709551616 AS BIGINT)
+		END`
+	}
+
+	slog.Info("querylog: migrating normalized_query_hash to BIGINT in place.", "from_type", colType)
+	if _, err := db.Exec("ALTER TABLE " + fullTableName + " ALTER COLUMN normalized_query_hash SET DATA TYPE BIGINT USING " + expr); err != nil {
+		return fmt.Errorf("migrate normalized_query_hash from %s to BIGINT: %w", colType, err)
+	}
 	return nil
 }
 
