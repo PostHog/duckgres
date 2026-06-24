@@ -35,13 +35,16 @@ type tenantQueryLogManager struct {
 
 	loggers     map[string]*tenantQueryLogState
 	orgKeys     map[string]string
+	keyRefs     map[string]map[string]struct{}
 	resolving   map[string]struct{}
 	nextResolve map[string]time.Time
 	configSig   string
 
-	stopped  bool
-	stopOnce sync.Once
-	mu       sync.Mutex
+	resolveTimeout time.Duration
+	retryInterval  time.Duration
+	stopped        bool
+	stopOnce       sync.Once
+	mu             sync.Mutex
 }
 
 type tenantQueryLogState struct {
@@ -70,18 +73,22 @@ func newTenantQueryLogManager(
 		now:         time.Now,
 		loggers:     make(map[string]*tenantQueryLogState),
 		orgKeys:     make(map[string]string),
+		keyRefs:     make(map[string]map[string]struct{}),
 		resolving:   make(map[string]struct{}),
 		nextResolve: make(map[string]time.Time),
+
+		resolveTimeout: queryLogManagerResolveTimeout,
+		retryInterval:  queryLogResolveRetryInterval,
 	}
 }
 
 func (m *tenantQueryLogManager) QueryLogSinkForOrg(orgID string) server.QueryLogSink {
-	logger, shouldResolve, stale := m.cachedLoggerForOrg(orgID)
+	logger, shouldResolve, forceResolve, stale := m.cachedLoggerForOrg(orgID)
 	if len(stale) > 0 {
 		go stopTenantQueryLogStores(stale)
 	}
 	if shouldResolve {
-		m.resolveLoggerInBackground(orgID)
+		m.resolveLoggerInBackground(orgID, forceResolve)
 	}
 	return logger
 }
@@ -99,7 +106,7 @@ func (m *tenantQueryLogManager) Stop() {
 	})
 }
 
-func (m *tenantQueryLogManager) loggerForOrg(ctx context.Context, orgID string) (tenantQueryLogStore, error) {
+func (m *tenantQueryLogManager) loggerForOrg(ctx context.Context, orgID string, forceResolve bool) (tenantQueryLogStore, error) {
 	if m == nil || orgID == "" {
 		return nil, nil
 	}
@@ -132,34 +139,49 @@ func (m *tenantQueryLogManager) loggerForOrg(ctx context.Context, orgID string) 
 			return nil, nil
 		}
 	}
-	if key := m.orgKeys[orgID]; key != "" {
-		if state := m.loggers[key]; state != nil && !queryLogCredentialsExpired(state.expiresAt, now) {
-			logger := state.logger
+	if key := m.orgKeys[orgID]; key != "" && !forceResolve {
+		if state := m.loggers[key]; state != nil {
+			if queryLogCredentialsExpired(state.expiresAt, now) {
+				stale := m.releaseOrgLocked(orgID)
+				m.mu.Unlock()
+				stopTenantQueryLogStores(stale)
+			} else {
+				logger := state.logger
+				m.mu.Unlock()
+				return logger, nil
+			}
+		} else {
+			delete(m.orgKeys, orgID)
 			m.mu.Unlock()
-			return logger, nil
 		}
+	} else {
+		m.mu.Unlock()
 	}
-	m.mu.Unlock()
 
 	if m.resolve == nil {
 		return nil, fmt.Errorf("tenant query log resolver is not configured")
 	}
-	resolveCtx, cancel := context.WithTimeout(ctx, queryLogManagerResolveTimeout)
+	resolveCtx, cancel := context.WithTimeout(ctx, m.currentResolveTimeout())
+	defer cancel()
 	runtime, err := m.resolve(resolveCtx, orgID)
-	cancel()
 	if err != nil {
 		return nil, err
 	}
 	if runtime.DuckLake.MetadataStore == "" {
+		m.mu.Lock()
+		stale := m.releaseOrgLocked(orgID)
+		m.mu.Unlock()
+		stopTenantQueryLogStores(stale)
 		return nil, nil
 	}
 	key := queryLogRuntimeKey(runtime.DuckLake)
 
 	m.mu.Lock()
 	if state := m.loggers[key]; state != nil && !queryLogCredentialsExpired(state.expiresAt, now) {
-		m.orgKeys[orgID] = key
+		stale := m.assignOrgKeyLocked(orgID, key)
 		logger := state.logger
 		m.mu.Unlock()
+		stopTenantQueryLogStores(stale)
 		return logger, nil
 	}
 	m.mu.Unlock()
@@ -167,7 +189,7 @@ func (m *tenantQueryLogManager) loggerForOrg(ctx context.Context, orgID string) 
 	base := m.base
 	base.QueryLog = serverQueryLogConfig(base.QueryLog, cfg)
 	base.DuckLake = runtime.DuckLake
-	logger, err := m.newLog(base, runtime.DuckLake)
+	logger, err := m.createLogger(resolveCtx, base, runtime.DuckLake)
 	if err != nil {
 		return nil, err
 	}
@@ -182,28 +204,29 @@ func (m *tenantQueryLogManager) loggerForOrg(ctx context.Context, orgID string) 
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.stopped {
+		m.mu.Unlock()
 		logger.Stop()
 		return nil, nil
 	}
 	if state := m.loggers[key]; state != nil && !queryLogCredentialsExpired(state.expiresAt, m.now()) {
+		stale := m.assignOrgKeyLocked(orgID, key)
+		existing := state.logger
+		m.mu.Unlock()
 		logger.Stop()
-		m.orgKeys[orgID] = key
-		return state.logger, nil
+		stopTenantQueryLogStores(stale)
+		return existing, nil
 	}
-	if old := m.loggers[key]; old != nil {
-		old.logger.Stop()
-	}
-	m.loggers[key] = &tenantQueryLogState{key: key, logger: logger, expiresAt: runtime.ExpiresAt}
-	m.orgKeys[orgID] = key
+	stale := m.installLoggerLocked(orgID, key, logger, runtime.ExpiresAt)
+	m.mu.Unlock()
+	stopTenantQueryLogStores(stale)
 	slog.Info("querylog: tenant logger enabled.", "org", orgID, "logger_key", key, "expires_at", runtime.ExpiresAt)
 	return logger, nil
 }
 
-func (m *tenantQueryLogManager) cachedLoggerForOrg(orgID string) (tenantQueryLogStore, bool, []tenantQueryLogStore) {
+func (m *tenantQueryLogManager) cachedLoggerForOrg(orgID string) (tenantQueryLogStore, bool, bool, []tenantQueryLogStore) {
 	if m == nil || orgID == "" {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	cfg := m.currentConfig()
 	sig := queryLogConfigSignature(cfg)
@@ -212,14 +235,14 @@ func (m *tenantQueryLogManager) cachedLoggerForOrg(orgID string) (tenantQueryLog
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.stopped {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 
 	var stale []tenantQueryLogStore
 	if !cfg.Enabled {
 		stale = m.clearLoggersLocked()
 		m.configSig = sig
-		return nil, false, stale
+		return nil, false, false, stale
 	}
 	if sig != m.configSig {
 		stale = m.clearLoggersLocked()
@@ -229,17 +252,21 @@ func (m *tenantQueryLogManager) cachedLoggerForOrg(orgID string) (tenantQueryLog
 	if key := m.orgKeys[orgID]; key != "" {
 		if state := m.loggers[key]; state != nil {
 			if queryLogCredentialsExpired(state.expiresAt, now) {
-				delete(m.orgKeys, orgID)
+				stale = append(stale, m.releaseOrgLocked(orgID)...)
 			} else {
 				resolve := false
+				forceResolve := false
 				if queryLogCredentialsExpiring(state.expiresAt, now) {
 					resolve = m.markResolvingLocked(orgID, now)
+					forceResolve = resolve
 				}
-				return state.logger, resolve, stale
+				return state.logger, resolve, forceResolve, stale
 			}
+		} else {
+			stale = append(stale, m.releaseOrgLocked(orgID)...)
 		}
 	}
-	return nil, m.markResolvingLocked(orgID, now), stale
+	return nil, m.markResolvingLocked(orgID, now), false, stale
 }
 
 func (m *tenantQueryLogManager) markResolvingLocked(orgID string, now time.Time) bool {
@@ -253,16 +280,16 @@ func (m *tenantQueryLogManager) markResolvingLocked(orgID string, now time.Time)
 	return true
 }
 
-func (m *tenantQueryLogManager) resolveLoggerInBackground(orgID string) {
+func (m *tenantQueryLogManager) resolveLoggerInBackground(orgID string, forceResolve bool) {
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), queryLogManagerResolveTimeout)
-		logger, err := m.loggerForOrg(ctx, orgID)
+		ctx, cancel := context.WithTimeout(context.Background(), m.currentResolveTimeout())
+		logger, err := m.loggerForOrg(ctx, orgID, forceResolve)
 		cancel()
 
 		m.mu.Lock()
 		delete(m.resolving, orgID)
 		if err != nil || logger == nil {
-			m.nextResolve[orgID] = m.now().Add(queryLogResolveRetryInterval)
+			m.nextResolve[orgID] = m.now().Add(m.currentRetryInterval())
 		} else {
 			delete(m.nextResolve, orgID)
 		}
@@ -274,6 +301,38 @@ func (m *tenantQueryLogManager) resolveLoggerInBackground(orgID string) {
 	}()
 }
 
+type tenantQueryLogCreateResult struct {
+	logger tenantQueryLogStore
+	err    error
+}
+
+func (m *tenantQueryLogManager) createLogger(ctx context.Context, cfg server.Config, dlCfg server.DuckLakeConfig) (tenantQueryLogStore, error) {
+	resultCh := make(chan tenantQueryLogCreateResult)
+	timedOut := make(chan struct{})
+	go func() {
+		logger, err := m.newLog(cfg, dlCfg)
+		result := tenantQueryLogCreateResult{logger: logger, err: err}
+		select {
+		case resultCh <- result:
+		case <-timedOut:
+			if result.logger != nil {
+				result.logger.Stop()
+			}
+			if result.err != nil {
+				slog.Warn("querylog: late tenant logger creation failed.", "error", result.err)
+			}
+		}
+	}()
+
+	select {
+	case result := <-resultCh:
+		return result.logger, result.err
+	case <-ctx.Done():
+		close(timedOut)
+		return nil, ctx.Err()
+	}
+}
+
 func (m *tenantQueryLogManager) clearLoggersLocked() []tenantQueryLogStore {
 	loggers := make([]tenantQueryLogStore, 0, len(m.loggers))
 	for _, state := range m.loggers {
@@ -283,7 +342,59 @@ func (m *tenantQueryLogManager) clearLoggersLocked() []tenantQueryLogStore {
 	}
 	m.loggers = make(map[string]*tenantQueryLogState)
 	m.orgKeys = make(map[string]string)
+	m.keyRefs = make(map[string]map[string]struct{})
 	return loggers
+}
+
+func (m *tenantQueryLogManager) installLoggerLocked(orgID, key string, logger tenantQueryLogStore, expiresAt *time.Time) []tenantQueryLogStore {
+	var stale []tenantQueryLogStore
+	if old := m.loggers[key]; old != nil && old.logger != nil && old.logger != logger {
+		stale = append(stale, old.logger)
+	}
+	m.loggers[key] = &tenantQueryLogState{key: key, logger: logger, expiresAt: expiresAt}
+	stale = append(stale, m.assignOrgKeyLocked(orgID, key)...)
+	return stale
+}
+
+func (m *tenantQueryLogManager) assignOrgKeyLocked(orgID, key string) []tenantQueryLogStore {
+	var stale []tenantQueryLogStore
+	if oldKey := m.orgKeys[orgID]; oldKey != "" && oldKey != key {
+		stale = append(stale, m.releaseOrgKeyLocked(orgID, oldKey)...)
+	}
+	m.orgKeys[orgID] = key
+	if m.keyRefs[key] == nil {
+		m.keyRefs[key] = make(map[string]struct{})
+	}
+	m.keyRefs[key][orgID] = struct{}{}
+	return stale
+}
+
+func (m *tenantQueryLogManager) releaseOrgLocked(orgID string) []tenantQueryLogStore {
+	key := m.orgKeys[orgID]
+	if key == "" {
+		return nil
+	}
+	return m.releaseOrgKeyLocked(orgID, key)
+}
+
+func (m *tenantQueryLogManager) releaseOrgKeyLocked(orgID, key string) []tenantQueryLogStore {
+	if m.orgKeys[orgID] == key {
+		delete(m.orgKeys, orgID)
+	}
+	refs := m.keyRefs[key]
+	if refs != nil {
+		delete(refs, orgID)
+		if len(refs) > 0 {
+			return nil
+		}
+		delete(m.keyRefs, key)
+	}
+	state := m.loggers[key]
+	delete(m.loggers, key)
+	if state == nil || state.logger == nil {
+		return nil
+	}
+	return []tenantQueryLogStore{state.logger}
 }
 
 func stopTenantQueryLogStores(loggers []tenantQueryLogStore) {
@@ -299,6 +410,20 @@ func (m *tenantQueryLogManager) currentConfig() configstore.QueryLogConfig {
 		return configstore.QueryLogConfig{}
 	}
 	return m.config()
+}
+
+func (m *tenantQueryLogManager) currentResolveTimeout() time.Duration {
+	if m.resolveTimeout > 0 {
+		return m.resolveTimeout
+	}
+	return queryLogManagerResolveTimeout
+}
+
+func (m *tenantQueryLogManager) currentRetryInterval() time.Duration {
+	if m.retryInterval > 0 {
+		return m.retryInterval
+	}
+	return queryLogResolveRetryInterval
 }
 
 func serverQueryLogConfig(base server.QueryLogConfig, cfg configstore.QueryLogConfig) server.QueryLogConfig {
