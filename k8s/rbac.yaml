@@ -11,6 +11,12 @@ metadata:
   namespace: duckgres
 automountServiceAccountToken: false
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres-query-log-writer
+  namespace: duckgres
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -46,4 +52,57 @@ subjects:
 roleRef:
   kind: Role
   name: duckgres-control-plane
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckgres-query-log-writer-runtime
+  namespace: duckgres
+rules:
+  # Resolve SecretRef-backed metadata-store and object-store credentials for
+  # tenant DuckLake attachments. Grant equivalent get-only Roles in any
+  # additional namespaces referenced by managed-warehouse SecretRefs.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-query-log-writer-runtime
+  namespace: duckgres
+subjects:
+  - kind: ServiceAccount
+    name: duckgres-query-log-writer
+    namespace: duckgres
+roleRef:
+  kind: Role
+  name: duckgres-query-log-writer-runtime
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckgres-query-log-writer-ducklings
+  namespace: ducklings
+rules:
+  # Read Duckling status to reuse the same tenant activation target and
+  # temporary object-store credential resolution as workers.
+  - apiGroups: ["k8s.posthog.com"]
+    resources: ["ducklings"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-query-log-writer-ducklings
+  namespace: ducklings
+subjects:
+  - kind: ServiceAccount
+    name: duckgres-query-log-writer
+    namespace: duckgres
+roleRef:
+  kind: Role
+  name: duckgres-query-log-writer-ducklings
   apiGroup: rbac.authorization.k8s.io

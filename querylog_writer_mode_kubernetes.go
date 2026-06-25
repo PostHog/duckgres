@@ -28,6 +28,8 @@ type staticQueryLogDuckLakeConfigResolver struct {
 	cfg server.Config
 }
 
+var queryLogWriterBootstrapBundledExtensions = server.BootstrapBundledExtensions
+
 func (r staticQueryLogDuckLakeConfigResolver) ResolveQueryLogDuckLakeConfig(context.Context, string) (server.QueryLogDuckLakeResolvedConfig, error) {
 	if r.cfg.DuckLake.MetadataStore == "" {
 		return server.QueryLogDuckLakeResolvedConfig{}, errors.New("querylog: static DuckLake metadata store is required")
@@ -82,6 +84,9 @@ func (r *configStoreQueryLogDuckLakeConfigResolver) ResolveQueryLogDuckLakeConfi
 func runQueryLogWriter(ctx context.Context, cfg server.Config, resolved configresolve.Resolved) error {
 	if !cfg.QueryLog.Enabled {
 		return errors.New("querylog: query log is disabled")
+	}
+	if err := queryLogWriterBootstrapBundledExtensions(cfg.DataDir); err != nil {
+		return fmt.Errorf("querylog: bootstrap bundled DuckDB extensions: %w", err)
 	}
 
 	metricsSrv := cliboot.InitMetrics()
