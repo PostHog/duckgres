@@ -2453,6 +2453,133 @@ func TestTakeOverWorkerSkipsNonReclaimableStatesPostgres(t *testing.T) {
 	}
 }
 
+// Regression: the hot-idle reaper must measure idle age from hot_idle_since, not
+// updated_at. Lease and credential-refresh writes (BumpWorkerEpoch,
+// MarkCredentialsRefreshed) bump updated_at without changing idleness; keying the
+// reap clock off updated_at let a periodically-refreshed hot-idle worker reset its
+// own TTL forever and never get retired.
+func TestListExpiredHotIdleWorkersUsesHotIdleSinceNotUpdatedAt(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	tbl := store.RuntimeSchema() + ".worker_records"
+
+	mk := func(id int) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-his-%d", id),
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        5,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	setTimestamps := func(id int, hotIdleSince, updatedAt time.Time) {
+		if err := store.DB().Exec(
+			fmt.Sprintf(`UPDATE %s SET hot_idle_since = ?, updated_at = ? WHERE worker_id = ?`, tbl),
+			hotIdleSince, updatedAt, id,
+		).Error; err != nil {
+			t.Fatalf("set worker %d timestamps: %v", id, err)
+		}
+	}
+
+	// Worker 1 became idle long ago (base) but a credential refresh bumped its
+	// updated_at recently (base+29m). It must still expire on its hot_idle_since.
+	mk(1)
+	setTimestamps(1, base, base.Add(29*time.Minute))
+	// Worker 2 genuinely became idle recently (base+29m); it must NOT expire,
+	// proving the reaper consults hot_idle_since rather than returning everything.
+	mk(2)
+	setTimestamps(2, base.Add(29*time.Minute), base.Add(29*time.Minute))
+
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	got := map[int]bool{}
+	for _, w := range expired {
+		got[w.WorkerID] = true
+	}
+	if !got[1] {
+		t.Error("worker idle since base (ttl 5m) must expire despite a recent updated_at bump")
+	}
+	if got[2] {
+		t.Error("worker that became idle only 1m before the cutoff must not expire")
+	}
+}
+
+// hot_idle_since is stamped on entry into hot_idle and preserved across same-state
+// re-upserts (so a re-write of an already-hot-idle row cannot reset the reap
+// clock), but is re-stamped when a worker leaves and re-enters hot_idle.
+func TestUpsertWorkerRecordStampsAndPreservesHotIdleSince(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	tbl := store.RuntimeSchema() + ".worker_records"
+	rec := configstore.WorkerRecord{
+		WorkerID:          1,
+		PodName:           "duckgres-worker-his",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   time.Now(),
+	}
+	upsert := func() {
+		t.Helper()
+		rec.HotIdleSince = nil // caller does not carry it; the store stamps on entry
+		if err := store.UpsertWorkerRecord(&rec); err != nil {
+			t.Fatalf("UpsertWorkerRecord(epoch %d, state %s): %v", rec.OwnerEpoch, rec.State, err)
+		}
+	}
+
+	upsert()
+	first, err := store.GetWorkerRecord(1)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if first.HotIdleSince == nil {
+		t.Fatal("hot_idle_since must be stamped on entry into hot_idle")
+	}
+
+	// Backdate to a known past value so the re-stamp comparison is deterministic.
+	past := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	if err := store.DB().Exec(
+		fmt.Sprintf(`UPDATE %s SET hot_idle_since = ? WHERE worker_id = ?`, tbl), past, 1,
+	).Error; err != nil {
+		t.Fatalf("backdate hot_idle_since: %v", err)
+	}
+
+	// Same-state re-upsert must preserve the existing hot_idle_since.
+	rec.OwnerEpoch = 2
+	upsert()
+	preserved, err := store.GetWorkerRecord(1)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if preserved.HotIdleSince == nil || !preserved.HotIdleSince.Equal(past) {
+		t.Errorf("hot_idle_since must be preserved across same-state upsert: got %v, want %v", preserved.HotIdleSince, past)
+	}
+
+	// Leaving hot_idle and re-entering must re-stamp to a fresh time.
+	rec.State = configstore.WorkerStateHot
+	rec.OwnerEpoch = 3
+	upsert()
+	rec.State = configstore.WorkerStateHotIdle
+	rec.OwnerEpoch = 4
+	upsert()
+	reentered, err := store.GetWorkerRecord(1)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if reentered.HotIdleSince == nil || !reentered.HotIdleSince.After(past) {
+		t.Errorf("hot_idle_since must be re-stamped on re-entry into hot_idle: got %v, want after %v", reentered.HotIdleSince, past)
+	}
+}
+
 func ptrTime(t time.Time) *time.Time {
 	return &t
 }
