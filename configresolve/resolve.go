@@ -122,7 +122,7 @@ type Resolved struct {
 	K8sWorkerProfileMinMemory       string
 	K8sWorkerProfileMaxMemory       string
 	K8sWorkerMaxTTL                 time.Duration
-	K8sWorkerDefaultTTL                   time.Duration
+	K8sWorkerDefaultTTL             time.Duration
 	AWSRegion                       string
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
@@ -163,10 +163,14 @@ func DefaultServerConfig() server.Config {
 		},
 		QueryLog: server.QueryLogConfig{
 			Enabled:              true,
+			Sink:                 server.QueryLogSinkDuckLake,
 			FlushInterval:        5 * time.Second,
 			BatchSize:            1000,
 			CompactInterval:      10 * time.Minute,
 			DataInliningRowLimit: 1000,
+			Kafka: server.QueryLogKafkaConfig{
+				ClientID: "duckgres-query-log",
+			},
 		},
 	}
 }
@@ -433,6 +437,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		if fileCfg.QueryLog.Enabled != nil {
 			cfg.QueryLog.Enabled = *fileCfg.QueryLog.Enabled
 		}
+		if fileCfg.QueryLog.Sink != "" {
+			cfg.QueryLog.Sink = fileCfg.QueryLog.Sink
+		}
 		if fileCfg.QueryLog.FlushInterval != "" {
 			if d, err := time.ParseDuration(fileCfg.QueryLog.FlushInterval); err == nil {
 				cfg.QueryLog.FlushInterval = d
@@ -452,6 +459,15 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.QueryLog.DataInliningRowLimit > 0 {
 			cfg.QueryLog.DataInliningRowLimit = fileCfg.QueryLog.DataInliningRowLimit
+		}
+		if len(fileCfg.QueryLog.Kafka.Brokers) > 0 {
+			cfg.QueryLog.Kafka.Brokers = append([]string(nil), fileCfg.QueryLog.Kafka.Brokers...)
+		}
+		if fileCfg.QueryLog.Kafka.Topic != "" {
+			cfg.QueryLog.Kafka.Topic = fileCfg.QueryLog.Kafka.Topic
+		}
+		if fileCfg.QueryLog.Kafka.ClientID != "" {
+			cfg.QueryLog.Kafka.ClientID = fileCfg.QueryLog.Kafka.ClientID
 		}
 
 		if fileCfg.TLS.ACME.Domain != "" {
@@ -911,6 +927,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_QUERY_LOG_ENABLED: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_QUERY_LOG_SINK"); v != "" {
+		cfg.QueryLog.Sink = v
+	}
 	if v := getenv("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.QueryLog.FlushInterval = d
@@ -938,6 +957,15 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		} else {
 			warn("Invalid DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT: " + err.Error())
 		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_KAFKA_BROKERS"); v != "" {
+		cfg.QueryLog.Kafka.Brokers = splitAndTrim(v, ",")
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_KAFKA_TOPIC"); v != "" {
+		cfg.QueryLog.Kafka.Topic = v
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID"); v != "" {
+		cfg.QueryLog.Kafka.ClientID = v
 	}
 
 	if cli.Set["host"] {
@@ -1196,6 +1224,14 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		warn("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL must be > 0; using default")
 		cfg.QueryLog.FlushInterval = defaultQueryLog.FlushInterval
 	}
+	cfg.QueryLog.Sink = strings.ToLower(strings.TrimSpace(cfg.QueryLog.Sink))
+	if cfg.QueryLog.Sink == "" {
+		cfg.QueryLog.Sink = defaultQueryLog.Sink
+	}
+	if cfg.QueryLog.Sink != server.QueryLogSinkDuckLake && cfg.QueryLog.Sink != server.QueryLogSinkKafka {
+		warn("DUCKGRES_QUERY_LOG_SINK must be ducklake or kafka; using default")
+		cfg.QueryLog.Sink = defaultQueryLog.Sink
+	}
 	if cfg.QueryLog.BatchSize <= 0 {
 		warn("DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0; using default")
 		cfg.QueryLog.BatchSize = defaultQueryLog.BatchSize
@@ -1242,7 +1278,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerProfileMinMemory:       k8sWorkerProfileMinMemory,
 		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
 		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
-		K8sWorkerDefaultTTL:                   k8sWorkerDefaultTTL,
+		K8sWorkerDefaultTTL:             k8sWorkerDefaultTTL,
 		AWSRegion:                       awsRegion,
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,

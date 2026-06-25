@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -67,10 +68,43 @@ type QueryLogger struct {
 	stopOnce sync.Once
 }
 
+// QueryLogSink accepts query log entries and drains them during shutdown.
+type QueryLogSink interface {
+	Log(QueryLogEntry)
+	StopContext(context.Context) error
+}
+
 const (
 	queryLogChannelSize = 10000
 	maxQueryLength      = 4096
+
+	QueryLogSinkDuckLake = "ducklake"
+	QueryLogSinkKafka    = "kafka"
 )
+
+// NewQueryLogSink creates the configured query-log sink. The default sink is
+// the historical DuckLake-backed system.query_log table.
+func NewQueryLogSink(cfg Config) (QueryLogSink, error) {
+	if !cfg.QueryLog.Enabled {
+		return nil, nil
+	}
+	sink := strings.TrimSpace(strings.ToLower(cfg.QueryLog.Sink))
+	if sink == "" {
+		sink = QueryLogSinkDuckLake
+	}
+	switch sink {
+	case QueryLogSinkDuckLake:
+		ql, err := NewQueryLogger(cfg)
+		if ql == nil {
+			return nil, err
+		}
+		return ql, err
+	case QueryLogSinkKafka:
+		return NewKafkaQueryLogSink(cfg.QueryLog)
+	default:
+		return nil, fmt.Errorf("querylog: unsupported sink %q", cfg.QueryLog.Sink)
+	}
+}
 
 // NewQueryLogger opens a dedicated :memory: DuckDB, attaches DuckLake,
 // creates the system.query_log table, and starts the background flush goroutine.
@@ -159,6 +193,14 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 
 // Log sends an entry to the query log. Non-blocking; drops if channel is full.
 func (ql *QueryLogger) Log(entry QueryLogEntry) {
+	if ql == nil || ql.ch == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("querylog: logger stopped while writing entry; dropping entry.")
+		}
+	}()
 	select {
 	case ql.ch <- entry:
 	default:
@@ -168,20 +210,35 @@ func (ql *QueryLogger) Log(entry QueryLogEntry) {
 
 // Stop drains remaining entries and shuts down the flush goroutine.
 func (ql *QueryLogger) Stop() {
+	_ = ql.StopContext(context.Background())
+}
+
+// StopContext drains remaining entries until ctx expires, then closes the DB to
+// unblock any in-flight flush.
+func (ql *QueryLogger) StopContext(ctx context.Context) error {
 	if ql == nil {
-		return
+		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var stopErr error
 	ql.stopOnce.Do(func() {
 		if ql.ch != nil {
 			close(ql.ch)
 		}
 		if ql.done != nil {
-			<-ql.done
+			select {
+			case <-ql.done:
+			case <-ctx.Done():
+				stopErr = ctx.Err()
+			}
 		}
 		if ql.db != nil {
 			_ = ql.db.Close()
 		}
 	})
+	return stopErr
 }
 
 func (ql *QueryLogger) flushLoop() {
@@ -509,7 +566,13 @@ func isQueryLogSelfReferential(query string) bool {
 func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType string,
 	resultRows, writtenRows int64, errCode, errMsg, protocol string) {
 
-	ql := c.server.queryLogger
+	var ql QueryLogSink
+	if c.server.queryLogSink != nil {
+		ql = c.server.queryLogSink
+	}
+	if ql == nil && c.server.queryLogger != nil {
+		ql = c.server.queryLogger
+	}
 	if ql == nil {
 		return
 	}

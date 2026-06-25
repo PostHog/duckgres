@@ -68,11 +68,19 @@ type K8sFileConfig struct {
 }
 
 type QueryLogFileConfig struct {
-	Enabled              *bool  `yaml:"enabled"`
-	FlushInterval        string `yaml:"flush_interval"`
-	BatchSize            int    `yaml:"batch_size"`
-	CompactInterval      string `yaml:"compact_interval"`
-	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"`
+	Enabled              *bool                   `yaml:"enabled"`
+	Sink                 string                  `yaml:"sink"`
+	FlushInterval        string                  `yaml:"flush_interval"`
+	BatchSize            int                     `yaml:"batch_size"`
+	CompactInterval      string                  `yaml:"compact_interval"`
+	DataInliningRowLimit int                     `yaml:"data_inlining_row_limit"`
+	Kafka                QueryLogKafkaFileConfig `yaml:"kafka"`
+}
+
+type QueryLogKafkaFileConfig struct {
+	Brokers  []string `yaml:"brokers"`
+	Topic    string   `yaml:"topic"`
+	ClientID string   `yaml:"client_id"`
 }
 
 type TLSConfig struct {

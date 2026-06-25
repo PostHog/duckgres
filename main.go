@@ -30,14 +30,15 @@ type FileConfig = configloader.FileConfig
 // the configloader. prefix on every line. The actual resolver now lives in
 // the configresolve package and takes *configloader.FileConfig directly.
 type (
-	ProcessFileConfig   = configloader.ProcessFileConfig
-	K8sFileConfig       = configloader.K8sFileConfig
-	QueryLogFileConfig  = configloader.QueryLogFileConfig
-	TLSConfig           = configloader.TLSConfig
-	ACMEConfig          = configloader.ACMEConfig
-	RateLimitFileConfig = configloader.RateLimitFileConfig
-	DuckLakeFileConfig  = configloader.DuckLakeFileConfig
-	IcebergFileConfig   = configloader.IcebergFileConfig
+	ProcessFileConfig       = configloader.ProcessFileConfig
+	K8sFileConfig           = configloader.K8sFileConfig
+	QueryLogFileConfig      = configloader.QueryLogFileConfig
+	QueryLogKafkaFileConfig = configloader.QueryLogKafkaFileConfig
+	TLSConfig               = configloader.TLSConfig
+	ACMEConfig              = configloader.ACMEConfig
+	RateLimitFileConfig     = configloader.RateLimitFileConfig
+	DuckLakeFileConfig      = configloader.DuckLakeFileConfig
+	IcebergFileConfig       = configloader.IcebergFileConfig
 )
 
 // loadConfigFile + env are thin wrappers around configloader for back-compat
@@ -374,7 +375,7 @@ func main() {
 				WorkerProfileMinMemory:       resolved.K8sWorkerProfileMinMemory,
 				WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
 				WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
-				WorkerDefaultTTL:                   resolved.K8sWorkerDefaultTTL,
+				WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
 				AWSRegion:                    resolved.AWSRegion,
 			},
 		}
