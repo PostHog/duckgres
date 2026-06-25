@@ -189,6 +189,40 @@ steps:
 	}
 }
 
+func TestRunnerRecordsClassifiedExecutorError(t *testing.T) {
+	sentinel := classifiedTestError{class: "cleanup_timeout", message: "cleanup timed out"}
+	scenario, err := ParseScenario([]byte(`
+name: classified
+steps:
+  - id: cleanup
+    type: fake
+`))
+	if err != nil {
+		t.Fatalf("ParseScenario returned error: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{
+		RunID:    "run-classified",
+		Scenario: scenario,
+		Executor: StepExecutorFunc(func(context.Context, Step) error {
+			return sentinel
+		}),
+		Now: fixedClock(time.Unix(1700000000, 0)),
+	})
+
+	_, err = runner.Run(context.Background())
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("runner error = %v, want classified sentinel", err)
+	}
+	results := runner.Results()
+	if len(results) != 1 {
+		t.Fatalf("results = %+v, want one result", results)
+	}
+	if results[0].ErrorClass != "cleanup_timeout" {
+		t.Fatalf("error class = %q, want cleanup_timeout", results[0].ErrorClass)
+	}
+}
+
 func TestRunnerReturnsSuccessForAllSuccessfulSteps(t *testing.T) {
 	scenario, err := ParseScenario([]byte(`
 name: success
@@ -237,4 +271,17 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+type classifiedTestError struct {
+	class   string
+	message string
+}
+
+func (e classifiedTestError) Error() string {
+	return e.message
+}
+
+func (e classifiedTestError) ErrorClass() string {
+	return e.class
 }
