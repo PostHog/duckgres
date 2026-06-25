@@ -11,6 +11,7 @@ import (
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // --- Helpers ---
@@ -211,4 +212,98 @@ func (p *K8sWorkerPool) logw(id int) *slog.Logger {
 		return slog.With(workerLogAttrs(w)...)
 	}
 	return slog.With("worker", id)
+}
+
+func workerPodStatusLogAttrs(pod *corev1.Pod) []any {
+	if pod == nil {
+		return nil
+	}
+	attrs := []any{
+		"pod_phase", string(pod.Status.Phase),
+	}
+	if pod.Status.Reason != "" {
+		attrs = append(attrs, "pod_reason", pod.Status.Reason)
+	}
+	if pod.Status.Message != "" {
+		attrs = append(attrs, "pod_message", pod.Status.Message)
+	}
+	if pod.Spec.NodeName != "" {
+		attrs = append(attrs, "pod_node", pod.Spec.NodeName)
+	}
+	if pod.Status.PodIP != "" {
+		attrs = append(attrs, "pod_ip", pod.Status.PodIP)
+	}
+	if pod.DeletionTimestamp != nil {
+		attrs = append(attrs, "pod_deletion_timestamp", pod.DeletionTimestamp.Time.UTC().Format(time.RFC3339Nano))
+	}
+	if status, ok := workerContainerStatus(pod.Status.ContainerStatuses); ok {
+		attrs = append(attrs, containerStatusLogAttrs(status)...)
+	}
+	return attrs
+}
+
+func workerContainerStatus(statuses []corev1.ContainerStatus) (corev1.ContainerStatus, bool) {
+	if len(statuses) == 0 {
+		return corev1.ContainerStatus{}, false
+	}
+	for _, status := range statuses {
+		if status.Name == "duckdb-worker" {
+			return status, true
+		}
+	}
+	return statuses[0], true
+}
+
+func containerStatusLogAttrs(status corev1.ContainerStatus) []any {
+	attrs := []any{
+		"container_name", status.Name,
+		"container_restart_count", status.RestartCount,
+	}
+	switch {
+	case status.State.Terminated != nil:
+		term := status.State.Terminated
+		attrs = append(attrs,
+			"container_state", "terminated",
+			"container_reason", term.Reason,
+			"container_exit_code", term.ExitCode,
+			"container_signal", term.Signal,
+		)
+		if term.Message != "" {
+			attrs = append(attrs, "container_message", term.Message)
+		}
+		if !term.StartedAt.IsZero() {
+			attrs = append(attrs, "container_started_at", term.StartedAt.Time.UTC().Format(time.RFC3339Nano))
+		}
+		if !term.FinishedAt.IsZero() {
+			attrs = append(attrs, "container_finished_at", term.FinishedAt.Time.UTC().Format(time.RFC3339Nano))
+		}
+	case status.State.Waiting != nil:
+		waiting := status.State.Waiting
+		attrs = append(attrs,
+			"container_state", "waiting",
+			"container_reason", waiting.Reason,
+		)
+		if waiting.Message != "" {
+			attrs = append(attrs, "container_message", waiting.Message)
+		}
+	case status.State.Running != nil:
+		running := status.State.Running
+		attrs = append(attrs, "container_state", "running")
+		if !running.StartedAt.IsZero() {
+			attrs = append(attrs, "container_started_at", running.StartedAt.Time.UTC().Format(time.RFC3339Nano))
+		}
+	default:
+		attrs = append(attrs, "container_state", "unknown")
+	}
+	if term := status.LastTerminationState.Terminated; term != nil {
+		attrs = append(attrs,
+			"last_container_reason", term.Reason,
+			"last_container_exit_code", term.ExitCode,
+			"last_container_signal", term.Signal,
+		)
+		if !term.FinishedAt.IsZero() {
+			attrs = append(attrs, "last_container_finished_at", term.FinishedAt.Time.UTC().Format(time.RFC3339Nano))
+		}
+	}
+	return attrs
 }

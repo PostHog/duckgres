@@ -438,15 +438,44 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 								}
 								observeControlPlaneWorkers(workerCount)
 
-								p.logw(lease.workerID).Error("K8s worker unresponsive, deleting pod.", "consecutive_failures", count)
 								if onCrash != nil {
 									onCrash(lease.workerID)
 								}
-								// Delete the pod to force cleanup
+
+								// Snapshot pod/container state before the delete below removes
+								// the easiest source of OOMKilled/Evicted/exit-code evidence.
 								podName := p.workerPodName(removedWorker)
-								_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-									GracePeriodSeconds: int64Ptr(10),
-								})
+								deleteAttrs := []any{"consecutive_failures", count}
+								if podName != "" && p.clientset != nil {
+									statusCtx, statusCancel := context.WithTimeout(ctx, 2*time.Second)
+									pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(statusCtx, podName, metav1.GetOptions{})
+									statusCancel()
+									if err != nil {
+										deleteAttrs = append(deleteAttrs, "pod_status_error", err)
+									} else {
+										deleteAttrs = append(deleteAttrs, workerPodStatusLogAttrs(pod)...)
+									}
+								}
+								logger := slog.With(workerLogAttrs(removedWorker)...)
+								logger.Error("K8s worker unresponsive, deleting pod.", deleteAttrs...)
+								deleteResultAttrs := append(append([]any{}, deleteAttrs...), "grace_period_seconds", 10)
+								if podName == "" || p.clientset == nil {
+									logger.Warn("K8s worker pod delete skipped.", append(deleteResultAttrs, "reason", "missing_pod_or_client")...)
+								} else {
+									deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
+									err := p.clientset.CoreV1().Pods(p.namespace).Delete(deleteCtx, podName, metav1.DeleteOptions{
+										GracePeriodSeconds: int64Ptr(10),
+									})
+									deleteCancel()
+									switch {
+									case err == nil:
+										logger.Info("K8s worker pod delete requested.", deleteResultAttrs...)
+									case errors.IsNotFound(err):
+										logger.Info("K8s worker pod already gone before delete request completed.", append(deleteResultAttrs, "error", err)...)
+									default:
+										logger.Warn("K8s worker pod delete request failed.", append(deleteResultAttrs, "error", err)...)
+									}
+								}
 								if removedWorker.client != nil {
 									_ = removedWorker.client.Close()
 								}

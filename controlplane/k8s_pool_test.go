@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +26,71 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+type capturedSlogRecord struct {
+	message string
+	attrs   map[string]string
+}
+
+type capturedSlogSink struct {
+	mu      sync.Mutex
+	records []capturedSlogRecord
+}
+
+func (s *capturedSlogSink) record(message string, attrs []slog.Attr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := capturedSlogRecord{message: message, attrs: make(map[string]string, len(attrs))}
+	for _, attr := range attrs {
+		record.attrs[attr.Key] = attr.Value.String()
+	}
+	s.records = append(s.records, record)
+}
+
+func (s *capturedSlogSink) findMessage(message string) (capturedSlogRecord, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, record := range s.records {
+		if record.message == message {
+			return record, true
+		}
+	}
+	return capturedSlogRecord{}, false
+}
+
+type capturedSlogHandler struct {
+	sink  *capturedSlogSink
+	attrs []slog.Attr
+}
+
+func (h *capturedSlogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturedSlogHandler) Handle(_ context.Context, r slog.Record) error {
+	attrs := append([]slog.Attr{}, h.attrs...)
+	r.Attrs(func(attr slog.Attr) bool {
+		attrs = append(attrs, attr)
+		return true
+	})
+	h.sink.record(r.Message, attrs)
+	return nil
+}
+
+func (h *capturedSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	next := &capturedSlogHandler{sink: h.sink}
+	next.attrs = append(append([]slog.Attr{}, h.attrs...), attrs...)
+	return next
+}
+
+func (h *capturedSlogHandler) WithGroup(string) slog.Handler { return h }
+
+func captureSlog(t *testing.T) *capturedSlogSink {
+	t.Helper()
+	previous := slog.Default()
+	sink := &capturedSlogSink{}
+	slog.SetDefault(slog.New(&capturedSlogHandler{sink: sink}))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return sink
+}
 
 type captureRuntimeWorkerStore struct {
 	mu                               sync.Mutex
@@ -1691,6 +1758,7 @@ func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
 
 func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
+	logs := captureSlog(t)
 	store := &captureRuntimeWorkerStore{
 		preloadedRecords: map[int]*configstore.WorkerRecord{
 			8: {
@@ -1711,15 +1779,38 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 
 	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "adopted-worker-8", Namespace: "default"},
-		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.8"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.0.0.8",
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:         "duckdb-worker",
+				RestartCount: 2,
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))},
+				},
+			}},
+		},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create worker pod: %v", err)
 	}
 
 	crashed := make(chan int, 1)
+	crashNotified := make(chan struct{})
+	var crashNotifiedOnce sync.Once
+	var snapshotBeforeCrash atomic.Bool
+	cs.Fake.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		select {
+		case <-crashNotified:
+		default:
+			snapshotBeforeCrash.Store(true)
+		}
+		return false, nil, nil
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashNotifiedOnce.Do(func() { close(crashNotified) })
 		crashed <- workerID
 	}, nil)
 
@@ -1745,6 +1836,32 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 	}
 	if got := podDeleteActionNames(cs); len(got) != 1 || got[0] != "adopted-worker-8" {
 		t.Fatalf("expected health-check failure to delete adopted pod, got %v", got)
+	}
+	if snapshotBeforeCrash.Load() {
+		t.Fatal("pod status snapshot must not run before crash notification")
+	}
+	deleteLog, ok := logs.findMessage("K8s worker unresponsive, deleting pod.")
+	if !ok {
+		t.Fatal("expected health-check pod delete log")
+	}
+	if deleteLog.attrs["worker_pod"] != "adopted-worker-8" {
+		t.Fatalf("expected worker_pod attr on delete log, got attrs %#v", deleteLog.attrs)
+	}
+	if deleteLog.attrs["pod_phase"] != "Running" {
+		t.Fatalf("expected pod_phase attr on delete log, got attrs %#v", deleteLog.attrs)
+	}
+	if deleteLog.attrs["container_name"] != "duckdb-worker" || deleteLog.attrs["container_state"] != "running" {
+		t.Fatalf("expected container summary attrs on delete log, got attrs %#v", deleteLog.attrs)
+	}
+	if deleteLog.attrs["container_restart_count"] != "2" {
+		t.Fatalf("expected container restart count attr on delete log, got attrs %#v", deleteLog.attrs)
+	}
+	deleteRequestedLog, ok := logs.findMessage("K8s worker pod delete requested.")
+	if !ok {
+		t.Fatal("expected post-delete request log")
+	}
+	if deleteRequestedLog.attrs["worker_pod"] != "adopted-worker-8" {
+		t.Fatalf("expected worker_pod attr on post-delete log, got attrs %#v", deleteRequestedLog.attrs)
 	}
 
 	store.mu.Lock()
@@ -2910,17 +3027,38 @@ func TestK8sPoolRetireWorkerUsesTrackedPodName(t *testing.T) {
 
 func TestK8sPool_OnPodTerminated(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
+	logs := captureSlog(t)
 
 	done := make(chan struct{})
 	pool.workers[5] = &ManagedWorker{ID: 5, done: done}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
+			Name: "worker-5",
 			Labels: map[string]string{
-				"duckgres/worker-id": "5",
+				"duckgres/worker-id":  "5",
+				"duckgres/active-org": "org-a",
 			},
 		},
-		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+		Status: corev1.PodStatus{
+			Phase:   corev1.PodFailed,
+			Reason:  "Evicted",
+			Message: "pod evicted by kubelet",
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:         "duckdb-worker",
+				RestartCount: 1,
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode:   137,
+						Signal:     9,
+						Reason:     "OOMKilled",
+						Message:    "container exceeded memory limit",
+						StartedAt:  metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)),
+						FinishedAt: metav1.NewTime(time.Date(2026, 1, 2, 3, 14, 5, 0, time.UTC)),
+					},
+				},
+			}},
+		},
 	}
 
 	pool.onPodTerminated(pod)
@@ -2931,6 +3069,24 @@ func TestK8sPool_OnPodTerminated(t *testing.T) {
 		// Good
 	default:
 		t.Fatal("done channel should be closed after pod termination")
+	}
+	terminatedLog, ok := logs.findMessage("Worker pod terminated.")
+	if !ok {
+		t.Fatal("expected worker pod terminated log")
+	}
+	if terminatedLog.attrs["worker_pod"] != "worker-5" || terminatedLog.attrs["org"] != "org-a" {
+		t.Fatalf("expected worker identity attrs on terminated log, got attrs %#v", terminatedLog.attrs)
+	}
+	if terminatedLog.attrs["pod_phase"] != "Failed" || terminatedLog.attrs["pod_reason"] != "Evicted" {
+		t.Fatalf("expected pod status attrs on terminated log, got attrs %#v", terminatedLog.attrs)
+	}
+	if terminatedLog.attrs["container_name"] != "duckdb-worker" ||
+		terminatedLog.attrs["container_state"] != "terminated" ||
+		terminatedLog.attrs["container_reason"] != "OOMKilled" ||
+		terminatedLog.attrs["container_exit_code"] != "137" ||
+		terminatedLog.attrs["container_signal"] != "9" ||
+		terminatedLog.attrs["container_restart_count"] != "1" {
+		t.Fatalf("expected container termination attrs on terminated log, got attrs %#v", terminatedLog.attrs)
 	}
 }
 

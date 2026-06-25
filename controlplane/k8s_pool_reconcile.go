@@ -400,7 +400,14 @@ func (p *K8sWorkerPool) onPodTerminated(pod *corev1.Pod) {
 	case <-w.done:
 		// Already closed
 	default:
-		slog.Warn("Worker pod terminated.", "worker", id, "worker_pod", pod.Name, "org", pod.Labels["duckgres/active-org"], "phase", pod.Status.Phase)
+		attrs := []any{
+			"worker", id,
+			"worker_pod", pod.Name,
+			"org", pod.Labels["duckgres/active-org"],
+			"phase", pod.Status.Phase,
+		}
+		attrs = append(attrs, workerPodStatusLogAttrs(pod)...)
+		slog.Warn("Worker pod terminated.", attrs...)
 		close(w.done)
 	}
 }
