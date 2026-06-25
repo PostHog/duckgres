@@ -696,6 +696,15 @@ const jsonExtractPathMacro = "duckgres_json_extract_path"
 // Returns (newKey, true) when a rewrite happened, (key, false) otherwise. Plain
 // keys and already-valid navigating JSONPaths ($.foo, $."foo", $.a[0], $[0]) are
 // returned unchanged, so the rewrite is idempotent.
+//
+// KNOWN DIVERGENCE: a '$.'/'$['-prefixed key is treated as a navigating DuckDB
+// JSONPath for BOTH direct json_extract calls and the -> / ->> operators, even
+// though in PostgreSQL `data ->> '$.a.b'` means the literal key "$.a.b". We keep
+// this consistent (and matching the pre-existing #639 transpiler test) rather
+// than giving arrows separate literal-key semantics, because (a) a single
+// runtime macro cannot both preserve a valid path and quote it, so arrow params
+// could not match arrow literals, and (b) the reported keys ($ai_session_id,
+// $group_0 — no dot) and HogQL property keys never take this branch.
 func normalizeJSONPathKey(key string) (string, bool) {
 	if !strings.HasPrefix(key, "$") {
 		// Plain key: DuckDB does a literal single-key lookup. Already correct.
@@ -723,27 +732,44 @@ func normalizeJSONPathKey(key string) (string, bool) {
 //     wrapped in the duckgres_json_extract_path() macro so the identical
 //     normalization runs at runtime, before DuckDB's binder sees the value. The
 //     parameter node still appears exactly once, so param count/position is
-//     unchanged.
+//     unchanged. The macro is type-aware, so an integer-bound parameter still
+//     indexes arrays (Postgres `json -> int`).
 //
-// Any other argument shape (integer array index, column reference, arbitrary
-// expression) is deliberately left untouched: integers are valid DuckDB array
-// indexes, and we must not blanket-rewrite non-path arguments.
+// An explicit cast is looked through (clients/drivers commonly add ::text to a
+// path argument, e.g. json_extract_string(p, $1::text), and a bare ParamRef
+// check would miss it). The whole casted expression is wrapped/rewritten so the
+// cast — and the parameter's wire type — is preserved.
+//
+// Any other argument shape (bare integer array index, column reference,
+// arbitrary expression) is deliberately left untouched: an integer literal is a
+// valid DuckDB array index, and we must not blanket-rewrite non-path arguments.
 func (t *OperatorTransform) normalizeJSONExtractPathArg(node *pg_query.Node) *pg_query.Node {
 	if node == nil {
 		return nil
 	}
-	// Literal string key → rewrite at transpile time.
-	if ac := node.GetAConst(); ac != nil {
+	// Look through any wrapping casts to find the underlying param/literal.
+	core := node
+	for {
+		tc := core.GetTypeCast()
+		if tc == nil || tc.Arg == nil {
+			break
+		}
+		core = tc.Arg
+	}
+	// Bound parameter (bare or cast-wrapped) → wrap the whole expression in the
+	// runtime macro.
+	if core.GetParamRef() != nil {
+		return t.jsonPathMacroCall(node)
+	}
+	// Literal string key → rewrite at transpile time. Mutate the inner constant
+	// in place so an enclosing cast (e.g. '$ai_session_id'::text) is preserved.
+	if ac := core.GetAConst(); ac != nil {
 		if sval := ac.GetSval(); sval != nil {
 			if newKey, changed := normalizeJSONPathKey(sval.Sval); changed {
-				return stringConstNode(newKey)
+				ac.Val = &pg_query.A_Const_Sval{Sval: &pg_query.String{Sval: newKey}}
+				return node
 			}
 		}
-		return nil
-	}
-	// Bound parameter → wrap with the runtime normalization macro.
-	if node.GetParamRef() != nil {
-		return t.jsonPathMacroCall(node)
 	}
 	return nil
 }

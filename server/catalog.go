@@ -1541,20 +1541,32 @@ func initUtilityMacros(db *sql.DB, serverStartTime, processStartTime time.Time, 
 		// is not mis-parsed by DuckDB as a (malformed) JSONPath and rejected at
 		// bind time ("JSON path error near ..."). The transpiler wraps the path
 		// argument of json_extract[_string] in this macro when it is a bound
-		// parameter ($N) whose value is unknown at transpile time (literal keys
-		// are rewritten statically). Rules MUST mirror normalizeJSONPathKey in
-		// transpiler/transform/operators.go:
+		// parameter ($N) whose value is unknown at transpile time (literal string
+		// keys are rewritten statically by normalizeJSONPathKey in
+		// transpiler/transform/operators.go; the string rules below MUST match it).
+		//
+		// Because the bound value's TYPE is only known at execute time, the macro
+		// dispatches on typeof(k):
 		//   - NULL                       -> NULL
+		//   - integer type               -> $[k]  (Postgres `json -> int` / `->> int`
+		//                                   array indexing; a bare integer would also
+		//                                   index, but every CASE branch must return
+		//                                   one type, so we emit a VARCHAR path)
 		//   - "$." / "$[" prefix         -> unchanged (already a valid JSONPath)
 		//   - other "$"-prefixed key     -> $."<key>" (escape \ and " for the
 		//                                   quoted member)
-		//   - plain key                  -> unchanged (DuckDB looks it up literally)
+		//   - plain key                  -> unchanged (DuckDB looks it up literally;
+		//                                   a string "0" stays an object-key lookup,
+		//                                   matching Postgres text-vs-int semantics)
+		// The string branches cast k to VARCHAR so LIKE type-checks for every bound
+		// type (an integer k would otherwise fail to bind the `~~`/LIKE operator).
 		`CREATE OR REPLACE MACRO duckgres_json_extract_path(k) AS (
 			CASE
 				WHEN k IS NULL THEN NULL
-				WHEN k LIKE '$.%' OR k LIKE '$[%' THEN k
-				WHEN k LIKE '$%' THEN '$."' || replace(replace(k, '\', '\\'), '"', '\"') || '"'
-				ELSE k
+				WHEN typeof(k) IN ('TINYINT','SMALLINT','INTEGER','BIGINT','HUGEINT','UTINYINT','USMALLINT','UINTEGER','UBIGINT','UHUGEINT') THEN '$[' || k::VARCHAR || ']'
+				WHEN k::VARCHAR LIKE '$.%' OR k::VARCHAR LIKE '$[%' THEN k::VARCHAR
+				WHEN k::VARCHAR LIKE '$%' THEN '$."' || replace(replace(k::VARCHAR, '\', '\\'), '"', '\"') || '"'
+				ELSE k::VARCHAR
 			END)`,
 	}
 

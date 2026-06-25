@@ -2555,6 +2555,13 @@ func TestTranspile_JSONExtract_DollarPrefixedKeys(t *testing.T) {
 			input:    "SELECT json_extract(data, '$.a') FROM t",
 			expected: "SELECT json_extract(data, '$.a') FROM t",
 		},
+		{
+			// A literal key wrapped in an explicit ::text cast: the cast must be
+			// looked through and the inner literal rewritten, preserving the cast.
+			name:     "dollar literal key wrapped in a text cast is rewritten",
+			input:    "SELECT json_extract_string(props, '$ai_session_id'::text) FROM events",
+			expected: `SELECT json_extract_string(props, '$."$ai_session_id"'::text) FROM events`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2603,6 +2610,19 @@ func TestTranspile_JSONExtract_ParameterPath(t *testing.T) {
 			expected: "SELECT json_extract_string(events.properties, duckgres_json_extract_path($1)) AS ai_session_id FROM events",
 		},
 		{
+			// A param wrapped in an explicit ::text cast (clients/drivers add
+			// these) must still be wrapped — the cast is preserved inside the macro
+			// call so the param's wire type is unchanged.
+			name:     "direct func param with ::text cast is wrapped",
+			input:    "SELECT json_extract_string(props, $1::text) FROM events",
+			expected: "SELECT json_extract_string(props, duckgres_json_extract_path($1::text)) FROM events",
+		},
+		{
+			name:     "arrow ->> param with ::text cast is wrapped",
+			input:    "SELECT props->>$1::text FROM events",
+			expected: "SELECT json_extract_string(props, duckgres_json_extract_path($1::text)) FROM events",
+		},
+		{
 			name:     "ordinary string parameter is NOT wrapped",
 			input:    "SELECT * FROM events WHERE name = $1",
 			expected: "SELECT * FROM events WHERE name = $1",
@@ -2648,6 +2668,11 @@ func TestTranspile_JSONExtract_ParameterPath_DuckLake(t *testing.T) {
 			name:     "direct json_extract_string param path is wrapped in the qualified macro",
 			input:    "SELECT json_extract_string(properties, $1) FROM events",
 			expected: "SELECT json_extract_string(properties, memory.main.duckgres_json_extract_path($1)) FROM events",
+		},
+		{
+			name:     "param path with a ::text cast is wrapped in the qualified macro",
+			input:    "SELECT json_extract_string(properties, $1::text) FROM events",
+			expected: "SELECT json_extract_string(properties, memory.main.duckgres_json_extract_path($1::text)) FROM events",
 		},
 	}
 	for _, tt := range tests {

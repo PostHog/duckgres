@@ -42,9 +42,23 @@ func TestJSONExtractDollarKey_RoundTrip(t *testing.T) {
 			want:  "ok",
 		},
 		{
-			// Regression guard: an already-valid navigating JSONPath still
-			// navigates (preserved DuckDB semantics).
-			name:  "valid JSONPath still navigates",
+			// A '$.'/'$['-prefixed argument is a valid DuckDB JSONPath, so it is
+			// left to navigate. For a direct json_extract[_string] call this is
+			// unambiguously correct — the client wrote a DuckDB function and a
+			// DuckDB path.
+			name:  "valid JSONPath in a direct call navigates",
+			query: `SELECT json_extract_string('{"a":{"b":"nested"}}', '$.a.b')`,
+			want:  "nested",
+		},
+		{
+			// KNOWN, DELIBERATE DIVERGENCE: in PostgreSQL `data ->> '$.a.b'` means
+			// the literal key named "$.a.b" (-> NULL here), but we keep DuckDB
+			// JSONPath semantics for '$.'/'$['-prefixed arrow keys too — consistent
+			// with direct calls and with the pre-existing #639 transpiler test. This
+			// only affects keys that are *also* valid JSONPaths; the reported bug
+			// keys ($ai_session_id, $group_0 — no dot) are unaffected and HogQL does
+			// not emit dotted JSONPath property keys. See normalizeJSONPathKey.
+			name:  "dotted JSONPath via arrow navigates (documented divergence)",
 			query: `SELECT ('{"a":{"b":"nested"}}'::json)->>'$.a.b'`,
 			want:  "nested",
 		},
@@ -73,11 +87,12 @@ func TestJSONExtractDollarKey_ParameterRoundTrip(t *testing.T) {
 	tr := transpiler.New(transpiler.Config{ConvertPlaceholders: true})
 
 	const doc = `{"$ai_session_id":"sess_from_param","normal":"plain_value"}`
+	const arrDoc = `["zero","one","two"]`
 
 	cases := []struct {
 		name  string
 		query string
-		arg   string
+		arg   any
 		want  string
 	}{
 		{
@@ -98,6 +113,29 @@ func TestJSONExtractDollarKey_ParameterRoundTrip(t *testing.T) {
 			arg:   "$ai_session_id",
 			want:  "sess_from_param",
 		},
+		{
+			// P2 regression: a path param wrapped in an explicit ::text cast (added
+			// by some drivers) must still resolve, not bypass normalization.
+			name:  "parameter dollar key with a ::text cast extracts the value",
+			query: `SELECT json_extract_string('` + doc + `'::json, $1::text)`,
+			arg:   "$ai_session_id",
+			want:  "sess_from_param",
+		},
+		{
+			// P2 regression: an INTEGER-bound parameter must still index the array
+			// (Postgres `json ->> int`). The type-aware macro emits a $[i] path
+			// rather than mangling the integer into a string key.
+			name:  "integer parameter indexes the array (arrow)",
+			query: `SELECT ('` + arrDoc + `'::json)->>$1`,
+			arg:   2,
+			want:  "two",
+		},
+		{
+			name:  "integer parameter indexes the array (direct call)",
+			query: `SELECT json_extract_string('` + arrDoc + `'::json, $1)`,
+			arg:   int64(0),
+			want:  "zero",
+		},
 	}
 
 	for _, tc := range cases {
@@ -111,10 +149,10 @@ func TestJSONExtractDollarKey_ParameterRoundTrip(t *testing.T) {
 			}
 			var got sql.NullString
 			if err := db.QueryRow(res.SQL, tc.arg).Scan(&got); err != nil {
-				t.Fatalf("exec %q (transpiled %q) arg=%q: %v", tc.query, res.SQL, tc.arg, err)
+				t.Fatalf("exec %q (transpiled %q) arg=%v: %v", tc.query, res.SQL, tc.arg, err)
 			}
 			if !got.Valid || got.String != tc.want {
-				t.Fatalf("%q arg=%q = %v, want %q (transpiled %q)", tc.query, tc.arg, got, tc.want, res.SQL)
+				t.Fatalf("%q arg=%v = %v, want %q (transpiled %q)", tc.query, tc.arg, got, tc.want, res.SQL)
 			}
 		})
 	}

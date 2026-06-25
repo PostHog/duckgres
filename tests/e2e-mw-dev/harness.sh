@@ -313,6 +313,10 @@ pg_compat_functions() { # org password
   # memory.main-qualified on the live DuckLake worker — the path a parameterized
   # `json_extract_string(props, $1)` from a HogQL client takes.
   assert_compat "$1" "$2" ducklake "SELECT json_extract_string('{\"\$ai_session_id\":\"viaMacro\"}', duckgres_json_extract_path('\$ai_session_id'))" "viaMacro" "json_dollar_key_macro"
+  # The macro is type-aware: an integer path argument (Postgres `json ->> int`
+  # array indexing) becomes a $[i] JSONPath rather than being mangled into a
+  # string key. Guards the parameterized-array-index path on the live worker.
+  assert_compat "$1" "$2" ducklake "SELECT json_extract_string('[\"a\",\"b\",\"c\"]', duckgres_json_extract_path(2))" "c" "json_int_index_macro"
   # PG curly-brace array literal cast.
   assert_compat "$1" "$2" ducklake "SELECT array_length('{1,2,3}'::int[],1)::text" "3" "array_literal_cast"
   # set-returning table macro in FROM position (memory.main-qualified).
