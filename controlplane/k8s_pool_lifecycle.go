@@ -438,12 +438,23 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 								}
 								observeControlPlaneWorkers(workerCount)
 
-								p.logw(lease.workerID).Error("K8s worker unresponsive, deleting pod.", "consecutive_failures", count)
+								// Snapshot pod/container state before the delete below removes
+								// the easiest source of OOMKilled/Evicted/exit-code evidence.
+								podName := p.workerPodName(removedWorker)
+								deleteAttrs := []any{"consecutive_failures", count}
+								if podName != "" && p.clientset != nil {
+									pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
+									if err != nil {
+										deleteAttrs = append(deleteAttrs, "pod_status_error", err)
+									} else {
+										deleteAttrs = append(deleteAttrs, workerPodStatusLogAttrs(pod)...)
+									}
+								}
+								slog.With(workerLogAttrs(removedWorker)...).Error("K8s worker unresponsive, deleting pod.", deleteAttrs...)
 								if onCrash != nil {
 									onCrash(lease.workerID)
 								}
 								// Delete the pod to force cleanup
-								podName := p.workerPodName(removedWorker)
 								_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 									GracePeriodSeconds: int64Ptr(10),
 								})
