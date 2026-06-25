@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckgres-query-log-kafka
+  namespace: duckgres
+data:
+  # Set sink=kafka on control-plane pods to publish query-log events instead of
+  # writing directly to DuckLake. The query-log-writer consumes the same topic
+  # and writes events into each tenant's ducklake.system.query_log table.
+  sink: kafka
+  brokers: "kafka:9092"
+  topic: "duckgres_query_log"
+  client_id: "duckgres-query-log"
+  group_id: "duckgres-query-log-writer"
+
+  # Query-log writer runtime. Use the same config store as the control plane.
+  config_store: "postgres://duckgres:duckgres@duckgres-config-store:5432/duckgres_config?sslmode=disable"
+  aws_region: ""
+  k8s_worker_namespace: "duckgres"

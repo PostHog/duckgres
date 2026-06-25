@@ -260,7 +260,7 @@ test:
 # Run unit tests only
 [group('test')]
 test-unit:
-    go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/...
+    go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/... ./tests/manifests/...
 
 # Run cache-proxy tests
 [group('test')]
@@ -286,7 +286,7 @@ test-configstore-integration:
 # Run Kubernetes-only control plane package tests
 [group('test')]
 test-controlplane-k8s:
-    go test -v -count=1 -tags kubernetes ./controlplane ./controlplane/admin ./controlplane/provisioner
+    go test -v -count=1 -tags kubernetes . ./controlplane ./controlplane/admin ./controlplane/provisioner
 
 # Print the test impact plan for the current branch
 [group('test')]

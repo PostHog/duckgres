@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-query-log-writer
+  namespace: duckgres
+  labels:
+    app: duckgres-query-log-writer
+spec:
+  # Disabled by default for the reference manifests. Apply
+  # query-log-kafka-config.example.yaml with real values, then scale this up.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: duckgres-query-log-writer
+  template:
+    metadata:
+      labels:
+        app: duckgres-query-log-writer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: duckgres-query-log-writer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: query-log-writer
+          image: duckgres:test
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--mode"
+            - "query-log-writer"
+            - "--config"
+            - "/etc/duckgres/duckgres.yaml"
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DUCKGRES_CONFIG_STORE
+              valueFrom:
+                configMapKeyRef:
+                  name: duckgres-query-log-kafka
+                  key: config_store
+            - name: DUCKGRES_QUERY_LOG_KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: duckgres-query-log-kafka
+                  key: brokers
+            - name: DUCKGRES_QUERY_LOG_KAFKA_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: duckgres-query-log-kafka
+                  key: topic
+            - name: DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: duckgres-query-log-kafka
+                  key: client_id
+                  optional: true
+            - name: DUCKGRES_QUERY_LOG_KAFKA_GROUP_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: duckgres-query-log-kafka
+                  key: group_id
+                  optional: true
+            - name: DUCKGRES_AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: duckgres-query-log-kafka
+                  key: aws_region
+                  optional: true
+            - name: DUCKGRES_K8S_WORKER_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: duckgres-query-log-kafka
+                  key: k8s_worker_namespace
+                  optional: true
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/duckgres
+              readOnly: true
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: duckgres-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-query-log-writer-metrics
+  namespace: duckgres
+  labels:
+    app: duckgres-query-log-writer
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    app: duckgres-query-log-writer

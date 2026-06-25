@@ -43,13 +43,16 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | File | Description |
 |------|-------------|
 | `namespace.yaml` | `duckgres` namespace |
-| `rbac.yaml` | Control-plane and shared worker ServiceAccounts, Role (pods + secrets), RoleBinding |
+| `rbac.yaml` | Control-plane, shared worker, and query-log writer ServiceAccounts plus required Roles/RoleBindings |
 | `configmap.yaml` | Shared duckgres config (users, extensions, data dir) |
 | `secret.yaml` | Bearer token secret (auto-populated by CP if empty) |
 | `managed-warehouse-secrets.yaml` | Local secret payloads referenced by the seeded managed-warehouse contract |
 | `worker-identity.yaml` | Local worker ServiceAccount referenced by the seeded managed-warehouse contract |
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
 | `control-plane-multitenant-local.yaml` | Optional OrbStack-oriented shared-worker control-plane manifest |
+| `query-log-kafka-config.example.yaml` | Example ConfigMap for enabling Kafka query-log producer and writer settings |
+| `query-log-writer.yaml` | Disabled-by-default query-log writer Deployment and metrics Service |
+| `query-log-writer-alerts.example.yaml` | Example PrometheusRule alerts for writer failures, drops, and high retry volume |
 | `kind/config-store.overlay.yaml` | Compose overlay that attaches local dependency containers to the external Docker `kind` network |
 | `kind/config-store.seed.sql` | Kind-oriented managed-warehouse seed for the shared-worker flow |
 | `kind/control-plane.yaml` | Kind-first shared-worker control-plane manifest used by local dev and CI |
@@ -89,6 +92,73 @@ For seamless planned deployments, use a rolling strategy with overlap and enough
 - `--handover-drain-timeout 15m`
 
 That gives the old replica time to fail readiness, stop taking new pgwire sessions, keep existing pgwire and Flight sessions alive during the drain window, and then force shutdown at the timeout boundary if sessions remain.
+
+## Query Log Kafka Writer
+
+By default, query logging writes directly to each tenant's DuckLake-backed
+`ducklake.system.query_log`. To route query logs through Kafka instead, deploy
+the producer config and query-log writer:
+
+```bash
+cp k8s/query-log-kafka-config.example.yaml /tmp/duckgres-query-log-kafka.yaml
+# edit brokers, topic, config_store, aws_region, and k8s_worker_namespace
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/rbac.yaml
+kubectl apply -f k8s/networkpolicy.yaml
+kubectl apply -f /tmp/duckgres-query-log-kafka.yaml
+kubectl apply -f k8s/query-log-writer.yaml
+# apply or upgrade the relevant control-plane manifest/chart so the
+# DUCKGRES_QUERY_LOG_* env refs exist before restarting control-plane pods
+kubectl apply -f k8s/kind/control-plane.yaml
+kubectl -n duckgres scale deploy/duckgres-query-log-writer --replicas=1
+kubectl -n duckgres rollout restart deploy/duckgres-control-plane
+```
+
+The control-plane manifests already include optional `DUCKGRES_QUERY_LOG_*`
+environment variables from the `duckgres-query-log-kafka` ConfigMap. When the
+ConfigMap is absent, direct DuckLake logging remains unchanged. When present
+with `sink: kafka`, control-plane pods publish query-log events to Kafka and the
+writer consumes the configured topic using `group_id`. The writer Deployment
+requires `config_store`, `brokers`, and `topic` from the ConfigMap so missing
+runtime config fails at pod start instead of retrying events without a tenant
+target.
+
+Multiple writer replicas can use the same `group_id`; Kafka partition ownership
+keeps each partition assigned to one active consumer in the group. Scale replicas
+up to the topic partition count when throughput requires it.
+
+The writer is a privileged infrastructure service. It never executes logged SQL;
+it resolves the target tenant by `org_id`, attaches that tenant's DuckLake, and
+inserts generated rows into `ducklake.system.query_log`. The reference RBAC
+grants read-only Duckling CR access plus `get` on Secrets in the `duckgres`
+namespace. If managed-warehouse SecretRefs point to other namespaces, grant the
+same get-only Secret access for those namespaces. Kubernetes RBAC does not grant
+cloud credentials: when `aws_region` is set and Duckling-backed tenants require
+STS, bind the `duckgres-query-log-writer` ServiceAccount to an IAM/Pod
+Identity/IRSA role with the same STS permissions needed to resolve tenant object
+store credentials.
+
+Rollback:
+
+```bash
+kubectl -n duckgres scale deploy/duckgres-query-log-writer --replicas=0
+kubectl -n duckgres delete configmap duckgres-query-log-kafka
+kubectl -n duckgres rollout restart deploy/duckgres-control-plane
+```
+
+Useful checks:
+
+```bash
+kubectl -n duckgres get deploy duckgres-query-log-writer
+kubectl -n duckgres logs deploy/duckgres-query-log-writer --tail=200
+kubectl -n duckgres port-forward svc/duckgres-query-log-writer-metrics 9090:9090
+curl -s localhost:9090/metrics | rg 'duckgres_query_log_kafka_writer'
+```
+
+If your cluster runs the Prometheus Operator, adapt and apply
+`k8s/query-log-writer-alerts.example.yaml`. Kafka consumer lag usually comes
+from your Kafka exporter rather than Duckgres itself, so wire a lag alert from
+that metric source alongside these writer-process alerts.
 
 ## Local Development with kind
 
