@@ -252,6 +252,7 @@ format:
 [group('test')]
 test:
     just test-unit
+    just test-scenario
     just test-integration
     just test-controlplane
     just test-configstore-integration
@@ -261,6 +262,11 @@ test:
 [group('test')]
 test-unit:
     go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/... ./tests/manifests/...
+
+# Run scenario runner unit tests
+[group('test')]
+test-scenario:
+    go test -v -count=1 ./tests/scenario/...
 
 # Run cache-proxy tests
 [group('test')]
@@ -358,6 +364,16 @@ perf-smoke:
 perf-nightly:
     ./scripts/perf_nightly.sh
 
+# Run a Duckgres scenario file against a configured dev environment
+[group('test')]
+scenario scenario="tests/scenario/scenarios/provision_smoke.yaml":
+    ./scripts/scenario_run.sh {{scenario}}
+
+# Run the dev provision smoke scenario
+[group('test')]
+scenario-smoke:
+    ./scripts/scenario_run.sh tests/scenario/scenarios/provision_smoke.yaml
+
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]
 lint:
@@ -365,7 +381,7 @@ lint:
 
 # Run what CI runs locally (excluding kind-backed K8s integration)
 [group('test')]
-ci: lint test-unit test-cache-proxy test-integration test-controlplane test-configstore-integration test-controlplane-k8s
+ci: lint test-unit test-scenario test-cache-proxy test-integration test-controlplane test-configstore-integration test-controlplane-k8s
 
 # === Metrics ===
 
