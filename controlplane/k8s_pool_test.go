@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1794,9 +1795,22 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 	}
 
 	crashed := make(chan int, 1)
+	crashNotified := make(chan struct{})
+	var crashNotifiedOnce sync.Once
+	var snapshotBeforeCrash atomic.Bool
+	cs.Fake.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		select {
+		case <-crashNotified:
+		default:
+			snapshotBeforeCrash.Store(true)
+		}
+		return false, nil, nil
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashNotifiedOnce.Do(func() { close(crashNotified) })
 		crashed <- workerID
 	}, nil)
 
@@ -1823,6 +1837,9 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 	if got := podDeleteActionNames(cs); len(got) != 1 || got[0] != "adopted-worker-8" {
 		t.Fatalf("expected health-check failure to delete adopted pod, got %v", got)
 	}
+	if snapshotBeforeCrash.Load() {
+		t.Fatal("pod status snapshot must not run before crash notification")
+	}
 	deleteLog, ok := logs.findMessage("K8s worker unresponsive, deleting pod.")
 	if !ok {
 		t.Fatal("expected health-check pod delete log")
@@ -1838,6 +1855,13 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 	}
 	if deleteLog.attrs["container_restart_count"] != "2" {
 		t.Fatalf("expected container restart count attr on delete log, got attrs %#v", deleteLog.attrs)
+	}
+	deleteRequestedLog, ok := logs.findMessage("K8s worker pod delete requested.")
+	if !ok {
+		t.Fatal("expected post-delete request log")
+	}
+	if deleteRequestedLog.attrs["worker_pod"] != "adopted-worker-8" {
+		t.Fatalf("expected worker_pod attr on post-delete log, got attrs %#v", deleteRequestedLog.attrs)
 	}
 
 	store.mu.Lock()
