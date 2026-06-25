@@ -468,8 +468,20 @@ type WorkerRecord struct {
 	// rows from before this column existed — both are treated as "due now"
 	// by the scheduler so they get refreshed eagerly.
 	S3CredentialsExpiresAt *time.Time `gorm:"index" json:"s3_credentials_expires_at,omitempty"`
-	CreatedAt              time.Time  `json:"created_at"`
-	UpdatedAt              time.Time  `json:"updated_at"`
+	// HotIdleSince is when the worker most recently entered the hot_idle state.
+	// The hot-idle TTL reaper measures idle age from this column instead of
+	// updated_at, because updated_at is legitimately bumped by lease and
+	// credential-refresh writes (BumpWorkerEpoch, MarkCredentialsRefreshed) that
+	// do not change a worker's idleness — keying the reap clock off it let a
+	// periodically-refreshed hot-idle worker reset its own TTL forever and never
+	// get retired. Stamped only on the transition into hot_idle and preserved
+	// across same-state upserts/refreshes. NULL on non-hot-idle rows and on
+	// legacy rows predating this column; the reaper falls back to updated_at when
+	// NULL so legacy hot-idle rows still expire. AutoMigrate adds this column; no
+	// migration file.
+	HotIdleSince *time.Time `gorm:"index" json:"hot_idle_since,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
 func (WorkerRecord) TableName() string { return "worker_records" }
