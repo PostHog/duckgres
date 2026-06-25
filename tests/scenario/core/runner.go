@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -30,7 +31,11 @@ type RunnerConfig struct {
 	Executor   StepExecutor
 	OutputDir  string
 	WriteFiles bool
-	Now        func() time.Time
+	// CleanupTimeout bounds always_run steps. These steps use a context whose
+	// cancellation is detached from the main scenario context so cleanup can run
+	// after the scenario times out.
+	CleanupTimeout time.Duration
+	Now            func() time.Time
 }
 
 type Runner struct {
@@ -62,13 +67,27 @@ func (r *Runner) Run(ctx context.Context) (RunSummary, error) {
 	if r.cfg.Executor == nil {
 		return summary, fmt.Errorf("scenario runner executor is required")
 	}
+	r.results = r.results[:0]
+	if r.cfg.WriteFiles {
+		if err := PrepareArtifactDir(r.cfg.OutputDir); err != nil {
+			summary.FinishedAt = r.cfg.Now()
+			return summary, err
+		}
+	}
 
 	statusByStep := make(map[string]StepStatus, len(r.cfg.Scenario.Steps))
-	r.results = r.results[:0]
+	normalStepsBlocked := false
+	var runErrs []error
 	for _, step := range r.cfg.Scenario.Steps {
-		result := r.runStep(ctx, runID, step, statusByStep)
+		result := r.runStep(ctx, runID, step, statusByStep, normalStepsBlocked)
 		r.results = append(r.results, result)
 		statusByStep[step.ID] = result.Status
+		if result.Err != nil {
+			runErrs = append(runErrs, result.Err)
+		}
+		if !step.AlwaysRun && result.Status != StepStatusOK {
+			normalStepsBlocked = true
+		}
 		switch result.Status {
 		case StepStatusOK:
 			summary.SucceededSteps++
@@ -86,7 +105,7 @@ func (r *Runner) Run(ctx context.Context) (RunSummary, error) {
 		}
 	}
 	if summary.FailedSteps > 0 || summary.SkippedSteps > 0 {
-		return summary, fmt.Errorf("scenario %s failed: %d failed, %d skipped", summary.ScenarioName, summary.FailedSteps, summary.SkippedSteps)
+		return summary, scenarioRunError(summary, runErrs)
 	}
 	return summary, nil
 }
@@ -97,26 +116,23 @@ func (r *Runner) Results() []StepResult {
 	return out
 }
 
-func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByStep map[string]StepStatus) StepResult {
+func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByStep map[string]StepStatus, normalStepsBlocked bool) StepResult {
 	if !step.AlwaysRun {
+		if normalStepsBlocked {
+			return r.skippedResult(runID, step, "prior_step_failed", "a prior non-cleanup step did not complete successfully", nil)
+		}
+		if err := ctx.Err(); err != nil {
+			return r.skippedResult(runID, step, "context_canceled", "scenario context is canceled", err)
+		}
 		if dep, ok := firstUnsuccessfulDependency(step, statusByStep); ok {
-			now := r.cfg.Now()
-			return StepResult{
-				RunID:        runID,
-				ScenarioName: r.cfg.Scenario.Name,
-				StepID:       step.ID,
-				StepType:     step.Type,
-				Status:       StepStatusSkipped,
-				ErrorClass:   "dependency_failed",
-				Error:        fmt.Sprintf("dependency %s did not complete successfully", dep),
-				StartedAt:    now,
-				FinishedAt:   now,
-			}
+			return r.skippedResult(runID, step, "dependency_failed", fmt.Sprintf("dependency %s did not complete successfully", dep), nil)
 		}
 	}
 
 	startedAt := r.cfg.Now()
-	err := r.cfg.Executor.ExecuteStep(ctx, step)
+	stepCtx, cancel := r.contextForStep(ctx, step)
+	defer cancel()
+	err := r.cfg.Executor.ExecuteStep(stepCtx, step)
 	finishedAt := r.cfg.Now()
 	result := StepResult{
 		RunID:        runID,
@@ -133,8 +149,36 @@ func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByS
 		result.Status = StepStatusFailed
 		result.ErrorClass = "execution_error"
 		result.Error = err.Error()
+		result.Err = err
 	}
 	return result
+}
+
+func (r *Runner) skippedResult(runID string, step Step, errorClass, message string, err error) StepResult {
+	now := r.cfg.Now()
+	return StepResult{
+		RunID:        runID,
+		ScenarioName: r.cfg.Scenario.Name,
+		StepID:       step.ID,
+		StepType:     step.Type,
+		Status:       StepStatusSkipped,
+		ErrorClass:   errorClass,
+		Error:        message,
+		StartedAt:    now,
+		FinishedAt:   now,
+		Err:          err,
+	}
+}
+
+func (r *Runner) contextForStep(ctx context.Context, step Step) (context.Context, context.CancelFunc) {
+	if !step.AlwaysRun {
+		return ctx, func() {}
+	}
+	base := context.WithoutCancel(ctx)
+	if r.cfg.CleanupTimeout <= 0 {
+		return base, func() {}
+	}
+	return context.WithTimeout(base, r.cfg.CleanupTimeout)
 }
 
 func firstUnsuccessfulDependency(step Step, statusByStep map[string]StepStatus) (string, bool) {
@@ -152,4 +196,12 @@ func defaultRunID(s Scenario, startedAt time.Time) string {
 		prefix = "scenario"
 	}
 	return fmt.Sprintf("%s-%s", prefix, startedAt.UTC().Format("20060102T150405Z"))
+}
+
+func scenarioRunError(summary RunSummary, causes []error) error {
+	aggregate := fmt.Errorf("scenario %s failed: %d failed, %d skipped", summary.ScenarioName, summary.FailedSteps, summary.SkippedSteps)
+	if len(causes) == 0 {
+		return aggregate
+	}
+	return errors.Join(append([]error{aggregate}, causes...)...)
 }

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strings"
@@ -46,7 +47,9 @@ func LoadScenario(path string) (Scenario, error) {
 
 func ParseScenario(raw []byte) (Scenario, error) {
 	var parsed rawScenario
-	if err := yaml.Unmarshal(raw, &parsed); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&parsed); err != nil {
 		return Scenario{}, fmt.Errorf("parse scenario: %w", err)
 	}
 	return normalizeScenario(parsed)

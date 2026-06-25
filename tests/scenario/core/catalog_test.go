@@ -105,3 +105,60 @@ steps:
 		t.Fatalf("expected unknown dependency error, got %v", err)
 	}
 }
+
+func TestParseScenarioRejectsUnknownFields(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"top-level": []byte(`
+name: bad
+stepz: []
+`),
+		"step": []byte(`
+name: bad
+steps:
+  - id: cleanup
+    type: fake
+    alwaysrun: true
+`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseScenario(raw)
+			if err == nil {
+				t.Fatal("expected unknown YAML field to fail")
+			}
+		})
+	}
+}
+
+func TestParseScenarioRejectsUnknownStepFieldWithFieldName(t *testing.T) {
+	_, err := ParseScenario([]byte(`
+name: bad
+steps:
+  - id: cleanup
+    type: fake
+    alwaysrun: true
+`))
+	if err == nil || !strings.Contains(err.Error(), "alwaysrun") {
+		t.Fatalf("expected unknown field name in error, got %v", err)
+	}
+}
+
+func TestParseScenarioAllowsOpenWithMap(t *testing.T) {
+	raw := []byte(`
+name: with-map
+steps:
+  - id: query
+    type: fake
+    with:
+      sql: SELECT 1
+      nested:
+        arbitrary_key: ok
+`)
+
+	scenario, err := ParseScenario(raw)
+	if err != nil {
+		t.Fatalf("ParseScenario returned error: %v", err)
+	}
+	if scenario.Steps[0].With["sql"] != "SELECT 1" {
+		t.Fatalf("unexpected with map: %#v", scenario.Steps[0].With)
+	}
+}

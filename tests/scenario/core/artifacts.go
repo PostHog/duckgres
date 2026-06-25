@@ -33,6 +33,7 @@ type StepResult struct {
 	FinishedAt   time.Time     `json:"finished_at"`
 	Duration     time.Duration `json:"duration_ns"`
 	Attempts     int           `json:"attempts"`
+	Err          error         `json:"-"`
 }
 
 var stepResultsHeader = []string{
@@ -50,11 +51,8 @@ var stepResultsHeader = []string{
 }
 
 func WriteArtifacts(dir string, summary RunSummary, results []StepResult) error {
-	if dir == "" {
-		return fmt.Errorf("artifact output dir is required")
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create artifact dir %s: %w", dir, err)
+	if err := PrepareArtifactDir(dir); err != nil {
+		return err
 	}
 	if err := writeSummary(filepath.Join(dir, "scenario_summary.json"), summary); err != nil {
 		return err
@@ -64,6 +62,16 @@ func WriteArtifacts(dir string, summary RunSummary, results []StepResult) error 
 	}
 	if err := writeEvents(filepath.Join(dir, "events.jsonl"), results); err != nil {
 		return err
+	}
+	return nil
+}
+
+func PrepareArtifactDir(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("artifact output dir is required")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create artifact dir %s: %w", dir, err)
 	}
 	return nil
 }
