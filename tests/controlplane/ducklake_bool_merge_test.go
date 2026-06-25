@@ -104,6 +104,9 @@ func TestDuckLakeBooleanPredicatesAndMergeInControlPlane(t *testing.T) {
 			t.Fatalf("Exec(%q): %v", stmt, err)
 		}
 	}
+	t.Cleanup(func() {
+		_, _ = db.Exec("DROP SCHEMA IF EXISTS merge_debug CASCADE")
+	})
 
 	boolCases := []struct {
 		name  string

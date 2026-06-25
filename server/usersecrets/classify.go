@@ -50,12 +50,10 @@ type Statement struct {
 }
 
 // Reserved secret names/prefixes. These belong to duckgres itself: the
-// system-issued catalog secrets, DuckDB's default names for unnamed secrets,
+// system-issued catalog secret, DuckDB's default names for unnamed secrets,
 // and a duckgres_ prefix reserved for future system use.
 var reservedNames = map[string]struct{}{
-	"ducklake_s3":   {},
-	"iceberg_sigv4": {},
-	"iceberg_oauth": {},
+	"ducklake_s3": {},
 }
 
 var reservedPrefixes = []string{"__default_", "duckgres_"}

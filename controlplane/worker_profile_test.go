@@ -37,7 +37,7 @@ func TestResolveWorkerProfileSizing(t *testing.T) {
 		wantWarn bool
 	}{
 		{name: "no opts -> default (nil)", opts: map[string]string{}, wantNil: true},
-		{name: "unrelated opts -> default (nil)", opts: map[string]string{"search_path": "iceberg.public"}, wantNil: true},
+		{name: "unrelated opts -> default (nil)", opts: map[string]string{"search_path": "analytics"}, wantNil: true},
 		{name: "client cpu+mem", opts: map[string]string{gucWorkerCPU: "4", gucWorkerMemory: "32Gi"}, wantKey: "4|32Gi", wantTTL: defaultWorkerTTL},
 		{name: "client ttl only -> concrete w/ default size", opts: map[string]string{gucWorkerTTL: "5m"}, wantKey: "8|16Gi", wantTTL: 5 * time.Minute},
 		{name: "cpu over max -> clamp+warn", opts: map[string]string{gucWorkerCPU: "64"}, wantKey: "16|16Gi", wantTTL: defaultWorkerTTL, wantWarn: true},

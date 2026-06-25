@@ -75,10 +75,10 @@ var credentialRefreshLookahead = stsSessionDuration / 2
 // secrets through the statement's MVCC snapshot). Stock httpfs has NO
 // mid-statement recovery path for scan workloads: its refresh-on-403 hook
 // only runs at file open AND only when the open performs a network request,
-// but DuckLake, Iceberg, and S3-glob scans all pre-populate file
+// but DuckLake and S3-glob scans all pre-populate file
 // size/etag/last-modified so opens skip the HEAD entirely and the first auth
 // failure surfaces on a range GET, which is not retried (verified against
-// httpfs v1.5.3 / ducklake / duckdb-iceberg sources; pinned by
+// httpfs v1.5.3 / ducklake sources; pinned by
 // TestInFlightScanDiesOnCredentialRotation in tests/integration). A
 // statement on stock httpfs therefore lives or dies on its starting runway:
 // this margin guarantees every statement at least lookahead+5m of token

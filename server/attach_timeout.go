@@ -10,15 +10,13 @@ import (
 	"time"
 )
 
-// Per-step deadlines for catalog attachment (AttachDuckLake, AttachDeltaCatalog,
-// attachLakekeeperCatalog) and secret refresh (RefreshS3Secret,
-// RefreshIcebergSecret).
+// Per-step deadlines for catalog attachment (AttachDuckLake, AttachDeltaCatalog)
+// and secret refresh (RefreshS3Secret).
 //
 // Why these exist: every step in those functions is a plain CGO db.Exec /
 // db.QueryRow with no deadline. A hung network dependency inside DuckDB
-// (unreachable Lakekeeper REST endpoint, an S3 connect that blackholes, the
-// IMDS probe documented in attachLakekeeperCatalog, a wedged metadata
-// Postgres) therefore eats the control plane's entire activate-tenant
+// (an S3 connect that blackholes, a wedged metadata Postgres) therefore eats
+// the control plane's entire activate-tenant
 // deadline (~60s) with zero Go-level logging — and, far worse, the activation
 // holds a drain token (beginDrainWork in duckdbservice/flight_handler.go), so
 // a retired worker pod with a hung attach stays Draining for up to
@@ -32,8 +30,8 @@ const (
 	// generous slack for a cold extension INSTALL from the CDN.
 	attachStepTimeout = 30 * time.Second
 	// attachStatementTimeout bounds the ATTACH statements themselves (DuckLake,
-	// Delta, Lakekeeper Iceberg) and the Delta post-attach probe. Deliberately
-	// loose: a DuckLake ATTACH against a busy metadata Postgres can
+	// Delta) and the Delta post-attach probe. Deliberately loose: a DuckLake
+	// ATTACH against a busy metadata Postgres can
 	// legitimately take tens of seconds (catalog snapshot read over many
 	// metadata rows), so do NOT tighten this without production latency data.
 	attachStatementTimeout = 60 * time.Second
@@ -50,7 +48,7 @@ const (
 // abandoning the goroutine. The duckdb-go driver re-asserts the interrupt
 // every 500ms after cancellation, but DuckDB only observes the flag at query
 // execution checkpoints — a statement blocked in extension network I/O (TCP
-// connect inside httpfs, Lakekeeper REST, IMDS probe) may never see it.
+// connect inside httpfs) may never see it.
 // Variable (not const) so tests can shrink it.
 var attachInterruptGrace = 5 * time.Second
 

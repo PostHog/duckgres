@@ -49,8 +49,8 @@ render() {
 
 # Bind this namespace's `duckgres` SA to the same IAM role the real mw-dev
 # control plane uses (EKS Pod Identity). With it, the CP brokers per-duckling
-# S3 STS creds exactly like prod and activation completes — without it, DuckLake/
-# Iceberg activation fails at AssumeRole. Idempotent: if an association for this
+# S3 STS creds exactly like prod and activation completes — without it, DuckLake
+# activation fails at AssumeRole. Idempotent: if an association for this
 # (ns, sa) already exists, leave it. Requires the runner's AWS role to hold
 # eks:{Create,List,Delete}PodIdentityAssociation + iam:PassRole on the CP role.
 ensure_pod_identity() {
@@ -106,25 +106,6 @@ restart_cp_with_identity() {
   return 1
 }
 
-# The cnpg lakekeeper_<org> role+db are owned by the Crossplane composition and
-# dropped when the Duckling CR deletes — but that cascade is async and can lag,
-# leaving a stranded role from a prior run (incl. a cancelled one with no
-# teardown). On the next run the same org id re-provisions against the stranded
-# role whose password has drifted, the Lakekeeper migrate Job hits SASL auth
-# failure, and the warehouse never goes ready. So drop it directly on the
-# active shard, idempotently, BOTH before provisioning (clean slate, so a rerun
-# never inherits stranded state) and at teardown (deterministic clean exit).
-# Scoped to this PR's unique org ids, so it can't touch another PR's tenant.
-drop_cnpg_role() { # org-id
-  local ident
-  # Mirror the composition's PG identifier: lakekeeper_<lower, [^a-z0-9_]→_>.
-  ident="lakekeeper_$(printf %s "$1" | tr 'A-Z-' 'a-z_' | tr -cd 'a-z0-9_')"
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP DATABASE IF EXISTS ${ident} WITH (FORCE);" >/dev/null 2>&1 || true
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
-}
-
 # Every duckling org a harness run provisions for a PR (harness.sh main()):
 # cnpg + ext (full coverage) and res1 + res2 (cnpg-shard/ducklake-only orgs
 # hosting the parallel resilience lanes). Keep in sync with harness.sh.
@@ -132,13 +113,6 @@ ci_orgs() { # pr-number
   local pr="$1"
   echo "ci-pr-${pr}-cnpg ci-pr-${pr}-ext ci-pr-${pr}-res1 ci-pr-${pr}-res2"
 }
-# The cnpg-shard-backed orgs (everything except ext) — these own a
-# lakekeeper_<org> role+db on the shard that drop_cnpg_role must clean.
-ci_cnpg_orgs() { # pr-number
-  local pr="$1"
-  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2"
-}
-
 delete_ci_ducklings() { # pr-number
   local pr="$1" org
   for org in $(ci_orgs "$pr"); do
@@ -156,16 +130,14 @@ wait_ci_ducklings_deleted() { # pr-number timeout
 delete_ci_bindings() { # pr-number
   local pr="$1"
   "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
-  "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
 }
 
 reset_pr_stack() {
   # A cancelled or failed run can leave a namespace, config-store rows, and
-  # shared Duckling/Lakekeeper resources for this PR. Start from a clean slate
+  # shared Duckling resources for this PR. Start from a clean slate
   # so apply never reuses stale network policies, services, or tenant state.
   delete_ci_ducklings "$PR_NUMBER"
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
-  for org in $(ci_cnpg_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
   delete_pod_identity
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=300s
@@ -277,7 +249,7 @@ cmd_diagnostics() {
 
 cmd_teardown() {
   # Deprovision the ci-pr ducklings FIRST so shared-infra resources (S3 bucket,
-  # cnpg role+db, lakekeeper CR/secret/SA) are cleaned up by the control plane
+  # cnpg role+db) are cleaned up by the control plane
   # before we delete it. Best-effort — the namespace delete + e2e-cleanup are the
   # backstop. Uses the CP admin API via a short-lived port-forward.
   if "${KUBECTL[@]}" -n "$NS" get deploy/duckgres-control-plane >/dev/null 2>&1; then
@@ -315,18 +287,10 @@ cmd_teardown() {
 
   # Wait for the Duckling CRs to FULLY delete — not just the warehouse row.
   # A warehouse flips to "deleted" the moment the CR delete is issued, but the
-  # CR's finalizers keep running (incl the downstream provider-sql DROP of the
-  # cnpg lakekeeper_<org> role+db). If we return before that finishes, a later
-  # run that reuses the same org id (rerun, or a force-pushed PR) provisions
-  # against a stranded cnpg role whose password has drifted -> the Lakekeeper
-  # migrate Job hits SASL auth failure and the warehouse never goes ready.
-  # `wait --for=delete` blocks until the CR (and its cascade) is gone.
+  # CR's finalizers keep running. `wait --for=delete` blocks until the CR (and
+  # its cascade) is gone.
   delete_ci_ducklings "$PR_NUMBER"
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
-
-  # Deterministically drop the cnpg role+db in case the composition's async
-  # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
-  for org in $(ci_cnpg_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
 
   # Drop the Pod Identity association (it's an EKS resource, not in the ns).
   delete_pod_identity
@@ -342,8 +306,8 @@ cmd_teardown() {
 # managed-by=e2e-mw-dev label and deletes any older than E2E_CLEANUP_MAX_AGE_HOURS
 # (default 6h — a real run finishes in <40m, so anything older is orphaned).
 # For each: delete its ducklings directly (drives the Crossplane teardown
-# without needing the now-gone per-run CP), drop the cnpg role+db, drop the Pod
-# Identity association, and sweep the ci-pr-labelled cross-ns bindings + the ns.
+# without needing the now-gone per-run CP), drop the Pod Identity association,
+# and sweep the ci-pr-labelled cross-ns bindings + the ns.
 # Named e2e-cleanup (not "janitor") to avoid colliding with duckgres's own
 # control-plane janitor. NAMESPACE is not required for this path.
 cmd_e2e_cleanup() {
@@ -362,7 +326,6 @@ cmd_e2e_cleanup() {
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
       delete_ci_ducklings "$pr"
       wait_ci_ducklings_deleted "$pr" 300s
-      for org in $(ci_cnpg_orgs "$pr"); do drop_cnpg_role "$org"; done
       NS="$ns" delete_pod_identity
       delete_ci_bindings "$pr"
       "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false

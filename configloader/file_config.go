@@ -26,7 +26,6 @@ type FileConfig struct {
 	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions                []string            `yaml:"extensions"`
 	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
-	Iceberg                   IcebergFileConfig   `yaml:"iceberg"`
 	FilePersistence           bool                `yaml:"file_persistence"`
 	ProcessIsolation          bool                `yaml:"process_isolation"`
 	IdleTimeout               string              `yaml:"idle_timeout"`
@@ -103,15 +102,6 @@ type RateLimitFileConfig struct {
 	BanDuration         string `yaml:"ban_duration"`
 	MaxConnectionsPerIP int    `yaml:"max_connections_per_ip"`
 	MaxConnections      int    `yaml:"max_connections"`
-}
-
-// IcebergFileConfig is the YAML shape for opting a single-tenant duckgres
-// instance into Iceberg catalog attachment. In multi-tenant mode the
-// equivalent values come from the per-warehouse configstore row, not YAML.
-type IcebergFileConfig struct {
-	Enabled   *bool  `yaml:"enabled"`
-	Region    string `yaml:"region"`
-	Namespace string `yaml:"namespace"`
 }
 
 type DuckLakeFileConfig struct {

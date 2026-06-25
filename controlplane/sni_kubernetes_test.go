@@ -265,7 +265,7 @@ func TestPostgresSNIUnknownModeIgnoresSNI(t *testing.T) {
 	}
 }
 
-// A non-selectable database name (anything other than ducklake/iceberg/empty)
+// A non-selectable database name (anything other than ducklake/empty)
 // is rejected with 3D000 — the database param is now catalog selection, not an
 // org/identity routing key.
 func TestPostgresInvalidCatalogSQLSTATE(t *testing.T) {
@@ -279,7 +279,7 @@ func TestPostgresInvalidCatalogSQLSTATE(t *testing.T) {
 				OrgID:        "other-org",
 				SNIOrgID:     "other-org",
 				SNIResolved:  true,
-				CatalogValid: false, // "requested_db" is not ducklake/iceberg
+				CatalogValid: false, // "requested_db" is not ducklake
 				Valid:        true,
 			}
 		},

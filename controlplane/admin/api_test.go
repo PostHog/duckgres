@@ -327,9 +327,9 @@ func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
 
 	body := []byte(`{
 		"org_id": "analytics",
-		"username": "iceberg_reader",
+		"username": "ducklake_reader",
 		"password": "secret",
-		"default_catalog": "iceberg"
+		"default_catalog": "ducklake"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -339,20 +339,20 @@ func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	user := store.users["analytics/iceberg_reader"]
+	user := store.users["analytics/ducklake_reader"]
 	if user == nil {
 		t.Fatal("expected user to be created")
 	}
-	if user.DefaultCatalog != "iceberg" {
-		t.Fatalf("DefaultCatalog = %q, want iceberg", user.DefaultCatalog)
+	if user.DefaultCatalog != "ducklake" {
+		t.Fatalf("DefaultCatalog = %q, want ducklake", user.DefaultCatalog)
 	}
 
 	var response configstore.OrgUser
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if response.DefaultCatalog != "iceberg" {
-		t.Fatalf("response DefaultCatalog = %q, want iceberg", response.DefaultCatalog)
+	if response.DefaultCatalog != "ducklake" {
+		t.Fatalf("response DefaultCatalog = %q, want ducklake", response.DefaultCatalog)
 	}
 }
 
@@ -362,9 +362,9 @@ func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
 
 	body := []byte(`{
 		"org_id": "analytics",
-		"username": "iceberg_reader",
+		"username": "ducklake_reader",
 		"password": "secret",
-		"default_catalog": "iceberg;DROP TABLE x"
+		"default_catalog": "ducklake;DROP TABLE x"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -381,44 +381,44 @@ func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
 
 func TestUpdateUserDefaultCatalogPreserveSetAndClear(t *testing.T) {
 	store := newFakeAPIStore()
-	store.users["analytics/iceberg_reader"] = &configstore.OrgUser{
+	store.users["analytics/ducklake_reader"] = &configstore.OrgUser{
 		OrgID:          "analytics",
-		Username:       "iceberg_reader",
+		Username:       "ducklake_reader",
 		Password:       "hash",
-		DefaultCatalog: "iceberg",
+		DefaultCatalog: "ducklake",
 	}
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"passthrough":true}`)))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/ducklake_reader", bytes.NewReader([]byte(`{"passthrough":true}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("preserve status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
-		t.Fatalf("preserved DefaultCatalog = %q, want iceberg", got)
+	if got := store.users["analytics/ducklake_reader"].DefaultCatalog; got != "ducklake" {
+		t.Fatalf("preserved DefaultCatalog = %q, want ducklake", got)
 	}
 
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":"iceberg"}`)))
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/ducklake_reader", bytes.NewReader([]byte(`{"default_catalog":"ducklake"}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("set status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
-		t.Fatalf("updated DefaultCatalog = %q, want iceberg", got)
+	if got := store.users["analytics/ducklake_reader"].DefaultCatalog; got != "ducklake" {
+		t.Fatalf("updated DefaultCatalog = %q, want ducklake", got)
 	}
 
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":""}`)))
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/ducklake_reader", bytes.NewReader([]byte(`{"default_catalog":""}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clear status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "" {
+	if got := store.users["analytics/ducklake_reader"].DefaultCatalog; got != "" {
 		t.Fatalf("cleared DefaultCatalog = %q, want empty", got)
 	}
 }
@@ -644,7 +644,7 @@ func TestPutWarehouseDisablesPgBouncerWhenSetToFalse(t *testing.T) {
 	}
 }
 
-func TestPutWarehouseEnablesIcebergWhenSetToTrue(t *testing.T) {
+func TestPutWarehouseRejectsIcebergUpdate(t *testing.T) {
 	store := newFakeAPIStore()
 	seedOrgWithWarehouse(store, "analytics")
 	router := newTestAPIRouter(store)
@@ -655,11 +655,8 @@ func TestPutWarehouseEnablesIcebergWhenSetToTrue(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if !store.warehouses["analytics"].Iceberg.Enabled {
-		t.Fatal("expected iceberg.enabled=true after PUT")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 }
 

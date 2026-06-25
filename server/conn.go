@@ -21,7 +21,6 @@ import (
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/internal/analytics"
 	"github.com/posthog/duckgres/server/auth"
-	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
@@ -154,30 +153,28 @@ const (
 )
 
 type clientConn struct {
-	server                 *Server
-	conn                   net.Conn
-	reader                 *bufio.Reader
-	writer                 *bufio.Writer
-	username               string
-	orgID                  string
-	database               string
-	executor               QueryExecutor
-	pid                    int32
-	secretKey              int32                    // unique key for cancel requests
-	stmts                  map[string]*preparedStmt // prepared statements by name
-	portals                map[string]*portal       // portals by name
-	txStatus               byte                     // current transaction status ('I', 'T', or 'E')
-	ignoreTillSync         bool                     // discard extended-query messages until Sync after an error; see runExtendedQueryMessage
-	errorResponsesSent     uint64                   // ErrorResponses sent via sendError; observed by runExtendedQueryMessage
-	lastErrorCode          string                   // most recent SQLSTATE sent via sendError; observed by query metrics
-	activeQueryMetrics     *queryMetricsScope       // active query attempt metrics scope for non-ErrorResponse failures
-	passthrough            bool                     // true for passthrough users (skip transpiler + pg_catalog)
-	cursors                map[string]*cursorState  // server-side cursor emulation
-	catalogUseRewrite      bool                     // true when bare `USE ducklake`/`USE iceberg` should expand to the reliable two-part target
-	tenantIcebergConfig    IcebergConfig
-	hasTenantIcebergConfig bool
-	ctx                    context.Context    // connection context, cancelled when connection is closed
-	cancel                 context.CancelFunc // cancels the connection context
+	server             *Server
+	conn               net.Conn
+	reader             *bufio.Reader
+	writer             *bufio.Writer
+	username           string
+	orgID              string
+	database           string
+	executor           QueryExecutor
+	pid                int32
+	secretKey          int32                    // unique key for cancel requests
+	stmts              map[string]*preparedStmt // prepared statements by name
+	portals            map[string]*portal       // portals by name
+	txStatus           byte                     // current transaction status ('I', 'T', or 'E')
+	ignoreTillSync     bool                     // discard extended-query messages until Sync after an error; see runExtendedQueryMessage
+	errorResponsesSent uint64                   // ErrorResponses sent via sendError; observed by runExtendedQueryMessage
+	lastErrorCode      string                   // most recent SQLSTATE sent via sendError; observed by query metrics
+	activeQueryMetrics *queryMetricsScope       // active query attempt metrics scope for non-ErrorResponse failures
+	passthrough        bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	cursors            map[string]*cursorState  // server-side cursor emulation
+	catalogUseRewrite  bool                     // true when bare `USE ducklake` should expand to the reliable two-part target
+	ctx                context.Context          // connection context, cancelled when connection is closed
+	cancel             context.CancelFunc       // cancels the connection context
 
 	// sharedDB is true when this connection uses a shared file-persistence DB pool.
 	// Cleanup differs: we return the pinned conn to the pool instead of closing the DB.
@@ -208,20 +205,15 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 	backend := transpiler.BackendMemory
 	physicalCatalog := c.physicalCatalog
 	switch {
-	case physicalCatalog == iceberg.CatalogName:
-		backend = transpiler.BackendIceberg
 	case physicalCatalog == physicalDuckLakeCatalog:
 		backend = transpiler.BackendDuckLake
-	case c.server.cfg.Iceberg.Enabled || c.hasTenantIcebergConfig:
-		backend = transpiler.BackendIceberg
-		physicalCatalog = iceberg.CatalogName
 	case c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake:
 		backend = transpiler.BackendDuckLake
 		physicalCatalog = physicalDuckLakeCatalog
 	}
 
 	logicalDatabaseName := ""
-	if backend == transpiler.BackendDuckLake || backend == transpiler.BackendIceberg {
+	if backend == transpiler.BackendDuckLake {
 		logicalDatabaseName = c.database
 	}
 
@@ -595,19 +587,6 @@ func (c *clientConn) safeCleanupDB() {
 		}
 
 		if connHealthy {
-			if c.server.cfg.Iceberg.Enabled {
-				// The iceberg catalog stays attached for the life of the session
-				// (attachLakekeeperCatalog no longer detaches empty warehouses),
-				// so release it here too — otherwise a pooled connection reused by
-				// the next activation hits the count>0 early-return in
-				// attachLakekeeperCatalog and keeps a stale catalog secret.
-				ctxIce, cancelIce := context.WithTimeout(context.Background(), cleanupTimeout)
-				_, err := c.executor.ExecContext(ctxIce, "DETACH "+iceberg.CatalogName)
-				cancelIce()
-				if err != nil {
-					c.logger().Warn("Failed to detach Iceberg catalog.", "error", err)
-				}
-			}
 			if c.server.cfg.DuckLake.DeltaCatalogEnabled {
 				ctxDelta, cancelDelta := context.WithTimeout(context.Background(), cleanupTimeout)
 				_, err := c.executor.ExecContext(ctxDelta, "DETACH delta")
@@ -841,61 +820,25 @@ func (c *clientConn) serve() error {
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
 			return err
 		}
-		icebergAttached, err := sessionmeta.HasAttachedCatalog(initCtx, c.executor, iceberg.CatalogName)
-		if err != nil {
-			initCancel()
-			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect iceberg catalog attachment: %v", err))
-			return err
-		}
 		// De-mask: current_database() and the pg_catalog surfaces should reflect
 		// the real attached catalog, not the client's connection database name.
 		// Standalone has a single backing catalog, so honor whatever is attached.
 		catalog := c.database
-		switch {
-		case duckLakeAttached:
+		if duckLakeAttached {
 			catalog = physicalDuckLakeCatalog
-		case icebergAttached:
-			catalog = iceberg.CatalogName
-		}
-		// Prime the Iceberg REST catalog's schema list on this connection before the
-		// compat-view bind in InitSessionDatabaseMetadata enumerates every attached
-		// catalog. On the first session of a cold backing instance an unmaterialized
-		// Iceberg catalog otherwise surfaces a schema with an empty name, failing the
-		// bind with `Schema with name "" not found`. Best-effort: a real failure
-		// still surfaces from InitSessionDatabaseMetadata below.
-		if icebergAttached {
-			if err := sessionmeta.PrimeIcebergCatalog(initCtx, c.executor, iceberg.CatalogName); err != nil {
-				c.logger().Warn("Failed to prime Iceberg catalog before session metadata init.", "error", err)
-			}
 		}
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
-		// InitSessionDatabaseMetadata's defer only restores the catalog for
-		// DuckLake sessions; it otherwise leaves the session in `memory`. For an
-		// Iceberg session we must issue the USE ourselves, or current_database()
-		// reports 'iceberg' while unqualified DDL/DML silently lands in the
-		// ephemeral in-memory catalog. Mirror server.setIcebergDefault and the
-		// control plane's effectiveSessionDefaultCommand: target
-		// iceberg.<DefaultSchema> (not a bare `USE iceberg`) because DuckDB
-		// shadows `main` on a REST catalog.
-		if catalog == iceberg.CatalogName {
-			useStmt := fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
-			if _, err := c.executor.ExecContext(initCtx, useStmt); err != nil {
-				initCancel()
-				c.sendError("FATAL", "XX000", fmt.Sprintf("failed to set iceberg as default catalog: %v", err))
-				return err
-			}
-		}
 		initCancel()
 		// Keep c.database aligned with the real catalog so observability surfaces
 		// agree with current_database(); record the physical catalog so the
-		// transpiler selects the right backend profile (DuckLake/Iceberg).
+		// transpiler selects the right backend profile.
 		c.database = catalog
 		c.physicalCatalog = catalog
-		c.catalogUseRewrite = duckLakeAttached || icebergAttached
+		c.catalogUseRewrite = duckLakeAttached
 	}
 
 	// Send initial parameters

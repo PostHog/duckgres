@@ -207,7 +207,7 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -248,7 +248,7 @@ func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -269,7 +269,7 @@ func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -293,7 +293,7 @@ func TestProvisionAllowsRetryAfterDeleted(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -439,7 +439,7 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	store.setProvisionUserFailHook(errors.New("simulated DB write failure"))
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "team-7-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "team-7-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/7/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -502,8 +502,7 @@ func TestProvisionCnpgShard(t *testing.T) {
 	store.orgs["shardco"] = &configstore.Org{Name: "shardco"}
 	router := newTestRouter(store)
 
-	// cnpg-shard takes no sizing and auto-enables iceberg.
-	body := []byte(`{"database_name": "shardco-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "shardco-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/shardco/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -520,26 +519,26 @@ func TestProvisionCnpgShard(t *testing.T) {
 	if w.MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
 		t.Errorf("metadata store kind = %q, want cnpg-shard", w.MetadataStore.Kind)
 	}
-	if !w.Iceberg.Enabled || w.Iceberg.Backend != configstore.IcebergBackendLakekeeper {
-		t.Errorf("expected iceberg enabled with lakekeeper backend, got %+v", w.Iceberg)
+	if !w.DuckLake.Enabled {
+		t.Errorf("expected ducklake enabled, got %+v", w.DuckLake)
 	}
 }
 
-func TestProvisionIcebergExternal(t *testing.T) {
+func TestProvisionDuckLakeExternalWithCustomDatabase(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
 	body := []byte(`{
-		"database_name": "extice-db",
+		"database_name": "extcustom-db",
 		"metadata_store": {"type": "external", "external": {
 			"endpoint": "rds.example.us-east-1.rds.amazonaws.com",
 			"password_aws_secret": "duckling-example-rds-password",
 			"user": "postgres", "database": "postgres"
 		}},
 		"data_store": {"type": "external", "bucket_name": "posthog-duckling-example", "region": "us-east-1"},
-		"iceberg": {"enabled": true}
+		"ducklake": {"enabled": true}
 	}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extice/provision", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extcustom/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -547,7 +546,7 @@ func TestProvisionIcebergExternal(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	w := store.warehouses["extice"]
+	w := store.warehouses["extcustom"]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
 		return
@@ -564,17 +563,12 @@ func TestProvisionIcebergExternal(t *testing.T) {
 	if w.DataStore.Kind != "external" || w.DataStore.BucketName != "posthog-duckling-example" || w.DataStore.Region != "us-east-1" {
 		t.Errorf("data store not persisted: %+v", w.DataStore)
 	}
-	if !w.Iceberg.Enabled || w.Iceberg.Backend != configstore.IcebergBackendLakekeeper {
-		t.Errorf("expected iceberg enabled with lakekeeper backend, got %+v", w.Iceberg)
-	}
-	// Decoupled: iceberg without a ducklake flag is iceberg-ONLY (no implicit DuckLake).
-	if w.DuckLake.Enabled {
-		t.Errorf("iceberg+external without a ducklake flag must NOT enable DuckLake; got ducklake=%v", w.DuckLake.Enabled)
+	if !w.DuckLake.Enabled {
+		t.Errorf("expected ducklake enabled, got %+v", w.DuckLake)
 	}
 }
 
-// TestProvisionRejectsNoCatalog verifies the ≥1-catalog gate: a duckling with
-// neither ducklake nor iceberg is rejected.
+// TestProvisionRejectsNoCatalog verifies DuckLake must be enabled.
 func TestProvisionRejectsNoCatalog(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
@@ -591,25 +585,19 @@ func TestProvisionRejectsNoCatalog(t *testing.T) {
 	}
 }
 
-// TestProvisionCnpgDuckLakeAndIceberg verifies the fully-decoupled combo:
-// cnpg-shard with both catalogs.
-func TestProvisionCnpgDuckLakeAndIceberg(t *testing.T) {
+func TestProvisionRejectsIcebergCatalogRequest(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
-	body := []byte(`{"database_name":"both-db","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"iceberg":{"enabled":true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/bothco/provision", bytes.NewReader(body))
+	body := []byte(`{"database_name":"iceberg-db","metadata_store":{"type":"cnpg-shard"},"iceberg":{"enabled":true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/acme/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
-	w := store.warehouses["bothco"]
-	if w == nil || w.MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
-		t.Fatalf("expected cnpg-shard warehouse, got %+v", w)
-	}
-	if !w.DuckLake.Enabled || !w.Iceberg.Enabled {
-		t.Errorf("expected both ducklake and iceberg enabled; got ducklake=%v iceberg=%v", w.DuckLake.Enabled, w.Iceberg.Enabled)
+	if _, ok := store.warehouses["acme"]; ok {
+		t.Error("iceberg provision request must not create a warehouse")
 	}
 }
 
@@ -617,7 +605,6 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	// ducklake on, no iceberg → DuckLake-only on external.
 	body := []byte(`{
 		"database_name": "extdl-db",
 		"metadata_store": {"type": "external", "external": {
@@ -643,8 +630,8 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 	if w.MetadataStore.Kind != configstore.MetadataStoreKindExternal {
 		t.Errorf("metadata store kind = %q, want external", w.MetadataStore.Kind)
 	}
-	if !w.DuckLake.Enabled || w.Iceberg.Enabled {
-		t.Errorf("ducklake-only+external: want ducklake on, iceberg off; got ducklake=%v iceberg=%v", w.DuckLake.Enabled, w.Iceberg.Enabled)
+	if !w.DuckLake.Enabled {
+		t.Errorf("ducklake-only+external: want ducklake on, got ducklake=%v", w.DuckLake.Enabled)
 	}
 }
 
@@ -773,11 +760,11 @@ func TestProvisionRejectsUnsupportedMetadataStore(t *testing.T) {
 }
 
 func TestProvisionRejectsInvalidOrgID(t *testing.T) {
-	for _, bad := range []string{"ben.iceberg", "Ben-Iceberg", "ben_iceberg", "-bad", "bad-"} {
+	for _, bad := range []string{"ben.ducklake", "Ben-Ducklake", "ben_ducklake", "-bad", "bad-"} {
 		t.Run(bad, func(t *testing.T) {
 			store := newFakeStore()
 			router := newTestRouter(store)
-			body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"},"iceberg":{"enabled":true}}`)
+			body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`)
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+bad+"/provision", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
@@ -795,8 +782,8 @@ func TestProvisionRejectsInvalidOrgID(t *testing.T) {
 func TestProvisionAcceptsHyphenatedOrgID(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
-	body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"},"iceberg":{"enabled":true}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-iceberg-cnpg/provision", bytes.NewReader(body))
+	body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-ducklake-cnpg/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

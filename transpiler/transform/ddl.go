@@ -8,10 +8,10 @@ import (
 	"github.com/posthog/duckgres/transpiler/backend"
 )
 
-// DDLTransform strips unsupported DDL features for backends (DuckLake, Iceberg)
-// that don't support: PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints,
-// SERIAL types, DEFAULT now(), GENERATED columns, or indexes. Which behaviors
-// apply is driven by the backend's capabilities.
+// DDLTransform strips unsupported DDL features for backends that don't support:
+// PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints, SERIAL types, DEFAULT
+// now(), GENERATED columns, or indexes. Which behaviors apply is driven by the
+// backend's capabilities.
 type DDLTransform struct {
 	policy backend.DDLPolicy
 }
@@ -60,7 +60,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 					result.NoOpTag = "DROP INDEX"
 					return true, nil
 				}
-				// DuckLake/Iceberg don't support CASCADE on DROP TABLE/VIEW.
+				// DuckLake doesn't support CASCADE on DROP TABLE/VIEW.
 				// Strip CASCADE by converting to RESTRICT (same approach as dbt-duckdb).
 				// See: https://github.com/duckdb/dbt-duckdb/pull/557
 				// Note: DROP SCHEMA CASCADE is supported by DuckDB natively, so preserve it.
@@ -90,7 +90,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_VacuumStmt:
 			// ANALYZE and VACUUM both parse as VacuumStmt; distinguish the command
-			// tag (DuckDB rejects either against an Iceberg/DuckLake catalog).
+			// tag (DuckDB rejects either against a DuckLake catalog).
 			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "VACUUM"
@@ -203,7 +203,7 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt, result *Re
 	return changed
 }
 
-// transformColumnDef modifies a column definition for DuckLake/Iceberg compatibility.
+// transformColumnDef modifies a column definition for DuckLake compatibility.
 // SERIAL, GENERATED STORED, and DEFAULT <expr> would silently produce NULL data on a
 // lake catalog; when ErrorOnSilentNullDefaults is set they raise a feature_not_supported
 // error instead. Unenforceable column constraints (PK/UNIQUE/CHECK/FK) are stripped, with
@@ -417,8 +417,8 @@ func (t *DDLTransform) transformAlterTableStmt(stmt *pg_query.AlterTableStmt, re
 			supported = append(supported, cmd)
 			continue
 		}
-		// DROP COLUMN is allowed through, but warn: on the Iceberg catalog dropping
-		// a column after schema churn can make the table unreadable (see PR3 guard).
+		// DROP COLUMN is allowed through, but warn: after schema churn it can make
+		// existing data difficult to read safely.
 		if alterCmd.Subtype == pg_query.AlterTableType_AT_DropColumn {
 			t.warnDropColumn(result)
 			supported = append(supported, cmd)
@@ -582,7 +582,7 @@ func (t *DDLTransform) warnDroppedAlterCommand(result *Result, cmd *pg_query.Alt
 }
 
 // warnDropColumn records a WARNING that DROP COLUMN may make existing data
-// unreadable on the Iceberg catalog (see the runtime guard in server/conn_errors.go).
+// unreadable after schema churn.
 func (t *DDLTransform) warnDropColumn(result *Result) {
 	if !t.policy.WarnOnStrippedConstraints || result == nil {
 		return

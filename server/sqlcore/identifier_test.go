@@ -12,11 +12,11 @@ func TestParseQualifiedIdentifier(t *testing.T) {
 		want   []string
 		wantOK bool
 	}{
-		{name: "unquoted lowercases", input: "ICEBERG.Fivetran_Testing", want: []string{"iceberg", "fivetran_testing"}, wantOK: true},
-		{name: "quoted preserves case", input: `"iceberg"."MixedSchema"`, want: []string{"iceberg", "MixedSchema"}, wantOK: true},
-		{name: "escaped quote", input: `"iceberg"."quote""schema"`, want: []string{"iceberg", `quote"schema`}, wantOK: true},
-		{name: "empty part", input: "iceberg..schema", wantOK: false},
-		{name: "unterminated quote", input: `"iceberg"."schema`, wantOK: false},
+		{name: "unquoted lowercases", input: "DUCKLAKE.Fivetran_Testing", want: []string{"ducklake", "fivetran_testing"}, wantOK: true},
+		{name: "quoted preserves case", input: `"ducklake"."MixedSchema"`, want: []string{"ducklake", "MixedSchema"}, wantOK: true},
+		{name: "escaped quote", input: `"ducklake"."quote""schema"`, want: []string{"ducklake", `quote"schema`}, wantOK: true},
+		{name: "empty part", input: "ducklake..schema", wantOK: false},
+		{name: "unterminated quote", input: `"ducklake"."schema`, wantOK: false},
 	}
 
 	for _, tt := range tests {
@@ -38,9 +38,9 @@ func TestCatalogFromSearchPath(t *testing.T) {
 		searchPath string
 		want       string
 	}{
-		{name: "qualified catalog first", searchPath: "iceberg.public,memory.main", want: "iceberg"},
-		{name: "quoted qualified catalog first", searchPath: `"iceberg"."public", memory.main`, want: "iceberg"},
-		{name: "escaped comma inside quoted schema", searchPath: `"iceberg"."pub,lic", memory.main`, want: "iceberg"},
+		{name: "qualified catalog first", searchPath: "ducklake.main,memory.main", want: "ducklake"},
+		{name: "quoted qualified catalog first", searchPath: `"ducklake"."main", memory.main`, want: "ducklake"},
+		{name: "escaped comma inside quoted schema", searchPath: `"ducklake"."ma,in", memory.main`, want: "ducklake"},
 		{name: "unqualified first entry", searchPath: "main,memory.main", want: ""},
 		{name: "empty", searchPath: "", want: ""},
 	}

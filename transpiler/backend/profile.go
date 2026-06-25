@@ -5,7 +5,6 @@ type Name string
 const (
 	Memory   Name = "memory"
 	DuckLake Name = "ducklake"
-	Iceberg  Name = "iceberg"
 )
 
 type ConstraintHandling string
@@ -103,10 +102,6 @@ func ForName(name Name) Profile {
 		// DuckLake keeps the historical silent-strip behavior (sqlmesh/dbt issue
 		// PK/serial/DEFAULT now() DDL and rely on it succeeding).
 		return lakeProfile(DuckLake, "ducklake", true, false)
-	case Iceberg:
-		// Iceberg surfaces the dropped Postgres semantics: WARNING for unenforced
-		// constraints, ERROR for silently-NULL data features.
-		return lakeProfile(Iceberg, "iceberg", false, true)
 	default:
 		return Profile{
 			name:    Memory,

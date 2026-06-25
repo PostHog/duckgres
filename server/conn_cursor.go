@@ -38,7 +38,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	// us — log the cursor metadata phase as rows=0 / err=initial failure.
 	cursorStart := time.Now()
 	c.logQueryStarted(cursor.query)
-	rows, err := c.queryContextWithMetadata(ctx, cursor.query)
+	rows, err := c.executor.QueryContext(ctx, cursor.query)
 	if err != nil {
 		c.logQueryFinished(cursor.query, cursorStart, 0, err)
 		cleanup()

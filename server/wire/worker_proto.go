@@ -2,7 +2,6 @@ package wire
 
 import (
 	"github.com/posthog/duckgres/server/ducklake"
-	"github.com/posthog/duckgres/server/iceberg"
 )
 
 // WorkerControlMetadata identifies the logical worker owner on a control
@@ -19,9 +18,6 @@ type WorkerActivationPayload struct {
 	WorkerControlMetadata
 	OrgID    string          `json:"org_id"`
 	DuckLake ducklake.Config `json:"ducklake"`
-	// Iceberg is the per-tenant Iceberg catalog (AWS S3 Tables) config.
-	// Empty when the tenant has not opted in or hasn't been provisioned yet.
-	Iceberg iceberg.Config `json:"iceberg"`
 }
 
 // WorkerCreateSessionPayload is the control plane request body for creating

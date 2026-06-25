@@ -43,10 +43,10 @@ options=-c duckgres.worker_tier=backfill        # ergonomic alias = {cpu, mem, c
 |---|---|---|---|---|
 | default / exclusive | false | 46 / 360Gi (pool-global; normalized `""/""`) | `duckgres-workers` (today) | absent GUCs / gate off / `worker_tier=heavy` |
 | backfill | true | 4 / 16Gi | `duckgres-workers-colocated` | `colocate=true` no size / `worker_tier=backfill` |
-| iceberg backfill | true | 8 / 48Gi | `duckgres-workers-colocated` | `colocate=true worker_cpu=8 worker_memory=48Gi` (Iceberg-allowlisted org) |
+| large backfill | true | 8 / 48Gi | `duckgres-workers-colocated` | `colocate=true worker_cpu=8 worker_memory=48Gi` (allowlisted org) |
 
-Iceberg dual-write does `INSERT … SELECT * FROM read_parquet(full-day)` (memory-heavy; can OOM 16Gi) — hence
-8/48 for allowlisted orgs; the common DuckLake register path is metadata-only and fine on 4/16.
+Large `INSERT ... SELECT * FROM read_parquet(full-day)` backfills are memory-heavy and can OOM 16Gi, so
+8/48 remains available for allowlisted orgs; the common DuckLake register path is metadata-only and fine on 4/16.
 
 ## Open decisions (locked for this implementation)
 
@@ -58,7 +58,7 @@ Iceberg dual-write does `INSERT … SELECT * FROM read_parquet(full-day)` (memor
 
 An adversarial multi-agent review (36/37 findings confirmed) drove these fixes:
 
-- **Shape-aware warm pool** (was single-shape 4/16): an 8/48 Iceberg request now matches a warm worker instead of permanent backpressure (`ColocatedWarmShapes`).
+- **Shape-aware warm pool** (was single-shape 4/16): an 8/48 backfill request now matches a warm worker instead of permanent backpressure (`ColocatedWarmShapes`).
 - **NULL-safe claim filters** (`COALESCE`): legacy `worker_records` rows (profile columns NULL before AutoMigrate) stay claimable by the default request.
 - **Profile-filtered `ClaimHotIdleWorker`**: a differently-shaped request no longer reclaims-and-retires an org's default-shape hot-idle workers.
 - **Authoritative per-org colocated quota** inside the claim txn (cross-CP), not just in-process.

@@ -2,9 +2,9 @@
 // a duckgres connection (current_database, pg_database, information_schema
 // views) so they reflect the catalog the session defaults to on the PG wire.
 //
-// The catalog name passed in is the real, attached catalog (e.g. "ducklake" or
-// "iceberg") the session uses — duckgres no longer masks a logical database
-// name onto a physical catalog, so current_database() reports the truth.
+// The catalog name passed in is the real, attached catalog the session uses.
+// Duckgres no longer masks a logical database name onto a physical catalog, so
+// current_database() reports the truth.
 //
 // Pure helpers — no dependency on github.com/duckdb/duckdb-go. The control
 // plane and other duckdb-free callers use this package without linking
@@ -15,54 +15,15 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
-	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
-
-// PrimeIcebergCatalog forces the attached Iceberg REST catalog's schema list to
-// materialize on this session's DuckDB instance BEFORE the pg_catalog compat
-// views are bound. On the first session of a freshly-spawned (cold) worker the
-// catalog is attached but its schema list hasn't been loaded yet; the bind's
-// catalog enumeration then surfaces a schema with an empty name and fails with
-// `Catalog Error: Schema with name "" not found`. This probe runs that same
-// enumeration as a harmless SELECT, retrying until it succeeds (the failed
-// enumeration itself completes the load), bounded by ctx. Best-effort: callers
-// log a failure and proceed — the load-bearing error still comes from
-// InitSessionDatabaseMetadata with full context.
-func PrimeIcebergCatalog(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) error {
-	if executor == nil {
-		return fmt.Errorf("session executor is required")
-	}
-	probe := fmt.Sprintf(
-		"SELECT count(*) FROM duckdb_schemas() WHERE database_name = %s",
-		quoteSQLStringLiteral(catalog),
-	)
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("prime %s catalog: %w (last probe error: %v)", catalog, ctx.Err(), lastErr)
-			case <-time.After(catalogSettleRetryDelay):
-			}
-		}
-		rows, err := executor.QueryContext(ctx, probe)
-		if err == nil {
-			_ = rows.Close()
-			return nil
-		}
-		lastErr = err
-	}
-	return fmt.Errorf("prime %s catalog: %w", catalog, lastErr)
-}
 
 // InitSessionDatabaseMetadata installs session-local overrides for metadata
 // surfaces (current_database, pg_database, information_schema views) so they
 // reflect `catalog` — the real, attached catalog the session defaults to. The
-// caller resolves `catalog` to "ducklake"/"iceberg" (the names the catalogs are
-// actually attached as); there is no logical→physical masking.
+// caller resolves `catalog` to the name the catalog is actually attached as;
+// there is no logical→physical masking.
 func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
@@ -90,10 +51,8 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 	}
 	defer func() {
 		// Leave the session in a real catalog (we entered `memory` to install the
-		// compat views there). For DuckLake sessions, restore `ducklake` here; for
-		// Iceberg the caller issues `USE iceberg.public` after this returns. Keep
-		// memory.main on the search_path so the pg_catalog compat macros stay
-		// resolvable after the switch.
+		// compat views there). Keep memory.main on the search_path so the
+		// pg_catalog compat macros stay resolvable after the switch.
 		if duckLakeAttached {
 			_, _ = executor.ExecContext(context.Background(), "USE ducklake")
 			_, _ = executor.ExecContext(context.Background(), "SET search_path = 'main,memory.main'")
@@ -101,41 +60,10 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 	}()
 
 	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog)); err != nil {
-		if !isCatalogSettlingError(err) {
-			return fmt.Errorf("apply session metadata override: %w", err)
-		}
-		// First session on a cold worker: an attached Iceberg REST catalog whose
-		// schema list isn't materialized on this DuckDB instance yet surfaces a
-		// schema with an empty name during the bind's catalog enumeration. The
-		// failed enumeration itself completes the load (observed: a second attempt
-		// on the same instance always succeeds), so retry the batch once.
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("apply session metadata override: %w", ctx.Err())
-		case <-time.After(catalogSettleRetryDelay):
-		}
-		if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog)); err != nil {
-			return fmt.Errorf("apply session metadata override (after catalog-settle retry): %w", err)
-		}
+		return fmt.Errorf("apply session metadata override: %w", err)
 	}
 
 	return nil
-}
-
-// catalogSettleRetryDelay is the pause before retrying the metadata batch when
-// the first attempt failed on an unsettled (cold) attached catalog.
-const catalogSettleRetryDelay = 300 * time.Millisecond
-
-// isCatalogSettlingError reports whether err matches the bind failure produced
-// by enumerating an attached-but-not-yet-materialized Iceberg REST catalog on a
-// cold DuckDB instance (`Catalog Error: Schema with name "" not found`). Scoped
-// to the empty-name schema lookup so genuine missing-schema errors still fail
-// the session immediately.
-func isCatalogSettlingError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), `Schema with name "" not found`)
 }
 
 func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) (bool, error) {
@@ -203,7 +131,6 @@ func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, cat
 func buildSessionMetadataSQL(database string) string {
 	parts := []string{
 		sessionColumnMetadataTableSQL(),
-		sessionIcebergColumnMetadataTableSQL(),
 		buildSessionPgDatabaseViewSQL(database),
 		buildSessionPgClassViewSQL(),
 		buildSessionPgNamespaceViewSQL(),
@@ -231,26 +158,6 @@ func sessionColumnMetadataTableSQL() string {
 			PRIMARY KEY (table_schema, table_name, column_name)
 		)
 	`
-}
-
-func sessionIcebergColumnMetadataTableSQL() string {
-	return fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS main.%s (
-			table_schema VARCHAR NOT NULL,
-			table_name VARCHAR NOT NULL,
-			column_name VARCHAR NOT NULL,
-			ordinal_position INTEGER NOT NULL,
-			is_nullable VARCHAR NOT NULL,
-			data_type VARCHAR NOT NULL,
-			udt_name VARCHAR,
-			character_maximum_length INTEGER,
-			character_octet_length INTEGER,
-			numeric_precision INTEGER,
-			numeric_scale INTEGER,
-			datetime_precision INTEGER,
-			PRIMARY KEY (table_schema, table_name, column_name)
-		)
-	`, icebergmeta.ColumnMetadataTable)
 }
 
 func buildSessionPgDatabaseViewSQL(database string) string {
@@ -320,7 +227,7 @@ func internalCompatRelationNamesSQL() string {
 		'information_schema_columns_compat', 'information_schema_tables_compat',
 		'information_schema_schemata_compat', 'information_schema_views_compat',
 		'information_schema_sequences_compat', 'information_schema_routines_compat',
-		'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+		'__duckgres_column_metadata'
 	`
 }
 
@@ -372,6 +279,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_tables()
 			WHERE table_name NOT IN (%s)
+				AND schema_name <> 'system'
 			UNION ALL
 			SELECT
 				view_oid AS oid,
@@ -413,6 +321,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_views()
 			WHERE view_name NOT IN (%s)
+				AND schema_name <> 'system'
 			UNION ALL
 			SELECT
 				sequence_oid AS oid,
@@ -454,6 +363,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_sequences()
 			WHERE sequence_name NOT IN (%s)
+				AND schema_name <> 'system'
 			UNION ALL
 			SELECT
 				index_oid AS oid,
@@ -495,6 +405,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_indexes()
 			WHERE index_name NOT IN (%s)
+				AND schema_name <> 'system'
 		)
 		SELECT
 			oid, relname, relnamespace, reltype, reloftype, relowner, relam,
@@ -535,6 +446,7 @@ func buildSessionPgNamespaceViewSQL() string {
 		CROSS JOIN active_catalog ac
 		WHERE n.database_name = ac.catalog
 			AND n.schema_name NOT LIKE '__ducklake_metadata_%'
+			AND n.schema_name <> 'system'
 		UNION ALL
 		SELECT 11::BIGINT AS oid, 'pg_catalog' AS nspname, 10::BIGINT AS nspowner, NULL AS nspacl
 		UNION ALL
@@ -594,105 +506,49 @@ func pgTypeOIDCaseSQL(dataTypeExpr, fallbackExpr string) string {
 
 func buildSessionPgAttributeViewSQL() string {
 	nativeTypeOID := pgTypeOIDCaseSQL("UPPER(dc.data_type)", "a.atttypid")
-	loadedTypeOID := pgTypeOIDCaseSQL("UPPER(im.data_type)", "1043")
 	return fmt.Sprintf(`
 		CREATE OR REPLACE VIEW main.pg_attribute AS
-		WITH native_attributes AS (
-			SELECT
-				a.attrelid::UINTEGER AS attrelid,
-				a.attname,
-				%s AS atttypid,
-				a.attstattarget,
-				a.attlen,
-				a.attnum::SMALLINT AS attnum,
-				a.attndims::SMALLINT AS attndims,
-				a.attcacheoff,
-				CASE
-					WHEN (dc.data_type LIKE 'DECIMAL%%' OR dc.data_type LIKE 'NUMERIC%%') AND a.atttypmod > 0 THEN
-						(((a.atttypmod / 1000)::INTEGER << 16) | ((a.atttypmod %% 1000)::INTEGER + 4))::INTEGER
-					ELSE a.atttypmod
-				END AS atttypmod,
-				a.attbyval,
-				a.attalign,
-				a.attstorage,
-				a.attcompression,
-				a.attnotnull,
-				a.atthasdef,
-				a.atthasmissing,
-				a.attidentity,
-				a.attgenerated,
-				a.attisdropped,
-				a.attislocal,
-				a.attinhcount::INTEGER AS attinhcount,
-				a.attcollation::UINTEGER AS attcollation,
-				a.attacl,
-				a.attoptions,
-				a.attfdwoptions,
-				a.attmissingval
-			FROM pg_catalog.pg_attribute a
-			JOIN main.pg_class_full c ON c.oid = a.attrelid
-			JOIN main.pg_namespace n ON n.oid = c.relnamespace
-			LEFT JOIN duckdb_columns() dc ON dc.table_oid = a.attrelid AND dc.column_name = a.attname
-			WHERE NOT (
-				current_database() = 'iceberg'
-				AND a.attname = '__'
-			)
-			AND NOT (
-				current_database() = 'iceberg'
-				AND EXISTS (
-					SELECT 1
-					FROM main.__duckgres_iceberg_column_metadata im
-					WHERE im.table_schema = n.nspname
-					AND im.table_name = c.relname
-				)
-			)
-		),
-		loaded_iceberg_attributes AS (
-			SELECT
-				c.oid::UINTEGER AS attrelid,
-				im.column_name AS attname,
-				%s AS atttypid,
-				-1::INTEGER AS attstattarget,
-				-1::INTEGER AS attlen,
-				im.ordinal_position::SMALLINT AS attnum,
-				0::SMALLINT AS attndims,
-				0::INTEGER AS attcacheoff,
-				-1::INTEGER AS atttypmod,
-				false AS attbyval,
-				'i' AS attalign,
-				'x' AS attstorage,
-				NULL AS attcompression,
-				(im.is_nullable = 'NO') AS attnotnull,
-				false AS atthasdef,
-				false AS atthasmissing,
-				'' AS attidentity,
-				'' AS attgenerated,
-				false AS attisdropped,
-				true AS attislocal,
-				0::INTEGER AS attinhcount,
-				0::UINTEGER AS attcollation,
-				NULL AS attacl,
-				NULL AS attoptions,
-				NULL AS attfdwoptions,
-				NULL AS attmissingval
-			FROM main.__duckgres_iceberg_column_metadata im
-			JOIN main.pg_namespace n ON n.nspname = im.table_schema
-			JOIN main.pg_class_full c ON c.relnamespace = n.oid AND c.relname = im.table_name
-			WHERE current_database() = 'iceberg'
-		)
-		SELECT * FROM native_attributes
-		UNION ALL
-		SELECT * FROM loaded_iceberg_attributes
-	`, nativeTypeOID, loadedTypeOID)
+		SELECT
+			a.attrelid::UINTEGER AS attrelid,
+			a.attname,
+			%s AS atttypid,
+			a.attstattarget,
+			a.attlen,
+			a.attnum::SMALLINT AS attnum,
+			a.attndims::SMALLINT AS attndims,
+			a.attcacheoff,
+			CASE
+				WHEN (dc.data_type LIKE 'DECIMAL%%' OR dc.data_type LIKE 'NUMERIC%%') AND a.atttypmod > 0 THEN
+					(((a.atttypmod / 1000)::INTEGER << 16) | ((a.atttypmod %% 1000)::INTEGER + 4))::INTEGER
+				ELSE a.atttypmod
+			END AS atttypmod,
+			a.attbyval,
+			a.attalign,
+			a.attstorage,
+			a.attcompression,
+			a.attnotnull,
+			a.atthasdef,
+			a.atthasmissing,
+			a.attidentity,
+			a.attgenerated,
+			a.attisdropped,
+			a.attislocal,
+			a.attinhcount::INTEGER AS attinhcount,
+			a.attcollation::UINTEGER AS attcollation,
+			a.attacl,
+			a.attoptions,
+			a.attfdwoptions,
+			a.attmissingval
+		FROM pg_catalog.pg_attribute a
+		JOIN main.pg_class_full c ON c.oid = a.attrelid
+		LEFT JOIN duckdb_columns() dc ON dc.table_oid = a.attrelid AND dc.column_name = a.attname
+	`, nativeTypeOID)
 }
 
 // buildSessionPgTablesViewSQL builds the catalog-scoped pg_catalog.pg_tables
 // compat view. DuckDB's native pg_tables spans EVERY attached catalog and
-// ignores current_database(), so on a dual-catalog worker (DuckLake + Iceberg
-// attached on one connection) a bare pg_tables would leak the other catalog's
-// table names into the session. This view sources duckdb_tables() filtered to
-// current_database() so an Iceberg session only sees Iceberg tables and a
-// DuckLake session only sees DuckLake tables. Column shape mirrors DuckDB's
+// ignores current_database(). This view sources duckdb_tables() filtered to
+// current_database() so a session only sees its active catalog. Column shape mirrors DuckDB's
 // native pg_tables (schemaname, tablename, tableowner, tablespace, hasindexes,
 // hasrules, hastriggers) so clients see no change beyond the scoping.
 func buildSessionPgTablesViewSQL() string {
@@ -714,6 +570,7 @@ func buildSessionPgTablesViewSQL() string {
 		CROSS JOIN active_catalog ac
 		WHERE t.database_name = ac.catalog
 			AND t.schema_name NOT LIKE '__ducklake_metadata_%%'
+			AND t.schema_name <> 'system'
 			AND t.table_name NOT IN (%s)
 	`, internalNames)
 }
@@ -739,6 +596,7 @@ func buildSessionPgViewsViewSQL() string {
 		CROSS JOIN active_catalog ac
 		WHERE v.database_name = ac.catalog
 			AND v.schema_name NOT LIKE '__ducklake_metadata_%%'
+			AND v.schema_name <> 'system'
 			AND v.view_name NOT IN (%s)
 	`, internalNames)
 }
@@ -772,6 +630,7 @@ func buildSessionPgSequencesViewSQL() string {
 		CROSS JOIN active_catalog ac
 		WHERE s.database_name = ac.catalog
 			AND s.schema_name NOT LIKE '__ducklake_metadata_%'
+			AND s.schema_name <> 'system'
 	`
 }
 
@@ -800,39 +659,6 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				ON c.table_schema = m.table_schema
 				AND c.table_name = m.table_name
 				AND c.column_name = m.column_name
-			WHERE NOT (
-				c.table_catalog = 'iceberg'
-				AND c.column_name = '__'
-				AND UPPER(c.data_type) = 'UNKNOWN'
-			)
-			AND NOT (
-				c.table_catalog = 'iceberg'
-				AND EXISTS (
-					SELECT 1
-					FROM main.__duckgres_iceberg_column_metadata im
-					WHERE im.table_schema = c.table_schema
-					AND im.table_name = c.table_name
-					AND im.column_name = c.column_name
-				)
-			)
-			UNION ALL
-			SELECT
-				'iceberg' AS source_catalog,
-				'iceberg' AS table_catalog,
-				table_schema,
-				table_name,
-				column_name,
-				ordinal_position,
-				NULL AS column_default,
-				is_nullable,
-				data_type,
-				udt_name,
-				character_maximum_length,
-				character_octet_length,
-				numeric_precision,
-				numeric_scale,
-				datetime_precision
-			FROM main.__duckgres_iceberg_column_metadata
 		),
 		active_catalog AS (
 			SELECT current_database() AS catalog
@@ -841,11 +667,11 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			SELECT c.*
 			FROM all_columns c
 			CROSS JOIN active_catalog ac
-			WHERE c.source_catalog = ac.catalog
-			OR (
-				ac.catalog <> 'iceberg'
-				AND c.source_catalog IN ('ducklake', 'memory')
+			WHERE (
+				c.source_catalog = ac.catalog
+				OR c.source_catalog IN ('ducklake', 'memory')
 			)
+			AND c.table_schema <> 'system'
 		),
 		active_search_path AS (
 			SELECT
@@ -886,8 +712,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 						),
 						CASE
 							WHEN c.source_catalog IN ('ducklake', 'memory') THEN 0
-							WHEN c.source_catalog = 'iceberg' THEN 1
-							ELSE 2
+							ELSE 1
 						END,
 						c.source_catalog
 				) AS search_path_rank
@@ -994,7 +819,7 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			NULL AS commit_action
 		FROM information_schema.tables t
 		WHERE t.table_name NOT IN (
-			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
+			'__duckgres_column_metadata',
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
@@ -1007,11 +832,9 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 		)
 		AND (
 			t.table_catalog = current_database()
-			OR (
-				current_database() <> 'iceberg'
-				AND t.table_catalog IN ('ducklake', 'memory')
-			)
+			OR t.table_catalog IN ('ducklake', 'memory')
 		)
+		AND t.table_schema <> 'system'
 		AND t.table_name NOT LIKE 'duckdb_%'
 		AND t.table_name NOT LIKE 'sqlite_%'
 		AND t.table_name NOT LIKE 'pragma_%'
@@ -1032,12 +855,10 @@ func buildSessionInformationSchemaSchemataViewSQL() string {
 		FROM information_schema.schemata s
 		WHERE s.schema_name NOT IN ('main', 'pg_catalog', 'information_schema')
 		AND s.catalog_name NOT LIKE '__ducklake_metadata_%'
+		AND s.schema_name <> 'system'
 		AND (
 			s.catalog_name = current_database()
-			OR (
-				current_database() <> 'iceberg'
-				AND s.catalog_name IN ('ducklake', 'memory')
-			)
+			OR s.catalog_name IN ('ducklake', 'memory')
 		)
 		UNION ALL
 		SELECT current_database() AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
@@ -1082,11 +903,9 @@ func buildSessionInformationSchemaViewsViewSQL() string {
 		)
 		AND (
 			v.table_catalog = current_database()
-			OR (
-				current_database() <> 'iceberg'
-				AND v.table_catalog IN ('ducklake', 'memory')
-			)
+			OR v.table_catalog IN ('ducklake', 'memory')
 		)
+		AND v.table_schema <> 'system'
 		AND v.table_name NOT LIKE 'duckdb_%'
 		AND v.table_name NOT LIKE 'sqlite_%'
 		AND v.table_name NOT LIKE 'pragma_%'

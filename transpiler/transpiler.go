@@ -97,8 +97,8 @@ func New(cfg Config) *Transpiler {
 	// 3. information_schema mappings to compat views
 	t.transforms = append(t.transforms, taggedTransform{FlagInfoSchema, transform.NewInformationSchemaTransform()})
 
-	// 3.1 Map PostgreSQL "public" schema to DuckDB "main" (backends whose default
-	// schema is "main"; disabled for Iceberg whose schema is literally "public")
+	// 3.1 Map PostgreSQL "public" schema to DuckDB "main" when the backend's
+	// physical default schema is "main".
 	t.transforms = append(t.transforms, taggedTransform{FlagPublicSchema, transform.NewPublicSchemaTransform(catalogPolicy.MapPublicToMain)})
 
 	// 3.2 Map logical database catalog references to the physical backend catalog

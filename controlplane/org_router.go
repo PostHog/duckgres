@@ -207,28 +207,6 @@ func (tr *OrgRouter) StackForOrg(orgID string) (*OrgStack, bool) {
 	return stack, ok
 }
 
-func (tr *OrgRouter) IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool) {
-	tr.mu.RLock()
-	stack, ok := tr.orgs[orgID]
-	tr.mu.RUnlock()
-	if !ok || stack == nil || stack.Config == nil || stack.Config.Warehouse == nil {
-		return server.IcebergConfig{}, false
-	}
-
-	src := stack.Config.Warehouse.Iceberg
-	cfg := server.IcebergConfig{
-		Enabled:                   src.Enabled,
-		Backend:                   src.Backend,
-		Namespace:                 src.Namespace,
-		Region:                    src.Region,
-		LakekeeperEndpoint:        src.LakekeeperEndpoint,
-		LakekeeperWarehouse:       src.LakekeeperWarehouse,
-		LakekeeperClientID:        src.LakekeeperClientID,
-		LakekeeperOAuth2ServerURI: src.LakekeeperOAuth2ServerURI,
-	}
-	return cfg, true
-}
-
 // SetMigrating marks an org as having a DuckLake migration in progress.
 func (tr *OrgRouter) SetMigrating(orgID string) {
 	tr.migrating.Store(orgID, struct{}{})

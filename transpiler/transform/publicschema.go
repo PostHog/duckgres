@@ -13,8 +13,8 @@ import (
 // `SELECT * FROM public.mytable` are sent to DuckDB unchanged and fail because DuckDB has no "public"
 // schema by default.
 type PublicSchemaTransform struct {
-	// enabled gates the public→main rewrite. It is false for backends (Iceberg)
-	// whose physical default schema is literally "public".
+	// enabled gates the public→main rewrite for backends whose physical default
+	// schema is "main".
 	enabled bool
 }
 

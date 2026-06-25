@@ -1,9 +1,8 @@
 # mw-dev per-PR e2e harness
 
 Replaces what `tests/k8s/` (kind) cannot exercise — real Cilium network
-policies, real Crossplane Duckling provisioning, real cnpg-shard + external
-RDS metadata stores, and the real per-org Lakekeeper operator. Those are the
-layers where this quarter's production bugs lived.
+policies, real Crossplane Duckling provisioning, and real cnpg-shard + external
+RDS metadata stores.
 
 ## Flow (`.github/workflows/e2e-mw-dev.yml`)
 
@@ -63,7 +62,7 @@ client-go:
   / `timed out waiting for an available worker`) rather than a hang/500/drop, and
   the pool must then serve a retrying connection. The harness logs whether
   backpressure was observed **and** handles it (queries retry through it).
-- **activation** — DuckLake **and** Iceberg catalogs attach and read/write.
+- **activation** — DuckLake catalogs attach and read/write.
 - **worker sizing** (TTL-pool model, `docs/design/worker-ttl-pool.md`) — a
   client-sized connection (`duckgres.worker_cpu`/`worker_memory`/`worker_ttl`
   startup options, sent via `PGOPTIONS`; CP runs `allowClientWorkerProfile=true`
@@ -71,10 +70,8 @@ client-go:
   requested CPU+memory on **both** requests and limits — proving the shape flows
   control-plane → k8s pod spec, not BestEffort. A same-shape reconnect **reuses**
   that hot-idle worker (no respawn — the count of that-shape pods stays 1).
-  Asserted on cnpg for **both** the ducklake and iceberg catalogs, with a
-  distinct shape per catalog (2/4Gi vs 1/2Gi) so the catalog-agnostic worker
-  can't satisfy the second from the first's hot-idle pool. There is no warm pool,
-  so the only workers are the ones a request sizes + spawns on demand.
+  Asserted on cnpg for DuckLake. There is no warm pool, so the only workers are
+  the ones a request sizes + spawns on demand.
   Clamp enforcement itself is unit-covered (`controlplane/worker_profile_test.go`).
 - **org default worker profile** — an operator-set per-org default worker shape
   + hot-idle TTL (config-store columns `default_worker_cpu`/`memory`/`ttl`, set
@@ -140,7 +137,7 @@ normal `go test ./...` lane.
   `tests/integration/credential_rotation_pin_test.go` (stock httpfs dies /
   patched httpfs survives rotation + revocation mid-scan); the harness's
   `assert_fork_extensions` pins that workers actually run the patched build
-  (`EXPECT_HTTPFS_SHA`), and every DuckLake/Iceberg assertion here exercises
+  (`EXPECT_HTTPFS_SHA`), and every DuckLake assertion here exercises
   the patched request paths against real S3.
 - **Version-mismatch worker reaper** — needs a mid-run image bump, so it stays
   covered by `controlplane/` unit tests rather than in-Job.
@@ -149,9 +146,9 @@ normal `go test ./...` lane.
   S3 the Job holds no list creds, so isolation is asserted **logically** (the
   cross-tenant read is denied) rather than by enumerating S3 objects.
 - **Cilium egress allow/deny probing** — asserting a worker reaches the cnpg
-  pooler + `lakekeeper:8181` but not a denied destination needs a stable
-  exec-into-worker probe; deferred (high flake risk). The policies themselves
-  are asserted statically in `tests/manifests/`.
+  pooler but not a denied destination needs a stable exec-into-worker probe;
+  deferred (high flake risk). The policies themselves are asserted statically in
+  `tests/manifests/`.
 - **Oversized Bind-parameter rejection (#717)** — rejecting a Bind message whose
   declared parameter length exceeds the remaining message body requires crafting
   a malformed wire-protocol packet on a raw socket (through TLS + auth); libpq
@@ -220,15 +217,15 @@ normal `go test ./...` lane.
 Dedicated CP + throwaway config-store **per PR**, provisioning **real**
 ducklings (org IDs `ci-pr-<N>-cnpg`, `ci-pr-<N>-ext`, plus the
 ducklake-only resilience-lane orgs `ci-pr-<N>-res1`/`-res2`) through the **shared**
-Crossplane / cnpg-shards / external RDS / Lakekeeper operator. The config-store
+Crossplane / cnpg-shards / external RDS resources. The config-store
 uses a namespace-scoped PVC so a pod recreation during the harness does not
 erase provisioned org rows. Everything PR-specific lives in the namespace and
 is deleted; the shared-infra footprint is removed by deprovisioning the
 ducklings first.
 
 Each deploy first reaps any existing resources for the same PR number (namespace,
-Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role)
-so a rerun never applies over stale Lakekeeper services or network policies.
+Duckling CRs, pod identity association, and cross-namespace bindings) so a rerun
+never applies over stale resources.
 
 ## One-time repo configuration
 
@@ -272,10 +269,10 @@ got through, in order — each was a real fix:
    `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES=.ci.duckgres.local` +
    `DUCKGRES_SNI_ROUTING_MODE=passthrough`, and connecting with libpq
    `host=<org>.<suffix>` (SNI) + `hostaddr=<CP ClusterIP>` (TCP).
-5. ✅ catalog selection — `dbname` must be `ducklake` or `iceberg`, not the org
-   (PR #651: *database = catalog selection*). harness.sh now does this.
+5. ✅ catalog selection — `dbname` must be `ducklake`, not the org
+   (*database = catalog selection*). harness.sh now does this.
 
-6. ✅ **activation (cnpg DuckLake + Iceberg)** — the blocker was NOT a metadata
+6. ✅ **activation (cnpg DuckLake)** — the blocker was NOT a metadata
    SecretRef; the duckling-status path reads the metadata password straight
    from the CR. It failed at **S3 STS brokering** because the isolated CP had no
    AWS identity. Fixed by binding the per-PR `duckgres` SA to the **same EKS Pod
@@ -305,20 +302,15 @@ id committed).
   failed auths (~15 min). The harness uses the provision-time password and
   settles one config-poll interval before connecting — keep it that way; a
   reset-password + tight retry loop will trip the ban.
-- **Teardown / recreate are now CR-synchronous.** `run.sh teardown` and the
-  in-harness same-org recreate both `kubectl wait --for=delete` on the Duckling
-  CR, whose finalizers run the Crossplane DROP of the cnpg role+db, before
-  returning / re-provisioning. `drop_cnpg_role` is still called at deploy + at
-  teardown as a belt-and-suspenders idempotent backstop. (Composition
-  `managementPolicies: ["*"]` from charts#11522 does the drop; the `--for=delete`
-  wait is what makes it synchronous from our side.)
+- **Teardown is CR-synchronous.** `run.sh teardown` and e2e-cleanup both
+  `kubectl wait --for=delete` on the Duckling CR before returning.
 - **Shared-infra contention.** Concurrent PRs provision real ducklings against
-  the same cnpg-shards / RDS / lakekeeper-operator. Org-ID prefix keeps them
+  the same cnpg-shards / RDS resources. Org-ID prefix keeps them
   distinct; watch quay.io / cnpg pooler / RDS limits under parallelism.
 - **e2e-cleanup** is wired: the `e2e-mw-dev.yml` `schedule` trigger runs
   `run.sh e2e-cleanup` every 6h, reaping `duckgres-ci-pr-*` namespaces older than
-  6h (`E2E_CLEANUP_MAX_AGE_HOURS`) along with their ducklings, cnpg role+db, Pod
-  Identity association, and ci-pr-labelled cross-ns bindings.
+  6h (`E2E_CLEANUP_MAX_AGE_HOURS`) along with their ducklings, Pod Identity
+  association, and ci-pr-labelled cross-ns bindings.
 - **Remaining deferrals** are listed under "Deliberately not covered here"
   above (warm-pool activation + version-reaper, physical S3-prefix isolation,
   Cilium egress allow/deny probing).
