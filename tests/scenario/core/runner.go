@@ -19,6 +19,11 @@ type StepExecutor interface {
 	ExecuteStep(context.Context, Step) error
 }
 
+type ClassifiedError interface {
+	error
+	ErrorClass() string
+}
+
 type StepExecutorFunc func(context.Context, Step) error
 
 func (f StepExecutorFunc) ExecuteStep(ctx context.Context, step Step) error {
@@ -147,7 +152,7 @@ func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByS
 	}
 	if err != nil {
 		result.Status = StepStatusFailed
-		result.ErrorClass = "execution_error"
+		result.ErrorClass = classifyStepError(err)
 		result.Error = err.Error()
 		result.Err = err
 	}
@@ -188,6 +193,14 @@ func firstUnsuccessfulDependency(step Step, statusByStep map[string]StepStatus) 
 		}
 	}
 	return "", false
+}
+
+func classifyStepError(err error) string {
+	var classified ClassifiedError
+	if errors.As(err, &classified) && classified.ErrorClass() != "" {
+		return classified.ErrorClass()
+	}
+	return "execution_error"
 }
 
 func defaultRunID(s Scenario, startedAt time.Time) string {
