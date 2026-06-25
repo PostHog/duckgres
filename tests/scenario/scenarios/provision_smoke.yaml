@@ -2,9 +2,37 @@ name: provision-smoke
 run_id_prefix: scenario-smoke
 steps:
   - id: provision
-    type: fake
+    type: provision_warehouse
+    with:
+      org_id: scenario-smoke-${run_id_compact}
+      request:
+        database_name: scenario_smoke_${run_id_compact}
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: scenario-smoke-${run_id_compact}
+      timeout: 15m
+      poll_interval: 10s
   - id: select_one
-    type: fake
+    type: sql
+    with:
+      org_id: scenario-smoke-${run_id_compact}
+      catalog: ducklake
+      sql: SELECT 1
+      max_attempts: 12
+      retry_interval: 10s
   - id: deprovision
-    type: fake
+    type: deprovision_warehouse
+    depends_on: [select_one]
     always_run: true
+    with:
+      org_id: scenario-smoke-${run_id_compact}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s
