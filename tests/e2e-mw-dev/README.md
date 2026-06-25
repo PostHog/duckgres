@@ -64,6 +64,13 @@ client-go:
   the pool must then serve a retrying connection. The harness logs whether
   backpressure was observed **and** handles it (queries retry through it).
 - **activation** — DuckLake **and** Iceberg catalogs attach and read/write.
+- **query log** — a successful marker query and a failed marker query both land
+  in `ducklake.system.query_log` on the cnpg and external-RDS lanes. The
+  completed marker row must expose non-negative `cpu_time_s` and
+  `peak_buffer_memory_bytes`, proving the durable resource columns are present
+  in the tenant DuckLake log table. The harness intentionally leaves the
+  optional Kafka query-log writer disabled, so this is the direct DuckLake sink
+  smoke rather than a Kafka deployment test.
 - **worker sizing** (TTL-pool model, `docs/design/worker-ttl-pool.md`) — a
   client-sized connection (`duckgres.worker_cpu`/`worker_memory`/`worker_ttl`
   startup options, sent via `PGOPTIONS`; CP runs `allowClientWorkerProfile=true`
