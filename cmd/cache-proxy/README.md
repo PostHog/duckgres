@@ -14,8 +14,29 @@ available, and forwards cache misses to origin object storage.
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
 | `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. |
+| `ORIGIN_MAX_IN_FLIGHT` | `0` | Maximum concurrent cacheable origin fills per proxy pod. `0` disables local origin backpressure. Configure a positive value after observing production origin-fill and retry metrics. Distinct cache misses queue when the limit is saturated. Same-key misses are singleflight-deduplicated and share one slot. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `DUCKGRES_TRACE_ENDPOINT` | empty | OTLP/HTTP trace endpoint. Unset → tracing is a no-op. |
 | `OTEL_EXPORTER_OTLP_TRACES_PATH` | empty | Overrides the OTLP path (e.g. VictoriaTraces' `/insert/opentelemetry/v1/traces`). Mirrors the main duckgres binary. |
+
+## Origin Backpressure
+
+Cacheable origin fills can be locally bounded by `ORIGIN_MAX_IN_FLIGHT` per
+cache-proxy pod. The default is `0`, which disables local origin backpressure so
+the limiter can be enabled after observing production metrics from the origin
+fetch and retry dashboards. When enabled, the limiter is applied after
+local-cache lookup, peer-cache lookup, and singleflight deduplication, so hits,
+peer hits, non-GET requests, `CONNECT` tunnels, and duplicate same-key waiters
+do not consume separate origin slots.
+
+When all origin slots are in use, a distinct cache miss waits until a slot is
+available or the request context is canceled. If the wait is canceled before an
+origin request starts, the proxy returns `503 Service Unavailable` with
+`Retry-After: 1`; nothing is written to the cache.
+
+Prometheus exposes `cache_proxy_origin_fetches_queued` for current waiters and
+`cache_proxy_origin_fetch_queue_wait_seconds{outcome}` for saturated-limit wait
+duration. `cache_proxy_origin_fetches_in_flight` continues to track only active
+origin fills.
 
 ## Tracing
 

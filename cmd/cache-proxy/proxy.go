@@ -49,6 +49,8 @@ type CacheProxy struct {
 	originRetryMaxAttempts    int
 	originRetryInitialBackoff time.Duration
 	originRetryMaxBackoff     time.Duration
+	originMaxInFlight         int
+	originSlots               chan struct{}
 
 	// cacheHostSuffixes are the Host substrings that identify DuckLake bucket
 	// traffic worth caching. Requests whose Host doesn't contain any of these
@@ -71,6 +73,7 @@ const (
 	defaultOriginRetryMaxAttempts    = 4
 	defaultOriginRetryInitialBackoff = 100 * time.Millisecond
 	defaultOriginRetryMaxBackoff     = 1 * time.Second
+	defaultOriginMaxInFlight         = 0
 )
 
 type singleFlight struct {
@@ -82,6 +85,18 @@ type call struct {
 	wg  sync.WaitGroup
 	res fetchResult
 	err error
+}
+
+type originBackpressureWaitError struct {
+	err error
+}
+
+func (e *originBackpressureWaitError) Error() string {
+	return fmt.Sprintf("origin fetch backpressure wait canceled: %v", e.err)
+}
+
+func (e *originBackpressureWaitError) Unwrap() error {
+	return e.err
 }
 
 func (sf *singleFlight) Do(key string, fn func() (fetchResult, error)) (fetchResult, error) {
@@ -110,7 +125,7 @@ func (sf *singleFlight) Do(key string, fn func() (fetchResult, error)) (fetchRes
 }
 
 func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []string) *CacheProxy {
-	return &CacheProxy{
+	proxy := &CacheProxy{
 		store:                     store,
 		peers:                     peers,
 		client:                    &http.Client{Timeout: defaultOriginTimeout},
@@ -120,6 +135,50 @@ func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []str
 		originRetryMaxBackoff:     defaultOriginRetryMaxBackoff,
 		cacheHostSuffixes:         cacheHostSuffixes,
 	}
+	proxy.setOriginMaxInFlight(defaultOriginMaxInFlight)
+	return proxy
+}
+
+func (p *CacheProxy) setOriginMaxInFlight(max int) {
+	p.originMaxInFlight = max
+	if max <= 0 {
+		p.originSlots = nil
+		return
+	}
+	p.originSlots = make(chan struct{}, max)
+}
+
+func (p *CacheProxy) acquireOriginSlot(ctx context.Context) (func(), error) {
+	if p.originSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case p.originSlots <- struct{}{}:
+		return func() { <-p.originSlots }, nil
+	default:
+	}
+
+	start := time.Now()
+	originFetchQueued.Inc()
+	defer originFetchQueued.Dec()
+	select {
+	case p.originSlots <- struct{}{}:
+		originFetchQueueWaitSeconds.WithLabelValues("admitted").Observe(time.Since(start).Seconds())
+		return func() { <-p.originSlots }, nil
+	case <-ctx.Done():
+		originFetchQueueWaitSeconds.WithLabelValues(originQueueWaitOutcome(ctx.Err())).Observe(time.Since(start).Seconds())
+		return nil, &originBackpressureWaitError{err: ctx.Err()}
+	}
+}
+
+func originQueueWaitOutcome(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	return "error"
 }
 
 // shouldCache returns true if the request targets a host we want to cache.
@@ -310,6 +369,14 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	res, err := p.fetchDedup(cacheKey, r, rangeHeader)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
+		var backpressureErr *originBackpressureWaitError
+		if errors.As(err, &backpressureErr) {
+			slog.Warn("Origin fetch backpressure wait canceled.",
+				"url", r.URL.String(), "range", rangeHeader, "error", err)
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		// An origin that responded with a non-2xx (e.g. S3 returning a 400 with
 		// <Code>ExpiredToken</Code> in an XML envelope) is forwarded back to
 		// DuckDB verbatim — same status code, same body, same headers minus
@@ -372,6 +439,11 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 				return fetchResult{size: n, source: "peer"}, nil
 			}
 		}
+		releaseOriginSlot, err := p.acquireOriginSlot(r.Context())
+		if err != nil {
+			return fetchResult{}, err
+		}
+		defer releaseOriginSlot()
 		originFetchInFlight.Inc()
 		defer originFetchInFlight.Dec()
 		size, ct, err := p.fetchOrigin(cacheKey, r)

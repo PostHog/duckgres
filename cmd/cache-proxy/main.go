@@ -97,6 +97,11 @@ func main() {
 	peerAddr := envOrDefault("PEER_ADDR", ":8081")
 	healthAddr := envOrDefault("HEALTH_ADDR", ":8082")
 	peerService := os.Getenv("PEER_SERVICE") // headless K8s service for peer discovery
+	originMaxInFlight, err := nonNegativeIntEnvOrDefault("ORIGIN_MAX_IN_FLIGHT", defaultOriginMaxInFlight)
+	if err != nil {
+		slog.Error("Invalid ORIGIN_MAX_IN_FLIGHT.", "error", err)
+		os.Exit(1)
+	}
 
 	// Comma-separated Host substrings we should cache. Anything else is tunneled
 	// or forwarded without caching. Empty means "cache everything" (legacy).
@@ -116,6 +121,7 @@ func main() {
 		"peer_listen", peerAddr,
 		"health", healthAddr,
 		"peer_service", peerService,
+		"origin_max_in_flight", originMaxInFlight,
 		"cache_host_suffixes", cacheHostSuffixes,
 	)
 
@@ -134,6 +140,7 @@ func main() {
 	}
 
 	proxy := NewCacheProxy(store, peers, cacheHostSuffixes)
+	proxy.setOriginMaxInFlight(originMaxInFlight)
 
 	// Forward HTTP proxy (DuckDB httpfs traffic). ServeMux can't match absolute
 	// URLs in forward-proxy requests, so use the handler directly.
@@ -192,4 +199,19 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func nonNegativeIntEnvOrDefault(key string, def int) (int, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not an integer", key, raw)
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("%s=%d must be non-negative", key, value)
+	}
+	return value, nil
 }
