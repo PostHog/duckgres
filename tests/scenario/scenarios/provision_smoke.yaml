@@ -1,0 +1,10 @@
+name: provision-smoke
+run_id_prefix: scenario-smoke
+steps:
+  - id: provision
+    type: fake
+  - id: select_one
+    type: fake
+  - id: deprovision
+    type: fake
+    always_run: true
