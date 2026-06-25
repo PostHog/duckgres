@@ -9,10 +9,23 @@ import (
 
 // OperatorTransform converts PostgreSQL operators to DuckDB equivalents.
 // Handles JSON operators, regex operators, and other PostgreSQL-specific operators.
-type OperatorTransform struct{}
+type OperatorTransform struct {
+	// qualifyMacros mirrors the catalog policy's QualifyMacros (true for
+	// DuckLake/Iceberg backends). When set, the duckgres_json_extract_path macro
+	// call we emit for parameterized JSON paths is qualified as
+	// memory.main.duckgres_json_extract_path so it resolves even though the
+	// default catalog is the lake catalog. See jsonPathMacroCall.
+	qualifyMacros bool
+}
 
 func NewOperatorTransform() *OperatorTransform {
 	return &OperatorTransform{}
+}
+
+// NewOperatorTransformWithConfig builds an OperatorTransform that qualifies the
+// custom macros it emits when qualifyMacros is set (DuckLake/Iceberg backends).
+func NewOperatorTransformWithConfig(qualifyMacros bool) *OperatorTransform {
+	return &OperatorTransform{qualifyMacros: qualifyMacros}
 }
 
 func (t *OperatorTransform) Name() string {
@@ -470,6 +483,17 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 				anyChanged = true
 			}
 		}
+		// Direct json_extract / json_extract_string calls (clients send these,
+		// and FunctionTransform rewrites json_extract_path* into them earlier in
+		// the pipeline): normalize the key/path argument so a '$'-prefixed
+		// Postgres key like "$ai_session_id" isn't mis-parsed as a JSONPath. The
+		// arrow operators are handled in createJsonExtractFuncCall instead.
+		if isJSONExtractFunc(funcCall) && len(funcCall.Args) == 2 {
+			if newPath := t.normalizeJSONExtractPathArg(funcCall.Args[1]); newPath != nil {
+				funcCall.Args[1] = newPath
+				anyChanged = true
+			}
+		}
 		if funcCall.AggFilter != nil {
 			if newFilter := t.transformExpression(funcCall.AggFilter); newFilter != nil {
 				funcCall.AggFilter = newFilter
@@ -625,6 +649,13 @@ func (t *OperatorTransform) createJsonExtractFuncCall(left, right *pg_query.Node
 		left = newLeft
 	}
 
+	// Normalize the key/path so a Postgres property key like "$ai_session_id"
+	// isn't mis-parsed as a (malformed) JSONPath by DuckDB. See
+	// normalizeJSONExtractPathArg.
+	if newRight := t.normalizeJSONExtractPathArg(right); newRight != nil {
+		right = newRight
+	}
+
 	funcName := "json_extract"
 	if asText {
 		funcName = "json_extract_string"
@@ -640,6 +671,124 @@ func (t *OperatorTransform) createJsonExtractFuncCall(left, right *pg_query.Node
 			},
 		},
 	}
+}
+
+// jsonExtractPathMacro is the DuckDB scalar macro that normalizes a JSON
+// extraction key/path at runtime. It is registered in initUtilityMacros
+// (server/catalog.go) so it is available on every backend (standalone, process
+// workers, k8s workers). We emit a call to it to wrap *dynamic* path arguments
+// (bound parameters) that cannot be rewritten at transpile time. Keep the name
+// and the macro body's normalization rules in sync with normalizeJSONPathKey.
+const jsonExtractPathMacro = "duckgres_json_extract_path"
+
+// normalizeJSONPathKey rewrites a *literal* JSON-extraction key so DuckDB looks
+// it up as the intended Postgres key instead of mis-parsing it as a JSONPath.
+//
+// DuckDB's json_extract[_string](doc, path) treats `path` as a JSONPath only
+// when it starts with '$'; otherwise the whole string is a single literal-key
+// lookup (dots, brackets and quotes included, so those need no special care). A
+// '$'-prefixed string is a valid JSONPath only when '$' is followed by '.' or
+// '[', so a Postgres property key like "$ai_session_id" or "$group_0" is parsed
+// as a malformed path and DuckDB fails at bind time ("JSON path error near
+// ..."). We rewrite such keys to an explicit quoted-member path, $."<key>",
+// which addresses the literal key.
+//
+// Returns (newKey, true) when a rewrite happened, (key, false) otherwise. Plain
+// keys and already-valid navigating JSONPaths ($.foo, $."foo", $.a[0], $[0]) are
+// returned unchanged, so the rewrite is idempotent.
+func normalizeJSONPathKey(key string) (string, bool) {
+	if !strings.HasPrefix(key, "$") {
+		// Plain key: DuckDB does a literal single-key lookup. Already correct.
+		return key, false
+	}
+	if strings.HasPrefix(key, "$.") || strings.HasPrefix(key, "$[") {
+		// Already a valid navigating JSONPath ($.foo, $."foo", $.a[0], $[0]).
+		return key, false
+	}
+	// '$' followed by neither '.' nor '[' (e.g. "$ai_session_id", "$group_0", or
+	// a lone "$"): not a valid JSONPath, but a valid Postgres literal key.
+	// Address it explicitly as a quoted member. Inside a DuckDB JSONPath quoted
+	// member, '\' and '"' are backslash-escaped (verified against DuckDB 1.5).
+	escaped := strings.ReplaceAll(key, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `$."` + escaped + `"`, true
+}
+
+// normalizeJSONExtractPathArg normalizes the key/path argument of a JSON
+// extraction so a '$'-prefixed Postgres key doesn't trip DuckDB's JSONPath
+// parser. It returns a replacement node, or nil if the argument needs no change.
+//
+//   - A string-literal key is rewritten at transpile time (normalizeJSONPathKey).
+//   - A bound parameter ($N), whose value is only known at execute time, is
+//     wrapped in the duckgres_json_extract_path() macro so the identical
+//     normalization runs at runtime, before DuckDB's binder sees the value. The
+//     parameter node still appears exactly once, so param count/position is
+//     unchanged.
+//
+// Any other argument shape (integer array index, column reference, arbitrary
+// expression) is deliberately left untouched: integers are valid DuckDB array
+// indexes, and we must not blanket-rewrite non-path arguments.
+func (t *OperatorTransform) normalizeJSONExtractPathArg(node *pg_query.Node) *pg_query.Node {
+	if node == nil {
+		return nil
+	}
+	// Literal string key → rewrite at transpile time.
+	if ac := node.GetAConst(); ac != nil {
+		if sval := ac.GetSval(); sval != nil {
+			if newKey, changed := normalizeJSONPathKey(sval.Sval); changed {
+				return stringConstNode(newKey)
+			}
+		}
+		return nil
+	}
+	// Bound parameter → wrap with the runtime normalization macro.
+	if node.GetParamRef() != nil {
+		return t.jsonPathMacroCall(node)
+	}
+	return nil
+}
+
+// jsonPathMacroCall builds a call to the duckgres_json_extract_path macro
+// wrapping arg. In DuckLake/Iceberg mode (qualifyMacros) the name is emitted as
+// memory.main.duckgres_json_extract_path: the macro is created in memory.main
+// but the default catalog is the lake catalog, so the call must be explicitly
+// qualified. The PgCatalogTransform qualifies other custom macros, but it runs
+// earlier in the pipeline and never sees this emitted call, so we qualify here.
+func (t *OperatorTransform) jsonPathMacroCall(arg *pg_query.Node) *pg_query.Node {
+	var funcname []*pg_query.Node
+	if t.qualifyMacros {
+		funcname = []*pg_query.Node{
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "memory"}}},
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "main"}}},
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: jsonExtractPathMacro}}},
+		}
+	} else {
+		funcname = []*pg_query.Node{
+			{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: jsonExtractPathMacro}}},
+		}
+	}
+	return &pg_query.Node{Node: &pg_query.Node_FuncCall{FuncCall: &pg_query.FuncCall{
+		Funcname: funcname,
+		Args:     []*pg_query.Node{arg},
+	}}}
+}
+
+// isJSONExtractFunc reports whether fc is a json_extract / json_extract_string
+// call (the DuckDB forms our pipeline and clients emit). The last funcname
+// element is checked so a schema-qualified name still matches.
+func isJSONExtractFunc(fc *pg_query.FuncCall) bool {
+	if fc == nil || len(fc.Funcname) == 0 {
+		return false
+	}
+	last := fc.Funcname[len(fc.Funcname)-1].GetString_()
+	if last == nil {
+		return false
+	}
+	switch last.Sval {
+	case "json_extract", "json_extract_string":
+		return true
+	}
+	return false
 }
 
 // looksJSON reports whether a node is syntactically JSON: a cast to json/jsonb,

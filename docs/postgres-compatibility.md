@@ -116,7 +116,7 @@ why.
 | date / time / timestamp / timestamptz / interval | ✅ | `types_test.go::TestTypesDateTime`; server `TestEncode/DecodeDate/Timestamp/Time/Interval` | incl. ancient dates, microseconds |
 | boolean | ✅ | `types_test.go::TestTypesBoolean`; server `TestEncode/DecodeBool` | all literal forms (t/f/yes/no/1/0) |
 | uuid | ✅ | `types_test.go::TestTypesUUID`; server `TestEncodeDecodeUUID` | |
-| json / jsonb | ✅ | `types_test.go::TestTypesJSON`; server `TestEncodeJSON`/`TestEncodeBinaryJSON` | operators `-> ->> @> ?`; JSONPath `@?` skipped |
+| json / jsonb | ✅ | `types_test.go::TestTypesJSON`; server `TestEncodeJSON`/`TestEncodeBinaryJSON`; server `TestJSONExtractDollarKey_RoundTrip` | operators `-> ->> @> ?`; `$`-prefixed property keys (`$ai_session_id`, `$group_0`) are rewritten to a quoted-member JSONPath so DuckDB looks them up literally instead of failing as a malformed path (literal keys statically, bound params via the `duckgres_json_extract_path` macro); JSONPath `@?` skipped |
 | arrays | ✅ | `types_test.go::TestTypesArray` | subscript, slice, concat, contains, ANY/ALL |
 | NULL handling (all types) | ✅ | `types_test.go::TestTypesNullHandling` | |
 | Casts (`CAST`, `::`, implicit) | ✅ | `types_test.go::TestTypesCasting` | |

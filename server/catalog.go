@@ -1535,6 +1535,27 @@ func initUtilityMacros(db *sql.DB, serverStartTime, processStartTime time.Time, 
 		// In standalone mode this equals control_plane_version(). During rolling updates
 		// these may differ if the control plane has been upgraded but workers haven't yet.
 		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_version() AS '%s'`, strings.ReplaceAll(processVersion, "'", "''")),
+
+		// duckgres_json_extract_path - normalize a JSON-extraction key/path at
+		// runtime so a Postgres property key like "$ai_session_id" or "$group_0"
+		// is not mis-parsed by DuckDB as a (malformed) JSONPath and rejected at
+		// bind time ("JSON path error near ..."). The transpiler wraps the path
+		// argument of json_extract[_string] in this macro when it is a bound
+		// parameter ($N) whose value is unknown at transpile time (literal keys
+		// are rewritten statically). Rules MUST mirror normalizeJSONPathKey in
+		// transpiler/transform/operators.go:
+		//   - NULL                       -> NULL
+		//   - "$." / "$[" prefix         -> unchanged (already a valid JSONPath)
+		//   - other "$"-prefixed key     -> $."<key>" (escape \ and " for the
+		//                                   quoted member)
+		//   - plain key                  -> unchanged (DuckDB looks it up literally)
+		`CREATE OR REPLACE MACRO duckgres_json_extract_path(k) AS (
+			CASE
+				WHEN k IS NULL THEN NULL
+				WHEN k LIKE '$.%' OR k LIKE '$[%' THEN k
+				WHEN k LIKE '$%' THEN '$."' || replace(replace(k, '\', '\\'), '"', '\"') || '"'
+				ELSE k
+			END)`,
 	}
 
 	for _, m := range macros {

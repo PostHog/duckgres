@@ -220,6 +220,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"worker_uptime":                   true, // Current process uptime as INTERVAL
 			"control_plane_version":           true, // Server/control-plane version
 			"worker_version":                  true, // Worker process version
+			"duckgres_json_extract_path":      true, // Normalize '$'-prefixed JSON keys (emitted by OperatorTransform for param paths)
 			"div":                             true, // Integer division
 			"array_remove":                    true, // Remove element from array
 			"array_lower":                     true, // PostgreSQL array lower-bound compatibility
