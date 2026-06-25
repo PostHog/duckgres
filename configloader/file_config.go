@@ -81,6 +81,7 @@ type QueryLogKafkaFileConfig struct {
 	Brokers  []string `yaml:"brokers"`
 	Topic    string   `yaml:"topic"`
 	ClientID string   `yaml:"client_id"`
+	GroupID  string   `yaml:"group_id"`
 }
 
 type TLSConfig struct {
