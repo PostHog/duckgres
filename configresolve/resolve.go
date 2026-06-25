@@ -167,6 +167,7 @@ func DefaultServerConfig() server.Config {
 			DataInliningRowLimit: 1000,
 			Kafka: server.QueryLogKafkaConfig{
 				ClientID: "duckgres-query-log",
+				GroupID:  "duckgres-query-log-writer",
 			},
 		},
 	}
@@ -456,6 +457,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.QueryLog.Kafka.ClientID != "" {
 			cfg.QueryLog.Kafka.ClientID = fileCfg.QueryLog.Kafka.ClientID
+		}
+		if fileCfg.QueryLog.Kafka.GroupID != "" {
+			cfg.QueryLog.Kafka.GroupID = fileCfg.QueryLog.Kafka.GroupID
 		}
 
 		if fileCfg.TLS.ACME.Domain != "" {
@@ -941,6 +945,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if v := getenv("DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID"); v != "" {
 		cfg.QueryLog.Kafka.ClientID = v
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_KAFKA_GROUP_ID"); v != "" {
+		cfg.QueryLog.Kafka.GroupID = v
 	}
 
 	if cli.Set["host"] {

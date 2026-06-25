@@ -315,6 +315,7 @@ type QueryLogKafkaConfig struct {
 	Brokers  []string
 	Topic    string
 	ClientID string
+	GroupID  string
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.

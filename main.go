@@ -86,7 +86,7 @@ func main() {
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
-	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
+	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, duckdb-service, or query-log-writer")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
 	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
@@ -293,6 +293,15 @@ func main() {
 			BearerToken:  token,
 			MaxSessions:  maxSessions,
 		})
+		return
+	}
+
+	// Handle query-log-writer mode. This consumes Kafka query-log events and
+	// writes them to each tenant's DuckLake-backed system.query_log table.
+	if *mode == "query-log-writer" {
+		if err := runQueryLogWriter(context.Background(), cfg, resolved); err != nil {
+			fatal("Query-log writer error: " + err.Error())
+		}
 		return
 	}
 

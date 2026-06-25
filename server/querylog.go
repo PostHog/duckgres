@@ -21,6 +21,7 @@ import (
 
 // QueryLogEntry represents a single entry in the query log.
 type QueryLogEntry struct {
+	EventID         string
 	EventTime       time.Time
 	QueryDurationMs int64
 	Type            string // "QueryFinish" or "ExceptionWhileProcessing"
@@ -113,6 +114,29 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		return nil, nil
 	}
 
+	db, err := openQueryLogDuckLakeDB(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	ql := &QueryLogger{
+		db:    db,
+		cfg:   cfg.QueryLog,
+		table: "ducklake.system.query_log",
+		ch:    make(chan QueryLogEntry, queryLogChannelSize),
+		done:  make(chan struct{}),
+	}
+
+	go ql.flushLoop()
+	slog.Info("Query log enabled.", "flush_interval", cfg.QueryLog.FlushInterval, "batch_size", cfg.QueryLog.BatchSize)
+	return ql, nil
+}
+
+func openQueryLogDuckLakeDB(cfg Config) (*sql.DB, error) {
+	if cfg.DuckLake.MetadataStore == "" {
+		return nil, errors.New("querylog: DuckLake metadata store is required")
+	}
+
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("querylog: open duckdb: %w", err)
@@ -178,17 +202,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		slog.Warn("querylog: failed to set data_inlining_row_limit, continuing without it.", "error", err)
 	}
 
-	ql := &QueryLogger{
-		db:    db,
-		cfg:   cfg.QueryLog,
-		table: "ducklake.system.query_log",
-		ch:    make(chan QueryLogEntry, queryLogChannelSize),
-		done:  make(chan struct{}),
-	}
-
-	go ql.flushLoop()
-	slog.Info("Query log enabled.", "flush_interval", cfg.QueryLog.FlushInterval, "batch_size", cfg.QueryLog.BatchSize)
-	return ql, nil
+	return db, nil
 }
 
 // Log sends an entry to the query log. Non-blocking; drops if channel is full.
@@ -283,13 +297,20 @@ func (ql *QueryLogger) flushLoop() {
 }
 
 func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
+	if err := insertQueryLogEntries(context.Background(), ql.db, ql.table, batch); err != nil {
+		slog.Error("querylog: flush failed.", "error", err, "batch_size", len(batch))
+	}
+}
+
+func insertQueryLogEntries(ctx context.Context, db *sql.DB, table string, batch []QueryLogEntry) error {
 	if len(batch) == 0 {
-		return
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	// Build multi-row INSERT with placeholders
 	var sb strings.Builder
-	table := ql.table
 	if table == "" {
 		table = "query_log"
 	}
@@ -308,38 +329,43 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
 			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23, base+24, base+25, base+26)
 
-		args = append(args,
-			e.EventTime,
-			e.QueryDurationMs,
-			e.Type,
-			truncateQuery(e.Query),
-			truncateNullableQuery(e.TranspiledQuery),
-			e.QueryKind,
-			e.NormalizedHash,
-			e.ResultRows,
-			e.WrittenRows,
-			e.ExceptionCode,
-			e.Exception,
-			e.UserName,
-			e.OrgID,
-			e.CurrentDatabase,
-			e.ClientAddress,
-			e.ClientPort,
-			e.ApplicationName,
-			e.PID,
-			e.WorkerID,
-			e.IsTranspiled,
-			e.Protocol,
-			e.TraceID,
-			e.SpanID,
-			e.PostgresScanMs,
-			e.CPUTimeSeconds,
-			e.PeakBufferMemoryBytes,
-		)
+		args = append(args, queryLogEntryInsertArgs(e)...)
 	}
 
-	if _, err := ql.db.Exec(sb.String(), args...); err != nil {
-		slog.Error("querylog: flush failed.", "error", err, "batch_size", len(batch))
+	if _, err := db.ExecContext(ctx, sb.String(), args...); err != nil {
+		return fmt.Errorf("insert query_log entries: %w", err)
+	}
+	return nil
+}
+
+func queryLogEntryInsertArgs(e QueryLogEntry) []any {
+	return []any{
+		e.EventTime,
+		e.QueryDurationMs,
+		e.Type,
+		truncateQuery(e.Query),
+		truncateNullableQuery(e.TranspiledQuery),
+		e.QueryKind,
+		e.NormalizedHash,
+		e.ResultRows,
+		e.WrittenRows,
+		e.ExceptionCode,
+		e.Exception,
+		e.UserName,
+		e.OrgID,
+		e.CurrentDatabase,
+		e.ClientAddress,
+		e.ClientPort,
+		e.ApplicationName,
+		e.PID,
+		e.WorkerID,
+		e.IsTranspiled,
+		e.Protocol,
+		e.TraceID,
+		e.SpanID,
+		e.PostgresScanMs,
+		e.CPUTimeSeconds,
+		e.PeakBufferMemoryBytes,
 	}
 }
 
@@ -391,8 +417,8 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 		}
 	}
 
-	// Add trace_id and span_id columns for OTEL tracing correlation.
-	for _, col := range []string{"trace_id", "span_id"} {
+	// Add columns for OTEL tracing correlation and Kafka writer idempotency.
+	for _, col := range []string{"trace_id", "span_id", "event_id"} {
 		hasCol, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, col)
 		if err != nil {
 			return fmt.Errorf("inspect %s column: %w", col, err)
@@ -456,6 +482,7 @@ func queryLogCreateTableSQL(fullTableName string) string {
 		protocol            VARCHAR,
 		trace_id            VARCHAR,
 		span_id             VARCHAR,
+		event_id            VARCHAR,
 		postgres_scan_ms    BIGINT DEFAULT 0,
 		cpu_time_s          DOUBLE DEFAULT 0,
 		peak_buffer_memory_bytes BIGINT DEFAULT 0
