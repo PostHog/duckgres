@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/tests/scenario/core"
+	scenarioperf "github.com/posthog/duckgres/tests/scenario/perf"
 	"github.com/posthog/duckgres/tests/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/scenario/sql"
 )
@@ -76,14 +77,29 @@ func TestScenarioRunner(t *testing.T) {
 			ApplicationName: "duckgres-scenario-runner",
 		},
 	})
+	scenarioOutputDir := filepath.Join(*scenarioOutputBase, runID)
+	perfExecutor := scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			HostAddr:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
+			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),
+			Port:            intEnv(t, "DUCKGRES_SCENARIO_PG_PORT", 5432),
+			SSLMode:         "require",
+			ConnectTimeout:  intEnv(t, "DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT", 10),
+			ApplicationName: "duckgres-scenario-runner",
+		},
+		OutputDir:                scenarioOutputDir,
+		FlightAddr:               os.Getenv("DUCKGRES_SCENARIO_FLIGHT_ADDR"),
+		FlightInsecureSkipVerify: boolEnv(t, "DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY", true),
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), *scenarioMaxRuntime)
 	defer cancel()
 	runner := core.NewRunner(core.RunnerConfig{
 		RunID:          runID,
 		Scenario:       loaded,
-		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor},
-		OutputDir:      filepath.Join(*scenarioOutputBase, runID),
+		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor},
+		OutputDir:      scenarioOutputDir,
 		WriteFiles:     true,
 		CleanupTimeout: 15 * time.Minute,
 	})
@@ -195,6 +211,50 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 	}
 }
 
+func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen perf scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-perf-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	foundPerf := false
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+		if step.Type != scenarioperf.StepTypePerfQueries {
+			continue
+		}
+		foundPerf = true
+		catalogFile, ok := step.With["catalog_file"].(string)
+		if !ok || !filepath.IsAbs(catalogFile) {
+			t.Fatalf("perf catalog_file = %#v, want absolute path", step.With["catalog_file"])
+		}
+		if _, err := os.Stat(catalogFile); err != nil {
+			t.Fatalf("perf catalog file %q should exist: %v", catalogFile, err)
+		}
+		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-perf-20260102t030405z" {
+			t.Fatalf("perf run_id = %q, want scenario run id", runID)
+		}
+		if _, ok := step.With["flight_insecure_skip_verify"]; ok {
+			t.Fatal("perf scenario should use DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY default instead of hardcoding TLS behavior")
+		}
+	}
+	if !foundPerf {
+		t.Fatal("expected frozen perf scenario to include a perf_queries step")
+	}
+}
+
 func TestResolveRunTemplatesRejectsMissingEnvTemplate(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
 
@@ -219,6 +279,7 @@ func TestResolveRunTemplatesRejectsMissingEnvTemplate(t *testing.T) {
 type dispatchExecutor struct {
 	provision *provision.Executor
 	sql       *scenariosql.Executor
+	perf      *scenarioperf.Executor
 }
 
 func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error {
@@ -227,6 +288,8 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 		return e.provision.ExecuteStep(ctx, step)
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return e.sql.ExecuteStep(ctx, step)
+	case scenarioperf.StepTypePerfQueries:
+		return e.perf.ExecuteStep(ctx, step)
 	default:
 		return fmt.Errorf("unsupported scenario step type %q", step.Type)
 	}
@@ -237,6 +300,8 @@ func dispatchSupports(stepType string) bool {
 	case provision.StepTypeProvisionWarehouse, provision.StepTypeWaitWarehouseReady, provision.StepTypeDeprovisionWarehouse:
 		return true
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
+		return true
+	case scenarioperf.StepTypePerfQueries:
 		return true
 	default:
 		return false
@@ -261,6 +326,19 @@ func intEnv(t *testing.T, key string, fallback int) int {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		t.Fatalf("%s must be an integer: %v", key, err)
+	}
+	return parsed
+}
+
+func boolEnv(t *testing.T, key string, fallback bool) bool {
+	t.Helper()
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		t.Fatalf("%s must be a boolean: %v", key, err)
 	}
 	return parsed
 }
@@ -295,7 +373,7 @@ func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {
 		}
 		with := make(map[string]any, len(step.With))
 		for k, v := range step.With {
-			if k == "file" {
+			if k == "file" || k == "catalog_file" {
 				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) {
 					v = filepath.Clean(filepath.Join(baseDir, file))
 				}

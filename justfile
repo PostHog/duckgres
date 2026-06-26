@@ -379,6 +379,11 @@ scenario-smoke:
 scenario-frozen-metadata:
     ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_metadata.yaml
 
+# Run the dev frozen dataset perf scenario
+[group('test')]
+scenario-frozen-perf:
+    ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_perf.yaml
+
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]
 lint:

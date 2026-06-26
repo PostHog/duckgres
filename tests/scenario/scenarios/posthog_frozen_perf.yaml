@@ -1,0 +1,54 @@
+name: posthog-frozen-perf
+run_id_prefix: scenario-frozen-perf
+required_env:
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
+  - DUCKGRES_SCENARIO_FLIGHT_ADDR
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: scenario-frozen-perf-${run_id_compact}
+      request:
+        database_name: scenario_frozen_perf_${run_id_compact}
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: scenario-frozen-perf-${run_id_compact}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: setup_frozen_views
+    type: sql
+    with:
+      org_id: scenario-frozen-perf-${run_id_compact}
+      catalog: ducklake
+      file: ../sql/setup_frozen_views.sql
+      max_attempts: 12
+      retry_interval: 10s
+
+  - id: perf_queries
+    type: perf_queries
+    with:
+      org_id: scenario-frozen-perf-${run_id_compact}
+      catalog: ducklake
+      catalog_file: ../../perf/queries/ducklake_frozen.yaml
+      run_id: ${run_id}
+      dataset_version: posthog-file-views-v1
+      flight_addr: ${env:DUCKGRES_SCENARIO_FLIGHT_ADDR}
+
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [perf_queries]
+    always_run: true
+    with:
+      org_id: scenario-frozen-perf-${run_id_compact}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s

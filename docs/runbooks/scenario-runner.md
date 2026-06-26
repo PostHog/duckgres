@@ -4,7 +4,7 @@
 
 The scenario runner executes end-to-end managed-warehouse flows against a configured dev environment. The first smoke scenario provisions a warehouse, waits for readiness, runs `SELECT 1` over PGWire with managed-hostname SNI, then deprovisions and verifies cleanup.
 
-The frozen metadata scenario provisions the same fresh dev warehouse shape, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, validates the dataset manifest row, runs lightweight metadata/user-exploration queries, then deprovisions.
+The frozen metadata and perf scenarios provision the same fresh dev warehouse shape, create read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, run their workload, then deprovision.
 
 ## Required Environment
 
@@ -36,6 +36,13 @@ Frozen dataset scenarios additionally require:
 export DUCKGRES_SCENARIO_FROZEN_S3_URI="s3://<dev-managed-bucket>/frozen_v1/"
 ```
 
+Frozen perf scenarios additionally require the Flight SQL address because the perf catalog exercises both PGWire and Flight:
+
+```bash
+export DUCKGRES_SCENARIO_FLIGHT_ADDR="<flight-sql-address>"
+export DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY="true"
+```
+
 Do not commit concrete dev endpoints, secrets, org IDs, or private bucket names.
 
 ## Run
@@ -58,6 +65,12 @@ Run frozen metadata exploration:
 just scenario-frozen-metadata
 ```
 
+Run frozen perf queries:
+
+```bash
+just scenario-frozen-perf
+```
+
 Run a specific scenario file:
 
 ```bash
@@ -71,6 +84,13 @@ The frozen metadata scenario uses:
 - `tests/scenario/scenarios/posthog_frozen_metadata.yaml`
 - `tests/scenario/sql/setup_frozen_views.sql`
 - `tests/scenario/sql/metadata_catalog.yaml`
+
+The frozen perf scenario uses:
+
+- `tests/scenario/scenarios/posthog_frozen_perf.yaml`
+- `tests/perf/queries/ducklake_frozen.yaml`
+
+Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `summary.json`, and `server_metrics.prom`.
 
 `DUCKGRES_SCENARIO_FROZEN_S3_URI` must point at a dev-owned frozen dataset prefix with `persons/` and `events/` parquet children.
 The provisioned Duckgres worker role also needs read/list access to that prefix; the runner process only supplies the URI, while the worker performs the S3 reads during `read_parquet`.
