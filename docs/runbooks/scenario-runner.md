@@ -4,7 +4,7 @@
 
 The scenario runner executes end-to-end managed-warehouse flows against a configured dev environment. The first smoke scenario provisions a warehouse, waits for readiness, runs `SELECT 1` over PGWire with managed-hostname SNI, then deprovisions and verifies cleanup.
 
-The frozen metadata and perf scenarios provision the same fresh dev warehouse shape, create read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, run their workload, then deprovision.
+The frozen metadata, perf, and dbt scenarios provision the same fresh dev warehouse shape, create read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, run their workload, then deprovision.
 
 ## Required Environment
 
@@ -26,6 +26,7 @@ export DUCKGRES_SCENARIO_OUTPUT_BASE="artifacts/scenario"
 export DUCKGRES_SCENARIO_RUN_ID="scenario-smoke-manual"
 export DUCKGRES_SCENARIO_PG_PORT="5432"
 export DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT="10"
+export DUCKGRES_SCENARIO_DBT_BIN="dbt"
 export DUCKGRES_SCENARIO_MAX_RUNTIME="30m"
 export DUCKGRES_SCENARIO_GO_TEST_TIMEOUT="60m"
 ```
@@ -71,6 +72,12 @@ Run frozen perf queries:
 just scenario-frozen-perf
 ```
 
+Run frozen dbt lifecycle:
+
+```bash
+just scenario-frozen-dbt
+```
+
 Run a specific scenario file:
 
 ```bash
@@ -91,6 +98,13 @@ The frozen perf scenario uses:
 - `tests/perf/queries/ducklake_frozen.yaml`
 
 Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `summary.json`, and `server_metrics.prom`.
+
+The frozen dbt scenario uses:
+
+- `tests/scenario/scenarios/posthog_frozen_dbt.yaml`
+- `tests/scenario/dbt/posthog_frozen_project/`
+
+dbt artifacts are written under `artifacts/scenario/<run_id>/dbt/`, including per-command stdout/stderr logs, `target/` artifacts, and dbt logs. Install `dbt-postgres` locally or set `DUCKGRES_SCENARIO_DBT_BIN` to the dbt executable to use.
 
 `DUCKGRES_SCENARIO_FROZEN_S3_URI` must point at a dev-owned frozen dataset prefix with `persons/` and `events/` parquet children.
 The provisioned Duckgres worker role also needs read/list access to that prefix; the runner process only supplies the URI, while the worker performs the S3 reads during `read_parquet`.

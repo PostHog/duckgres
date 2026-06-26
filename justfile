@@ -384,6 +384,11 @@ scenario-frozen-metadata:
 scenario-frozen-perf:
     ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_perf.yaml
 
+# Run the dev frozen dataset dbt scenario
+[group('test')]
+scenario-frozen-dbt:
+    ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_dbt.yaml
+
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]
 lint:

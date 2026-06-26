@@ -1,0 +1,52 @@
+name: posthog-frozen-dbt
+run_id_prefix: scenario-frozen-dbt
+required_env:
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: scenario-frozen-dbt-${run_id_compact}
+      request:
+        database_name: scenario_frozen_dbt_${run_id_compact}
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: scenario-frozen-dbt-${run_id_compact}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: setup_frozen_views
+    type: sql
+    with:
+      org_id: scenario-frozen-dbt-${run_id_compact}
+      catalog: ducklake
+      file: ../sql/setup_frozen_views.sql
+      max_attempts: 12
+      retry_interval: 10s
+
+  - id: dbt_models
+    type: dbt_run
+    with:
+      org_id: scenario-frozen-dbt-${run_id_compact}
+      catalog: ducklake
+      schema: dbt_frozen
+      project_dir: ../dbt/posthog_frozen_project
+      commands: [debug, run, test, docs_generate]
+
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [dbt_models]
+    always_run: true
+    with:
+      org_id: scenario-frozen-dbt-${run_id_compact}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/tests/scenario/core"
+	scenariodbt "github.com/posthog/duckgres/tests/scenario/dbt"
 	scenarioperf "github.com/posthog/duckgres/tests/scenario/perf"
 	"github.com/posthog/duckgres/tests/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/scenario/sql"
@@ -92,13 +93,26 @@ func TestScenarioRunner(t *testing.T) {
 		FlightAddr:               os.Getenv("DUCKGRES_SCENARIO_FLIGHT_ADDR"),
 		FlightInsecureSkipVerify: boolEnv(t, "DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY", true),
 	})
+	dbtExecutor := scenariodbt.NewExecutor(scenariodbt.ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			HostAddr:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
+			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),
+			Port:            intEnv(t, "DUCKGRES_SCENARIO_PG_PORT", 5432),
+			SSLMode:         "require",
+			ConnectTimeout:  intEnv(t, "DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT", 10),
+			ApplicationName: "duckgres-scenario-runner",
+		},
+		OutputDir: scenarioOutputDir,
+		DBTBinary: envOrDefault("DUCKGRES_SCENARIO_DBT_BIN", "dbt"),
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), *scenarioMaxRuntime)
 	defer cancel()
 	runner := core.NewRunner(core.RunnerConfig{
 		RunID:          runID,
 		Scenario:       loaded,
-		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor},
+		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor, dbt: dbtExecutor},
 		OutputDir:      scenarioOutputDir,
 		WriteFiles:     true,
 		CleanupTimeout: 15 * time.Minute,
@@ -255,6 +269,43 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	}
 }
 
+func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_dbt.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen dbt scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-dbt-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	foundDBT := false
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+		if step.Type != scenariodbt.StepTypeDBTRun {
+			continue
+		}
+		foundDBT = true
+		projectDir, ok := step.With["project_dir"].(string)
+		if !ok || !filepath.IsAbs(projectDir) {
+			t.Fatalf("dbt project_dir = %#v, want absolute path", step.With["project_dir"])
+		}
+		if _, err := os.Stat(filepath.Join(projectDir, "dbt_project.yml")); err != nil {
+			t.Fatalf("dbt project should exist at %q: %v", projectDir, err)
+		}
+	}
+	if !foundDBT {
+		t.Fatal("expected frozen dbt scenario to include a dbt_run step")
+	}
+}
+
 func TestResolveRunTemplatesRejectsMissingEnvTemplate(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
 
@@ -280,6 +331,7 @@ type dispatchExecutor struct {
 	provision *provision.Executor
 	sql       *scenariosql.Executor
 	perf      *scenarioperf.Executor
+	dbt       *scenariodbt.Executor
 }
 
 func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error {
@@ -290,6 +342,8 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 		return e.sql.ExecuteStep(ctx, step)
 	case scenarioperf.StepTypePerfQueries:
 		return e.perf.ExecuteStep(ctx, step)
+	case scenariodbt.StepTypeDBTRun:
+		return e.dbt.ExecuteStep(ctx, step)
 	default:
 		return fmt.Errorf("unsupported scenario step type %q", step.Type)
 	}
@@ -302,6 +356,8 @@ func dispatchSupports(stepType string) bool {
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return true
 	case scenarioperf.StepTypePerfQueries:
+		return true
+	case scenariodbt.StepTypeDBTRun:
 		return true
 	default:
 		return false
@@ -343,6 +399,14 @@ func boolEnv(t *testing.T, key string, fallback bool) bool {
 	return parsed
 }
 
+func envOrDefault(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
 func defaultRunID(s core.Scenario) string {
 	prefix := s.RunIDPrefix
 	if prefix == "" {
@@ -373,7 +437,7 @@ func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {
 		}
 		with := make(map[string]any, len(step.With))
 		for k, v := range step.With {
-			if k == "file" || k == "catalog_file" {
+			if k == "file" || k == "catalog_file" || k == "project_dir" || k == "profiles_dir" {
 				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) {
 					v = filepath.Clean(filepath.Join(baseDir, file))
 				}
