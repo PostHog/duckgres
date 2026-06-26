@@ -27,65 +27,66 @@ import (
 type CLIInputs struct {
 	Set map[string]bool
 
-	Host                        string
-	Port                        int
-	FlightPort                  int
-	FlightSessionIdleTTL        string
-	FlightSessionReapInterval   string
-	FlightHandleIdleTTL         string
-	FlightSessionTokenTTL       string
-	DataDir                     string
-	CertFile                    string
-	KeyFile                     string
-	FilePersistence             bool
-	ProcessIsolation            bool
-	IdleTimeout                 string
-	SessionInitTimeout          string
-	MemoryLimit                 string
-	Threads                     int
-	MemoryBudget                string
-	MemoryRebalance             bool
-	DuckLakeDeltaCatalogEnabled bool
-	DuckLakeDeltaCatalogPath    string
-	DuckLakeDefaultSpecVersion  string
-	IcebergEnabled              bool
-	IcebergRegion               string
-	IcebergNamespace            string
-	ProcessMinWorkers           int
-	ProcessMaxWorkers           int
-	ProcessRetireOnSessionEnd   bool
-	WorkerQueueTimeout          string
-	WorkerIdleTimeout           string
-	HandoverDrainTimeout        string
-	ACMEDomain                  string
-	ACMEEmail                   string
-	ACMECacheDir                string
-	ACMEDNSProvider             string
-	ACMEDNSZoneID               string
-	MaxConnections              int
-	ConfigStoreConn             string
-	ConfigPollInterval          string
-	InternalSecret              string
-	InternalSecretFallbacks     string
-	SNIRoutingMode              string
-	ManagedHostnameSuffixes     string
-	WorkerBackend               string
-	K8sWorkerImage              string
-	K8sWorkerNamespace          string
-	K8sControlPlaneID           string
-	K8sWorkerPort               int
-	K8sWorkerSecret             string
-	K8sWorkerConfigMap          string
-	K8sWorkerImagePullPolicy    string
-	K8sWorkerServiceAccount     string
-	K8sMaxWorkers               int
-	K8sWorkerCPURequest         string
-	K8sWorkerMemoryRequest      string
-	K8sWorkerNodeSelector       string
-	K8sWorkerTolerationKey      string
-	K8sWorkerTolerationValue    string
-	AWSRegion                   string
-	QueryLog                    bool
+	Host                          string
+	Port                          int
+	FlightPort                    int
+	FlightSessionIdleTTL          string
+	FlightSessionReapInterval     string
+	FlightHandleIdleTTL           string
+	FlightSessionTokenTTL         string
+	DataDir                       string
+	CertFile                      string
+	KeyFile                       string
+	FilePersistence               bool
+	ProcessIsolation              bool
+	IdleTimeout                   string
+	SessionInitTimeout            string
+	MemoryLimit                   string
+	Threads                       int
+	MemoryBudget                  string
+	MemoryRebalance               bool
+	DuckLakeDeltaCatalogEnabled   bool
+	DuckLakeDeltaCatalogPath      string
+	DuckLakeDefaultSpecVersion    string
+	IcebergEnabled                bool
+	IcebergRegion                 string
+	IcebergNamespace              string
+	ProcessMinWorkers             int
+	ProcessMaxWorkers             int
+	ProcessRetireOnSessionEnd     bool
+	WorkerQueueTimeout            string
+	WorkerIdleTimeout             string
+	HandoverDrainTimeout          string
+	DrainingInstanceExpiryTimeout string
+	ACMEDomain                    string
+	ACMEEmail                     string
+	ACMECacheDir                  string
+	ACMEDNSProvider               string
+	ACMEDNSZoneID                 string
+	MaxConnections                int
+	ConfigStoreConn               string
+	ConfigPollInterval            string
+	InternalSecret                string
+	InternalSecretFallbacks       string
+	SNIRoutingMode                string
+	ManagedHostnameSuffixes       string
+	WorkerBackend                 string
+	K8sWorkerImage                string
+	K8sWorkerNamespace            string
+	K8sControlPlaneID             string
+	K8sWorkerPort                 int
+	K8sWorkerSecret               string
+	K8sWorkerConfigMap            string
+	K8sWorkerImagePullPolicy      string
+	K8sWorkerServiceAccount       string
+	K8sMaxWorkers                 int
+	K8sWorkerCPURequest           string
+	K8sWorkerMemoryRequest        string
+	K8sWorkerNodeSelector         string
+	K8sWorkerTolerationKey        string
+	K8sWorkerTolerationValue      string
+	AWSRegion                     string
+	QueryLog                      bool
 }
 
 type Resolved struct {
@@ -97,6 +98,7 @@ type Resolved struct {
 	WorkerQueueTimeout              time.Duration
 	WorkerIdleTimeout               time.Duration
 	HandoverDrainTimeout            time.Duration
+	DrainingInstanceExpiryTimeout   time.Duration
 	WorkerBackend                   string
 	K8sWorkerImage                  string
 	K8sWorkerNamespace              string
@@ -196,6 +198,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	workerQueueTimeout := 60 * time.Second
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
+	var drainingInstanceExpiryTimeout time.Duration
 	var processMinWorkers, processMaxWorkers int
 	var processRetireOnSessionEnd bool
 	var workerBackend string
@@ -425,6 +428,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 				handoverDrainTimeout = d
 			} else {
 				warn("Invalid handover_drain_timeout duration: " + err.Error())
+			}
+		}
+		if fileCfg.DrainingInstanceExpiryTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.DrainingInstanceExpiryTimeout); err == nil {
+				drainingInstanceExpiryTimeout = d
+			} else {
+				warn("Invalid draining_instance_expiry_timeout duration: " + err.Error())
 			}
 		}
 		if len(fileCfg.PassthroughUsers) > 0 {
@@ -758,6 +768,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			handoverDrainTimeout = d
 		} else {
 			warn("Invalid DUCKGRES_HANDOVER_DRAIN_TIMEOUT duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_DRAINING_INSTANCE_EXPIRY_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			drainingInstanceExpiryTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_DRAINING_INSTANCE_EXPIRY_TIMEOUT duration: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_ACME_DOMAIN"); v != "" {
@@ -1101,6 +1118,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid --handover-drain-timeout duration: " + err.Error())
 		}
 	}
+	if cli.Set["draining-instance-expiry-timeout"] {
+		if d, err := time.ParseDuration(cli.DrainingInstanceExpiryTimeout); err == nil {
+			drainingInstanceExpiryTimeout = d
+		} else {
+			warn("Invalid --draining-instance-expiry-timeout duration: " + err.Error())
+		}
+	}
 	if cli.Set["acme-domain"] {
 		cfg.ACMEDomain = cli.ACMEDomain
 	}
@@ -1260,6 +1284,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		WorkerQueueTimeout:              workerQueueTimeout,
 		WorkerIdleTimeout:               workerIdleTimeout,
 		HandoverDrainTimeout:            handoverDrainTimeout,
+		DrainingInstanceExpiryTimeout:   drainingInstanceExpiryTimeout,
 		WorkerBackend:                   workerBackend,
 		K8sWorkerImage:                  k8sWorkerImage,
 		K8sWorkerNamespace:              k8sWorkerNamespace,

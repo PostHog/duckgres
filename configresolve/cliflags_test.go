@@ -63,6 +63,7 @@ func fieldNameToFlagName(name string) string {
 		{"WorkerQueueTimeout", "worker-queue-timeout"},
 		{"WorkerIdleTimeout", "worker-idle-timeout"},
 		{"HandoverDrainTimeout", "handover-drain-timeout"},
+		{"DrainingInstanceExpiryTimeout", "draining-instance-expiry-timeout"},
 		{"ProcessMinWorkers", "process-min-workers"},
 		{"ProcessMaxWorkers", "process-max-workers"},
 		{"ProcessRetireOnSessionEnd", "process-retire-on-session-end"},

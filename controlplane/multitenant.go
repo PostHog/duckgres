@@ -41,6 +41,29 @@ func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
 	return defaultWorkerTTL
 }
 
+// defaultDrainingInstanceExpiry is the built-in cap on how long a draining
+// control-plane row may linger before the leader janitor force-expires it. It
+// is deliberately generous: it only needs to bound leaked-worker dwell, and a
+// value shorter than the longest legitimate session drain could expire a CP row
+// while it is still serving (its actively-serving workers stay protected by the
+// orphan sweep's Flight-session guard, but a finite cap should still not be
+// aggressive). Operators tune it via DrainingInstanceExpiryTimeout.
+const defaultDrainingInstanceExpiry = 2 * time.Hour
+
+// effectiveDrainingInstanceExpiry resolves the finite cap the leader janitor
+// uses to expire stuck *draining* control-plane rows so their orphaned workers
+// become reapable. A non-positive configured value falls back to
+// defaultDrainingInstanceExpiry so the reaper is NEVER disabled by an unset
+// knob — which is exactly the trap that let HandoverDrainTimeout=0 (unbounded
+// session drain, correct) silently turn the draining-row reaper off when the
+// two were wired to the same field.
+func effectiveDrainingInstanceExpiry(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return defaultDrainingInstanceExpiry
+}
+
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
 	if !ok {
@@ -251,7 +274,11 @@ func SetupMultiTenant(
 		5*time.Second,
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
-	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
+	// NOT cfg.HandoverDrainTimeout: that knob is the *session* drain wall and is
+	// intentionally 0 (unbounded) in remote mode, which would disable the
+	// draining-CP-row reaper (janitor.go: `if maxDrainTimeout > 0`) and leave a
+	// draining CP's orphaned workers unreapable. Use the dedicated finite cap.
+	janitor.maxDrainTimeout = effectiveDrainingInstanceExpiry(cfg.DrainingInstanceExpiryTimeout)
 	janitor.hotIdleTTL = effectiveDefaultWorkerTTL(cfg.K8s.WorkerDefaultTTL)
 	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
 	// all flow through this lifecycle service. The legacy retireWorker /
