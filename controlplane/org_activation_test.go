@@ -305,6 +305,7 @@ func TestSharedWorkerActivatorDucklingCRRequiresSTSBroker(t *testing.T) {
 			if orgID != "test-org" {
 				t.Fatalf("expected test-org, got %q", orgID)
 			}
+			ducklakeEnabled := true
 			return &provisioner.DucklingStatus{
 				MetadataStore: struct {
 					Type              string
@@ -327,7 +328,8 @@ func TestSharedWorkerActivatorDucklingCRRequiresSTSBroker(t *testing.T) {
 					BucketName: "posthog-duckling-test-org",
 					S3Region:   "us-east-1",
 				},
-				IAMRoleARN: "arn:aws:iam::123:role/duckling-test-org",
+				IAMRoleARN:      "arn:aws:iam::123:role/duckling-test-org",
+				DuckLakeEnabled: &ducklakeEnabled,
 			}, nil
 		},
 	}

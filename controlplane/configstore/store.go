@@ -50,7 +50,6 @@ type Snapshot struct {
 // non-empty values a client may request.
 const (
 	catalogDuckLake = "ducklake"
-	catalogIceberg  = "iceberg"
 )
 
 // PostgresConnectionResolution is the result of resolving and authenticating a
@@ -70,11 +69,10 @@ type PostgresConnectionResolution struct {
 	// SNIResolved is true when the managed hostname resolved to a known org.
 	SNIResolved bool
 	// EffectiveCatalog is the catalog the session should default to, selected by
-	// the startup `database` param: "" (use the per-user/attached default),
-	// "ducklake", or "iceberg".
+	// the startup `database` param: "" (use the attached default) or "ducklake".
 	EffectiveCatalog string
 	// CatalogValid is false when the requested `database` is not a selectable
-	// catalog name (anything other than "", "ducklake", "iceberg").
+	// catalog name (anything other than "" or "ducklake").
 	CatalogValid bool
 	// Valid is true when (OrgID, username, password) authenticated.
 	Valid bool
@@ -244,8 +242,8 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			if u.Passthrough {
 				snap.OrgUserPassthrough[key] = true
 			}
-			if u.DefaultCatalog != "" {
-				snap.OrgUserDefaultCatalog[key] = u.DefaultCatalog
+			if strings.EqualFold(u.DefaultCatalog, catalogDuckLake) {
+				snap.OrgUserDefaultCatalog[key] = catalogDuckLake
 			}
 		}
 		snap.Orgs[o.Name] = oc
@@ -359,17 +357,13 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result := PostgresConnectionResolution{}
 
 	// The startup `database` param is now pure catalog selection, not identity.
-	// Valid values: "" (use the per-user/attached default), "ducklake", or
-	// "iceberg". Anything else fails closed — there is no logical-name masking,
+	// Valid values: "" (use the attached default) or "ducklake". Anything else fails closed — there is no logical-name masking,
 	// so an arbitrary name no longer routes anywhere.
 	switch strings.ToLower(strings.TrimSpace(startupDatabase)) {
 	case "":
 		result.CatalogValid = true
 	case catalogDuckLake:
 		result.EffectiveCatalog = catalogDuckLake
-		result.CatalogValid = true
-	case catalogIceberg:
-		result.EffectiveCatalog = catalogIceberg
 		result.CatalogValid = true
 	}
 
@@ -607,28 +601,6 @@ var ErrWarehouseStateMismatch = errors.New("warehouse not in expected state")
 // has no row in duckgres_managed_warehouses.
 var ErrWarehouseNotFound = errors.New("warehouse not found")
 
-// UpdateIcebergConfig writes the supplied column updates to the org's
-// warehouse row without CAS'ing on the top-level state. Used by the
-// Lakekeeper provisioner — Iceberg sub-state runs in parallel with the
-// main warehouse state machine, so persisting the Lakekeeper endpoint
-// after a top-level state transition shouldn't silently no-op.
-//
-// Caller-side discipline: the updates map should only contain
-// iceberg_* columns. Untyped to keep the controller's WarehouseStore
-// interface independent of the column list.
-func (cs *ConfigStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
-	result := cs.db.Model(&ManagedWarehouse{}).
-		Where("org_id = ?", orgID).
-		Updates(updates)
-	if result.Error != nil {
-		return fmt.Errorf("update iceberg config: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("warehouse %q: %w", orgID, ErrWarehouseNotFound)
-	}
-	return nil
-}
-
 func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	result := cs.db.Model(&ManagedWarehouse{}).
 		Where("org_id = ? AND state = ?", orgID, expectedState).
@@ -640,22 +612,6 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("warehouse %q expected state %q: %w", orgID, expectedState, ErrWarehouseStateMismatch)
 	}
 	return nil
-}
-
-// GetManagedWarehouseIceberg reads the embedded Iceberg config for an
-// org. Returns (nil, nil) when the org has no warehouse row so callers
-// can distinguish "never provisioned" from a DB error.
-func (cs *ConfigStore) GetManagedWarehouseIceberg(orgID string) (*ManagedWarehouseIceberg, error) {
-	var warehouse ManagedWarehouse
-	err := cs.db.First(&warehouse, "org_id = ?", orgID).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get iceberg config for %q: %w", orgID, err)
-	}
-	ic := warehouse.Iceberg
-	return &ic, nil
 }
 
 func resolveRuntimeSchema(db *gorm.DB) (string, error) {

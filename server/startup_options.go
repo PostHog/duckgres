@@ -7,7 +7,7 @@ import (
 
 // ParseStartupOptions parses the Postgres startup-message `options` parameter,
 // which carries `-c name=value` GUC settings (also accepted: `-cname=value` and
-// `--name=value`), e.g. `-c search_path=iceberg.public`. libpq's `options`
+// `--name=value`), e.g. `-c search_path=ducklake.main`. libpq's `options`
 // connection keyword, the PGOPTIONS env var, and pgjdbc's `currentSchema` all
 // arrive here. Values may contain backslash-escaped spaces. Returns a map of
 // setting name -> value (later settings win on duplicate names).

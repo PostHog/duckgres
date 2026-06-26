@@ -49,10 +49,6 @@ func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManage
 	return stack.Pool, stack.Sessions, stack.Rebalancer, true
 }
 
-func (a *orgRouterAdapter) IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool) {
-	return a.router.IcebergConfigForOrg(orgID)
-}
-
 func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
 }
@@ -390,19 +386,6 @@ func SetupMultiTenant(
 		// spec.dataStore.bucketName onto existing ready ducklings. Empty leaves
 		// it disabled (composition keeps deriving).
 		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
-		// Opt-in: enable the per-org Lakekeeper provisioning branch. Off by
-		// default so existing deploys are unaffected. Best-effort — if the
-		// K8s client can't be built we log and leave the controller running
-		// without the Lakekeeper branch (S3-Tables warehouses still work).
-		if lakekeeperProvisionerEnabled() {
-			if k8sClient, lkErr := provisioner.NewLakekeeperK8sClient(); lkErr != nil {
-				slog.Warn("Lakekeeper provisioner enabled but K8s client unavailable; skipping.", "error", lkErr)
-			} else {
-				lkProv := provisioner.NewLakekeeperProvisioner(store, k8sClient)
-				provCtrl.WithLakekeeperProvisioner(lkProv, newLakekeeperInputsResolver(resolveDucklingStatus))
-				slog.Info("Lakekeeper provisioner enabled (allowall + NetworkPolicy mode).")
-			}
-		}
 		go provCtrl.Run(context.Background())
 	}
 

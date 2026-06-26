@@ -255,14 +255,6 @@ func TestInformationSchemaCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 			wantView:       "duck_view",
 			wantColumnTbls: "duck_only,duck_view",
 		},
-		{
-			name:           "iceberg",
-			catalog:        "iceberg",
-			useAfterInit:   "USE iceberg.public",
-			wantTables:     "ice_only,ice_view",
-			wantView:       "ice_view",
-			wantColumnTbls: "ice_only,ice_view",
-		},
 	}
 
 	for _, tc := range tests {
@@ -276,9 +268,6 @@ func TestInformationSchemaCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 
 			if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
 				t.Fatalf("attach ducklake: %v", err)
-			}
-			if _, err := db.Exec(`ATTACH ':memory:' AS iceberg`); err != nil {
-				t.Fatalf("attach iceberg: %v", err)
 			}
 			if err := initInformationSchema(db, true); err != nil {
 				t.Fatalf("init information_schema: %v", err)
@@ -294,18 +283,6 @@ func TestInformationSchemaCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 			}
 			if _, err := db.Exec("CREATE VIEW shared.duck_view AS SELECT id FROM shared.duck_only"); err != nil {
 				t.Fatalf("create ducklake view: %v", err)
-			}
-			if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
-				t.Fatalf("create iceberg public schema: %v", err)
-			}
-			if _, err := db.Exec("CREATE SCHEMA iceberg.shared"); err != nil {
-				t.Fatalf("create iceberg schema: %v", err)
-			}
-			if _, err := db.Exec("CREATE TABLE iceberg.shared.ice_only(id INTEGER)"); err != nil {
-				t.Fatalf("create iceberg table: %v", err)
-			}
-			if _, err := db.Exec("CREATE VIEW iceberg.shared.ice_view AS SELECT id FROM iceberg.shared.ice_only"); err != nil {
-				t.Fatalf("create iceberg view: %v", err)
 			}
 
 			executor := NewLocalExecutor(db)
@@ -375,18 +352,7 @@ func TestPgCatalogCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 			name:          "ducklake session sees ducklake only",
 			selected:      "ducklake",
 			wantTable:     "duck_only",
-			rejectTable:   "ice_only",
 			wantColumnRel: "duck_only",
-			rejectColumn:  "ice_only",
-		},
-		{
-			name:          "iceberg session sees iceberg only",
-			selected:      "iceberg",
-			useAfterInit:  "USE iceberg.public",
-			wantTable:     "ice_only",
-			rejectTable:   "duck_only",
-			wantColumnRel: "ice_only",
-			rejectColumn:  "duck_only",
 		},
 	}
 
@@ -405,9 +371,6 @@ func TestPgCatalogCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 			if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
 				t.Fatalf("attach ducklake: %v", err)
 			}
-			if _, err := db.Exec(`ATTACH ':memory:' AS iceberg`); err != nil {
-				t.Fatalf("attach iceberg: %v", err)
-			}
 
 			if _, err := db.Exec("USE ducklake"); err != nil {
 				t.Fatalf("use ducklake: %v", err)
@@ -419,15 +382,6 @@ func TestPgCatalogCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 				t.Fatalf("create ducklake table: %v", err)
 			}
 
-			if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
-				t.Fatalf("create iceberg public schema: %v", err)
-			}
-			if _, err := db.Exec("CREATE SCHEMA iceberg.shared"); err != nil {
-				t.Fatalf("create iceberg schema: %v", err)
-			}
-			if _, err := db.Exec("CREATE TABLE iceberg.shared.ice_only(id INTEGER, payload VARCHAR)"); err != nil {
-				t.Fatalf("create iceberg table: %v", err)
-			}
 			if _, err := db.Exec("USE memory"); err != nil {
 				t.Fatalf("use memory before pg catalog rewrite: %v", err)
 			}
@@ -471,10 +425,7 @@ func TestPgCatalogCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 				t.Fatalf("query pg_class_full: %v", err)
 			}
 			if tables != tc.wantTable {
-				t.Fatalf("tables = %q, want %q and not %q", tables, tc.wantTable, tc.rejectTable)
-			}
-			if strings.Contains(tables, tc.rejectTable) {
-				t.Fatalf("tables leaked %q: %q", tc.rejectTable, tables)
+				t.Fatalf("tables = %q, want %q", tables, tc.wantTable)
 			}
 
 			var columnRelations string
@@ -491,87 +442,9 @@ func TestPgCatalogCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 				t.Fatalf("query pg_attribute join: %v", err)
 			}
 			if columnRelations != tc.wantColumnRel {
-				t.Fatalf("column relations = %q, want %q and not %q", columnRelations, tc.wantColumnRel, tc.rejectColumn)
-			}
-			if strings.Contains(columnRelations, tc.rejectColumn) {
-				t.Fatalf("column relations leaked %q: %q", tc.rejectColumn, columnRelations)
+				t.Fatalf("column relations = %q, want %q", columnRelations, tc.wantColumnRel)
 			}
 		})
-	}
-}
-
-func TestHexMetadataQueryDoesNotLeakDuckLakeIntoIceberg(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	defer func() { _ = db.Close() }()
-
-	if err := initPgCatalog(db, time.Now(), time.Now(), "test", "test"); err != nil {
-		t.Fatalf("init pg catalog: %v", err)
-	}
-	if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
-		t.Fatalf("attach ducklake: %v", err)
-	}
-	if _, err := db.Exec(`ATTACH ':memory:' AS iceberg`); err != nil {
-		t.Fatalf("attach iceberg: %v", err)
-	}
-	if _, err := db.Exec("USE ducklake"); err != nil {
-		t.Fatalf("use ducklake: %v", err)
-	}
-	if _, err := db.Exec("CREATE SCHEMA stripe"); err != nil {
-		t.Fatalf("create ducklake stripe: %v", err)
-	}
-	if _, err := db.Exec("CREATE TABLE stripe.cash_balance(id INTEGER)"); err != nil {
-		t.Fatalf("create ducklake table: %v", err)
-	}
-	if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
-		t.Fatalf("create iceberg public: %v", err)
-	}
-	if _, err := db.Exec("CREATE SCHEMA iceberg.stripe"); err != nil {
-		t.Fatalf("create iceberg stripe: %v", err)
-	}
-	if _, err := db.Exec("CREATE TABLE iceberg.stripe.product(id INTEGER)"); err != nil {
-		t.Fatalf("create iceberg table: %v", err)
-	}
-	if _, err := db.Exec("USE memory"); err != nil {
-		t.Fatalf("use memory before pg catalog rewrite: %v", err)
-	}
-	if err := recreatePgClassForDuckLake(db); err != nil {
-		t.Fatalf("recreate pg_class_full for ducklake: %v", err)
-	}
-	if err := recreatePgNamespaceForDuckLake(db); err != nil {
-		t.Fatalf("recreate pg_namespace for ducklake: %v", err)
-	}
-
-	executor := NewLocalExecutor(db)
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "iceberg"); err != nil {
-		t.Fatalf("init session metadata: %v", err)
-	}
-	if _, err := db.Exec("USE iceberg.public"); err != nil {
-		t.Fatalf("use iceberg public: %v", err)
-	}
-
-	var tables string
-	if err := db.QueryRow(`
-		SELECT string_agg("TABLE_NAME", ',' ORDER BY "TABLE_NAME")
-		FROM (
-			SELECT current_database() AS "TABLE_CAT",
-				n.nspname AS "TABLE_SCHEM",
-				c.relname AS "TABLE_NAME"
-			FROM memory.main.pg_namespace n,
-				memory.main.pg_class_full c
-			WHERE c.relnamespace = n.oid
-				AND current_database() = 'iceberg'
-				AND c.relkind = 'r'
-				AND n.nspname = 'stripe'
-		) q
-	`).Scan(&tables); err != nil {
-		t.Fatalf("hex table query: %v", err)
-	}
-	if tables != "product" {
-		t.Fatalf("Hex table query returned %q, want product only", tables)
 	}
 }
 
@@ -596,16 +469,6 @@ func TestPgTablesViewsSequencesOnlyExposeSelectedCatalog(t *testing.T) {
 			wantTable:    "duck_only",
 			wantView:     "duck_view",
 			wantSequence: "duck_seq",
-			rejectTable:  "ice_only",
-		},
-		{
-			name:         "iceberg session sees iceberg only",
-			selected:     "iceberg",
-			useAfterInit: "USE iceberg.public",
-			wantTable:    "ice_only",
-			wantView:     "ice_view",
-			wantSequence: "ice_seq",
-			rejectTable:  "duck_only",
 		},
 	}
 
@@ -620,9 +483,6 @@ func TestPgTablesViewsSequencesOnlyExposeSelectedCatalog(t *testing.T) {
 
 			if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
 				t.Fatalf("attach ducklake: %v", err)
-			}
-			if _, err := db.Exec(`ATTACH ':memory:' AS iceberg`); err != nil {
-				t.Fatalf("attach iceberg: %v", err)
 			}
 
 			if _, err := db.Exec("USE ducklake"); err != nil {
@@ -641,21 +501,6 @@ func TestPgTablesViewsSequencesOnlyExposeSelectedCatalog(t *testing.T) {
 				t.Fatalf("create ducklake sequence: %v", err)
 			}
 
-			if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
-				t.Fatalf("create iceberg public schema: %v", err)
-			}
-			if _, err := db.Exec("CREATE SCHEMA iceberg.shared"); err != nil {
-				t.Fatalf("create iceberg schema: %v", err)
-			}
-			if _, err := db.Exec("CREATE TABLE iceberg.shared.ice_only(id INTEGER)"); err != nil {
-				t.Fatalf("create iceberg table: %v", err)
-			}
-			if _, err := db.Exec("CREATE VIEW iceberg.shared.ice_view AS SELECT id FROM iceberg.shared.ice_only"); err != nil {
-				t.Fatalf("create iceberg view: %v", err)
-			}
-			if _, err := db.Exec("CREATE SEQUENCE iceberg.shared.ice_seq"); err != nil {
-				t.Fatalf("create iceberg sequence: %v", err)
-			}
 			if _, err := db.Exec("USE memory"); err != nil {
 				t.Fatalf("use memory: %v", err)
 			}
@@ -697,17 +542,6 @@ func TestPgTablesViewsSequencesOnlyExposeSelectedCatalog(t *testing.T) {
 				WHERE schemaname = 'shared'
 			`, tc.wantSequence)
 
-			var leakCount int
-			if err := db.QueryRow(`
-				SELECT COUNT(*)
-				FROM memory.main.pg_tables
-				WHERE schemaname = 'shared' AND tablename = ?
-			`, tc.rejectTable).Scan(&leakCount); err != nil {
-				t.Fatalf("pg_tables leak query: %v", err)
-			}
-			if leakCount != 0 {
-				t.Fatalf("pg_tables leaked %q into %s session", tc.rejectTable, tc.selected)
-			}
 		})
 	}
 }
@@ -757,147 +591,5 @@ func TestPgCatalogConvenienceViewsMatchNativeShape(t *testing.T) {
 				t.Fatalf("%s shape mismatch:\n native = %s\n compat = %s", view, native, compat)
 			}
 		})
-	}
-}
-
-func TestInformationSchemaColumnsCompatScopesLoadedMetadataToSelectedCatalog(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	db.SetMaxOpenConns(1)
-	defer func() { _ = db.Close() }()
-
-	if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
-		t.Fatalf("attach ducklake: %v", err)
-	}
-	if _, err := db.Exec(`ATTACH ':memory:' AS "iceberg"`); err != nil {
-		t.Fatalf("attach iceberg: %v", err)
-	}
-	if err := initInformationSchema(db, true); err != nil {
-		t.Fatalf("init information_schema: %v", err)
-	}
-	if _, err := db.Exec("USE ducklake"); err != nil {
-		t.Fatalf("use ducklake: %v", err)
-	}
-	if _, err := db.Exec("CREATE SCHEMA billing_public"); err != nil {
-		t.Fatalf("create schema: %v", err)
-	}
-	if _, err := db.Exec("CREATE TABLE billing_public.public_api_keys(id VARCHAR NOT NULL, permissions JSON)"); err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-	if _, err := db.Exec("CREATE SCHEMA iceberg.billing_public"); err != nil {
-		t.Fatalf("create iceberg schema: %v", err)
-	}
-	if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
-		t.Fatalf("create iceberg public schema: %v", err)
-	}
-	if _, err := db.Exec("CREATE TABLE iceberg.billing_public.public_api_keys(__ VARCHAR)"); err != nil {
-		t.Fatalf("create iceberg dummy table: %v", err)
-	}
-
-	executor := NewLocalExecutor(db)
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "ducklake"); err != nil {
-		t.Fatalf("init session database metadata: %v", err)
-	}
-
-	if _, err := db.Exec(`
-		INSERT INTO memory.main.__duckgres_iceberg_column_metadata (
-			table_schema,
-			table_name,
-			column_name,
-			ordinal_position,
-			is_nullable,
-			data_type,
-			udt_name,
-			character_maximum_length,
-			character_octet_length,
-			numeric_precision,
-			numeric_scale,
-			datetime_precision
-		)
-		VALUES
-			('billing_public', 'public_api_keys', 'id', 1, 'YES', 'text', 'text', NULL, NULL, NULL, NULL, NULL),
-			('billing_public', 'public_api_keys', 'permissions', 2, 'YES', 'text', 'text', NULL, NULL, NULL, NULL, NULL)
-	`); err != nil {
-		t.Fatalf("insert iceberg metadata: %v", err)
-	}
-
-	assertColumns := func(searchPath, wantCatalog, wantIDNullable, wantPermissionsType string) {
-		t.Helper()
-
-		if _, err := db.Exec("SET search_path = '" + searchPath + "'"); err != nil {
-			t.Fatalf("set search_path %q: %v", searchPath, err)
-		}
-
-		var duplicateCount int
-		if err := db.QueryRow(`
-			SELECT COUNT(*)
-			FROM memory.main.information_schema_columns_compat
-			WHERE table_schema = 'billing_public'
-				AND table_name = 'public_api_keys'
-				AND column_name = 'id'
-		`).Scan(&duplicateCount); err != nil {
-			t.Fatalf("query id duplicate count: %v", err)
-		}
-		if duplicateCount != 1 {
-			t.Fatalf("id row count with search_path %q = %d, want 1", searchPath, duplicateCount)
-		}
-
-		var gotCatalog, gotNullable string
-		if err := db.QueryRow(`
-			SELECT table_catalog, is_nullable
-			FROM memory.main.information_schema_columns_compat
-			WHERE table_schema = 'billing_public'
-				AND table_name = 'public_api_keys'
-				AND column_name = 'id'
-		`).Scan(&gotCatalog, &gotNullable); err != nil {
-			t.Fatalf("query id metadata: %v", err)
-		}
-		if gotCatalog != wantCatalog || gotNullable != wantIDNullable {
-			t.Fatalf("id metadata with search_path %q = (%q, %q), want (%q, %q)", searchPath, gotCatalog, gotNullable, wantCatalog, wantIDNullable)
-		}
-
-		var gotPermissionsType string
-		if err := db.QueryRow(`
-			SELECT data_type
-			FROM memory.main.information_schema_columns_compat
-			WHERE table_schema = 'billing_public'
-				AND table_name = 'public_api_keys'
-				AND column_name = 'permissions'
-		`).Scan(&gotPermissionsType); err != nil {
-			t.Fatalf("query permissions metadata: %v", err)
-		}
-		if gotPermissionsType != wantPermissionsType {
-			t.Fatalf("permissions type with search_path %q = %q, want %q", searchPath, gotPermissionsType, wantPermissionsType)
-		}
-	}
-
-	assertColumns("ducklake.billing_public,memory.main", "ducklake", "NO", "json")
-	assertColumns("iceberg.billing_public,memory.main", "ducklake", "NO", "json")
-
-	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "iceberg"); err != nil {
-		t.Fatalf("init iceberg session database metadata: %v", err)
-	}
-	if _, err := db.Exec("USE iceberg.public"); err != nil {
-		t.Fatalf("use iceberg.public: %v", err)
-	}
-	assertColumns("iceberg.billing_public,memory.main", "iceberg", "YES", "text")
-
-	var pgAttributeColumns string
-	if err := db.QueryRow(`
-		SELECT string_agg(a.attname, ',' ORDER BY a.attnum)
-		FROM memory.main.pg_namespace n
-		JOIN memory.main.pg_class_full c ON c.relnamespace = n.oid
-		JOIN memory.main.pg_attribute a ON a.attrelid = c.oid
-		WHERE n.nspname = 'billing_public'
-			AND c.relname = 'public_api_keys'
-			AND a.attnum > 0
-			AND NOT a.attisdropped
-	`).Scan(&pgAttributeColumns); err != nil {
-		t.Fatalf("query loaded iceberg pg_attribute columns: %v", err)
-	}
-	if pgAttributeColumns != "id,permissions" {
-		t.Fatalf("loaded iceberg pg_attribute columns = %q, want id,permissions", pgAttributeColumns)
 	}
 }

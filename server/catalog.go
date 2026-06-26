@@ -102,7 +102,7 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_sequences_compat',
-			'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+			'information_schema_routines_compat', '__duckgres_column_metadata'
 		)
 	`
 	if _, err := db.Exec(pgClassSQL); err != nil {
@@ -1660,11 +1660,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			ON c.table_schema = m.table_schema
 			AND c.table_name = m.table_name
 			AND c.column_name = m.column_name
-		WHERE NOT (
-			c.table_catalog = 'iceberg'
-			AND c.column_name = '__'
-			AND UPPER(c.data_type) = 'UNKNOWN'
-		)
+		WHERE c.table_schema <> 'system'
 	`
 	if _, err := db.Exec(fmt.Sprintf(columnsViewSQL, infoSchemaPrefix)); err != nil {
 		// If join with metadata table fails, create simpler view without it
@@ -1748,11 +1744,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 				NULL AS generation_expression,
 				'YES' AS is_updatable
 			FROM %s.columns
-			WHERE NOT (
-				table_catalog = 'iceberg'
-				AND column_name = '__'
-				AND UPPER(data_type) = 'UNKNOWN'
-			)
+			WHERE table_schema <> 'system'
 		`
 		if _, err := db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix)); err != nil {
 			slog.Warn("Failed to create information_schema_columns_compat view.", "error", err)
@@ -1780,7 +1772,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		FROM %s.tables t
 		WHERE t.table_name NOT IN (
 			-- Internal duckgres tables
-			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
+			'__duckgres_column_metadata',
 			-- pg_catalog compat views
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
@@ -1795,6 +1787,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		AND t.table_name NOT LIKE 'duckdb_%%'
 		AND t.table_name NOT LIKE 'sqlite_%%'
 		AND t.table_name NOT LIKE 'pragma_%%'
+		AND t.table_schema <> 'system'
 	`
 	if _, err := db.Exec(fmt.Sprintf(tablesViewSQL, infoSchemaPrefix)); err != nil {
 		slog.Warn("Failed to create information_schema_tables_compat view.", "error", err)
@@ -1816,6 +1809,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		FROM %s.schemata s
 		WHERE s.schema_name NOT IN ('main', 'pg_catalog', 'information_schema')
 		AND s.catalog_name NOT LIKE '__ducklake_metadata_%%'
+		AND s.schema_name <> 'system'
 		UNION ALL
 		SELECT current_database() AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
@@ -1865,6 +1859,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		AND v.table_name NOT LIKE 'duckdb_%%'
 		AND v.table_name NOT LIKE 'sqlite_%%'
 		AND v.table_name NOT LIKE 'pragma_%%'
+		AND v.table_schema <> 'system'
 	`
 	if _, err := db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix)); err != nil {
 		slog.Warn("Failed to create information_schema_views_compat view.", "error", err)
@@ -1892,6 +1887,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			CASE WHEN s.cycle THEN 'YES' ELSE 'NO' END AS cycle_option
 		FROM duckdb_sequences() s
 		WHERE s.database_name = current_database()
+			AND s.schema_name <> 'system'
 	`
 	if _, err := db.Exec(sequencesViewSQL); err != nil {
 		slog.Warn("Failed to create information_schema_sequences_compat view.", "error", err)
@@ -1971,6 +1967,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS relpartbound
 		FROM duckdb_tables()
 		WHERE database_name = 'ducklake'
+		  AND schema_name <> 'system'
 		  AND table_name NOT IN (
 				'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
@@ -1979,7 +1976,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', 'information_schema_sequences_compat',
-				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_routines_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
 		-- Views from ducklake catalog
@@ -2022,6 +2019,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS relpartbound
 		FROM duckdb_views()
 		WHERE database_name = 'ducklake'
+		  AND schema_name <> 'system'
 		  AND view_name NOT IN (
 				'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
@@ -2030,7 +2028,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', 'information_schema_sequences_compat',
-				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_routines_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
 		-- Sequences from ducklake catalog
@@ -2073,6 +2071,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS relpartbound
 		FROM duckdb_sequences()
 		WHERE database_name = 'ducklake'
+		  AND schema_name <> 'system'
 		UNION ALL
 		-- Indexes from ducklake catalog
 		SELECT
@@ -2114,6 +2113,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS relpartbound
 		FROM duckdb_indexes()
 		WHERE database_name = 'ducklake'
+		  AND schema_name <> 'system'
 	`
 	_, err := db.Exec(pgClassSQL)
 	return err
@@ -2138,6 +2138,7 @@ func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 			SELECT schema_oid, schema_name FROM duckdb_views() WHERE database_name = 'ducklake'
 		)
 		WHERE schema_name NOT LIKE '__ducklake_metadata_%'
+			AND schema_name <> 'system'
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err

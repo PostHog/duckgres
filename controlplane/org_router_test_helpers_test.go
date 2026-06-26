@@ -1,7 +1,5 @@
 package controlplane
 
-import "github.com/posthog/duckgres/server"
-
 // mockOrgRouter implements OrgRouterInterface for testing.
 type mockOrgRouter struct {
 	sessions   *SessionManager
@@ -11,10 +9,6 @@ type mockOrgRouter struct {
 
 func (m *mockOrgRouter) StackForOrg(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	return nil, m.sessions, m.rebalancer, m.ok
-}
-
-func (m *mockOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig, bool) {
-	return server.IcebergConfig{}, false
 }
 
 func (m *mockOrgRouter) IsMigratingForOrg(_ string) bool { return false }

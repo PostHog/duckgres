@@ -449,6 +449,8 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		"users",
 		"types_test",
 		// DDL test tables that may persist in DuckLake
+		"merge_debug.sub_data",
+		"merge_debug.sub_tgt",
 		"ddl_test_basic",
 		"ddl_test_types",
 		"ddl_test_pk",
@@ -599,6 +601,8 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.bill CASCADE")
 	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.ddl_schema_test CASCADE")
 	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.dbt_test CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.demask_ns CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.merge_debug CASCADE")
 
 	return nil
 }

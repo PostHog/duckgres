@@ -21,7 +21,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 
 	requireGooseMigrationRecorded(t, db, 1)
 	requireGooseMigrationRecorded(t, db, 3)
-	requireGooseLatestVersion(t, db, 3)
+	requireGooseMigrationRecorded(t, db, 4)
+	requireGooseLatestVersion(t, db, 4)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	var columnCount int

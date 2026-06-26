@@ -296,7 +296,7 @@ func TestResolvePostgresConnection(t *testing.T) {
 				{OrgID: "test-org-smoke-1778167994", Username: "root"}: true,
 			},
 			OrgUserDefaultCatalog: map[OrgUserKey]string{
-				{OrgID: "billing", Username: "root"}: "iceberg",
+				{OrgID: "billing", Username: "root"}: "ducklake",
 			},
 		},
 	}
@@ -320,13 +320,10 @@ func TestResolvePostgresConnection(t *testing.T) {
 		}
 	})
 
-	t.Run("iceberg catalog selected", func(t *testing.T) {
+	t.Run("iceberg catalog rejected", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection("iceberg", "test-org-smoke-1778167994", true, "root", "secret")
-		if !got.CatalogValid || got.EffectiveCatalog != "iceberg" {
-			t.Fatalf("catalog = (valid=%v, %q), want iceberg: %+v", got.CatalogValid, got.EffectiveCatalog, got)
-		}
-		if !got.Valid {
-			t.Fatalf("expected valid auth: %+v", got)
+		if got.CatalogValid {
+			t.Fatalf("iceberg must not be a selectable catalog: %+v", got)
 		}
 	})
 
@@ -341,7 +338,7 @@ func TestResolvePostgresConnection(t *testing.T) {
 	})
 
 	t.Run("legacy database name is no longer a valid catalog", func(t *testing.T) {
-		// The org's old database_name is not "ducklake"/"iceberg", so it fails the
+		// The org's old database_name is not "ducklake", so it fails the
 		// catalog check even though SNI+auth would otherwise succeed.
 		got := cs.ResolvePostgresConnection("test_org_smoke_1778167994", "test-org-smoke-1778167994", true, "root", "secret")
 		if got.CatalogValid {
@@ -385,8 +382,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 		if got.OrgID != "billing" {
 			t.Fatalf("OrgID = %q, want billing (via hostname alias)", got.OrgID)
 		}
-		if got.DefaultCatalog != "iceberg" {
-			t.Fatalf("DefaultCatalog = %q, want iceberg", got.DefaultCatalog)
+		if got.DefaultCatalog != "ducklake" {
+			t.Fatalf("DefaultCatalog = %q, want ducklake", got.DefaultCatalog)
 		}
 	})
 }

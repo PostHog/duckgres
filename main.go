@@ -38,7 +38,6 @@ type (
 	ACMEConfig              = configloader.ACMEConfig
 	RateLimitFileConfig     = configloader.RateLimitFileConfig
 	DuckLakeFileConfig      = configloader.DuckLakeFileConfig
-	IcebergFileConfig       = configloader.IcebergFileConfig
 )
 
 // loadConfigFile + env are thin wrappers around configloader for back-compat

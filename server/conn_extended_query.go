@@ -697,7 +697,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Result-returning query: use Query with converted query
 	runQuery := func() (RowSet, error) {
-		return c.queryWithArgsWithMetadata(queryCtx, convertedQuery, args...)
+		return c.executor.QueryContext(queryCtx, convertedQuery, args...)
 	}
 
 	execStart := time.Now()

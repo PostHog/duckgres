@@ -210,17 +210,6 @@ CREATE TABLE IF NOT EXISTS duckgres_managed_warehouses (
     s3_delta_catalog_enabled BOOLEAN DEFAULT true,
     s3_delta_catalog_path VARCHAR(1024),
     ducklake_enabled BOOLEAN DEFAULT false,
-    iceberg_enabled BOOLEAN DEFAULT false,
-    iceberg_backend VARCHAR(32) DEFAULT 'lakekeeper',
-    iceberg_namespace VARCHAR(255),
-    iceberg_region VARCHAR(64),
-    iceberg_lakekeeper_endpoint VARCHAR(512),
-    iceberg_lakekeeper_warehouse VARCHAR(128),
-    iceberg_lakekeeper_client_id VARCHAR(128),
-    iceberg_lakekeeper_o_auth2_server_uri VARCHAR(512),
-    iceberg_lakekeeper_client_credentials_namespace VARCHAR(255),
-    iceberg_lakekeeper_client_credentials_name VARCHAR(255),
-    iceberg_lakekeeper_client_credentials_key VARCHAR(255),
     worker_identity_namespace VARCHAR(255),
     worker_identity_service_account_name VARCHAR(255),
     worker_identity_iam_role_arn VARCHAR(512),
@@ -244,8 +233,6 @@ CREATE TABLE IF NOT EXISTS duckgres_managed_warehouses (
     metadata_store_status_message VARCHAR(1024),
     s3_state VARCHAR(32),
     s3_status_message VARCHAR(1024),
-    iceberg_state VARCHAR(32),
-    iceberg_status_message VARCHAR(1024),
     identity_state VARCHAR(32),
     identity_status_message VARCHAR(1024),
     secrets_state VARCHAR(32),
@@ -286,17 +273,6 @@ ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS s3_url_style VA
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS s3_delta_catalog_enabled BOOLEAN DEFAULT true;
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS s3_delta_catalog_path VARCHAR(1024);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS ducklake_enabled BOOLEAN DEFAULT false;
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_enabled BOOLEAN DEFAULT false;
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_backend VARCHAR(32) DEFAULT 'lakekeeper';
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_namespace VARCHAR(255);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_region VARCHAR(64);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_lakekeeper_endpoint VARCHAR(512);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_lakekeeper_warehouse VARCHAR(128);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_lakekeeper_client_id VARCHAR(128);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_lakekeeper_o_auth2_server_uri VARCHAR(512);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_lakekeeper_client_credentials_namespace VARCHAR(255);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_lakekeeper_client_credentials_name VARCHAR(255);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_lakekeeper_client_credentials_key VARCHAR(255);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS worker_identity_namespace VARCHAR(255);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS worker_identity_service_account_name VARCHAR(255);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS worker_identity_iam_role_arn VARCHAR(512);
@@ -320,8 +296,6 @@ ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS metadata_store_
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS metadata_store_status_message VARCHAR(1024);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS s3_state VARCHAR(32);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS s3_status_message VARCHAR(1024);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
-ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_status_message VARCHAR(1024);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS identity_state VARCHAR(32);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS identity_status_message VARCHAR(1024);
 ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS secrets_state VARCHAR(32);

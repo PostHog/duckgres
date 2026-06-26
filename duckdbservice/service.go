@@ -85,13 +85,6 @@ type SessionPool struct {
 	// inject a stub to verify the credential-refresh path is non-blocking
 	// (see TestReuseExistingActivationDoesNotBlockHealthChecks).
 	refreshS3Secret func(*sql.DB, server.DuckLakeConfig, chan struct{}) error
-	// refreshIcebergSecret is the sibling indirection for rotating the
-	// iceberg_sigv4 secret. Runs alongside refreshS3Secret on hot-idle
-	// reuse whenever the tenant has iceberg enabled — without it, iceberg
-	// queries on a long-lived worker would 403 after STS rotation while
-	// DuckLake stays fresh. Defaults to server.RefreshIcebergSecret;
-	// stubbed by tests the same way refreshS3Secret is.
-	refreshIcebergSecret func(*sql.DB, server.IcebergConfig, chan struct{}, string, string, string) error
 
 	drainMu       sync.Mutex
 	draining      bool
@@ -485,7 +478,6 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		createDBPair:         CreateWorkerDBPair,
 		activateDBConnection: server.ActivateDBConnection,
 		refreshS3Secret:      server.RefreshS3Secret,
-		refreshIcebergSecret: server.RefreshIcebergSecret,
 		drainZero:            make(chan struct{}),
 		drainZeroOpen:        true,
 	}

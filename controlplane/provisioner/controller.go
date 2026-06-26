@@ -4,7 +4,6 @@ package provisioner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -22,7 +21,6 @@ func provisionEventProps(w *configstore.ManagedWarehouse) map[string]any {
 	return map[string]any{
 		"metadata_store":   string(w.MetadataStore.Kind),
 		"ducklake_enabled": w.DuckLake.Enabled,
-		"iceberg_enabled":  w.Iceberg.Enabled,
 	}
 }
 
@@ -43,13 +41,6 @@ func captureProvisionFailed(w *configstore.ManagedWarehouse, reason string, upda
 type WarehouseStore interface {
 	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
 	UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error
-	// UpdateIcebergConfig writes per-org Iceberg/Lakekeeper config without
-	// CAS'ing on the top-level warehouse state. The Lakekeeper provisioner
-	// uses this because Iceberg provisioning runs in parallel with the
-	// top-level Duckling state machine — by the time we're ready to persist
-	// the Lakekeeper endpoint, the warehouse may already have transitioned
-	// to Ready, and a state-CAS update would silently no-op.
-	UpdateIcebergConfig(orgID string, updates map[string]interface{}) error
 }
 
 // MetadataProbe is the signature for an end-to-end metadata-store probe. The
@@ -64,12 +55,6 @@ type Controller struct {
 	pollInterval time.Duration
 	probe        MetadataProbe
 
-	// Lakekeeper-side reconcile dependencies. All optional: if any is nil
-	// (e.g. in older deployments or unit tests that don't exercise the
-	// Lakekeeper path), reconcileLakekeeper is skipped silently.
-	lakekeeperProvisioner *LakekeeperProvisioner
-	lakekeeperInputs      LakekeeperInputsResolver
-
 	// bucketSuffix is the env suffix for CP-owned s3bucket naming
 	// (DUCKGRES_DUCKLING_BUCKET_SUFFIX, e.g. "mw-prod-us"). When set, the
 	// controller backfills spec.dataStore.bucketName onto ready s3bucket
@@ -77,17 +62,6 @@ type Controller struct {
 	// the composition keeps deriving the name.
 	bucketSuffix string
 }
-
-// LakekeeperInputsResolver is the function shape the controller uses to
-// build ProvisioningInputs for a given warehouse. Resolves things the
-// configstore doesn't carry directly: the admin Postgres DSN (from a
-// K8s Secret managed by Crossplane), the PG host the Lakekeeper pod uses
-// to reach the cluster, and the S3 storage profile.
-//
-// Defined as a function rather than a method on Controller so tests can
-// substitute a fake and so the convention for sourcing the admin DSN
-// (Crossplane-emitted Secret name pattern) lives outside this package.
-type LakekeeperInputsResolver func(ctx context.Context, w *configstore.ManagedWarehouse) (ProvisioningInputs, error)
 
 // NewController creates a provisioning controller. Returns an error if the
 // Kubernetes client cannot be initialized (e.g., not running in-cluster).
@@ -117,22 +91,6 @@ func NewControllerWithClient(store WarehouseStore, dc *DucklingClient, pollInter
 // SetProbe overrides the metadata-store probe. Used by tests.
 func (c *Controller) SetProbe(p MetadataProbe) {
 	c.probe = p
-}
-
-// WithLakekeeperProvisioner enables the Lakekeeper reconcile branch.
-// Both p and inputs must be non-nil — partial wiring would silently
-// disable the reconcile step and that's a misconfiguration we'd rather
-// surface at startup than at the first activation.
-func (c *Controller) WithLakekeeperProvisioner(p *LakekeeperProvisioner, inputs LakekeeperInputsResolver) *Controller {
-	if p == nil {
-		panic("WithLakekeeperProvisioner: provisioner is nil; call NewLakekeeperProvisioner first")
-	}
-	if inputs == nil {
-		panic("WithLakekeeperProvisioner: inputs resolver is nil")
-	}
-	c.lakekeeperProvisioner = p
-	c.lakekeeperInputs = inputs
-	return c
 }
 
 // WithBucketSuffix sets the env suffix used to compute and backfill the
@@ -219,9 +177,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 	}
 
 	// Create the Duckling CR
-	log.Info("Creating Duckling CR.",
-		"pgbouncer_enabled", w.PgBouncer.Enabled,
-		"iceberg_enabled", w.Iceberg.Enabled)
+	log.Info("Creating Duckling CR.", "pgbouncer_enabled", w.PgBouncer.Enabled)
 	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
 		MetadataStoreType:         w.MetadataStore.Kind,
 		PgBouncerEnabled:          w.PgBouncer.Enabled,
@@ -232,8 +188,6 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		DataStoreType:             w.DataStore.Kind,
 		DataStoreBucket:           w.DataStore.BucketName,
 		DataStoreRegion:           w.DataStore.Region,
-		IcebergEnabled:            w.Iceberg.Enabled,
-		IcebergNamespace:          w.Iceberg.Namespace,
 		DuckLakeEnabled:           w.DuckLake.Enabled,
 	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
@@ -319,12 +273,6 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		updates["identity_state"] = configstore.ManagedWarehouseStateReady
 	}
 
-	// Iceberg readiness for the Lakekeeper backend is owned by
-	// reconcileLakekeeper, which writes iceberg_state=Ready directly once
-	// the per-org Lakekeeper warehouse is provisioned. Nothing here needs
-	// to propagate from the Crossplane Duckling status — the Lakekeeper
-	// provisioner is the source of truth.
-
 	// Infrastructure is ready when all components are provisioned AND the
 	// Crossplane Ready condition is True. The Ready condition ensures all
 	// composed resources (including the metadata store) are fully reconciled,
@@ -333,12 +281,8 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
 	secretsReady := w.SecretsState == configstore.ManagedWarehouseStateReady || updates["secrets_state"] == configstore.ManagedWarehouseStateReady
 	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
-	// Iceberg is only required for Ready when the tenant opted in.
-	icebergReady := !w.Iceberg.Enabled ||
-		w.IcebergState == configstore.ManagedWarehouseStateReady ||
-		updates["iceberg_state"] == configstore.ManagedWarehouseStateReady
 
-	if s3Ready && metaReady && secretsReady && identReady && icebergReady && status.ReadyCondition {
+	if s3Ready && metaReady && secretsReady && identReady && status.ReadyCondition {
 		// End-to-end probe: AWS reports the metadata store (RDS) Available before
 		// its DNS record has propagated to in-cluster CoreDNS, and even longer
 		// before pgbouncer's resolver picks it up. Flipping to Ready on
@@ -394,32 +338,16 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		}
 	}
 
-	// Provision the per-org Lakekeeper as part of turn-up, not only as a
-	// post-Ready late-enable. A cnpg-shard Duckling is required by the XRD to
-	// have iceberg.enabled=true, so its warehouse can never reach Ready until
-	// iceberg_state flips — and for the Lakekeeper backend that only happens
-	// once EnsureForOrg has stood the catalog up (there's no S3 Tables bucket
-	// whose ARN would otherwise trigger it). reconcileLakekeeper is idempotent,
-	// no-ops for non-Lakekeeper backends, and returns quietly until the
-	// Duckling status carries the metadata creds and the Lakekeeper CR has
-	// bootstrapped; the poll loop is the requeue. The iceberg_state=Ready it
-	// writes is picked up by the readiness check on a subsequent tick.
-	c.reconcileLakekeeper(ctx, w)
 }
 
 // reconcileReady handles drift correction for Ready warehouses. The
-// post-create-mutable spec fields are metadataStore.pgbouncer.enabled and
-// iceberg.enabled; if an operator flips either in the config store (admin
-// API), we patch the CR so the Crossplane composition provisions / tears
-// down the affected resource.
+// post-create-mutable spec field is metadataStore.pgbouncer.enabled; if an
+// operator flips it in the config store (admin API), we patch the CR so the
+// Crossplane composition converges.
 //
 // Scope is intentionally narrow: we do NOT reconcile ACU, image, or other
 // spec fields. Those aren't user-mutable via the admin API today, and
 // aggressive drift correction would conflict with manual kubectl patches.
-//
-// iceberg.namespace is NOT drift-corrected — the XRD's CEL admission rule
-// rejects post-create namespace changes, so a drift attempt would just hit
-// a 422 from the API server. Namespace changes require warehouse re-creation.
 func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "ready")
 
@@ -443,30 +371,12 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 		}
 	}
 
-	currentIceberg, err := c.duckling.GetIcebergEnabled(ctx, w.OrgID)
-	if err != nil {
-		log.Warn("Failed to read Duckling CR iceberg.enabled for drift check.", "error", err)
-		return
-	}
-	if currentIceberg != w.Iceberg.Enabled {
-		log.Info("Iceberg drift detected, patching Duckling CR.",
-			"desired", w.Iceberg.Enabled, "current", currentIceberg)
-		if err := c.duckling.SetIcebergEnabled(ctx, w.OrgID, w.Iceberg.Enabled); err != nil {
-			log.Warn("Failed to patch Duckling CR iceberg.enabled.", "error", err)
-		}
-	}
-
 	// Backfill the CP-owned s3bucket name onto ducklings provisioned before the
 	// control plane started supplying it (spec.dataStore carries only
 	// {type: s3bucket}). The name computed here is exactly what the composition
 	// has been deriving into status, so the patch moves it from a derived output
 	// into a durable input without changing the actual bucket. No-op once set.
 	c.reconcileBucketName(ctx, w, log)
-
-	// Lakekeeper reconcile is independent of the Duckling state machine —
-	// provisioning a Lakekeeper for an org doesn't depend on, and doesn't
-	// block, the warehouse top-level state.
-	c.reconcileLakekeeper(ctx, w)
 }
 
 // reconcileBucketName backfills spec.dataStore.bucketName (and the config-store
@@ -523,80 +433,8 @@ func (c *Controller) reconcileBucketName(ctx context.Context, w *configstore.Man
 	}
 }
 
-// reconcileLakekeeper provisions a per-org Lakekeeper instance when the
-// warehouse selects the lakekeeper backend and isn't yet provisioned. Called
-// from both reconcileProvisioning (initial turn-up — required for cnpg-shard,
-// which must have iceberg enabled and so can't reach Ready until the catalog
-// is up) and reconcileReady (late-enable on an already-Ready warehouse).
-// Idempotent: a warehouse with LakekeeperEndpoint already populated is a
-// no-op. ErrBootstrapPending from the underlying EnsureForOrg is logged
-// at debug and treated as "retry on the next tick" — the controller's
-// poll loop is the requeue mechanism.
-//
-// Skipped silently when the controller wasn't built with
-// WithLakekeeperProvisioner (e.g. in deployments where the operator
-// isn't installed, or in tests).
-func (c *Controller) reconcileLakekeeper(ctx context.Context, w *configstore.ManagedWarehouse) {
-	if c.lakekeeperProvisioner == nil || c.lakekeeperInputs == nil {
-		return
-	}
-	if !w.Iceberg.Enabled {
-		return
-	}
-	if w.Iceberg.ResolvedBackend() != configstore.IcebergBackendLakekeeper {
-		return
-	}
-	log := slog.With("org", w.OrgID, "phase", "lakekeeper")
-
-	if w.Iceberg.LakekeeperEndpoint != "" {
-		// Already provisioned. Converge the pod-shape fields (replicas, resource
-		// requests, scrape annotations) onto the org's existing CR(s) via a
-		// label-matched merge patch — no inputs needed, never recreates under a
-		// new name. The operator rolls the Deployment only when the spec actually
-		// changes. (The operator can't add fields that aren't in the CR, so a
-		// spec change in the provisioner must be written back here — it won't
-		// appear on its own.)
-		if err := c.lakekeeperProvisioner.PatchPodShape(ctx, w.OrgID); err != nil {
-			log.Warn("Lakekeeper CR pod-shape drift correction failed.", "error", err)
-		}
-		return
-	}
-
-	inputs, err := c.lakekeeperInputs(ctx, w)
-	if err != nil {
-		log.Warn("Failed to resolve lakekeeper provisioning inputs.", "error", err)
-		return
-	}
-	if err := c.lakekeeperProvisioner.EnsureForOrg(ctx, w, inputs); err != nil {
-		if errors.Is(err, ErrBootstrapPending) {
-			log.Debug("Lakekeeper bootstrap still pending; next tick will retry.")
-			return
-		}
-		log.Warn("Lakekeeper provisioning failed.", "error", err)
-		return
-	}
-	log.Info("Lakekeeper provisioning completed.")
-}
-
 func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "deleting")
-
-	// Resolve the Lakekeeper inputs BEFORE deleting the Duckling CR. The
-	// inputs include the metadata-store admin DSN derived from the CR's
-	// status; once the CR is gone the resolver can't reconstruct it, and
-	// we'd lose the only way to drop the per-tenant lakekeeper_<org>
-	// Postgres database. Best-effort resolution: when the inputs aren't
-	// available (resolver unwired, CR never reconciled, dev/orbstack
-	// without env config), the subsequent DeleteForOrg call falls back to
-	// k8s-only teardown.
-	var lkInputs ProvisioningInputs
-	if c.lakekeeperProvisioner != nil && c.lakekeeperInputs != nil {
-		if in, err := c.lakekeeperInputs(ctx, w); err != nil {
-			log.Debug("Lakekeeper inputs unavailable at delete time; skipping PG cleanup.", "error", err)
-		} else {
-			lkInputs = in
-		}
-	}
 
 	log.Info("Deleting Duckling CR.")
 	if err := c.duckling.Delete(ctx, w.OrgID); err != nil {
@@ -612,26 +450,6 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 			// events table.
 			analytics.Default().Capture("warehouse_deprovision_failed", w.OrgID, map[string]any{
 				"reason": "duckling_delete_failed",
-			})
-			return
-		}
-	}
-
-	// Tear down the per-org Lakekeeper instance the control plane provisioned
-	// out-of-band (CR + Secret + ServiceAccount in the lakekeeper namespace,
-	// and — when this provisioner created them — the lakekeeper_<org>
-	// Postgres database and role on the metadata store). The Crossplane
-	// Duckling composition doesn't own the k8s pieces, so without an explicit
-	// teardown they leak after the warehouse is gone. Idempotent and
-	// NotFound-tolerant — a clean no-op for ducklings that never enabled
-	// Iceberg. Skipped silently when the provisioner isn't wired (mirrors
-	// reconcileLakekeeper). On error we return without marking the warehouse
-	// deleted so the next reconcile pass retries.
-	if c.lakekeeperProvisioner != nil {
-		if err := c.lakekeeperProvisioner.DeleteForOrg(ctx, w.OrgID, lkInputs); err != nil {
-			log.Warn("Failed to tear down Lakekeeper resources, will retry.", "error", err)
-			analytics.Default().Capture("warehouse_deprovision_failed", w.OrgID, map[string]any{
-				"reason": "lakekeeper_teardown_failed",
 			})
 			return
 		}

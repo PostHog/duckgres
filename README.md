@@ -121,7 +121,6 @@ LIMIT 20;
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
-- [Lakekeeper Iceberg Catalog](docs/runbooks/lakekeeper-iceberg-catalog.md): Per-org Lakekeeper Iceberg REST catalog backend — architecture, the no-vending credential model, activation, and the `ACCESS_DELEGATION_MODE 'none'` gotcha.
 
 ## Quick Start
 
@@ -324,12 +323,12 @@ teardown), so you can build a provisioning funnel and alert on failures.
 
 | Event | Fires when | Properties |
 | --- | --- | --- |
-| `warehouse_provision_begin` | Provisioning accepted by the admin API (warehouse not usable yet) | `database_name`, `metadata_store`, `ducklake_enabled`, `iceberg_enabled` |
-| `warehouse_provision_success` | Warehouse reaches Ready and is usable (provisioner controller) | `metadata_store`, `ducklake_enabled`, `iceberg_enabled` |
-| `warehouse_provision_failed` | Warehouse reaches Failed (provisioner controller) | `metadata_store`, `ducklake_enabled`, `iceberg_enabled`, `reason` (`provisioning_timeout`/`crossplane_sync_failure`) |
+| `warehouse_provision_begin` | Provisioning accepted by the admin API (warehouse not usable yet) | `database_name`, `metadata_store`, `ducklake_enabled` |
+| `warehouse_provision_success` | Warehouse reaches Ready and is usable (provisioner controller) | `metadata_store`, `ducklake_enabled` |
+| `warehouse_provision_failed` | Warehouse reaches Failed (provisioner controller) | `metadata_store`, `ducklake_enabled`, `reason` (`provisioning_timeout`/`crossplane_sync_failure`) |
 | `warehouse_deprovision_begin` | Deprovisioning accepted by the admin API (teardown not finished yet) | — |
 | `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
-| `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`/`lakekeeper_teardown_failed`) |
+| `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
 | `query_initiated` | A client query begins execution | `user`, `trace_id` |
 | `query_failed` | A query errors | `user`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
@@ -775,7 +774,7 @@ Managed-warehouse contract notes:
 
 - At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
 - The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
-- User rows support an optional `default_catalog` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. The default is empty, which preserves the standard DuckLake-first session behavior. Set `default_catalog` to `iceberg` for users whose sessions should resolve schema-qualified names and compatibility metadata through the Iceberg catalog by default; a client-supplied startup `search_path` still takes precedence.
+- User rows support an optional `default_catalog` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. The default is empty, which preserves the standard DuckLake session behavior. `ducklake` is the only non-empty value accepted.
 - The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared worker mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
 - Secret references only are stored in the config store. Secret material remains outside the database.
 - The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.

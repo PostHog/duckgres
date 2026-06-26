@@ -124,8 +124,8 @@ func TestReconcileProvisioningSuccessEmitsEvent(t *testing.T) {
 	if e.props["ducklake_enabled"] != true {
 		t.Errorf("ducklake_enabled = %v, want true", e.props["ducklake_enabled"])
 	}
-	if e.props["iceberg_enabled"] != false {
-		t.Errorf("iceberg_enabled = %v, want false", e.props["iceberg_enabled"])
+	if _, ok := e.props["iceberg_enabled"]; ok {
+		t.Errorf("iceberg_enabled should not be emitted")
 	}
 	if n := fake.count("warehouse_provision_failed"); n != 0 {
 		t.Errorf("expected no failure event, got %d", n)
