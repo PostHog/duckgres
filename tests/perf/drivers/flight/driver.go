@@ -24,17 +24,33 @@ type Driver struct {
 	exec Executor
 }
 
+type ConnectionConfig struct {
+	Addr               string
+	ServerName         string
+	Username           string
+	Password           string
+	InsecureSkipVerify bool
+}
+
 func NewWithExecutor(exec Executor) *Driver {
 	return &Driver{exec: exec}
 }
 
 func NewFromAddress(addr, username, password string, insecureSkipVerify bool) (*Driver, error) {
-	tlsCfg := &tls.Config{InsecureSkipVerify: insecureSkipVerify} // test/perf env only
+	return NewFromConfig(ConnectionConfig{
+		Addr:               addr,
+		Username:           username,
+		Password:           password,
+		InsecureSkipVerify: insecureSkipVerify,
+	})
+}
+
+func NewFromConfig(cfg ConnectionConfig) (*Driver, error) {
 	client, err := flightsql.NewClient(
-		addr,
+		cfg.Addr,
 		nil,
 		nil,
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfigForConnection(cfg))),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(flightclient.MaxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(flightclient.MaxGRPCMessageSize),
@@ -44,7 +60,7 @@ func NewFromAddress(addr, username, password string, insecureSkipVerify bool) (*
 		return nil, fmt.Errorf("create Flight SQL client: %w", err)
 	}
 
-	token, err := bootstrapSessionToken(client, username, password)
+	token, err := bootstrapSessionToken(client, cfg.Username, cfg.Password)
 	if err != nil {
 		_ = client.Close()
 		return nil, err
@@ -56,6 +72,14 @@ func NewFromAddress(addr, username, password string, insecureSkipVerify bool) (*
 			exec:   exec,
 		},
 	}, nil
+}
+
+func tlsConfigForConnection(cfg ConnectionConfig) *tls.Config {
+	tlsCfg := &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify} // test/perf env only
+	if cfg.ServerName != "" {
+		tlsCfg.ServerName = cfg.ServerName
+	}
+	return tlsCfg
 }
 
 func (d *Driver) Protocol() core.Protocol {

@@ -18,6 +18,8 @@ Optional environment:
   DUCKGRES_SCENARIO_RUN_ID
   DUCKGRES_SCENARIO_PG_PORT
   DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT
+  DUCKGRES_SCENARIO_FLIGHT_ADDR (required by frozen perf scenarios)
+  DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY
   DUCKGRES_SCENARIO_MAX_RUNTIME
   DUCKGRES_SCENARIO_GO_TEST_TIMEOUT
   DUCKGRES_SCENARIO_FROZEN_S3_URI (required by frozen dataset scenarios)
@@ -75,12 +77,36 @@ root_relative_path() {
   esac
 }
 
+scenario_file="$(root_relative_path "$scenario_file")"
+output_base="$(root_relative_path "$output_base")"
+
+scenario_required_env() {
+  awk '
+    /^[^[:space:]]/ { in_required = 0 }
+    /^required_env:[[:space:]]*$/ { in_required = 1; next }
+    in_required && /^[[:space:]]*-[[:space:]]*/ {
+      value = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+      gsub(/^["'\'']|["'\'']$/, "", value)
+      if (value != "") print value
+    }
+  ' "$1"
+}
+
 required=(
   DUCKGRES_SCENARIO_API_BASE
   DUCKGRES_SCENARIO_INTERNAL_SECRET
   DUCKGRES_SCENARIO_PG_HOST
   DUCKGRES_SCENARIO_SNI_SUFFIX
 )
+if [ -f "$scenario_file" ]; then
+  while IFS= read -r name; do
+    required+=("$name")
+  done < <(scenario_required_env "$scenario_file")
+elif [ "$check_env_only" -eq 1 ]; then
+  echo "Scenario file not found: $scenario_file" >&2
+  exit 2
+fi
 missing=()
 for name in "${required[@]}"; do
   if [ -z "${!name:-}" ]; then
@@ -100,9 +126,6 @@ if [ "$check_env_only" -eq 1 ]; then
   echo "Duckgres scenario environment is configured."
   exit 0
 fi
-
-scenario_file="$(root_relative_path "$scenario_file")"
-output_base="$(root_relative_path "$output_base")"
 
 args=(
   go test -count=1 ./tests/scenario

@@ -34,3 +34,16 @@ func TestDriverUsesDuckhogVariant(t *testing.T) {
 		t.Fatalf("expected duckhog SQL, got %q", exec.lastQuery)
 	}
 }
+
+func TestTLSConfigUsesExplicitServerName(t *testing.T) {
+	cfg := tlsConfigForConnection(ConnectionConfig{
+		ServerName:         "scenario-org.dev.example",
+		InsecureSkipVerify: true,
+	})
+	if cfg.ServerName != "scenario-org.dev.example" {
+		t.Fatalf("server name = %q, want explicit managed hostname", cfg.ServerName)
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Fatal("expected insecure skip verify to pass through")
+	}
+}
