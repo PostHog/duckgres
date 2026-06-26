@@ -3,6 +3,8 @@ package sql
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -122,6 +124,50 @@ func TestExecutorDoesNotRetryNonTransientSQLErrors(t *testing.T) {
 	}
 }
 
+func TestExecutorFailsWhenSQLReturnsFewerThanMinRows(t *testing.T) {
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			Port:      5432,
+			SSLMode:   "require",
+		},
+		Driver: &fakeDriver{
+			executeFunc: func(context.Context, QueryRequest) (QueryResult, error) {
+				return QueryResult{Rows: 0}, nil
+			},
+		},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "validate_manifest",
+		Type: StepTypeSQL,
+		With: map[string]any{
+			"org_id":   "scenario-org",
+			"catalog":  "ducklake",
+			"sql":      "SELECT 1 WHERE false",
+			"min_rows": 1,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected min_rows assertion failure")
+	}
+	if !strings.Contains(err.Error(), "returned 0 rows, want at least 1") {
+		t.Fatalf("error = %v, want min_rows message", err)
+	}
+	var classified core.ClassifiedError
+	if !errors.As(err, &classified) || classified.ErrorClass() != ErrorClassSQL {
+		t.Fatalf("error = %T %v, want class %q", err, err, ErrorClassSQL)
+	}
+}
+
 func TestExecutorRunsInlineSQLCatalog(t *testing.T) {
 	provisionState := provision.NewState()
 	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
@@ -170,6 +216,134 @@ func TestExecutorRunsInlineSQLCatalog(t *testing.T) {
 	}
 	if _, ok := executor.State().Result("catalog/two"); !ok {
 		t.Fatal("expected second catalog query result")
+	}
+}
+
+func TestExecutorRunsSQLCatalogFile(t *testing.T) {
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	catalogFile := filepath.Join(t.TempDir(), "metadata_catalog.yaml")
+	if err := os.WriteFile(catalogFile, []byte(`
+name: metadata-smoke
+queries:
+  - id: schemata
+    sql: SELECT schema_name FROM information_schema.schemata
+  - id: tables
+    catalog: ducklake
+    sql: SELECT table_name FROM information_schema.tables
+`), 0o644); err != nil {
+		t.Fatalf("write catalog file: %v", err)
+	}
+
+	var queryIDs []string
+	driver := &fakeDriver{
+		executeFunc: func(_ context.Context, req QueryRequest) (QueryResult, error) {
+			queryIDs = append(queryIDs, req.QueryID)
+			return QueryResult{Rows: 1}, nil
+		},
+	}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			Port:      5432,
+			SSLMode:   "require",
+		},
+		Driver: driver,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "metadata",
+		Type: StepTypeSQLCatalog,
+		With: map[string]any{
+			"org_id": "scenario-org",
+			"file":   catalogFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if got := strings.Join(queryIDs, ","); got != "schemata,tables" {
+		t.Fatalf("query IDs = %q, want schemata,tables", got)
+	}
+	if _, ok := executor.State().Result("metadata/schemata"); !ok {
+		t.Fatal("expected schemata result")
+	}
+	if _, ok := executor.State().Result("metadata/tables"); !ok {
+		t.Fatal("expected tables result")
+	}
+}
+
+func TestRepositoryMetadataCatalogFileParses(t *testing.T) {
+	step := core.Step{
+		ID:   "metadata",
+		Type: StepTypeSQLCatalog,
+		With: map[string]any{
+			"catalog": "ducklake",
+			"file":    filepath.Join("metadata_catalog.yaml"),
+		},
+	}
+	specs, err := parseCatalogStep(step)
+	if err != nil {
+		t.Fatalf("parseCatalogStep returned error: %v", err)
+	}
+	if len(specs) == 0 {
+		t.Fatal("expected repository metadata catalog to contain queries")
+	}
+}
+
+func TestExecutorTemplatesSQLFileEnvVars(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	sqlFile := filepath.Join(t.TempDir(), "setup.sql")
+	if err := os.WriteFile(sqlFile, []byte("SELECT '${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet'"), 0o644); err != nil {
+		t.Fatalf("write SQL file: %v", err)
+	}
+
+	var gotSQL string
+	driver := &fakeDriver{
+		executeFunc: func(_ context.Context, req QueryRequest) (QueryResult, error) {
+			gotSQL = req.SQL
+			return QueryResult{Rows: 1}, nil
+		},
+	}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			Port:      5432,
+			SSLMode:   "require",
+		},
+		Driver: driver,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "setup_frozen",
+		Type: StepTypeSQL,
+		With: map[string]any{
+			"org_id": "scenario-org",
+			"file":   sqlFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if !strings.Contains(gotSQL, "s3://example-frozen/frozen_v1/persons/*.parquet") {
+		t.Fatalf("SQL = %q, want templated frozen S3 URI", gotSQL)
+	}
+	if strings.Contains(gotSQL, "${env:") {
+		t.Fatalf("SQL still contains env template: %q", gotSQL)
 	}
 }
 

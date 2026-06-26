@@ -1,0 +1,65 @@
+name: posthog-frozen-metadata
+run_id_prefix: scenario-frozen-metadata
+required_env:
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: scenario-frozen-${run_id_compact}
+      request:
+        database_name: scenario_frozen_${run_id_compact}
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: scenario-frozen-${run_id_compact}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: setup_frozen_views
+    type: sql
+    with:
+      org_id: scenario-frozen-${run_id_compact}
+      catalog: ducklake
+      file: ../sql/setup_frozen_views.sql
+      max_attempts: 12
+      retry_interval: 10s
+
+  - id: validate_dataset_manifest
+    type: sql
+    with:
+      org_id: scenario-frozen-${run_id_compact}
+      catalog: ducklake
+      sql: |
+        SELECT dataset_version
+        FROM main.dataset_manifest
+        WHERE dataset_version = 'posthog-file-views-v1'
+      min_rows: 1
+      max_attempts: 3
+      retry_interval: 5s
+
+  - id: metadata_exploration
+    type: sql_catalog
+    with:
+      org_id: scenario-frozen-${run_id_compact}
+      catalog: ducklake
+      file: ../sql/metadata_catalog.yaml
+      max_attempts: 3
+      retry_interval: 5s
+
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [metadata_exploration]
+    always_run: true
+    with:
+      org_id: scenario-frozen-${run_id_compact}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s

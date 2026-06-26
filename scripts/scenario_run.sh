@@ -20,6 +20,7 @@ Optional environment:
   DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT
   DUCKGRES_SCENARIO_MAX_RUNTIME
   DUCKGRES_SCENARIO_GO_TEST_TIMEOUT
+  DUCKGRES_SCENARIO_FROZEN_S3_URI (required by frozen dataset scenarios)
 USAGE
 }
 
@@ -64,6 +65,16 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+
+root_relative_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$repo_root/$1" ;;
+  esac
+}
+
 required=(
   DUCKGRES_SCENARIO_API_BASE
   DUCKGRES_SCENARIO_INTERNAL_SECRET
@@ -89,6 +100,9 @@ if [ "$check_env_only" -eq 1 ]; then
   echo "Duckgres scenario environment is configured."
   exit 0
 fi
+
+scenario_file="$(root_relative_path "$scenario_file")"
+output_base="$(root_relative_path "$output_base")"
 
 args=(
   go test -count=1 ./tests/scenario

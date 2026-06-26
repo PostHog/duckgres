@@ -145,6 +145,8 @@ steps:
 func TestParseScenarioAllowsOpenWithMap(t *testing.T) {
 	raw := []byte(`
 name: with-map
+required_env:
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
 steps:
   - id: query
     type: fake
@@ -158,7 +160,28 @@ steps:
 	if err != nil {
 		t.Fatalf("ParseScenario returned error: %v", err)
 	}
+	if got := scenario.RequiredEnv; len(got) != 1 || got[0] != "DUCKGRES_SCENARIO_FROZEN_S3_URI" {
+		t.Fatalf("required_env = %#v, want frozen S3 URI", got)
+	}
 	if scenario.Steps[0].With["sql"] != "SELECT 1" {
 		t.Fatalf("unexpected with map: %#v", scenario.Steps[0].With)
+	}
+}
+
+func TestParseScenarioRejectsEmptyRequiredEnv(t *testing.T) {
+	_, err := ParseScenario([]byte(`
+name: bad-env
+required_env: [DUCKGRES_SCENARIO_FROZEN_S3_URI, ""]
+steps:
+  - id: query
+    type: fake
+    with:
+      sql: SELECT 1
+`))
+	if err == nil {
+		t.Fatal("expected empty required_env entry to fail")
+	}
+	if !strings.Contains(err.Error(), "required_env[1] must be non-empty") {
+		t.Fatalf("error = %v, want required_env index", err)
 	}
 }

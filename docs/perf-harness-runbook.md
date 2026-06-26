@@ -5,6 +5,8 @@
 Golden-query performance signal collection for `pgwire` and `flight` protocols.
 This is observability-only; there is no pass/fail performance gate.
 
+Status: the old prod-us deployed perf runner path is legacy while the dev Duckgres Scenario Runner replacement is being built. Prefer `tests/scenario/scenarios/posthog_frozen_metadata.yaml` for current frozen dataset end-to-end validation; keep this perf harness for local/library use and historical artifact compatibility until the scenario perf adapter is available.
+
 ## Local Prerequisites
 
 - Run commands from the Duckgres repository root.

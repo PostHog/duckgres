@@ -1,0 +1,48 @@
+name: posthog-frozen-metadata-v1
+description: Lightweight metadata and user-exploration queries over frozen persons/events parquet views.
+queries:
+  - id: manifest_has_dataset
+    sql: |
+      SELECT dataset_version
+      FROM main.dataset_manifest
+      WHERE dataset_version = 'posthog-file-views-v1'
+
+  - id: list_frozen_schemata
+    sql: |
+      SELECT schema_name
+      FROM information_schema.schemata
+      WHERE schema_name IN ('frozen_v1', 'main')
+      ORDER BY schema_name
+
+  - id: list_frozen_views
+    sql: |
+      SELECT table_schema, table_name, table_type
+      FROM information_schema.tables
+      WHERE table_schema = 'frozen_v1'
+      ORDER BY table_name
+
+  - id: describe_persons_columns
+    sql: |
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'frozen_v1' AND table_name = 'persons_file_view'
+      ORDER BY ordinal_position
+
+  - id: describe_events_columns
+    sql: |
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'frozen_v1' AND table_name = 'events_file_view'
+      ORDER BY ordinal_position
+
+  - id: persons_sample
+    sql: |
+      SELECT *
+      FROM frozen_v1.persons_file_view
+      LIMIT 5
+
+  - id: events_sample
+    sql: |
+      SELECT *
+      FROM frozen_v1.events_file_view
+      LIMIT 5
