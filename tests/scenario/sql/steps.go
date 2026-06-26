@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/posthog/duckgres/tests/scenario/core"
 	"github.com/posthog/duckgres/tests/scenario/provision"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -57,6 +59,18 @@ type querySpec struct {
 	ID      string
 	SQL     string
 	Catalog string
+}
+
+type catalogFile struct {
+	Name        string             `yaml:"name"`
+	Description string             `yaml:"description"`
+	Queries     []catalogFileQuery `yaml:"queries"`
+}
+
+type catalogFileQuery struct {
+	ID      string `yaml:"id"`
+	SQL     string `yaml:"sql"`
+	Catalog string `yaml:"catalog"`
 }
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
@@ -148,6 +162,11 @@ func (e *Executor) executeQuery(ctx context.Context, step core.Step, spec queryS
 	for attempts = 1; attempts <= retry.MaxAttempts; attempts++ {
 		result, err := e.driver.Execute(ctx, req)
 		if err == nil {
+			if minRows, ok, err := intFromWith(step, "min_rows"); err != nil {
+				return err
+			} else if ok && result.Rows < int64(minRows) {
+				return classified(ErrorClassSQL, fmt.Errorf("execute SQL step %s query %s returned %d rows, want at least %d", step.ID, spec.ID, result.Rows, minRows))
+			}
 			e.state.StoreResult(StepResult{
 				StepID:   resultID,
 				QueryID:  spec.ID,
@@ -224,9 +243,16 @@ func parseSQLStep(step core.Step) (querySpec, error) {
 }
 
 func parseCatalogStep(step core.Step) ([]querySpec, error) {
+	file := stringFromWith(step, "file", "")
+	if file != "" {
+		if _, ok := step.With["queries"]; ok {
+			return nil, invalidStep(step.ID, "with.file and with.queries are mutually exclusive")
+		}
+		return parseCatalogFile(step, file)
+	}
 	raw, ok := step.With["queries"]
 	if !ok {
-		return nil, invalidStep(step.ID, "with.queries is required")
+		return nil, invalidStep(step.ID, "with.queries or with.file is required")
 	}
 	items, ok := raw.([]any)
 	if !ok || len(items) == 0 {
@@ -252,9 +278,48 @@ func parseCatalogStep(step core.Step) ([]querySpec, error) {
 	return specs, nil
 }
 
+func parseCatalogFile(step core.Step, file string) ([]querySpec, error) {
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return nil, invalidStep(step.ID, "read catalog file %s: %v", file, err)
+	}
+	var catalog catalogFile
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&catalog); err != nil {
+		return nil, invalidStep(step.ID, "parse catalog file %s: %v", file, err)
+	}
+	if len(catalog.Queries) == 0 {
+		return nil, invalidStep(step.ID, "catalog file %s must contain at least one query", file)
+	}
+	defaultCatalog := stringFromWith(step, "catalog", "ducklake")
+	specs := make([]querySpec, 0, len(catalog.Queries))
+	for i, item := range catalog.Queries {
+		item.ID = strings.TrimSpace(item.ID)
+		item.SQL = strings.TrimSpace(item.SQL)
+		item.Catalog = strings.TrimSpace(item.Catalog)
+		if item.ID == "" {
+			return nil, invalidStep(step.ID, "catalog file %s queries[%d].id must be non-empty", file, i)
+		}
+		if item.SQL == "" {
+			return nil, invalidStep(step.ID, "catalog file %s queries[%d].sql must be non-empty", file, i)
+		}
+		catalogName := item.Catalog
+		if catalogName == "" {
+			catalogName = defaultCatalog
+		}
+		specs = append(specs, querySpec{ID: item.ID, SQL: item.SQL, Catalog: catalogName})
+	}
+	return specs, nil
+}
+
 func sqlFromStep(step core.Step) (string, error) {
 	if sqlText := stringFromWith(step, "sql", ""); strings.TrimSpace(sqlText) != "" {
-		return sqlText, nil
+		resolved, err := core.ResolveEnvTemplates(sqlText)
+		if err != nil {
+			return "", invalidStep(step.ID, "%v", err)
+		}
+		return resolved, nil
 	}
 	file := stringFromWith(step, "file", "")
 	if file == "" {
@@ -267,7 +332,11 @@ func sqlFromStep(step core.Step) (string, error) {
 	if strings.TrimSpace(string(raw)) == "" {
 		return "", invalidStep(step.ID, "SQL file %s is empty", file)
 	}
-	return string(raw), nil
+	resolved, err := core.ResolveEnvTemplates(string(raw))
+	if err != nil {
+		return "", invalidStep(step.ID, "%v", err)
+	}
+	return resolved, nil
 }
 
 func retryConfigForStep(step core.Step, base RetryConfig) (RetryConfig, error) {

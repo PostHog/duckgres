@@ -374,6 +374,11 @@ scenario scenario="tests/scenario/scenarios/provision_smoke.yaml":
 scenario-smoke:
     ./scripts/scenario_run.sh tests/scenario/scenarios/provision_smoke.yaml
 
+# Run the dev frozen dataset metadata exploration scenario
+[group('test')]
+scenario-frozen-metadata:
+    ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_metadata.yaml
+
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]
 lint:

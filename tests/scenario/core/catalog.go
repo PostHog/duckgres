@@ -10,9 +10,10 @@ import (
 )
 
 type Scenario struct {
-	Name        string `yaml:"name" json:"name"`
-	RunIDPrefix string `yaml:"run_id_prefix" json:"run_id_prefix,omitempty"`
-	Steps       []Step `yaml:"steps" json:"steps"`
+	Name        string   `yaml:"name" json:"name"`
+	RunIDPrefix string   `yaml:"run_id_prefix" json:"run_id_prefix,omitempty"`
+	RequiredEnv []string `yaml:"required_env" json:"required_env,omitempty"`
+	Steps       []Step   `yaml:"steps" json:"steps"`
 }
 
 type Step struct {
@@ -26,6 +27,7 @@ type Step struct {
 type rawScenario struct {
 	Name        string    `yaml:"name"`
 	RunIDPrefix string    `yaml:"run_id_prefix"`
+	RequiredEnv []string  `yaml:"required_env"`
 	Steps       []rawStep `yaml:"steps"`
 }
 
@@ -59,6 +61,7 @@ func normalizeScenario(raw rawScenario) (Scenario, error) {
 	scenario := Scenario{
 		Name:        strings.TrimSpace(raw.Name),
 		RunIDPrefix: strings.TrimSpace(raw.RunIDPrefix),
+		RequiredEnv: make([]string, 0, len(raw.RequiredEnv)),
 		Steps:       make([]Step, 0, len(raw.Steps)),
 	}
 	if scenario.Name == "" {
@@ -66,6 +69,13 @@ func normalizeScenario(raw rawScenario) (Scenario, error) {
 	}
 	if len(raw.Steps) == 0 {
 		return Scenario{}, fmt.Errorf("scenario steps must include at least one step")
+	}
+	for i, key := range raw.RequiredEnv {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return Scenario{}, fmt.Errorf("required_env[%d] must be non-empty", i)
+		}
+		scenario.RequiredEnv = append(scenario.RequiredEnv, key)
 	}
 
 	seen := make(map[string]struct{}, len(raw.Steps))

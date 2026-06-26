@@ -32,7 +32,7 @@ func TestScenarioRunner(t *testing.T) {
 		t.Fatal("-scenario-file is required")
 	}
 
-	loaded, err := core.LoadScenario(*scenarioFile)
+	loaded, _, err := loadScenarioForRun(*scenarioFile)
 	if err != nil {
 		t.Fatalf("load scenario: %v", err)
 	}
@@ -40,7 +40,13 @@ func TestScenarioRunner(t *testing.T) {
 	if runID == "" {
 		runID = defaultRunID(loaded)
 	}
-	loaded = resolveRunTemplates(loaded, runID)
+	if missing := missingRequiredEnv(loaded); len(missing) != 0 {
+		t.Fatalf("missing required scenario environment: %s", strings.Join(missing, ", "))
+	}
+	loaded, err = resolveRunTemplates(loaded, runID)
+	if err != nil {
+		t.Fatalf("resolve scenario templates: %v", err)
+	}
 
 	provisionClient, err := provision.NewClient(provision.Config{
 		BaseURL:        mustEnv(t, "DUCKGRES_SCENARIO_API_BASE"),
@@ -91,7 +97,10 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load provision smoke: %v", err)
 	}
-	resolved := resolveRunTemplates(scenario, "scenario-smoke-20260102t030405z")
+	resolved, err := resolveRunTemplates(scenario, "scenario-smoke-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
 	for _, step := range resolved.Steps {
 		if !dispatchSupports(step.Type) {
 			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
@@ -112,6 +121,98 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	databaseName, _ := request["database_name"].(string)
 	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "20260102t030405z") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
+	}
+}
+
+func TestFrozenMetadataScenarioRequiresDatasetURI(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
+
+	scenario, err := core.LoadScenario(filepath.Join("scenarios", "posthog_frozen_metadata.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen metadata scenario: %v", err)
+	}
+	missing := missingRequiredEnv(scenario)
+	if len(missing) != 1 || missing[0] != "DUCKGRES_SCENARIO_FROZEN_S3_URI" {
+		t.Fatalf("missing required env = %#v, want frozen S3 URI", missing)
+	}
+}
+
+func TestFrozenMetadataScenarioResolvesEnvTemplates(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+
+	scenario, err := core.LoadScenario(filepath.Join("scenarios", "posthog_frozen_metadata.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen metadata scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+	}
+}
+
+func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
+	scenario, scenarioPath, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_metadata.yaml"))
+	if err != nil {
+		t.Fatalf("loadScenarioForRun returned error: %v", err)
+	}
+	if !filepath.IsAbs(scenarioPath) {
+		t.Fatalf("scenarioPath = %q, want absolute path", scenarioPath)
+	}
+
+	foundSetupFile := false
+	foundCatalogFile := false
+	for _, step := range scenario.Steps {
+		file, ok := step.With["file"].(string)
+		if !ok {
+			continue
+		}
+		if !filepath.IsAbs(file) {
+			t.Fatalf("step %s file path = %q, want absolute path", step.ID, file)
+		}
+		if _, err := os.Stat(file); err != nil {
+			t.Fatalf("step %s file path %q should exist: %v", step.ID, file, err)
+		}
+		switch step.ID {
+		case "setup_frozen_views":
+			foundSetupFile = strings.HasSuffix(file, filepath.Join("sql", "setup_frozen_views.sql"))
+		case "metadata_exploration":
+			foundCatalogFile = strings.HasSuffix(file, filepath.Join("sql", "metadata_catalog.yaml"))
+		}
+	}
+	if !foundSetupFile {
+		t.Fatal("expected setup_frozen_views file to resolve under sql/")
+	}
+	if !foundCatalogFile {
+		t.Fatal("expected metadata_exploration file to resolve under sql/")
+	}
+}
+
+func TestResolveRunTemplatesRejectsMissingEnvTemplate(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
+
+	_, err := resolveRunTemplates(core.Scenario{
+		Name: "env-template",
+		Steps: []core.Step{{
+			ID:   "setup",
+			Type: scenariosql.StepTypeSQL,
+			With: map[string]any{
+				"sql": "SELECT '${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}'",
+			},
+		}},
+	}, "scenario-env-20260102t030405z")
+	if err == nil {
+		t.Fatal("expected missing env template to fail")
+	}
+	if !strings.Contains(err.Error(), "DUCKGRES_SCENARIO_FROZEN_S3_URI") {
+		t.Fatalf("error = %v, want env var name", err)
 	}
 }
 
@@ -172,7 +273,52 @@ func defaultRunID(s core.Scenario) string {
 	return fmt.Sprintf("%s-%s", prefix, time.Now().UTC().Format("20060102t150405z"))
 }
 
-func resolveRunTemplates(s core.Scenario, runID string) core.Scenario {
+func loadScenarioForRun(path string) (core.Scenario, string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return core.Scenario{}, "", fmt.Errorf("resolve scenario path %s: %w", path, err)
+	}
+	scenario, err := core.LoadScenario(absPath)
+	if err != nil {
+		return core.Scenario{}, "", err
+	}
+	return resolveScenarioFilePaths(scenario, filepath.Dir(absPath)), absPath, nil
+}
+
+func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {
+	out := s
+	out.Steps = make([]core.Step, len(s.Steps))
+	for i, step := range s.Steps {
+		if step.With == nil {
+			out.Steps[i] = step
+			continue
+		}
+		with := make(map[string]any, len(step.With))
+		for k, v := range step.With {
+			if k == "file" {
+				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) {
+					v = filepath.Clean(filepath.Join(baseDir, file))
+				}
+			}
+			with[k] = v
+		}
+		step.With = with
+		out.Steps[i] = step
+	}
+	return out
+}
+
+func missingRequiredEnv(s core.Scenario) []string {
+	var missing []string
+	for _, key := range s.RequiredEnv {
+		if os.Getenv(key) == "" {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+func resolveRunTemplates(s core.Scenario, runID string) (core.Scenario, error) {
 	vars := map[string]string{
 		"run_id":         runID,
 		"run_id_compact": compactRunID(runID),
@@ -181,11 +327,15 @@ func resolveRunTemplates(s core.Scenario, runID string) core.Scenario {
 	out.Steps = make([]core.Step, len(s.Steps))
 	for i, step := range s.Steps {
 		if step.With != nil {
-			step.With = resolveTemplateValue(step.With, vars).(map[string]any)
+			resolved, err := resolveTemplateValue(step.With, vars)
+			if err != nil {
+				return core.Scenario{}, fmt.Errorf("step %s: %w", step.ID, err)
+			}
+			step.With = resolved.(map[string]any)
 		}
 		out.Steps[i] = step
 	}
-	return out
+	return out, nil
 }
 
 func compactRunID(runID string) string {
@@ -201,28 +351,40 @@ func compactRunID(runID string) string {
 	return b.String()
 }
 
-func resolveTemplateValue(value any, vars map[string]string) any {
+func resolveTemplateValue(value any, vars map[string]string) (any, error) {
 	switch typed := value.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(typed))
 		for k, v := range typed {
-			out[k] = resolveTemplateValue(v, vars)
+			resolved, err := resolveTemplateValue(v, vars)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = resolved
 		}
-		return out
+		return out, nil
 	case []any:
 		out := make([]any, len(typed))
 		for i, v := range typed {
-			out[i] = resolveTemplateValue(v, vars)
+			resolved, err := resolveTemplateValue(v, vars)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = resolved
 		}
-		return out
+		return out, nil
 	case string:
 		out := typed
 		for k, v := range vars {
 			out = strings.ReplaceAll(out, "${"+k+"}", v)
 		}
-		return out
+		out, err := core.ResolveEnvTemplates(out)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
 	default:
-		return typed
+		return typed, nil
 	}
 }
 
