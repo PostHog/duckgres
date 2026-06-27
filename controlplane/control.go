@@ -169,7 +169,7 @@ type K8sConfig struct {
 	// "default TTL", pairing with WorkerMaxTTL (the clamp). It governs both
 	// no-ttl paths the same way: default-shape workers (reaped by the janitor)
 	// and sized-but-no-ttl workers (stamped at profile resolution). Per-request
-	// precedence: client GUC > org default > this > built-in (20m,
+	// precedence: client GUC > org default > this > built-in (1m,
 	// defaultWorkerTTL). Raise it above a tenant's job cadence (e.g. 70m for
 	// hourly jobs) so scheduled workloads reuse hot-idle workers instead of
 	// cold-spawning every run — at the cost of idle worker nodes.

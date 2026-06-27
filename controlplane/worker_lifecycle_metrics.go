@@ -88,6 +88,14 @@ const (
 	// rather than the leader — is doing the reaping, which is the signal that
 	// leadership is wedged.
 	LifecycleOriginPerCPHotIdleTTL LifecycleOrigin = "per_cp_hot_idle_ttl"
+	// LifecycleOriginPerCPOrphan marks the per-CP fallback reaper retiring a
+	// hot-idle worker whose OWNING CP instance is no longer live (rollout/crash
+	// orphan). Distinct from LifecycleOriginJanitorOrphan (the leader-only orphan
+	// sweep) so dashboards can see the fallback doing cross-CP orphan reclamation
+	// during a leaderless window. Every CP start mints a fresh cpInstanceID, so a
+	// graceful rollout orphans the prior process's hot-idle rows; without this
+	// path they would wait on the leader.
+	LifecycleOriginPerCPOrphan LifecycleOrigin = "per_cp_orphan"
 	// LifecycleOriginPoolStuckActivating marks the pool-local
 	// reapStuckActivatingWorkers loop, which runs every minute on every
 	// CP. Distinct from LifecycleOriginJanitorStuckActivating (which is

@@ -178,7 +178,10 @@ func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
 	if err := p.persistWorkerRecord(hotIdleRecord); err != nil {
 		observeHotIdlePersistFailure(w.image)
-		p.logw(id).Warn("Failed to persist hot_idle transition; leaving worker hot for retry.", "error", err)
+		// Log with the worker's own attrs, NOT p.logw(id): logw -> p.Worker(id)
+		// takes p.mu.RLock and we hold p.mu here (sync.RWMutex is not reentrant,
+		// so logw would self-deadlock). workerLogAttrs reads only worker fields.
+		slog.With(workerLogAttrs(w)...).Warn("Failed to persist hot_idle transition; leaving worker hot for retry.", "error", err)
 		return false
 	}
 	if err := w.SetSharedState(nextState); err != nil {
@@ -806,6 +809,14 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 		case <-w.done:
 			continue
 		default:
+		}
+		// A worker with a live pre-claimed session is NOT stuck — a client is
+		// blocked on its activation (which can legitimately run long, e.g. an
+		// in-band DuckLake migration). Retiring it here would delete the pod out
+		// from under that client. Only reap genuinely idle reserved/activating
+		// workers; a truly wedged activation with no waiter still gets reaped.
+		if w.activeSessions > 0 {
+			continue
 		}
 		lifecycle := w.SharedState().NormalizedLifecycle()
 		if (lifecycle == WorkerLifecycleReserved || lifecycle == WorkerLifecycleActivating) &&

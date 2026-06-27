@@ -12,6 +12,7 @@ type fakePerCPHotIdleStore struct {
 	listErr  error
 	counts   map[string]int
 	listCPID string
+	orphaned []configstore.WorkerSnapshot
 }
 
 func (s *fakePerCPHotIdleStore) ListExpiredHotIdleSnapshotsForCP(cpID string, now time.Time, ttl time.Duration) ([]configstore.WorkerSnapshot, error) {
@@ -21,6 +22,10 @@ func (s *fakePerCPHotIdleStore) ListExpiredHotIdleSnapshotsForCP(cpID string, no
 
 func (s *fakePerCPHotIdleStore) CountHotIdleWorkers(orgID, image, cpu, mem string) (int, error) {
 	return s.counts[orgID], nil
+}
+
+func (s *fakePerCPHotIdleStore) ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+	return s.orphaned, nil
 }
 
 func hotIdleSnap(id int, org string) configstore.WorkerSnapshot {
@@ -83,6 +88,54 @@ func TestPerCPHotIdleReaperHonorsFloor(t *testing.T) {
 
 	if len(lcStore.terminalTransitions) != 0 {
 		t.Fatalf("expected floor-protected worker NOT to be retired, got %d retires", len(lcStore.terminalTransitions))
+	}
+}
+
+// The per-CP reaper also reaps hot-idle workers orphaned by a dead owning CP
+// (rollout/crash), but leaves non-hot-idle orphans to the leader sweep. This is
+// the leader-independent backstop for the rollout+leaderless-window case.
+func TestPerCPHotIdleReaperReapsOrphanedHotIdle(t *testing.T) {
+	spawningOrphan := configstore.NewWorkerSnapshot(configstore.WorkerRecord{
+		WorkerID: 10, State: configstore.WorkerStateSpawning, OrgID: "x", Image: "img",
+	})
+	store := &fakePerCPHotIdleStore{
+		orphaned: []configstore.WorkerSnapshot{hotIdleSnap(9, "deadorg"), spawningOrphan},
+	}
+	lcStore := &fakeLifecycleStore{orphanReturn: true}
+	r := &perCPHotIdleReaper{
+		store:        store,
+		lifecycle:    NewWorkerLifecycle(lcStore, &fakePhysicalCleanup{}),
+		cpInstanceID: "cp-self",
+		hotIdleTTL:   time.Minute,
+		orphanGrace:  30 * time.Second,
+	}
+
+	r.runOnce()
+
+	if len(lcStore.orphanTransitions) != 1 {
+		t.Fatalf("expected exactly 1 orphan retire (the hot-idle one), got %d: %+v", len(lcStore.orphanTransitions), lcStore.orphanTransitions)
+	}
+	if lcStore.orphanTransitions[0].workerID != 9 {
+		t.Fatalf("expected hot-idle orphan 9 reaped, got worker %d", lcStore.orphanTransitions[0].workerID)
+	}
+}
+
+// orphanGrace==0 disables the orphan pass (self-owned reaping still runs).
+func TestPerCPHotIdleReaperOrphanPassDisabled(t *testing.T) {
+	store := &fakePerCPHotIdleStore{orphaned: []configstore.WorkerSnapshot{hotIdleSnap(9, "deadorg")}}
+	lcStore := &fakeLifecycleStore{orphanReturn: true}
+	r := &perCPHotIdleReaper{
+		store:        store,
+		lifecycle:    NewWorkerLifecycle(lcStore, &fakePhysicalCleanup{}),
+		cpInstanceID: "cp-self",
+		hotIdleTTL:   time.Minute,
+		orphanGrace:  0,
+	}
+
+	r.runOnce()
+
+	if len(lcStore.orphanTransitions) != 0 {
+		t.Fatalf("expected no orphan retires when orphanGrace=0, got %d", len(lcStore.orphanTransitions))
 	}
 }
 

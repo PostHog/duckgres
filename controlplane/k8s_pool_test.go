@@ -993,6 +993,61 @@ func TestK8sPool_RetireWorkerIfNoSessions_LastSession(t *testing.T) {
 	}
 }
 
+// Regression for fix #3: a transient persist failure at the hot->hot_idle park
+// must leave the worker Hot (still reusable), NOT advance in-memory to hot_idle
+// while the durable row stays hot (the invisible-to-both split). The session is
+// still decremented.
+func TestK8sPoolTransitionToHotIdlePersistFailureStaysHot(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.runtimeStore = &captureRuntimeWorkerStore{upsertErr: errors.New("store blip")}
+	worker := &ManagedWorker{ID: 5, activeSessions: 1, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	if pool.TransitionToHotIdleIfNoSessions(worker.ID) {
+		t.Fatal("expected park to report false on persist failure")
+	}
+	if got := worker.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHot {
+		t.Fatalf("expected worker to stay Hot on persist failure, got %q", got)
+	}
+	if worker.activeSessions != 0 {
+		t.Fatalf("expected session decremented to 0, got %d", worker.activeSessions)
+	}
+}
+
+// Regression for fix #4: when the durable Hot persist fails during activation,
+// ActivateReservedWorker must return an error and NOT advance the worker to Hot
+// (leaving a durable=activating / in-memory=Hot split the stuck reaper could
+// kill mid-session).
+func TestK8sPoolActivateReservedWorkerHotPersistFailureReturnsError(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.runtimeStore = &captureRuntimeWorkerStore{upsertErr: errors.New("store blip")}
+	worker := &ManagedWorker{ID: 9, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		return nil // activation itself succeeds; only the durable Hot persist fails
+	}
+
+	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected ActivateReservedWorker to return an error when the Hot persist fails")
+	}
+	if got := worker.SharedState().NormalizedLifecycle(); got == WorkerLifecycleHot {
+		t.Fatalf("expected worker NOT advanced to Hot on persist failure, got %q", got)
+	}
+}
+
 func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}

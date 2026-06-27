@@ -40,7 +40,7 @@ type ControlPlaneJanitor struct {
 	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
-	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured node-headroom % (leader-only)
+	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured headroom target (constant HeadroomNodes or legacy percent; leader-only)
 	hotIdleFloor                  func(configstore.WorkerSnapshot) int
 }
 
@@ -164,32 +164,37 @@ func (j *ControlPlaneJanitor) runOnce() {
 			// hotIdleTTL is the fallback for default/warm/legacy workers (ttl=0).
 			expired, err := j.store.ListExpiredHotIdleSnapshots(j.now(), j.hotIdleTTL)
 			if err != nil {
+				// Do NOT stamp the last-successful-reap gauge on a list failure:
+				// it backs the wedged-reaper alert, and a config-store outage (the
+				// moment reaping is actually dark) would otherwise keep it fresh
+				// and silence the alert. The per-CP reaper returns early here too.
 				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
-			}
-			for _, snap := range expired {
-				if j.hotIdleFloor != nil {
-					floor := j.hotIdleFloor(snap)
-					if floor > 0 {
-						count, err := j.store.CountHotIdleWorkers(snap.OrgID(), snap.Image(), snap.ProfileCPU(), snap.ProfileMemory())
-						if err != nil {
-							slog.Warn("Janitor failed to count compatible hot-idle workers.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
-							continue
-						}
-						if count <= floor {
-							slog.Debug("Janitor skipping hot-idle TTL because worker is protected by floor.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "floor", floor, "compatible_hot_idle", count)
-							continue
+			} else {
+				for _, snap := range expired {
+					if j.hotIdleFloor != nil {
+						floor := j.hotIdleFloor(snap)
+						if floor > 0 {
+							count, err := j.store.CountHotIdleWorkers(snap.OrgID(), snap.Image(), snap.ProfileCPU(), snap.ProfileMemory())
+							if err != nil {
+								slog.Warn("Janitor failed to count compatible hot-idle workers.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
+								continue
+							}
+							if count <= floor {
+								slog.Debug("Janitor skipping hot-idle TTL because worker is protected by floor.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "floor", floor, "compatible_hot_idle", count)
+								continue
+							}
 						}
 					}
+					if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired", LifecycleOriginJanitorHotIdleTTL); err != nil {
+						slog.Warn("Janitor failed to retire hot-idle worker.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
+					}
 				}
-				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired", LifecycleOriginJanitorHotIdleTTL); err != nil {
-					slog.Warn("Janitor failed to retire hot-idle worker.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
-				}
+				// Stamp the last-successful-reap gauge only after a successful
+				// list pass so an alert can detect a wedged/absent reaper. The
+				// per-CP fallback reaper stamps the same gauge, so max() across
+				// replicas tracks "some replica reaped recently".
+				observeHotIdleReapRun(j.now())
 			}
-			// Stamp the last-successful-reap gauge so an alert can detect a
-			// wedged/absent reaper regardless of cause. The per-CP fallback
-			// reaper stamps the same gauge, so max() across replicas tracks
-			// "some replica reaped recently".
-			observeHotIdleReapRun(j.now())
 		}
 	}
 

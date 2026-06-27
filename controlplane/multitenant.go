@@ -349,6 +349,7 @@ func SetupMultiTenant(
 		cpInstanceID: cpInstanceID,
 		hotIdleTTL:   janitor.hotIdleTTL,
 		hotIdleFloor: janitor.hotIdleFloor,
+		orphanGrace:  janitor.orphanGrace, // same cutoff as the leader orphan sweep
 		interval:     time.Minute,
 	}
 	go fallbackReaper.Run(context.Background())

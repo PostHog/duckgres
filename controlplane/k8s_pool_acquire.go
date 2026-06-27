@@ -219,8 +219,9 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	// swallowed-error behavior), the leader stuck-activating reaper would later
 	// CAS-retire this LIVE, about-to-serve worker and delete its pod mid-session.
 	// On persist failure leave the worker Activating and return the error: the
-	// caller (activateWorkerForOrg) retires + retries, wasting one activation but
-	// never stranding a durable/in-memory split. workerRecordFor takes the target
+	// caller (activateWorkerForOrg) retires the worker and surfaces the error to
+	// the client (no transparent retry), which is wasteful but never strands a
+	// durable=activating / in-memory=Hot split. workerRecordFor takes the target
 	// state explicitly, so building it before the in-memory commit is safe.
 	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
 	if err := p.persistWorkerRecord(hotRecord); err != nil {

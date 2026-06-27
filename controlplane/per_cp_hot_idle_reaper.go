@@ -12,6 +12,11 @@ import (
 type perCPHotIdleStore interface {
 	ListExpiredHotIdleSnapshotsForCP(ownerCPInstanceID string, now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
 	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
+	// ListOrphanedWorkerSnapshots returns workers whose owning CP instance is no
+	// longer live (expired/missing past the cutoff). Reused here so the per-CP
+	// reaper can reclaim hot-idle workers orphaned by a rollout/crash without
+	// waiting on the leader.
+	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 }
 
 // perCPHotIdleReaper retires THIS replica's own expired hot-idle workers on a
@@ -33,8 +38,13 @@ type perCPHotIdleReaper struct {
 	// must not over-reap a floor the leader would have preserved). Counts are
 	// global (CountHotIdleWorkers), so the floor holds across replicas.
 	hotIdleFloor func(configstore.WorkerSnapshot) int
-	interval     time.Duration
-	now          func() time.Time
+	// orphanGrace is how long an owning CP instance must have been gone before
+	// its hot-idle workers are treated as orphaned and reaped here. 0 disables
+	// the per-CP orphan pass (self-owned reaping still runs). Matches the leader
+	// janitor's orphanGrace so timing is identical, just leader-independent.
+	orphanGrace time.Duration
+	interval    time.Duration
+	now         func() time.Time
 }
 
 func (r *perCPHotIdleReaper) Run(ctx context.Context) {
@@ -90,7 +100,45 @@ func (r *perCPHotIdleReaper) runOnce() {
 				"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
 		}
 	}
-	// Stamp the last-successful-reap gauge even when nothing was expired: the
-	// alert cares that the reap path RAN recently, not that it found work.
+
+	// Orphan pass: reap hot-idle workers whose OWNING CP instance is no longer
+	// live. cpInstanceID is freshly minted on every CP start, so a graceful
+	// rollout/crash leaves the prior process's hot-idle rows owned by a dead
+	// instance — owned by no live CP, they are invisible to the self-owned pass
+	// above and were previously reaped ONLY by the leader janitor's orphan sweep.
+	// Running it here too makes hot-idle reclamation genuinely leader-independent
+	// (the whole point of this reaper) so a rollout concurrent with a leaderless
+	// window can't accumulate orphaned idle pods. RetireOrphanFromSnapshot
+	// re-checks owner-still-expired in its fenced CAS, so a worker meanwhile
+	// reclaimed by a live CP (ClaimHotIdleWorker) is skipped; no floor is applied
+	// (a dead owner's worker is not a warm reserve), matching the leader sweep.
+	r.reapOrphanedHotIdle(now())
+
+	// Stamp the last-successful-reap gauge after a successful self-owned list
+	// (reached only if that list did not error): the alert cares that the reap
+	// path RAN recently, not that it found work.
 	observeHotIdleReapRun(now())
+}
+
+func (r *perCPHotIdleReaper) reapOrphanedHotIdle(now time.Time) {
+	if r.orphanGrace <= 0 {
+		return
+	}
+	orphaned, err := r.store.ListOrphanedWorkerSnapshots(now.Add(-r.orphanGrace))
+	if err != nil {
+		slog.Warn("Per-CP hot-idle reaper failed to list orphaned workers.", "error", err)
+		return
+	}
+	for _, snap := range orphaned {
+		// Only hot-idle: other orphan states (spawning/reserved/activating/
+		// draining) stay the leader orphan sweep's job — they can carry
+		// in-flight work this reaper must not second-guess.
+		if snap.State() != configstore.WorkerStateHotIdle {
+			continue
+		}
+		if _, err := r.lifecycle.RetireOrphanFromSnapshot(snap, "orphaned", LifecycleOriginPerCPOrphan); err != nil {
+			slog.Warn("Per-CP hot-idle reaper failed to retire orphaned worker.",
+				"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
+		}
+	}
 }

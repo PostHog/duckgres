@@ -831,14 +831,17 @@ reuse_sized_worker() { # org password catalog cpu memory ttl
   log "sized worker reuse OK: 1 pod of cpu=$cpu (reused, no respawn)"
 }
 
-# Hot-idle TTL RETIREMENT: a worker parked hot-idle past its TTL must be reaped
-# (pod deleted), so an idle one-session worker — and the node behind it — does
-# not linger. This is the load-bearing regression for the idle-worker leak: if
-# the hot-idle reaper goes dark (leader-election wedged, swallowed persist), the
-# pod never disappears and this assertion fails. The reaper runs two ways now —
-# the leader janitor AND a per-CP fallback — so a single elected leader is not a
-# prerequisite. Uses worker_ttl=1m (the smallest non-truncated TTL) and a shape
-# no other test uses (3 CPU) so the pod is unambiguously ours.
+# Hot-idle TTL RETIREMENT (end-to-end smoke): a worker parked hot-idle past its
+# TTL must be reaped (pod deleted), so an idle one-session worker — and the node
+# behind it — does not linger. This exercises the real reap path (CP -> store ->
+# pod delete) against a single healthy CP holding the lease. NOTE: it is NOT a
+# regression gate for the leader-loss / persist-failure / spawn-failure paths —
+# those would pass on the pre-fix binary too (one healthy leader already reaps
+# within TTL). The regression gates for those live in the unit tests
+# (janitor_leader_k8s_test.go re-contend, k8s_pool_test.go persist-failure,
+# per_cp_hot_idle_reaper_test.go orphan/floor); killing the leader or injecting a
+# store fault in-Job is not deterministic here. Uses worker_ttl=1m (the smallest
+# non-truncated TTL) and a shape no other test uses (3 CPU) so the pod is ours.
 hot_idle_retired() { # org password catalog cpu memory
   org="$1"; pw="$2"; cat="$3"; cpu="$4"; mem="$5"; ttl=1m
   log "hot-idle TTL retirement on $org/$cat: cpu=$cpu mem=$mem ttl=$ttl (idle worker must be reaped)"
