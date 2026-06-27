@@ -30,6 +30,9 @@
 #                  session on a cold Iceberg worker must not fail the pg_catalog
 #                  compat-view bind (the CP primes the REST catalog's schema list
 #                  first); asserted on cnpg + ext.
+#   query log    : a successful marker query and a failed marker query land in
+#                  ducklake.system.query_log, with cpu_time_s and
+#                  peak_buffer_memory_bytes present for completed queries.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
@@ -614,6 +617,48 @@ rw_ducklake() { # org password
   n="$(pg "$1" "$2" ducklake "SELECT COUNT(*) FROM $t;")"
   [ "$n" = "3" ] || fail "$1 DuckLake rowcount=$n want 3"
   pg "$1" "$2" ducklake "DROP TABLE $t;"
+}
+
+wait_query_log_sql() { # org password label sql_returning_ok_or_wait
+  a=0 out=""
+  while [ "$a" -lt 30 ]; do
+    if out="$(pg_try "$1" "$2" ducklake "$4")"; then
+      [ "$out" = "ok" ] && return
+    fi
+    sleep 2
+    a=$((a + 1))
+  done
+  fail "$1 query_log: timed out waiting for $3 (last=$out)"
+}
+
+query_log_smoke() { # org password
+  log "query_log smoke on $1"
+  base="e2e_ql_$(echo "$1" | tr -c 'a-z0-9' _)_$$_$(date +%s)"
+  ok_marker="${base}_ok"
+  bad_table="${base}_missing"
+
+  got="$(pg "$1" "$2" ducklake \
+    "SELECT '$ok_marker' || '|' || count(*)::VARCHAR FROM range(1000000) t(i);")"
+  [ "$got" = "$ok_marker|1000000" ] || \
+    fail "$1 query_log marker query returned '$got'"
+
+  wait_query_log_sql "$1" "$2" "completed marker query $ok_marker" \
+    "SELECT CASE WHEN count(*) > 0 AND min(cpu_time_s) >= 0 AND min(peak_buffer_memory_bytes) >= 0 THEN 'ok' ELSE 'wait' END
+       FROM ducklake.system.query_log
+      WHERE query LIKE '%$ok_marker%'
+        AND type = 'QueryFinish'
+        AND COALESCE(exception_code, '') = '';"
+
+  if out="$(pg_try "$1" "$2" ducklake "SELECT * FROM $bad_table;")"; then
+    fail "$1 query_log failed marker query unexpectedly succeeded: $out"
+  fi
+
+  wait_query_log_sql "$1" "$2" "failed marker query $bad_table" \
+    "SELECT CASE WHEN count(*) > 0 THEN 'ok' ELSE 'wait' END
+       FROM ducklake.system.query_log
+      WHERE query LIKE '%$bad_table%'
+        AND type = 'ExceptionWhileProcessing'
+        AND COALESCE(exception, '') <> '';"
 }
 
 # Regression for the S3-throttling backfill failure: a sustained HTTP 503
@@ -1420,6 +1465,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  query_log_smoke      "$CNPG" "$cnpg_pw"
   httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
   persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
   persistent_user_secret_isolation "$CNPG" "$cnpg_pw"
@@ -1498,6 +1544,7 @@ lane_ext() { # external-RDS metadata backend + org default profile
   basic_query  "$EXT" "$ext_pw"
   pg_compat_functions "$EXT" "$ext_pw"
   rw_ducklake  "$EXT" "$ext_pw"
+  query_log_smoke  "$EXT" "$ext_pw"
   httpfs_retry_budget "$EXT" "$ext_pw"      # S3-503 retry budget per worker, ext-metadata backend too
   persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
   iceberg_cold_first_connect "$EXT" "$ext_pw"  # cold first session must not fail the metadata-init bind (ext backend)
@@ -1579,7 +1626,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + query-log + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

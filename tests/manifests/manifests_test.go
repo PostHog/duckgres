@@ -232,6 +232,70 @@ func TestQueryLogWriterAlertsReferenceWriterMetrics(t *testing.T) {
 	}
 }
 
+func TestE2EHarnessIncludesQueryLogSmoke(t *testing.T) {
+	content := readManifest(t, "tests", "e2e-mw-dev", "harness.sh")
+	for _, want := range []string{
+		"query_log_smoke()",
+		"ducklake.system.query_log",
+		"cpu_time_s",
+		"peak_buffer_memory_bytes",
+		"ExceptionWhileProcessing",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in tests/e2e-mw-dev/harness.sh", want)
+		}
+	}
+	for _, tt := range []struct {
+		name  string
+		parts []string
+	}{
+		{name: "cnpg lane", parts: []string{"query_log_smoke", `"$CNPG"`, `"$cnpg_pw"`}},
+		{name: "ext lane", parts: []string{"query_log_smoke", `"$EXT"`, `"$ext_pw"`}},
+	} {
+		if !lineContainsAll(content, tt.parts...) {
+			t.Fatalf("expected %s to call query_log_smoke in tests/e2e-mw-dev/harness.sh", tt.name)
+		}
+	}
+}
+
+func TestE2EReadmeDocumentsQueryLogSmoke(t *testing.T) {
+	content := readManifest(t, "tests", "e2e-mw-dev", "README.md")
+	for _, want := range []string{
+		"query log",
+		"ducklake.system.query_log",
+		"cpu_time_s",
+		"peak_buffer_memory_bytes",
+		"failed marker query",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in tests/e2e-mw-dev/README.md", want)
+		}
+	}
+}
+
+func TestQueryLogWriterRunbookCoversOperatorChecks(t *testing.T) {
+	content := readManifest(t, "docs", "runbooks", "query-log-writer.md")
+	for _, want := range []string{
+		"DUCKGRES_QUERY_LOG_SINK=kafka",
+		"duckgres-query-log-writer",
+		"Kafka lag",
+		"system.query_log",
+		"cpu_time_s",
+		"peak_buffer_memory_bytes",
+		"missing schema",
+		"missing table",
+		"stuck writer",
+		"rollout restart",
+		"offsets",
+		`outcome="inserted"`,
+		`outcome="committed"`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in docs/runbooks/query-log-writer.md", want)
+		}
+	}
+}
+
 func TestManifestTestsRunInUnitRecipe(t *testing.T) {
 	content := readManifest(t, "justfile")
 	if !strings.Contains(content, "./tests/manifests/...") {
@@ -280,4 +344,20 @@ func envBlock(t *testing.T, content, name string) string {
 		return rest[:len("name: "+name)+next]
 	}
 	return rest
+}
+
+func lineContainsAll(content string, parts ...string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		ok := true
+		for _, part := range parts {
+			if !strings.Contains(line, part) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }
