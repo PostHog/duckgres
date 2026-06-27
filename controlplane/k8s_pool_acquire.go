@@ -190,7 +190,28 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		}
 	}
 
-	if err := activate(ctx, worker, payload); err != nil {
+	// Heartbeat the activating row while activate() runs — it can include a long,
+	// in-band DuckLake migration. The leader stuck-activating reaper keys off
+	// updated_at, and (unlike the pool-local reaper) cannot see the live
+	// in-memory session; without this, a legitimately-progressing activation that
+	// outlives activateTimeout (5m) would be CAS-retired mid-session by the
+	// durable reaper and its pod deleted. The heartbeat ties "fresh" to "this
+	// activation goroutine is alive and running": a wedged activation returns via
+	// its ctx deadline (workerSpawnActivateTimeout) and is retired below, and a
+	// crashed CP's goroutine dies so the row goes stale and IS reaped — so
+	// genuinely-stuck rows are still cleaned up. The fenced upsert can't resurrect
+	// a worker another path retired (state/epoch guard).
+	stopHB := make(chan struct{})
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		p.heartbeatActivatingWorker(worker, stopHB)
+	}()
+	activateErr := activate(ctx, worker, payload)
+	close(stopHB)
+	<-hbDone
+
+	if err := activateErr; err != nil {
 		if hadPrevState {
 			p.mu.Lock()
 			_ = worker.SetSharedState(prevState)
@@ -234,6 +255,49 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	}
 	p.mu.Unlock()
 	return nil
+}
+
+// activatingHeartbeatInterval is how often a long-running activation refreshes
+// its durable activating row so the leader stuck-activating reaper (which keys
+// off updated_at) does not treat a progressing activation as wedged. Well below
+// the janitor's activateTimeout (5m).
+const activatingHeartbeatInterval = 60 * time.Second
+
+// heartbeatActivatingWorker re-persists the worker's activating row on a timer
+// until stop is closed, keeping updated_at fresh while activate() is in flight.
+// Stops (and skips) the moment the worker is no longer this CP's and still
+// Activating — so once activation commits Hot under p.mu, a racing heartbeat
+// sees the new state and can never clobber the Hot row back to activating.
+func (p *K8sWorkerPool) heartbeatActivatingWorker(worker *ManagedWorker, stop <-chan struct{}) {
+	interval := p.activatingHBInterval
+	if interval <= 0 {
+		interval = activatingHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			// Build AND persist under p.mu so this serializes with the Hot
+			// transition's persist: the lifecycle re-check below means a heartbeat
+			// that wins the lock after Hot was committed skips instead of writing
+			// a stale activating row. persistWorkerRecord doesn't take p.mu and
+			// logs via plain slog, so holding the lock here is deadlock-safe
+			// (mirrors markWorkerRetiredLocked).
+			p.mu.Lock()
+			w, ok := p.workers[worker.ID]
+			if !ok || w != worker || w.SharedState().NormalizedLifecycle() != WorkerLifecycleActivating {
+				p.mu.Unlock()
+				return
+			}
+			now := time.Now()
+			rec := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateActivating, "", &now)
+			_ = p.persistWorkerRecord(rec)
+			p.mu.Unlock()
+		}
+	}
 }
 
 // ReserveSharedWorker claims a hot-idle worker or spawns one on demand.

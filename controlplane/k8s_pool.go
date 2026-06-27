@@ -86,6 +86,10 @@ type K8sWorkerPool struct {
 	placeholderImage             string
 	placeholderPriorityClassName string
 
+	// activatingHBInterval overrides the activating-row heartbeat cadence
+	// (0 = activatingHeartbeatInterval). Set small in tests; not configured in prod.
+	activatingHBInterval time.Duration
+
 	orgID             string                                       // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator func() int                                   // shared ID generator across orgs (nil = internal counter)
 	resolveOrgConfig  func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping

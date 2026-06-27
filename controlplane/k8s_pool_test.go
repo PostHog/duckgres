@@ -1048,6 +1048,54 @@ func TestK8sPoolActivateReservedWorkerHotPersistFailureReturnsError(t *testing.T
 	}
 }
 
+// Regression for (b): a long-running activation must heartbeat its durable
+// activating row so the leader stuck-activating reaper (which keys off
+// updated_at and can't see the live session) doesn't reap it mid-activation.
+func TestK8sPoolActivateReservedWorkerHeartbeatsActivatingRow(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	pool.activatingHBInterval = 20 * time.Millisecond
+	worker := &ManagedWorker{ID: 11, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		time.Sleep(150 * time.Millisecond) // long activation; heartbeats should fire
+		return nil
+	}
+
+	if err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{OrgID: "analytics"}); err != nil {
+		t.Fatalf("ActivateReservedWorker: %v", err)
+	}
+
+	activatingUpserts, sawHot := 0, false
+	for _, r := range store.snapshot() {
+		if r.WorkerID != 11 {
+			continue
+		}
+		switch r.State {
+		case configstore.WorkerStateActivating:
+			activatingUpserts++
+		case configstore.WorkerStateHot:
+			sawHot = true
+		}
+	}
+	if activatingUpserts < 2 {
+		t.Fatalf("expected >=2 activating upserts (initial + heartbeat), got %d", activatingUpserts)
+	}
+	if !sawHot {
+		t.Fatal("expected a final Hot upsert after activation completed")
+	}
+	if got := worker.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHot {
+		t.Fatalf("expected Hot lifecycle after activation, got %q", got)
+	}
+}
+
 func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
