@@ -376,6 +376,7 @@ func main() {
 				WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
 				AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
 				WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
+				HeadroomNodes:                resolved.K8sHeadroomNodes,
 				HeadroomPercent:              resolved.K8sHeadroomPercent,
 				PlaceholderImage:             resolved.K8sPlaceholderImage,
 				PlaceholderPriorityClassName: resolved.K8sPlaceholderPriorityClassName,

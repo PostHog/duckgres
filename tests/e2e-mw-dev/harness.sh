@@ -831,6 +831,35 @@ reuse_sized_worker() { # org password catalog cpu memory ttl
   log "sized worker reuse OK: 1 pod of cpu=$cpu (reused, no respawn)"
 }
 
+# Hot-idle TTL RETIREMENT: a worker parked hot-idle past its TTL must be reaped
+# (pod deleted), so an idle one-session worker — and the node behind it — does
+# not linger. This is the load-bearing regression for the idle-worker leak: if
+# the hot-idle reaper goes dark (leader-election wedged, swallowed persist), the
+# pod never disappears and this assertion fails. The reaper runs two ways now —
+# the leader janitor AND a per-CP fallback — so a single elected leader is not a
+# prerequisite. Uses worker_ttl=1m (the smallest non-truncated TTL) and a shape
+# no other test uses (3 CPU) so the pod is unambiguously ours.
+hot_idle_retired() { # org password catalog cpu memory
+  org="$1"; pw="$2"; cat="$3"; cpu="$4"; mem="$5"; ttl=1m
+  log "hot-idle TTL retirement on $org/$cat: cpu=$cpu mem=$mem ttl=$ttl (idle worker must be reaped)"
+  ( export PGOPTIONS="-c duckgres.worker_cpu=$cpu -c duckgres.worker_memory=$mem -c duckgres.worker_ttl=$ttl"
+    _pg_exec "$org" "$pw" "$cat" 'SELECT 1' ) >/dev/null \
+    || fail "hot-idle retire: query failed on $org/$cat"
+  n="$(count_org_workers_of_cpu "$org" "$cpu")"
+  [ "$n" -ge 1 ] || fail "hot-idle retire: expected >=1 pod of cpu=$cpu after connect, got $n"
+  # Session has ended → worker parks hot-idle → its 1m TTL expires → reaper must
+  # delete the pod. Poll (fast-exit) up to ~4m: 1m TTL + per-CP reaper tick (1m) +
+  # cluster slack. A pod that never disappears is the leak regression.
+  i=0
+  while [ "$i" -lt 16 ]; do
+    sleep 15
+    [ "$(count_org_workers_of_cpu "$org" "$cpu")" = "0" ] && {
+      log "hot-idle retire OK: cpu=$cpu worker reaped after TTL"; return; }
+    i=$((i + 1))
+  done
+  fail "hot-idle retire: cpu=$cpu worker still present after ~4m (TTL=1m) — hot-idle reaper not retiring idle workers (the idle-leak regression)"
+}
+
 # ---- org default worker profile --------------------------------------------
 # Operators can give a tenant a server-side default worker shape + hot-idle TTL
 # (config-store columns default_worker_cpu/memory/ttl, set via the admin API).
@@ -1407,6 +1436,9 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
   sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
   reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
+  # Idle worker reclamation: a 3-CPU worker with a 1m TTL must be reaped after it
+  # goes idle (catches the hot-idle-reaper-dark / persist-swallow idle leak).
+  hot_idle_retired    "$CNPG" "$cnpg_pw" ducklake 3 6Gi
 }
 
 # Busy-only Karpenter disruption protection: a worker pod must carry

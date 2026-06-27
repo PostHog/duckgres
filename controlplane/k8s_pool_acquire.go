@@ -166,7 +166,13 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	if err != nil {
 		return err
 	}
-	_ = p.persistWorkerRecord(activatingRecord)
+	// A failed activating persist is self-correcting: the hot persist below is a
+	// full upsert that overwrites the durable state once activation succeeds, and
+	// a failed activation retires the worker. Log it (it shouldn't happen) but do
+	// not abort activation on a transient write blip.
+	if err := p.persistWorkerRecord(activatingRecord); err != nil {
+		p.logw(worker.ID).Warn("Failed to persist activating worker record.", "error", err)
+	}
 
 	activate := p.activateTenantFunc
 	if activate == nil {
@@ -208,13 +214,24 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		p.mu.Unlock()
 		return err
 	}
+	// Persist the hot row BEFORE committing the in-memory Hot transition. If we
+	// flipped in-memory to Hot but the durable row stayed at activating (the old
+	// swallowed-error behavior), the leader stuck-activating reaper would later
+	// CAS-retire this LIVE, about-to-serve worker and delete its pod mid-session.
+	// On persist failure leave the worker Activating and return the error: the
+	// caller (activateWorkerForOrg) retires + retries, wasting one activation but
+	// never stranding a durable/in-memory split. workerRecordFor takes the target
+	// state explicitly, so building it before the in-memory commit is safe.
+	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
+	if err := p.persistWorkerRecord(hotRecord); err != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("persist hot worker record: %w", err)
+	}
 	if setErr := worker.SetSharedState(nextState); setErr != nil {
 		p.mu.Unlock()
 		return setErr
 	}
-	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
 	p.mu.Unlock()
-	_ = p.persistWorkerRecord(hotRecord)
 	return nil
 }
 
@@ -253,6 +270,11 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 type sharedWorkerClaim struct {
 	hotClaimed *configstore.WorkerRecord
 	slotID     int
+	// slot is the durable spawning-slot row (state=spawning) created by
+	// CreateSpawningWorkerSlot, retained so a failed spawn can CAS it terminal
+	// on the request thread instead of leaking org+global cap until the leader's
+	// stale-spawning sweep. nil in runtime-store-less mode (no durable row).
+	slot *configstore.WorkerRecord
 }
 
 // reserveSharedWorkerDecision is the short, DB-only half of ReserveSharedWorker:
@@ -307,7 +329,7 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 		if slot == nil {
 			return nil, NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
 		}
-		return &sharedWorkerClaim{slotID: slot.WorkerID}, nil
+		return &sharedWorkerClaim{slotID: slot.WorkerID, slot: slot}, nil
 	}
 
 	// Runtime-store-less mode (unit tests / standalone k8s): no durable pool,
@@ -348,6 +370,17 @@ func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, cla
 		return nil, true, reserveErr
 	}
 	worker, err = p.spawnReservedWorkerForSlot(ctx, claim.slotID, assignment)
+	if err != nil && claim.slot != nil {
+		// The spawning-slot row counts against the org + global worker caps until
+		// it is reaped. Free it on the request thread (CAS spawning->terminal)
+		// instead of waiting for the leader-only 10m stale-spawning sweep —
+		// otherwise a burst of transient spawn failures drives the org to a false
+		// at-cap state (spurious OrgCap refusals) and the ghost slots survive a
+		// janitor-leader outage indefinitely. If spawnReservedWorkerForSlot
+		// already retired the row via its post-spawn failure paths, this CAS
+		// simply misses (row no longer spawning) and is a harmless no-op.
+		p.retireClaimedWorker(claim.slot, RetireReasonSpawnFailure, LifecycleOriginSpawnFailure)
+	}
 	return worker, false, err
 }
 

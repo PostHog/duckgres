@@ -185,6 +185,11 @@ func (j *ControlPlaneJanitor) runOnce() {
 					slog.Warn("Janitor failed to retire hot-idle worker.", "worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
 				}
 			}
+			// Stamp the last-successful-reap gauge so an alert can detect a
+			// wedged/absent reaper regardless of cause. The per-CP fallback
+			// reaper stamps the same gauge, so max() across replicas tracks
+			// "some replica reaped recently".
+			observeHotIdleReapRun(j.now())
 		}
 	}
 

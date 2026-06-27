@@ -81,6 +81,13 @@ const (
 	// pod terminations (eviction, OOM, manual delete, node drain) from
 	// our own health-check decisions.
 	LifecycleOriginInformerCrash LifecycleOrigin = "informer_crash"
+	// LifecycleOriginPerCPHotIdleTTL marks the per-CP fallback hot-idle reaper
+	// (per_cp_hot_idle_reaper.go), which runs on EVERY replica independent of the
+	// janitor leader lease. Distinct from LifecycleOriginJanitorHotIdleTTL (the
+	// leader-only janitor reaper) so dashboards can tell when the fallback —
+	// rather than the leader — is doing the reaping, which is the signal that
+	// leadership is wedged.
+	LifecycleOriginPerCPHotIdleTTL LifecycleOrigin = "per_cp_hot_idle_ttl"
 	// LifecycleOriginPoolStuckActivating marks the pool-local
 	// reapStuckActivatingWorkers loop, which runs every minute on every
 	// CP. Distinct from LifecycleOriginJanitorStuckActivating (which is
@@ -160,6 +167,10 @@ const (
 	RetireReasonIdleTimeout       = "idle_timeout"
 	RetireReasonStuckActivating   = "stuck_activating"
 	RetireReasonMismatchedVersion = "mismatched_version"
+	// RetireReasonSpawnFailure marks a spawning-slot row freed on the request
+	// thread after its pod spawn failed (k8s_pool_acquire.go), so the org+global
+	// cap is released immediately instead of waiting for the stale-spawning sweep.
+	RetireReasonSpawnFailure = "spawn_failure"
 )
 
 // --- Metric definitions ---
@@ -200,6 +211,21 @@ var workerHealthChecksCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_worker_health_checks_total",
 	Help: "Worker RPC health-check probes partitioned by result (pass|fail) and image. Pass-rate complements the mark-lost transitions counter: a worker that's intermittently failing health checks but not yet crossing the consecutive-failure threshold is invisible without this.",
 }, []string{"result", "image"})
+
+var janitorIsLeaderGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_control_plane_janitor_is_leader",
+	Help: "1 if this control-plane replica currently holds the janitor leader lease, else 0. Summed across replicas it should be ~1; a sustained 0 means no replica is running the fleet-wide reapers (hot-idle TTL, orphan/stuck sweeps, headroom) — alert on it.",
+})
+
+var hotIdleReapLastRunGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_control_plane_hot_idle_reap_last_run_timestamp_seconds",
+	Help: "Unix timestamp of the most recent successful hot-idle reap pass on THIS replica — either the leader janitor or the per-CP fallback reaper. Alert when max() across replicas falls far behind now(): idle worker pods are not being retired and node capacity is leaking.",
+})
+
+var workerHotIdlePersistFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_worker_hot_idle_persist_failures_total",
+	Help: "Failures to durably persist a worker's hot->hot_idle transition. The worker is held Hot (and stays reusable by its org) rather than advanced to an in-memory-hot_idle / durable-hot split that would be invisible to BOTH reuse and the TTL reaper. A sustained nonzero rate points at runtime-store write problems.",
+}, []string{"image"})
 
 // --- Observation helpers ---
 
@@ -292,6 +318,32 @@ func observeDrainTotalDuration(d time.Duration) {
 		d = 0
 	}
 	workerDrainTotalDurationHistogram.Observe(d.Seconds())
+}
+
+// setJanitorIsLeader records whether this replica currently holds the janitor
+// leader lease (1) or not (0).
+func setJanitorIsLeader(isLeader bool) {
+	if isLeader {
+		janitorIsLeaderGauge.Set(1)
+		return
+	}
+	janitorIsLeaderGauge.Set(0)
+}
+
+// observeHotIdleReapRun stamps the last-successful-hot-idle-reap gauge with the
+// given time. Called by both the leader janitor and the per-CP fallback reaper.
+func observeHotIdleReapRun(t time.Time) {
+	hotIdleReapLastRunGauge.Set(float64(t.Unix()))
+}
+
+// observeHotIdlePersistFailure increments the hot_idle persist-failure
+// counter. Empty image falls back to "unknown".
+func observeHotIdlePersistFailure(image string) {
+	img := strings.TrimSpace(image)
+	if img == "" {
+		img = "unknown"
+	}
+	workerHotIdlePersistFailuresCounter.WithLabelValues(img).Inc()
 }
 
 // observeHealthCheck records the result of one health-check probe.

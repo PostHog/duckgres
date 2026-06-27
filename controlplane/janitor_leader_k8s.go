@@ -24,11 +24,18 @@ type leaderElectorRunner interface {
 	Run(context.Context)
 }
 
+// defaultElectorRecontendBackoff is the pause between losing the janitor lease
+// and re-contending for it. Short enough that a lost leader rejoins the
+// election promptly (so reaping is never long without a leader), long enough
+// that a persistently failing Run() doesn't hot-loop the API server.
+const defaultElectorRecontendBackoff = 2 * time.Second
+
 type JanitorLeaderManager struct {
-	elector    leaderElectorRunner
-	leaderLoop *leaderOnlyLoop
-	mu         sync.Mutex
-	cancel     context.CancelFunc
+	elector          leaderElectorRunner
+	leaderLoop       *leaderOnlyLoop
+	recontendBackoff time.Duration
+	mu               sync.Mutex
+	cancel           context.CancelFunc
 }
 
 func NewJanitorLeaderManager(namespace, identity string, janitor *ControlPlaneJanitor) (*JanitorLeaderManager, error) {
@@ -91,8 +98,12 @@ func newJanitorLeaderManagerFromClients(
 		ReleaseOnCancel: true,
 		Name:            "duckgres-janitor",
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: leaderLoop.onStartedLeading,
+			OnStartedLeading: func(ctx context.Context) {
+				setJanitorIsLeader(true)
+				leaderLoop.onStartedLeading(ctx)
+			},
 			OnStoppedLeading: func() {
+				setJanitorIsLeader(false)
 				leaderLoop.onStoppedLeading()
 				slog.Info("Lost janitor leadership.")
 			},
@@ -106,8 +117,9 @@ func newJanitorLeaderManagerFromClients(
 	}
 
 	return &JanitorLeaderManager{
-		elector:    elector,
-		leaderLoop: leaderLoop,
+		elector:          elector,
+		leaderLoop:       leaderLoop,
+		recontendBackoff: defaultElectorRecontendBackoff,
 	}, nil
 }
 
@@ -121,8 +133,40 @@ func (m *JanitorLeaderManager) Start(ctx context.Context) error {
 		m.cancel()
 	}
 	m.cancel = cancel
+	backoff := m.recontendBackoff
 	m.mu.Unlock()
-	go m.elector.Run(runCtx)
+	if backoff <= 0 {
+		backoff = defaultElectorRecontendBackoff
+	}
+
+	// client-go's LeaderElector.Run returns as soon as this CP loses (or fails
+	// to renew) the lease — it does NOT re-contend on its own. Running it only
+	// once (the prior behavior) meant a single transient renewal failure
+	// (API-server blip > RenewDeadline, GC pause, network hiccup) permanently
+	// dropped this replica out of the election. Because every fleet-wide
+	// reclamation pass (hot-idle TTL reap, orphan/stuck sweeps, stranded-pod
+	// cleanup, headroom scale-down) is leader-gated, enough leadership churn
+	// would leave the lease stale with no contender and the reaper dark
+	// fleet-wide. Re-contend in a loop so a lost leader always rejoins; the
+	// elector is safe to Run again after it returns. The loop exits only when
+	// runCtx is cancelled (Stop or parent shutdown).
+	go func() {
+		for {
+			m.elector.Run(runCtx)
+			// Run returned: either runCtx was cancelled (Stop/shutdown → exit)
+			// or we lost the lease. Re-contend after a short backoff. Checking
+			// the error before the backoff means a cancelled ctx exits promptly
+			// without an extra Run call.
+			if runCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-runCtx.Done():
+				return
+			case <-time.After(backoff):
+			}
+		}
+	}()
 	return nil
 }
 

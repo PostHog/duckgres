@@ -41,6 +41,16 @@ func (cs *ConfigStore) ListExpiredHotIdleSnapshots(now time.Time, defaultTTL tim
 	return workerSnapshotsFromRecords(records), nil
 }
 
+// ListExpiredHotIdleSnapshotsForCP is the snapshot-typed, owner-scoped variant
+// of ListExpiredHotIdleWorkers used by the per-CP fallback reaper.
+func (cs *ConfigStore) ListExpiredHotIdleSnapshotsForCP(ownerCPInstanceID string, now time.Time, defaultTTL time.Duration) ([]WorkerSnapshot, error) {
+	records, err := cs.ListExpiredHotIdleWorkersForCP(ownerCPInstanceID, now, defaultTTL)
+	if err != nil {
+		return nil, err
+	}
+	return workerSnapshotsFromRecords(records), nil
+}
+
 // ListStuckWorkerSnapshots is the snapshot-typed variant of
 // ListStuckWorkers used by the janitor's stuck-spawn/activate reaper.
 func (cs *ConfigStore) ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]WorkerSnapshot, error) {

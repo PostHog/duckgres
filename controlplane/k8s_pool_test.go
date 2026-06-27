@@ -1306,6 +1306,53 @@ func TestK8sPoolReserveSharedWorkerDecisionDoesNotReplaceIncompatibleHotIdleOnGl
 	}
 }
 
+// Regression for the spawning-slot leak: when the pod spawn fails, the durable
+// spawning-slot row must be CAS'd terminal on the request thread (freeing the
+// org+global cap) rather than left for the leader's 10m stale-spawning sweep.
+func TestK8sPoolReserveSharedWorkerFreesSlotOnSpawnFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimMissReason: configstore.WorkerClaimMissReasonNoIdle,
+		spawned: &configstore.WorkerRecord{
+			WorkerID:          77,
+			PodName:           "duckgres-worker-test-cp-77",
+			State:             configstore.WorkerStateSpawning,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
+		return fmt.Errorf("boom: node unschedulable")
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 5,
+		Image:      "duckgres:v2",
+	})
+	if err == nil {
+		t.Fatalf("expected spawn failure error, got worker=%#v", worker)
+	}
+
+	freed := false
+	for i, id := range store.markTerminalCalledIDs {
+		if id != 77 {
+			continue
+		}
+		freed = true
+		if store.markTerminalReasons[i] != RetireReasonSpawnFailure {
+			t.Fatalf("expected slot freed with reason %q, got %q", RetireReasonSpawnFailure, store.markTerminalReasons[i])
+		}
+		if store.markTerminalStates[i] != configstore.WorkerStateRetired {
+			t.Fatalf("expected slot freed to retired, got %q", store.markTerminalStates[i])
+		}
+	}
+	if !freed {
+		t.Fatalf("expected spawning slot 77 to be freed on spawn failure; MarkWorkerTerminalIfCurrent ids=%v", store.markTerminalCalledIDs)
+	}
+}
+
 func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{

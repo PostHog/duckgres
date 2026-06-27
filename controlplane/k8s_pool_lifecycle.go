@@ -146,35 +146,45 @@ func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int, origin LifecycleOrigin)
 // The session decrement always happens regardless of the return value.
 func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	w, ok := p.workers[id]
 	if !ok {
-		p.mu.Unlock()
 		return false
 	}
 	if w.activeSessions > 0 {
 		w.activeSessions--
 	}
 	if w.activeSessions != 0 {
-		p.mu.Unlock()
 		return false
 	}
 	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleHot {
-		p.mu.Unlock()
 		return false
 	}
 	nextState, err := w.SharedState().Transition(WorkerLifecycleHotIdle, nil)
 	if err != nil {
-		p.mu.Unlock()
+		return false
+	}
+	// Persist the hot_idle row BEFORE committing the in-memory transition
+	// (mirrors markWorkerRetiredLocked). workerRecordFor takes the target state
+	// explicitly and reads only stable fields (profile, owner, assignment), so
+	// it is safe to build before the in-memory commit. If the durable write
+	// fails we must NOT advance to hot_idle: a durable-hot / in-memory-hot_idle
+	// split hides the worker from BOTH reuse (ClaimHotIdleWorker filters
+	// state=hot_idle) AND the TTL reaper (same filter) until this CP restarts,
+	// stranding an idle pod forever. Leaving it Hot keeps it reusable by its org
+	// (findIdleAssignedWorkerLocked reuses Hot, activeSessions==0 workers) and a
+	// later release/retire retries the park; the session decrement above already
+	// happened, so the worker is honestly idle, just not yet durably parked.
+	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
+	if err := p.persistWorkerRecord(hotIdleRecord); err != nil {
+		observeHotIdlePersistFailure(w.image)
+		p.logw(id).Warn("Failed to persist hot_idle transition; leaving worker hot for retry.", "error", err)
 		return false
 	}
 	if err := w.SetSharedState(nextState); err != nil {
-		p.mu.Unlock()
 		return false
 	}
 	w.lastUsed = time.Now()
-	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
-	p.mu.Unlock()
-	_ = p.persistWorkerRecord(hotIdleRecord)
 	return true
 }
 
