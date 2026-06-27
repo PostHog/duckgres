@@ -45,7 +45,7 @@ options=-c duckgres.worker_cpu=8 -c duckgres.worker_memory=16Gi -c duckgres.work
 
 - `duckgres.worker_cpu` — integer cores. Default **8**.
 - `duckgres.worker_memory` — k8s quantity. Default **16Gi**.
-- `duckgres.worker_ttl` — Go duration. Default **20m**.
+- `duckgres.worker_ttl` — Go duration. Default **1m**.
 - Absent GUCs → defaults. Gated behind `AllowClientWorkerSizing`; sizes clamped
   to `[min,max]` and ttl to `[0,maxTTL]` per deployment (out-of-range → clamp +
   warn). Gate off → every request uses the defaults.
@@ -57,7 +57,9 @@ explicit one):
 1. client GUC `duckgres.worker_ttl` (gated, clamped to `WORKER_MAX_TTL`)
 2. org default `default_worker_ttl` (admin API `PUT /orgs/:id`, #742)
 3. deployment default `DUCKGRES_K8S_WORKER_DEFAULT_TTL`
-4. built-in **20m**
+4. built-in **1m** (kept short so idle one-session worker pods + their nodes are
+   reclaimed quickly by default; raise the deployment/org default for tenants
+   that want warm reuse, or pin a floor via `default_worker_min_hot_idle`)
 
 `duckgres.colocate` / `worker_tier` are removed (unknown GUCs are ignored, so old
 clients that still send them degrade to defaults rather than erroring).
@@ -156,8 +158,13 @@ only) it:
   disrupted; pinning is bounded by query lifetime, not the worker TTL (which
   would stall drift rollouts).
 
-Config: `DUCKGRES_K8S_HEADROOM_PERCENT` (0 = disabled), placeholder pod size,
-the two PriorityClass names. Manifests add the PriorityClasses.
+Config: `DUCKGRES_K8S_HEADROOM_NODES` (preferred — a CONSTANT number of
+node-sized placeholders, demand-independent, the prod default) or the legacy
+`DUCKGRES_K8S_HEADROOM_PERCENT` (demand-proportional, used only when
+HEADROOM_NODES is 0); 0 on both = disabled (existing placeholders are deleted).
+Plus the two PriorityClass names. Manifests add the PriorityClasses. The
+constant mode exists because the percent mode counted hot_idle (idle-but-alive)
+workers as demand and so amplified any idle-worker leak into extra placeholders.
 
 ## Config knobs (env-only K8s, per existing convention)
 
@@ -167,9 +174,10 @@ options), `DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/
 `_MAX_MEMORY` (clamps), `DUCKGRES_K8S_WORKER_MAX_TTL` (clamp ceiling) and
 `DUCKGRES_K8S_WORKER_DEFAULT_TTL` (the default for requests that specify no
 ttl — see the TTL resolution chain above),
-`DUCKGRES_K8S_HEADROOM_PERCENT`, `DUCKGRES_K8S_PLACEHOLDER_IMAGE`/`_PRIORITY_CLASS`
-(`_PLACEHOLDER_CPU`/`_MEMORY` are removed — placeholders take the default
-worker shape).
+`DUCKGRES_K8S_HEADROOM_NODES` (constant node-headroom; preferred) /
+`DUCKGRES_K8S_HEADROOM_PERCENT` (legacy demand-%), `DUCKGRES_K8S_PLACEHOLDER_IMAGE`/`_PRIORITY_CLASS`
+(`_PLACEHOLDER_CPU`/`_MEMORY` are removed — percent-mode placeholders take the
+default worker shape; constant-mode placeholders are node-sized).
 
 Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_TIERS*`,
 `*ALLOW_CLIENT_EXCLUSIVE_NODE*`, `*SHARED_WARM_TARGET*`,

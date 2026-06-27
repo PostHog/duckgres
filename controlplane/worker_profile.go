@@ -20,12 +20,15 @@ const (
 // and the deployment did not configure its own default size/TTL.
 // defaultWorkerTTL is the SINGLE built-in TTL: it backs both sized-but-no-ttl
 // requests here and default-shape workers in the janitor
-// (effectiveDefaultWorkerTTL), so "no TTL anywhere" means 20m regardless of
-// how the worker was requested.
+// (effectiveDefaultWorkerTTL), so "no TTL anywhere" means 1m regardless of
+// how the worker was requested. Kept short so an idle one-session worker pod
+// (and the r6gd node behind it) is reclaimed quickly by default; deployments
+// that want longer warm reuse set DUCKGRES_K8S_WORKER_DEFAULT_TTL, and a
+// specific connection/org can opt up via duckgres.worker_ttl / default_worker_ttl.
 const (
 	defaultWorkerCPU    = "8"
 	defaultWorkerMemory = "16Gi"
-	defaultWorkerTTL    = 20 * time.Minute
+	defaultWorkerTTL    = 1 * time.Minute
 )
 
 // orgWorkerProfileDefaults carries an org's operator-set default worker
@@ -53,7 +56,7 @@ type orgWorkerProfileDefaults struct {
 //     ignored with a warning — a bad config-store row must not break
 //     connections.
 //  3. pool-global WorkerCPURequest/MemoryRequest (else built-in 8/16Gi); TTL
-//     defaults to the deployment WorkerDefaultTTL (else built-in 20m).
+//     defaults to the deployment WorkerDefaultTTL (else built-in 1m).
 //
 // Returns:
 //   - (nil, warns, false, nil)  => the DEFAULT profile: no client sizing and no
@@ -127,7 +130,7 @@ func resolveWorkerProfileWithConfig(k K8sConfig, opts map[string]string, org org
 	mem := firstNonEmpty(orgMem, firstNonEmpty(strings.TrimSpace(k.WorkerMemoryRequest), defaultWorkerMemory))
 	// TTL base layer mirrors cpu/mem: org default, else the deployment default
 	// TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL — the same knob that governs
-	// default-shape workers via the janitor), else the built-in 20m.
+	// default-shape workers via the janitor), else the built-in 1m.
 	ttl := defaultWorkerTTL
 	if k.WorkerDefaultTTL > 0 {
 		ttl = k.WorkerDefaultTTL

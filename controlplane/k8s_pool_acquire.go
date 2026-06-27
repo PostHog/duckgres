@@ -9,6 +9,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
@@ -166,7 +167,13 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	if err != nil {
 		return err
 	}
-	_ = p.persistWorkerRecord(activatingRecord)
+	// A failed activating persist is self-correcting: the hot persist below is a
+	// full upsert that overwrites the durable state once activation succeeds, and
+	// a failed activation retires the worker. Log it (it shouldn't happen) but do
+	// not abort activation on a transient write blip.
+	if err := p.persistWorkerRecord(activatingRecord); err != nil {
+		p.logw(worker.ID).Warn("Failed to persist activating worker record.", "error", err)
+	}
 
 	activate := p.activateTenantFunc
 	if activate == nil {
@@ -184,7 +191,36 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		}
 	}
 
-	if err := activate(ctx, worker, payload); err != nil {
+	// Heartbeat the activating row while activate() runs — it can include a long,
+	// in-band DuckLake migration. The leader stuck-activating reaper keys off
+	// updated_at, and (unlike the pool-local reaper) cannot see the live
+	// in-memory session; without this, a legitimately-progressing activation that
+	// outlives activateTimeout (5m) would be CAS-retired mid-session by the
+	// durable reaper and its pod deleted. The heartbeat ties "fresh" to "this
+	// activation goroutine is alive and running": a wedged activation returns via
+	// its ctx deadline (workerSpawnActivateTimeout) and is retired below, and a
+	// crashed CP's goroutine dies so the row goes stale and IS reaped — so
+	// genuinely-stuck rows are still cleaned up. The fenced upsert can't resurrect
+	// a worker another path retired (state/epoch guard).
+	stopHB := make(chan struct{})
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		p.heartbeatActivatingWorker(worker, stopHB)
+	}()
+	// stopHeartbeat is idempotent (sync.Once) and deferred as a panic-safe
+	// backstop AND called explicitly on the normal path. The explicit call
+	// joins the heartbeat BEFORE the Hot-commit block below, so a heartbeat can
+	// never clobber the committed Hot row; the defer guarantees the goroutine +
+	// ticker are not leaked if activate() panics.
+	var stopOnce sync.Once
+	stopHeartbeat := func() { stopOnce.Do(func() { close(stopHB); <-hbDone }) }
+	defer stopHeartbeat()
+
+	activateErr := activate(ctx, worker, payload)
+	stopHeartbeat()
+
+	if err := activateErr; err != nil {
 		if hadPrevState {
 			p.mu.Lock()
 			_ = worker.SetSharedState(prevState)
@@ -208,14 +244,69 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		p.mu.Unlock()
 		return err
 	}
+	// Persist the hot row BEFORE committing the in-memory Hot transition. If we
+	// flipped in-memory to Hot but the durable row stayed at activating (the old
+	// swallowed-error behavior), the leader stuck-activating reaper would later
+	// CAS-retire this LIVE, about-to-serve worker and delete its pod mid-session.
+	// On persist failure leave the worker Activating and return the error: the
+	// caller (activateWorkerForOrg) retires the worker and surfaces the error to
+	// the client (no transparent retry), which is wasteful but never strands a
+	// durable=activating / in-memory=Hot split. workerRecordFor takes the target
+	// state explicitly, so building it before the in-memory commit is safe.
+	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
+	if err := p.persistWorkerRecord(hotRecord); err != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("persist hot worker record: %w", err)
+	}
 	if setErr := worker.SetSharedState(nextState); setErr != nil {
 		p.mu.Unlock()
 		return setErr
 	}
-	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
 	p.mu.Unlock()
-	_ = p.persistWorkerRecord(hotRecord)
 	return nil
+}
+
+// activatingHeartbeatInterval is how often a long-running activation refreshes
+// its durable activating row so the leader stuck-activating reaper (which keys
+// off updated_at) does not treat a progressing activation as wedged. Well below
+// the janitor's activateTimeout (5m).
+const activatingHeartbeatInterval = 60 * time.Second
+
+// heartbeatActivatingWorker re-persists the worker's activating row on a timer
+// until stop is closed, keeping updated_at fresh while activate() is in flight.
+// Stops (and skips) the moment the worker is no longer this CP's and still
+// Activating — so once activation commits Hot under p.mu, a racing heartbeat
+// sees the new state and can never clobber the Hot row back to activating.
+func (p *K8sWorkerPool) heartbeatActivatingWorker(worker *ManagedWorker, stop <-chan struct{}) {
+	interval := p.activatingHBInterval
+	if interval <= 0 {
+		interval = activatingHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			// Build AND persist under p.mu so this serializes with the Hot
+			// transition's persist: the lifecycle re-check below means a heartbeat
+			// that wins the lock after Hot was committed skips instead of writing
+			// a stale activating row. persistWorkerRecord doesn't take p.mu and
+			// logs via plain slog, so holding the lock here is deadlock-safe
+			// (mirrors markWorkerRetiredLocked).
+			p.mu.Lock()
+			w, ok := p.workers[worker.ID]
+			if !ok || w != worker || w.SharedState().NormalizedLifecycle() != WorkerLifecycleActivating {
+				p.mu.Unlock()
+				return
+			}
+			now := time.Now()
+			rec := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateActivating, "", &now)
+			_ = p.persistWorkerRecord(rec)
+			p.mu.Unlock()
+		}
+	}
 }
 
 // ReserveSharedWorker claims a hot-idle worker or spawns one on demand.
@@ -253,6 +344,11 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 type sharedWorkerClaim struct {
 	hotClaimed *configstore.WorkerRecord
 	slotID     int
+	// slot is the durable spawning-slot row (state=spawning) created by
+	// CreateSpawningWorkerSlot, retained so a failed spawn can CAS it terminal
+	// on the request thread instead of leaking org+global cap until the leader's
+	// stale-spawning sweep. nil in runtime-store-less mode (no durable row).
+	slot *configstore.WorkerRecord
 }
 
 // reserveSharedWorkerDecision is the short, DB-only half of ReserveSharedWorker:
@@ -307,7 +403,7 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 		if slot == nil {
 			return nil, NewWorkerCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
 		}
-		return &sharedWorkerClaim{slotID: slot.WorkerID}, nil
+		return &sharedWorkerClaim{slotID: slot.WorkerID, slot: slot}, nil
 	}
 
 	// Runtime-store-less mode (unit tests / standalone k8s): no durable pool,
@@ -348,6 +444,17 @@ func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, cla
 		return nil, true, reserveErr
 	}
 	worker, err = p.spawnReservedWorkerForSlot(ctx, claim.slotID, assignment)
+	if err != nil && claim.slot != nil {
+		// The spawning-slot row counts against the org + global worker caps until
+		// it is reaped. Free it on the request thread (CAS spawning->terminal)
+		// instead of waiting for the leader-only 10m stale-spawning sweep —
+		// otherwise a burst of transient spawn failures drives the org to a false
+		// at-cap state (spurious OrgCap refusals) and the ghost slots survive a
+		// janitor-leader outage indefinitely. If spawnReservedWorkerForSlot
+		// already retired the row via its post-spawn failure paths, this CAS
+		// simply misses (row no longer spawning) and is a harmless no-op.
+		p.retireClaimedWorker(claim.slot, RetireReasonSpawnFailure, LifecycleOriginSpawnFailure)
+	}
 	return worker, false, err
 }
 

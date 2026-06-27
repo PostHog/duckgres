@@ -81,6 +81,21 @@ const (
 	// pod terminations (eviction, OOM, manual delete, node drain) from
 	// our own health-check decisions.
 	LifecycleOriginInformerCrash LifecycleOrigin = "informer_crash"
+	// LifecycleOriginPerCPHotIdleTTL marks the per-CP fallback hot-idle reaper
+	// (per_cp_hot_idle_reaper.go), which runs on EVERY replica independent of the
+	// janitor leader lease. Distinct from LifecycleOriginJanitorHotIdleTTL (the
+	// leader-only janitor reaper) so dashboards can tell when the fallback —
+	// rather than the leader — is doing the reaping, which is the signal that
+	// leadership is wedged.
+	LifecycleOriginPerCPHotIdleTTL LifecycleOrigin = "per_cp_hot_idle_ttl"
+	// LifecycleOriginPerCPOrphan marks the per-CP fallback reaper retiring a
+	// hot-idle worker whose OWNING CP instance is no longer live (rollout/crash
+	// orphan). Distinct from LifecycleOriginJanitorOrphan (the leader-only orphan
+	// sweep) so dashboards can see the fallback doing cross-CP orphan reclamation
+	// during a leaderless window. Every CP start mints a fresh cpInstanceID, so a
+	// graceful rollout orphans the prior process's hot-idle rows; without this
+	// path they would wait on the leader.
+	LifecycleOriginPerCPOrphan LifecycleOrigin = "per_cp_orphan"
 	// LifecycleOriginPoolStuckActivating marks the pool-local
 	// reapStuckActivatingWorkers loop, which runs every minute on every
 	// CP. Distinct from LifecycleOriginJanitorStuckActivating (which is
@@ -160,6 +175,10 @@ const (
 	RetireReasonIdleTimeout       = "idle_timeout"
 	RetireReasonStuckActivating   = "stuck_activating"
 	RetireReasonMismatchedVersion = "mismatched_version"
+	// RetireReasonSpawnFailure marks a spawning-slot row freed on the request
+	// thread after its pod spawn failed (k8s_pool_acquire.go), so the org+global
+	// cap is released immediately instead of waiting for the stale-spawning sweep.
+	RetireReasonSpawnFailure = "spawn_failure"
 )
 
 // --- Metric definitions ---
@@ -200,6 +219,16 @@ var workerHealthChecksCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_worker_health_checks_total",
 	Help: "Worker RPC health-check probes partitioned by result (pass|fail) and image. Pass-rate complements the mark-lost transitions counter: a worker that's intermittently failing health checks but not yet crossing the consecutive-failure threshold is invisible without this.",
 }, []string{"result", "image"})
+
+// hotIdleReapLastRunGauge is updated by both the leader janitor (janitor.go,
+// untagged) and the per-CP fallback reaper (per_cp_hot_idle_reaper.go, untagged),
+// so it stays in this shared file. The kubernetes-only janitor_is_leader and
+// hot_idle_persist_failures metrics live in worker_lifecycle_metrics_k8s.go so
+// they are not flagged unused under the default-tag lint.
+var hotIdleReapLastRunGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_control_plane_hot_idle_reap_last_run_timestamp_seconds",
+	Help: "Unix timestamp of the most recent successful hot-idle reap pass on THIS replica — either the leader janitor or the per-CP fallback reaper. Alert when max() across replicas falls far behind now(): idle worker pods are not being retired and node capacity is leaking.",
+})
 
 // --- Observation helpers ---
 
@@ -292,6 +321,13 @@ func observeDrainTotalDuration(d time.Duration) {
 		d = 0
 	}
 	workerDrainTotalDurationHistogram.Observe(d.Seconds())
+}
+
+// observeHotIdleReapRun stamps the last-successful-hot-idle-reap gauge with the
+// given time. Called by both the leader janitor and the per-CP fallback reaper
+// (both untagged), so it lives here rather than in the kubernetes-tagged file.
+func observeHotIdleReapRun(t time.Time) {
+	hotIdleReapLastRunGauge.Set(float64(t.Unix()))
 }
 
 // observeHealthCheck records the result of one health-check probe.

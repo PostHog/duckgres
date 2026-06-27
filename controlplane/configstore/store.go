@@ -993,6 +993,29 @@ func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.
 	return workers, nil
 }
 
+// ListExpiredHotIdleWorkersForCP is the owner-scoped variant of
+// ListExpiredHotIdleWorkers: it returns only expired hot-idle workers owned by
+// ownerCPInstanceID. Used by the per-CP fallback reaper, which runs on every
+// replica independent of the janitor leader lease so hot-idle workers are still
+// retired (and their nodes reclaimed) even if leadership is wedged/absent. Each
+// replica only reaps the workers it owns; the leader janitor still handles
+// cross-CP/orphaned rows.
+func (cs *ConfigStore) ListExpiredHotIdleWorkersForCP(ownerCPInstanceID string, now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
+	defMins := int64(defaultTTL.Minutes())
+	if defMins < 0 {
+		defMins = 0
+	}
+	var workers []WorkerRecord
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("state = ? AND owner_cp_instance_id = ? AND COALESCE(hot_idle_since, updated_at) + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+			WorkerStateHotIdle, ownerCPInstanceID, defMins, now).
+		Find(&workers).Error
+	if err != nil {
+		return nil, fmt.Errorf("list expired hot-idle workers for cp: %w", err)
+	}
+	return workers, nil
+}
+
 // CountHotIdleWorkers returns the number of compatible hot-idle workers for an
 // org/profile/image bucket. Empty profile CPU/memory is the default profile.
 func (cs *ConfigStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {

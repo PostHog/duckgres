@@ -993,6 +993,109 @@ func TestK8sPool_RetireWorkerIfNoSessions_LastSession(t *testing.T) {
 	}
 }
 
+// Regression for fix #3: a transient persist failure at the hot->hot_idle park
+// must leave the worker Hot (still reusable), NOT advance in-memory to hot_idle
+// while the durable row stays hot (the invisible-to-both split). The session is
+// still decremented.
+func TestK8sPoolTransitionToHotIdlePersistFailureStaysHot(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.runtimeStore = &captureRuntimeWorkerStore{upsertErr: errors.New("store blip")}
+	worker := &ManagedWorker{ID: 5, activeSessions: 1, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	if pool.TransitionToHotIdleIfNoSessions(worker.ID) {
+		t.Fatal("expected park to report false on persist failure")
+	}
+	if got := worker.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHot {
+		t.Fatalf("expected worker to stay Hot on persist failure, got %q", got)
+	}
+	if worker.activeSessions != 0 {
+		t.Fatalf("expected session decremented to 0, got %d", worker.activeSessions)
+	}
+}
+
+// Regression for fix #4: when the durable Hot persist fails during activation,
+// ActivateReservedWorker must return an error and NOT advance the worker to Hot
+// (leaving a durable=activating / in-memory=Hot split the stuck reaper could
+// kill mid-session).
+func TestK8sPoolActivateReservedWorkerHotPersistFailureReturnsError(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.runtimeStore = &captureRuntimeWorkerStore{upsertErr: errors.New("store blip")}
+	worker := &ManagedWorker{ID: 9, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		return nil // activation itself succeeds; only the durable Hot persist fails
+	}
+
+	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected ActivateReservedWorker to return an error when the Hot persist fails")
+	}
+	if got := worker.SharedState().NormalizedLifecycle(); got == WorkerLifecycleHot {
+		t.Fatalf("expected worker NOT advanced to Hot on persist failure, got %q", got)
+	}
+}
+
+// Regression for (b): a long-running activation must heartbeat its durable
+// activating row so the leader stuck-activating reaper (which keys off
+// updated_at and can't see the live session) doesn't reap it mid-activation.
+func TestK8sPoolActivateReservedWorkerHeartbeatsActivatingRow(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	pool.activatingHBInterval = 20 * time.Millisecond
+	worker := &ManagedWorker{ID: 11, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		time.Sleep(150 * time.Millisecond) // long activation; heartbeats should fire
+		return nil
+	}
+
+	if err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{OrgID: "analytics"}); err != nil {
+		t.Fatalf("ActivateReservedWorker: %v", err)
+	}
+
+	activatingUpserts, sawHot := 0, false
+	for _, r := range store.snapshot() {
+		if r.WorkerID != 11 {
+			continue
+		}
+		switch r.State {
+		case configstore.WorkerStateActivating:
+			activatingUpserts++
+		case configstore.WorkerStateHot:
+			sawHot = true
+		}
+	}
+	if activatingUpserts < 2 {
+		t.Fatalf("expected >=2 activating upserts (initial + heartbeat), got %d", activatingUpserts)
+	}
+	if !sawHot {
+		t.Fatal("expected a final Hot upsert after activation completed")
+	}
+	if got := worker.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHot {
+		t.Fatalf("expected Hot lifecycle after activation, got %q", got)
+	}
+}
+
 func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
@@ -1303,6 +1406,53 @@ func TestK8sPoolReserveSharedWorkerDecisionDoesNotReplaceIncompatibleHotIdleOnGl
 	}
 	if store.spawnCalls != 1 {
 		t.Fatalf("expected direct spawn attempt to enforce global cap, got %d spawn calls", store.spawnCalls)
+	}
+}
+
+// Regression for the spawning-slot leak: when the pod spawn fails, the durable
+// spawning-slot row must be CAS'd terminal on the request thread (freeing the
+// org+global cap) rather than left for the leader's 10m stale-spawning sweep.
+func TestK8sPoolReserveSharedWorkerFreesSlotOnSpawnFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimMissReason: configstore.WorkerClaimMissReasonNoIdle,
+		spawned: &configstore.WorkerRecord{
+			WorkerID:          77,
+			PodName:           "duckgres-worker-test-cp-77",
+			State:             configstore.WorkerStateSpawning,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
+		return fmt.Errorf("boom: node unschedulable")
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 5,
+		Image:      "duckgres:v2",
+	})
+	if err == nil {
+		t.Fatalf("expected spawn failure error, got worker=%#v", worker)
+	}
+
+	freed := false
+	for i, id := range store.markTerminalCalledIDs {
+		if id != 77 {
+			continue
+		}
+		freed = true
+		if store.markTerminalReasons[i] != RetireReasonSpawnFailure {
+			t.Fatalf("expected slot freed with reason %q, got %q", RetireReasonSpawnFailure, store.markTerminalReasons[i])
+		}
+		if store.markTerminalStates[i] != configstore.WorkerStateRetired {
+			t.Fatalf("expected slot freed to retired, got %q", store.markTerminalStates[i])
+		}
+	}
+	if !freed {
+		t.Fatalf("expected spawning slot 77 to be freed on spawn failure; MarkWorkerTerminalIfCurrent ids=%v", store.markTerminalCalledIDs)
 	}
 }
 

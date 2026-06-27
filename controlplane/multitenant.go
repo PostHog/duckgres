@@ -30,10 +30,10 @@ type orgRouterAdapter struct {
 // effectiveDefaultWorkerTTL resolves the janitor's hot-idle retention: the
 // operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
 // K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
-// defaultWorkerTTL (20m — the same fallback sized-but-no-ttl requests get at
+// defaultWorkerTTL (1m — the same fallback sized-but-no-ttl requests get at
 // profile resolution, so there is exactly ONE default TTL however a worker
 // came to have no explicit one). The full per-request precedence is:
-// client GUC > org default > deployment default TTL > built-in 20m.
+// client GUC > org default > deployment default TTL > built-in 1m.
 func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
 	if configured > 0 {
 		return configured
@@ -199,6 +199,7 @@ func SetupMultiTenant(
 		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,
 		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
+		HeadroomNodes:                cfg.K8s.HeadroomNodes,
 		HeadroomPercent:              cfg.K8s.HeadroomPercent,
 		PlaceholderImage:             cfg.K8s.PlaceholderImage,
 		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,
@@ -324,16 +325,34 @@ func SetupMultiTenant(
 		}
 		return org.DefaultWorkerMinHotIdle
 	}
-	// Node-headroom controller: keep low-priority placeholder pods holding the
-	// configured % of worker-nodepool allocatable free so worker spawns schedule
-	// immediately. Leader-only (runs on the janitor tick). No-op when disabled.
-	if cfg.K8s.HeadroomPercent > 0 {
-		janitor.reconcileHeadroom = func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			router.sharedPool.reconcileHeadroom(ctx)
-		}
+	// Node-headroom controller: keep low-priority placeholder pods as warm,
+	// preemptible spare capacity so worker spawns schedule immediately.
+	// Leader-only (runs on the janitor tick). Always wired — reconcileHeadroom
+	// itself decides the target (constant HeadroomNodes, legacy HeadroomPercent,
+	// or disabled). It must run even when disabled so a pool that had headroom
+	// turned off converges its placeholders to zero instead of stranding them.
+	janitor.reconcileHeadroom = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		router.sharedPool.reconcileHeadroom(ctx)
 	}
+
+	// Per-CP fallback hot-idle reaper: runs on EVERY replica, independent of the
+	// janitor leader lease, retiring this replica's own expired hot-idle workers.
+	// Backstops the leader-only janitor reaper above so a wedged/absent leader
+	// can no longer let idle worker pods (and their r6gd nodes) accumulate
+	// fleet-wide. Reuses the same TTL, floor, lifecycle and store as the janitor;
+	// the fenced CAS makes concurrent leader/fallback retires safe.
+	fallbackReaper := &perCPHotIdleReaper{
+		store:        store,
+		lifecycle:    router.sharedPool.lifecycle,
+		cpInstanceID: cpInstanceID,
+		hotIdleTTL:   janitor.hotIdleTTL,
+		hotIdleFloor: janitor.hotIdleFloor,
+		orphanGrace:  janitor.orphanGrace, // same cutoff as the leader orphan sweep
+		interval:     time.Minute,
+	}
+	go fallbackReaper.Run(context.Background())
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance
 	// that the credential-refresh tick uses to re-broker STS sessions for

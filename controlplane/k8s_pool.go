@@ -75,12 +75,20 @@ type K8sWorkerPool struct {
 	workerTolerationValue   string            // taint value for NoSchedule toleration
 	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
-	// Headroom controller: keep headroomPercent% of worker-nodepool allocatable
-	// CPU+mem held by low-priority placeholder pods so a worker spawn schedules
-	// immediately (preempting placeholders) instead of waiting on a fresh node.
+	// Headroom controller holds preemptible low-priority placeholder pods so a
+	// worker spawn schedules immediately (preempting a placeholder) instead of
+	// waiting on a fresh Karpenter node. headroomNodes>0 selects the CONSTANT
+	// mode (a fixed number of node-sized placeholders, demand-independent — the
+	// prod default); otherwise headroomPercent selects the legacy
+	// demand-proportional mode. Both 0 = disabled (placeholders converge to 0).
+	headroomNodes                int
 	headroomPercent              int
 	placeholderImage             string
 	placeholderPriorityClassName string
+
+	// activatingHBInterval overrides the activating-row heartbeat cadence
+	// (0 = activatingHeartbeatInterval). Set small in tests; not configured in prod.
+	activatingHBInterval time.Duration
 
 	orgID             string                                       // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator func() int                                   // shared ID generator across orgs (nil = internal counter)
@@ -187,6 +195,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerTolerationValue:   cfg.WorkerTolerationValue,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
 
+		headroomNodes:                cfg.HeadroomNodes,
 		headroomPercent:              cfg.HeadroomPercent,
 		placeholderImage:             cfg.PlaceholderImage,
 		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,

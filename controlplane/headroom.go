@@ -16,6 +16,19 @@ import (
 // headroomPodLabel marks the low-priority placeholder pods this controller owns.
 const headroomPodLabel = "duckgres-headroom"
 
+// Node-sized placeholder shape for CONSTANT node-headroom (HeadroomNodes>0):
+// one placeholder ≈ one worker node, so N placeholders reserve N preemptible
+// nodes' worth of warm capacity regardless of current demand. Sized to an r6gd
+// worker node's schedulable capacity (matches the historical exclusive-worker
+// shape). A real worker (any shape) preempts one placeholder to claim a node;
+// the next reconcile recreates it, which makes Karpenter add a node in the
+// background. Kept as a constant — the count is the only knob — per the
+// "keep headroom small and constant" decision.
+const (
+	headroomNodeCPU    = "46"
+	headroomNodeMemory = "360Gi"
+)
+
 // headroomPlaceholdersNeeded returns how many placeholder pods of size
 // (phCPUMillis, phMemBytes) are required to hold `percent`% of the CURRENT
 // WORKER DEMAND (workerCPUMillis/workerMemBytes — the summed resource requests
@@ -69,39 +82,31 @@ func ceilDiv(a, b int64) int {
 	return int((a + b - 1) / b)
 }
 
-// reconcileHeadroom drives the number of placeholder pods toward the configured
-// percentage of CURRENT WORKER DEMAND (summed live worker pod requests).
-// Leader-gated (called from the janitor, which runs only on the elected CP).
-// A no-op when headroomPercent<=0.
+// reconcileHeadroom drives the number of low-priority placeholder pods toward
+// the headroom target. Leader-gated (called from the janitor, which runs only
+// on the elected CP). Always runs (even when headroom is disabled) so that a
+// disabled/just-disabled pool converges to ZERO placeholders instead of
+// stranding the ones it created — there is no other path that deletes them.
 //
-// Placeholders are sized to the pool's DEFAULT WORKER SHAPE (WorkerCPURequest/
-// WorkerMemoryRequest, else the built-in defaults) — no separate sizing knob:
-// one preempted placeholder always frees exactly one default-worker slot, in
-// every environment. They carry a PriorityClass BELOW the worker
-// PriorityClass, so the scheduler preempts them to fit a real worker; a worker
-// larger than one placeholder preempts AS MANY as it needs (standard k8s
-// priority preemption). The reconcile then recreates placeholders back toward
+// Two modes:
+//   - CONSTANT (HeadroomNodes>0, the prod default): keep exactly HeadroomNodes
+//     node-sized placeholders, INDEPENDENT of worker demand. This is what
+//     bounds headroom cost: the previous demand-proportional mode counted
+//     hot_idle (idle-but-alive) workers as demand and provisioned an extra
+//     headroomPercent% of full-worker-sized placeholders, so it AMPLIFIED any
+//     idle-worker leak ~1.75x. A fixed node count cannot do that.
+//   - LEGACY percent (HeadroomPercent>0, HeadroomNodes==0): demand-proportional
+//     sizing, retained for small/dev pools.
+//
+// Placeholders carry a PriorityClass BELOW the worker PriorityClass, so the
+// scheduler preempts them to fit a real worker; a worker larger than one
+// placeholder preempts as many as it needs. The reconcile recreates them toward
 // the target on the next tick, which makes Karpenter add node capacity in the
-// background. So headroom self-heals after any size of spawn.
+// background, so headroom self-heals after any spawn.
 func (p *K8sWorkerPool) reconcileHeadroom(ctx context.Context) {
-	if p.headroomPercent <= 0 {
-		return
-	}
-	phCPU, err := resource.ParseQuantity(firstNonEmpty(p.workerCPURequest, defaultWorkerCPU))
-	if err != nil {
-		slog.Warn("Headroom: invalid default worker cpu for placeholder sizing.", "value", p.workerCPURequest, "error", err)
-		return
-	}
-	phMem, err := resource.ParseQuantity(firstNonEmpty(p.workerMemoryRequest, defaultWorkerMemory))
-	if err != nil {
-		slog.Warn("Headroom: invalid default worker memory for placeholder sizing.", "value", p.workerMemoryRequest, "error", err)
-		return
-	}
-
-	workerCPU, workerMem, err := p.activeWorkerDemand(ctx)
-	if err != nil {
-		slog.Warn("Headroom: failed to sum worker demand.", "error", err)
-		return
+	desired, phCPU, phMem, ok := p.headroomTarget(ctx)
+	if !ok {
+		return // sizing/demand error already logged; back off, retry next tick
 	}
 
 	existing, _, err := p.listPlaceholderPods(ctx)
@@ -109,8 +114,6 @@ func (p *K8sWorkerPool) reconcileHeadroom(ctx context.Context) {
 		slog.Warn("Headroom: failed to list placeholder pods.", "error", err)
 		return
 	}
-
-	desired := headroomPlaceholdersNeeded(workerCPU, workerMem, phCPU.MilliValue(), phMem.Value(), p.headroomPercent)
 
 	switch {
 	case len(existing) < desired:
@@ -120,15 +123,58 @@ func (p *K8sWorkerPool) reconcileHeadroom(ctx context.Context) {
 				return // back off; next tick retries
 			}
 		}
-		slog.Info("Headroom: scaled placeholder pods up.", "from", len(existing), "to", desired, "percent", p.headroomPercent)
+		slog.Info("Headroom: scaled placeholder pods up.", "from", len(existing), "to", desired)
 	case len(existing) > desired:
 		// Delete the newest placeholders first (stable order by name).
 		sort.Slice(existing, func(i, j int) bool { return existing[i] > existing[j] })
 		for i := 0; i < len(existing)-desired; i++ {
 			_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, existing[i], metav1.DeleteOptions{GracePeriodSeconds: int64Ptr(0)})
 		}
-		slog.Info("Headroom: scaled placeholder pods down.", "from", len(existing), "to", desired, "percent", p.headroomPercent)
+		slog.Info("Headroom: scaled placeholder pods down.", "from", len(existing), "to", desired)
 	}
+}
+
+// headroomTarget resolves the desired placeholder count and per-placeholder
+// size for this tick. ok=false means a transient sizing/demand error (already
+// logged) and the caller should skip this tick. A desired of 0 with ok=true is
+// the disabled state — the caller still lists and deletes any existing
+// placeholders so they don't leak.
+func (p *K8sWorkerPool) headroomTarget(ctx context.Context) (desired int, phCPU, phMem resource.Quantity, ok bool) {
+	if p.headroomNodes > 0 {
+		cpu, err := resource.ParseQuantity(headroomNodeCPU)
+		if err != nil {
+			slog.Warn("Headroom: invalid node cpu for placeholder sizing.", "value", headroomNodeCPU, "error", err)
+			return 0, resource.Quantity{}, resource.Quantity{}, false
+		}
+		mem, err := resource.ParseQuantity(headroomNodeMemory)
+		if err != nil {
+			slog.Warn("Headroom: invalid node memory for placeholder sizing.", "value", headroomNodeMemory, "error", err)
+			return 0, resource.Quantity{}, resource.Quantity{}, false
+		}
+		return p.headroomNodes, cpu, mem, true
+	}
+
+	if p.headroomPercent > 0 {
+		cpu, err := resource.ParseQuantity(firstNonEmpty(p.workerCPURequest, defaultWorkerCPU))
+		if err != nil {
+			slog.Warn("Headroom: invalid default worker cpu for placeholder sizing.", "value", p.workerCPURequest, "error", err)
+			return 0, resource.Quantity{}, resource.Quantity{}, false
+		}
+		mem, err := resource.ParseQuantity(firstNonEmpty(p.workerMemoryRequest, defaultWorkerMemory))
+		if err != nil {
+			slog.Warn("Headroom: invalid default worker memory for placeholder sizing.", "value", p.workerMemoryRequest, "error", err)
+			return 0, resource.Quantity{}, resource.Quantity{}, false
+		}
+		workerCPU, workerMem, err := p.activeWorkerDemand(ctx)
+		if err != nil {
+			slog.Warn("Headroom: failed to sum worker demand.", "error", err)
+			return 0, resource.Quantity{}, resource.Quantity{}, false
+		}
+		return headroomPlaceholdersNeeded(workerCPU, workerMem, cpu.MilliValue(), mem.Value(), p.headroomPercent), cpu, mem, true
+	}
+
+	// Disabled: converge to zero placeholders.
+	return 0, resource.Quantity{}, resource.Quantity{}, true
 }
 
 // activeWorkerDemand sums the resource REQUESTS of live (non-terminating)

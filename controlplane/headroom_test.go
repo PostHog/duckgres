@@ -4,13 +4,31 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
+
+// emulateGenerateName makes the fake clientset assign unique names from
+// metav1.GenerateName on pod create, as the real API server does (the fake
+// otherwise leaves Name empty, so multiple GenerateName creates collide).
+func emulateGenerateName(cs *fake.Clientset) {
+	var n int
+	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pod, ok := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		if ok && pod.Name == "" && pod.GenerateName != "" {
+			n++
+			pod.Name = fmt.Sprintf("%s%d", pod.GenerateName, n)
+		}
+		return false, nil, nil // fall through to the default tracker with the mutated object
+	})
+}
 
 func TestHeadroomPlaceholdersNeeded(t *testing.T) {
 	const (
@@ -78,6 +96,70 @@ func TestPlaceholderPodGenerateName(t *testing.T) {
 	// under the old name stay managed across a rollout.
 	if pod.Labels["app"] != "duckgres-headroom" {
 		t.Fatalf("app label = %q, want duckgres-headroom", pod.Labels["app"])
+	}
+}
+
+// Constant node-headroom keeps a FIXED number of node-sized placeholders and
+// does NOT scale with worker demand — the property that prevents an idle-worker
+// leak from being amplified into runaway placeholder capacity.
+func TestReconcileHeadroomConstantNodesIgnoresDemand(t *testing.T) {
+	worker := map[string]string{"app": "duckgres-worker"}
+	mkWorker := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: worker},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name: "duckdb-worker",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("16"),
+					corev1.ResourceMemory: resource.MustParse("64Gi"),
+				}},
+			}}},
+		}
+	}
+	// A large worker population (as a hot_idle leak would produce) must NOT
+	// inflate the placeholder count under constant mode.
+	objs := []runtime.Object{}
+	for i := 0; i < 50; i++ {
+		objs = append(objs, mkWorker(fmt.Sprintf("w%d", i)))
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	emulateGenerateName(cs)
+	p := &K8sWorkerPool{clientset: cs, namespace: "default", cpID: "duckgres-cp-abcde", headroomNodes: 3}
+
+	p.reconcileHeadroom(context.Background())
+
+	pods, err := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{LabelSelector: "app=" + headroomPodLabel})
+	if err != nil {
+		t.Fatalf("list placeholders: %v", err)
+	}
+	if len(pods.Items) != 3 {
+		t.Fatalf("constant headroom: expected 3 placeholders regardless of 50 workers, got %d", len(pods.Items))
+	}
+	req := pods.Items[0].Spec.Containers[0].Resources.Requests
+	if req.Cpu().String() != headroomNodeCPU || req.Memory().String() != headroomNodeMemory {
+		t.Fatalf("expected node-sized placeholder %s/%s, got %s/%s", headroomNodeCPU, headroomNodeMemory, req.Cpu(), req.Memory())
+	}
+}
+
+// Disabling headroom (both knobs 0) must converge existing placeholders to zero,
+// not strand them — there is no other path that deletes placeholder pods.
+func TestReconcileHeadroomDisabledDeletesPlaceholders(t *testing.T) {
+	mkPlaceholder := func(name string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "default", Labels: map[string]string{"app": headroomPodLabel},
+		}}
+	}
+	cs := fake.NewSimpleClientset(mkPlaceholder("duckgres-placeholder-x-1"), mkPlaceholder("duckgres-placeholder-x-2"))
+	p := &K8sWorkerPool{clientset: cs, namespace: "default", headroomNodes: 0, headroomPercent: 0}
+
+	p.reconcileHeadroom(context.Background())
+
+	pods, err := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{LabelSelector: "app=" + headroomPodLabel})
+	if err != nil {
+		t.Fatalf("list placeholders: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("expected disabled headroom to delete all placeholders, got %d", len(pods.Items))
 	}
 }
 

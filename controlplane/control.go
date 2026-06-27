@@ -143,11 +143,14 @@ type K8sConfig struct {
 	WorkerPriorityClassName string // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
 	AWSRegion               string // AWS region for STS client
 
-	// Node-headroom controller: keep HeadroomPercent% of the worker nodepool's
-	// allocatable CPU+memory free via low-priority placeholder pods, so a worker
-	// spawn schedules immediately (preempting placeholders) rather than waiting
-	// on a fresh Karpenter node. 0 = disabled.
-	HeadroomPercent              int    // % of worker-nodepool allocatable to hold free (0 = disabled)
+	// Node-headroom controller holds preemptible low-priority placeholder pods so
+	// a worker spawn schedules immediately (preempting a placeholder) rather than
+	// waiting on a fresh Karpenter node. HeadroomNodes>0 selects the constant
+	// mode (a fixed number of node-sized placeholders, demand-independent — the
+	// prod default); HeadroomPercent is the legacy demand-proportional fallback.
+	// Both 0 = disabled.
+	HeadroomNodes                int    // CONSTANT node-headroom: number of node-sized placeholder pods (0 = use HeadroomPercent)
+	HeadroomPercent              int    // legacy demand-% headroom, used only when HeadroomNodes==0 (0 = disabled)
 	PlaceholderImage             string // Image for placeholder pods (a pause image)
 	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName
 
@@ -166,7 +169,7 @@ type K8sConfig struct {
 	// "default TTL", pairing with WorkerMaxTTL (the clamp). It governs both
 	// no-ttl paths the same way: default-shape workers (reaped by the janitor)
 	// and sized-but-no-ttl workers (stamped at profile resolution). Per-request
-	// precedence: client GUC > org default > this > built-in (20m,
+	// precedence: client GUC > org default > this > built-in (1m,
 	// defaultWorkerTTL). Raise it above a tenant's job cadence (e.g. 70m for
 	// hourly jobs) so scheduled workloads reuse hot-idle workers instead of
 	// cold-spawning every run — at the cost of idle worker nodes.

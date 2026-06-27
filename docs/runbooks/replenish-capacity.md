@@ -17,10 +17,10 @@ There is **no warm pool**. In the remote/k8s backend a worker pod is spawned
 `duckgres.worker_cpu`/`worker_memory` request, and kept **hot-idle** after the
 session ends so the same org can reuse it (by exact shape) until its
 `duckgres.worker_ttl` expires. Startup latency is hidden by the **node-headroom
-controller** (`reconcileHeadroom`, a janitor hook): it keeps
-`DUCKGRES_K8S_HEADROOM_PERCENT` of the worker nodepool's allocatable CPU+memory
-held by low-priority placeholder ("pause") pods; a real worker spawn preempts a
-placeholder and schedules immediately. So "low capacity" now means one of: spawns
+controller** (`reconcileHeadroom`, a janitor hook): it keeps a constant
+`DUCKGRES_K8S_HEADROOM_NODES` node-sized low-priority placeholder ("pause") pods
+(or, in the legacy mode, `DUCKGRES_K8S_HEADROOM_PERCENT` of worker demand) ready;
+a real worker spawn preempts a placeholder and schedules immediately. So "low capacity" now means one of: spawns
 are failing, the cluster can't schedule pods, headroom is exhausted, or an org /
 the global pool has hit its worker cap.
 
@@ -76,9 +76,10 @@ unassigned anymore); production capacity lives in `binding="org_bound"`.
    ```
    - Confirm placeholder pods exist and are `Running` (they should be preempted,
      then rescheduled, as real workers spawn).
-   - Raise `DUCKGRES_K8S_HEADROOM_PERCENT` (or `placeholderCPU`/`placeholderMemory`
-     in the chart) to hold more capacity ready. Placeholders use a PriorityClass
-     ranked **below** the worker PriorityClass so workers always win.
+   - Raise `DUCKGRES_K8S_HEADROOM_NODES` (constant mode) — or
+     `DUCKGRES_K8S_HEADROOM_PERCENT` in the legacy mode — to hold more capacity
+     ready. Placeholders use a PriorityClass ranked **below** the worker
+     PriorityClass so workers always win.
 
 4. **Check the caps.** If you hit `worker capacity exhausted for organization` or
    `...by global pool limit`, the request is at a real cap, not a scheduling
