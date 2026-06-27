@@ -9,6 +9,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
@@ -207,9 +208,17 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		defer close(hbDone)
 		p.heartbeatActivatingWorker(worker, stopHB)
 	}()
+	// stopHeartbeat is idempotent (sync.Once) and deferred as a panic-safe
+	// backstop AND called explicitly on the normal path. The explicit call
+	// joins the heartbeat BEFORE the Hot-commit block below, so a heartbeat can
+	// never clobber the committed Hot row; the defer guarantees the goroutine +
+	// ticker are not leaked if activate() panics.
+	var stopOnce sync.Once
+	stopHeartbeat := func() { stopOnce.Do(func() { close(stopHB); <-hbDone }) }
+	defer stopHeartbeat()
+
 	activateErr := activate(ctx, worker, payload)
-	close(stopHB)
-	<-hbDone
+	stopHeartbeat()
 
 	if err := activateErr; err != nil {
 		if hadPrevState {

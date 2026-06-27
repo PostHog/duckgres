@@ -69,12 +69,29 @@ func (r *perCPHotIdleReaper) Run(ctx context.Context) {
 }
 
 func (r *perCPHotIdleReaper) runOnce() {
-	if r.hotIdleTTL <= 0 {
-		return
-	}
 	now := r.now
 	if now == nil {
 		now = time.Now
+	}
+
+	// Orphan pass: reap hot-idle workers whose OWNING CP instance is no longer
+	// live. cpInstanceID is freshly minted on every CP start, so a rollout/crash
+	// leaves the prior process's hot-idle rows owned by a dead instance — owned
+	// by no live CP, they are invisible to the self-owned pass below and were
+	// previously reaped ONLY by the leader janitor's orphan sweep. Running it
+	// here makes hot-idle reclamation genuinely leader-independent (the whole
+	// point of this reaper) so a rollout concurrent with a leaderless window
+	// can't accumulate orphaned idle pods. RetireOrphanFromSnapshot re-checks
+	// owner-still-expired in its fenced CAS, so a worker meanwhile reclaimed by a
+	// live CP (ClaimHotIdleWorker) is skipped; no floor is applied (a dead
+	// owner's worker is not a warm reserve), matching the leader sweep. Runs
+	// independent of hotIdleTTL — like the leader's orphan sweep, which is not
+	// gated on the hot-idle TTL block — so a (hypothetical) hotIdleTTL<=0 config
+	// can't disable the orphan backstop.
+	r.reapOrphanedHotIdle(now())
+
+	if r.hotIdleTTL <= 0 {
+		return
 	}
 	expired, err := r.store.ListExpiredHotIdleSnapshotsForCP(r.cpInstanceID, now(), r.hotIdleTTL)
 	if err != nil {
@@ -100,19 +117,6 @@ func (r *perCPHotIdleReaper) runOnce() {
 				"worker", snap.WorkerID(), "worker_pod", snap.PodName(), "org", snap.OrgID(), "error", err)
 		}
 	}
-
-	// Orphan pass: reap hot-idle workers whose OWNING CP instance is no longer
-	// live. cpInstanceID is freshly minted on every CP start, so a graceful
-	// rollout/crash leaves the prior process's hot-idle rows owned by a dead
-	// instance — owned by no live CP, they are invisible to the self-owned pass
-	// above and were previously reaped ONLY by the leader janitor's orphan sweep.
-	// Running it here too makes hot-idle reclamation genuinely leader-independent
-	// (the whole point of this reaper) so a rollout concurrent with a leaderless
-	// window can't accumulate orphaned idle pods. RetireOrphanFromSnapshot
-	// re-checks owner-still-expired in its fenced CAS, so a worker meanwhile
-	// reclaimed by a live CP (ClaimHotIdleWorker) is skipped; no floor is applied
-	// (a dead owner's worker is not a warm reserve), matching the leader sweep.
-	r.reapOrphanedHotIdle(now())
 
 	// Stamp the last-successful-reap gauge after a successful self-owned list
 	// (reached only if that list did not error): the alert cares that the reap
