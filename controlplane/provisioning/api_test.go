@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -787,6 +788,32 @@ func TestProvisionRejectsInvalidOrgID(t *testing.T) {
 				t.Errorf("warehouse must not be created for invalid org id %q", bad)
 			}
 		})
+	}
+}
+
+func TestProvisionRejectsOverlongSlugOrgID(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+	org := strings.Repeat("a", 36)
+	body := []byte(`{
+		"database_name":"d",
+		"metadata_store":{"type":"external","external":{"endpoint":"h","password_aws_secret":"s"}},
+		"data_store":{"type":"external","bucket_name":"posthog-duckling-example"},
+		"ducklake":{"enabled":true}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+org+"/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "canonical UUID or a slug") {
+		t.Fatalf("error = %s, want org id slug length error", rec.Body.String())
+	}
+	if _, ok := store.warehouses[org]; ok {
+		t.Error("warehouse must not be created for overlong slug org id")
 	}
 }
 
