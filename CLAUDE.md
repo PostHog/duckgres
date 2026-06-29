@@ -46,7 +46,7 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - Flight SQL ingress adapter: `flight_ingress.go`
   - Runtime loops: `janitor.go`, `leader_loop.go`, `memory_rebalancer.go`, `runtime_tracker.go`
   - K8s / multitenant under build tag `kubernetes` (including: `multitenant.go`, `k8s_pool.go`, `k8s_pool_acquire.go`, `k8s_pool_spawn.go`, `k8s_pool_lifecycle.go`, `k8s_pool_reconcile.go`, `k8s_pool_helpers.go`, `k8s_factory.go`, `org_router.go`, `org_reserved_pool.go`, `sts_broker.go`, `shared_worker_activator.go`, `worker_rpc_security.go`, `janitor_leader_k8s.go`)
-  - Subpackages: `admin/` (HTTP admin API, `kubernetes` tag), `provisioner/` (k8s controller, `kubernetes` tag), `provisioning/` (HTTP API), `configstore/` (Postgres-backed config)
+  - Subpackages: `admin/` (HTTP admin API + dashboard, `kubernetes` tag; includes the models explorer UI `static/models.html` + `models_api.go`, and `devserver/` for local UI dev against a port-forwarded CP — see `admin/README.md`), `provisioner/` (k8s controller, `kubernetes` tag), `provisioning/` (HTTP API), `configstore/` (Postgres-backed config)
 - **duckdbservice/** — DuckDB Arrow Flight SQL service
   - Core: `service.go`, `flight_handler.go`, `arrow_helpers.go`, `auth.go`, `config.go`
   - Lifecycle, caching, profiling, metrics: `activation.go`, `transient.go`, `cache_proxy.go`, `profiling.go`, `progress.go`, `metrics.go`

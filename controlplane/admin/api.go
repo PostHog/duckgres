@@ -72,6 +72,10 @@ type OrgStackInfo interface {
 // RegisterAPI registers all admin REST endpoints on the given router group.
 func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo) {
 	registerAPIWithStore(r, newGormAPIStore(store), info)
+	// Generic read-only models explorer (sidebar + table + detail UI). Reads
+	// the concrete store directly because it needs the runtime schema name and
+	// raw DB for tables the typed apiStore interface doesn't surface.
+	registerModelsAPI(r, store)
 }
 
 func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo) {

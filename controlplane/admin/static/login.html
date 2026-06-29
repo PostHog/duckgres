@@ -3,33 +3,72 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Duckgres - Admin Login</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Duckgres — Admin Login</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --bg: #07090d; --panel2: #11161d; --line: #1d2630; --line-bright: #2c3a48;
+        --text: #c9d6e2; --dim: #5a6b7c; --worker: #38e1ff; --bad: #ff4d5e;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: var(--bg); color: var(--text);
+        font-family: "IBM Plex Mono", monospace; font-size: 13px;
+        display: flex; align-items: center; justify-content: center; padding: 24px;
+      }
+      body::before {
+        content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+        background:
+          radial-gradient(ellipse at 50% -10%, rgba(56,225,255,.05), transparent 60%),
+          repeating-linear-gradient(0deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px),
+          repeating-linear-gradient(90deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px);
+      }
+      main {
+        position: relative; z-index: 1; width: 100%; max-width: 380px;
+        background: linear-gradient(180deg, var(--panel2), #0d1117);
+        border: 1px solid var(--line-bright); border-radius: 6px;
+        padding: 30px 30px 34px; box-shadow: 0 8px 40px rgba(0,0,0,.55);
+      }
+      .brand { font-family: "Chakra Petch", sans-serif; font-weight: 700;
+        font-size: 22px; letter-spacing: .14em; color: var(--worker);
+        text-shadow: 0 0 18px rgba(56,225,255,.35); }
+      .sub { font-size: 9.5px; letter-spacing: .3em; text-transform: uppercase; color: var(--dim); margin: 4px 0 22px; }
+      label { display: block; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--dim); margin-bottom: 8px; }
+      input[type=password] {
+        width: 100%; background: #0d1117; border: 1px solid var(--line-bright); border-radius: 4px;
+        color: var(--text); font-family: inherit; font-size: 13px; padding: 9px 11px;
+      }
+      input[type=password]:focus { outline: none; border-color: var(--worker); }
+      button {
+        width: 100%; margin-top: 18px; cursor: pointer;
+        background: var(--worker); color: #07090d; border: none; border-radius: 4px;
+        font-family: "Chakra Petch", sans-serif; font-weight: 600;
+        font-size: 13px; letter-spacing: .14em; text-transform: uppercase; padding: 10px;
+      }
+      button:hover { box-shadow: 0 0 18px rgba(56,225,255,.4); }
+      .err {
+        margin-bottom: 16px; border: 1px solid rgba(255,77,94,.4); background: rgba(255,77,94,.1);
+        color: var(--bad); border-radius: 4px; padding: 9px 12px; font-size: 12px;
+      }
+    </style>
 </head>
-<body class="bg-gray-900 text-gray-100 min-h-screen flex items-center justify-center px-6">
-    <main class="w-full max-w-md bg-gray-800 border border-gray-700 rounded-xl p-8 shadow-2xl">
-        <div class="mb-6">
-            <h1 class="text-2xl font-bold text-yellow-400">Duckgres Admin</h1>
-            <p class="text-gray-400 mt-2">Enter the admin token printed in the control-plane logs.</p>
-        </div>
+<body>
+    <main>
+        <div class="brand">DUCKGRES</div>
+        <div class="sub">Control Plane Admin</div>
 
         {{if .Error}}
-        <div class="mb-4 rounded border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-            {{.Error}}
-        </div>
+        <div class="err">{{.Error}}</div>
         {{end}}
 
-        <form method="post" action="/login" class="space-y-4">
+        <form method="post" action="/login">
             <input type="hidden" name="next" value="{{.Next}}">
-            <div>
-                <label for="token" class="block text-sm font-medium text-gray-300 mb-2">Admin Token</label>
-                <input id="token" name="token" type="password" autocomplete="off" required
-                       class="w-full rounded border border-gray-600 bg-gray-900 px-3 py-2 text-gray-100 focus:border-yellow-400 focus:outline-none">
-            </div>
-            <button type="submit"
-                    class="w-full rounded bg-yellow-500 px-4 py-2 font-medium text-gray-900 hover:bg-yellow-400">
-                Sign In
-            </button>
+            <label for="token">Admin Token</label>
+            <input id="token" name="token" type="password" autocomplete="off" required autofocus>
+            <button type="submit">Sign In</button>
         </form>
     </main>
 </body>
