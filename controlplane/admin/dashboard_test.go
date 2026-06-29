@@ -54,7 +54,7 @@ func TestDashboardRejectsTokenQueryParam(t *testing.T) {
 	r := gin.New()
 	RegisterDashboard(r, NewTokenSet("secret", nil))
 
-	for _, path := range []string{"/?token=secret", "/workers?token=secret&foo=bar"} {
+	for _, path := range []string{"/?token=secret", "/models?token=secret&foo=bar"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)

@@ -8,10 +8,7 @@ public exposure; reach it via `kubectl port-forward`.
 
 | Route | Page | Purpose |
 |-------|------|---------|
-| `/`, `/models` | `static/models.html` | **Models explorer** — the primary surface. Sidebar of every config-store model grouped Tenants / Runtime, a table of the selected model's rows, and a click-through detail panel. Nested warehouse sub-configs render as expandable sections. |
-| `/orgs` | `static/orgs.html` | Org list + create/delete. |
-| `/workers` | `static/workers.html` | Live worker/duckling status. |
-| `/sessions` | `static/sessions.html` | Active sessions. |
+| `/`, `/models` | `static/models.html` | **Models explorer** — the only dashboard surface. Sidebar of every config-store model grouped Tenants / Runtime, a table of the selected model's rows, and a click-through detail panel. Columns are sortable with per-column tooltips; the orgs table cross-links to org-users + managed-warehouses; the orgs detail panel supports inline edit + delete. Nested warehouse sub-configs render as expandable sections. |
 | `POST /login` | `static/login.html` | Token login (sets the `duckgres_admin_token` cookie). |
 
 The pages are plain HTML + vanilla JS served via `//go:embed static/*` and
@@ -51,23 +48,28 @@ Covered by `models_api_test.go` (redaction + real query path) and the
 ## Local UI development (no redeploy)
 
 Iterate on the UI against a *deployed* control plane without rebuilding the
-image. A tiny dev proxy (`devserver/`) serves `static/` off disk and proxies
-`/api`, `/login`, `/health` to the port-forwarded CP, injecting the internal
-secret server-side. The browser sees one origin → no CORS, and the secret never
-reaches page JS. The embedded UI uses relative `/api/v1` paths, so the same HTML
-runs byte-for-byte embedded or under the dev proxy.
+image. The dev proxy (`devserver/`) serves `static/` off disk and proxies
+`/api`, `/login`, `/health` to the CP, injecting the internal secret
+server-side. The browser sees one origin → no CORS, and the secret never reaches
+page JS. The embedded UI uses relative `/api/v1` paths, so the same HTML runs
+byte-for-byte embedded or under the dev proxy.
+
+One `--context` drives everything: the devserver fetches the internal secret
+(`kubectl get secret duckgres-tokens`), port-forwards that context's control
+plane, and serves the explorer with a **context banner — RED when the context
+name contains `prod`** (a dev-only cue; the deployed CP has no such endpoint).
 
 ```sh
-# 1. port-forward the deployed control plane's admin API (own terminal):
-just ui-port-forward                       # defaults: posthog-mw-dev / duckgres / duckgres-control-plane
-#   or: kubectl --context <ctx> -n <ns> port-forward deploy/<cp> 8080:8080
+# one environment:
+just ui-dev mw-dev-admin                 # → http://127.0.0.1:5173 (dev banner)
+just ui-dev mw-prod-us-admin             # → http://127.0.0.1:5173 (RED prod banner)
 
-# 2. serve the UI locally, pointed at the port-forward:
-DUCKGRES_INTERNAL_SECRET=<cp-secret> just ui-dev
-#   → http://127.0.0.1:5173
+# both side by side (prod :5173, dev :5174):
+just ui-dev-all
 
-# 3. edit controlplane/admin/static/*.html and refresh the browser. No rebuild.
+# edit controlplane/admin/static/*.html and refresh — no rebuild.
 ```
 
 Once the markup is right, it is already what `//go:embed` bakes into the CP — no
-separate build step.
+separate build step. (Without `--context`, the devserver falls back to an
+external `--target` + `--secret`/`$DUCKGRES_INTERNAL_SECRET`.)
