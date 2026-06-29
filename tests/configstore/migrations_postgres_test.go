@@ -22,7 +22,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 1)
 	requireGooseMigrationRecorded(t, db, 3)
 	requireGooseMigrationRecorded(t, db, 4)
-	requireGooseLatestVersion(t, db, 4)
+	requireGooseMigrationRecorded(t, db, 5)
+	requireGooseLatestVersion(t, db, 5)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000004 dropped the dead cluster-wide singleton config tables.

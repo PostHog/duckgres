@@ -25,9 +25,8 @@ func TestSnapshotBuild(t *testing.T) {
 
 	orgs := []Org{
 		{
-			Name:         "analytics",
-			MaxWorkers:   4,
-			MemoryBudget: "8GB",
+			Name:       "analytics",
+			MaxWorkers: 4,
 			Warehouse: &ManagedWarehouse{
 				OrgID: "analytics",
 				WarehouseDatabase: ManagedWarehouseDatabase{
@@ -103,11 +102,9 @@ func TestSnapshotBuild(t *testing.T) {
 
 	for _, o := range orgs {
 		oc := &OrgConfig{
-			Name:         o.Name,
-			MaxWorkers:   o.MaxWorkers,
-			MemoryBudget: o.MemoryBudget,
-			IdleTimeoutS: o.IdleTimeoutS,
-			Users:        make(map[string]string),
+			Name:       o.Name,
+			MaxWorkers: o.MaxWorkers,
+			Users:      make(map[string]string),
 		}
 		if o.Warehouse != nil {
 			oc.Warehouse = copyManagedWarehouseConfig(o.Warehouse)
@@ -125,9 +122,6 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 	if snap.Orgs["analytics"].MaxWorkers != 4 {
 		t.Errorf("expected analytics max_workers=4, got %d", snap.Orgs["analytics"].MaxWorkers)
-	}
-	if snap.Orgs["analytics"].MemoryBudget != "8GB" {
-		t.Errorf("expected analytics memory_budget=8GB, got %s", snap.Orgs["analytics"].MemoryBudget)
 	}
 	if len(snap.Orgs["analytics"].Users) != 2 {
 		t.Errorf("expected 2 analytics users, got %d", len(snap.Orgs["analytics"].Users))

@@ -55,7 +55,6 @@ type OrgStatus struct {
 	Workers        int    `json:"workers"`
 	ActiveSessions int    `json:"active_sessions"`
 	MaxWorkers     int    `json:"max_workers"`
-	MemoryBudget   string `json:"memory_budget"`
 }
 
 // OrgStackInfo provides info about an org's live state.
@@ -171,8 +170,6 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	fields := map[string]interface{}{
 		"max_workers":     updates.MaxWorkers,
-		"memory_budget":   updates.MemoryBudget,
-		"idle_timeout_s":  updates.IdleTimeoutS,
 		"max_connections": updates.MaxConnections,
 		// Org default worker profile: written unconditionally so an explicit
 		// empty string CLEARS the default (the handler's presence-merge keeps
@@ -181,14 +178,6 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		"default_worker_memory":       updates.DefaultWorkerMemory,
 		"default_worker_ttl":          updates.DefaultWorkerTTL,
 		"default_worker_min_hot_idle": updates.DefaultWorkerMinHotIdle,
-	}
-	// Only update resource fields when explicitly provided to avoid clearing
-	// previously-set values when the caller omits them from the JSON payload.
-	if updates.WorkerCPURequest != "" {
-		fields["worker_cpu_request"] = updates.WorkerCPURequest
-	}
-	if updates.WorkerMemoryRequest != "" {
-		fields["worker_memory_request"] = updates.WorkerMemoryRequest
 	}
 	// HostnameAlias is *string: nil = preserve, "" = clear (NULL), "x" = set.
 	// NULL releases the unique-index slot so other orgs can take that alias.
@@ -568,20 +557,8 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["max_workers"]; ok {
 		merged.MaxWorkers = updates.MaxWorkers
 	}
-	if _, ok := fields["memory_budget"]; ok {
-		merged.MemoryBudget = updates.MemoryBudget
-	}
-	if _, ok := fields["idle_timeout_s"]; ok {
-		merged.IdleTimeoutS = updates.IdleTimeoutS
-	}
 	if _, ok := fields["max_connections"]; ok {
 		merged.MaxConnections = updates.MaxConnections
-	}
-	if _, ok := fields["worker_cpu_request"]; ok {
-		merged.WorkerCPURequest = updates.WorkerCPURequest
-	}
-	if _, ok := fields["worker_memory_request"]; ok {
-		merged.WorkerMemoryRequest = updates.WorkerMemoryRequest
 	}
 	// Org default worker profile: present-in-payload wins, including an
 	// explicit "" which clears the default.

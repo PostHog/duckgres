@@ -10,23 +10,17 @@ import "time"
 // alias", multiple orgs can share the NULL state, but any non-NULL alias must
 // be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
-	Name                string  `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName        string  `gorm:"size:255;uniqueIndex" json:"database_name"`
-	HostnameAlias       *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
-	MaxWorkers          int     `gorm:"default:0" json:"max_workers"`
-	MaxConnections      int     `gorm:"default:0" json:"max_connections"`
-	MemoryBudget        string  `gorm:"size:32" json:"memory_budget"`
-	IdleTimeoutS        int     `gorm:"default:0" json:"idle_timeout_s"`
-	WorkerCPURequest    string  `gorm:"size:32" json:"worker_cpu_request"`
-	WorkerMemoryRequest string  `gorm:"size:32" json:"worker_memory_request"`
+	Name           string  `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName   string  `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias  *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
+	MaxWorkers     int     `gorm:"default:0" json:"max_workers"`
+	MaxConnections int     `gorm:"default:0" json:"max_connections"`
 	// DefaultWorkerCPU/Memory/TTL are the org's operator-set default worker
 	// profile: the pod shape (k8s resource quantities, e.g. "2"/"8Gi") and
 	// hot-idle TTL (Go duration string, e.g. "75m" — stored as a string for
 	// human editability) applied to connections that don't size themselves via
-	// the duckgres.worker_* startup options. Distinct from WorkerCPURequest/
-	// WorkerMemoryRequest above, which mutate the GLOBAL pool default (a known
-	// last-org-wins footgun). Empty = unset. Versioned SQL migrations add
-	// these columns.
+	// the duckgres.worker_* startup options. Empty = unset. Versioned SQL
+	// migrations add these columns.
 	DefaultWorkerCPU        string            `gorm:"size:32" json:"default_worker_cpu"`
 	DefaultWorkerMemory     string            `gorm:"size:32" json:"default_worker_memory"`
 	DefaultWorkerTTL        string            `gorm:"size:32" json:"default_worker_ttl"`
@@ -501,10 +495,6 @@ type OrgConfig struct {
 	HostnameAlias           string // empty when no alias is configured
 	MaxWorkers              int
 	MaxConnections          int
-	MemoryBudget            string
-	IdleTimeoutS            int
-	WorkerCPURequest        string
-	WorkerMemoryRequest     string
 	DefaultWorkerCPU        string            // org default worker profile: pod cpu quantity ("" = unset)
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
 	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
