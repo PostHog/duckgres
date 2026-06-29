@@ -300,7 +300,7 @@ func main() {
 	// writes them to each tenant's DuckLake-backed system.query_log table.
 	if *mode == "query-log-writer" {
 		if err := runQueryLogWriter(context.Background(), cfg, resolved); err != nil {
-			fatal("Query-log writer error: " + err.Error())
+			fatal("Query-log writer error: " + server.RedactQueryLogWriterError(err))
 		}
 		return
 	}

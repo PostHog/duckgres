@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,6 +189,47 @@ func TestQueryLogKafkaWriterDoesNotCommitWhenWriteFails(t *testing.T) {
 	}
 	if resolver.invalidated[0].orgID != "org-a" || resolver.invalidated[0].writer != entryWriter {
 		t.Fatalf("unexpected invalidation: %#v", resolver.invalidated[0])
+	}
+}
+
+func TestRedactQueryLogWriterErrorScrubsAttachAndSecretMaterial(t *testing.T) {
+	err := errors.New("querylog: attach ducklake: Parser Error: ATTACH 'ducklake:postgres:host=db user=metadata password=metadata-secret dbname=ducklake' AS ducklake; CREATE OR REPLACE SECRET ducklake_s3 (TYPE s3, KEY_ID 'access-key', SECRET 's3-secret', SESSION_TOKEN 'session-token'); CLIENT_SECRET 'oauth-secret'")
+
+	got := RedactQueryLogWriterError(err)
+	for _, secret := range []string{
+		"metadata-secret",
+		"access-key",
+		"s3-secret",
+		"session-token",
+		"oauth-secret",
+		"ducklake:postgres:host=db",
+	} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("redacted error still contains %q: %s", secret, got)
+		}
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("redacted error should contain redaction marker, got %s", got)
+	}
+}
+
+func TestQueryLogKafkaWriterRetryLogRedactsSecrets(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	writer := &QueryLogKafkaWriter{}
+	writer.recordRetryableError(errors.New("write failed: ATTACH 'ducklake:postgres:host=db user=metadata password=metadata-secret dbname=ducklake' AS ducklake; CREATE SECRET ducklake_s3 (TYPE s3, SECRET 's3-secret', SESSION_TOKEN 'session-token')"))
+
+	got := buf.String()
+	for _, secret := range []string{"metadata-secret", "s3-secret", "session-token", "ducklake:postgres:host=db"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("retry log still contains %q: %s", secret, got)
+		}
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("retry log should contain redaction marker, got %s", got)
 	}
 }
 
