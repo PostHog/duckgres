@@ -2,6 +2,7 @@ package scenario
 
 import (
 	"context"
+	"crypto/sha1"
 	"flag"
 	"fmt"
 	"os"
@@ -141,16 +142,50 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	}
 	provisionStep := resolved.Steps[0]
 	orgID, _ := provisionStep.With["org_id"].(string)
-	if orgID == "scenario-smoke" || !strings.Contains(orgID, "20260102t030405z") {
-		t.Fatalf("org_id = %q, want run-unique templated org", orgID)
+	if orgID == "scenario-smoke" || len(orgID) > 35 {
+		t.Fatalf("org_id = %q, want run-unique valid provisioning slug of at most 35 chars", orgID)
 	}
 	request, ok := provisionStep.With["request"].(map[string]any)
 	if !ok {
 		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
 	}
 	databaseName, _ := request["database_name"].(string)
-	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "20260102t030405z") {
+	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "scenario_smoke_") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
+	}
+}
+
+func TestProvisionRejectionScenarioUsesExpectedProvisionFailure(t *testing.T) {
+	scenario, err := core.LoadScenario(filepath.Join("scenarios", "provision_rejection.yaml"))
+	if err != nil {
+		t.Fatalf("load provision rejection: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-smoke-manual-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+	}
+	provisionStep := resolved.Steps[0]
+	orgID, _ := provisionStep.With["org_id"].(string)
+	if len(orgID) <= 35 {
+		t.Fatalf("org_id = %q, want deliberately too-long slug", orgID)
+	}
+	expected := provisionStep.ExpectError
+	if expected == nil {
+		t.Fatal("provision step should assert the expected rejection")
+	}
+	if expected.ErrorClass != provision.ErrorClassProvisionStepError {
+		t.Fatalf("error_class = %q, want %s", expected.ErrorClass, provision.ErrorClassProvisionStepError)
+	}
+	if got := strings.Join(expected.Contains, "\n"); !strings.Contains(got, "HTTP 400") || !strings.Contains(got, "slug of at most 35 characters") {
+		t.Fatalf("expected error contains = %#v, want HTTP 400 and slug limit", expected.Contains)
 	}
 }
 
@@ -464,6 +499,7 @@ func resolveRunTemplates(s core.Scenario, runID string) (core.Scenario, error) {
 	vars := map[string]string{
 		"run_id":         runID,
 		"run_id_compact": compactRunID(runID),
+		"run_id_token":   shortRunIDToken(runID),
 	}
 	out := s
 	out.Steps = make([]core.Step, len(s.Steps))
@@ -491,6 +527,11 @@ func compactRunID(runID string) string {
 		return "scenario"
 	}
 	return b.String()
+}
+
+func shortRunIDToken(runID string) string {
+	sum := sha1.Sum([]byte(runID))
+	return fmt.Sprintf("%x", sum)[:12]
 }
 
 func resolveTemplateValue(value any, vars map[string]string) (any, error) {

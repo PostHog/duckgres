@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -13,6 +14,9 @@ const (
 	StepStatusOK      StepStatus = "ok"
 	StepStatusFailed  StepStatus = "failed"
 	StepStatusSkipped StepStatus = "skipped"
+
+	errorClassExpectedErrorMissing  = "expected_error_missing"
+	errorClassExpectedErrorMismatch = "expected_error_mismatch"
 )
 
 type StepExecutor interface {
@@ -150,6 +154,10 @@ func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByS
 		Duration:     finishedAt.Sub(startedAt),
 		Attempts:     1,
 	}
+	if step.ExpectError != nil {
+		r.applyExpectedError(step, err, &result)
+		return result
+	}
 	if err != nil {
 		result.Status = StepStatusFailed
 		result.ErrorClass = classifyStepError(err)
@@ -157,6 +165,42 @@ func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByS
 		result.Err = err
 	}
 	return result
+}
+
+func (r *Runner) applyExpectedError(step Step, err error, result *StepResult) {
+	if err == nil {
+		result.Status = StepStatusFailed
+		result.ErrorClass = errorClassExpectedErrorMissing
+		result.Error = fmt.Sprintf("step %s expected an error but completed successfully", step.ID)
+		result.Err = errors.New(result.Error)
+		return
+	}
+
+	actualClass := classifyStepError(err)
+	actualMessage := err.Error()
+	if mismatch := expectedErrorMismatch(step.ExpectError, actualClass, actualMessage); mismatch != "" {
+		result.Status = StepStatusFailed
+		result.ErrorClass = errorClassExpectedErrorMismatch
+		result.Error = fmt.Sprintf("step %s expected error did not match: %s; actual class %q: %s", step.ID, mismatch, actualClass, actualMessage)
+		result.Err = fmt.Errorf("%s: %w", result.Error, err)
+		return
+	}
+
+	result.Status = StepStatusOK
+	result.ErrorClass = actualClass
+	result.Error = actualMessage
+}
+
+func expectedErrorMismatch(expected *ExpectedError, actualClass, actualMessage string) string {
+	if expected.ErrorClass != "" && expected.ErrorClass != actualClass {
+		return fmt.Sprintf("error_class %q", expected.ErrorClass)
+	}
+	for _, contains := range expected.Contains {
+		if !strings.Contains(actualMessage, contains) {
+			return fmt.Sprintf("message containing %q", contains)
+		}
+	}
+	return ""
 }
 
 func (r *Runner) skippedResult(runID string, step Step, errorClass, message string, err error) StepResult {

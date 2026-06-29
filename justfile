@@ -372,7 +372,17 @@ scenario scenario="tests/scenario/scenarios/provision_smoke.yaml":
 # Run the dev provision smoke scenario
 [group('test')]
 scenario-smoke:
+    just scenario-provision-success
+
+# Run the dev provision success scenario
+[group('test')]
+scenario-provision-success:
     ./scripts/scenario_run.sh tests/scenario/scenarios/provision_smoke.yaml
+
+# Run the dev provision rejection scenario
+[group('test')]
+scenario-provision-rejection:
+    ./scripts/scenario_run.sh tests/scenario/scenarios/provision_rejection.yaml
 
 # Run the dev frozen dataset metadata exploration scenario
 [group('test')]

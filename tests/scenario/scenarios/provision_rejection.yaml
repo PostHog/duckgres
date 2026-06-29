@@ -1,0 +1,26 @@
+name: provision-rejection
+run_id_prefix: scenario-provision-rejection
+steps:
+  - id: provision
+    type: provision_warehouse
+    expect_error:
+      error_class: provision_step_error
+      contains:
+        - HTTP 400
+        - org id must be a canonical UUID or a slug of at most 35 characters
+    with:
+      org_id: scenario-reject-${run_id_compact}
+      request:
+        database_name: scenario_reject_${run_id_token}
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [provision]
+    always_run: true
+    with:
+      org_id: scenario-reject-${run_id_compact}

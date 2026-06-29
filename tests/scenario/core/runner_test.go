@@ -223,6 +223,51 @@ steps:
 	}
 }
 
+func TestRunnerTreatsExpectedErrorAsSuccessfulAssertion(t *testing.T) {
+	sentinel := classifiedTestError{class: "provision_step_error", message: "HTTP 400: org id must be a canonical UUID or a slug of at most 35 characters"}
+	scenario, err := ParseScenario([]byte(`
+name: expected-provision-rejection
+steps:
+  - id: provision
+    type: provision_warehouse
+    expect_error:
+      error_class: provision_step_error
+      contains:
+        - HTTP 400
+        - slug of at most 35 characters
+`))
+	if err != nil {
+		t.Fatalf("ParseScenario returned error: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{
+		RunID:    "run-expected-error",
+		Scenario: scenario,
+		Executor: StepExecutorFunc(func(context.Context, Step) error {
+			return sentinel
+		}),
+		Now: fixedClock(time.Unix(1700000000, 0)),
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error for matching expected error: %v", err)
+	}
+	if summary.SucceededSteps != 1 || summary.FailedSteps != 0 || summary.SkippedSteps != 0 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	results := runner.Results()
+	if len(results) != 1 {
+		t.Fatalf("results = %+v, want one result", results)
+	}
+	if results[0].Status != StepStatusOK {
+		t.Fatalf("expected matching error assertion to be ok, got %+v", results[0])
+	}
+	if results[0].ErrorClass != "provision_step_error" || results[0].Error == "" {
+		t.Fatalf("expected matched error details to be recorded, got %+v", results[0])
+	}
+}
+
 func TestRunnerReturnsSuccessForAllSuccessfulSteps(t *testing.T) {
 	scenario, err := ParseScenario([]byte(`
 name: success
