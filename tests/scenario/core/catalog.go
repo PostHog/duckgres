@@ -17,11 +17,17 @@ type Scenario struct {
 }
 
 type Step struct {
-	ID        string         `yaml:"id" json:"id"`
-	Type      string         `yaml:"type" json:"type"`
-	DependsOn []string       `yaml:"depends_on" json:"depends_on,omitempty"`
-	AlwaysRun bool           `yaml:"always_run" json:"always_run,omitempty"`
-	With      map[string]any `yaml:"with" json:"with,omitempty"`
+	ID          string         `yaml:"id" json:"id"`
+	Type        string         `yaml:"type" json:"type"`
+	DependsOn   []string       `yaml:"depends_on" json:"depends_on,omitempty"`
+	AlwaysRun   bool           `yaml:"always_run" json:"always_run,omitempty"`
+	ExpectError *ExpectedError `yaml:"expect_error" json:"expect_error,omitempty"`
+	With        map[string]any `yaml:"with" json:"with,omitempty"`
+}
+
+type ExpectedError struct {
+	ErrorClass string   `yaml:"error_class" json:"error_class,omitempty"`
+	Contains   []string `yaml:"contains" json:"contains,omitempty"`
 }
 
 type rawScenario struct {
@@ -32,11 +38,12 @@ type rawScenario struct {
 }
 
 type rawStep struct {
-	ID        string         `yaml:"id"`
-	Type      string         `yaml:"type"`
-	DependsOn *[]string      `yaml:"depends_on"`
-	AlwaysRun bool           `yaml:"always_run"`
-	With      map[string]any `yaml:"with"`
+	ID          string         `yaml:"id"`
+	Type        string         `yaml:"type"`
+	DependsOn   *[]string      `yaml:"depends_on"`
+	AlwaysRun   bool           `yaml:"always_run"`
+	ExpectError *ExpectedError `yaml:"expect_error"`
+	With        map[string]any `yaml:"with"`
 }
 
 func LoadScenario(path string) (Scenario, error) {
@@ -112,6 +119,23 @@ func normalizeScenario(raw rawScenario) (Scenario, error) {
 				return Scenario{}, fmt.Errorf("step %s has unknown dependency %q", step.ID, dep)
 			}
 			step.DependsOn[depIdx] = dep
+		}
+		if rawStep.ExpectError != nil {
+			expected := ExpectedError{
+				ErrorClass: strings.TrimSpace(rawStep.ExpectError.ErrorClass),
+				Contains:   make([]string, 0, len(rawStep.ExpectError.Contains)),
+			}
+			for containsIdx, contains := range rawStep.ExpectError.Contains {
+				contains = strings.TrimSpace(contains)
+				if contains == "" {
+					return Scenario{}, fmt.Errorf("step %s expect_error.contains[%d] must be non-empty", step.ID, containsIdx)
+				}
+				expected.Contains = append(expected.Contains, contains)
+			}
+			if expected.ErrorClass == "" && len(expected.Contains) == 0 {
+				return Scenario{}, fmt.Errorf("step %s expect_error requires error_class or contains", step.ID)
+			}
+			step.ExpectError = &expected
 		}
 
 		seen[step.ID] = struct{}{}

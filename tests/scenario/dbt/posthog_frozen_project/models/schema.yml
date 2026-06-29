@@ -1,0 +1,38 @@
+version: 2
+
+models:
+  - name: stg_persons_daily
+    columns:
+      - name: person_day
+        tests:
+          - not_null
+      - name: persons
+        tests:
+          - not_null
+
+  - name: stg_events
+    columns:
+      - name: event
+        tests:
+          - not_null
+      - name: event_timestamp
+        tests:
+          - not_null
+
+  - name: daily_event_counts
+    columns:
+      - name: event_day
+        tests:
+          - not_null
+      - name: events
+        tests:
+          - not_null
+
+  - name: person_event_rollup
+    columns:
+      - name: person_id
+        tests:
+          - not_null
+      - name: events
+        tests:
+          - not_null
