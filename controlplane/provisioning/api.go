@@ -28,17 +28,44 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &s) && s.SQLState() == "23505"
 }
 
-// ducklingOrgIDPattern constrains org IDs that get a provisioned warehouse to a
-// single DNS-1123 label (lowercase alphanumerics + hyphens, start/end
-// alphanumeric). This is the shape every derived name needs:
-//   - the SNI prefix <org>.<managed-suffix> is a single DNS label already;
-//   - the Duckling CR / IAM role / S3 bucket / Lakekeeper CR names use the org
-//     ID verbatim (lowercased), so it must be a valid k8s/AWS name;
-//   - the Postgres identifier maps any non-[a-z0-9_] char to '_', which is only
-//     injective when the source charset excludes everything but hyphens.
-//
-// Validating here keeps the org ID → resource-name mappings collision-free.
+const (
+	// maxDucklingSlugOrgIDLength is the public Duckgres provisioning contract
+	// for non-UUID org IDs. It is intentionally stricter than most individual
+	// downstream limits: with the current managed-warehouse suffix "mw-prod-us",
+	// the S3 bucket name is:
+	//
+	//   posthog-duckling-<slug>-mw-prod-us
+	//
+	// S3 caps bucket names at 63 chars, leaving 35 chars for <slug>. That cap
+	// also leaves enough room for the other request-driven names derived from
+	// org ID today (Duckling/Lakekeeper k8s names, IAM roles, PgBouncer names,
+	// and Postgres identifiers). Canonical UUID org IDs are allowed separately
+	// because configstore.DucklingBucketName compacts them from 36 to 32 chars
+	// before building the S3 bucket name. If the managed bucket suffix grows
+	// beyond "mw-prod-us", lower this cap or validate the suffix at startup.
+	maxDucklingSlugOrgIDLength = 35
+)
+
+// ducklingOrgIDPattern constrains provisionable org IDs to a single DNS-1123
+// label (lowercase alphanumerics + hyphens, start/end alphanumeric). This keeps
+// SNI labels valid and makes the Postgres hyphen-to-underscore mapping
+// collision-free for names Duckgres derives from org ID.
 var ducklingOrgIDPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// canonicalDucklingUUIDPattern matches the UUID-shaped org IDs PostHog sends.
+// These are longer than maxDucklingSlugOrgIDLength but safe because Duckgres
+// compacts UUID hyphens only for S3 bucket naming.
+var canonicalDucklingUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func validateDucklingOrgID(orgID string) error {
+	if !ducklingOrgIDPattern.MatchString(orgID) {
+		return errors.New("org id must be a DNS-1123 label (lowercase alphanumerics and hyphens, starting and ending alphanumeric) so the derived resource names are valid and collision-free")
+	}
+	if !canonicalDucklingUUIDPattern.MatchString(orgID) && len(orgID) > maxDucklingSlugOrgIDLength {
+		return fmt.Errorf("org id must be a canonical UUID or a slug of at most %d characters", maxDucklingSlugOrgIDLength)
+	}
+	return nil
+}
 
 // Store defines the config store operations needed by the provisioning API.
 type Store interface {
@@ -194,8 +221,8 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if !ducklingOrgIDPattern.MatchString(orgID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be a DNS-1123 label (lowercase alphanumerics and hyphens, starting and ending alphanumeric) so the derived resource names are valid and collision-free"})
+	if err := validateDucklingOrgID(orgID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
