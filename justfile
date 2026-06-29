@@ -47,9 +47,22 @@ build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
 
 # Serve the admin UI locally for one kube context. The devserver fetches the
+# Build the admin console SPA into controlplane/admin/ui/dist (embedded by the
+# kubernetes build via //go:embed all:ui/dist). The Docker image rebuilds this
+# in its own node stage; run this locally before `go build -tags kubernetes` if
+# you want the real bundle embedded instead of the committed placeholder.
+[group('dev')]
+ui-build:
+    cd controlplane/admin/ui && npm ci && npm run build
+
+# Live React dev server (HMR) against a port-forwarded control plane. Point
+# VITE_PROXY_TARGET at the CP (or the Go devserver) — default http://127.0.0.1:8080.
+[group('dev')]
+ui-dev-vite target="http://127.0.0.1:8080":
+    cd controlplane/admin/ui && VITE_PROXY_TARGET={{target}} npm run dev
+
 # internal secret, port-forwards that context's control plane, and serves the
-# explorer with a context banner (RED when the context name contains "prod").
-# Edit controlplane/admin/static/*.html and refresh — no rebuild/redeploy.
+# built SPA with a context banner (RED when the context name contains "prod").
 [group('dev')]
 ui-dev context listen="127.0.0.1:5173" namespace="duckgres":
     go run ./controlplane/admin/devserver --context {{context}} --namespace {{namespace}} --listen {{listen}}

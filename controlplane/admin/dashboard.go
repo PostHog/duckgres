@@ -83,31 +83,21 @@ func APIAuthMiddleware(tokens TokenSet) gin.HandlerFunc {
 	}
 }
 
-// RegisterDashboard serves the admin dashboard on the Gin engine.
-func RegisterDashboard(r *gin.Engine, tokens TokenSet) {
-	// The models explorer is the only dashboard surface: a sidebar of every
-	// config-store model, a table of its rows, and a detail view per row. "/"
-	// and "/models" both land here. The legacy per-entity pages were removed.
-	r.GET("/", dashboardPageHandler("models.html", tokens))
-	r.GET("/models", dashboardPageHandler("models.html", tokens))
-	r.POST("/login", loginHandler(tokens))
-}
-
-func dashboardPageHandler(templateName string, tokens TokenSet) gin.HandlerFunc {
-	return func(c *gin.Context) {
+// RegisterLogin wires the break-glass internal-secret login on the Gin engine.
+// The React SPA (served by RegisterUI) owns "/" and all app routes; the primary
+// auth path in production is ALB/Cognito SSO. This cookie login remains as a
+// service-to-service / break-glass path (e.g. local port-forward or an env
+// without SSO wired): POST /login sets the admin-token cookie, which
+// AuthMiddleware accepts and maps to the admin role.
+func RegisterLogin(r *gin.Engine, tokens TokenSet) {
+	r.GET("/login", func(c *gin.Context) {
 		// The admin token is deliberately NOT accepted via URL query parameters:
 		// URL-borne secrets persist in browser history and any future proxy/access
-		// logs. Authenticate via the POST /login form or the
-		// X-Duckgres-Internal-Secret header instead.
-		if !tokens.Valid(requestAdminToken(c)) {
-			renderLoginPage(c, loginNextURI(c.Request.URL), "")
-			return
-		}
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		if err := dashboardTmpl.ExecuteTemplate(c.Writer, templateName, nil); err != nil {
-			c.String(http.StatusInternalServerError, "template error: %v", err)
-		}
-	}
+		// logs. Submit the POST /login form or send the X-Duckgres-Internal-Secret
+		// header instead.
+		renderLoginPage(c, normalizeNextPath(c.Query("next")), "")
+	})
+	r.POST("/login", loginHandler(tokens))
 }
 
 func loginHandler(tokens TokenSet) gin.HandlerFunc {

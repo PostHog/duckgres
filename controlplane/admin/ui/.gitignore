@@ -1,0 +1,7 @@
+# Only node_modules is ignored. `dist/` is intentionally NOT ignored — the Go
+# control plane embeds it via //go:embed all:dist and CI rebuilds it.
+node_modules
+*.local
+.DS_Store
+npm-debug.log*
+*.tsbuildinfo

@@ -1352,6 +1352,59 @@ models_explorer_api() {
   [ "$code" = "404" ] || fail "GET /api/v1/models/not-a-model returned $code, want 404"
 }
 
+# ---- admin console: identity + live state + auth gate ----------------------
+# The VPC-private admin console (controlplane/admin/, docs/design/admin-ui.md)
+# adds identity resolution (/me), live cluster state, a metrics proxy, and an
+# audit log on top of the models explorer. The internal secret maps to the admin
+# role; an unauthenticated request is rejected. This asserts the new read
+# surfaces are wired and return their documented envelopes.
+admin_console_api() {
+  log "admin console: /me identity, live state, auth gate"
+  # Internal secret → admin role.
+  role="$(curl -fsS -H "$H" "$API/api/v1/me" | jq -r '.role')"
+  [ "$role" = "admin" ] || fail "GET /me with internal secret role='$role', want admin"
+  # No auth → 401 (the accept-list stays closed for SSO-less callers).
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/me")"
+  [ "$code" = "401" ] || fail "GET /me with no auth returned $code, want 401"
+  # Live read endpoints return their documented envelopes.
+  curl -fsS -H "$H" "$API/api/v1/queries"           | jq -e 'has("queries")' >/dev/null || fail "/queries missing 'queries' key"
+  curl -fsS -H "$H" "$API/api/v1/workers/fleet"     | jq -e 'has("fleet")'   >/dev/null || fail "/workers/fleet missing 'fleet' key"
+  curl -fsS -H "$H" "$API/api/v1/cluster/instances" \
+    | jq -e '.instances | map(select(.self)) | length >= 1' >/dev/null \
+    || fail "/cluster/instances has no self-flagged CP replica"
+  # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
+  curl -fsS -H "$H" "$API/api/v1/metrics/panels" | jq -e '.panels | index("query_rate")' >/dev/null \
+    || fail "/metrics/panels missing 'query_rate'"
+}
+
+# ---- admin impersonation round-trip + audit --------------------------------
+# An admin can open a session as an org user (workers trust the CP — no password)
+# and run SQL on that org's worker; every statement is audited with the admin
+# actor, and a write requires allow_write=true. This asserts the full round-trip
+# against a real worker AND that an audit row is persisted — the load-bearing
+# behaviours of the impersonation path (impersonate.go + admin_providers.go).
+admin_impersonation_audited() { # org
+  org="$1"
+  log "admin impersonation: run SQL as root@$org + assert audit row"
+  out="$(curl -fsS --max-time 360 -H "$H" -H 'Content-Type: application/json' \
+    -d '{"username":"root","sql":"SELECT 42 AS answer","allow_write":false}' \
+    "$API/api/v1/orgs/$org/impersonate/query")" \
+    || fail "impersonate: request failed for root@$org"
+  echo "$out" | jq -e '.columns | index("answer")' >/dev/null \
+    || fail "impersonate: missing column 'answer' in: $out"
+  echo "$out" | jq -e '.rows[0][0] == 42' >/dev/null \
+    || fail "impersonate: rows[0][0] != 42 in: $out"
+  # A write statement without allow_write must be rejected (conservative classifier).
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -H "$H" -H 'Content-Type: application/json' \
+    -d '{"username":"root","sql":"CREATE TABLE imp_x(i int)","allow_write":false}' \
+    "$API/api/v1/orgs/$org/impersonate/query")"
+  [ "$code" = "400" ] || fail "impersonate: write without allow_write returned $code, want 400"
+  # The successful impersonation must have left an audit row attributing the admin.
+  curl -fsS -H "$H" "$API/api/v1/audit?org=$org" \
+    | jq -e --arg o "$org" '.entries | map(select(.action=="impersonate.query" and .target_user=="root" and .org==$o)) | length >= 1' >/dev/null \
+    || fail "impersonate: no audit row for impersonate.query root@$org"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -1606,6 +1659,10 @@ main() {
   # against a real bcrypt-hash-bearing row.
   models_explorer_api
 
+  # Admin console read surfaces: identity/role, live state, metrics proxy, auth
+  # gate. Independent of the per-org lanes, so run it here once orgs exist.
+  admin_console_api
+
   # Join the kubectl background download started at script load — first k use
   # is inside the lanes, so the fetch overlapped the whole provisioning phase.
   bootstrap_kubectl
@@ -1616,6 +1673,9 @@ main() {
   run_lane res2 lane_res2
   run_lane ext  lane_ext
   join_lanes cnpg res1 res2 ext
+
+  # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
+  admin_impersonation_audited "$CNPG"
 
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
@@ -1629,7 +1689,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

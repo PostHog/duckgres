@@ -38,6 +38,7 @@ type SessionStatus struct {
 	PID      int32  `json:"pid"`
 	WorkerID int    `json:"worker_id"`
 	Org      string `json:"org"`
+	User     string `json:"user"`
 	Protocol string `json:"protocol"`
 }
 

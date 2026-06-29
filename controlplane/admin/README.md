@@ -1,75 +1,108 @@
-# Control-plane admin dashboard
+# Control-plane admin console
 
-The control plane (multi-tenant / `kubernetes` build tag) serves a small admin
-dashboard on `:8080`. It is gated behind the internal secret — there is no
-public exposure; reach it via `kubectl port-forward`.
+The control plane (multi-tenant / `kubernetes` build tag) serves a React admin
+console + REST API on `:8080`. It is the operate-everything surface: metrics,
+live queries/sessions/connections, the worker fleet, the full config store, user
+impersonation, and an audit log — sliceable by org and user.
 
-## Pages
+Exposure is VPC-private: an internal-scheme ALB + Cognito (Google Workspace SSO),
+reachable only over the Tailscale subnet router. See `docs/design/admin-ui.md`.
 
-| Route | Page | Purpose |
+## Architecture
+
+- **Frontend** (`ui/`): React + Vite + TypeScript + Tailwind + shadcn/ui,
+  TanStack Query/Table, Recharts. Built to `ui/dist/` and embedded via
+  `//go:embed all:ui/dist` (`embed_ui.go`), served by Gin with SPA fallback. A
+  committed placeholder `ui/dist/index.html` keeps `go build` working without a
+  node toolchain; CI/Docker run `npm run build` to produce the real bundle
+  before `go build`.
+- **Backend**: Gin on `:8080`, all routes under `/api/v1` (the SPA owns `/`).
+
+## Auth + RBAC
+
+`AuthMiddleware` (`authz.go`) resolves every `/api/v1` request to an `Identity`
+with a `Role`:
+
+- A valid `TokenSet` token (`X-Duckgres-Internal-Secret` header or the
+  `duckgres_admin_token` cookie) → **admin**. This is the service-to-service /
+  break-glass path (`RegisterLogin` mints the cookie via `POST /login`).
+- Otherwise the ALB-injected `X-Amzn-Oidc-Data` JWT (Cognito/Google) is decoded
+  to email + groups. Membership in `DUCKGRES_ADMIN_SSO_GROUP` → **admin**, else
+  **viewer**. (Unset group → admin for any SSO user, logged — set it in prod.)
+
+`RoleGate` enforces the split: mutating verbs (POST/PUT/PATCH/DELETE) and the
+audit-log GET require admin; other GETs allow viewer. `AuditMiddleware` records
+every mutation. The ALB OIDC JWT signature is currently trusted-by-network (the
+internal LB is the only ingress and strips client copies); verifying it by `kid`
+is a hardening follow-up (see the design doc).
+
+`?token=` URL auth is deliberately rejected (#721).
+
+## API surface
+
+Existing typed CRUD (`api.go`): orgs, users, managed warehouses (+ tenant
+pinning). Generic read-only models explorer (`models_api.go`): `GET
+/api/v1/models`, `GET /api/v1/models/:model` — secret columns (`json:"-"`)
+dropped by the typed scan; **never swap in a raw map scan**.
+
+Added for the console:
+
+| Route | Role | Purpose |
 |-------|------|---------|
-| `/`, `/models` | `static/models.html` | **Models explorer** — the only dashboard surface. Sidebar of every config-store model grouped Tenants / Runtime, a table of the selected model's rows, and a click-through detail panel. Columns are sortable with per-column tooltips; the orgs table cross-links to org-users + managed-warehouses; the orgs detail panel supports inline edit + delete. Nested warehouse sub-configs render as expandable sections. |
-| `POST /login` | `static/login.html` | Token login (sets the `duckgres_admin_token` cookie). |
+| `GET /api/v1/me` | any | caller identity + role (SPA tailors its UI) |
+| `GET /api/v1/queries` | viewer | running queries w/ progress, `?org=&user=` slicing |
+| `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
+| `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
+| `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |
+| `POST /api/v1/sessions/:pid/cancel` | admin | tear down a session + its worker |
+| `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
+| `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
+| `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
+| `GET /api/v1/audit` | admin | admin action log |
 
-The pages are plain HTML + vanilla JS served via `//go:embed static/*` and
-`html/template`. The models explorer and login page follow the dark "mission
-control" design language (Chakra Petch + IBM Plex Mono, cyan/amber accents).
-Because the templates are parsed with `html/template`, **do not write `{{` in
-their inline JS** — only `login.html` uses template directives (`{{.Next}}` /
-`{{.Error}}`).
+### Impersonation (`impersonate.go` + `controlplane/admin_providers.go`)
 
-## Auth
+`POST /api/v1/orgs/:id/impersonate/query` `{username, sql, allow_write}` opens a
+**real** session as the target org+user (workers trust the CP — no password),
+runs the SQL via the returned `FlightExecutor`, streams rows back, and **always**
+destroys the session. It is admin-only, every statement is audited with the admin
+actor + redacted SQL, and a write statement requires `allow_write=true` (the SQL
+classifier is conservative — WITH/CTEs and anything non-obviously-read-only count
+as writes). Caveat: the session consumes a worker exclusively
+(one-session-per-worker), counts against the org's connection limits, and appears
+in the org's session accounting. Rows capped at `maxImpersonationRows`.
 
-- Service-to-service: `X-Duckgres-Internal-Secret` header.
-- Dashboard UI: the `POST /login` form mints an `HttpOnly` cookie.
-- The internal secret plus rotation fallbacks are accepted (see `TokenSet`).
-- `?token=` URL auth is deliberately rejected (#721).
+### Metrics proxy (`metrics_proxy.go`)
 
-## Models explorer API (read-only)
+Not an open PromQL relay: the client passes a panel KEY (+ optional org/window);
+the PromQL is built server-side from the allow-list (`rangePanels`). Forwards to
+`DUCKGRES_PROMETHEUS_URL` (the in-cluster VictoriaMetrics vmselect, Prometheus-
+compatible). Org-labelled panels (`duckgres_query_total{org,outcome}` etc.) keep
+slicing enforced. Unset URL → 503 so the UI shows "metrics not configured".
 
-Backed by `models_api.go`. The registry in `modelDescriptors()` is the single
-source of truth — add a config-store model there and it appears in the sidebar,
-listing, and column derivation.
+## Local UI development
 
-- `GET /api/v1/models` → `{ "models": [ { key, label, group, count } ] }` — sidebar with live row counts.
-- `GET /api/v1/models/:model` → `{ key, label, group, table, columns, count, truncated, rows }` — one model's rows.
+Two ways to iterate without redeploying:
 
-Rows are scanned into the typed model and marshaled via its `json` tags, so
-columns tagged `json:"-"` (`OrgUser.Password`, `OrgUserSecret.Ciphertext`,
-`DuckLakeConfig.S3SecretKey`, the singleton IDs) are dropped from the response —
-**never swap the typed scan for a raw `map` scan**, that would leak them.
-Runtime-schema tables (`worker_records`, `cp_instances`, …) are schema-qualified
-with `ConfigStore.RuntimeSchema()`. Listings are capped at `modelsRowLimit`
-(`truncated: true` when hit).
-
-Covered by `models_api_test.go` (redaction + real query path) and the
-`models_explorer_api` assertion in `tests/e2e-mw-dev/harness.sh`.
-
-## Local UI development (no redeploy)
-
-Iterate on the UI against a *deployed* control plane without rebuilding the
-image. The dev proxy (`devserver/`) serves `static/` off disk and proxies
-`/api`, `/login`, `/health` to the CP, injecting the internal secret
-server-side. The browser sees one origin → no CORS, and the secret never reaches
-page JS. The embedded UI uses relative `/api/v1` paths, so the same HTML runs
-byte-for-byte embedded or under the dev proxy.
-
-One `--context` drives everything: the devserver fetches the internal secret
-(`kubectl get secret duckgres-tokens`), port-forwards that context's control
-plane, and serves the explorer with a **context banner — RED when the context
-name contains `prod`** (a dev-only cue; the deployed CP has no such endpoint).
+1. **Vite dev server** (live React/HMR): `cd controlplane/admin/ui && npm run dev`,
+   with `VITE_PROXY_TARGET` pointing at a port-forwarded CP (or the devserver).
+2. **Go devserver** (`devserver/`): serves the built UI off disk and proxies
+   `/api`, `/login`, `/health` to a deployed CP, injecting the internal secret
+   server-side. One `--context` drives secret fetch + port-forward, with a RED
+   banner when the context name contains `prod`.
 
 ```sh
-# one environment:
-just ui-dev mw-dev-admin                 # → http://127.0.0.1:5173 (dev banner)
-just ui-dev mw-prod-us-admin             # → http://127.0.0.1:5173 (RED prod banner)
-
-# both side by side (prod :5173, dev :5174):
-just ui-dev-all
-
-# edit controlplane/admin/static/*.html and refresh — no rebuild.
+just ui-dev mw-dev-admin       # → http://127.0.0.1:5173 (dev banner)
+just ui-dev mw-prod-us-admin   # → RED prod banner
 ```
 
-Once the markup is right, it is already what `//go:embed` bakes into the CP — no
-separate build step. (Without `--context`, the devserver falls back to an
-external `--target` + `--secret`/`$DUCKGRES_INTERNAL_SECRET`.)
+The SPA uses relative `/api/v1` paths, so the same bundle runs identically
+embedded, under Vite, or under the Go devserver.
+
+## Tests
+
+`authz_test.go` (SSO role mapping, RoleGate, SQL classifier), `dashboard_test.go`
+(TokenSet / break-glass login / cookie), `api_test.go` + `api_postgres_test.go`
+(CRUD), `models_api_test.go` (redaction). e2e: the `admin_*` /
+`impersonation_*` / `models_explorer_api` assertions in
+`tests/e2e-mw-dev/harness.sh`.

@@ -47,14 +47,14 @@ func TestAPIMiddlewareAcceptsCookie(t *testing.T) {
 
 // Regression test for #721: the admin token must never be accepted via a URL
 // query parameter — URL-borne secrets persist in browser history and proxy
-// access logs. A request carrying the correct token in ?token= must get the
-// login page (401), with no Set-Cookie and no redirect.
+// access logs. A GET /login carrying the correct token in ?token= must still
+// just render the login page (401), with no Set-Cookie and no redirect.
 func TestDashboardRejectsTokenQueryParam(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterDashboard(r, NewTokenSet("secret", nil))
+	RegisterLogin(r, NewTokenSet("secret", nil))
 
-	for _, path := range []string{"/?token=secret", "/models?token=secret&foo=bar"} {
+	for _, path := range []string{"/login?token=secret", "/login?token=secret&foo=bar"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
@@ -80,7 +80,7 @@ func TestDashboardRejectsTokenQueryParam(t *testing.T) {
 func TestLoginCookieIsHttpOnlyStrict(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterDashboard(r, NewTokenSet("secret", nil))
+	RegisterLogin(r, NewTokenSet("secret", nil))
 
 	form := url.Values{"token": {"secret"}, "next": {"/"}}
 	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
@@ -103,14 +103,14 @@ func TestLoginCookieIsHttpOnlyStrict(t *testing.T) {
 func TestDashboardRequiresLoginThenSetsCookie(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterDashboard(r, NewTokenSet("secret", nil))
+	RegisterLogin(r, NewTokenSet("secret", nil))
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("GET / status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		t.Fatalf("GET /login status = %d, want %d", rec.Code, http.StatusUnauthorized)
 	}
 	if body := rec.Body.String(); body == "" {
 		t.Fatal("expected login page body")
@@ -222,7 +222,13 @@ func TestAPIMiddlewareAcceptsFallbackDuringRotation(t *testing.T) {
 func TestLoginWithFallbackTokenWorksEndToEnd(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterDashboard(r, NewTokenSet("new-secret", []string{"old-secret"}))
+	tokens := NewTokenSet("new-secret", []string{"old-secret"})
+	RegisterLogin(r, tokens)
+	// A cookie-authenticated request must be accepted by AuthMiddleware (and
+	// mapped to the admin role via the internal-secret path).
+	r.GET("/api/v1/ping", AuthMiddleware(tokens, SSOConfig{}), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
+	})
 
 	form := url.Values{"token": {"old-secret"}, "next": {"/"}}
 	loginReq := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
@@ -238,12 +244,12 @@ func TestLoginWithFallbackTokenWorksEndToEnd(t *testing.T) {
 		t.Fatalf("cookies = %v, want exactly one %q cookie", cookies, adminTokenCookieName)
 	}
 
-	// The cookie minted from the fallback must authenticate a dashboard GET.
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	// The cookie minted from the fallback must authenticate an API request.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/ping", nil)
 	req.AddCookie(cookies[0])
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET / with fallback cookie status = %d, want %d", rec.Code, http.StatusOK)
+		t.Fatalf("GET /api/v1/ping with fallback cookie status = %d, want %d", rec.Code, http.StatusOK)
 	}
 }
