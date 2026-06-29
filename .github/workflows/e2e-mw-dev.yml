@@ -1,10 +1,10 @@
 # Per-PR end-to-end test against the real posthog-mw-dev EKS cluster.
 #
 # Replaces what kind (tests/k8s/) cannot exercise: real Cilium network
-# policies, real Crossplane Duckling provisioning, real cnpg-shard + external
-# RDS metadata stores, and the real per-org Lakekeeper operator — the layers
-# where this quarter's bugs actually lived (Cilium egress, lakekeeper
-# encryption-key drift, cnpg role drift, RBAC delete gaps).
+# policies, real Crossplane Duckling provisioning, and real cnpg-shard +
+# external RDS metadata stores — the production-like layers where this
+# quarter's bugs actually lived (Cilium egress, cnpg role drift, RBAC delete
+# gaps).
 #
 # Flow:
 #   1. build arm64-only worker + control-plane images, tagged pr-<N>-<sha>,
@@ -17,7 +17,7 @@
 #      ClusterIP service (no public DNS / NLB needed). Covers the cnpg-shard
 #      and external metadata backends.
 #   5. always tear the namespace down (and deprovision the ci-pr ducklings so
-#      no S3 / cnpg role / lakekeeper CR leaks on shared infra).
+#      no S3 / cnpg role leaks on shared infra).
 #
 # SECURITY — who can run this:
 #   Same model as the AWS/OIDC job in ci.yml: the gate is the repo setting
@@ -201,8 +201,8 @@ jobs:
         uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
-      # Deprovision the ci-pr ducklings (so no S3 / cnpg role+db / lakekeeper CR
-      # leaks on shared infra) then delete the namespace.
+      # Deprovision the ci-pr ducklings (so no S3 / cnpg role+db leaks on
+      # shared infra) then delete the namespace.
       - name: Teardown
         run: bash tests/e2e-mw-dev/run.sh teardown
 
