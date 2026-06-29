@@ -107,7 +107,6 @@ type captureRuntimeWorkerStore struct {
 	spawnOwnerEpoch                  int64
 	spawnPodNamePrefix               string
 	spawnMaxOrgWorkers               int
-	spawnMaxGlobalWorks              int
 	hotIdleClaimResult               *configstore.WorkerRecord
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
@@ -212,7 +211,7 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID,
 	}
 	return nil, s.hotIdleClaimMissReason, nil
 }
-func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.spawnCalls++
@@ -224,7 +223,6 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 	s.spawnOwnerEpoch = ownerEpoch
 	s.spawnPodNamePrefix = podNamePrefix
 	s.spawnMaxOrgWorkers = maxOrgWorkers
-	s.spawnMaxGlobalWorks = maxGlobalWorkers
 	if s.spawnErr != nil {
 		return nil, s.spawnErr
 	}
@@ -1382,30 +1380,6 @@ func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 	}
 	if store.recordMissCalls != 0 {
 		t.Fatalf("expected no recorded miss for org-cap, got %d", store.recordMissCalls)
-	}
-}
-
-func TestK8sPoolReserveSharedWorkerDecisionDoesNotReplaceIncompatibleHotIdleOnGlobalCapMiss(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 1)
-	store := &captureRuntimeWorkerStore{
-		hotIdleClaimMissReason: configstore.WorkerClaimMissReasonNoIdle,
-	}
-	pool.runtimeStore = store
-
-	claim, err := pool.reserveSharedWorkerDecision(&WorkerAssignment{
-		OrgID:      "analytics",
-		MaxWorkers: 1,
-		Image:      "duckgres:new",
-	})
-	var capacityErr *WorkerCapacityExhaustedError
-	if !errors.As(err, &capacityErr) {
-		t.Fatalf("expected capacity error, got claim=%#v err=%v", claim, err)
-	}
-	if claim != nil {
-		t.Fatalf("expected no claim on capacity miss, got %#v", claim)
-	}
-	if store.spawnCalls != 1 {
-		t.Fatalf("expected direct spawn attempt to enforce global cap, got %d spawn calls", store.spawnCalls)
 	}
 }
 

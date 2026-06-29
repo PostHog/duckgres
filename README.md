@@ -266,7 +266,6 @@ Run with config file:
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
-| `DUCKGRES_K8S_MAX_WORKERS` | Global cap for shared K8s workers (`0` means Duckgres does not impose a cap) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
@@ -381,7 +380,6 @@ Options:
   -sni-routing-mode string Hostname routing: off, passthrough, or enforce
   -managed-hostname-suffixes string
                           Comma-separated managed tenant hostname suffixes
-  -k8s-max-workers int    Max K8s workers in the shared pool, 0=unbounded
 ```
 
 ## DuckDB Extensions

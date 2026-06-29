@@ -78,7 +78,6 @@ type CLIInputs struct {
 	K8sWorkerConfigMap          string
 	K8sWorkerImagePullPolicy    string
 	K8sWorkerServiceAccount     string
-	K8sMaxWorkers               int
 	K8sWorkerCPURequest         string
 	K8sWorkerMemoryRequest      string
 	K8sWorkerNodeSelector       string
@@ -106,7 +105,6 @@ type Resolved struct {
 	K8sWorkerConfigMap              string
 	K8sWorkerImagePullPolicy        string
 	K8sWorkerServiceAccount         string
-	K8sMaxWorkers                   int
 	K8sWorkerCPURequest             string
 	K8sWorkerMemoryRequest          string
 	K8sWorkerNodeSelector           string
@@ -212,7 +210,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
-	var k8sMaxWorkers int
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var awsRegion string
@@ -518,9 +515,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.K8s.WorkerServiceAccount != "" {
 			k8sWorkerServiceAccount = fileCfg.K8s.WorkerServiceAccount
-		}
-		if fileCfg.K8s.MaxWorkers != 0 {
-			k8sMaxWorkers = fileCfg.K8s.MaxWorkers
 		}
 		if fileCfg.DuckLake.DefaultSpecVersion != "" {
 			cfg.DuckLake.SpecVersion = fileCfg.DuckLake.DefaultSpecVersion
@@ -848,13 +842,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT"); v != "" {
 		k8sWorkerServiceAccount = v
-	}
-	if v := getenv("DUCKGRES_K8S_MAX_WORKERS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sMaxWorkers = n
-		} else {
-			warn("Invalid DUCKGRES_K8S_MAX_WORKERS: " + err.Error())
-		}
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_CPU_REQUEST"); v != "" {
 		k8sWorkerCPURequest = v
@@ -1185,9 +1172,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cli.Set["k8s-worker-service-account"] {
 		k8sWorkerServiceAccount = cli.K8sWorkerServiceAccount
 	}
-	if cli.Set["k8s-max-workers"] {
-		k8sMaxWorkers = cli.K8sMaxWorkers
-	}
 	if cli.Set["aws-region"] {
 		awsRegion = cli.AWSRegion
 	}
@@ -1276,7 +1260,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerConfigMap:              k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy:        k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:         k8sWorkerServiceAccount,
-		K8sMaxWorkers:                   k8sMaxWorkers,
 		K8sWorkerCPURequest:             k8sWorkerCPURequest,
 		K8sWorkerMemoryRequest:          k8sWorkerMemoryRequest,
 		K8sWorkerNodeSelector:           k8sWorkerNodeSelector,

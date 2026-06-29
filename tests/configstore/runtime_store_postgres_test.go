@@ -835,7 +835,7 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 3, 5)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 3)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
 	}
@@ -874,7 +874,7 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	}
 }
 
-func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
+func TestCreateSpawningWorkerSlotRespectsOrgCap(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 13, 0, 0, 0, time.UTC)
 
@@ -890,20 +890,12 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(existing): %v", err)
 	}
 
-	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 1, 5)
+	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 1)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(org cap): %v", err)
 	}
 	if orgLimited != nil {
 		t.Fatalf("expected org cap to block spawning, got %#v", orgLimited)
-	}
-
-	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 2, 1)
-	if err != nil {
-		t.Fatalf("CreateSpawningWorkerSlot(global cap): %v", err)
-	}
-	if globalLimited != nil {
-		t.Fatalf("expected global cap to block spawning, got %#v", globalLimited)
 	}
 }
 
@@ -924,7 +916,7 @@ func TestCreateSpawningWorkerSlotIgnoresIncompatibleHotIdleForOrgCapPostgres(t *
 		t.Fatalf("UpsertWorkerRecord(old hot-idle): %v", err)
 	}
 
-	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1, 5)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
 	}
@@ -947,38 +939,12 @@ func TestCreateSpawningWorkerSlotIgnoresIncompatibleHotIdleForOrgCapPostgres(t *
 		t.Fatalf("UpsertWorkerRecord(sized hot-idle): %v", err)
 	}
 
-	profileSlot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "marketing", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1, 5)
+	profileSlot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "marketing", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(profile): %v", err)
 	}
 	if profileSlot == nil {
 		t.Fatal("expected wrong-profile hot-idle worker not to block org-cap spawn")
-	}
-}
-
-func TestCreateSpawningWorkerSlotCountsIncompatibleHotIdleForGlobalCapPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	now := time.Date(2026, time.June, 11, 13, 5, 0, 0, time.UTC)
-
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          23,
-		PodName:           "duckgres-worker-old-global-hot-idle",
-		State:             configstore.WorkerStateHotIdle,
-		OrgID:             "analytics",
-		Image:             "duckgres:old",
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        2,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(old hot-idle): %v", err)
-	}
-
-	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 5, 1)
-	if err != nil {
-		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
-	}
-	if slot != nil {
-		t.Fatalf("expected incompatible hot-idle worker to block global-cap spawn, got %#v", slot)
 	}
 }
 

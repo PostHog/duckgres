@@ -160,7 +160,7 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 				Pool:   pool,
 			},
 		},
-		baseCfg:   K8sWorkerPoolConfig{MaxWorkers: 2},
+		baseCfg:   K8sWorkerPoolConfig{},
 		globalCfg: ControlPlaneConfig{},
 	}
 
@@ -198,7 +198,7 @@ func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
 				Pool:   pool,
 			},
 		},
-		baseCfg: K8sWorkerPoolConfig{MaxWorkers: 2, WorkerImage: "posthog/duckgres:v1.0.0"},
+		baseCfg: K8sWorkerPoolConfig{WorkerImage: "posthog/duckgres:v1.0.0"},
 	}
 
 	tr.HandleConfigChange(
@@ -224,7 +224,7 @@ func TestOrgRouterHandleConfigChangeRefreshesDefaultWorkerMinHotIdle(t *testing.
 				Pool:   pool,
 			},
 		},
-		baseCfg: K8sWorkerPoolConfig{MaxWorkers: 2},
+		baseCfg: K8sWorkerPoolConfig{},
 	}
 
 	tr.HandleConfigChange(
@@ -340,7 +340,7 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 	tr := &OrgRouter{
 		orgs:        make(map[string]*OrgStack),
 		configStore: store,
-		baseCfg:     K8sWorkerPoolConfig{MaxWorkers: 2},
+		baseCfg:     K8sWorkerPoolConfig{},
 		sharedPool:  sharedPool,
 		globalCfg:   ControlPlaneConfig{},
 	}

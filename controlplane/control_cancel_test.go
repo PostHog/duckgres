@@ -116,11 +116,6 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 			message: "your organization has reached its maximum number of concurrent Duckgres workers and they are all busy; retry once a query finishes",
 		},
 		{
-			name:    "global capacity exhausted",
-			reason:  configstore.WorkerClaimMissReasonGlobalCap,
-			message: "Duckgres worker capacity is currently exhausted; retry later",
-		},
-		{
 			name:    "control plane shutting down",
 			reason:  configstore.WorkerClaimMissReasonShuttingDown,
 			message: "Duckgres control plane is shutting down; retry later",
@@ -157,7 +152,6 @@ func TestCapacityMissPolicyForKnownReasons(t *testing.T) {
 		{name: "none defaults to no_idle", reason: configstore.WorkerClaimMissReasonNone, policyReason: configstore.WorkerClaimMissReasonNoIdle},
 		{name: "no_idle", reason: configstore.WorkerClaimMissReasonNoIdle, policyReason: configstore.WorkerClaimMissReasonNoIdle},
 		{name: "org_cap", reason: configstore.WorkerClaimMissReasonOrgCap, policyReason: configstore.WorkerClaimMissReasonOrgCap},
-		{name: "global_cap", reason: configstore.WorkerClaimMissReasonGlobalCap, policyReason: configstore.WorkerClaimMissReasonGlobalCap},
 		{name: "shutting_down", reason: configstore.WorkerClaimMissReasonShuttingDown, policyReason: configstore.WorkerClaimMissReasonShuttingDown},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

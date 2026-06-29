@@ -421,7 +421,6 @@ const (
 	WorkerClaimMissReasonNone         WorkerClaimMissReason = ""
 	WorkerClaimMissReasonNoIdle       WorkerClaimMissReason = "no_idle"
 	WorkerClaimMissReasonOrgCap       WorkerClaimMissReason = "org_cap"
-	WorkerClaimMissReasonGlobalCap    WorkerClaimMissReason = "global_cap"
 	WorkerClaimMissReasonShuttingDown WorkerClaimMissReason = "shutting_down"
 )
 

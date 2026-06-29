@@ -137,7 +137,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET_FALLBACKS  Comma-separated previous internal secrets still accepted during rotation\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool (0=unbounded)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
@@ -368,7 +367,6 @@ func main() {
 				WorkerConfigMap:              resolved.K8sWorkerConfigMap,
 				ImagePullPolicy:              resolved.K8sWorkerImagePullPolicy,
 				ServiceAccount:               resolved.K8sWorkerServiceAccount,
-				MaxWorkers:                   resolved.K8sMaxWorkers,
 				WorkerCPURequest:             resolved.K8sWorkerCPURequest,
 				WorkerMemoryRequest:          resolved.K8sWorkerMemoryRequest,
 				WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,

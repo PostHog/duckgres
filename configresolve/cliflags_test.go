@@ -46,7 +46,6 @@ func fieldNameToFlagName(name string) string {
 		{"K8sWorkerImage", "k8s-worker-image"},
 		{"K8sWorkerSecret", "k8s-worker-secret"},
 		{"K8sWorkerPort", "k8s-worker-port"},
-		{"K8sMaxWorkers", "k8s-max-workers"},
 		{"ACMEDNSProvider", "acme-dns-provider"},
 		{"ACMEDNSZoneID", "acme-dns-zone-id"},
 		{"ACMECacheDir", "acme-cache-dir"},

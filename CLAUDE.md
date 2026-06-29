@@ -75,7 +75,7 @@ Key CLI flags for control-plane mode:
 - `--ducklake-delta-catalog-enabled` / `--ducklake-delta-catalog-path`
 - Remote backend (requires `--config-store`; `-tags kubernetes` for K8s pool):
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
-  - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account`, `--k8s-max-workers`
+  - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
 

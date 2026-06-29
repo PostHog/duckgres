@@ -12,7 +12,6 @@ type capacityClientMessageKind int
 const (
 	capacityMessageNoIdle capacityClientMessageKind = iota
 	capacityMessageOrgCap
-	capacityMessageGlobalCap
 	capacityMessageShuttingDown
 	capacityMessageGeneric
 )
@@ -31,8 +30,6 @@ func capacityMissPolicyForReason(reason configstore.WorkerClaimMissReason) capac
 		}
 	case configstore.WorkerClaimMissReasonOrgCap:
 		return capacityMissPolicy{reason: reason, messageKind: capacityMessageOrgCap}
-	case configstore.WorkerClaimMissReasonGlobalCap:
-		return capacityMissPolicy{reason: reason, messageKind: capacityMessageGlobalCap}
 	case configstore.WorkerClaimMissReasonShuttingDown:
 		return capacityMissPolicy{reason: reason, messageKind: capacityMessageShuttingDown}
 	default:
@@ -46,8 +43,6 @@ func (p capacityMissPolicy) errorString(retryAfter time.Duration) string {
 		return fmt.Sprintf("worker capacity exhausted; retry in about %s", normalizedCapacityRetryAfter(retryAfter).Round(time.Second))
 	case capacityMessageOrgCap:
 		return "worker capacity exhausted for organization"
-	case capacityMessageGlobalCap:
-		return "worker capacity exhausted by global pool limit"
 	case capacityMessageShuttingDown:
 		return "worker capacity unavailable while control plane is shutting down"
 	default:
@@ -61,8 +56,6 @@ func (p capacityMissPolicy) sqlMessage(retryAfter time.Duration) string {
 		return fmt.Sprintf("no Duckgres worker is currently available; one is being spawned, retry in about %d seconds", capacityRetrySeconds(retryAfter))
 	case capacityMessageOrgCap:
 		return "your organization has reached its maximum number of concurrent Duckgres workers and they are all busy; retry once a query finishes"
-	case capacityMessageGlobalCap:
-		return "Duckgres worker capacity is currently exhausted; retry later"
 	case capacityMessageShuttingDown:
 		return "Duckgres control plane is shutting down; retry later"
 	default:
