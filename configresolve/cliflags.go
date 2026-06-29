@@ -52,6 +52,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	workerQueueTimeout := fs.String("worker-queue-timeout", "", "How long to wait for an available worker/org connection slot (e.g., '60s') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
 	workerIdleTimeout := fs.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	handoverDrainTimeout := fs.String("handover-drain-timeout", "", "How long to wait for planned shutdowns/upgrades to drain before forcing exit (default: '24h' in process mode, '15m' in remote mode) (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
+	drainingInstanceExpiryTimeout := fs.String("draining-instance-expiry-timeout", "", "How long a draining control-plane row may linger before the leader janitor force-expires it so its orphaned workers become reapable. Independent of --handover-drain-timeout. (default: '2h') (env: DUCKGRES_DRAINING_INSTANCE_EXPIRY_TIMEOUT)")
 	acmeDomain := fs.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
 	acmeEmail := fs.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
 	acmeCacheDir := fs.String("acme-cache-dir", "", "Directory for ACME certificate cache (env: DUCKGRES_ACME_CACHE_DIR)")
@@ -112,6 +113,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.WorkerQueueTimeout = *workerQueueTimeout
 		cli.WorkerIdleTimeout = *workerIdleTimeout
 		cli.HandoverDrainTimeout = *handoverDrainTimeout
+		cli.DrainingInstanceExpiryTimeout = *drainingInstanceExpiryTimeout
 		cli.ACMEDomain = *acmeDomain
 		cli.ACMEEmail = *acmeEmail
 		cli.ACMECacheDir = *acmeCacheDir

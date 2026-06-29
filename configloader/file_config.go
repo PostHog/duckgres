@@ -13,35 +13,36 @@ package configloader
 // mode (e.g., the worker binary reads but ignores ControlPlane fields);
 // the cost is one parsed-but-unused struct field per binary.
 type FileConfig struct {
-	Host                      string              `yaml:"host"`
-	Port                      int                 `yaml:"port"`
-	FlightPort                int                 `yaml:"flight_port"`                  // Control-plane Flight SQL ingress port (0 disables)
-	FlightSessionIdleTTL      string              `yaml:"flight_session_idle_ttl"`      // e.g., "10m"
-	FlightSessionReapInterval string              `yaml:"flight_session_reap_interval"` // e.g., "1m"
-	FlightHandleIdleTTL       string              `yaml:"flight_handle_idle_ttl"`       // e.g., "15m"
-	FlightSessionTokenTTL     string              `yaml:"flight_session_token_ttl"`     // e.g., "1h"
-	DataDir                   string              `yaml:"data_dir"`
-	TLS                       TLSConfig           `yaml:"tls"`
-	Users                     map[string]string   `yaml:"users"`
-	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
-	Extensions                []string            `yaml:"extensions"`
-	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
-	Iceberg                   IcebergFileConfig   `yaml:"iceberg"`
-	FilePersistence           bool                `yaml:"file_persistence"`
-	ProcessIsolation          bool                `yaml:"process_isolation"`
-	IdleTimeout               string              `yaml:"idle_timeout"`
-	SessionInitTimeout        string              `yaml:"session_init_timeout"`
-	MemoryLimit               string              `yaml:"memory_limit"`
-	Threads                   int                 `yaml:"threads"`
-	MemoryBudget              string              `yaml:"memory_budget"`
-	MemoryRebalance           *bool               `yaml:"memory_rebalance"`
-	Process                   ProcessFileConfig   `yaml:"process"`
-	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`
-	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`
-	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"`
-	PassthroughUsers          []string            `yaml:"passthrough_users"`
-	LogLevel                  string              `yaml:"log_level"`
-	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`
+	Host                          string              `yaml:"host"`
+	Port                          int                 `yaml:"port"`
+	FlightPort                    int                 `yaml:"flight_port"`                  // Control-plane Flight SQL ingress port (0 disables)
+	FlightSessionIdleTTL          string              `yaml:"flight_session_idle_ttl"`      // e.g., "10m"
+	FlightSessionReapInterval     string              `yaml:"flight_session_reap_interval"` // e.g., "1m"
+	FlightHandleIdleTTL           string              `yaml:"flight_handle_idle_ttl"`       // e.g., "15m"
+	FlightSessionTokenTTL         string              `yaml:"flight_session_token_ttl"`     // e.g., "1h"
+	DataDir                       string              `yaml:"data_dir"`
+	TLS                           TLSConfig           `yaml:"tls"`
+	Users                         map[string]string   `yaml:"users"`
+	RateLimit                     RateLimitFileConfig `yaml:"rate_limit"`
+	Extensions                    []string            `yaml:"extensions"`
+	DuckLake                      DuckLakeFileConfig  `yaml:"ducklake"`
+	Iceberg                       IcebergFileConfig   `yaml:"iceberg"`
+	FilePersistence               bool                `yaml:"file_persistence"`
+	ProcessIsolation              bool                `yaml:"process_isolation"`
+	IdleTimeout                   string              `yaml:"idle_timeout"`
+	SessionInitTimeout            string              `yaml:"session_init_timeout"`
+	MemoryLimit                   string              `yaml:"memory_limit"`
+	Threads                       int                 `yaml:"threads"`
+	MemoryBudget                  string              `yaml:"memory_budget"`
+	MemoryRebalance               *bool               `yaml:"memory_rebalance"`
+	Process                       ProcessFileConfig   `yaml:"process"`
+	WorkerQueueTimeout            string              `yaml:"worker_queue_timeout"`
+	WorkerIdleTimeout             string              `yaml:"worker_idle_timeout"`
+	HandoverDrainTimeout          string              `yaml:"handover_drain_timeout"`
+	DrainingInstanceExpiryTimeout string              `yaml:"draining_instance_expiry_timeout"`
+	PassthroughUsers              []string            `yaml:"passthrough_users"`
+	LogLevel                      string              `yaml:"log_level"`
+	QueryLog                      QueryLogFileConfig  `yaml:"query_log"`
 
 	// Worker backend configuration
 	WorkerBackend string        `yaml:"worker_backend"` // "process" (default) or "remote"

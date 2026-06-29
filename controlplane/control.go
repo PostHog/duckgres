@@ -44,7 +44,16 @@ type ControlPlaneConfig struct {
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade. 0 = unbounded (wait until k8s SIGKILL via terminationGracePeriodSeconds). Default: 0 in remote mode (so a CP rolling out doesn't kill in-flight customer queries at a self-imposed wall — see drainAndShutdown), 24h in process mode.
-	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
+	// DrainingInstanceExpiryTimeout bounds how long a *draining* control-plane
+	// row may linger before the leader janitor force-expires it, so its orphaned
+	// workers become visible to the orphan sweep (ListOrphanedWorkers only lists
+	// workers whose owning CP is expired). This is deliberately independent of
+	// HandoverDrainTimeout: session draining stays unbounded (0) in remote mode so
+	// a rollout never cuts an in-flight import, while the draining *row* still gets
+	// a finite life so leaked workers can be reaped. 0 = use the built-in default
+	// (see effectiveDrainingInstanceExpiry); the reaper is never disabled.
+	DrainingInstanceExpiryTimeout time.Duration
+	MetricsServer                 *http.Server // Optional metrics server to shut down during upgrade
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
