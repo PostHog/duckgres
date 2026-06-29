@@ -49,7 +49,7 @@ func (f *fakeRuntimeInstanceStore) waitForUpserts(t *testing.T, count int, timeo
 
 func TestControlPlaneRuntimeTrackerStartHeartbeats(t *testing.T) {
 	store := &fakeRuntimeInstanceStore{upsertCh: make(chan struct{}, 8)}
-	tracker := NewControlPlaneRuntimeTracker(store, "cp-1:boot-a", "duckgres-0", "pod-uid-1", "boot-a", 10*time.Millisecond)
+	tracker := NewControlPlaneRuntimeTracker(store, "cp-1:boot-a", "duckgres-0", 10*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -74,7 +74,7 @@ func TestControlPlaneRuntimeTrackerStartHeartbeats(t *testing.T) {
 
 func TestControlPlaneRuntimeTrackerMarkDraining(t *testing.T) {
 	store := &fakeRuntimeInstanceStore{}
-	tracker := NewControlPlaneRuntimeTracker(store, "cp-1:boot-a", "duckgres-0", "pod-uid-1", "boot-a", time.Hour)
+	tracker := NewControlPlaneRuntimeTracker(store, "cp-1:boot-a", "duckgres-0", time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

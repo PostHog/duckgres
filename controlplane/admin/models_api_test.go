@@ -26,7 +26,6 @@ func TestModelDescriptorsRedaction(t *testing.T) {
 	// Registry must cover exactly the persisted models we expect.
 	wantKeys := map[string]bool{
 		"orgs": true, "org-users": true, "org-user-secrets": true, "managed-warehouses": true,
-		"global-config": true, "ducklake-config": true, "ratelimit-config": true, "querylog-config": true,
 		"cp-instances": true, "worker-records": true, "flight-session-records": true,
 		"org-connection-queue": true, "org-connection-leases": true,
 	}
@@ -58,8 +57,6 @@ func TestModelDescriptorsRedaction(t *testing.T) {
 	mustHide := map[string][]string{
 		"org-users":        {"password"},
 		"org-user-secrets": {"ciphertext"},
-		"ducklake-config":  {"s3_secret_key", "s3secretkey"},
-		"global-config":    {"id"},
 	}
 	for _, d := range descs {
 		cols := jsonFieldOrder(d.elem)

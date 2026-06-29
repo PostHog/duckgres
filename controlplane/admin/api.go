@@ -107,16 +107,6 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo)
 	// Sessions (read-only)
 	r.GET("/sessions", h.listSessions)
 
-	// Config singletons
-	r.GET("/config/global", h.getGlobalConfig)
-	r.PUT("/config/global", h.updateGlobalConfig)
-	r.GET("/config/ducklake", h.getDuckLakeConfig)
-	r.PUT("/config/ducklake", h.updateDuckLakeConfig)
-	r.GET("/config/ratelimit", h.getRateLimitConfig)
-	r.PUT("/config/ratelimit", h.updateRateLimitConfig)
-	r.GET("/config/querylog", h.getQueryLogConfig)
-	r.PUT("/config/querylog", h.updateQueryLogConfig)
-
 	// Overview
 	r.GET("/status", h.getClusterStatus)
 }
@@ -143,15 +133,6 @@ type apiStore interface {
 	// when concurrent PUTs target the same org. Returns (nil, false, nil) if
 	// the org doesn't exist.
 	MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error)
-
-	GetGlobalConfig() (configstore.GlobalConfig, error)
-	SaveGlobalConfig(cfg *configstore.GlobalConfig) error
-	GetDuckLakeConfig() (configstore.DuckLakeConfig, error)
-	SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error
-	GetRateLimitConfig() (configstore.RateLimitConfig, error)
-	SaveRateLimitConfig(cfg *configstore.RateLimitConfig) error
-	GetQueryLogConfig() (configstore.QueryLogConfig, error)
-	SaveQueryLogConfig(cfg *configstore.QueryLogConfig) error
 }
 
 type gormAPIStore struct {
@@ -409,14 +390,9 @@ func managedWarehouseUpsertColumns() []string {
 		// DB column name. Mismatching this against the actual column makes
 		// the ON CONFLICT … DO UPDATE clause throw 42703.
 		"duck_lake_version",
-		"warehouse_database_region",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",
-		"warehouse_database_database_name",
-		"warehouse_database_username",
 		"metadata_store_kind",
-		"metadata_store_engine",
-		"metadata_store_region",
 		"metadata_store_endpoint",
 		"metadata_store_port",
 		"metadata_store_database_name",
@@ -435,7 +411,6 @@ func managedWarehouseUpsertColumns() []string {
 		"iceberg_region",
 		"iceberg_namespace",
 		"worker_identity_namespace",
-		"worker_identity_service_account_name",
 		"worker_identity_iam_role_arn",
 		"warehouse_database_credentials_namespace",
 		"warehouse_database_credentials_name",
@@ -451,70 +426,15 @@ func managedWarehouseUpsertColumns() []string {
 		"runtime_config_key",
 		"state",
 		"status_message",
-		"warehouse_database_state",
-		"warehouse_database_status_message",
 		"metadata_store_state",
-		"metadata_store_status_message",
 		"s3_state",
-		"s3_status_message",
 		"iceberg_state",
-		"iceberg_status_message",
 		"identity_state",
-		"identity_status_message",
 		"secrets_state",
-		"secrets_status_message",
 		"ready_at",
 		"failed_at",
 		"updated_at",
 	}
-}
-
-func (s *gormAPIStore) GetGlobalConfig() (configstore.GlobalConfig, error) {
-	var cfg configstore.GlobalConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.GlobalConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveGlobalConfig(cfg *configstore.GlobalConfig) error {
-	return s.db().Save(cfg).Error
-}
-
-func (s *gormAPIStore) GetDuckLakeConfig() (configstore.DuckLakeConfig, error) {
-	var cfg configstore.DuckLakeConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.DuckLakeConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error {
-	return s.db().Save(cfg).Error
-}
-
-func (s *gormAPIStore) GetRateLimitConfig() (configstore.RateLimitConfig, error) {
-	var cfg configstore.RateLimitConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.RateLimitConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveRateLimitConfig(cfg *configstore.RateLimitConfig) error {
-	return s.db().Save(cfg).Error
-}
-
-func (s *gormAPIStore) GetQueryLogConfig() (configstore.QueryLogConfig, error) {
-	var cfg configstore.QueryLogConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.QueryLogConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveQueryLogConfig(cfg *configstore.QueryLogConfig) error {
-	return s.db().Save(cfg).Error
 }
 
 type apiHandler struct {
@@ -530,34 +450,27 @@ type apiHandler struct {
 // add a field here without a matching tag on ManagedWarehouse, strict decode
 // will accept it and the merge will silently drop it.
 type managedWarehouseRequest struct {
-	Image                          string                                        `json:"image"`
-	DuckLakeVersion                string                                        `json:"ducklake_version"`
-	WarehouseDatabase              configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
-	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
-	PgBouncer                      configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
-	S3                             configstore.ManagedWarehouseS3                `json:"s3"`
-	Iceberg                        configstore.ManagedWarehouseIceberg           `json:"iceberg"`
-	WorkerIdentity                 configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
-	WarehouseDatabaseCredentials   configstore.SecretRef                         `json:"warehouse_database_credentials"`
-	MetadataStoreCredentials       configstore.SecretRef                         `json:"metadata_store_credentials"`
-	S3Credentials                  configstore.SecretRef                         `json:"s3_credentials"`
-	RuntimeConfig                  configstore.SecretRef                         `json:"runtime_config"`
-	State                          configstore.ManagedWarehouseProvisioningState `json:"state"`
-	StatusMessage                  string                                        `json:"status_message"`
-	WarehouseDatabaseState         configstore.ManagedWarehouseProvisioningState `json:"warehouse_database_state"`
-	WarehouseDatabaseStatusMessage string                                        `json:"warehouse_database_status_message"`
-	MetadataStoreState             configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
-	MetadataStoreStatusMessage     string                                        `json:"metadata_store_status_message"`
-	S3State                        configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
-	S3StatusMessage                string                                        `json:"s3_status_message"`
-	IcebergState                   configstore.ManagedWarehouseProvisioningState `json:"iceberg_state"`
-	IcebergStatusMessage           string                                        `json:"iceberg_status_message"`
-	IdentityState                  configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
-	IdentityStatusMessage          string                                        `json:"identity_status_message"`
-	SecretsState                   configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
-	SecretsStatusMessage           string                                        `json:"secrets_status_message"`
-	ReadyAt                        *time.Time                                    `json:"ready_at"`
-	FailedAt                       *time.Time                                    `json:"failed_at"`
+	Image                        string                                        `json:"image"`
+	DuckLakeVersion              string                                        `json:"ducklake_version"`
+	WarehouseDatabase            configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
+	MetadataStore                configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
+	PgBouncer                    configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
+	S3                           configstore.ManagedWarehouseS3                `json:"s3"`
+	Iceberg                      configstore.ManagedWarehouseIceberg           `json:"iceberg"`
+	WorkerIdentity               configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
+	WarehouseDatabaseCredentials configstore.SecretRef                         `json:"warehouse_database_credentials"`
+	MetadataStoreCredentials     configstore.SecretRef                         `json:"metadata_store_credentials"`
+	S3Credentials                configstore.SecretRef                         `json:"s3_credentials"`
+	RuntimeConfig                configstore.SecretRef                         `json:"runtime_config"`
+	State                        configstore.ManagedWarehouseProvisioningState `json:"state"`
+	StatusMessage                string                                        `json:"status_message"`
+	MetadataStoreState           configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
+	S3State                      configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
+	IcebergState                 configstore.ManagedWarehouseProvisioningState `json:"iceberg_state"`
+	IdentityState                configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
+	SecretsState                 configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
+	ReadyAt                      *time.Time                                    `json:"ready_at"`
+	FailedAt                     *time.Time                                    `json:"failed_at"`
 }
 
 // decodeStrictWarehouseRequest validates a PUT body by decoding it into
@@ -1130,100 +1043,6 @@ func (h *apiHandler) listSessions(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, h.info.AllSessionStatuses())
-}
-
-// --- Config Singletons ---
-
-func (h *apiHandler) getGlobalConfig(c *gin.Context) {
-	cfg, err := h.store.GetGlobalConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateGlobalConfig(c *gin.Context) {
-	var cfg configstore.GlobalConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveGlobalConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) getDuckLakeConfig(c *gin.Context) {
-	cfg, err := h.store.GetDuckLakeConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateDuckLakeConfig(c *gin.Context) {
-	var cfg configstore.DuckLakeConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveDuckLakeConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) getRateLimitConfig(c *gin.Context) {
-	cfg, err := h.store.GetRateLimitConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateRateLimitConfig(c *gin.Context) {
-	var cfg configstore.RateLimitConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveRateLimitConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) getQueryLogConfig(c *gin.Context) {
-	cfg, err := h.store.GetQueryLogConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateQueryLogConfig(c *gin.Context) {
-	var cfg configstore.QueryLogConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveQueryLogConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
 }
 
 // --- Status ---

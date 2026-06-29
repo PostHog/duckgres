@@ -33,16 +33,11 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	if err := store.DB().Create(&configstore.ManagedWarehouse{
 		OrgID: "analytics",
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
-			Region:       "us-east-1",
-			Endpoint:     "analytics.cluster.example",
-			Port:         5432,
-			DatabaseName: "analytics_wh",
-			Username:     "warehouse_user",
+			Endpoint: "analytics.cluster.example",
+			Port:     5432,
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:         "dedicated_rds",
-			Engine:       "postgres",
-			Region:       "us-east-1",
 			Endpoint:     "analytics-metadata.cluster.example",
 			Port:         5432,
 			DatabaseName: "ducklake_metadata",
@@ -72,8 +67,8 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 		t.Fatal("expected warehouse to be preloaded into snapshot")
 		return
 	}
-	if orgCfg.Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
-		t.Fatalf("expected analytics_wh, got %q", orgCfg.Warehouse.WarehouseDatabase.DatabaseName)
+	if orgCfg.Warehouse.WarehouseDatabase.Endpoint != "analytics.cluster.example" {
+		t.Fatalf("expected analytics.cluster.example, got %q", orgCfg.Warehouse.WarehouseDatabase.Endpoint)
 	}
 	if orgCfg.Warehouse.MetadataStore.Kind != "dedicated_rds" {
 		t.Fatalf("expected metadata store kind dedicated_rds, got %q", orgCfg.Warehouse.MetadataStore.Kind)

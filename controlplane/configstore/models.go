@@ -99,12 +99,12 @@ type SecretRef struct {
 }
 
 // ManagedWarehouseDatabase stores primary warehouse DB metadata for an org.
+// Only Endpoint/Port are consumed (the curated provision connection response);
+// the warehouse DB name/user/region are not part of any provisioning or worker
+// path and were dropped.
 type ManagedWarehouseDatabase struct {
-	Region       string `gorm:"size:64" json:"region"`
-	Endpoint     string `gorm:"size:512" json:"endpoint"`
-	Port         int    `json:"port"`
-	DatabaseName string `gorm:"size:255" json:"database_name"`
-	Username     string `gorm:"size:255" json:"username"`
+	Endpoint string `gorm:"size:512" json:"endpoint"`
+	Port     int    `json:"port"`
 }
 
 // Metadata-store kinds, stored verbatim in ManagedWarehouseMetadataStore.Kind
@@ -125,8 +125,6 @@ const (
 // ManagedWarehouseMetadataStore stores org-scoped DuckLake metadata DB info.
 type ManagedWarehouseMetadataStore struct {
 	Kind         string `gorm:"size:64" json:"kind"`
-	Engine       string `gorm:"size:64" json:"engine"`
-	Region       string `gorm:"size:64" json:"region"`
 	Endpoint     string `gorm:"size:512" json:"endpoint"`
 	Port         int    `json:"port"`
 	DatabaseName string `gorm:"size:255" json:"database_name"`
@@ -180,10 +178,11 @@ type ManagedWarehouseS3 struct {
 }
 
 // ManagedWarehouseWorkerIdentity stores org-scoped worker identity metadata.
+// The Namespace + IAM role ARN are consumed at activation; the worker
+// ServiceAccount name is computed (not read from config), so it was dropped.
 type ManagedWarehouseWorkerIdentity struct {
-	Namespace          string `gorm:"size:255" json:"namespace"`
-	ServiceAccountName string `gorm:"size:255" json:"service_account_name"`
-	IAMRoleARN         string `gorm:"size:512" json:"iam_role_arn"`
+	Namespace  string `gorm:"size:255" json:"namespace"`
+	IAMRoleARN string `gorm:"size:512" json:"iam_role_arn"`
 }
 
 // ManagedWarehouseDuckLake captures whether the org's DuckLake catalog is
@@ -285,91 +284,33 @@ type ManagedWarehouse struct {
 	S3Credentials                SecretRef `gorm:"embedded;embeddedPrefix:s3_credentials_" json:"s3_credentials"`
 	RuntimeConfig                SecretRef `gorm:"embedded;embeddedPrefix:runtime_config_" json:"runtime_config"`
 
-	State                          ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
-	StatusMessage                  string                            `gorm:"size:1024" json:"status_message"`
-	WarehouseDatabaseState         ManagedWarehouseProvisioningState `gorm:"size:32" json:"warehouse_database_state"`
-	WarehouseDatabaseStatusMessage string                            `gorm:"size:1024" json:"warehouse_database_status_message"`
-	MetadataStoreState             ManagedWarehouseProvisioningState `gorm:"size:32" json:"metadata_store_state"`
-	MetadataStoreStatusMessage     string                            `gorm:"size:1024" json:"metadata_store_status_message"`
-	S3State                        ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
-	S3StatusMessage                string                            `gorm:"size:1024" json:"s3_status_message"`
-	IcebergState                   ManagedWarehouseProvisioningState `gorm:"size:32" json:"iceberg_state"`
-	IcebergStatusMessage           string                            `gorm:"size:1024" json:"iceberg_status_message"`
-	IdentityState                  ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
-	IdentityStatusMessage          string                            `gorm:"size:1024" json:"identity_status_message"`
-	SecretsState                   ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
-	SecretsStatusMessage           string                            `gorm:"size:1024" json:"secrets_status_message"`
-	ProvisioningStartedAt          *time.Time                        `json:"provisioning_started_at"`
-	ReadyAt                        *time.Time                        `json:"ready_at"`
-	FailedAt                       *time.Time                        `json:"failed_at"`
-	CreatedAt                      time.Time                         `json:"created_at"`
-	UpdatedAt                      time.Time                         `json:"updated_at"`
+	// Top-level State/StatusMessage are the rolled-up provisioning status; the
+	// per-component *State fields below drive readiness. The provisioner only
+	// ever writes the top-level status_message, so per-component status-message
+	// columns were dropped. warehouse_database has no provisioning sub-state, so
+	// its *State was dropped too.
+	State              ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
+	StatusMessage      string                            `gorm:"size:1024" json:"status_message"`
+	MetadataStoreState ManagedWarehouseProvisioningState `gorm:"size:32" json:"metadata_store_state"`
+	S3State            ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
+	IcebergState       ManagedWarehouseProvisioningState `gorm:"size:32" json:"iceberg_state"`
+	IdentityState      ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
+	SecretsState       ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
+
+	ProvisioningStartedAt *time.Time `json:"provisioning_started_at"`
+	ReadyAt               *time.Time `json:"ready_at"`
+	FailedAt              *time.Time `json:"failed_at"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
 func (ManagedWarehouse) TableName() string { return "duckgres_managed_warehouses" }
 
-// GlobalConfig is a singleton row (ID=1) for cluster-wide settings.
-type GlobalConfig struct {
-	ID                  uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
-	MemoryBudget        string    `gorm:"size:32" json:"memory_budget"`
-	MemoryRebalance     bool      `gorm:"default:false" json:"memory_rebalance"`
-	MaxConnections      int       `gorm:"default:0" json:"max_connections"`
-	IdleTimeoutS        int       `gorm:"default:0" json:"idle_timeout_s"`
-	WorkerQueueTimeoutS int       `gorm:"default:0" json:"worker_queue_timeout_s"`
-	WorkerIdleTimeoutS  int       `gorm:"default:0" json:"worker_idle_timeout_s"`
-	Extensions          string    `gorm:"size:1024" json:"extensions"`
-	UpdatedAt           time.Time `json:"updated_at"`
-}
-
-func (GlobalConfig) TableName() string { return "duckgres_global_config" }
-
-// DuckLakeConfig is a singleton row (ID=1) for legacy cluster-wide DuckLake settings.
-// In multi-tenant mode, the managed-warehouse contract is the intended per-org source of truth.
-type DuckLakeConfig struct {
-	ID                  uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
-	MetadataStore       string    `gorm:"size:1024" json:"metadata_store"`
-	ObjectStore         string    `gorm:"size:1024" json:"object_store"`
-	DataPath            string    `gorm:"size:1024" json:"data_path"`
-	S3Provider          string    `gorm:"size:64" json:"s3_provider"`
-	S3Endpoint          string    `gorm:"size:512" json:"s3_endpoint"`
-	S3AccessKey         string    `gorm:"size:255" json:"s3_access_key"`
-	S3SecretKey         string    `gorm:"size:255" json:"-"`
-	S3Region            string    `gorm:"size:64" json:"s3_region"`
-	S3UseSSL            bool      `gorm:"default:false" json:"s3_use_ssl"`
-	S3URLStyle          string    `gorm:"size:16" json:"s3_url_style"`
-	S3Chain             string    `gorm:"size:255" json:"s3_chain"`
-	S3Profile           string    `gorm:"size:255" json:"s3_profile"`
-	DeltaCatalogEnabled bool      `gorm:"default:true" json:"delta_catalog_enabled"`
-	DeltaCatalogPath    string    `gorm:"size:1024" json:"delta_catalog_path"`
-	UpdatedAt           time.Time `json:"updated_at"`
-}
-
-func (DuckLakeConfig) TableName() string { return "duckgres_ducklake_config" }
-
-// RateLimitConfig is a singleton row (ID=1) for rate limiting.
-type RateLimitConfig struct {
-	ID                   uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
-	MaxFailedAttempts    int       `gorm:"default:0" json:"max_failed_attempts"`
-	FailedAttemptWindowS int       `gorm:"default:0" json:"failed_attempt_window_s"`
-	BanDurationS         int       `gorm:"default:0" json:"ban_duration_s"`
-	MaxConnectionsPerIP  int       `gorm:"default:0" json:"max_connections_per_ip"`
-	UpdatedAt            time.Time `json:"updated_at"`
-}
-
-func (RateLimitConfig) TableName() string { return "duckgres_rate_limit_config" }
-
-// QueryLogConfig is a singleton row (ID=1) for query logging.
-type QueryLogConfig struct {
-	ID                   uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
-	Enabled              bool      `gorm:"default:false" json:"enabled"`
-	FlushIntervalS       int       `gorm:"default:0" json:"flush_interval_s"`
-	BatchSize            int       `gorm:"default:0" json:"batch_size"`
-	CompactIntervalS     int       `gorm:"default:0" json:"compact_interval_s"`
-	DataInliningRowLimit int       `gorm:"default:0" json:"data_inlining_row_limit"`
-	UpdatedAt            time.Time `json:"updated_at"`
-}
-
-func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
+// NOTE: the cluster-wide singleton config tables (global_config,
+// ducklake_config, rate_limit_config, query_log_config) were removed — they
+// were seeded and served by the admin API but never read to drive runtime
+// behavior. Effective config comes from CLI flags/env (server.Config) and the
+// per-org ManagedWarehouse contract. See migration 000004.
 
 // ControlPlaneInstanceState describes the liveness state of a control-plane instance.
 type ControlPlaneInstanceState string
@@ -383,10 +324,10 @@ const (
 // ControlPlaneInstance is a runtime coordination record for one control-plane process.
 // These rows live in the runtime schema, not the snapshot-backed config tables.
 type ControlPlaneInstance struct {
-	ID              string                    `gorm:"primaryKey;size:255" json:"id"`
-	PodName         string                    `gorm:"size:255;not null" json:"pod_name"`
-	PodUID          string                    `gorm:"size:255;not null" json:"pod_uid"`
-	BootID          string                    `gorm:"size:255;not null" json:"boot_id"`
+	ID      string `gorm:"primaryKey;size:255" json:"id"`
+	PodName string `gorm:"size:255;not null" json:"pod_name"`
+	// pod_uid + boot_id were dropped: both are already encoded into the
+	// primary-key ID (<pod_uid>-<bootIDHex>) and were never read back.
 	State           ControlPlaneInstanceState `gorm:"size:32;not null" json:"state"`
 	StartedAt       time.Time                 `json:"started_at"`
 	LastHeartbeatAt time.Time                 `gorm:"index" json:"last_heartbeat_at"`
@@ -438,7 +379,6 @@ type WorkerLifecycleStats struct {
 type WorkerRecord struct {
 	WorkerID int    `gorm:"primaryKey" json:"worker_id"`
 	PodName  string `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
-	PodUID   string `gorm:"size:255" json:"pod_uid"`
 	Image    string `gorm:"size:512;index" json:"image"`
 	// Worker pod-shape profile (connection-string-selected sizing). Empty
 	// CPU/Memory is the default profile, so legacy rows read back as the default
@@ -524,9 +464,10 @@ type OrgConnectionQueueEntry struct {
 	EnqueuedAt   time.Time  `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
 	ExpiresAt    time.Time  `gorm:"not null;index" json:"expires_at"`
 	GrantedAt    *time.Time `gorm:"index" json:"granted_at,omitempty"`
-	CanceledAt   *time.Time `gorm:"index" json:"canceled_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// canceled_at was dropped: cancellation is a hard DELETE of the row, so the
+	// column was never set to a non-NULL value.
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (OrgConnectionQueueEntry) TableName() string { return "org_connection_queue" }
@@ -591,22 +532,15 @@ type ManagedWarehouseConfig struct {
 	S3Credentials                SecretRef
 	RuntimeConfig                SecretRef
 
-	State                          ManagedWarehouseProvisioningState
-	StatusMessage                  string
-	WarehouseDatabaseState         ManagedWarehouseProvisioningState
-	WarehouseDatabaseStatusMessage string
-	MetadataStoreState             ManagedWarehouseProvisioningState
-	MetadataStoreStatusMessage     string
-	S3State                        ManagedWarehouseProvisioningState
-	S3StatusMessage                string
-	IcebergState                   ManagedWarehouseProvisioningState
-	IcebergStatusMessage           string
-	IdentityState                  ManagedWarehouseProvisioningState
-	IdentityStatusMessage          string
-	SecretsState                   ManagedWarehouseProvisioningState
-	SecretsStatusMessage           string
-	ReadyAt                        *time.Time
-	FailedAt                       *time.Time
+	State              ManagedWarehouseProvisioningState
+	StatusMessage      string
+	MetadataStoreState ManagedWarehouseProvisioningState
+	S3State            ManagedWarehouseProvisioningState
+	IcebergState       ManagedWarehouseProvisioningState
+	IdentityState      ManagedWarehouseProvisioningState
+	SecretsState       ManagedWarehouseProvisioningState
+	ReadyAt            *time.Time
+	FailedAt           *time.Time
 }
 
 func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseConfig {
@@ -615,33 +549,26 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 	}
 
 	cfg := &ManagedWarehouseConfig{
-		OrgID:                          warehouse.OrgID,
-		Image:                          warehouse.Image,
-		DuckLakeVersion:                warehouse.DuckLakeVersion,
-		WarehouseDatabase:              warehouse.WarehouseDatabase,
-		MetadataStore:                  warehouse.MetadataStore,
-		PgBouncer:                      warehouse.PgBouncer,
-		S3:                             warehouse.S3,
-		Iceberg:                        warehouse.Iceberg,
-		WorkerIdentity:                 warehouse.WorkerIdentity,
-		WarehouseDatabaseCredentials:   warehouse.WarehouseDatabaseCredentials,
-		MetadataStoreCredentials:       warehouse.MetadataStoreCredentials,
-		S3Credentials:                  warehouse.S3Credentials,
-		RuntimeConfig:                  warehouse.RuntimeConfig,
-		State:                          warehouse.State,
-		StatusMessage:                  warehouse.StatusMessage,
-		WarehouseDatabaseState:         warehouse.WarehouseDatabaseState,
-		WarehouseDatabaseStatusMessage: warehouse.WarehouseDatabaseStatusMessage,
-		MetadataStoreState:             warehouse.MetadataStoreState,
-		MetadataStoreStatusMessage:     warehouse.MetadataStoreStatusMessage,
-		S3State:                        warehouse.S3State,
-		S3StatusMessage:                warehouse.S3StatusMessage,
-		IcebergState:                   warehouse.IcebergState,
-		IcebergStatusMessage:           warehouse.IcebergStatusMessage,
-		IdentityState:                  warehouse.IdentityState,
-		IdentityStatusMessage:          warehouse.IdentityStatusMessage,
-		SecretsState:                   warehouse.SecretsState,
-		SecretsStatusMessage:           warehouse.SecretsStatusMessage,
+		OrgID:                        warehouse.OrgID,
+		Image:                        warehouse.Image,
+		DuckLakeVersion:              warehouse.DuckLakeVersion,
+		WarehouseDatabase:            warehouse.WarehouseDatabase,
+		MetadataStore:                warehouse.MetadataStore,
+		PgBouncer:                    warehouse.PgBouncer,
+		S3:                           warehouse.S3,
+		Iceberg:                      warehouse.Iceberg,
+		WorkerIdentity:               warehouse.WorkerIdentity,
+		WarehouseDatabaseCredentials: warehouse.WarehouseDatabaseCredentials,
+		MetadataStoreCredentials:     warehouse.MetadataStoreCredentials,
+		S3Credentials:                warehouse.S3Credentials,
+		RuntimeConfig:                warehouse.RuntimeConfig,
+		State:                        warehouse.State,
+		StatusMessage:                warehouse.StatusMessage,
+		MetadataStoreState:           warehouse.MetadataStoreState,
+		S3State:                      warehouse.S3State,
+		IcebergState:                 warehouse.IcebergState,
+		IdentityState:                warehouse.IdentityState,
+		SecretsState:                 warehouse.SecretsState,
 	}
 	if warehouse.ReadyAt != nil {
 		readyAt := *warehouse.ReadyAt

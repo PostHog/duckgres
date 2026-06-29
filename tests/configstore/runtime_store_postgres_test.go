@@ -40,8 +40,6 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-1:boot-a",
 		PodName:         "duckgres-abc",
-		PodUID:          "pod-uid-1",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: heartbeatAt,
@@ -655,8 +653,6 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-stale:boot-a",
 		PodName:         "duckgres-stale",
-		PodUID:          "pod-stale",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: staleHeartbeat,
@@ -666,8 +662,6 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-fresh:boot-b",
 		PodName:         "duckgres-fresh",
-		PodUID:          "pod-fresh",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: freshHeartbeat,
@@ -714,8 +708,6 @@ func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-active:boot-a",
 		PodName:         "duckgres-active",
-		PodUID:          "pod-active",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now,
@@ -727,8 +719,6 @@ func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-draining:boot-b",
 		PodName:         "duckgres-draining",
-		PodUID:          "pod-draining",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateDraining,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now.Add(-30 * time.Second),
@@ -741,8 +731,6 @@ func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-expired:boot-c",
 		PodName:         "duckgres-expired",
-		PodUID:          "pod-expired",
-		BootID:          "boot-c",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now.Add(-5 * time.Minute),
@@ -779,8 +767,6 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-draining-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateDraining,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: recentDrain,
@@ -791,8 +777,6 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-draining-recent:boot-b",
 		PodName:         "duckgres-recent",
-		PodUID:          "pod-recent",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateDraining,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: recentDrain,
@@ -989,8 +973,6 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-expired:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now.Add(-time.Minute),
@@ -1005,8 +987,6 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-live:boot-b",
 		PodName:         "duckgres-live",
-		PodUID:          "pod-live",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now,
@@ -1605,8 +1585,6 @@ func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-1 * time.Hour),
@@ -1666,8 +1644,6 @@ func TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions(t *tes
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-1 * time.Hour),
@@ -1723,8 +1699,6 @@ func TestListOrphanedWorkersIncludesWorkersWithExpiredFlightSessions(t *testing.
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-1 * time.Hour),
@@ -2052,8 +2026,6 @@ func TestRetireOrphanWorkerRejectsRevivedOwnerControlPlanePostgres(t *testing.T)
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-revived:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-time.Hour),
@@ -2084,8 +2056,6 @@ func TestRetireOrphanWorkerRejectsRevivedOwnerControlPlanePostgres(t *testing.T)
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-revived:boot-a",
 		PodName:         "duckgres-new",
-		PodUID:          "pod-new",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now,

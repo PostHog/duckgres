@@ -111,7 +111,7 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 		CreatedAt: createdAt,
 		UpdatedAt: createdAt,
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
-			DatabaseName: "analytics_wh",
+			Endpoint: "analytics-wh.cluster.example",
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:         "shared",
@@ -129,11 +129,10 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 		State:         configstore.ManagedWarehouseStateReady,
 		StatusMessage: "ready",
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
-			DatabaseName: "analytics_ready",
+			Endpoint: "analytics-ready.cluster.example",
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:         "dedicated_rds",
-			Engine:       "postgres",
 			DatabaseName: "ducklake_metadata",
 		},
 	})
@@ -147,8 +146,8 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	if !stored.CreatedAt.Equal(createdAt) {
 		t.Fatalf("expected created_at %s, got %s", createdAt.Format(time.RFC3339Nano), stored.CreatedAt.Format(time.RFC3339Nano))
 	}
-	if stored.WarehouseDatabase.DatabaseName != "analytics_ready" {
-		t.Fatalf("expected updated warehouse db name, got %q", stored.WarehouseDatabase.DatabaseName)
+	if stored.WarehouseDatabase.Endpoint != "analytics-ready.cluster.example" {
+		t.Fatalf("expected updated warehouse db endpoint, got %q", stored.WarehouseDatabase.Endpoint)
 	}
 	if stored.MetadataStore.DatabaseName != "ducklake_metadata" {
 		t.Fatalf("expected updated metadata db name, got %q", stored.MetadataStore.DatabaseName)

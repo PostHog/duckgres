@@ -195,38 +195,6 @@ func (s *fakeAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configs
 	return copyWarehouse(clone), true, nil
 }
 
-func (s *fakeAPIStore) GetGlobalConfig() (configstore.GlobalConfig, error) {
-	return configstore.GlobalConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveGlobalConfig(cfg *configstore.GlobalConfig) error {
-	return nil
-}
-
-func (s *fakeAPIStore) GetDuckLakeConfig() (configstore.DuckLakeConfig, error) {
-	return configstore.DuckLakeConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error {
-	return nil
-}
-
-func (s *fakeAPIStore) GetRateLimitConfig() (configstore.RateLimitConfig, error) {
-	return configstore.RateLimitConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveRateLimitConfig(cfg *configstore.RateLimitConfig) error {
-	return nil
-}
-
-func (s *fakeAPIStore) GetQueryLogConfig() (configstore.QueryLogConfig, error) {
-	return configstore.QueryLogConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveQueryLogConfig(cfg *configstore.QueryLogConfig) error {
-	return nil
-}
-
 func copyWarehouse(warehouse *configstore.ManagedWarehouse) *configstore.ManagedWarehouse {
 	if warehouse == nil {
 		return nil
@@ -261,16 +229,11 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	warehouse := &configstore.ManagedWarehouse{
 		OrgID: name,
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
-			Region:       "us-east-1",
-			Endpoint:     fmt.Sprintf("%s.cluster.example", name),
-			Port:         5432,
-			DatabaseName: name + "_warehouse",
-			Username:     "warehouse_user",
+			Endpoint: fmt.Sprintf("%s.cluster.example", name),
+			Port:     5432,
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:         "dedicated_rds",
-			Engine:       "postgres",
-			Region:       "us-east-1",
 			Endpoint:     fmt.Sprintf("%s-metadata.cluster.example", name),
 			Port:         5432,
 			DatabaseName: name + "_metadata",
@@ -283,9 +246,8 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 			PathPrefix: name + "/ducklake/",
 		},
 		WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
-			Namespace:          "duckgres",
-			ServiceAccountName: name + "-worker",
-			IAMRoleARN:         "arn:aws:iam::123456789012:role/" + name + "-worker",
+			Namespace:  "duckgres",
+			IAMRoleARN: "arn:aws:iam::123456789012:role/" + name + "-worker",
 		},
 		WarehouseDatabaseCredentials: configstore.SecretRef{
 			Namespace: "duckgres",
@@ -307,12 +269,11 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 			Name:      name + "-runtime",
 			Key:       "duckgres.yaml",
 		},
-		State:                  configstore.ManagedWarehouseStateReady,
-		WarehouseDatabaseState: configstore.ManagedWarehouseStateReady,
-		MetadataStoreState:     configstore.ManagedWarehouseStateReady,
-		S3State:                configstore.ManagedWarehouseStateReady,
-		IdentityState:          configstore.ManagedWarehouseStateReady,
-		SecretsState:           configstore.ManagedWarehouseStateReady,
+		State:              configstore.ManagedWarehouseStateReady,
+		MetadataStoreState: configstore.ManagedWarehouseStateReady,
+		S3State:            configstore.ManagedWarehouseStateReady,
+		IdentityState:      configstore.ManagedWarehouseStateReady,
+		SecretsState:       configstore.ManagedWarehouseStateReady,
 	}
 	store.orgs[name] = &configstore.Org{
 		Name:      name,
@@ -443,8 +404,8 @@ func TestGetOrgIncludesWarehouse(t *testing.T) {
 	if org.Warehouse == nil {
 		t.Fatal("expected warehouse in org response")
 	}
-	if org.Warehouse.WarehouseDatabase.DatabaseName != "analytics_warehouse" {
-		t.Fatalf("expected analytics_warehouse, got %q", org.Warehouse.WarehouseDatabase.DatabaseName)
+	if org.Warehouse.MetadataStore.DatabaseName != "analytics_metadata" {
+		t.Fatalf("expected analytics_metadata, got %q", org.Warehouse.MetadataStore.DatabaseName)
 	}
 	if org.Warehouse.MetadataStore.Kind != "dedicated_rds" {
 		t.Fatalf("expected metadata store kind dedicated_rds, got %q", org.Warehouse.MetadataStore.Kind)
@@ -497,16 +458,11 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 
 	body := []byte(`{
 		"warehouse_database": {
-			"region": "us-east-1",
 			"endpoint": "analytics.cluster.example",
-			"port": 5432,
-			"database_name": "analytics_warehouse",
-			"username": "warehouse_user"
+			"port": 5432
 		},
 		"metadata_store": {
 			"kind": "dedicated_rds",
-			"engine": "postgres",
-			"region": "us-east-1",
 			"endpoint": "analytics-metadata.cluster.example",
 			"port": 5432,
 			"database_name": "ducklake_metadata",
@@ -523,7 +479,6 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 		},
 		"worker_identity": {
 			"namespace": "duckgres",
-			"service_account_name": "analytics-worker",
 			"iam_role_arn": "arn:aws:iam::123456789012:role/analytics-worker"
 		},
 		"warehouse_database_credentials": {
@@ -548,7 +503,6 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 		},
 		"state": "ready",
 		"status_message": "ready",
-		"warehouse_database_state": "ready",
 		"metadata_store_state": "ready",
 		"s3_state": "ready",
 		"identity_state": "ready",
@@ -687,17 +641,11 @@ func TestPutWarehousePreservesNestedFieldsOnPartialUpdate(t *testing.T) {
 	if got.Endpoint != "analytics-metadata.cluster.example" {
 		t.Fatalf("endpoint = %q, want analytics-metadata.cluster.example (nested fields were wiped)", got.Endpoint)
 	}
-	if got.Region != "us-east-1" {
-		t.Fatalf("region = %q, want us-east-1", got.Region)
-	}
 	if got.Port != 5432 {
 		t.Fatalf("port = %d, want 5432", got.Port)
 	}
 	if got.Kind != "dedicated_rds" {
 		t.Fatalf("kind = %q, want dedicated_rds", got.Kind)
-	}
-	if got.Engine != "postgres" {
-		t.Fatalf("engine = %q, want postgres", got.Engine)
 	}
 	if got.Username != "metadata_user" {
 		t.Fatalf("username = %q, want metadata_user", got.Username)
@@ -731,16 +679,13 @@ func TestPutWarehouseRejectsSecretRefsOutsideTenantScope(t *testing.T) {
 	body := []byte(`{
 		"metadata_store": {
 			"kind": "dedicated_rds",
-			"engine": "postgres",
-			"region": "us-east-1",
 			"endpoint": "analytics-metadata.cluster.example",
 			"port": 5432,
 			"database_name": "ducklake_metadata",
 			"username": "metadata_user"
 		},
 		"worker_identity": {
-			"namespace": "tenant-a",
-			"service_account_name": "analytics-worker"
+			"namespace": "tenant-a"
 		},
 		"metadata_store_credentials": {
 			"namespace": "tenant-b",
@@ -766,7 +711,7 @@ func TestPutWarehouseRejectsSecretRefsWithoutWorkerNamespace(t *testing.T) {
 
 	body := []byte(`{
 		"worker_identity": {
-			"service_account_name": "analytics-worker"
+			"iam_role_arn": "arn:aws:iam::123456789012:role/analytics-worker"
 		},
 		"metadata_store_credentials": {
 			"namespace": "tenant-b",
@@ -811,7 +756,7 @@ func TestPutWarehouseRejectsServerManagedFields(t *testing.T) {
 		"org_id": "wrong-org",
 		"created_at": "2026-03-18T10:00:00Z",
 		"warehouse_database": {
-			"database_name": "analytics_warehouse"
+			"endpoint": "analytics.cluster.example"
 		}
 	}`)
 
@@ -832,7 +777,6 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 
 	body := []byte(`{
 		"state": "awaiting-human-approval",
-		"warehouse_database_state": "queued-for-bootstrap",
 		"metadata_store_state": "vendor-pending",
 		"s3_state": "bucket-handshake",
 		"identity_state": "iam-review",
@@ -855,9 +799,6 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	}
 	if warehouse.State != "awaiting-human-approval" {
 		t.Fatalf("expected custom overall state, got %q", warehouse.State)
-	}
-	if warehouse.WarehouseDatabaseState != "queued-for-bootstrap" {
-		t.Fatalf("expected custom warehouse db state, got %q", warehouse.WarehouseDatabaseState)
 	}
 	if warehouse.MetadataStoreState != "vendor-pending" {
 		t.Fatalf("expected custom metadata state, got %q", warehouse.MetadataStoreState)
@@ -1089,9 +1030,6 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	}
 	if !slices.Contains(columns, "updated_at") {
 		t.Fatal("expected updated_at to be included in managed warehouse upserts")
-	}
-	if !slices.Contains(columns, "warehouse_database_database_name") {
-		t.Fatal("expected warehouse_database_database_name to be included in managed warehouse upserts")
 	}
 	if !slices.Contains(columns, "metadata_store_database_name") {
 		t.Fatal("expected metadata_store_database_name to be included in managed warehouse upserts")

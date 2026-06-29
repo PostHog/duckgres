@@ -93,7 +93,6 @@ func RegisterDashboard(r *gin.Engine, tokens TokenSet) {
 	r.GET("/orgs", dashboardPageHandler("orgs.html", tokens))
 	r.GET("/workers", dashboardPageHandler("workers.html", tokens))
 	r.GET("/sessions", dashboardPageHandler("sessions.html", tokens))
-	r.GET("/settings", dashboardPageHandler("settings.html", tokens))
 	r.POST("/login", loginHandler(tokens))
 }
 

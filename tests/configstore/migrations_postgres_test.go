@@ -21,8 +21,15 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 
 	requireGooseMigrationRecorded(t, db, 1)
 	requireGooseMigrationRecorded(t, db, 3)
-	requireGooseLatestVersion(t, db, 3)
+	requireGooseMigrationRecorded(t, db, 4)
+	requireGooseLatestVersion(t, db, 4)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
+
+	// Migration 000004 dropped the dead cluster-wide singleton config tables.
+	requireTableAbsent(t, db, "duckgres_global_config")
+	requireTableAbsent(t, db, "duckgres_ducklake_config")
+	requireTableAbsent(t, db, "duckgres_rate_limit_config")
+	requireTableAbsent(t, db, "duckgres_query_log_config")
 
 	var columnCount int
 	if err := store.DB().Raw(`
@@ -183,10 +190,6 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 		&cpconfigstore.ManagedWarehouse{},
 		&cpconfigstore.OrgUser{},
 		&cpconfigstore.OrgUserSecret{},
-		&cpconfigstore.GlobalConfig{},
-		&cpconfigstore.DuckLakeConfig{},
-		&cpconfigstore.RateLimitConfig{},
-		&cpconfigstore.QueryLogConfig{},
 	); err != nil {
 		t.Fatalf("auto-migrate gorm comparison schema: %v", err)
 	}
