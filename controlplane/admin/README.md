@@ -8,11 +8,10 @@ public exposure; reach it via `kubectl port-forward`.
 
 | Route | Page | Purpose |
 |-------|------|---------|
-| `/`, `/models` | `static/models.html` | **Models explorer** — the primary surface. Sidebar of every config-store model grouped Tenants / Config / Runtime, a table of the selected model's rows, and a click-through detail panel. Nested warehouse sub-configs render as expandable sections. |
+| `/`, `/models` | `static/models.html` | **Models explorer** — the primary surface. Sidebar of every config-store model grouped Tenants / Runtime, a table of the selected model's rows, and a click-through detail panel. Nested warehouse sub-configs render as expandable sections. |
 | `/orgs` | `static/orgs.html` | Org list + create/delete. |
 | `/workers` | `static/workers.html` | Live worker/duckling status. |
 | `/sessions` | `static/sessions.html` | Active sessions. |
-| `/settings` | `static/settings.html` | Singleton config editing. |
 | `POST /login` | `static/login.html` | Token login (sets the `duckgres_admin_token` cookie). |
 
 The pages are plain HTML + vanilla JS served via `//go:embed static/*` and

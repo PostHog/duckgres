@@ -22,7 +22,6 @@ type modelGroup string
 
 const (
 	modelGroupTenants modelGroup = "Tenants"
-	modelGroupConfig  modelGroup = "Config"
 	modelGroupRuntime modelGroup = "Runtime"
 )
 
@@ -84,11 +83,6 @@ func modelDescriptors() []modelDescriptor {
 		mk("org-users", "Org Users", modelGroupTenants, false, configstore.OrgUser{}),
 		mk("org-user-secrets", "Org User Secrets", modelGroupTenants, false, configstore.OrgUserSecret{}),
 		mk("managed-warehouses", "Managed Warehouses", modelGroupTenants, false, configstore.ManagedWarehouse{}),
-
-		mk("global-config", "Global Config", modelGroupConfig, false, configstore.GlobalConfig{}),
-		mk("ducklake-config", "DuckLake Config", modelGroupConfig, false, configstore.DuckLakeConfig{}),
-		mk("ratelimit-config", "Rate Limit Config", modelGroupConfig, false, configstore.RateLimitConfig{}),
-		mk("querylog-config", "Query Log Config", modelGroupConfig, false, configstore.QueryLogConfig{}),
 
 		mk("cp-instances", "Control Plane Instances", modelGroupRuntime, true, configstore.ControlPlaneInstance{}),
 		mk("worker-records", "Worker Records", modelGroupRuntime, true, configstore.WorkerRecord{}),

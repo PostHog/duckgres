@@ -1322,9 +1322,9 @@ internal_secret_fallback_auth() {
 # in the operator UI.
 models_explorer_api() {
   log "admin models explorer API (sidebar + listing + redaction)"
-  # Sidebar: must enumerate the known models across all three groups.
+  # Sidebar: must enumerate the known models across the Tenants + Runtime groups.
   idx="$(curl -fsS -H "$H" "$API/api/v1/models")"
-  for key in orgs org-users managed-warehouses global-config worker-records org-connection-leases; do
+  for key in orgs org-users managed-warehouses worker-records org-connection-leases; do
     echo "$idx" | jq -e --arg k "$key" '.models[] | select(.key == $k)' >/dev/null \
       || fail "models index missing model '$key'"
   done

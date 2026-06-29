@@ -266,7 +266,6 @@
       <a href="/orgs">Orgs</a>
       <a href="/workers">Ducklings</a>
       <a href="/sessions">Sessions</a>
-      <a href="/settings">Settings</a>
     </nav>
     <div id="conn"><span class="dot"></span><span id="conn-label">connecting</span></div>
   </header>
@@ -349,7 +348,7 @@
   }
 
   function renderSidebar() {
-    const order = ["Tenants", "Config", "Runtime"];
+    const order = ["Tenants", "Runtime"];
     const byGroup = {};
     for (const m of state.models) (byGroup[m.group] = byGroup[m.group] || []).push(m);
     const groups = order.filter(g => byGroup[g]).concat(Object.keys(byGroup).filter(g => !order.includes(g)));
