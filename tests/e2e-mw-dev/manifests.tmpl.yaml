@@ -279,7 +279,6 @@ spec:
             #   cert-manager / a Trino cluster in the per-PR namespace; the CP
             #   serves its self-signed cert and Trino is not under e2e.
             - { name: DUCKGRES_WORKER_QUEUE_TIMEOUT, value: "5m" }
-            - { name: DUCKGRES_K8S_MAX_WORKERS, value: "50" }
             # Fast config-store poll for CI only (default 30s). The harness has
             # three waits bounded by this interval — the post-provision auth-cache
             # settle and two org-default-profile propagation waits — which drop

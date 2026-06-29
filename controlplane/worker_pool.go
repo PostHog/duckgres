@@ -98,7 +98,6 @@ type K8sWorkerPoolConfig struct {
 	WorkerPort                   int
 	SecretName                   string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
 	ConfigMap                    string // ConfigMap name for duckgres.yaml
-	MaxWorkers                   int
 	IdleTimeout                  time.Duration
 	ConfigPath                   string                                       // Path inside worker pod where config is mounted
 	ImagePullPolicy              string                                       // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
@@ -132,7 +131,7 @@ type K8sWorkerPoolConfig struct {
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
 	ClaimHotIdleWorker(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
-	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers int) (*configstore.WorkerRecord, error)
 	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)

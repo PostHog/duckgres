@@ -99,10 +99,9 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Per-org worker cap. 0 = unbounded (the cluster autoscaler / node capacity
+	// is the only ceiling). There is no global/cluster-default fallback.
 	maxWorkers := tc.MaxWorkers
-	if maxWorkers == 0 {
-		maxWorkers = tr.baseCfg.MaxWorkers
-	}
 
 	// Apply per-org worker resource overrides to the shared pool.
 	if tc.WorkerCPURequest != "" || tc.WorkerMemoryRequest != "" {
@@ -328,11 +327,8 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			if limitsChanged {
 				slog.Info("Org config changed.", "org", name,
 					"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
-				maxWorkers := newTC.MaxWorkers
-				if maxWorkers == 0 {
-					maxWorkers = tr.baseCfg.MaxWorkers
-				}
-				stack.Pool.SetMaxWorkers(maxWorkers)
+				// 0 = unbounded; no global/cluster-default fallback.
+				stack.Pool.SetMaxWorkers(newTC.MaxWorkers)
 			}
 			if floorChanged {
 				slog.Info("Org default hot-idle floor changed.", "org", name,

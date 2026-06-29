@@ -172,8 +172,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	spawnConcurrency := 50
 	retireConcurrency := 5
 	pool := &K8sWorkerPool{
-		workers:                 make(map[int]*ManagedWorker),
-		maxWorkers:              cfg.MaxWorkers,
+		workers: make(map[int]*ManagedWorker),
+		// maxWorkers defaults to 0 (unbounded); there is no global cluster cap.
+		// Per-org caps are applied by OrgReservedPool, not the shared pool.
 		idleTimeout:             cfg.IdleTimeout,
 		shutdownCh:              make(chan struct{}),
 		stopInform:              make(chan struct{}),

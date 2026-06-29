@@ -130,7 +130,6 @@ func SetupMultiTenant(
 	cfg ControlPlaneConfig,
 	srv *server.Server,
 	memBudget uint64,
-	maxWorkers int,
 	isHealthy func() bool,
 ) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
 	pollInterval := cfg.ConfigPollInterval
@@ -188,7 +187,6 @@ func SetupMultiTenant(
 		WorkerPort:                   cfg.K8s.WorkerPort,
 		SecretName:                   cfg.K8s.WorkerSecret,
 		ConfigMap:                    cfg.K8s.WorkerConfigMap,
-		MaxWorkers:                   maxWorkers,
 		IdleTimeout:                  cfg.WorkerIdleTimeout,
 		ConfigPath:                   cfg.ConfigPath,
 		ImagePullPolicy:              cfg.K8s.ImagePullPolicy,

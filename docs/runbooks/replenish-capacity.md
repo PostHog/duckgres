@@ -21,14 +21,14 @@ controller** (`reconcileHeadroom`, a janitor hook): it keeps a constant
 `DUCKGRES_K8S_HEADROOM_NODES` node-sized low-priority placeholder ("pause") pods
 (or, in the legacy mode, `DUCKGRES_K8S_HEADROOM_PERCENT` of worker demand) ready;
 a real worker spawn preempts a placeholder and schedules immediately. So "low capacity" now means one of: spawns
-are failing, the cluster can't schedule pods, headroom is exhausted, or an org /
-the global pool has hit its worker cap.
+are failing, the cluster can't schedule pods, headroom is exhausted, or an org
+has hit its per-org worker cap (`Org.MaxWorkers`; 0 = unbounded). There is no
+global/cluster worker cap — the node pool / autoscaler is the only shared ceiling.
 
 ## Metrics to watch
 
 | Metric | What it means |
 |--------|---------------|
-| `sum(duckgres_worker_lifecycle_count{state="hot"})` near `--k8s-max-workers` | Global pool at its cap; sessions get `worker capacity exhausted by global pool limit` |
 | `sum(duckgres_worker_lifecycle_count{state="spawning"})` sustained > 0 | Spawns are slow/stuck (image pull, Pending pods, cold nodes) |
 | `sum by (reason)(rate(duckgres_worker_spawn_failures_total[5m]))` | Pod spawn errors by stage |
 | `duckgres_control_plane_worker_acquire_seconds` (if present) | Session acquire latency |
@@ -81,13 +81,13 @@ unassigned anymore); production capacity lives in `binding="org_bound"`.
      ready. Placeholders use a PriorityClass ranked **below** the worker
      PriorityClass so workers always win.
 
-4. **Check the caps.** If you hit `worker capacity exhausted for organization` or
-   `...by global pool limit`, the request is at a real cap, not a scheduling
-   problem:
-   - Global: raise `--k8s-max-workers` (env `DUCKGRES_K8S_MAX_WORKERS`) if the pool
-     is legitimately undersized; otherwise scale the worker node pool.
-   - Per-org: the org reached its configured max concurrent workers and all are
-     busy — expected backpressure; the client should retry as queries finish.
+4. **Check the cap.** If you hit `worker capacity exhausted for organization`,
+   the request is at a real cap, not a scheduling problem:
+   - Per-org: the org reached its configured max concurrent workers
+     (`Org.MaxWorkers`) and all are busy — expected backpressure; the client
+     should retry as queries finish. Raise the org's `max_workers` (or set it to
+     0 = unbounded) if it is legitimately undersized; otherwise scale the worker
+     node pool. There is no global worker cap to raise.
 
 5. **Verify recovery.** New sessions stop getting capacity errors;
    `duckgres_worker_lifecycle_count{state="spawning"}` settles back toward 0.

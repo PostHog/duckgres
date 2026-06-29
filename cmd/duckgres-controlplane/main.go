@@ -228,7 +228,6 @@ func main() {
 			WorkerConfigMap:              resolved.K8sWorkerConfigMap,
 			ImagePullPolicy:              resolved.K8sWorkerImagePullPolicy,
 			ServiceAccount:               resolved.K8sWorkerServiceAccount,
-			MaxWorkers:                   resolved.K8sMaxWorkers,
 			WorkerCPURequest:             resolved.K8sWorkerCPURequest,
 			WorkerMemoryRequest:          resolved.K8sWorkerMemoryRequest,
 			WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
@@ -245,7 +244,7 @@ func main() {
 			WorkerProfileMinMemory:       resolved.K8sWorkerProfileMinMemory,
 			WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
 			WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
-			WorkerDefaultTTL:                   resolved.K8sWorkerDefaultTTL,
+			WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
 			AWSRegion:                    resolved.AWSRegion,
 		},
 	}

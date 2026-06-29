@@ -134,7 +134,6 @@ type K8sConfig struct {
 	WorkerConfigMap         string // ConfigMap name for duckgres.yaml
 	ImagePullPolicy         string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 	ServiceAccount          string // ServiceAccount name for worker pods (default: "duckgres-worker")
-	MaxWorkers              int    // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
 	WorkerCPURequest        string // CPU request for worker pods (e.g., "500m")
 	WorkerMemoryRequest     string // Memory request for worker pods (e.g., "1Gi")
 	WorkerNodeSelector      string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
@@ -418,8 +417,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if processMaxWorkers == 0 {
 		processMaxWorkers = tempRebalancer.DefaultMaxWorkers()
 	}
-	// K8s max_workers: 0 = unbounded (no cap derived from CP memory).
-	k8sMaxWorkers := cfg.K8s.MaxWorkers
 
 	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
 
@@ -428,8 +425,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			"process_max_workers", processMaxWorkers,
 			"memory_budget", formatBytes(memBudget))
 	}
-	if isK8s && k8sMaxWorkers == 0 {
-		slog.Info("k8s.max_workers unset; worker pool is unbounded — cluster autoscaler (e.g. Karpenter) is the ceiling.")
+	if isK8s {
+		// K8s worker pools have no global/cluster cap. Per-org caps
+		// (Org.MaxWorkers, 0 = unbounded) plus the cluster autoscaler
+		// (e.g. Karpenter) are the only ceilings.
+		slog.Info("K8s worker pool has no global cap; per-org Org.MaxWorkers (0=unbounded) + cluster autoscaler are the ceilings.")
 	}
 
 	processMinWorkers := cfg.Process.MinWorkers
@@ -476,7 +476,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers, cp.healthReady)
+		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, cp.healthReady)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -652,7 +652,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"worker_backend", cfg.WorkerBackend,
 		"process_min_workers", processMinWorkers,
 		"process_max_workers", processMaxWorkers,
-		"k8s_max_workers", k8sMaxWorkers,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"session_init_timeout", cfg.SessionInitTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),

@@ -64,7 +64,6 @@ type K8sFileConfig struct {
 	WorkerConfigMap       string `yaml:"worker_configmap"`
 	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
 	WorkerServiceAccount  string `yaml:"worker_service_account"`
-	MaxWorkers            int    `yaml:"max_workers"`
 }
 
 type QueryLogFileConfig struct {

@@ -369,7 +369,6 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 		return nil, fmt.Errorf("pool is shutting down")
 	}
 	p.cleanDeadWorkersLocked()
-	maxGlobal := p.maxWorkers
 	p.mu.Unlock()
 
 	if p.runtimeStore != nil && assignment.OrgID != "" {
@@ -389,14 +388,14 @@ func (p *K8sWorkerPool) reserveSharedWorkerDecision(assignment *WorkerAssignment
 	// No reusable hot-idle worker for this org — spawn one on demand, sized from
 	// the request profile (or the pool-global default for a default request).
 	// Allocate a real, unique worker id. In the runtime-store path this MUST come
-	// from the DB via CreateSpawningWorkerSlot (which also enforces the per-org and
-	// global worker caps cross-CP and returns a nil slot when capped) — the
-	// background id allocator returns a placeholder 0 that collides across spawns.
+	// from the DB via CreateSpawningWorkerSlot (which enforces the per-org worker
+	// cap cross-CP and returns a nil slot when capped) — the background id
+	// allocator returns a placeholder 0 that collides across spawns.
 	if p.runtimeStore != nil {
 		spawnProfileCPU, spawnProfileMem := assignment.Profile.Parts()
 		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
 			p.cpInstanceID, assignment.OrgID, assignment.Image, spawnProfileCPU, spawnProfileMem, 0,
-			p.workerPodNamePrefix(), assignment.MaxWorkers, maxGlobal)
+			p.workerPodNamePrefix(), assignment.MaxWorkers)
 		if err != nil {
 			return nil, err
 		}

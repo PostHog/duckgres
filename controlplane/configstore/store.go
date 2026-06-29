@@ -1350,9 +1350,11 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 	return claimed, nil
 }
 
-// CreateSpawningWorkerSlot creates a durable spawning worker row under advisory-lock
-// protected org/global capacity checks. A nil result means capacity blocked the spawn.
-func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+// CreateSpawningWorkerSlot creates a durable spawning worker row under an
+// advisory-lock-protected per-org capacity check. A nil result means the org
+// cap blocked the spawn. There is no global/cluster cap: maxOrgWorkers == 0
+// means the org is unbounded (cluster autoscaler is the only ceiling).
+func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, profileCPU, profileMemory string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers int) (*WorkerRecord, error) {
 	if strings.TrimSpace(podNamePrefix) == "" {
 		return nil, fmt.Errorf("pod name prefix is required")
 	}
@@ -1364,9 +1366,6 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 				return err
 			}
 		}
-		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:global-worker-capacity")).Error; err != nil {
-			return err
-		}
 
 		if maxOrgWorkers > 0 && orgID != "" {
 			count, err := cs.countOrgAdmittingWorkers(tx, orgID, image, profileCPU, profileMemory)
@@ -1374,16 +1373,6 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 				return err
 			}
 			if count >= int64(maxOrgWorkers) {
-				return nil
-			}
-		}
-
-		if maxGlobalWorkers > 0 {
-			count, err := cs.countActiveWorkers(tx)
-			if err != nil {
-				return err
-			}
-			if count >= int64(maxGlobalWorkers) {
 				return nil
 			}
 		}
