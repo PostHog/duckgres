@@ -85,14 +85,11 @@ func APIAuthMiddleware(tokens TokenSet) gin.HandlerFunc {
 
 // RegisterDashboard serves the admin dashboard on the Gin engine.
 func RegisterDashboard(r *gin.Engine, tokens TokenSet) {
-	// The models explorer is the primary dashboard surface: a sidebar of every
+	// The models explorer is the only dashboard surface: a sidebar of every
 	// config-store model, a table of its rows, and a detail view per row. "/"
-	// and "/models" both land here. The legacy per-entity pages stay reachable.
+	// and "/models" both land here. The legacy per-entity pages were removed.
 	r.GET("/", dashboardPageHandler("models.html", tokens))
 	r.GET("/models", dashboardPageHandler("models.html", tokens))
-	r.GET("/orgs", dashboardPageHandler("orgs.html", tokens))
-	r.GET("/workers", dashboardPageHandler("workers.html", tokens))
-	r.GET("/sessions", dashboardPageHandler("sessions.html", tokens))
 	r.POST("/login", loginHandler(tokens))
 }
 

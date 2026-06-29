@@ -46,17 +46,23 @@ run-control-plane: build
 build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
 
-# Port-forward a deployed control plane's admin API to localhost:8080 (run in its own terminal)
+# Serve the admin UI locally for one kube context. The devserver fetches the
+# internal secret, port-forwards that context's control plane, and serves the
+# explorer with a context banner (RED when the context name contains "prod").
+# Edit controlplane/admin/static/*.html and refresh — no rebuild/redeploy.
 [group('dev')]
-ui-port-forward context="posthog-mw-dev" namespace="duckgres" deploy="duckgres-control-plane":
-    kubectl --context {{context}} -n {{namespace}} port-forward deploy/{{deploy}} 8080:8080
+ui-dev context listen="127.0.0.1:5173" namespace="duckgres":
+    go run ./controlplane/admin/devserver --context {{context}} --namespace {{namespace}} --listen {{listen}}
 
-# Serve the admin UI locally, proxying /api to the port-forwarded control plane.
-# Run `just ui-port-forward` first; set DUCKGRES_INTERNAL_SECRET to the CP secret.
-# Edit controlplane/admin/static/*.html and refresh the browser — no rebuild/redeploy.
+# Serve BOTH environments side by side: prod on :5173 (red banner), dev on :5174.
 [group('dev')]
-ui-dev target="http://127.0.0.1:8080" listen="127.0.0.1:5173":
-    go run ./controlplane/admin/devserver --target {{target}} --listen {{listen}}
+ui-dev-all prod_context="mw-prod-us-admin" dev_context="mw-dev-admin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    go run ./controlplane/admin/devserver --context {{prod_context}} --listen 127.0.0.1:5173 &
+    go run ./controlplane/admin/devserver --context {{dev_context}}  --listen 127.0.0.1:5174 &
+    echo "prod → http://127.0.0.1:5173   dev → http://127.0.0.1:5174"
+    wait
 
 # Recreate the local kind cluster used by the portable K8s integration flow
 [group('dev')]

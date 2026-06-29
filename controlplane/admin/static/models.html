@@ -47,7 +47,33 @@
         repeating-linear-gradient(0deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px),
         repeating-linear-gradient(90deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px);
     }
-    header, #layout { position: relative; z-index: 1; }
+    #cluster-bar, header, #layout { position: relative; z-index: 1; }
+
+    /* Cluster-context banner — sits above the header in the flex column, so it
+       pushes content down rather than overlapping. Hidden until a label loads;
+       prod gets a loud red treatment. */
+    #cluster-bar {
+      flex: none;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 6px 22px;
+      font-family: "Chakra Petch", sans-serif;
+      font-size: 11px;
+      letter-spacing: .24em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel2);
+      color: var(--dim);
+    }
+    #cluster-bar.show { display: flex; }
+    #cluster-bar.prod {
+      background: var(--bad);
+      color: #1a0205;
+      font-weight: 700;
+      border-bottom-color: rgba(0,0,0,.45);
+    }
 
     /* Header */
     header {
@@ -237,6 +263,23 @@
     details.dsec .dbody { background: rgba(0,0,0,.18); }
     details.dsec .drow { padding-left: 30px; }
 
+    /* Detail edit/delete actions (orgs model) */
+    .dhead .btn { padding: 3px 10px; }
+    .btn.danger { color: var(--bad); border-color: rgba(255,77,94,.5); }
+    .btn.danger:hover { background: var(--bad); border-color: var(--bad); color: #1a0205; }
+    .derror { padding: 9px 18px; color: var(--bad); font-size: 11px; border-bottom: 1px solid var(--line); word-break: break-word; }
+    .dform .frow {
+      display: grid; grid-template-columns: 168px 1fr; gap: 10px;
+      padding: 6px 18px; border-bottom: 1px solid var(--line); align-items: center;
+    }
+    .dform .frow label { color: var(--dim); font-size: 11px; letter-spacing: .04em; }
+    .dform .frow input {
+      background: var(--panel2); border: 1px solid var(--line-bright); border-radius: 4px;
+      color: var(--text); font-family: inherit; font-size: 12px; padding: 5px 8px; width: 100%;
+    }
+    .dform .frow input:focus { outline: none; border-color: var(--worker); }
+    .dform .factions { display: flex; gap: 8px; padding: 13px 18px; }
+
     .empty { padding: 40px 22px; color: var(--dim); font-size: 12px; letter-spacing: .04em; }
     .loading { padding: 24px 22px; color: var(--dim); }
 
@@ -262,6 +305,7 @@
   </style>
 </head>
 <body>
+  <div id="cluster-bar"></div>
   <header>
     <div class="brand">
       <span class="t">DUCKGRES</span>
@@ -270,9 +314,6 @@
     <div class="spacer"></div>
     <nav class="nav">
       <a href="/models" class="active">Models</a>
-      <a href="/orgs">Orgs</a>
-      <a href="/workers">Ducklings</a>
-      <a href="/sessions">Sessions</a>
     </nav>
     <div id="conn"><span class="dot"></span><span id="conn-label">connecting</span></div>
   </header>
@@ -359,8 +400,18 @@
     document.getElementById("conn-label").textContent = label;
   }
 
-  async function api(path) {
-    const res = await fetch(path, { headers: { "Accept": "application/json" } });
+  // api(path[, opts]) — GET by default. opts.method sets the verb; opts.body
+  // (any JSON-able value) is sent as a JSON request body with the matching
+  // Content-Type. The 401 gate applies to every verb.
+  async function api(path, opts) {
+    opts = opts || {};
+    const init = { headers: { "Accept": "application/json" } };
+    if (opts.method) init.method = opts.method;
+    if (opts.body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.body);
+    }
+    const res = await fetch(path, init);
     if (res.status === 401) {
       document.getElementById("gate").classList.add("show");
       throw new Error("unauthorized");
@@ -370,7 +421,8 @@
       try { const j = await res.json(); if (j && j.error) msg = j.error; } catch (e) {}
       throw new Error(msg);
     }
-    return res.json();
+    // 2xx with an empty/non-JSON body (some mutations) → return null.
+    try { return await res.json(); } catch (e) { return null; }
   }
 
   const STATE_COL = /(^|_)(state|status)$/;
@@ -523,16 +575,134 @@
     return esc(v);
   }
 
+  // Org detail fields the PUT /orgs/:id endpoint can presence-merge. The map is
+  // intersected with the live listing columns (orgEditableCols) so the edit form
+  // auto-adapts as columns are added/removed from the model — non-mergeable
+  // columns (name, database_name, users, warehouse, *_state, timestamps) are
+  // simply never in this allowlist. "int" → numeric input, else text.
+  const ORG_EDIT_FIELDS = {
+    max_workers: "int",
+    max_connections: "int",
+    default_worker_cpu: "text",
+    default_worker_memory: "text",
+    default_worker_ttl: "text",
+    default_worker_min_hot_idle: "int",
+    hostname_alias: "text",
+  };
+  function orgEditableCols() {
+    const cols = (state.listing && state.listing.columns) || [];
+    return cols.filter(c => ORG_EDIT_FIELDS[c]);
+  }
+
   function showDetail(idx, rows) {
     state.selected = idx;
     const row = rows[idx];
     const panel = document.getElementById("detail");
     panel.classList.remove("hidden");
+    if (state.key === "orgs") renderOrgDetail(panel, row, rows, "view");
+    else renderReadOnlyDetail(panel, row);
+    document.querySelectorAll("#table-scroll tbody tr").forEach(tr =>
+      tr.classList.toggle("sel", parseInt(tr.dataset.idx, 10) === idx));
+  }
+
+  function renderReadOnlyDetail(panel, row) {
     panel.innerHTML = '<div class="dhead"><span class="dt">' + esc(state.listing.label) +
       '</span><span class="x" id="dclose">✕</span></div>' + detailRows(row);
     document.getElementById("dclose").addEventListener("click", closeDetail);
-    document.querySelectorAll("#table-scroll tbody tr").forEach(tr =>
-      tr.classList.toggle("sel", parseInt(tr.dataset.idx, 10) === idx));
+  }
+
+  // renderOrgDetail renders the orgs detail panel in one of three modes:
+  // "view" (read-only rows + Edit/Delete actions), "confirm-delete" (inline
+  // confirm in the header, no native confirm()), or "edit" (a form prefilled
+  // from the row). errMsg, when set, is shown above the body and the panel
+  // stays open so the operator can retry.
+  function renderOrgDetail(panel, row, rows, mode, errMsg) {
+    const title = esc(state.listing.label);
+    const err = errMsg ? '<div class="derror">' + esc(errMsg) + "</div>" : "";
+    let head, body;
+    if (mode === "confirm-delete") {
+      head = '<div class="dhead"><span class="dt">Delete org ' + esc(row.name) + "?</span>" +
+        '<button class="btn danger" id="org-del-confirm">Confirm</button>' +
+        '<button class="btn" id="org-del-cancel">Cancel</button>' +
+        '<span class="x" id="dclose">✕</span></div>';
+      body = err + detailRows(row);
+    } else if (mode === "edit") {
+      head = '<div class="dhead"><span class="dt">' + title + "</span>" +
+        '<span class="x" id="dclose">✕</span></div>';
+      body = err + orgEditFormHTML(row);
+    } else {
+      head = '<div class="dhead"><span class="dt">' + title + "</span>" +
+        '<button class="btn" id="org-edit">Edit</button>' +
+        '<button class="btn danger" id="org-delete">Delete</button>' +
+        '<span class="x" id="dclose">✕</span></div>';
+      body = detailRows(row);
+    }
+    panel.innerHTML = head + body;
+    document.getElementById("dclose").addEventListener("click", closeDetail);
+
+    if (mode === "confirm-delete") {
+      document.getElementById("org-del-cancel").addEventListener("click", () => renderOrgDetail(panel, row, rows, "view"));
+      document.getElementById("org-del-confirm").addEventListener("click", async () => {
+        try {
+          await api("/api/v1/orgs/" + encodeURIComponent(row.name), { method: "DELETE" });
+          closeDetail();
+          selectModel("orgs");
+        } catch (e) {
+          if (e.message !== "unauthorized") renderOrgDetail(panel, row, rows, "confirm-delete", e.message);
+        }
+      });
+    } else if (mode === "edit") {
+      document.getElementById("org-edit-cancel").addEventListener("click", () => renderOrgDetail(panel, row, rows, "view"));
+      document.getElementById("org-edit-save").addEventListener("click", async () => {
+        const payload = {};
+        for (const c of orgEditableCols()) {
+          const inp = document.getElementById("orgf-" + c);
+          if (!inp) continue;
+          if (ORG_EDIT_FIELDS[c] === "int") payload[c] = inp.value === "" ? 0 : parseInt(inp.value, 10);
+          else payload[c] = inp.value;
+        }
+        try {
+          const updated = await api("/api/v1/orgs/" + encodeURIComponent(row.name), { method: "PUT", body: payload });
+          await refreshOrgsTable();
+          // Re-render the detail from the server's response (falls back to the
+          // edited row if the body was empty) so the panel shows stored values.
+          renderOrgDetail(panel, updated || row, rows, "view");
+        } catch (e) {
+          if (e.message !== "unauthorized") renderOrgDetail(panel, row, rows, "edit", e.message);
+        }
+      });
+    } else {
+      document.getElementById("org-edit").addEventListener("click", () => renderOrgDetail(panel, row, rows, "edit"));
+      document.getElementById("org-delete").addEventListener("click", () => renderOrgDetail(panel, row, rows, "confirm-delete"));
+    }
+  }
+
+  function orgEditFormHTML(row) {
+    let html = '<div class="dform">';
+    for (const c of orgEditableCols()) {
+      const type = ORG_EDIT_FIELDS[c] === "int" ? "number" : "text";
+      const raw = row[c];
+      const v = (raw === null || raw === undefined) ? "" : String(raw);
+      html += '<div class="frow"><label for="orgf-' + esc(c) + '">' + esc(c) + "</label>" +
+        '<input id="orgf-' + esc(c) + '" type="' + type + '" value="' + esc(v) + '"></div>';
+    }
+    html += '<div class="factions"><button class="btn" id="org-edit-save">Save</button>' +
+      '<button class="btn" id="org-edit-cancel">Cancel</button></div></div>';
+    return html;
+  }
+
+  // refreshOrgsTable re-fetches the orgs listing + cross-model aux and re-renders
+  // the table in place, without disturbing an open detail panel (used after an
+  // org edit so the row reflects the change while the panel stays open).
+  async function refreshOrgsTable() {
+    try {
+      const lst = await api("/api/v1/models/orgs");
+      state.listing = lst;
+      await loadOrgAux();
+      document.getElementById("model-count").textContent =
+        lst.count + " row" + (lst.count === 1 ? "" : "s") + (lst.truncated ? " (showing first " + lst.rows.length + ")" : "");
+      renderTable();
+    } catch (e) { /* best-effort table refresh */ }
   }
   function closeDetail() {
     document.getElementById("detail").classList.add("hidden");
@@ -587,9 +757,25 @@
     }
   }
 
+  // loadClusterInfo renders the top cluster-context banner. Best-effort: a
+  // missing label or an endpoint error just leaves the banner hidden.
+  async function loadClusterInfo() {
+    try {
+      const info = await api("/api/v1/cluster-info");
+      const bar = document.getElementById("cluster-bar");
+      if (info && info.label) {
+        bar.textContent = "CLUSTER: " + info.label;
+        bar.className = info.prod ? "show prod" : "show";
+      } else {
+        bar.className = "";
+      }
+    } catch (e) { /* banner is best-effort; ignore */ }
+  }
+
   document.getElementById("search").addEventListener("input", e => { state.filter = e.target.value.trim(); renderTable(); });
   document.getElementById("refresh").addEventListener("click", () => { loadModels(); if (state.key) selectModel(state.key); });
 
+  loadClusterInfo();
   loadModels();
   </script>
 </body>
