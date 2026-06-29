@@ -67,8 +67,6 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			w.MetadataStore.Port = v.(int)
 		case "metadata_store_kind":
 			w.MetadataStore.Kind = v.(string)
-		case "metadata_store_engine":
-			w.MetadataStore.Engine = v.(string)
 		case "identity_state":
 			w.IdentityState = v.(configstore.ManagedWarehouseProvisioningState)
 		case "worker_identity_iam_role_arn":
@@ -81,8 +79,6 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			w.MetadataStore.DatabaseName = v.(string)
 		case "secrets_state":
 			w.SecretsState = v.(configstore.ManagedWarehouseProvisioningState)
-		case "warehouse_database_state":
-			w.WarehouseDatabaseState = v.(configstore.ManagedWarehouseProvisioningState)
 		case "ready_at":
 			t := v.(time.Time)
 			w.ReadyAt = &t

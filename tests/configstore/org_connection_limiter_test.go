@@ -19,8 +19,6 @@ func upsertActiveCP(t *testing.T, store *cpconfigstore.ConfigStore, id string) {
 	if err := store.UpsertControlPlaneInstance(&cpconfigstore.ControlPlaneInstance{
 		ID:              id,
 		PodName:         id,
-		PodUID:          id,
-		BootID:          "boot-" + id,
 		State:           cpconfigstore.ControlPlaneInstanceStateActive,
 		StartedAt:       now,
 		LastHeartbeatAt: now,
@@ -221,8 +219,6 @@ func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&cpconfigstore.ControlPlaneInstance{
 		ID:              "cp-a",
 		PodName:         "cp-a",
-		PodUID:          "cp-a",
-		BootID:          "boot-cp-a",
 		State:           cpconfigstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now,
 		LastHeartbeatAt: now,

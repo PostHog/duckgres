@@ -118,7 +118,7 @@ func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, maxCon
 			lease = existing
 			return err
 		}
-		if !request.ExpiresAt.After(now) || request.CanceledAt != nil || request.GrantedAt != nil {
+		if !request.ExpiresAt.After(now) || request.GrantedAt != nil {
 			return nil
 		}
 		atHead, err := cs.isOrgConnectionQueueHead(tx, tables.queue, request, now)
@@ -199,7 +199,7 @@ func (cs *ConfigStore) existingOrgConnectionLease(tx *gorm.DB, leaseTable, reque
 func (cs *ConfigStore) isOrgConnectionQueueHead(tx *gorm.DB, queueTable string, request *OrgConnectionQueueEntry, now time.Time) (bool, error) {
 	var head OrgConnectionQueueEntry
 	if err := tx.Table(queueTable).
-		Where("org_id = ? AND granted_at IS NULL AND canceled_at IS NULL AND expires_at > ?", request.OrgID, now).
+		Where("org_id = ? AND granted_at IS NULL AND expires_at > ?", request.OrgID, now).
 		Order("enqueued_at ASC, request_id ASC").
 		Limit(1).
 		Take(&head).Error; err != nil {
@@ -264,7 +264,7 @@ func (cs *ConfigStore) CancelOrgConnectionRequest(requestID string, _ time.Time)
 		return nil
 	}
 	result := cs.db.Table(cs.runtimeTable((&OrgConnectionQueueEntry{}).TableName())).
-		Where("request_id = ? AND granted_at IS NULL AND canceled_at IS NULL", requestID).
+		Where("request_id = ? AND granted_at IS NULL", requestID).
 		Delete(&OrgConnectionQueueEntry{})
 	if result.Error != nil {
 		return fmt.Errorf("cancel org connection request: %w", result.Error)
@@ -293,7 +293,7 @@ func (cs *ConfigStore) cleanupOrgConnectionRowsLocked(tx *gorm.DB, orgID string,
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
 
 	if err := tx.Table(queueTable).
-		Where("org_id = ? AND granted_at IS NULL AND canceled_at IS NULL AND expires_at <= ?", orgID, now).
+		Where("org_id = ? AND granted_at IS NULL AND expires_at <= ?", orgID, now).
 		Delete(&OrgConnectionQueueEntry{}).Error; err != nil {
 		return err
 	}

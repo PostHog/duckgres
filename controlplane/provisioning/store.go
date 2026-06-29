@@ -115,7 +115,6 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, warehouse
 
 	warehouse.OrgID = orgID
 	warehouse.State = configstore.ManagedWarehouseStatePending
-	warehouse.WarehouseDatabaseState = configstore.ManagedWarehouseStatePending
 	warehouse.MetadataStoreState = configstore.ManagedWarehouseStatePending
 	warehouse.S3State = configstore.ManagedWarehouseStatePending
 	warehouse.IdentityState = configstore.ManagedWarehouseStatePending

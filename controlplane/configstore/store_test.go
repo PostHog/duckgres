@@ -31,16 +31,11 @@ func TestSnapshotBuild(t *testing.T) {
 			Warehouse: &ManagedWarehouse{
 				OrgID: "analytics",
 				WarehouseDatabase: ManagedWarehouseDatabase{
-					Region:       "us-east-1",
-					Endpoint:     "analytics.cluster-xyz.us-east-1.rds.amazonaws.com",
-					Port:         5432,
-					DatabaseName: "analytics_wh",
-					Username:     "warehouse_user",
+					Endpoint: "analytics.cluster-xyz.us-east-1.rds.amazonaws.com",
+					Port:     5432,
 				},
 				MetadataStore: ManagedWarehouseMetadataStore{
 					Kind:         "dedicated_rds",
-					Engine:       "postgres",
-					Region:       "us-east-1",
 					Endpoint:     "analytics-meta.cluster-xyz.us-east-1.rds.amazonaws.com",
 					Port:         5432,
 					DatabaseName: "ducklake_metadata",
@@ -56,9 +51,8 @@ func TestSnapshotBuild(t *testing.T) {
 					URLStyle:   "vhost",
 				},
 				WorkerIdentity: ManagedWarehouseWorkerIdentity{
-					Namespace:          "duckgres",
-					ServiceAccountName: "org-analytics-worker",
-					IAMRoleARN:         "arn:aws:iam::123456789012:role/org-analytics-worker",
+					Namespace:  "duckgres",
+					IAMRoleARN: "arn:aws:iam::123456789012:role/org-analytics-worker",
 				},
 				WarehouseDatabaseCredentials: SecretRef{
 					Namespace: "duckgres",
@@ -80,14 +74,13 @@ func TestSnapshotBuild(t *testing.T) {
 					Name:      "analytics-runtime",
 					Key:       "duckgres.yaml",
 				},
-				State:                  ManagedWarehouseStateReady,
-				StatusMessage:          "warehouse ready",
-				WarehouseDatabaseState: ManagedWarehouseStateReady,
-				MetadataStoreState:     ManagedWarehouseStateReady,
-				S3State:                ManagedWarehouseStateReady,
-				IdentityState:          ManagedWarehouseStateReady,
-				SecretsState:           ManagedWarehouseStateReady,
-				ReadyAt:                &readyAt,
+				State:              ManagedWarehouseStateReady,
+				StatusMessage:      "warehouse ready",
+				MetadataStoreState: ManagedWarehouseStateReady,
+				S3State:            ManagedWarehouseStateReady,
+				IdentityState:      ManagedWarehouseStateReady,
+				SecretsState:       ManagedWarehouseStateReady,
+				ReadyAt:            &readyAt,
 			},
 			Users: []OrgUser{
 				{Username: "alice", Password: hash1, OrgID: "analytics"},
@@ -142,8 +135,8 @@ func TestSnapshotBuild(t *testing.T) {
 	if snap.Orgs["analytics"].Warehouse == nil {
 		t.Fatal("expected analytics warehouse to be present")
 	}
-	if snap.Orgs["analytics"].Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
-		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Orgs["analytics"].Warehouse.WarehouseDatabase.DatabaseName)
+	if snap.Orgs["analytics"].Warehouse.MetadataStore.DatabaseName != "ducklake_metadata" {
+		t.Fatalf("expected analytics metadata db name ducklake_metadata, got %q", snap.Orgs["analytics"].Warehouse.MetadataStore.DatabaseName)
 	}
 	if snap.Orgs["analytics"].Warehouse.MetadataStore.Kind != "dedicated_rds" {
 		t.Fatalf("expected metadata store kind dedicated_rds, got %q", snap.Orgs["analytics"].Warehouse.MetadataStore.Kind)
@@ -450,10 +443,6 @@ func TestTableNames(t *testing.T) {
 		{OrgUser{}, "duckgres_org_users"},
 		{OrgUserSecret{}, "duckgres_org_user_secrets"},
 		{ManagedWarehouse{}, "duckgres_managed_warehouses"},
-		{GlobalConfig{}, "duckgres_global_config"},
-		{DuckLakeConfig{}, "duckgres_ducklake_config"},
-		{RateLimitConfig{}, "duckgres_rate_limit_config"},
-		{QueryLogConfig{}, "duckgres_query_log_config"},
 	}
 
 	for _, tt := range tests {

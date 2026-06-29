@@ -247,8 +247,6 @@ func SetupMultiTenant(
 		store,
 		cpInstanceID,
 		cpID,
-		podUID,
-		bootIDHex,
 		5*time.Second,
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)

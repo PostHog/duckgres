@@ -73,7 +73,6 @@ func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 	clone := *warehouse
 	clone.OrgID = orgID
 	clone.State = configstore.ManagedWarehouseStatePending
-	clone.WarehouseDatabaseState = configstore.ManagedWarehouseStatePending
 	clone.MetadataStoreState = configstore.ManagedWarehouseStatePending
 	clone.S3State = configstore.ManagedWarehouseStatePending
 	clone.IdentityState = configstore.ManagedWarehouseStatePending
@@ -115,7 +114,6 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	clone := *req.Warehouse
 	clone.OrgID = req.OrgID
 	clone.State = configstore.ManagedWarehouseStatePending
-	clone.WarehouseDatabaseState = configstore.ManagedWarehouseStatePending
 	clone.MetadataStoreState = configstore.ManagedWarehouseStatePending
 	clone.S3State = configstore.ManagedWarehouseStatePending
 	clone.IdentityState = configstore.ManagedWarehouseStatePending

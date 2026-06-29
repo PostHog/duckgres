@@ -39,10 +39,6 @@ type Snapshot struct {
 	OrgUserPassword       map[OrgUserKey]string // (orgID, username) -> bcrypt hash
 	OrgUserPassthrough    map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
 	OrgUserDefaultCatalog map[OrgUserKey]string // (orgID, username) -> default session catalog
-	Global                GlobalConfig
-	DuckLake              DuckLakeConfig
-	RateLimit             RateLimitConfig
-	QueryLog              QueryLogConfig
 }
 
 // Selectable catalog names. The startup `database` param now names the catalog
@@ -121,12 +117,6 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		return nil, fmt.Errorf("auto-migrate runtime schema: %w", err)
 	}
 
-	// Ensure singleton rows exist with defaults
-	db.FirstOrCreate(&GlobalConfig{}, GlobalConfig{ID: 1})
-	db.FirstOrCreate(&DuckLakeConfig{}, DuckLakeConfig{ID: 1})
-	db.FirstOrCreate(&RateLimitConfig{}, RateLimitConfig{ID: 1})
-	db.FirstOrCreate(&QueryLogConfig{}, QueryLogConfig{ID: 1})
-
 	cs := &ConfigStore{
 		db:            db,
 		runtimeSchema: runtimeSchema,
@@ -184,18 +174,6 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		return nil, fmt.Errorf("load orgs: %w", err)
 	}
 
-	var global GlobalConfig
-	cs.db.First(&global, 1)
-
-	var duckLake DuckLakeConfig
-	cs.db.First(&duckLake, 1)
-
-	var rateLimit RateLimitConfig
-	cs.db.First(&rateLimit, 1)
-
-	var queryLog QueryLogConfig
-	cs.db.First(&queryLog, 1)
-
 	snap := &Snapshot{
 		Orgs:                  make(map[string]*OrgConfig),
 		DatabaseOrg:           make(map[string]string),
@@ -203,10 +181,6 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		OrgUserPassword:       make(map[OrgUserKey]string),
 		OrgUserPassthrough:    make(map[OrgUserKey]bool),
 		OrgUserDefaultCatalog: make(map[OrgUserKey]string),
-		Global:                global,
-		DuckLake:              duckLake,
-		RateLimit:             rateLimit,
-		QueryLog:              queryLog,
 	}
 
 	for _, o := range orgs {
@@ -692,6 +666,26 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 			return err
 		}
 	}
+
+	// Drop runtime columns whose Go struct fields were removed. AutoMigrate
+	// never drops columns, and on an existing deployment cp_instances.pod_uid /
+	// boot_id are NOT NULL — leaving them would make every heartbeat insert (which
+	// no longer supplies them) fail the moment the new control plane rolls out.
+	// These columns are dead: pod_uid/boot_id are already encoded into the cp
+	// instance id, worker_records.pod_uid was never written, and
+	// org_connection_queue.canceled_at was never set (cancel is a DELETE). DROP
+	// ... IF EXISTS is idempotent and a no-op on a fresh schema. This must run
+	// before the first UpsertControlPlaneInstance.
+	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
+	for _, stmt := range []string{
+		`ALTER TABLE ` + qs + `.cp_instances DROP COLUMN IF EXISTS pod_uid, DROP COLUMN IF EXISTS boot_id`,
+		`ALTER TABLE ` + qs + `.worker_records DROP COLUMN IF EXISTS pod_uid`,
+		`ALTER TABLE ` + qs + `.org_connection_queue DROP COLUMN IF EXISTS canceled_at`,
+	} {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -745,7 +739,7 @@ func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error
 func (cs *ConfigStore) UpsertControlPlaneInstance(instance *ControlPlaneInstance) error {
 	if err := cs.db.Table(cs.runtimeTable(instance.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "pod_uid", "boot_id", "state", "started_at", "last_heartbeat_at", "draining_at", "expired_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "state", "started_at", "last_heartbeat_at", "draining_at", "expired_at", "updated_at"}),
 	}).Create(instance).Error; err != nil {
 		return fmt.Errorf("upsert control plane instance: %w", err)
 	}
