@@ -184,6 +184,8 @@
     table.tbl tbody tr.sel { background: rgba(56,225,255,.12); }
     .muted { color: var(--dim); }
     .nestref { color: var(--cp); }
+    a.celllink { color: var(--worker); text-decoration: none; border-bottom: 1px dotted var(--worker); cursor: pointer; }
+    a.celllink:hover { color: var(--text); border-bottom-color: var(--text); }
     .pill {
       font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
       border-radius: 4px; padding: 1px 7px; border: 1px solid var(--line-bright);
@@ -309,8 +311,43 @@
   const COLUMN_TOOLTIPS = {
     orgs: {
       hostname_alias: "Optional public hostname label for SNI routing. Empty/NULL: the org is reached at <database_name>.<managed-suffix> (or its org name if DNS-safe). Set: reachable at <hostname_alias>.<managed-suffix> while clients still connect with dbname=<database_name>. Must be a single DNS label (alphanumeric + hyphens, no leading/trailing hyphen).",
+      users: "Number of users in this org. Click to open Org Users filtered to this org.",
+      warehouse: "The org's managed warehouse (1:1, keyed by org name). Click to open it in Managed Warehouses.",
     },
   };
+
+  // Per-org aux data computed client-side: the live /models/orgs listing does
+  // not preload users/warehouse, so we fetch those two models once and group by
+  // org_id to render a live user count + warehouse-presence link in the orgs
+  // table. Cached until the next orgs load.
+  const orgAux = { userCounts: {}, hasWarehouse: {} };
+  async function loadOrgAux() {
+    try {
+      const [users, whs] = await Promise.all([
+        api("/api/v1/models/org-users"),
+        api("/api/v1/models/managed-warehouses"),
+      ]);
+      const uc = {}, hw = {};
+      for (const u of (users.rows || [])) { if (u.org_id) uc[u.org_id] = (uc[u.org_id] || 0) + 1; }
+      for (const w of (whs.rows || [])) { if (w.org_id) hw[w.org_id] = true; }
+      orgAux.userCounts = uc;
+      orgAux.hasWarehouse = hw;
+    } catch (e) { /* on failure leave maps empty; cells still render as links */ }
+  }
+
+  // cellHTML renders one table cell, special-casing the orgs cross-model links
+  // (users count → Org Users, warehouse → Managed Warehouses), else renderCell.
+  function cellHTML(model, col, row) {
+    if (model === "orgs" && col === "users") {
+      const n = orgAux.userCounts[row.name] || 0;
+      return '<a class="celllink" data-nav="org-users" data-filter="' + esc(row.name) + '">' + n + " user" + (n === 1 ? "" : "s") + "</a>";
+    }
+    if (model === "orgs" && col === "warehouse") {
+      if (!orgAux.hasWarehouse[row.name]) return '<span class="muted">—</span>';
+      return '<a class="celllink" data-nav="managed-warehouses" data-filter="' + esc(row.name) + '">warehouse →</a>';
+    }
+    return renderCell(col, row[col]);
+  }
 
   function esc(s) {
     const d = document.createElement("div");
@@ -439,11 +476,18 @@
     html += "</tr></thead><tbody>";
     rows.forEach((r, i) => {
       html += '<tr data-idx="' + i + '">';
-      for (const c of cols) html += "<td>" + renderCell(c, r[c]) + "</td>";
+      for (const c of cols) html += "<td>" + cellHTML(state.key, c, r) + "</td>";
       html += "</tr>";
     });
     html += "</tbody></table>";
     scroll.innerHTML = html;
+    // Cross-model link cells: navigate to the related model filtered to the org,
+    // and stop the row-detail click from also firing.
+    scroll.querySelectorAll("a.celllink").forEach(a => a.addEventListener("click", e => {
+      e.stopPropagation();
+      e.preventDefault();
+      selectModel(a.dataset.nav, a.dataset.filter);
+    }));
     scroll.querySelectorAll("thead th.sortable").forEach(th => th.addEventListener("click", () => {
       const c = th.dataset.col;
       // Same column → flip direction; new column → start ascending.
@@ -497,12 +541,12 @@
     document.querySelectorAll("#table-scroll tbody tr.sel").forEach(tr => tr.classList.remove("sel"));
   }
 
-  async function selectModel(key) {
+  async function selectModel(key, filterText) {
     state.key = key;
-    state.filter = "";
+    state.filter = filterText || "";
     state.sortCol = null;
     state.sortDir = 1;
-    document.getElementById("search").value = "";
+    document.getElementById("search").value = state.filter;
     closeDetail();
     renderSidebar();
     const m = state.models.find(x => x.key === key) || {};
@@ -513,6 +557,8 @@
     try {
       const lst = await api("/api/v1/models/" + encodeURIComponent(key));
       state.listing = lst;
+      // Orgs table needs per-org user counts + warehouse presence (client-side).
+      if (key === "orgs") await loadOrgAux();
       // Default sort: first column ascending, so the table opens in a defined,
       // visible order (▲ on column 0) rather than raw DB order.
       state.sortCol = (lst.columns && lst.columns[0]) || null;
