@@ -313,10 +313,11 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
 
 - **Frontend is an embedded React/Vite SPA** (`ui/`, built to `ui/dist/`,
   `//go:embed all:ui/dist` in `embed_ui.go`, SPA-fallback served by Gin; the SPA
-  owns `/`). A committed placeholder `ui/dist/index.html` keeps `go build`
-  working without node; CI/Docker run `npm run build` (in `controlplane/admin/ui`)
-  **before** `go build` so the real bundle is embedded. Do not delete the
-  placeholder.
+  owns `/`). `ui/dist` is a **gitignored build artifact** — only `ui/dist/.gitkeep`
+  is tracked, so the embed has a target and `go build` compiles without node
+  (the server then serves a "UI not built" notice). `just ui-build` builds it
+  locally; both `Dockerfile` and `Dockerfile.controlplane` run `npm run build`
+  **before** `go build`. Do not delete `.gitkeep` and do not commit `ui/dist`.
 - **Two-tier authz** (`authz.go`): `AuthMiddleware` resolves every `/api/v1`
   request to admin (valid `TokenSet` internal secret — service/break-glass) or to
   an SSO identity from the ALB `X-Amzn-Oidc-Data` JWT (group `DUCKGRES_ADMIN_SSO_GROUP`
