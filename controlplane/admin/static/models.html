@@ -167,10 +167,16 @@
       flex: none; display: flex; align-items: center; gap: 14px;
       padding: 12px 22px; border-bottom: 1px solid var(--line);
     }
+    #toolbar .titleblock { display: flex; flex-direction: column; gap: 2px; line-height: 1.2; }
     #toolbar .title {
       font-family: "Chakra Petch", sans-serif; font-weight: 600;
       font-size: 15px; letter-spacing: .08em; color: var(--text);
     }
+    #toolbar .model-desc {
+      font-size: 11px; color: var(--dim); letter-spacing: .02em;
+      max-width: 640px; white-space: normal;
+    }
+    #toolbar .model-desc:empty { display: none; }
     #toolbar .tbl-name { font-size: 10.5px; color: var(--dim); letter-spacing: .1em; }
     #toolbar .rowcount { font-size: 10.5px; color: var(--dim); letter-spacing: .18em; text-transform: uppercase; }
     input.search {
@@ -322,7 +328,10 @@
     <aside id="sidebar"><div class="loading">Loading models…</div></aside>
     <main id="main">
       <div id="toolbar">
-        <span class="title" id="model-title">—</span>
+        <div class="titleblock">
+          <span class="title" id="model-title">—</span>
+          <span class="model-desc" id="model-desc"></span>
+        </div>
         <span class="tbl-name" id="model-table"></span>
         <div class="spacer" style="flex:1"></div>
         <span class="rowcount" id="model-count"></span>
@@ -353,7 +362,141 @@
       hostname_alias: "Optional public hostname label for SNI routing. Empty/NULL: the org is reached at <database_name>.<managed-suffix> (or its org name if DNS-safe). Set: reachable at <hostname_alias>.<managed-suffix> while clients still connect with dbname=<database_name>. Must be a single DNS label (alphanumeric + hyphens, no leading/trailing hyphen).",
       users: "Number of users in this org. Click to open Org Users filtered to this org.",
       warehouse: "The org's managed warehouse (1:1, keyed by org name). Click to open it in Managed Warehouses.",
+      name: "Org name. Primary key and stable tenant identifier.",
+      database_name: "Database name clients connect with (dbname=). Unique across orgs.",
+      max_workers: "Maximum concurrent worker pods this org may run. 0 means use the deployment default.",
+      max_connections: "Maximum concurrent client connections for this org. 0 means use the deployment default.",
+      default_worker_cpu: "Operator-set default worker pod CPU (k8s quantity, e.g. 2). Empty means unset. Applied when a connection does not size itself via duckgres.worker_* options.",
+      default_worker_memory: "Operator-set default worker pod memory (k8s quantity, e.g. 8Gi). Empty means unset.",
+      default_worker_ttl: "Operator-set default hot-idle TTL for workers (Go duration string, e.g. 75m). Empty means unset.",
+      default_worker_min_hot_idle: "Minimum number of default-profile hot-idle workers to keep warm for this org.",
+      created_at: "When this org record was created.",
+      updated_at: "When this org record was last modified.",
     },
+    "org-users": {
+      org_id: "Org this user belongs to. Part of the (org_id, username) primary key.",
+      username: "Login name, scoped to the org. Part of the primary key.",
+      passthrough: "When true, bypass the PostgreSQL compatibility layer (transpiler + pg_catalog) and forward SQL straight to DuckDB. For clients that speak DuckDB SQL natively.",
+      default_catalog: "Default catalog (database) selected for this user's sessions. Empty means the deployment default.",
+      created_at: "When this user record was created.",
+      updated_at: "When this user record was last modified.",
+    },
+    "org-user-secrets": {
+      org_id: "Org that owns this persistent secret. Part of the (org, user, name) primary key.",
+      username: "User the secret is scoped to. Part of the primary key.",
+      secret_name: "Name of the persistent DuckDB secret. Part of the primary key.",
+      created_at: "When this secret was first stored.",
+      updated_at: "When this secret was last updated.",
+    },
+    "managed-warehouses": {
+      org_id: "Org that owns this managed warehouse (1:1, keyed by org name). Primary key.",
+      image: "Worker container image used for this org's warehouse pods.",
+      ducklake_version: "DuckLake extension version pinned for this warehouse.",
+      warehouse_database: "Primary warehouse database connection metadata (endpoint + port).",
+      metadata_store: "DuckLake/Iceberg metadata Postgres config (kind cnpg-shard or external, endpoint, database, user).",
+      data_store: "Object-store provisioning intent for the Duckling (s3bucket fresh per-org bucket, or external reuse).",
+      pgbouncer: "Per-org opt-in for the PgBouncer pooler in front of the metadata database.",
+      s3: "Resolved activation-time object-store config (provider, region, bucket, path prefix, endpoint, delta-catalog).",
+      ducklake: "Whether the org's DuckLake catalog is enabled.",
+      iceberg: "Per-org Iceberg (Lakekeeper) catalog config: enabled flag, endpoint, warehouse name, OAuth2 client.",
+      worker_identity: "Org-scoped worker identity: k8s namespace + IAM role ARN consumed at activation.",
+      warehouse_database_credentials: "Secret reference (namespace/name/key) for the warehouse DB password. No secret material stored here.",
+      metadata_store_credentials: "Secret reference (namespace/name/key) for the metadata DB password.",
+      s3_credentials: "Secret reference (namespace/name/key) for the object-store credentials.",
+      runtime_config: "Secret reference (namespace/name/key) for additional worker runtime config.",
+      state: "Rolled-up provisioning status of the warehouse (pending, provisioning, ready, failed, deleting, deleted).",
+      status_message: "Human-readable detail for the current provisioning state.",
+      metadata_store_state: "Provisioning readiness of the metadata-store component.",
+      s3_state: "Provisioning readiness of the object-store component.",
+      iceberg_state: "Provisioning readiness of the Iceberg/Lakekeeper component.",
+      identity_state: "Provisioning readiness of the worker-identity (IAM/namespace) component.",
+      secrets_state: "Provisioning readiness of the secrets component.",
+      provisioning_started_at: "When provisioning began.",
+      ready_at: "When the warehouse last became ready.",
+      failed_at: "When provisioning last failed.",
+      created_at: "When this warehouse record was created.",
+      updated_at: "When this warehouse record was last modified.",
+    },
+    "cp-instances": {
+      id: "Control-plane instance id (<pod_uid>-<bootIDHex>). Primary key.",
+      pod_name: "Kubernetes pod name of this control-plane process.",
+      state: "Liveness state of the instance (active, draining, expired).",
+      started_at: "When this control-plane process started.",
+      last_heartbeat_at: "Most recent heartbeat; used to detect expired instances.",
+      draining_at: "When the instance began draining, if applicable.",
+      expired_at: "When the instance was marked expired, if applicable.",
+      created_at: "When this instance row was created.",
+      updated_at: "When this instance row was last modified.",
+    },
+    "worker-records": {
+      worker_id: "Numeric worker id. Primary key.",
+      pod_name: "Kubernetes pod name of the worker. Unique.",
+      image: "Container image the worker is running.",
+      profile_cpu: "Worker pod CPU profile (connection-selected sizing). Empty means the default profile.",
+      profile_memory: "Worker pod memory profile (connection-selected sizing). Empty means the default profile.",
+      ttl_minutes: "How long the worker stays hot-idle after its last query before the janitor retires it. 0 means use the global hot-idle TTL.",
+      state: "Durable lifecycle state (spawning, idle, reserved, activating, hot, hot_idle, draining, retired, lost).",
+      org_id: "Org this worker is bound to, if any.",
+      owner_cp_instance_id: "Control-plane instance that currently owns this worker.",
+      owner_epoch: "Ownership epoch, bumped on takeover to fence stale owners.",
+      activation_started_at: "When activation of this worker began, if applicable.",
+      last_heartbeat_at: "Most recent heartbeat from the worker.",
+      retire_reason: "Why the worker was retired, if applicable.",
+      s3_credentials_expires_at: "When the worker's current STS-brokered S3 credentials expire. NULL means due for refresh now.",
+      hot_idle_since: "When the worker most recently entered hot_idle; the TTL reaper measures idle age from here. NULL on non-hot-idle rows.",
+      created_at: "When this worker record was created.",
+      updated_at: "When this worker record was last modified.",
+    },
+    "flight-session-records": {
+      session_token: "Opaque Flight session token. Primary key.",
+      username: "User that owns the Flight session.",
+      org_id: "Org the session belongs to.",
+      worker_id: "Worker pod serving this session.",
+      owner_epoch: "Worker ownership epoch at the time the session was bound, to fence stale workers.",
+      cp_instance_id: "Control-plane instance handling this session.",
+      state: "Durable reconnect state (active, reconnecting, expired, closed).",
+      expires_at: "When the session reconnect window expires.",
+      last_seen_at: "Most recent activity on the session.",
+      created_at: "When this session record was created.",
+      updated_at: "When this session record was last modified.",
+    },
+    "org-connection-queue": {
+      request_id: "Unique admission request id. Primary key.",
+      org_id: "Org requesting an admission slot.",
+      cp_instance_id: "Control-plane instance that enqueued the request.",
+      pid: "Client backend PID associated with the request.",
+      protocol: "Client protocol of the request (e.g. postgres, flight).",
+      enqueued_at: "When the request joined the FIFO queue; orders fairness.",
+      expires_at: "When this queue entry expires and is reclaimed.",
+      granted_at: "When admission was granted, if applicable.",
+      created_at: "When this queue entry was created.",
+      updated_at: "When this queue entry was last modified.",
+    },
+    "org-connection-leases": {
+      lease_id: "Unique admission lease id. Primary key.",
+      request_id: "Queue request id this lease was granted for. Unique.",
+      org_id: "Org holding the admission lease.",
+      cp_instance_id: "Control-plane instance that owns the lease.",
+      pid: "Client backend PID holding the lease.",
+      protocol: "Client protocol of the leased connection.",
+      acquired_at: "When the lease was acquired; counts toward the org's active-connection capacity.",
+      created_at: "When this lease record was created.",
+      updated_at: "When this lease record was last modified.",
+    },
+  };
+
+  // One-line description of each model, shown dim under the model title.
+  // Grounded in the configstore struct doc comments.
+  const MODEL_DESCRIPTIONS = {
+    orgs: "A tenant, with its connection database name, per-org resource limits, and default worker profile.",
+    "org-users": "A username mapped to an org, with credentials and a per-user PostgreSQL-passthrough flag.",
+    "org-user-secrets": "A customer-set persistent DuckDB secret, scoped to (org, user) and replayed onto the user's worker at session creation.",
+    "managed-warehouses": "The config-store source of truth for an org's managed warehouse: image, metadata/object stores, catalogs, identity, and provisioning status.",
+    "cp-instances": "A runtime coordination record for one control-plane process, with liveness state and heartbeat.",
+    "worker-records": "A durable runtime record for one worker pod: lifecycle state, owner, profile, TTL, and credential expiry.",
+    "flight-session-records": "A durable reconnect record for a Flight-only session, binding it to a worker and control-plane instance.",
+    "org-connection-queue": "A cluster-wide FIFO admission request for one org connection; rows expire quickly and coordinate fairness across CP replicas.",
+    "org-connection-leases": "A durable cluster-wide admission lease for a live session; active leases count toward an org's connection capacity.",
   };
 
   // Per-org aux data computed client-side: the live /models/orgs listing does
@@ -720,6 +863,7 @@
     renderSidebar();
     const m = state.models.find(x => x.key === key) || {};
     document.getElementById("model-title").textContent = m.label || key;
+    document.getElementById("model-desc").textContent = MODEL_DESCRIPTIONS[key] || "";
     document.getElementById("model-table").textContent = "";
     document.getElementById("model-count").textContent = "";
     document.getElementById("table-scroll").innerHTML = '<div class="loading">Loading…</div>';
