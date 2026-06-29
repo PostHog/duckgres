@@ -6,9 +6,9 @@ steps:
   - id: provision
     type: provision_warehouse
     with:
-      org_id: scn-met-${run_id_resource}
+      org_id: scenario-frozen-${run_id_compact}
       request:
-        database_name: scn_met_${run_id_resource_sql}
+        database_name: scenario_frozen_${run_id_compact}
         metadata_store:
           type: cnpg-shard
         ducklake:
@@ -19,14 +19,14 @@ steps:
   - id: wait_ready
     type: wait_warehouse_ready
     with:
-      org_id: scn-met-${run_id_resource}
+      org_id: scenario-frozen-${run_id_compact}
       timeout: 15m
       poll_interval: 10s
 
   - id: setup_frozen_views
     type: sql
     with:
-      org_id: scn-met-${run_id_resource}
+      org_id: scenario-frozen-${run_id_compact}
       catalog: ducklake
       file: ../sql/setup_frozen_views.sql
       max_attempts: 12
@@ -35,7 +35,7 @@ steps:
   - id: validate_dataset_manifest
     type: sql
     with:
-      org_id: scn-met-${run_id_resource}
+      org_id: scenario-frozen-${run_id_compact}
       catalog: ducklake
       sql: |
         SELECT dataset_version
@@ -48,7 +48,7 @@ steps:
   - id: metadata_exploration
     type: sql_catalog
     with:
-      org_id: scn-met-${run_id_resource}
+      org_id: scenario-frozen-${run_id_compact}
       catalog: ducklake
       file: ../sql/metadata_catalog.yaml
       max_attempts: 3
@@ -59,7 +59,7 @@ steps:
     depends_on: [metadata_exploration]
     always_run: true
     with:
-      org_id: scn-met-${run_id_resource}
+      org_id: scenario-frozen-${run_id_compact}
       verify_deleted: true
       cleanup_timeout: 15m
       poll_interval: 10s
