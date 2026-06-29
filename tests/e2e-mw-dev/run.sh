@@ -49,9 +49,9 @@ render() {
 
 # Bind this namespace's `duckgres` SA to the same IAM role the real mw-dev
 # control plane uses (EKS Pod Identity). With it, the CP brokers per-duckling
-# S3 STS creds exactly like prod and activation completes — without it, DuckLake/
-# Iceberg activation fails at AssumeRole. Idempotent: if an association for this
-# (ns, sa) already exists, leave it. Requires the runner's AWS role to hold
+# S3 STS creds exactly like prod and activation completes — without it,
+# DuckLake activation fails at AssumeRole. Idempotent: if an association for
+# this (ns, sa) already exists, leave it. Requires the runner's AWS role to hold
 # eks:{Create,List,Delete}PodIdentityAssociation + iam:PassRole on the CP role.
 ensure_pod_identity() {
   : "${CP_POD_IDENTITY_ROLE:?CP_POD_IDENTITY_ROLE (CP IAM role ARN) is required}"
@@ -106,15 +106,14 @@ restart_cp_with_identity() {
   return 1
 }
 
-# The cnpg lakekeeper_<org> role+db are owned by the Crossplane composition and
+# The cnpg-shard metadata role+db are owned by the Crossplane composition and
 # dropped when the Duckling CR deletes — but that cascade is async and can lag,
-# leaving a stranded role from a prior run (incl. a cancelled one with no
-# teardown). On the next run the same org id re-provisions against the stranded
-# role whose password has drifted, the Lakekeeper migrate Job hits SASL auth
-# failure, and the warehouse never goes ready. So drop it directly on the
-# active shard, idempotently, BOTH before provisioning (clean slate, so a rerun
-# never inherits stranded state) and at teardown (deterministic clean exit).
-# Scoped to this PR's unique org ids, so it can't touch another PR's tenant.
+# leaving stranded state from a prior run (incl. a cancelled one with no
+# teardown). The composition's live identifier still uses the historical
+# lakekeeper_<org> prefix, so drop that role+db directly on the active shard,
+# idempotently, BOTH before provisioning (clean slate, so a rerun never
+# inherits stranded state) and at teardown (deterministic clean exit). Scoped
+# to this PR's unique org ids, so it can't touch another PR's tenant.
 drop_cnpg_role() { # org-id
   local ident
   # Mirror the composition's PG identifier: lakekeeper_<lower, [^a-z0-9_]→_>.
@@ -132,8 +131,8 @@ ci_orgs() { # pr-number
   local pr="$1"
   echo "ci-pr-${pr}-cnpg ci-pr-${pr}-ext ci-pr-${pr}-res1 ci-pr-${pr}-res2"
 }
-# The cnpg-shard-backed orgs (everything except ext) — these own a
-# lakekeeper_<org> role+db on the shard that drop_cnpg_role must clean.
+# The cnpg-shard-backed orgs (everything except ext) own a metadata role+db on
+# the shard that drop_cnpg_role must clean.
 ci_cnpg_orgs() { # pr-number
   local pr="$1"
   echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2"
@@ -156,12 +155,15 @@ wait_ci_ducklings_deleted() { # pr-number timeout
 delete_ci_bindings() { # pr-number
   local pr="$1"
   "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+  # Historical cleanup: older e2e runs created per-PR Lakekeeper RoleBindings.
+  # Keep sweeping them by label so stale resources disappear after the workflow
+  # stops creating new ones.
   "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
 }
 
 reset_pr_stack() {
   # A cancelled or failed run can leave a namespace, config-store rows, and
-  # shared Duckling/Lakekeeper resources for this PR. Start from a clean slate
+  # shared Duckling resources for this PR. Start from a clean slate
   # so apply never reuses stale network policies, services, or tenant state.
   delete_ci_ducklings "$PR_NUMBER"
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
@@ -277,7 +279,7 @@ cmd_diagnostics() {
 
 cmd_teardown() {
   # Deprovision the ci-pr ducklings FIRST so shared-infra resources (S3 bucket,
-  # cnpg role+db, lakekeeper CR/secret/SA) are cleaned up by the control plane
+  # cnpg role+db) are cleaned up by the control plane
   # before we delete it. Best-effort — the namespace delete + e2e-cleanup are the
   # backstop. Uses the CP admin API via a short-lived port-forward.
   if "${KUBECTL[@]}" -n "$NS" get deploy/duckgres-control-plane >/dev/null 2>&1; then
@@ -316,10 +318,9 @@ cmd_teardown() {
   # Wait for the Duckling CRs to FULLY delete — not just the warehouse row.
   # A warehouse flips to "deleted" the moment the CR delete is issued, but the
   # CR's finalizers keep running (incl the downstream provider-sql DROP of the
-  # cnpg lakekeeper_<org> role+db). If we return before that finishes, a later
-  # run that reuses the same org id (rerun, or a force-pushed PR) provisions
-  # against a stranded cnpg role whose password has drifted -> the Lakekeeper
-  # migrate Job hits SASL auth failure and the warehouse never goes ready.
+  # cnpg metadata role+db). If we return before that finishes, a later run that
+  # reuses the same org id (rerun, or a force-pushed PR) can provision against
+  # stranded cnpg state and never reach ready.
   # `wait --for=delete` blocks until the CR (and its cascade) is gone.
   delete_ci_ducklings "$PR_NUMBER"
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
