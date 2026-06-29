@@ -53,3 +53,4 @@ tmp/
 # Built Go binaries (build artifacts, never commit)
 /duckgres-controlplane
 /duckgres-worker
+/devserver
