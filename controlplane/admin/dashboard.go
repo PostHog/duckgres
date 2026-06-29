@@ -8,7 +8,6 @@ import (
 	"embed"
 	"html/template"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -144,25 +143,13 @@ func requestAdminToken(c *gin.Context) string {
 }
 
 func setAdminTokenCookie(c *gin.Context, token string) {
-	// HttpOnly + SameSite=Strict; not Secure because the dashboard is served
-	// plain-HTTP on a network-policy-restricted port reached via port-forward.
+	// HttpOnly + SameSite=Strict. Secure is set when the request arrived over
+	// HTTPS (the TLS ALB ingress sets X-Forwarded-Proto=https); a plain-HTTP
+	// port-forward leaves it false. Browsers treat http://localhost as a secure
+	// context, so port-forward login still works either way.
 	c.SetSameSite(http.SameSiteStrictMode)
-	c.SetCookie(adminTokenCookieName, token, 7*24*60*60, "/", "", false, true)
-}
-
-// loginNextURI returns the request URI to round-trip through the login form's
-// hidden "next" field, with any ?token= query key (the pre-#721 URL auth flow,
-// e.g. a stale bookmark) stripped — the login page must never embed the secret
-// or redirect it back into the URL bar / browser history.
-func loginNextURI(u *url.URL) string {
-	q := u.Query()
-	if _, ok := q["token"]; !ok {
-		return u.RequestURI()
-	}
-	q.Del("token")
-	cloned := *u
-	cloned.RawQuery = q.Encode()
-	return cloned.RequestURI()
+	secure := c.GetHeader("X-Forwarded-Proto") == "https"
+	c.SetCookie(adminTokenCookieName, token, 7*24*60*60, "/", "", secure, true)
 }
 
 func normalizeNextPath(next string) string {

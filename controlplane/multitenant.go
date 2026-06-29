@@ -454,7 +454,10 @@ func SetupMultiTenant(
 
 	// Admin UI dependencies. SSO group + Prometheus URL are env-only K8s knobs
 	// (set by the chart); see config_resolution.go / CLAUDE.md.
-	ssoCfg := admin.SSOConfig{AdminGroup: os.Getenv("DUCKGRES_ADMIN_SSO_GROUP")}
+	ssoCfg := admin.SSOConfig{
+		AdminGroup:  os.Getenv("DUCKGRES_ADMIN_SSO_GROUP"),
+		AllowAllSSO: os.Getenv("DUCKGRES_ADMIN_SSO_ALLOW_ALL") == "true",
+	}
 	auditStore, err := admin.NewAuditStore(store.DB())
 	if err != nil {
 		return nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
@@ -467,10 +470,12 @@ func SetupMultiTenant(
 	// admin, else ALB/Cognito SSO → viewer/admin). AuditMiddleware records every
 	// mutation. RoleGate enforces viewer/admin (mutations + the audit log read
 	// require admin).
+	// RoleGate blocks viewer mutations (method-based); the audit-log read
+	// self-gates via RequireAdmin at its route (no brittle path coupling here).
 	api := engine.Group("/api/v1",
 		admin.AuthMiddleware(adminTokens, ssoCfg),
 		admin.AuditMiddleware(auditStore),
-		admin.RoleGate("/api/v1/audit"),
+		admin.RoleGate(),
 	)
 	admin.RegisterAPI(api, store, adpt)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)

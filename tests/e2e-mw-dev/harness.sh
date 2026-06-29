@@ -1377,6 +1377,25 @@ admin_console_api() {
     || fail "/metrics/panels missing 'query_rate'"
 }
 
+# ---- admin RBAC: SSO viewer is read-only -----------------------------------
+# A forged ALB OIDC header (no internal secret) with a non-admin group resolves
+# to the viewer role: it can read but must be blocked from mutations and from
+# the audit log. Exercises RoleGate + RequireAdmin against the REAL router (the
+# unit tests cover the gate algorithm; this covers the wiring). The JWT is
+# unsigned because the CP trusts the ALB-injected header by network position.
+admin_rbac_viewer() { # org
+  org="$1"
+  log "admin RBAC: forged SSO viewer is read-only (no mutate, no audit)"
+  payload="$(printf '{"email":"ci-viewer@posthog.com","cognito:groups":["definitely-not-admin"]}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+  vh="X-Amzn-Oidc-Data: e30.${payload}.sig"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "viewer GET /orgs returned $code, want 200 (reads allowed)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/audit")"
+  [ "$code" = "403" ] || fail "viewer GET /audit returned $code, want 403 (audit is admin-only)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$vh" -H 'Content-Type: application/json' -d '{}' "$API/api/v1/orgs/$org")"
+  [ "$code" = "403" ] || fail "viewer PUT /orgs/$org returned $code, want 403 (mutations are admin-only)"
+}
+
 # ---- admin impersonation round-trip + audit --------------------------------
 # An admin can open a session as an org user (workers trust the CP — no password)
 # and run SQL on that org's worker; every statement is audited with the admin
@@ -1662,6 +1681,7 @@ main() {
   # Admin console read surfaces: identity/role, live state, metrics proxy, auth
   # gate. Independent of the per-org lanes, so run it here once orgs exist.
   admin_console_api
+  admin_rbac_viewer "$CNPG"
 
   # Join the kubectl background download started at script load — first k use
   # is inside the lanes, so the fetch overlapped the whole provisioning phase.
@@ -1689,7 +1709,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -33,18 +34,30 @@ func NewMetricsProxy(promURL string) *MetricsProxy {
 	}
 }
 
-// panel maps a stable key to a PromQL template. %[1]s = org label selector
-// (already including braces when org is set, empty otherwise), %[2]s = rate
-// window. Templates that don't need org/window simply ignore the verbs.
+// panel maps a stable key to a PromQL template with named tokens substituted
+// server-side: $ORG = org label selector (e.g. {org="x"}, empty when no org),
+// $ORGERR = the same scoped to outcome="error", $WIN = rate window. A token
+// replacer (not positional fmt) is used so a template that omits a token is
+// rendered cleanly — no surplus-argument corruption.
 var rangePanels = map[string]string{
-	"query_rate":      `sum by (outcome) (rate(duckgres_query_total%[1]s[%[2]s]))`,
-	"error_ratio":     `sum(rate(duckgres_query_total%[3]s[%[2]s])) / clamp_min(sum(rate(duckgres_query_total%[1]s[%[2]s])), 1)`,
-	"duration_p95":    `histogram_quantile(0.95, sum by (le) (rate(duckgres_query_duration_seconds_bucket%[1]s[%[2]s])))`,
-	"duration_p50":    `histogram_quantile(0.50, sum by (le) (rate(duckgres_query_duration_seconds_bucket%[1]s[%[2]s])))`,
-	"sessions_active": `sum(duckgres_org_sessions_active%[1]s)`,
-	"s3_bytes_rate":   `sum(rate(duckgres_s3_bytes_read_total%[1]s[%[2]s]))`,
+	"query_rate":      `sum by (outcome) (rate(duckgres_query_total$ORG[$WIN]))`,
+	"error_ratio":     `sum(rate(duckgres_query_total$ORGERR[$WIN])) / clamp_min(sum(rate(duckgres_query_total$ORG[$WIN])), 1)`,
+	"duration_p95":    `histogram_quantile(0.95, sum by (le) (rate(duckgres_query_duration_seconds_bucket$ORG[$WIN])))`,
+	"duration_p50":    `histogram_quantile(0.50, sum by (le) (rate(duckgres_query_duration_seconds_bucket$ORG[$WIN])))`,
+	"sessions_active": `sum(duckgres_org_sessions_active$ORG)`,
+	"s3_bytes_rate":   `sum(rate(duckgres_s3_bytes_read_total$ORG[$WIN]))`,
 	"worker_states":   `sum by (state) (duckgres_worker_lifecycle_count)`,
 	"queue_depth":     `sum(duckgres_control_plane_worker_queue_depth)`,
+}
+
+// renderPanel substitutes the named tokens into a panel template. $ORGERR is
+// listed before $ORG so the replacer matches the longer token first.
+func renderPanel(tmpl, orgSel, orgErrSel, rateWindow string) string {
+	return strings.NewReplacer(
+		"$ORGERR", orgErrSel,
+		"$ORG", orgSel,
+		"$WIN", rateWindow,
+	).Replace(tmpl)
 }
 
 // RegisterMetricsProxy wires the metrics endpoints onto the group.
@@ -70,16 +83,19 @@ func (m *MetricsProxy) queryRange(c *gin.Context) {
 		return
 	}
 
-	// Org selector: an exact-match label selector, empty when no org given.
+	// Org selectors: exact-match label selectors, empty (cluster-wide) when no
+	// org is given. orgErrSel additionally scopes to failed queries.
 	orgSel := ""
+	orgErrSel := `{outcome="error"}`
 	if org := c.Query("org"); org != "" {
 		orgSel = fmt.Sprintf(`{org=%q}`, org)
+		orgErrSel = fmt.Sprintf(`{org=%q,outcome="error"}`, org)
 	}
 	rateWindow := c.DefaultQuery("rate_window", "5m")
-	if _, err := time.ParseDuration(rateWindow); err != nil {
+	if d, err := time.ParseDuration(rateWindow); err != nil || d <= 0 {
 		rateWindow = "5m"
 	}
-	promql := fmt.Sprintf(tmpl, orgSel, rateWindow, orgSel)
+	promql := renderPanel(tmpl, orgSel, orgErrSel, rateWindow)
 
 	// Time window → [start, end, step]. Cap at ~250 points.
 	window, err := time.ParseDuration(c.DefaultQuery("window", "1h"))

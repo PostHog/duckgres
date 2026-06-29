@@ -54,50 +54,56 @@ func registerImpersonateAPI(r *gin.RouterGroup, imp Impersonator, audit *AuditSt
 			c.JSON(http.StatusBadRequest, gin.H{"error": "username and sql are required"})
 			return
 		}
+
+		// recordAudit writes one rich impersonation audit row (admin actor +
+		// target user + redacted SQL) on EVERY exit path — success, engine
+		// failure, AND the write-without-allow_write rejection — and marks the
+		// request handled so the generic AuditMiddleware does not also record a
+		// mislabeled "config.create" row. A failed audit write is logged loudly
+		// but never discards an already-executed query (it cannot be un-run).
+		recordAudit := func(status int) {
+			entry := &AdminAuditEntry{
+				Action:      "impersonate.query",
+				Method:      c.Request.Method,
+				Path:        c.FullPath(),
+				Org:         org,
+				TargetUser:  req.Username,
+				SQLRedacted: usersecrets.RedactForLog(req.SQL),
+				RemoteAddr:  c.ClientIP(),
+				Status:      status,
+			}
+			if id != nil {
+				entry.Actor, entry.Role, entry.Source = id.Email, string(id.Role), id.Source
+			}
+			if audit != nil {
+				if err := audit.Record(entry); err != nil {
+					slog.Error("admin: FAILED to audit impersonation",
+						"actor", entry.Actor, "org", org, "target_user", req.Username, "error", err)
+				}
+			}
+			c.Set(ctxAuditHandledKey, true)
+		}
+
 		// Defense in depth: a write statement must be explicitly opted into
 		// (the UI also forces a confirm). The classifier is conservative — it
-		// treats WITH/CTEs and anything not obviously read-only as a write, so
-		// false positives only cost an extra confirm.
+		// treats WITH/CTEs, EXPLAIN ANALYZE of a writer, and anything not
+		// obviously read-only as a write, so false positives only cost an extra
+		// confirm.
 		if !req.AllowWrite && !isReadOnlySQL(req.SQL) {
+			recordAudit(http.StatusBadRequest)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "statement may write; resend with allow_write=true"})
 			return
 		}
 
 		result, runErr := imp.Impersonate(c, org, req.Username, req.SQL, req.AllowWrite)
-
-		// Audit EVERY impersonation attempt, success or failure, with the admin
-		// actor and redacted SQL (the engine echoes SQL in errors, so redact
-		// both the stored statement and never log it raw). A failed audit write
-		// is logged loudly but does not discard an already-executed query.
-		entry := &AdminAuditEntry{
-			Action:      "impersonate.query",
-			Method:      c.Request.Method,
-			Path:        c.FullPath(),
-			Org:         org,
-			TargetUser:  req.Username,
-			SQLRedacted: usersecrets.RedactForLog(req.SQL),
-			RemoteAddr:  c.ClientIP(),
-		}
-		if id != nil {
-			entry.Actor, entry.Role, entry.Source = id.Email, string(id.Role), id.Source
-		}
 		if runErr != nil {
-			entry.Status = http.StatusBadGateway
-		} else {
-			entry.Status = http.StatusOK
-		}
-		if audit != nil {
-			if err := audit.Record(entry); err != nil {
-				slog.Error("admin: FAILED to audit impersonation — action executed unaudited",
-					"actor", entry.Actor, "org", org, "target_user", req.Username, "error", err)
-			}
-		}
-		c.Set(ctxAuditHandledKey, true)
-
-		if runErr != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"error": runErr.Error()})
+			recordAudit(http.StatusBadGateway)
+			// The engine echoes the offending SQL in errors (LINE 1: ... SECRET
+			// '...'), so redact before returning it to the client / proxy logs.
+			c.JSON(http.StatusBadGateway, gin.H{"error": usersecrets.RedactErrorForLog(req.SQL, runErr.Error())})
 			return
 		}
+		recordAudit(http.StatusOK)
 		c.JSON(http.StatusOK, result)
 	})
 }
@@ -123,7 +129,36 @@ func isReadOnlySQL(sql string) bool {
 			if strings.Contains(strings.TrimRight(s, "; \n\t"), ";") {
 				return false
 			}
+			// EXPLAIN ANALYZE executes the inner statement to profile it, so
+			// EXPLAIN ANALYZE <DML/DDL> is a WRITE despite the read-only-looking
+			// EXPLAIN prefix. Treat it as a write so allow_write is required.
+			if kw == "explain" && explainExecutes(s) {
+				return false
+			}
 			return true
+		}
+	}
+	return false
+}
+
+// explainExecutes reports whether an EXPLAIN statement actually runs its inner
+// query (EXPLAIN ANALYZE, or EXPLAIN (ANALYZE[, ...])) — and can therefore
+// mutate through it. Plain EXPLAIN only plans and is safe.
+func explainExecutes(s string) bool {
+	rest := strings.TrimSpace(strings.TrimPrefix(s, "explain"))
+	if strings.HasPrefix(rest, "analyze") {
+		return true
+	}
+	// Parenthesized option list, e.g. EXPLAIN (ANALYZE, VERBOSE) INSERT ...
+	if strings.HasPrefix(rest, "(") {
+		if end := strings.IndexByte(rest, ')'); end > 0 {
+			for _, tok := range strings.FieldsFunc(rest[1:end], func(r rune) bool {
+				return r == ' ' || r == ',' || r == '\t' || r == '\n'
+			}) {
+				if tok == "analyze" {
+					return true
+				}
+			}
 		}
 	}
 	return false

@@ -42,10 +42,14 @@ const (
 // SSOConfig controls how the ALB/Cognito identity maps to a Role.
 type SSOConfig struct {
 	// AdminGroup is the Google Workspace / Cognito group whose members get the
-	// admin role. When empty, any SSO-authenticated user is treated as admin
-	// (single-tier fallback so the tool is usable before groups are wired) and
-	// a warning is logged.
+	// admin role. When empty, SSO users default to VIEWER (fail closed) unless
+	// AllowAllSSO is set. The break-glass internal-secret path is unaffected.
 	AdminGroup string
+	// AllowAllSSO, when true AND AdminGroup is empty, grants admin to every
+	// SSO-authenticated user (single-tier dev convenience). It must be opted
+	// into explicitly (DUCKGRES_ADMIN_SSO_ALLOW_ALL=true) so a missing group
+	// config in production cannot silently grant admin to everyone.
+	AllowAllSSO bool
 }
 
 // Identity is the resolved caller for an admin-UI request.
@@ -127,10 +131,16 @@ func identityFromOIDC(c *gin.Context, sso SSOConfig) *Identity {
 // resolveRole assigns admin/viewer based on group membership.
 func resolveRole(id *Identity, sso SSOConfig) *Identity {
 	if sso.AdminGroup == "" {
-		// No group configured: every authenticated user is admin. Logged so the
-		// gap is visible in prod where AdminGroup should be set.
-		id.Role = RoleAdmin
-		slog.Warn("admin: DUCKGRES_ADMIN_SSO_GROUP unset — granting admin to all SSO users", "email", id.Email)
+		if sso.AllowAllSSO {
+			// Explicit opt-in (DUCKGRES_ADMIN_SSO_ALLOW_ALL): single-tier dev mode.
+			id.Role = RoleAdmin
+			slog.Warn("admin: DUCKGRES_ADMIN_SSO_GROUP unset and ALLOW_ALL set — granting admin to all SSO users", "email", id.Email)
+			return id
+		}
+		// Fail closed: without a configured admin group, SSO users are viewers.
+		// (The internal-secret / break-glass path still grants admin.)
+		id.Role = RoleViewer
+		slog.Warn("admin: DUCKGRES_ADMIN_SSO_GROUP unset — SSO user defaults to viewer (set the group, or DUCKGRES_ADMIN_SSO_ALLOW_ALL for dev)", "email", id.Email)
 		return id
 	}
 	id.Role = RoleViewer
@@ -167,6 +177,24 @@ func RoleGate(adminOnlyGET ...string) gin.HandlerFunc {
 			c.Request.Method == http.MethodDelete
 		_, adminGETPath := adminGET[c.FullPath()]
 		if (mutating || adminGETPath) && id.Role != RoleAdmin {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// RequireAdmin is a per-route gate for admin-only endpoints (e.g. the audit
+// log read). Unlike RoleGate's path allow-list, it travels with the route
+// registration, so moving/renaming the route cannot silently downgrade it.
+func RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := IdentityFromContext(c)
+		if id == nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+			return
+		}
+		if id.Role != RoleAdmin {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "admin role required"})
 			return
 		}

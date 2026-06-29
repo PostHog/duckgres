@@ -12,10 +12,11 @@ reachable only over the Tailscale subnet router. See `docs/design/admin-ui.md`.
 
 - **Frontend** (`ui/`): React + Vite + TypeScript + Tailwind + shadcn/ui,
   TanStack Query/Table, Recharts. Built to `ui/dist/` and embedded via
-  `//go:embed all:ui/dist` (`embed_ui.go`), served by Gin with SPA fallback. A
-  committed placeholder `ui/dist/index.html` keeps `go build` working without a
-  node toolchain; CI/Docker run `npm run build` to produce the real bundle
-  before `go build`.
+  `//go:embed all:ui/dist` (`embed_ui.go`), served by Gin with SPA fallback. The
+  real built bundle is **committed** to `ui/dist` (so `go build` works without a
+  node toolchain); regenerate it with `just ui-build` and re-commit when the UI
+  changes. Both `Dockerfile` and `Dockerfile.controlplane` rebuild it in a node
+  stage before `go build`, so a shipped image is never stale.
 - **Backend**: Gin on `:8080`, all routes under `/api/v1` (the SPA owns `/`).
 
 ## Auth + RBAC

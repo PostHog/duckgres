@@ -1,6 +1,6 @@
 # Build the admin console SPA (controlplane/admin/ui) so the kubernetes build
-# can embed a fresh dist/ via //go:embed all:ui/dist. Runs before the Go build;
-# the committed ui/dist/index.html placeholder is overwritten with this output.
+# embeds a FRESH dist/ via //go:embed all:ui/dist, overwriting the committed
+# bundle. Runs before the Go build.
 FROM node:20-bookworm-slim AS uibuilder
 WORKDIR /ui
 COPY controlplane/admin/ui/package.json controlplane/admin/ui/package-lock.json ./

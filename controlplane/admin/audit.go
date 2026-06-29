@@ -49,9 +49,10 @@ func NewAuditStore(db *gorm.DB) (*AuditStore, error) {
 	return &AuditStore{db: db}, nil
 }
 
-// Record appends an entry. A failure to persist is returned to the caller; for
-// security-sensitive actions (impersonation) the handler treats a failed audit
-// write as a failed request.
+// Record appends an entry. A failure to persist is returned to the caller. The
+// impersonation handler logs a failed audit write loudly (slog.Error) but does
+// not discard an already-executed query — it cannot be un-run; other mutations
+// are audited best-effort by AuditMiddleware.
 func (a *AuditStore) Record(e *AdminAuditEntry) error {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now().UTC()
@@ -97,10 +98,13 @@ func AuditMiddleware(store *AuditStore) gin.HandlerFunc {
 		}
 		id := IdentityFromContext(c)
 		entry := &AdminAuditEntry{
-			Action:     "config." + actionVerb(c.Request.Method),
-			Method:     c.Request.Method,
-			Path:       c.FullPath(),
+			Action: "config." + actionVerb(c.Request.Method),
+			Method: c.Request.Method,
+			// Resolved path (not the route template) so "who changed which
+			// user/secret" is answerable from the log.
+			Path:       c.Request.URL.Path,
 			Org:        c.Param("id"),
+			TargetUser: c.Param("username"),
 			Status:     c.Writer.Status(),
 			RemoteAddr: c.ClientIP(),
 		}
@@ -126,9 +130,10 @@ func actionVerb(method string) string {
 	}
 }
 
-// registerAuditAPI wires GET /audit (admin-only via RoleGate adminOnlyGET list).
+// registerAuditAPI wires GET /audit, admin-only via a per-route RequireAdmin
+// gate that travels with the route (a rename cannot silently expose it).
 func registerAuditAPI(r *gin.RouterGroup, store *AuditStore) {
-	r.GET("/audit", func(c *gin.Context) {
+	r.GET("/audit", RequireAdmin(), func(c *gin.Context) {
 		limit, _ := strconv.Atoi(c.Query("limit"))
 		entries, err := store.List(c.Query("org"), c.Query("actor"), limit)
 		if err != nil {

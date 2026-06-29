@@ -11,10 +11,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// uiDistFS holds the built React SPA. The committed ui/dist/index.html is a
-// placeholder so `go build` works without a node toolchain; CI/Docker run
-// `npm run build` (controlplane/admin/ui) to produce the real bundle before the
-// Go build, overwriting it. `all:` includes Vite's hashed asset files.
+// uiDistFS holds the built React SPA. The real Vite bundle is committed to
+// controlplane/admin/ui/dist and embedded here, so `go build` works without a
+// node toolchain — but it must be regenerated (`just ui-build`) and re-committed
+// when the UI changes. The Dockerfile / Dockerfile.controlplane node stages
+// rebuild it before `go build` so the shipped image is never stale. `all:`
+// includes Vite's hashed asset files.
 //
 //go:embed all:ui/dist
 var uiDistFS embed.FS
@@ -37,7 +39,7 @@ func RegisterUI(engine *gin.Engine) error {
 	engine.NoRoute(func(c *gin.Context) {
 		p := c.Request.URL.Path
 		// Never SPA-fallback an API path — return a JSON 404 instead of HTML.
-		if strings.HasPrefix(p, "/api/") {
+		if p == "/api" || strings.HasPrefix(p, "/api/") {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}

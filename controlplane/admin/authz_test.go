@@ -48,7 +48,8 @@ func TestAuthMiddlewareSSORoleMapping(t *testing.T) {
 	}{
 		{"member of admin group", []string{"eng", "admins"}, "admins", RoleAdmin},
 		{"not a member", []string{"eng"}, "admins", RoleViewer},
-		{"no admin group configured = admin", []string{"eng"}, "", RoleAdmin},
+		// Fail closed: no admin group configured (and no allow-all) => viewer.
+		{"no admin group configured = viewer", []string{"eng"}, "", RoleViewer},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -69,6 +70,62 @@ func TestAuthMiddlewareSSORoleMapping(t *testing.T) {
 			want := `{"role":"` + string(tc.want) + `"}`
 			if got := rec.Body.String(); got != want {
 				t.Fatalf("body = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+// Without an admin group, SSO users must default to viewer (fail closed) —
+// unless AllowAllSSO is explicitly opted in (dev convenience).
+func TestAuthMiddlewareFailClosedVsAllowAll(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name     string
+		allowAll bool
+		want     Role
+	}{
+		{"fail closed by default", false, RoleViewer},
+		{"allow-all opt-in", true, RoleAdmin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := gin.New()
+			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{AllowAllSSO: tc.allowAll}), func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
+			})
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			req.Header.Set(albOIDCDataHeader, mkOIDC(map[string]any{"email": "u@posthog.com"}))
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if want := `{"role":"` + string(tc.want) + `"}`; rec.Body.String() != want {
+				t.Fatalf("body = %s, want %s", rec.Body.String(), want)
+			}
+		})
+	}
+}
+
+// RequireAdmin gates a route regardless of method (used by the audit read).
+func TestRequireAdmin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/audit", AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{AdminGroup: "admins"}), RequireAdmin(), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	viewer := mkOIDC(map[string]any{"email": "v@posthog.com", "cognito:groups": []any{"eng"}})
+	admin := mkOIDC(map[string]any{"email": "a@posthog.com", "cognito:groups": []any{"admins"}})
+	for _, tc := range []struct {
+		name, oidc string
+		want       int
+	}{
+		{"viewer blocked", viewer, http.StatusForbidden},
+		{"admin allowed", admin, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/audit", nil)
+			req.Header.Set(albOIDCDataHeader, tc.oidc)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
 			}
 		})
 	}
@@ -137,6 +194,12 @@ func TestIsReadOnlySQL(t *testing.T) {
 		{"SELECT 1", true},
 		{"  select * from t ", true},
 		{"EXPLAIN SELECT 1", true},
+		// EXPLAIN ANALYZE executes the inner statement, so it is a write when
+		// the inner statement mutates (and conservatively flagged even for SELECT).
+		{"EXPLAIN ANALYZE INSERT INTO t VALUES (1)", false},
+		{"EXPLAIN (ANALYZE, VERBOSE) DELETE FROM t", false},
+		{"explain analyze update t set x=1", false},
+		{"EXPLAIN ANALYZE SELECT 1", false},
 		{"SHOW TABLES", true},
 		{"PRAGMA database_list", true},
 		{"VALUES (1)", true},

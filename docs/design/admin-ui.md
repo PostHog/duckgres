@@ -111,13 +111,14 @@ for live views), TanStack Table (dense sortable tables), Recharts (trends). Page
 9. **Audit** — searchable admin action log.
 
 ### Build + embed
-`npm run build` → `controlplane/admin/ui/dist/`. `embed.go` in the admin package:
-`//go:embed all:dist` served by Gin with SPA fallback to `index.html`; the API/login/health
-routes keep precedence. A committed placeholder `dist/index.html` keeps `go build` working
-without a node toolchain (CI/Docker regenerate the real bundle). Dockerfile gains a
-`node` builder stage producing `dist/`, copied into the Go build context before `go build`.
-The React app calls relative `/api/v1` paths, so the existing `devserver` (port-forward +
-secret injection) and a Vite dev proxy both work for local iteration.
+`npm run build` → `controlplane/admin/ui/dist/`. `embed_ui.go` in the admin package:
+`//go:embed all:ui/dist` served by Gin with SPA fallback to `index.html`; the API/login/health
+routes keep precedence. The real built bundle is **committed** to `ui/dist` (so `go build`
+works without a node toolchain) and must be regenerated (`just ui-build`) + re-committed when
+the UI changes. Both `Dockerfile` and `Dockerfile.controlplane` (the prod CP image) have a
+`node` builder stage that rebuilds `dist/` and copies it into the Go build context before
+`go build`, so a shipped image is never stale. The React app calls relative `/api/v1` paths,
+so a Vite dev proxy (`just ui-dev-vite`) and the `devserver` both work for local iteration.
 
 ## Exposure (charts + cloud-infra)
 
