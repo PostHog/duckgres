@@ -64,8 +64,6 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		return nil, false, nil
 	}
 	org.MaxWorkers = updates.MaxWorkers
-	org.MemoryBudget = updates.MemoryBudget
-	org.IdleTimeoutS = updates.IdleTimeoutS
 	org.MaxConnections = updates.MaxConnections
 	// Mirrors gormAPIStore: written unconditionally so "" clears (the handler
 	// presence-merge already preserved omitted fields).
@@ -73,12 +71,6 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.DefaultWorkerMemory = updates.DefaultWorkerMemory
 	org.DefaultWorkerTTL = updates.DefaultWorkerTTL
 	org.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
-	if updates.WorkerCPURequest != "" {
-		org.WorkerCPURequest = updates.WorkerCPURequest
-	}
-	if updates.WorkerMemoryRequest != "" {
-		org.WorkerMemoryRequest = updates.WorkerMemoryRequest
-	}
 	if updates.HostnameAlias != nil {
 		if *updates.HostnameAlias == "" {
 			org.HostnameAlias = nil
@@ -1396,8 +1388,6 @@ func TestUpdateOrgMaxConnections(t *testing.T) {
 		Name:           "analytics",
 		MaxWorkers:     2,
 		MaxConnections: 5,
-		MemoryBudget:   "8GB",
-		IdleTimeoutS:   30,
 	}
 	router := newTestAPIRouter(store)
 
@@ -1418,12 +1408,6 @@ func TestUpdateOrgMaxConnections(t *testing.T) {
 	}
 	if store.orgs["analytics"].MaxWorkers != 2 {
 		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
-	}
-	if store.orgs["analytics"].MemoryBudget != "8GB" {
-		t.Fatalf("expected memory_budget to be preserved, got %q", store.orgs["analytics"].MemoryBudget)
-	}
-	if store.orgs["analytics"].IdleTimeoutS != 30 {
-		t.Fatalf("expected idle_timeout_s to be preserved, got %d", store.orgs["analytics"].IdleTimeoutS)
 	}
 }
 

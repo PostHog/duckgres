@@ -70,7 +70,6 @@ func (a *orgRouterAdapter) AllOrgStats() []admin.OrgStatus {
 			Name:           name,
 			ActiveSessions: sessionCount,
 			MaxWorkers:     stack.Config.MaxWorkers,
-			MemoryBudget:   stack.Config.MemoryBudget,
 		})
 		// Emit per-org Prometheus metrics
 		observeOrgSessionsActive(name, sessionCount)

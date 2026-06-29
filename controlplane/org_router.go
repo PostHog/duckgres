@@ -103,19 +103,6 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	// is the only ceiling). There is no global/cluster-default fallback.
 	maxWorkers := tc.MaxWorkers
 
-	// Apply per-org worker resource overrides to the shared pool.
-	if tc.WorkerCPURequest != "" || tc.WorkerMemoryRequest != "" {
-		cpu := tc.WorkerCPURequest
-		if cpu == "" {
-			cpu = tr.baseCfg.WorkerCPURequest
-		}
-		mem := tc.WorkerMemoryRequest
-		if mem == "" {
-			mem = tr.baseCfg.WorkerMemoryRequest
-		}
-		tr.sharedPool.SetWorkerResources(cpu, mem)
-	}
-
 	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker)
 	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, tr.globalCfg.DuckLakeDefaultSpecVersion, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
@@ -313,8 +300,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		connLimitChanged := oldTC.MaxConnections != newTC.MaxConnections
 		floorChanged := oldTC.DefaultWorkerMinHotIdle != newTC.DefaultWorkerMinHotIdle
 		imageChanged := workerImageForOrg(oldTC, tr.baseCfg.WorkerImage) != workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
-		resourcesChanged := oldTC.WorkerCPURequest != newTC.WorkerCPURequest ||
-			oldTC.WorkerMemoryRequest != newTC.WorkerMemoryRequest
 
 		tr.mu.Lock()
 		if stack, ok := tr.orgs[name]; ok {
@@ -341,19 +326,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 				if pool, ok := stack.Pool.(interface{ SetWorkerImage(string) }); ok {
 					pool.SetWorkerImage(image)
 				}
-			}
-			if resourcesChanged && (newTC.WorkerCPURequest != "" || newTC.WorkerMemoryRequest != "") {
-				cpu := newTC.WorkerCPURequest
-				if cpu == "" {
-					cpu = tr.baseCfg.WorkerCPURequest
-				}
-				mem := newTC.WorkerMemoryRequest
-				if mem == "" {
-					mem = tr.baseCfg.WorkerMemoryRequest
-				}
-				slog.Info("Org worker resources changed, updating shared pool defaults.",
-					"org", name, "cpu", cpu, "memory", mem)
-				tr.sharedPool.SetWorkerResources(cpu, mem)
 			}
 		}
 		tr.mu.Unlock()
