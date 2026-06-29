@@ -1202,23 +1202,27 @@ concurrent_writers() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
-# ---- admin dashboard auth (#721) -------------------------------------------
-# Regression for #721: the admin dashboard must NOT accept the internal secret
-# via a ?token= URL query parameter (URL-borne secrets persist in browser
-# history and any future proxy access logs). A request carrying the correct
-# token in the query string gets the login page (401) with no auth cookie and
-# no redirect; the X-Duckgres-Internal-Secret header path still authenticates.
+# ---- admin API auth (#721) -------------------------------------------------
+# Regression for #721: the internal secret must NOT be accepted via a ?token=
+# URL query parameter (URL-borne secrets persist in browser history and any
+# future proxy access logs) — only the X-Duckgres-Internal-Secret header / login
+# cookie authenticate. The admin console serves its React SPA UNauthenticated at
+# "/" (the bundle carries no secrets; all data is behind /api auth), so this
+# asserts the invariant against an authenticated API endpoint, not "/".
 admin_dashboard_no_query_token() {
-  log "admin dashboard rejects ?token= query auth"
+  log "admin API rejects ?token= query auth (#721)"
   hdrs=/tmp/admin_qt_hdrs
-  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/?token=$SECRET")"
-  [ "$code" = "401" ] || fail "GET /?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
+  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/api/v1/orgs?token=$SECRET")"
+  [ "$code" = "401" ] || fail "GET /api/v1/orgs?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
   if grep -qi '^set-cookie:' "$hdrs"; then
-    fail "GET /?token=<secret> set a cookie — query-param auth is back"
+    fail "GET /api/v1/orgs?token=<secret> set a cookie — query-param auth is back"
   fi
-  # Sanity: the header path (what this harness uses everywhere) still works.
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/")"
-  [ "$code" = "200" ] || fail "GET / with internal-secret header returned $code, want 200"
+  # The header path (what this harness uses everywhere) still authenticates.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "GET /api/v1/orgs with internal-secret header returned $code, want 200"
+  # The public SPA is served unauthenticated at "/".
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/")"
+  [ "$code" = "200" ] || fail "GET / (public SPA) returned $code, want 200"
 }
 
 # ---- internal secret rotation fallback --------------------------------------
@@ -1233,9 +1237,11 @@ internal_secret_fallback_auth() {
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Duckgres-Internal-Secret: $fb" "$API/api/v1/orgs")"
   [ "$code" = "200" ] || fail "GET /api/v1/orgs with fallback secret returned $code, want 200 (rotation overlap broken)"
+  # Dashboard cookie path: the fallback secret must also authenticate via the
+  # login cookie (not the public "/" SPA, which 200s for everyone).
   code="$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "X-Duckgres-Internal-Secret: $fb" "$API/")"
-  [ "$code" = "200" ] || fail "GET / (dashboard) with fallback secret returned $code, want 200"
+    --cookie "duckgres_admin_token=$fb" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "GET /api/v1/orgs with fallback-secret cookie returned $code, want 200 (dashboard cookie path)"
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Duckgres-Internal-Secret: definitely-not-a-secret" "$API/api/v1/orgs")"
   [ "$code" = "401" ] || fail "GET /api/v1/orgs with garbage secret returned $code, want 401 (accept-list must stay closed)"
@@ -1280,6 +1286,78 @@ models_explorer_api() {
   # Unknown model → 404.
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/models/not-a-model")"
   [ "$code" = "404" ] || fail "GET /api/v1/models/not-a-model returned $code, want 404"
+}
+
+# ---- admin console: identity + live state + auth gate ----------------------
+# The VPC-private admin console (controlplane/admin/, docs/design/admin-ui.md)
+# adds identity resolution (/me), live cluster state, a metrics proxy, and an
+# audit log on top of the models explorer. The internal secret maps to the admin
+# role; an unauthenticated request is rejected. This asserts the new read
+# surfaces are wired and return their documented envelopes.
+admin_console_api() {
+  log "admin console: /me identity, live state, auth gate"
+  # Internal secret → admin role.
+  role="$(curl -fsS -H "$H" "$API/api/v1/me" | jq -r '.role')"
+  [ "$role" = "admin" ] || fail "GET /me with internal secret role='$role', want admin"
+  # No auth → 401 (the accept-list stays closed for SSO-less callers).
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/me")"
+  [ "$code" = "401" ] || fail "GET /me with no auth returned $code, want 401"
+  # Live read endpoints return their documented envelopes.
+  curl -fsS -H "$H" "$API/api/v1/queries"           | jq -e 'has("queries")' >/dev/null || fail "/queries missing 'queries' key"
+  curl -fsS -H "$H" "$API/api/v1/workers/fleet"     | jq -e 'has("fleet")'   >/dev/null || fail "/workers/fleet missing 'fleet' key"
+  curl -fsS -H "$H" "$API/api/v1/cluster/instances" \
+    | jq -e '.instances | map(select(.self)) | length >= 1' >/dev/null \
+    || fail "/cluster/instances has no self-flagged CP replica"
+  # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
+  curl -fsS -H "$H" "$API/api/v1/metrics/panels" | jq -e '.panels | index("query_rate")' >/dev/null \
+    || fail "/metrics/panels missing 'query_rate'"
+}
+
+# ---- admin RBAC: SSO viewer is read-only -----------------------------------
+# A forged ALB OIDC header (no internal secret) with a non-admin group resolves
+# to the viewer role: it can read but must be blocked from mutations and from
+# the audit log. Exercises RoleGate + RequireAdmin against the REAL router (the
+# unit tests cover the gate algorithm; this covers the wiring). The JWT is
+# unsigned because the CP trusts the ALB-injected header by network position.
+admin_rbac_viewer() { # org
+  org="$1"
+  log "admin RBAC: forged SSO viewer is read-only (no mutate, no audit)"
+  payload="$(printf '{"email":"ci-viewer@posthog.com","cognito:groups":["definitely-not-admin"]}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+  vh="X-Amzn-Oidc-Data: e30.${payload}.sig"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "viewer GET /orgs returned $code, want 200 (reads allowed)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/audit")"
+  [ "$code" = "403" ] || fail "viewer GET /audit returned $code, want 403 (audit is admin-only)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$vh" -H 'Content-Type: application/json' -d '{}' "$API/api/v1/orgs/$org")"
+  [ "$code" = "403" ] || fail "viewer PUT /orgs/$org returned $code, want 403 (mutations are admin-only)"
+}
+
+# ---- admin impersonation round-trip + audit --------------------------------
+# An admin can open a session as an org user (workers trust the CP — no password)
+# and run SQL on that org's worker; every statement is audited with the admin
+# actor, and a write requires allow_write=true. This asserts the full round-trip
+# against a real worker AND that an audit row is persisted — the load-bearing
+# behaviours of the impersonation path (impersonate.go + admin_providers.go).
+admin_impersonation_audited() { # org
+  org="$1"
+  log "admin impersonation: run SQL as root@$org + assert audit row"
+  out="$(curl -fsS --max-time 360 -H "$H" -H 'Content-Type: application/json' \
+    -d '{"username":"root","sql":"SELECT 42 AS answer","allow_write":false}' \
+    "$API/api/v1/orgs/$org/impersonate/query")" \
+    || fail "impersonate: request failed for root@$org"
+  echo "$out" | jq -e '.columns | index("answer")' >/dev/null \
+    || fail "impersonate: missing column 'answer' in: $out"
+  echo "$out" | jq -e '.rows[0][0] == 42' >/dev/null \
+    || fail "impersonate: rows[0][0] != 42 in: $out"
+  # A write statement without allow_write must be rejected (conservative classifier).
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -H "$H" -H 'Content-Type: application/json' \
+    -d '{"username":"root","sql":"CREATE TABLE imp_x(i int)","allow_write":false}' \
+    "$API/api/v1/orgs/$org/impersonate/query")"
+  [ "$code" = "400" ] || fail "impersonate: write without allow_write returned $code, want 400"
+  # The successful impersonation must have left an audit row attributing the admin.
+  curl -fsS -H "$H" "$API/api/v1/audit?org=$org" \
+    | jq -e --arg o "$org" '.entries | map(select(.action=="impersonate.query" and .target_user=="root" and .org==$o)) | length >= 1' >/dev/null \
+    || fail "impersonate: no audit row for impersonate.query root@$org"
 }
 
 # ---- tenant isolation -----------------------------------------------------
@@ -1527,6 +1605,11 @@ main() {
   # against a real bcrypt-hash-bearing row.
   models_explorer_api
 
+  # Admin console read surfaces: identity/role, live state, metrics proxy, auth
+  # gate. Independent of the per-org lanes, so run it here once orgs exist.
+  admin_console_api
+  admin_rbac_viewer "$CNPG"
+
   # Join the kubectl background download started at script load — first k use
   # is inside the lanes, so the fetch overlapped the whole provisioning phase.
   bootstrap_kubectl
@@ -1537,6 +1620,9 @@ main() {
   run_lane res2 lane_res2
   run_lane ext  lane_ext
   join_lanes cnpg res1 res2 ext
+
+  # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
+  admin_impersonation_audited "$CNPG"
 
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
@@ -1550,7 +1636,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

@@ -12,6 +12,16 @@
 # CGO is still enabled because the transpiler uses
 # github.com/pganalyze/pg_query_go which links libpg_query. That's a
 # pure-Postgres parser dependency — nothing to do with DuckDB.
+# Build the admin console SPA so the kubernetes build embeds a FRESH dist/ via
+# //go:embed all:ui/dist (this is the prod CP image — without this stage it
+# would ship whatever ui/dist was last committed).
+FROM node:20-bookworm-slim AS uibuilder
+WORKDIR /ui
+COPY controlplane/admin/ui/package.json controlplane/admin/ui/package-lock.json ./
+RUN npm ci
+COPY controlplane/admin/ui/ ./
+RUN npm run build
+
 FROM golang:1.25-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev && rm -rf /var/lib/apt/lists/*
@@ -21,6 +31,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# Overwrite the committed bundle with the freshly built SPA before go build.
+COPY --from=uibuilder /ui/dist ./controlplane/admin/ui/dist
 
 ARG VERSION=dev
 ARG COMMIT=unknown

@@ -35,6 +35,7 @@ type SessionProgress struct {
 // ManagedSession tracks a client session bound to a worker.
 type ManagedSession struct {
 	PID          int32
+	Username     string // org user the session was created for (for admin slicing/attribution)
 	WorkerID     int
 	Protocol     string // "postgres" or "flight"
 	SessionToken string
@@ -510,6 +511,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 
 	session := &ManagedSession{
 		PID:          pid,
+		Username:     username,
 		WorkerID:     worker.ID,
 		Protocol:     protocol,
 		SessionToken: sessionToken,

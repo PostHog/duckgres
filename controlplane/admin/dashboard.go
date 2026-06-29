@@ -8,7 +8,6 @@ import (
 	"embed"
 	"html/template"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -83,31 +82,21 @@ func APIAuthMiddleware(tokens TokenSet) gin.HandlerFunc {
 	}
 }
 
-// RegisterDashboard serves the admin dashboard on the Gin engine.
-func RegisterDashboard(r *gin.Engine, tokens TokenSet) {
-	// The models explorer is the only dashboard surface: a sidebar of every
-	// config-store model, a table of its rows, and a detail view per row. "/"
-	// and "/models" both land here. The legacy per-entity pages were removed.
-	r.GET("/", dashboardPageHandler("models.html", tokens))
-	r.GET("/models", dashboardPageHandler("models.html", tokens))
-	r.POST("/login", loginHandler(tokens))
-}
-
-func dashboardPageHandler(templateName string, tokens TokenSet) gin.HandlerFunc {
-	return func(c *gin.Context) {
+// RegisterLogin wires the break-glass internal-secret login on the Gin engine.
+// The React SPA (served by RegisterUI) owns "/" and all app routes; the primary
+// auth path in production is ALB/Cognito SSO. This cookie login remains as a
+// service-to-service / break-glass path (e.g. local port-forward or an env
+// without SSO wired): POST /login sets the admin-token cookie, which
+// AuthMiddleware accepts and maps to the admin role.
+func RegisterLogin(r *gin.Engine, tokens TokenSet) {
+	r.GET("/login", func(c *gin.Context) {
 		// The admin token is deliberately NOT accepted via URL query parameters:
 		// URL-borne secrets persist in browser history and any future proxy/access
-		// logs. Authenticate via the POST /login form or the
-		// X-Duckgres-Internal-Secret header instead.
-		if !tokens.Valid(requestAdminToken(c)) {
-			renderLoginPage(c, loginNextURI(c.Request.URL), "")
-			return
-		}
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		if err := dashboardTmpl.ExecuteTemplate(c.Writer, templateName, nil); err != nil {
-			c.String(http.StatusInternalServerError, "template error: %v", err)
-		}
-	}
+		// logs. Submit the POST /login form or send the X-Duckgres-Internal-Secret
+		// header instead.
+		renderLoginPage(c, normalizeNextPath(c.Query("next")), "")
+	})
+	r.POST("/login", loginHandler(tokens))
 }
 
 func loginHandler(tokens TokenSet) gin.HandlerFunc {
@@ -154,25 +143,13 @@ func requestAdminToken(c *gin.Context) string {
 }
 
 func setAdminTokenCookie(c *gin.Context, token string) {
-	// HttpOnly + SameSite=Strict; not Secure because the dashboard is served
-	// plain-HTTP on a network-policy-restricted port reached via port-forward.
+	// HttpOnly + SameSite=Strict. Secure is set when the request arrived over
+	// HTTPS (the TLS ALB ingress sets X-Forwarded-Proto=https); a plain-HTTP
+	// port-forward leaves it false. Browsers treat http://localhost as a secure
+	// context, so port-forward login still works either way.
 	c.SetSameSite(http.SameSiteStrictMode)
-	c.SetCookie(adminTokenCookieName, token, 7*24*60*60, "/", "", false, true)
-}
-
-// loginNextURI returns the request URI to round-trip through the login form's
-// hidden "next" field, with any ?token= query key (the pre-#721 URL auth flow,
-// e.g. a stale bookmark) stripped — the login page must never embed the secret
-// or redirect it back into the URL bar / browser history.
-func loginNextURI(u *url.URL) string {
-	q := u.Query()
-	if _, ok := q["token"]; !ok {
-		return u.RequestURI()
-	}
-	q.Del("token")
-	cloned := *u
-	cloned.RawQuery = q.Encode()
-	return cloned.RequestURI()
+	secure := c.GetHeader("X-Forwarded-Proto") == "https"
+	c.SetCookie(adminTokenCookieName, token, 7*24*60*60, "/", "", secure, true)
 }
 
 func normalizeNextPath(next string) string {

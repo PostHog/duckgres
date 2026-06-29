@@ -302,6 +302,48 @@ Invariants for anyone touching this path:
   and the `persistent_user_secret`(+`_isolation`) assertions in
   `tests/e2e-mw-dev/harness.sh`.
 
+## Admin Console (VPC-private web UI, `kubernetes` tag)
+
+`controlplane/admin/` serves a React admin console + REST API on `:8080` — the
+operate-everything surface (metrics, live queries/sessions/connections, worker
+fleet, full config store, user impersonation, audit log; sliceable by org +
+user). Design + decisions: `docs/design/admin-ui.md`; package details:
+`controlplane/admin/README.md`. Exposed VPC-privately via an internal-scheme ALB
++ Cognito (Google SSO) behind Tailscale (charts: `ingress-admin.yaml`). Invariants:
+
+- **Frontend is an embedded React/Vite SPA** (`ui/`, built to `ui/dist/`,
+  `//go:embed all:ui/dist` in `embed_ui.go`, SPA-fallback served by Gin; the SPA
+  owns `/`). `ui/dist` is a **gitignored build artifact** — only `ui/dist/.gitkeep`
+  is tracked, so the embed has a target and `go build` compiles without node
+  (the server then serves a "UI not built" notice). `just ui-build` builds it
+  locally; both `Dockerfile` and `Dockerfile.controlplane` run `npm run build`
+  **before** `go build`. Do not delete `.gitkeep` and do not commit `ui/dist`.
+- **Two-tier authz** (`authz.go`): `AuthMiddleware` resolves every `/api/v1`
+  request to admin (valid `TokenSet` internal secret — service/break-glass) or to
+  an SSO identity from the ALB `X-Amzn-Oidc-Data` JWT (group `DUCKGRES_ADMIN_SSO_GROUP`
+  → admin, else viewer). `RoleGate` requires admin for all mutating verbs + the
+  audit GET. `AuditMiddleware` records every mutation. Keep new mutating routes
+  under this gate; never add a write path that bypasses RoleGate/audit.
+- **Impersonation is a real session** (`impersonate.go` + `admin_providers.go`):
+  it reuses `SessionManager.CreateSessionWithProtocol` (workers trust the CP — no
+  password) and **always** `DestroySession` in a defer. Admin-only, every
+  statement audited with the admin actor + `usersecrets.RedactForLog` SQL; writes
+  require `allow_write=true` (conservative classifier — WITH/CTEs count as
+  writes). It consumes a worker under one-session-per-worker and counts against
+  the org's connection limits — do not silently exempt it.
+- **Metrics proxy is allow-listed** (`metrics_proxy.go`): the client passes a
+  panel KEY, PromQL is built server-side from `rangePanels` (never an open PromQL
+  relay) and forwarded to `DUCKGRES_PROMETHEUS_URL`. Org-labelled panels keep
+  slicing enforced.
+- **Env-only knobs**: `DUCKGRES_ADMIN_SSO_GROUP`, `DUCKGRES_PROMETHEUS_URL` (read
+  in `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit`
+  is AutoMigrated at startup (operational state, not goose-migrated tenant config).
+- `ManagedSession.Username` is populated at session create so the console can
+  slice live sessions/queries by user; keep it set on every create path.
+- Touching any of the above → update `controlplane/admin/*_test.go` (esp
+  `authz_test.go`) AND the `admin_*` / `impersonation_*` assertions in
+  `tests/e2e-mw-dev/harness.sh`.
+
 ## TODO Reference
 
 `TODO.md` is a lightweight backlog for ideas that do not yet have a better

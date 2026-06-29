@@ -111,6 +111,7 @@ func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 				PID:      s.PID,
 				WorkerID: s.WorkerID,
 				Org:      name,
+				User:     s.Username,
 				Protocol: s.Protocol,
 			})
 		}
@@ -451,13 +452,48 @@ func SetupMultiTenant(
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
 
-	// Authenticated API
-	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminTokens))
+	// Admin UI dependencies. SSO group + Prometheus URL are env-only K8s knobs
+	// (set by the chart); see config_resolution.go / CLAUDE.md.
+	ssoCfg := admin.SSOConfig{
+		AdminGroup:  os.Getenv("DUCKGRES_ADMIN_SSO_GROUP"),
+		AllowAllSSO: os.Getenv("DUCKGRES_ADMIN_SSO_ALLOW_ALL") == "true",
+	}
+	auditStore, err := admin.NewAuditStore(store.DB())
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
+	}
+	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
+	clusterInfo := &clusterInfoProvider{router: router, store: store, selfCPID: cpInstanceID}
+	imp := &impersonator{router: router}
+
+	// Authenticated API. AuthMiddleware resolves the caller (internal-secret →
+	// admin, else ALB/Cognito SSO → viewer/admin). AuditMiddleware records every
+	// mutation. RoleGate enforces viewer/admin (mutations + the audit log read
+	// require admin).
+	// RoleGate blocks viewer mutations (method-based); the audit-log read
+	// self-gates via RequireAdmin at its route (no brittle path coupling here).
+	api := engine.Group("/api/v1",
+		admin.AuthMiddleware(adminTokens, ssoCfg),
+		admin.AuditMiddleware(auditStore),
+		admin.RoleGate(),
+	)
 	admin.RegisterAPI(api, store, adpt)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	admin.RegisterExtras(api, admin.Extras{
+		Store:        store,
+		Live:         clusterInfo,
+		Impersonator: imp,
+		Audit:        auditStore,
+		Metrics:      metricsProxy,
+	})
 
-	// Dashboard
-	admin.RegisterDashboard(engine, adminTokens)
+	// Break-glass internal-secret login (the SPA owns "/" and app routes).
+	admin.RegisterLogin(engine, adminTokens)
+
+	// Embedded React SPA (served unauthenticated; all data is under /api/v1).
+	if err := admin.RegisterUI(engine); err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
+	}
 
 	apiServer := &http.Server{
 		Addr:    ":8080",
