@@ -86,10 +86,10 @@ RES2="ci-pr-${PR_NUMBER}-res2"
 
 # The bundled extensions MUST be the PostHog forks. These are the short commit
 # SHAs duckdb_extensions() reports for the tags the image pins
-# (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh).
+# (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry).
 # If the image accidentally ships upstream, the version differs and we fail.
 EXPECT_DUCKLAKE_SHA="e4ac5150"
-EXPECT_HTTPFS_SHA="b1fece6"
+EXPECT_HTTPFS_SHA="0dac6fc"
 
 # duckling-example RDS — the shared external metadata store (same one the
 # manual validation used). Endpoint is stable in mw-dev.

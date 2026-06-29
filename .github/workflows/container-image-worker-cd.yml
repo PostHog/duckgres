@@ -71,13 +71,13 @@ jobs:
                     - version: "1.5.3"
                       go: "v2.10503.0"
                       bindings: "v0.10503.0"
-                      # cred-refresh: mid-statement S3 credential recovery on
-                      # auth failure (PostHog/duckdb-httpfs cred-refresh-read-path;
-                      # supersedes v1.5.3-stoi-fix, which it is based on). Lets
-                      # statements outlive their starting STS token as long as
-                      # the credential-refresh scheduler keeps rotating the
+                      # cred-refresh-write-retry: mid-statement S3 credential
+                      # recovery on ExpiredToken read/write auth failures
+                      # (supersedes v1.5.3-cred-refresh, which it is based on).
+                      # Lets statements outlive their starting STS token as long
+                      # as the credential-refresh scheduler keeps rotating the
                       # ducklake_s3 secret.
-                      httpfs: "v1.5.3-cred-refresh"
+                      httpfs: "v1.5.3-cred-refresh-write-retry"
                       ducklake: "v1.0-posthog.4"
                       # Stable repo hosts postgres_scanner for 1.5.3; nightly
                       # does not. See scripts/ducklake_version_matrix.sh
