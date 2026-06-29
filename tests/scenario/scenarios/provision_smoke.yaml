@@ -4,9 +4,9 @@ steps:
   - id: provision
     type: provision_warehouse
     with:
-      org_id: scenario-smoke-${run_id_compact}
+      org_id: scn-smk-${run_id_resource}
       request:
-        database_name: scenario_smoke_${run_id_compact}
+        database_name: scn_smk_${run_id_resource_sql}
         metadata_store:
           type: cnpg-shard
         ducklake:
@@ -16,13 +16,13 @@ steps:
   - id: wait_ready
     type: wait_warehouse_ready
     with:
-      org_id: scenario-smoke-${run_id_compact}
+      org_id: scn-smk-${run_id_resource}
       timeout: 15m
       poll_interval: 10s
   - id: select_one
     type: sql
     with:
-      org_id: scenario-smoke-${run_id_compact}
+      org_id: scn-smk-${run_id_resource}
       catalog: ducklake
       sql: SELECT 1
       max_attempts: 12
@@ -32,7 +32,7 @@ steps:
     depends_on: [select_one]
     always_run: true
     with:
-      org_id: scenario-smoke-${run_id_compact}
+      org_id: scn-smk-${run_id_resource}
       verify_deleted: true
       cleanup_timeout: 15m
       poll_interval: 10s

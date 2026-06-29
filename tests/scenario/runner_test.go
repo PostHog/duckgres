@@ -2,6 +2,8 @@ package scenario
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
@@ -141,7 +143,7 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	}
 	provisionStep := resolved.Steps[0]
 	orgID, _ := provisionStep.With["org_id"].(string)
-	if orgID == "scenario-smoke" || !strings.Contains(orgID, "20260102t030405z") {
+	if orgID == "scenario-smoke" || !strings.HasPrefix(orgID, "scn-smk-") {
 		t.Fatalf("org_id = %q, want run-unique templated org", orgID)
 	}
 	request, ok := provisionStep.With["request"].(map[string]any)
@@ -149,8 +151,45 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
 	}
 	databaseName, _ := request["database_name"].(string)
-	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "20260102t030405z") {
+	if databaseName == "scenario_smoke" || !strings.HasPrefix(databaseName, "scn_smk_") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
+	}
+}
+
+func TestScenarioResourceNamesFitBucketNameLimit(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
+
+	for _, scenarioFile := range []string{
+		filepath.Join("scenarios", "provision_smoke.yaml"),
+		filepath.Join("scenarios", "posthog_frozen_metadata.yaml"),
+		filepath.Join("scenarios", "posthog_frozen_perf.yaml"),
+		filepath.Join("scenarios", "posthog_frozen_dbt.yaml"),
+	} {
+		t.Run(filepath.Base(scenarioFile), func(t *testing.T) {
+			scenario, _, err := loadScenarioForRun(scenarioFile)
+			if err != nil {
+				t.Fatalf("load scenario: %v", err)
+			}
+			resolved, err := resolveRunTemplates(scenario, "scenario-smoke-manual-20260627T143309Z")
+			if err != nil {
+				t.Fatalf("resolve templates: %v", err)
+			}
+			for _, step := range resolved.Steps {
+				orgID, ok := step.With["org_id"].(string)
+				if ok {
+					assertScenarioOrgIDFitsBucketName(t, orgID)
+				}
+				request, ok := step.With["request"].(map[string]any)
+				if !ok {
+					continue
+				}
+				databaseName, ok := request["database_name"].(string)
+				if ok && len(databaseName) > 63 {
+					t.Fatalf("database_name %q length = %d, want <= 63", databaseName, len(databaseName))
+				}
+			}
+		})
 	}
 }
 
@@ -462,8 +501,10 @@ func missingRequiredEnv(s core.Scenario) []string {
 
 func resolveRunTemplates(s core.Scenario, runID string) (core.Scenario, error) {
 	vars := map[string]string{
-		"run_id":         runID,
-		"run_id_compact": compactRunID(runID),
+		"run_id":              runID,
+		"run_id_compact":      compactRunID(runID),
+		"run_id_resource":     boundedCompactRunID(runID, 18),
+		"run_id_resource_sql": boundedCompactRunID(runID, 18),
 	}
 	out := s
 	out.Steps = make([]core.Step, len(s.Steps))
@@ -491,6 +532,31 @@ func compactRunID(runID string) string {
 		return "scenario"
 	}
 	return b.String()
+}
+
+func boundedCompactRunID(runID string, maxLen int) string {
+	compact := compactRunID(runID)
+	if len(compact) <= maxLen {
+		return compact
+	}
+	hash := sha256.Sum256([]byte(runID))
+	hashText := hex.EncodeToString(hash[:])[:8]
+	prefixLen := maxLen - len(hashText)
+	if prefixLen <= 0 {
+		return hashText[:maxLen]
+	}
+	return compact[:prefixLen] + hashText
+}
+
+func assertScenarioOrgIDFitsBucketName(t *testing.T, orgID string) {
+	t.Helper()
+	if len(orgID) > 35 {
+		t.Fatalf("org_id %q length = %d, want <= 35 so generated buckets fit prod/dev suffixes", orgID, len(orgID))
+	}
+	bucketName := "posthog-duckling-" + orgID + "-mw-prod-us"
+	if len(bucketName) > 63 {
+		t.Fatalf("generated bucket name %q length = %d, want <= 63", bucketName, len(bucketName))
+	}
 }
 
 func resolveTemplateValue(value any, vars map[string]string) (any, error) {
