@@ -168,6 +168,33 @@ steps:
 	}
 }
 
+func TestParseScenarioAllowsExpectedStepError(t *testing.T) {
+	scenario, err := ParseScenario([]byte(`
+name: expected-error
+steps:
+  - id: provision
+    type: provision_warehouse
+    expect_error:
+      error_class: provision_step_error
+      contains:
+        - HTTP 400
+        - org id must be a canonical UUID
+`))
+	if err != nil {
+		t.Fatalf("ParseScenario returned error: %v", err)
+	}
+	expected := scenario.Steps[0].ExpectError
+	if expected == nil {
+		t.Fatal("expected expect_error to be parsed")
+	}
+	if expected.ErrorClass != "provision_step_error" {
+		t.Fatalf("error_class = %q, want provision_step_error", expected.ErrorClass)
+	}
+	if got := expected.Contains; len(got) != 2 || got[0] != "HTTP 400" || got[1] != "org id must be a canonical UUID" {
+		t.Fatalf("contains = %#v", got)
+	}
+}
+
 func TestParseScenarioRejectsEmptyRequiredEnv(t *testing.T) {
 	_, err := ParseScenario([]byte(`
 name: bad-env

@@ -2,6 +2,7 @@ package scenario
 
 import (
 	"context"
+	"crypto/sha1"
 	"flag"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/tests/scenario/core"
+	scenariodbt "github.com/posthog/duckgres/tests/scenario/dbt"
 	scenarioperf "github.com/posthog/duckgres/tests/scenario/perf"
 	"github.com/posthog/duckgres/tests/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/scenario/sql"
@@ -92,13 +94,26 @@ func TestScenarioRunner(t *testing.T) {
 		FlightAddr:               os.Getenv("DUCKGRES_SCENARIO_FLIGHT_ADDR"),
 		FlightInsecureSkipVerify: boolEnv(t, "DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY", true),
 	})
+	dbtExecutor := scenariodbt.NewExecutor(scenariodbt.ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			HostAddr:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
+			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),
+			Port:            intEnv(t, "DUCKGRES_SCENARIO_PG_PORT", 5432),
+			SSLMode:         "require",
+			ConnectTimeout:  intEnv(t, "DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT", 10),
+			ApplicationName: "duckgres-scenario-runner",
+		},
+		OutputDir: scenarioOutputDir,
+		DBTBinary: envOrDefault("DUCKGRES_SCENARIO_DBT_BIN", "dbt"),
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), *scenarioMaxRuntime)
 	defer cancel()
 	runner := core.NewRunner(core.RunnerConfig{
 		RunID:          runID,
 		Scenario:       loaded,
-		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor},
+		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor, dbt: dbtExecutor},
 		OutputDir:      scenarioOutputDir,
 		WriteFiles:     true,
 		CleanupTimeout: 15 * time.Minute,
@@ -127,16 +142,50 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	}
 	provisionStep := resolved.Steps[0]
 	orgID, _ := provisionStep.With["org_id"].(string)
-	if orgID == "scenario-smoke" || !strings.Contains(orgID, "20260102t030405z") {
-		t.Fatalf("org_id = %q, want run-unique templated org", orgID)
+	if orgID == "scenario-smoke" || len(orgID) > 35 {
+		t.Fatalf("org_id = %q, want run-unique valid provisioning slug of at most 35 chars", orgID)
 	}
 	request, ok := provisionStep.With["request"].(map[string]any)
 	if !ok {
 		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
 	}
 	databaseName, _ := request["database_name"].(string)
-	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "20260102t030405z") {
+	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "scenario_smoke_") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
+	}
+}
+
+func TestProvisionRejectionScenarioUsesExpectedProvisionFailure(t *testing.T) {
+	scenario, err := core.LoadScenario(filepath.Join("scenarios", "provision_rejection.yaml"))
+	if err != nil {
+		t.Fatalf("load provision rejection: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-smoke-manual-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+	}
+	provisionStep := resolved.Steps[0]
+	orgID, _ := provisionStep.With["org_id"].(string)
+	if len(orgID) <= 35 {
+		t.Fatalf("org_id = %q, want deliberately too-long slug", orgID)
+	}
+	expected := provisionStep.ExpectError
+	if expected == nil {
+		t.Fatal("provision step should assert the expected rejection")
+	}
+	if expected.ErrorClass != provision.ErrorClassProvisionStepError {
+		t.Fatalf("error_class = %q, want %s", expected.ErrorClass, provision.ErrorClassProvisionStepError)
+	}
+	if got := strings.Join(expected.Contains, "\n"); !strings.Contains(got, "HTTP 400") || !strings.Contains(got, "slug of at most 35 characters") {
+		t.Fatalf("expected error contains = %#v, want HTTP 400 and slug limit", expected.Contains)
 	}
 }
 
@@ -255,6 +304,43 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	}
 }
 
+func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_dbt.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen dbt scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-dbt-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	foundDBT := false
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+		if step.Type != scenariodbt.StepTypeDBTRun {
+			continue
+		}
+		foundDBT = true
+		projectDir, ok := step.With["project_dir"].(string)
+		if !ok || !filepath.IsAbs(projectDir) {
+			t.Fatalf("dbt project_dir = %#v, want absolute path", step.With["project_dir"])
+		}
+		if _, err := os.Stat(filepath.Join(projectDir, "dbt_project.yml")); err != nil {
+			t.Fatalf("dbt project should exist at %q: %v", projectDir, err)
+		}
+	}
+	if !foundDBT {
+		t.Fatal("expected frozen dbt scenario to include a dbt_run step")
+	}
+}
+
 func TestResolveRunTemplatesRejectsMissingEnvTemplate(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
 
@@ -280,6 +366,7 @@ type dispatchExecutor struct {
 	provision *provision.Executor
 	sql       *scenariosql.Executor
 	perf      *scenarioperf.Executor
+	dbt       *scenariodbt.Executor
 }
 
 func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error {
@@ -290,6 +377,8 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 		return e.sql.ExecuteStep(ctx, step)
 	case scenarioperf.StepTypePerfQueries:
 		return e.perf.ExecuteStep(ctx, step)
+	case scenariodbt.StepTypeDBTRun:
+		return e.dbt.ExecuteStep(ctx, step)
 	default:
 		return fmt.Errorf("unsupported scenario step type %q", step.Type)
 	}
@@ -302,6 +391,8 @@ func dispatchSupports(stepType string) bool {
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return true
 	case scenarioperf.StepTypePerfQueries:
+		return true
+	case scenariodbt.StepTypeDBTRun:
 		return true
 	default:
 		return false
@@ -343,6 +434,14 @@ func boolEnv(t *testing.T, key string, fallback bool) bool {
 	return parsed
 }
 
+func envOrDefault(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
 func defaultRunID(s core.Scenario) string {
 	prefix := s.RunIDPrefix
 	if prefix == "" {
@@ -373,7 +472,7 @@ func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {
 		}
 		with := make(map[string]any, len(step.With))
 		for k, v := range step.With {
-			if k == "file" || k == "catalog_file" {
+			if k == "file" || k == "catalog_file" || k == "project_dir" || k == "profiles_dir" {
 				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) {
 					v = filepath.Clean(filepath.Join(baseDir, file))
 				}
@@ -400,6 +499,7 @@ func resolveRunTemplates(s core.Scenario, runID string) (core.Scenario, error) {
 	vars := map[string]string{
 		"run_id":         runID,
 		"run_id_compact": compactRunID(runID),
+		"run_id_token":   shortRunIDToken(runID),
 	}
 	out := s
 	out.Steps = make([]core.Step, len(s.Steps))
@@ -427,6 +527,11 @@ func compactRunID(runID string) string {
 		return "scenario"
 	}
 	return b.String()
+}
+
+func shortRunIDToken(runID string) string {
+	sum := sha1.Sum([]byte(runID))
+	return fmt.Sprintf("%x", sum)[:12]
 }
 
 func resolveTemplateValue(value any, vars map[string]string) (any, error) {

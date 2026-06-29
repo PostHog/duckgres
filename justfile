@@ -46,11 +46,11 @@ run-control-plane: build
 build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
 
-# Serve the admin UI locally for one kube context. The devserver fetches the
 # Build the admin console SPA into controlplane/admin/ui/dist (embedded by the
-# kubernetes build via //go:embed all:ui/dist). The Docker image rebuilds this
-# in its own node stage; run this locally before `go build -tags kubernetes` if
-# you want the real bundle embedded instead of the committed placeholder.
+# kubernetes build via //go:embed all:ui/dist). dist is a gitignored build
+# artifact (only .gitkeep is tracked); the Docker images rebuild it in a node
+# stage, so run this locally before `go build -tags kubernetes` if you want the
+# real bundle embedded instead of the "UI not built" fallback.
 [group('dev')]
 ui-build:
     cd controlplane/admin/ui && npm ci && npm run build
@@ -61,6 +61,7 @@ ui-build:
 ui-dev-vite target="http://127.0.0.1:8080":
     cd controlplane/admin/ui && VITE_PROXY_TARGET={{target}} npm run dev
 
+# Serve the admin UI locally for one kube context. The devserver fetches the
 # internal secret, port-forwards that context's control plane, and serves the
 # built SPA with a context banner (RED when the context name contains "prod").
 [group('dev')]
@@ -403,7 +404,17 @@ scenario scenario="tests/scenario/scenarios/provision_smoke.yaml":
 # Run the dev provision smoke scenario
 [group('test')]
 scenario-smoke:
+    just scenario-provision-success
+
+# Run the dev provision success scenario
+[group('test')]
+scenario-provision-success:
     ./scripts/scenario_run.sh tests/scenario/scenarios/provision_smoke.yaml
+
+# Run the dev provision rejection scenario
+[group('test')]
+scenario-provision-rejection:
+    ./scripts/scenario_run.sh tests/scenario/scenarios/provision_rejection.yaml
 
 # Run the dev frozen dataset metadata exploration scenario
 [group('test')]
@@ -414,6 +425,11 @@ scenario-frozen-metadata:
 [group('test')]
 scenario-frozen-perf:
     ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_perf.yaml
+
+# Run the dev frozen dataset dbt scenario
+[group('test')]
+scenario-frozen-dbt:
+    ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_dbt.yaml
 
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]

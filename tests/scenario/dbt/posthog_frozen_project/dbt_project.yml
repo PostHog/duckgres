@@ -1,0 +1,13 @@
+name: posthog_frozen_scenario
+version: "1.0.0"
+profile: duckgres_scenario
+
+model-paths: ["models"]
+test-paths: ["tests"]
+
+models:
+  posthog_frozen_scenario:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

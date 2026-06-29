@@ -6,8 +6,8 @@
 # This is the SUCCESSOR to the kind-based tests/k8s/ Go suite: every behavior
 # that suite asserted against a fake kind cluster is re-asserted here against the
 # REAL posthog-mw-dev cluster (real Cilium, real Crossplane ducklings, real
-# cnpg-shard + external-RDS metadata, real per-org Lakekeeper). Covers the two
-# real metadata backends cnpg + ext (aurora is retired — out of scope).
+# cnpg-shard + external-RDS metadata). Covers the two real metadata backends
+# cnpg + ext (aurora is retired — out of scope).
 #
 # STRUCTURE: assertions run in four PARALLEL per-org lanes (see main() and the
 # lane_* functions) — cnpg (wire/catalog/concurrency/sizing), res1 (worker-kill
@@ -26,14 +26,11 @@
 #                  transpilation (#716), and a pipelined extended-query error
 #                  discards queued messages until Sync (#718). A same pgwire
 #                  session remains usable immediately after CancelRequest.
-#   activation   : DuckLake + Iceberg catalogs attach and read/write. The FIRST
-#                  session on a cold Iceberg worker must not fail the pg_catalog
-#                  compat-view bind (the CP primes the REST catalog's schema list
-#                  first); asserted on cnpg + ext.
+#   activation   : DuckLake catalogs attach and read/write on cnpg + ext.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
-#                  — asserted on cnpg for BOTH the ducklake and iceberg catalogs.
+#                  — asserted on cnpg for the ducklake catalog.
 #   org default  : an operator-set org default worker profile (admin PUT
 #                  /orgs/:id default_worker_cpu/memory/ttl) sizes a PLAIN
 #                  connection's worker pod (no client GUCs); garbage values are
@@ -169,7 +166,7 @@ wait_state() { # org target timeout_s
 }
 
 # Org routing is by TLS SNI hostname <org>.<managed-suffix>; the dbname selects
-# the CATALOG (`ducklake` or `iceberg`), not the org (PR #651). The control
+# the DuckLake catalog, not the org (PR #651). The control
 # plane rejects connections without a managed SNI host. We use libpq's
 # host (→ SNI + TLS name) / hostaddr (→ TCP target) split: SNI carries the org
 # hostname while the TCP connection still lands on the CP ClusterIP. The suffix
@@ -184,8 +181,8 @@ resolve_cp_ip() {
 
 # On-demand spawn backpressure ("…retry in about 45 seconds" / "timed out waiting
 # for an available worker") is a FEATURE, not an error: there is no warm pool, so
-# ANY new-session acquisition — a fresh catalog (ducklake→iceberg), a burst, or
-# the first connect after the pool churned (worker kills / idle timeout) — can
+# ANY new-session acquisition — a burst, or the first connect after the pool
+# churned (worker kills / idle timeout) — can
 # transiently get it while the CP spawns a worker (or while a freshly-spawned pod
 # is still pulling/booting). It is a FATAL at session create, BEFORE any SQL runs,
 # so retrying the whole command is safe (no half-applied INSERT). So every harness
@@ -644,73 +641,6 @@ httpfs_retry_budget() { # org password
   assert_compat "$1" "$2" ducklake "SELECT (value::BIGINT = 10)::text  FROM duckdb_settings() WHERE name='http_retries'"       "true" "http_retries"
   assert_compat "$1" "$2" ducklake "SELECT (value::BIGINT = 500)::text FROM duckdb_settings() WHERE name='http_retry_wait_ms'" "true" "http_retry_wait_ms"
   assert_compat "$1" "$2" ducklake "SELECT (value::DOUBLE = 2.0)::text FROM duckdb_settings() WHERE name='http_retry_backoff'" "true" "http_retry_backoff"
-}
-
-rw_iceberg() { # org password
-  log "Iceberg R/W on $1"
-  c="$(pg "$1" "$2" iceberg "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name='iceberg'")"
-  [ "$c" = "1" ] || fail "$1 iceberg catalog not attached (duckdb_databases count=$c)"
-  t="e2e_ice_$(echo "$1" | tr -c 'a-z0-9' _)"
-  pg "$1" "$2" iceberg "DROP TABLE IF EXISTS iceberg.public.$t;
-            CREATE TABLE iceberg.public.$t(id INT, label VARCHAR);
-            INSERT INTO iceberg.public.$t VALUES (10,'ten'),(20,'twenty');"
-  n="$(pg "$1" "$2" iceberg "SELECT COUNT(*) FROM iceberg.public.$t;")"
-  [ "$n" = "2" ] || fail "$1 Iceberg rowcount=$n want 2"
-  pg "$1" "$2" iceberg "DROP TABLE iceberg.public.$t;"
-}
-
-# Regression for the Iceberg cold-start session-init bug: the FIRST session on a
-# freshly-spawned (cold) worker must not fail the pg_catalog compat-view bind.
-# Before the fix, InitSessionDatabaseMetadata enumerated every attached catalog
-# before anything had materialized the Iceberg REST catalog's schema list on the
-# new session connection, so the bind hit `Catalog Error: Schema with name ""
-# not found` and the connection was rejected with `failed to initialize session
-# database metadata`; only a reconnect (instance since settled) masked it. With
-# the warm pool gone, every org's first connect lands the literal first session
-# on its worker, so this fired in practice. The CP now primes the catalog with a
-# retried schema-enumeration probe before the bind, and the bind itself retries
-# once on the settle signature. This forces a cold worker and asserts
-# the first connect succeeds: cold-spawn backpressure is still tolerated, but the
-# metadata-init bind error fails the test immediately instead of being retried
-# away (which is exactly how a live reconnect would mask it).
-iceberg_cold_first_connect() { # org password
-  log "iceberg cold first-connect (metadata-init regression) on $1"
-  # Force cold: delete every worker for the org and wait until none remain, so
-  # the next connect cold-spawns a brand-new worker whose first session is the
-  # client's — the precise condition that triggered the bug.
-  for p in $(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" -o name 2>/dev/null); do
-    k delete "$p" --grace-period=0 --force >/dev/null 2>&1 || true
-  done
-  i=0
-  while [ "$i" -lt 45 ]; do
-    n="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
-    [ "$n" = "0" ] && break
-    sleep 2; i=$((i + 1))
-  done
-  # First connect. Tolerate cold-spawn backpressure (worker still booting), but
-  # treat the session-metadata-init bind failure as a hard regression — do NOT
-  # retry it, or the bug would be masked exactly as a live reconnect masks it.
-  # The metadata-init clause is listed first so it wins over the broader
-  # "failed to initialize session" transient it is a prefix-superset of.
-  a=0 out=""
-  while [ "$a" -lt 12 ]; do
-    if out="$(PGPASSWORD="$2" psql \
-        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=iceberg" \
-        -v ON_ERROR_STOP=1 -tAc "SELECT 1" 2>&1)"; then
-      [ "$out" = "1" ] || fail "iceberg_cold_first_connect: $1 returned '$out' want 1"
-      return
-    fi
-    case "$out" in
-      *"failed to initialize session database metadata"*|*'Schema with name "" not found'*)
-        fail "iceberg_cold_first_connect: cold first session hit the metadata-init bind bug on $1 (prime regressed): $out" ;;
-      *"capacity exhausted"*|*"no Duckgres worker"*|*"still provisioning"*|\
-      *"failed to initialize session"*|*"timed out waiting for an available worker"*|\
-      *"failed to start"*|*"spawn sized worker"*|*"failed to detect attached catalogs"*)
-        sleep 10; a=$((a + 1)); continue ;;
-      *) fail "iceberg_cold_first_connect: unexpected error on $1: $out" ;;
-    esac
-  done
-  fail "iceberg_cold_first_connect: exhausted retries waiting for a cold worker on $1"
 }
 
 # ---- worker pod assertions (via the K8s API) ------------------------------
@@ -1451,7 +1381,7 @@ tenant_isolation() { # orgA pwA orgB pwB
 # ---- lifecycle: deprovision → warehouse deleted → Duckling CR fully gone ----
 # Proves the teardown path works end to end: warehouse marked deleted, the
 # Crossplane Duckling CR removed, and its finalizer cascade (which drops the
-# cnpg lakekeeper_<org> role+db) completed.
+# cnpg metadata role+db) completed.
 #
 # NOTE: same-org-id *re-provision* in the SAME run is intentionally NOT done
 # here. It is the regression net for the stranded-cnpg-role bugs
@@ -1460,11 +1390,11 @@ tenant_isolation() { # orgA pwA orgB pwB
 # the cnpg-shards Postgres, which only `run.sh` (on the runner, with
 # cnpg-shards exec rights) can do — the in-cluster Job SA cannot and must not.
 # Re-provisioning the same id while the async cnpg cascade is still in flight
-# races a drifted-password role → Lakekeeper SASL failure → the warehouse never
-# goes ready. So the same-id regression is covered ACROSS runs instead: every
-# run's `run.sh deploy` drops the cnpg role for a clean slate, and `run.sh
-# teardown` waits the CR `--for=delete` before returning. (This is the same
-# reasoning the original harness used to drop the in-Job recreate.)
+# can race stranded metadata state and leave the warehouse stuck. So the
+# same-id regression is covered ACROSS runs instead: every run's `run.sh
+# deploy` drops the cnpg role for a clean slate, and `run.sh teardown` waits the
+# CR `--for=delete` before returning. (This is the same reasoning the original
+# harness used to drop the in-Job recreate.)
 lifecycle_teardown_cnpg() { # org
   log "lifecycle: deprovision $1 + assert Duckling CR fully deleted"
   api_post "$1" deprovision >/dev/null
@@ -1474,22 +1404,21 @@ lifecycle_teardown_cnpg() { # org
   fi
 }
 
-# ---- cnpg duckling: cnpg-shard metadata + DuckLake + Iceberg --------------
+# ---- cnpg duckling: cnpg-shard metadata + DuckLake ------------------------
 CNPG_BODY='{"database_name":"'"$CNPG"'","metadata_store":{"type":"cnpg-shard"},
-  "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true},
-  "iceberg":{"enabled":true,"namespace":"main"}}'
+  "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
 
-# ---- ext duckling: external RDS metadata + DuckLake + Iceberg -------------
+# ---- ext duckling: external RDS metadata + DuckLake -----------------------
 EXT_BODY='{"database_name":"'"$EXT"'",
   "metadata_store":{"type":"external","external":{
     "endpoint":"'"$EXT_RDS_ENDPOINT"'","password_aws_secret":"'"$EXT_RDS_SECRET"'",
     "user":"ducklingexample","database":"ducklingexample"}},
   "data_store":{"type":"external","bucket_name":"posthog-duckling-example-managed-warehouse-dev","region":"us-east-1"},
-  "ducklake":{"enabled":true},"iceberg":{"enabled":true,"namespace":"main"}}'
+  "ducklake":{"enabled":true}}'
 
 # ---- resilience ducklings: cnpg-shard metadata + DuckLake only -------------
-# No iceberg (no per-org Lakekeeper) — these orgs exist purely to host the
-# worker-churn-heavy resilience lanes, so keep their provision footprint small.
+# DuckLake-only: these orgs exist purely to host the worker-churn-heavy
+# resilience lanes, so keep their provision footprint small.
 res_body() { # org
   printf '{"database_name":"%s","metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
 }
@@ -1550,18 +1479,12 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   server_side_cursors    "$CNPG" "$cnpg_pw"
   cancel_then_reuse_same_session "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
-  iceberg_cold_first_connect "$CNPG" "$cnpg_pw"  # cold first session must not fail the metadata-init bind
-  rw_iceberg             "$CNPG" "$cnpg_pw"
-  assert_worker_pod      "$CNPG"   # newest org pod = the default-shape iceberg worker above
+  assert_worker_pod      "$CNPG"   # newest org pod = a DuckLake worker above
   concurrent_connections "$CNPG" "$cnpg_pw"
   concurrent_writers     "$CNPG" "$cnpg_pw"
-  # Worker sizing, both catalogs. Distinct shapes per catalog (2/4Gi vs 1/2Gi)
-  # so the iceberg sized request can't reuse the ducklake hot-idle 2-CPU worker
-  # — each catalog gets a verified fresh sized spawn + a same-shape reuse.
+  # Worker sizing on DuckLake: verified fresh sized spawn + same-shape reuse.
   sized_worker        "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
   reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
-  sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
-  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
   # Idle worker reclamation: a 3-CPU worker with a 1m TTL must be reaped after it
   # goes idle (catches the hot-idle-reaper-dark / persist-swallow idle leak).
   hot_idle_retired    "$CNPG" "$cnpg_pw" ducklake 3 6Gi
@@ -1623,8 +1546,6 @@ lane_ext() { # external-RDS metadata backend + org default profile
   rw_ducklake  "$EXT" "$ext_pw"
   httpfs_retry_budget "$EXT" "$ext_pw"      # S3-503 retry budget per worker, ext-metadata backend too
   persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
-  iceberg_cold_first_connect "$EXT" "$ext_pw"  # cold first session must not fail the metadata-init bind (ext backend)
-  rw_iceberg   "$EXT" "$ext_pw"
   # Org default profile on ext: no client-sized assertions run on this org, so
   # the 2-CPU shape is unambiguously the org default's.
   org_default_profile "$EXT" "$ext_pw" ducklake
@@ -1715,7 +1636,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
