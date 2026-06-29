@@ -1272,23 +1272,27 @@ concurrent_writers() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
-# ---- admin dashboard auth (#721) -------------------------------------------
-# Regression for #721: the admin dashboard must NOT accept the internal secret
-# via a ?token= URL query parameter (URL-borne secrets persist in browser
-# history and any future proxy access logs). A request carrying the correct
-# token in the query string gets the login page (401) with no auth cookie and
-# no redirect; the X-Duckgres-Internal-Secret header path still authenticates.
+# ---- admin API auth (#721) -------------------------------------------------
+# Regression for #721: the internal secret must NOT be accepted via a ?token=
+# URL query parameter (URL-borne secrets persist in browser history and any
+# future proxy access logs) — only the X-Duckgres-Internal-Secret header / login
+# cookie authenticate. The admin console serves its React SPA UNauthenticated at
+# "/" (the bundle carries no secrets; all data is behind /api auth), so this
+# asserts the invariant against an authenticated API endpoint, not "/".
 admin_dashboard_no_query_token() {
-  log "admin dashboard rejects ?token= query auth"
+  log "admin API rejects ?token= query auth (#721)"
   hdrs=/tmp/admin_qt_hdrs
-  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/?token=$SECRET")"
-  [ "$code" = "401" ] || fail "GET /?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
+  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/api/v1/orgs?token=$SECRET")"
+  [ "$code" = "401" ] || fail "GET /api/v1/orgs?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
   if grep -qi '^set-cookie:' "$hdrs"; then
-    fail "GET /?token=<secret> set a cookie — query-param auth is back"
+    fail "GET /api/v1/orgs?token=<secret> set a cookie — query-param auth is back"
   fi
-  # Sanity: the header path (what this harness uses everywhere) still works.
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/")"
-  [ "$code" = "200" ] || fail "GET / with internal-secret header returned $code, want 200"
+  # The header path (what this harness uses everywhere) still authenticates.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "GET /api/v1/orgs with internal-secret header returned $code, want 200"
+  # The public SPA is served unauthenticated at "/".
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/")"
+  [ "$code" = "200" ] || fail "GET / (public SPA) returned $code, want 200"
 }
 
 # ---- internal secret rotation fallback --------------------------------------
@@ -1303,9 +1307,11 @@ internal_secret_fallback_auth() {
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Duckgres-Internal-Secret: $fb" "$API/api/v1/orgs")"
   [ "$code" = "200" ] || fail "GET /api/v1/orgs with fallback secret returned $code, want 200 (rotation overlap broken)"
+  # Dashboard cookie path: the fallback secret must also authenticate via the
+  # login cookie (not the public "/" SPA, which 200s for everyone).
   code="$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "X-Duckgres-Internal-Secret: $fb" "$API/")"
-  [ "$code" = "200" ] || fail "GET / (dashboard) with fallback secret returned $code, want 200"
+    --cookie "duckgres_admin_token=$fb" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "GET /api/v1/orgs with fallback-secret cookie returned $code, want 200 (dashboard cookie path)"
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Duckgres-Internal-Secret: definitely-not-a-secret" "$API/api/v1/orgs")"
   [ "$code" = "401" ] || fail "GET /api/v1/orgs with garbage secret returned $code, want 401 (accept-list must stay closed)"
