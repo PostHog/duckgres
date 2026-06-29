@@ -93,27 +93,35 @@ func isProxiedPath(p string) bool {
 	return strings.HasPrefix(p, "/api/") || p == "/login" || p == "/health"
 }
 
-// serveStatic serves UI assets, routing "/" and "/models" to the models
-// explorer page (matching the CP's RegisterDashboard route table).
+// dashboardPages maps a request path (route or bare filename) to the static
+// asset that serves it. The values are literals, so the filename handed to
+// http.ServeFile never derives from the request — no path traversal is possible
+// regardless of what the client sends. Routes mirror the CP's
+// RegisterDashboard table; "/" and "/models" both land on the models explorer.
+var dashboardPages = map[string]string{
+	"":              "models.html",
+	"models":        "models.html",
+	"orgs":          "orgs.html",
+	"workers":       "workers.html",
+	"sessions":      "sessions.html",
+	"settings":      "settings.html",
+	"login":         "login.html",
+	"models.html":   "models.html",
+	"orgs.html":     "orgs.html",
+	"workers.html":  "workers.html",
+	"sessions.html": "sessions.html",
+	"settings.html": "settings.html",
+	"login.html":    "login.html",
+}
+
+// serveStatic serves the dashboard's static assets. Any unrecognized path falls
+// back to the models explorer (single-page-style entry).
 func serveStatic(w http.ResponseWriter, r *http.Request, dir string) {
-	name := strings.TrimPrefix(r.URL.Path, "/")
-	switch name {
-	case "", "models":
-		name = "models.html"
-	case "orgs", "workers", "sessions", "settings":
-		name = name + ".html"
+	file, ok := dashboardPages[strings.TrimPrefix(r.URL.Path, "/")]
+	if !ok {
+		file = "models.html"
 	}
-	// Constrain to the static dir; reject path traversal.
-	clean := filepath.Clean(filepath.Join(dir, name))
-	if !strings.HasPrefix(clean, dir+string(os.PathSeparator)) && clean != dir {
-		http.NotFound(w, r)
-		return
-	}
-	if info, err := os.Stat(clean); err != nil || info.IsDir() {
-		http.ServeFile(w, r, filepath.Join(dir, "models.html"))
-		return
-	}
-	http.ServeFile(w, r, clean)
+	http.ServeFile(w, r, filepath.Join(dir, file))
 }
 
 // defaultStaticDir resolves the static dir relative to the repo layout so the
