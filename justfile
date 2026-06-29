@@ -46,6 +46,18 @@ run-control-plane: build
 build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
 
+# Port-forward a deployed control plane's admin API to localhost:8080 (run in its own terminal)
+[group('dev')]
+ui-port-forward context="posthog-mw-dev" namespace="duckgres" deploy="duckgres-control-plane":
+    kubectl --context {{context}} -n {{namespace}} port-forward deploy/{{deploy}} 8080:8080
+
+# Serve the admin UI locally, proxying /api to the port-forwarded control plane.
+# Run `just ui-port-forward` first; set DUCKGRES_INTERNAL_SECRET to the CP secret.
+# Edit controlplane/admin/static/*.html and refresh the browser — no rebuild/redeploy.
+[group('dev')]
+ui-dev target="http://127.0.0.1:8080" listen="127.0.0.1:5173":
+    go run ./controlplane/admin/devserver --target {{target}} --listen {{listen}}
+
 # Recreate the local kind cluster used by the portable K8s integration flow
 [group('dev')]
 kind-cluster-reset:

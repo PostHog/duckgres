@@ -52,6 +52,10 @@
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
 #   admin auth   : the dashboard rejects ?token= query-param auth (#721); only
 #                  the internal-secret header / POST login form authenticate.
+#   models api   : the dashboard models explorer lists every config-store model
+#                  with row counts (GET /api/v1/models) and one model's rows +
+#                  columns (GET /api/v1/models/:model), redacting secret-bearing
+#                  columns (org_users.password must never appear in the UI).
 #   lifecycle    : deprovision → warehouse deleted → Duckling CR fully gone
 #                  (finalizer cascade that drops the cnpg role+db completed).
 #                  Same-id re-provision is covered across runs by run.sh, not
@@ -1307,6 +1311,47 @@ internal_secret_fallback_auth() {
   [ "$code" = "401" ] || fail "GET /api/v1/orgs with garbage secret returned $code, want 401 (accept-list must stay closed)"
 }
 
+# ---- admin models explorer API ---------------------------------------------
+# The dashboard's generic models explorer (sidebar + table + detail UI) is
+# backed by GET /api/v1/models (sidebar: every config-store model + a live row
+# count) and GET /api/v1/models/:model (one model's rows + derived columns).
+# This asserts the surface is wired and — load-bearing — that the listing never
+# leaks secret-bearing columns: org_users carry a bcrypt password hash in the
+# DB, but Password is json:"-", so it must NOT appear in the API response. A
+# regression here (someone retagging Password) would surface a credential hash
+# in the operator UI.
+models_explorer_api() {
+  log "admin models explorer API (sidebar + listing + redaction)"
+  # Sidebar: must enumerate the known models across all three groups.
+  idx="$(curl -fsS -H "$H" "$API/api/v1/models")"
+  for key in orgs org-users managed-warehouses global-config worker-records org-connection-leases; do
+    echo "$idx" | jq -e --arg k "$key" '.models[] | select(.key == $k)' >/dev/null \
+      || fail "models index missing model '$key'"
+  done
+  # The seeded cnpg org must show up with a >=1 count on the orgs model.
+  orgcount="$(echo "$idx" | jq -r '.models[] | select(.key=="orgs") | .count')"
+  [ "$orgcount" -ge 1 ] 2>/dev/null || fail "orgs model count '$orgcount' < 1 (expected seeded orgs)"
+
+  # org-users listing: present users, derive columns, and NEVER a password.
+  users="$(curl -fsS -H "$H" "$API/api/v1/models/org-users")"
+  echo "$users" | jq -e '.columns | index("username")' >/dev/null \
+    || fail "org-users listing missing 'username' column"
+  if echo "$users" | jq -e '.columns | index("password")' >/dev/null 2>&1; then
+    fail "org-users listing exposes a 'password' column (must be redacted)"
+  fi
+  if echo "$users" | jq -e '[.rows[] | has("password")] | any' >/dev/null 2>&1; then
+    fail "org-users row carries a password field (credential hash leak via UI)"
+  fi
+  # A runtime-schema model must list (schema qualification works), returning
+  # columns even when the table is empty.
+  curl -fsS -H "$H" "$API/api/v1/models/worker-records" \
+    | jq -e '.columns | index("worker_id")' >/dev/null \
+    || fail "worker-records listing missing 'worker_id' column (runtime schema qualification broken)"
+  # Unknown model → 404.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/models/not-a-model")"
+  [ "$code" = "404" ] || fail "GET /api/v1/models/not-a-model returned $code, want 404"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -1556,6 +1601,11 @@ main() {
   log "settling ${CONFIG_POLL_SETTLE:-12}s for CP auth cache…"
   sleep "${CONFIG_POLL_SETTLE:-12}"
 
+  # Admin models explorer: orgs + their users now exist in the config store, so
+  # the sidebar counts are non-trivial and the org-users redaction check bites
+  # against a real bcrypt-hash-bearing row.
+  models_explorer_api
+
   # Join the kubectl background download started at script load — first k use
   # is inside the lanes, so the fetch overlapped the whole provisioning phase.
   bootstrap_kubectl
@@ -1579,7 +1629,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
