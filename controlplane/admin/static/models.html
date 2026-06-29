@@ -169,6 +169,11 @@
       font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
       padding: 9px 12px; border-bottom: 1px solid var(--line-bright);
     }
+    table.tbl thead th.sortable { cursor: pointer; user-select: none; }
+    table.tbl thead th.sortable:hover { color: var(--text); }
+    table.tbl thead th .sortind { color: var(--worker); margin-left: 5px; font-size: 9px; }
+    table.tbl thead th .tipmark { color: var(--cp); margin-left: 4px; font-size: 10px; cursor: help; }
+    table.tbl thead th.hastip { text-decoration: underline dotted var(--line-bright); text-underline-offset: 3px; }
     table.tbl tbody td {
       padding: 7px 12px; border-bottom: 1px solid var(--line);
       white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis;
@@ -297,7 +302,15 @@
 
   <script>
   "use strict";
-  const state = { models: [], key: null, listing: null, filter: "", selected: -1 };
+  const state = { models: [], key: null, listing: null, filter: "", selected: -1, sortCol: null, sortDir: 1 };
+
+  // Per-model column tooltips (shown on the header, native title=). Keep text
+  // free of double quotes. Angle-bracket placeholders render literally.
+  const COLUMN_TOOLTIPS = {
+    orgs: {
+      hostname_alias: "Optional public hostname label for SNI routing. Empty/NULL: the org is reached at <database_name>.<managed-suffix> (or its org name if DNS-safe). Set: reachable at <hostname_alias>.<managed-suffix> while clients still connect with dbname=<database_name>. Must be a single DNS label (alphanumeric + hyphens, no leading/trailing hyphen).",
+    },
+  };
 
   function esc(s) {
     const d = document.createElement("div");
@@ -375,18 +388,54 @@
     return rows.filter(r => JSON.stringify(r).toLowerCase().includes(f));
   }
 
+  // cmpScalar compares two non-empty cell values: numbers numerically, booleans
+  // false<true, objects/arrays by their JSON, everything else as numeric-aware
+  // strings (so "9" < "10" and "worker-2" < "worker-10").
+  function cmpScalar(a, b) {
+    if (typeof a === "boolean" || typeof b === "boolean") return (a === b) ? 0 : (a ? 1 : -1);
+    if (typeof a === "number" && typeof b === "number") return a - b;
+    const sa = (a !== null && typeof a === "object") ? JSON.stringify(a) : String(a);
+    const sb = (b !== null && typeof b === "object") ? JSON.stringify(b) : String(b);
+    return sa.localeCompare(sb, undefined, { numeric: true, sensitivity: "base" });
+  }
+
+  // sortRows returns a sorted copy by the active column. Empty/null values
+  // always sink to the bottom regardless of direction; the click toggles
+  // asc/desc over the remaining values.
+  function sortRows(rows) {
+    if (!state.sortCol) return rows;
+    const c = state.sortCol, d = state.sortDir;
+    return rows.slice().sort((x, y) => {
+      const a = x[c], b = y[c];
+      const ea = a === null || a === undefined || a === "";
+      const eb = b === null || b === undefined || b === "";
+      if (ea && eb) return 0;
+      if (ea) return 1;
+      if (eb) return -1;
+      return d * cmpScalar(a, b);
+    });
+  }
+
   function renderTable() {
     const scroll = document.getElementById("table-scroll");
     const lst = state.listing;
     if (!lst) { scroll.innerHTML = '<div class="empty">Select a model from the sidebar.</div>'; return; }
     const cols = lst.columns || [];
-    const rows = filteredRows();
+    const rows = sortRows(filteredRows());
     if (!rows.length) {
       scroll.innerHTML = '<div class="empty">' + (lst.count === 0 ? "No rows in this table." : "No rows match the filter.") + "</div>";
       return;
     }
     let html = '<table class="tbl"><thead><tr>';
-    for (const c of cols) html += "<th>" + esc(c) + "</th>";
+    const tips = COLUMN_TOOLTIPS[state.key] || {};
+    for (const c of cols) {
+      const ind = state.sortCol === c ? (state.sortDir === 1 ? "▲" : "▼") : "";
+      const tip = tips[c];
+      const titleAttr = tip ? ' title="' + esc(tip) + '"' : "";
+      const cls = tip ? "sortable hastip" : "sortable";
+      const info = tip ? '<span class="tipmark">ⓘ</span>' : "";
+      html += '<th class="' + cls + '" data-col="' + esc(c) + '"' + titleAttr + ">" + esc(c) + info + '<span class="sortind">' + ind + "</span></th>";
+    }
     html += "</tr></thead><tbody>";
     rows.forEach((r, i) => {
       html += '<tr data-idx="' + i + '">';
@@ -395,6 +444,13 @@
     });
     html += "</tbody></table>";
     scroll.innerHTML = html;
+    scroll.querySelectorAll("thead th.sortable").forEach(th => th.addEventListener("click", () => {
+      const c = th.dataset.col;
+      // Same column → flip direction; new column → start ascending.
+      if (state.sortCol === c) state.sortDir = -state.sortDir;
+      else { state.sortCol = c; state.sortDir = 1; }
+      renderTable();
+    }));
     scroll.querySelectorAll("tbody tr").forEach(tr => tr.addEventListener("click", () => showDetail(parseInt(tr.dataset.idx, 10), rows)));
   }
 
@@ -444,6 +500,8 @@
   async function selectModel(key) {
     state.key = key;
     state.filter = "";
+    state.sortCol = null;
+    state.sortDir = 1;
     document.getElementById("search").value = "";
     closeDetail();
     renderSidebar();
@@ -455,6 +513,10 @@
     try {
       const lst = await api("/api/v1/models/" + encodeURIComponent(key));
       state.listing = lst;
+      // Default sort: first column ascending, so the table opens in a defined,
+      // visible order (▲ on column 0) rather than raw DB order.
+      state.sortCol = (lst.columns && lst.columns[0]) || null;
+      state.sortDir = 1;
       document.getElementById("model-table").textContent = lst.table || "";
       document.getElementById("model-count").textContent =
         lst.count + " row" + (lst.count === 1 ? "" : "s") + (lst.truncated ? " (showing first " + lst.rows.length + ")" : "");
