@@ -59,11 +59,11 @@ func dedupeBy[T any, K comparable](items []T, key func(T) K) []T {
 }
 
 // mergeOrgStats folds each peer's ClusterStatus into the local per-org stats:
-// active_sessions is summed across CPs (each reports its own slice). Workers is
-// also summed for forward-compatibility, but the adapter currently leaves it 0
-// (per-org worker counts aren't surfaced), so it's effectively a no-op today.
-// max_workers is config-store-backed (identical on every CP) so the max is
-// taken. Org identity is the name; order follows first-seen.
+// active_sessions and workers are both summed across CPs (each reports only the
+// sessions / workers it owns — a worker is owned by exactly one CP, so the sum
+// is the cluster-wide per-org count). max_workers is config-store-backed
+// (identical on every CP) so the max is taken. Org identity is the name; order
+// follows first-seen.
 func mergeOrgStats(local []OrgStatus, bodies [][]byte) []OrgStatus {
 	byName := map[string]*OrgStatus{}
 	var order []string
