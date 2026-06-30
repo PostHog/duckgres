@@ -78,6 +78,9 @@ func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgSta
 	// the concrete store directly because it needs the runtime schema name and
 	// raw DB for tables the typed apiStore interface doesn't surface.
 	registerModelsAPI(r, store)
+	// Admin-only Operators management (the admin-console access list). Each
+	// route self-gates with RequireAdmin; mutations are audited via the group.
+	registerOperatorsAPI(r, store)
 }
 
 func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo, fetcher PeerFetcher) {

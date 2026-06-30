@@ -456,11 +456,33 @@ func SetupMultiTenant(
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
 
-	// Admin UI dependencies. SSO group + Prometheus URL are env-only K8s knobs
-	// (set by the chart); see config_resolution.go / CLAUDE.md.
-	ssoCfg := admin.SSOConfig{
-		AdminGroup:  os.Getenv("DUCKGRES_ADMIN_SSO_GROUP"),
-		AllowAllSSO: os.Getenv("DUCKGRES_ADMIN_SSO_ALLOW_ALL") == "true",
+	// Admin UI dependencies. Prometheus URL is an env-only K8s knob (set by the
+	// chart); see config_resolution.go / CLAUDE.md. The admin role for an SSO
+	// caller is resolved per-request from the operators table (managed under
+	// Admin → Operators); the break-glass internal-secret path is independent.
+	//
+	// There is no bootstrap seed. The first SSO login auto-provisions a
+	// create-only VIEWER row for the caller (so an operator appears in the
+	// config store just by logging in), and the role is then read back. To make
+	// the first admin: log in over break-glass (internal-secret → admin) and
+	// patch your auto-provisioned row to admin under Admin → Operators.
+	resolve := func(email string) admin.Role {
+		role, err := store.OperatorRole(email)
+		if err != nil {
+			slog.Warn("admin: operator role lookup failed", "email", email, "error", err)
+		}
+		if role == "" {
+			// Auto-provision (create-only, never clobbers an existing role) so the
+			// caller has a row to be promoted from. Best-effort: a failure here
+			// must not block authentication — the caller simply stays viewer.
+			if err := store.SeedOperator(email, string(admin.RoleViewer)); err != nil {
+				slog.Warn("admin: operator auto-provision failed", "email", email, "error", err)
+			}
+		}
+		if role == "admin" {
+			return admin.RoleAdmin
+		}
+		return admin.RoleViewer
 	}
 	auditStore, err := admin.NewAuditStore(store.DB())
 	if err != nil {
@@ -487,7 +509,7 @@ func SetupMultiTenant(
 	// RoleGate blocks viewer mutations (method-based); the audit-log read
 	// self-gates via RequireAdmin at its route (no brittle path coupling here).
 	api := engine.Group("/api/v1",
-		admin.AuthMiddleware(adminTokens, ssoCfg),
+		admin.AuthMiddleware(adminTokens, resolve),
 		admin.AuditMiddleware(auditStore),
 		admin.RoleGate(),
 	)

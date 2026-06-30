@@ -17,6 +17,7 @@ import type {
   MetricsPanels,
   ModelListing,
   ModelSummary,
+  Operator,
   Org,
   OrgUpdate,
   OrgUser,
@@ -158,6 +159,14 @@ export const api = {
       window,
       rate_window: rateWindow,
     }),
+
+  // operators (admin allow-list)
+  listOperators: () =>
+    get<{ operators: Operator[] }>("/operators").then((r) => r.operators ?? []),
+  upsertOperator: (body: { email: string; role: Operator["role"] }) =>
+    post<Operator>("/operators", body),
+  deleteOperator: (email: string): Promise<void> =>
+    del<{ deleted: boolean }>(`/operators/${enc(email)}`).then(() => undefined),
 
   // config-store models explorer
   listModels: () => get<{ models: ModelSummary[] }>("/models"),

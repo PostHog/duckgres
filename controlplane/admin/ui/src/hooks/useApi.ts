@@ -22,6 +22,7 @@ import type {
   MetricsPanels,
   ModelListing,
   ModelSummary,
+  Operator,
   Org,
   OrgUpdate,
   OrgUser,
@@ -265,6 +266,39 @@ export function useModel(model: string | undefined) {
     queryKey: ["models", model],
     queryFn: () => api.getModel(model!),
     enabled: !!model,
+  });
+}
+
+// ---- operators (admin allow-list) ----
+
+export function useOperators() {
+  return useQuery<Operator[]>({
+    queryKey: ["operators"],
+    queryFn: () => tolerate404<Operator[]>([])(api.listOperators()),
+  });
+}
+
+// Invalidate both ["operators"] (the table) and ["models"] (the sidebar count
+// shown under the Admin group in the config-store explorer).
+export function useUpsertOperator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { email: string; role: Operator["role"] }) => api.upsertOperator(body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["operators"] });
+      qc.invalidateQueries({ queryKey: ["models"] });
+    },
+  });
+}
+
+export function useDeleteOperator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (email: string) => api.deleteOperator(email),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["operators"] });
+      qc.invalidateQueries({ queryKey: ["models"] });
+    },
   });
 }
 

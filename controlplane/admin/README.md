@@ -28,9 +28,16 @@ with a `Role`:
 - A valid `TokenSet` token (`X-Duckgres-Internal-Secret` header or the
   `duckgres_admin_token` cookie) → **admin**. This is the service-to-service /
   break-glass path (`RegisterLogin` mints the cookie via `POST /login`).
-- Otherwise the ALB-injected `X-Amzn-Oidc-Data` JWT (Cognito/Google) is decoded
-  to email + groups. Membership in `DUCKGRES_ADMIN_SSO_GROUP` → **admin**, else
-  **viewer**. (Unset group → admin for any SSO user, logged — set it in prod.)
+- Otherwise the ALB-injected `X-Amzn-Oidc-Data` JWT (Cognito/Google) yields the
+  caller's email (only `@posthog.com`, `email_verified != false`; otherwise
+  treated as unauthenticated). The role is then resolved **per-request** from the
+  `duckgres_operators` table in the config schema (goose migration
+  `000006_create_operators.sql`): an `admin` row →
+  **admin**, anything else (including no row) → **viewer**. Operators are managed
+  by admins under **Admin → Operators** in the config-store explorer (and the
+  `/api/v1/operators` API). The first SSO login auto-provisions a create-only
+  **viewer** operator row; to mint the first admin, log in over the break-glass
+  internal token and patch that row to `admin` under **Admin → Operators**.
 
 `RoleGate` enforces the split: mutating verbs (POST/PUT/PATCH/DELETE) and the
 audit-log GET require admin; other GETs allow viewer. `AuditMiddleware` records
@@ -61,6 +68,9 @@ Added for the console:
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
 | `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
 | `GET /api/v1/audit` | admin | admin action log |
+| `GET /api/v1/operators` | admin | list console operators (email → role) |
+| `POST /api/v1/operators` | admin | add/update an operator (`{email, role}`; last-admin demotion → 409) |
+| `DELETE /api/v1/operators/:email` | admin | remove an operator (removing the last admin → 409) |
 
 ### Cross-CP live-state aggregation (`live_aggregate.go` + `controlplane/live_aggregator.go`)
 

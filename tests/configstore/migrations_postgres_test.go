@@ -23,7 +23,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 3)
 	requireGooseMigrationRecorded(t, db, 4)
 	requireGooseMigrationRecorded(t, db, 5)
-	requireGooseLatestVersion(t, db, 5)
+	requireGooseMigrationRecorded(t, db, 6)
+	requireGooseLatestVersion(t, db, 6)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000004 dropped the dead cluster-wide singleton config tables.
@@ -191,6 +192,7 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 		&cpconfigstore.ManagedWarehouse{},
 		&cpconfigstore.OrgUser{},
 		&cpconfigstore.OrgUserSecret{},
+		&cpconfigstore.Operator{},
 	); err != nil {
 		t.Fatalf("auto-migrate gorm comparison schema: %v", err)
 	}
@@ -330,6 +332,7 @@ func loadConfigStoreColumnMetadata(t *testing.T, db *sql.DB) map[string]columnMe
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -386,6 +389,7 @@ func loadConfigStorePrimaryKeys(t *testing.T, db *sql.DB) map[string]primaryKeyM
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -437,6 +441,7 @@ func loadConfigStoreIndexes(t *testing.T, db *sql.DB) map[string]indexMetadata {
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -500,6 +505,7 @@ func loadConfigStoreForeignKeys(t *testing.T, db *sql.DB) map[string]foreignKeyM
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
