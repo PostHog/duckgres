@@ -358,6 +358,63 @@ malformed_startup_resilience() { # org password
   [ "$v" = "1" ] || fail "CP stopped serving after malformed startup (got '$v')"
 }
 
+# Connection lifetime is recorded at disconnect: the CP's per-connection teardown
+# (control.go defer -> server.CloseConnectionMetrics) bumps the per-org
+# duckgres_connection_duration_seconds histogram AND stamps duration_ms on the
+# "Client disconnected." log. The histogram is the load-bearing series (its _sum
+# gives exact total connection-seconds with no scrape-integral bias), but the
+# :9090 metrics port is NetworkPolicy-blocked from this in-cluster Job and the
+# CP image ships no HTTP client to self-scrape — so we assert the log field,
+# which is emitted by the SAME teardown call that records the histogram. A
+# positive duration_ms proves real elapsed time was measured (guards an
+# always-zero / unset-backendStart regression).
+connection_duration_logged() { # org password
+  log "connection duration_ms stamped on disconnect for $1"
+  # psql opens and closes exactly one connection per call → a fresh disconnect.
+  v="$(pg "$1" "$2" ducklake 'SELECT 1')"
+  [ "$v" = "1" ] || fail "warmup query for duration assertion returned '$v'"
+  sleep 3 # let the disconnect log flush
+  ms=""
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    # logfmt: `... msg="Client disconnected." ... duration_ms=NN`. Take the max
+    # duration_ms seen on a disconnect line in the recent window across replicas.
+    m="$(k logs "$p" --since=180s 2>/dev/null \
+          | grep 'Client disconnected.' \
+          | grep -oE 'duration_ms=[0-9]+' \
+          | grep -oE '[0-9]+' \
+          | sort -nr | head -1)"
+    if [ -n "$m" ] && { [ -z "$ms" ] || [ "$m" -gt "$ms" ]; }; then ms="$m"; fi
+  done
+  [ -n "$ms" ] || fail "no 'Client disconnected.' log carrying duration_ms in last 180s (CP not recording connection lifetime)"
+  [ "$ms" -gt 0 ] || fail "disconnect duration_ms is $ms (want > 0 — backendStart not honoured?)"
+}
+
+# Managed-warehouse compute-usage metering (billing emit side). At connection
+# teardown the CP meters cpu_seconds/memory_seconds from the provisioned worker
+# size over the connection lifetime into an in-proc per-org counter (best-effort),
+# flushes it to the durable config-store buffer (~15s), and the leader drains
+# closed buckets to PostHog ingestion (~60s, ship-then-delete). The :9090 metrics
+# port + the ingestion HTTP path are not observable from this in-cluster Job, so
+# we assert the CP's startup log line that proves the metering config knob is
+# wired and reports its enabled/disabled state. When the deploy sets
+# DUCKGRES_BILLING_INGEST_URL/TOKEN this line reads "enabled"; otherwise
+# "disabled" — either way the knob is present and the emit path is compiled in.
+# (NOTE: a full end-to-end "the event landed in PostHog ClickHouse" assertion
+# needs a billing-analytics token + CH read access from the Job, which this lane
+# does not have — see README. The buffer UPSERT/drain SQL is exercised by the
+# tests/configstore Postgres migration test, and the meter/drain logic by the
+# controlplane/ unit tests.)
+compute_usage_metering_wired() {
+  log "compute-usage metering config knob wired in CP"
+  found=""
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    m="$(k logs "$p" 2>/dev/null | grep -E 'Managed-warehouse compute-usage metering (enabled|disabled)' | tail -1)"
+    if [ -n "$m" ]; then found="$m"; fi
+  done
+  [ -n "$found" ] || fail "no compute-usage metering startup log line found (config knob not wired into SetupMultiTenant?)"
+  log "compute-usage metering state: $found"
+}
+
 # jsonb || must keep Postgres concatenation semantics through the full CP
 # transpile → worker DuckDB execute path (regression for #716: the transpiler
 # used to rewrite it to json_merge_patch, which REPLACED arrays instead of
@@ -810,6 +867,19 @@ hot_idle_retired() { # org password catalog cpu memory
 # Hot, skip busy, no session decrement) by k8s_pool_test.go
 # (TestK8sPoolReleaseIdleHotWorkers*/ParkIdleHotWorker*), and the reaper
 # destination (hot_idle -> pod delete within TTL) by hot_idle_retired above.
+
+# NOTE — the hot-idle TTL reaper now spares hot-idle workers that still back a
+# reclaimable (Active/Reconnecting) Flight session, mirroring the long-standing
+# exclusion in ListOrphanedWorkers (so a TTL reap can't kill a customer's query
+# at the moment they reconnect by session token). That sparing is a NEGATIVE
+# assertion over a multi-minute TTL window on a worker holding a live durable
+# Flight session — not deterministic to set up in-Job — so it is gated by the
+# real-Postgres regression test
+# TestListExpiredHotIdleWorkersSparesReclaimableFlightSessions
+# (tests/configstore/runtime_store_postgres_test.go), which asserts both the
+# global and per-CP reaper variants spare Active/Reconnecting sessions and still
+# reap workers with no session (or only a closed one). hot_idle_retired above
+# covers the positive (no Flight session -> reaped within TTL).
 
 # ---- org default worker profile --------------------------------------------
 # Operators can give a tenant a server-side default worker shape + hot-idle TTL
@@ -1317,7 +1387,14 @@ admin_console_api() {
   code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/me")"
   [ "$code" = "401" ] || fail "GET /me with no auth returned $code, want 401"
   # Live read endpoints return their documented envelopes.
-  curl -fsS -H "$H" "$API/api/v1/queries"           | jq -e 'has("queries")' >/dev/null || fail "/queries missing 'queries' key"
+  # /queries aggregates each CP's in-memory view and reports coverage. The CI CP
+  # runs a SINGLE replica, so this only asserts the envelope (cp_total==cp_responders,
+  # no failed peers); it cannot exercise a real peer hop. The multi-CP fan-out
+  # (peer discovery + self-exclusion + merge/dedup) is covered by unit tests
+  # (TestDiscoverPeerIPs, TestQueriesAggregateAcrossCPs).
+  curl -fsS -H "$H" "$API/api/v1/queries" \
+    | jq -e 'has("queries") and (.cp_total >= 1) and (.cp_responders == .cp_total)' >/dev/null \
+    || fail "/queries envelope wrong (queries/cp_total/cp_responders)"
   curl -fsS -H "$H" "$API/api/v1/workers/fleet"     | jq -e 'has("fleet")'   >/dev/null || fail "/workers/fleet missing 'fleet' key"
   curl -fsS -H "$H" "$API/api/v1/cluster/instances" \
     | jq -e '.instances | map(select(.self)) | length >= 1' >/dev/null \
@@ -1328,15 +1405,17 @@ admin_console_api() {
 }
 
 # ---- admin RBAC: SSO viewer is read-only -----------------------------------
-# A forged ALB OIDC header (no internal secret) with a non-admin group resolves
-# to the viewer role: it can read but must be blocked from mutations and from
-# the audit log. Exercises RoleGate + RequireAdmin against the REAL router (the
-# unit tests cover the gate algorithm; this covers the wiring). The JWT is
-# unsigned because the CP trusts the ALB-injected header by network position.
+# A forged ALB OIDC header (no internal secret) for an @posthog.com email that
+# is NOT in the operators table resolves to the viewer role (fail-closed
+# default): it can read but must be blocked from mutations and from the audit
+# log. Exercises RoleGate + RequireAdmin against the REAL router (the unit tests
+# cover the gate algorithm; this covers the wiring). The JWT is unsigned because
+# the CP trusts the ALB-injected header by network position. (Role is no longer
+# group-based — it comes from the operators table; an unknown email = viewer.)
 admin_rbac_viewer() { # org
   org="$1"
-  log "admin RBAC: forged SSO viewer is read-only (no mutate, no audit)"
-  payload="$(printf '{"email":"ci-viewer@posthog.com","cognito:groups":["definitely-not-admin"]}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+  log "admin RBAC: forged SSO viewer (unknown operator) is read-only (no mutate, no audit)"
+  payload="$(printf '{"email":"ci-viewer@posthog.com","email_verified":true}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
   vh="X-Amzn-Oidc-Data: e30.${payload}.sig"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/orgs")"
   [ "$code" = "200" ] || fail "viewer GET /orgs returned $code, want 200 (reads allowed)"
@@ -1740,6 +1819,13 @@ main() {
   # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
   admin_query_detail "$CNPG" "$cnpg_pw"
 
+  # ---- connection-duration observability (any org; lanes already churned
+  #      many connect/disconnects, so the disconnect log is warm) ----
+  connection_duration_logged "$CNPG" "$cnpg_pw"
+
+  # ---- compute-usage metering wired (billing emit side) ----
+  compute_usage_metering_wired
+
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
 
@@ -1752,7 +1838,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + connection-duration-logged + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

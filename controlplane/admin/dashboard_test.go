@@ -226,7 +226,7 @@ func TestLoginWithFallbackTokenWorksEndToEnd(t *testing.T) {
 	RegisterLogin(r, tokens)
 	// A cookie-authenticated request must be accepted by AuthMiddleware (and
 	// mapped to the admin role via the internal-secret path).
-	r.GET("/api/v1/ping", AuthMiddleware(tokens, SSOConfig{}), func(c *gin.Context) {
+	r.GET("/api/v1/ping", AuthMiddleware(tokens, nil), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
 	})
 

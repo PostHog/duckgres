@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/wire"
 )
@@ -114,6 +115,29 @@ func (s *Server) ConnDetailByPID(pid int32) (ConnDetail, bool) {
 	return c.connDetail(), true
 }
 
+// SetConnectionWorkerSize records the provisioned worker pod size (in
+// milli-units) on a control-plane connection for compute-usage billing.
+// millicores == 0 means the size is unknown (non-remote / standalone) and
+// metering is skipped. Constant for the connection's life.
+func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
+	if cc != nil {
+		cc.workerMillicores = millicores
+		cc.workerMiB = mib
+	}
+}
+
+// ConnectionBilling returns the data needed to meter one connection's
+// compute-usage at teardown: the org, the provisioned worker size in
+// milli-units, and the connection's elapsed lifetime. millicores == 0 means
+// metering should be skipped (unknown worker size). Call at the same teardown
+// point as CloseConnectionMetrics.
+func ConnectionBilling(cc *clientConn) (orgID string, millicores, mib int64, dur time.Duration) {
+	if cc == nil {
+		return "", 0, 0, 0
+	}
+	return cc.orgID, cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
+}
+
 // CancelClientConn cancels the context of a clientConn.
 func CancelClientConn(cc *clientConn) {
 	if cc.cancel != nil {
@@ -184,6 +208,17 @@ func RunMessageLoop(cc *clientConn) error {
 	cc.server.registerConn(cc)
 	defer cc.server.unregisterConn(cc.pid)
 	return cc.messageLoop()
+}
+
+// CloseConnectionMetrics records the completed connection's lifetime in the
+// duckgres_connection_duration_seconds histogram (per org) and returns the
+// elapsed duration so the caller can log it. Call exactly once per connection
+// at teardown. backendStart is always set in NewClientConn, so the duration is
+// always meaningful for control-plane connections.
+func CloseConnectionMetrics(cc *clientConn) time.Duration {
+	d := time.Since(cc.backendStart)
+	observe.ObserveConnectionDuration(cc.orgID, d.Seconds())
+	return d
 }
 
 // InitMinimalServer initializes a Server struct with minimal fields for use

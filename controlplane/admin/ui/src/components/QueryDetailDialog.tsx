@@ -72,7 +72,7 @@ export function QueryDetailDialog({
           <p className="py-8 text-center text-sm text-muted-foreground">Loading…</p>
         ) : notFound ? (
           <p className="py-8 text-center text-sm text-muted-foreground">
-            This query is no longer running, or it is owned by a different control-plane replica.
+            This query has finished, or its control-plane replica is briefly unreachable.
           </p>
         ) : !d ? (
           <p className="py-8 text-center text-sm text-muted-foreground">No detail available.</p>

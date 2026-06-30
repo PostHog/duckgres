@@ -117,6 +117,23 @@ type ControlPlaneConfig struct {
 	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
 	// used for migration checks when an org doesn't specify an override.
 	DuckLakeDefaultSpecVersion string
+
+	// BillingIngestURL and BillingIngestToken configure managed-warehouse
+	// compute-usage metering (remote/k8s backend only). The URL is PostHog's
+	// public ingestion base (e.g. https://us.i.posthog.com); the token is the
+	// project API write key, stamped on the capture event's `token` property.
+	// If EITHER is empty, metering is disabled: usage is never shipped and a
+	// query is NEVER failed on its account. See
+	// docs/design/billing-compute-seconds-plan.md.
+	BillingIngestURL   string
+	BillingIngestToken string
+}
+
+// BillingMeteringEnabled reports whether compute-usage metering is configured.
+// Metering also requires the remote backend; this only checks the ingest
+// config (both URL and token present).
+func (c ControlPlaneConfig) BillingMeteringEnabled() bool {
+	return c.BillingIngestURL != "" && c.BillingIngestToken != ""
 }
 
 type ProcessConfig struct {
@@ -210,6 +227,12 @@ type ControlPlane struct {
 	apiServer      *http.Server // API server on :8080 (shut down on graceful exit)
 	runtimeTracker *ControlPlaneRuntimeTracker
 	janitorLeader  *JanitorLeaderManager
+
+	// computeMeter accumulates per-org compute-usage and flushes it to the
+	// durable buffer (remote/k8s backend with billing config only; nil
+	// otherwise — every call site is nil-safe). The leader-only drain loop that
+	// ships buffered usage to PostHog is wired separately in SetupMultiTenant.
+	computeMeter *computeMeter
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -480,7 +503,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, cp.healthReady)
+		store, adapter, apiServer, runtimeTracker, janitorLeader, meter, err := SetupMultiTenant(cfg, srv, memBudget, cp.healthReady)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -490,6 +513,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.apiServer = apiServer
 		cp.runtimeTracker = runtimeTracker
 		cp.janitorLeader = janitorLeader
+		cp.computeMeter = meter
 		cp.cfg = cfg
 		_ = store // keep linter happy
 		if cp.runtimeTracker != nil {
@@ -1323,6 +1347,33 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Create real clientConn with FlightExecutor and worker assignment
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
+	// Stamp the provisioned worker pod size for compute-usage billing. Only the
+	// remote/k8s backend has a per-org worker pod with a known size; the process
+	// backend leaves it zero so metering is skipped. Constant for the
+	// connection's life (computed once at teardown over its full lifetime).
+	if cp.isRemoteBackend {
+		millicores, mib := cp.workerBillingSize(workerProfile)
+		server.SetConnectionWorkerSize(cc, millicores, mib)
+	}
+	// Record the connection's full lifetime exactly once, on every exit path
+	// (clean disconnect, message-loop error, or handshake-completion failure):
+	// bumps duckgres_connection_duration_seconds (per org) and logs duration_ms,
+	// and meters compute-usage (best-effort; never affects the client).
+	defer func() {
+		dur := server.CloseConnectionMetrics(cc)
+		clog.Info("Client disconnected.", "duration_ms", dur.Milliseconds())
+		// Best-effort compute-usage metering. cp.computeMeter is nil unless the
+		// remote backend is configured with billing ingest; Record is nil-safe
+		// and a zero worker size (non-remote/unknown) is a no-op. A panic here
+		// must never escape teardown.
+		if cp.computeMeter != nil {
+			func() {
+				defer func() { _ = recover() }()
+				billOrg, millicores, mib, billDur := server.ConnectionBilling(cc)
+				cp.computeMeter.Record(billOrg, millicores, mib, time.Now(), billDur)
+			}()
+		}
+	}()
 	if cp.orgRouter != nil && orgID != "" {
 		if icebergCfg, ok := cp.orgRouter.IcebergConfigForOrg(orgID); ok {
 			server.SetConnectionIcebergConfig(cc, icebergCfg)
@@ -1351,13 +1402,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Run message loop
+	// Run message loop. Disconnect log + duration histogram are emitted by the
+	// deferred CloseConnectionMetrics above on every return path.
 	if err := server.RunMessageLoop(cc); err != nil {
 		clog.Error("Message loop error.", "error", err)
 		return
 	}
-
-	clog.Info("Client disconnected.")
 }
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
@@ -1398,6 +1448,26 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	return memLimit, threads
+}
+
+// workerBillingSize returns the provisioned worker pod size for compute-usage
+// billing, in milli-units (millicores, MiB). It mirrors workerDuckDBLimits's
+// source-of-truth selection: a non-default profile sizes from the profile's pod
+// shape, falling back to the pool-global request. Returns (0, 0) when the size
+// is unconfigured (metering then skipped). NOTE: this is the *provisioned*
+// pod size (the full vCPU/GiB billed), NOT the 75%-of-RAM DuckDB memory_limit.
+func (cp *ControlPlane) workerBillingSize(profile *WorkerProfile) (millicores, mib int64) {
+	cpuReq := cp.cfg.K8s.WorkerCPURequest
+	memReq := cp.cfg.K8s.WorkerMemoryRequest
+	if profile != nil {
+		if profile.CPU != "" {
+			cpuReq = profile.CPU
+		}
+		if profile.Memory != "" {
+			memReq = profile.Memory
+		}
+	}
+	return parseK8sCPUMillicores(cpuReq), parseK8sMemoryMiB(memReq)
 }
 
 // parseK8sMemory parses a Kubernetes memory string (e.g., "360Gi", "8Gi", "512Mi", "4GB")
@@ -1451,6 +1521,40 @@ func parseK8sCPU(s string) int {
 		return 0
 	}
 	return cores
+}
+
+// parseK8sCPUMillicores parses a Kubernetes CPU string (e.g. "8", "8000m",
+// "500m") into millicores (1 core = 1000 millicores). Used by compute-usage
+// metering, which counts internally in millicore-seconds to avoid truncating a
+// fractional-core worker. Returns 0 on empty/unparseable input.
+func parseK8sCPUMillicores(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if strings.HasSuffix(s, "m") {
+		var millicores int64
+		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores); err != nil || millicores < 0 {
+			return 0
+		}
+		return millicores
+	}
+	var cores float64
+	if _, err := fmt.Sscanf(s, "%f", &cores); err != nil || cores < 0 {
+		return 0
+	}
+	return int64(cores * 1000)
+}
+
+// parseK8sMemoryMiB parses a Kubernetes memory string into whole mebibytes
+// (MiB = 1024*1024 bytes). Used by compute-usage metering, which counts
+// internally in MiB-seconds. Returns 0 on empty/unparseable input.
+func parseK8sMemoryMiB(s string) int64 {
+	bytes := parseK8sMemory(s)
+	if bytes == 0 {
+		return 0
+	}
+	return int64(bytes / (1024 * 1024))
 }
 
 // startupResult holds the parsed initial startup message.
@@ -1572,6 +1676,13 @@ func (cp *ControlPlane) shutdown() {
 	slog.Info("Waiting for connections to drain...")
 	cp.wg.Wait()
 
+	// Final compute-usage flush: drained connections fired their end records
+	// into the in-process counter; land them in the durable buffer before exit
+	// (best-effort, nil-safe). See billing plan §5.3.
+	if cp.computeMeter != nil {
+		cp.computeMeter.Flush()
+	}
+
 	cp.shutdownRuntimeResources()
 }
 
@@ -1602,6 +1713,11 @@ func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
+	}
+	// Final compute-usage flush after connections have drained to their natural
+	// end (best-effort, nil-safe). See billing plan §5.3.
+	if cp.computeMeter != nil {
+		cp.computeMeter.Flush()
 	}
 	cp.shutdownRuntimeResources()
 }

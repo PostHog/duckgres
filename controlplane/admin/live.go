@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -85,13 +86,26 @@ type LiveInfo interface {
 }
 
 // registerLiveAPI wires the live-state read endpoints + the session-kill action.
-func registerLiveAPI(r *gin.RouterGroup, live LiveInfo) {
+// fetcher (may be nil) aggregates per-CP in-memory state across replicas.
+func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher) {
 	if live == nil {
 		return
 	}
 	r.GET("/queries", func(c *gin.Context) {
 		queries := live.RunningQueries()
-		// Optional org/user slicing.
+		responders, total := 1, 1
+		// Aggregate every other CP's in-memory view (a query lives on exactly
+		// one CP, so the union is disjoint; dedupeBy makes it idempotent anyway).
+		if !localScope(c) && fetcher != nil {
+			bodies, peers := fetcher.FetchPeers(c.Request.Context(), "/api/v1/queries")
+			type env struct {
+				Queries []QueryStatus `json:"queries"`
+			}
+			responders += mergePeer(&queries, bodies, func(e env) []QueryStatus { return e.Queries })
+			total += peers
+			queries = dedupeBy(queries, func(q QueryStatus) int { return q.WorkerID })
+		}
+		// Optional org/user slicing (applied AFTER the merge).
 		org, user := c.Query("org"), c.Query("user")
 		if org != "" || user != "" {
 			filtered := queries[:0:0]
@@ -106,23 +120,38 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo) {
 			}
 			queries = filtered
 		}
-		c.JSON(http.StatusOK, gin.H{"queries": queries})
+		c.JSON(http.StatusOK, gin.H{"queries": queries, "cp_responders": responders, "cp_total": total})
 	})
 
 	// Expanded detail for a single in-flight query (redacted SQL + metadata).
-	// Served on demand so the polled list stays light.
+	// Served on demand so the polled list stays light. The query's SQL text
+	// lives only on the CP replica that owns the connection, so this scatter-
+	// gathers like /queries: check locally first, and if this replica doesn't
+	// own the pid, fan out to peers (scope=local guard prevents re-fanning) and
+	// return the one owner's 200 (FetchPeers drops every peer's 404).
 	r.GET("/queries/:pid", func(c *gin.Context) {
 		pid64, err := strconv.ParseInt(c.Param("pid"), 10, 32)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid pid"})
 			return
 		}
-		detail, ok := live.QueryDetailForPID(int32(pid64))
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "no live query with that pid on this replica"})
+		if detail, ok := live.QueryDetailForPID(int32(pid64)); ok {
+			c.JSON(http.StatusOK, detail)
 			return
 		}
-		c.JSON(http.StatusOK, detail)
+		// Not owned locally. A peer fan-out call (scope=local) stops here so a
+		// missing pid can't recurse across the cluster.
+		if !localScope(c) && fetcher != nil {
+			bodies, _ := fetcher.FetchPeers(c.Request.Context(), "/api/v1/queries/"+strconv.FormatInt(pid64, 10))
+			for _, b := range bodies {
+				var d QueryDetail
+				if json.Unmarshal(b, &d) == nil && d.PID == int32(pid64) {
+					c.JSON(http.StatusOK, d)
+					return
+				}
+			}
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "no live query with that pid"})
 	})
 
 	r.GET("/workers/fleet", func(c *gin.Context) {

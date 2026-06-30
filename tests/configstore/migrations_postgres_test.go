@@ -23,8 +23,14 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 3)
 	requireGooseMigrationRecorded(t, db, 4)
 	requireGooseMigrationRecorded(t, db, 5)
-	requireGooseLatestVersion(t, db, 5)
+	requireGooseMigrationRecorded(t, db, 6)
+	requireGooseMigrationRecorded(t, db, 7)
+	requireGooseLatestVersion(t, db, 7)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
+
+	// Migration 000007 added the compute-usage billing buffer + drain state.
+	requireTablePresent(t, db, "duckgres_org_compute_usage")
+	requireTablePresent(t, db, "duckgres_org_compute_drain_state")
 
 	// Migration 000004 dropped the dead cluster-wide singleton config tables.
 	requireTableAbsent(t, db, "duckgres_global_config")
@@ -191,6 +197,7 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 		&cpconfigstore.ManagedWarehouse{},
 		&cpconfigstore.OrgUser{},
 		&cpconfigstore.OrgUserSecret{},
+		&cpconfigstore.Operator{},
 	); err != nil {
 		t.Fatalf("auto-migrate gorm comparison schema: %v", err)
 	}
@@ -258,6 +265,25 @@ func requireGooseLatestVersion(t *testing.T, db *sql.DB, version int64) {
 	}
 	if !latest.Valid || latest.Int64 != version {
 		t.Fatalf("latest goose migration version = %v, want %d", latest, version)
+	}
+}
+
+func requireTablePresent(t *testing.T, db *sql.DB, tableName string) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+		)
+	`, tableName).Scan(&exists); err != nil {
+		t.Fatalf("check table %q presence: %v", tableName, err)
+	}
+	if !exists {
+		t.Fatalf("table %q missing, want present", tableName)
 	}
 }
 
@@ -330,6 +356,7 @@ func loadConfigStoreColumnMetadata(t *testing.T, db *sql.DB) map[string]columnMe
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -386,6 +413,7 @@ func loadConfigStorePrimaryKeys(t *testing.T, db *sql.DB) map[string]primaryKeyM
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -437,6 +465,7 @@ func loadConfigStoreIndexes(t *testing.T, db *sql.DB) map[string]indexMetadata {
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -500,6 +529,7 @@ func loadConfigStoreForeignKeys(t *testing.T, db *sql.DB) map[string]foreignKeyM
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',

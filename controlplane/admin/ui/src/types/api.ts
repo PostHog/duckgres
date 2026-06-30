@@ -14,9 +14,22 @@ export type Role = "admin" | "viewer";
 // internal-secret). Backed by admin/authz.go Identity.
 export interface Me {
   email: string;
-  groups: string[];
   role: Role;
   source: string; // "sso" | "internal-secret"
+}
+
+// ---- Operators (admin allow-list) ----
+
+// GET /api/v1/operators → { operators: Operator[] } (admin-only). An operator is
+// an SSO identity granted admin/viewer access to this console. Mutations go
+// through POST /api/v1/operators (upsert) and DELETE /api/v1/operators/:email;
+// both 409 if the change would remove the last admin.
+export interface Operator {
+  email: string;
+  role: Role;
+  added_by: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // ---- Orgs (confirmed) ----

@@ -135,7 +135,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	isHealthy func() bool,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, *computeMeter, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -143,7 +143,7 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Per-user persistent secret manager (CREATE PERSISTENT SECRET). With no
@@ -151,7 +151,7 @@ func SetupMultiTenant(
 	// but persistence is disabled with a clear client-facing error.
 	userSecrets, err := NewCPUserSecretManager(store, cfg.UserSecretKey)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 	server.SetUserSecretManager(srv, userSecrets)
 	if cfg.UserSecretKey == "" {
@@ -162,7 +162,7 @@ func SetupMultiTenant(
 
 	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	cpID := cfg.K8s.ControlPlaneID
@@ -178,7 +178,7 @@ func SetupMultiTenant(
 	}
 	bootID := make([]byte, 16)
 	if _, err := rand.Read(bootID); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
 	}
 	bootIDHex := hex.EncodeToString(bootID)
 	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
@@ -241,7 +241,7 @@ func SetupMultiTenant(
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, userSecrets, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	adpt := &orgRouterAdapter{router: router}
@@ -397,7 +397,7 @@ func SetupMultiTenant(
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
@@ -436,7 +436,7 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret; set --internal-secret or DUCKGRES_INTERNAL_SECRET explicitly to avoid rotation on restart.")
@@ -456,19 +456,51 @@ func SetupMultiTenant(
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
 
-	// Admin UI dependencies. SSO group + Prometheus URL are env-only K8s knobs
-	// (set by the chart); see config_resolution.go / CLAUDE.md.
-	ssoCfg := admin.SSOConfig{
-		AdminGroup:  os.Getenv("DUCKGRES_ADMIN_SSO_GROUP"),
-		AllowAllSSO: os.Getenv("DUCKGRES_ADMIN_SSO_ALLOW_ALL") == "true",
+	// Admin UI dependencies. Prometheus URL is an env-only K8s knob (set by the
+	// chart); see config_resolution.go / CLAUDE.md. The admin role for an SSO
+	// caller is resolved per-request from the operators table (managed under
+	// Admin → Operators); the break-glass internal-secret path is independent.
+	//
+	// There is no bootstrap seed. The first SSO login auto-provisions a
+	// create-only VIEWER row for the caller (so an operator appears in the
+	// config store just by logging in), and the role is then read back. To make
+	// the first admin: log in over break-glass (internal-secret → admin) and
+	// patch your auto-provisioned row to admin under Admin → Operators.
+	resolve := func(email string) admin.Role {
+		role, err := store.OperatorRole(email)
+		if err != nil {
+			slog.Warn("admin: operator role lookup failed", "email", email, "error", err)
+		}
+		if role == "" {
+			// Auto-provision (create-only, never clobbers an existing role) so the
+			// caller has a row to be promoted from. Best-effort: a failure here
+			// must not block authentication — the caller simply stays viewer.
+			if err := store.SeedOperator(email, string(admin.RoleViewer)); err != nil {
+				slog.Warn("admin: operator auto-provision failed", "email", email, "error", err)
+			}
+		}
+		if role == "admin" {
+			return admin.RoleAdmin
+		}
+		return admin.RoleViewer
 	}
 	auditStore, err := admin.NewAuditStore(store.DB())
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
 	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
 	clusterInfo := &clusterInfoProvider{router: router, store: store, srv: srv, selfCPID: cpInstanceID}
 	imp := &impersonator{router: router}
+	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
+	// memory, so a single replica only sees its own slice. The fetcher fans the
+	// read out to peer CP pods so the dashboard shows cluster-wide numbers.
+	var liveFetcher admin.PeerFetcher
+	if router.sharedPool != nil && router.sharedPool.clientset != nil {
+		liveFetcher = newClusterPeerFetcher(
+			router.sharedPool.clientset, router.sharedPool.namespace,
+			router.sharedPool.cpID, internalSecret, 8080,
+		)
+	}
 
 	// Authenticated API. AuthMiddleware resolves the caller (internal-secret →
 	// admin, else ALB/Cognito SSO → viewer/admin). AuditMiddleware records every
@@ -477,15 +509,16 @@ func SetupMultiTenant(
 	// RoleGate blocks viewer mutations (method-based); the audit-log read
 	// self-gates via RequireAdmin at its route (no brittle path coupling here).
 	api := engine.Group("/api/v1",
-		admin.AuthMiddleware(adminTokens, ssoCfg),
+		admin.AuthMiddleware(adminTokens, resolve),
 		admin.AuditMiddleware(auditStore),
 		admin.RoleGate(),
 	)
-	admin.RegisterAPI(api, store, adpt)
+	admin.RegisterAPI(api, store, adpt, liveFetcher)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
 	admin.RegisterExtras(api, admin.Extras{
 		Store:        store,
 		Live:         clusterInfo,
+		Fetcher:      liveFetcher,
 		Impersonator: imp,
 		Audit:        auditStore,
 		Metrics:      metricsProxy,
@@ -496,7 +529,7 @@ func SetupMultiTenant(
 
 	// Embedded React SPA (served unauthenticated; all data is under /api/v1).
 	if err := admin.RegisterUI(engine); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
 	}
 
 	apiServer := &http.Server{
@@ -510,7 +543,26 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
+	// Compute-usage metering (managed-warehouse billing). Enabled only when both
+	// ingest URL and token are configured; otherwise the meter is nil and every
+	// call site no-ops (queries are NEVER failed on its account). The flusher
+	// runs on every CP pod (cross-pod UPSERT-increment); the drain loop is
+	// leader-only, co-located under the janitor lease so exactly one CP ships.
+	var meter *computeMeter
+	if cfg.BillingMeteringEnabled() {
+		meter = newComputeMeter(store)
+		go meter.Run(context.Background())
+
+		drainer := newComputeDrainer(store, newComputeCaptureClient(cfg.BillingIngestURL, cfg.BillingIngestToken))
+		if janitorLeader != nil {
+			janitorLeader.AttachLeaderLoop(drainer.Run)
+		}
+		slog.Info("Managed-warehouse compute-usage metering enabled.", "ingest_url", cfg.BillingIngestURL)
+	} else {
+		slog.Info("Managed-warehouse compute-usage metering disabled (DUCKGRES_BILLING_INGEST_URL/TOKEN not both set).")
+	}
+
+	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
 }
 
 type workerLifecycleStatsLister interface {

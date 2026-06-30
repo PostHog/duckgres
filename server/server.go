@@ -2747,10 +2747,20 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 		conn:   conn,
 	}
 
-	if err := c.serve(); err != nil {
-		slog.Error("Connection error.", "user", c.username, "remote_addr", remoteAddr, "error", err)
+	err := c.serve()
+	// backendStart is set early in serve() (after the startup message); if serve
+	// failed before that (e.g. TLS/startup error) it is zero — skip the histogram
+	// and report duration_ms=0 rather than a bogus since-epoch value.
+	var durMs int64
+	if !c.backendStart.IsZero() {
+		d := time.Since(c.backendStart)
+		durMs = d.Milliseconds()
+		observe.ObserveConnectionDuration(c.orgID, d.Seconds())
+	}
+	if err != nil {
+		slog.Error("Connection error.", "user", c.username, "remote_addr", remoteAddr, "duration_ms", durMs, "error", err)
 	} else {
-		slog.Info("Client disconnected.", "user", c.username, "remote_addr", remoteAddr)
+		slog.Info("Client disconnected.", "user", c.username, "remote_addr", remoteAddr, "duration_ms", durMs)
 	}
 }
 
