@@ -129,7 +129,7 @@ type apiStore interface {
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
-	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error)
+	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
@@ -180,6 +180,7 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	fields := map[string]interface{}{
 		"max_workers":     updates.MaxWorkers,
 		"max_connections": updates.MaxConnections,
+		"max_vcpus":       updates.MaxVCPUs,
 		// Org default worker profile: written unconditionally so an explicit
 		// empty string CLEARS the default (the handler's presence-merge keeps
 		// omitted fields at their stored values before this runs).
@@ -250,7 +251,7 @@ func (s *gormAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
@@ -260,6 +261,9 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	}
 	if defaultCatalog != nil {
 		updates["default_catalog"] = *defaultCatalog
+	}
+	if maxVCPUs != nil {
+		updates["max_vcpus"] = *maxVCPUs
 	}
 	if len(updates) == 0 {
 		// Nothing to change — return the current row so callers can still
@@ -570,6 +574,9 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["max_connections"]; ok {
 		merged.MaxConnections = updates.MaxConnections
 	}
+	if _, ok := fields["max_vcpus"]; ok {
+		merged.MaxVCPUs = updates.MaxVCPUs
+	}
 	// Org default worker profile: present-in-payload wins, including an
 	// explicit "" which clears the default.
 	if _, ok := fields["default_worker_cpu"]; ok {
@@ -630,6 +637,9 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	if org.DefaultWorkerMinHotIdle < 0 {
 		return fmt.Errorf("default_worker_min_hot_idle: value %d must be >= 0", org.DefaultWorkerMinHotIdle)
+	}
+	if org.MaxVCPUs < 0 {
+		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
 	}
 	return nil
 }
@@ -895,6 +905,7 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		OrgID          string `json:"org_id"`
 		Passthrough    bool   `json:"passthrough"`
 		DefaultCatalog string `json:"default_catalog"`
+		MaxVCPUs       int    `json:"max_vcpus"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -914,6 +925,10 @@ func (h *apiHandler) createUser(c *gin.Context) {
 	} else {
 		raw.DefaultCatalog = catalog
 	}
+	if raw.MaxVCPUs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
+		return
+	}
 	hash, err := configstore.HashPassword(raw.Password)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
@@ -925,6 +940,7 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		OrgID:          raw.OrgID,
 		Passthrough:    raw.Passthrough,
 		DefaultCatalog: raw.DefaultCatalog,
+		MaxVCPUs:       raw.MaxVCPUs,
 	}
 	if err := h.store.CreateUser(&user); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -953,10 +969,26 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		Password       string  `json:"password"`
 		Passthrough    *bool   `json:"passthrough,omitempty"`
 		DefaultCatalog *string `json:"default_catalog,omitempty"`
+		MaxVCPUs       *int    `json:"max_vcpus,omitempty"`
 	}
-	if err := c.ShouldBindJSON(&raw); err != nil {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	maxVCPUs := raw.MaxVCPUs
+	if rawMaxVCPUs, ok := fields["max_vcpus"]; ok && bytes.Equal(bytes.TrimSpace(rawMaxVCPUs), []byte("null")) {
+		zero := 0
+		maxVCPUs = &zero
 	}
 	passwordHash := ""
 	if raw.Password != "" {
@@ -975,7 +1007,11 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		raw.DefaultCatalog = &catalog
 	}
-	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog)
+	if maxVCPUs != nil && *maxVCPUs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
+		return
+	}
+	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog, maxVCPUs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

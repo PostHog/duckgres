@@ -101,6 +101,7 @@ type DurableSessionRecord struct {
 	Username     string
 	OrgID        string
 	WorkerID     int
+	PID          int32
 	OwnerEpoch   int64
 	CPInstanceID string
 	State        DurableSessionState
@@ -113,6 +114,7 @@ type DurableSessionStore interface {
 	GetSession(sessionToken string) (*DurableSessionRecord, error)
 	TouchSession(sessionToken string, lastSeenAt time.Time) error
 	CloseSession(sessionToken string, closedAt time.Time) error
+	CloseSessionIfReconnectTargetUnchanged(stale DurableSessionRecord, closedAt time.Time) (bool, error)
 }
 
 type sessionMetadataProvider interface {
@@ -1914,6 +1916,7 @@ func (s *flightAuthSessionStore) persistSession(session *flightClientSession, us
 		Username:     username,
 		OrgID:        meta.OrgID,
 		WorkerID:     meta.WorkerID,
+		PID:          session.pid,
 		OwnerEpoch:   meta.OwnerEpoch,
 		CPInstanceID: meta.CPInstanceID,
 		State:        DurableSessionStateActive,
@@ -1955,14 +1958,14 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 		return nil, false
 	}
 	if !record.ExpiresAt.IsZero() && time.Now().After(record.ExpiresAt) {
-		_ = s.durableStore.CloseSession(token, time.Now())
+		s.closeDurableSessionIfReconnectTargetUnchanged(token, *record, time.Now())
 		return nil, false
 	}
 	pid, executor, err := s.reconnector.ReconnectSession(ctx, *record)
 	if err != nil {
 		slog.Warn("Reconnecting durable Flight session failed.", "token_fp", tokenFingerprint(token), "error", err)
 		if errors.Is(err, ErrDurableReconnectTerminal) {
-			_ = s.durableStore.CloseSession(token, time.Now())
+			s.closeDurableSessionIfReconnectTargetUnchanged(token, *record, time.Now())
 		}
 		return nil, false
 	}
@@ -1982,6 +1985,25 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	s.notifySessionCountChanged(sessionCount)
 	s.persistSession(session, record.Username)
 	return session, true
+}
+
+func (s *flightAuthSessionStore) closeDurableSessionIfReconnectTargetUnchanged(token string, stale DurableSessionRecord, closedAt time.Time) {
+	if s == nil || s.durableStore == nil {
+		return
+	}
+	if _, err := s.durableStore.CloseSessionIfReconnectTargetUnchanged(stale, closedAt); err != nil {
+		slog.Warn("Closing durable Flight session failed.", "token_fp", tokenFingerprint(token), "error", err)
+	}
+}
+
+func sameDurableReconnectTarget(a, b DurableSessionRecord) bool {
+	return a.SessionToken == b.SessionToken &&
+		a.Username == b.Username &&
+		a.OrgID == b.OrgID &&
+		a.WorkerID == b.WorkerID &&
+		a.PID == b.PID &&
+		a.OwnerEpoch == b.OwnerEpoch &&
+		a.CPInstanceID == b.CPInstanceID
 }
 
 func (s *flightAuthSessionStore) removeByKeyForTokenLocked(token string) {

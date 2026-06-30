@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatal("expected runtime schema to be configured")
 	}
 
-	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records"} {
+	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records", "org_connection_queue", "org_connection_leases"} {
 		var count int64
 		if err := store.DB().Raw(
 			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
@@ -35,6 +36,10 @@ func TestRuntimeStorePostgres(t *testing.T) {
 			t.Fatalf("expected runtime table %s.%s to exist", runtimeSchema, table)
 		}
 	}
+	requireRuntimeIndexDefinition(t, store, "org_connection_queue", "idx_org_connection_queue_user_heads",
+		"(org_id, username, enqueued_at, request_id)", "WHERE (granted_at IS NULL)")
+	requireRuntimeIndexDefinition(t, store, "org_connection_leases", "idx_org_connection_leases_org_user",
+		"(org_id, username)")
 
 	startedAt := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	heartbeatAt := startedAt.Add(5 * time.Second)
@@ -87,6 +92,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		Username:     "postgres",
 		OrgID:        "analytics",
 		WorkerID:     42,
+		PID:          1234,
 		OwnerEpoch:   7,
 		State:        configstore.FlightSessionStateActive,
 		ExpiresAt:    sessionExpiry,
@@ -102,6 +108,9 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	if session.WorkerID != 42 {
 		t.Fatalf("expected worker id 42, got %d", session.WorkerID)
 	}
+	if session.PID != 1234 {
+		t.Fatalf("expected pid 1234, got %d", session.PID)
+	}
 	if session.Username != "postgres" {
 		t.Fatalf("expected username postgres, got %q", session.Username)
 	}
@@ -109,6 +118,30 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatalf("expected session state active, got %q", session.State)
 	}
 }
+
+func requireRuntimeIndexDefinition(t *testing.T, store *configstore.ConfigStore, tableName, indexName string, wantSubstrings ...string) {
+	t.Helper()
+
+	var indexDef string
+	err := store.DB().Raw(
+		"SELECT indexdef FROM pg_indexes WHERE schemaname = ? AND tablename = ? AND indexname = ?",
+		store.RuntimeSchema(),
+		tableName,
+		indexName,
+	).Scan(&indexDef).Error
+	if err != nil {
+		t.Fatalf("lookup runtime index %s.%s: %v", tableName, indexName, err)
+	}
+	if indexDef == "" {
+		t.Fatalf("runtime index %s.%s is missing", tableName, indexName)
+	}
+	for _, want := range wantSubstrings {
+		if !strings.Contains(indexDef, want) {
+			t.Fatalf("runtime index %s.%s definition = %q, want substring %q", tableName, indexName, indexDef, want)
+		}
+	}
+}
+
 func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 26, 14, 45, 0, 0, time.UTC)
@@ -1677,9 +1710,10 @@ func TestMarkCredentialsRefreshedFailsOnOwnerMismatch(t *testing.T) {
 // worker whose owning CP has expired is normally an orphan-cleanup
 // candidate. But if a Flight client could still reconnect by session
 // token (record is in active or reconnecting state), the orphan retire
-// would kill an in-flight customer query the moment they reconnect. The
-// JOIN onto flight_session_records gives those workers a reprieve until
-// the session record itself is expired by ExpireFlightSessionRecords.
+// would remove the worker before the token holder can establish a fresh
+// remote session. The JOIN onto flight_session_records gives those
+// workers a reprieve until the session record itself is expired by
+// ExpireFlightSessionRecords.
 func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
@@ -1737,9 +1771,9 @@ func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T
 }
 
 // TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions:
-// the reconnecting state means a customer is mid-handshake from a Flight
-// client picking the session back up. Same protection applies — kill the
-// worker and you kill the resumption.
+// the reconnecting state means a Flight client is mid-handshake for a
+// token-backed fresh remote session. Same protection applies — retire the
+// worker and that reconnect attempt cannot finish.
 func TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
@@ -1933,6 +1967,65 @@ func TestGetTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
 	}
 	if !record.LastSeenAt.Equal(closedAt) {
 		t.Fatalf("expected close timestamp %v, got %v", closedAt, record.LastSeenAt)
+	}
+}
+
+func TestCloseFlightSessionRecordIfReconnectTargetUnchangedPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 16, 30, 0, 0, time.UTC)
+	stale := configstore.FlightSessionRecord{
+		SessionToken: "flight-cas-close",
+		Username:     "postgres",
+		OrgID:        "analytics",
+		WorkerID:     42,
+		PID:          1001,
+		OwnerEpoch:   7,
+		CPInstanceID: "cp-old:boot-a",
+		State:        configstore.FlightSessionStateActive,
+		ExpiresAt:    now.Add(time.Hour),
+		LastSeenAt:   now,
+	}
+	if err := store.UpsertFlightSessionRecord(&stale); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord(stale): %v", err)
+	}
+
+	refreshed := stale
+	refreshed.PID = 2002
+	refreshed.OwnerEpoch = 8
+	refreshed.CPInstanceID = "cp-new:boot-b"
+	refreshed.LastSeenAt = now.Add(time.Minute)
+	if err := store.UpsertFlightSessionRecord(&refreshed); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord(refreshed): %v", err)
+	}
+
+	closed, err := store.CloseFlightSessionRecordIfReconnectTargetUnchanged(stale, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("CloseFlightSessionRecordIfReconnectTargetUnchanged(stale): %v", err)
+	}
+	if closed {
+		t.Fatal("expected stale reconnect target not to close refreshed durable session")
+	}
+	record, err := store.GetFlightSessionRecord("flight-cas-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord: %v", err)
+	}
+	if record.State != configstore.FlightSessionStateActive || record.PID != 2002 || record.CPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected refreshed durable record to remain active, got %#v", record)
+	}
+
+	closed, err = store.CloseFlightSessionRecordIfReconnectTargetUnchanged(refreshed, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("CloseFlightSessionRecordIfReconnectTargetUnchanged(refreshed): %v", err)
+	}
+	if !closed {
+		t.Fatal("expected current reconnect target to close")
+	}
+	record, err = store.GetFlightSessionRecord("flight-cas-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord(closed): %v", err)
+	}
+	if record.State != configstore.FlightSessionStateClosed {
+		t.Fatalf("expected durable record to be closed, got %#v", record)
 	}
 }
 

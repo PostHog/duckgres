@@ -179,6 +179,9 @@ func (f *fakeConfigStore) TouchFlightSessionRecord(string, time.Time) error {
 func (f *fakeConfigStore) CloseFlightSessionRecord(string, time.Time) error {
 	panic("CloseFlightSessionRecord should not be called from SNI tests")
 }
+func (f *fakeConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(configstore.FlightSessionRecord, time.Time) (bool, error) {
+	panic("CloseFlightSessionRecordIfReconnectTargetUnchanged should not be called from SNI tests")
+}
 
 func newFlightValidator(t *testing.T, mode string, store *fakeConfigStore) *cpFlightCredentialValidator {
 	t.Helper()

@@ -240,3 +240,22 @@ func firstNonEmpty(a, b string) string {
 	}
 	return b
 }
+
+func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int, error) {
+	cpu := strings.TrimSpace(workerCPURequest)
+	if profile != nil && strings.TrimSpace(profile.CPU) != "" {
+		cpu = strings.TrimSpace(profile.CPU)
+	}
+	if cpu == "" {
+		cpu = defaultWorkerCPU
+	}
+	q, err := resource.ParseQuantity(cpu)
+	if err != nil {
+		return 0, fmt.Errorf("invalid worker cpu quantity %q: %w", cpu, err)
+	}
+	millis := q.MilliValue()
+	if millis <= 0 {
+		return 0, fmt.Errorf("worker cpu quantity %q must be positive", cpu)
+	}
+	return int((millis + 999) / 1000), nil
+}
