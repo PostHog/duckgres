@@ -124,6 +124,42 @@ func TestResolveWorkerProfileSizing_NoSizingIsNil(t *testing.T) {
 	}
 }
 
+func TestRequestedWorkerVCPUs(t *testing.T) {
+	tests := []struct {
+		name       string
+		profile    *WorkerProfile
+		defaultCPU string
+		want       int
+		wantErr    bool
+	}{
+		{name: "profile wins", profile: &WorkerProfile{CPU: "4"}, defaultCPU: "8", want: 4},
+		{name: "default cpu", defaultCPU: "8", want: 8},
+		{name: "built in default", want: 8},
+		{name: "millicpu rounds up", defaultCPU: "500m", want: 1},
+		{name: "profile millicpu rounds up", profile: &WorkerProfile{CPU: "1500m"}, defaultCPU: "8", want: 2},
+		{name: "bad cpu", defaultCPU: "a lot", wantErr: true},
+		{name: "zero cpu", defaultCPU: "0", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := requestedWorkerVCPUs(tt.profile, tt.defaultCPU)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("requestedWorkerVCPUs() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 // When the client DOES set sizing and no default size is configured, the built-in
 // 8/16Gi/20m applies for the omitted fields.
 func TestResolveWorkerProfileSizing_BuiltinDefaults(t *testing.T) {

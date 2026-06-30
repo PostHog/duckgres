@@ -45,7 +45,7 @@ export interface Org {
   database_name: string;
   hostname_alias: string | null;
   max_workers: number;
-  max_connections: number;
+  max_vcpus: number;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -59,7 +59,7 @@ export interface Org {
 // Editable subset of Org accepted by PUT /api/v1/orgs/:id.
 export interface OrgUpdate {
   max_workers?: number;
-  max_connections?: number;
+  max_vcpus?: number;
   default_worker_cpu?: string;
   default_worker_memory?: string;
   default_worker_ttl?: string;
@@ -74,6 +74,7 @@ export interface OrgUser {
   username: string;
   passthrough: boolean;
   default_catalog?: string;
+  max_vcpus: number;
   created_at: string;
   updated_at: string;
 }
@@ -84,12 +85,14 @@ export interface CreateUserBody {
   org_id: string;
   passthrough?: boolean;
   default_catalog?: string;
+  max_vcpus?: number;
 }
 
 export interface UpdateUserBody {
   password?: string;
   passthrough?: boolean;
   default_catalog?: string;
+  max_vcpus?: number;
 }
 
 // GET /api/v1/orgs/:id/users/:username/secrets → { secrets: OrgUserSecret[] }.
@@ -115,6 +118,9 @@ export type WarehouseState =
 
 export interface ManagedWarehouse {
   org_id: string;
+  // The explicit Duckling CR name (provisioner-owned). May be "" on legacy rows
+  // that predate the field — callers fall back to ducklingName(org) in that case.
+  duckling_name: string;
   image: string;
   ducklake_version: string;
   warehouse_database: { endpoint: string; port: number };
@@ -171,6 +177,30 @@ export interface ManagedWarehouse {
   updated_at: string;
 }
 
+// ---- Duckling drift (admin-only) ----
+
+// One mismatch between a managed warehouse row and its Duckling custom resource.
+// For issue "orphan" (a CR with no warehouse row) `org` is "".
+export type DucklingDriftIssue = "missing" | "not_ready" | "state_mismatch" | "orphan" | "check_error";
+
+export interface DucklingDrift {
+  org: string;
+  duckling_name: string;
+  warehouse_state: string;
+  cr_present: boolean;
+  cr_ready: boolean;
+  issue: DucklingDriftIssue;
+  message: string;
+}
+
+// GET /api/v1/ducklings/drift → drift report (admin-only; 403s for viewers).
+// `available` is false when the check could not run.
+export interface DucklingDriftResponse {
+  available: boolean;
+  checked: number;
+  entries: DucklingDrift[];
+}
+
 // ---- Cluster status (confirmed) ----
 
 export interface OrgStatus {
@@ -195,6 +225,9 @@ export interface WorkerStatus {
   org: string;
   active_sessions: number;
   status: string; // "active" | "idle"
+  cpu: string; // e.g. "8"
+  memory: string; // e.g. "16Gi"
+  ttl_seconds: number; // 0 = default/unset
 }
 
 // GET /api/v1/sessions → SessionStatus[]. Note `user` (not `username`).
@@ -226,6 +259,8 @@ export interface FleetStat {
   state: WorkerLifecycleState;
   binding: string;
   count: number;
+  cpu_cores: number;
+  memory_bytes: number;
 }
 
 // GET /api/v1/cluster/instances → { instances: CPInstance[] }.
@@ -248,13 +283,14 @@ export interface RunningQuery {
   rows: number;
   total_rows: number;
   stalled: boolean;
+  started_at?: string; // RFC3339 session start (session age); may be absent/zero
   elapsed_ms: number; // how long the current statement has been running (0 = idle)
 }
 
-// GET /api/v1/queries/:pid → expanded detail for one in-flight query. Fetched
-// on demand when a query row is opened. `query` is redacted server-side
-// (usersecrets.RedactForLog) — never raw SQL. Scoped to queries owned by the
-// serving control-plane replica (404 otherwise).
+// GET /api/v1/queries/by-worker/:wid → expanded detail for one in-flight query,
+// addressed by cluster-unique worker id. Fetched on demand when a query row is
+// opened. `query` is redacted server-side (usersecrets.RedactForLog) — never raw
+// SQL. Scatter-gathers across CP replicas; 404 if no replica owns the worker.
 export interface QueryDetail {
   org: string;
   user: string;

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	cpconfigstore "github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func upsertActiveCP(t *testing.T, store *cpconfigstore.ConfigStore, id string) {
@@ -27,29 +29,33 @@ func upsertActiveCP(t *testing.T, store *cpconfigstore.ConfigStore, id string) {
 	}
 }
 
-func TestOrgConnectionLeasesEnforceClusterWideLimit(t *testing.T) {
+func TestOrgConnectionLeasesEnforceOrgVCPUBudget(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
 	upsertActiveCP(t, store, "cp-b")
 
 	now := time.Now()
 	first := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "request-a",
-		OrgID:        "org-1",
-		CPInstanceID: "cp-a",
-		PID:          1001,
-		Protocol:     "postgres",
-		EnqueuedAt:   now,
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      "request-a",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 4,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	second := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "request-b",
-		OrgID:        "org-1",
-		CPInstanceID: "cp-b",
-		PID:          1002,
-		Protocol:     "postgres",
-		EnqueuedAt:   now.Add(time.Millisecond),
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      "request-b",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 3,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(first); err != nil {
 		t.Fatalf("enqueue first request: %v", err)
@@ -58,7 +64,788 @@ func TestOrgConnectionLeasesEnforceClusterWideLimit(t *testing.T) {
 		t.Fatalf("enqueue second request: %v", err)
 	}
 
-	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, 1, now)
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 6}
+	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire first lease: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected first request to acquire a lease")
+	}
+
+	blocked, err := store.TryAcquireOrgConnectionLease(second.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire second lease: %v", err)
+	}
+	if blocked != nil {
+		t.Fatalf("expected second request to be blocked by org vCPU budget, got lease %q", blocked.LeaseID)
+	}
+
+	if err := store.ReleaseOrgConnectionLease(lease.LeaseID); err != nil {
+		t.Fatalf("release first lease: %v", err)
+	}
+	lease, err = store.TryAcquireOrgConnectionLease(second.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire second lease after release: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected second request to acquire after vCPUs are released")
+	}
+}
+
+func TestOrgConnectionLeasesEnforceUserVCPUBudget(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	first := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-a",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 4,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	second := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-b",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 3,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(first); err != nil {
+		t.Fatalf("enqueue first request: %v", err)
+	}
+	if err := store.EnqueueOrgConnectionRequest(second); err != nil {
+		t.Fatalf("enqueue second request: %v", err)
+	}
+
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 20, UserMaxVCPUs: 6}
+	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire first lease: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected first request to acquire a lease")
+	}
+
+	blocked, err := store.TryAcquireOrgConnectionLease(second.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire second lease: %v", err)
+	}
+	if blocked != nil {
+		t.Fatalf("expected second request to be blocked by user vCPU budget, got lease %q", blocked.LeaseID)
+	}
+}
+
+func TestOrgConnectionLeasesUserCapDoesNotBlockOtherUsers(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	activeAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-active-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(activeAlice); err != nil {
+		t.Fatalf("enqueue active alice request: %v", err)
+	}
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 10, UserMaxVCPUs: 1}
+	lease, err := store.TryAcquireOrgConnectionLease(activeAlice.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire active alice lease: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected active alice request to acquire a lease")
+	}
+
+	blockedAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-blocked-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1003,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(2 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(blockedAlice); err != nil {
+		t.Fatalf("enqueue blocked alice request: %v", err)
+	}
+	if err := store.EnqueueOrgConnectionRequest(bob); err != nil {
+		t.Fatalf("enqueue bob request: %v", err)
+	}
+
+	lease, err = store.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire bob request: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected bob request to bypass alice request blocked by alice's user vCPU budget")
+	}
+	if lease.RequestID != bob.RequestID {
+		t.Fatalf("expected bob lease, got %#v", lease)
+	}
+
+	stillBlocked, err := store.TryAcquireOrgConnectionLease(blockedAlice.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire blocked alice request: %v", err)
+	}
+	if stillBlocked != nil {
+		t.Fatalf("expected alice request to remain blocked by alice's user vCPU budget, got lease %q", stillBlocked.LeaseID)
+	}
+}
+
+func TestOrgConnectionLeasesQueueUsesEachUsersOwnLimit(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	activeAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-active-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(activeAlice); err != nil {
+		t.Fatalf("enqueue active alice request: %v", err)
+	}
+	limitLookup := func(username string) cpconfigstore.OrgResourceLimits {
+		switch username {
+		case "alice":
+			return cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 10, UserMaxVCPUs: 1}
+		case "bob":
+			return cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 10}
+		default:
+			return cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 10}
+		}
+	}
+	lease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(activeAlice.RequestID, limitLookup, now)
+	if err != nil {
+		t.Fatalf("acquire active alice lease: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected active alice request to acquire a lease")
+	}
+
+	blockedAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-blocked-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1003,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(2 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(blockedAlice); err != nil {
+		t.Fatalf("enqueue blocked alice request: %v", err)
+	}
+	if err := store.EnqueueOrgConnectionRequest(bob); err != nil {
+		t.Fatalf("enqueue bob request: %v", err)
+	}
+
+	lease, err = store.TryAcquireOrgConnectionLeaseWithLimitLookup(bob.RequestID, limitLookup, now)
+	if err != nil {
+		t.Fatalf("acquire bob request: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected bob request to bypass alice using alice's saturated user limit, even though bob is unlimited")
+	}
+}
+
+func TestOrgConnectionLeasesOutOfOrderPollGrantsOldestEligibleUserHead(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	alice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(alice); err != nil {
+		t.Fatalf("enqueue alice request: %v", err)
+	}
+	if err := store.EnqueueOrgConnectionRequest(bob); err != nil {
+		t.Fatalf("enqueue bob request: %v", err)
+	}
+
+	outOfOrder, err := store.TryAcquireOrgConnectionLease(bob.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
+	if err != nil {
+		t.Fatalf("out-of-order acquire: %v", err)
+	}
+	if outOfOrder != nil {
+		t.Fatalf("expected bob to keep waiting while alice is granted first, got lease %q", outOfOrder.LeaseID)
+	}
+
+	aliceLease, err := store.TryAcquireOrgConnectionLease(alice.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
+	if err != nil {
+		t.Fatalf("acquire alice after scheduler grant: %v", err)
+	}
+	if aliceLease == nil || aliceLease.RequestID != alice.RequestID {
+		t.Fatalf("expected alice lease to have been granted by bob's poll, got %#v", aliceLease)
+	}
+}
+
+func TestCancelOrgConnectionRequestReleasesForeignGrantedLease(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	alice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{alice, bob} {
+		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+			t.Fatalf("enqueue %s: %v", entry.RequestID, err)
+		}
+	}
+
+	outOfOrder, err := store.TryAcquireOrgConnectionLease(bob.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+	if err != nil {
+		t.Fatalf("out-of-order acquire: %v", err)
+	}
+	if outOfOrder != nil {
+		t.Fatalf("expected bob to keep waiting while alice is granted first, got lease %q", outOfOrder.LeaseID)
+	}
+	count, err := store.ActiveOrgConnectionLeaseCount(alice.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases before cancel: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected alice foreign-granted lease to reserve capacity, got %d active leases", count)
+	}
+
+	if err := store.CancelOrgConnectionRequest(alice.RequestID, now.Add(time.Second)); err != nil {
+		t.Fatalf("cancel alice request: %v", err)
+	}
+	count, err = store.ActiveOrgConnectionLeaseCount(alice.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after cancel: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected cancel to release unclaimed foreign-granted lease, got %d active leases", count)
+	}
+}
+
+func TestOrgConnectionLeasesUserCapSkipDoesNotBypassSameUserFIFO(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	activeAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-active-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 2,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(activeAlice); err != nil {
+		t.Fatalf("enqueue active alice request: %v", err)
+	}
+	limitLookup := func(username string) cpconfigstore.OrgResourceLimits {
+		switch username {
+		case "alice":
+			return cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 10, UserMaxVCPUs: 3}
+		default:
+			return cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 10}
+		}
+	}
+	lease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(activeAlice.RequestID, limitLookup, now)
+	if err != nil {
+		t.Fatalf("acquire active alice request: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected active alice request to acquire a lease")
+	}
+
+	aliceBig := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice-big",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 2,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	aliceSmall := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice-small",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1003,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(2 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1004,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(3 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{aliceBig, aliceSmall, bob} {
+		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+			t.Fatalf("enqueue %s: %v", entry.RequestID, err)
+		}
+	}
+
+	aliceSmallLease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(aliceSmall.RequestID, limitLookup, now)
+	if err != nil {
+		t.Fatalf("acquire alice small request: %v", err)
+	}
+	if aliceSmallLease != nil {
+		t.Fatalf("expected alice small request to wait behind alice big FIFO head, got lease %q", aliceSmallLease.LeaseID)
+	}
+
+	bobLease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(bob.RequestID, limitLookup, now)
+	if err != nil {
+		t.Fatalf("acquire bob request: %v", err)
+	}
+	if bobLease == nil || bobLease.RequestID != bob.RequestID {
+		t.Fatalf("expected bob to bypass alice's user-capped queue, got %#v", bobLease)
+	}
+}
+
+func TestOrgConnectionLeasesOrgCapStopsAtFirstUnblockedUserHead(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+	upsertActiveCP(t, store, "cp-c")
+
+	now := time.Now()
+	activeAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-active-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	activeOrg := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-active-org",
+		OrgID:          "org-1",
+		Username:       "dave",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 2,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	limitLookup := func(username string) cpconfigstore.OrgResourceLimits {
+		switch username {
+		case "alice":
+			return cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 4, UserMaxVCPUs: 1}
+		default:
+			return cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 4}
+		}
+	}
+	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{activeAlice, activeOrg} {
+		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+			t.Fatalf("enqueue %s: %v", entry.RequestID, err)
+		}
+		lease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(entry.RequestID, limitLookup, now)
+		if err != nil {
+			t.Fatalf("acquire %s: %v", entry.RequestID, err)
+		}
+		if lease == nil {
+			t.Fatalf("expected %s to acquire a lease", entry.RequestID)
+		}
+	}
+
+	blockedAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-blocked-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1003,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(2 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1004,
+		Protocol:       "postgres",
+		RequestedVCPUs: 2,
+		EnqueuedAt:     now.Add(3 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	carol := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-carol",
+		OrgID:          "org-1",
+		Username:       "carol",
+		CPInstanceID:   "cp-c",
+		PID:            1005,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(4 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{blockedAlice, bob, carol} {
+		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+			t.Fatalf("enqueue %s: %v", entry.RequestID, err)
+		}
+	}
+
+	carolLease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(carol.RequestID, limitLookup, now)
+	if err != nil {
+		t.Fatalf("acquire carol request: %v", err)
+	}
+	if carolLease != nil {
+		t.Fatalf("expected carol to wait behind bob's org-cap-blocked head, got lease %q", carolLease.LeaseID)
+	}
+
+	if err := store.ReleaseOrgConnectionLease(activeOrg.RequestID); err != nil {
+		t.Fatalf("release active org lease: %v", err)
+	}
+	bobLease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(bob.RequestID, limitLookup, now)
+	if err != nil {
+		t.Fatalf("acquire bob after release: %v", err)
+	}
+	if bobLease == nil || bobLease.RequestID != bob.RequestID {
+		t.Fatalf("expected bob to acquire before carol after org capacity frees, got %#v", bobLease)
+	}
+}
+
+func TestOrgConnectionLeasesReordersUserQueueAfterHeadGranted(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	aliceFirst := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice-1",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob-1",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	aliceSecond := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice-2",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1003,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(2 * time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{aliceFirst, bob, aliceSecond} {
+		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+			t.Fatalf("enqueue %s: %v", entry.RequestID, err)
+		}
+	}
+
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 3}
+	aliceFirstLease, err := store.TryAcquireOrgConnectionLease(aliceFirst.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire alice first: %v", err)
+	}
+	if aliceFirstLease == nil {
+		t.Fatal("expected alice first request to acquire")
+	}
+
+	aliceSecondLease, err := store.TryAcquireOrgConnectionLease(aliceSecond.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire alice second before bob: %v", err)
+	}
+	if aliceSecondLease != nil {
+		t.Fatalf("expected alice second to wait behind bob after alice first is granted, got lease %q", aliceSecondLease.LeaseID)
+	}
+
+	bobLease, err := store.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("acquire bob: %v", err)
+	}
+	if bobLease == nil || bobLease.RequestID != bob.RequestID {
+		t.Fatalf("expected bob to acquire before alice second, got %#v", bobLease)
+	}
+}
+
+func TestOrgConnectionAdmissionMetricsObserveAttemptsAndQueueShape(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+
+	durationBefore := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_duration_seconds")
+	queueBefore := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_queue_depth")
+	userQueuesBefore := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_user_queues")
+	outcomesBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_attempts_total")
+
+	now := time.Now()
+	request := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-metrics",
+		OrgID:          "org-metrics",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue metrics request: %v", err)
+	}
+	lease, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
+	if err != nil {
+		t.Fatalf("acquire metrics request: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected metrics request to acquire")
+	}
+
+	durationAfter := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_duration_seconds")
+	queueAfter := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_queue_depth")
+	userQueuesAfter := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_user_queues")
+	outcomesAfter := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_attempts_total")
+
+	if durationAfter-durationBefore != 1 {
+		t.Fatalf("expected admission duration sample delta 1, got %d", durationAfter-durationBefore)
+	}
+	if queueAfter-queueBefore != 1 {
+		t.Fatalf("expected queue depth sample delta 1, got %d", queueAfter-queueBefore)
+	}
+	if userQueuesAfter-userQueuesBefore != 1 {
+		t.Fatalf("expected user queues sample delta 1, got %d", userQueuesAfter-userQueuesBefore)
+	}
+	if outcomesAfter-outcomesBefore != 1 {
+		t.Fatalf("expected admission attempts counter delta 1, got %f", outcomesAfter-outcomesBefore)
+	}
+}
+
+func TestOrgConnectionLeasesChargeLegacyZeroVCPULeaseAsOneVCPU(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	if err := store.DB().Exec(
+		"INSERT INTO "+store.RuntimeSchema()+".org_connection_leases (lease_id, request_id, org_id, cp_instance_id, p_id, protocol, requested_vcpus, acquired_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"legacy-lease", "legacy-request", "org-1", "cp-a", 1001, "postgres", 0, now, now, now,
+	).Error; err != nil {
+		t.Fatalf("insert legacy lease: %v", err)
+	}
+
+	request := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-b",
+		OrgID:          "org-1",
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue request: %v", err)
+	}
+
+	blocked, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+	if err != nil {
+		t.Fatalf("acquire request: %v", err)
+	}
+	if blocked != nil {
+		t.Fatalf("expected legacy zero-vCPU lease to consume fallback capacity, got lease %q", blocked.LeaseID)
+	}
+}
+
+func TestOrgConnectionLeasesChargeLegacyEmptyUserLeaseAgainstUserBudget(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	if err := store.DB().Exec(
+		"INSERT INTO "+store.RuntimeSchema()+".org_connection_leases (lease_id, request_id, org_id, cp_instance_id, p_id, protocol, requested_vcpus, acquired_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"legacy-lease", "legacy-request", "org-1", "cp-a", 1001, "postgres", 0, now, now, now,
+	).Error; err != nil {
+		t.Fatalf("insert legacy lease: %v", err)
+	}
+
+	request := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue request: %v", err)
+	}
+
+	blocked, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 10, UserMaxVCPUs: 1}, now)
+	if err != nil {
+		t.Fatalf("acquire request: %v", err)
+	}
+	if blocked != nil {
+		t.Fatalf("expected legacy empty-user lease to consume fallback user capacity, got lease %q", blocked.LeaseID)
+	}
+}
+
+func TestOrgConnectionLeasesEnforceClusterWideLimit(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	first := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-a",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	second := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-b",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(first); err != nil {
+		t.Fatalf("enqueue first request: %v", err)
+	}
+	if err := store.EnqueueOrgConnectionRequest(second); err != nil {
+		t.Fatalf("enqueue second request: %v", err)
+	}
+
+	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("acquire first lease: %v", err)
 	}
@@ -67,7 +854,7 @@ func TestOrgConnectionLeasesEnforceClusterWideLimit(t *testing.T) {
 		return
 	}
 
-	blocked, err := store.TryAcquireOrgConnectionLease(second.RequestID, 1, now)
+	blocked, err := store.TryAcquireOrgConnectionLease(second.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("acquire second lease: %v", err)
 	}
@@ -87,7 +874,7 @@ func TestOrgConnectionLeasesEnforceClusterWideLimit(t *testing.T) {
 		t.Fatalf("release first lease: %v", err)
 	}
 
-	lease, err = store.TryAcquireOrgConnectionLease(second.RequestID, 1, now)
+	lease, err = store.TryAcquireOrgConnectionLease(second.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("acquire second lease after release: %v", err)
 	}
@@ -104,22 +891,26 @@ func TestOrgConnectionLeasesPreserveFIFOAcrossControlPlanes(t *testing.T) {
 	now := time.Now()
 	entries := []*cpconfigstore.OrgConnectionQueueEntry{
 		{
-			RequestID:    "request-a",
-			OrgID:        "org-1",
-			CPInstanceID: "cp-a",
-			PID:          1001,
-			Protocol:     "postgres",
-			EnqueuedAt:   now,
-			ExpiresAt:    now.Add(time.Minute),
+			RequestID:      "request-a",
+			OrgID:          "org-1",
+			Username:       "alice",
+			CPInstanceID:   "cp-a",
+			PID:            1001,
+			Protocol:       "postgres",
+			RequestedVCPUs: 1,
+			EnqueuedAt:     now,
+			ExpiresAt:      now.Add(time.Minute),
 		},
 		{
-			RequestID:    "request-b",
-			OrgID:        "org-1",
-			CPInstanceID: "cp-b",
-			PID:          1002,
-			Protocol:     "postgres",
-			EnqueuedAt:   now.Add(time.Millisecond),
-			ExpiresAt:    now.Add(time.Minute),
+			RequestID:      "request-b",
+			OrgID:          "org-1",
+			Username:       "alice",
+			CPInstanceID:   "cp-b",
+			PID:            1002,
+			Protocol:       "postgres",
+			RequestedVCPUs: 1,
+			EnqueuedAt:     now.Add(time.Millisecond),
+			ExpiresAt:      now.Add(time.Minute),
 		},
 	}
 	for _, entry := range entries {
@@ -128,7 +919,7 @@ func TestOrgConnectionLeasesPreserveFIFOAcrossControlPlanes(t *testing.T) {
 		}
 	}
 
-	outOfOrder, err := store.TryAcquireOrgConnectionLease("request-b", 1, now)
+	outOfOrder, err := store.TryAcquireOrgConnectionLease("request-b", cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("out-of-order acquire: %v", err)
 	}
@@ -136,7 +927,7 @@ func TestOrgConnectionLeasesPreserveFIFOAcrossControlPlanes(t *testing.T) {
 		t.Fatalf("expected FIFO to block request-b while request-a is pending, got lease %q", outOfOrder.LeaseID)
 	}
 
-	first, err := store.TryAcquireOrgConnectionLease("request-a", 1, now)
+	first, err := store.TryAcquireOrgConnectionLease("request-a", cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("acquire request-a: %v", err)
 	}
@@ -152,22 +943,26 @@ func TestOrgConnectionQueueUsesDatabaseInsertionTimeForFIFO(t *testing.T) {
 
 	now := time.Now()
 	first := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "request-first-inserted",
-		OrgID:        "org-clock-skew",
-		CPInstanceID: "cp-a",
-		PID:          1001,
-		Protocol:     "postgres",
-		EnqueuedAt:   now.Add(10 * time.Minute),
-		ExpiresAt:    now.Add(70 * time.Minute),
+		RequestID:      "request-first-inserted",
+		OrgID:          "org-clock-skew",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(10 * time.Minute),
+		ExpiresAt:      now.Add(70 * time.Minute),
 	}
 	second := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "request-second-inserted",
-		OrgID:        "org-clock-skew",
-		CPInstanceID: "cp-b",
-		PID:          1002,
-		Protocol:     "postgres",
-		EnqueuedAt:   now.Add(-10 * time.Minute),
-		ExpiresAt:    now.Add(50 * time.Minute),
+		RequestID:      "request-second-inserted",
+		OrgID:          "org-clock-skew",
+		Username:       "alice",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(-10 * time.Minute),
+		ExpiresAt:      now.Add(50 * time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(first); err != nil {
 		t.Fatalf("enqueue first request: %v", err)
@@ -176,7 +971,7 @@ func TestOrgConnectionQueueUsesDatabaseInsertionTimeForFIFO(t *testing.T) {
 		t.Fatalf("enqueue second request: %v", err)
 	}
 
-	outOfOrder, err := store.TryAcquireOrgConnectionLease(second.RequestID, 1, now)
+	outOfOrder, err := store.TryAcquireOrgConnectionLease(second.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("out-of-order acquire: %v", err)
 	}
@@ -184,7 +979,7 @@ func TestOrgConnectionQueueUsesDatabaseInsertionTimeForFIFO(t *testing.T) {
 		t.Fatalf("expected database insertion order to block request-second-inserted, got lease %q", outOfOrder.LeaseID)
 	}
 
-	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, 1, now)
+	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("acquire first request: %v", err)
 	}
@@ -200,18 +995,20 @@ func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
 
 	now := time.Now()
 	first := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "request-a",
-		OrgID:        "org-1",
-		CPInstanceID: "cp-a",
-		PID:          1001,
-		Protocol:     "postgres",
-		EnqueuedAt:   now,
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      "request-a",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(first); err != nil {
 		t.Fatalf("enqueue first request: %v", err)
 	}
-	if _, err := store.TryAcquireOrgConnectionLease(first.RequestID, 1, now); err != nil {
+	if _, err := store.TryAcquireOrgConnectionLease(first.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now); err != nil {
 		t.Fatalf("acquire first lease: %v", err)
 	}
 
@@ -228,18 +1025,20 @@ func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
 	}
 
 	second := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "request-b",
-		OrgID:        "org-1",
-		CPInstanceID: "cp-b",
-		PID:          1002,
-		Protocol:     "postgres",
-		EnqueuedAt:   now.Add(time.Millisecond),
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      "request-b",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(second); err != nil {
 		t.Fatalf("enqueue second request: %v", err)
 	}
-	lease, err := store.TryAcquireOrgConnectionLease(second.RequestID, 1, now)
+	lease, err := store.TryAcquireOrgConnectionLease(second.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("acquire second lease: %v", err)
 	}
@@ -254,32 +1053,36 @@ func TestTryAcquireOrgConnectionLeasePrunesStaleMissingControlPlaneOwner(t *test
 
 	now := time.Now()
 	staleLease := &cpconfigstore.OrgConnectionLease{
-		LeaseID:      "missing-owner-lease",
-		RequestID:    "missing-owner-request",
-		OrgID:        "org-missing-owner",
-		CPInstanceID: "missing-cp",
-		PID:          1001,
-		Protocol:     "postgres",
-		AcquiredAt:   now.Add(-10 * time.Minute),
+		LeaseID:        "missing-owner-lease",
+		RequestID:      "missing-owner-request",
+		OrgID:          "org-missing-owner",
+		Username:       "alice",
+		CPInstanceID:   "missing-cp",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		AcquiredAt:     now.Add(-10 * time.Minute),
 	}
 	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_leases").Create(staleLease).Error; err != nil {
 		t.Fatalf("insert stale missing-owner lease: %v", err)
 	}
 
 	entry := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "replacement-request",
-		OrgID:        staleLease.OrgID,
-		CPInstanceID: "cp-a",
-		PID:          1002,
-		Protocol:     "postgres",
-		EnqueuedAt:   now,
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      "replacement-request",
+		OrgID:          staleLease.OrgID,
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
 		t.Fatalf("enqueue replacement request: %v", err)
 	}
 
-	lease, err := store.TryAcquireOrgConnectionLease(entry.RequestID, 1, now)
+	lease, err := store.TryAcquireOrgConnectionLease(entry.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("acquire replacement request: %v", err)
 	}
@@ -294,19 +1097,21 @@ func TestTryAcquireOrgConnectionLeaseRetryReturnsExistingLease(t *testing.T) {
 
 	now := time.Now()
 	entry := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "request-a",
-		OrgID:        "org-1",
-		CPInstanceID: "cp-a",
-		PID:          1001,
-		Protocol:     "postgres",
-		EnqueuedAt:   now,
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      "request-a",
+		OrgID:          "org-1",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
 		t.Fatalf("enqueue request: %v", err)
 	}
 
-	first, err := store.TryAcquireOrgConnectionLease(entry.RequestID, 1, now)
+	first, err := store.TryAcquireOrgConnectionLease(entry.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
@@ -315,7 +1120,7 @@ func TestTryAcquireOrgConnectionLeaseRetryReturnsExistingLease(t *testing.T) {
 		return
 	}
 
-	retry, err := store.TryAcquireOrgConnectionLease(entry.RequestID, 1, now.Add(time.Second))
+	retry, err := store.TryAcquireOrgConnectionLease(entry.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("retry acquire: %v", err)
 	}
@@ -344,13 +1149,15 @@ func TestTryAcquireOrgConnectionLeaseTakesOrgLockBeforeExpiredRowLock(t *testing
 
 	now := time.Now()
 	entry := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "expired-request",
-		OrgID:        "org-lock-order",
-		CPInstanceID: "cp-a",
-		PID:          1001,
-		Protocol:     "postgres",
-		EnqueuedAt:   now.Add(-2 * time.Minute),
-		ExpiresAt:    now.Add(-time.Minute),
+		RequestID:      "expired-request",
+		OrgID:          "org-lock-order",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(-2 * time.Minute),
+		ExpiresAt:      now.Add(-time.Minute),
 	}
 	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_queue").Create(entry).Error; err != nil {
 		t.Fatalf("insert expired request: %v", err)
@@ -376,7 +1183,7 @@ func TestTryAcquireOrgConnectionLeaseTakesOrgLockBeforeExpiredRowLock(t *testing
 
 	acquireDone := make(chan error, 1)
 	go func() {
-		lease, err := store.TryAcquireOrgConnectionLease(entry.RequestID, 1, now)
+		lease, err := store.TryAcquireOrgConnectionLease(entry.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 		if lease != nil {
 			acquireDone <- fmt.Errorf("expected expired request not to receive lease, got %q", lease.LeaseID)
 			return
@@ -420,13 +1227,15 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 
 	now := time.Now()
 	oldEntry := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    "reused-request",
-		OrgID:        "org-old",
-		CPInstanceID: "cp-a",
-		PID:          1001,
-		Protocol:     "postgres",
-		EnqueuedAt:   now,
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      "reused-request",
+		OrgID:          "org-old",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(oldEntry); err != nil {
 		t.Fatalf("enqueue old request: %v", err)
@@ -452,7 +1261,7 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 
 	acquireDone := make(chan acquireResult, 1)
 	go func() {
-		lease, err := store.TryAcquireOrgConnectionLease(oldEntry.RequestID, 1, now)
+		lease, err := store.TryAcquireOrgConnectionLease(oldEntry.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 		acquireDone <- acquireResult{lease: lease, err: err}
 	}()
 
@@ -465,13 +1274,15 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 		t.Fatalf("delete old request: %v", err)
 	}
 	newEntry := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:    oldEntry.RequestID,
-		OrgID:        "org-new",
-		CPInstanceID: "cp-a",
-		PID:          1002,
-		Protocol:     "postgres",
-		EnqueuedAt:   now.Add(time.Millisecond),
-		ExpiresAt:    now.Add(time.Minute),
+		RequestID:      oldEntry.RequestID,
+		OrgID:          "org-new",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
 	}
 	if err := store.EnqueueOrgConnectionRequest(newEntry); err != nil {
 		t.Fatalf("enqueue reused request: %v", err)
@@ -556,4 +1367,48 @@ func waitForAdvisoryLockWaiter(t *testing.T, db *sql.DB, holderPID int) {
 		}
 	}
 	t.Fatalf("timed out waiting for advisory lock waiter; activities: %s", strings.Join(activities, "; "))
+}
+
+func configstoreMetricHistogramCount(t *testing.T, metricName string) uint64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_HISTOGRAM {
+			t.Fatalf("metric %q is not a histogram", metricName)
+		}
+		var total uint64
+		for _, metric := range fam.GetMetric() {
+			total += metric.GetHistogram().GetSampleCount()
+		}
+		return total
+	}
+	return 0
+}
+
+func configstoreMetricCounterFamilyTotal(t *testing.T, metricName string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_COUNTER {
+			t.Fatalf("metric %q is not a counter", metricName)
+		}
+		var total float64
+		for _, metric := range fam.GetMetric() {
+			total += metric.GetCounter().GetValue()
+		}
+		return total
+	}
+	return 0
 }

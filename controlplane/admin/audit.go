@@ -5,6 +5,7 @@ package admin
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,19 +17,19 @@ import (
 // statement writes a row. SQL text is stored already-redacted by the caller —
 // never store raw secret DDL here.
 type AdminAuditEntry struct {
-	ID         uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
-	Timestamp  time.Time `gorm:"index" json:"ts"`
-	Actor      string    `gorm:"index" json:"actor"`  // SSO email or "internal-secret"
-	Role       string    `json:"role"`                // viewer/admin
-	Source     string    `json:"source"`              // sso / internal-secret
-	Action     string    `gorm:"index" json:"action"` // e.g. "config.update", "impersonate.query"
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	Org        string    `gorm:"index" json:"org"`
-	TargetUser string    `json:"target_user"`
-	SQLRedacted string   `json:"sql_redacted"`
-	Status     int       `json:"status"`
-	RemoteAddr string    `json:"remote_addr"`
+	ID          uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
+	Timestamp   time.Time `gorm:"index" json:"ts"`
+	Actor       string    `gorm:"index" json:"actor"`  // SSO email or "internal-secret"
+	Role        string    `json:"role"`                // viewer/admin
+	Source      string    `json:"source"`              // sso / internal-secret
+	Action      string    `gorm:"index" json:"action"` // e.g. "config.update", "impersonate.query"
+	Method      string    `json:"method"`
+	Path        string    `json:"path"`
+	Org         string    `gorm:"index" json:"org"`
+	TargetUser  string    `json:"target_user"`
+	SQLRedacted string    `json:"sql_redacted"`
+	Status      int       `json:"status"`
+	RemoteAddr  string    `json:"remote_addr"`
 }
 
 // TableName pins the audit table name in the config-store database.
@@ -96,15 +97,20 @@ func AuditMiddleware(store *AuditStore) gin.HandlerFunc {
 		if c.GetBool(ctxAuditHandledKey) {
 			return
 		}
+		// Operators routes key the target on :email; org user routes on :username.
+		targetUser := c.Param("username")
+		if targetUser == "" {
+			targetUser = c.Param("email")
+		}
 		id := IdentityFromContext(c)
 		entry := &AdminAuditEntry{
-			Action: "config." + actionVerb(c.Request.Method),
+			Action: auditActionFor(c.Request.Method, c.Request.URL.Path),
 			Method: c.Request.Method,
 			// Resolved path (not the route template) so "who changed which
 			// user/secret" is answerable from the log.
 			Path:       c.Request.URL.Path,
 			Org:        c.Param("id"),
-			TargetUser: c.Param("username"),
+			TargetUser: targetUser,
 			Status:     c.Writer.Status(),
 			RemoteAddr: c.ClientIP(),
 		}
@@ -116,6 +122,39 @@ func AuditMiddleware(store *AuditStore) gin.HandlerFunc {
 }
 
 const ctxAuditHandledKey = "duckgres_audit_handled"
+
+// auditActionFor derives a resource-specific audit Action ("<resource>.<verb>")
+// from the request method and path. It tolerates both the resolved path
+// (c.Request.URL.Path, e.g. "/api/v1/orgs/acme/users/bob") and the route
+// template (c.FullPath()), and an optional "/api/v1" version prefix. Unknown
+// shapes fall back to the generic "config.<verb>".
+func auditActionFor(method, path string) string {
+	verb := actionVerb(method)
+	segs := strings.FieldsFunc(path, func(r rune) bool { return r == '/' })
+	// Drop a leading API version prefix so segs[0] is the resource.
+	if len(segs) >= 2 && segs[0] == "api" && segs[1] == "v1" {
+		segs = segs[2:]
+	}
+	if len(segs) == 0 {
+		return "config." + verb
+	}
+	switch segs[0] {
+	case "operators":
+		return "operators." + verb
+	case "orgs":
+		// Sub-resources under an org get their own action; the org row itself
+		// (and anything else) is generic config.
+		for _, s := range segs[1:] {
+			switch s {
+			case "warehouse":
+				return "warehouse." + verb
+			case "users":
+				return "user." + verb
+			}
+		}
+	}
+	return "config." + verb
+}
 
 func actionVerb(method string) string {
 	switch method {

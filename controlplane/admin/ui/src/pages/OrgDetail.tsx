@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, Save, Trash2, Warehouse } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Save, Trash2, Warehouse } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AdminGate } from "@/components/AdminOnly";
 import { JsonValue } from "@/components/JsonView";
 import { ErrorState, LoadingState } from "@/components/states";
@@ -20,7 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError } from "@/lib/api";
-import { fmtTime } from "@/lib/format";
+import { ducklingBroken, ducklingName, fmtTime } from "@/lib/format";
 import {
   useDeleteOrg,
   useOrg,
@@ -32,7 +33,7 @@ import type { ManagedWarehouse, OrgUpdate } from "@/types/api";
 
 interface FormState {
   max_workers: string;
-  max_connections: string;
+  max_vcpus: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -42,7 +43,7 @@ interface FormState {
 
 function orgToForm(o: {
   max_workers: number;
-  max_connections: number;
+  max_vcpus: number;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -51,7 +52,7 @@ function orgToForm(o: {
 }): FormState {
   return {
     max_workers: String(o.max_workers),
-    max_connections: String(o.max_connections),
+    max_vcpus: String(o.max_vcpus),
     default_worker_cpu: o.default_worker_cpu,
     default_worker_memory: o.default_worker_memory,
     default_worker_ttl: o.default_worker_ttl,
@@ -101,7 +102,7 @@ export function OrgDetail() {
     setMsg(null);
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
-      max_connections: Number(form.max_connections) || 0,
+      max_vcpus: Number(form.max_vcpus) || 0,
       default_worker_cpu: form.default_worker_cpu,
       default_worker_memory: form.default_worker_memory,
       default_worker_ttl: form.default_worker_ttl,
@@ -152,11 +153,12 @@ export function OrgDetail() {
                 <Field label="Max workers (0 = unbounded)">
                   <Input type="number" value={form.max_workers} onChange={(e) => set("max_workers", e.target.value)} />
                 </Field>
-                <Field label="Max connections (0 = unbounded)">
+                <Field label="Max vCPUs (0 = unbounded)">
                   <Input
                     type="number"
-                    value={form.max_connections}
-                    onChange={(e) => set("max_connections", e.target.value)}
+                    min={0}
+                    value={form.max_vcpus}
+                    onChange={(e) => set("max_vcpus", e.target.value)}
                   />
                 </Field>
                 <Field label="Default worker CPU">
@@ -296,6 +298,15 @@ function WarehousePanel({
   }, [data]);
 
   const notFound = error instanceof ApiError && error.status === 404;
+  const missing = notFound || !data;
+  const broken = !missing && ducklingBroken(data?.state);
+  const ducklingWarning = loading
+    ? null
+    : missing
+      ? "No duckling provisioned for this org"
+      : broken
+        ? `Duckling unhealthy (state: ${data?.state})`
+        : null;
 
   const save = async () => {
     setMsg(null);
@@ -316,6 +327,20 @@ function WarehousePanel({
         {data && <StateBadge state={data.state} />}
       </CardHeader>
       <CardContent className="space-y-4">
+        <div className="flex items-center justify-between rounded-md border border-border bg-background/40 px-3 py-2">
+          <div>
+            <div className="text-[10px] uppercase text-muted-foreground">Duckling</div>
+            <div className="font-mono text-xs">{data?.duckling_name || ducklingName(orgId)}</div>
+          </div>
+          {ducklingWarning && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <AlertTriangle className="h-4 w-4 text-warning" />
+              </TooltipTrigger>
+              <TooltipContent>{ducklingWarning}</TooltipContent>
+            </Tooltip>
+          )}
+        </div>
         {loading ? (
           <LoadingState />
         ) : notFound || !data ? (

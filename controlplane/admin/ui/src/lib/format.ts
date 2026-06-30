@@ -48,10 +48,11 @@ export function fmtBytes(n: number | null | undefined): string {
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-// fmtDuration renders a millisecond duration as a compact human string
+// fmtDurationMs renders a MILLISECOND duration as a compact human string
 // (250ms, 3.4s, 2m 5s, 1h 3m). <=0 / nullish → "—". Used for running-query
-// elapsed time in the Live view + detail dialog.
-export function fmtDuration(ms: number | null | undefined): string {
+// elapsed time in the Live view + detail dialog. (fmtDuration below takes
+// SECONDS — different unit, used for worker TTLs/ages.)
+export function fmtDurationMs(ms: number | null | undefined): string {
   if (ms == null || Number.isNaN(ms) || ms <= 0) return "—";
   const s = ms / 1000;
   if (s < 1) return `${Math.round(ms)}ms`;
@@ -95,8 +96,39 @@ export function fmtAge(ts: string | number | Date | null | undefined): string {
   return `${days}d ${h % 24}h`;
 }
 
+// Humanize a duration in seconds, e.g. 1800 → "30m", 3600 → "1h", 5400 → "1h 30m".
+// Returns "—" for 0/unset (the backend uses 0 to mean "default").
+export function fmtDuration(seconds: number | null | undefined): string {
+  if (seconds == null || Number.isNaN(seconds) || seconds <= 0) return "—";
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) {
+    const rem = m % 60;
+    return rem ? `${h}h ${rem}m` : `${h}h`;
+  }
+  const days = Math.floor(h / 24);
+  const remH = h % 24;
+  return remH ? `${days}d ${remH}h` : `${days}d`;
+}
+
 export function isZeroTime(ts: string | null | undefined): boolean {
   return !ts || ts.startsWith(ZERO_TIME);
+}
+
+// The Duckling (managed warehouse) CR name is the org ID lowercased, hyphens
+// preserved.
+export function ducklingName(orgName: string): string {
+  return orgName.toLowerCase();
+}
+
+// A Duckling is broken/unhealthy when its warehouse row exists but the overall
+// state is failed or deleted.
+export function ducklingBroken(state: string | undefined): boolean {
+  const s = (state ?? "").toLowerCase();
+  return s === "failed" || s === "deleted";
 }
 
 // A SQL statement is a "read" if it begins (ignoring leading comments/whitespace)

@@ -9,8 +9,9 @@ import { ProgressBar } from "@/components/ProgressBar";
 import { AdminGate } from "@/components/AdminOnly";
 import { EmptyState } from "@/components/states";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCancelSession, useQueries, useSessions } from "@/hooks/useApi";
-import { fmtDuration, fmtInt } from "@/lib/format";
+import { fmtAge, fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
 export function Live() {
@@ -82,6 +83,7 @@ export function Live() {
                     <TableHead>PID</TableHead>
                     <TableHead>Org</TableHead>
                     <TableHead>User</TableHead>
+                    <TableHead>Started</TableHead>
                     <TableHead>Worker</TableHead>
                     <TableHead>Protocol</TableHead>
                     <TableHead>Duration</TableHead>
@@ -97,29 +99,42 @@ export function Live() {
                     return (
                       <TableRow
                         key={`${q.pid}-${q.worker_id}`}
-                        className="cursor-pointer"
+                        className="cursor-pointer [&>td]:py-1.5"
                         onClick={() => setDetailWid(q.worker_id)}
                         title="View query detail"
                       >
                         <TableCell className="font-mono text-xs">{q.pid}</TableCell>
                         <TableCell className="font-mono text-xs">{q.org}</TableCell>
                         <TableCell className="font-mono text-xs">{q.user || "—"}</TableCell>
+                        <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span>{fmtAge(q.started_at)}</span>
+                            </TooltipTrigger>
+                            <TooltipContent>{fmtTime(q.started_at)}</TooltipContent>
+                          </Tooltip>
+                        </TableCell>
                         <TableCell className="font-mono text-xs">#{q.worker_id}</TableCell>
                         <TableCell>
                           <Badge variant="outline">{q.protocol || "pg"}</Badge>
                         </TableCell>
-                        <TableCell className="font-mono text-xs tabular-nums">{fmtDuration(q.elapsed_ms)}</TableCell>
+                        <TableCell className="font-mono text-xs tabular-nums">{fmtDurationMs(q.elapsed_ms)}</TableCell>
                         <TableCell>
-                          <ProgressBar percentage={pct} stalled={q.stalled} indeterminate={pct == null} />
-                          <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
-                            <span>
+                          <div className="flex items-center gap-2">
+                            <ProgressBar
+                              percentage={pct}
+                              stalled={q.stalled}
+                              indeterminate={pct == null}
+                              className="flex-1"
+                            />
+                            <span className="whitespace-nowrap text-[10px] text-muted-foreground">
                               {q.rows > 0
                                 ? `${fmtInt(q.rows)}${q.total_rows > 0 ? ` / ${fmtInt(q.total_rows)}` : ""} rows`
                                 : pct != null
                                   ? `${pct.toFixed(0)}%`
                                   : "running"}
                             </span>
-                            {q.stalled && <span className="text-warning">stalled</span>}
+                            {q.stalled && <span className="text-[10px] text-warning">stalled</span>}
                           </div>
                         </TableCell>
                         <TableCell className="text-right">
@@ -127,6 +142,7 @@ export function Live() {
                             <Button
                               variant="ghost"
                               size="sm"
+                              className="-my-1 h-6"
                               disabled={cancel.isPending}
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -168,7 +184,7 @@ export function Live() {
                 </TableHeader>
                 <TableBody>
                   {liveSessions.map((s) => (
-                    <TableRow key={`${s.pid}-${s.worker_id}`}>
+                    <TableRow key={`${s.pid}-${s.worker_id}`} className="[&>td]:py-1.5">
                       <TableCell className="font-mono text-xs">{s.pid}</TableCell>
                       <TableCell className="font-mono text-xs">{s.org}</TableCell>
                       <TableCell className="font-mono text-xs">{s.user || "—"}</TableCell>
@@ -178,7 +194,13 @@ export function Live() {
                       </TableCell>
                       <TableCell className="text-right">
                         <AdminGate>
-                          <Button variant="ghost" size="sm" disabled={cancel.isPending} onClick={() => cancel.mutate(s.pid)}>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="-my-1 h-6"
+                            disabled={cancel.isPending}
+                            onClick={() => cancel.mutate(s.pid)}
+                          >
                             <Ban className="h-4 w-4 text-destructive" /> Cancel
                           </Button>
                         </AdminGate>

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -13,20 +14,22 @@ import (
 // QueryStatus is a currently-running query/session with its live progress,
 // sliceable by org and user.
 type QueryStatus struct {
-	Org        string  `json:"org"`
-	User       string  `json:"user"`
-	PID        int32   `json:"pid"`
-	WorkerID   int     `json:"worker_id"`
-	Protocol   string  `json:"protocol"`
-	Percentage float64 `json:"percentage"`
-	Rows       uint64  `json:"rows"`
-	TotalRows  uint64  `json:"total_rows"`
-	Stalled    bool    `json:"stalled"`
-	// ElapsedMS is how long the current statement has been running, in
-	// milliseconds (0 when idle / no query in flight). Computed on the owning CP
-	// from the connection's query-start, so it survives the cross-CP /queries
-	// merge unchanged.
-	ElapsedMS int64 `json:"elapsed_ms"`
+	Org      string `json:"org"`
+	User     string `json:"user"`
+	PID      int32  `json:"pid"`
+	WorkerID int    `json:"worker_id"`
+	Protocol string `json:"protocol"`
+	// StartedAt is when the SESSION was created (session age). ElapsedMS is how
+	// long the CURRENT statement has been running (0 when idle); computed on the
+	// owning CP from the connection's query-start, so it survives the cross-CP
+	// /queries merge unchanged. The Live view shows query-elapsed when a query is
+	// in flight and falls back to session age otherwise.
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	ElapsedMS  int64     `json:"elapsed_ms"`
+	Percentage float64   `json:"percentage"`
+	Rows       uint64    `json:"rows"`
+	TotalRows  uint64    `json:"total_rows"`
+	Stalled    bool      `json:"stalled"`
 }
 
 // QueryDetail is the expanded, single-session view behind a running query: the
@@ -60,10 +63,12 @@ type QueryDetail struct {
 // from the durable runtime store (the source of truth for hot-idle/spawning/
 // draining counts the in-memory session map cannot see).
 type FleetStat struct {
-	Image   string `json:"image"`
-	State   string `json:"state"`
-	Binding string `json:"binding"`
-	Count   int64  `json:"count"`
+	Image       string  `json:"image"`
+	State       string  `json:"state"`
+	Binding     string  `json:"binding"`
+	Count       int64   `json:"count"`
+	CPUCores    float64 `json:"cpu_cores"`
+	MemoryBytes int64   `json:"memory_bytes"`
 }
 
 // CPInstance is a live control-plane replica.

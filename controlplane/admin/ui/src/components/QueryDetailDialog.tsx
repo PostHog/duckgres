@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { ProgressBar } from "@/components/ProgressBar";
 import { AdminGate } from "@/components/AdminOnly";
 import { useQueryDetail } from "@/hooks/useApi";
-import { fmtDuration, fmtInt, fmtTime } from "@/lib/format";
+import { fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
 
 function Field({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
@@ -101,7 +101,7 @@ export function QueryDetailDialog({
                 value={d.client_addr ? `${d.client_addr}${d.client_port ? `:${d.client_port}` : ""}` : "—"}
                 mono
               />
-              <Field label="Elapsed" value={fmtDuration(d.elapsed_ms)} />
+              <Field label="Elapsed" value={fmtDurationMs(d.elapsed_ms)} />
               <Field label="Query start" value={d.query_start ? fmtTime(d.query_start) : "—"} />
               <Field label="Backend start" value={d.backend_start ? fmtTime(d.backend_start) : "—"} />
             </div>

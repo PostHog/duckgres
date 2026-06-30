@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
 import { useClusterStatus, useFleet, useMetricRange, useModel } from "@/hooks/useApi";
 import { fmtInt, fmtPercent, promToSeries } from "@/lib/format";
+import { isIdleLeak, orgLoadPercent, summarizeFleet, topOrgsByLoad } from "@/lib/fleet";
 import type { WorkerLifecycleState } from "@/types/api";
 
 const LIFECYCLE: WorkerLifecycleState[] = [
@@ -25,17 +26,11 @@ export function Overview() {
   const cps = useModel("cp-instances");
   const qTotal = useMetricRange("query_rate", undefined, "1h");
 
-  const stateCounts = useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const f of fleet.data ?? []) {
-      counts[f.state] = (counts[f.state] ?? 0) + f.count;
-    }
-    return counts;
-  }, [fleet.data]);
-  const totalFleet = useMemo(
-    () => (fleet.data ?? []).reduce((n, f) => n + f.count, 0),
-    [fleet.data],
-  );
+  // Worker fleet math (busy/idle/total/byState) lives in lib/fleet.ts so it can
+  // be unit-tested — see fleet.test.ts. Keep derivations there, not in the JSX.
+  const fleetSummary = useMemo(() => summarizeFleet(fleet.data), [fleet.data]);
+  const stateCounts = fleetSummary.byState;
+  const totalFleet = fleetSummary.total;
 
   const queueDepth = (queue.data?.rows ?? []).filter((r) => !r["granted_at"]).length;
   const cpRows = (cps.data?.rows ?? []) as { state?: string; pod_name?: string }[];
@@ -64,14 +59,9 @@ export function Overview() {
 
   // Busy vs idle split, both from the durable fleet (/workers/fleet) so they
   // share scope: `hot` = holding a session (busy), `hot_idle` = parked idle
-  // (warm, reserving the pod but running no query). Do NOT derive idle from
-  // status.total_workers — that's the serving CP's in-memory session count
-  // (often 0) on a different scope than the cluster-wide fleet, which made
-  // "hot" and "idle" report the same number (hotCount - 0).
-  const busyWorkers = stateCounts["hot"] ?? 0;
-  // A large, persistent hot-idle count is the cost/leak signal — workers warm
-  // but doing no work, holding vCPU & memory.
-  const idleWorkers = stateCounts["hot_idle"] ?? 0;
+  // (warm, reserving the pod but running no query).
+  const busyWorkers = fleetSummary.busy;
+  const idleWorkers = fleetSummary.idle;
 
   return (
     <>
@@ -83,7 +73,7 @@ export function Overview() {
             label="Workers"
             value={fleet.isSuccess ? fmtInt(totalFleet) : "—"}
             hint={fleet.isSuccess ? `${fmtInt(busyWorkers)} hot · ${fmtInt(idleWorkers)} idle` : undefined}
-            accent={idleWorkers >= 20 ? "warning" : "default"}
+            accent={isIdleLeak(idleWorkers) ? "warning" : "default"}
             icon={<Server className="h-4 w-4" />}
           />
           <StatCard label="Sessions" value={fmtInt(status.data?.total_sessions)} icon={<Users className="h-4 w-4" />} />
@@ -130,7 +120,7 @@ export function Overview() {
                   Fleet detail unavailable (GET /api/v1/workers/fleet). Showing totals only.
                 </p>
               )}
-              {fleet.isSuccess && idleWorkers >= 20 ? (
+              {fleet.isSuccess && isIdleLeak(idleWorkers) ? (
                 <p className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
                   ⚠ {fmtInt(idleWorkers)} workers are parked <span className="font-medium">hot-idle</span> —
                   warm but holding no session, reserving vCPU &amp; memory. Check the Workers page for the
@@ -173,24 +163,20 @@ export function Overview() {
               <p className="py-6 text-center text-sm text-muted-foreground">No org activity reported.</p>
             ) : (
               <div className="space-y-1.5">
-                {[...(status.data?.orgs ?? [])]
-                  .sort((a, b) => b.active_sessions - a.active_sessions)
-                  .slice(0, 12)
-                  .map((o) => {
-                    const cap = o.max_workers > 0 ? o.max_workers : Math.max(o.workers, 1);
-                    const pct = Math.min(100, (o.workers / cap) * 100);
-                    return (
-                      <div key={o.name} className="flex items-center gap-3 text-sm">
-                        <span className="w-44 truncate font-mono text-xs">{o.name}</span>
-                        <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
-                          <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
-                        </div>
-                        <span className="w-28 text-right tabular-nums text-xs text-muted-foreground">
-                          {o.workers}/{o.max_workers || "∞"} wk · {o.active_sessions} sess
-                        </span>
+                {topOrgsByLoad(status.data?.orgs, 12).map((o) => {
+                  const pct = orgLoadPercent(o.workers, o.max_workers);
+                  return (
+                    <div key={o.name} className="flex items-center gap-3 text-sm">
+                      <span className="w-44 truncate font-mono text-xs">{o.name}</span>
+                      <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
+                        <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
                       </div>
-                    );
-                  })}
+                      <span className="w-28 text-right tabular-nums text-xs text-muted-foreground">
+                        {o.workers}/{o.max_workers || "∞"} wk · {o.active_sessions} sess
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </CardContent>

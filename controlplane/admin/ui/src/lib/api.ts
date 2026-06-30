@@ -10,6 +10,7 @@ import type {
   ClusterStatus,
   CreateUserBody,
   CPInstance,
+  DucklingDriftResponse,
   FleetStat,
   ImpersonateBody,
   Me,
@@ -122,6 +123,9 @@ export const api = {
   getWarehouse: (id: string) => get<ManagedWarehouse>(`/orgs/${enc(id)}/warehouse`),
   updateWarehouse: (id: string, body: Partial<ManagedWarehouse>) =>
     put<ManagedWarehouse>(`/orgs/${enc(id)}/warehouse`, body),
+
+  // ducklings (admin-only)
+  getDucklingDrift: () => get<DucklingDriftResponse>("/ducklings/drift"),
 
   // users
   listUsers: () => get<OrgUser[]>("/users"),

@@ -27,7 +27,7 @@ import {
   useUserSecrets,
   useUsers,
 } from "@/hooks/useApi";
-import { fmtTime } from "@/lib/format";
+import { fmtInt, fmtTime } from "@/lib/format";
 import type { OrgUser } from "@/types/api";
 
 export function UsersPage() {
@@ -67,6 +67,14 @@ export function UsersPage() {
         },
       },
       {
+        accessorKey: "max_vcpus",
+        header: "Max vCPUs",
+        cell: ({ getValue }) => {
+          const v = getValue() as number;
+          return <span className="tabular-nums">{v === 0 ? "∞" : fmtInt(v)}</span>;
+        },
+      },
+      {
         accessorKey: "created_at",
         header: "Created",
         cell: ({ getValue }) => <span className="text-xs text-muted-foreground">{fmtTime(getValue() as string)}</span>,
@@ -76,18 +84,24 @@ export function UsersPage() {
         header: "",
         enableSorting: false,
         cell: ({ row }) => (
-          <div className="flex justify-end gap-1">
-            <Button variant="ghost" size="icon" title="Persistent secrets" onClick={() => setSecretsFor(row.original)}>
-              <KeyRound className="h-4 w-4" />
+          <div className="-my-1 flex justify-end gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6"
+              title="Persistent secrets"
+              onClick={() => setSecretsFor(row.original)}
+            >
+              <KeyRound className="h-3.5 w-3.5" />
             </Button>
             <AdminGate>
-              <Button variant="ghost" size="icon" title="Edit" onClick={() => setEditing(row.original)}>
-                <Pencil className="h-4 w-4" />
+              <Button variant="ghost" size="icon" className="h-6 w-6" title="Edit" onClick={() => setEditing(row.original)}>
+                <Pencil className="h-3.5 w-3.5" />
               </Button>
             </AdminGate>
             <AdminGate>
-              <Button variant="ghost" size="icon" title="Delete" onClick={() => setDeleting(row.original)}>
-                <Trash2 className="h-4 w-4 text-destructive" />
+              <Button variant="ghost" size="icon" className="h-6 w-6" title="Delete" onClick={() => setDeleting(row.original)}>
+                <Trash2 className="h-3.5 w-3.5 text-destructive" />
               </Button>
             </AdminGate>
           </div>
@@ -119,7 +133,7 @@ export function UsersPage() {
       <PageBody>
         <Card className="overflow-hidden">
           {users.isLoading ? (
-            <TableSkeleton cols={6} />
+            <TableSkeleton cols={7} />
           ) : users.isError ? (
             <ErrorState error={users.error} onRetry={() => users.refetch()} />
           ) : (
@@ -180,6 +194,7 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
   const [password, setPassword] = useState("");
   const [passthrough, setPassthrough] = useState(false);
   const [iceberg, setIceberg] = useState(false);
+  const [maxVCPUs, setMaxVCPUs] = useState("0");
   const [err, setErr] = useState<string | null>(null);
 
   const submit = async () => {
@@ -191,6 +206,7 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
         password,
         passthrough,
         default_catalog: iceberg ? "iceberg" : "",
+        max_vcpus: Number(maxVCPUs) || 0,
       });
       onClose();
     } catch (e) {
@@ -220,6 +236,10 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
             <Label>Password</Label>
             <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
           </div>
+          <div className="space-y-1">
+            <Label>Max vCPUs (0 = unbounded)</Label>
+            <Input type="number" min={0} value={maxVCPUs} onChange={(e) => setMaxVCPUs(e.target.value)} />
+          </div>
           <div className="flex items-center gap-6">
             <label className="flex items-center gap-2 text-sm">
               <Switch checked={passthrough} onCheckedChange={setPassthrough} /> Passthrough
@@ -248,6 +268,7 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
   const [password, setPassword] = useState("");
   const [passthrough, setPassthrough] = useState(user.passthrough);
   const [iceberg, setIceberg] = useState(user.default_catalog === "iceberg");
+  const [maxVCPUs, setMaxVCPUs] = useState(String(user.max_vcpus));
   const [err, setErr] = useState<string | null>(null);
 
   const submit = async () => {
@@ -260,6 +281,7 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
           ...(password ? { password } : {}),
           passthrough,
           default_catalog: iceberg ? "iceberg" : "",
+          max_vcpus: Number(maxVCPUs) || 0,
         },
       });
       onClose();
@@ -283,6 +305,10 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
           <div className="space-y-1">
             <Label>New password</Label>
             <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="unchanged" />
+          </div>
+          <div className="space-y-1">
+            <Label>Max vCPUs (0 = unbounded)</Label>
+            <Input type="number" min={0} value={maxVCPUs} onChange={(e) => setMaxVCPUs(e.target.value)} />
           </div>
           <div className="flex items-center gap-6">
             <label className="flex items-center gap-2 text-sm">
