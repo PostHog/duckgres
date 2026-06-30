@@ -93,6 +93,15 @@ func AuditMiddleware(store *AuditStore) gin.HandlerFunc {
 		default:
 			return
 		}
+		// A scope=local request is an internal control-plane→control-plane fan-out
+		// leg (e.g. the per-user kill switch reaching the replica that owns a
+		// session), not a distinct operator action. The originating request — the
+		// one the operator actually made, with their real SSO identity — is audited
+		// on the serving replica; auditing each peer leg too would write N
+		// duplicate rows (actor "internal-secret") for one action. Skip them.
+		if localScope(c) {
+			return
+		}
 		// Impersonation records itself with full detail; skip the generic row.
 		if c.GetBool(ctxAuditHandledKey) {
 			return
