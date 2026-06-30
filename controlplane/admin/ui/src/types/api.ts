@@ -45,7 +45,6 @@ export interface Org {
   database_name: string;
   hostname_alias: string | null;
   max_workers: number;
-  max_connections: number;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -59,7 +58,6 @@ export interface Org {
 // Editable subset of Org accepted by PUT /api/v1/orgs/:id.
 export interface OrgUpdate {
   max_workers?: number;
-  max_connections?: number;
   default_worker_cpu?: string;
   default_worker_memory?: string;
   default_worker_ttl?: string;
@@ -115,6 +113,9 @@ export type WarehouseState =
 
 export interface ManagedWarehouse {
   org_id: string;
+  // The explicit Duckling CR name (provisioner-owned). May be "" on legacy rows
+  // that predate the field — callers fall back to ducklingName(org) in that case.
+  duckling_name: string;
   image: string;
   ducklake_version: string;
   warehouse_database: { endpoint: string; port: number };
@@ -171,6 +172,30 @@ export interface ManagedWarehouse {
   updated_at: string;
 }
 
+// ---- Duckling drift (admin-only) ----
+
+// One mismatch between a managed warehouse row and its Duckling custom resource.
+// For issue "orphan" (a CR with no warehouse row) `org` is "".
+export type DucklingDriftIssue = "missing" | "not_ready" | "state_mismatch" | "orphan" | "check_error";
+
+export interface DucklingDrift {
+  org: string;
+  duckling_name: string;
+  warehouse_state: string;
+  cr_present: boolean;
+  cr_ready: boolean;
+  issue: DucklingDriftIssue;
+  message: string;
+}
+
+// GET /api/v1/ducklings/drift → drift report (admin-only; 403s for viewers).
+// `available` is false when the check could not run.
+export interface DucklingDriftResponse {
+  available: boolean;
+  checked: number;
+  entries: DucklingDrift[];
+}
+
 // ---- Cluster status (confirmed) ----
 
 export interface OrgStatus {
@@ -195,6 +220,9 @@ export interface WorkerStatus {
   org: string;
   active_sessions: number;
   status: string; // "active" | "idle"
+  cpu: string; // e.g. "8"
+  memory: string; // e.g. "16Gi"
+  ttl_seconds: number; // 0 = default/unset
 }
 
 // GET /api/v1/sessions → SessionStatus[]. Note `user` (not `username`).
@@ -226,6 +254,8 @@ export interface FleetStat {
   state: WorkerLifecycleState;
   binding: string;
   count: number;
+  cpu_cores: number;
+  memory_bytes: number;
 }
 
 // GET /api/v1/cluster/instances → { instances: CPInstance[] }.
@@ -248,6 +278,7 @@ export interface RunningQuery {
   rows: number;
   total_rows: number;
   stalled: boolean;
+  started_at?: string; // RFC3339; may be absent/zero
 }
 
 // ---- Metrics (raw Prometheus / VictoriaMetrics) ----

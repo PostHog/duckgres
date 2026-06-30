@@ -266,6 +266,7 @@ type ConfigStoreInterface interface {
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
 	CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error
+	CloseFlightSessionRecordIfReconnectTargetUnchanged(stale configstore.FlightSessionRecord, closedAt time.Time) (bool, error)
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.

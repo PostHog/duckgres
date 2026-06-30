@@ -11,10 +11,12 @@ import {
 } from "@tanstack/react-query";
 import { api, ApiError } from "@/lib/api";
 import { POLL } from "@/lib/query";
+import { useIdentity } from "@/components/IdentityProvider";
 import type {
   AuditEntry,
   ClusterStatus,
   CreateUserBody,
+  DucklingDriftResponse,
   FleetStat,
   ImpersonateBody,
   ManagedWarehouse,
@@ -121,6 +123,26 @@ export function useUpdateWarehouse(id: string) {
   return useMutation({
     mutationFn: (body: Partial<ManagedWarehouse>) => api.updateWarehouse(id, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["orgs", id, "warehouse"] }),
+  });
+}
+
+// ---- ducklings (admin-only) ----
+
+const EMPTY_DRIFT: DucklingDriftResponse = { available: false, checked: 0, entries: [] };
+
+// GET /ducklings/drift — the endpoint 403s for viewers, so we only fire it for
+// admins. Any failure (403/404/503/network) degrades quietly to an empty,
+// unavailable report rather than surfacing an error toast.
+export function useDucklingDrift() {
+  const { isAdmin } = useIdentity();
+  return useQuery<DucklingDriftResponse>({
+    queryKey: ["ducklings", "drift"],
+    queryFn: () =>
+      tolerateStatus<DucklingDriftResponse>(EMPTY_DRIFT, 403, 404, 503)(api.getDucklingDrift()).catch(
+        () => EMPTY_DRIFT,
+      ),
+    enabled: isAdmin,
+    refetchInterval: POLL.normal,
   });
 }
 

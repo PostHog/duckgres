@@ -149,13 +149,13 @@ func (l *blockingCrashConnectionLease) Release(ctx context.Context) error {
 }
 
 type observingConnectionLimiter struct {
-	firstRead  chan int
+	firstRead  chan configstore.OrgResourceLimits
 	readAgain  chan struct{}
-	secondRead chan int
+	secondRead chan configstore.OrgResourceLimits
 }
 
-func (l *observingConnectionLimiter) Acquire(ctx context.Context, pid int32, protocol string, maxConnections func() int) (connectionLease, error) {
-	first := maxConnections()
+func (l *observingConnectionLimiter) Acquire(ctx context.Context, request connectionAdmissionRequest, limits func(string) configstore.OrgResourceLimits) (connectionLease, error) {
+	first := limits(request.Username)
 	l.firstRead <- first
 
 	select {
@@ -164,16 +164,17 @@ func (l *observingConnectionLimiter) Acquire(ctx context.Context, pid int32, pro
 		return nil, ctx.Err()
 	}
 
-	l.secondRead <- maxConnections()
+	l.secondRead <- limits(request.Username)
 	return nil, nil
 }
 
 type runtimeLimiterTestStore struct {
 	mu          sync.Mutex
-	tryMaxes    []int
+	tryLimits   []configstore.OrgResourceLimits
 	cancels     int
 	firstTry    chan struct{}
 	leaseID     string
+	acquireErr  error
 	queuedEntry *configstore.OrgConnectionQueueEntry
 }
 
@@ -185,12 +186,17 @@ func (s *runtimeLimiterTestStore) EnqueueOrgConnectionRequest(entry *configstore
 	return nil
 }
 
-func (s *runtimeLimiterTestStore) TryAcquireOrgConnectionLease(requestID string, maxConnections int, now time.Time) (*configstore.OrgConnectionLease, error) {
+func (s *runtimeLimiterTestStore) TryAcquireOrgConnectionLease(requestID string, limits configstore.OrgResourceLimits, now time.Time) (*configstore.OrgConnectionLease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tryMaxes = append(s.tryMaxes, maxConnections)
-	if len(s.tryMaxes) == 1 {
-		close(s.firstTry)
+	s.tryLimits = append(s.tryLimits, limits)
+	if s.acquireErr != nil {
+		return nil, s.acquireErr
+	}
+	if len(s.tryLimits) == 1 {
+		if s.firstTry != nil {
+			close(s.firstTry)
+		}
 		return nil, nil
 	}
 	return &configstore.OrgConnectionLease{LeaseID: s.leaseID, RequestID: requestID}, nil
@@ -207,11 +213,41 @@ func (s *runtimeLimiterTestStore) CancelOrgConnectionRequest(requestID string, c
 	return nil
 }
 
-func (s *runtimeLimiterTestStore) snapshot() ([]int, int, *configstore.OrgConnectionQueueEntry) {
+func (s *runtimeLimiterTestStore) snapshot() ([]configstore.OrgResourceLimits, int, *configstore.OrgConnectionQueueEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tryMaxes := append([]int(nil), s.tryMaxes...)
-	return tryMaxes, s.cancels, s.queuedEntry
+	tryLimits := append([]configstore.OrgResourceLimits(nil), s.tryLimits...)
+	return tryLimits, s.cancels, s.queuedEntry
+}
+
+type reconnectRuntimeStore struct {
+	enqueues  int
+	tries     int
+	releaseID string
+	cancelID  string
+	entry     *configstore.OrgConnectionQueueEntry
+}
+
+func (s *reconnectRuntimeStore) EnqueueOrgConnectionRequest(entry *configstore.OrgConnectionQueueEntry) error {
+	s.enqueues++
+	entryCopy := *entry
+	s.entry = &entryCopy
+	return nil
+}
+
+func (s *reconnectRuntimeStore) TryAcquireOrgConnectionLease(requestID string, limits configstore.OrgResourceLimits, now time.Time) (*configstore.OrgConnectionLease, error) {
+	s.tries++
+	return &configstore.OrgConnectionLease{LeaseID: requestID, RequestID: requestID}, nil
+}
+
+func (s *reconnectRuntimeStore) ReleaseOrgConnectionLease(leaseID string) error {
+	s.releaseID = leaseID
+	return nil
+}
+
+func (s *reconnectRuntimeStore) CancelOrgConnectionRequest(requestID string, canceledAt time.Time) error {
+	s.cancelID = requestID
+	return nil
 }
 
 type blockingCreateSessionPool struct {
@@ -291,6 +327,15 @@ func (p *cancelAwareWorkerPool) ReconnectFlightWorker(ctx context.Context, worke
 	return nil, ctx.Err()
 }
 
+type reconnectProfileWorkerPool struct {
+	cancelAwareWorkerPool
+	profile *WorkerProfile
+}
+
+func (p *reconnectProfileWorkerPool) ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error) {
+	return p.profile, nil
+}
+
 type countingConnectionLease struct {
 	releases atomic.Int32
 }
@@ -304,8 +349,18 @@ type blockingCreateSessionLimiter struct {
 	lease connectionLease
 }
 
-func (l *blockingCreateSessionLimiter) Acquire(ctx context.Context, pid int32, protocol string, maxConnections func() int) (connectionLease, error) {
+func (l *blockingCreateSessionLimiter) Acquire(ctx context.Context, request connectionAdmissionRequest, limits func(string) configstore.OrgResourceLimits) (connectionLease, error) {
 	return l.lease, nil
+}
+
+type captureAdmissionLimiter struct {
+	request connectionAdmissionRequest
+	err     error
+}
+
+func (l *captureAdmissionLimiter) Acquire(ctx context.Context, request connectionAdmissionRequest, limits func(string) configstore.OrgResourceLimits) (connectionLease, error) {
+	l.request = request
+	return nil, l.err
 }
 
 type blockingAcquireLimiter struct {
@@ -315,7 +370,7 @@ type blockingAcquireLimiter struct {
 	once    sync.Once
 }
 
-func (l *blockingAcquireLimiter) Acquire(ctx context.Context, pid int32, protocol string, maxConnections func() int) (connectionLease, error) {
+func (l *blockingAcquireLimiter) Acquire(ctx context.Context, request connectionAdmissionRequest, limits func(string) configstore.OrgResourceLimits) (connectionLease, error) {
 	l.once.Do(func() { close(l.entered) })
 	select {
 	case <-l.release:
@@ -904,42 +959,52 @@ func countEvents(events []string, want string) int {
 	return count
 }
 
-func TestSessionManager_RuntimeLimiterObservesDynamicLimitWhileQueued(t *testing.T) {
+func TestSessionManager_RuntimeLimiterObservesDynamicResourceLimitWhileQueued(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
-	sm.SetMaxConnections(1)
+	var orgMaxVCPUs atomic.Int32
+	orgMaxVCPUs.Store(4)
+	sm.SetResourceLimitsProvider(func(username string) configstore.OrgResourceLimits {
+		return configstore.OrgResourceLimits{
+			OrgMaxVCPUs:  int(orgMaxVCPUs.Load()),
+			UserMaxVCPUs: 2,
+		}
+	})
+	sm.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
+		return 2, nil
+	})
 
 	limiter := &observingConnectionLimiter{
-		firstRead:  make(chan int, 1),
+		firstRead:  make(chan configstore.OrgResourceLimits, 1),
 		readAgain:  make(chan struct{}),
-		secondRead: make(chan int, 1),
+		secondRead: make(chan configstore.OrgResourceLimits, 1),
 	}
 	sm.SetConnectionLimiter(limiter)
 
 	acquired := make(chan error, 1)
 	go func() {
-		_, err := sm.acquireConnectionSlot(context.Background(), 1001, "postgres")
+		_, err := sm.acquireConnectionSlot(context.Background(), 1001, "alice", "postgres", nil)
 		acquired <- err
 	}()
 
 	select {
 	case got := <-limiter.firstRead:
-		if got != 1 {
-			t.Fatalf("expected first max connection read to see 1, got %d", got)
+		if got.OrgMaxVCPUs != 4 || got.UserMaxVCPUs != 2 {
+			t.Fatalf("expected first limits org=4/user=2, got %#v", got)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for first max connection read")
+		t.Fatal("timed out waiting for first limit read")
 	}
 
-	sm.SetMaxConnections(2)
+	orgMaxVCPUs.Store(8)
 	close(limiter.readAgain)
 
 	select {
 	case got := <-limiter.secondRead:
-		if got != 2 {
-			t.Fatalf("expected queued limiter read to observe updated max connections 2, got %d", got)
+		if got.OrgMaxVCPUs != 8 || got.UserMaxVCPUs != 2 {
+			t.Fatalf("expected queued limiter read to observe updated org limit 8, got %#v", got)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for second max connection read")
+		t.Fatal("timed out waiting for second limit read")
 	}
 
 	select {
@@ -952,7 +1017,73 @@ func TestSessionManager_RuntimeLimiterObservesDynamicLimitWhileQueued(t *testing
 	}
 }
 
-func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenLimitBecomesUnlimited(t *testing.T) {
+func TestSessionManager_ReconnectFlightSessionUsesWorkerProfileForAdmission(t *testing.T) {
+	stop := errors.New("stop after admission")
+	pool := &reconnectProfileWorkerPool{
+		profile: &WorkerProfile{CPU: "4", Memory: "16Gi"},
+	}
+	sm := NewSessionManager(pool, nil)
+	sm.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
+		return requestedWorkerVCPUs(profile, "8")
+	})
+	limiter := &captureAdmissionLimiter{err: stop}
+	sm.SetConnectionLimiter(limiter)
+
+	_, _, err := sm.ReconnectFlightSession(context.Background(), "alice", 42, 7)
+	if !errors.Is(err, stop) {
+		t.Fatalf("ReconnectFlightSession error = %v, want %v", err, stop)
+	}
+	if limiter.request.Username != "alice" || limiter.request.Protocol != "flight" {
+		t.Fatalf("unexpected admission request: %#v", limiter.request)
+	}
+	if limiter.request.RequestedVCPUs != 4 {
+		t.Fatalf("RequestedVCPUs = %d, want 4 from reconnect worker profile", limiter.request.RequestedVCPUs)
+	}
+}
+
+func TestSessionManager_ReconnectFlightSessionUsesNormalAdmission(t *testing.T) {
+	stop := errors.New("stop after admission")
+	pool := &reconnectProfileWorkerPool{
+		profile: &WorkerProfile{CPU: "4", Memory: "16Gi"},
+	}
+	sm := NewSessionManager(pool, nil)
+	sm.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
+		return requestedWorkerVCPUs(profile, "8")
+	})
+	limiter := &captureAdmissionLimiter{err: stop}
+	sm.SetConnectionLimiter(limiter)
+
+	_, _, err := sm.ReconnectFlightSession(context.Background(), "alice", 42, 7)
+	if !errors.Is(err, stop) {
+		t.Fatalf("ReconnectFlightSession error = %v, want %v", err, stop)
+	}
+	if limiter.request.PID == 0 {
+		t.Fatalf("expected reconnect to reserve a replacement PID before admission, got %#v", limiter.request)
+	}
+	if limiter.request.Username != "alice" || limiter.request.Protocol != "flight" || limiter.request.RequestedVCPUs != 4 {
+		t.Fatalf("unexpected reconnect admission request: %#v", limiter.request)
+	}
+}
+
+func TestSessionManager_CreateFlightSessionReservesPIDBeforeAdmission(t *testing.T) {
+	stop := errors.New("stop after admission")
+	sm := NewSessionManager(nil, nil)
+	limiter := &captureAdmissionLimiter{err: stop}
+	sm.SetConnectionLimiter(limiter)
+
+	_, _, err := sm.CreateSessionWithProtocol(context.Background(), "alice", 0, "", 0, "flight", nil)
+	if !errors.Is(err, stop) {
+		t.Fatalf("CreateSessionWithProtocol error = %v, want %v", err, stop)
+	}
+	if limiter.request.PID == 0 {
+		t.Fatalf("expected Flight session creation to reserve a PID before admission, got %#v", limiter.request)
+	}
+	if limiter.request.Username != "alice" || limiter.request.Protocol != "flight" {
+		t.Fatalf("unexpected admission request: %#v", limiter.request)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenResourceLimitBecomesUnlimited(t *testing.T) {
 	store := &runtimeLimiterTestStore{
 		firstTry: make(chan struct{}),
 		leaseID:  "lease-1",
@@ -969,13 +1100,18 @@ func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenLimitBecomesUnlimited(t 
 		},
 	}
 
-	var maxConnections atomic.Int32
-	maxConnections.Store(1)
+	var orgMaxVCPUs atomic.Int32
+	orgMaxVCPUs.Store(1)
 	acquired := make(chan connectionLease, 1)
 	acquireErr := make(chan error, 1)
 	go func() {
-		lease, err := limiter.Acquire(context.Background(), 1001, "postgres", func() int {
-			return int(maxConnections.Load())
+		lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+			PID:            1001,
+			Username:       "alice",
+			Protocol:       "postgres",
+			RequestedVCPUs: 1,
+		}, func(username string) configstore.OrgResourceLimits {
+			return configstore.OrgResourceLimits{OrgMaxVCPUs: int(orgMaxVCPUs.Load())}
 		})
 		acquired <- lease
 		acquireErr <- err
@@ -986,7 +1122,7 @@ func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenLimitBecomesUnlimited(t 
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for first lease attempt")
 	}
-	maxConnections.Store(0)
+	orgMaxVCPUs.Store(0)
 
 	var lease connectionLease
 	select {
@@ -1007,17 +1143,104 @@ func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenLimitBecomesUnlimited(t 
 		t.Fatal("timed out waiting for limiter acquire error")
 	}
 
-	tryMaxes, cancels, queuedEntry := store.snapshot()
+	tryLimits, cancels, queuedEntry := store.snapshot()
 	if queuedEntry == nil {
 		t.Fatal("expected request to be queued")
 	}
-	if len(tryMaxes) != 2 {
-		t.Fatalf("expected two lease attempts, got %d (%v)", len(tryMaxes), tryMaxes)
+	if queuedEntry.Username != "alice" || queuedEntry.RequestedVCPUs != 1 {
+		t.Fatalf("expected queued username/requested_vcpus to be recorded, got %#v", queuedEntry)
 	}
-	if tryMaxes[0] != 1 || tryMaxes[1] != 0 {
-		t.Fatalf("expected lease attempts with max connections [1 0], got %v", tryMaxes)
+	if len(tryLimits) != 2 {
+		t.Fatalf("expected two lease attempts, got %d (%v)", len(tryLimits), tryLimits)
+	}
+	if tryLimits[0].OrgMaxVCPUs != 1 || tryLimits[1].OrgMaxVCPUs != 0 {
+		t.Fatalf("expected lease attempts with org max vcpus [1 0], got %v", tryLimits)
 	}
 	if cancels != 0 {
 		t.Fatalf("expected queued request not to be canceled, got %d cancels", cancels)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterReconnectCapableStoreUsesQueue(t *testing.T) {
+	store := &reconnectRuntimeStore{}
+	limiter := &runtimeOrgConnectionLimiter{
+		store:        store,
+		orgID:        "org-1",
+		cpInstanceID: "cp-new",
+		queueTTL:     time.Second,
+		now:          time.Now,
+		newID: func() (string, error) {
+			return "reconnect-lease", nil
+		},
+	}
+
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID:            2002,
+		Username:       "alice",
+		Protocol:       "flight",
+		RequestedVCPUs: 4,
+	}, func(username string) configstore.OrgResourceLimits {
+		return configstore.OrgResourceLimits{OrgMaxVCPUs: 4, UserMaxVCPUs: 4}
+	})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected reconnect admission to return a lease")
+	}
+	if store.enqueues != 1 || store.tries != 1 || store.cancelID != "" {
+		t.Fatalf("expected reconnect admission to use queue path, got enqueues=%d tries=%d cancelID=%q", store.enqueues, store.tries, store.cancelID)
+	}
+	if store.entry == nil {
+		t.Fatal("expected reconnect admission to enqueue a request")
+	}
+	if store.entry.Username != "alice" || store.entry.Protocol != "flight" || store.entry.RequestedVCPUs != 4 || store.entry.PID != 2002 {
+		t.Fatalf("unexpected queued reconnect request: %#v", store.entry)
+	}
+	if err := lease.Release(context.Background()); err != nil {
+		t.Fatalf("release reconnect lease: %v", err)
+	}
+	if store.releaseID != "reconnect-lease" {
+		t.Fatalf("expected release of normal lease id, got %q", store.releaseID)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterCancelsQueuedRequestAfterAcquireError(t *testing.T) {
+	boom := errors.New("config store unavailable")
+	store := &runtimeLimiterTestStore{
+		acquireErr: boom,
+	}
+	limiter := &runtimeOrgConnectionLimiter{
+		store:        store,
+		orgID:        "org-1",
+		cpInstanceID: "cp-1",
+		queueTTL:     time.Second,
+		pollInterval: time.Millisecond,
+		now:          time.Now,
+		newID: func() (string, error) {
+			return "request-error", nil
+		},
+	}
+
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID:            1001,
+		Username:       "alice",
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+	}, func(username string) configstore.OrgResourceLimits {
+		return configstore.OrgResourceLimits{OrgMaxVCPUs: 1}
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("expected acquire error %v, got lease=%v err=%v", boom, lease, err)
+	}
+	tryLimits, cancels, queuedEntry := store.snapshot()
+	if len(tryLimits) != 1 {
+		t.Fatalf("expected one acquire attempt, got %d", len(tryLimits))
+	}
+	if queuedEntry == nil || queuedEntry.RequestID != "request-error" {
+		t.Fatalf("expected queued request-error entry, got %#v", queuedEntry)
+	}
+	if cancels != 1 {
+		t.Fatalf("expected acquire error to cancel queued request once, got %d", cancels)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // OrgUserKey is the composite key for org-scoped user lookups.
@@ -39,6 +40,7 @@ type Snapshot struct {
 	OrgUserPassword       map[OrgUserKey]string // (orgID, username) -> bcrypt hash
 	OrgUserPassthrough    map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
 	OrgUserDefaultCatalog map[OrgUserKey]string // (orgID, username) -> default session catalog
+	OrgUserMaxVCPUs       map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
 }
 
 // Selectable catalog names. The startup `database` param now names the catalog
@@ -181,6 +183,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		OrgUserPassword:       make(map[OrgUserKey]string),
 		OrgUserPassthrough:    make(map[OrgUserKey]bool),
 		OrgUserDefaultCatalog: make(map[OrgUserKey]string),
+		OrgUserMaxVCPUs:       make(map[OrgUserKey]int),
 	}
 
 	for _, o := range orgs {
@@ -193,7 +196,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			DatabaseName:            o.DatabaseName,
 			HostnameAlias:           alias,
 			MaxWorkers:              o.MaxWorkers,
-			MaxConnections:          o.MaxConnections,
+			MaxVCPUs:                o.MaxVCPUs,
 			DefaultWorkerCPU:        o.DefaultWorkerCPU,
 			DefaultWorkerMemory:     o.DefaultWorkerMemory,
 			DefaultWorkerTTL:        o.DefaultWorkerTTL,
@@ -216,6 +219,9 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			}
 			if u.DefaultCatalog != "" {
 				snap.OrgUserDefaultCatalog[key] = u.DefaultCatalog
+			}
+			if u.MaxVCPUs > 0 {
+				snap.OrgUserMaxVCPUs[key] = u.MaxVCPUs
 			}
 		}
 		snap.Orgs[o.Name] = oc
@@ -556,6 +562,16 @@ func (cs *ConfigStore) OnChange(fn func(old, new *Snapshot)) {
 
 // ListWarehousesByStates returns all warehouses with a state matching one of the given values.
 // This is a direct DB query, not snapshot-based, for use by the provisioning controller.
+// ListWarehouses returns every managed-warehouse row. Used by the admin drift
+// finder, which only consumes org_id, state, and duckling_name.
+func (cs *ConfigStore) ListWarehouses() ([]ManagedWarehouse, error) {
+	var warehouses []ManagedWarehouse
+	if err := cs.db.Find(&warehouses).Error; err != nil {
+		return nil, fmt.Errorf("list warehouses: %w", err)
+	}
+	return warehouses, nil
+}
+
 func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvisioningState) ([]ManagedWarehouse, error) {
 	var warehouses []ManagedWarehouse
 	if err := cs.db.Where("state IN ?", states).Find(&warehouses).Error; err != nil {
@@ -663,6 +679,16 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 		}
 	}
 
+	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_org_connection_queue_user_heads ON ` + qs + `.org_connection_queue (org_id, username, enqueued_at, request_id) WHERE granted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_org_connection_leases_org_user ON ` + qs + `.org_connection_leases (org_id, username)`,
+	} {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+
 	// Drop runtime columns whose Go struct fields were removed. AutoMigrate
 	// never drops columns, and on an existing deployment cp_instances.pod_uid /
 	// boot_id are NOT NULL — leaving them would make every heartbeat insert (which
@@ -672,7 +698,6 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 	// org_connection_queue.canceled_at was never set (cancel is a DELETE). DROP
 	// ... IF EXISTS is idempotent and a no-op on a fresh schema. This must run
 	// before the first UpsertControlPlaneInstance.
-	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
 	for _, stmt := range []string{
 		`ALTER TABLE ` + qs + `.cp_instances DROP COLUMN IF EXISTS pod_uid, DROP COLUMN IF EXISTS boot_id`,
 		`ALTER TABLE ` + qs + `.worker_records DROP COLUMN IF EXISTS pod_uid`,
@@ -747,16 +772,35 @@ func (cs *ConfigStore) runtimeTable(base string) string {
 }
 
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
-// state by image and tenant binding for Prometheus observability.
+// state by image and tenant binding for Prometheus observability, with summed
+// cpu cores and memory bytes per group.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
 	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
 	// now; the branch only matches pre-existing/legacy rows or single-tenant mode.
-	const bindingExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
-	var out []WorkerLifecycleStats
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Select("image, state, "+bindingExpr+" AS binding, COUNT(*)::bigint AS count").
-		Where("image <> ''").
-		Where("state IN ?", []WorkerState{
+	const bindingExpr = "CASE WHEN NULLIF(w.org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
+	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
+	// Org is a config table (not runtime-qualified); its default worker profile
+	// supplies the cpu/mem for workers that carry no explicit profile.
+	orgTable := (&Org{}).TableName()
+
+	// k8s quantity strings can't be summed in SQL, so pull the raw filtered rows
+	// (cpu/mem resolved to the org default when the worker carries none) and
+	// aggregate per (image,state,binding) group in Go below.
+	type workerRow struct {
+		Image   string
+		State   WorkerState
+		Binding string
+		CPU     string
+		Memory  string
+	}
+	var rows []workerRow
+	err := cs.db.Table(workerTable+" AS w").
+		Select("w.image AS image, w.state AS state, "+bindingExpr+" AS binding, "+
+			"COALESCE(NULLIF(w.profile_cpu, ''), o.default_worker_cpu, '') AS cpu, "+
+			"COALESCE(NULLIF(w.profile_memory, ''), o.default_worker_memory, '') AS memory").
+		Joins("LEFT JOIN "+orgTable+" AS o ON o.name = w.org_id").
+		Where("w.image <> ''").
+		Where("w.state IN ?", []WorkerState{
 			WorkerStateSpawning,
 			WorkerStateIdle,
 			WorkerStateReserved,
@@ -765,11 +809,42 @@ func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error
 			WorkerStateHotIdle,
 			WorkerStateDraining,
 		}).
-		Group("image, state, " + bindingExpr).
-		Order("image ASC, state ASC, binding ASC").
-		Scan(&out).Error
+		Order("w.image ASC, w.state ASC, " + bindingExpr + " ASC").
+		Scan(&rows).Error
 	if err != nil {
 		return nil, fmt.Errorf("list worker lifecycle stats: %w", err)
+	}
+
+	// Aggregate count + summed cpu cores / memory bytes per group, preserving the
+	// image/state/binding ordering established by the query above.
+	type groupKey struct {
+		image   string
+		state   WorkerState
+		binding string
+	}
+	index := make(map[groupKey]int)
+	var out []WorkerLifecycleStats
+	for _, r := range rows {
+		k := groupKey{r.Image, r.State, r.Binding}
+		i, ok := index[k]
+		if !ok {
+			i = len(out)
+			index[k] = i
+			out = append(out, WorkerLifecycleStats{Image: r.Image, State: r.State, Binding: r.Binding})
+		}
+		out[i].Count++
+		// Unparseable/empty quantities (e.g. default profile with no org default)
+		// contribute 0.
+		if r.CPU != "" {
+			if q, err := resource.ParseQuantity(r.CPU); err == nil {
+				out[i].CPUCores += q.AsApproximateFloat64()
+			}
+		}
+		if r.Memory != "" {
+			if q, err := resource.ParseQuantity(r.Memory); err == nil {
+				out[i].MemoryBytes += q.Value()
+			}
+		}
 	}
 	return out, nil
 }
@@ -1507,10 +1582,11 @@ func (cs *ConfigStore) countOrgAdmittingWorkers(tx *gorm.DB, orgID, image, profi
 // Apr 2026 also added an exclusion for workers with reclaimable Flight
 // sessions: a row with at least one flight_session_records entry in
 // active or reconnecting state is spared from orphan retirement so a
-// customer reconnecting by session token can still pick up their query
-// (see TakeOverWorker). Once the session record itself becomes terminal
-// (expired/closed via ExpireFlightSessionRecords), the worker is
-// retired normally on the next sweep.
+// customer reconnecting by session token can establish a fresh remote
+// session on the surviving worker (see TakeOverWorker). Once the session
+// record itself becomes terminal (expired/closed via
+// ExpireFlightSessionRecords), the worker is retired normally on the next
+// sweep.
 //
 // See TestListOrphanedWorkers* in tests/configstore for the regression
 // fixtures.
@@ -1548,8 +1624,8 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 			before,
 		).
 		// Spare workers with at least one reclaimable Flight session: a
-		// retire here would kill the customer's mid-flight query at the
-		// moment they reconnect by session token. Bounded by
+		// retire here would remove the worker before a token holder can
+		// establish a fresh remote session. Bounded by
 		// ExpireFlightSessionRecords — once the session record is moved
 		// to a terminal state, the worker is no longer protected.
 		Where("NOT EXISTS (SELECT 1 FROM "+flightTable+" AS f "+
@@ -1661,7 +1737,7 @@ func advisoryLockKey(s string) int64 {
 func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "session_token"}},
-		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "p_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert flight session record: %w", err)
 	}
@@ -1706,6 +1782,27 @@ func (cs *ConfigStore) CloseFlightSessionRecord(sessionToken string, closedAt ti
 		return fmt.Errorf("close flight session record: %w", result.Error)
 	}
 	return nil
+}
+
+func (cs *ConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(stale FlightSessionRecord, closedAt time.Time) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
+		Where("session_token = ?", stale.SessionToken).
+		Where("state = ?", FlightSessionStateActive).
+		Where("username = ?", stale.Username).
+		Where("org_id = ?", stale.OrgID).
+		Where("worker_id = ?", stale.WorkerID).
+		Where("p_id = ?", stale.PID).
+		Where("owner_epoch = ?", stale.OwnerEpoch).
+		Where("cp_instance_id = ?", stale.CPInstanceID).
+		Updates(map[string]any{
+			"state":        FlightSessionStateClosed,
+			"last_seen_at": closedAt,
+			"updated_at":   time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("close flight session record if reconnect target unchanged: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // Reload forces an immediate config reload from the database.

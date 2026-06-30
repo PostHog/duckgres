@@ -625,7 +625,8 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// Leave the worker in `hot` state, owned by this dying CP. Two
 		// downstream guarantees keep this safe:
 		//   (1) Flight clients can reconnect by session token; a peer CP
-		//       claims via TakeOverWorker and the query resumes.
+		//       claims via TakeOverWorker and starts a fresh remote session
+		//       on the surviving worker.
 		//   (2) ListOrphanedWorkers' JOIN against flight_session_records
 		//       prevents peer CPs' janitors from retiring the worker
 		//       while a session is still active or reconnecting; once the

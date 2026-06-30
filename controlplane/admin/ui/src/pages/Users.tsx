@@ -76,18 +76,24 @@ export function UsersPage() {
         header: "",
         enableSorting: false,
         cell: ({ row }) => (
-          <div className="flex justify-end gap-1">
-            <Button variant="ghost" size="icon" title="Persistent secrets" onClick={() => setSecretsFor(row.original)}>
-              <KeyRound className="h-4 w-4" />
+          <div className="-my-1 flex justify-end gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6"
+              title="Persistent secrets"
+              onClick={() => setSecretsFor(row.original)}
+            >
+              <KeyRound className="h-3.5 w-3.5" />
             </Button>
             <AdminGate>
-              <Button variant="ghost" size="icon" title="Edit" onClick={() => setEditing(row.original)}>
-                <Pencil className="h-4 w-4" />
+              <Button variant="ghost" size="icon" className="h-6 w-6" title="Edit" onClick={() => setEditing(row.original)}>
+                <Pencil className="h-3.5 w-3.5" />
               </Button>
             </AdminGate>
             <AdminGate>
-              <Button variant="ghost" size="icon" title="Delete" onClick={() => setDeleting(row.original)}>
-                <Trash2 className="h-4 w-4 text-destructive" />
+              <Button variant="ghost" size="icon" className="h-6 w-6" title="Delete" onClick={() => setDeleting(row.original)}>
+                <Trash2 className="h-3.5 w-3.5 text-destructive" />
               </Button>
             </AdminGate>
           </div>

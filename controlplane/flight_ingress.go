@@ -47,11 +47,10 @@ type flightSessionProvider struct {
 }
 
 func (p *flightSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
-	workerPID, executor, err := p.sm.CreateSession(ctx, username, pid, memoryLimit, threads, nil)
+	workerPID, executor, err := p.sm.CreateSessionWithProtocol(ctx, username, pid, memoryLimit, threads, "flight", nil)
 	if err != nil {
 		return 0, nil, err
 	}
-	p.sm.SetProtocol(workerPID, "flight")
 	return workerPID, executor, nil
 }
 
@@ -192,6 +191,7 @@ func (s *configStoreFlightSessionStore) UpsertSession(record flightsqlingress.Du
 		Username:     record.Username,
 		OrgID:        record.OrgID,
 		WorkerID:     record.WorkerID,
+		PID:          record.PID,
 		OwnerEpoch:   record.OwnerEpoch,
 		CPInstanceID: record.CPInstanceID,
 		State:        configstore.FlightSessionState(record.State),
@@ -210,6 +210,7 @@ func (s *configStoreFlightSessionStore) GetSession(sessionToken string) (*flight
 		Username:     record.Username,
 		OrgID:        record.OrgID,
 		WorkerID:     record.WorkerID,
+		PID:          record.PID,
 		OwnerEpoch:   record.OwnerEpoch,
 		CPInstanceID: record.CPInstanceID,
 		State:        flightsqlingress.DurableSessionState(record.State),
@@ -224,4 +225,19 @@ func (s *configStoreFlightSessionStore) TouchSession(sessionToken string, lastSe
 
 func (s *configStoreFlightSessionStore) CloseSession(sessionToken string, closedAt time.Time) error {
 	return s.store.CloseFlightSessionRecord(sessionToken, closedAt)
+}
+
+func (s *configStoreFlightSessionStore) CloseSessionIfReconnectTargetUnchanged(stale flightsqlingress.DurableSessionRecord, closedAt time.Time) (bool, error) {
+	return s.store.CloseFlightSessionRecordIfReconnectTargetUnchanged(configstore.FlightSessionRecord{
+		SessionToken: stale.SessionToken,
+		Username:     stale.Username,
+		OrgID:        stale.OrgID,
+		WorkerID:     stale.WorkerID,
+		PID:          stale.PID,
+		OwnerEpoch:   stale.OwnerEpoch,
+		CPInstanceID: stale.CPInstanceID,
+		State:        configstore.FlightSessionState(stale.State),
+		ExpiresAt:    stale.ExpiresAt,
+		LastSeenAt:   stale.LastSeenAt,
+	}, closedAt)
 }

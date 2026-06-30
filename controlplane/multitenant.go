@@ -95,12 +95,20 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 			if count == 0 {
 				status = "idle"
 			}
-			result = append(result, admin.WorkerStatus{
+			ws := admin.WorkerStatus{
 				ID:             wID,
 				Org:            name,
 				ActiveSessions: count,
 				Status:         status,
-			})
+			}
+			// Pod-shape (cpu/memory/ttl) of the session-holding worker; empty/zero
+			// for the default profile or a worker no longer in the pool.
+			if profile, ok := stack.Sessions.WorkerProfile(wID); ok {
+				ws.CPU = profile.CPU
+				ws.Memory = profile.Memory
+				ws.TTLSeconds = int(profile.TTL.Seconds())
+			}
+			result = append(result, ws)
 		}
 	}
 	return result
@@ -523,6 +531,16 @@ func SetupMultiTenant(
 		Audit:        auditStore,
 		Metrics:      metricsProxy,
 	})
+
+	// Live Duckling drift finder. Reuse the in-cluster Duckling client built
+	// above (dc); pass nil when it's unavailable so the endpoint degrades to
+	// {"available": false} rather than 500ing. A typed-nil *DucklingClient must
+	// not be boxed into the interface, so only assign when dc is usable.
+	var ducklingChecker admin.DucklingChecker
+	if dcErr == nil && dc != nil {
+		ducklingChecker = dc
+	}
+	admin.RegisterDucklingsDrift(api, store, ducklingChecker)
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)

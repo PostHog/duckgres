@@ -10,11 +10,11 @@ import "time"
 // alias", multiple orgs can share the NULL state, but any non-NULL alias must
 // be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
-	Name           string  `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName   string  `gorm:"size:255;uniqueIndex" json:"database_name"`
-	HostnameAlias  *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
-	MaxWorkers     int     `gorm:"default:0" json:"max_workers"`
-	MaxConnections int     `gorm:"default:0" json:"max_connections"`
+	Name          string  `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName  string  `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
+	MaxWorkers    int     `gorm:"default:0" json:"max_workers"`
+	MaxVCPUs      int     `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
 	// DefaultWorkerCPU/Memory/TTL are the org's operator-set default worker
 	// profile: the pod shape (k8s resource quantities, e.g. "2"/"8Gi") and
 	// hot-idle TTL (Go duration string, e.g. "75m" — stored as a string for
@@ -46,6 +46,7 @@ type OrgUser struct {
 	Password       string    `gorm:"size:255;not null" json:"-"`
 	Passthrough    bool      `gorm:"not null;default:false" json:"passthrough"`
 	DefaultCatalog string    `gorm:"size:255" json:"default_catalog,omitempty"`
+	MaxVCPUs       int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -282,6 +283,11 @@ type ManagedWarehouse struct {
 	Image           string `gorm:"size:512" json:"image"`
 	DuckLakeVersion string `gorm:"size:32" json:"ducklake_version"`
 
+	// DucklingName is the k8s Duckling CR name; canonical = lowercased org ID.
+	// Authoritative, not derived — stored explicitly so lookups stop guessing
+	// it from the org ID (see provisioner.ducklingName for the canonical form).
+	DucklingName string `gorm:"size:255" json:"duckling_name"`
+
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
 	DataStore         ManagedWarehouseDataStore      `gorm:"embedded;embeddedPrefix:data_store_" json:"data_store"`
@@ -380,10 +386,12 @@ const (
 // WorkerLifecycleStats is the grouped worker lifecycle state used for
 // cluster-wide worker observability.
 type WorkerLifecycleStats struct {
-	Image   string      `json:"image"`
-	State   WorkerState `json:"state"`
-	Binding string      `json:"binding"`
-	Count   int64       `json:"count"`
+	Image       string      `json:"image"`
+	State       WorkerState `json:"state"`
+	Binding     string      `json:"binding"`
+	Count       int64       `json:"count"`
+	CPUCores    float64     `json:"cpu_cores"`
+	MemoryBytes int64       `json:"memory_bytes"`
 }
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.
@@ -453,6 +461,7 @@ type FlightSessionRecord struct {
 	Username     string             `gorm:"size:255;not null" json:"username"`
 	OrgID        string             `gorm:"size:255;not null" json:"org_id"`
 	WorkerID     int                `gorm:"not null;index" json:"worker_id"`
+	PID          int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
 	OwnerEpoch   int64              `gorm:"not null" json:"owner_epoch"`
 	CPInstanceID string             `gorm:"size:255" json:"cp_instance_id"`
 	State        FlightSessionState `gorm:"size:32;not null" json:"state"`
@@ -464,17 +473,26 @@ type FlightSessionRecord struct {
 
 func (FlightSessionRecord) TableName() string { return "flight_session_records" }
 
+// OrgResourceLimits is the current resource-admission ceiling for an org and
+// the connecting user. 0 means unlimited for either dimension.
+type OrgResourceLimits struct {
+	OrgMaxVCPUs  int
+	UserMaxVCPUs int
+}
+
 // OrgConnectionQueueEntry is a cluster-wide FIFO admission request for one org
 // connection. Rows expire quickly; they coordinate fairness across CP replicas.
 type OrgConnectionQueueEntry struct {
-	RequestID    string     `gorm:"primaryKey;size:64" json:"request_id"`
-	OrgID        string     `gorm:"size:255;not null;index:idx_org_connection_queue_pending,priority:1" json:"org_id"`
-	CPInstanceID string     `gorm:"size:255;not null;index" json:"cp_instance_id"`
-	PID          int32      `gorm:"not null" json:"pid"`
-	Protocol     string     `gorm:"size:32;not null" json:"protocol"`
-	EnqueuedAt   time.Time  `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
-	ExpiresAt    time.Time  `gorm:"not null;index" json:"expires_at"`
-	GrantedAt    *time.Time `gorm:"index" json:"granted_at,omitempty"`
+	RequestID      string     `gorm:"primaryKey;size:64" json:"request_id"`
+	OrgID          string     `gorm:"size:255;not null;index:idx_org_connection_queue_pending,priority:1" json:"org_id"`
+	Username       string     `gorm:"size:255;index" json:"username"`
+	CPInstanceID   string     `gorm:"size:255;not null;index" json:"cp_instance_id"`
+	PID            int32      `gorm:"not null" json:"pid"`
+	Protocol       string     `gorm:"size:32;not null" json:"protocol"`
+	RequestedVCPUs int        `gorm:"column:requested_vcpus;not null;default:1" json:"requested_vcpus"`
+	EnqueuedAt     time.Time  `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
+	ExpiresAt      time.Time  `gorm:"not null;index" json:"expires_at"`
+	GrantedAt      *time.Time `gorm:"index" json:"granted_at,omitempty"`
 	// canceled_at was dropped: cancellation is a hard DELETE of the row, so the
 	// column was never set to a non-NULL value.
 	CreatedAt time.Time `json:"created_at"`
@@ -487,15 +505,17 @@ func (OrgConnectionQueueEntry) TableName() string { return "org_connection_queue
 // session. Capacity checks count active leases, ignoring owners whose CP row
 // has expired.
 type OrgConnectionLease struct {
-	LeaseID      string    `gorm:"primaryKey;size:64" json:"lease_id"`
-	RequestID    string    `gorm:"size:64;not null;uniqueIndex" json:"request_id"`
-	OrgID        string    `gorm:"size:255;not null;index" json:"org_id"`
-	CPInstanceID string    `gorm:"size:255;not null;index" json:"cp_instance_id"`
-	PID          int32     `gorm:"not null" json:"pid"`
-	Protocol     string    `gorm:"size:32;not null" json:"protocol"`
-	AcquiredAt   time.Time `gorm:"not null" json:"acquired_at"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	LeaseID        string    `gorm:"primaryKey;size:64" json:"lease_id"`
+	RequestID      string    `gorm:"size:64;not null;uniqueIndex" json:"request_id"`
+	OrgID          string    `gorm:"size:255;not null;index" json:"org_id"`
+	Username       string    `gorm:"size:255;index" json:"username"`
+	CPInstanceID   string    `gorm:"size:255;not null;index" json:"cp_instance_id"`
+	PID            int32     `gorm:"not null" json:"pid"`
+	Protocol       string    `gorm:"size:32;not null" json:"protocol"`
+	RequestedVCPUs int       `gorm:"column:requested_vcpus;not null;default:1" json:"requested_vcpus"`
+	AcquiredAt     time.Time `gorm:"not null" json:"acquired_at"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func (OrgConnectionLease) TableName() string { return "org_connection_leases" }
@@ -511,7 +531,7 @@ type OrgConfig struct {
 	DatabaseName            string
 	HostnameAlias           string // empty when no alias is configured
 	MaxWorkers              int
-	MaxConnections          int
+	MaxVCPUs                int
 	DefaultWorkerCPU        string            // org default worker profile: pod cpu quantity ("" = unset)
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
 	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)

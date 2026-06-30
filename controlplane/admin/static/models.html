@@ -365,7 +365,7 @@
       name: "Org name. Primary key and stable tenant identifier.",
       database_name: "Database name clients connect with (dbname=). Unique across orgs.",
       max_workers: "Maximum concurrent worker pods this org may run. 0 means use the deployment default.",
-      max_connections: "Maximum concurrent client connections for this org. 0 means use the deployment default.",
+      max_vcpus: "Maximum active worker pod vCPUs this org may have admitted. 0 means unlimited.",
       default_worker_cpu: "Operator-set default worker pod CPU (k8s quantity, e.g. 2). Empty means unset. Applied when a connection does not size itself via duckgres.worker_* options.",
       default_worker_memory: "Operator-set default worker pod memory (k8s quantity, e.g. 8Gi). Empty means unset.",
       default_worker_ttl: "Operator-set default hot-idle TTL for workers (Go duration string, e.g. 75m). Empty means unset.",
@@ -378,6 +378,7 @@
       username: "Login name, scoped to the org. Part of the primary key.",
       passthrough: "When true, bypass the PostgreSQL compatibility layer (transpiler + pg_catalog) and forward SQL straight to DuckDB. For clients that speak DuckDB SQL natively.",
       default_catalog: "Default catalog (database) selected for this user's sessions. Empty means the deployment default.",
+      max_vcpus: "Maximum active worker pod vCPUs this user may have admitted. 0 means unlimited.",
       created_at: "When this user record was created.",
       updated_at: "When this user record was last modified.",
     },
@@ -452,6 +453,7 @@
       username: "User that owns the Flight session.",
       org_id: "Org the session belongs to.",
       worker_id: "Worker pod serving this session.",
+      pid: "Client backend PID associated with the durable session.",
       owner_epoch: "Worker ownership epoch at the time the session was bound, to fence stale workers.",
       cp_instance_id: "Control-plane instance handling this session.",
       state: "Durable reconnect state (active, reconnecting, expired, closed).",
@@ -462,10 +464,12 @@
     },
     "org-connection-queue": {
       request_id: "Unique admission request id. Primary key.",
-      org_id: "Org requesting an admission slot.",
+      org_id: "Org requesting resource admission.",
+      username: "User requesting resource admission.",
       cp_instance_id: "Control-plane instance that enqueued the request.",
       pid: "Client backend PID associated with the request.",
       protocol: "Client protocol of the request (e.g. postgres, flight).",
+      requested_vcpus: "Worker pod vCPUs requested by this admission entry.",
       enqueued_at: "When the request joined the FIFO queue; orders fairness.",
       expires_at: "When this queue entry expires and is reclaimed.",
       granted_at: "When admission was granted, if applicable.",
@@ -476,10 +480,12 @@
       lease_id: "Unique admission lease id. Primary key.",
       request_id: "Queue request id this lease was granted for. Unique.",
       org_id: "Org holding the admission lease.",
+      username: "User holding the admission lease.",
       cp_instance_id: "Control-plane instance that owns the lease.",
       pid: "Client backend PID holding the lease.",
       protocol: "Client protocol of the leased connection.",
-      acquired_at: "When the lease was acquired; counts toward the org's active-connection capacity.",
+      requested_vcpus: "Worker pod vCPUs charged to the org and user budgets.",
+      acquired_at: "When the lease was acquired; counts toward active vCPU resource budgets.",
       created_at: "When this lease record was created.",
       updated_at: "When this lease record was last modified.",
     },
@@ -489,14 +495,14 @@
   // Grounded in the configstore struct doc comments.
   const MODEL_DESCRIPTIONS = {
     orgs: "A tenant, with its connection database name, per-org resource limits, and default worker profile.",
-    "org-users": "A username mapped to an org, with credentials and a per-user PostgreSQL-passthrough flag.",
+    "org-users": "A username mapped to an org, with credentials, passthrough/default-catalog settings, and per-user resource limits.",
     "org-user-secrets": "A customer-set persistent DuckDB secret, scoped to (org, user) and replayed onto the user's worker at session creation.",
     "managed-warehouses": "The config-store source of truth for an org's managed warehouse: image, metadata/object stores, catalogs, identity, and provisioning status.",
     "cp-instances": "A runtime coordination record for one control-plane process, with liveness state and heartbeat.",
     "worker-records": "A durable runtime record for one worker pod: lifecycle state, owner, profile, TTL, and credential expiry.",
     "flight-session-records": "A durable reconnect record for a Flight-only session, binding it to a worker and control-plane instance.",
-    "org-connection-queue": "A cluster-wide FIFO admission request for one org connection; rows expire quickly and coordinate fairness across CP replicas.",
-    "org-connection-leases": "A durable cluster-wide admission lease for a live session; active leases count toward an org's connection capacity.",
+    "org-connection-queue": "A cluster-wide FIFO resource admission request for one org/user session; rows expire quickly and coordinate fairness across CP replicas.",
+    "org-connection-leases": "A durable cluster-wide resource admission lease for a live session; active leases count toward org and user vCPU budgets.",
   };
 
   // Per-org aux data computed client-side: the live /models/orgs listing does
@@ -725,7 +731,7 @@
   // simply never in this allowlist. "int" → numeric input, else text.
   const ORG_EDIT_FIELDS = {
     max_workers: "int",
-    max_connections: "int",
+    max_vcpus: "int",
     default_worker_cpu: "text",
     default_worker_memory: "text",
     default_worker_ttl: "text",
@@ -737,12 +743,21 @@
     return cols.filter(c => ORG_EDIT_FIELDS[c]);
   }
 
+  const ORG_USER_EDIT_FIELDS = {
+    max_vcpus: "int",
+  };
+  function orgUserEditableCols() {
+    const cols = (state.listing && state.listing.columns) || [];
+    return cols.filter(c => ORG_USER_EDIT_FIELDS[c]);
+  }
+
   function showDetail(idx, rows) {
     state.selected = idx;
     const row = rows[idx];
     const panel = document.getElementById("detail");
     panel.classList.remove("hidden");
     if (state.key === "orgs") renderOrgDetail(panel, row, rows, "view");
+    else if (state.key === "org-users") renderOrgUserDetail(panel, row, rows, "view");
     else renderReadOnlyDetail(panel, row);
     document.querySelectorAll("#table-scroll tbody tr").forEach(tr =>
       tr.classList.toggle("sel", parseInt(tr.dataset.idx, 10) === idx));
@@ -834,6 +849,60 @@
     return html;
   }
 
+  function renderOrgUserDetail(panel, row, rows, mode, errMsg) {
+    const title = esc(state.listing.label);
+    const err = errMsg ? '<div class="derror">' + esc(errMsg) + "</div>" : "";
+    let head, body;
+    if (mode === "edit") {
+      head = '<div class="dhead"><span class="dt">' + title + "</span>" +
+        '<span class="x" id="dclose">✕</span></div>';
+      body = err + orgUserEditFormHTML(row);
+    } else {
+      head = '<div class="dhead"><span class="dt">' + title + "</span>" +
+        '<button class="btn" id="org-user-edit">Edit</button>' +
+        '<span class="x" id="dclose">✕</span></div>';
+      body = detailRows(row);
+    }
+    panel.innerHTML = head + body;
+    document.getElementById("dclose").addEventListener("click", closeDetail);
+
+    if (mode === "edit") {
+      document.getElementById("org-user-edit-cancel").addEventListener("click", () => renderOrgUserDetail(panel, row, rows, "view"));
+      document.getElementById("org-user-edit-save").addEventListener("click", async () => {
+        const payload = {};
+        for (const c of orgUserEditableCols()) {
+          const inp = document.getElementById("orguserf-" + c);
+          if (!inp) continue;
+          if (ORG_USER_EDIT_FIELDS[c] === "int") payload[c] = inp.value === "" ? 0 : parseInt(inp.value, 10);
+          else payload[c] = inp.value;
+        }
+        try {
+          const updated = await api("/api/v1/orgs/" + encodeURIComponent(row.org_id) + "/users/" + encodeURIComponent(row.username), { method: "PUT", body: payload });
+          await refreshOrgUsersTable();
+          renderOrgUserDetail(panel, updated || row, rows, "view");
+        } catch (e) {
+          if (e.message !== "unauthorized") renderOrgUserDetail(panel, row, rows, "edit", e.message);
+        }
+      });
+    } else {
+      document.getElementById("org-user-edit").addEventListener("click", () => renderOrgUserDetail(panel, row, rows, "edit"));
+    }
+  }
+
+  function orgUserEditFormHTML(row) {
+    let html = '<div class="dform">';
+    for (const c of orgUserEditableCols()) {
+      const type = ORG_USER_EDIT_FIELDS[c] === "int" ? "number" : "text";
+      const raw = row[c];
+      const v = (raw === null || raw === undefined) ? "" : String(raw);
+      html += '<div class="frow"><label for="orguserf-' + esc(c) + '">' + esc(c) + "</label>" +
+        '<input id="orguserf-' + esc(c) + '" type="' + type + '" value="' + esc(v) + '"></div>';
+    }
+    html += '<div class="factions"><button class="btn" id="org-user-edit-save">Save</button>' +
+      '<button class="btn" id="org-user-edit-cancel">Cancel</button></div></div>';
+    return html;
+  }
+
   // refreshOrgsTable re-fetches the orgs listing + cross-model aux and re-renders
   // the table in place, without disturbing an open detail panel (used after an
   // org edit so the row reflects the change while the panel stays open).
@@ -847,6 +916,17 @@
       renderTable();
     } catch (e) { /* best-effort table refresh */ }
   }
+
+  async function refreshOrgUsersTable() {
+    try {
+      const lst = await api("/api/v1/models/org-users");
+      state.listing = lst;
+      document.getElementById("model-count").textContent =
+        lst.count + " row" + (lst.count === 1 ? "" : "s") + (lst.truncated ? " (showing first " + lst.rows.length + ")" : "");
+      renderTable();
+    } catch (e) { /* best-effort table refresh */ }
+  }
+
   function closeDetail() {
     document.getElementById("detail").classList.add("hidden");
     state.selected = -1;

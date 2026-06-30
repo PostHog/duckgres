@@ -10,11 +10,15 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const missingOwnerOrgConnectionLeaseGrace = 5 * time.Minute
+const (
+	missingOwnerOrgConnectionLeaseGrace = 5 * time.Minute
+	legacyOrgConnectionRequestedVCPUs   = 1
+)
 
 // EnqueueOrgConnectionRequest inserts a pending cluster-wide connection
 // admission request. FIFO ordering is scoped to org_id and ordered by
-// enqueued_at, then request_id.
+// enqueued_at, then request_id. RequestedVCPUs is charged against active
+// resource leases when the request is granted.
 func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntry) error {
 	if entry == nil {
 		return fmt.Errorf("org connection queue entry is required")
@@ -24,6 +28,12 @@ func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntr
 	}
 	if strings.TrimSpace(entry.OrgID) == "" {
 		return fmt.Errorf("org connection org id is required")
+	}
+	if strings.TrimSpace(entry.Username) == "" {
+		return fmt.Errorf("org connection username is required")
+	}
+	if entry.RequestedVCPUs <= 0 {
+		return fmt.Errorf("org connection requested vcpus must be positive")
 	}
 	if entry.EnqueuedAt.IsZero() {
 		entry.EnqueuedAt = time.Now()
@@ -51,20 +61,43 @@ func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntr
 	return nil
 }
 
-// TryAcquireOrgConnectionLease attempts to grant one queued request under a
-// cluster-wide per-org limit. A nil lease means the request is still waiting
-// behind FIFO order or active capacity.
-func (cs *ConfigStore) TryAcquireOrgConnectionLease(requestID string, maxConnections int, _ time.Time) (*OrgConnectionLease, error) {
+// TryAcquireOrgConnectionLease attempts to grant one queued request under
+// cluster-wide per-org and per-user vCPU budgets. A nil lease means the request
+// is still waiting behind FIFO order or active resource capacity.
+func (cs *ConfigStore) TryAcquireOrgConnectionLease(requestID string, limits OrgResourceLimits, now time.Time) (*OrgConnectionLease, error) {
+	return cs.TryAcquireOrgConnectionLeaseWithLimitLookup(requestID, func(string) OrgResourceLimits {
+		return limits
+	}, now)
+}
+
+// TryAcquireOrgConnectionLeaseWithLimitLookup attempts to grant one queued
+// request using a username-scoped limit lookup. Earlier queued requests must be
+// evaluated with their own user limits so one saturated user does not stall
+// unrelated users in the same org.
+func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookup(requestID string, limitLookup func(string) OrgResourceLimits, _ time.Time) (*OrgConnectionLease, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return nil, fmt.Errorf("org connection request id is required")
 	}
+	if limitLookup == nil {
+		limitLookup = func(string) OrgResourceLimits { return OrgResourceLimits{} }
+	}
+
+	start := time.Now()
+	outcome := orgConnectionAdmissionOutcomeWaiting
+	var stats orgConnectionAdmissionStats
+	defer func() {
+		observeOrgConnectionAdmission(time.Since(start), outcome, stats)
+	}()
 
 	for {
-		lease, retry, err := cs.tryAcquireOrgConnectionLeaseOnce(requestID, maxConnections)
+		lease, retry, attemptStats, attemptOutcome, err := cs.tryAcquireOrgConnectionLeaseOnce(requestID, limitLookup)
+		stats = attemptStats
+		outcome = attemptOutcome
 		if retry {
 			continue
 		}
 		if err != nil {
+			outcome = orgConnectionAdmissionOutcomeError
 			return nil, fmt.Errorf("try acquire org connection lease: %w", err)
 		}
 		return lease, nil
@@ -83,10 +116,12 @@ func (cs *ConfigStore) orgConnectionRuntimeTables() orgConnectionRuntimeTables {
 	}
 }
 
-func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, maxConnections int) (*OrgConnectionLease, bool, error) {
+func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, limitLookup func(string) OrgResourceLimits) (*OrgConnectionLease, bool, orgConnectionAdmissionStats, string, error) {
 	tables := cs.orgConnectionRuntimeTables()
 	var lease *OrgConnectionLease
 	retryWithFreshOrg := false
+	var stats orgConnectionAdmissionStats
+	outcome := orgConnectionAdmissionOutcomeMissing
 
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
 		orgID, found, err := cs.orgIDForConnectionRequest(tx, tables.queue, requestID)
@@ -110,39 +145,40 @@ func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, maxCon
 		}
 		if request.OrgID != orgID {
 			retryWithFreshOrg = true
+			outcome = orgConnectionAdmissionOutcomeRetry
 			return nil
 		}
 
 		existing, found, err := cs.existingOrgConnectionLease(tx, tables.lease, requestID)
 		if err != nil || found {
 			lease = existing
+			if found {
+				outcome = orgConnectionAdmissionOutcomeAlreadyGranted
+			}
 			return err
 		}
 		if !request.ExpiresAt.After(now) || request.GrantedAt != nil {
+			outcome = orgConnectionAdmissionOutcomeInactive
 			return nil
 		}
-		atHead, err := cs.isOrgConnectionQueueHead(tx, tables.queue, request, now)
-		if err != nil || !atHead {
-			return err
-		}
-		if maxConnections > 0 {
-			count, err := cs.countActiveOrgConnectionLeases(tx, orgID)
-			if err != nil {
-				return err
-			}
-			if count >= int64(maxConnections) {
-				return nil
-			}
-		}
 
-		created, err := cs.createOrgConnectionLease(tx, request, now)
+		created, grantStats, grantOutcome, err := cs.grantNextEligibleOrgConnectionRequestLocked(tx, tables, orgID, limitLookup, now)
+		stats = grantStats
 		if err != nil {
 			return err
 		}
-		lease = created
+		if created != nil && created.RequestID == requestID {
+			lease = created
+			outcome = orgConnectionAdmissionOutcomeGranted
+			return nil
+		}
+		outcome = grantOutcome
+		if created != nil {
+			outcome = orgConnectionAdmissionOutcomeGrantedOther
+		}
 		return nil
 	})
-	return lease, retryWithFreshOrg, err
+	return lease, retryWithFreshOrg, stats, outcome, err
 }
 
 func (cs *ConfigStore) orgConnectionDatabaseNow(tx *gorm.DB) (time.Time, error) {
@@ -196,31 +232,125 @@ func (cs *ConfigStore) existingOrgConnectionLease(tx *gorm.DB, leaseTable, reque
 	return &existing, true, nil
 }
 
-func (cs *ConfigStore) isOrgConnectionQueueHead(tx *gorm.DB, queueTable string, request *OrgConnectionQueueEntry, now time.Time) (bool, error) {
-	var head OrgConnectionQueueEntry
-	if err := tx.Table(queueTable).
-		Where("org_id = ? AND granted_at IS NULL AND expires_at > ?", request.OrgID, now).
-		Order("enqueued_at ASC, request_id ASC").
-		Limit(1).
-		Take(&head).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return false, nil
-		}
-		return false, err
+func (cs *ConfigStore) grantNextEligibleOrgConnectionRequestLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, orgID string, limitLookup func(string) OrgResourceLimits, now time.Time) (*OrgConnectionLease, orgConnectionAdmissionStats, string, error) {
+	heads, stats, err := cs.pendingOrgConnectionUserQueueHeads(tx, tables.queue, orgID, now)
+	if err != nil {
+		return nil, stats, orgConnectionAdmissionOutcomeError, err
 	}
-	return head.RequestID == request.RequestID, nil
+	if len(heads) == 0 {
+		return nil, stats, orgConnectionAdmissionOutcomeWaiting, nil
+	}
+
+	orgUsed, userUsed, legacyUserUsed, err := cs.activeOrgConnectionLeaseVCPUUsage(tx, orgID)
+	if err != nil {
+		return nil, stats, orgConnectionAdmissionOutcomeError, err
+	}
+
+	for i := range heads {
+		head := &heads[i]
+		limits := limitLookup(head.Username)
+		requested := int64(head.RequestedVCPUs)
+		if limits.UserMaxVCPUs > 0 {
+			used := legacyUserUsed + userUsed[head.Username]
+			if used+requested > int64(limits.UserMaxVCPUs) {
+				stats.userLimitSkips++
+				continue
+			}
+		}
+		if limits.OrgMaxVCPUs > 0 && orgUsed+requested > int64(limits.OrgMaxVCPUs) {
+			return nil, stats, orgConnectionAdmissionOutcomeBlockedOrgVCPU, nil
+		}
+
+		request, found, err := cs.lockOrgConnectionRequest(tx, tables.queue, head.RequestID)
+		if err != nil {
+			return nil, stats, orgConnectionAdmissionOutcomeError, err
+		}
+		if !found || request.OrgID != orgID || request.GrantedAt != nil || !request.ExpiresAt.After(now) {
+			continue
+		}
+		created, err := cs.createOrgConnectionLease(tx, request, now)
+		if err != nil {
+			return nil, stats, orgConnectionAdmissionOutcomeError, err
+		}
+		return created, stats, orgConnectionAdmissionOutcomeGranted, nil
+	}
+
+	if stats.userLimitSkips > 0 {
+		return nil, stats, orgConnectionAdmissionOutcomeBlockedUserVCPU, nil
+	}
+	return nil, stats, orgConnectionAdmissionOutcomeWaiting, nil
+}
+
+func (cs *ConfigStore) pendingOrgConnectionUserQueueHeads(tx *gorm.DB, queueTable, orgID string, now time.Time) ([]OrgConnectionQueueEntry, orgConnectionAdmissionStats, error) {
+	var stats orgConnectionAdmissionStats
+	if err := tx.Table(queueTable).
+		Where("org_id = ? AND granted_at IS NULL AND expires_at > ?", orgID, now).
+		Count(&stats.queueDepth).Error; err != nil {
+		return nil, stats, err
+	}
+
+	var heads []OrgConnectionQueueEntry
+	if err := tx.Raw(
+		"SELECT * FROM ("+
+			"SELECT DISTINCT ON (username) * FROM "+queueTable+" "+
+			"WHERE org_id = ? AND granted_at IS NULL AND expires_at > ? "+
+			"ORDER BY username ASC, enqueued_at ASC, request_id ASC"+
+			") AS user_heads ORDER BY enqueued_at ASC, request_id ASC",
+		orgID, now,
+	).Scan(&heads).Error; err != nil {
+		return nil, stats, err
+	}
+	stats.userQueues = len(heads)
+	return heads, stats, nil
+}
+
+func (cs *ConfigStore) activeOrgConnectionLeaseVCPUUsage(tx *gorm.DB, orgID string) (int64, map[string]int64, int64, error) {
+	orgUsed, err := cs.sumActiveOrgConnectionLeaseVCPUs(tx, orgID)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+
+	type userUsageRow struct {
+		Username string
+		VCPUs    int64 `gorm:"column:vcpus"`
+	}
+	var rows []userUsageRow
+	leaseTable := cs.runtimeTable((&OrgConnectionLease{}).TableName())
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	if err := tx.Table(leaseTable+" AS l").
+		Select("COALESCE(l.username, '') AS username, COALESCE(SUM(CASE WHEN l.requested_vcpus > 0 THEN l.requested_vcpus ELSE ? END), 0) AS vcpus", legacyOrgConnectionRequestedVCPUs).
+		Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = l.cp_instance_id").
+		Where("l.org_id = ?", orgID).
+		Where("cp.id IS NULL OR cp.state <> ?", ControlPlaneInstanceStateExpired).
+		Group("COALESCE(l.username, '')").
+		Scan(&rows).Error; err != nil {
+		return 0, nil, 0, err
+	}
+
+	userUsed := make(map[string]int64, len(rows))
+	var legacyUserUsed int64
+	for _, row := range rows {
+		if row.Username == "" {
+			legacyUserUsed += row.VCPUs
+			continue
+		}
+		userUsed[row.Username] += row.VCPUs
+	}
+	return orgUsed, userUsed, legacyUserUsed, nil
 }
 
 func (cs *ConfigStore) createOrgConnectionLease(tx *gorm.DB, request *OrgConnectionQueueEntry, now time.Time) (*OrgConnectionLease, error) {
 	granted := now
 	created := &OrgConnectionLease{
-		LeaseID:      request.RequestID,
-		RequestID:    request.RequestID,
-		OrgID:        request.OrgID,
-		CPInstanceID: request.CPInstanceID,
-		PID:          request.PID,
-		Protocol:     request.Protocol,
-		AcquiredAt:   now,
+		LeaseID:        request.RequestID,
+		RequestID:      request.RequestID,
+		OrgID:          request.OrgID,
+		Username:       request.Username,
+		CPInstanceID:   request.CPInstanceID,
+		PID:            request.PID,
+		Protocol:       request.Protocol,
+		RequestedVCPUs: request.RequestedVCPUs,
+		AcquiredAt:     now,
 	}
 	if err := tx.Table(cs.runtimeTable(created.TableName())).Create(created).Error; err != nil {
 		return nil, err
@@ -257,17 +387,33 @@ func (cs *ConfigStore) ReleaseOrgConnectionLease(leaseID string) error {
 	return nil
 }
 
-// CancelOrgConnectionRequest removes a pending queue request. It does not
-// delete an already-granted lease; callers must release leases explicitly.
+// CancelOrgConnectionRequest removes a request whose owner gave up before
+// Acquire returned. If another request's poll already granted this request, the
+// owner still has no lease handle, so cancellation must also reclaim that
+// unclaimed lease.
 func (cs *ConfigStore) CancelOrgConnectionRequest(requestID string, _ time.Time) error {
 	if strings.TrimSpace(requestID) == "" {
 		return nil
 	}
-	result := cs.db.Table(cs.runtimeTable((&OrgConnectionQueueEntry{}).TableName())).
-		Where("request_id = ? AND granted_at IS NULL", requestID).
-		Delete(&OrgConnectionQueueEntry{})
-	if result.Error != nil {
-		return fmt.Errorf("cancel org connection request: %w", result.Error)
+	tables := cs.orgConnectionRuntimeTables()
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		request, found, err := cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
+		if err != nil || !found {
+			return err
+		}
+		if request.GrantedAt != nil {
+			if err := tx.Table(tables.lease).
+				Where("request_id = ?", requestID).
+				Delete(&OrgConnectionLease{}).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Table(tables.queue).
+			Where("request_id = ?", requestID).
+			Delete(&OrgConnectionQueueEntry{}).Error
+	})
+	if err != nil {
+		return fmt.Errorf("cancel org connection request: %w", err)
 	}
 	return nil
 }
@@ -322,4 +468,23 @@ func (cs *ConfigStore) countActiveOrgConnectionLeases(tx *gorm.DB, orgID string)
 		Where("cp.id IS NULL OR cp.state <> ?", ControlPlaneInstanceStateExpired).
 		Count(&count).Error
 	return count, err
+}
+
+func (cs *ConfigStore) sumActiveOrgConnectionLeaseVCPUs(tx *gorm.DB, orgID string) (int64, error) {
+	return cs.sumActiveConnectionLeaseVCPUs(tx, "l.org_id = ?", orgID)
+}
+
+func (cs *ConfigStore) sumActiveConnectionLeaseVCPUs(tx *gorm.DB, where string, args ...any) (int64, error) {
+	var total int64
+	leaseTable := cs.runtimeTable((&OrgConnectionLease{}).TableName())
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	query := tx.Table(leaseTable+" AS l").
+		Select("COALESCE(SUM(CASE WHEN l.requested_vcpus > 0 THEN l.requested_vcpus ELSE ? END), 0)", legacyOrgConnectionRequestedVCPUs).
+		Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = l.cp_instance_id").
+		Where(where, args...).
+		Where("cp.id IS NULL OR cp.state <> ?", ControlPlaneInstanceStateExpired)
+	if err := query.Scan(&total).Error; err != nil {
+		return 0, err
+	}
+	return total, nil
 }
