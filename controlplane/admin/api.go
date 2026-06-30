@@ -70,16 +70,18 @@ type OrgStackInfo interface {
 }
 
 // RegisterAPI registers all admin REST endpoints on the given router group.
-func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo) {
-	registerAPIWithStore(r, newGormAPIStore(store), info)
+// fetcher (may be nil) aggregates per-CP live state (sessions/workers) across
+// replicas so the dashboard shows cluster-wide numbers instead of one CP's slice.
+func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo, fetcher PeerFetcher) {
+	registerAPIWithStore(r, newGormAPIStore(store), info, fetcher)
 	// Generic read-only models explorer (sidebar + table + detail UI). Reads
 	// the concrete store directly because it needs the runtime schema name and
 	// raw DB for tables the typed apiStore interface doesn't surface.
 	registerModelsAPI(r, store)
 }
 
-func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo) {
-	h := &apiHandler{store: store, info: info}
+func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo, fetcher PeerFetcher) {
+	h := &apiHandler{store: store, info: info, fetcher: fetcher}
 
 	// Orgs CRUD
 	r.GET("/orgs", h.listOrgs)
@@ -428,8 +430,9 @@ func managedWarehouseUpsertColumns() []string {
 }
 
 type apiHandler struct {
-	store apiStore
-	info  OrgStackInfo
+	store   apiStore
+	info    OrgStackInfo
+	fetcher PeerFetcher // nil = no cross-CP aggregation (single-CP or tests)
 }
 
 // managedWarehouseRequest is the whitelist of fields a caller may set on the
@@ -1006,32 +1009,49 @@ func (h *apiHandler) deleteUser(c *gin.Context) {
 // --- Workers ---
 
 func (h *apiHandler) listWorkers(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, []WorkerStatus{})
-		return
+	workers := []WorkerStatus{}
+	if h.info != nil {
+		workers = h.info.AllWorkerStatuses()
 	}
-	c.JSON(http.StatusOK, h.info.AllWorkerStatuses())
+	// A worker is owned by exactly one CP (disjoint union); dedup makes it idempotent.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
+		mergePeer(&workers, bodies, func(e []WorkerStatus) []WorkerStatus { return e })
+		workers = dedupeBy(workers, func(w WorkerStatus) int { return w.ID })
+	}
+	c.JSON(http.StatusOK, workers)
 }
 
 // --- Sessions ---
 
 func (h *apiHandler) listSessions(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, []SessionStatus{})
-		return
+	sessions := []SessionStatus{}
+	if h.info != nil {
+		sessions = h.info.AllSessionStatuses()
 	}
-	c.JSON(http.StatusOK, h.info.AllSessionStatuses())
+	// A session lives on exactly one CP (disjoint union); dedup makes it idempotent.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
+		mergePeer(&sessions, bodies, func(e []SessionStatus) []SessionStatus { return e })
+		sessions = dedupeBy(sessions, func(s SessionStatus) int { return s.WorkerID })
+	}
+	c.JSON(http.StatusOK, sessions)
 }
 
 // --- Status ---
 
 func (h *apiHandler) getClusterStatus(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, ClusterStatus{})
-		return
+	orgStats := []OrgStatus{}
+	if h.info != nil {
+		orgStats = h.info.AllOrgStats()
+	}
+	// Per-org active-session counts are per-CP; merge every CP's slice so the
+	// Overview cards reflect the whole cluster instead of one replica's view.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/status")
+		orgStats = mergeOrgStats(orgStats, bodies)
 	}
 
-	orgStats := h.info.AllOrgStats()
 	totalWorkers := 0
 	totalSessions := 0
 	for _, os := range orgStats {

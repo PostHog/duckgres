@@ -62,6 +62,21 @@ Added for the console:
 | `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
 | `GET /api/v1/audit` | admin | admin action log |
 
+### Cross-CP live-state aggregation (`live_aggregate.go` + `controlplane/live_aggregator.go`)
+
+Live session/query state is **in-memory per CP** — each replica only knows the
+sessions it owns. Behind the load-balancer that made the dashboard's numbers
+flicker as polls landed on different pods. The session/query endpoints
+(`/queries`, `/sessions`, `/workers`, `/status`) **fan out**: the serving CP
+discovers its peer CP pods (K8s pod list, name-prefix match), GETs each peer's
+`?scope=local` view (the recursion guard — a peer returns only its own slice)
+with the internal secret, and concatenates (a session is owned by exactly one
+CP, so the union is disjoint — no dedup). Peers are fetched concurrently with a
+short per-peer timeout; a slow/down peer is omitted, and `/queries` reports
+`cp_responders`/`cp_total` for coverage. `PeerFetcher` is nil in single-CP /
+test setups (local-only). `/workers/fleet` is already cluster-wide (config
+store) and is not fanned out.
+
 ### Impersonation (`impersonate.go` + `controlplane/admin_providers.go`)
 
 `POST /api/v1/orgs/:id/impersonate/query` `{username, sql, allow_write}` opens a

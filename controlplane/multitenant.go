@@ -469,6 +469,16 @@ func SetupMultiTenant(
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
 	clusterInfo := &clusterInfoProvider{router: router, store: store, selfCPID: cpInstanceID}
 	imp := &impersonator{router: router}
+	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
+	// memory, so a single replica only sees its own slice. The fetcher fans the
+	// read out to peer CP pods so the dashboard shows cluster-wide numbers.
+	var liveFetcher admin.PeerFetcher
+	if router.sharedPool != nil && router.sharedPool.clientset != nil {
+		liveFetcher = newClusterPeerFetcher(
+			router.sharedPool.clientset, router.sharedPool.namespace,
+			router.sharedPool.cpID, internalSecret, 8080,
+		)
+	}
 
 	// Authenticated API. AuthMiddleware resolves the caller (internal-secret →
 	// admin, else ALB/Cognito SSO → viewer/admin). AuditMiddleware records every
@@ -481,11 +491,12 @@ func SetupMultiTenant(
 		admin.AuditMiddleware(auditStore),
 		admin.RoleGate(),
 	)
-	admin.RegisterAPI(api, store, adpt)
+	admin.RegisterAPI(api, store, adpt, liveFetcher)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
 	admin.RegisterExtras(api, admin.Extras{
 		Store:        store,
 		Live:         clusterInfo,
+		Fetcher:      liveFetcher,
 		Impersonator: imp,
 		Audit:        auditStore,
 		Metrics:      metricsProxy,
