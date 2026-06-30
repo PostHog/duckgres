@@ -24,10 +24,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 4)
 	requireGooseMigrationRecorded(t, db, 5)
 	requireGooseMigrationRecorded(t, db, 6)
-	requireGooseLatestVersion(t, db, 6)
+	requireGooseMigrationRecorded(t, db, 7)
+	requireGooseLatestVersion(t, db, 7)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
-	// Migration 000006 added the compute-usage billing buffer + drain state.
+	// Migration 000007 added the compute-usage billing buffer + drain state.
 	requireTablePresent(t, db, "duckgres_org_compute_usage")
 	requireTablePresent(t, db, "duckgres_org_compute_drain_state")
 
