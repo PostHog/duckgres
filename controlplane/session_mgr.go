@@ -49,6 +49,21 @@ type ManagedSession struct {
 	queryProgress atomic.Value // stores *SessionProgress (or nil)
 }
 
+// globalNextPID hands out backend PIDs that are unique across the WHOLE control
+// plane process, not per-org. SessionManagers are per-org, but every client
+// connection registers into the ONE server.conns map keyed by pid, so per-org
+// pids (each manager starting at 1000) collided: two orgs' connections at the
+// same pid value would shadow each other in that map, corrupting
+// pg_stat_activity, cancel-by-pid routing, and any pid-keyed lookup. A single
+// process-global counter makes pids unique within the CP and eliminates the
+// collision. (Cross-CP pids can still coincide, but each CP has its own conns
+// map; cross-CP addressing uses the cluster-unique worker id.)
+var globalNextPID = func() *atomic.Int32 {
+	v := new(atomic.Int32)
+	v.Store(1000) // start above typical OS PIDs
+	return v
+}()
+
 // SessionManager tracks all active sessions and their worker assignments.
 type SessionManager struct {
 	mu         sync.RWMutex
@@ -60,8 +75,6 @@ type SessionManager struct {
 	// log carries the manager's org identity (multi-tenant: one manager per
 	// org stack) so every session/worker lifecycle line is org-filterable.
 	log *slog.Logger
-
-	nextPID atomic.Int32
 
 	maxConnections int
 	activeSlots    int
@@ -111,7 +124,6 @@ func NewOrgSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer, orgID s
 		lifecycle:  newSessionLifecycle(),
 		log:        log,
 	}
-	sm.nextPID.Store(1000) // Start PIDs above typical OS PIDs
 	return sm
 }
 
@@ -156,7 +168,7 @@ func (sm *SessionManager) SetRequestedVCPUsResolver(fn func(profile *WorkerProfi
 
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
-	return sm.nextPID.Add(1)
+	return globalNextPID.Add(1)
 }
 
 func (sm *SessionManager) acquireSlot(ctx context.Context) error {
@@ -561,7 +573,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
 
 	if pid == 0 {
-		pid = sm.nextPID.Add(1)
+		pid = globalNextPID.Add(1)
 	}
 
 	session := &ManagedSession{

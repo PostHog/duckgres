@@ -107,6 +107,30 @@ func TestIsWorkerSessionCapError(t *testing.T) {
 	}
 }
 
+// TestReservePIDGloballyUniqueAcrossManagers is the regression for the conns-map
+// collision: backend pids must be unique across the whole CP process, not
+// per-org. Two managers (two org stacks) reserving pids must never hand out the
+// same value — otherwise their connections shadow each other in the single
+// server.conns map (keyed by pid), corrupting pg_stat_activity / cancel.
+func TestReservePIDGloballyUniqueAcrossManagers(t *testing.T) {
+	smA := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, nil)
+	smB := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, nil)
+
+	seen := make(map[int32]string)
+	for i := 0; i < 100; i++ {
+		for who, sm := range map[string]*SessionManager{"A": smA, "B": smB} {
+			pid := sm.ReservePID()
+			if prev, dup := seen[pid]; dup {
+				t.Fatalf("pid %d handed out twice (manager %s then %s) — per-org collision regressed", pid, prev, who)
+			}
+			seen[pid] = who
+			if pid <= 1000 {
+				t.Fatalf("pid %d is not above the 1000 floor", pid)
+			}
+		}
+	}
+}
+
 func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {
 	pool := &FlightWorkerPool{
 		workers: make(map[int]*ManagedWorker),
