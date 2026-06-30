@@ -85,12 +85,12 @@ var credentialRefreshLookahead = stsSessionDuration / 2
 // validity at start; statements longer than that can still die with
 // ExpiredToken.
 //
-// The PostHog httpfs fork (PostHog/duckdb-httpfs, branch
-// cred-refresh-read-path) FIXES this: on an auth failure in any S3 request
-// path it re-resolves the latest committed secret — picking up this
-// scheduler's rotation pushes — and retries (proven by
+// The PostHog httpfs fork (PostHog/duckdb-httpfs,
+// v1.5.3-cred-refresh-write-retry) FIXES this: on an ExpiredToken auth failure
+// in S3 read/write request paths it re-resolves the latest committed secret —
+// picking up this scheduler's rotation pushes — and retries (proven by
 // TestInFlightScanSurvivesRotationWithPatchedHTTPFS in tests/integration).
-// Once a fork release with that patch is pinned via HTTPFS_EXTENSION_TAG in
+// With that fork release pinned via HTTPFS_EXTENSION_TAG in
 // Dockerfile.worker, this margin becomes defense-in-depth (a statement's
 // first credentials still want a healthy runway so recovery stays rare)
 // rather than the only thing standing between a long statement and
