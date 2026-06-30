@@ -1441,7 +1441,18 @@ res_body() { # org
 # The assertions are grouped into per-org LANES that run concurrently: all
 # worker churn (kills, drains, cold spawns, TTL reaps) is org-scoped, so lanes
 # for different orgs cannot interfere — and the wall-clock becomes the slowest
-# lane instead of the sum. Each lane runs in a background subshell with its
+# lane instead of the sum.
+#
+# This cross-org concurrency is ALSO the regression gate for the global
+# worker-id allocation fix (CreateSpawningWorkerSlot via nextval off a shared
+# sequence; see configstore.ensureWorkerIDSequence). The lanes below spawn
+# worker pods for DIFFERENT orgs at the same time against the SAME config store
+# — exactly the scenario where the old SELECT MAX(worker_id)+1 allocation (only
+# serialized by a per-org advisory lock) handed two orgs the same worker_id and
+# failed the spawn with worker_records_pkey (SQLSTATE 23505). A green multi-lane
+# run is the in-Job proof the collision is gone; the deterministic unit repro is
+# TestCreateSpawningWorkerSlotConcurrentCrossOrgUniqueIDs
+# (tests/configstore/runtime_store_postgres_test.go). Each lane runs in a background subshell with its
 # output captured to a file; the parent prints a heartbeat while lanes run and
 # replays each lane's log (prefixed) when it finishes. A lane's failure
 # (missing/nonzero rc file) fails the harness after all lanes settle, so one

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -855,6 +856,62 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	}
 	if persisted.State != configstore.WorkerStateSpawning {
 		t.Fatalf("expected persisted spawning state, got %q", persisted.State)
+	}
+}
+
+// Regression: concurrent CreateSpawningWorkerSlot calls for DIFFERENT orgs must
+// never allocate the same worker_id. The old SELECT MAX(worker_id)+1 allocation
+// was serialized only by a per-org advisory lock, so cross-org concurrency read
+// the same MAX and collided on worker_records_pkey (SQLSTATE 23505) — the flake
+// that was failing the e2e res1/res2 lanes. nextval() off the global sequence
+// makes allocation atomic across orgs.
+func TestCreateSpawningWorkerSlotConcurrentCrossOrgUniqueIDs(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	const n = 24
+	var wg sync.WaitGroup
+	ids := make([]int, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all goroutines together to maximize contention
+			// A distinct org per goroutine → distinct per-org advisory locks →
+			// the allocation step runs concurrently (the colliding scenario).
+			slot, err := store.CreateSpawningWorkerSlot(
+				"cp:boot", fmt.Sprintf("org-%d", i), "duckgres:test", "", "", 1,
+				"duckgres-worker-test", 0 /* uncapped */)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			if slot == nil {
+				errs[i] = fmt.Errorf("goroutine %d: nil slot without cap", i)
+				return
+			}
+			ids[i] = slot.WorkerID
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := map[int]int{} // worker_id -> goroutine that got it
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: CreateSpawningWorkerSlot errored (pre-fix: pkey collision): %v", i, errs[i])
+		}
+		if ids[i] <= 0 {
+			t.Fatalf("goroutine %d: non-positive worker id %d", i, ids[i])
+		}
+		if prev, dup := seen[ids[i]]; dup {
+			t.Fatalf("worker_id %d allocated to both goroutine %d and %d — collision not prevented", ids[i], prev, i)
+		}
+		seen[ids[i]] = i
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d distinct worker ids, got %d", n, len(seen))
 	}
 }
 
