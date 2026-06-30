@@ -381,6 +381,86 @@ func TestListExpiredHotIdleWorkersPerWorkerTTL(t *testing.T) {
 	}
 }
 
+// Regression: the hot-idle TTL reaper must NOT retire a hot-idle worker that
+// still backs a reclaimable (Active/Reconnecting) Flight session — the customer
+// is mid-reconnect by session token, and retiring the worker would kill their
+// in-flight query on reconnect. This mirrors the long-standing exclusion in
+// ListOrphanedWorkers. A worker with only a terminal (closed) Flight record, or
+// none at all, is still reaped once its TTL elapses.
+func TestListExpiredHotIdleWorkersSparesReclaimableFlightSessions(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	mkWorker := func(id int) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-flt-%d", id),
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        5, // all well past TTL at base+30m
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	mkSession := func(token string, workerID int, state configstore.FlightSessionState) {
+		if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+			SessionToken: token,
+			Username:     "postgres",
+			OrgID:        "analytics",
+			WorkerID:     workerID,
+			OwnerEpoch:   1,
+			State:        state,
+			ExpiresAt:    base.Add(time.Hour),
+			LastSeenAt:   base,
+		}); err != nil {
+			t.Fatalf("UpsertFlightSessionRecord(%s): %v", token, err)
+		}
+	}
+
+	mkWorker(1) // no flight session         → reaped
+	mkWorker(2) // active flight session      → spared
+	mkWorker(3) // reconnecting flight session → spared
+	mkWorker(4) // closed flight session only → reaped
+	mkSession("tok-active", 2, configstore.FlightSessionStateActive)
+	mkSession("tok-reconnecting", 3, configstore.FlightSessionStateReconnecting)
+	mkSession("tok-closed", 4, configstore.FlightSessionStateClosed)
+
+	assertSpared := func(name string, expired []configstore.WorkerRecord) {
+		got := map[int]bool{}
+		for _, w := range expired {
+			got[w.WorkerID] = true
+		}
+		if !got[1] {
+			t.Errorf("%s: worker 1 (no flight session) should be reaped", name)
+		}
+		if got[2] {
+			t.Errorf("%s: worker 2 (active flight session) must be spared", name)
+		}
+		if got[3] {
+			t.Errorf("%s: worker 3 (reconnecting flight session) must be spared", name)
+		}
+		if !got[4] {
+			t.Errorf("%s: worker 4 (closed flight session only) should be reaped", name)
+		}
+	}
+
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	assertSpared("global", expired)
+
+	// The per-CP fallback reaper variant must spare them too.
+	expiredCP, err := store.ListExpiredHotIdleWorkersForCP("cp:boot", base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkersForCP: %v", err)
+	}
+	assertSpared("per-cp", expiredCP)
+}
+
 // Regression: UpsertWorkerRecord must update the profile (cpu/mem/colocate) and
 // ttl_minutes columns on conflict. CreateSpawningWorkerSlot inserts a sized
 // worker's row with an empty profile, and the reserve/hot-idle persists set it
