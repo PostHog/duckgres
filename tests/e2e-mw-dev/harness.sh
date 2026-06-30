@@ -1458,6 +1458,16 @@ admin_query_detail() { # org password
   done
   [ -n "$pid" ] || { cleanup_bg; fail "admin_query_detail: no in-flight query appeared for $org within timeout"; }
 
+  # The /queries list item carries the running-query duration. Give it a moment
+  # to accrue, then assert elapsed_ms is present and positive for our pid.
+  sleep 3
+  ems="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+    | jq -r --argjson p "$pid" 'first(.queries[]? | select(.pid==$p) | .elapsed_ms) // -1')"
+  case "$ems" in
+    ''|-1|0) cleanup_bg; fail "admin_query_detail: /queries elapsed_ms not populated for pid $pid (got '$ems')" ;;
+    *) [ "$ems" -gt 0 ] || { cleanup_bg; fail "admin_query_detail: elapsed_ms not positive for pid $pid (got '$ems')"; } ;;
+  esac
+
   # Expand it: 200 with the redacted SQL text + matching identity + a real worker.
   d="$(curl -fsS -H "$H" "$API/api/v1/queries/$pid")" \
     || { cleanup_bg; fail "admin_query_detail: GET /queries/$pid failed"; }

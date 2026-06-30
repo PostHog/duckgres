@@ -110,7 +110,9 @@ for live views), TanStack Table (dense sortable tables), Recharts (trends). Page
    worker cpu/mem/ttl, hot-idle floor, hostname alias); managed-warehouse view/edit.
 3. **Users** — per-org users CRUD; persistent secrets list/delete.
 4. **Live** — running queries / sessions / connections, sliced + filterable by org & user,
-   with progress bars (SessionProgress) and a cancel affordance. Opening a running-query
+   with progress bars (SessionProgress), a running-query **Duration** column
+   (`QueryStatus.ElapsedMS`, computed on the owning CP from the connection's query-start),
+   and a cancel affordance. Opening a running-query
    row fetches `GET /api/v1/queries/:pid` on demand: a detail dialog with the redacted SQL
    text (`server.ConnDetailByPID` → `usersecrets.RedactForLog`), connection metadata
    (worker pod, client addr, application, elapsed) and live progress. The SQL text lives

@@ -22,6 +22,11 @@ type QueryStatus struct {
 	Rows       uint64  `json:"rows"`
 	TotalRows  uint64  `json:"total_rows"`
 	Stalled    bool    `json:"stalled"`
+	// ElapsedMS is how long the current statement has been running, in
+	// milliseconds (0 when idle / no query in flight). Computed on the owning CP
+	// from the connection's query-start, so it survives the cross-CP /queries
+	// merge unchanged.
+	ElapsedMS int64 `json:"elapsed_ms"`
 }
 
 // QueryDetail is the expanded, single-session view behind a running query: the

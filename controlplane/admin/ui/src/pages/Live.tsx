@@ -10,7 +10,7 @@ import { AdminGate } from "@/components/AdminOnly";
 import { EmptyState } from "@/components/states";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useCancelSession, useQueries, useSessions } from "@/hooks/useApi";
-import { fmtInt } from "@/lib/format";
+import { fmtDuration, fmtInt } from "@/lib/format";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
 export function Live() {
@@ -84,6 +84,7 @@ export function Live() {
                     <TableHead>User</TableHead>
                     <TableHead>Worker</TableHead>
                     <TableHead>Protocol</TableHead>
+                    <TableHead>Duration</TableHead>
                     <TableHead className="w-56">Progress</TableHead>
                     <TableHead className="text-right">Action</TableHead>
                   </TableRow>
@@ -107,6 +108,7 @@ export function Live() {
                         <TableCell>
                           <Badge variant="outline">{q.protocol || "pg"}</Badge>
                         </TableCell>
+                        <TableCell className="font-mono text-xs tabular-nums">{fmtDuration(q.elapsed_ms)}</TableCell>
                         <TableCell>
                           <ProgressBar percentage={pct} stalled={q.stalled} indeterminate={pct == null} />
                           <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">

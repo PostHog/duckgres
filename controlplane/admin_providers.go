@@ -46,6 +46,13 @@ func (p *clusterInfoProvider) RunningQueries() []admin.QueryStatus {
 				q.TotalRows = prog.TotalRows
 				q.Stalled = prog.Stalled
 			}
+			// Running-query duration from the owning connection's query-start
+			// (the conn lives on this CP). Zero when the session is idle.
+			if p.srv != nil {
+				if cd, ok := p.srv.ConnDetailByPID(s.PID); ok && !cd.QueryStart.IsZero() {
+					q.ElapsedMS = time.Since(cd.QueryStart).Milliseconds()
+				}
+			}
 			out = append(out, q)
 		}
 	}

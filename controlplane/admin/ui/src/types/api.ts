@@ -248,6 +248,7 @@ export interface RunningQuery {
   rows: number;
   total_rows: number;
   stalled: boolean;
+  elapsed_ms: number; // how long the current statement has been running (0 = idle)
 }
 
 // GET /api/v1/queries/:pid → expanded detail for one in-flight query. Fetched

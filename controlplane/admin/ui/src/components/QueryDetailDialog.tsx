@@ -12,20 +12,7 @@ import { Button } from "@/components/ui/button";
 import { ProgressBar } from "@/components/ProgressBar";
 import { AdminGate } from "@/components/AdminOnly";
 import { useQueryDetail } from "@/hooks/useApi";
-import { fmtInt, fmtTime } from "@/lib/format";
-
-// Human-readable elapsed from a millisecond duration.
-function fmtElapsed(ms: number): string {
-  if (!ms || ms < 0) return "—";
-  const s = ms / 1000;
-  if (s < 1) return `${ms}ms`;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.round(s % 60);
-  if (m < 60) return `${m}m ${rem}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
+import { fmtDuration, fmtInt, fmtTime } from "@/lib/format";
 
 function Field({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
@@ -114,7 +101,7 @@ export function QueryDetailDialog({
                 value={d.client_addr ? `${d.client_addr}${d.client_port ? `:${d.client_port}` : ""}` : "—"}
                 mono
               />
-              <Field label="Elapsed" value={fmtElapsed(d.elapsed_ms)} />
+              <Field label="Elapsed" value={fmtDuration(d.elapsed_ms)} />
               <Field label="Query start" value={d.query_start ? fmtTime(d.query_start) : "—"} />
               <Field label="Backend start" value={d.backend_start ? fmtTime(d.backend_start) : "—"} />
             </div>
