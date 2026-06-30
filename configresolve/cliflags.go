@@ -75,6 +75,8 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	k8sWorkerServiceAccount := fs.String("k8s-worker-service-account", "", "Neutral ServiceAccount name for K8s worker pods (default: duckgres-worker) (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 	awsRegion := fs.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
 	queryLog := fs.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
+	billingIngestURL := fs.String("billing-ingest-url", "", "PostHog public ingestion base URL for managed-warehouse compute-usage events, e.g. https://us.i.posthog.com (remote backend only; unset disables metering) (env: DUCKGRES_BILLING_INGEST_URL)")
+	billingIngestToken := fs.String("billing-ingest-token", "", "PostHog project API token for managed-warehouse compute-usage events (remote backend only; unset disables metering) (env: DUCKGRES_BILLING_INGEST_TOKEN)")
 
 	return func() CLIInputs {
 		cli := CLIInputs{Set: map[string]bool{}}
@@ -134,6 +136,8 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.K8sWorkerServiceAccount = *k8sWorkerServiceAccount
 		cli.AWSRegion = *awsRegion
 		cli.QueryLog = *queryLog
+		cli.BillingIngestURL = *billingIngestURL
+		cli.BillingIngestToken = *billingIngestToken
 		return cli
 	}
 }

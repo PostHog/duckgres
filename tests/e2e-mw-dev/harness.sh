@@ -389,6 +389,32 @@ connection_duration_logged() { # org password
   [ "$ms" -gt 0 ] || fail "disconnect duration_ms is $ms (want > 0 — backendStart not honoured?)"
 }
 
+# Managed-warehouse compute-usage metering (billing emit side). At connection
+# teardown the CP meters cpu_seconds/memory_seconds from the provisioned worker
+# size over the connection lifetime into an in-proc per-org counter (best-effort),
+# flushes it to the durable config-store buffer (~15s), and the leader drains
+# closed buckets to PostHog ingestion (~60s, ship-then-delete). The :9090 metrics
+# port + the ingestion HTTP path are not observable from this in-cluster Job, so
+# we assert the CP's startup log line that proves the metering config knob is
+# wired and reports its enabled/disabled state. When the deploy sets
+# DUCKGRES_BILLING_INGEST_URL/TOKEN this line reads "enabled"; otherwise
+# "disabled" — either way the knob is present and the emit path is compiled in.
+# (NOTE: a full end-to-end "the event landed in PostHog ClickHouse" assertion
+# needs a billing-analytics token + CH read access from the Job, which this lane
+# does not have — see README. The buffer UPSERT/drain SQL is exercised by the
+# tests/configstore Postgres migration test, and the meter/drain logic by the
+# controlplane/ unit tests.)
+compute_usage_metering_wired() {
+  log "compute-usage metering config knob wired in CP"
+  found=""
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    m="$(k logs "$p" 2>/dev/null | grep -E 'Managed-warehouse compute-usage metering (enabled|disabled)' | tail -1)"
+    if [ -n "$m" ]; then found="$m"; fi
+  done
+  [ -n "$found" ] || fail "no compute-usage metering startup log line found (config knob not wired into SetupMultiTenant?)"
+  log "compute-usage metering state: $found"
+}
+
 # jsonb || must keep Postgres concatenation semantics through the full CP
 # transpile → worker DuckDB execute path (regression for #716: the transpiler
 # used to rewrite it to json_merge_patch, which REPLACED arrays instead of
@@ -1705,6 +1731,9 @@ main() {
   # ---- connection-duration observability (any org; lanes already churned
   #      many connect/disconnects, so the disconnect log is warm) ----
   connection_duration_logged "$CNPG" "$cnpg_pw"
+
+  # ---- compute-usage metering wired (billing emit side) ----
+  compute_usage_metering_wired
 
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"

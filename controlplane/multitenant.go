@@ -135,7 +135,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	isHealthy func() bool,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, *computeMeter, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -143,7 +143,7 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Per-user persistent secret manager (CREATE PERSISTENT SECRET). With no
@@ -151,7 +151,7 @@ func SetupMultiTenant(
 	// but persistence is disabled with a clear client-facing error.
 	userSecrets, err := NewCPUserSecretManager(store, cfg.UserSecretKey)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 	server.SetUserSecretManager(srv, userSecrets)
 	if cfg.UserSecretKey == "" {
@@ -162,7 +162,7 @@ func SetupMultiTenant(
 
 	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	cpID := cfg.K8s.ControlPlaneID
@@ -178,7 +178,7 @@ func SetupMultiTenant(
 	}
 	bootID := make([]byte, 16)
 	if _, err := rand.Read(bootID); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
 	}
 	bootIDHex := hex.EncodeToString(bootID)
 	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
@@ -241,7 +241,7 @@ func SetupMultiTenant(
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, userSecrets, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	adpt := &orgRouterAdapter{router: router}
@@ -397,7 +397,7 @@ func SetupMultiTenant(
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
@@ -436,7 +436,7 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret; set --internal-secret or DUCKGRES_INTERNAL_SECRET explicitly to avoid rotation on restart.")
@@ -486,7 +486,7 @@ func SetupMultiTenant(
 	}
 	auditStore, err := admin.NewAuditStore(store.DB())
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
 	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
 	clusterInfo := &clusterInfoProvider{router: router, store: store, selfCPID: cpInstanceID}
@@ -529,7 +529,7 @@ func SetupMultiTenant(
 
 	// Embedded React SPA (served unauthenticated; all data is under /api/v1).
 	if err := admin.RegisterUI(engine); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
 	}
 
 	apiServer := &http.Server{
@@ -543,7 +543,26 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
+	// Compute-usage metering (managed-warehouse billing). Enabled only when both
+	// ingest URL and token are configured; otherwise the meter is nil and every
+	// call site no-ops (queries are NEVER failed on its account). The flusher
+	// runs on every CP pod (cross-pod UPSERT-increment); the drain loop is
+	// leader-only, co-located under the janitor lease so exactly one CP ships.
+	var meter *computeMeter
+	if cfg.BillingMeteringEnabled() {
+		meter = newComputeMeter(store)
+		go meter.Run(context.Background())
+
+		drainer := newComputeDrainer(store, newComputeCaptureClient(cfg.BillingIngestURL, cfg.BillingIngestToken))
+		if janitorLeader != nil {
+			janitorLeader.AttachLeaderLoop(drainer.Run)
+		}
+		slog.Info("Managed-warehouse compute-usage metering enabled.", "ingest_url", cfg.BillingIngestURL)
+	} else {
+		slog.Info("Managed-warehouse compute-usage metering disabled (DUCKGRES_BILLING_INGEST_URL/TOKEN not both set).")
+	}
+
+	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
 }
 
 type workerLifecycleStatsLister interface {

@@ -54,6 +54,8 @@ func fieldNameToFlagName(name string) string {
 		{"AWSRegion", "aws-region"},
 		{"SNIRoutingMode", "sni-routing-mode"},
 		{"ManagedHostnameSuffixes", "managed-hostname-suffixes"},
+		{"BillingIngestURL", "billing-ingest-url"},
+		{"BillingIngestToken", "billing-ingest-token"},
 		{"ConfigStoreConn", "config-store"},
 		{"ConfigPollInterval", "config-poll-interval"},
 		{"InternalSecretFallbacks", "internal-secret-fallbacks"},

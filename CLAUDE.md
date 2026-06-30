@@ -77,6 +77,7 @@ Key CLI flags for control-plane mode:
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
   - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
+  - Compute-usage billing (emit side): `--billing-ingest-url` / `--billing-ingest-token` (env `DUCKGRES_BILLING_INGEST_URL` / `DUCKGRES_BILLING_INGEST_TOKEN`). Both must be set to enable per-org compute-usage metering+emit; either unset disables it (usage ships nowhere, queries never fail). See `docs/design/billing-compute-seconds-plan.md` and "Compute-Usage Billing" below.
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
 
 Key CLI flags for duckdb-service mode:
@@ -354,6 +355,61 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
   `authz_test.go`) AND the `admin_*` / `impersonation_*` assertions in
   `tests/e2e-mw-dev/harness.sh`.
+
+## Compute-Usage Billing (managed-warehouse, remote backend only)
+
+duckgres meters per-org compute usage of worker pods and ships it to PostHog's
+public ingestion as `"managed warehouse compute usage"` capture events (billing
+sums the two raw metrics externally). Full design + decisions:
+`docs/design/billing-compute-seconds-plan.md`. Scope is the **emit side**, and
+**only** the remote/k8s backend (per-org worker pod with a known
+`WorkerProfile` size). Pipeline:
+
+```
+conn end → in-proc per-org counter (best-effort; never fails teardown)
+        │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
+        ▼  duckgres_org_compute_usage / duckgres_org_compute_drain_state
+   leader drain (~60s) → POST {DUCKGRES_BILLING_INGEST_URL}/capture (ship-then-delete)
+```
+
+Two raw metrics per connection over its full lifetime, using the **provisioned**
+worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
+ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
+**MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
+sub-GiB worker. Invariants for anyone touching this path:
+
+- **Metering is strictly best-effort and off the hot path.** A metering error
+  (counter, flush, drain) must NEVER block or fail a query or connection
+  teardown. The connection-end record is added to an in-process per-org counter
+  (map+mutex, microseconds, no I/O); everything downstream is async/retried.
+  `cp.computeMeter` is nil unless the remote backend is configured with both
+  ingest URL+token — every call site is nil-safe.
+- **Enable gate = both `DUCKGRES_BILLING_INGEST_URL` and
+  `DUCKGRES_BILLING_INGEST_TOKEN` set** (`ControlPlaneConfig.BillingMeteringEnabled`).
+  Either unset → metering disabled (logged once at startup, ships nowhere). The
+  env names are fixed (infra wires them); keep them exact.
+- **Worker size is plumbed onto the connection** (`server.SetConnectionWorkerSize`
+  → `clientConn.workerMillicores/workerMiB`, set in `control.go::handleConnection`
+  from `workerBillingSize(workerProfile)`, remote-only). `workerMillicores==0`
+  (non-remote / unknown) → metering skipped. The metric is computed once at the
+  SAME teardown point as `CloseConnectionMetrics` (the `#841` lifetime defer).
+- **Bucket = connection-end time floored to 60s.** Flush carries the sub-unit
+  remainder forward so rounding never loses counts across flushes. Buffer flush
+  is UPSERT-increment so all CP pods sum into one row.
+- **Drain is leader-only** (co-located under the janitor lease via
+  `JanitorLeaderManager.AttachLeaderLoop`), **ship-then-delete / at-least-once**:
+  only buckets `bucket_start ≤ now-60s-30s grace AND > last_drained_bucket` ship;
+  on HTTP 2xx → TXN advance high-water + DELETE row; on failure → keep + retry.
+  `event_uuid = hash(org_id, bucket_start)` + `timestamp = bucket_start` are
+  deterministic so a re-ship collapses onto the same ClickHouse row.
+- **Graceful shutdown does a final flush** after connections drain to their
+  natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
+  last interval before exit.
+- Touching the meter/flush/drain/capture, the worker-size plumbing, or the
+  config knobs → update `controlplane/compute_meter_test.go`,
+  `compute_drain_test.go`, `compute_size_test.go`, the migration assertion in
+  `tests/configstore/migrations_postgres_test.go`, and the
+  `compute_usage_metering_wired` assertion in `tests/e2e-mw-dev/harness.sh`.
 
 ## TODO Reference
 

@@ -33,9 +33,23 @@ const defaultElectorRecontendBackoff = 2 * time.Second
 type JanitorLeaderManager struct {
 	elector          leaderElectorRunner
 	leaderLoop       *leaderOnlyLoop
+	extraLoops       []*leaderOnlyLoop // additional leader-only loops (e.g. compute-usage drain) started/stopped with the janitor lease
 	recontendBackoff time.Duration
 	mu               sync.Mutex
 	cancel           context.CancelFunc
+}
+
+// AttachLeaderLoop registers an additional run function to start when this CP
+// acquires the janitor lease and stop when it loses it. Used to co-locate
+// other leader-only loops (compute-usage drain) under the existing lease so
+// exactly one CP runs them. Must be called before Start.
+func (m *JanitorLeaderManager) AttachLeaderLoop(run func(context.Context)) {
+	if m == nil || run == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.extraLoops = append(m.extraLoops, newLeaderOnlyLoop(run))
 }
 
 func NewJanitorLeaderManager(namespace, identity string, janitor *ControlPlaneJanitor) (*JanitorLeaderManager, error) {
@@ -90,6 +104,10 @@ func newJanitorLeaderManagerFromClients(
 	}
 
 	leaderLoop := newLeaderOnlyLoop(janitor.Run)
+	mgr := &JanitorLeaderManager{
+		leaderLoop:       leaderLoop,
+		recontendBackoff: defaultElectorRecontendBackoff,
+	}
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		LeaseDuration:   20 * time.Second,
@@ -100,11 +118,11 @@ func newJanitorLeaderManagerFromClients(
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				setJanitorIsLeader(true)
-				leaderLoop.onStartedLeading(ctx)
+				mgr.startLeaderLoops(ctx)
 			},
 			OnStoppedLeading: func() {
 				setJanitorIsLeader(false)
-				leaderLoop.onStoppedLeading()
+				mgr.stopLeaderLoops()
 				slog.Info("Lost janitor leadership.")
 			},
 			OnNewLeader: func(current string) {
@@ -115,12 +133,32 @@ func newJanitorLeaderManagerFromClients(
 	if err != nil {
 		return nil, fmt.Errorf("create leader elector: %w", err)
 	}
+	mgr.elector = elector
+	return mgr, nil
+}
 
-	return &JanitorLeaderManager{
-		elector:          elector,
-		leaderLoop:       leaderLoop,
-		recontendBackoff: defaultElectorRecontendBackoff,
-	}, nil
+// startLeaderLoops starts the janitor loop plus any attached extra leader-only
+// loops (compute-usage drain) when this CP acquires the lease.
+func (m *JanitorLeaderManager) startLeaderLoops(ctx context.Context) {
+	m.leaderLoop.onStartedLeading(ctx)
+	m.mu.Lock()
+	loops := append([]*leaderOnlyLoop(nil), m.extraLoops...)
+	m.mu.Unlock()
+	for _, l := range loops {
+		l.onStartedLeading(ctx)
+	}
+}
+
+// stopLeaderLoops stops the janitor loop plus any attached extra leader-only
+// loops when this CP loses the lease.
+func (m *JanitorLeaderManager) stopLeaderLoops() {
+	m.leaderLoop.onStoppedLeading()
+	m.mu.Lock()
+	loops := append([]*leaderOnlyLoop(nil), m.extraLoops...)
+	m.mu.Unlock()
+	for _, l := range loops {
+		l.onStoppedLeading()
+	}
 }
 
 func (m *JanitorLeaderManager) Start(ctx context.Context) error {
@@ -184,5 +222,5 @@ func (m *JanitorLeaderManager) Stop() {
 	if m.leaderLoop == nil {
 		return
 	}
-	m.leaderLoop.onStoppedLeading()
+	m.stopLeaderLoops()
 }
