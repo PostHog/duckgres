@@ -30,13 +30,13 @@ var _ admin.LiveInfo = (*clusterInfoProvider)(nil)
 // progress, attributed to org + user.
 func (p *clusterInfoProvider) RunningQueries() []admin.QueryStatus {
 	stacks := p.router.AllStacks()
-	// Running-query duration comes from the owning connection's query-start.
-	// Key it by cluster-unique worker id, not pid: pids are allocated per-org
-	// (every stack starts at 1000), so a pid-keyed lookup can read the wrong
-	// org's connection. Snapshot once per poll.
-	var queryStarts map[int]time.Time
+	// Per-connection live state (active/idle + query-start) comes from the owning
+	// connection. Key it by cluster-unique worker id, not pid: pids are allocated
+	// per-org (every stack starts at 1000), so a pid-keyed lookup can read the
+	// wrong org's connection. Snapshot once per poll.
+	var conns map[int]server.ConnLiveSummary
 	if p.srv != nil {
-		queryStarts = p.srv.QueryStartsByWorkerID()
+		conns = p.srv.ConnSummariesByWorkerID()
 	}
 	var out []admin.QueryStatus
 	for org, stack := range stacks {
@@ -55,8 +55,11 @@ func (p *clusterInfoProvider) RunningQueries() []admin.QueryStatus {
 				q.TotalRows = prog.TotalRows
 				q.Stalled = prog.Stalled
 			}
-			if qs, ok := queryStarts[s.WorkerID]; ok {
-				q.ElapsedMS = time.Since(qs).Milliseconds()
+			if cs, ok := conns[s.WorkerID]; ok {
+				q.State = cs.State
+				if !cs.QueryStart.IsZero() {
+					q.ElapsedMS = time.Since(cs.QueryStart).Milliseconds()
+				}
 			}
 			out = append(out, q)
 		}

@@ -112,7 +112,9 @@ for live views), TanStack Table (dense sortable tables), Recharts (trends). Page
 4. **Live** — running queries / sessions / connections, sliced + filterable by org & user,
    with progress bars (SessionProgress), a running-query **Duration** column
    (`QueryStatus.ElapsedMS`, computed on the owning CP from the connection's query-start),
-   and a cancel affordance. Opening a running-query row fetches
+   a **State** column (`QueryStatus.State`, the pg_stat_activity-style state) that flags
+   sessions holding a worker with **no in-flight query** — `idle` / `idle in transaction` —
+   a smell when persistent, and a cancel affordance. Opening a running-query row fetches
    `GET /api/v1/queries/by-worker/:wid` on demand — addressed by the **cluster-unique worker
    id**, not pid, because the CP allocates backend pids per-org (every stack starts at 1000)
    so two orgs can share a pid. The detail dialog shows the redacted SQL text

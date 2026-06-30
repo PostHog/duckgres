@@ -300,6 +300,7 @@ export interface RunningQuery {
   stalled: boolean;
   started_at?: string; // RFC3339 session start (session age); may be absent/zero
   elapsed_ms: number; // how long the current statement has been running (0 = idle)
+  state: string; // "active" | "idle" | "idle in transaction" | "idle in transaction (aborted)"
 }
 
 // GET /api/v1/queries/by-worker/:wid → expanded detail for one in-flight query,

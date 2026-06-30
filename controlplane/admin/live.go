@@ -27,12 +27,17 @@ type QueryStatus struct {
 	// owning CP from the connection's query-start, so it survives the cross-CP
 	// /queries merge unchanged. The Live view shows query-elapsed when a query is
 	// in flight and falls back to session age otherwise.
-	StartedAt  time.Time `json:"started_at,omitempty"`
-	ElapsedMS  int64     `json:"elapsed_ms"`
-	Percentage float64   `json:"percentage"`
-	Rows       uint64    `json:"rows"`
-	TotalRows  uint64    `json:"total_rows"`
-	Stalled    bool      `json:"stalled"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	ElapsedMS int64     `json:"elapsed_ms"`
+	// State is the pg_stat_activity-style connection state: "active" when a query
+	// is in flight, else "idle" / "idle in transaction" / "idle in transaction
+	// (aborted)". A non-active session holds a worker but has no in-flight query —
+	// surfaced in the Live view so idle sessions are visible at a glance.
+	State      string  `json:"state"`
+	Percentage float64 `json:"percentage"`
+	Rows       uint64  `json:"rows"`
+	TotalRows  uint64  `json:"total_rows"`
+	Stalled    bool    `json:"stalled"`
 }
 
 // QueryDetail is the expanded, single-session view behind a running query: the

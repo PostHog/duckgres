@@ -227,21 +227,27 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 // path must never surface raw SQL, or a CREATE PERSISTENT SECRET credential
 // would leak into the admin UI. The state string mirrors the pg_stat_activity
 // derivation above (active iff a query is in flight, else the txn idle state).
+// connState returns the pg_stat_activity-style state string: "active" when a
+// query is in flight, else the idle / idle-in-transaction state from the txn
+// status. An "active" session has query data; anything else is idle (no
+// in-flight query) — the smell the Live view flags.
+func (c *clientConn) connState() string {
+	if q, _ := c.currentQuery.Load().(string); q != "" {
+		return "active"
+	}
+	switch c.txStatus {
+	case txStatusTransaction:
+		return "idle in transaction"
+	case txStatusError:
+		return "idle in transaction (aborted)"
+	default:
+		return "idle"
+	}
+}
+
 func (c *clientConn) connDetail() ConnDetail {
 	q, _ := c.currentQuery.Load().(string)
-	var state string
-	if q != "" {
-		state = "active"
-	} else {
-		switch c.txStatus {
-		case txStatusTransaction:
-			state = "idle in transaction"
-		case txStatusError:
-			state = "idle in transaction (aborted)"
-		default:
-			state = "idle"
-		}
-	}
+	state := c.connState()
 	d := ConnDetail{
 		PID:             c.pid,
 		OrgID:           c.orgID,

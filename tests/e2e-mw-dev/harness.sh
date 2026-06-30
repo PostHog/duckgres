@@ -1476,6 +1476,36 @@ admin_rbac_viewer() { # org
 # in-Job here: forcing a collision needs a FRESH CP with two orgs opening their
 # first connection at the same pid count, which a warm cluster can't reproduce.
 # The deterministic gate is TestReservePIDGloballyUniqueAcrossManagers.
+
+# ---- admin live: idle (no in-flight query) sessions are flagged ------------
+# QueryStatus.State surfaces the pg_stat_activity-style connection state in
+# /queries, so the Live view can flag sessions that hold a worker but run no
+# query (idle / idle in transaction) — a smell when persistent. We hold a
+# connection idle-in-transaction (send BEGIN, then keep stdin open so psql
+# waits) and assert /queries reports an idle* state for that session.
+admin_idle_session_flagged() { # org password
+  org="$1"; pw="$2"
+  log "admin live: idle-in-transaction session is flagged (no in-flight query) on $org"
+  ( printf 'BEGIN;\n'; sleep 30 ) | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+  bg=$!
+  cleanup_idle() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  found="" a=0
+  while [ "$a" -lt 20 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    found="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and ((.state // "")|test("idle";"i"))) | .state) // empty')"
+    [ -n "$found" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  cleanup_idle
+  case "$found" in
+    idle*) log "admin live: idle session flagged OK (state='$found') on $org" ;;
+    *) fail "admin_idle_session_flagged: /queries never reported an idle* state for an idle-in-transaction session on $org (got '$found')" ;;
+  esac
+}
+
 admin_query_detail() { # org password
   org="$1"; pw="$2"
   log "admin live: per-query detail round-trip on $org"
@@ -1970,6 +2000,9 @@ main() {
 
   # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
   admin_query_detail "$CNPG" "$cnpg_pw"
+
+  # ---- admin live: idle-in-transaction session is flagged (state column) ----
+  admin_idle_session_flagged "$CNPG" "$cnpg_pw"
 
   # ---- admin /status per-org worker count is populated (not the old 0) ----
   admin_per_org_workers "$CNPG" "$cnpg_pw"
