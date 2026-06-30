@@ -25,12 +25,17 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 5)
 	requireGooseMigrationRecorded(t, db, 6)
 	requireGooseMigrationRecorded(t, db, 7)
-	requireGooseLatestVersion(t, db, 7)
+	requireGooseMigrationRecorded(t, db, 8)
+	requireGooseLatestVersion(t, db, 8)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000007 added the compute-usage billing buffer + drain state.
 	requireTablePresent(t, db, "duckgres_org_compute_usage")
 	requireTablePresent(t, db, "duckgres_org_compute_drain_state")
+
+	// Migration 000008 added the explicit Duckling CR name column on
+	// managed warehouses, backfilled from lower(org_id).
+	requireColumnPresent(t, db, "duckgres_managed_warehouses", "duckling_name")
 
 	// Migration 000004 dropped the dead cluster-wide singleton config tables.
 	requireTableAbsent(t, db, "duckgres_global_config")
@@ -265,6 +270,26 @@ func requireGooseLatestVersion(t *testing.T, db *sql.DB, version int64) {
 	}
 	if !latest.Valid || latest.Int64 != version {
 		t.Fatalf("latest goose migration version = %v, want %d", latest, version)
+	}
+}
+
+func requireColumnPresent(t *testing.T, db *sql.DB, tableName, columnName string) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+			  AND column_name = $2
+		)
+	`, tableName, columnName).Scan(&exists); err != nil {
+		t.Fatalf("check column %q.%q presence: %v", tableName, columnName, err)
+	}
+	if !exists {
+		t.Fatalf("column %q.%q missing, want present", tableName, columnName)
 	}
 }
 

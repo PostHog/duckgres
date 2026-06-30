@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useFleet, useWorkers } from "@/hooks/useApi";
-import { fmtInt } from "@/lib/format";
+import { fmtBytes, fmtDuration, fmtInt } from "@/lib/format";
 import type { WorkerStatus } from "@/types/api";
 
 // Canonical lifecycle-state order for the rollup chips.
@@ -36,6 +36,8 @@ export function Workers() {
   }, [fleetRows]);
 
   const totalFleet = useMemo(() => fleetRows.reduce((n, f) => n + f.count, 0), [fleetRows]);
+  const totalCpu = useMemo(() => fleetRows.reduce((n, f) => n + (f.cpu_cores ?? 0), 0), [fleetRows]);
+  const totalMem = useMemo(() => fleetRows.reduce((n, f) => n + (f.memory_bytes ?? 0), 0), [fleetRows]);
 
   const columns = useMemo<ColumnDef<WorkerStatus, any>[]>(
     () => [
@@ -62,6 +64,34 @@ export function Workers() {
           return <span className={v > 0 ? "font-medium tabular-nums" : "tabular-nums text-muted-foreground"}>{v}</span>;
         },
       },
+      {
+        accessorKey: "cpu",
+        header: "CPU",
+        cell: ({ getValue }) => {
+          const v = getValue() as string;
+          return v ? <span className="tabular-nums">{v}</span> : <span className="text-muted-foreground">—</span>;
+        },
+      },
+      {
+        accessorKey: "memory",
+        header: "Memory",
+        cell: ({ getValue }) => {
+          const v = getValue() as string;
+          return v ? <span className="tabular-nums">{v}</span> : <span className="text-muted-foreground">—</span>;
+        },
+      },
+      {
+        accessorKey: "ttl_seconds",
+        header: "TTL",
+        cell: ({ getValue }) => {
+          const v = getValue() as number;
+          return v > 0 ? (
+            <span className="tabular-nums">{fmtDuration(v)}</span>
+          ) : (
+            <span className="text-muted-foreground">default</span>
+          );
+        },
+      },
     ],
     [],
   );
@@ -83,7 +113,11 @@ export function Workers() {
           <Card className="lg:col-span-2">
             <CardHeader className="flex-row items-center justify-between">
               <CardTitle>Fleet by state</CardTitle>
-              <Badge variant="secondary">{fmtInt(totalFleet)} total</Badge>
+              <div className="flex items-center gap-1.5">
+                <Badge variant="secondary">{fmtInt(totalFleet)} total</Badge>
+                <Badge variant="muted">{fmtInt(totalCpu)} cores</Badge>
+                <Badge variant="muted">{fmtBytes(totalMem)}</Badge>
+              </div>
             </CardHeader>
             <CardContent>
               {fleet.isError ? (
@@ -135,7 +169,7 @@ export function Workers() {
             <CardTitle>Session-holding workers</CardTitle>
           </CardHeader>
           {workers.isLoading ? (
-            <TableSkeleton cols={4} />
+            <TableSkeleton cols={7} />
           ) : workers.isError ? (
             <ErrorState error={workers.error} onRetry={() => workers.refetch()} />
           ) : (

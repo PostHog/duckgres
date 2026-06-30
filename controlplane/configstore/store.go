@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // OrgUserKey is the composite key for org-scoped user lookups.
@@ -556,6 +557,16 @@ func (cs *ConfigStore) OnChange(fn func(old, new *Snapshot)) {
 
 // ListWarehousesByStates returns all warehouses with a state matching one of the given values.
 // This is a direct DB query, not snapshot-based, for use by the provisioning controller.
+// ListWarehouses returns every managed-warehouse row. Used by the admin drift
+// finder, which only consumes org_id, state, and duckling_name.
+func (cs *ConfigStore) ListWarehouses() ([]ManagedWarehouse, error) {
+	var warehouses []ManagedWarehouse
+	if err := cs.db.Find(&warehouses).Error; err != nil {
+		return nil, fmt.Errorf("list warehouses: %w", err)
+	}
+	return warehouses, nil
+}
+
 func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvisioningState) ([]ManagedWarehouse, error) {
 	var warehouses []ManagedWarehouse
 	if err := cs.db.Where("state IN ?", states).Find(&warehouses).Error; err != nil {
@@ -747,16 +758,35 @@ func (cs *ConfigStore) runtimeTable(base string) string {
 }
 
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
-// state by image and tenant binding for Prometheus observability.
+// state by image and tenant binding for Prometheus observability, with summed
+// cpu cores and memory bytes per group.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
 	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
 	// now; the branch only matches pre-existing/legacy rows or single-tenant mode.
-	const bindingExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
-	var out []WorkerLifecycleStats
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Select("image, state, "+bindingExpr+" AS binding, COUNT(*)::bigint AS count").
-		Where("image <> ''").
-		Where("state IN ?", []WorkerState{
+	const bindingExpr = "CASE WHEN NULLIF(w.org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
+	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
+	// Org is a config table (not runtime-qualified); its default worker profile
+	// supplies the cpu/mem for workers that carry no explicit profile.
+	orgTable := (&Org{}).TableName()
+
+	// k8s quantity strings can't be summed in SQL, so pull the raw filtered rows
+	// (cpu/mem resolved to the org default when the worker carries none) and
+	// aggregate per (image,state,binding) group in Go below.
+	type workerRow struct {
+		Image   string
+		State   WorkerState
+		Binding string
+		CPU     string
+		Memory  string
+	}
+	var rows []workerRow
+	err := cs.db.Table(workerTable+" AS w").
+		Select("w.image AS image, w.state AS state, "+bindingExpr+" AS binding, "+
+			"COALESCE(NULLIF(w.profile_cpu, ''), o.default_worker_cpu, '') AS cpu, "+
+			"COALESCE(NULLIF(w.profile_memory, ''), o.default_worker_memory, '') AS memory").
+		Joins("LEFT JOIN "+orgTable+" AS o ON o.name = w.org_id").
+		Where("w.image <> ''").
+		Where("w.state IN ?", []WorkerState{
 			WorkerStateSpawning,
 			WorkerStateIdle,
 			WorkerStateReserved,
@@ -765,11 +795,42 @@ func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error
 			WorkerStateHotIdle,
 			WorkerStateDraining,
 		}).
-		Group("image, state, " + bindingExpr).
-		Order("image ASC, state ASC, binding ASC").
-		Scan(&out).Error
+		Order("w.image ASC, w.state ASC, " + bindingExpr + " ASC").
+		Scan(&rows).Error
 	if err != nil {
 		return nil, fmt.Errorf("list worker lifecycle stats: %w", err)
+	}
+
+	// Aggregate count + summed cpu cores / memory bytes per group, preserving the
+	// image/state/binding ordering established by the query above.
+	type groupKey struct {
+		image   string
+		state   WorkerState
+		binding string
+	}
+	index := make(map[groupKey]int)
+	var out []WorkerLifecycleStats
+	for _, r := range rows {
+		k := groupKey{r.Image, r.State, r.Binding}
+		i, ok := index[k]
+		if !ok {
+			i = len(out)
+			index[k] = i
+			out = append(out, WorkerLifecycleStats{Image: r.Image, State: r.State, Binding: r.Binding})
+		}
+		out[i].Count++
+		// Unparseable/empty quantities (e.g. default profile with no org default)
+		// contribute 0.
+		if r.CPU != "" {
+			if q, err := resource.ParseQuantity(r.CPU); err == nil {
+				out[i].CPUCores += q.AsApproximateFloat64()
+			}
+		}
+		if r.Memory != "" {
+			if q, err := resource.ParseQuantity(r.Memory); err == nil {
+				out[i].MemoryBytes += q.Value()
+			}
+		}
 	}
 	return out, nil
 }
