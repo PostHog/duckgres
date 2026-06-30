@@ -203,6 +203,55 @@ func TestOnWorkerCrash_MultipleSessions(t *testing.T) {
 	}
 }
 
+// TestDestroySessionsForUser proves the per-user kill switch tears down only the
+// target user's sessions (cancelling their executors and closing their client
+// connections) and leaves other users' sessions untouched.
+func TestDestroySessionsForUser(t *testing.T) {
+	pool := &FlightWorkerPool{workers: make(map[int]*ManagedWorker)}
+	sm := NewSessionManager(pool, nil)
+
+	bobExec1 := &flightclient.FlightExecutor{}
+	bobExec2 := &flightclient.FlightExecutor{}
+	aliceExec := &flightclient.FlightExecutor{}
+	bobConn1 := &mockCloser{}
+	bobConn2 := &mockCloser{}
+	aliceConn := &mockCloser{}
+
+	sm.mu.Lock()
+	sm.sessions[1001] = &ManagedSession{PID: 1001, Username: "bob", WorkerID: 1, Executor: bobExec1, connCloser: bobConn1}
+	sm.sessions[1002] = &ManagedSession{PID: 1002, Username: "bob", WorkerID: 2, Executor: bobExec2, connCloser: bobConn2}
+	sm.sessions[1003] = &ManagedSession{PID: 1003, Username: "alice", WorkerID: 3, Executor: aliceExec, connCloser: aliceConn}
+	sm.byWorker[1] = []int32{1001}
+	sm.byWorker[2] = []int32{1002}
+	sm.byWorker[3] = []int32{1003}
+	sm.mu.Unlock()
+
+	n := sm.DestroySessionsForUser("bob")
+	if n != 2 {
+		t.Fatalf("DestroySessionsForUser returned %d, want 2", n)
+	}
+
+	// Bob's sessions are gone; their client connections were force-closed.
+	if !bobConn1.closed.Load() || !bobConn2.closed.Load() {
+		t.Fatal("expected bob's client connections to be closed")
+	}
+	// Alice is untouched.
+	if aliceConn.closed.Load() {
+		t.Fatal("alice's connection must not be closed by a kill scoped to bob")
+	}
+	if sm.SessionCount() != 1 {
+		t.Fatalf("expected 1 surviving session (alice), got %d", sm.SessionCount())
+	}
+	if _, ok := sm.sessions[1003]; !ok {
+		t.Fatal("alice's session (pid 1003) should survive")
+	}
+
+	// Killing a user with no sessions is a no-op returning 0.
+	if got := sm.DestroySessionsForUser("nobody"); got != 0 {
+		t.Fatalf("DestroySessionsForUser(nobody) = %d, want 0", got)
+	}
+}
+
 func TestSetConnCloser(t *testing.T) {
 	pool := &FlightWorkerPool{
 		workers: make(map[int]*ManagedWorker),

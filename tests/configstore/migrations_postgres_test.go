@@ -28,7 +28,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 8)
 	requireGooseMigrationRecorded(t, db, 9)
 	requireGooseMigrationRecorded(t, db, 10)
-	requireGooseLatestVersion(t, db, 10)
+	requireGooseMigrationRecorded(t, db, 11)
+	requireGooseLatestVersion(t, db, 11)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000007 added the compute-usage billing buffer + drain state.
@@ -60,6 +61,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	}
 	requireColumnDefault(t, db, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, db, "duckgres_org_users", "max_vcpus", "0")
+	// Migration 000011 added the per-user kill-switch column.
+	requireColumnDefault(t, db, "duckgres_org_users", "disabled", "false")
 	requireColumnAbsent(t, db, "duckgres_orgs", "max_connections")
 }
 
@@ -77,13 +80,15 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	if err := store.DB().Exec(`
 			ALTER TABLE duckgres_orgs DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
+			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
 			ALTER TABLE duckgres_orgs ADD COLUMN IF NOT EXISTS max_connections BIGINT DEFAULT 0;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
 	requireColumnAbsent(t, baselineDB, "duckgres_orgs", "max_vcpus")
 	requireColumnAbsent(t, baselineDB, "duckgres_org_users", "max_vcpus")
+	requireColumnAbsent(t, baselineDB, "duckgres_org_users", "disabled")
 	requireColumnPresent(t, baselineDB, "duckgres_orgs", "max_connections")
 	requireGooseLatestVersion(t, baselineDB, 8)
 
@@ -98,9 +103,11 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 
 	requireGooseMigrationRecorded(t, upgradedDB, 9)
 	requireGooseMigrationRecorded(t, upgradedDB, 10)
-	requireGooseLatestVersion(t, upgradedDB, 10)
+	requireGooseMigrationRecorded(t, upgradedDB, 11)
+	requireGooseLatestVersion(t, upgradedDB, 11)
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
+	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "max_connections")
 }
 

@@ -149,6 +149,17 @@ func auditActionFor(method, path string) string {
 			case "warehouse":
 				return "warehouse." + verb
 			case "users":
+				// A trailing action segment names the user action explicitly so
+				// the kill switch shows up as user.kill/disable/enable rather than
+				// a generic user.create in the audit log.
+				switch segs[len(segs)-1] {
+				case "kill":
+					return "user.kill"
+				case "disable":
+					return "user.disable"
+				case "enable":
+					return "user.enable"
+				}
 				return "user." + verb
 			}
 		}

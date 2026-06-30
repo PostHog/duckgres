@@ -32,6 +32,10 @@ var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 // rejected by the monotonic owner/terminal-state fence and did not persist.
 var ErrWorkerRecordUpsertFenceMiss = errors.New("worker record upsert fence miss")
 
+// ErrOrgUserNotFound is returned by user mutators (e.g. SetOrgUserDisabled) when
+// no row matches (orgID, username). Callers map it to a 404.
+var ErrOrgUserNotFound = errors.New("org user not found")
+
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
 	Orgs                  map[string]*OrgConfig
@@ -39,6 +43,7 @@ type Snapshot struct {
 	HostnameAliasOrg      map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
 	OrgUserPassword       map[OrgUserKey]string // (orgID, username) -> bcrypt hash
 	OrgUserPassthrough    map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
+	OrgUserDisabled       map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
 	OrgUserDefaultCatalog map[OrgUserKey]string // (orgID, username) -> default session catalog
 	OrgUserMaxVCPUs       map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
 }
@@ -79,6 +84,11 @@ type PostgresConnectionResolution struct {
 	// Passthrough / DefaultCatalog are the per-user flags for the resolved user.
 	Passthrough    bool
 	DefaultCatalog string
+	// Disabled is true when the resolved user authenticated but is administratively
+	// disabled (kill switch). Callers must refuse the connection. It is only ever
+	// set together with Valid=true — a wrong password / unknown user returns
+	// Valid=false and never leaks the disabled state.
+	Disabled bool
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -182,6 +192,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		HostnameAliasOrg:      make(map[string]string),
 		OrgUserPassword:       make(map[OrgUserKey]string),
 		OrgUserPassthrough:    make(map[OrgUserKey]bool),
+		OrgUserDisabled:       make(map[OrgUserKey]bool),
 		OrgUserDefaultCatalog: make(map[OrgUserKey]string),
 		OrgUserMaxVCPUs:       make(map[OrgUserKey]int),
 	}
@@ -217,6 +228,9 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			if u.Passthrough {
 				snap.OrgUserPassthrough[key] = true
 			}
+			if u.Disabled {
+				snap.OrgUserDisabled[key] = true
+			}
 			if u.DefaultCatalog != "" {
 				snap.OrgUserDefaultCatalog[key] = u.DefaultCatalog
 			}
@@ -228,6 +242,29 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	}
 
 	return snap, nil
+}
+
+// ReloadSnapshot forces an immediate reload of the config snapshot from the
+// database, bypassing the poll interval, and fires OnChange callbacks exactly
+// like a poll tick. Admin actions that must take effect without waiting up to
+// one poll interval use it — notably the per-user kill switch, where the disable
+// handler reloads every CP replica (via fan-out) so a disabled user is refused
+// cluster-wide the instant the call returns, not one poll later.
+func (cs *ConfigStore) ReloadSnapshot() error {
+	newSnap, err := cs.load()
+	if err != nil {
+		return fmt.Errorf("reload config snapshot: %w", err)
+	}
+	cs.mu.Lock()
+	oldSnap := cs.snapshot
+	cs.snapshot = newSnap
+	callbacks := make([]func(old, new *Snapshot), len(cs.onChange))
+	copy(callbacks, cs.onChange)
+	cs.mu.Unlock()
+	for _, fn := range callbacks {
+		fn(oldSnap, newSnap)
+	}
+	return nil
 }
 
 // Snapshot returns the current config snapshot.
@@ -384,6 +421,10 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result.Valid = true
 	result.Passthrough = cs.snapshot.OrgUserPassthrough[key]
 	result.DefaultCatalog = cs.snapshot.OrgUserDefaultCatalog[key]
+	// Disabled is only meaningful (and only revealed) once credentials check out,
+	// so a disabled user gets a distinct "account disabled" error while a wrong
+	// password still looks identical to an unknown user.
+	result.Disabled = cs.snapshot.OrgUserDisabled[key]
 	return result
 }
 
@@ -463,7 +504,11 @@ func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
 		return false
 	}
-	return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return false
+	}
+	// A disabled user (kill switch) is refused even with correct credentials.
+	return !cs.snapshot.OrgUserDisabled[OrgUserKey{OrgID: orgID, Username: username}]
 }
 
 // IsOrgUserPassthrough reports whether the given (org, user) is configured to
@@ -503,6 +548,11 @@ func (cs *ConfigStore) ValidateOrgUserAndGetPassthrough(orgID, username, passwor
 		return false, false
 	}
 	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return false, false
+	}
+	// A disabled user (kill switch) is refused even with correct credentials;
+	// valid=false also guarantees passthrough is never leaked for a disabled user.
+	if cs.snapshot.OrgUserDisabled[key] {
 		return false, false
 	}
 	return true, cs.snapshot.OrgUserPassthrough[key]
@@ -549,6 +599,23 @@ func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash strin
 	}
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("user %q not found in org %q", username, orgID)
+	}
+	return nil
+}
+
+// SetOrgUserDisabled flips the per-user kill switch for an existing user. The
+// change is persisted immediately; it becomes effective for new connections on
+// the next snapshot poll (or sooner on the writing replica, which can read its
+// own write). Returns an error if the user does not exist.
+func (cs *ConfigStore) SetOrgUserDisabled(orgID, username string, disabled bool) error {
+	result := cs.db.Model(&OrgUser{}).
+		Where("org_id = ? AND username = ?", orgID, username).
+		Updates(map[string]any{"disabled": disabled, "updated_at": time.Now()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("user %q in org %q: %w", username, orgID, ErrOrgUserNotFound)
 	}
 	return nil
 }

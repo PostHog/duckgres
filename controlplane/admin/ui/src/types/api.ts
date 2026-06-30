@@ -73,10 +73,25 @@ export interface OrgUser {
   org_id: string;
   username: string;
   passthrough: boolean;
+  // disabled is the per-user kill switch: when true the user is refused at
+  // connect time. Toggled via disableUser/enableUser (which also kill live
+  // sessions on disable). Optional for back-compat with older API responses.
+  disabled?: boolean;
   default_catalog?: string;
   max_vcpus: number;
   created_at: string;
   updated_at: string;
+}
+
+// Envelope returned by the per-user kill switch endpoints (kill/disable/enable).
+// killed is the cluster-wide count of sessions torn down; cp_responders/cp_total
+// report how many control-plane replicas answered the fan-out.
+export interface UserKillResult {
+  killed?: number;
+  disabled?: boolean;
+  enabled?: boolean;
+  cp_responders?: number;
+  cp_total?: number;
 }
 
 export interface CreateUserBody {

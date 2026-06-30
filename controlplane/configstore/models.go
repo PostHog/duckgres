@@ -41,10 +41,14 @@ func (Org) TableName() string { return "duckgres_orgs" }
 // (org_id, username) so the same login name can be passthrough in one tenant
 // and not in another.
 type OrgUser struct {
-	OrgID          string    `gorm:"primaryKey;size:255" json:"org_id"`
-	Username       string    `gorm:"primaryKey;size:255" json:"username"`
-	Password       string    `gorm:"size:255;not null" json:"-"`
-	Passthrough    bool      `gorm:"not null;default:false" json:"passthrough"`
+	OrgID       string `gorm:"primaryKey;size:255" json:"org_id"`
+	Username    string `gorm:"primaryKey;size:255" json:"username"`
+	Password    string `gorm:"size:255;not null" json:"-"`
+	Passthrough bool   `gorm:"not null;default:false" json:"passthrough"`
+	// Disabled is the per-user kill switch: when true the user is refused at
+	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
+	// user's live sessions (see admin disable endpoint).
+	Disabled       bool      `gorm:"not null;default:false" json:"disabled"`
 	DefaultCatalog string    `gorm:"size:255" json:"default_catalog,omitempty"`
 	MaxVCPUs       int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
 	CreatedAt      time.Time `json:"created_at"`

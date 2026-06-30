@@ -14,7 +14,7 @@ import (
 func liveTestRouter(live LiveInfo, fetcher PeerFetcher) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	e := gin.New()
-	registerLiveAPI(e.Group("/api/v1"), live, fetcher)
+	registerLiveAPI(e.Group("/api/v1"), live, fetcher, nil)
 	return e
 }
 

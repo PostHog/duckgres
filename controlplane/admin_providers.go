@@ -174,6 +174,20 @@ func (p *clusterInfoProvider) KillSession(pid int32) error {
 	return fmt.Errorf("no active session with pid %d", pid)
 }
 
+// KillUserSessions tears down every active session for (orgID, username) owned by
+// THIS control-plane replica and returns the count destroyed. It is the local
+// half of the cluster-wide per-user kill switch: the admin handler fans this out
+// to every CP replica (sessions live in-memory on whichever replica owns the
+// connection) and sums the counts. An org with no live stack on this replica
+// (returns 0, not an error) is normal — its sessions, if any, live elsewhere.
+func (p *clusterInfoProvider) KillUserSessions(orgID, username string) int {
+	stack, ok := p.router.AllStacks()[orgID]
+	if !ok {
+		return 0
+	}
+	return stack.Sessions.DestroySessionsForUser(username)
+}
+
 // impersonator implements admin.Impersonator. It opens a real session as the
 // target org+user on that org's worker, runs the SQL, and ALWAYS destroys the
 // session. The session is a real session: it acquires a worker exclusively

@@ -4,11 +4,14 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 // QueryStatus is a currently-running query/session with its live progress,
@@ -96,12 +99,48 @@ type LiveInfo interface {
 	// KillSession tears down the session (and its exclusive worker) for pid.
 	// Returns an error if no such session exists.
 	KillSession(pid int32) error
+	// KillUserSessions tears down every active session for (orgID, username) owned
+	// by THIS control-plane replica and returns the count destroyed. The handler
+	// fans it out to peers so the kill is cluster-wide. 0 (not an error) when the
+	// org/user has no live sessions on this replica.
+	KillUserSessions(orgID, username string) int
 }
 
-// registerLiveAPI wires the live-state read endpoints + the session-kill action.
-// fetcher (may be nil) aggregates per-CP in-memory state across replicas.
-func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher) {
+// UserAdmin persists the per-user kill switch (the disabled flag) and forces a
+// config-snapshot reload so a flip takes effect immediately rather than one poll
+// interval later. *configstore.ConfigStore satisfies it. nil disables the
+// disable/enable endpoints (they 503).
+type UserAdmin interface {
+	SetOrgUserDisabled(orgID, username string, disabled bool) error
+	ReloadSnapshot() error
+}
+
+// registerLiveAPI wires the live-state read endpoints + the session-kill and
+// per-user kill-switch actions. fetcher (may be nil) aggregates / fans out
+// per-CP in-memory state across replicas; users (may be nil) persists the
+// disabled flag for the disable/enable endpoints.
+func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher, users UserAdmin) {
 	if live == nil {
+		return
+	}
+
+	// userActionPath builds the peer fan-out path for a per-user action, escaping
+	// org/user so names with slashes or reserved chars route correctly.
+	userActionPath := func(org, user, action string) string {
+		return "/api/v1/orgs/" + url.PathEscape(org) + "/users/" + url.PathEscape(user) + "/" + action
+	}
+	// sumKilled parses peer {"killed":N} bodies, returning the total and how many
+	// peers responded with a parseable 200.
+	sumKilled := func(bodies [][]byte) (killed, responders int) {
+		for _, b := range bodies {
+			var e struct {
+				Killed int `json:"killed"`
+			}
+			if json.Unmarshal(b, &e) == nil {
+				killed += e.Killed
+			}
+			responders++
+		}
 		return
 	}
 	r.GET("/queries", func(c *gin.Context) {
@@ -198,5 +237,108 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"killed": pid64})
+	})
+
+	// Per-user kill switch (admin-only via RoleGate — all POSTs). A user's
+	// sessions live on whichever CP replica owns each connection, so every action
+	// kills locally and fans out to peers (?scope=local stops the recursion); the
+	// per-CP killed counts are summed. org/user come from the path params, so the
+	// audit middleware records Org + TargetUser automatically.
+
+	// One-shot terminate: kill all of the user's sessions + in-flight queries
+	// cluster-wide. Does NOT block reconnects (use /disable for that).
+	r.POST("/orgs/:id/users/:username/kill", func(c *gin.Context) {
+		org, user := c.Param("id"), c.Param("username")
+		killed := live.KillUserSessions(org, user)
+		responders, total := 1, 1
+		if !localScope(c) && fetcher != nil {
+			bodies, peers := fetcher.PostPeers(c.Request.Context(), userActionPath(org, user, "kill"))
+			total += peers
+			k, r := sumKilled(bodies)
+			killed += k
+			responders += r
+		}
+		c.JSON(http.StatusOK, gin.H{"killed": killed, "cp_responders": responders, "cp_total": total})
+	})
+
+	// Disable (block + kill): persist disabled=true, reload every replica's
+	// snapshot so new connections are refused cluster-wide immediately, and kill
+	// the user's live sessions. A scope=local peer call only reloads + kills (the
+	// DB write already happened on the primary).
+	r.POST("/orgs/:id/users/:username/disable", func(c *gin.Context) {
+		org, user := c.Param("id"), c.Param("username")
+		if users == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "user administration unavailable"})
+			return
+		}
+		if localScope(c) {
+			if err := users.ReloadSnapshot(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			killed := live.KillUserSessions(org, user)
+			c.JSON(http.StatusOK, gin.H{"killed": killed})
+			return
+		}
+		if err := users.SetOrgUserDisabled(org, user, true); err != nil {
+			if errors.Is(err, configstore.ErrOrgUserNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		// Reload + kill locally, then fan out to peers (which reload + kill too).
+		if err := users.ReloadSnapshot(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		killed := live.KillUserSessions(org, user)
+		responders, total := 1, 1
+		if fetcher != nil {
+			bodies, peers := fetcher.PostPeers(c.Request.Context(), userActionPath(org, user, "disable"))
+			total += peers
+			k, r := sumKilled(bodies)
+			killed += k
+			responders += r
+		}
+		c.JSON(http.StatusOK, gin.H{"disabled": true, "killed": killed, "cp_responders": responders, "cp_total": total})
+	})
+
+	// Enable (unblock): persist disabled=false and reload every replica's snapshot
+	// so the user can reconnect immediately. No session kill.
+	r.POST("/orgs/:id/users/:username/enable", func(c *gin.Context) {
+		org, user := c.Param("id"), c.Param("username")
+		if users == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "user administration unavailable"})
+			return
+		}
+		if localScope(c) {
+			if err := users.ReloadSnapshot(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"enabled": true})
+			return
+		}
+		if err := users.SetOrgUserDisabled(org, user, false); err != nil {
+			if errors.Is(err, configstore.ErrOrgUserNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if err := users.ReloadSnapshot(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		responders, total := 1, 1
+		if fetcher != nil {
+			bodies, peers := fetcher.PostPeers(c.Request.Context(), userActionPath(org, user, "enable"))
+			total += peers
+			responders += len(bodies)
+		}
+		c.JSON(http.StatusOK, gin.H{"disabled": false, "cp_responders": responders, "cp_total": total})
 	})
 }

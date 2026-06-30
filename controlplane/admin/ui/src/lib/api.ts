@@ -29,6 +29,7 @@ import type {
   RunningQuery,
   SessionStatus,
   UpdateUserBody,
+  UserKillResult,
   WorkerStatus,
 } from "@/types/api";
 
@@ -151,6 +152,15 @@ export const api = {
   // Detail is addressed by cluster-unique worker id (pid is per-org, not unique).
   queryDetail: (workerId: number) => get<QueryDetail>(`/queries/by-worker/${workerId}`),
   cancelSession: (pid: number) => post<{ killed: number }>(`/sessions/${pid}/cancel`, {}),
+  // Per-user kill switch. killUser terminates all of a user's sessions + queries
+  // (one-shot); disableUser also persists a block so new connections are refused
+  // until enableUser. All three fan out across CP replicas server-side.
+  killUserSessions: (org: string, username: string) =>
+    post<UserKillResult>(`/orgs/${enc(org)}/users/${enc(username)}/kill`, {}),
+  disableUser: (org: string, username: string) =>
+    post<UserKillResult>(`/orgs/${enc(org)}/users/${enc(username)}/disable`, {}),
+  enableUser: (org: string, username: string) =>
+    post<UserKillResult>(`/orgs/${enc(org)}/users/${enc(username)}/enable`, {}),
 
   // metrics
   metricsPanels: () => get<MetricsPanels>("/metrics/panels"),

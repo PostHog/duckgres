@@ -87,6 +87,16 @@ func cpDeploymentPrefix(podName string) string {
 // number of peers attempted. Peers are fetched concurrently with a short
 // per-peer timeout; a slow/down peer is simply omitted (graceful degradation).
 func (f *clusterPeerFetcher) FetchPeers(ctx context.Context, path string) ([][]byte, int) {
+	return f.fanOut(ctx, http.MethodGet, path)
+}
+
+// PostPeers is FetchPeers for a mutating action — same discovery, concurrency,
+// timeouts, and scope=local recursion guard, but with POST.
+func (f *clusterPeerFetcher) PostPeers(ctx context.Context, path string) ([][]byte, int) {
+	return f.fanOut(ctx, http.MethodPost, path)
+}
+
+func (f *clusterPeerFetcher) fanOut(ctx context.Context, method, path string) ([][]byte, int) {
 	if f == nil || f.clientset == nil || f.selfPod == "" {
 		return nil, 0
 	}
@@ -101,7 +111,7 @@ func (f *clusterPeerFetcher) FetchPeers(ctx context.Context, path string) ([][]b
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-			if b, ok := f.fetchOne(ctx, ip, path); ok {
+			if b, ok := f.doOne(ctx, method, ip, path); ok {
 				mu.Lock()
 				bodies = append(bodies, b)
 				mu.Unlock()
@@ -148,11 +158,11 @@ func (f *clusterPeerFetcher) discoverPeerIPs(ctx context.Context) []string {
 	return ips
 }
 
-func (f *clusterPeerFetcher) fetchOne(ctx context.Context, ip, path string) ([]byte, bool) {
+func (f *clusterPeerFetcher) doOne(ctx context.Context, method, ip, path string) ([]byte, bool) {
 	rctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
 	url := fmt.Sprintf("http://%s:%d%s?scope=local", ip, f.port, path)
-	req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(rctx, method, url, nil)
 	if err != nil {
 		return nil, false
 	}

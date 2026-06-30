@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 // fakeLiveInfo returns a fixed local view.
@@ -19,7 +21,12 @@ type fakeLiveInfo struct {
 	sessions []SessionStatus
 	orgStats []OrgStatus
 	detail   *QueryDetail // local detail for QueryDetailForWorkerID (nil = not owned here)
+
+	killedPerUser int            // returned by KillUserSessions (local kill count)
+	killUserCalls []killUserCall // recorded (org, user) of each KillUserSessions
 }
+
+type killUserCall struct{ org, user string }
 
 func (f *fakeLiveInfo) RunningQueries() []QueryStatus { return f.queries }
 func (f *fakeLiveInfo) QueryDetailForWorkerID(wid int) (QueryDetail, bool) {
@@ -31,16 +38,59 @@ func (f *fakeLiveInfo) QueryDetailForWorkerID(wid int) (QueryDetail, bool) {
 func (f *fakeLiveInfo) WorkerFleet() ([]FleetStat, error)            { return nil, nil }
 func (f *fakeLiveInfo) ControlPlaneInstances() ([]CPInstance, error) { return nil, nil }
 func (f *fakeLiveInfo) KillSession(int32) error                      { return nil }
+func (f *fakeLiveInfo) KillUserSessions(org, user string) int {
+	f.killUserCalls = append(f.killUserCalls, killUserCall{org, user})
+	return f.killedPerUser
+}
 
 func (f *fakeLiveInfo) AllOrgStats() []OrgStatus            { return f.orgStats }
 func (f *fakeLiveInfo) AllWorkerStatuses() []WorkerStatus   { return nil }
 func (f *fakeLiveInfo) AllSessionStatuses() []SessionStatus { return f.sessions }
 
+// fakeUserAdmin records disable/enable + reload calls for the kill-switch tests.
+type fakeUserAdmin struct {
+	mu       sync.Mutex
+	disabled map[string]bool // "org/user" -> disabled
+	reloads  int
+	notFound bool // when true, SetOrgUserDisabled returns ErrOrgUserNotFound
+}
+
+func (f *fakeUserAdmin) SetOrgUserDisabled(org, user string, disabled bool) error {
+	if f.notFound {
+		return configstore.ErrOrgUserNotFound
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.disabled == nil {
+		f.disabled = map[string]bool{}
+	}
+	f.disabled[org+"/"+user] = disabled
+	return nil
+}
+
+func (f *fakeUserAdmin) ReloadSnapshot() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reloads++
+	return nil
+}
+
+func (f *fakeUserAdmin) isDisabled(org, user string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.disabled[org+"/"+user]
+}
+
 // fakePeerFetcher returns canned peer bodies and counts how many times it ran
-// (to prove ?scope=local does NOT fan out).
+// (to prove ?scope=local does NOT fan out). It serves GET (byPath) and POST
+// (postByPath) fan-outs separately so a test can assert which verb was used.
 type fakePeerFetcher struct {
-	byPath map[string][][]byte
-	calls  int32
+	byPath     map[string][][]byte
+	postByPath map[string][][]byte
+	calls      int32
+	postCalls  int32
+	mu         sync.Mutex
+	postPaths  []string
 }
 
 func (f *fakePeerFetcher) FetchPeers(_ context.Context, path string) ([][]byte, int) {
@@ -49,7 +99,17 @@ func (f *fakePeerFetcher) FetchPeers(_ context.Context, path string) ([][]byte, 
 	return b, len(b)
 }
 
-func (f *fakePeerFetcher) callCount() int32 { return atomic.LoadInt32(&f.calls) }
+func (f *fakePeerFetcher) PostPeers(_ context.Context, path string) ([][]byte, int) {
+	atomic.AddInt32(&f.postCalls, 1)
+	f.mu.Lock()
+	f.postPaths = append(f.postPaths, path)
+	f.mu.Unlock()
+	b := f.postByPath[path]
+	return b, len(b)
+}
+
+func (f *fakePeerFetcher) callCount() int32     { return atomic.LoadInt32(&f.calls) }
+func (f *fakePeerFetcher) postCallCount() int32 { return atomic.LoadInt32(&f.postCalls) }
 
 func TestQueriesAggregateAcrossCPs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -58,7 +118,7 @@ func TestQueriesAggregateAcrossCPs(t *testing.T) {
 	fetcher := &fakePeerFetcher{byPath: map[string][][]byte{"/api/v1/queries": {peerBody}}}
 
 	r := gin.New()
-	registerLiveAPI(r.Group("/api/v1"), local, fetcher)
+	registerLiveAPI(r.Group("/api/v1"), local, fetcher, nil)
 
 	// Default: merged (local + 1 peer).
 	rec := httptest.NewRecorder()
