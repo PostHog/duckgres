@@ -192,6 +192,15 @@ type clientConn struct {
 	workerPod       string       // K8s pod name of the worker, empty for standalone or in-process workers
 	physicalCatalog string       // selected DuckDB catalog for execution, empty for memory/standalone default
 
+	// Provisioned worker pod size for compute-usage billing (remote/k8s backend
+	// only). Counted in milli-units to avoid truncating a fractional-core or
+	// sub-GiB worker. workerMillicores == 0 means "unknown size" (non-remote /
+	// standalone), in which case metering is skipped. Constant for the
+	// connection's life; the metric is computed once at teardown over
+	// backendStart→now.
+	workerMillicores int64
+	workerMiB        int64
+
 	// lastProfilingSummary holds the rollup from the most recent
 	// EnrichSpanWithProfiling call on this connection. Consumed by the very
 	// next logQuery and then cleared. Per-connection state is safe because

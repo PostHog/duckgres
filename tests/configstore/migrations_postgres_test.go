@@ -27,6 +27,10 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseLatestVersion(t, db, 6)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
+	// Migration 000006 added the compute-usage billing buffer + drain state.
+	requireTablePresent(t, db, "duckgres_org_compute_usage")
+	requireTablePresent(t, db, "duckgres_org_compute_drain_state")
+
 	// Migration 000004 dropped the dead cluster-wide singleton config tables.
 	requireTableAbsent(t, db, "duckgres_global_config")
 	requireTableAbsent(t, db, "duckgres_ducklake_config")
@@ -260,6 +264,25 @@ func requireGooseLatestVersion(t *testing.T, db *sql.DB, version int64) {
 	}
 	if !latest.Valid || latest.Int64 != version {
 		t.Fatalf("latest goose migration version = %v, want %d", latest, version)
+	}
+}
+
+func requireTablePresent(t *testing.T, db *sql.DB, tableName string) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+		)
+	`, tableName).Scan(&exists); err != nil {
+		t.Fatalf("check table %q presence: %v", tableName, err)
+	}
+	if !exists {
+		t.Fatalf("table %q missing, want present", tableName)
 	}
 }
 
