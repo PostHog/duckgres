@@ -45,6 +45,7 @@ export interface Org {
   database_name: string;
   hostname_alias: string | null;
   max_workers: number;
+  max_vcpus: number;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -58,6 +59,7 @@ export interface Org {
 // Editable subset of Org accepted by PUT /api/v1/orgs/:id.
 export interface OrgUpdate {
   max_workers?: number;
+  max_vcpus?: number;
   default_worker_cpu?: string;
   default_worker_memory?: string;
   default_worker_ttl?: string;
@@ -72,6 +74,7 @@ export interface OrgUser {
   username: string;
   passthrough: boolean;
   default_catalog?: string;
+  max_vcpus: number;
   created_at: string;
   updated_at: string;
 }
@@ -82,12 +85,14 @@ export interface CreateUserBody {
   org_id: string;
   passthrough?: boolean;
   default_catalog?: string;
+  max_vcpus?: number;
 }
 
 export interface UpdateUserBody {
   password?: string;
   passthrough?: boolean;
   default_catalog?: string;
+  max_vcpus?: number;
 }
 
 // GET /api/v1/orgs/:id/users/:username/secrets → { secrets: OrgUserSecret[] }.

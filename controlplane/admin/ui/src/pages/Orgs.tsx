@@ -49,6 +49,14 @@ export function Orgs() {
         },
       },
       {
+        accessorKey: "max_vcpus",
+        header: "Max vCPUs",
+        cell: ({ getValue }) => {
+          const v = getValue() as number;
+          return <span className="tabular-nums">{v === 0 ? "∞" : fmtInt(v)}</span>;
+        },
+      },
+      {
         id: "users",
         header: "Users",
         accessorFn: (o) => o.users?.length ?? 0,
@@ -130,7 +138,7 @@ export function Orgs() {
         )}
         <Card className="overflow-hidden">
           {orgs.isLoading ? (
-            <TableSkeleton cols={7} />
+            <TableSkeleton cols={8} />
           ) : orgs.isError ? (
             <ErrorState error={orgs.error} onRetry={() => orgs.refetch()} />
           ) : (
