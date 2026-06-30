@@ -1464,11 +1464,18 @@ admin_rbac_viewer() { # org
 # connection metadata + live progress. Backed by GET /api/v1/queries/:pid, which
 # joins server.ConnDetailByPID (the already-redacted currentQuery, scoped to the
 # replica that owns the connection) with the session manager's cached progress.
-# Asserts: a real running query is findable via /queries, /queries/:pid returns
-# 200 with the SQL round-tripped + matching identity, and an unknown pid 404s
-# (not a 500). The redaction guarantee itself is unit-tested
+# Asserts: a real running query is findable via /queries, /queries/by-worker/:wid
+# returns 200 with the SQL round-tripped + matching identity, and an unknown
+# worker 404s (not a 500). The redaction guarantee itself is unit-tested
 # (server/conn_detail_test.go, controlplane/admin/live_test.go) — this proves
 # the wiring against a real worker pod.
+#
+# NOTE: backend pids are process-global within a CP (controlplane/session_mgr.go
+# globalNextPID), which removed the per-org pid collision that shadowed conns in
+# the server.conns map (pg_stat_activity / cancel). That can't be asserted
+# in-Job here: forcing a collision needs a FRESH CP with two orgs opening their
+# first connection at the same pid count, which a warm cluster can't reproduce.
+# The deterministic gate is TestReservePIDGloballyUniqueAcrossManagers.
 admin_query_detail() { # org password
   org="$1"; pw="$2"
   log "admin live: per-query detail round-trip on $org"
