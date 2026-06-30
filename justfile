@@ -55,6 +55,12 @@ build-k8s-image tag="duckgres:test":
 ui-build:
     cd controlplane/admin/ui && npm ci && npm run build
 
+# Frontend typecheck + unit tests (Vitest) + production build — the derivation
+# logic guard, and proves the embedded SPA still builds on every PR.
+[group('dev')]
+ui-test:
+    cd controlplane/admin/ui && npm ci && npm run typecheck && npm run test && npm run build
+
 # Live React dev server (HMR) against a port-forwarded control plane. Point
 # VITE_PROXY_TARGET at the CP (or the Go devserver) — default http://127.0.0.1:8080.
 [group('dev')]
