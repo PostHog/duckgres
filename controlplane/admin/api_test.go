@@ -64,7 +64,6 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		return nil, false, nil
 	}
 	org.MaxWorkers = updates.MaxWorkers
-	org.MaxConnections = updates.MaxConnections
 	org.MaxVCPUs = updates.MaxVCPUs
 	// Mirrors gormAPIStore: written unconditionally so "" clears (the handler
 	// presence-merge already preserved omitted fields).
@@ -1174,6 +1173,25 @@ func TestGetOrgOmitsMinWorkers(t *testing.T) {
 	}
 }
 
+func TestGetOrgOmitsMaxConnections(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name: "analytics",
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"max_connections"`)) {
+		t.Fatalf("expected org response to omit max_connections, got %s", rec.Body.String())
+	}
+}
+
 func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	columns := managedWarehouseUpsertColumns()
 
@@ -1542,35 +1560,6 @@ func TestIsValidDuckLakeSpecVersion(t *testing.T) {
 		if got := isValidDuckLakeSpecVersion(tc.v); got != tc.want {
 			t.Errorf("isValidDuckLakeSpecVersion(%q) = %v, want %v", tc.v, got, tc.want)
 		}
-	}
-}
-
-func TestUpdateOrgMaxConnections(t *testing.T) {
-	store := newFakeAPIStore()
-	store.orgs["analytics"] = &configstore.Org{
-		Name:           "analytics",
-		MaxWorkers:     2,
-		MaxConnections: 5,
-	}
-	router := newTestAPIRouter(store)
-
-	body := []byte(`{
-		"max_connections": 10
-	}`)
-
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if store.orgs["analytics"].MaxConnections != 10 {
-		t.Fatalf("expected org max_connections to be updated, got %d", store.orgs["analytics"].MaxConnections)
-	}
-	if store.orgs["analytics"].MaxWorkers != 2 {
-		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
 	}
 }
 

@@ -178,9 +178,8 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 
 func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	fields := map[string]interface{}{
-		"max_workers":     updates.MaxWorkers,
-		"max_connections": updates.MaxConnections,
-		"max_vcpus":       updates.MaxVCPUs,
+		"max_workers": updates.MaxWorkers,
+		"max_vcpus":   updates.MaxVCPUs,
 		// Org default worker profile: written unconditionally so an explicit
 		// empty string CLEARS the default (the handler's presence-merge keeps
 		// omitted fields at their stored values before this runs).
@@ -570,9 +569,6 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	merged := *existing
 	if _, ok := fields["max_workers"]; ok {
 		merged.MaxWorkers = updates.MaxWorkers
-	}
-	if _, ok := fields["max_connections"]; ok {
-		merged.MaxConnections = updates.MaxConnections
 	}
 	if _, ok := fields["max_vcpus"]; ok {
 		merged.MaxVCPUs = updates.MaxVCPUs

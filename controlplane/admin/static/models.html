@@ -365,7 +365,6 @@
       name: "Org name. Primary key and stable tenant identifier.",
       database_name: "Database name clients connect with (dbname=). Unique across orgs.",
       max_workers: "Maximum concurrent worker pods this org may run. 0 means use the deployment default.",
-      max_connections: "Legacy org connection cap. Not used for K8s multi-tenant admission.",
       max_vcpus: "Maximum active worker pod vCPUs this org may have admitted. 0 means unlimited.",
       default_worker_cpu: "Operator-set default worker pod CPU (k8s quantity, e.g. 2). Empty means unset. Applied when a connection does not size itself via duckgres.worker_* options.",
       default_worker_memory: "Operator-set default worker pod memory (k8s quantity, e.g. 8Gi). Empty means unset.",
@@ -732,7 +731,6 @@
   // simply never in this allowlist. "int" → numeric input, else text.
   const ORG_EDIT_FIELDS = {
     max_workers: "int",
-    max_connections: "int",
     max_vcpus: "int",
     default_worker_cpu: "text",
     default_worker_memory: "text",

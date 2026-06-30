@@ -49,14 +49,6 @@ export function Orgs() {
         },
       },
       {
-        accessorKey: "max_connections",
-        header: "Max conns",
-        cell: ({ getValue }) => {
-          const v = getValue() as number;
-          return <span className="tabular-nums">{v === 0 ? "∞" : fmtInt(v)}</span>;
-        },
-      },
-      {
         id: "users",
         header: "Users",
         accessorFn: (o) => o.users?.length ?? 0,
@@ -138,7 +130,7 @@ export function Orgs() {
         )}
         <Card className="overflow-hidden">
           {orgs.isLoading ? (
-            <TableSkeleton cols={8} />
+            <TableSkeleton cols={7} />
           ) : orgs.isError ? (
             <ErrorState error={orgs.error} onRetry={() => orgs.refetch()} />
           ) : (
