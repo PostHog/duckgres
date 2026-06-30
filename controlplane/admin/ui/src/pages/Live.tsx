@@ -11,7 +11,8 @@ import { EmptyState } from "@/components/states";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCancelSession, useQueries, useSessions } from "@/hooks/useApi";
-import { fmtAge, fmtInt, fmtTime } from "@/lib/format";
+import { fmtAge, fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
+import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
 export function Live() {
   const queries = useQueries();
@@ -19,6 +20,7 @@ export function Live() {
   const cancel = useCancelSession();
   const [org, setOrg] = useState("");
   const [user, setUser] = useState("");
+  const [detailWid, setDetailWid] = useState<number | null>(null);
 
   const matchOrg = (o?: string) => !org || (o ?? "").toLowerCase().includes(org.toLowerCase());
   const matchUser = (u?: string) => !user || (u ?? "").toLowerCase().includes(user.toLowerCase());
@@ -84,6 +86,7 @@ export function Live() {
                     <TableHead>Started</TableHead>
                     <TableHead>Worker</TableHead>
                     <TableHead>Protocol</TableHead>
+                    <TableHead>Duration</TableHead>
                     <TableHead className="w-56">Progress</TableHead>
                     <TableHead className="text-right">Action</TableHead>
                   </TableRow>
@@ -94,7 +97,12 @@ export function Live() {
                     // progress reported yet" → indeterminate animation.
                     const pct = q.percentage > 0 ? q.percentage : undefined;
                     return (
-                      <TableRow key={`${q.pid}-${q.worker_id}`} className="[&>td]:py-1.5">
+                      <TableRow
+                        key={`${q.pid}-${q.worker_id}`}
+                        className="cursor-pointer [&>td]:py-1.5"
+                        onClick={() => setDetailWid(q.worker_id)}
+                        title="View query detail"
+                      >
                         <TableCell className="font-mono text-xs">{q.pid}</TableCell>
                         <TableCell className="font-mono text-xs">{q.org}</TableCell>
                         <TableCell className="font-mono text-xs">{q.user || "—"}</TableCell>
@@ -110,6 +118,7 @@ export function Live() {
                         <TableCell>
                           <Badge variant="outline">{q.protocol || "pg"}</Badge>
                         </TableCell>
+                        <TableCell className="font-mono text-xs tabular-nums">{fmtDurationMs(q.elapsed_ms)}</TableCell>
                         <TableCell>
                           <div className="flex items-center gap-2">
                             <ProgressBar
@@ -135,7 +144,10 @@ export function Live() {
                               size="sm"
                               className="-my-1 h-6"
                               disabled={cancel.isPending}
-                              onClick={() => cancel.mutate(q.pid)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                cancel.mutate(q.pid);
+                              }}
                             >
                               <Ban className="h-4 w-4 text-destructive" /> Cancel
                             </Button>
@@ -201,6 +213,11 @@ export function Live() {
           </CardContent>
         </Card>
       </PageBody>
+      <QueryDetailDialog
+        workerId={detailWid}
+        onClose={() => setDetailWid(null)}
+        onCancel={(pid) => cancel.mutate(pid)}
+      />
     </>
   );
 }

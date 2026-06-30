@@ -1459,6 +1459,111 @@ admin_rbac_viewer() { # org
   [ "$code" = "403" ] || fail "viewer PUT /orgs/$org returned $code, want 403 (mutations are admin-only)"
 }
 
+# ---- admin live-query detail (phase 1): per-pid expansion ------------------
+# The Live page can open one in-flight query to see its (redacted) SQL text +
+# connection metadata + live progress. Backed by GET /api/v1/queries/:pid, which
+# joins server.ConnDetailByPID (the already-redacted currentQuery, scoped to the
+# replica that owns the connection) with the session manager's cached progress.
+# Asserts: a real running query is findable via /queries, /queries/:pid returns
+# 200 with the SQL round-tripped + matching identity, and an unknown pid 404s
+# (not a 500). The redaction guarantee itself is unit-tested
+# (server/conn_detail_test.go, controlplane/admin/live_test.go) — this proves
+# the wiring against a real worker pod.
+admin_query_detail() { # org password
+  org="$1"; pw="$2"
+  log "admin live: per-query detail round-trip on $org"
+  # Distinctive constant so we can prove the SQL text round-trips into the
+  # detail payload (survives transpilation as a bare numeric literal).
+  q="SELECT count(*) FROM range(2718281828) t(i) WHERE i % 2 = 0;"
+  out="$(mktemp)"
+  ( pg_try "$org" "$pw" ducklake "$q" >"$out" 2>&1 || true ) &
+  bg=$!
+  cleanup_bg() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
+
+  # Poll /queries until our marker query shows an in-flight row, and capture its
+  # CLUSTER-UNIQUE worker id (detail is addressed by worker id, not the per-org
+  # pid). Filter on the marker SQL is not possible from the list (no SQL there),
+  # so filter on org and the running state; the lane is otherwise quiet here.
+  wid="" pid="" a=0
+  while [ "$a" -lt 60 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    row="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -c --arg o "$org" 'first(.queries[]? | select(.org==$o))')"
+    wid="$(printf '%s' "$row" | jq -r '.worker_id // empty')"
+    pid="$(printf '%s' "$row" | jq -r '.pid // empty')"
+    [ -n "$wid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$wid" ] || { cleanup_bg; fail "admin_query_detail: no in-flight query appeared for $org within timeout"; }
+
+  # The /queries list item carries the running-query duration. Give it a moment
+  # to accrue, then assert elapsed_ms is present and positive for our worker.
+  sleep 3
+  ems="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+    | jq -r --argjson w "$wid" 'first(.queries[]? | select(.worker_id==$w) | .elapsed_ms) // -1')"
+  case "$ems" in
+    ''|-1|0) cleanup_bg; fail "admin_query_detail: /queries elapsed_ms not populated for worker $wid (got '$ems')" ;;
+    *) [ "$ems" -gt 0 ] || { cleanup_bg; fail "admin_query_detail: elapsed_ms not positive for worker $wid (got '$ems')"; } ;;
+  esac
+
+  # Expand it by worker id: 200 with the redacted SQL text + matching identity.
+  d="$(curl -fsS -H "$H" "$API/api/v1/queries/by-worker/$wid")" \
+    || { cleanup_bg; fail "admin_query_detail: GET /queries/by-worker/$wid failed"; }
+  echo "$d" | jq -e --arg o "$org" --argjson w "$wid" \
+    '.worker_id == $w and .org == $o and (.query | contains("2718281828"))' >/dev/null \
+    || { cleanup_bg; fail "admin_query_detail: detail mismatch for worker $wid: $(echo "$d" | jq -c '{pid,org,worker_id,state,qlen:(.query|length)}')"; }
+
+  # An unknown worker id is a clean 404, never a 500.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/queries/by-worker/999999999")"
+  [ "$code" = "404" ] || { cleanup_bg; fail "admin_query_detail: unknown worker id returned $code, want 404"; }
+  cleanup_bg
+
+  # Redaction in the LIVE path (load-bearing): a real CREATE SECRET executing on
+  # a worker must NOT expose its credential material via /queries/:pid. The unit
+  # test proves connDetail passes the redacted currentQuery through; this proves
+  # the live server actually stores the redacted form (no un-redacted detail
+  # source slipped in). We run a long CREATE SECRET so it's catchable in flight,
+  # capture its pid, expand it, and assert the secret literal is absent.
+  cred="e2eSECRET-$(openssl rand -hex 12)"
+  # A count(*) over a big range forces a FULL scan (no LIMIT short-circuit), so
+  # the CREATE SECRET stays in flight ~tens of seconds while DuckDB evaluates the
+  # option subquery — long enough to catch. The cred literal is what must never
+  # leak; RedactForLog replaces the whole option list with a placeholder.
+  sq="CREATE OR REPLACE SECRET e2e_detail_redact (TYPE s3, KEY_ID 'AKIADETAILPROBE', SECRET '${cred}', REGION (SELECT count(*)::VARCHAR FROM range(3000000000) t(i) WHERE i % 2 = 0));"
+  sout="$(mktemp)"
+  ( pg_try "$org" "$pw" ducklake "$sq" >"$sout" 2>&1 || true ) &
+  sbg=$!
+  cleanup_sbg() { kill "$sbg" 2>/dev/null || true; wait "$sbg" 2>/dev/null || true; rm -f "$sout"; }
+  # Poll each org worker's detail and pin to the one whose (redacted) SQL is our
+  # CREATE SECRET — so concurrent org churn can't make us probe a different query.
+  swid="" a=0
+  while [ "$a" -lt 60 ]; do
+    kill -0 "$sbg" 2>/dev/null || break
+    for w in $(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --arg o "$org" '.queries[]? | select(.org==$o) | .worker_id'); do
+      sd="$(curl -fsS -H "$H" "$API/api/v1/queries/by-worker/$w" || true)"
+      if printf '%s' "$sd" | jq -e '.query | test("e2e_detail_redact"; "i")' >/dev/null 2>&1; then
+        swid="$w"; break
+      fi
+    done
+    [ -n "$swid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  if [ -n "$swid" ]; then
+    # sd holds the matched detail. The credential literal must be absent.
+    case "$sd" in
+      *"$cred"*|*"AKIADETAILPROBE"*) cleanup_sbg; fail "admin_query_detail: REDACTION BREACH — CREATE SECRET credential leaked into /queries/by-worker/$swid" ;;
+    esac
+    log "admin live: redaction holds in live path (credential absent from worker $swid detail)"
+  else
+    # Don't fail the whole suite on a missed catch (the secret DDL may finish or
+    # error fast on a cold worker); the unit test is the deterministic gate.
+    log "admin live: CREATE SECRET detail probe did not catch the query in flight — skipped (unit test is the gate)"
+  fi
+  cleanup_sbg
+
+  log "admin live: per-query detail OK (worker $wid, SQL round-tripped, unknown→404, redaction) on $org"
+}
+
 # ---- admin impersonation round-trip + audit --------------------------------
 # An admin can open a session as an org user (workers trust the CP — no password)
 # and run SQL on that org's worker; every statement is audited with the admin
@@ -1761,6 +1866,9 @@ main() {
 
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
+
+  # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
+  admin_query_detail "$CNPG" "$cnpg_pw"
 
   # ---- admin /status per-org worker count is populated (not the old 0) ----
   admin_per_org_workers "$CNPG" "$cnpg_pw"

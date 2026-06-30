@@ -30,6 +30,7 @@ import type {
   OrgUser,
   OrgUserSecret,
   PromRangeResponse,
+  QueryDetail,
   RunningQuery,
   SessionStatus,
   UpdateUserBody,
@@ -205,6 +206,20 @@ export function useQueries() {
     queryKey: ["queries"],
     queryFn: () => tolerate404<RunningQuery[]>([])(api.listQueries()),
     refetchInterval: POLL.fast,
+  });
+}
+
+// Detail for one in-flight query, addressed by cluster-unique worker id and
+// fetched on demand when a row is opened. Keeps refreshing while open so
+// progress/elapsed stay live; workerId=null disables. Stops polling once the
+// query is gone (404) — no point hammering a finished worker.
+export function useQueryDetail(workerId: number | null) {
+  return useQuery<QueryDetail>({
+    queryKey: ["queryDetail", workerId],
+    queryFn: () => api.queryDetail(workerId as number),
+    enabled: workerId != null,
+    retry: false,
+    refetchInterval: (q) => (q.state.error ? false : POLL.fast),
   });
 }
 

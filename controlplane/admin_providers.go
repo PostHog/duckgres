@@ -5,17 +5,22 @@ package controlplane
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server"
 )
 
 // clusterInfoProvider implements admin.LiveInfo over the org router + config
 // store. It is the source of live state for the admin UI's monitoring views.
+// srv is the local PG wire server, the only place the (redacted) in-flight SQL
+// text lives — so QueryDetailForPID is scoped to queries this replica owns.
 type clusterInfoProvider struct {
 	router   *OrgRouter
 	store    *configstore.ConfigStore
+	srv      *server.Server
 	selfCPID string
 }
 
@@ -25,6 +30,14 @@ var _ admin.LiveInfo = (*clusterInfoProvider)(nil)
 // progress, attributed to org + user.
 func (p *clusterInfoProvider) RunningQueries() []admin.QueryStatus {
 	stacks := p.router.AllStacks()
+	// Running-query duration comes from the owning connection's query-start.
+	// Key it by cluster-unique worker id, not pid: pids are allocated per-org
+	// (every stack starts at 1000), so a pid-keyed lookup can read the wrong
+	// org's connection. Snapshot once per poll.
+	var queryStarts map[int]time.Time
+	if p.srv != nil {
+		queryStarts = p.srv.QueryStartsByWorkerID()
+	}
 	var out []admin.QueryStatus
 	for org, stack := range stacks {
 		for _, s := range stack.Sessions.AllSessions() {
@@ -42,10 +55,76 @@ func (p *clusterInfoProvider) RunningQueries() []admin.QueryStatus {
 				q.TotalRows = prog.TotalRows
 				q.Stalled = prog.Stalled
 			}
+			if qs, ok := queryStarts[s.WorkerID]; ok {
+				q.ElapsedMS = time.Since(qs).Milliseconds()
+			}
 			out = append(out, q)
 		}
 	}
 	return out
+}
+
+// QueryDetailForWorkerID expands one in-flight query, addressed by its
+// cluster-unique worker id: the redacted SQL text + conn metadata from the local
+// PG server, joined with org + protocol + live progress from the session
+// manager. ok=false when no live session/conn for that worker is owned by this
+// replica (the SQL text only exists on the CP that owns the connection).
+//
+// Worker id, NOT pid, is the address: pids are per-org (every stack starts at
+// 1000), so a pid lookup can stitch one org's SQL onto another org's identity.
+func (p *clusterInfoProvider) QueryDetailForWorkerID(workerID int) (admin.QueryDetail, bool) {
+	if p.srv == nil {
+		return admin.QueryDetail{}, false
+	}
+	cd, connOK := p.srv.ConnDetailByWorkerID(workerID)
+
+	d := admin.QueryDetail{WorkerID: workerID}
+	if connOK {
+		d.Org = cd.OrgID
+		d.User = cd.Username
+		d.PID = cd.PID
+		d.WorkerPod = cd.WorkerPod
+		d.Database = cd.Database
+		d.ApplicationName = cd.ApplicationName
+		d.ClientAddr = cd.ClientAddr
+		d.ClientPort = cd.ClientPort
+		d.State = cd.State
+		d.Query = cd.Query
+		if !cd.BackendStart.IsZero() {
+			d.BackendStart = cd.BackendStart.UTC().Format(time.RFC3339)
+		}
+		if !cd.QueryStart.IsZero() {
+			d.QueryStart = cd.QueryStart.UTC().Format(time.RFC3339)
+			d.ElapsedMS = time.Since(cd.QueryStart).Milliseconds()
+		}
+	}
+
+	// Org (stack-keyed, consistent with the list), protocol, pid, and cached
+	// progress from the owning session manager — located by worker id.
+	sessOK := false
+	for org, stack := range p.router.AllStacks() {
+		s, ok := stack.Sessions.SessionForWorker(workerID)
+		if !ok {
+			continue
+		}
+		sessOK = true
+		d.Org = org
+		d.PID = s.PID
+		d.Protocol = s.Protocol
+		if prog := stack.Sessions.GetProgress(s.PID); prog != nil {
+			d.Percentage = prog.Percentage
+			d.Rows = prog.Rows
+			d.TotalRows = prog.TotalRows
+			d.Stalled = prog.Stalled
+		}
+		break
+	}
+
+	// Found neither a live conn nor a session for this worker on this CP.
+	if !connOK && !sessOK {
+		return admin.QueryDetail{}, false
+	}
+	return d, true
 }
 
 // WorkerFleet returns cluster-wide worker counts by lifecycle state from the

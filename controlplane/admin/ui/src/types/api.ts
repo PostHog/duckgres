@@ -283,7 +283,34 @@ export interface RunningQuery {
   rows: number;
   total_rows: number;
   stalled: boolean;
-  started_at?: string; // RFC3339; may be absent/zero
+  started_at?: string; // RFC3339 session start (session age); may be absent/zero
+  elapsed_ms: number; // how long the current statement has been running (0 = idle)
+}
+
+// GET /api/v1/queries/by-worker/:wid → expanded detail for one in-flight query,
+// addressed by cluster-unique worker id. Fetched on demand when a query row is
+// opened. `query` is redacted server-side (usersecrets.RedactForLog) — never raw
+// SQL. Scatter-gathers across CP replicas; 404 if no replica owns the worker.
+export interface QueryDetail {
+  org: string;
+  user: string;
+  pid: number;
+  worker_id: number;
+  worker_pod: string;
+  protocol: string;
+  database: string;
+  application_name: string;
+  client_addr: string;
+  client_port: number;
+  state: string;
+  query: string;
+  backend_start: string; // RFC3339, "" if unknown
+  query_start: string; // RFC3339, "" if idle
+  elapsed_ms: number;
+  percentage: number;
+  rows: number;
+  total_rows: number;
+  stalled: boolean;
 }
 
 // ---- Metrics (raw Prometheus / VictoriaMetrics) ----

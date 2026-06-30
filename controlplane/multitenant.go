@@ -504,7 +504,7 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
 	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
-	clusterInfo := &clusterInfoProvider{router: router, store: store, selfCPID: cpInstanceID}
+	clusterInfo := &clusterInfoProvider{router: router, store: store, srv: srv, selfCPID: cpInstanceID}
 	imp := &impersonator{router: router}
 	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
 	// memory, so a single replica only sees its own slice. The fetcher fans the

@@ -18,9 +18,16 @@ type fakeLiveInfo struct {
 	queries  []QueryStatus
 	sessions []SessionStatus
 	orgStats []OrgStatus
+	detail   *QueryDetail // local detail for QueryDetailForWorkerID (nil = not owned here)
 }
 
-func (f *fakeLiveInfo) RunningQueries() []QueryStatus                { return f.queries }
+func (f *fakeLiveInfo) RunningQueries() []QueryStatus { return f.queries }
+func (f *fakeLiveInfo) QueryDetailForWorkerID(wid int) (QueryDetail, bool) {
+	if f.detail != nil && f.detail.WorkerID == wid {
+		return *f.detail, true
+	}
+	return QueryDetail{}, false
+}
 func (f *fakeLiveInfo) WorkerFleet() ([]FleetStat, error)            { return nil, nil }
 func (f *fakeLiveInfo) ControlPlaneInstances() ([]CPInstance, error) { return nil, nil }
 func (f *fakeLiveInfo) KillSession(int32) error                      { return nil }
@@ -41,6 +48,8 @@ func (f *fakePeerFetcher) FetchPeers(_ context.Context, path string) ([][]byte, 
 	b := f.byPath[path]
 	return b, len(b)
 }
+
+func (f *fakePeerFetcher) callCount() int32 { return atomic.LoadInt32(&f.calls) }
 
 func TestQueriesAggregateAcrossCPs(t *testing.T) {
 	gin.SetMode(gin.TestMode)

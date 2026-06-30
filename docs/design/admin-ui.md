@@ -110,7 +110,18 @@ for live views), TanStack Table (dense sortable tables), Recharts (trends). Page
    worker cpu/mem/ttl, hot-idle floor, hostname alias); managed-warehouse view/edit.
 3. **Users** — per-org users CRUD; persistent secrets list/delete.
 4. **Live** — running queries / sessions / connections, sliced + filterable by org & user,
-   with progress bars (SessionProgress) and a cancel affordance.
+   with progress bars (SessionProgress), a running-query **Duration** column
+   (`QueryStatus.ElapsedMS`, computed on the owning CP from the connection's query-start),
+   and a cancel affordance. Opening a running-query row fetches
+   `GET /api/v1/queries/by-worker/:wid` on demand — addressed by the **cluster-unique worker
+   id**, not pid, because the CP allocates backend pids per-org (every stack starts at 1000)
+   so two orgs can share a pid. The detail dialog shows the redacted SQL text
+   (`server.ConnDetailByWorkerID` → `usersecrets.RedactForLog`), connection metadata (worker
+   pod, client addr, application, elapsed) and live progress. The SQL text lives only on the
+   CP replica that owns the connection, so this scatter-gathers like `/queries`: it checks
+   locally, then fans out to peer CPs via the `PeerFetcher` (`?scope=local` recursion guard)
+   and returns the owning replica's result — a 404 means no replica owns the worker (the
+   query ended), not "wrong replica answered".
 5. **Workers** — fleet table by lifecycle state, per-org rollup, spawn/reap/drain activity.
 6. **Metrics** — error/success/duration trends per org (Prometheus), selectable org & window.
 7. **Config store** — generic explorer over every model (read), with edit where safe.

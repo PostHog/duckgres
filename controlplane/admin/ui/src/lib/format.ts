@@ -48,6 +48,21 @@ export function fmtBytes(n: number | null | undefined): string {
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+// fmtDurationMs renders a MILLISECOND duration as a compact human string
+// (250ms, 3.4s, 2m 5s, 1h 3m). <=0 / nullish → "—". Used for running-query
+// elapsed time in the Live view + detail dialog. (fmtDuration below takes
+// SECONDS — different unit, used for worker TTLs/ages.)
+export function fmtDurationMs(ms: number | null | undefined): string {
+  if (ms == null || Number.isNaN(ms) || ms <= 0) return "—";
+  const s = ms / 1000;
+  if (s < 1) return `${Math.round(ms)}ms`;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${Math.round(s % 60)}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 export function fmtTime(ts: string | number | Date | null | undefined): string {
   if (ts == null) return "—";
   const d = new Date(ts);
