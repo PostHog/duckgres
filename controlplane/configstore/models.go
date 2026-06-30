@@ -10,12 +10,11 @@ import "time"
 // alias", multiple orgs can share the NULL state, but any non-NULL alias must
 // be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
-	Name           string  `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName   string  `gorm:"size:255;uniqueIndex" json:"database_name"`
-	HostnameAlias  *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
-	MaxWorkers     int     `gorm:"default:0" json:"max_workers"`
-	MaxConnections int     `gorm:"default:0" json:"max_connections"`
-	MaxVCPUs       int     `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
+	Name          string  `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName  string  `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
+	MaxWorkers    int     `gorm:"default:0" json:"max_workers"`
+	MaxVCPUs      int     `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
 	// DefaultWorkerCPU/Memory/TTL are the org's operator-set default worker
 	// profile: the pod shape (k8s resource quantities, e.g. "2"/"8Gi") and
 	// hot-idle TTL (Go duration string, e.g. "75m" — stored as a string for
@@ -532,7 +531,6 @@ type OrgConfig struct {
 	DatabaseName            string
 	HostnameAlias           string // empty when no alias is configured
 	MaxWorkers              int
-	MaxConnections          int
 	MaxVCPUs                int
 	DefaultWorkerCPU        string            // org default worker profile: pod cpu quantity ("" = unset)
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
