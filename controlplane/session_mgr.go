@@ -827,6 +827,21 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 	return -1
 }
 
+// SessionForWorker returns the session bound to the given cluster-unique worker
+// id, or ok=false if this stack has none. One session per worker, so the first
+// (only) pid in the worker's index is authoritative. Used by the admin
+// live-query detail to address a query by worker id instead of the per-org pid.
+func (sm *SessionManager) SessionForWorker(workerID int) (*ManagedSession, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	pids := sm.byWorker[workerID]
+	if len(pids) == 0 {
+		return nil, false
+	}
+	s, ok := sm.sessions[pids[0]]
+	return s, ok
+}
+
 // ProtocolForPID returns the wire protocol ("postgres"/"flight") for a session,
 // or "" if not found. O(1) lookup for the admin live-query detail view.
 func (sm *SessionManager) ProtocolForPID(pid int32) string {

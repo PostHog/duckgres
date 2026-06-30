@@ -77,10 +77,13 @@ type CPInstance struct {
 type LiveInfo interface {
 	// RunningQueries returns every active session with its cached progress.
 	RunningQueries() []QueryStatus
-	// QueryDetailForPID returns the expanded detail (redacted SQL + connection
-	// metadata + progress) for one in-flight query, or ok=false if no live
-	// session with that pid is owned by this control-plane replica.
-	QueryDetailForPID(pid int32) (QueryDetail, bool)
+	// QueryDetailForWorkerID returns the expanded detail (redacted SQL +
+	// connection metadata + progress) for the in-flight query on the given
+	// cluster-unique worker id, or ok=false if no live session/conn for that
+	// worker is owned by this control-plane replica. Addressed by worker id, not
+	// pid: pids are per-org and not unique, so a pid key can return the wrong
+	// org's query.
+	QueryDetailForWorkerID(workerID int) (QueryDetail, bool)
 	// WorkerFleet returns worker counts by lifecycle state across the cluster.
 	WorkerFleet() ([]FleetStat, error)
 	// ControlPlaneInstances returns the live CP replicas.
@@ -128,35 +131,36 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher) {
 		c.JSON(http.StatusOK, gin.H{"queries": queries, "cp_responders": responders, "cp_total": total})
 	})
 
-	// Expanded detail for a single in-flight query (redacted SQL + metadata).
-	// Served on demand so the polled list stays light. The query's SQL text
-	// lives only on the CP replica that owns the connection, so this scatter-
-	// gathers like /queries: check locally first, and if this replica doesn't
-	// own the pid, fan out to peers (scope=local guard prevents re-fanning) and
-	// return the one owner's 200 (FetchPeers drops every peer's 404).
-	r.GET("/queries/:pid", func(c *gin.Context) {
-		pid64, err := strconv.ParseInt(c.Param("pid"), 10, 32)
+	// Expanded detail for a single in-flight query (redacted SQL + metadata),
+	// addressed by CLUSTER-UNIQUE worker id (pid is per-org, not a safe key).
+	// Served on demand so the polled list stays light. The SQL text lives only
+	// on the CP replica that owns the connection, so this scatter-gathers like
+	// /queries: check locally first, and if this replica doesn't own the worker,
+	// fan out to peers (scope=local guard prevents re-fanning) and return the one
+	// owner's 200 (FetchPeers drops every peer's 404).
+	r.GET("/queries/by-worker/:wid", func(c *gin.Context) {
+		wid, err := strconv.Atoi(c.Param("wid"))
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid pid"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid worker id"})
 			return
 		}
-		if detail, ok := live.QueryDetailForPID(int32(pid64)); ok {
+		if detail, ok := live.QueryDetailForWorkerID(wid); ok {
 			c.JSON(http.StatusOK, detail)
 			return
 		}
 		// Not owned locally. A peer fan-out call (scope=local) stops here so a
-		// missing pid can't recurse across the cluster.
+		// missing worker can't recurse across the cluster.
 		if !localScope(c) && fetcher != nil {
-			bodies, _ := fetcher.FetchPeers(c.Request.Context(), "/api/v1/queries/"+strconv.FormatInt(pid64, 10))
+			bodies, _ := fetcher.FetchPeers(c.Request.Context(), "/api/v1/queries/by-worker/"+strconv.Itoa(wid))
 			for _, b := range bodies {
 				var d QueryDetail
-				if json.Unmarshal(b, &d) == nil && d.PID == int32(pid64) {
+				if json.Unmarshal(b, &d) == nil && d.WorkerID == wid {
 					c.JSON(http.StatusOK, d)
 					return
 				}
 			}
 		}
-		c.JSON(http.StatusNotFound, gin.H{"error": "no live query with that pid"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "no live query on that worker"})
 	})
 
 	r.GET("/workers/fleet", func(c *gin.Context) {

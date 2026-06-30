@@ -144,7 +144,8 @@ export const api = {
     get<{ instances: CPInstance[] }>("/cluster/instances").then((r) => r.instances ?? []),
   listSessions: () => get<SessionStatus[]>("/sessions"),
   listQueries: () => get<{ queries: RunningQuery[] }>("/queries").then((r) => r.queries ?? []),
-  queryDetail: (pid: number) => get<QueryDetail>(`/queries/${pid}`),
+  // Detail is addressed by cluster-unique worker id (pid is per-org, not unique).
+  queryDetail: (workerId: number) => get<QueryDetail>(`/queries/by-worker/${workerId}`),
   cancelSession: (pid: number) => post<{ killed: number }>(`/sessions/${pid}/cancel`, {}),
 
   // metrics

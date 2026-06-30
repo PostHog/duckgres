@@ -19,7 +19,7 @@ export function Live() {
   const cancel = useCancelSession();
   const [org, setOrg] = useState("");
   const [user, setUser] = useState("");
-  const [detailPid, setDetailPid] = useState<number | null>(null);
+  const [detailWid, setDetailWid] = useState<number | null>(null);
 
   const matchOrg = (o?: string) => !org || (o ?? "").toLowerCase().includes(org.toLowerCase());
   const matchUser = (u?: string) => !user || (u ?? "").toLowerCase().includes(user.toLowerCase());
@@ -98,7 +98,7 @@ export function Live() {
                       <TableRow
                         key={`${q.pid}-${q.worker_id}`}
                         className="cursor-pointer"
-                        onClick={() => setDetailPid(q.pid)}
+                        onClick={() => setDetailWid(q.worker_id)}
                         title="View query detail"
                       >
                         <TableCell className="font-mono text-xs">{q.pid}</TableCell>
@@ -191,7 +191,11 @@ export function Live() {
           </CardContent>
         </Card>
       </PageBody>
-      <QueryDetailDialog pid={detailPid} onClose={() => setDetailPid(null)} onCancel={(pid) => cancel.mutate(pid)} />
+      <QueryDetailDialog
+        workerId={detailWid}
+        onClose={() => setDetailWid(null)}
+        onCancel={(pid) => cancel.mutate(pid)}
+      />
     </>
   );
 }

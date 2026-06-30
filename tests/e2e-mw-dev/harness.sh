@@ -1446,38 +1446,42 @@ admin_query_detail() { # org password
   bg=$!
   cleanup_bg() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
 
-  # Poll /queries until our org shows an in-flight pid (worker spawn + the query
-  # reaching the worker), bounded.
-  pid="" a=0
+  # Poll /queries until our marker query shows an in-flight row, and capture its
+  # CLUSTER-UNIQUE worker id (detail is addressed by worker id, not the per-org
+  # pid). Filter on the marker SQL is not possible from the list (no SQL there),
+  # so filter on org and the running state; the lane is otherwise quiet here.
+  wid="" pid="" a=0
   while [ "$a" -lt 60 ]; do
     kill -0 "$bg" 2>/dev/null || break
-    pid="$(curl -fsS -H "$H" "$API/api/v1/queries" \
-      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o) | .pid) // empty')"
-    [ -n "$pid" ] && break
+    row="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -c --arg o "$org" 'first(.queries[]? | select(.org==$o))')"
+    wid="$(printf '%s' "$row" | jq -r '.worker_id // empty')"
+    pid="$(printf '%s' "$row" | jq -r '.pid // empty')"
+    [ -n "$wid" ] && break
     sleep 2; a=$((a + 1))
   done
-  [ -n "$pid" ] || { cleanup_bg; fail "admin_query_detail: no in-flight query appeared for $org within timeout"; }
+  [ -n "$wid" ] || { cleanup_bg; fail "admin_query_detail: no in-flight query appeared for $org within timeout"; }
 
   # The /queries list item carries the running-query duration. Give it a moment
-  # to accrue, then assert elapsed_ms is present and positive for our pid.
+  # to accrue, then assert elapsed_ms is present and positive for our worker.
   sleep 3
   ems="$(curl -fsS -H "$H" "$API/api/v1/queries" \
-    | jq -r --argjson p "$pid" 'first(.queries[]? | select(.pid==$p) | .elapsed_ms) // -1')"
+    | jq -r --argjson w "$wid" 'first(.queries[]? | select(.worker_id==$w) | .elapsed_ms) // -1')"
   case "$ems" in
-    ''|-1|0) cleanup_bg; fail "admin_query_detail: /queries elapsed_ms not populated for pid $pid (got '$ems')" ;;
-    *) [ "$ems" -gt 0 ] || { cleanup_bg; fail "admin_query_detail: elapsed_ms not positive for pid $pid (got '$ems')"; } ;;
+    ''|-1|0) cleanup_bg; fail "admin_query_detail: /queries elapsed_ms not populated for worker $wid (got '$ems')" ;;
+    *) [ "$ems" -gt 0 ] || { cleanup_bg; fail "admin_query_detail: elapsed_ms not positive for worker $wid (got '$ems')"; } ;;
   esac
 
-  # Expand it: 200 with the redacted SQL text + matching identity + a real worker.
-  d="$(curl -fsS -H "$H" "$API/api/v1/queries/$pid")" \
-    || { cleanup_bg; fail "admin_query_detail: GET /queries/$pid failed"; }
-  echo "$d" | jq -e --arg o "$org" --argjson p "$pid" \
-    '.pid == $p and .org == $o and (.query | contains("2718281828")) and .worker_id >= 0' >/dev/null \
-    || { cleanup_bg; fail "admin_query_detail: detail mismatch for pid $pid: $(echo "$d" | jq -c '{pid,org,worker_id,state,qlen:(.query|length)}')"; }
+  # Expand it by worker id: 200 with the redacted SQL text + matching identity.
+  d="$(curl -fsS -H "$H" "$API/api/v1/queries/by-worker/$wid")" \
+    || { cleanup_bg; fail "admin_query_detail: GET /queries/by-worker/$wid failed"; }
+  echo "$d" | jq -e --arg o "$org" --argjson w "$wid" \
+    '.worker_id == $w and .org == $o and (.query | contains("2718281828"))' >/dev/null \
+    || { cleanup_bg; fail "admin_query_detail: detail mismatch for worker $wid: $(echo "$d" | jq -c '{pid,org,worker_id,state,qlen:(.query|length)}')"; }
 
-  # An unknown pid is a clean 404, never a 500.
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/queries/2147483647")"
-  [ "$code" = "404" ] || { cleanup_bg; fail "admin_query_detail: unknown pid returned $code, want 404"; }
+  # An unknown worker id is a clean 404, never a 500.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/queries/by-worker/999999999")"
+  [ "$code" = "404" ] || { cleanup_bg; fail "admin_query_detail: unknown worker id returned $code, want 404"; }
   cleanup_bg
 
   # Redaction in the LIVE path (load-bearing): a real CREATE SECRET executing on
@@ -1496,23 +1500,26 @@ admin_query_detail() { # org password
   ( pg_try "$org" "$pw" ducklake "$sq" >"$sout" 2>&1 || true ) &
   sbg=$!
   cleanup_sbg() { kill "$sbg" 2>/dev/null || true; wait "$sbg" 2>/dev/null || true; rm -f "$sout"; }
-  spid="" a=0
+  # Poll each org worker's detail and pin to the one whose (redacted) SQL is our
+  # CREATE SECRET — so concurrent org churn can't make us probe a different query.
+  swid="" a=0
   while [ "$a" -lt 60 ]; do
     kill -0 "$sbg" 2>/dev/null || break
-    spid="$(curl -fsS -H "$H" "$API/api/v1/queries" \
-      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o) | .pid) // empty')"
-    [ -n "$spid" ] && break
+    for w in $(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --arg o "$org" '.queries[]? | select(.org==$o) | .worker_id'); do
+      sd="$(curl -fsS -H "$H" "$API/api/v1/queries/by-worker/$w" || true)"
+      if printf '%s' "$sd" | jq -e '.query | test("e2e_detail_redact"; "i")' >/dev/null 2>&1; then
+        swid="$w"; break
+      fi
+    done
+    [ -n "$swid" ] && break
     sleep 2; a=$((a + 1))
   done
-  if [ -n "$spid" ]; then
-    sd="$(curl -fsS -H "$H" "$API/api/v1/queries/$spid" || true)"
+  if [ -n "$swid" ]; then
+    # sd holds the matched detail. The credential literal must be absent.
     case "$sd" in
-      *"$cred"*|*"AKIADETAILPROBE"*) cleanup_sbg; fail "admin_query_detail: REDACTION BREACH — CREATE SECRET credential leaked into /queries/$spid" ;;
+      *"$cred"*|*"AKIADETAILPROBE"*) cleanup_sbg; fail "admin_query_detail: REDACTION BREACH — CREATE SECRET credential leaked into /queries/by-worker/$swid" ;;
     esac
-    # And the statement IS visible (redacted), proving we caught the right query.
-    echo "$sd" | jq -e '.query | test("SECRET"; "i")' >/dev/null \
-      || { cleanup_sbg; fail "admin_query_detail: expected redacted CREATE SECRET text in detail, got $(echo "$sd" | jq -c '{state,qlen:(.query|length)}')"; }
-    log "admin live: redaction holds in live path (credential absent from pid $spid)"
+    log "admin live: redaction holds in live path (credential absent from worker $swid detail)"
   else
     # Don't fail the whole suite on a missed catch (the secret DDL may finish or
     # error fast on a cold worker); the unit test is the deterministic gate.
@@ -1520,7 +1527,7 @@ admin_query_detail() { # org password
   fi
   cleanup_sbg
 
-  log "admin live: per-query detail OK (pid $pid, SQL round-tripped, unknown→404, redaction) on $org"
+  log "admin live: per-query detail OK (worker $wid, SQL round-tripped, unknown→404, redaction) on $org"
 }
 
 # ---- admin impersonation round-trip + audit --------------------------------

@@ -115,6 +115,52 @@ func (s *Server) ConnDetailByPID(pid int32) (ConnDetail, bool) {
 	return c.connDetail(), true
 }
 
+// ConnDetailByWorkerID returns a redacted snapshot of the live connection bound
+// to the given control-plane worker id, or ok=false if none is registered here.
+//
+// Worker ids are CLUSTER-UNIQUE (config-store issued) and there is exactly one
+// session per worker, so this is the collision-free address for the admin
+// live-query detail. PID is NOT safe: the CP allocates backend pids per-org
+// (every org's SessionManager starts at 1000), so two orgs can share a pid and a
+// lookup keyed by pid can return the wrong org's connection. A negative workerID
+// (standalone / transient describe conns) never matches.
+func (s *Server) ConnDetailByWorkerID(workerID int) (ConnDetail, bool) {
+	if s == nil || workerID < 0 {
+		return ConnDetail{}, false
+	}
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	for _, c := range s.conns {
+		if c.workerID == workerID {
+			return c.connDetail(), true
+		}
+	}
+	return ConnDetail{}, false
+}
+
+// QueryStartsByWorkerID returns the current-statement start time of every live
+// connection that has a query in flight, keyed by cluster-unique worker id. Used
+// to attach running-query duration to the live list in one pass (no per-session
+// lookup, and keyed on worker id rather than the collision-prone per-org pid).
+// Idle connections (no query) are omitted.
+func (s *Server) QueryStartsByWorkerID() map[int]time.Time {
+	if s == nil {
+		return nil
+	}
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	out := make(map[int]time.Time, len(s.conns))
+	for _, c := range s.conns {
+		if c.workerID < 0 {
+			continue
+		}
+		if qs, ok := c.queryStart.Load().(time.Time); ok && !qs.IsZero() {
+			out[c.workerID] = qs
+		}
+	}
+	return out
+}
+
 // SetConnectionWorkerSize records the provisioned worker pod size (in
 // milli-units) on a control-plane connection for compute-usage billing.
 // millicores == 0 means the size is unknown (non-remote / standalone) and

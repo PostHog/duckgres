@@ -28,21 +28,21 @@ function Field({ label, value, mono }: { label: string; value: React.ReactNode; 
 // SECRET statements never reach the UI. Detail is scoped to the control-plane
 // replica that owns the connection, so a 404 renders a clear notice.
 export function QueryDetailDialog({
-  pid,
+  workerId,
   onClose,
   onCancel,
 }: {
-  pid: number | null;
+  workerId: number | null;
   onClose: () => void;
   onCancel: (pid: number) => void;
 }) {
-  const detail = useQueryDetail(pid);
+  const detail = useQueryDetail(workerId);
   const d = detail.data;
   const notFound = detail.isError && (detail.error as { status?: number })?.status === 404;
   const pct = d && d.percentage > 0 ? d.percentage : undefined;
 
   return (
-    <Dialog open={pid != null} onOpenChange={(o) => !o && onClose()}>
+    <Dialog open={workerId != null} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">

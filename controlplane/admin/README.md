@@ -60,7 +60,7 @@ Added for the console:
 |-------|------|---------|
 | `GET /api/v1/me` | any | caller identity + role (SPA tailors its UI) |
 | `GET /api/v1/queries` | viewer | running queries w/ progress, `?org=&user=` slicing |
-| `GET /api/v1/queries/:pid` | viewer | one query's detail: redacted SQL text + conn metadata + progress. Scatter-gathers like `/queries` — checks locally, else fans out to peer CPs (`?scope=local` guard); 404 only if no replica owns the pid |
+| `GET /api/v1/queries/by-worker/:wid` | viewer | one query's detail: redacted SQL text + conn metadata + progress, addressed by cluster-unique worker id (pid is per-org, not unique). Scatter-gathers like `/queries` — checks locally, else fans out to peer CPs (`?scope=local` guard); 404 only if no replica owns the worker |
 | `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
 | `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
 | `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |
