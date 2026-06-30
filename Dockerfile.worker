@@ -51,7 +51,7 @@ RUN go mod download
 # keeps the GHA layer-cache hit and skips the 5 downloads. (They previously
 # ran after the source COPY + build, so they re-fetched on every edit.)
 ARG DUCKDB_EXTENSION_VERSION=1.5.3
-ARG HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh
+ARG HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry
 ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # Repository for postgres_scanner specifically. Defaults to the stable

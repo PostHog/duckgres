@@ -13,7 +13,7 @@ RUN go mod download
 # edit.)
 ARG TARGETARCH
 ARG DUCKDB_EXTENSION_VERSION=1.5.3
-ARG HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh
+ARG HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry
 ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # Repository for postgres_scanner specifically. Defaults to the stable
