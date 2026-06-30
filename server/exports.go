@@ -78,6 +78,42 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 	}
 }
 
+// ConnDetail is a redacted snapshot of one live client connection, for the
+// admin live-query detail view. Query is the ALREADY-redacted current/last
+// query (usersecrets.RedactForLog, same as pg_stat_activity) — callers must
+// never expose raw SQL here.
+type ConnDetail struct {
+	PID             int32
+	OrgID           string
+	Username        string
+	Database        string
+	ApplicationName string
+	ClientAddr      string
+	ClientPort      int32
+	WorkerID        int
+	WorkerPod       string
+	State           string // active | idle | idle in transaction | idle in transaction (aborted)
+	Query           string // redacted current/last query ("" when idle)
+	BackendStart    time.Time
+	QueryStart      time.Time // zero when no query is in flight
+}
+
+// ConnDetailByPID returns a redacted snapshot of the live connection for pid,
+// or ok=false if no such connection is registered on this server. Used by the
+// control-plane admin API to render the live-query detail view.
+func (s *Server) ConnDetailByPID(pid int32) (ConnDetail, bool) {
+	if s == nil {
+		return ConnDetail{}, false
+	}
+	s.connsMu.RLock()
+	c, ok := s.conns[pid]
+	s.connsMu.RUnlock()
+	if !ok {
+		return ConnDetail{}, false
+	}
+	return c.connDetail(), true
+}
+
 // CancelClientConn cancels the context of a clientConn.
 func CancelClientConn(cc *clientConn) {
 	if cc.cancel != nil {

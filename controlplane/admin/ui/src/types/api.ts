@@ -237,6 +237,32 @@ export interface RunningQuery {
   stalled: boolean;
 }
 
+// GET /api/v1/queries/:pid → expanded detail for one in-flight query. Fetched
+// on demand when a query row is opened. `query` is redacted server-side
+// (usersecrets.RedactForLog) — never raw SQL. Scoped to queries owned by the
+// serving control-plane replica (404 otherwise).
+export interface QueryDetail {
+  org: string;
+  user: string;
+  pid: number;
+  worker_id: number;
+  worker_pod: string;
+  protocol: string;
+  database: string;
+  application_name: string;
+  client_addr: string;
+  client_port: number;
+  state: string;
+  query: string;
+  backend_start: string; // RFC3339, "" if unknown
+  query_start: string; // RFC3339, "" if idle
+  elapsed_ms: number;
+  percentage: number;
+  rows: number;
+  total_rows: number;
+  stalled: boolean;
+}
+
 // ---- Metrics (raw Prometheus / VictoriaMetrics) ----
 
 // GET /api/v1/metrics/panels → { panels: string[], configured: boolean }.

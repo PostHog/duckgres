@@ -53,6 +53,7 @@ Added for the console:
 |-------|------|---------|
 | `GET /api/v1/me` | any | caller identity + role (SPA tailors its UI) |
 | `GET /api/v1/queries` | viewer | running queries w/ progress, `?org=&user=` slicing |
+| `GET /api/v1/queries/:pid` | viewer | one query's detail: redacted SQL text + conn metadata + progress (scoped to the owning CP replica; 404 otherwise) |
 | `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
 | `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
 | `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |

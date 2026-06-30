@@ -5,17 +5,22 @@ package controlplane
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server"
 )
 
 // clusterInfoProvider implements admin.LiveInfo over the org router + config
 // store. It is the source of live state for the admin UI's monitoring views.
+// srv is the local PG wire server, the only place the (redacted) in-flight SQL
+// text lives — so QueryDetailForPID is scoped to queries this replica owns.
 type clusterInfoProvider struct {
 	router   *OrgRouter
 	store    *configstore.ConfigStore
+	srv      *server.Server
 	selfCPID string
 }
 
@@ -45,6 +50,63 @@ func (p *clusterInfoProvider) RunningQueries() []admin.QueryStatus {
 		}
 	}
 	return out
+}
+
+// QueryDetailForPID expands one in-flight query: the redacted SQL text + conn
+// metadata from the local PG server, joined with protocol + live progress from
+// the session manager. ok=false when no live session with that pid is owned by
+// this replica (the SQL text only exists on the CP that owns the connection).
+func (p *clusterInfoProvider) QueryDetailForPID(pid int32) (admin.QueryDetail, bool) {
+	if p.srv == nil {
+		return admin.QueryDetail{}, false
+	}
+	cd, ok := p.srv.ConnDetailByPID(pid)
+	if !ok {
+		return admin.QueryDetail{}, false
+	}
+	d := admin.QueryDetail{
+		Org:             cd.OrgID,
+		User:            cd.Username,
+		PID:             cd.PID,
+		WorkerID:        cd.WorkerID,
+		WorkerPod:       cd.WorkerPod,
+		Database:        cd.Database,
+		ApplicationName: cd.ApplicationName,
+		ClientAddr:      cd.ClientAddr,
+		ClientPort:      cd.ClientPort,
+		State:           cd.State,
+		Query:           cd.Query,
+	}
+	if !cd.BackendStart.IsZero() {
+		d.BackendStart = cd.BackendStart.UTC().Format(time.RFC3339)
+	}
+	if !cd.QueryStart.IsZero() {
+		d.QueryStart = cd.QueryStart.UTC().Format(time.RFC3339)
+		d.ElapsedMS = time.Since(cd.QueryStart).Milliseconds()
+	}
+	// Org (consistent with the list view's stack-keyed attribution), protocol,
+	// and cached progress come from the session manager. Locate the owning stack
+	// by pid, like KillSession.
+	for org, stack := range p.router.AllStacks() {
+		if stack.Sessions.WorkerIDForPID(pid) < 0 {
+			continue
+		}
+		d.Org = org
+		for _, s := range stack.Sessions.AllSessions() {
+			if s.PID == pid {
+				d.Protocol = s.Protocol
+				break
+			}
+		}
+		if prog := stack.Sessions.GetProgress(pid); prog != nil {
+			d.Percentage = prog.Percentage
+			d.Rows = prog.Rows
+			d.TotalRows = prog.TotalRows
+			d.Stalled = prog.Stalled
+		}
+		break
+	}
+	return d, true
 }
 
 // WorkerFleet returns cluster-wide worker counts by lifecycle state from the

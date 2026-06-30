@@ -103,7 +103,12 @@ for live views), TanStack Table (dense sortable tables), Recharts (trends). Page
    worker cpu/mem/ttl, hot-idle floor, hostname alias); managed-warehouse view/edit.
 3. **Users** — per-org users CRUD; persistent secrets list/delete.
 4. **Live** — running queries / sessions / connections, sliced + filterable by org & user,
-   with progress bars (SessionProgress) and a cancel affordance.
+   with progress bars (SessionProgress) and a cancel affordance. Opening a running-query
+   row fetches `GET /api/v1/queries/:pid` on demand: a detail dialog with the redacted SQL
+   text (`server.ConnDetailByPID` → `usersecrets.RedactForLog`), connection metadata
+   (worker pod, client addr, application, elapsed) and live progress. Detail is scoped to
+   the CP replica that owns the connection (where the SQL text lives), so a query owned by
+   another replica returns 404 rather than empty text.
 5. **Workers** — fleet table by lifecycle state, per-org rollup, spawn/reap/drain activity.
 6. **Metrics** — error/success/duration trends per org (Prometheus), selectable org & window.
 7. **Config store** — generic explorer over every model (read), with edit where safe.

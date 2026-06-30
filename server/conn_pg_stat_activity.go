@@ -220,3 +220,48 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 
 	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)
 }
+
+// connDetail builds a redacted ConnDetail snapshot of this connection for the
+// admin live-query detail view. Query is the ALREADY-redacted currentQuery
+// (usersecrets.RedactForLog, the same value pg_stat_activity exposes) — this
+// path must never surface raw SQL, or a CREATE PERSISTENT SECRET credential
+// would leak into the admin UI. The state string mirrors the pg_stat_activity
+// derivation above (active iff a query is in flight, else the txn idle state).
+func (c *clientConn) connDetail() ConnDetail {
+	q, _ := c.currentQuery.Load().(string)
+	var state string
+	if q != "" {
+		state = "active"
+	} else {
+		switch c.txStatus {
+		case txStatusTransaction:
+			state = "idle in transaction"
+		case txStatusError:
+			state = "idle in transaction (aborted)"
+		default:
+			state = "idle"
+		}
+	}
+	d := ConnDetail{
+		PID:             c.pid,
+		OrgID:           c.orgID,
+		Username:        c.username,
+		Database:        c.database,
+		ApplicationName: c.applicationName,
+		WorkerID:        c.workerID,
+		WorkerPod:       c.workerPod,
+		State:           state,
+		Query:           q,
+		BackendStart:    c.backendStart,
+	}
+	if c.conn != nil {
+		if addr, ok := c.conn.RemoteAddr().(*net.TCPAddr); ok {
+			d.ClientAddr = addr.IP.String()
+			d.ClientPort = int32(addr.Port)
+		}
+	}
+	if qs, ok := c.queryStart.Load().(time.Time); ok && !qs.IsZero() {
+		d.QueryStart = qs
+	}
+	return d
+}

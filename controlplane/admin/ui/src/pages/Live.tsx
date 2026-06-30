@@ -11,6 +11,7 @@ import { EmptyState } from "@/components/states";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useCancelSession, useQueries, useSessions } from "@/hooks/useApi";
 import { fmtInt } from "@/lib/format";
+import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
 export function Live() {
   const queries = useQueries();
@@ -18,6 +19,7 @@ export function Live() {
   const cancel = useCancelSession();
   const [org, setOrg] = useState("");
   const [user, setUser] = useState("");
+  const [detailPid, setDetailPid] = useState<number | null>(null);
 
   const matchOrg = (o?: string) => !org || (o ?? "").toLowerCase().includes(org.toLowerCase());
   const matchUser = (u?: string) => !user || (u ?? "").toLowerCase().includes(user.toLowerCase());
@@ -92,7 +94,12 @@ export function Live() {
                     // progress reported yet" → indeterminate animation.
                     const pct = q.percentage > 0 ? q.percentage : undefined;
                     return (
-                      <TableRow key={`${q.pid}-${q.worker_id}`}>
+                      <TableRow
+                        key={`${q.pid}-${q.worker_id}`}
+                        className="cursor-pointer"
+                        onClick={() => setDetailPid(q.pid)}
+                        title="View query detail"
+                      >
                         <TableCell className="font-mono text-xs">{q.pid}</TableCell>
                         <TableCell className="font-mono text-xs">{q.org}</TableCell>
                         <TableCell className="font-mono text-xs">{q.user || "—"}</TableCell>
@@ -119,7 +126,10 @@ export function Live() {
                               variant="ghost"
                               size="sm"
                               disabled={cancel.isPending}
-                              onClick={() => cancel.mutate(q.pid)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                cancel.mutate(q.pid);
+                              }}
                             >
                               <Ban className="h-4 w-4 text-destructive" /> Cancel
                             </Button>
@@ -179,6 +189,7 @@ export function Live() {
           </CardContent>
         </Card>
       </PageBody>
+      <QueryDetailDialog pid={detailPid} onClose={() => setDetailPid(null)} onCancel={(pid) => cancel.mutate(pid)} />
     </>
   );
 }
