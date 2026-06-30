@@ -62,6 +62,28 @@ func TestScheduledCleanupKeepsGoingWhenDucklingsDoNotDelete(t *testing.T) {
 	}
 }
 
+func TestScheduledCleanupDropsCurrentAndLegacyCnpgIdentifiers(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "e2e-cleanup")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("e2e-cleanup failed: %v\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	for _, want := range []string{
+		"DROP DATABASE IF EXISTS mdstore_ci_pr_123_cnpg WITH (FORCE);",
+		"DROP ROLE IF EXISTS mdstore_ci_pr_123_cnpg;",
+		"DROP DATABASE IF EXISTS lakekeeper_ci_pr_123_cnpg WITH (FORCE);",
+		"DROP ROLE IF EXISTS lakekeeper_ci_pr_123_cnpg;",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("cleanup did not drop expected cnpg identifier %q; calls:\n%s", want, calls)
+		}
+	}
+}
+
 func TestTeardownContinuesCleanupWhenDucklingsDoNotDelete(t *testing.T) {
 	fakes := newRunSHFakes(t)
 

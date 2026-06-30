@@ -127,19 +127,22 @@ restart_cp_with_identity() {
 # The cnpg-shard metadata role+db are owned by the Crossplane composition and
 # dropped when the Duckling CR deletes — but that cascade is async and can lag,
 # leaving stranded state from a prior run (incl. a cancelled one with no
-# teardown). The composition's live identifier still uses the historical
-# lakekeeper_<org> prefix, so drop that role+db directly on the active shard,
+# teardown). New Ducklings use mdstore_<org>; legacy Ducklings can still use
+# lakekeeper_<org>. Drop both role+db names directly on the active shard,
 # idempotently, BOTH before provisioning (clean slate, so a rerun never
 # inherits stranded state) and at teardown (deterministic clean exit). Scoped
 # to this PR's unique org ids, so it can't touch another PR's tenant.
 drop_cnpg_role() { # org-id
-  local ident
-  # Mirror the composition's PG identifier: lakekeeper_<lower, [^a-z0-9_]→_>.
-  ident="lakekeeper_$(printf %s "$1" | tr 'A-Z-' 'a-z_' | tr -cd 'a-z0-9_')"
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP DATABASE IF EXISTS ${ident} WITH (FORCE);" >/dev/null 2>&1 || true
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
+  local suffix prefix ident
+  # Mirror the composition's PG identifier suffix: lower, [^a-z0-9_] -> _.
+  suffix="$(printf %s "$1" | tr 'A-Z-' 'a-z_' | tr -cd 'a-z0-9_')"
+  for prefix in mdstore lakekeeper; do
+    ident="${prefix}_${suffix}"
+    "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
+      psql -U postgres -c "DROP DATABASE IF EXISTS ${ident} WITH (FORCE);" >/dev/null 2>&1 || true
+    "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
+      psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
+  done
 }
 
 # Every duckling org a harness run provisions for a PR (harness.sh main()):
