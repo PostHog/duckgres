@@ -5,6 +5,7 @@ package admin
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -12,25 +13,28 @@ import (
 // QueryStatus is a currently-running query/session with its live progress,
 // sliceable by org and user.
 type QueryStatus struct {
-	Org        string  `json:"org"`
-	User       string  `json:"user"`
-	PID        int32   `json:"pid"`
-	WorkerID   int     `json:"worker_id"`
-	Protocol   string  `json:"protocol"`
-	Percentage float64 `json:"percentage"`
-	Rows       uint64  `json:"rows"`
-	TotalRows  uint64  `json:"total_rows"`
-	Stalled    bool    `json:"stalled"`
+	Org        string    `json:"org"`
+	User       string    `json:"user"`
+	PID        int32     `json:"pid"`
+	WorkerID   int       `json:"worker_id"`
+	Protocol   string    `json:"protocol"`
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	Percentage float64   `json:"percentage"`
+	Rows       uint64    `json:"rows"`
+	TotalRows  uint64    `json:"total_rows"`
+	Stalled    bool      `json:"stalled"`
 }
 
 // FleetStat is a cluster-wide worker count grouped by image/state/binding,
 // from the durable runtime store (the source of truth for hot-idle/spawning/
 // draining counts the in-memory session map cannot see).
 type FleetStat struct {
-	Image   string `json:"image"`
-	State   string `json:"state"`
-	Binding string `json:"binding"`
-	Count   int64  `json:"count"`
+	Image       string  `json:"image"`
+	State       string  `json:"state"`
+	Binding     string  `json:"binding"`
+	Count       int64   `json:"count"`
+	CPUCores    float64 `json:"cpu_cores"`
+	MemoryBytes int64   `json:"memory_bytes"`
 }
 
 // CPInstance is a live control-plane replica.

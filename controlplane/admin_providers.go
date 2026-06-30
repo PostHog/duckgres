@@ -29,11 +29,12 @@ func (p *clusterInfoProvider) RunningQueries() []admin.QueryStatus {
 	for org, stack := range stacks {
 		for _, s := range stack.Sessions.AllSessions() {
 			q := admin.QueryStatus{
-				Org:      org,
-				User:     s.Username,
-				PID:      s.PID,
-				WorkerID: s.WorkerID,
-				Protocol: s.Protocol,
+				Org:       org,
+				User:      s.Username,
+				PID:       s.PID,
+				WorkerID:  s.WorkerID,
+				Protocol:  s.Protocol,
+				StartedAt: s.StartedAt,
 			}
 			if prog := stack.Sessions.GetProgress(s.PID); prog != nil {
 				q.Percentage = prog.Percentage
@@ -58,10 +59,12 @@ func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
 	out := make([]admin.FleetStat, 0, len(stats))
 	for _, s := range stats {
 		out = append(out, admin.FleetStat{
-			Image:   s.Image,
-			State:   string(s.State),
-			Binding: s.Binding,
-			Count:   s.Count,
+			Image:       s.Image,
+			State:       string(s.State),
+			Binding:     s.Binding,
+			Count:       s.Count,
+			CPUCores:    s.CPUCores,
+			MemoryBytes: s.MemoryBytes,
 		})
 	}
 	return out, nil

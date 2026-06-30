@@ -58,6 +58,12 @@ type ManagedWorker struct {
 	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
 }
 
+// Profile returns the pod-shape profile this worker was spawned with (zero =
+// default exclusive profile). Exposes the unexported field for the admin API.
+func (w *ManagedWorker) Profile() WorkerProfile {
+	return w.profile
+}
+
 // SharedState returns the additive shared worker lifecycle metadata for
 // this worker. The zero value normalizes to an idle, unassigned worker.
 func (w *ManagedWorker) SharedState() SharedWorkerState {

@@ -62,15 +62,16 @@ export function Overview() {
     return { rateSeries: pts, errorPct: total > 0 ? (error / total) * 100 : 0 };
   }, [qTotal.data]);
 
-  // The real worker count is the fleet (cluster-wide, from the config store).
-  // status.total_workers is only the SESSION-HOLDING workers the serving CP
-  // happens to see (0 when idle) — using it as the headline undercounts the
-  // fleet, and `?? totalFleet` never fell back because 0 is not nullish.
-  const busyWorkers = status.data?.total_workers ?? 0;
-  const hotCount = stateCounts["hot"] ?? 0;
-  // Idle hot workers: `hot` in the fleet but not holding a session. A large,
-  // persistent value is the leak signal (workers stuck hot, never reaped).
-  const idleHot = Math.max(0, hotCount - busyWorkers);
+  // Busy vs idle split, both from the durable fleet (/workers/fleet) so they
+  // share scope: `hot` = holding a session (busy), `hot_idle` = parked idle
+  // (warm, reserving the pod but running no query). Do NOT derive idle from
+  // status.total_workers — that's the serving CP's in-memory session count
+  // (often 0) on a different scope than the cluster-wide fleet, which made
+  // "hot" and "idle" report the same number (hotCount - 0).
+  const busyWorkers = stateCounts["hot"] ?? 0;
+  // A large, persistent hot-idle count is the cost/leak signal — workers warm
+  // but doing no work, holding vCPU & memory.
+  const idleWorkers = stateCounts["hot_idle"] ?? 0;
 
   return (
     <>
@@ -81,8 +82,8 @@ export function Overview() {
           <StatCard
             label="Workers"
             value={fleet.isSuccess ? fmtInt(totalFleet) : "—"}
-            hint={fleet.isSuccess ? `${fmtInt(hotCount)} hot · ${fmtInt(idleHot)} idle` : undefined}
-            accent={idleHot >= 20 ? "warning" : "default"}
+            hint={fleet.isSuccess ? `${fmtInt(busyWorkers)} hot · ${fmtInt(idleWorkers)} idle` : undefined}
+            accent={idleWorkers >= 20 ? "warning" : "default"}
             icon={<Server className="h-4 w-4" />}
           />
           <StatCard label="Sessions" value={fmtInt(status.data?.total_sessions)} icon={<Users className="h-4 w-4" />} />
@@ -129,11 +130,11 @@ export function Overview() {
                   Fleet detail unavailable (GET /api/v1/workers/fleet). Showing totals only.
                 </p>
               )}
-              {fleet.isSuccess && idleHot >= 20 ? (
+              {fleet.isSuccess && idleWorkers >= 20 ? (
                 <p className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
-                  ⚠ {fmtInt(idleHot)} <span className="font-medium">hot</span> workers are not holding a
-                  session — possible idle/leaked workers reserving vCPU &amp; memory. Check the Workers page
-                  for the fleet breakdown and owner.
+                  ⚠ {fmtInt(idleWorkers)} workers are parked <span className="font-medium">hot-idle</span> —
+                  warm but holding no session, reserving vCPU &amp; memory. Check the Workers page for the
+                  fleet breakdown and owner.
                 </p>
               ) : null}
             </CardContent>

@@ -38,7 +38,8 @@ type ManagedSession struct {
 	PID          int32
 	Username     string // org user the session was created for (for admin slicing/attribution)
 	WorkerID     int
-	Protocol     string // "postgres" or "flight"
+	Protocol     string    // "postgres" or "flight"
+	StartedAt    time.Time // when the session was created (UTC); surfaced in the Live view
 	SessionToken string
 	Executor     *flightclient.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
@@ -568,6 +569,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		Username:     username,
 		WorkerID:     worker.ID,
 		Protocol:     protocol,
+		StartedAt:    time.Now().UTC(),
 		SessionToken: sessionToken,
 		Executor:     executor,
 		lease:        lease,
@@ -895,6 +897,17 @@ func (sm *SessionManager) WorkerPodNameForPID(pid int32) string {
 		return ""
 	}
 	return worker.PodName()
+}
+
+// WorkerProfile returns the pod-shape profile (cpu/memory/ttl) of a worker by
+// ID, or false if the worker is not in the pool. The zero profile is the
+// default profile (empty cpu/memory).
+func (sm *SessionManager) WorkerProfile(workerID int) (WorkerProfile, bool) {
+	w, ok := sm.pool.Worker(workerID)
+	if !ok || w == nil {
+		return WorkerProfile{}, false
+	}
+	return w.Profile(), true
 }
 
 // GetProgress returns the cached query progress for a session, or nil.

@@ -31,6 +31,9 @@ type WorkerStatus struct {
 	Org            string `json:"org"`
 	ActiveSessions int    `json:"active_sessions"`
 	Status         string `json:"status"`
+	CPU            string `json:"cpu"`
+	Memory         string `json:"memory"`
+	TTLSeconds     int    `json:"ttl_seconds"`
 }
 
 // SessionStatus represents an active session for the API.

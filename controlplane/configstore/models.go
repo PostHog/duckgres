@@ -284,6 +284,11 @@ type ManagedWarehouse struct {
 	Image           string `gorm:"size:512" json:"image"`
 	DuckLakeVersion string `gorm:"size:32" json:"ducklake_version"`
 
+	// DucklingName is the k8s Duckling CR name; canonical = lowercased org ID.
+	// Authoritative, not derived — stored explicitly so lookups stop guessing
+	// it from the org ID (see provisioner.ducklingName for the canonical form).
+	DucklingName string `gorm:"size:255" json:"duckling_name"`
+
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
 	DataStore         ManagedWarehouseDataStore      `gorm:"embedded;embeddedPrefix:data_store_" json:"data_store"`
@@ -382,10 +387,12 @@ const (
 // WorkerLifecycleStats is the grouped worker lifecycle state used for
 // cluster-wide worker observability.
 type WorkerLifecycleStats struct {
-	Image   string      `json:"image"`
-	State   WorkerState `json:"state"`
-	Binding string      `json:"binding"`
-	Count   int64       `json:"count"`
+	Image       string      `json:"image"`
+	State       WorkerState `json:"state"`
+	Binding     string      `json:"binding"`
+	Count       int64       `json:"count"`
+	CPUCores    float64     `json:"cpu_cores"`
+	MemoryBytes int64       `json:"memory_bytes"`
 }
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.

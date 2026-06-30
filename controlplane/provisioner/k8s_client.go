@@ -297,6 +297,39 @@ func (d *DucklingClient) getCR(ctx context.Context, orgID string) (*unstructured
 	return nil, name, err
 }
 
+// ListCRNames returns the names of every Duckling CR in the namespace. Used by
+// the admin drift finder to detect orphan CRs (CRs with no warehouse row).
+func (d *DucklingClient) ListCRNames(ctx context.Context) ([]string, error) {
+	list, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list duckling CRs: %w", err)
+	}
+	names := make([]string, 0, len(list.Items))
+	for i := range list.Items {
+		names = append(names, list.Items[i].GetName())
+	}
+	return names, nil
+}
+
+// CRStatus reports whether the org's Duckling CR exists and, if so, whether it
+// is Ready — without treating absence as an error. A NotFound resolves to
+// (false, false, nil) so the drift finder can classify a missing CR rather than
+// surfacing a 500. Any other error is returned as-is.
+func (d *DucklingClient) CRStatus(ctx context.Context, orgID string) (present bool, ready bool, err error) {
+	cr, _, gerr := d.getCR(ctx, orgID)
+	if gerr != nil {
+		if apierrors.IsNotFound(gerr) {
+			return false, false, nil
+		}
+		return false, false, gerr
+	}
+	status, perr := parseDucklingStatus(cr)
+	if perr != nil {
+		return true, false, perr
+	}
+	return true, status.ReadyCondition, nil
+}
+
 // Get fetches the Duckling CR and parses its status.
 func (d *DucklingClient) Get(ctx context.Context, orgID string) (*DucklingStatus, error) {
 	cr, name, err := d.getCR(ctx, orgID)

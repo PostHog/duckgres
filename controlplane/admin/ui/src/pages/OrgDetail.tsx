@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, Save, Trash2, Warehouse } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Save, Trash2, Warehouse } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AdminGate } from "@/components/AdminOnly";
 import { JsonValue } from "@/components/JsonView";
 import { ErrorState, LoadingState } from "@/components/states";
@@ -20,7 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError } from "@/lib/api";
-import { fmtTime } from "@/lib/format";
+import { ducklingBroken, ducklingName, fmtTime } from "@/lib/format";
 import {
   useDeleteOrg,
   useOrg,
@@ -296,6 +297,15 @@ function WarehousePanel({
   }, [data]);
 
   const notFound = error instanceof ApiError && error.status === 404;
+  const missing = notFound || !data;
+  const broken = !missing && ducklingBroken(data?.state);
+  const ducklingWarning = loading
+    ? null
+    : missing
+      ? "No duckling provisioned for this org"
+      : broken
+        ? `Duckling unhealthy (state: ${data?.state})`
+        : null;
 
   const save = async () => {
     setMsg(null);
@@ -316,6 +326,20 @@ function WarehousePanel({
         {data && <StateBadge state={data.state} />}
       </CardHeader>
       <CardContent className="space-y-4">
+        <div className="flex items-center justify-between rounded-md border border-border bg-background/40 px-3 py-2">
+          <div>
+            <div className="text-[10px] uppercase text-muted-foreground">Duckling</div>
+            <div className="font-mono text-xs">{data?.duckling_name || ducklingName(orgId)}</div>
+          </div>
+          {ducklingWarning && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <AlertTriangle className="h-4 w-4 text-warning" />
+              </TooltipTrigger>
+              <TooltipContent>{ducklingWarning}</TooltipContent>
+            </Tooltip>
+          )}
+        </div>
         {loading ? (
           <LoadingState />
         ) : notFound || !data ? (
