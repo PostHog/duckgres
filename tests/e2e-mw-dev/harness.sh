@@ -1317,10 +1317,14 @@ admin_console_api() {
   code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/me")"
   [ "$code" = "401" ] || fail "GET /me with no auth returned $code, want 401"
   # Live read endpoints return their documented envelopes.
-  # /queries aggregates each CP's in-memory view; cp_total reflects how many
-  # replicas were polled (>=1), proving the cross-CP fan-out is wired.
-  curl -fsS -H "$H" "$API/api/v1/queries" | jq -e 'has("queries") and (.cp_total >= 1)' >/dev/null \
-    || fail "/queries missing 'queries' key or cp_total (<1)"
+  # /queries aggregates each CP's in-memory view and reports coverage. The CI CP
+  # runs a SINGLE replica, so this only asserts the envelope (cp_total==cp_responders,
+  # no failed peers); it cannot exercise a real peer hop. The multi-CP fan-out
+  # (peer discovery + self-exclusion + merge/dedup) is covered by unit tests
+  # (TestDiscoverPeerIPs, TestQueriesAggregateAcrossCPs).
+  curl -fsS -H "$H" "$API/api/v1/queries" \
+    | jq -e 'has("queries") and (.cp_total >= 1) and (.cp_responders == .cp_total)' >/dev/null \
+    || fail "/queries envelope wrong (queries/cp_total/cp_responders)"
   curl -fsS -H "$H" "$API/api/v1/workers/fleet"     | jq -e 'has("fleet")'   >/dev/null || fail "/workers/fleet missing 'fleet' key"
   curl -fsS -H "$H" "$API/api/v1/cluster/instances" \
     | jq -e '.instances | map(select(.self)) | length >= 1' >/dev/null \

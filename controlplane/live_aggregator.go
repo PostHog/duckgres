@@ -6,7 +6,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +29,9 @@ import (
 type clusterPeerFetcher struct {
 	clientset      kubernetes.Interface
 	namespace      string
-	selfPod        string // own pod name (POD_NAME / pool cpID)
-	deployPrefix   string // pod-name prefix shared by all CP replicas
+	selfPod        string              // own pod name (POD_NAME / pool cpID)
+	selfIPs        map[string]struct{} // own pod IPs — robust self-exclusion when cpID != pod name
+	deployPrefix   string              // pod-name prefix shared by all CP replicas
 	internalSecret string
 	port           int
 	client         *http.Client
@@ -38,11 +42,31 @@ func newClusterPeerFetcher(clientset kubernetes.Interface, namespace, selfPod, i
 		clientset:      clientset,
 		namespace:      namespace,
 		selfPod:        selfPod,
+		selfIPs:        ownPodIPs(),
 		deployPrefix:   cpDeploymentPrefix(selfPod),
 		internalSecret: internalSecret,
 		port:           port,
 		client:         &http.Client{Timeout: 2 * time.Second},
 	}
+}
+
+// ownPodIPs collects this pod's own IPs (POD_IP downward-API env if present,
+// plus the non-loopback interface addresses). Used to exclude self from the
+// peer list by IP — robust even if cpID was overridden to a non-pod-name value
+// (DUCKGRES_K8S_CONTROL_PLANE_ID), where name-based self-exclusion would fail
+// and the serving CP would fan out to itself and double-count.
+func ownPodIPs() map[string]struct{} {
+	ips := map[string]struct{}{}
+	if v := strings.TrimSpace(os.Getenv("POD_IP")); v != "" {
+		ips[v] = struct{}{}
+	}
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			ips[ipnet.IP.String()] = struct{}{}
+		}
+	}
+	return ips
 }
 
 var _ admin.PeerFetcher = (*clusterPeerFetcher)(nil)
@@ -100,16 +124,26 @@ func (f *clusterPeerFetcher) discoverPeerIPs(ctx context.Context) []string {
 	var ips []string
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Name == f.selfPod {
-			continue
-		}
 		if !strings.HasPrefix(p.Name, f.deployPrefix+"-") {
 			continue
 		}
 		if p.Status.Phase != corev1.PodRunning || p.Status.PodIP == "" {
 			continue
 		}
+		// Exclude self by name AND by IP (IP is robust if cpID != pod name).
+		if p.Name == f.selfPod {
+			continue
+		}
+		if _, isSelf := f.selfIPs[p.Status.PodIP]; isSelf {
+			continue
+		}
 		ips = append(ips, p.Status.PodIP)
+	}
+	// A label/RBAC mismatch yields zero peers and a silent revert to per-CP
+	// flicker; log it so the failure is diagnosable (the label is applied by the
+	// Helm chart and not verifiable in-repo).
+	if len(ips) == 0 && len(pods.Items) <= 1 {
+		slog.Debug("admin live aggregation found no peer CPs", "namespace", f.namespace, "deploy_prefix", f.deployPrefix, "pods_listed", len(pods.Items))
 	}
 	return ips
 }

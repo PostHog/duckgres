@@ -36,10 +36,34 @@ type aggMeta struct {
 // must return only the local CP's view (no further fan-out).
 func localScope(c *gin.Context) bool { return c.Query("scope") == "local" }
 
+// dedupeBy keeps the first item per key, preserving order. The live lists are
+// disjoint by ownership (a session/worker lives on exactly one CP), so this is
+// normally a no-op — but it makes the cross-CP merge idempotent even if a
+// worker briefly appears on two CPs during a takeover/handover window, or if
+// self-exclusion ever fails. Keyed on worker id (unique cluster-wide).
+func dedupeBy[T any, K comparable](items []T, key func(T) K) []T {
+	if len(items) < 2 {
+		return items
+	}
+	seen := make(map[K]struct{}, len(items))
+	out := items[:0:0]
+	for _, it := range items {
+		k := key(it)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, it)
+	}
+	return out
+}
+
 // mergeOrgStats folds each peer's ClusterStatus into the local per-org stats:
-// active_sessions and workers are summed across CPs (each reports its own
-// slice); max_workers is config-store-backed (identical on every CP) so the max
-// is taken. Org identity is the name; order follows first-seen.
+// active_sessions is summed across CPs (each reports its own slice). Workers is
+// also summed for forward-compatibility, but the adapter currently leaves it 0
+// (per-org worker counts aren't surfaced), so it's effectively a no-op today.
+// max_workers is config-store-backed (identical on every CP) so the max is
+// taken. Org identity is the name; order follows first-seen.
 func mergeOrgStats(local []OrgStatus, bodies [][]byte) []OrgStatus {
 	byName := map[string]*OrgStatus{}
 	var order []string

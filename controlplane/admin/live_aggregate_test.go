@@ -17,14 +17,15 @@ import (
 type fakeLiveInfo struct {
 	queries  []QueryStatus
 	sessions []SessionStatus
+	orgStats []OrgStatus
 }
 
-func (f *fakeLiveInfo) RunningQueries() []QueryStatus                 { return f.queries }
+func (f *fakeLiveInfo) RunningQueries() []QueryStatus                { return f.queries }
 func (f *fakeLiveInfo) WorkerFleet() ([]FleetStat, error)            { return nil, nil }
 func (f *fakeLiveInfo) ControlPlaneInstances() ([]CPInstance, error) { return nil, nil }
 func (f *fakeLiveInfo) KillSession(int32) error                      { return nil }
 
-func (f *fakeLiveInfo) AllOrgStats() []OrgStatus            { return nil }
+func (f *fakeLiveInfo) AllOrgStats() []OrgStatus            { return f.orgStats }
 func (f *fakeLiveInfo) AllWorkerStatuses() []WorkerStatus   { return nil }
 func (f *fakeLiveInfo) AllSessionStatuses() []SessionStatus { return f.sessions }
 
@@ -54,9 +55,9 @@ func TestQueriesAggregateAcrossCPs(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/queries", nil))
 	var got struct {
-		Queries     []QueryStatus `json:"queries"`
-		Responders  int           `json:"cp_responders"`
-		Total       int           `json:"cp_total"`
+		Queries    []QueryStatus `json:"queries"`
+		Responders int           `json:"cp_responders"`
+		Total      int           `json:"cp_total"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -110,8 +111,82 @@ func TestSessionsAggregateAcrossCPs(t *testing.T) {
 	}
 }
 
-// cpDeploymentPrefix lives in package controlplane; this asserts the prefix
-// logic the fetcher relies on, mirrored here as documentation of the contract.
 func TestPeerFetcherInterfaceSatisfied(t *testing.T) {
 	var _ PeerFetcher = (*fakePeerFetcher)(nil)
+}
+
+// /status merges per-org stats across CPs: active_sessions summed, orgs unioned.
+func TestStatusAggregateAcrossCPs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	local := &fakeLiveInfo{orgStats: []OrgStatus{{Name: "a", ActiveSessions: 1, MaxWorkers: 5}}}
+	peerBody, _ := json.Marshal(ClusterStatus{Orgs: []OrgStatus{
+		{Name: "a", ActiveSessions: 1, MaxWorkers: 5},
+		{Name: "b", ActiveSessions: 2, MaxWorkers: 0},
+	}})
+	fetcher := &fakePeerFetcher{byPath: map[string][][]byte{"/api/v1/status": {peerBody}}}
+
+	r := gin.New()
+	registerAPIWithStore(r.Group("/api/v1"), nil, local, fetcher)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+
+	var cs ClusterStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &cs); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cs.TotalSessions != 4 { // a:1+1, b:2
+		t.Fatalf("total_sessions = %d, want 4", cs.TotalSessions)
+	}
+	if cs.TotalOrgs != 2 {
+		t.Fatalf("total_orgs = %d, want 2 (a,b)", cs.TotalOrgs)
+	}
+	var aSessions int
+	for _, o := range cs.Orgs {
+		if o.Name == "a" {
+			aSessions = o.ActiveSessions
+		}
+	}
+	if aSessions != 2 {
+		t.Fatalf("org a active_sessions = %d, want 2 (summed across CPs)", aSessions)
+	}
+}
+
+// A peer that returns garbage is skipped, not allowed to corrupt the result.
+func TestAggregateSkipsBadPeer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	local := &fakeLiveInfo{sessions: []SessionStatus{{PID: 1, WorkerID: 10}}}
+	fetcher := &fakePeerFetcher{byPath: map[string][][]byte{
+		"/api/v1/sessions": {[]byte("not json"), []byte(`{"unexpected":true}`)},
+	}}
+	r := gin.New()
+	registerAPIWithStore(r.Group("/api/v1"), nil, local, fetcher)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/sessions", nil))
+
+	var sessions []SessionStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &sessions); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("bad peers must be skipped; got %d sessions, want 1 (local only)", len(sessions))
+	}
+}
+
+// A worker that appears on both local and a peer (handover window / self-loop)
+// is deduped by worker id — the merge is idempotent.
+func TestAggregateDedupesByWorker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	local := &fakeLiveInfo{sessions: []SessionStatus{{PID: 1, WorkerID: 10, Org: "a"}}}
+	peerBody, _ := json.Marshal([]SessionStatus{{PID: 99, WorkerID: 10, Org: "a"}}) // same worker
+	fetcher := &fakePeerFetcher{byPath: map[string][][]byte{"/api/v1/sessions": {peerBody}}}
+	r := gin.New()
+	registerAPIWithStore(r.Group("/api/v1"), nil, local, fetcher)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/sessions", nil))
+
+	var sessions []SessionStatus
+	_ = json.Unmarshal(rec.Body.Bytes(), &sessions)
+	if len(sessions) != 1 {
+		t.Fatalf("duplicate worker not deduped; got %d sessions, want 1", len(sessions))
+	}
 }

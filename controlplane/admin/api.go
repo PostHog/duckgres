@@ -1013,10 +1013,11 @@ func (h *apiHandler) listWorkers(c *gin.Context) {
 	if h.info != nil {
 		workers = h.info.AllWorkerStatuses()
 	}
-	// A worker is owned by exactly one CP, so the union across CPs is disjoint.
+	// A worker is owned by exactly one CP (disjoint union); dedup makes it idempotent.
 	if !localScope(c) && h.fetcher != nil {
 		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
 		mergePeer(&workers, bodies, func(e []WorkerStatus) []WorkerStatus { return e })
+		workers = dedupeBy(workers, func(w WorkerStatus) int { return w.ID })
 	}
 	c.JSON(http.StatusOK, workers)
 }
@@ -1028,10 +1029,11 @@ func (h *apiHandler) listSessions(c *gin.Context) {
 	if h.info != nil {
 		sessions = h.info.AllSessionStatuses()
 	}
-	// A session lives on exactly one CP, so the union across CPs is disjoint.
+	// A session lives on exactly one CP (disjoint union); dedup makes it idempotent.
 	if !localScope(c) && h.fetcher != nil {
 		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
 		mergePeer(&sessions, bodies, func(e []SessionStatus) []SessionStatus { return e })
+		sessions = dedupeBy(sessions, func(s SessionStatus) int { return s.WorkerID })
 	}
 	c.JSON(http.StatusOK, sessions)
 }

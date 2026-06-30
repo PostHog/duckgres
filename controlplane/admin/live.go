@@ -63,7 +63,7 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher) {
 		queries := live.RunningQueries()
 		responders, total := 1, 1
 		// Aggregate every other CP's in-memory view (a query lives on exactly
-		// one CP, so the union is disjoint — concatenate, no dedup).
+		// one CP, so the union is disjoint; dedupeBy makes it idempotent anyway).
 		if !localScope(c) && fetcher != nil {
 			bodies, peers := fetcher.FetchPeers(c.Request.Context(), "/api/v1/queries")
 			type env struct {
@@ -71,6 +71,7 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher) {
 			}
 			responders += mergePeer(&queries, bodies, func(e env) []QueryStatus { return e.Queries })
 			total += peers
+			queries = dedupeBy(queries, func(q QueryStatus) int { return q.WorkerID })
 		}
 		// Optional org/user slicing (applied AFTER the merge).
 		org, user := c.Query("org"), c.Query("user")
