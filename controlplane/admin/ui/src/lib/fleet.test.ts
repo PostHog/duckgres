@@ -14,6 +14,8 @@ const fs = (state: string, count: number): FleetStat => ({
   state,
   binding: "org_bound",
   count,
+  cpu_cores: 0,
+  memory_bytes: 0,
 });
 
 describe("summarizeFleet", () => {

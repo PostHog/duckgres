@@ -27,7 +27,14 @@ function setup(fleet: FleetStat[], opts?: { sessions?: number; orgs?: number }) 
   hooks.useMetricRange.mockReturnValue(ok(undefined));
 }
 
-const fs = (state: string, count: number): FleetStat => ({ image: "img", state, binding: "org_bound", count });
+const fs = (state: string, count: number): FleetStat => ({
+  image: "img",
+  state,
+  binding: "org_bound",
+  count,
+  cpu_cores: 0,
+  memory_bytes: 0,
+});
 
 // Find a StatCard by its stable data-testid (set in StatCard.tsx), so the test
 // isn't coupled to the card's Tailwind classes.
