@@ -64,6 +64,22 @@ var globalNextPID = func() *atomic.Int32 {
 	return v
 }()
 
+// reservePID returns the next backend pid from counter, skipping 0. Backend pids
+// are int32; after ~2.1B connections in one process the counter wraps and passes
+// through 0, which the session-create path treats as "unset" (re-allocating and
+// shipping a stale pid to the client → broken cancel for that one connection).
+// Skipping 0 closes that wrap-time edge with a single extra Add. Negative values
+// after wrap are still unique within the CP's conns map and are left as-is
+// (reaching them needs a further ~2.1B connections, and a CP restarts on every
+// deploy long before either bound).
+func reservePID(counter *atomic.Int32) int32 {
+	p := counter.Add(1)
+	if p == 0 {
+		p = counter.Add(1)
+	}
+	return p
+}
+
 // SessionManager tracks all active sessions and their worker assignments.
 type SessionManager struct {
 	mu         sync.RWMutex
@@ -168,7 +184,7 @@ func (sm *SessionManager) SetRequestedVCPUsResolver(fn func(profile *WorkerProfi
 
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
-	return globalNextPID.Add(1)
+	return reservePID(globalNextPID)
 }
 
 func (sm *SessionManager) acquireSlot(ctx context.Context) error {
@@ -573,7 +589,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
 
 	if pid == 0 {
-		pid = globalNextPID.Add(1)
+		pid = reservePID(globalNextPID)
 	}
 
 	session := &ManagedSession{

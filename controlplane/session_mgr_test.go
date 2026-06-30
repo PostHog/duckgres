@@ -131,6 +131,25 @@ func TestReservePIDGloballyUniqueAcrossManagers(t *testing.T) {
 	}
 }
 
+// TestReservePIDSkipsZeroAtWrap covers the int32-wrap edge: when the counter
+// passes through 0 (only after ~2.1B connections), reservePID must skip it so a
+// real pid never looks "unset". Uses a LOCAL counter so it doesn't perturb the
+// process-global one other tests share.
+func TestReservePIDSkipsZeroAtWrap(t *testing.T) {
+	var c atomic.Int32
+	c.Store(-1) // next Add(1) lands exactly on 0
+	if p := reservePID(&c); p == 0 {
+		t.Fatalf("reservePID returned 0 at the wrap point; must skip it")
+	}
+	// Normal range: monotonic, never 0.
+	c.Store(1000)
+	for i := 0; i < 5; i++ {
+		if p := reservePID(&c); p == 0 {
+			t.Fatalf("reservePID returned 0 in the normal range")
+		}
+	}
+}
+
 func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {
 	pool := &FlightWorkerPool{
 		workers: make(map[int]*ManagedWorker),
