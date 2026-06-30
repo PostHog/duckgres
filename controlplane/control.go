@@ -477,6 +477,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.AlwaysDuckLake = true
 	}
 
+	// Default the connection idle timeout to a short value: in control-plane
+	// mode an idle client connection pins a worker (a scarce k8s pod / local
+	// process), so a connection idle this long is closed and its worker released
+	// to hot-idle. InitMinimalServer does NOT run server.New's defaulting, so set
+	// it here. --idle-timeout overrides (negative disables). Standalone keeps the
+	// 24h default applied in server.New.
+	cfg.Config.IdleTimeout = server.NormalizeIdleTimeout(cfg.Config.IdleTimeout, server.DefaultControlPlaneIdleTimeout)
+	slog.Info("Control-plane connection idle timeout.", "timeout", cfg.Config.IdleTimeout)
+
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)

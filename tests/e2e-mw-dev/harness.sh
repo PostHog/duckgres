@@ -1438,6 +1438,58 @@ admin_per_org_workers() { # org password
   log "admin: /status per-org worker count OK (workers>=1, total_workers>=1) on $org"
 }
 
+# ---- connection idle timeout: idle conn reaped, worker freed ----------------
+# An idle client connection pins a worker (one session per worker), so the
+# control plane defaults to a short connection idle timeout (server.Default
+# ControlPlaneIdleTimeout, 60s): a connection with no traffic for that long is
+# closed by the message loop's read deadline, DestroySession runs, and the
+# worker returns to hot-idle. We hold a connection idle-in-transaction PAST the
+# timeout and assert its session disappears from /queries while our client is
+# still connected (so the reap is the CP's, not our client exiting). The unit
+# tests (TestNormalizeIdleTimeout + TestMessageLoopIdleTimeoutClosesConnection)
+# are the deterministic gate for the mechanism; this proves the real default
+# fires end-to-end in-cluster.
+conn_idle_timeout_reaps_session() { # org password
+  org="$1"; pw="$2"
+  log "conn idle timeout: idle connection is reaped + worker freed on $org"
+  rootwids() {
+    curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" '[.queries[]? | select(.org==$o and .user=="root") | .worker_id] | sort | join(" ")'
+  }
+  before="$(rootwids)"
+  # Hold a connection idle-in-transaction for 150s (well past the 60s timeout):
+  # send BEGIN, then keep stdin open so psql waits and issues no further query.
+  ( printf 'BEGIN;\n'; sleep 150 ) | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+  bg=$!
+  cleanup_ir() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  # The NEW root worker_id (not present before) is our idle connection's.
+  wid="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    for w in $(rootwids); do
+      case " $before " in *" $w "*) : ;; *) wid="$w"; break ;; esac
+    done
+    [ -n "$wid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$wid" ] || { cleanup_ir; fail "conn_idle_timeout: idle session never appeared for $org"; }
+  log "conn idle timeout: idle session on worker $wid — waiting for the CP to reap it"
+  # Must vanish from /queries within ~90s (60s timeout + grace), while our client
+  # is STILL alive (kill -0) so the disappearance is the CP reaping, not us.
+  gone="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || { cleanup_ir; fail "conn_idle_timeout: our client exited before reap — inconclusive"; }
+    present="$(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --argjson w "$wid" 'any(.queries[]?; .worker_id==$w)')"
+    [ "$present" = "false" ] && { gone=1; break; }
+    sleep 3; a=$((a + 1))
+  done
+  cleanup_ir
+  [ -n "$gone" ] || fail "conn_idle_timeout: idle session on worker $wid was NOT reaped within ~90s (idle timeout not enforced)"
+  log "conn idle timeout: idle session reaped, worker $wid freed on $org"
+}
+
 # ---- admin RBAC: SSO viewer is read-only -----------------------------------
 # A forged ALB OIDC header (no internal secret) for an @posthog.com email that
 # is NOT in the operators table resolves to the viewer role (fail-closed
@@ -1973,6 +2025,9 @@ main() {
 
   # ---- admin /status per-org worker count is populated (not the old 0) ----
   admin_per_org_workers "$CNPG" "$cnpg_pw"
+
+  # ---- connection idle timeout: idle conn reaped, worker freed ----
+  conn_idle_timeout_reaps_session "$CNPG" "$cnpg_pw"
 
   # ---- per-user kill switch + disable/enable block (cnpg stack is warm) ----
   user_kill_switch   "$CNPG" "$cnpg_pw"

@@ -416,13 +416,11 @@ func New(cfg Config) (*Server, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
-	// Use default idle timeout if not specified (24 hours)
-	// Negative value means explicitly disabled (set to 0)
-	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 24 * time.Hour
-	} else if cfg.IdleTimeout < 0 {
-		cfg.IdleTimeout = 0
-	}
+	// Standalone defaults to a 24h connection idle timeout (an idle in-process
+	// connection costs little). The control plane overrides this with a much
+	// shorter default (see NormalizeIdleTimeout) because there an idle
+	// connection pins a scarce worker.
+	cfg.IdleTimeout = NormalizeIdleTimeout(cfg.IdleTimeout, 24*time.Hour)
 	if cfg.SessionInitTimeout == 0 {
 		cfg.SessionInitTimeout = DefaultSessionInitTimeout
 	}

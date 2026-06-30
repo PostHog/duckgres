@@ -34,7 +34,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	keyFile := fs.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
 	filePersistence := fs.Bool("file-persistence", false, "Persist DuckDB to <data-dir>/<username>.duckdb instead of in-memory (env: DUCKGRES_FILE_PERSISTENCE)")
 	processIsolation := fs.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
-	idleTimeout := fs.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	idleTimeout := fs.String("idle-timeout", "", "Connection idle timeout: close a connection idle (no traffic) this long, freeing its worker (e.g., '30m', '1h', '-1s' to disable). Default 24h standalone, 60s control-plane where idle connections pin a worker (env: DUCKGRES_IDLE_TIMEOUT)")
 	sessionInitTimeout := fs.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
 	memoryLimit := fs.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := fs.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
