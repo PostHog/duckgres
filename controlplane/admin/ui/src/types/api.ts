@@ -45,7 +45,6 @@ export interface Org {
   database_name: string;
   hostname_alias: string | null;
   max_workers: number;
-  max_connections: number;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -59,7 +58,6 @@ export interface Org {
 // Editable subset of Org accepted by PUT /api/v1/orgs/:id.
 export interface OrgUpdate {
   max_workers?: number;
-  max_connections?: number;
   default_worker_cpu?: string;
   default_worker_memory?: string;
   default_worker_ttl?: string;
