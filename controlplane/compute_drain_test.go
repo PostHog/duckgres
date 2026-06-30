@@ -58,9 +58,8 @@ func (f *fakeDrainStore) SweepDrainedComputeBuckets() (int64, error) {
 
 // fakeShipper records what it ships and can be made to fail per-org.
 type fakeShipper struct {
-	shipped  []computeUsageBucket
-	failOrg  string
-	failOnce map[string]bool
+	shipped []computeUsageBucket
+	failOrg string
 }
 
 func (s *fakeShipper) Ship(_ context.Context, b computeUsageBucket) error {

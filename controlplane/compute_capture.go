@@ -102,7 +102,7 @@ func (c *computeCaptureClient) Ship(ctx context.Context, b computeUsageBucket) e
 	if err != nil {
 		return fmt.Errorf("post capture event: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("capture event rejected: status %d", resp.StatusCode)
 	}

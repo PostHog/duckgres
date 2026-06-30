@@ -72,7 +72,7 @@ ORDER BY u.org_id, u.bucket_start`
 	if err != nil {
 		return nil, fmt.Errorf("list drainable compute buckets: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []ComputeUsageBucket
 	for rows.Next() {
