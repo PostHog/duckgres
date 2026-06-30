@@ -320,10 +320,17 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   **before** `go build`. Do not delete `.gitkeep` and do not commit `ui/dist`.
 - **Two-tier authz** (`authz.go`): `AuthMiddleware` resolves every `/api/v1`
   request to admin (valid `TokenSet` internal secret — service/break-glass) or to
-  an SSO identity from the ALB `X-Amzn-Oidc-Data` JWT (group `DUCKGRES_ADMIN_SSO_GROUP`
-  → admin, else viewer). `RoleGate` requires admin for all mutating verbs + the
-  audit GET. `AuditMiddleware` records every mutation. Keep new mutating routes
-  under this gate; never add a write path that bypasses RoleGate/audit.
+  an SSO identity from the ALB `X-Amzn-Oidc-Data` JWT. The SSO email
+  (`@posthog.com` + `email_verified != false`, else 401) is mapped to a role
+  **per-request** by a `RoleResolver` backed by the `operators` config-store table
+  (runtime schema) — `admin` row → admin, else viewer. Admins manage operators
+  under **Admin → Operators** (`/api/v1/operators`); the first SSO login
+  auto-provisions a create-only **viewer** row, and the first admin is minted by
+  logging in over the break-glass internal token and patching that row to `admin`
+  under **Admin → Operators**. `RoleGate` requires admin for
+  all mutating verbs + the audit GET. `AuditMiddleware` records every mutation.
+  Keep new mutating routes under this gate; never add a write path that bypasses
+  RoleGate/audit.
 - **Impersonation is a real session** (`impersonate.go` + `admin_providers.go`):
   it reuses `SessionManager.CreateSessionWithProtocol` (workers trust the CP — no
   password) and **always** `DestroySession` in a defer. Admin-only, every
@@ -335,9 +342,10 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   panel KEY, PromQL is built server-side from `rangePanels` (never an open PromQL
   relay) and forwarded to `DUCKGRES_PROMETHEUS_URL`. Org-labelled panels keep
   slicing enforced.
-- **Env-only knobs**: `DUCKGRES_ADMIN_SSO_GROUP`, `DUCKGRES_PROMETHEUS_URL` (read
-  in `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit`
-  is AutoMigrated at startup (operational state, not goose-migrated tenant config).
+- **Env-only knobs**: `DUCKGRES_PROMETHEUS_URL` (read in
+  `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit` and
+  the `operators` table are AutoMigrated at startup (operational state, not
+  goose-migrated tenant config).
 - `ManagedSession.Username` is populated at session create so the console can
   slice live sessions/queries by user; keep it set on every create path.
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp

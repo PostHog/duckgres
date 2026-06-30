@@ -28,6 +28,7 @@ func TestModelDescriptorsRedaction(t *testing.T) {
 		"orgs": true, "org-users": true, "org-user-secrets": true, "managed-warehouses": true,
 		"cp-instances": true, "worker-records": true, "flight-session-records": true,
 		"org-connection-queue": true, "org-connection-leases": true,
+		"operators": true,
 	}
 	seen := map[string]bool{}
 	for _, d := range descs {

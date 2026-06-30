@@ -39,24 +39,21 @@ const (
 	albOIDCIdentityHeader = "X-Amzn-Oidc-Identity"
 )
 
-// SSOConfig controls how the ALB/Cognito identity maps to a Role.
-type SSOConfig struct {
-	// AdminGroup is the Google Workspace / Cognito group whose members get the
-	// admin role. When empty, SSO users default to VIEWER (fail closed) unless
-	// AllowAllSSO is set. The break-glass internal-secret path is unaffected.
-	AdminGroup string
-	// AllowAllSSO, when true AND AdminGroup is empty, grants admin to every
-	// SSO-authenticated user (single-tier dev convenience). It must be opted
-	// into explicitly (DUCKGRES_ADMIN_SSO_ALLOW_ALL=true) so a missing group
-	// config in production cannot silently grant admin to everyone.
-	AllowAllSSO bool
-}
+// ssoEmailDomain is the only email domain accepted on the SSO path. SSO emails
+// outside this domain are treated as unauthenticated (defense in depth on top
+// of the ALB/Cognito allow-list and the operators table).
+const ssoEmailDomain = "@posthog.com"
+
+// RoleResolver maps an authenticated SSO email to a Role. It is injected into
+// AuthMiddleware so the auth layer stays free of any config-store dependency;
+// the control plane wires one backed by the operators table. A nil resolver
+// (or one that returns RoleViewer) means the caller is a viewer.
+type RoleResolver func(email string) Role
 
 // Identity is the resolved caller for an admin-UI request.
 type Identity struct {
-	Email  string   `json:"email"`
-	Groups []string `json:"groups"`
-	Role   Role     `json:"role"`
+	Email string `json:"email"`
+	Role  Role   `json:"role"`
 	// Source records how the identity was established (for audit): "sso" or
 	// "internal-secret".
 	Source string `json:"source"`
@@ -74,83 +71,84 @@ func IdentityFromContext(c *gin.Context) *Identity {
 
 // AuthMiddleware authenticates a request and resolves its Role. A valid
 // TokenSet bearer token (header/cookie) is the service-to-service / break-glass
-// path and always maps to admin. Otherwise the ALB-injected Cognito JWT is
-// decoded into an Identity. Unauthenticated requests are rejected 401.
-func AuthMiddleware(tokens TokenSet, sso SSOConfig) gin.HandlerFunc {
+// path and always maps to admin. Otherwise the ALB-injected Cognito JWT yields
+// the caller's email, and resolve (the operators-table lookup) maps that email
+// to a Role. Unauthenticated requests are rejected 401.
+func AuthMiddleware(tokens TokenSet, resolve RoleResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. Internal secret (header or login cookie) -> admin.
+		// 1. Internal secret (header or login cookie) -> admin (break-glass).
 		if tokens.Valid(requestAdminToken(c)) {
 			c.Set(ctxIdentityKey, &Identity{Email: "internal-secret", Role: RoleAdmin, Source: "internal-secret"})
 			c.Next()
 			return
 		}
-		// 2. ALB/Cognito SSO identity.
-		if id := identityFromOIDC(c, sso); id != nil {
-			c.Set(ctxIdentityKey, id)
-			c.Next()
+		// 2. ALB/Cognito SSO identity: extract the email, then resolve its role.
+		email := emailFromOIDC(c)
+		if email == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
 			return
 		}
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		role := RoleViewer
+		if resolve != nil {
+			role = resolve(email)
+		}
+		c.Set(ctxIdentityKey, &Identity{Email: email, Role: role, Source: "sso"})
+		c.Next()
 	}
 }
 
-// identityFromOIDC decodes the ALB OIDC data JWT (or falls back to the identity
-// header) into an Identity with a resolved Role. Returns nil if no SSO identity
-// is present.
+// emailFromOIDC extracts the caller's email from the ALB OIDC data JWT (falling
+// back to the `sub` claim, then to the identity-only header). It returns "" when
+// no usable SSO identity is present OR when the email fails domain hardening.
+//
+// Domain hardening: only @posthog.com emails are accepted, and a JWT
+// email_verified claim that is explicitly false rejects the identity. This is
+// defense in depth on top of the ALB/Cognito allow-list — a stray non-corporate
+// or unverified identity never becomes a logged-in (even viewer) caller.
 //
 // The JWT signature is NOT verified here: the request only reaches this pod via
 // the internal-scheme ALB (which signs and injects the header and strips
 // client-supplied copies) over a tailnet-restricted network. Verifying the
 // ALB's regional public key by `kid` is a hardening follow-up tracked in the
-// design doc; it does not change the role mapping below.
-func identityFromOIDC(c *gin.Context, sso SSOConfig) *Identity {
+// design doc.
+func emailFromOIDC(c *gin.Context) string {
 	raw := c.GetHeader(albOIDCDataHeader)
 	if raw == "" {
-		// Fallback: identity-only header (email/subject), no groups.
-		if email := c.GetHeader(albOIDCIdentityHeader); email != "" {
-			return resolveRole(&Identity{Email: email, Source: "sso"}, sso)
+		// Fallback: identity-only header (email/subject). The data JWT is absent,
+		// so there is no email_verified claim to consult — domain check still applies.
+		if email := c.GetHeader(albOIDCIdentityHeader); acceptableSSOEmail(email, true) {
+			return strings.ToLower(strings.TrimSpace(email))
 		}
-		return nil
+		return ""
 	}
 	claims, err := decodeJWTClaims(raw)
 	if err != nil {
 		slog.Warn("admin: failed to decode ALB OIDC data header", "error", err)
-		return nil
+		return ""
 	}
-	id := &Identity{
-		Email:  stringClaim(claims, "email"),
-		Groups: groupsClaim(claims),
-		Source: "sso",
+	email := stringClaim(claims, "email")
+	if email == "" {
+		email = stringClaim(claims, "sub")
 	}
-	if id.Email == "" {
-		id.Email = stringClaim(claims, "sub")
+	// email_verified, when present, must not be false.
+	verified := true
+	if v, ok := claims["email_verified"]; ok {
+		if b, ok := v.(bool); ok {
+			verified = b
+		}
 	}
-	return resolveRole(id, sso)
+	if !acceptableSSOEmail(email, verified) {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(email))
 }
 
-// resolveRole assigns admin/viewer based on group membership.
-func resolveRole(id *Identity, sso SSOConfig) *Identity {
-	if sso.AdminGroup == "" {
-		if sso.AllowAllSSO {
-			// Explicit opt-in (DUCKGRES_ADMIN_SSO_ALLOW_ALL): single-tier dev mode.
-			id.Role = RoleAdmin
-			slog.Warn("admin: DUCKGRES_ADMIN_SSO_GROUP unset and ALLOW_ALL set — granting admin to all SSO users", "email", id.Email)
-			return id
-		}
-		// Fail closed: without a configured admin group, SSO users are viewers.
-		// (The internal-secret / break-glass path still grants admin.)
-		id.Role = RoleViewer
-		slog.Warn("admin: DUCKGRES_ADMIN_SSO_GROUP unset — SSO user defaults to viewer (set the group, or DUCKGRES_ADMIN_SSO_ALLOW_ALL for dev)", "email", id.Email)
-		return id
+// acceptableSSOEmail enforces the domain + verification hardening rules.
+func acceptableSSOEmail(email string, verified bool) bool {
+	if !verified {
+		return false
 	}
-	id.Role = RoleViewer
-	for _, g := range id.Groups {
-		if strings.EqualFold(strings.TrimSpace(g), sso.AdminGroup) {
-			id.Role = RoleAdmin
-			break
-		}
-	}
-	return id
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(email)), ssoEmailDomain)
 }
 
 // RoleGate enforces the viewer/admin split:
@@ -245,31 +243,4 @@ func stringClaim(claims map[string]any, key string) string {
 		return v
 	}
 	return ""
-}
-
-// groupsClaim extracts group membership from the common claim shapes Cognito /
-// Google emit: a JSON array, or a space/comma-separated string. Checks several
-// claim names.
-func groupsClaim(claims map[string]any) []string {
-	for _, key := range []string{"cognito:groups", "custom:groups", "groups"} {
-		v, ok := claims[key]
-		if !ok {
-			continue
-		}
-		switch t := v.(type) {
-		case []any:
-			out := make([]string, 0, len(t))
-			for _, g := range t {
-				if s, ok := g.(string); ok {
-					out = append(out, s)
-				}
-			}
-			if len(out) > 0 {
-				return out
-			}
-		case string:
-			return strings.FieldsFunc(t, func(r rune) bool { return r == ' ' || r == ',' })
-		}
-	}
-	return nil
 }

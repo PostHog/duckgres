@@ -20,10 +20,25 @@ func mkOIDC(claims map[string]any) string {
 	return "eyJ0eXAiOiJKV1QifQ." + seg + ".sig"
 }
 
+// roleByEmail builds a fake RoleResolver from an email→role map. Unknown
+// emails resolve to viewer (the production fail-closed default).
+func roleByEmail(admins ...string) RoleResolver {
+	set := map[string]bool{}
+	for _, e := range admins {
+		set[e] = true
+	}
+	return func(email string) Role {
+		if set[email] {
+			return RoleAdmin
+		}
+		return RoleViewer
+	}
+}
+
 func TestAuthMiddlewareInternalSecretIsAdmin(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{AdminGroup: "admins"}), func(c *gin.Context) {
+	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), roleByEmail()), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
 	})
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -38,30 +53,28 @@ func TestAuthMiddlewareInternalSecretIsAdmin(t *testing.T) {
 	}
 }
 
+// The SSO email is resolved to a role by the injected RoleResolver (in
+// production, the operators-table lookup). Unknown emails fail closed to viewer.
 func TestAuthMiddlewareSSORoleMapping(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	resolve := roleByEmail("a@posthog.com")
 	cases := []struct {
-		name    string
-		groups  []string
-		adminGr string
-		want    Role
+		name  string
+		email string
+		want  Role
 	}{
-		{"member of admin group", []string{"eng", "admins"}, "admins", RoleAdmin},
-		{"not a member", []string{"eng"}, "admins", RoleViewer},
-		// Fail closed: no admin group configured (and no allow-all) => viewer.
-		{"no admin group configured = viewer", []string{"eng"}, "", RoleViewer},
+		{"known admin email", "a@posthog.com", RoleAdmin},
+		{"known viewer email", "v@posthog.com", RoleViewer},
+		{"unknown email defaults to viewer", "nobody@posthog.com", RoleViewer},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := gin.New()
-			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{AdminGroup: tc.adminGr}), func(c *gin.Context) {
+			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve), func(c *gin.Context) {
 				c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
 			})
 			req := httptest.NewRequest(http.MethodGet, "/x", nil)
-			req.Header.Set(albOIDCDataHeader, mkOIDC(map[string]any{
-				"email":          "u@posthog.com",
-				"cognito:groups": tc.groups,
-			}))
+			req.Header.Set(albOIDCDataHeader, mkOIDC(map[string]any{"email": tc.email}))
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
@@ -75,29 +88,31 @@ func TestAuthMiddlewareSSORoleMapping(t *testing.T) {
 	}
 }
 
-// Without an admin group, SSO users must default to viewer (fail closed) —
-// unless AllowAllSSO is explicitly opted in (dev convenience).
-func TestAuthMiddlewareFailClosedVsAllowAll(t *testing.T) {
+// Domain hardening: a non-@posthog.com email (even if it would resolve to a
+// role) is treated as unauthenticated, and an explicit email_verified=false is
+// rejected too.
+func TestAuthMiddlewareDomainHardening(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	// Resolver returns admin for everything to prove rejection is upstream of it.
+	resolve := func(string) Role { return RoleAdmin }
 	for _, tc := range []struct {
-		name     string
-		allowAll bool
-		want     Role
+		name   string
+		claims map[string]any
 	}{
-		{"fail closed by default", false, RoleViewer},
-		{"allow-all opt-in", true, RoleAdmin},
+		{"foreign domain rejected", map[string]any{"email": "attacker@evil.com"}},
+		{"unverified email rejected", map[string]any{"email": "u@posthog.com", "email_verified": false}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := gin.New()
-			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{AllowAllSSO: tc.allowAll}), func(c *gin.Context) {
-				c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
+			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve), func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"ok": true})
 			})
 			req := httptest.NewRequest(http.MethodGet, "/x", nil)
-			req.Header.Set(albOIDCDataHeader, mkOIDC(map[string]any{"email": "u@posthog.com"}))
+			req.Header.Set(albOIDCDataHeader, mkOIDC(tc.claims))
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
-			if want := `{"role":"` + string(tc.want) + `"}`; rec.Body.String() != want {
-				t.Fatalf("body = %s, want %s", rec.Body.String(), want)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
 			}
 		})
 	}
@@ -106,12 +121,13 @@ func TestAuthMiddlewareFailClosedVsAllowAll(t *testing.T) {
 // RequireAdmin gates a route regardless of method (used by the audit read).
 func TestRequireAdmin(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	resolve := roleByEmail("a@posthog.com")
 	r := gin.New()
-	r.GET("/audit", AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{AdminGroup: "admins"}), RequireAdmin(), func(c *gin.Context) {
+	r.GET("/audit", AuthMiddleware(NewTokenSet("secret", nil), resolve), RequireAdmin(), func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
-	viewer := mkOIDC(map[string]any{"email": "v@posthog.com", "cognito:groups": []any{"eng"}})
-	admin := mkOIDC(map[string]any{"email": "a@posthog.com", "cognito:groups": []any{"admins"}})
+	viewer := mkOIDC(map[string]any{"email": "v@posthog.com"})
+	admin := mkOIDC(map[string]any{"email": "a@posthog.com"})
 	for _, tc := range []struct {
 		name, oidc string
 		want       int
@@ -134,7 +150,7 @@ func TestRequireAdmin(t *testing.T) {
 func TestAuthMiddlewareRejectsUnauthenticated(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{}), func(c *gin.Context) {
+	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), roleByEmail()), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -148,10 +164,11 @@ func TestAuthMiddlewareRejectsUnauthenticated(t *testing.T) {
 // RoleGate: viewers can GET but not mutate; the audit log GET is admin-only.
 func TestRoleGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	resolve := roleByEmail("a@posthog.com")
 	build := func() *gin.Engine {
 		r := gin.New()
 		grp := r.Group("/api/v1",
-			AuthMiddleware(NewTokenSet("secret", nil), SSOConfig{AdminGroup: "admins"}),
+			AuthMiddleware(NewTokenSet("secret", nil), resolve),
 			RoleGate("/api/v1/audit"),
 		)
 		grp.GET("/orgs", func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -159,8 +176,8 @@ func TestRoleGate(t *testing.T) {
 		grp.GET("/audit", func(c *gin.Context) { c.Status(http.StatusOK) })
 		return r
 	}
-	viewer := mkOIDC(map[string]any{"email": "v@posthog.com", "cognito:groups": []any{"eng"}})
-	admin := mkOIDC(map[string]any{"email": "a@posthog.com", "cognito:groups": []any{"admins"}})
+	viewer := mkOIDC(map[string]any{"email": "v@posthog.com"})
+	admin := mkOIDC(map[string]any{"email": "a@posthog.com"})
 
 	cases := []struct {
 		name, method, path, oidc string

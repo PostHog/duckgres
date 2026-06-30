@@ -15,7 +15,7 @@ It extends the existing `controlplane/admin/` server — it is **not** a new ser
 |---|---|
 | Frontend | React + Vite + TypeScript + Tailwind + shadcn/ui; TanStack Query/Table; Recharts. Built to `dist/`, embedded via `go:embed`, served by the existing Gin admin server on `:8080`. |
 | Impersonation | Full read-write. Every statement audited with the admin's SSO identity. Mutating statements require an explicit client-side confirm. |
-| AuthZ | Two tiers — **viewer** (read/monitor) and **admin** (edit config store + impersonate) — derived from the ALB Cognito identity (Google Workspace group). The existing `TokenSet` (internal secret) remains the service-to-service / break-glass admin path. |
+| AuthZ | Two tiers — **viewer** (read/monitor) and **admin** (edit config store + impersonate). The ALB Cognito identity yields the caller's `@posthog.com` email; the role is resolved per-request from the `operators` config-store table (admins manage it under **Admin → Operators**; the first SSO login auto-provisions a create-only viewer row, and the first admin is minted by logging in over break-glass and patching that row to admin). The existing `TokenSet` (internal secret) remains the service-to-service / break-glass admin path. |
 | Metrics | Live "now" view from in-memory CP state; time-series trends (error/success/duration per org) from the in-cluster Prometheus via a backend proxy. Native Recharts, no Grafana embed. |
 | Exposure | Internal-scheme AWS ALB Ingress + Cognito (the Grafana pattern already in `posthog-mw-prod-us`), behind the Tailscale subnet router. Host under `*.mw-prod-us.posthog.dev`. Dev (`mw-dev`) first, then prod-us. |
 
@@ -25,9 +25,9 @@ It extends the existing `controlplane/admin/` server — it is **not** a new ser
 Operator laptop (tailnet, group:managed-warehouse/engineering)
   → Tailscale subnet router (10.62.0.0/16, scheme=internal)
   → internal ALB  ── Cognito (Google Workspace SSO) ──┐
-                                                       │ injects x-amzn-oidc-data (signed JWT, groups)
+                                                       │ injects x-amzn-oidc-data (signed JWT, email)
   → duckgres control-plane pod :8080 (Gin)
-       middleware: ssoIdentity → role(viewer|admin)  (TokenSet bypass = admin)
+       middleware: ssoEmail → operators-table role(viewer|admin)  (TokenSet bypass = admin)
        /                     → React SPA (go:embed dist/, SPA fallback)
        /api/v1/...           → existing CRUD + new endpoints below
        /api/v1/metrics/*     → Prometheus proxy (PROMETHEUS_URL)
@@ -64,10 +64,16 @@ the proxy is not an open PromQL relay. Org-labelled metrics we expose:
 `duckgres_scan_*{org}`. Fleet (no org label): worker lifecycle/spawn/reap/queue/cap-drift.
 
 ### 3. RBAC + audit — `authz.go`, `audit.go`
-- `ssoMiddleware`: decode `x-amzn-oidc-data` (ALB-signed JWT; verify via the ALB public
-  key endpoint, cache keys) → email + groups → role. Config maps a Google group →
-  `admin`; everyone else authenticated → `viewer`. A valid `TokenSet` token (header/cookie)
-  short-circuits to `admin` (service / break-glass). Sets `role` + `actor` in `gin.Context`.
+- `AuthMiddleware`: decode `x-amzn-oidc-data` (ALB-signed JWT; verify via the ALB public
+  key endpoint, cache keys — hardening follow-up) → email. Only `@posthog.com` +
+  `email_verified != false` is accepted, else 401. The role is resolved per-request from
+  the `operators` config-store table (runtime schema): an `admin` row → `admin`, else
+  (including no row) → `viewer`. Admins manage operators under **Admin → Operators**
+  (`/api/v1/operators`, admin-only, with a last-admin guard); the first SSO login
+  auto-provisions a create-only viewer row, and the first admin is minted by logging in
+  over break-glass and patching that row to admin. A valid `TokenSet` token (header/cookie)
+  short-circuits to `admin` (service / break-glass). Sets the `Identity` (email, role,
+  source) in `gin.Context`.
 - `requireAdmin`: per-route gate on all mutating verbs (POST/PUT/PATCH/DELETE), the
   configstore write endpoints, and impersonation.
 - `audit`: append-only table `duckgres_admin_audit` (actor, role, action, method, path,

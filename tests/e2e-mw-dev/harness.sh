@@ -1348,15 +1348,17 @@ admin_console_api() {
 }
 
 # ---- admin RBAC: SSO viewer is read-only -----------------------------------
-# A forged ALB OIDC header (no internal secret) with a non-admin group resolves
-# to the viewer role: it can read but must be blocked from mutations and from
-# the audit log. Exercises RoleGate + RequireAdmin against the REAL router (the
-# unit tests cover the gate algorithm; this covers the wiring). The JWT is
-# unsigned because the CP trusts the ALB-injected header by network position.
+# A forged ALB OIDC header (no internal secret) for an @posthog.com email that
+# is NOT in the operators table resolves to the viewer role (fail-closed
+# default): it can read but must be blocked from mutations and from the audit
+# log. Exercises RoleGate + RequireAdmin against the REAL router (the unit tests
+# cover the gate algorithm; this covers the wiring). The JWT is unsigned because
+# the CP trusts the ALB-injected header by network position. (Role is no longer
+# group-based — it comes from the operators table; an unknown email = viewer.)
 admin_rbac_viewer() { # org
   org="$1"
-  log "admin RBAC: forged SSO viewer is read-only (no mutate, no audit)"
-  payload="$(printf '{"email":"ci-viewer@posthog.com","cognito:groups":["definitely-not-admin"]}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+  log "admin RBAC: forged SSO viewer (unknown operator) is read-only (no mutate, no audit)"
+  payload="$(printf '{"email":"ci-viewer@posthog.com","email_verified":true}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
   vh="X-Amzn-Oidc-Data: e30.${payload}.sig"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/orgs")"
   [ "$code" = "200" ] || fail "viewer GET /orgs returned $code, want 200 (reads allowed)"
