@@ -1389,9 +1389,49 @@ admin_query_detail() { # org password
   # An unknown pid is a clean 404, never a 500.
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/queries/2147483647")"
   [ "$code" = "404" ] || { cleanup_bg; fail "admin_query_detail: unknown pid returned $code, want 404"; }
-
   cleanup_bg
-  log "admin live: per-query detail OK (pid $pid, SQL round-tripped, unknown→404) on $org"
+
+  # Redaction in the LIVE path (load-bearing): a real CREATE SECRET executing on
+  # a worker must NOT expose its credential material via /queries/:pid. The unit
+  # test proves connDetail passes the redacted currentQuery through; this proves
+  # the live server actually stores the redacted form (no un-redacted detail
+  # source slipped in). We run a long CREATE SECRET so it's catchable in flight,
+  # capture its pid, expand it, and assert the secret literal is absent.
+  cred="e2eSECRET-$(openssl rand -hex 12)"
+  # A count(*) over a big range forces a FULL scan (no LIMIT short-circuit), so
+  # the CREATE SECRET stays in flight ~tens of seconds while DuckDB evaluates the
+  # option subquery — long enough to catch. The cred literal is what must never
+  # leak; RedactForLog replaces the whole option list with a placeholder.
+  sq="CREATE OR REPLACE SECRET e2e_detail_redact (TYPE s3, KEY_ID 'AKIADETAILPROBE', SECRET '${cred}', REGION (SELECT count(*)::VARCHAR FROM range(3000000000) t(i) WHERE i % 2 = 0));"
+  sout="$(mktemp)"
+  ( pg_try "$org" "$pw" ducklake "$sq" >"$sout" 2>&1 || true ) &
+  sbg=$!
+  cleanup_sbg() { kill "$sbg" 2>/dev/null || true; wait "$sbg" 2>/dev/null || true; rm -f "$sout"; }
+  spid="" a=0
+  while [ "$a" -lt 60 ]; do
+    kill -0 "$sbg" 2>/dev/null || break
+    spid="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o) | .pid) // empty')"
+    [ -n "$spid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  if [ -n "$spid" ]; then
+    sd="$(curl -fsS -H "$H" "$API/api/v1/queries/$spid" || true)"
+    case "$sd" in
+      *"$cred"*|*"AKIADETAILPROBE"*) cleanup_sbg; fail "admin_query_detail: REDACTION BREACH — CREATE SECRET credential leaked into /queries/$spid" ;;
+    esac
+    # And the statement IS visible (redacted), proving we caught the right query.
+    echo "$sd" | jq -e '.query | test("SECRET"; "i")' >/dev/null \
+      || { cleanup_sbg; fail "admin_query_detail: expected redacted CREATE SECRET text in detail, got $(echo "$sd" | jq -c '{state,qlen:(.query|length)}')"; }
+    log "admin live: redaction holds in live path (credential absent from pid $spid)"
+  else
+    # Don't fail the whole suite on a missed catch (the secret DDL may finish or
+    # error fast on a cold worker); the unit test is the deterministic gate.
+    log "admin live: CREATE SECRET detail probe did not catch the query in flight — skipped (unit test is the gate)"
+  fi
+  cleanup_sbg
+
+  log "admin live: per-query detail OK (pid $pid, SQL round-tripped, unknown→404, redaction) on $org"
 }
 
 # ---- admin impersonation round-trip + audit --------------------------------

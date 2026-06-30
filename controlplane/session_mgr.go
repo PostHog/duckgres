@@ -827,6 +827,17 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 	return -1
 }
 
+// ProtocolForPID returns the wire protocol ("postgres"/"flight") for a session,
+// or "" if not found. O(1) lookup for the admin live-query detail view.
+func (sm *SessionManager) ProtocolForPID(pid int32) string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		return s.Protocol
+	}
+	return ""
+}
+
 // WorkerPodNameForPID returns the K8s pod name of the worker hosting the
 // session, or "" if not found or not running on K8s.
 func (sm *SessionManager) WorkerPodNameForPID(pid int32) string {

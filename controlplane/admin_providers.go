@@ -92,12 +92,7 @@ func (p *clusterInfoProvider) QueryDetailForPID(pid int32) (admin.QueryDetail, b
 			continue
 		}
 		d.Org = org
-		for _, s := range stack.Sessions.AllSessions() {
-			if s.PID == pid {
-				d.Protocol = s.Protocol
-				break
-			}
-		}
+		d.Protocol = stack.Sessions.ProtocolForPID(pid)
 		if prog := stack.Sessions.GetProgress(pid); prog != nil {
 			d.Percentage = prog.Percentage
 			d.Rows = prog.Rows
