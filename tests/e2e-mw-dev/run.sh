@@ -33,6 +33,24 @@ internal_secret_fallback_file="/tmp/duckgres-ci-internal-secret-fallback"
 # run: stored user secrets only need to outlive the run's sessions.
 user_secret_key_file="/tmp/duckgres-ci-user-secret-key"
 
+require_pr_identity() {
+  : "${PR_NUMBER:?PR_NUMBER is required}"
+  case "$PR_NUMBER" in
+    *[!0-9]*)
+      echo "PR_NUMBER must be numeric, got '$PR_NUMBER'." >&2
+      return 2
+      ;;
+  esac
+  if [ -z "$NS" ]; then
+    echo "NAMESPACE is required." >&2
+    return 2
+  fi
+  if [ "$NS" != "duckgres-ci-pr-$PR_NUMBER" ]; then
+    echo "NAMESPACE '$NS' does not match PR_NUMBER '$PR_NUMBER'." >&2
+    return 2
+  fi
+}
+
 render() {
   : "${WORKER_IMAGE:?}" "${CONTROLPLANE_IMAGE:?}" "${PR_NUMBER:?}"
   [ -f "$internal_secret_file" ] || openssl rand -hex 16 > "$internal_secret_file"
@@ -146,10 +164,29 @@ delete_ci_ducklings() { # pr-number
 }
 
 wait_ci_ducklings_deleted() { # pr-number timeout
-  local pr="$1" timeout="$2" org
+  local pr="$1" timeout="$2" org get_out deletion_timestamp finalizers conditions rest rc=0
   for org in $(ci_orgs "$pr"); do
-    "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout="$timeout" 2>/dev/null || true
+    if ! "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout="$timeout"; then
+      if get_out="$("${KUBECTL[@]}" -n ducklings get "duckling/$org" \
+          -o jsonpath='{.metadata.deletionTimestamp}{"|"}{.metadata.finalizers}{"|"}{range .status.conditions[*]}{.type}={.status}:{.reason}{";"}{end}' 2>&1)"; then
+        deletion_timestamp="${get_out%%|*}"
+        rest="${get_out#*|}"
+        finalizers="${rest%%|*}"
+        conditions="${rest#*|}"
+        [ -n "$deletion_timestamp" ] || deletion_timestamp="<none>"
+        [ -n "$finalizers" ] || finalizers="<none>"
+        [ -n "$conditions" ] || conditions="<none>"
+        echo "Duckling $org did not delete within $timeout; refusing to reuse same-PR resource names." >&2
+        echo "Duckling $org summary: deletionTimestamp=$deletion_timestamp finalizers=$finalizers conditions=$conditions" >&2
+        rc=1
+      elif ! printf '%s\n' "$get_out" | grep -qi 'not found'; then
+        echo "Could not verify Duckling $org was deleted after wait failed; refusing to reuse same-PR resource names." >&2
+        printf '%s\n' "$get_out" >&2
+        rc=1
+      fi
+    fi
   done
+  return "$rc"
 }
 
 delete_ci_bindings() { # pr-number
@@ -278,6 +315,8 @@ cmd_diagnostics() {
 }
 
 cmd_teardown() {
+  local duckling_delete_rc=0
+
   # Deprovision the ci-pr ducklings FIRST so shared-infra resources (S3 bucket,
   # cnpg role+db) are cleaned up by the control plane
   # before we delete it. Best-effort — the namespace delete + e2e-cleanup are the
@@ -323,7 +362,7 @@ cmd_teardown() {
   # stranded cnpg state and never reach ready.
   # `wait --for=delete` blocks until the CR (and its cascade) is gone.
   delete_ci_ducklings "$PR_NUMBER"
-  wait_ci_ducklings_deleted "$PR_NUMBER" 300s
+  wait_ci_ducklings_deleted "$PR_NUMBER" 300s || duckling_delete_rc=$?
 
   # Deterministically drop the cnpg role+db in case the composition's async
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
@@ -335,6 +374,7 @@ cmd_teardown() {
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=false
+  return "$duckling_delete_rc"
 }
 
 # Sweep stale per-PR namespaces left behind by runs that died hard (cancelled
@@ -362,7 +402,7 @@ cmd_e2e_cleanup() {
       pr="${ns#duckgres-ci-pr-}"
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
       delete_ci_ducklings "$pr"
-      wait_ci_ducklings_deleted "$pr" 300s
+      wait_ci_ducklings_deleted "$pr" 300s || true
       for org in $(ci_cnpg_orgs "$pr"); do drop_cnpg_role "$org"; done
       NS="$ns" delete_pod_identity
       delete_ci_bindings "$pr"
@@ -371,10 +411,10 @@ cmd_e2e_cleanup() {
 }
 
 case "${1:?usage: run.sh deploy|test|diagnostics|teardown|e2e-cleanup}" in
-  deploy) : "${NAMESPACE:?}"; cmd_deploy ;;
-  test) : "${NAMESPACE:?}"; cmd_test ;;
-  diagnostics) : "${NAMESPACE:?}"; cmd_diagnostics ;;
-  teardown) : "${NAMESPACE:?}"; cmd_teardown ;;
+  deploy) : "${NAMESPACE:?}"; require_pr_identity; cmd_deploy ;;
+  test) : "${NAMESPACE:?}"; require_pr_identity; cmd_test ;;
+  diagnostics) : "${NAMESPACE:?}"; require_pr_identity; cmd_diagnostics ;;
+  teardown) : "${NAMESPACE:?}"; require_pr_identity; cmd_teardown ;;
   e2e-cleanup) cmd_e2e_cleanup ;;
   *) echo "unknown: $1" >&2; exit 2 ;;
 esac

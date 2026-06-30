@@ -57,8 +57,10 @@ on:
   schedule:
     - cron: "0 */6 * * *"
 
-# One in-flight run per PR; a new push cancels the old run (and its namespace
-# is GC'd by the always() teardown of the cancelled run + the e2e-cleanup sweep).
+# One in-flight run per PR; a new push cancels the old run. The replacement
+# deploy starts by deleting same-PR shared resources and refuses to reuse the
+# PR-scoped names until Duckling CR deletion completes; e2e-cleanup is the
+# backstop for namespaces with no follow-up run.
 concurrency:
   group: e2e-mw-dev-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -116,6 +118,14 @@ jobs:
       CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test e2e harness scripts
+        run: go test -count=1 ./tests/e2e-mw-dev
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
