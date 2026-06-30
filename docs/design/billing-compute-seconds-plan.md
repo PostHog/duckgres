@@ -40,6 +40,11 @@ managed_warehouse_compute_cpu_seconds    = vCPU × ceil(connection_seconds)   # 
 managed_warehouse_compute_memory_seconds = GiB  × ceil(connection_seconds)   # GiB-seconds
 ```
 
+A **vCPU-second** is one virtual CPU reserved for one second; a **GiB-second** is
+one GiB of RAM reserved for one second (capacity × time, like kWh). Example: an
+8 vCPU / 16 GiB worker held by a connection for 10 seconds = `8 × 10 = 80`
+vCPU-seconds and `16 × 10 = 160` GiB-seconds.
+
 - `vCPU` / `GiB` = the **provisioned** worker size (`WorkerProfile`), not measured
   usage. Memory is provisioned in **GiB** (not GB) — keep that unit consistent in
   billing.
