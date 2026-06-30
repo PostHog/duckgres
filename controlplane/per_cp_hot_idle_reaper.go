@@ -16,7 +16,7 @@ type perCPHotIdleStore interface {
 	// longer live (expired/missing past the cutoff). Reused here so the per-CP
 	// reaper can reclaim hot-idle workers orphaned by a rollout/crash without
 	// waiting on the leader.
-	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
+	ListOrphanedWorkerSnapshots(before, workerStale time.Time) ([]configstore.WorkerSnapshot, error)
 }
 
 // perCPHotIdleReaper retires THIS replica's own expired hot-idle workers on a
@@ -43,8 +43,12 @@ type perCPHotIdleReaper struct {
 	// the per-CP orphan pass (self-owned reaping still runs). Matches the leader
 	// janitor's orphanGrace so timing is identical, just leader-independent.
 	orphanGrace time.Duration
-	interval    time.Duration
-	now         func() time.Time
+	// abandonedWorkerGrace mirrors the leader janitor's: how stale a worker's
+	// own heartbeat must be (with a draining/stale owner CP) before the orphan
+	// pass reclaims it. Generous so active-session workers are never reaped.
+	abandonedWorkerGrace time.Duration
+	interval             time.Duration
+	now                  func() time.Time
 }
 
 func (r *perCPHotIdleReaper) Run(ctx context.Context) {
@@ -128,7 +132,11 @@ func (r *perCPHotIdleReaper) reapOrphanedHotIdle(now time.Time) {
 	if r.orphanGrace <= 0 {
 		return
 	}
-	orphaned, err := r.store.ListOrphanedWorkerSnapshots(now.Add(-r.orphanGrace))
+	abandonedGrace := r.abandonedWorkerGrace
+	if abandonedGrace <= 0 {
+		abandonedGrace = r.orphanGrace
+	}
+	orphaned, err := r.store.ListOrphanedWorkerSnapshots(now.Add(-r.orphanGrace), now.Add(-abandonedGrace))
 	if err != nil {
 		slog.Warn("Per-CP hot-idle reaper failed to list orphaned workers.", "error", err)
 		return

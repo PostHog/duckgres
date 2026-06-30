@@ -17,7 +17,7 @@ const (
 type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
 	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)
-	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
+	ListOrphanedWorkerSnapshots(before, workerStale time.Time) ([]configstore.WorkerSnapshot, error)
 	ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error)
 	ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
 	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
@@ -29,6 +29,7 @@ type ControlPlaneJanitor struct {
 	interval                      time.Duration
 	expiryTimeout                 time.Duration
 	orphanGrace                   time.Duration
+	abandonedWorkerGrace          time.Duration
 	spawnTimeout                  time.Duration
 	activateTimeout               time.Duration
 	maxDrainTimeout               time.Duration
@@ -56,6 +57,12 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		interval:      interval,
 		expiryTimeout: expiryTimeout,
 		orphanGrace:   30 * time.Second,
+		// A worker whose heartbeat is this stale AND whose owner CP is draining
+		// or itself stale is treated as abandoned (orphan condition (4)). Kept
+		// generous — far beyond the worker health-check interval — so a worker
+		// with an active session (which a draining CP keeps health-checking per
+		// the drain contract) keeps a fresh heartbeat and is never reaped here.
+		abandonedWorkerGrace: 5 * time.Minute,
 		// The stuck-worker cutoffs must exceed the detached spawn+activate
 		// budget (workerSpawnActivateTimeout, 8m: pod-ready incl. Karpenter
 		// node provisioning + gRPC connect + activation). A spawning row's
@@ -132,7 +139,8 @@ func (j *ControlPlaneJanitor) runOnce() {
 		})
 	} else {
 		orphanedBefore := j.now().Add(-j.orphanGrace)
-		orphaned, err := j.store.ListOrphanedWorkerSnapshots(orphanedBefore)
+		abandonedBefore := j.now().Add(-j.abandonedWorkerGrace)
+		orphaned, err := j.store.ListOrphanedWorkerSnapshots(orphanedBefore, abandonedBefore)
 		if err != nil {
 			slog.Warn("Janitor failed to list orphaned workers.", "error", err)
 		} else {

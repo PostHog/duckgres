@@ -344,9 +344,10 @@ func SetupMultiTenant(
 		lifecycle:    router.sharedPool.lifecycle,
 		cpInstanceID: cpInstanceID,
 		hotIdleTTL:   janitor.hotIdleTTL,
-		hotIdleFloor: janitor.hotIdleFloor,
-		orphanGrace:  janitor.orphanGrace, // same cutoff as the leader orphan sweep
-		interval:     time.Minute,
+		hotIdleFloor:         janitor.hotIdleFloor,
+		orphanGrace:          janitor.orphanGrace, // same cutoff as the leader orphan sweep
+		abandonedWorkerGrace: janitor.abandonedWorkerGrace,
+		interval:             time.Minute,
 	}
 	go fallbackReaper.Run(context.Background())
 

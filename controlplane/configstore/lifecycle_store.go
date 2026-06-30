@@ -23,8 +23,8 @@ func (cs *ConfigStore) ObserveWorker(workerID int) (*WorkerSnapshot, error) {
 // snapshot binds the observation (state, owner, epoch, updated_at) to
 // the subsequent retire CAS, so callers cannot accidentally retire a
 // row that has changed under them since the listing.
-func (cs *ConfigStore) ListOrphanedWorkerSnapshots(before time.Time) ([]WorkerSnapshot, error) {
-	records, err := cs.ListOrphanedWorkers(before)
+func (cs *ConfigStore) ListOrphanedWorkerSnapshots(before, workerStale time.Time) ([]WorkerSnapshot, error) {
+	records, err := cs.ListOrphanedWorkers(before, workerStale)
 	if err != nil {
 		return nil, err
 	}

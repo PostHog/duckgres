@@ -1015,7 +1015,7 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 		t.Fatalf("age stuck worker: %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -1055,12 +1055,85 @@ func TestListOrphanedWorkersIncludesOwnerlessIdleWorkers(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(ownerless idle): %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
 	if len(orphaned) != 1 || orphaned[0].WorkerID != 77 {
 		t.Fatalf("expected ownerless idle worker 77 to be returned as an orphan, got %#v", orphaned)
+	}
+}
+
+// TestListOrphanedWorkersReclaimsAbandonedHotWorker covers condition (4):
+// a `hot` worker whose owning CP is DRAINING (or itself heartbeat-stale) and
+// whose own heartbeat has gone stale past the abandoned grace is reclaimed,
+// even though the CP row was never marked expired. This is the prod leak where
+// the remote backend's unbounded handover-drain timeout lets a draining CP
+// linger while its idle hot workers (no longer health-checked) pile up. The
+// control rows assert the safety boundary: a hot worker with a FRESH heartbeat
+// (still being health-checked → has an active session) and a hot worker owned
+// by a healthy ACTIVE CP are both spared.
+func TestListOrphanedWorkersReclaimsAbandonedHotWorker(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 30, 14, 0, 0, 0, time.UTC)
+
+	// A draining CP (rolling out) that still heartbeats — NOT expired.
+	drainingAt := now.Add(-20 * time.Minute)
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-draining:boot-x",
+		PodName:         "duckgres-cp-draining",
+		State:           configstore.ControlPlaneInstanceStateDraining,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now,
+		DrainingAt:      ptrTime(drainingAt),
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(draining): %v", err)
+	}
+	// A healthy active CP.
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-active:boot-y",
+		PodName:         "duckgres-cp-active",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(active): %v", err)
+	}
+
+	// (A) hot worker, draining owner, STALE heartbeat → must be reclaimed.
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID: 201, PodName: "duckgres-worker-201", State: configstore.WorkerStateHot,
+		OrgID: "acme", OwnerCPInstanceID: "cp-draining:boot-x", OwnerEpoch: 1,
+		LastHeartbeatAt: now.Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(abandoned hot): %v", err)
+	}
+	// (B) hot worker, draining owner, FRESH heartbeat (still health-checked /
+	//     active session) → must be SPARED.
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID: 202, PodName: "duckgres-worker-202", State: configstore.WorkerStateHot,
+		OrgID: "acme", OwnerCPInstanceID: "cp-draining:boot-x", OwnerEpoch: 1,
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(fresh hot): %v", err)
+	}
+	// (C) hot worker, ACTIVE healthy owner, stale heartbeat → must be SPARED
+	//     (a live CP is responsible for it; don't reap a healthy CP's worker).
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID: 203, PodName: "duckgres-worker-203", State: configstore.WorkerStateHot,
+		OrgID: "acme", OwnerCPInstanceID: "cp-active:boot-y", OwnerEpoch: 1,
+		LastHeartbeatAt: now.Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(active-owned hot): %v", err)
+	}
+
+	// before = orphan/cp-staleness cutoff (30s); workerStale = abandoned grace (5m).
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-5*time.Minute))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 201 {
+		t.Fatalf("expected only abandoned hot worker 201 reclaimed, got %#v", orphaned)
 	}
 }
 
@@ -1085,7 +1158,7 @@ func TestRetireOrphanWorkerHandlesNullOwnerPostgres(t *testing.T) {
 		t.Fatalf("set owner_cp_instance_id null: %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -1124,7 +1197,7 @@ func TestListOrphanedWorkersIncludesDanglingOwnerWorkers(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(dangling owner): %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -1155,7 +1228,7 @@ func TestListOrphanedWorkersExcludesFreshOwnerlessWorker(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(fresh ownerless): %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -1588,7 +1661,7 @@ func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T
 		t.Fatalf("UpsertFlightSessionRecord: %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -1641,7 +1714,7 @@ func TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions(t *tes
 		t.Fatalf("UpsertFlightSessionRecord: %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -1696,7 +1769,7 @@ func TestListOrphanedWorkersIncludesWorkersWithExpiredFlightSessions(t *testing.
 		t.Fatalf("UpsertFlightSessionRecord: %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -2011,7 +2084,7 @@ func TestRetireOrphanWorkerRejectsRevivedOwnerControlPlanePostgres(t *testing.T)
 		t.Fatalf("UpsertWorkerRecord(orphan candidate): %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
@@ -2063,7 +2136,7 @@ func TestRetireOrphanWorkerRejectsStaleListSnapshotAfterTakeoverPostgres(t *test
 		t.Fatalf("UpsertWorkerRecord(orphan candidate): %v", err)
 	}
 
-	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30*time.Second), now.Add(-30*time.Second))
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}

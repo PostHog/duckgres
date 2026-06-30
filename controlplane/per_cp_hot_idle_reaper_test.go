@@ -24,7 +24,7 @@ func (s *fakePerCPHotIdleStore) CountHotIdleWorkers(orgID, image, cpu, mem strin
 	return s.counts[orgID], nil
 }
 
-func (s *fakePerCPHotIdleStore) ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+func (s *fakePerCPHotIdleStore) ListOrphanedWorkerSnapshots(before, workerStale time.Time) ([]configstore.WorkerSnapshot, error) {
 	return s.orphaned, nil
 }
 

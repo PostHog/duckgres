@@ -1425,6 +1425,18 @@ func (cs *ConfigStore) countOrgAdmittingWorkers(tx *gorm.DB, orgID, image, profi
 //  3. owner_cp_instance_id is set but no matching cp_instances row
 //     exists at all (hard-deleted somehow), and again the heartbeat
 //     is stale. Same shape as (2), different cause.
+//  4. The owning CP row exists and is DRAINING (or itself heartbeat-stale
+//     past `before`) AND the worker's own heartbeat has gone stale past
+//     `workerStale`. This closes the leak where a CP drains (or dies
+//     ungracefully) without being marked expired — with the remote
+//     backend's unbounded handover-drain timeout a draining CP can linger
+//     for the full pod grace period, and its idle `hot` workers (no longer
+//     health-checked, so their heartbeat goes stale) were invisible to
+//     (1)/(2)/(3). `workerStale` is a deliberately generous grace (well
+//     beyond the health-check interval) so a worker with an active session
+//     — which a draining CP keeps health-checking per the drain contract —
+//     keeps a fresh heartbeat and is never reaped here; the Flight-session
+//     guard below is a second line of defense.
 //
 // Retired/lost rows are deliberately excluded — their pods are already
 // gone (or are reconciled by K8sWorkerPool.cleanupOrphanedWorkerPods).
@@ -1443,7 +1455,7 @@ func (cs *ConfigStore) countOrgAdmittingWorkers(tx *gorm.DB, orgID, image, profi
 //
 // See TestListOrphanedWorkers* in tests/configstore for the regression
 // fixtures.
-func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
+func (cs *ConfigStore) ListOrphanedWorkers(before, workerStale time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
 	cleanupStates := []WorkerState{
 		WorkerStateSpawning,
@@ -1471,10 +1483,15 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 				// (2) owner string is empty/NULL and heartbeat is stale
 				"OR (NULLIF(w.owner_cp_instance_id, '') IS NULL AND w.last_heartbeat_at <= ?) "+
 				// (3) owner string is set but no matching CP row, heartbeat stale
-				"OR (cp.id IS NULL AND NULLIF(w.owner_cp_instance_id, '') IS NOT NULL AND w.last_heartbeat_at <= ?)",
+				"OR (cp.id IS NULL AND NULLIF(w.owner_cp_instance_id, '') IS NOT NULL AND w.last_heartbeat_at <= ?) "+
+				// (4) owner CP is draining (or itself heartbeat-stale) and the
+				//     worker's own heartbeat is stale past the generous grace —
+				//     a draining/dead-but-not-yet-expired owner won't manage it.
+				"OR ((cp.state = ? OR cp.last_heartbeat_at <= ?) AND w.last_heartbeat_at <= ?)",
 			ControlPlaneInstanceStateExpired, before,
 			before,
 			before,
+			ControlPlaneInstanceStateDraining, before, workerStale,
 		).
 		// Spare workers with at least one reclaimable Flight session: a
 		// retire here would kill the customer's mid-flight query at the

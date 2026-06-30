@@ -54,7 +54,7 @@ func (s *captureControlPlaneExpiryStore) snapshot() []time.Time {
 // slice through NewWorkerSnapshot so existing fixtures that
 // populate orphanedWorkers also drive the lifecycle path when a
 // lifecycle is wired.
-func (s *captureControlPlaneExpiryStore) ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+func (s *captureControlPlaneExpiryStore) ListOrphanedWorkerSnapshots(before, workerStale time.Time) ([]configstore.WorkerSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.orphanedWorkers) == 0 {
