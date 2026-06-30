@@ -1410,6 +1410,9 @@ admin_console_api() {
 # (cap-counting assigned workers, summed across replicas by the /status
 # fan-out). With a query in flight the org's worker is Hot, so /status must
 # report workers>=1 for that org and a nonzero cluster total_workers.
+# PRECONDITION: the caller passes an org whose lane is already warm (e.g. CNPG
+# after join_lanes), so the query lands on a Hot worker within the 120s budget
+# rather than waiting on a multi-minute cold pod spawn — see the call site.
 admin_per_org_workers() { # org password
   org="$1"; pw="$2"
   log "admin: /status per-org worker count is populated on $org"
