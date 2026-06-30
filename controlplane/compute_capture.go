@@ -55,7 +55,13 @@ func computeEventUUID(orgID string, bucketStart time.Time) string {
 }
 
 // capturePayload is the PostHog capture API request body.
+//
+// APIKey is the project write key — it routes the event to its PostHog project
+// (team); the ingestion host (base URL) only selects the region. The same token
+// is ALSO stamped on properties.token as the billing validity marker the
+// usage-report gather query filters on. Both uses carry the same value.
 type capturePayload struct {
+	APIKey     string                 `json:"api_key"`
 	Event      string                 `json:"event"`
 	DistinctID string                 `json:"distinct_id"`
 	Properties map[string]interface{} `json:"properties"`
@@ -68,6 +74,7 @@ type capturePayload struct {
 func (c *computeCaptureClient) Ship(ctx context.Context, b computeUsageBucket) error {
 	uuid := computeEventUUID(b.OrgID, b.BucketStart)
 	payload := capturePayload{
+		APIKey:     c.token,
 		Event:      computeUsageEventName,
 		DistinctID: b.OrgID,
 		Properties: map[string]interface{}{
