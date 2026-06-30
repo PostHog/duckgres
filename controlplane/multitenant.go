@@ -533,6 +533,7 @@ func SetupMultiTenant(
 	admin.RegisterExtras(api, admin.Extras{
 		Store:        store,
 		Live:         clusterInfo,
+		Users:        store,
 		Fetcher:      liveFetcher,
 		Impersonator: imp,
 		Audit:        auditStore,

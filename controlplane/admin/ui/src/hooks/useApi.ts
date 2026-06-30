@@ -181,6 +181,39 @@ export function useDeleteUser() {
   });
 }
 
+// Per-user kill switch. All three invalidate the live views (sessions/queries/
+// workers) plus the user list (so the disabled badge refreshes).
+function invalidateUserLive(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: ["users"] });
+  qc.invalidateQueries({ queryKey: ["sessions"] });
+  qc.invalidateQueries({ queryKey: ["queries"] });
+  qc.invalidateQueries({ queryKey: ["workers"] });
+}
+
+export function useKillUserSessions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { org: string; username: string }) => api.killUserSessions(v.org, v.username),
+    onSuccess: () => invalidateUserLive(qc),
+  });
+}
+
+export function useDisableUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { org: string; username: string }) => api.disableUser(v.org, v.username),
+    onSuccess: () => invalidateUserLive(qc),
+  });
+}
+
+export function useEnableUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { org: string; username: string }) => api.enableUser(v.org, v.username),
+    onSuccess: () => invalidateUserLive(qc),
+  });
+}
+
 export function useUserSecrets(org: string | undefined, username: string | undefined) {
   return useQuery<OrgUserSecret[]>({
     queryKey: ["users", org, username, "secrets"],

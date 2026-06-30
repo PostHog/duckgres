@@ -23,6 +23,12 @@ import (
 // and degrade gracefully when a peer is slow/down.
 type PeerFetcher interface {
 	FetchPeers(ctx context.Context, path string) (bodies [][]byte, peers int)
+	// PostPeers is FetchPeers for a mutating action: it POSTs path+"?scope=local"
+	// to every OTHER replica and returns each peer's raw 200 body plus the number
+	// of peers attempted. Cluster-wide actions (the per-user kill switch) use it so
+	// the action reaches whichever replica owns the target sessions; the caller
+	// sums the per-CP results. The scope=local guard stops peers re-fanning out.
+	PostPeers(ctx context.Context, path string) (bodies [][]byte, peers int)
 }
 
 // aggMeta is attached to aggregated responses so the UI can show coverage

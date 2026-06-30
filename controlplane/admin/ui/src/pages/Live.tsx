@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Activity, Ban, RefreshCw } from "lucide-react";
+import { Activity, Ban, RefreshCw, Zap } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,15 @@ import { AdminGate } from "@/components/AdminOnly";
 import { EmptyState } from "@/components/states";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { useCancelSession, useQueries, useSessions } from "@/hooks/useApi";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { useCancelSession, useKillUserSessions, useQueries, useSessions } from "@/hooks/useApi";
 import { fmtAge, fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
@@ -18,9 +26,14 @@ export function Live() {
   const queries = useQueries();
   const sessions = useSessions();
   const cancel = useCancelSession();
+  const killUser = useKillUserSessions();
   const [org, setOrg] = useState("");
   const [user, setUser] = useState("");
   const [detailWid, setDetailWid] = useState<number | null>(null);
+  const [killOpen, setKillOpen] = useState(false);
+  // The kill endpoint targets an EXACT (org, user); the filter boxes are
+  // substring matches, so only offer it once both are set, and pass them verbatim.
+  const canKillUser = org.trim() !== "" && user.trim() !== "";
 
   const matchOrg = (o?: string) => !org || (o ?? "").toLowerCase().includes(org.toLowerCase());
   const matchUser = (u?: string) => !user || (u ?? "").toLowerCase().includes(user.toLowerCase());
@@ -45,6 +58,17 @@ export function Live() {
           <div className="flex items-center gap-2">
             <Input value={org} onChange={(e) => setOrg(e.target.value)} placeholder="Filter org…" className="w-40" />
             <Input value={user} onChange={(e) => setUser(e.target.value)} placeholder="Filter user…" className="w-40" />
+            <AdminGate>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!canKillUser}
+                title={canKillUser ? "Kill all sessions for this org + user" : "Set both org and user filters first"}
+                onClick={() => setKillOpen(true)}
+              >
+                <Zap className="h-4 w-4 text-destructive" /> Kill user
+              </Button>
+            </AdminGate>
             <Button
               variant="outline"
               size="icon"
@@ -59,6 +83,36 @@ export function Live() {
           </div>
         }
       />
+
+      <Dialog open={killOpen} onOpenChange={setKillOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Kill all sessions for "{user}"?</DialogTitle>
+            <DialogDescription>
+              Immediately terminates every active session and in-flight query for user{" "}
+              <span className="font-mono">{user}</span> in org <span className="font-mono">{org}</span> across
+              all control-plane replicas. The user can reconnect right away. To also block new connections,
+              use Disable on the Users page.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setKillOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={killUser.isPending || !canKillUser}
+              onClick={async () => {
+                await killUser.mutateAsync({ org: org.trim(), username: user.trim() });
+                setKillOpen(false);
+              }}
+            >
+              {killUser.isPending ? "Killing…" : "Kill sessions"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <PageBody>
         <Card className="mb-4">
           <CardHeader className="flex-row items-center justify-between">

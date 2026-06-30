@@ -378,6 +378,75 @@ func TestResolvePostgresConnection(t *testing.T) {
 	})
 }
 
+// TestDisabledUserEnforcement covers the per-user kill switch at the snapshot
+// level: a disabled user with CORRECT credentials is refused on every auth path
+// (PG resolution reports Valid+Disabled so the CP can emit a distinct error;
+// Flight's ValidateOrgUser* return false), while enabled users are unaffected.
+func TestDisabledUserEnforcement(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"acme": {Name: "acme", DatabaseName: "acme_db"},
+			},
+			DatabaseOrg: map[string]string{"acme_db": "acme"},
+			OrgUserPassword: map[OrgUserKey]string{
+				{OrgID: "acme", Username: "bob"}:   mustHash(t, "secret"),
+				{OrgID: "acme", Username: "alice"}: mustHash(t, "secret"),
+			},
+			OrgUserPassthrough: map[OrgUserKey]bool{
+				{OrgID: "acme", Username: "bob"}: true,
+			},
+			OrgUserDisabled: map[OrgUserKey]bool{
+				{OrgID: "acme", Username: "bob"}: true,
+			},
+		},
+	}
+
+	t.Run("PG resolution: disabled user authenticates but is flagged Disabled", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "acme", true, "bob", "secret")
+		if !got.Valid {
+			t.Fatalf("disabled user with correct creds should still authenticate (Valid=true) so the CP can distinguish from a bad password: %+v", got)
+		}
+		if !got.Disabled {
+			t.Fatalf("expected Disabled=true: %+v", got)
+		}
+	})
+
+	t.Run("PG resolution: wrong password never reveals Disabled", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "acme", true, "bob", "wrong")
+		if got.Valid || got.Disabled {
+			t.Fatalf("wrong password must not authenticate or leak Disabled: %+v", got)
+		}
+	})
+
+	t.Run("PG resolution: enabled user unaffected", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "acme", true, "alice", "secret")
+		if !got.Valid || got.Disabled {
+			t.Fatalf("enabled user should authenticate and not be Disabled: %+v", got)
+		}
+	})
+
+	t.Run("Flight ValidateOrgUser refuses disabled user", func(t *testing.T) {
+		if cs.ValidateOrgUser("acme", "bob", "secret") {
+			t.Fatal("ValidateOrgUser must return false for a disabled user")
+		}
+		if !cs.ValidateOrgUser("acme", "alice", "secret") {
+			t.Fatal("ValidateOrgUser must return true for an enabled user")
+		}
+	})
+
+	t.Run("ValidateOrgUserAndGetPassthrough refuses disabled user without leaking passthrough", func(t *testing.T) {
+		valid, passthrough := cs.ValidateOrgUserAndGetPassthrough("acme", "bob", "secret")
+		if valid || passthrough {
+			t.Fatalf("disabled user: want (false,false), got (%v,%v)", valid, passthrough)
+		}
+		valid, _ = cs.ValidateOrgUserAndGetPassthrough("acme", "alice", "secret")
+		if !valid {
+			t.Fatal("enabled user should validate")
+		}
+	})
+}
+
 func TestHashPassword(t *testing.T) {
 	hash, err := HashPassword("testpass")
 	if err != nil {

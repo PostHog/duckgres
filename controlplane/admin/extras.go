@@ -12,6 +12,7 @@ import (
 type Extras struct {
 	Store        secretStore // *configstore.ConfigStore
 	Live         LiveInfo
+	Users        UserAdmin // per-user kill switch (disable/enable); *configstore.ConfigStore
 	Impersonator Impersonator
 	Audit        *AuditStore
 	Metrics      *MetricsProxy
@@ -23,7 +24,7 @@ type Extras struct {
 // individual handlers re-check where needed (impersonation).
 func RegisterExtras(r *gin.RouterGroup, x Extras) {
 	r.GET("/me", meHandler)
-	registerLiveAPI(r, x.Live, x.Fetcher)
+	registerLiveAPI(r, x.Live, x.Fetcher, x.Users)
 	if x.Store != nil {
 		registerUserSecretsAPI(r, x.Store)
 	}

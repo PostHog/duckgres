@@ -352,8 +352,33 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   AutoMigrate.
 - `ManagedSession.Username` is populated at session create so the console can
   slice live sessions/queries by user; keep it set on every create path.
+- **Per-user kill switch** (`live.go` routes + `admin_providers.go` +
+  `session_mgr.go::DestroySessionsForUser` + `configstore` `disabled` column):
+  - `POST …/users/:username/kill` is a **one-shot** terminate — it tears down all
+    of a user's sessions + in-flight queries but does NOT block reconnects.
+  - `POST …/users/:username/disable` is the **persistent block**: it sets the
+    `duckgres_org_users.disabled` column (goose migration
+    `000011_add_org_user_disabled.sql`), kills the user's live sessions, AND
+    refuses the user's NEW connections at auth time on BOTH front-ends — PG wire
+    (`control.go`, distinct `28000` "account is disabled" error, emitted only
+    after the password checks out so it never leaks account existence) and Flight
+    (`ConfigStore.ValidateOrgUser` / `ValidateOrgUserAndGetPassthrough` return
+    false). `enable` reverses it. The disabled state is read from the in-memory
+    snapshot, so disable/enable call `ConfigStore.ReloadSnapshot()` to make the
+    flip effective immediately instead of one config-poll later.
+  - These are **cluster-wide**: a user's sessions live on whichever CP replica
+    owns each connection, so the handlers fan out the kill/disable/enable to peers
+    via `PeerFetcher.PostPeers` (POST sibling of the read fan-out, same
+    `?scope=local` recursion guard) and sum the per-CP `killed` counts. The
+    snapshot reload is fanned out too so every replica enforces the block at once.
+  - Kill must be **scoped to the target user** — never tear down another user's
+    sessions on the shared org stack (the regression the e2e asserts with a
+    concurrent root query that must survive).
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
-  `authz_test.go`) AND the `admin_*` / `impersonation_*` assertions in
+  `authz_test.go`, `kill_switch_test.go`), `controlplane/session_mgr_test.go`
+  (`TestDestroySessionsForUser`), `controlplane/configstore/store_test.go`
+  (`TestDisabledUserEnforcement`) AND the `admin_*` / `impersonation_*` /
+  `user_kill_switch` / `user_disable_block` assertions in
   `tests/e2e-mw-dev/harness.sh`.
 
 ## Compute-Usage Billing (managed-warehouse, remote backend only)

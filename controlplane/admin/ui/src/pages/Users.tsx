@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { KeyRound, Pencil, Plus, Search, Trash2, Users as UsersIcon } from "lucide-react";
+import { Ban, KeyRound, Pencil, Plus, Power, Search, Trash2, Users as UsersIcon, Zap } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { DataTable } from "@/components/DataTable";
 import { Card } from "@/components/ui/card";
@@ -23,6 +23,9 @@ import {
   useCreateUser,
   useDeleteUser,
   useDeleteUserSecret,
+  useDisableUser,
+  useEnableUser,
+  useKillUserSessions,
   useUpdateUser,
   useUserSecrets,
   useUsers,
@@ -36,9 +39,14 @@ export function UsersPage() {
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<OrgUser | null>(null);
   const [deleting, setDeleting] = useState<OrgUser | null>(null);
+  const [killing, setKilling] = useState<OrgUser | null>(null);
+  const [disabling, setDisabling] = useState<OrgUser | null>(null);
   const [secretsFor, setSecretsFor] = useState<OrgUser | null>(null);
 
   const delUser = useDeleteUser();
+  const killUser = useKillUserSessions();
+  const disableUser = useDisableUser();
+  const enableUser = useEnableUser();
 
   const columns = useMemo<ColumnDef<OrgUser, any>[]>(
     () => [
@@ -51,6 +59,16 @@ export function UsersPage() {
         accessorKey: "username",
         header: "Username",
         cell: ({ getValue }) => <span className="font-mono text-xs font-medium">{String(getValue())}</span>,
+      },
+      {
+        accessorKey: "disabled",
+        header: "Status",
+        cell: ({ getValue }) =>
+          getValue() ? (
+            <Badge variant="destructive">disabled</Badge>
+          ) : (
+            <Badge variant="secondary">active</Badge>
+          ),
       },
       {
         accessorKey: "passthrough",
@@ -100,6 +118,41 @@ export function UsersPage() {
               </Button>
             </AdminGate>
             <AdminGate>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6"
+                title="Kill all sessions & queries"
+                onClick={() => setKilling(row.original)}
+              >
+                <Zap className="h-3.5 w-3.5 text-destructive" />
+              </Button>
+            </AdminGate>
+            <AdminGate>
+              {row.original.disabled ? (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6"
+                  title="Enable (allow new connections)"
+                  disabled={enableUser.isPending}
+                  onClick={() => enableUser.mutate({ org: row.original.org_id, username: row.original.username })}
+                >
+                  <Power className="h-3.5 w-3.5 text-emerald-500" />
+                </Button>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6"
+                  title="Disable (block new connections + kill live sessions)"
+                  onClick={() => setDisabling(row.original)}
+                >
+                  <Ban className="h-3.5 w-3.5 text-destructive" />
+                </Button>
+              )}
+            </AdminGate>
+            <AdminGate>
               <Button variant="ghost" size="icon" className="h-6 w-6" title="Delete" onClick={() => setDeleting(row.original)}>
                 <Trash2 className="h-3.5 w-3.5 text-destructive" />
               </Button>
@@ -108,7 +161,7 @@ export function UsersPage() {
         ),
       },
     ],
-    [],
+    [enableUser],
   );
 
   return (
@@ -133,7 +186,7 @@ export function UsersPage() {
       <PageBody>
         <Card className="overflow-hidden">
           {users.isLoading ? (
-            <TableSkeleton cols={7} />
+            <TableSkeleton cols={8} />
           ) : users.isError ? (
             <ErrorState error={users.error} onRetry={() => users.refetch()} />
           ) : (
@@ -154,6 +207,67 @@ export function UsersPage() {
       {creating && <CreateUserDialog onClose={() => setCreating(false)} />}
       {editing && <EditUserDialog user={editing} onClose={() => setEditing(null)} />}
       {secretsFor && <SecretsDialog user={secretsFor} onClose={() => setSecretsFor(null)} />}
+
+      <Dialog open={!!killing} onOpenChange={(o) => !o && setKilling(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Kill all sessions for "{killing?.username}"?</DialogTitle>
+            <DialogDescription>
+              Immediately terminates every active session and in-flight query for{" "}
+              <span className="font-mono">{killing?.username}</span> @{" "}
+              <span className="font-mono">{killing?.org_id}</span> across all control-plane replicas. The
+              user can reconnect right away — use Disable to also block new connections.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setKilling(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={killUser.isPending}
+              onClick={async () => {
+                if (!killing) return;
+                await killUser.mutateAsync({ org: killing.org_id, username: killing.username });
+                setKilling(null);
+              }}
+            >
+              {killUser.isPending ? "Killing…" : "Kill sessions"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!disabling} onOpenChange={(o) => !o && setDisabling(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Disable "{disabling?.username}"?</DialogTitle>
+            <DialogDescription>
+              Blocks all new connections for <span className="font-mono">{disabling?.username}</span> @{" "}
+              <span className="font-mono">{disabling?.org_id}</span> (PG wire + Flight SQL) and kills their
+              live sessions now. Reverse it any time with Enable.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setDisabling(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={disableUser.isPending}
+              onClick={async () => {
+                if (!disabling) return;
+                await disableUser.mutateAsync({ org: disabling.org_id, username: disabling.username });
+                setDisabling(null);
+              }}
+            >
+              {disableUser.isPending ? "Disabling…" : "Disable user"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={!!deleting} onOpenChange={(o) => !o && setDeleting(null)}>
         <DialogContent>

@@ -1048,6 +1048,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
+		if resolution.Disabled {
+			// Per-user kill switch: credentials are correct but the account is
+			// administratively disabled. Distinct from a bad password (28P01) so
+			// the user gets an actionable message; only reachable with valid creds,
+			// so it never leaks account existence to a password-guessing attacker.
+			clog.Warn("Postgres connection rejected: user is disabled.", "org", resolution.OrgID, "user", username)
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "this account is disabled; contact your administrator")
+			_ = writer.Flush()
+			return
+		}
 		orgID = resolution.OrgID
 		clog = clog.With("org", orgID)
 		passthroughUser = resolution.Passthrough

@@ -745,6 +745,42 @@ func (sm *SessionManager) DestroyAllSessions() {
 	}
 }
 
+// DestroySessionsForUser tears down every active session owned by username (the
+// per-user kill switch). Each DestroySession cancels the session's in-flight
+// query (via the executor) and destroys the worker-side session; here we
+// additionally force-close the client TCP connection so the client is dropped
+// immediately rather than lingering until its next query returns ErrWorkerDead
+// (mirrors OnWorkerCrash). Returns the number of sessions destroyed.
+//
+// Unlike DestroyAllSessions this does NOT close the manager lifecycle: the org
+// stays open for other users, and (unless the user is also disabled) for the
+// killed user's subsequent reconnects.
+func (sm *SessionManager) DestroySessionsForUser(username string) int {
+	type target struct {
+		pid    int32
+		closer io.Closer
+	}
+	sm.mu.Lock()
+	var targets []target
+	for pid, s := range sm.sessions {
+		if s.Username == username {
+			targets = append(targets, target{pid: pid, closer: s.connCloser})
+		}
+	}
+	sm.mu.Unlock()
+
+	for _, t := range targets {
+		sm.DestroySession(t.pid)
+		// Drop the client connection immediately. The deferred close in
+		// handleConnection will also Close() this conn; a double close on a
+		// socket is harmless (the error is discarded).
+		if t.closer != nil {
+			_ = t.closer.Close()
+		}
+	}
+	return len(targets)
+}
+
 func (sm *SessionManager) sessionPIDsLocked() []int32 {
 	pids := make([]int32, 0, len(sm.sessions))
 	for pid := range sm.sessions {

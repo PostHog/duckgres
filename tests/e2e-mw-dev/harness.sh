@@ -1662,6 +1662,100 @@ res_body() { # org
   printf '{"database_name":"%s","metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
 }
 
+# ---- per-user kill switch ---------------------------------------------------
+# Admin one-shot kill (controlplane/admin live.go + session_mgr
+# DestroySessionsForUser): POST /orgs/:id/users/:user/kill tears down ALL of a
+# user's live sessions + in-flight queries cluster-wide, while a DIFFERENT user's
+# concurrent query on the same org is untouched. Regression net would have caught
+# a kill that missed sessions (leak) or over-killed (hit the wrong user).
+user_kill_switch() { # org rootpw
+  org="$1"; pw="$2"; vic="e2ekilluser"; vicpw="e2e-$(openssl rand -hex 12)"
+  log "user kill switch on $org"
+  code="$(curl -s -o /tmp/ku_create -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"org_id\":\"$org\",\"username\":\"$vic\",\"password\":\"$vicpw\"}" "$API/api/v1/users")"
+  case "$code" in 200|201) ;; *) fail "user_kill_switch: create $vic -> HTTP $code: $(cat /tmp/ku_create)";; esac
+  # New-user auth is config-snapshot-driven; wait one poll before first login.
+  sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  vout="$(mktemp)"; vrc="$(mktemp)"; rout="$(mktemp)"; rrc="$(mktemp)"
+  # Victim's long query AND a root long query run concurrently (distinct users,
+  # distinct workers — MaxSessions=1). Only the victim's must die.
+  ( if pg_try "$org" "$vicpw" ducklake "$HEAVY_Q" "$vic" >"$vout" 2>&1; then echo 0 >"$vrc"; else echo 1 >"$vrc"; fi ) &
+  vpid=$!
+  ( if pg_try "$org" "$pw" ducklake "$HEAVY_Q" >"$rout" 2>&1; then echo 0 >"$rrc"; else echo 1 >"$rrc"; fi ) &
+  rpid=$!
+
+  # Wait until the victim's query is live in the admin /queries view.
+  a=0 seen=0
+  while [ "$a" -lt 40 ]; do
+    n="$(curl -fsS -H "$H" "$API/api/v1/queries?org=$org&user=$vic" 2>/dev/null | jq -r '.queries | length' 2>/dev/null || echo 0)"
+    [ "${n:-0}" -ge 1 ] && { seen=1; break; }
+    kill -0 "$vpid" 2>/dev/null || break
+    sleep 2; a=$((a + 1))
+  done
+  [ "$seen" = 1 ] || { kill "$vpid" "$rpid" 2>/dev/null || true; fail "user_kill_switch: victim query never appeared in /queries"; }
+  # Overlap proof: both queries must still be running at kill time, else the test
+  # measures nothing (false pass on a query that already finished).
+  kill -0 "$vpid" 2>/dev/null || fail "user_kill_switch: victim query finished before kill (raise HEAVY_Q row count)"
+
+  killed="$(api_post "$org" "users/$vic/kill" | jq -r '.killed')"
+  [ "${killed:-0}" -ge 1 ] || fail "user_kill_switch: kill reported killed=$killed (want >=1)"
+
+  wait "$vpid" 2>/dev/null || true
+  wait "$rpid" 2>/dev/null || true
+  [ "$(cat "$vrc")" = 1 ] \
+    || fail "user_kill_switch: victim query survived the kill: $(tr -d '\n' <"$vout" | tail -c 200)"
+  [ "$(cat "$rrc")" = 0 ] \
+    || fail "user_kill_switch: root (other user) query was wrongly killed: $(tr -d '\n' <"$rout" | tail -c 200)"
+  rn="$(tr -dc '0-9' <"$rout")"
+  [ "$rn" = "$HEAVY_EXPECT" ] || fail "user_kill_switch: root result=$rn want $HEAVY_EXPECT (kill corrupted an unrelated query)"
+
+  n="$(curl -fsS -H "$H" "$API/api/v1/queries?org=$org&user=$vic" | jq -r '.queries | length')"
+  [ "${n:-0}" = 0 ] || fail "user_kill_switch: victim still has $n live queries after kill"
+  rm -f "$vout" "$vrc" "$rout" "$rrc"
+  log "user kill switch OK on $org (victim torn down, root untouched)"
+}
+
+# ---- per-user disable/enable block ------------------------------------------
+# Admin persistent block (configstore disabled column + control.go/Flight auth):
+# POST /orgs/:id/users/:user/disable refuses the user's NEW connections at auth
+# time (distinct "disabled" error, not a password/transient error), while a
+# different user still connects; enable restores access. The block is effective
+# immediately because the disable handler reloads the snapshot cluster-wide (no
+# poll wait). Run on BOTH metadata backends since the flag is config-store-backed.
+user_disable_block() { # org rootpw
+  org="$1"; pw="$2"; vic="e2edisableuser"; vicpw="e2e-$(openssl rand -hex 12)"
+  log "user disable/enable block on $org"
+  code="$(curl -s -o /tmp/du_create -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"org_id\":\"$org\",\"username\":\"$vic\",\"password\":\"$vicpw\"}" "$API/api/v1/users")"
+  case "$code" in 200|201) ;; *) fail "user_disable_block: create $vic -> HTTP $code: $(cat /tmp/du_create)";; esac
+  sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  # Baseline: the victim connects fine while enabled (cold spawn tolerated).
+  out="$(pg_try "$org" "$vicpw" ducklake "SELECT 1" "$vic")"
+  [ "$out" = "1" ] || fail "user_disable_block: victim could not connect before disable: $out"
+
+  resp="$(api_post "$org" "users/$vic/disable")"
+  echo "$resp" | jq -e '.disabled == true' >/dev/null 2>&1 || fail "user_disable_block: disable response wrong: $resp"
+
+  # Now a NEW victim connection is refused with the disabled error. No settle
+  # needed — the disable handler reloaded the snapshot cluster-wide.
+  if out="$(pg_try "$org" "$vicpw" ducklake "SELECT 1" "$vic")"; then
+    fail "user_disable_block: disabled victim still connected (got '$out')"
+  fi
+  echo "$out" | grep -qi "disabled" || fail "user_disable_block: refusal was not a disabled error: $out"
+
+  # A different user (root) must be unaffected by the victim's block.
+  out="$(pg_try "$org" "$pw" ducklake "SELECT 1")"
+  [ "$out" = "1" ] || fail "user_disable_block: root wrongly blocked while $vic disabled: $out"
+
+  resp="$(api_post "$org" "users/$vic/enable")"
+  echo "$resp" | jq -e '.disabled == false' >/dev/null 2>&1 || fail "user_disable_block: enable response wrong: $resp"
+  out="$(pg_try "$org" "$vicpw" ducklake "SELECT 1" "$vic")"
+  [ "$out" = "1" ] || fail "user_disable_block: victim could not reconnect after enable: $out"
+  log "user disable/enable block OK on $org"
+}
+
 # ---- parallel lane machinery ------------------------------------------------
 # The assertions are grouped into per-org LANES that run concurrently: all
 # worker churn (kills, drains, cold spawns, TTL reaps) is org-scoped, so lanes
@@ -1880,6 +1974,13 @@ main() {
   # ---- admin /status per-org worker count is populated (not the old 0) ----
   admin_per_org_workers "$CNPG" "$cnpg_pw"
 
+  # ---- per-user kill switch + disable/enable block (cnpg stack is warm) ----
+  user_kill_switch   "$CNPG" "$cnpg_pw"
+  user_disable_block "$CNPG" "$cnpg_pw"
+  # The disabled flag is config-store-backed, so exercise the ext metadata
+  # backend too (CLAUDE.md: metadata-touching changes run on cnpg + ext).
+  user_disable_block "$EXT" "$ext_pw"
+
   # ---- connection-duration observability (any org; lanes already churned
   #      many connect/disconnects, so the disconnect log is warm) ----
   connection_duration_logged "$CNPG" "$cnpg_pw"
@@ -1899,7 +2000,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + connection-duration-logged + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
