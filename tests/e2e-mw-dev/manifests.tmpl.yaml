@@ -141,6 +141,9 @@ rules:
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch", "patch"]
   - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
     resources: ["secrets"]
     # list/watch needed by the CP's stranded-secret reconciler (the prod chart
     # Role grants them implicitly via the shared duckgres namespace; spelled
