@@ -17,7 +17,7 @@ const fs = (state: string, count: number): FleetStat => ({
 });
 
 describe("summarizeFleet", () => {
-  it("splits busy (hot) from idle (hot_idle) — never equal by construction", () => {
+  it("splits busy (hot) from idle (hot_idle) — distinct states, not derived from each other", () => {
     const s = summarizeFleet([fs("hot", 12), fs("hot_idle", 3), fs("spawning", 2)]);
     expect(s.busy).toBe(12);
     expect(s.idle).toBe(3);

@@ -21,9 +21,10 @@ export interface FleetSummary {
 
 // summarizeFleet folds the per-(image,state,binding) fleet rows into cluster
 // totals. busy and idle come from DISTINCT lifecycle states (`hot` vs
-// `hot_idle`) of the SAME source, so they can never be equal-by-construction —
-// the bug where idle was `hot - total_workers` (and total_workers was always 0,
-// so idle collapsed onto the hot count) cannot recur here.
+// `hot_idle`) of the SAME source. They may still coincide (e.g. 5 hot + 5
+// hot_idle), but they are no longer derived from each other — the bug where
+// idle was `hot - total_workers` (and total_workers was always 0, so idle
+// collapsed onto the hot count) cannot recur here.
 export function summarizeFleet(fleet: FleetStat[] | undefined): FleetSummary {
   const byState: Record<string, number> = {};
   let total = 0;

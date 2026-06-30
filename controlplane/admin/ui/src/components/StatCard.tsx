@@ -26,7 +26,7 @@ export function StatCard({
           ? "text-destructive"
           : "text-foreground";
   return (
-    <Card className="p-4">
+    <Card className="p-4" data-testid={`stat-${label}`}>
       <div className="flex items-start justify-between">
         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
         {icon && <span className="text-muted-foreground">{icon}</span>}

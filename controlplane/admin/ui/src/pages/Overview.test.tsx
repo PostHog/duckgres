@@ -29,11 +29,10 @@ function setup(fleet: FleetStat[], opts?: { sessions?: number; orgs?: number }) 
 
 const fs = (state: string, count: number): FleetStat => ({ image: "img", state, binding: "org_bound", count });
 
-// Find the StatCard whose uppercase label matches, return its element.
+// Find a StatCard by its stable data-testid (set in StatCard.tsx), so the test
+// isn't coupled to the card's Tailwind classes.
 function card(label: string): HTMLElement {
-  const labelEl = screen.getByText(label);
-  // StatCard root is the label's grandparent (label → flex row → Card).
-  return labelEl.closest(".p-4") as HTMLElement;
+  return screen.getByTestId(`stat-${label}`);
 }
 
 describe("Overview Workers card", () => {
