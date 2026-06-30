@@ -1018,6 +1018,80 @@ func TestK8sPoolTransitionToHotIdlePersistFailureStaysHot(t *testing.T) {
 	}
 }
 
+// ReleaseIdleHotWorkers parks Hot/0-session workers into hot_idle (so the
+// hot-idle TTL reaper can reclaim them) and leaves busy Hot workers untouched.
+// This is the drain-time release that prevents idle Hot workers from pinning
+// vCPU for the whole (possibly unbounded) drain wall.
+func TestK8sPoolReleaseIdleHotWorkersParksIdleSkipsBusy(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	mkHot := func(id int, sessions int) *ManagedWorker {
+		w := &ManagedWorker{ID: id, activeSessions: sessions, done: make(chan struct{})}
+		if err := w.SetSharedState(SharedWorkerState{
+			Lifecycle:  WorkerLifecycleHot,
+			Assignment: &WorkerAssignment{OrgID: "analytics"},
+		}); err != nil {
+			t.Fatalf("SetSharedState(%d): %v", id, err)
+		}
+		pool.workers[id] = w
+		return w
+	}
+
+	idle := mkHot(1, 0)
+	busy := mkHot(2, 1)
+	// A worker already in hot_idle must not be re-parked or counted.
+	alreadyIdle := &ManagedWorker{ID: 3, activeSessions: 0, done: make(chan struct{})}
+	if err := alreadyIdle.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleHotIdle,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState(3): %v", err)
+	}
+	pool.workers[3] = alreadyIdle
+
+	parked := pool.ReleaseIdleHotWorkers(LifecycleOriginDrainReleaseIdle)
+	if parked != 1 {
+		t.Fatalf("expected exactly 1 worker parked, got %d", parked)
+	}
+	if got := idle.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHotIdle {
+		t.Fatalf("idle Hot worker should be parked to hot_idle, got %q", got)
+	}
+	if got := busy.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHot {
+		t.Fatalf("busy worker must stay Hot, got %q", got)
+	}
+	if busy.activeSessions != 1 {
+		t.Fatalf("busy worker session count must be untouched, got %d", busy.activeSessions)
+	}
+	if got := alreadyIdle.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHotIdle {
+		t.Fatalf("already-idle worker should remain hot_idle, got %q", got)
+	}
+}
+
+// parkIdleHotWorker must NOT decrement the session count (unlike the
+// session-release callback TransitionToHotIdleIfNoSessions): it is a sweep over
+// already-idle workers, so a worker that has any session must be left alone.
+func TestK8sPoolParkIdleHotWorkerNoDecrement(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 7, activeSessions: 1, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	if pool.parkIdleHotWorker(worker.ID) {
+		t.Fatal("parkIdleHotWorker must not park a worker with an active session")
+	}
+	if worker.activeSessions != 1 {
+		t.Fatalf("parkIdleHotWorker must not decrement sessions, got %d", worker.activeSessions)
+	}
+	if got := worker.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHot {
+		t.Fatalf("busy worker must stay Hot, got %q", got)
+	}
+}
+
 // Regression for fix #4: when the durable Hot persist fails during activation,
 // ActivateReservedWorker must return an error and NOT advance the worker to Hot
 // (leaving a durable=activating / in-memory=Hot split the stuck reaper could

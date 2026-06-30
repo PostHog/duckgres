@@ -251,6 +251,10 @@ type OrgRouterInterface interface {
 	IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool)
 	IsMigratingForOrg(orgID string) bool
 	ShutdownAll()
+	// ReleaseIdleHotWorkers parks idle (zero-session) Hot workers into hot_idle
+	// at drain start so the TTL reaper reclaims them instead of letting them
+	// linger for the whole drain wait. Returns the number parked.
+	ReleaseIdleHotWorkers() int
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -1575,6 +1579,15 @@ func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
 	cp.stopAcceptingPGConnections()
 	if cp.flight != nil {
 		cp.flight.BeginDrain()
+	}
+	// Park idle (zero-session) Hot workers into hot_idle NOW, at drain start, so
+	// the hot-idle TTL reaper (or a peer-CP takeover) reclaims them during the
+	// drain wait below. Without this they linger for the entire — possibly
+	// unbounded — wait, because ShutdownAll (which cleans idle workers) runs only
+	// AFTER waitForDrain returns. No new sessions can land on them: PG accept is
+	// already closed and Flight is draining. Busy workers are untouched.
+	if cp.orgRouter != nil {
+		cp.orgRouter.ReleaseIdleHotWorkers()
 	}
 	if timeout > 0 {
 		slog.Info("Waiting for planned shutdown drain.", "timeout", timeout)
