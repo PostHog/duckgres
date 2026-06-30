@@ -30,37 +30,36 @@ it.
 
 ---
 
-## 2. Billable units — two raw metrics (cpu-seconds + memory-seconds)
+## 2. Metering model — two raw metrics
 
-✅ Ship **two raw, unweighted metrics** per org/period; **billing aggregates them
-externally** (applies the weighting/sum), so users see **one compute line item**.
-Per the pricing proposal:
-
-- `managed_warehouse_compute_cpu_seconds`
-- `managed_warehouse_compute_memory_seconds`
+We meter two raw numbers per connection, over the connection's full lifetime
+(connect → disconnect, idle-reap, or error):
 
 ```
-conn_secs      = connection wall-clock (connect → disconnect/reap/error/shutdown-close)
-cpu_seconds    = cores × ceil(conn_secs)        # vCPU-seconds
-memory_seconds = gib   × ceil(conn_secs)        # GiB-seconds
+managed_warehouse_compute_cpu_seconds    = vCPU × ceil(connection_seconds)   # vCPU-seconds
+managed_warehouse_compute_memory_seconds = GiB  × ceil(connection_seconds)   # GiB-seconds
 ```
 
-- `cores` = worker pod vCPU (WorkerProfile.CPU, millicores → cores)
-- `gib`   = worker pod RAM (WorkerProfile.Memory, bytes → GiB)
-- **Raw, not normalized.** No `R`, no `max()`, no dominant-resource collapse — we
-  emit cpu-seconds and memory-seconds separately and let billing weight/sum them.
-  duckgres stays a dumb meter; pricing policy lives in billing.
+- `vCPU` / `GiB` = the **provisioned** worker size (`WorkerProfile`), not measured
+  usage. Memory is provisioned in **GiB** (not GB) — keep that unit consistent in
+  billing.
+- The billing service applies the rates and sums. Shipping the two components raw
+  lets billing aggregate however it sees fit, and makes splitting out Endpoints
+  trivial (a tag or a parallel metric).
+- Rounded up to the whole second, once per connection.
+- Aggregated at org level.
 
-✅ **Rounding = ceil per connection** (one ceil of `conn_secs`, applied to both
-metrics, at connection end).
+Implementation note (doesn't change the model): to avoid truncation if a worker is
+ever sized in fractions, count internally in integer **millicore-seconds** /
+**MiB-seconds**; billing divides back to vCPU-/GiB-seconds.
 
 Worked examples:
 
-| worker pod  | conn   | ceil | cpu_seconds = cores×ceil | memory_seconds = gib×ceil |
-|-------------|--------|------|--------------------------|---------------------------|
-| 8cpu / 16Gi | 9.2s   | 10   | 80                       | 160                       |
-| 8cpu / 64Gi | 10.0s  | 10   | 80                       | 640                       |
-| 2cpu / 4Gi  | 0.3s   | 1    | 2                        | 4                         |
+| worker pod   | conn   | ceil | cpu_seconds | memory_seconds |
+|--------------|--------|------|-------------|----------------|
+| 8cpu / 16GiB | 9.2s   | 10   | 80          | 160            |
+| 8cpu / 64GiB | 10.0s  | 10   | 80          | 640            |
+| 2cpu / 4GiB  | 0.3s   | 1    | 2           | 4              |
 
 A connection holds exactly one worker pod for its whole life (one-session-per-
 worker). Warm-idle pool time *between* connections is held by no connection →
