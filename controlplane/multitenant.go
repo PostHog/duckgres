@@ -61,6 +61,10 @@ func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }
 
+func (a *orgRouterAdapter) ReleaseIdleHotWorkers() int {
+	return a.router.ReleaseIdleHotWorkers()
+}
+
 func (a *orgRouterAdapter) AllOrgStats() []admin.OrgStatus {
 	stacks := a.router.AllStacks()
 	stats := make([]admin.OrgStatus, 0, len(stacks))

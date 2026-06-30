@@ -380,6 +380,17 @@ func (tr *OrgRouter) ShutdownAll() {
 	}
 }
 
+// ReleaseIdleHotWorkers parks this CP's idle (zero-session) Hot workers into
+// hot_idle so the TTL reaper can reclaim them, instead of letting them linger
+// for the whole (possibly unbounded) drain wait. All workers live in the shared
+// pool; per-org reserved pools are slices of it. Returns the number parked.
+func (tr *OrgRouter) ReleaseIdleHotWorkers() int {
+	if tr.sharedPool == nil {
+		return 0
+	}
+	return tr.sharedPool.ReleaseIdleHotWorkers(LifecycleOriginDrainReleaseIdle)
+}
+
 func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {
 	stack, orgID, ok := tr.stackForWorker(workerID)
 	if !ok {

@@ -797,6 +797,20 @@ hot_idle_retired() { # org password catalog cpu memory
   fail "hot-idle retire: cpu=$cpu worker still present after ~4m (TTL=1m) — hot-idle reaper not retiring idle workers (the idle-leak regression)"
 }
 
+# NOTE — drain-time idle-Hot release (OrgRouter.ReleaseIdleHotWorkers, the #832
+# redesign): when a CP enters drain it now parks its idle (zero-session) Hot
+# workers into hot_idle at drain START, so the unfenced hot-idle TTL reaper
+# reclaims them during the (possibly unbounded) drain wait instead of leaving
+# them pinned until the CP is declared expired and the owner-expired-fenced
+# orphan reaper picks them up. This closes the stuck-Hot/0-session leak that
+# accumulated across CP rollout generations. It is NOT asserted directly in-Job:
+# doing so would require draining the live CP pod (whole-Job blast radius across
+# every org lane below) AND fault-injecting a stuck Hot/0-session worker, neither
+# deterministic here. The two ends ARE covered: the sweep selection (park idle
+# Hot, skip busy, no session decrement) by k8s_pool_test.go
+# (TestK8sPoolReleaseIdleHotWorkers*/ParkIdleHotWorker*), and the reaper
+# destination (hot_idle -> pod delete within TTL) by hot_idle_retired above.
+
 # ---- org default worker profile --------------------------------------------
 # Operators can give a tenant a server-side default worker shape + hot-idle TTL
 # (config-store columns default_worker_cpu/memory/ttl, set via the admin API).
