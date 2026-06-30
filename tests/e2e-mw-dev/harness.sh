@@ -1404,6 +1404,35 @@ admin_console_api() {
     || fail "/metrics/panels missing 'query_rate'"
 }
 
+# ---- admin: /status reports per-org worker counts --------------------------
+# OrgStatus.Workers (the Overview per-org load bars + total_workers) was an
+# always-0 dead field; it's now populated from each CP's OrgReservedPool
+# (cap-counting assigned workers, summed across replicas by the /status
+# fan-out). With a query in flight the org's worker is Hot, so /status must
+# report workers>=1 for that org and a nonzero cluster total_workers.
+admin_per_org_workers() { # org password
+  org="$1"; pw="$2"
+  log "admin: /status per-org worker count is populated on $org"
+  q="SELECT count(*) FROM range(2718281828) t(i) WHERE i % 2 = 0;"
+  out="$(mktemp)"
+  ( pg_try "$org" "$pw" ducklake "$q" >"$out" 2>&1 || true ) &
+  bg=$!
+  cleanup_pow() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
+
+  ok="" a=0
+  while [ "$a" -lt 60 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    w="$(curl -fsS -H "$H" "$API/api/v1/status" \
+      | jq -r --arg o "$org" '(.orgs[]? | select(.name==$o) | .workers) // 0')"
+    tot="$(curl -fsS -H "$H" "$API/api/v1/status" | jq -r '.total_workers // 0')"
+    if [ "${w:-0}" -ge 1 ] && [ "${tot:-0}" -ge 1 ]; then ok=1; break; fi
+    sleep 2; a=$((a + 1))
+  done
+  cleanup_pow
+  [ -n "$ok" ] || fail "admin_per_org_workers: /status never reported workers>=1 for $org (per-org worker count not populated)"
+  log "admin: /status per-org worker count OK (workers>=1, total_workers>=1) on $org"
+}
+
 # ---- admin RBAC: SSO viewer is read-only -----------------------------------
 # A forged ALB OIDC header (no internal secret) for an @posthog.com email that
 # is NOT in the operators table resolves to the viewer role (fail-closed
@@ -1727,6 +1756,9 @@ main() {
 
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
+
+  # ---- admin /status per-org worker count is populated (not the old 0) ----
+  admin_per_org_workers "$CNPG" "$cnpg_pw"
 
   # ---- connection-duration observability (any org; lanes already churned
   #      many connect/disconnects, so the disconnect log is warm) ----

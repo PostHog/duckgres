@@ -70,11 +70,18 @@ func (a *orgRouterAdapter) AllOrgStats() []admin.OrgStatus {
 	stats := make([]admin.OrgStatus, 0, len(stacks))
 	for name, stack := range stacks {
 		sessionCount := stack.Sessions.SessionCount()
-		stats = append(stats, admin.OrgStatus{
+		st := admin.OrgStatus{
 			Name:           name,
 			ActiveSessions: sessionCount,
 			MaxWorkers:     stack.Config.MaxWorkers,
-		})
+		}
+		// Workers this CP has assigned to the org (cap-counting; excludes
+		// hot-idle). Per-CP local view — the admin /status fan-out sums it
+		// across replicas (mergeOrgStats) for a cluster-wide per-org count.
+		if rp, ok := stack.Pool.(*OrgReservedPool); ok {
+			st.Workers = rp.WorkerCount()
+		}
+		stats = append(stats, st)
 		// Emit per-org Prometheus metrics
 		observeOrgSessionsActive(name, sessionCount)
 	}

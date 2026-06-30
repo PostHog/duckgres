@@ -274,6 +274,17 @@ func (p *OrgReservedPool) atOrgWorkerCap() bool {
 	return p.maxWorkers > 0 && p.assignedWorkerCountLocked() >= p.maxWorkers
 }
 
+// WorkerCount returns the number of workers this CP currently has assigned to
+// the org that count against MaxWorkers (hot-idle workers are excluded — they're
+// parked for reclaim and don't consume the cap budget, same as atOrgWorkerCap).
+// This is the per-CP local view; the admin layer sums it across replicas (a
+// worker is owned by exactly one CP) for the Overview per-org load bar.
+func (p *OrgReservedPool) WorkerCount() int {
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	return p.assignedWorkerCountLocked()
+}
+
 // tryReuseIdleAssigned returns an already-assigned, idle (Hot) worker of the
 // requested shape with its session count bumped, or nil if none is available.
 func (p *OrgReservedPool) tryReuseIdleAssigned(profile *WorkerProfile) *ManagedWorker {
