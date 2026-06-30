@@ -811,6 +811,19 @@ hot_idle_retired() { # org password catalog cpu memory
 # (TestK8sPoolReleaseIdleHotWorkers*/ParkIdleHotWorker*), and the reaper
 # destination (hot_idle -> pod delete within TTL) by hot_idle_retired above.
 
+# NOTE — the hot-idle TTL reaper now spares hot-idle workers that still back a
+# reclaimable (Active/Reconnecting) Flight session, mirroring the long-standing
+# exclusion in ListOrphanedWorkers (so a TTL reap can't kill a customer's query
+# at the moment they reconnect by session token). That sparing is a NEGATIVE
+# assertion over a multi-minute TTL window on a worker holding a live durable
+# Flight session — not deterministic to set up in-Job — so it is gated by the
+# real-Postgres regression test
+# TestListExpiredHotIdleWorkersSparesReclaimableFlightSessions
+# (tests/configstore/runtime_store_postgres_test.go), which asserts both the
+# global and per-CP reaper variants spare Active/Reconnecting sessions and still
+# reap workers with no session (or only a closed one). hot_idle_retired above
+# covers the positive (no Flight session -> reaped within TTL).
+
 # ---- org default worker profile --------------------------------------------
 # Operators can give a tenant a server-side default worker shape + hot-idle TTL
 # (config-store columns default_worker_cpu/memory/ttl, set via the admin API).

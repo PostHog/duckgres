@@ -1009,21 +1009,42 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID, image string
 // keying off it let a periodically-refreshed worker reset its own TTL forever.
 // Legacy rows with a NULL hot_idle_since fall back to updated_at so they still
 // expire. A worker's ttl_minutes governs it; 0 falls back to defaultTTL
-// (default/legacy and unassigned rows).
+// (default/legacy and unassigned rows). Workers still backing a reclaimable
+// Flight session are spared (see reclaimableFlightSessionGuard).
 func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
 	defMins := int64(defaultTTL.Minutes())
 	if defMins < 0 {
 		defMins = 0
 	}
 	var workers []WorkerRecord
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("state = ? AND COALESCE(hot_idle_since, updated_at) + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+	clause, args := cs.reclaimableFlightSessionGuard()
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())+" AS w").
+		Where("w.state = ? AND COALESCE(w.hot_idle_since, w.updated_at) + (CASE WHEN COALESCE(w.ttl_minutes, 0) > 0 THEN w.ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
 			WorkerStateHotIdle, defMins, now).
+		Where(clause, args...).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)
 	}
 	return workers, nil
+}
+
+// reclaimableFlightSessionGuard returns a correlated NOT-EXISTS clause (and its
+// args) that spares a worker row (aliased `w`) which still backs a reclaimable
+// Flight session (Active or Reconnecting). It mirrors the same exclusion in
+// ListOrphanedWorkers so the hot-idle TTL reaper does not retire a worker whose
+// customer is mid-reconnect by session token — a retire there would kill the
+// in-flight query at the moment they reconnect. Bounded by
+// ExpireFlightSessionRecords: once the session record is moved to a terminal
+// state, the worker is no longer protected.
+func (cs *ConfigStore) reclaimableFlightSessionGuard() (string, []any) {
+	flightTable := cs.runtimeTable((&FlightSessionRecord{}).TableName())
+	reclaimableSessionStates := []FlightSessionState{
+		FlightSessionStateActive,
+		FlightSessionStateReconnecting,
+	}
+	return "NOT EXISTS (SELECT 1 FROM " + flightTable + " AS f " +
+		"WHERE f.worker_id = w.worker_id AND f.state IN ?)", []any{reclaimableSessionStates}
 }
 
 // ListExpiredHotIdleWorkersForCP is the owner-scoped variant of
@@ -1039,9 +1060,11 @@ func (cs *ConfigStore) ListExpiredHotIdleWorkersForCP(ownerCPInstanceID string, 
 		defMins = 0
 	}
 	var workers []WorkerRecord
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("state = ? AND owner_cp_instance_id = ? AND COALESCE(hot_idle_since, updated_at) + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+	clause, args := cs.reclaimableFlightSessionGuard()
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())+" AS w").
+		Where("w.state = ? AND w.owner_cp_instance_id = ? AND COALESCE(w.hot_idle_since, w.updated_at) + (CASE WHEN COALESCE(w.ttl_minutes, 0) > 0 THEN w.ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
 			WorkerStateHotIdle, ownerCPInstanceID, defMins, now).
+		Where(clause, args...).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers for cp: %w", err)
