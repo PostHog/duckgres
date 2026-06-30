@@ -31,7 +31,8 @@ with a `Role`:
 - Otherwise the ALB-injected `X-Amzn-Oidc-Data` JWT (Cognito/Google) yields the
   caller's email (only `@posthog.com`, `email_verified != false`; otherwise
   treated as unauthenticated). The role is then resolved **per-request** from the
-  `operators` table in the config store (runtime schema): an `admin` row →
+  `duckgres_operators` table in the config schema (goose migration
+  `000006_create_operators.sql`): an `admin` row →
   **admin**, anything else (including no row) → **viewer**. Operators are managed
   by admins under **Admin → Operators** in the config-store explorer (and the
   `/api/v1/operators` API). The first SSO login auto-provisions a create-only

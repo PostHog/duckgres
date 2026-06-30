@@ -53,8 +53,10 @@ type OrgUser struct {
 func (OrgUser) TableName() string { return "duckgres_org_users" }
 
 // Operator is one admin-console operator and the role they resolve to. Rows
-// live in the control-plane runtime schema (CP-owned operational state, not
-// snapshot-backed tenant config) and are managed via the admin API's
+// are authoritative access-control data (losing them locks every operator out),
+// not rebuildable runtime state — so they live in the goose-migrated config
+// schema (see migration 000006_create_operators.sql), alongside the other
+// duckgres_-prefixed config tables, and are managed via the admin API's
 // Admin → Operators section. AuthMiddleware resolves each SSO request's role
 // from this table per-request (see admin.RoleResolver); the break-glass
 // internal-secret path is independent and always grants admin.
@@ -66,7 +68,7 @@ type Operator struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-func (Operator) TableName() string { return "operators" }
+func (Operator) TableName() string { return "duckgres_operators" }
 
 // OrgUserSecret is one customer-set persistent DuckDB secret, scoped to
 // (org, user) and replayed onto the user's worker at session creation. The

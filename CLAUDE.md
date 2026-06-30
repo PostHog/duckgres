@@ -322,8 +322,9 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   request to admin (valid `TokenSet` internal secret — service/break-glass) or to
   an SSO identity from the ALB `X-Amzn-Oidc-Data` JWT. The SSO email
   (`@posthog.com` + `email_verified != false`, else 401) is mapped to a role
-  **per-request** by a `RoleResolver` backed by the `operators` config-store table
-  (runtime schema) — `admin` row → admin, else viewer. Admins manage operators
+  **per-request** by a `RoleResolver` backed by the `duckgres_operators` config-schema
+  table (goose migration `000006_create_operators.sql`) — `admin` row → admin, else
+  viewer. Admins manage operators
   under **Admin → Operators** (`/api/v1/operators`); the first SSO login
   auto-provisions a create-only **viewer** row, and the first admin is minted by
   logging in over the break-glass internal token and patching that row to `admin`
@@ -343,9 +344,11 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   relay) and forwarded to `DUCKGRES_PROMETHEUS_URL`. Org-labelled panels keep
   slicing enforced.
 - **Env-only knobs**: `DUCKGRES_PROMETHEUS_URL` (read in
-  `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit` and
-  the `operators` table are AutoMigrated at startup (operational state, not
-  goose-migrated tenant config).
+  `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit` is
+  AutoMigrated at startup (operational state, not goose-migrated tenant config).
+  The `duckgres_operators` table is authoritative access-control data, so it lives
+  in the config schema via goose migration `000006_create_operators.sql`, not
+  AutoMigrate.
 - `ManagedSession.Username` is populated at session create so the console can
   slice live sessions/queries by user; keep it set on every create path.
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp

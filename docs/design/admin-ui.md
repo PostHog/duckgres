@@ -15,7 +15,7 @@ It extends the existing `controlplane/admin/` server — it is **not** a new ser
 |---|---|
 | Frontend | React + Vite + TypeScript + Tailwind + shadcn/ui; TanStack Query/Table; Recharts. Built to `dist/`, embedded via `go:embed`, served by the existing Gin admin server on `:8080`. |
 | Impersonation | Full read-write. Every statement audited with the admin's SSO identity. Mutating statements require an explicit client-side confirm. |
-| AuthZ | Two tiers — **viewer** (read/monitor) and **admin** (edit config store + impersonate). The ALB Cognito identity yields the caller's `@posthog.com` email; the role is resolved per-request from the `operators` config-store table (admins manage it under **Admin → Operators**; the first SSO login auto-provisions a create-only viewer row, and the first admin is minted by logging in over break-glass and patching that row to admin). The existing `TokenSet` (internal secret) remains the service-to-service / break-glass admin path. |
+| AuthZ | Two tiers — **viewer** (read/monitor) and **admin** (edit config store + impersonate). The ALB Cognito identity yields the caller's `@posthog.com` email; the role is resolved per-request from the `duckgres_operators` config-schema table (goose migration `000006_create_operators.sql`; admins manage it under **Admin → Operators**; the first SSO login auto-provisions a create-only viewer row, and the first admin is minted by logging in over break-glass and patching that row to admin). The existing `TokenSet` (internal secret) remains the service-to-service / break-glass admin path. |
 | Metrics | Live "now" view from in-memory CP state; time-series trends (error/success/duration per org) from the in-cluster Prometheus via a backend proxy. Native Recharts, no Grafana embed. |
 | Exposure | Internal-scheme AWS ALB Ingress + Cognito (the Grafana pattern already in `posthog-mw-prod-us`), behind the Tailscale subnet router. Host under `*.mw-prod-us.posthog.dev`. Dev (`mw-dev`) first, then prod-us. |
 
@@ -67,7 +67,8 @@ the proxy is not an open PromQL relay. Org-labelled metrics we expose:
 - `AuthMiddleware`: decode `x-amzn-oidc-data` (ALB-signed JWT; verify via the ALB public
   key endpoint, cache keys — hardening follow-up) → email. Only `@posthog.com` +
   `email_verified != false` is accepted, else 401. The role is resolved per-request from
-  the `operators` config-store table (runtime schema): an `admin` row → `admin`, else
+  the `duckgres_operators` config-schema table (goose migration
+  `000006_create_operators.sql`): an `admin` row → `admin`, else
   (including no row) → `viewer`. Admins manage operators under **Admin → Operators**
   (`/api/v1/operators`, admin-only, with a last-admin guard); the first SSO login
   auto-provisions a create-only viewer row, and the first admin is minted by logging in

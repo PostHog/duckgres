@@ -24,13 +24,6 @@ func validOperatorRole(role string) bool {
 	return role == operatorRoleAdmin || role == operatorRoleViewer
 }
 
-// operatorsTable returns the schema-qualified operators table name. Operators
-// live in the CP runtime schema (operational state), so reads/writes must be
-// schema-qualified the same way the other runtime-table accessors are.
-func (cs *ConfigStore) operatorsTable() string {
-	return cs.runtimeTable((Operator{}).TableName())
-}
-
 // OperatorRole returns the role for an operator email, case-insensitively.
 // Returns "" (and no error) when the email has no operator row — callers treat
 // "no row" as "not an operator" (which resolves to viewer at the auth layer).
@@ -40,7 +33,7 @@ func (cs *ConfigStore) OperatorRole(email string) (string, error) {
 		return "", nil
 	}
 	var op Operator
-	err := cs.db.Table(cs.operatorsTable()).Where("email = ?", email).Take(&op).Error
+	err := cs.db.Model(&Operator{}).Where("email = ?", email).Take(&op).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return "", nil
@@ -53,7 +46,7 @@ func (cs *ConfigStore) OperatorRole(email string) (string, error) {
 // ListOperators returns all operators ordered by email.
 func (cs *ConfigStore) ListOperators() ([]Operator, error) {
 	var ops []Operator
-	if err := cs.db.Table(cs.operatorsTable()).Order("email ASC").Find(&ops).Error; err != nil {
+	if err := cs.db.Model(&Operator{}).Order("email ASC").Find(&ops).Error; err != nil {
 		return nil, fmt.Errorf("list operators: %w", err)
 	}
 	return ops, nil
@@ -78,7 +71,7 @@ func (cs *ConfigStore) UpsertOperator(email, role, addedBy string) error {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	err := cs.db.Table(cs.operatorsTable()).Clauses(clause.OnConflict{
+	err := cs.db.Model(&Operator{}).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
 		DoUpdates: clause.AssignmentColumns([]string{"role", "added_by", "updated_at"}),
 	}).Create(&op).Error
@@ -92,7 +85,7 @@ func (cs *ConfigStore) UpsertOperator(email, role, addedBy string) error {
 // whether a row was deleted. Deleting a missing operator is not an error.
 func (cs *ConfigStore) DeleteOperator(email string) (bool, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
-	result := cs.db.Table(cs.operatorsTable()).Where("email = ?", email).Delete(&Operator{})
+	result := cs.db.Model(&Operator{}).Where("email = ?", email).Delete(&Operator{})
 	if result.Error != nil {
 		return false, fmt.Errorf("delete operator: %w", result.Error)
 	}
@@ -103,7 +96,7 @@ func (cs *ConfigStore) DeleteOperator(email string) (bool, error) {
 // last-admin guard so the admin role can never be fully removed from the table.
 func (cs *ConfigStore) CountAdmins() (int64, error) {
 	var count int64
-	if err := cs.db.Table(cs.operatorsTable()).Where("role = ?", operatorRoleAdmin).Count(&count).Error; err != nil {
+	if err := cs.db.Model(&Operator{}).Where("role = ?", operatorRoleAdmin).Count(&count).Error; err != nil {
 		return 0, fmt.Errorf("count admins: %w", err)
 	}
 	return count, nil
@@ -129,7 +122,7 @@ func (cs *ConfigStore) SeedOperator(email, role string) error {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	err := cs.db.Table(cs.operatorsTable()).Clauses(clause.OnConflict{
+	err := cs.db.Model(&Operator{}).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
 		DoNothing: true,
 	}).Create(&op).Error
