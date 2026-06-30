@@ -1323,6 +1323,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Create real clientConn with FlightExecutor and worker assignment
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
+	// Record the connection's full lifetime exactly once, on every exit path
+	// (clean disconnect, message-loop error, or handshake-completion failure):
+	// bumps duckgres_connection_duration_seconds (per org) and logs duration_ms.
+	defer func() {
+		dur := server.CloseConnectionMetrics(cc)
+		clog.Info("Client disconnected.", "duration_ms", dur.Milliseconds())
+	}()
 	if cp.orgRouter != nil && orgID != "" {
 		if icebergCfg, ok := cp.orgRouter.IcebergConfigForOrg(orgID); ok {
 			server.SetConnectionIcebergConfig(cc, icebergCfg)
@@ -1351,13 +1358,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Run message loop
+	// Run message loop. Disconnect log + duration histogram are emitted by the
+	// deferred CloseConnectionMetrics above on every return path.
 	if err := server.RunMessageLoop(cc); err != nil {
 		clog.Error("Message loop error.", "error", err)
 		return
 	}
-
-	clog.Info("Client disconnected.")
 }
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker

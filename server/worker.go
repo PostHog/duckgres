@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server/auth"
+	"github.com/posthog/duckgres/server/observe"
 )
 
 // Exit codes for child processes
@@ -369,6 +370,12 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	// In process isolation mode each child only sees itself.
 	srv.registerConn(clientConn)
 
+	// Record the connection's full lifetime once on exit (orgID is empty in the
+	// single-host process-isolation backend; the histogram still aggregates).
+	defer func() {
+		observe.ObserveConnectionDuration(clientConn.orgID, time.Since(clientConn.backendStart).Seconds())
+	}()
+
 	// Ensure cleanup on exit
 	defer func() {
 		if clientConn.executor != nil {
@@ -404,7 +411,8 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 			slog.Error("Message loop error", "error", err)
 			return ExitError
 		}
-		slog.Info("Client disconnected cleanly", "user", username, "remote_addr", cfg.RemoteAddr)
+		slog.Info("Client disconnected cleanly", "user", username, "remote_addr", cfg.RemoteAddr,
+			"duration_ms", time.Since(clientConn.backendStart).Milliseconds())
 		return ExitSuccess
 
 	case <-shutdownCtx.Done():
