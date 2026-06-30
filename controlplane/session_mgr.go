@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"go.opentelemetry.io/otel/attribute"
@@ -65,6 +66,8 @@ type SessionManager struct {
 	activeSlots    int
 	waiters        []*connectionWaiter
 	limiter        connectionLimiter
+	resourceLimits func(username string) configstore.OrgResourceLimits
+	requestedVCPUs func(profile *WorkerProfile) (int, error)
 
 	// userSecretLoader returns the user's persistent CREATE SECRET statements
 	// (decrypted) to replay on a worker at session creation. nil outside the
@@ -75,6 +78,10 @@ type SessionManager struct {
 
 type flightReconnectPool interface {
 	ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error)
+}
+
+type flightReconnectProfileProvider interface {
+	ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error)
 }
 
 type connectionWaiter struct {
@@ -130,31 +137,66 @@ func (sm *SessionManager) SetConnectionLimiter(limiter connectionLimiter) {
 	sm.limiter = limiter
 }
 
+// SetResourceLimitsProvider installs the dynamic org/user resource-limit lookup
+// used by the runtime limiter. The callback must be safe for concurrent use.
+func (sm *SessionManager) SetResourceLimitsProvider(fn func(username string) configstore.OrgResourceLimits) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.resourceLimits = fn
+}
+
+// SetRequestedVCPUsResolver installs the worker-profile-to-vCPU resolver used
+// for resource admission. nil means every session costs one vCPU.
+func (sm *SessionManager) SetRequestedVCPUsResolver(fn func(profile *WorkerProfile) (int, error)) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.requestedVCPUs = fn
+}
+
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
 	return sm.nextPID.Add(1)
 }
 
 func (sm *SessionManager) acquireSlot(ctx context.Context) error {
-	_, err := sm.acquireConnectionSlot(ctx, 0, "postgres")
+	_, err := sm.acquireConnectionSlot(ctx, 0, "", "postgres", nil)
 	return err
 }
 
-func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, protocol string) (connectionLease, error) {
+func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, username string, protocol string, profile *WorkerProfile) (connectionLease, error) {
 	sm.mu.Lock()
 	if sm.lifecycle.isClosed() {
 		sm.mu.Unlock()
 		return nil, ErrSessionManagerDraining
 	}
 	limiter := sm.limiter
+	resourceLimits := sm.resourceLimits
+	requestedVCPUs := sm.requestedVCPUs
 	sm.mu.Unlock()
 	if limiter != nil {
-		maxConnections := func() int {
-			sm.mu.RLock()
-			defer sm.mu.RUnlock()
-			return sm.maxConnections
+		vcpus := 1
+		if requestedVCPUs != nil {
+			var err error
+			vcpus, err = requestedVCPUs(profile)
+			if err != nil {
+				return nil, err
+			}
 		}
-		lease, err := limiter.Acquire(ctx, pid, protocol, maxConnections)
+		if vcpus <= 0 {
+			return nil, fmt.Errorf("requested vcpus must be positive, got %d", vcpus)
+		}
+		limits := func(user string) configstore.OrgResourceLimits {
+			if resourceLimits == nil {
+				return configstore.OrgResourceLimits{}
+			}
+			return resourceLimits(user)
+		}
+		lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+			PID:            pid,
+			Username:       username,
+			Protocol:       protocol,
+			RequestedVCPUs: vcpus,
+		}, limits)
 		if err != nil {
 			return nil, err
 		}
@@ -267,7 +309,10 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 	}
 	defer endCreation()
 
-	lease, err := sm.acquireConnectionSlot(ctx, pid, protocol)
+	if protocol == "flight" && pid == 0 {
+		pid = sm.ReservePID()
+	}
+	lease, err := sm.acquireConnectionSlot(ctx, pid, username, protocol, profile)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -419,7 +464,16 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	}
 	defer endCreation()
 
-	lease, err := sm.acquireConnectionSlot(ctx, 0, "flight")
+	var profile *WorkerProfile
+	if provider, ok := sm.pool.(flightReconnectProfileProvider); ok {
+		profile, err = provider.ReconnectFlightWorkerProfile(ctx, workerID, ownerEpoch)
+		if err != nil {
+			return 0, nil, fmt.Errorf("resolve reconnect worker profile %d: %w", workerID, err)
+		}
+	}
+
+	pid := sm.ReservePID()
+	lease, err := sm.acquireConnectionSlot(ctx, pid, username, "flight", profile)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -438,7 +492,7 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	if err != nil {
 		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
 	}
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false, lease)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, "", 0, worker, "flight", false, lease)
 	if err != nil {
 		// ReconnectFlightWorker pre-claimed the session on the worker; undo
 		// the claim so the worker parks hot-idle instead of looking busy

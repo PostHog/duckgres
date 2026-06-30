@@ -476,6 +476,11 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 }
 
 func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error) {
+	profile, err := p.ReconnectFlightWorkerProfile(ctx, workerID, ownerEpoch)
+	if err != nil {
+		return nil, fmt.Errorf("resolve reconnect worker profile %d: %w", workerID, err)
+	}
+
 	p.shared.mu.RLock()
 	maxWorkers := p.maxWorkers
 	image := p.image
@@ -485,6 +490,7 @@ func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID in
 		OrgID:      p.orgID,
 		MaxWorkers: maxWorkers,
 		Image:      image,
+		Profile:    profile,
 	})
 	if err != nil {
 		return nil, err
@@ -496,7 +502,7 @@ func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID in
 	// activeSessions==0 — findIdleAssignedWorkerLocked then co-assigns the
 	// org's next connection onto it, the worker-side MaxSessions=1 cap
 	// rejects that, and the cap-drift recovery retires the worker out from
-	// under the live reconnected query (ShutdownAll's active-session
+	// under the live reconnected session (ShutdownAll's active-session
 	// preservation also wouldn't protect it).
 	p.shared.mu.Lock()
 	worker.claimSessionLocked()
@@ -507,6 +513,28 @@ func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID in
 		return nil, err
 	}
 	return worker, nil
+}
+
+func (p *OrgReservedPool) ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if p == nil || p.shared == nil || p.shared.runtimeStore == nil {
+		return nil, nil
+	}
+	record, err := p.shared.runtimeStore.GetWorkerRecord(workerID)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil {
+		return nil, nil
+	}
+	if record.ProfileCPU == "" && record.ProfileMemory == "" {
+		return nil, nil
+	}
+	return &WorkerProfile{CPU: record.ProfileCPU, Memory: record.ProfileMemory}, nil
 }
 
 func (p *OrgReservedPool) activateReservedWorkerDefault(_ context.Context, _ *ManagedWorker) error {
