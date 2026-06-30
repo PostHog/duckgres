@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
@@ -40,5 +41,15 @@ export default defineConfig({
       "/login": { target: proxyTarget, changeOrigin: true },
       "/health": { target: proxyTarget, changeOrigin: true },
     },
+  },
+  test: {
+    // jsdom + jest-dom so the same setup supports both pure-function tests and
+    // future component tests. globals lets tests use describe/it/expect without
+    // imports. Only test files under src/ are collected (node_modules excluded).
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test/setup.ts"],
+    include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    css: false,
   },
 });

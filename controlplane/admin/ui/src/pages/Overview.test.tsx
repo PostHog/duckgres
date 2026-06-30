@@ -1,0 +1,64 @@
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import { render, screen, within } from "@testing-library/react";
+import type { FleetStat } from "@/types/api";
+
+// Mock the data hooks so we can render Overview with controlled fleet/status and
+// assert the derived UI directly — this is the render-level guard for the
+// worker-count regressions (the pure math is covered in lib/fleet.test.ts).
+const hooks = vi.hoisted(() => ({
+  useClusterStatus: vi.fn(),
+  useFleet: vi.fn(),
+  useModel: vi.fn(),
+  useMetricRange: vi.fn(),
+}));
+
+vi.mock("@/hooks/useApi", () => hooks);
+
+import { Overview } from "./Overview";
+
+const ok = <T,>(data: T) => ({ data, isSuccess: true, isLoading: false, isError: false });
+
+function setup(fleet: FleetStat[], opts?: { sessions?: number; orgs?: number }) {
+  hooks.useFleet.mockReturnValue(ok(fleet));
+  hooks.useClusterStatus.mockReturnValue(
+    ok({ total_orgs: opts?.orgs ?? 11, total_sessions: opts?.sessions ?? 0, total_workers: 0, orgs: [] }),
+  );
+  hooks.useModel.mockReturnValue(ok({ rows: [] }));
+  hooks.useMetricRange.mockReturnValue(ok(undefined));
+}
+
+const fs = (state: string, count: number): FleetStat => ({ image: "img", state, binding: "org_bound", count });
+
+// Find the StatCard whose uppercase label matches, return its element.
+function card(label: string): HTMLElement {
+  const labelEl = screen.getByText(label);
+  // StatCard root is the label's grandparent (label → flex row → Card).
+  return labelEl.closest(".p-4") as HTMLElement;
+}
+
+describe("Overview Workers card", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  // Regression for the prod screenshot: 150 hot workers, 150 sessions, 0
+  // hot_idle. Must read "150 hot · 0 idle" and NOT show the leak warning.
+  it("shows busy/idle from distinct states and no false leak warning", () => {
+    setup([fs("hot", 150)], { sessions: 150 });
+    render(<Overview />);
+
+    const workers = card("Workers");
+    expect(within(workers).getByText("150")).toBeInTheDocument();
+    expect(within(workers).getByText("150 hot · 0 idle")).toBeInTheDocument();
+
+    // The "not holding a session" / hot-idle leak warning must be absent.
+    expect(screen.queryByText(/parked/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/reserving vCPU/i)).not.toBeInTheDocument();
+  });
+
+  it("raises the leak warning only when hot_idle is genuinely high", () => {
+    setup([fs("hot", 4), fs("hot_idle", 25)], { sessions: 4 });
+    render(<Overview />);
+
+    expect(within(card("Workers")).getByText("4 hot · 25 idle")).toBeInTheDocument();
+    expect(screen.getByText(/reserving vCPU/i)).toBeInTheDocument();
+  });
+});

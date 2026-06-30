@@ -128,8 +128,18 @@ embedded, under Vite, or under the Go devserver.
 
 ## Tests
 
-`authz_test.go` (SSO role mapping, RoleGate, SQL classifier), `dashboard_test.go`
-(TokenSet / break-glass login / cookie), `api_test.go` + `api_postgres_test.go`
-(CRUD), `models_api_test.go` (redaction). e2e: the `admin_*` /
-`impersonation_*` / `models_explorer_api` assertions in
+**Backend:** `authz_test.go` (SSO role mapping, RoleGate, SQL classifier),
+`dashboard_test.go` (TokenSet / break-glass login / cookie), `api_test.go` +
+`api_postgres_test.go` (CRUD), `models_api_test.go` (redaction). e2e: the
+`admin_*` / `impersonation_*` / `models_explorer_api` assertions in
 `tests/e2e-mw-dev/harness.sh`.
+
+**Frontend** (`ui/`, Vitest + Testing Library — `just ui-test`, CI job
+`ui-tests`): the dashboard's data-derivation logic has shipped wrong more than
+once (worker hot/idle counts; a leak warning firing while every worker was
+busy), so that math lives in pure, unit-tested modules (`src/lib/*.ts`) instead
+of inline JSX. `src/lib/fleet.test.ts` pins the worker-fleet/load math
+(busy=`hot` vs idle=`hot_idle`, the leak threshold, per-org load %);
+`src/pages/Overview.test.tsx` renders the page with mocked hooks and asserts the
+Workers card + leak warning. New derivation/display logic on a page **must** get
+a `*.test.ts(x)` here — keep computed values out of the JSX so they're testable.
