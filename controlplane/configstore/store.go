@@ -682,6 +682,49 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 			return err
 		}
 	}
+
+	if err := ensureWorkerIDSequence(db, runtimeSchema); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureWorkerIDSequence creates the global worker-id sequence that
+// CreateSpawningWorkerSlot allocates from. It replaces the old
+// SELECT MAX(worker_id)+1 allocation, which was only serialized by a PER-ORG
+// advisory lock while worker_id is a GLOBAL primary key: two concurrent spawns
+// for DIFFERENT orgs (or with an empty org) read the same MAX and inserted the
+// same id, colliding on worker_records_pkey (SQLSTATE 23505). nextval() is
+// globally atomic, so it removes that race entirely.
+//
+// The sequence is seeded ONCE, just above the highest existing worker_id, and
+// deliberately NOT re-seeded on later startups: a re-seed could race a
+// concurrent nextval on a peer CP and move the sequence backward, reintroducing
+// the very collision it replaces. CREATE SEQUENCE IF NOT EXISTS makes a
+// concurrent first-startup create a no-op for the loser. Sequences are
+// non-transactional, so a rolled-back CreateSpawningWorkerSlot leaves an unused
+// id — gaps are fine; only uniqueness matters.
+func ensureWorkerIDSequence(db *gorm.DB, runtimeSchema string) error {
+	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
+	seq := qs + `.worker_records_id_seq`
+
+	var exists bool
+	if err := db.Raw(`SELECT to_regclass(?) IS NOT NULL`, runtimeSchema+".worker_records_id_seq").Scan(&exists).Error; err != nil {
+		return fmt.Errorf("probe worker id sequence: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	var start int64
+	if err := db.Raw(`SELECT COALESCE(MAX(worker_id), 0) + 1 FROM ` + qs + `.worker_records`).Scan(&start).Error; err != nil {
+		return fmt.Errorf("seed worker id sequence: %w", err)
+	}
+	// START WITH is an integer literal (no user input); IF NOT EXISTS handles a
+	// concurrent peer creating it first (its START WITH wins, ours no-ops).
+	if err := db.Exec(fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s AS BIGINT START WITH %d", seq, start)).Error; err != nil {
+		return fmt.Errorf("create worker id sequence: %w", err)
+	}
 	return nil
 }
 
@@ -1373,8 +1416,13 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 			}
 		}
 
+		// Allocate the worker_id from the global sequence (nextval is atomic
+		// across orgs and CPs). The old SELECT MAX(worker_id)+1 was only
+		// serialized by the per-org advisory lock above, so two concurrent
+		// spawns for different orgs picked the same id and collided on
+		// worker_records_pkey. See ensureWorkerIDSequence.
 		var workerID int64
-		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+		if err := tx.Raw("SELECT nextval(?::regclass)", cs.runtimeTable("worker_records_id_seq")).Scan(&workerID).Error; err != nil {
 			return err
 		}
 		now := time.Now()
