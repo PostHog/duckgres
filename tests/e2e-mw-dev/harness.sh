@@ -378,7 +378,9 @@ connection_duration_logged() { # org password
   for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
     # logfmt: `... msg="Client disconnected." ... duration_ms=NN`. Take the max
     # duration_ms seen on a disconnect line in the recent window across replicas.
-    m="$(k logs "$p" --since=180s 2>/dev/null \
+    logs="$(k logs "$p" --since=180s 2>&1)" \
+      || fail "kubectl logs failed for control-plane pod $p while checking duration_ms: $logs"
+    m="$(printf '%s\n' "$logs" \
           | grep 'Client disconnected.' \
           | grep -oE 'duration_ms=[0-9]+' \
           | grep -oE '[0-9]+' \
