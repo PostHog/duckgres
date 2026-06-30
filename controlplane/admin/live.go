@@ -54,13 +54,25 @@ type LiveInfo interface {
 }
 
 // registerLiveAPI wires the live-state read endpoints + the session-kill action.
-func registerLiveAPI(r *gin.RouterGroup, live LiveInfo) {
+// fetcher (may be nil) aggregates per-CP in-memory state across replicas.
+func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher) {
 	if live == nil {
 		return
 	}
 	r.GET("/queries", func(c *gin.Context) {
 		queries := live.RunningQueries()
-		// Optional org/user slicing.
+		responders, total := 1, 1
+		// Aggregate every other CP's in-memory view (a query lives on exactly
+		// one CP, so the union is disjoint — concatenate, no dedup).
+		if !localScope(c) && fetcher != nil {
+			bodies, peers := fetcher.FetchPeers(c.Request.Context(), "/api/v1/queries")
+			type env struct {
+				Queries []QueryStatus `json:"queries"`
+			}
+			responders += mergePeer(&queries, bodies, func(e env) []QueryStatus { return e.Queries })
+			total += peers
+		}
+		// Optional org/user slicing (applied AFTER the merge).
 		org, user := c.Query("org"), c.Query("user")
 		if org != "" || user != "" {
 			filtered := queries[:0:0]
@@ -75,7 +87,7 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo) {
 			}
 			queries = filtered
 		}
-		c.JSON(http.StatusOK, gin.H{"queries": queries})
+		c.JSON(http.StatusOK, gin.H{"queries": queries, "cp_responders": responders, "cp_total": total})
 	})
 
 	r.GET("/workers/fleet", func(c *gin.Context) {

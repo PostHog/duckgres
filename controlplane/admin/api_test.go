@@ -213,7 +213,7 @@ func copyOrg(org *configstore.Org) *configstore.Org {
 func newTestAPIRouter(store apiStore) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	registerAPIWithStore(r.Group("/api/v1"), store, nil)
+	registerAPIWithStore(r.Group("/api/v1"), store, nil, nil)
 	return r
 }
 

@@ -15,6 +15,7 @@ type Extras struct {
 	Impersonator Impersonator
 	Audit        *AuditStore
 	Metrics      *MetricsProxy
+	Fetcher      PeerFetcher // cross-CP live-state aggregation (nil = single-CP)
 }
 
 // RegisterExtras wires the additional endpoints onto the authenticated /api/v1
@@ -22,7 +23,7 @@ type Extras struct {
 // individual handlers re-check where needed (impersonation).
 func RegisterExtras(r *gin.RouterGroup, x Extras) {
 	r.GET("/me", meHandler)
-	registerLiveAPI(r, x.Live)
+	registerLiveAPI(r, x.Live, x.Fetcher)
 	if x.Store != nil {
 		registerUserSecretsAPI(r, x.Store)
 	}
