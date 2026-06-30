@@ -65,6 +65,7 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | Metric | Type | Description |
 |--------|------|-------------|
 | `duckgres_connections_open` | Gauge | Number of currently open client connections |
+| `duckgres_connection_duration_seconds{org}` | Histogram | Client connection lifetime, accept→disconnect (includes `_count`, `_sum`, `_bucket`); `_sum` is exact total connection-seconds (per org) with no scrape-integral bias. The disconnect log also carries `duration_ms` |
 | `duckgres_query_total{org,outcome}` | Counter | Total number of non-empty query attempts by terminal outcome (`success`, `error`, `canceled`) |
 | `duckgres_query_duration_seconds{org}` | Histogram | Simple/extended query execution latency (includes `_count`, `_sum`, `_bucket`); use `duckgres_query_total` for attempt totals |
 | `duckgres_auth_failures_total` | Counter | Total number of authentication failures |

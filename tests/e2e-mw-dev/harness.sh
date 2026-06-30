@@ -358,6 +358,37 @@ malformed_startup_resilience() { # org password
   [ "$v" = "1" ] || fail "CP stopped serving after malformed startup (got '$v')"
 }
 
+# Connection lifetime is recorded at disconnect: the CP's per-connection teardown
+# (control.go defer -> server.CloseConnectionMetrics) bumps the per-org
+# duckgres_connection_duration_seconds histogram AND stamps duration_ms on the
+# "Client disconnected." log. The histogram is the load-bearing series (its _sum
+# gives exact total connection-seconds with no scrape-integral bias), but the
+# :9090 metrics port is NetworkPolicy-blocked from this in-cluster Job and the
+# CP image ships no HTTP client to self-scrape — so we assert the log field,
+# which is emitted by the SAME teardown call that records the histogram. A
+# positive duration_ms proves real elapsed time was measured (guards an
+# always-zero / unset-backendStart regression).
+connection_duration_logged() { # org password
+  log "connection duration_ms stamped on disconnect for $1"
+  # psql opens and closes exactly one connection per call → a fresh disconnect.
+  v="$(pg "$1" "$2" ducklake 'SELECT 1')"
+  [ "$v" = "1" ] || fail "warmup query for duration assertion returned '$v'"
+  sleep 3 # let the disconnect log flush
+  ms=""
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    # logfmt: `... msg="Client disconnected." ... duration_ms=NN`. Take the max
+    # duration_ms seen on a disconnect line in the recent window across replicas.
+    m="$(k logs "$p" --since=180s 2>/dev/null \
+          | grep 'Client disconnected.' \
+          | grep -oE 'duration_ms=[0-9]+' \
+          | grep -oE '[0-9]+' \
+          | sort -nr | head -1)"
+    if [ -n "$m" ] && { [ -z "$ms" ] || [ "$m" -gt "$ms" ]; }; then ms="$m"; fi
+  done
+  [ -n "$ms" ] || fail "no 'Client disconnected.' log carrying duration_ms in last 180s (CP not recording connection lifetime)"
+  [ "$ms" -gt 0 ] || fail "disconnect duration_ms is $ms (want > 0 — backendStart not honoured?)"
+}
+
 # jsonb || must keep Postgres concatenation semantics through the full CP
 # transpile → worker DuckDB execute path (regression for #716: the transpiler
 # used to rewrite it to json_merge_patch, which REPLACED arrays instead of
@@ -1669,6 +1700,10 @@ main() {
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
 
+  # ---- connection-duration observability (any org; lanes already churned
+  #      many connect/disconnects, so the disconnect log is warm) ----
+  connection_duration_logged "$CNPG" "$cnpg_pw"
+
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
 
@@ -1681,7 +1716,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + connection-duration-logged + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

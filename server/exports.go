@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/wire"
 )
@@ -148,6 +149,17 @@ func RunMessageLoop(cc *clientConn) error {
 	cc.server.registerConn(cc)
 	defer cc.server.unregisterConn(cc.pid)
 	return cc.messageLoop()
+}
+
+// CloseConnectionMetrics records the completed connection's lifetime in the
+// duckgres_connection_duration_seconds histogram (per org) and returns the
+// elapsed duration so the caller can log it. Call exactly once per connection
+// at teardown. backendStart is always set in NewClientConn, so the duration is
+// always meaningful for control-plane connections.
+func CloseConnectionMetrics(cc *clientConn) time.Duration {
+	d := time.Since(cc.backendStart)
+	observe.ObserveConnectionDuration(cc.orgID, d.Seconds())
+	return d
 }
 
 // InitMinimalServer initializes a Server struct with minimal fields for use
