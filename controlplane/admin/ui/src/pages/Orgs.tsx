@@ -57,6 +57,14 @@ export function Orgs() {
         },
       },
       {
+        accessorKey: "max_vcpus",
+        header: "Max vCPUs",
+        cell: ({ getValue }) => {
+          const v = getValue() as number;
+          return <span className="tabular-nums">{v === 0 ? "∞" : fmtInt(v)}</span>;
+        },
+      },
+      {
         id: "users",
         header: "Users",
         accessorFn: (o) => o.users?.length ?? 0,

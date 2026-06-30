@@ -34,6 +34,7 @@ import type { ManagedWarehouse, OrgUpdate } from "@/types/api";
 interface FormState {
   max_workers: string;
   max_connections: string;
+  max_vcpus: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -44,6 +45,7 @@ interface FormState {
 function orgToForm(o: {
   max_workers: number;
   max_connections: number;
+  max_vcpus: number;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -53,6 +55,7 @@ function orgToForm(o: {
   return {
     max_workers: String(o.max_workers),
     max_connections: String(o.max_connections),
+    max_vcpus: String(o.max_vcpus),
     default_worker_cpu: o.default_worker_cpu,
     default_worker_memory: o.default_worker_memory,
     default_worker_ttl: o.default_worker_ttl,
@@ -103,6 +106,7 @@ export function OrgDetail() {
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
       max_connections: Number(form.max_connections) || 0,
+      max_vcpus: Number(form.max_vcpus) || 0,
       default_worker_cpu: form.default_worker_cpu,
       default_worker_memory: form.default_worker_memory,
       default_worker_ttl: form.default_worker_ttl,
@@ -158,6 +162,14 @@ export function OrgDetail() {
                     type="number"
                     value={form.max_connections}
                     onChange={(e) => set("max_connections", e.target.value)}
+                  />
+                </Field>
+                <Field label="Max vCPUs (0 = unbounded)">
+                  <Input
+                    type="number"
+                    min={0}
+                    value={form.max_vcpus}
+                    onChange={(e) => set("max_vcpus", e.target.value)}
                   />
                 </Field>
                 <Field label="Default worker CPU">
