@@ -61,9 +61,9 @@ func (OrgUser) TableName() string { return "duckgres_org_users" }
 // from this table per-request (see admin.RoleResolver); the break-glass
 // internal-secret path is independent and always grants admin.
 type Operator struct {
-	Email     string    `gorm:"primaryKey" json:"email"`
-	Role      string    `json:"role"` // "admin" | "viewer"
-	AddedBy   string    `json:"added_by"`
+	Email     string    `gorm:"primaryKey;size:255" json:"email"`
+	Role      string    `gorm:"size:16;not null" json:"role"` // "admin" | "viewer"
+	AddedBy   string    `gorm:"size:255" json:"added_by"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

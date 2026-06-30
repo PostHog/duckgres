@@ -4,7 +4,7 @@
 -- config schema rather than runtime AutoMigrate.
 CREATE TABLE IF NOT EXISTS duckgres_operators (
     email VARCHAR(255) PRIMARY KEY,
-    role VARCHAR(16) NOT NULL DEFAULT 'viewer',
+    role VARCHAR(16) NOT NULL,
     added_by VARCHAR(255),
     created_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ
