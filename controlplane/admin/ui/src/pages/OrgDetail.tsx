@@ -33,7 +33,6 @@ import type { ManagedWarehouse, OrgUpdate } from "@/types/api";
 
 interface FormState {
   max_workers: string;
-  max_connections: string;
   max_vcpus: string;
   default_worker_cpu: string;
   default_worker_memory: string;
@@ -44,7 +43,6 @@ interface FormState {
 
 function orgToForm(o: {
   max_workers: number;
-  max_connections: number;
   max_vcpus: number;
   default_worker_cpu: string;
   default_worker_memory: string;
@@ -54,7 +52,6 @@ function orgToForm(o: {
 }): FormState {
   return {
     max_workers: String(o.max_workers),
-    max_connections: String(o.max_connections),
     max_vcpus: String(o.max_vcpus),
     default_worker_cpu: o.default_worker_cpu,
     default_worker_memory: o.default_worker_memory,
@@ -105,7 +102,6 @@ export function OrgDetail() {
     setMsg(null);
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
-      max_connections: Number(form.max_connections) || 0,
       max_vcpus: Number(form.max_vcpus) || 0,
       default_worker_cpu: form.default_worker_cpu,
       default_worker_memory: form.default_worker_memory,
@@ -156,13 +152,6 @@ export function OrgDetail() {
               <div className="grid grid-cols-2 gap-3">
                 <Field label="Max workers (0 = unbounded)">
                   <Input type="number" value={form.max_workers} onChange={(e) => set("max_workers", e.target.value)} />
-                </Field>
-                <Field label="Max connections (0 = unbounded)">
-                  <Input
-                    type="number"
-                    value={form.max_connections}
-                    onChange={(e) => set("max_connections", e.target.value)}
-                  />
                 </Field>
                 <Field label="Max vCPUs (0 = unbounded)">
                   <Input
