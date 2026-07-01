@@ -1536,11 +1536,10 @@ conn_idle_timeout_reaps_session() { # org password
 # read with rows=0 (i.e. nothing ever arrived), NOT a re-arm bug. The producer's
 # sleeps paced the SHELL, not the wire.
 #
-# FIX: send fat chunks (~32KB each, well over libpq's flush threshold) so every
-# 5s interval forces a real flush and the server actually receives a burst of
-# CopyData to re-arm on. 14 chunks × 5s ≈ 70s of genuine wire activity — past the
-# 60s idle timeout (a broken re-arm would still be caught), with each gap ~12x
-# under the deadline. Each row carries a 2000-char pad so ~16 rows = ~32KB/chunk.
+# FIX: use a direct psycopg2 COPY client and return fat chunks so each 5s
+# interval forces real wire traffic. 15 chunks × 5s ≈ 70s of genuine COPY
+# activity — past the 60s idle timeout (a broken re-arm would still be caught),
+# with each gap ~12x under the deadline.
 copy_active_and_survives_idle() { # org password
   org="$1"; pw="$2"
   log "COPY FROM STDIN: active in Live + survives idle timeout on $org"
@@ -1549,9 +1548,11 @@ copy_active_and_survives_idle() { # org password
   # bare COPY connection would cold-spawn a worker inside the stream's critical
   # path. Force activation up front so the streamed data never races a cold start.
   wait_worker "$org" "$pw" ducklake
-  # 2000-char pad → each row line is ~2KB, so a 16-row chunk is ~32KB: bigger than
-  # libpq's ~8KB output buffer, which forces a flush to the wire each interval.
-  pad="$(printf '%02000d' 0)"
+  copy_table="e2e_idle_copy_$$"
+  copy_chunks=15
+  copy_rows_per_chunk=24
+  copy_expected_rows=$((copy_chunks * copy_rows_per_chunk))
+  copy_row_pad_bytes=16000
   # A one-off environmental blip (a real CP→worker forward stall, a connection
   # reset) can trip the client read deadline even though the COPY itself never
   # idled — that is NOT the behavior under test, so retry the streaming attempt a
@@ -1562,40 +1563,104 @@ copy_active_and_survives_idle() { # org password
   while [ "$attempt" -lt 2 ]; do
     attempt=$((attempt + 1))
     out="$(mktemp)"
-    ( printf 'DROP TABLE IF EXISTS e2e_idle_copy;\n'
-      printf 'CREATE TABLE e2e_idle_copy(v TEXT);\n'
-      printf '\\copy e2e_idle_copy(v) FROM STDIN\n'
-      for i in $(seq 1 14); do
-        for j in $(seq 1 16); do printf 'r%d_%d_%s\n' "$i" "$j" "$pad"; done
-        sleep 5
-      done
-      printf '\\.\n'
-      printf 'SELECT count(*) FROM e2e_idle_copy;\n'
-      printf 'DROP TABLE e2e_idle_copy;\n'
-    ) | PGPASSWORD="$pw" psql "$conn" -v ON_ERROR_STOP=1 -qtA >"$out" 2>&1 &
+    COPY_CONN="$conn" COPY_TABLE="$copy_table" COPY_CHUNKS="$copy_chunks" \
+      COPY_ROWS_PER_CHUNK="$copy_rows_per_chunk" COPY_ROW_PAD_BYTES="$copy_row_pad_bytes" \
+      PGPASSWORD="$pw" python3 - <<'PY' >"$out" 2>&1 &
+import os
+import sys
+import time
+
+import psycopg2
+
+conn = psycopg2.connect(os.environ["COPY_CONN"])
+conn.autocommit = True
+table = os.environ["COPY_TABLE"]
+qtable = '"' + table.replace('"', '""') + '"'
+chunks = int(os.environ["COPY_CHUNKS"])
+rows_per_chunk = int(os.environ["COPY_ROWS_PER_CHUNK"])
+pad = "x" * int(os.environ["COPY_ROW_PAD_BYTES"])
+
+
+class SlowCopy:
+    def __init__(self):
+        self.chunk = 0
+        self.pad = pad
+
+    def read(self, size=-1):
+        if self.chunk >= chunks:
+            return ""
+        if self.chunk > 0:
+            time.sleep(5)
+        self.chunk += 1
+        return "".join(f"row-{self.chunk}-{j:04d}-{self.pad}\n" for j in range(1, rows_per_chunk + 1))
+
+
+with conn.cursor() as cur:
+    cur.execute(f"DROP TABLE IF EXISTS {qtable}")
+    cur.execute(f"CREATE TABLE {qtable}(v TEXT)")
+    main_ok = False
+    try:
+        cur.copy_expert(f"COPY {qtable} (v) FROM STDIN", SlowCopy(), size=1048576)
+        cur.execute(f"SELECT count(*) FROM {qtable}")
+        print(cur.fetchone()[0], flush=True)
+        main_ok = True
+    finally:
+        try:
+            cur.execute(f"DROP TABLE IF EXISTS {qtable}")
+        except Exception as exc:
+            print(f"cleanup failed: {exc}", file=sys.stderr, flush=True)
+            if main_ok:
+                raise
+PY
     bg=$!
+    cleanup_copy() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
     # While it streams, /queries must show it as an ACTIVE query (elapsed_ms>0),
-    # not an idle session. Poll until seen active or the client exits (bounded).
-    active="" a=0
-    while [ "$a" -lt 30 ]; do
+    # not an idle session. The list endpoint does not include SQL text, so expand
+    # candidate active root sessions by worker id to prove this is our COPY.
+    active_wid="" last_poll_error="" a=0
+    while [ "$a" -lt 45 ]; do
       kill -0 "$bg" 2>/dev/null || break
-      e="$(curl -fsS -H "$H" "$API/api/v1/queries" \
-        | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and .user=="root" and (.elapsed_ms>0))) | .elapsed_ms // empty')"
-      [ -n "$e" ] && { active=1; break; }
-      sleep 3; a=$((a + 1))
+      queries_json="$(curl -fsS -H "$H" "$API/api/v1/queries?org=$org&user=root" 2>&1)" \
+        || { last_poll_error="list queries failed: $queries_json"; sleep 2; a=$((a + 1)); continue; }
+      workers="$(printf '%s' "$queries_json" | jq -r '.queries[]? | select(.state=="active" and (.elapsed_ms>0)) | .worker_id' 2>&1)" \
+        || { last_poll_error="parse queries failed: $workers"; sleep 2; a=$((a + 1)); continue; }
+      for w in $workers; do
+        d="$(curl -fsS -H "$H" "$API/api/v1/queries/by-worker/$w" 2>&1)" \
+          || { last_poll_error="query detail failed for worker $w: $d"; continue; }
+        if printf '%s' "$d" | jq -e --arg o "$org" --arg t "$copy_table" \
+          '.org == $o and .user == "root" and .state == "active" and (.elapsed_ms > 0) and (.query | contains($t))' >/dev/null 2>&1; then
+          active_wid="$w"; break
+        fi
+      done
+      [ -n "$active_wid" ] && break
+      sleep 2; a=$((a + 1))
     done
-    # It must finish successfully with all 224 rows (NOT reaped mid-stream).
+    if [ -z "$active_wid" ]; then
+      body="$(tr '\n' ' ' <"$out" | tail -c 300 || true)"
+      if kill -0 "$bg" 2>/dev/null; then
+        cleanup_copy
+        fail "copy_active: streaming COPY not categorized active (elapsed_ms>0) in /queries/by-worker on $org (last_poll_error=${last_poll_error:-none}; client_output=$body)"
+      fi
+      if wait "$bg"; then rc=0; else rc=$?; fi
+      body="$(tr '\n' ' ' <"$out" | tail -c 300 || true)"; rm -f "$out"
+      case "$body" in
+        *"i/o timeout"*|*"read csv stream"*|*"connection reset"*|*"broken pipe"*|*"EOF"*|*"server closed the connection"*)
+          log "copy_active: transient stream blip before active row on $org (attempt $attempt/2), retrying: $body"
+          last="$body"
+          continue ;;
+        *)
+          fail "copy_active: COPY client exited before active row appeared (rc=$rc; last_poll_error=${last_poll_error:-none}): $body" ;;
+      esac
+    fi
+    # It must finish successfully with all rows (NOT reaped mid-stream).
     # NB: `wait; rc=$?` must NOT be a bare statement — under `set -e` a non-zero
-    # psql exit would abort the whole harness at `wait` (the "HARNESS EXIT rc=3,
+    # client exit would abort the whole harness at `wait` (the "HARNESS EXIT rc=3,
     # no FAIL line" seen before) before the retry/branch logic below could run.
     if wait "$bg"; then rc=0; else rc=$?; fi
-    ok=""; { [ "$rc" -eq 0 ] && grep -qx "224" "$out"; } && ok=1
+    ok=""; { [ "$rc" -eq 0 ] && grep -qx "$copy_expected_rows" "$out"; } && ok=1
     body="$(tr '\n' ' ' <"$out" | tail -c 300)"; rm -f "$out"
     if [ -n "$ok" ]; then
-      # Streamed ~70s of real wire traffic past the idle timeout without being
-      # reaped: now the active-categorization assertion is the remaining signal.
-      [ -n "$active" ] || fail "copy_active: streaming COPY not categorized active (elapsed_ms>0) in /queries on $org"
-      log "COPY FROM STDIN: active in Live + survived idle timeout (224 rows) on $org"
+      log "COPY FROM STDIN: active in Live + survived idle timeout ($copy_expected_rows rows, worker $active_wid) on $org"
       return 0
     fi
     last="$body"
@@ -1604,7 +1669,7 @@ copy_active_and_survives_idle() { # org password
         log "copy_active: transient stream blip on $org (attempt $attempt/2), retrying: $body"
         continue ;;
       *)
-        fail "copy_active: streaming COPY (~70s) did not succeed with 224 rows (rc=$rc): $body" ;;
+        fail "copy_active: streaming COPY (~70s) did not succeed with $copy_expected_rows rows (rc=$rc): $body" ;;
     esac
   done
   fail "copy_active: streaming COPY (~70s) failed all $attempt attempts with transient stream errors — likely a real re-arm/reaper regression (last: $last)"

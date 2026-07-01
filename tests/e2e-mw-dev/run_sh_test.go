@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -118,6 +119,62 @@ func TestDeployRejectsMissingPRNumberBeforeCleanup(t *testing.T) {
 	if strings.Contains(calls, "duckling/ci-pr--") {
 		t.Fatalf("deploy touched empty-PR Duckling names before validating PR identity; calls:\n%s", calls)
 	}
+}
+
+func TestHarnessCopyIdleTimeoutRegressionGuard(t *testing.T) {
+	bodyBytes, err := os.ReadFile("harness.sh")
+	if err != nil {
+		t.Fatalf("read harness.sh: %v", err)
+	}
+	body := string(bodyBytes)
+
+	fn := extractShellFunction(t, body, "copy_active_and_survives_idle")
+
+	for _, want := range []string{
+		"copy_table=\"e2e_idle_copy_$$\"",
+		"copy_rows_per_chunk=",
+		"copy_expected_rows=$((copy_chunks * copy_rows_per_chunk))",
+		"COPY_CONN=\"$conn\" COPY_TABLE=\"$copy_table\"",
+		"python3 - <<'PY' >\"$out\" 2>&1 &",
+		"import sys",
+		"cur.copy_expert(f\"COPY {qtable} (v) FROM STDIN\", SlowCopy(), size=1048576)",
+		"print(f\"cleanup failed: {exc}\", file=sys.stderr, flush=True)",
+		"last_poll_error=",
+		"queries_json=\"$(curl -fsS -H \"$H\" \"$API/api/v1/queries?org=$org&user=root\" 2>&1)\"",
+		"workers=\"$(printf '%s' \"$queries_json\" | jq -r",
+		"copy_active: COPY client exited before active row appeared",
+		"last_poll_error=${last_poll_error:-none}",
+		"if wait \"$bg\"; then rc=0; else rc=$?; fi",
+		"grep -qx \"$copy_expected_rows\" \"$out\"",
+	} {
+		if !strings.Contains(fn, want) {
+			t.Fatalf("copy_active_and_survives_idle missing %q:\n%s", want, fn)
+		}
+	}
+
+	if !regexp.MustCompile(`return ""\.join\(f"row-\{self\.chunk\}-\{j:04d\}-\{self\.pad\}\\n"`).MatchString(fn) {
+		t.Fatalf("copy_active_and_survives_idle should stream padded rows from the COPY client itself:\n%s", fn)
+	}
+	if !strings.Contains(fn, `"$API/api/v1/queries/by-worker/$w"`) ||
+		!regexp.MustCompile(`\.query \| contains\(\$t\)`).MatchString(fn) {
+		t.Fatalf("copy_active_and_survives_idle should verify the matching COPY detail row, not any active root query:\n%s", fn)
+	}
+}
+
+func extractShellFunction(t *testing.T, body, name string) string {
+	t.Helper()
+
+	start := strings.Index(body, name+"()")
+	if start < 0 {
+		t.Fatalf("function %s not found", name)
+	}
+	rest := body[start:]
+	endMarker := "\n}\n\n# ----"
+	end := strings.Index(rest, endMarker)
+	if end < 0 {
+		t.Fatalf("end of function %s not found", name)
+	}
+	return rest[:end+len("\n}")]
 }
 
 type runSHFakes struct {
