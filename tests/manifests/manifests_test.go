@@ -14,30 +14,6 @@ import (
 	"testing"
 )
 
-func TestClusterTopologyRBACGrantsReadOnlyClusterAccess(t *testing.T) {
-	// The admin console "Nodes" view (GET /api/v1/cluster/{nodes,pods,events,
-	// nodepools}) needs cluster-scoped read the in-namespace Role doesn't cover.
-	content := readManifest(t, "k8s", "cluster-topology-rbac.yaml")
-	for _, want := range []string{
-		"kind: ClusterRole",
-		"name: duckgres-control-plane-cluster-topology",
-		`resources: ["nodes", "pods", "events"]`,
-		`apiGroups: ["karpenter.sh"]`,
-		`resources: ["nodepools"]`,
-		`verbs: ["get", "list"]`,
-	} {
-		if !strings.Contains(content, want) {
-			t.Fatalf("expected %q in k8s/cluster-topology-rbac.yaml", want)
-		}
-	}
-	// Read-only: no write verbs on this ClusterRole.
-	for _, forbidden := range []string{"create", "update", "patch", "delete", "watch"} {
-		if strings.Contains(content, forbidden) {
-			t.Fatalf("k8s/cluster-topology-rbac.yaml must stay read-only, found verb %q", forbidden)
-		}
-	}
-}
-
 func TestControlPlaneRBACIncludesLeaseAccess(t *testing.T) {
 	content := readManifest(t, "k8s", "rbac.yaml")
 	for _, want := range []string{

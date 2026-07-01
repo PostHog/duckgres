@@ -185,7 +185,9 @@ roleRef:
 # Cluster-scoped read for the admin console's live "Nodes" topology view
 # (GET /api/v1/cluster/{nodes,pods,events,nodepools}). Read-only; per-PR name +
 # binding so it's isolated and swept on teardown by the ci-pr label. Mirrors the
-# prod chart's duckgres-control-plane-cluster-topology ClusterRole.
+# reads the chart adds to the CP's duckgres-duckling-reader ClusterRole — granted
+# explicitly here so the e2e passes regardless of when the chart change lands on
+# the shared cluster.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

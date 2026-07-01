@@ -391,7 +391,11 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   proxies the karpenter NodePool CRD (v1→v1beta1, degrading to an empty list when
   karpenter is absent). Backed by the shared K8s pool's clientset
   (`Extras.ClusterClient`, nil on non-k8s backends → routes unregistered). All
-  four are GETs so RoleGate admits viewers; there is no mutation path. Touching
+  four are GETs so RoleGate admits viewers; there is no mutation path. **RBAC:**
+  these reads are cluster-scoped / cross-namespace, which the CP's in-namespace
+  Role doesn't cover — the grant lives on the CP's always-bound cluster role
+  (`duckgres-duckling-reader` in the `charts` repo, `charts/duckgres/templates/rbac.yaml`);
+  the e2e mirrors it per-PR in `tests/e2e-mw-dev/manifests.tmpl.yaml`. Touching
   the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
   and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
   (`tests/e2e-mw-dev/harness.sh`).
