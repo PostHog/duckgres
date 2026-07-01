@@ -8,6 +8,7 @@ SET database_name = EXCLUDED.database_name,
 
 INSERT INTO duckgres_managed_warehouses (
     org_id,
+    duckling_name,
     image,
     warehouse_database_endpoint,
     warehouse_database_port,
@@ -51,6 +52,7 @@ INSERT INTO duckgres_managed_warehouses (
 VALUES
 (
     'analytics',
+    'analytics',
     '',
     'duckgres-local-warehouse-db',
     5432,
@@ -92,6 +94,7 @@ VALUES
     NOW()
 ),
 (
+    'billing',
     'billing',
     '',
     'duckgres-local-warehouse-db',

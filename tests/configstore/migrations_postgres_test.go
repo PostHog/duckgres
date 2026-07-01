@@ -83,7 +83,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
 			ALTER TABLE duckgres_orgs ADD COLUMN IF NOT EXISTS max_connections BIGINT DEFAULT 0;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11);
+			ALTER TABLE duckgres_managed_warehouses ALTER COLUMN duckling_name DROP NOT NULL;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
