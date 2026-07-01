@@ -219,7 +219,7 @@ export function Live() {
                               disabled={cancel.isPending}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                cancel.mutate(q.pid);
+                                cancel.mutate(q.worker_id);
                               }}
                             >
                               <Ban className="h-4 w-4 text-destructive" /> Cancel
@@ -272,7 +272,7 @@ export function Live() {
                             size="sm"
                             className="-my-1 h-6"
                             disabled={cancel.isPending}
-                            onClick={() => cancel.mutate(s.pid)}
+                            onClick={() => cancel.mutate(s.worker_id)}
                           >
                             <Ban className="h-4 w-4 text-destructive" /> Cancel
                           </Button>
@@ -289,7 +289,7 @@ export function Live() {
       <QueryDetailDialog
         workerId={detailWid}
         onClose={() => setDetailWid(null)}
-        onCancel={(pid) => cancel.mutate(pid)}
+        onCancel={(workerId) => cancel.mutate(workerId)}
       />
     </>
   );

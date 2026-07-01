@@ -5,6 +5,7 @@ package admin
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -102,8 +103,14 @@ type LiveInfo interface {
 	// ControlPlaneInstances returns the live CP replicas.
 	ControlPlaneInstances() ([]CPInstance, error)
 	// KillSession tears down the session (and its exclusive worker) for pid.
-	// Returns an error if no such session exists.
+	// Returns an error if no such session exists. NOTE: pid is per-CP, not
+	// cluster-unique — prefer KillSessionByWorkerID for cross-CP cancel.
 	KillSession(pid int32) error
+	// KillSessionByWorkerID tears down the session bound to the cluster-unique
+	// worker id on THIS replica (0 or 1). The handler fans it out so a cancel
+	// hits whichever replica owns the session — pid can't be used for the
+	// fan-out because pids collide across CPs.
+	KillSessionByWorkerID(workerID int) int
 	// KillUserSessions tears down every active session for (orgID, username) owned
 	// by THIS control-plane replica and returns the count destroyed. The handler
 	// fans it out to peers so the kill is cluster-wide. 0 (not an error) when the
@@ -230,7 +237,9 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher, use
 		c.JSON(http.StatusOK, gin.H{"instances": instances})
 	})
 
-	// Kill a session (admin-only via RoleGate — it's a POST).
+	// Kill a session by pid (admin-only via RoleGate — it's a POST). LOCAL ONLY:
+	// pid is per-CP, so this only finds a session the serving replica owns.
+	// Prefer /sessions/by-worker/:wid/cancel, which fans out.
 	r.POST("/sessions/:pid/cancel", func(c *gin.Context) {
 		pid64, err := strconv.ParseInt(c.Param("pid"), 10, 32)
 		if err != nil {
@@ -242,6 +251,35 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher, use
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"killed": pid64})
+	})
+
+	// Kill a session addressed by CLUSTER-UNIQUE worker id (admin-only POST).
+	// A session lives on exactly one CP, so this kills locally and, unless it's
+	// a scope=local peer call, fans out to peer replicas (?scope=local stops the
+	// recursion). Worker id — not pid — is the address because pids collide
+	// across CPs, so a pid fan-out could kill the wrong replica's session.
+	r.POST("/sessions/by-worker/:wid/cancel", func(c *gin.Context) {
+		wid, err := strconv.Atoi(c.Param("wid"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid worker id"})
+			return
+		}
+		killed := live.KillSessionByWorkerID(wid)
+		responders, total := 1, 1
+		// A worker hosts exactly one session on exactly one CP: only fan out when
+		// this replica didn't own it (avoids needless peer POSTs on the hit path).
+		if killed == 0 && !localScope(c) && fetcher != nil {
+			bodies, peers := fetcher.PostPeers(c.Request.Context(), "/api/v1/sessions/by-worker/"+strconv.Itoa(wid)+"/cancel")
+			total += peers
+			k, r := sumKilled(bodies)
+			killed += k
+			responders += r
+		}
+		if killed == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no active session on worker %d", wid)})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"killed": killed, "cp_responders": responders, "cp_total": total})
 	})
 
 	// Per-user kill switch (admin-only via RoleGate — all POSTs). A user's

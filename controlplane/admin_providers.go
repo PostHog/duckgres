@@ -177,6 +177,21 @@ func (p *clusterInfoProvider) KillSession(pid int32) error {
 	return fmt.Errorf("no active session with pid %d", pid)
 }
 
+// KillSessionByWorkerID tears down the session bound to the cluster-unique
+// worker id on this replica, returning the count destroyed (0 or 1 — one
+// session per worker). The admin handler fans this out so a cancel reaches
+// whichever CP owns the session; addressing by worker id (not the per-CP pid,
+// which collides across CPs) makes that fan-out collision-safe.
+func (p *clusterInfoProvider) KillSessionByWorkerID(workerID int) int {
+	for _, stack := range p.router.AllStacks() {
+		if s, ok := stack.Sessions.SessionForWorker(workerID); ok {
+			stack.Sessions.DestroySession(s.PID)
+			return 1
+		}
+	}
+	return 0
+}
+
 // KillUserSessions tears down every active session for (orgID, username) owned by
 // THIS control-plane replica and returns the count destroyed. It is the local
 // half of the cluster-wide per-user kill switch: the admin handler fans this out

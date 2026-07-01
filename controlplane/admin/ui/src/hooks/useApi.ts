@@ -267,7 +267,7 @@ export function useSessions() {
 export function useCancelSession() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (pid: number) => api.cancelSession(pid),
+    mutationFn: (workerId: number) => api.cancelSession(workerId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["sessions"] });
       qc.invalidateQueries({ queryKey: ["queries"] });
