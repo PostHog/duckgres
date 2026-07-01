@@ -24,6 +24,9 @@ type fakeLiveInfo struct {
 
 	killedPerUser int            // returned by KillUserSessions (local kill count)
 	killUserCalls []killUserCall // recorded (org, user) of each KillUserSessions
+
+	killByWorkerReturn int   // returned by KillSessionByWorkerID (local kill count)
+	killByWorkerCalls  []int // recorded worker ids
 }
 
 type killUserCall struct{ org, user string }
@@ -38,6 +41,10 @@ func (f *fakeLiveInfo) QueryDetailForWorkerID(wid int) (QueryDetail, bool) {
 func (f *fakeLiveInfo) WorkerFleet() ([]FleetStat, error)            { return nil, nil }
 func (f *fakeLiveInfo) ControlPlaneInstances() ([]CPInstance, error) { return nil, nil }
 func (f *fakeLiveInfo) KillSession(int32) error                      { return nil }
+func (f *fakeLiveInfo) KillSessionByWorkerID(wid int) int {
+	f.killByWorkerCalls = append(f.killByWorkerCalls, wid)
+	return f.killByWorkerReturn
+}
 func (f *fakeLiveInfo) KillUserSessions(org, user string) int {
 	f.killUserCalls = append(f.killUserCalls, killUserCall{org, user})
 	return f.killedPerUser

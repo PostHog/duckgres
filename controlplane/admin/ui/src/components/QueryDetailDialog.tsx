@@ -34,7 +34,7 @@ export function QueryDetailDialog({
 }: {
   workerId: number | null;
   onClose: () => void;
-  onCancel: (pid: number) => void;
+  onCancel: (workerId: number) => void;
 }) {
   const detail = useQueryDetail(workerId);
   const d = detail.data;
@@ -115,7 +115,7 @@ export function QueryDetailDialog({
                 variant="ghost"
                 size="sm"
                 onClick={() => {
-                  onCancel(d.pid);
+                  onCancel(d.worker_id);
                   onClose();
                 }}
               >

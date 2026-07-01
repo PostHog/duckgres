@@ -151,7 +151,10 @@ export const api = {
   listQueries: () => get<{ queries: RunningQuery[] }>("/queries").then((r) => r.queries ?? []),
   // Detail is addressed by cluster-unique worker id (pid is per-org, not unique).
   queryDetail: (workerId: number) => get<QueryDetail>(`/queries/by-worker/${workerId}`),
-  cancelSession: (pid: number) => post<{ killed: number }>(`/sessions/${pid}/cancel`, {}),
+  // Cancel is addressed by cluster-unique worker id (pid is per-CP and collides
+  // across replicas); the server fans out to whichever CP owns the session.
+  cancelSession: (workerId: number) =>
+    post<{ killed: number }>(`/sessions/by-worker/${workerId}/cancel`, {}),
   // Per-user kill switch. killUser terminates all of a user's sessions + queries
   // (one-shot); disableUser also persists a block so new connections are refused
   // until enableUser. All three fan out across CP replicas server-side.

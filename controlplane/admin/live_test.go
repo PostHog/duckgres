@@ -124,3 +124,56 @@ func TestQueryDetailWorkerIDDistinguishesCollidingPIDs(t *testing.T) {
 		t.Fatalf("worker 22 should resolve to org-b's query despite the shared pid, got %d %+v", w.Code, b)
 	}
 }
+
+// TestCancelByWorkerFansOut covers the collision-safe cross-CP cancel: the
+// serving replica kills locally if it owns the worker, else fans out to peers
+// (scope=local guard), and 404s only if no replica owns it.
+func TestCancelByWorkerFansOut(t *testing.T) {
+	// Owned locally → killed without fan-out.
+	local := &fakeLiveInfo{killByWorkerReturn: 1}
+	fetcher := &fakePeerFetcher{}
+	r := liveTestRouter(local, fetcher)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/by-worker/77/cancel", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("locally-owned cancel: got %d (%s)", w.Code, w.Body.String())
+	}
+	if len(local.killByWorkerCalls) != 1 || local.killByWorkerCalls[0] != 77 {
+		t.Fatalf("KillSessionByWorkerID not called with 77: %v", local.killByWorkerCalls)
+	}
+	if fetcher.postCallCount() != 0 {
+		t.Fatalf("owned locally should not fan out, but PostPeers ran")
+	}
+
+	// Not local → fan out; a peer reports killed:1 → success.
+	local2 := &fakeLiveInfo{killByWorkerReturn: 0}
+	peerBody, _ := json.Marshal(map[string]any{"killed": 1})
+	fetcher2 := &fakePeerFetcher{postByPath: map[string][][]byte{"/api/v1/sessions/by-worker/88/cancel": {peerBody}}}
+	r2 := liveTestRouter(local2, fetcher2)
+	w = httptest.NewRecorder()
+	r2.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/by-worker/88/cancel", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("peer-owned cancel via fan-out: got %d (%s)", w.Code, w.Body.String())
+	}
+
+	// scope=local (a peer answering us): kill locally only, NO recursion.
+	before := fetcher2.postCallCount()
+	w = httptest.NewRecorder()
+	r2.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/by-worker/88/cancel?scope=local", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("scope=local with no local session should 404, got %d", w.Code)
+	}
+	if fetcher2.postCallCount() != before {
+		t.Fatalf("scope=local must not fan out")
+	}
+
+	// Nobody owns it anywhere → 404.
+	local3 := &fakeLiveInfo{killByWorkerReturn: 0}
+	fetcher3 := &fakePeerFetcher{}
+	r3 := liveTestRouter(local3, fetcher3)
+	w = httptest.NewRecorder()
+	r3.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/by-worker/99/cancel", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown worker cancel should 404, got %d", w.Code)
+	}
+}

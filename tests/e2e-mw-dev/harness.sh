@@ -1604,6 +1604,52 @@ admin_idle_session_flagged() { # org password
   esac
 }
 
+# ---- admin: cancel a session by (cluster-unique) worker id ------------------
+# The Live view's Cancel button posts /sessions/by-worker/:wid/cancel. Worker id
+# (not the per-CP pid) is the address, and the handler kills locally or fans out
+# to whichever CP owns the session — so cancel works regardless of which replica
+# the request lands on. (The cross-CP fan-out itself is unit-tested in
+# TestCancelByWorkerFansOut; the CI CP is single-replica, so this covers the
+# real kill + the unknown→404 path end-to-end.)
+admin_cancel_by_worker() { # org password
+  org="$1"; pw="$2"
+  log "admin: cancel a live session by worker id on $org"
+  # Hold longer than the appear-poll budget (30×2s) so a slow cold-start can't
+  # exit the client before the session is observed (we cancel it well before
+  # the 60s idle timeout anyway).
+  ( printf 'BEGIN;\n'; sleep 90 ) | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+  bg=$!
+  cleanup_cbw() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  wid="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    wid="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and .user=="root")) | .worker_id // empty')"
+    [ -n "$wid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$wid" ] || { cleanup_cbw; fail "admin_cancel_by_worker: session never appeared for $org"; }
+  # Cancel it by worker id → killed>=1.
+  resp="$(curl -fsS -H "$H" -X POST "$API/api/v1/sessions/by-worker/$wid/cancel")" \
+    || { cleanup_cbw; fail "admin_cancel_by_worker: POST cancel failed for worker $wid"; }
+  echo "$resp" | jq -e '.killed >= 1' >/dev/null \
+    || { cleanup_cbw; fail "admin_cancel_by_worker: cancel did not kill worker $wid: $resp"; }
+  # The session must disappear from /queries.
+  gone="" a=0
+  while [ "$a" -lt 15 ]; do
+    [ "$(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --argjson w "$wid" 'any(.queries[]?; .worker_id==$w)')" = "false" ] && { gone=1; break; }
+    sleep 2; a=$((a + 1))
+  done
+  cleanup_cbw
+  [ -n "$gone" ] || fail "admin_cancel_by_worker: session on worker $wid still present after cancel"
+  # Unknown worker → 404 (not a 500).
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" -X POST "$API/api/v1/sessions/by-worker/999999999/cancel")"
+  [ "$code" = "404" ] || fail "admin_cancel_by_worker: unknown worker cancel returned $code, want 404"
+  log "admin: cancel by worker id OK (killed worker $wid, unknown→404) on $org"
+}
+
 admin_query_detail() { # org password
   org="$1"; pw="$2"
   log "admin live: per-query detail round-trip on $org"
@@ -2098,6 +2144,9 @@ main() {
 
   # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
   admin_query_detail "$CNPG" "$cnpg_pw"
+
+  # ---- admin: cancel a live session by worker id (cross-CP addressed) ----
+  admin_cancel_by_worker "$CNPG" "$cnpg_pw"
 
   # ---- admin live: idle-in-transaction session is flagged (state column) ----
   admin_idle_session_flagged "$CNPG" "$cnpg_pw"
