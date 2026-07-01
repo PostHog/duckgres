@@ -1080,12 +1080,22 @@ func (c *clientConn) sendInitialParams() {
 	}
 }
 
+// armIdleReadDeadline re-arms the connection's read deadline to the configured
+// idle timeout ahead of a client read. Loops that read MANY client messages
+// within one logical operation (COPY FROM STDIN streaming its CopyData) must
+// call this before EACH read, so the timeout measures inter-message idle rather
+// than the operation's total duration — an actively-streaming COPY never times
+// out, a stalled/abandoned one is reaped after the idle timeout. No-op when the
+// idle timeout is disabled (IdleTimeout <= 0), matching the message loop.
+func (c *clientConn) armIdleReadDeadline() {
+	if c.server.cfg.IdleTimeout > 0 {
+		_ = c.conn.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
+	}
+}
+
 func (c *clientConn) messageLoop() error {
 	for {
-		// Set read deadline if idle timeout is configured
-		if c.server.cfg.IdleTimeout > 0 {
-			_ = c.conn.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
-		}
+		c.armIdleReadDeadline()
 
 		msgType, body, err := wire.ReadMessage(c.reader)
 		if err != nil {

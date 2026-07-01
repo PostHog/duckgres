@@ -1438,6 +1438,104 @@ admin_per_org_workers() { # org password
   log "admin: /status per-org worker count OK (workers>=1, total_workers>=1) on $org"
 }
 
+# ---- connection idle timeout: idle conn reaped, worker freed ----------------
+# An idle client connection pins a worker (one session per worker), so the
+# control plane defaults to a short connection idle timeout (server.Default
+# ControlPlaneIdleTimeout, 60s): a connection with no traffic for that long is
+# closed by the message loop's read deadline, DestroySession runs, and the
+# worker returns to hot-idle. We hold a connection idle-in-transaction PAST the
+# timeout and assert its session disappears from /queries while our client is
+# still connected (so the reap is the CP's, not our client exiting). The unit
+# tests (TestNormalizeIdleTimeout + TestMessageLoopIdleTimeoutClosesConnection)
+# are the deterministic gate for the mechanism; this proves the real default
+# fires end-to-end in-cluster.
+conn_idle_timeout_reaps_session() { # org password
+  org="$1"; pw="$2"
+  log "conn idle timeout: idle connection is reaped + worker freed on $org"
+  rootwids() {
+    curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" '[.queries[]? | select(.org==$o and .user=="root") | .worker_id] | sort | join(" ")'
+  }
+  before="$(rootwids)"
+  # Hold a connection idle-in-transaction for 150s (well past the 60s timeout):
+  # send BEGIN, then keep stdin open so psql waits and issues no further query.
+  ( printf 'BEGIN;\n'; sleep 150 ) | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+  bg=$!
+  cleanup_ir() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  # The NEW root worker_id (not present before) is our idle connection's.
+  wid="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    for w in $(rootwids); do
+      case " $before " in *" $w "*) : ;; *) wid="$w"; break ;; esac
+    done
+    [ -n "$wid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$wid" ] || { cleanup_ir; fail "conn_idle_timeout: idle session never appeared for $org"; }
+  log "conn idle timeout: idle session on worker $wid — waiting for the CP to reap it"
+  # Must vanish from /queries within ~90s (60s timeout + grace), while our client
+  # is STILL alive (kill -0) so the disappearance is the CP reaping, not us.
+  gone="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || { cleanup_ir; fail "conn_idle_timeout: our client exited before reap — inconclusive"; }
+    present="$(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --argjson w "$wid" 'any(.queries[]?; .worker_id==$w)')"
+    [ "$present" = "false" ] && { gone=1; break; }
+    sleep 3; a=$((a + 1))
+  done
+  cleanup_ir
+  [ -n "$gone" ] || fail "conn_idle_timeout: idle session on worker $wid was NOT reaped within ~90s (idle timeout not enforced)"
+  log "conn idle timeout: idle session reaped, worker $wid freed on $org"
+}
+
+# ---- COPY FROM STDIN: active in Live + survives the idle timeout ------------
+# An actively-streaming COPY reads many CopyData messages; each in-loop read
+# re-arms the read deadline (server/conn_copy.go armIdleReadDeadline), so a COPY
+# that streams for LONGER than the idle timeout but never stalls must NOT be
+# reaped mid-stream (the regression the 60s default would otherwise cause for
+# the COPY-heavy data-import users). It must also be categorized as an ACTIVE
+# query in /queries (elapsed_ms>0), not an idle session, while it streams.
+copy_active_and_survives_idle() { # org password
+  org="$1"; pw="$2"
+  log "COPY FROM STDIN: active in Live + survives idle timeout on $org"
+  out="$(mktemp)"
+  conn="sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake"
+  # 6 chunks of 60 rows with 11s gaps → ~66s total stream, each gap < the 60s
+  # timeout. ON_ERROR_STOP makes a mid-stream reap fail the run (no 360 count).
+  ( printf 'DROP TABLE IF EXISTS e2e_idle_copy;\n'
+    printf 'CREATE TABLE e2e_idle_copy(v TEXT);\n'
+    printf '\\copy e2e_idle_copy(v) FROM STDIN\n'
+    for i in $(seq 1 6); do
+      for j in $(seq 1 60); do printf 'row-%d-%d\n' "$i" "$j"; done
+      sleep 11
+    done
+    printf '\\.\n'
+    printf 'SELECT count(*) FROM e2e_idle_copy;\n'
+    printf 'DROP TABLE e2e_idle_copy;\n'
+  ) | PGPASSWORD="$pw" psql "$conn" -v ON_ERROR_STOP=1 -qtA >"$out" 2>&1 &
+  bg=$!
+  cleanup_copy() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
+  # While it streams, /queries must show it as an ACTIVE query (elapsed_ms>0),
+  # not an idle session.
+  active="" a=0
+  while [ "$a" -lt 20 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    e="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and .user=="root" and (.elapsed_ms>0))) | .elapsed_ms // empty')"
+    [ -n "$e" ] && { active=1; break; }
+    sleep 3; a=$((a + 1))
+  done
+  [ -n "$active" ] || { cleanup_copy; fail "copy_active: streaming COPY not categorized active (elapsed_ms>0) in /queries on $org"; }
+  # It must finish successfully with all 360 rows (NOT reaped mid-stream).
+  wait "$bg"; rc=$?
+  { [ "$rc" -eq 0 ] && grep -qx "360" "$out"; } \
+    || { rm -f "$out"; fail "copy_active: streaming COPY (~66s) did not succeed with 360 rows (rc=$rc): $(tr '\n' ' ' <"$out" | tail -c 300)"; }
+  rm -f "$out"
+  log "COPY FROM STDIN: active in Live + survived idle timeout (360 rows) on $org"
+}
+
 # ---- admin RBAC: SSO viewer is read-only -----------------------------------
 # A forged ALB OIDC header (no internal secret) for an @posthog.com email that
 # is NOT in the operators table resolves to the viewer role (fail-closed
@@ -1973,6 +2071,12 @@ main() {
 
   # ---- admin /status per-org worker count is populated (not the old 0) ----
   admin_per_org_workers "$CNPG" "$cnpg_pw"
+
+  # ---- connection idle timeout: idle conn reaped, worker freed ----
+  conn_idle_timeout_reaps_session "$CNPG" "$cnpg_pw"
+
+  # ---- COPY FROM STDIN survives the idle timeout + shows active ----
+  copy_active_and_survives_idle "$CNPG" "$cnpg_pw"
 
   # ---- per-user kill switch + disable/enable block (cnpg stack is warm) ----
   user_kill_switch   "$CNPG" "$cnpg_pw"

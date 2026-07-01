@@ -68,6 +68,7 @@ Key CLI flags for control-plane mode:
 - `--process-min-workers N` / `--process-max-workers N`
 - `--process-retire-on-session-end`
 - `--worker-queue-timeout DURATION` / `--worker-idle-timeout DURATION`
+- `--idle-timeout DURATION` — connection idle timeout: a client connection with no traffic for this long is closed and its worker released to hot-idle (in control-plane mode an idle connection otherwise pins a worker forever). **Control-plane default is `60s`** (`server.DefaultControlPlaneIdleTimeout`; standalone defaults to `24h`); a negative value disables it. `server.New` applies the standalone default, so the control plane sets it explicitly before `InitMinimalServer` (which skips that defaulting).
 - `--memory-budget SIZE` (default 75% RAM) / `--memory-rebalance`
 - `--socket-dir /path` (process backend)
 - `--handover-drain-timeout DURATION` (default `24h` process; **remote default is `0` = unbounded** — the CP waits for active sessions for as long as it takes and the pod's k8s `terminationGracePeriodSeconds` is the only hard wall. cloudflare/tableflip FD passing applies to process/standalone single-host upgrades, not k8s pod replacement.)
