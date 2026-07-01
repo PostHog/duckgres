@@ -4,11 +4,11 @@
 #
 # Isolation model (decided with the design): a DEDICATED control plane +
 # throwaway config-store per PR, provisioning REAL ducklings (PR-prefixed org
-# IDs) through the SHARED Crossplane / cnpg-shards / external RDS / Lakekeeper
-# operator. The shared infra is what kind can't model and where the bugs live.
+# IDs) through the SHARED Crossplane / cnpg-shards / external RDS infra. The
+# shared infra is what kind can't model and where the bugs live.
 # Everything PR-specific lives in ${NAMESPACE} and is deleted on teardown; the
-# shared-infra footprint (ducklings, lakekeeper CRs, cnpg roles, S3) is removed
-# by deprovisioning the ci-pr ducklings before the namespace goes.
+# shared-infra footprint (ducklings, cnpg roles, S3) is removed by
+# deprovisioning the ci-pr ducklings before the namespace goes.
 ---
 apiVersion: v1
 kind: Namespace
@@ -141,6 +141,9 @@ rules:
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch", "patch"]
   - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
     resources: ["secrets"]
     # list/watch needed by the CP's stranded-secret reconciler (the prod chart
     # Role grants them implicitly via the shared duckgres namespace; spelled
@@ -178,21 +181,12 @@ subjects:
   - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
 roleRef:
   { kind: ClusterRole, name: duckgres-duckling-reader, apiGroup: rbac.authorization.k8s.io }
----
-# Cross-namespace Lakekeeper provisioning. Reuses the `duckgres-lakekeeper-provisioner`
-# Role in the shared `lakekeeper` namespace (the one PR #11518 fixed to include
-# delete). Per-PR RoleBinding; deleted on teardown.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: duckgres-ci-pr-${PR_NUMBER}
-  namespace: lakekeeper
-  labels:
-    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
-subjects:
-  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
-roleRef:
-  { kind: Role, name: duckgres-lakekeeper-provisioner, apiGroup: rbac.authorization.k8s.io }
+# NOTE: the admin console "Nodes" view's cluster-scoped reads (nodes/pods/events
+# + karpenter nodepools) ALSO come through this same duckgres-duckling-reader
+# binding — the chart adds those rules to that ClusterRole. The CI deployer can
+# only bind to that pre-existing cluster role, not create new ClusterRoles, so
+# the grant must live on duckgres-duckling-reader (see charts repo,
+# charts/duckgres/templates/rbac.yaml) and be deployed to the cluster.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -314,8 +308,10 @@ spec:
             # worker image is arm64-only and the default pool is mixed-arch, so
             # pin the arch (no toleration needed — the default pool is untainted).
             - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"kubernetes.io/arch":"arm64"}' }
-            # Provision real per-org Lakekeeper instances (iceberg path).
-            - { name: DUCKGRES_LAKEKEEPER_PROVISIONER_ENABLED, value: "true" }
+            # Lakekeeper/Iceberg provisioning is intentionally not wired into
+            # the PR e2e stack; the product direction moved back to DuckLake.
+            # The harness still provisions real cnpg-shard and external
+            # metadata-store orgs.
             # Org identity is resolved from the TLS SNI hostname
             # <org-id>.<managed-suffix> (the server rejects connections without
             # it). The harness connects with libpq host=<org>.<suffix> (→ SNI)

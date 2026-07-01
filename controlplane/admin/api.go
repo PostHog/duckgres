@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,6 +33,9 @@ type WorkerStatus struct {
 	Org            string `json:"org"`
 	ActiveSessions int    `json:"active_sessions"`
 	Status         string `json:"status"`
+	CPU            string `json:"cpu"`
+	Memory         string `json:"memory"`
+	TTLSeconds     int    `json:"ttl_seconds"`
 }
 
 // SessionStatus represents an active session for the API.
@@ -38,6 +43,7 @@ type SessionStatus struct {
 	PID      int32  `json:"pid"`
 	WorkerID int    `json:"worker_id"`
 	Org      string `json:"org"`
+	User     string `json:"user"`
 	Protocol string `json:"protocol"`
 }
 
@@ -69,16 +75,21 @@ type OrgStackInfo interface {
 }
 
 // RegisterAPI registers all admin REST endpoints on the given router group.
-func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo) {
-	registerAPIWithStore(r, newGormAPIStore(store), info)
+// fetcher (may be nil) aggregates per-CP live state (sessions/workers) across
+// replicas so the dashboard shows cluster-wide numbers instead of one CP's slice.
+func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo, fetcher PeerFetcher) {
+	registerAPIWithStore(r, newGormAPIStore(store), info, fetcher)
 	// Generic read-only models explorer (sidebar + table + detail UI). Reads
 	// the concrete store directly because it needs the runtime schema name and
 	// raw DB for tables the typed apiStore interface doesn't surface.
 	registerModelsAPI(r, store)
+	// Admin-only Operators management (the admin-console access list). Each
+	// route self-gates with RequireAdmin; mutations are audited via the group.
+	registerOperatorsAPI(r, store)
 }
 
-func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo) {
-	h := &apiHandler{store: store, info: info}
+func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo, fetcher PeerFetcher) {
+	h := &apiHandler{store: store, info: info, fetcher: fetcher}
 
 	// Orgs CRUD
 	r.GET("/orgs", h.listOrgs)
@@ -120,7 +131,7 @@ type apiStore interface {
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
-	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error)
+	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
@@ -169,8 +180,8 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 
 func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	fields := map[string]interface{}{
-		"max_workers":     updates.MaxWorkers,
-		"max_connections": updates.MaxConnections,
+		"max_workers": updates.MaxWorkers,
+		"max_vcpus":   updates.MaxVCPUs,
 		// Org default worker profile: written unconditionally so an explicit
 		// empty string CLEARS the default (the handler's presence-merge keeps
 		// omitted fields at their stored values before this runs).
@@ -241,7 +252,7 @@ func (s *gormAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
@@ -251,6 +262,9 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	}
 	if defaultCatalog != nil {
 		updates["default_catalog"] = *defaultCatalog
+	}
+	if maxVCPUs != nil {
+		updates["max_vcpus"] = *maxVCPUs
 	}
 	if len(updates) == 0 {
 		// Nothing to change — return the current row so callers can still
@@ -427,8 +441,9 @@ func managedWarehouseUpsertColumns() []string {
 }
 
 type apiHandler struct {
-	store apiStore
-	info  OrgStackInfo
+	store   apiStore
+	info    OrgStackInfo
+	fetcher PeerFetcher // nil = no cross-CP aggregation (single-CP or tests)
 }
 
 // managedWarehouseRequest is the whitelist of fields a caller may set on the
@@ -441,6 +456,7 @@ type apiHandler struct {
 type managedWarehouseRequest struct {
 	Image                        string                                        `json:"image"`
 	DuckLakeVersion              string                                        `json:"ducklake_version"`
+	DucklingName                 string                                        `json:"duckling_name"`
 	WarehouseDatabase            configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
 	MetadataStore                configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
 	PgBouncer                    configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
@@ -506,6 +522,9 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 	if org.HostnameAlias != nil && *org.HostnameAlias == "" {
 		org.HostnameAlias = nil
 	}
+	// POST /orgs has no :id param, so the audit org column is blank — record the
+	// created org's name here instead.
+	setAuditDetail(c, "created org "+org.Name)
 	if err := h.store.CreateOrg(&org); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -557,8 +576,8 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["max_workers"]; ok {
 		merged.MaxWorkers = updates.MaxWorkers
 	}
-	if _, ok := fields["max_connections"]; ok {
-		merged.MaxConnections = updates.MaxConnections
+	if _, ok := fields["max_vcpus"]; ok {
+		merged.MaxVCPUs = updates.MaxVCPUs
 	}
 	// Org default worker profile: present-in-payload wins, including an
 	// explicit "" which clears the default.
@@ -577,6 +596,27 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
+
+	// Audit detail: which fields changed and their old → new values, so the
+	// console shows "max_workers 4 → 10" instead of a bare "org.update". These
+	// are all non-sensitive config columns (no credentials among them).
+	var changes []string
+	addChange := func(key string, old, next any) {
+		if _, ok := fields[key]; ok && old != next {
+			changes = append(changes, fmt.Sprintf("%s %v → %v", key, old, next))
+		}
+	}
+	addChange("max_workers", existing.MaxWorkers, merged.MaxWorkers)
+	addChange("max_vcpus", existing.MaxVCPUs, merged.MaxVCPUs)
+	addChange("default_worker_cpu", orgStr(existing.DefaultWorkerCPU), orgStr(merged.DefaultWorkerCPU))
+	addChange("default_worker_memory", orgStr(existing.DefaultWorkerMemory), orgStr(merged.DefaultWorkerMemory))
+	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
+	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
+	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
+	if len(changes) > 0 {
+		setAuditDetail(c, strings.Join(changes, ", "))
+	}
+
 	org, ok, err := h.store.UpdateOrg(name, merged)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -603,6 +643,40 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
 }
 
+// topLevelJSONKeys returns the sorted top-level object keys of a JSON body, or
+// nil if it isn't a JSON object. Used to audit WHICH warehouse sections a PUT
+// touched without recording their (possibly secret) values.
+func topLevelJSONKeys(body []byte) []string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// orgStr renders an org config string value for audit detail, showing "" as a
+// readable "(unset)" so a cleared field is unambiguous.
+func orgStr(s string) string {
+	if s == "" {
+		return "(unset)"
+	}
+	return s
+}
+
+// orgStrPtr renders an optional org config string (nil == unset) for audit
+// detail.
+func orgStrPtr(s *string) string {
+	if s == nil {
+		return "(unset)"
+	}
+	return orgStr(*s)
+}
+
 func validateOrgMutationPayload(org *configstore.Org) error {
 	if org == nil {
 		return nil
@@ -620,6 +694,9 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	if org.DefaultWorkerMinHotIdle < 0 {
 		return fmt.Errorf("default_worker_min_hot_idle: value %d must be >= 0", org.DefaultWorkerMinHotIdle)
+	}
+	if org.MaxVCPUs < 0 {
+		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
 	}
 	return nil
 }
@@ -723,6 +800,14 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		return
 	}
 
+	// Audit detail: the top-level warehouse sections touched by this PUT (field
+	// NAMES only — the values can carry credentials/secret refs, so we never put
+	// them in the audit log). Gives "changed: metadata_store, s3" instead of a
+	// bare "warehouse.update".
+	if changed := topLevelJSONKeys(body); len(changed) > 0 {
+		setAuditDetail(c, "changed: "+strings.Join(changed, ", "))
+	}
+
 	// MutateManagedWarehouse locks the row inside a transaction, runs the
 	// closure, and commits — closing the race where two concurrent PUTs would
 	// otherwise Get + modify different snapshots and silently clobber each
@@ -733,6 +818,9 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		// `{"metadata_store":{"database_name":"x"}}`) without wiping siblings.
 		if err := json.Unmarshal(body, w); err != nil {
 			return warehouseBadRequestError{err}
+		}
+		if w.DucklingName == "" {
+			return warehouseBadRequestError{errors.New("duckling_name cannot be empty")}
 		}
 		cfgView := &configstore.ManagedWarehouseConfig{
 			OrgID:                        orgID,
@@ -819,6 +907,16 @@ func (h *apiHandler) patchTenantPinning(c *gin.Context) {
 		}
 	}
 
+	// Audit detail: image / ducklake_version are safe (non-secret) pins.
+	var pins []string
+	if req.Image != nil {
+		pins = append(pins, "image="+orgStr(*req.Image))
+	}
+	if req.DuckLakeVersion != nil {
+		pins = append(pins, "ducklake_version="+orgStr(*req.DuckLakeVersion))
+	}
+	setAuditDetail(c, strings.Join(pins, ", "))
+
 	stored, ok, err := h.store.MutateManagedWarehouse(orgID, func(w *configstore.ManagedWarehouse) error {
 		if req.Image != nil {
 			w.Image = *req.Image
@@ -885,6 +983,7 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		OrgID          string `json:"org_id"`
 		Passthrough    bool   `json:"passthrough"`
 		DefaultCatalog string `json:"default_catalog"`
+		MaxVCPUs       int    `json:"max_vcpus"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -904,6 +1003,10 @@ func (h *apiHandler) createUser(c *gin.Context) {
 	} else {
 		raw.DefaultCatalog = catalog
 	}
+	if raw.MaxVCPUs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
+		return
+	}
 	hash, err := configstore.HashPassword(raw.Password)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
@@ -915,7 +1018,11 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		OrgID:          raw.OrgID,
 		Passthrough:    raw.Passthrough,
 		DefaultCatalog: raw.DefaultCatalog,
+		MaxVCPUs:       raw.MaxVCPUs,
 	}
+	// The audit row's org/target columns come from URL params, but this route is
+	// the top-level POST /users with no params — record who was created here.
+	setAuditDetail(c, "created user "+raw.Username+" in org "+raw.OrgID)
 	if err := h.store.CreateUser(&user); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -943,10 +1050,26 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		Password       string  `json:"password"`
 		Passthrough    *bool   `json:"passthrough,omitempty"`
 		DefaultCatalog *string `json:"default_catalog,omitempty"`
+		MaxVCPUs       *int    `json:"max_vcpus,omitempty"`
 	}
-	if err := c.ShouldBindJSON(&raw); err != nil {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	maxVCPUs := raw.MaxVCPUs
+	if rawMaxVCPUs, ok := fields["max_vcpus"]; ok && bytes.Equal(bytes.TrimSpace(rawMaxVCPUs), []byte("null")) {
+		zero := 0
+		maxVCPUs = &zero
 	}
 	passwordHash := ""
 	if raw.Password != "" {
@@ -965,7 +1088,30 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		raw.DefaultCatalog = &catalog
 	}
-	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog)
+	if maxVCPUs != nil && *maxVCPUs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
+		return
+	}
+	// Audit detail: which fields the update touched. The password is NEVER
+	// logged — only that it was reset.
+	var changes []string
+	if _, ok := fields["password"]; ok && raw.Password != "" {
+		changes = append(changes, "password reset")
+	}
+	if raw.Passthrough != nil {
+		changes = append(changes, fmt.Sprintf("passthrough=%v", *raw.Passthrough))
+	}
+	if raw.DefaultCatalog != nil {
+		changes = append(changes, "default_catalog="+orgStr(*raw.DefaultCatalog))
+	}
+	if maxVCPUs != nil {
+		changes = append(changes, fmt.Sprintf("max_vcpus=%d", *maxVCPUs))
+	}
+	if len(changes) > 0 {
+		setAuditDetail(c, strings.Join(changes, ", "))
+	}
+
+	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog, maxVCPUs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1005,32 +1151,49 @@ func (h *apiHandler) deleteUser(c *gin.Context) {
 // --- Workers ---
 
 func (h *apiHandler) listWorkers(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, []WorkerStatus{})
-		return
+	workers := []WorkerStatus{}
+	if h.info != nil {
+		workers = h.info.AllWorkerStatuses()
 	}
-	c.JSON(http.StatusOK, h.info.AllWorkerStatuses())
+	// A worker is owned by exactly one CP (disjoint union); dedup makes it idempotent.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
+		mergePeer(&workers, bodies, func(e []WorkerStatus) []WorkerStatus { return e })
+		workers = dedupeBy(workers, func(w WorkerStatus) int { return w.ID })
+	}
+	c.JSON(http.StatusOK, workers)
 }
 
 // --- Sessions ---
 
 func (h *apiHandler) listSessions(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, []SessionStatus{})
-		return
+	sessions := []SessionStatus{}
+	if h.info != nil {
+		sessions = h.info.AllSessionStatuses()
 	}
-	c.JSON(http.StatusOK, h.info.AllSessionStatuses())
+	// A session lives on exactly one CP (disjoint union); dedup makes it idempotent.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
+		mergePeer(&sessions, bodies, func(e []SessionStatus) []SessionStatus { return e })
+		sessions = dedupeBy(sessions, func(s SessionStatus) int { return s.WorkerID })
+	}
+	c.JSON(http.StatusOK, sessions)
 }
 
 // --- Status ---
 
 func (h *apiHandler) getClusterStatus(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, ClusterStatus{})
-		return
+	orgStats := []OrgStatus{}
+	if h.info != nil {
+		orgStats = h.info.AllOrgStats()
+	}
+	// Per-org active-session counts are per-CP; merge every CP's slice so the
+	// Overview cards reflect the whole cluster instead of one replica's view.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/status")
+		orgStats = mergeOrgStats(orgStats, bodies)
 	}
 
-	orgStats := h.info.AllOrgStats()
 	totalWorkers := 0
 	totalSessions := 0
 	for _, os := range orgStats {

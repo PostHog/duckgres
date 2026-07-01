@@ -160,6 +160,16 @@ func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleHot {
 		return false
 	}
+	return p.commitHotIdleLocked(id, w)
+}
+
+// commitHotIdleLocked performs the durable-first Hot → hot_idle transition for a
+// worker the caller has already verified is Hot with activeSessions == 0.
+// Caller holds p.mu. Extracted so both the session-release path
+// (TransitionToHotIdleIfNoSessions) and the no-decrement sweep
+// (parkIdleHotWorker / ReleaseIdleHotWorkers) share one correct
+// implementation.
+func (p *K8sWorkerPool) commitHotIdleLocked(id int, w *ManagedWorker) bool {
 	nextState, err := w.SharedState().Transition(WorkerLifecycleHotIdle, nil)
 	if err != nil {
 		return false
@@ -173,8 +183,7 @@ func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	// state=hot_idle) AND the TTL reaper (same filter) until this CP restarts,
 	// stranding an idle pod forever. Leaving it Hot keeps it reusable by its org
 	// (findIdleAssignedWorkerLocked reuses Hot, activeSessions==0 workers) and a
-	// later release/retire retries the park; the session decrement above already
-	// happened, so the worker is honestly idle, just not yet durably parked.
+	// later release/retire retries the park.
 	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
 	if err := p.persistWorkerRecord(hotIdleRecord); err != nil {
 		observeHotIdlePersistFailure(w.image)
@@ -189,6 +198,58 @@ func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	}
 	w.lastUsed = time.Now()
 	return true
+}
+
+// parkIdleHotWorker parks a Hot, zero-session worker into hot_idle WITHOUT
+// decrementing the session count (unlike TransitionToHotIdleIfNoSessions, which
+// is a session-release callback). It re-checks state + activeSessions under the
+// lock, so it is safe against a worker becoming busy between selection and park.
+// Returns true if it parked the worker.
+func (p *K8sWorkerPool) parkIdleHotWorker(id int) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w, ok := p.workers[id]
+	if !ok || w.activeSessions != 0 {
+		return false
+	}
+	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleHot {
+		return false
+	}
+	return p.commitHotIdleLocked(id, w)
+}
+
+// ReleaseIdleHotWorkers parks every Hot worker this CP owns that currently holds
+// NO session into hot_idle, so the hot-idle TTL reaper (or a peer-CP takeover)
+// reclaims it through the existing fenced path. A Hot/0-session worker is a
+// worker whose Hot → hot_idle park was missed (e.g. an earlier persist failure
+// that never got retried because the worker received no further session); left
+// alone it is invisible to the TTL reaper and pins its pod's vCPU/memory.
+//
+// Called when this CP enters drain (drainAndShutdown): otherwise such workers
+// linger for the entire — possibly unbounded — drain wall, because ShutdownAll
+// (which would clean them) runs only AFTER waitForDrain returns. Selection is a
+// lock-held snapshot; each park re-validates under the lock, so a worker that
+// became busy in between is skipped. Returns the number parked.
+func (p *K8sWorkerPool) ReleaseIdleHotWorkers(origin LifecycleOrigin) int {
+	p.mu.Lock()
+	var ids []int
+	for id, w := range p.workers {
+		if w.activeSessions == 0 && w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+			ids = append(ids, id)
+		}
+	}
+	p.mu.Unlock()
+
+	parked := 0
+	for _, id := range ids {
+		if p.parkIdleHotWorker(id) {
+			parked++
+		}
+	}
+	if parked > 0 {
+		slog.Info("Parked idle hot workers into hot_idle on drain.", "count", parked, "origin", origin)
+	}
+	return parked
 }
 
 func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
@@ -564,7 +625,8 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// Leave the worker in `hot` state, owned by this dying CP. Two
 		// downstream guarantees keep this safe:
 		//   (1) Flight clients can reconnect by session token; a peer CP
-		//       claims via TakeOverWorker and the query resumes.
+		//       claims via TakeOverWorker and starts a fresh remote session
+		//       on the surviving worker.
 		//   (2) ListOrphanedWorkers' JOIN against flight_session_records
 		//       prevents peer CPs' janitors from retiring the worker
 		//       while a session is still active or reconnecting; once the

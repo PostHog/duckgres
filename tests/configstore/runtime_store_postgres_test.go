@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +23,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatal("expected runtime schema to be configured")
 	}
 
-	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records"} {
+	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records", "org_connection_queue", "org_connection_leases"} {
 		var count int64
 		if err := store.DB().Raw(
 			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
@@ -34,6 +36,10 @@ func TestRuntimeStorePostgres(t *testing.T) {
 			t.Fatalf("expected runtime table %s.%s to exist", runtimeSchema, table)
 		}
 	}
+	requireRuntimeIndexDefinition(t, store, "org_connection_queue", "idx_org_connection_queue_user_heads",
+		"(org_id, username, enqueued_at, request_id)", "WHERE (granted_at IS NULL)")
+	requireRuntimeIndexDefinition(t, store, "org_connection_leases", "idx_org_connection_leases_org_user",
+		"(org_id, username)")
 
 	startedAt := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	heartbeatAt := startedAt.Add(5 * time.Second)
@@ -86,6 +92,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		Username:     "postgres",
 		OrgID:        "analytics",
 		WorkerID:     42,
+		PID:          1234,
 		OwnerEpoch:   7,
 		State:        configstore.FlightSessionStateActive,
 		ExpiresAt:    sessionExpiry,
@@ -101,6 +108,9 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	if session.WorkerID != 42 {
 		t.Fatalf("expected worker id 42, got %d", session.WorkerID)
 	}
+	if session.PID != 1234 {
+		t.Fatalf("expected pid 1234, got %d", session.PID)
+	}
 	if session.Username != "postgres" {
 		t.Fatalf("expected username postgres, got %q", session.Username)
 	}
@@ -108,6 +118,30 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatalf("expected session state active, got %q", session.State)
 	}
 }
+
+func requireRuntimeIndexDefinition(t *testing.T, store *configstore.ConfigStore, tableName, indexName string, wantSubstrings ...string) {
+	t.Helper()
+
+	var indexDef string
+	err := store.DB().Raw(
+		"SELECT indexdef FROM pg_indexes WHERE schemaname = ? AND tablename = ? AND indexname = ?",
+		store.RuntimeSchema(),
+		tableName,
+		indexName,
+	).Scan(&indexDef).Error
+	if err != nil {
+		t.Fatalf("lookup runtime index %s.%s: %v", tableName, indexName, err)
+	}
+	if indexDef == "" {
+		t.Fatalf("runtime index %s.%s is missing", tableName, indexName)
+	}
+	for _, want := range wantSubstrings {
+		if !strings.Contains(indexDef, want) {
+			t.Fatalf("runtime index %s.%s definition = %q, want substring %q", tableName, indexName, indexDef, want)
+		}
+	}
+}
+
 func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 26, 14, 45, 0, 0, time.UTC)
@@ -378,6 +412,86 @@ func TestListExpiredHotIdleWorkersPerWorkerTTL(t *testing.T) {
 	if got[4] {
 		t.Error("non-hot-idle (hot) worker must never be returned")
 	}
+}
+
+// Regression: the hot-idle TTL reaper must NOT retire a hot-idle worker that
+// still backs a reclaimable (Active/Reconnecting) Flight session — the customer
+// is mid-reconnect by session token, and retiring the worker would kill their
+// in-flight query on reconnect. This mirrors the long-standing exclusion in
+// ListOrphanedWorkers. A worker with only a terminal (closed) Flight record, or
+// none at all, is still reaped once its TTL elapses.
+func TestListExpiredHotIdleWorkersSparesReclaimableFlightSessions(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	mkWorker := func(id int) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-flt-%d", id),
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        5, // all well past TTL at base+30m
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	mkSession := func(token string, workerID int, state configstore.FlightSessionState) {
+		if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+			SessionToken: token,
+			Username:     "postgres",
+			OrgID:        "analytics",
+			WorkerID:     workerID,
+			OwnerEpoch:   1,
+			State:        state,
+			ExpiresAt:    base.Add(time.Hour),
+			LastSeenAt:   base,
+		}); err != nil {
+			t.Fatalf("UpsertFlightSessionRecord(%s): %v", token, err)
+		}
+	}
+
+	mkWorker(1) // no flight session         → reaped
+	mkWorker(2) // active flight session      → spared
+	mkWorker(3) // reconnecting flight session → spared
+	mkWorker(4) // closed flight session only → reaped
+	mkSession("tok-active", 2, configstore.FlightSessionStateActive)
+	mkSession("tok-reconnecting", 3, configstore.FlightSessionStateReconnecting)
+	mkSession("tok-closed", 4, configstore.FlightSessionStateClosed)
+
+	assertSpared := func(name string, expired []configstore.WorkerRecord) {
+		got := map[int]bool{}
+		for _, w := range expired {
+			got[w.WorkerID] = true
+		}
+		if !got[1] {
+			t.Errorf("%s: worker 1 (no flight session) should be reaped", name)
+		}
+		if got[2] {
+			t.Errorf("%s: worker 2 (active flight session) must be spared", name)
+		}
+		if got[3] {
+			t.Errorf("%s: worker 3 (reconnecting flight session) must be spared", name)
+		}
+		if !got[4] {
+			t.Errorf("%s: worker 4 (closed flight session only) should be reaped", name)
+		}
+	}
+
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	assertSpared("global", expired)
+
+	// The per-CP fallback reaper variant must spare them too.
+	expiredCP, err := store.ListExpiredHotIdleWorkersForCP("cp:boot", base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkersForCP: %v", err)
+	}
+	assertSpared("per-cp", expiredCP)
 }
 
 // Regression: UpsertWorkerRecord must update the profile (cpu/mem/colocate) and
@@ -855,6 +969,62 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	}
 	if persisted.State != configstore.WorkerStateSpawning {
 		t.Fatalf("expected persisted spawning state, got %q", persisted.State)
+	}
+}
+
+// Regression: concurrent CreateSpawningWorkerSlot calls for DIFFERENT orgs must
+// never allocate the same worker_id. The old SELECT MAX(worker_id)+1 allocation
+// was serialized only by a per-org advisory lock, so cross-org concurrency read
+// the same MAX and collided on worker_records_pkey (SQLSTATE 23505) — the flake
+// that was failing the e2e res1/res2 lanes. nextval() off the global sequence
+// makes allocation atomic across orgs.
+func TestCreateSpawningWorkerSlotConcurrentCrossOrgUniqueIDs(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	const n = 24
+	var wg sync.WaitGroup
+	ids := make([]int, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all goroutines together to maximize contention
+			// A distinct org per goroutine → distinct per-org advisory locks →
+			// the allocation step runs concurrently (the colliding scenario).
+			slot, err := store.CreateSpawningWorkerSlot(
+				"cp:boot", fmt.Sprintf("org-%d", i), "duckgres:test", "", "", 1,
+				"duckgres-worker-test", 0 /* uncapped */)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			if slot == nil {
+				errs[i] = fmt.Errorf("goroutine %d: nil slot without cap", i)
+				return
+			}
+			ids[i] = slot.WorkerID
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := map[int]int{} // worker_id -> goroutine that got it
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: CreateSpawningWorkerSlot errored (pre-fix: pkey collision): %v", i, errs[i])
+		}
+		if ids[i] <= 0 {
+			t.Fatalf("goroutine %d: non-positive worker id %d", i, ids[i])
+		}
+		if prev, dup := seen[ids[i]]; dup {
+			t.Fatalf("worker_id %d allocated to both goroutine %d and %d — collision not prevented", ids[i], prev, i)
+		}
+		seen[ids[i]] = i
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d distinct worker ids, got %d", n, len(seen))
 	}
 }
 
@@ -1540,9 +1710,10 @@ func TestMarkCredentialsRefreshedFailsOnOwnerMismatch(t *testing.T) {
 // worker whose owning CP has expired is normally an orphan-cleanup
 // candidate. But if a Flight client could still reconnect by session
 // token (record is in active or reconnecting state), the orphan retire
-// would kill an in-flight customer query the moment they reconnect. The
-// JOIN onto flight_session_records gives those workers a reprieve until
-// the session record itself is expired by ExpireFlightSessionRecords.
+// would remove the worker before the token holder can establish a fresh
+// remote session. The JOIN onto flight_session_records gives those
+// workers a reprieve until the session record itself is expired by
+// ExpireFlightSessionRecords.
 func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
@@ -1600,9 +1771,9 @@ func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T
 }
 
 // TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions:
-// the reconnecting state means a customer is mid-handshake from a Flight
-// client picking the session back up. Same protection applies — kill the
-// worker and you kill the resumption.
+// the reconnecting state means a Flight client is mid-handshake for a
+// token-backed fresh remote session. Same protection applies — retire the
+// worker and that reconnect attempt cannot finish.
 func TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
@@ -1796,6 +1967,65 @@ func TestGetTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
 	}
 	if !record.LastSeenAt.Equal(closedAt) {
 		t.Fatalf("expected close timestamp %v, got %v", closedAt, record.LastSeenAt)
+	}
+}
+
+func TestCloseFlightSessionRecordIfReconnectTargetUnchangedPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 16, 30, 0, 0, time.UTC)
+	stale := configstore.FlightSessionRecord{
+		SessionToken: "flight-cas-close",
+		Username:     "postgres",
+		OrgID:        "analytics",
+		WorkerID:     42,
+		PID:          1001,
+		OwnerEpoch:   7,
+		CPInstanceID: "cp-old:boot-a",
+		State:        configstore.FlightSessionStateActive,
+		ExpiresAt:    now.Add(time.Hour),
+		LastSeenAt:   now,
+	}
+	if err := store.UpsertFlightSessionRecord(&stale); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord(stale): %v", err)
+	}
+
+	refreshed := stale
+	refreshed.PID = 2002
+	refreshed.OwnerEpoch = 8
+	refreshed.CPInstanceID = "cp-new:boot-b"
+	refreshed.LastSeenAt = now.Add(time.Minute)
+	if err := store.UpsertFlightSessionRecord(&refreshed); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord(refreshed): %v", err)
+	}
+
+	closed, err := store.CloseFlightSessionRecordIfReconnectTargetUnchanged(stale, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("CloseFlightSessionRecordIfReconnectTargetUnchanged(stale): %v", err)
+	}
+	if closed {
+		t.Fatal("expected stale reconnect target not to close refreshed durable session")
+	}
+	record, err := store.GetFlightSessionRecord("flight-cas-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord: %v", err)
+	}
+	if record.State != configstore.FlightSessionStateActive || record.PID != 2002 || record.CPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected refreshed durable record to remain active, got %#v", record)
+	}
+
+	closed, err = store.CloseFlightSessionRecordIfReconnectTargetUnchanged(refreshed, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("CloseFlightSessionRecordIfReconnectTargetUnchanged(refreshed): %v", err)
+	}
+	if !closed {
+		t.Fatal("expected current reconnect target to close")
+	}
+	record, err = store.GetFlightSessionRecord("flight-cas-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord(closed): %v", err)
+	}
+	if record.State != configstore.FlightSessionStateClosed {
+		t.Fatalf("expected durable record to be closed, got %#v", record)
 	}
 }
 

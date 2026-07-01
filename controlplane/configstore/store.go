@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // OrgUserKey is the composite key for org-scoped user lookups.
@@ -31,6 +32,10 @@ var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 // rejected by the monotonic owner/terminal-state fence and did not persist.
 var ErrWorkerRecordUpsertFenceMiss = errors.New("worker record upsert fence miss")
 
+// ErrOrgUserNotFound is returned by user mutators (e.g. SetOrgUserDisabled) when
+// no row matches (orgID, username). Callers map it to a 404.
+var ErrOrgUserNotFound = errors.New("org user not found")
+
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
 	Orgs                  map[string]*OrgConfig
@@ -38,7 +43,9 @@ type Snapshot struct {
 	HostnameAliasOrg      map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
 	OrgUserPassword       map[OrgUserKey]string // (orgID, username) -> bcrypt hash
 	OrgUserPassthrough    map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
+	OrgUserDisabled       map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
 	OrgUserDefaultCatalog map[OrgUserKey]string // (orgID, username) -> default session catalog
+	OrgUserMaxVCPUs       map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
 }
 
 // Selectable catalog names. The startup `database` param now names the catalog
@@ -77,6 +84,11 @@ type PostgresConnectionResolution struct {
 	// Passthrough / DefaultCatalog are the per-user flags for the resolved user.
 	Passthrough    bool
 	DefaultCatalog string
+	// Disabled is true when the resolved user authenticated but is administratively
+	// disabled (kill switch). Callers must refuse the connection. It is only ever
+	// set together with Valid=true — a wrong password / unknown user returns
+	// Valid=false and never leaks the disabled state.
+	Disabled bool
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -180,7 +192,9 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		HostnameAliasOrg:      make(map[string]string),
 		OrgUserPassword:       make(map[OrgUserKey]string),
 		OrgUserPassthrough:    make(map[OrgUserKey]bool),
+		OrgUserDisabled:       make(map[OrgUserKey]bool),
 		OrgUserDefaultCatalog: make(map[OrgUserKey]string),
+		OrgUserMaxVCPUs:       make(map[OrgUserKey]int),
 	}
 
 	for _, o := range orgs {
@@ -193,7 +207,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			DatabaseName:            o.DatabaseName,
 			HostnameAlias:           alias,
 			MaxWorkers:              o.MaxWorkers,
-			MaxConnections:          o.MaxConnections,
+			MaxVCPUs:                o.MaxVCPUs,
 			DefaultWorkerCPU:        o.DefaultWorkerCPU,
 			DefaultWorkerMemory:     o.DefaultWorkerMemory,
 			DefaultWorkerTTL:        o.DefaultWorkerTTL,
@@ -214,14 +228,43 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			if u.Passthrough {
 				snap.OrgUserPassthrough[key] = true
 			}
+			if u.Disabled {
+				snap.OrgUserDisabled[key] = true
+			}
 			if u.DefaultCatalog != "" {
 				snap.OrgUserDefaultCatalog[key] = u.DefaultCatalog
+			}
+			if u.MaxVCPUs > 0 {
+				snap.OrgUserMaxVCPUs[key] = u.MaxVCPUs
 			}
 		}
 		snap.Orgs[o.Name] = oc
 	}
 
 	return snap, nil
+}
+
+// ReloadSnapshot forces an immediate reload of the config snapshot from the
+// database, bypassing the poll interval, and fires OnChange callbacks exactly
+// like a poll tick. Admin actions that must take effect without waiting up to
+// one poll interval use it — notably the per-user kill switch, where the disable
+// handler reloads every CP replica (via fan-out) so a disabled user is refused
+// cluster-wide the instant the call returns, not one poll later.
+func (cs *ConfigStore) ReloadSnapshot() error {
+	newSnap, err := cs.load()
+	if err != nil {
+		return fmt.Errorf("reload config snapshot: %w", err)
+	}
+	cs.mu.Lock()
+	oldSnap := cs.snapshot
+	cs.snapshot = newSnap
+	callbacks := make([]func(old, new *Snapshot), len(cs.onChange))
+	copy(callbacks, cs.onChange)
+	cs.mu.Unlock()
+	for _, fn := range callbacks {
+		fn(oldSnap, newSnap)
+	}
+	return nil
 }
 
 // Snapshot returns the current config snapshot.
@@ -378,6 +421,10 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result.Valid = true
 	result.Passthrough = cs.snapshot.OrgUserPassthrough[key]
 	result.DefaultCatalog = cs.snapshot.OrgUserDefaultCatalog[key]
+	// Disabled is only meaningful (and only revealed) once credentials check out,
+	// so a disabled user gets a distinct "account disabled" error while a wrong
+	// password still looks identical to an unknown user.
+	result.Disabled = cs.snapshot.OrgUserDisabled[key]
 	return result
 }
 
@@ -457,7 +504,11 @@ func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
 		return false
 	}
-	return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return false
+	}
+	// A disabled user (kill switch) is refused even with correct credentials.
+	return !cs.snapshot.OrgUserDisabled[OrgUserKey{OrgID: orgID, Username: username}]
 }
 
 // IsOrgUserPassthrough reports whether the given (org, user) is configured to
@@ -497,6 +548,11 @@ func (cs *ConfigStore) ValidateOrgUserAndGetPassthrough(orgID, username, passwor
 		return false, false
 	}
 	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return false, false
+	}
+	// A disabled user (kill switch) is refused even with correct credentials;
+	// valid=false also guarantees passthrough is never leaked for a disabled user.
+	if cs.snapshot.OrgUserDisabled[key] {
 		return false, false
 	}
 	return true, cs.snapshot.OrgUserPassthrough[key]
@@ -547,6 +603,23 @@ func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash strin
 	return nil
 }
 
+// SetOrgUserDisabled flips the per-user kill switch for an existing user. The
+// change is persisted immediately; it becomes effective for new connections on
+// the next snapshot poll (or sooner on the writing replica, which can read its
+// own write). Returns an error if the user does not exist.
+func (cs *ConfigStore) SetOrgUserDisabled(orgID, username string, disabled bool) error {
+	result := cs.db.Model(&OrgUser{}).
+		Where("org_id = ? AND username = ?", orgID, username).
+		Updates(map[string]any{"disabled": disabled, "updated_at": time.Now()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("user %q in org %q: %w", username, orgID, ErrOrgUserNotFound)
+	}
+	return nil
+}
+
 // OnChange registers a callback that fires when the config snapshot changes.
 func (cs *ConfigStore) OnChange(fn func(old, new *Snapshot)) {
 	cs.mu.Lock()
@@ -556,6 +629,16 @@ func (cs *ConfigStore) OnChange(fn func(old, new *Snapshot)) {
 
 // ListWarehousesByStates returns all warehouses with a state matching one of the given values.
 // This is a direct DB query, not snapshot-based, for use by the provisioning controller.
+// ListWarehouses returns every managed-warehouse row. Used by the admin drift
+// finder, which only consumes org_id, state, and duckling_name.
+func (cs *ConfigStore) ListWarehouses() ([]ManagedWarehouse, error) {
+	var warehouses []ManagedWarehouse
+	if err := cs.db.Find(&warehouses).Error; err != nil {
+		return nil, fmt.Errorf("list warehouses: %w", err)
+	}
+	return warehouses, nil
+}
+
 func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvisioningState) ([]ManagedWarehouse, error) {
 	var warehouses []ManagedWarehouse
 	if err := cs.db.Where("state IN ?", states).Find(&warehouses).Error; err != nil {
@@ -663,6 +746,16 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 		}
 	}
 
+	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_org_connection_queue_user_heads ON ` + qs + `.org_connection_queue (org_id, username, enqueued_at, request_id) WHERE granted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_org_connection_leases_org_user ON ` + qs + `.org_connection_leases (org_id, username)`,
+	} {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+
 	// Drop runtime columns whose Go struct fields were removed. AutoMigrate
 	// never drops columns, and on an existing deployment cp_instances.pod_uid /
 	// boot_id are NOT NULL — leaving them would make every heartbeat insert (which
@@ -672,7 +765,6 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 	// org_connection_queue.canceled_at was never set (cancel is a DELETE). DROP
 	// ... IF EXISTS is idempotent and a no-op on a fresh schema. This must run
 	// before the first UpsertControlPlaneInstance.
-	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
 	for _, stmt := range []string{
 		`ALTER TABLE ` + qs + `.cp_instances DROP COLUMN IF EXISTS pod_uid, DROP COLUMN IF EXISTS boot_id`,
 		`ALTER TABLE ` + qs + `.worker_records DROP COLUMN IF EXISTS pod_uid`,
@@ -681,6 +773,49 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 		if err := db.Exec(stmt).Error; err != nil {
 			return err
 		}
+	}
+
+	if err := ensureWorkerIDSequence(db, runtimeSchema); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureWorkerIDSequence creates the global worker-id sequence that
+// CreateSpawningWorkerSlot allocates from. It replaces the old
+// SELECT MAX(worker_id)+1 allocation, which was only serialized by a PER-ORG
+// advisory lock while worker_id is a GLOBAL primary key: two concurrent spawns
+// for DIFFERENT orgs (or with an empty org) read the same MAX and inserted the
+// same id, colliding on worker_records_pkey (SQLSTATE 23505). nextval() is
+// globally atomic, so it removes that race entirely.
+//
+// The sequence is seeded ONCE, just above the highest existing worker_id, and
+// deliberately NOT re-seeded on later startups: a re-seed could race a
+// concurrent nextval on a peer CP and move the sequence backward, reintroducing
+// the very collision it replaces. CREATE SEQUENCE IF NOT EXISTS makes a
+// concurrent first-startup create a no-op for the loser. Sequences are
+// non-transactional, so a rolled-back CreateSpawningWorkerSlot leaves an unused
+// id — gaps are fine; only uniqueness matters.
+func ensureWorkerIDSequence(db *gorm.DB, runtimeSchema string) error {
+	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
+	seq := qs + `.worker_records_id_seq`
+
+	var exists bool
+	if err := db.Raw(`SELECT to_regclass(?) IS NOT NULL`, runtimeSchema+".worker_records_id_seq").Scan(&exists).Error; err != nil {
+		return fmt.Errorf("probe worker id sequence: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	var start int64
+	if err := db.Raw(`SELECT COALESCE(MAX(worker_id), 0) + 1 FROM ` + qs + `.worker_records`).Scan(&start).Error; err != nil {
+		return fmt.Errorf("seed worker id sequence: %w", err)
+	}
+	// START WITH is an integer literal (no user input); IF NOT EXISTS handles a
+	// concurrent peer creating it first (its START WITH wins, ours no-ops).
+	if err := db.Exec(fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s AS BIGINT START WITH %d", seq, start)).Error; err != nil {
+		return fmt.Errorf("create worker id sequence: %w", err)
 	}
 	return nil
 }
@@ -704,16 +839,35 @@ func (cs *ConfigStore) runtimeTable(base string) string {
 }
 
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
-// state by image and tenant binding for Prometheus observability.
+// state by image and tenant binding for Prometheus observability, with summed
+// cpu cores and memory bytes per group.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
 	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
 	// now; the branch only matches pre-existing/legacy rows or single-tenant mode.
-	const bindingExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
-	var out []WorkerLifecycleStats
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Select("image, state, "+bindingExpr+" AS binding, COUNT(*)::bigint AS count").
-		Where("image <> ''").
-		Where("state IN ?", []WorkerState{
+	const bindingExpr = "CASE WHEN NULLIF(w.org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
+	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
+	// Org is a config table (not runtime-qualified); its default worker profile
+	// supplies the cpu/mem for workers that carry no explicit profile.
+	orgTable := (&Org{}).TableName()
+
+	// k8s quantity strings can't be summed in SQL, so pull the raw filtered rows
+	// (cpu/mem resolved to the org default when the worker carries none) and
+	// aggregate per (image,state,binding) group in Go below.
+	type workerRow struct {
+		Image   string
+		State   WorkerState
+		Binding string
+		CPU     string
+		Memory  string
+	}
+	var rows []workerRow
+	err := cs.db.Table(workerTable+" AS w").
+		Select("w.image AS image, w.state AS state, "+bindingExpr+" AS binding, "+
+			"COALESCE(NULLIF(w.profile_cpu, ''), o.default_worker_cpu, '') AS cpu, "+
+			"COALESCE(NULLIF(w.profile_memory, ''), o.default_worker_memory, '') AS memory").
+		Joins("LEFT JOIN "+orgTable+" AS o ON o.name = w.org_id").
+		Where("w.image <> ''").
+		Where("w.state IN ?", []WorkerState{
 			WorkerStateSpawning,
 			WorkerStateIdle,
 			WorkerStateReserved,
@@ -722,11 +876,42 @@ func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error
 			WorkerStateHotIdle,
 			WorkerStateDraining,
 		}).
-		Group("image, state, " + bindingExpr).
-		Order("image ASC, state ASC, binding ASC").
-		Scan(&out).Error
+		Order("w.image ASC, w.state ASC, " + bindingExpr + " ASC").
+		Scan(&rows).Error
 	if err != nil {
 		return nil, fmt.Errorf("list worker lifecycle stats: %w", err)
+	}
+
+	// Aggregate count + summed cpu cores / memory bytes per group, preserving the
+	// image/state/binding ordering established by the query above.
+	type groupKey struct {
+		image   string
+		state   WorkerState
+		binding string
+	}
+	index := make(map[groupKey]int)
+	var out []WorkerLifecycleStats
+	for _, r := range rows {
+		k := groupKey{r.Image, r.State, r.Binding}
+		i, ok := index[k]
+		if !ok {
+			i = len(out)
+			index[k] = i
+			out = append(out, WorkerLifecycleStats{Image: r.Image, State: r.State, Binding: r.Binding})
+		}
+		out[i].Count++
+		// Unparseable/empty quantities (e.g. default profile with no org default)
+		// contribute 0.
+		if r.CPU != "" {
+			if q, err := resource.ParseQuantity(r.CPU); err == nil {
+				out[i].CPUCores += q.AsApproximateFloat64()
+			}
+		}
+		if r.Memory != "" {
+			if q, err := resource.ParseQuantity(r.Memory); err == nil {
+				out[i].MemoryBytes += q.Value()
+			}
+		}
 	}
 	return out, nil
 }
@@ -966,21 +1151,42 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID, image string
 // keying off it let a periodically-refreshed worker reset its own TTL forever.
 // Legacy rows with a NULL hot_idle_since fall back to updated_at so they still
 // expire. A worker's ttl_minutes governs it; 0 falls back to defaultTTL
-// (default/legacy and unassigned rows).
+// (default/legacy and unassigned rows). Workers still backing a reclaimable
+// Flight session are spared (see reclaimableFlightSessionGuard).
 func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
 	defMins := int64(defaultTTL.Minutes())
 	if defMins < 0 {
 		defMins = 0
 	}
 	var workers []WorkerRecord
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("state = ? AND COALESCE(hot_idle_since, updated_at) + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+	clause, args := cs.reclaimableFlightSessionGuard()
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())+" AS w").
+		Where("w.state = ? AND COALESCE(w.hot_idle_since, w.updated_at) + (CASE WHEN COALESCE(w.ttl_minutes, 0) > 0 THEN w.ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
 			WorkerStateHotIdle, defMins, now).
+		Where(clause, args...).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)
 	}
 	return workers, nil
+}
+
+// reclaimableFlightSessionGuard returns a correlated NOT-EXISTS clause (and its
+// args) that spares a worker row (aliased `w`) which still backs a reclaimable
+// Flight session (Active or Reconnecting). It mirrors the same exclusion in
+// ListOrphanedWorkers so the hot-idle TTL reaper does not retire a worker whose
+// customer is mid-reconnect by session token — a retire there would kill the
+// in-flight query at the moment they reconnect. Bounded by
+// ExpireFlightSessionRecords: once the session record is moved to a terminal
+// state, the worker is no longer protected.
+func (cs *ConfigStore) reclaimableFlightSessionGuard() (string, []any) {
+	flightTable := cs.runtimeTable((&FlightSessionRecord{}).TableName())
+	reclaimableSessionStates := []FlightSessionState{
+		FlightSessionStateActive,
+		FlightSessionStateReconnecting,
+	}
+	return "NOT EXISTS (SELECT 1 FROM " + flightTable + " AS f " +
+		"WHERE f.worker_id = w.worker_id AND f.state IN ?)", []any{reclaimableSessionStates}
 }
 
 // ListExpiredHotIdleWorkersForCP is the owner-scoped variant of
@@ -996,9 +1202,11 @@ func (cs *ConfigStore) ListExpiredHotIdleWorkersForCP(ownerCPInstanceID string, 
 		defMins = 0
 	}
 	var workers []WorkerRecord
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("state = ? AND owner_cp_instance_id = ? AND COALESCE(hot_idle_since, updated_at) + (CASE WHEN COALESCE(ttl_minutes, 0) > 0 THEN ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
+	clause, args := cs.reclaimableFlightSessionGuard()
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())+" AS w").
+		Where("w.state = ? AND w.owner_cp_instance_id = ? AND COALESCE(w.hot_idle_since, w.updated_at) + (CASE WHEN COALESCE(w.ttl_minutes, 0) > 0 THEN w.ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
 			WorkerStateHotIdle, ownerCPInstanceID, defMins, now).
+		Where(clause, args...).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers for cp: %w", err)
@@ -1373,8 +1581,13 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 			}
 		}
 
+		// Allocate the worker_id from the global sequence (nextval is atomic
+		// across orgs and CPs). The old SELECT MAX(worker_id)+1 was only
+		// serialized by the per-org advisory lock above, so two concurrent
+		// spawns for different orgs picked the same id and collided on
+		// worker_records_pkey. See ensureWorkerIDSequence.
 		var workerID int64
-		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+		if err := tx.Raw("SELECT nextval(?::regclass)", cs.runtimeTable("worker_records_id_seq")).Scan(&workerID).Error; err != nil {
 			return err
 		}
 		now := time.Now()
@@ -1436,10 +1649,11 @@ func (cs *ConfigStore) countOrgAdmittingWorkers(tx *gorm.DB, orgID, image, profi
 // Apr 2026 also added an exclusion for workers with reclaimable Flight
 // sessions: a row with at least one flight_session_records entry in
 // active or reconnecting state is spared from orphan retirement so a
-// customer reconnecting by session token can still pick up their query
-// (see TakeOverWorker). Once the session record itself becomes terminal
-// (expired/closed via ExpireFlightSessionRecords), the worker is
-// retired normally on the next sweep.
+// customer reconnecting by session token can establish a fresh remote
+// session on the surviving worker (see TakeOverWorker). Once the session
+// record itself becomes terminal (expired/closed via
+// ExpireFlightSessionRecords), the worker is retired normally on the next
+// sweep.
 //
 // See TestListOrphanedWorkers* in tests/configstore for the regression
 // fixtures.
@@ -1477,8 +1691,8 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 			before,
 		).
 		// Spare workers with at least one reclaimable Flight session: a
-		// retire here would kill the customer's mid-flight query at the
-		// moment they reconnect by session token. Bounded by
+		// retire here would remove the worker before a token holder can
+		// establish a fresh remote session. Bounded by
 		// ExpireFlightSessionRecords — once the session record is moved
 		// to a terminal state, the worker is no longer protected.
 		Where("NOT EXISTS (SELECT 1 FROM "+flightTable+" AS f "+
@@ -1590,7 +1804,7 @@ func advisoryLockKey(s string) int64 {
 func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "session_token"}},
-		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "p_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert flight session record: %w", err)
 	}
@@ -1635,6 +1849,27 @@ func (cs *ConfigStore) CloseFlightSessionRecord(sessionToken string, closedAt ti
 		return fmt.Errorf("close flight session record: %w", result.Error)
 	}
 	return nil
+}
+
+func (cs *ConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(stale FlightSessionRecord, closedAt time.Time) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
+		Where("session_token = ?", stale.SessionToken).
+		Where("state = ?", FlightSessionStateActive).
+		Where("username = ?", stale.Username).
+		Where("org_id = ?", stale.OrgID).
+		Where("worker_id = ?", stale.WorkerID).
+		Where("p_id = ?", stale.PID).
+		Where("owner_epoch = ?", stale.OwnerEpoch).
+		Where("cp_instance_id = ?", stale.CPInstanceID).
+		Updates(map[string]any{
+			"state":        FlightSessionStateClosed,
+			"last_seen_at": closedAt,
+			"updated_at":   time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("close flight session record if reconnect target unchanged: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // Reload forces an immediate config reload from the database.

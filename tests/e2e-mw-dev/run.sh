@@ -33,6 +33,24 @@ internal_secret_fallback_file="/tmp/duckgres-ci-internal-secret-fallback"
 # run: stored user secrets only need to outlive the run's sessions.
 user_secret_key_file="/tmp/duckgres-ci-user-secret-key"
 
+require_pr_identity() {
+  : "${PR_NUMBER:?PR_NUMBER is required}"
+  case "$PR_NUMBER" in
+    *[!0-9]*)
+      echo "PR_NUMBER must be numeric, got '$PR_NUMBER'." >&2
+      return 2
+      ;;
+  esac
+  if [ -z "$NS" ]; then
+    echo "NAMESPACE is required." >&2
+    return 2
+  fi
+  if [ "$NS" != "duckgres-ci-pr-$PR_NUMBER" ]; then
+    echo "NAMESPACE '$NS' does not match PR_NUMBER '$PR_NUMBER'." >&2
+    return 2
+  fi
+}
+
 render() {
   : "${WORKER_IMAGE:?}" "${CONTROLPLANE_IMAGE:?}" "${PR_NUMBER:?}"
   [ -f "$internal_secret_file" ] || openssl rand -hex 16 > "$internal_secret_file"
@@ -49,9 +67,9 @@ render() {
 
 # Bind this namespace's `duckgres` SA to the same IAM role the real mw-dev
 # control plane uses (EKS Pod Identity). With it, the CP brokers per-duckling
-# S3 STS creds exactly like prod and activation completes — without it, DuckLake/
-# Iceberg activation fails at AssumeRole. Idempotent: if an association for this
-# (ns, sa) already exists, leave it. Requires the runner's AWS role to hold
+# S3 STS creds exactly like prod and activation completes — without it,
+# DuckLake activation fails at AssumeRole. Idempotent: if an association for
+# this (ns, sa) already exists, leave it. Requires the runner's AWS role to hold
 # eks:{Create,List,Delete}PodIdentityAssociation + iam:PassRole on the CP role.
 ensure_pod_identity() {
   : "${CP_POD_IDENTITY_ROLE:?CP_POD_IDENTITY_ROLE (CP IAM role ARN) is required}"
@@ -106,23 +124,25 @@ restart_cp_with_identity() {
   return 1
 }
 
-# The cnpg lakekeeper_<org> role+db are owned by the Crossplane composition and
+# The cnpg-shard metadata role+db are owned by the Crossplane composition and
 # dropped when the Duckling CR deletes — but that cascade is async and can lag,
-# leaving a stranded role from a prior run (incl. a cancelled one with no
-# teardown). On the next run the same org id re-provisions against the stranded
-# role whose password has drifted, the Lakekeeper migrate Job hits SASL auth
-# failure, and the warehouse never goes ready. So drop it directly on the
-# active shard, idempotently, BOTH before provisioning (clean slate, so a rerun
-# never inherits stranded state) and at teardown (deterministic clean exit).
-# Scoped to this PR's unique org ids, so it can't touch another PR's tenant.
+# leaving stranded state from a prior run (incl. a cancelled one with no
+# teardown). New Ducklings use mdstore_<org>; legacy Ducklings can still use
+# lakekeeper_<org>. Drop both role+db names directly on the active shard,
+# idempotently, BOTH before provisioning (clean slate, so a rerun never
+# inherits stranded state) and at teardown (deterministic clean exit). Scoped
+# to this PR's unique org ids, so it can't touch another PR's tenant.
 drop_cnpg_role() { # org-id
-  local ident
-  # Mirror the composition's PG identifier: lakekeeper_<lower, [^a-z0-9_]→_>.
-  ident="lakekeeper_$(printf %s "$1" | tr 'A-Z-' 'a-z_' | tr -cd 'a-z0-9_')"
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP DATABASE IF EXISTS ${ident} WITH (FORCE);" >/dev/null 2>&1 || true
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
+  local suffix prefix ident
+  # Mirror the composition's PG identifier suffix: lower, [^a-z0-9_] -> _.
+  suffix="$(printf %s "$1" | tr 'A-Z-' 'a-z_' | tr -cd 'a-z0-9_')"
+  for prefix in mdstore lakekeeper; do
+    ident="${prefix}_${suffix}"
+    "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
+      psql -U postgres -c "DROP DATABASE IF EXISTS ${ident} WITH (FORCE);" >/dev/null 2>&1 || true
+    "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
+      psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
+  done
 }
 
 # Every duckling org a harness run provisions for a PR (harness.sh main()):
@@ -132,8 +152,8 @@ ci_orgs() { # pr-number
   local pr="$1"
   echo "ci-pr-${pr}-cnpg ci-pr-${pr}-ext ci-pr-${pr}-res1 ci-pr-${pr}-res2"
 }
-# The cnpg-shard-backed orgs (everything except ext) — these own a
-# lakekeeper_<org> role+db on the shard that drop_cnpg_role must clean.
+# The cnpg-shard-backed orgs (everything except ext) own a metadata role+db on
+# the shard that drop_cnpg_role must clean.
 ci_cnpg_orgs() { # pr-number
   local pr="$1"
   echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2"
@@ -147,21 +167,43 @@ delete_ci_ducklings() { # pr-number
 }
 
 wait_ci_ducklings_deleted() { # pr-number timeout
-  local pr="$1" timeout="$2" org
+  local pr="$1" timeout="$2" org get_out deletion_timestamp finalizers conditions rest rc=0
   for org in $(ci_orgs "$pr"); do
-    "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout="$timeout" 2>/dev/null || true
+    if ! "${KUBECTL[@]}" -n ducklings wait --for=delete "duckling/$org" --timeout="$timeout"; then
+      if get_out="$("${KUBECTL[@]}" -n ducklings get "duckling/$org" \
+          -o jsonpath='{.metadata.deletionTimestamp}{"|"}{.metadata.finalizers}{"|"}{range .status.conditions[*]}{.type}={.status}:{.reason}{";"}{end}' 2>&1)"; then
+        deletion_timestamp="${get_out%%|*}"
+        rest="${get_out#*|}"
+        finalizers="${rest%%|*}"
+        conditions="${rest#*|}"
+        [ -n "$deletion_timestamp" ] || deletion_timestamp="<none>"
+        [ -n "$finalizers" ] || finalizers="<none>"
+        [ -n "$conditions" ] || conditions="<none>"
+        echo "Duckling $org did not delete within $timeout; refusing to reuse same-PR resource names." >&2
+        echo "Duckling $org summary: deletionTimestamp=$deletion_timestamp finalizers=$finalizers conditions=$conditions" >&2
+        rc=1
+      elif ! printf '%s\n' "$get_out" | grep -qi 'not found'; then
+        echo "Could not verify Duckling $org was deleted after wait failed; refusing to reuse same-PR resource names." >&2
+        printf '%s\n' "$get_out" >&2
+        rc=1
+      fi
+    fi
   done
+  return "$rc"
 }
 
 delete_ci_bindings() { # pr-number
   local pr="$1"
   "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+  # Historical cleanup: older e2e runs created per-PR Lakekeeper RoleBindings.
+  # Keep sweeping them by label so stale resources disappear after the workflow
+  # stops creating new ones.
   "${KUBECTL[@]}" -n lakekeeper delete rolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
 }
 
 reset_pr_stack() {
   # A cancelled or failed run can leave a namespace, config-store rows, and
-  # shared Duckling/Lakekeeper resources for this PR. Start from a clean slate
+  # shared Duckling resources for this PR. Start from a clean slate
   # so apply never reuses stale network policies, services, or tenant state.
   delete_ci_ducklings "$PR_NUMBER"
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
@@ -276,8 +318,10 @@ cmd_diagnostics() {
 }
 
 cmd_teardown() {
+  local duckling_delete_rc=0
+
   # Deprovision the ci-pr ducklings FIRST so shared-infra resources (S3 bucket,
-  # cnpg role+db, lakekeeper CR/secret/SA) are cleaned up by the control plane
+  # cnpg role+db) are cleaned up by the control plane
   # before we delete it. Best-effort — the namespace delete + e2e-cleanup are the
   # backstop. Uses the CP admin API via a short-lived port-forward.
   if "${KUBECTL[@]}" -n "$NS" get deploy/duckgres-control-plane >/dev/null 2>&1; then
@@ -316,13 +360,12 @@ cmd_teardown() {
   # Wait for the Duckling CRs to FULLY delete — not just the warehouse row.
   # A warehouse flips to "deleted" the moment the CR delete is issued, but the
   # CR's finalizers keep running (incl the downstream provider-sql DROP of the
-  # cnpg lakekeeper_<org> role+db). If we return before that finishes, a later
-  # run that reuses the same org id (rerun, or a force-pushed PR) provisions
-  # against a stranded cnpg role whose password has drifted -> the Lakekeeper
-  # migrate Job hits SASL auth failure and the warehouse never goes ready.
+  # cnpg metadata role+db). If we return before that finishes, a later run that
+  # reuses the same org id (rerun, or a force-pushed PR) can provision against
+  # stranded cnpg state and never reach ready.
   # `wait --for=delete` blocks until the CR (and its cascade) is gone.
   delete_ci_ducklings "$PR_NUMBER"
-  wait_ci_ducklings_deleted "$PR_NUMBER" 300s
+  wait_ci_ducklings_deleted "$PR_NUMBER" 300s || duckling_delete_rc=$?
 
   # Deterministically drop the cnpg role+db in case the composition's async
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
@@ -334,6 +377,7 @@ cmd_teardown() {
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=false
+  return "$duckling_delete_rc"
 }
 
 # Sweep stale per-PR namespaces left behind by runs that died hard (cancelled
@@ -361,7 +405,7 @@ cmd_e2e_cleanup() {
       pr="${ns#duckgres-ci-pr-}"
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
       delete_ci_ducklings "$pr"
-      wait_ci_ducklings_deleted "$pr" 300s
+      wait_ci_ducklings_deleted "$pr" 300s || true
       for org in $(ci_cnpg_orgs "$pr"); do drop_cnpg_role "$org"; done
       NS="$ns" delete_pod_identity
       delete_ci_bindings "$pr"
@@ -370,10 +414,10 @@ cmd_e2e_cleanup() {
 }
 
 case "${1:?usage: run.sh deploy|test|diagnostics|teardown|e2e-cleanup}" in
-  deploy) : "${NAMESPACE:?}"; cmd_deploy ;;
-  test) : "${NAMESPACE:?}"; cmd_test ;;
-  diagnostics) : "${NAMESPACE:?}"; cmd_diagnostics ;;
-  teardown) : "${NAMESPACE:?}"; cmd_teardown ;;
+  deploy) : "${NAMESPACE:?}"; require_pr_identity; cmd_deploy ;;
+  test) : "${NAMESPACE:?}"; require_pr_identity; cmd_test ;;
+  diagnostics) : "${NAMESPACE:?}"; require_pr_identity; cmd_diagnostics ;;
+  teardown) : "${NAMESPACE:?}"; require_pr_identity; cmd_teardown ;;
   e2e-cleanup) cmd_e2e_cleanup ;;
   *) echo "unknown: $1" >&2; exit 2 ;;
 esac

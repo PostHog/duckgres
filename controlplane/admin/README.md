@@ -1,75 +1,162 @@
-# Control-plane admin dashboard
+# Control-plane admin console
 
-The control plane (multi-tenant / `kubernetes` build tag) serves a small admin
-dashboard on `:8080`. It is gated behind the internal secret — there is no
-public exposure; reach it via `kubectl port-forward`.
+The control plane (multi-tenant / `kubernetes` build tag) serves a React admin
+console + REST API on `:8080`. It is the operate-everything surface: metrics,
+live queries/sessions/connections, the worker fleet, the full config store, user
+impersonation, and an audit log — sliceable by org and user.
 
-## Pages
+Exposure is VPC-private: an internal-scheme ALB + Cognito (Google Workspace SSO),
+reachable only over the Tailscale subnet router. See `docs/design/admin-ui.md`.
 
-| Route | Page | Purpose |
+## Architecture
+
+- **Frontend** (`ui/`): React + Vite + TypeScript + Tailwind + shadcn/ui,
+  TanStack Query/Table, Recharts. Built to `ui/dist/` and embedded via
+  `//go:embed all:ui/dist` (`embed_ui.go`), served by Gin with SPA fallback. The
+  built bundle is a **gitignored build artifact** — only `ui/dist/.gitkeep` is
+  tracked, so the embed has a target and `go build` compiles without node (the
+  server then serves a "UI not built" notice). `just ui-build` produces it
+  locally; both `Dockerfile` and `Dockerfile.controlplane` rebuild it in a node
+  stage before `go build`, so a shipped image always has the fresh UI.
+- **Backend**: Gin on `:8080`, all routes under `/api/v1` (the SPA owns `/`).
+
+## Auth + RBAC
+
+`AuthMiddleware` (`authz.go`) resolves every `/api/v1` request to an `Identity`
+with a `Role`:
+
+- A valid `TokenSet` token (`X-Duckgres-Internal-Secret` header or the
+  `duckgres_admin_token` cookie) → **admin**. This is the service-to-service /
+  break-glass path (`RegisterLogin` mints the cookie via `POST /login`).
+- Otherwise the ALB-injected `X-Amzn-Oidc-Data` JWT (Cognito/Google) yields the
+  caller's email (only `@posthog.com`, `email_verified != false`; otherwise
+  treated as unauthenticated). The role is then resolved **per-request** from the
+  `duckgres_operators` table in the config schema (goose migration
+  `000006_create_operators.sql`): an `admin` row →
+  **admin**, anything else (including no row) → **viewer**. Operators are managed
+  by admins under **Admin → Operators** in the config-store explorer (and the
+  `/api/v1/operators` API). The first SSO login auto-provisions a create-only
+  **viewer** operator row; to mint the first admin, log in over the break-glass
+  internal token and patch that row to `admin` under **Admin → Operators**.
+
+`RoleGate` enforces the split: mutating verbs (POST/PUT/PATCH/DELETE) and the
+audit-log GET require admin; other GETs allow viewer. `AuditMiddleware` records
+every mutation. The ALB OIDC JWT signature is currently trusted-by-network (the
+internal LB is the only ingress and strips client copies); verifying it by `kid`
+is a hardening follow-up (see the design doc).
+
+`?token=` URL auth is deliberately rejected (#721).
+
+## API surface
+
+Existing typed CRUD (`api.go`): orgs, users, managed warehouses (+ tenant
+pinning). Generic read-only models explorer (`models_api.go`): `GET
+/api/v1/models`, `GET /api/v1/models/:model` — secret columns (`json:"-"`)
+dropped by the typed scan; **never swap in a raw map scan**.
+
+Added for the console:
+
+| Route | Role | Purpose |
 |-------|------|---------|
-| `/`, `/models` | `static/models.html` | **Models explorer** — the only dashboard surface. Sidebar of every config-store model grouped Tenants / Runtime, a table of the selected model's rows, and a click-through detail panel. Columns are sortable with per-column tooltips; the orgs table cross-links to org-users + managed-warehouses; the orgs detail panel supports inline edit + delete. Nested warehouse sub-configs render as expandable sections. |
-| `POST /login` | `static/login.html` | Token login (sets the `duckgres_admin_token` cookie). |
+| `GET /api/v1/me` | any | caller identity + role (SPA tailors its UI) |
+| `GET /api/v1/queries` | viewer | running queries w/ progress, `?org=&user=` slicing |
+| `GET /api/v1/queries/by-worker/:wid` | viewer | one query's detail: redacted SQL text + conn metadata + progress, addressed by cluster-unique worker id (pid is per-org, not unique). Scatter-gathers like `/queries` — checks locally, else fans out to peer CPs (`?scope=local` guard); 404 only if no replica owns the worker |
+| `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
+| `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
+| `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |
+| `POST /api/v1/sessions/:pid/cancel` | admin | tear down a session by pid — LOCAL only (pid is per-CP); prefer the worker-id form |
+| `POST /api/v1/sessions/by-worker/:wid/cancel` | admin | tear down the session on a cluster-unique worker id; fans out to whichever CP owns it (pid can't be fanned out — it collides across CPs). Returns `{killed, cp_responders, cp_total}` |
+| `POST /api/v1/orgs/:id/users/:username/kill` | admin | per-user kill switch (one-shot): tear down ALL of a user's sessions + in-flight queries cluster-wide. Returns `{killed, cp_responders, cp_total}`. Does NOT block reconnects |
+| `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at connect on PG wire + Flight), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
+| `POST /api/v1/orgs/:id/users/:username/enable` | admin | persist `disabled=false` + reload cluster-wide so the user can reconnect at once |
+| `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
+| `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
+| `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
+| `GET /api/v1/audit` | admin | admin action log |
+| `GET /api/v1/operators` | admin | list console operators (email → role) |
+| `POST /api/v1/operators` | admin | add/update an operator (`{email, role}`; last-admin demotion → 409) |
+| `DELETE /api/v1/operators/:email` | admin | remove an operator (removing the last admin → 409) |
 
-The pages are plain HTML + vanilla JS served via `//go:embed static/*` and
-`html/template`. The models explorer and login page follow the dark "mission
-control" design language (Chakra Petch + IBM Plex Mono, cyan/amber accents).
-Because the templates are parsed with `html/template`, **do not write `{{` in
-their inline JS** — only `login.html` uses template directives (`{{.Next}}` /
-`{{.Error}}`).
+### Cross-CP live-state aggregation (`live_aggregate.go` + `controlplane/live_aggregator.go`)
 
-## Auth
+Live session/query state is **in-memory per CP** — each replica only knows the
+sessions it owns. Behind the load-balancer that made the dashboard's numbers
+flicker as polls landed on different pods. The session/query endpoints
+(`/queries`, `/sessions`, `/workers`, `/status`) **fan out**: the serving CP
+discovers its peer CP pods (K8s pod list, name-prefix match), GETs each peer's
+`?scope=local` view (the recursion guard — a peer returns only its own slice)
+with the internal secret, and concatenates (a session is owned by exactly one
+CP, so the union is disjoint — no dedup). Peers are fetched concurrently with a
+short per-peer timeout; a slow/down peer is omitted, and `/queries` reports
+`cp_responders`/`cp_total` for coverage. `PeerFetcher` is nil in single-CP /
+test setups (local-only). `/workers/fleet` is already cluster-wide (config
+store) and is not fanned out.
 
-- Service-to-service: `X-Duckgres-Internal-Secret` header.
-- Dashboard UI: the `POST /login` form mints an `HttpOnly` cookie.
-- The internal secret plus rotation fallbacks are accepted (see `TokenSet`).
-- `?token=` URL auth is deliberately rejected (#721).
+The same fan-out also powers the per-user **kill switch** as a mutation:
+`PeerFetcher.PostPeers` POSTs `…/kill` (or `…/disable`) `?scope=local` to every
+peer so the user's sessions are torn down on whichever replica owns them, and the
+per-CP `killed` counts are summed. The `disable`/`enable` handlers additionally
+call `ConfigStore.ReloadSnapshot()` on every replica so the connect-time block
+(the `duckgres_org_users.disabled` column, goose migration
+`000011_add_org_user_disabled.sql`) takes effect cluster-wide immediately rather
+than one config-poll later. The disabled flag is enforced at auth in
+`control.go` (PG wire → distinct `28000` "account is disabled" error, only after
+the password checks out so it never leaks account existence) and in
+`ConfigStore.ValidateOrgUser*` (Flight ingress).
 
-## Models explorer API (read-only)
+### Impersonation (`impersonate.go` + `controlplane/admin_providers.go`)
 
-Backed by `models_api.go`. The registry in `modelDescriptors()` is the single
-source of truth — add a config-store model there and it appears in the sidebar,
-listing, and column derivation.
+`POST /api/v1/orgs/:id/impersonate/query` `{username, sql, allow_write}` opens a
+**real** session as the target org+user (workers trust the CP — no password),
+runs the SQL via the returned `FlightExecutor`, streams rows back, and **always**
+destroys the session. It is admin-only, every statement is audited with the admin
+actor + redacted SQL, and a write statement requires `allow_write=true` (the SQL
+classifier is conservative — WITH/CTEs and anything non-obviously-read-only count
+as writes). Caveat: the session consumes a worker exclusively
+(one-session-per-worker), counts against the org's connection limits, and appears
+in the org's session accounting. Rows capped at `maxImpersonationRows`.
 
-- `GET /api/v1/models` → `{ "models": [ { key, label, group, count } ] }` — sidebar with live row counts.
-- `GET /api/v1/models/:model` → `{ key, label, group, table, columns, count, truncated, rows }` — one model's rows.
+### Metrics proxy (`metrics_proxy.go`)
 
-Rows are scanned into the typed model and marshaled via its `json` tags, so
-columns tagged `json:"-"` (`OrgUser.Password`, `OrgUserSecret.Ciphertext`,
-`DuckLakeConfig.S3SecretKey`, the singleton IDs) are dropped from the response —
-**never swap the typed scan for a raw `map` scan**, that would leak them.
-Runtime-schema tables (`worker_records`, `cp_instances`, …) are schema-qualified
-with `ConfigStore.RuntimeSchema()`. Listings are capped at `modelsRowLimit`
-(`truncated: true` when hit).
+Not an open PromQL relay: the client passes a panel KEY (+ optional org/window);
+the PromQL is built server-side from the allow-list (`rangePanels`). Forwards to
+`DUCKGRES_PROMETHEUS_URL` (the in-cluster VictoriaMetrics vmselect, Prometheus-
+compatible). Org-labelled panels (`duckgres_query_total{org,outcome}` etc.) keep
+slicing enforced. Unset URL → 503 so the UI shows "metrics not configured".
 
-Covered by `models_api_test.go` (redaction + real query path) and the
-`models_explorer_api` assertion in `tests/e2e-mw-dev/harness.sh`.
+## Local UI development
 
-## Local UI development (no redeploy)
+Two ways to iterate without redeploying:
 
-Iterate on the UI against a *deployed* control plane without rebuilding the
-image. The dev proxy (`devserver/`) serves `static/` off disk and proxies
-`/api`, `/login`, `/health` to the CP, injecting the internal secret
-server-side. The browser sees one origin → no CORS, and the secret never reaches
-page JS. The embedded UI uses relative `/api/v1` paths, so the same HTML runs
-byte-for-byte embedded or under the dev proxy.
-
-One `--context` drives everything: the devserver fetches the internal secret
-(`kubectl get secret duckgres-tokens`), port-forwards that context's control
-plane, and serves the explorer with a **context banner — RED when the context
-name contains `prod`** (a dev-only cue; the deployed CP has no such endpoint).
+1. **Vite dev server** (live React/HMR): `cd controlplane/admin/ui && npm run dev`,
+   with `VITE_PROXY_TARGET` pointing at a port-forwarded CP (or the devserver).
+2. **Go devserver** (`devserver/`): serves the built UI off disk and proxies
+   `/api`, `/login`, `/health` to a deployed CP, injecting the internal secret
+   server-side. One `--context` drives secret fetch + port-forward, with a RED
+   banner when the context name contains `prod`.
 
 ```sh
-# one environment:
-just ui-dev mw-dev-admin                 # → http://127.0.0.1:5173 (dev banner)
-just ui-dev mw-prod-us-admin             # → http://127.0.0.1:5173 (RED prod banner)
-
-# both side by side (prod :5173, dev :5174):
-just ui-dev-all
-
-# edit controlplane/admin/static/*.html and refresh — no rebuild.
+just ui-dev mw-dev-admin       # → http://127.0.0.1:5173 (dev banner)
+just ui-dev mw-prod-us-admin   # → RED prod banner
 ```
 
-Once the markup is right, it is already what `//go:embed` bakes into the CP — no
-separate build step. (Without `--context`, the devserver falls back to an
-external `--target` + `--secret`/`$DUCKGRES_INTERNAL_SECRET`.)
+The SPA uses relative `/api/v1` paths, so the same bundle runs identically
+embedded, under Vite, or under the Go devserver.
+
+## Tests
+
+**Backend:** `authz_test.go` (SSO role mapping, RoleGate, SQL classifier),
+`dashboard_test.go` (TokenSet / break-glass login / cookie), `api_test.go` +
+`api_postgres_test.go` (CRUD), `models_api_test.go` (redaction). e2e: the
+`admin_*` / `impersonation_*` / `models_explorer_api` assertions in
+`tests/e2e-mw-dev/harness.sh`.
+
+**Frontend** (`ui/`, Vitest + Testing Library — `just ui-test`, CI job
+`ui-tests`): the dashboard's data-derivation logic has shipped wrong more than
+once (worker hot/idle counts; a leak warning firing while every worker was
+busy), so that math lives in pure, unit-tested modules (`src/lib/*.ts`) instead
+of inline JSX. `src/lib/fleet.test.ts` pins the worker-fleet/load math
+(busy=`hot` vs idle=`hot_idle`, the leak threshold, per-org load %);
+`src/pages/Overview.test.tsx` renders the page with mocked hooks and asserts the
+Workers card + leak warning. New derivation/display logic on a page **must** get
+a `*.test.ts(x)` here — keep computed values out of the JSX so they're testable.

@@ -23,8 +23,23 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 3)
 	requireGooseMigrationRecorded(t, db, 4)
 	requireGooseMigrationRecorded(t, db, 5)
-	requireGooseLatestVersion(t, db, 5)
+	requireGooseMigrationRecorded(t, db, 6)
+	requireGooseMigrationRecorded(t, db, 7)
+	requireGooseMigrationRecorded(t, db, 8)
+	requireGooseMigrationRecorded(t, db, 9)
+	requireGooseMigrationRecorded(t, db, 10)
+	requireGooseMigrationRecorded(t, db, 11)
+	requireGooseMigrationRecorded(t, db, 12)
+	requireGooseLatestVersion(t, db, 12)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
+
+	// Migration 000007 added the compute-usage billing buffer + drain state.
+	requireTablePresent(t, db, "duckgres_org_compute_usage")
+	requireTablePresent(t, db, "duckgres_org_compute_drain_state")
+
+	// Migration 000008 added the explicit Duckling CR name column on
+	// managed warehouses, backfilled from lower(org_id).
+	requireColumnPresent(t, db, "duckgres_managed_warehouses", "duckling_name")
 
 	// Migration 000004 dropped the dead cluster-wide singleton config tables.
 	requireTableAbsent(t, db, "duckgres_global_config")
@@ -45,6 +60,58 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	if columnCount != 1 {
 		t.Fatalf("default_worker_min_hot_idle column count = %d, want 1", columnCount)
 	}
+	requireColumnDefault(t, db, "duckgres_orgs", "max_vcpus", "0")
+	requireColumnDefault(t, db, "duckgres_org_users", "max_vcpus", "0")
+	// Migration 000011 added the per-user kill-switch column.
+	requireColumnDefault(t, db, "duckgres_org_users", "disabled", "false")
+	requireColumnAbsent(t, db, "duckgres_orgs", "max_connections")
+}
+
+func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
+	_, connStr := newIsolatedConfigStoreSchema(t)
+	store, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("create baseline config store: %v", err)
+	}
+	baselineDB := storeDB(t, store)
+	t.Cleanup(func() {
+		_ = baselineDB.Close()
+	})
+
+	if err := store.DB().Exec(`
+			ALTER TABLE duckgres_orgs DROP COLUMN max_vcpus;
+			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
+			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
+			ALTER TABLE duckgres_orgs ADD COLUMN IF NOT EXISTS max_connections BIGINT DEFAULT 0;
+			ALTER TABLE duckgres_managed_warehouses ALTER COLUMN duckling_name DROP NOT NULL;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12);
+		`).Error; err != nil {
+		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
+	}
+	requireColumnAbsent(t, baselineDB, "duckgres_orgs", "max_vcpus")
+	requireColumnAbsent(t, baselineDB, "duckgres_org_users", "max_vcpus")
+	requireColumnAbsent(t, baselineDB, "duckgres_org_users", "disabled")
+	requireColumnPresent(t, baselineDB, "duckgres_orgs", "max_connections")
+	requireGooseLatestVersion(t, baselineDB, 8)
+
+	upgradedStore, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("upgrade pre-v8 schema: %v", err)
+	}
+	upgradedDB := storeDB(t, upgradedStore)
+	t.Cleanup(func() {
+		_ = upgradedDB.Close()
+	})
+
+	requireGooseMigrationRecorded(t, upgradedDB, 9)
+	requireGooseMigrationRecorded(t, upgradedDB, 10)
+	requireGooseMigrationRecorded(t, upgradedDB, 11)
+	requireGooseMigrationRecorded(t, upgradedDB, 12)
+	requireGooseLatestVersion(t, upgradedDB, 12)
+	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
+	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
+	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")
+	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "max_connections")
 }
 
 func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
@@ -98,6 +165,14 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	if floor != 0 {
 		t.Fatalf("default_worker_min_hot_idle after migration = %d, want 0", floor)
 	}
+	var maxVCPUs int
+	if err := store.DB().Raw(`SELECT max_vcpus FROM duckgres_orgs WHERE name = 'old-org'`).Scan(&maxVCPUs).Error; err != nil {
+		t.Fatalf("read migrated org max_vcpus: %v", err)
+	}
+	if maxVCPUs != 0 {
+		t.Fatalf("org max_vcpus after migration = %d, want 0", maxVCPUs)
+	}
+	requireColumnAbsent(t, sqlDB, "duckgres_orgs", "max_connections")
 	requireGooseMigrationRecorded(t, sqlDB, 3)
 }
 
@@ -169,6 +244,14 @@ func TestConfigStoreSQLMigrationsUpgradeLegacyOrgUsersUsernamePK(t *testing.T) {
 		t.Fatalf("duckgres_org_users org FK = %#v, want %#v", got, wantFK)
 	}
 
+	var maxVCPUs int
+	if err := store.DB().Raw(`SELECT max_vcpus FROM duckgres_org_users WHERE org_id = 'old-org' AND username = 'old-user'`).Scan(&maxVCPUs).Error; err != nil {
+		t.Fatalf("read migrated user max_vcpus: %v", err)
+	}
+	if maxVCPUs != 0 {
+		t.Fatalf("user max_vcpus after migration = %d, want 0", maxVCPUs)
+	}
+
 	resolution := store.ResolvePostgresConnection("ducklake", "old-org", true, "old-user", "secret")
 	if !resolution.Valid || resolution.OrgID != "old-org" {
 		t.Fatalf("legacy migrated user resolution = %#v, want valid old-org", resolution)
@@ -191,6 +274,7 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 		&cpconfigstore.ManagedWarehouse{},
 		&cpconfigstore.OrgUser{},
 		&cpconfigstore.OrgUserSecret{},
+		&cpconfigstore.Operator{},
 	); err != nil {
 		t.Fatalf("auto-migrate gorm comparison schema: %v", err)
 	}
@@ -261,6 +345,45 @@ func requireGooseLatestVersion(t *testing.T, db *sql.DB, version int64) {
 	}
 }
 
+func requireColumnPresent(t *testing.T, db *sql.DB, tableName, columnName string) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+			  AND column_name = $2
+		)
+	`, tableName, columnName).Scan(&exists); err != nil {
+		t.Fatalf("check column %q.%q presence: %v", tableName, columnName, err)
+	}
+	if !exists {
+		t.Fatalf("column %q.%q missing, want present", tableName, columnName)
+	}
+}
+
+func requireTablePresent(t *testing.T, db *sql.DB, tableName string) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+		)
+	`, tableName).Scan(&exists); err != nil {
+		t.Fatalf("check table %q presence: %v", tableName, err)
+	}
+	if !exists {
+		t.Fatalf("table %q missing, want present", tableName)
+	}
+}
+
 func requireTableAbsent(t *testing.T, db *sql.DB, tableName string) {
 	t.Helper()
 
@@ -277,6 +400,26 @@ func requireTableAbsent(t *testing.T, db *sql.DB, tableName string) {
 	}
 	if exists {
 		t.Fatalf("table %q exists, want absent", tableName)
+	}
+}
+
+func requireColumnAbsent(t *testing.T, db *sql.DB, tableName, columnName string) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = $1
+			  AND column_name = $2
+		)
+	`, tableName, columnName).Scan(&exists); err != nil {
+		t.Fatalf("check column %s.%s absence: %v", tableName, columnName, err)
+	}
+	if exists {
+		t.Fatalf("column %s.%s exists, want absent", tableName, columnName)
 	}
 }
 
@@ -318,6 +461,28 @@ type foreignKeyMetadata struct {
 	DeleteRule         string
 }
 
+func requireColumnDefault(t *testing.T, db *sql.DB, tableName, columnName, wantDefault string) {
+	t.Helper()
+
+	var got sql.NullString
+	err := db.QueryRow(`
+		SELECT column_default
+		FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = $1
+		  AND column_name = $2
+	`, tableName, columnName).Scan(&got)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			t.Fatalf("%s.%s column missing", tableName, columnName)
+		}
+		t.Fatalf("query %s.%s column default: %v", tableName, columnName, err)
+	}
+	if !got.Valid || got.String != wantDefault {
+		t.Fatalf("%s.%s default = %q (valid=%v), want %q", tableName, columnName, got.String, got.Valid, wantDefault)
+	}
+}
+
 func loadConfigStoreColumnMetadata(t *testing.T, db *sql.DB) map[string]columnMetadata {
 	t.Helper()
 
@@ -330,6 +495,7 @@ func loadConfigStoreColumnMetadata(t *testing.T, db *sql.DB) map[string]columnMe
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -386,6 +552,7 @@ func loadConfigStorePrimaryKeys(t *testing.T, db *sql.DB) map[string]primaryKeyM
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -437,6 +604,7 @@ func loadConfigStoreIndexes(t *testing.T, db *sql.DB) map[string]indexMetadata {
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -500,6 +668,7 @@ func loadConfigStoreForeignKeys(t *testing.T, db *sql.DB) map[string]foreignKeyM
 			'duckgres_org_users',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
+			'duckgres_operators',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',

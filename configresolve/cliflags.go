@@ -34,7 +34,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	keyFile := fs.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
 	filePersistence := fs.Bool("file-persistence", false, "Persist DuckDB to <data-dir>/<username>.duckdb instead of in-memory (env: DUCKGRES_FILE_PERSISTENCE)")
 	processIsolation := fs.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
-	idleTimeout := fs.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	idleTimeout := fs.String("idle-timeout", "", "Connection idle timeout: close a connection idle (no traffic) this long, freeing its worker (e.g., '30m', '1h', '-1s' to disable). Default 24h standalone, 60s control-plane where idle connections pin a worker (env: DUCKGRES_IDLE_TIMEOUT)")
 	sessionInitTimeout := fs.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
 	memoryLimit := fs.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := fs.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
@@ -75,6 +75,8 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	k8sWorkerServiceAccount := fs.String("k8s-worker-service-account", "", "Neutral ServiceAccount name for K8s worker pods (default: duckgres-worker) (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 	awsRegion := fs.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
 	queryLog := fs.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
+	billingIngestURL := fs.String("billing-ingest-url", "", "PostHog public ingestion base URL for managed-warehouse compute-usage events, e.g. https://us.i.posthog.com (remote backend only; unset disables metering) (env: DUCKGRES_BILLING_INGEST_URL)")
+	billingIngestToken := fs.String("billing-ingest-token", "", "PostHog project API token for managed-warehouse compute-usage events (remote backend only; unset disables metering) (env: DUCKGRES_BILLING_INGEST_TOKEN)")
 
 	return func() CLIInputs {
 		cli := CLIInputs{Set: map[string]bool{}}
@@ -134,6 +136,8 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.K8sWorkerServiceAccount = *k8sWorkerServiceAccount
 		cli.AWSRegion = *awsRegion
 		cli.QueryLog = *queryLog
+		cli.BillingIngestURL = *billingIngestURL
+		cli.BillingIngestToken = *billingIngestToken
 		return cli
 	}
 }

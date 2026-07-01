@@ -19,6 +19,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
+	"k8s.io/client-go/kubernetes"
 )
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
@@ -61,16 +62,27 @@ func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }
 
+func (a *orgRouterAdapter) ReleaseIdleHotWorkers() int {
+	return a.router.ReleaseIdleHotWorkers()
+}
+
 func (a *orgRouterAdapter) AllOrgStats() []admin.OrgStatus {
 	stacks := a.router.AllStacks()
 	stats := make([]admin.OrgStatus, 0, len(stacks))
 	for name, stack := range stacks {
 		sessionCount := stack.Sessions.SessionCount()
-		stats = append(stats, admin.OrgStatus{
+		st := admin.OrgStatus{
 			Name:           name,
 			ActiveSessions: sessionCount,
 			MaxWorkers:     stack.Config.MaxWorkers,
-		})
+		}
+		// Workers this CP has assigned to the org (cap-counting; excludes
+		// hot-idle). Per-CP local view — the admin /status fan-out sums it
+		// across replicas (mergeOrgStats) for a cluster-wide per-org count.
+		if rp, ok := stack.Pool.(*OrgReservedPool); ok {
+			st.Workers = rp.WorkerCount()
+		}
+		stats = append(stats, st)
 		// Emit per-org Prometheus metrics
 		observeOrgSessionsActive(name, sessionCount)
 	}
@@ -91,12 +103,20 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 			if count == 0 {
 				status = "idle"
 			}
-			result = append(result, admin.WorkerStatus{
+			ws := admin.WorkerStatus{
 				ID:             wID,
 				Org:            name,
 				ActiveSessions: count,
 				Status:         status,
-			})
+			}
+			// Pod-shape (cpu/memory/ttl) of the session-holding worker; empty/zero
+			// for the default profile or a worker no longer in the pool.
+			if profile, ok := stack.Sessions.WorkerProfile(wID); ok {
+				ws.CPU = profile.CPU
+				ws.Memory = profile.Memory
+				ws.TTLSeconds = int(profile.TTL.Seconds())
+			}
+			result = append(result, ws)
 		}
 	}
 	return result
@@ -111,6 +131,7 @@ func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 				PID:      s.PID,
 				WorkerID: s.WorkerID,
 				Org:      name,
+				User:     s.Username,
 				Protocol: s.Protocol,
 			})
 		}
@@ -130,7 +151,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	isHealthy func() bool,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, *computeMeter, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -138,7 +159,7 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Per-user persistent secret manager (CREATE PERSISTENT SECRET). With no
@@ -146,7 +167,7 @@ func SetupMultiTenant(
 	// but persistence is disabled with a clear client-facing error.
 	userSecrets, err := NewCPUserSecretManager(store, cfg.UserSecretKey)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 	server.SetUserSecretManager(srv, userSecrets)
 	if cfg.UserSecretKey == "" {
@@ -157,7 +178,7 @@ func SetupMultiTenant(
 
 	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	cpID := cfg.K8s.ControlPlaneID
@@ -173,7 +194,7 @@ func SetupMultiTenant(
 	}
 	bootID := make([]byte, 16)
 	if _, err := rand.Read(bootID); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
 	}
 	bootIDHex := hex.EncodeToString(bootID)
 	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
@@ -236,7 +257,7 @@ func SetupMultiTenant(
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, userSecrets, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	adpt := &orgRouterAdapter{router: router}
@@ -392,7 +413,7 @@ func SetupMultiTenant(
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
@@ -431,7 +452,7 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret; set --internal-secret or DUCKGRES_INTERNAL_SECRET explicitly to avoid rotation on restart.")
@@ -451,13 +472,99 @@ func SetupMultiTenant(
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
 
-	// Authenticated API
-	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminTokens))
-	admin.RegisterAPI(api, store, adpt)
-	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// Admin UI dependencies. Prometheus URL is an env-only K8s knob (set by the
+	// chart); see config_resolution.go / CLAUDE.md. The admin role for an SSO
+	// caller is resolved per-request from the operators table (managed under
+	// Admin → Operators); the break-glass internal-secret path is independent.
+	//
+	// There is no bootstrap seed. The first SSO login auto-provisions a
+	// create-only VIEWER row for the caller (so an operator appears in the
+	// config store just by logging in), and the role is then read back. To make
+	// the first admin: log in over break-glass (internal-secret → admin) and
+	// patch your auto-provisioned row to admin under Admin → Operators.
+	resolve := func(email string) admin.Role {
+		role, err := store.OperatorRole(email)
+		if err != nil {
+			slog.Warn("admin: operator role lookup failed", "email", email, "error", err)
+		}
+		if role == "" {
+			// Auto-provision (create-only, never clobbers an existing role) so the
+			// caller has a row to be promoted from. Best-effort: a failure here
+			// must not block authentication — the caller simply stays viewer.
+			if err := store.SeedOperator(email, string(admin.RoleViewer)); err != nil {
+				slog.Warn("admin: operator auto-provision failed", "email", email, "error", err)
+			}
+		}
+		if role == "admin" {
+			return admin.RoleAdmin
+		}
+		return admin.RoleViewer
+	}
+	auditStore, err := admin.NewAuditStore(store.DB())
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
+	}
+	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
+	clusterInfo := &clusterInfoProvider{router: router, store: store, srv: srv, selfCPID: cpInstanceID}
+	imp := &impersonator{router: router}
+	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
+	// memory, so a single replica only sees its own slice. The fetcher fans the
+	// read out to peer CP pods so the dashboard shows cluster-wide numbers.
+	var liveFetcher admin.PeerFetcher
+	if router.sharedPool != nil && router.sharedPool.clientset != nil {
+		liveFetcher = newClusterPeerFetcher(
+			router.sharedPool.clientset, router.sharedPool.namespace,
+			router.sharedPool.cpID, internalSecret, 8080,
+		)
+	}
 
-	// Dashboard
-	admin.RegisterDashboard(engine, adminTokens)
+	// Authenticated API. AuthMiddleware resolves the caller (internal-secret →
+	// admin, else ALB/Cognito SSO → viewer/admin). AuditMiddleware records every
+	// mutation. RoleGate enforces viewer/admin (mutations + the audit log read
+	// require admin).
+	// RoleGate blocks viewer mutations (method-based); the audit-log read
+	// self-gates via RequireAdmin at its route (no brittle path coupling here).
+	api := engine.Group("/api/v1",
+		admin.AuthMiddleware(adminTokens, resolve),
+		admin.AuditMiddleware(auditStore),
+		admin.RoleGate(),
+	)
+	admin.RegisterAPI(api, store, adpt, liveFetcher)
+	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// Node-overview topology reads reuse the shared K8s pool's in-cluster
+	// clientset (nil when there's no shared pool — leaves those routes off).
+	var clusterClient kubernetes.Interface
+	if router.sharedPool != nil {
+		clusterClient = router.sharedPool.clientset
+	}
+	admin.RegisterExtras(api, admin.Extras{
+		Store:         store,
+		Live:          clusterInfo,
+		Users:         store,
+		Fetcher:       liveFetcher,
+		Impersonator:  imp,
+		Audit:         auditStore,
+		Metrics:       metricsProxy,
+		ClusterClient: clusterClient,
+	})
+
+	// Live Duckling drift finder. Reuse the in-cluster Duckling client built
+	// above (dc); pass nil when it's unavailable so the endpoint degrades to
+	// {"available": false} rather than 500ing. A typed-nil *DucklingClient must
+	// not be boxed into the interface, so only assign when dc is usable.
+	var ducklingChecker admin.DucklingChecker
+	if dcErr == nil && dc != nil {
+		ducklingChecker = dc
+	}
+	admin.RegisterDucklingsDrift(api, store, ducklingChecker)
+
+	// Break-glass internal-secret login (the SPA owns "/" and app routes).
+	admin.RegisterLogin(engine, adminTokens)
+
+	// Embedded React SPA (served unauthenticated; all data is under /api/v1).
+	if err := admin.RegisterUI(engine); err != nil {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
+	}
 
 	apiServer := &http.Server{
 		Addr:    ":8080",
@@ -470,7 +577,26 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
+	// Compute-usage metering (managed-warehouse billing). Enabled only when both
+	// ingest URL and token are configured; otherwise the meter is nil and every
+	// call site no-ops (queries are NEVER failed on its account). The flusher
+	// runs on every CP pod (cross-pod UPSERT-increment); the drain loop is
+	// leader-only, co-located under the janitor lease so exactly one CP ships.
+	var meter *computeMeter
+	if cfg.BillingMeteringEnabled() {
+		meter = newComputeMeter(store)
+		go meter.Run(context.Background())
+
+		drainer := newComputeDrainer(store, newComputeCaptureClient(cfg.BillingIngestURL, cfg.BillingIngestToken))
+		if janitorLeader != nil {
+			janitorLeader.AttachLeaderLoop(drainer.Run)
+		}
+		slog.Info("Managed-warehouse compute-usage metering enabled.", "ingest_url", cfg.BillingIngestURL)
+	} else {
+		slog.Info("Managed-warehouse compute-usage metering disabled (DUCKGRES_BILLING_INGEST_URL/TOKEN not both set).")
+	}
+
+	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
 }
 
 type workerLifecycleStatsLister interface {

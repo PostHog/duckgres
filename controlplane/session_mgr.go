@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"go.opentelemetry.io/otel/attribute"
@@ -35,8 +36,10 @@ type SessionProgress struct {
 // ManagedSession tracks a client session bound to a worker.
 type ManagedSession struct {
 	PID          int32
+	Username     string // org user the session was created for (for admin slicing/attribution)
 	WorkerID     int
-	Protocol     string // "postgres" or "flight"
+	Protocol     string    // "postgres" or "flight"
+	StartedAt    time.Time // when the session was created (UTC); surfaced in the Live view
 	SessionToken string
 	Executor     *flightclient.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
@@ -44,6 +47,37 @@ type ManagedSession struct {
 
 	// Cached query progress from worker health checks.
 	queryProgress atomic.Value // stores *SessionProgress (or nil)
+}
+
+// globalNextPID hands out backend PIDs that are unique across the WHOLE control
+// plane process, not per-org. SessionManagers are per-org, but every client
+// connection registers into the ONE server.conns map keyed by pid, so per-org
+// pids (each manager starting at 1000) collided: two orgs' connections at the
+// same pid value would shadow each other in that map, corrupting
+// pg_stat_activity, cancel-by-pid routing, and any pid-keyed lookup. A single
+// process-global counter makes pids unique within the CP and eliminates the
+// collision. (Cross-CP pids can still coincide, but each CP has its own conns
+// map; cross-CP addressing uses the cluster-unique worker id.)
+var globalNextPID = func() *atomic.Int32 {
+	v := new(atomic.Int32)
+	v.Store(1000) // start above typical OS PIDs
+	return v
+}()
+
+// reservePID returns the next backend pid from counter, skipping 0. Backend pids
+// are int32; after ~2.1B connections in one process the counter wraps and passes
+// through 0, which the session-create path treats as "unset" (re-allocating and
+// shipping a stale pid to the client → broken cancel for that one connection).
+// Skipping 0 closes that wrap-time edge with a single extra Add. Negative values
+// after wrap are still unique within the CP's conns map and are left as-is
+// (reaching them needs a further ~2.1B connections, and a CP restarts on every
+// deploy long before either bound).
+func reservePID(counter *atomic.Int32) int32 {
+	p := counter.Add(1)
+	if p == 0 {
+		p = counter.Add(1)
+	}
+	return p
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -58,12 +92,12 @@ type SessionManager struct {
 	// org stack) so every session/worker lifecycle line is org-filterable.
 	log *slog.Logger
 
-	nextPID atomic.Int32
-
 	maxConnections int
 	activeSlots    int
 	waiters        []*connectionWaiter
 	limiter        connectionLimiter
+	resourceLimits func(username string) configstore.OrgResourceLimits
+	requestedVCPUs func(profile *WorkerProfile) (int, error)
 
 	// userSecretLoader returns the user's persistent CREATE SECRET statements
 	// (decrypted) to replay on a worker at session creation. nil outside the
@@ -74,6 +108,10 @@ type SessionManager struct {
 
 type flightReconnectPool interface {
 	ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error)
+}
+
+type flightReconnectProfileProvider interface {
+	ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error)
 }
 
 type connectionWaiter struct {
@@ -102,7 +140,6 @@ func NewOrgSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer, orgID s
 		lifecycle:  newSessionLifecycle(),
 		log:        log,
 	}
-	sm.nextPID.Store(1000) // Start PIDs above typical OS PIDs
 	return sm
 }
 
@@ -129,31 +166,66 @@ func (sm *SessionManager) SetConnectionLimiter(limiter connectionLimiter) {
 	sm.limiter = limiter
 }
 
+// SetResourceLimitsProvider installs the dynamic org/user resource-limit lookup
+// used by the runtime limiter. The callback must be safe for concurrent use.
+func (sm *SessionManager) SetResourceLimitsProvider(fn func(username string) configstore.OrgResourceLimits) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.resourceLimits = fn
+}
+
+// SetRequestedVCPUsResolver installs the worker-profile-to-vCPU resolver used
+// for resource admission. nil means every session costs one vCPU.
+func (sm *SessionManager) SetRequestedVCPUsResolver(fn func(profile *WorkerProfile) (int, error)) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.requestedVCPUs = fn
+}
+
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
-	return sm.nextPID.Add(1)
+	return reservePID(globalNextPID)
 }
 
 func (sm *SessionManager) acquireSlot(ctx context.Context) error {
-	_, err := sm.acquireConnectionSlot(ctx, 0, "postgres")
+	_, err := sm.acquireConnectionSlot(ctx, 0, "", "postgres", nil)
 	return err
 }
 
-func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, protocol string) (connectionLease, error) {
+func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, username string, protocol string, profile *WorkerProfile) (connectionLease, error) {
 	sm.mu.Lock()
 	if sm.lifecycle.isClosed() {
 		sm.mu.Unlock()
 		return nil, ErrSessionManagerDraining
 	}
 	limiter := sm.limiter
+	resourceLimits := sm.resourceLimits
+	requestedVCPUs := sm.requestedVCPUs
 	sm.mu.Unlock()
 	if limiter != nil {
-		maxConnections := func() int {
-			sm.mu.RLock()
-			defer sm.mu.RUnlock()
-			return sm.maxConnections
+		vcpus := 1
+		if requestedVCPUs != nil {
+			var err error
+			vcpus, err = requestedVCPUs(profile)
+			if err != nil {
+				return nil, err
+			}
 		}
-		lease, err := limiter.Acquire(ctx, pid, protocol, maxConnections)
+		if vcpus <= 0 {
+			return nil, fmt.Errorf("requested vcpus must be positive, got %d", vcpus)
+		}
+		limits := func(user string) configstore.OrgResourceLimits {
+			if resourceLimits == nil {
+				return configstore.OrgResourceLimits{}
+			}
+			return resourceLimits(user)
+		}
+		lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+			PID:            pid,
+			Username:       username,
+			Protocol:       protocol,
+			RequestedVCPUs: vcpus,
+		}, limits)
 		if err != nil {
 			return nil, err
 		}
@@ -266,7 +338,10 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 	}
 	defer endCreation()
 
-	lease, err := sm.acquireConnectionSlot(ctx, pid, protocol)
+	if protocol == "flight" && pid == 0 {
+		pid = sm.ReservePID()
+	}
+	lease, err := sm.acquireConnectionSlot(ctx, pid, username, protocol, profile)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -418,7 +493,16 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	}
 	defer endCreation()
 
-	lease, err := sm.acquireConnectionSlot(ctx, 0, "flight")
+	var profile *WorkerProfile
+	if provider, ok := sm.pool.(flightReconnectProfileProvider); ok {
+		profile, err = provider.ReconnectFlightWorkerProfile(ctx, workerID, ownerEpoch)
+		if err != nil {
+			return 0, nil, fmt.Errorf("resolve reconnect worker profile %d: %w", workerID, err)
+		}
+	}
+
+	pid := sm.ReservePID()
+	lease, err := sm.acquireConnectionSlot(ctx, pid, username, "flight", profile)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -437,7 +521,7 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	if err != nil {
 		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
 	}
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false, lease)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, "", 0, worker, "flight", false, lease)
 	if err != nil {
 		// ReconnectFlightWorker pre-claimed the session on the worker; undo
 		// the claim so the worker parks hot-idle instead of looking busy
@@ -505,13 +589,15 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
 
 	if pid == 0 {
-		pid = sm.nextPID.Add(1)
+		pid = reservePID(globalNextPID)
 	}
 
 	session := &ManagedSession{
 		PID:          pid,
+		Username:     username,
 		WorkerID:     worker.ID,
 		Protocol:     protocol,
+		StartedAt:    time.Now().UTC(),
 		SessionToken: sessionToken,
 		Executor:     executor,
 		lease:        lease,
@@ -657,6 +743,42 @@ func (sm *SessionManager) DestroyAllSessions() {
 			sm.DestroySession(pid)
 		}
 	}
+}
+
+// DestroySessionsForUser tears down every active session owned by username (the
+// per-user kill switch). Each DestroySession cancels the session's in-flight
+// query (via the executor) and destroys the worker-side session; here we
+// additionally force-close the client TCP connection so the client is dropped
+// immediately rather than lingering until its next query returns ErrWorkerDead
+// (mirrors OnWorkerCrash). Returns the number of sessions destroyed.
+//
+// Unlike DestroyAllSessions this does NOT close the manager lifecycle: the org
+// stays open for other users, and (unless the user is also disabled) for the
+// killed user's subsequent reconnects.
+func (sm *SessionManager) DestroySessionsForUser(username string) int {
+	type target struct {
+		pid    int32
+		closer io.Closer
+	}
+	sm.mu.Lock()
+	var targets []target
+	for pid, s := range sm.sessions {
+		if s.Username == username {
+			targets = append(targets, target{pid: pid, closer: s.connCloser})
+		}
+	}
+	sm.mu.Unlock()
+
+	for _, t := range targets {
+		sm.DestroySession(t.pid)
+		// Drop the client connection immediately. The deferred close in
+		// handleConnection will also Close() this conn; a double close on a
+		// socket is harmless (the error is discarded).
+		if t.closer != nil {
+			_ = t.closer.Close()
+		}
+	}
+	return len(targets)
 }
 
 func (sm *SessionManager) sessionPIDsLocked() []int32 {
@@ -825,6 +947,32 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 	return -1
 }
 
+// SessionForWorker returns the session bound to the given cluster-unique worker
+// id, or ok=false if this stack has none. One session per worker, so the first
+// (only) pid in the worker's index is authoritative. Used by the admin
+// live-query detail to address a query by worker id instead of the per-org pid.
+func (sm *SessionManager) SessionForWorker(workerID int) (*ManagedSession, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	pids := sm.byWorker[workerID]
+	if len(pids) == 0 {
+		return nil, false
+	}
+	s, ok := sm.sessions[pids[0]]
+	return s, ok
+}
+
+// ProtocolForPID returns the wire protocol ("postgres"/"flight") for a session,
+// or "" if not found. O(1) lookup for the admin live-query detail view.
+func (sm *SessionManager) ProtocolForPID(pid int32) string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		return s.Protocol
+	}
+	return ""
+}
+
 // WorkerPodNameForPID returns the K8s pod name of the worker hosting the
 // session, or "" if not found or not running on K8s.
 func (sm *SessionManager) WorkerPodNameForPID(pid int32) string {
@@ -839,6 +987,17 @@ func (sm *SessionManager) WorkerPodNameForPID(pid int32) string {
 		return ""
 	}
 	return worker.PodName()
+}
+
+// WorkerProfile returns the pod-shape profile (cpu/memory/ttl) of a worker by
+// ID, or false if the worker is not in the pool. The zero profile is the
+// default profile (empty cpu/memory).
+func (sm *SessionManager) WorkerProfile(workerID int) (WorkerProfile, bool) {
+	w, ok := sm.pool.Worker(workerID)
+	if !ok || w == nil {
+		return WorkerProfile{}, false
+	}
+	return w.Profile(), true
 }
 
 // GetProgress returns the cached query progress for a session, or nil.

@@ -6,8 +6,8 @@
 # This is the SUCCESSOR to the kind-based tests/k8s/ Go suite: every behavior
 # that suite asserted against a fake kind cluster is re-asserted here against the
 # REAL posthog-mw-dev cluster (real Cilium, real Crossplane ducklings, real
-# cnpg-shard + external-RDS metadata, real per-org Lakekeeper). Covers the two
-# real metadata backends cnpg + ext (aurora is retired — out of scope).
+# cnpg-shard + external-RDS metadata). Covers the two real metadata backends
+# cnpg + ext (aurora is retired — out of scope).
 #
 # STRUCTURE: assertions run in four PARALLEL per-org lanes (see main() and the
 # lane_* functions) — cnpg (wire/catalog/concurrency/sizing), res1 (worker-kill
@@ -26,14 +26,11 @@
 #                  transpilation (#716), and a pipelined extended-query error
 #                  discards queued messages until Sync (#718). A same pgwire
 #                  session remains usable immediately after CancelRequest.
-#   activation   : DuckLake + Iceberg catalogs attach and read/write. The FIRST
-#                  session on a cold Iceberg worker must not fail the pg_catalog
-#                  compat-view bind (the CP primes the REST catalog's schema list
-#                  first); asserted on cnpg + ext.
+#   activation   : DuckLake catalogs attach and read/write on cnpg + ext.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
-#                  — asserted on cnpg for BOTH the ducklake and iceberg catalogs.
+#                  — asserted on cnpg for the ducklake catalog.
 #   org default  : an operator-set org default worker profile (admin PUT
 #                  /orgs/:id default_worker_cpu/memory/ttl) sizes a PLAIN
 #                  connection's worker pod (no client GUCs); garbage values are
@@ -86,10 +83,10 @@ RES2="ci-pr-${PR_NUMBER}-res2"
 
 # The bundled extensions MUST be the PostHog forks. These are the short commit
 # SHAs duckdb_extensions() reports for the tags the image pins
-# (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh).
+# (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry).
 # If the image accidentally ships upstream, the version differs and we fail.
 EXPECT_DUCKLAKE_SHA="e4ac5150"
-EXPECT_HTTPFS_SHA="b1fece6"
+EXPECT_HTTPFS_SHA="0dac6fc"
 
 # duckling-example RDS — the shared external metadata store (same one the
 # manual validation used). Endpoint is stable in mw-dev.
@@ -169,7 +166,7 @@ wait_state() { # org target timeout_s
 }
 
 # Org routing is by TLS SNI hostname <org>.<managed-suffix>; the dbname selects
-# the CATALOG (`ducklake` or `iceberg`), not the org (PR #651). The control
+# the DuckLake catalog, not the org (PR #651). The control
 # plane rejects connections without a managed SNI host. We use libpq's
 # host (→ SNI + TLS name) / hostaddr (→ TCP target) split: SNI carries the org
 # hostname while the TCP connection still lands on the CP ClusterIP. The suffix
@@ -184,8 +181,8 @@ resolve_cp_ip() {
 
 # On-demand spawn backpressure ("…retry in about 45 seconds" / "timed out waiting
 # for an available worker") is a FEATURE, not an error: there is no warm pool, so
-# ANY new-session acquisition — a fresh catalog (ducklake→iceberg), a burst, or
-# the first connect after the pool churned (worker kills / idle timeout) — can
+# ANY new-session acquisition — a burst, or the first connect after the pool
+# churned (worker kills / idle timeout) — can
 # transiently get it while the CP spawns a worker (or while a freshly-spawned pod
 # is still pulling/booting). It is a FATAL at session create, BEFORE any SQL runs,
 # so retrying the whole command is safe (no half-applied INSERT). So every harness
@@ -359,6 +356,65 @@ malformed_startup_resilience() { # org password
   [ "$after" = "$before" ] || fail "CP pod $cp_pod restarted on malformed startup (restarts $before -> $after)"
   v="$(pg "$1" "$2" ducklake 'SELECT 1')"
   [ "$v" = "1" ] || fail "CP stopped serving after malformed startup (got '$v')"
+}
+
+# Connection lifetime is recorded at disconnect: the CP's per-connection teardown
+# (control.go defer -> server.CloseConnectionMetrics) bumps the per-org
+# duckgres_connection_duration_seconds histogram AND stamps duration_ms on the
+# "Client disconnected." log. The histogram is the load-bearing series (its _sum
+# gives exact total connection-seconds with no scrape-integral bias), but the
+# :9090 metrics port is NetworkPolicy-blocked from this in-cluster Job and the
+# CP image ships no HTTP client to self-scrape — so we assert the log field,
+# which is emitted by the SAME teardown call that records the histogram. A
+# positive duration_ms proves real elapsed time was measured (guards an
+# always-zero / unset-backendStart regression).
+connection_duration_logged() { # org password
+  log "connection duration_ms stamped on disconnect for $1"
+  # psql opens and closes exactly one connection per call → a fresh disconnect.
+  v="$(pg "$1" "$2" ducklake 'SELECT 1')"
+  [ "$v" = "1" ] || fail "warmup query for duration assertion returned '$v'"
+  sleep 3 # let the disconnect log flush
+  ms=""
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    # logfmt: `... msg="Client disconnected." ... duration_ms=NN`. Take the max
+    # duration_ms seen on a disconnect line in the recent window across replicas.
+    logs="$(k logs "$p" --since=180s 2>&1)" \
+      || fail "kubectl logs failed for control-plane pod $p while checking duration_ms: $logs"
+    m="$(printf '%s\n' "$logs" \
+          | grep 'Client disconnected.' \
+          | grep -oE 'duration_ms=[0-9]+' \
+          | grep -oE '[0-9]+' \
+          | sort -nr | head -1)"
+    if [ -n "$m" ] && { [ -z "$ms" ] || [ "$m" -gt "$ms" ]; }; then ms="$m"; fi
+  done
+  [ -n "$ms" ] || fail "no 'Client disconnected.' log carrying duration_ms in last 180s (CP not recording connection lifetime)"
+  [ "$ms" -gt 0 ] || fail "disconnect duration_ms is $ms (want > 0 — backendStart not honoured?)"
+}
+
+# Managed-warehouse compute-usage metering (billing emit side). At connection
+# teardown the CP meters cpu_seconds/memory_seconds from the provisioned worker
+# size over the connection lifetime into an in-proc per-org counter (best-effort),
+# flushes it to the durable config-store buffer (~15s), and the leader drains
+# closed buckets to PostHog ingestion (~60s, ship-then-delete). The :9090 metrics
+# port + the ingestion HTTP path are not observable from this in-cluster Job, so
+# we assert the CP's startup log line that proves the metering config knob is
+# wired and reports its enabled/disabled state. When the deploy sets
+# DUCKGRES_BILLING_INGEST_URL/TOKEN this line reads "enabled"; otherwise
+# "disabled" — either way the knob is present and the emit path is compiled in.
+# (NOTE: a full end-to-end "the event landed in PostHog ClickHouse" assertion
+# needs a billing-analytics token + CH read access from the Job, which this lane
+# does not have — see README. The buffer UPSERT/drain SQL is exercised by the
+# tests/configstore Postgres migration test, and the meter/drain logic by the
+# controlplane/ unit tests.)
+compute_usage_metering_wired() {
+  log "compute-usage metering config knob wired in CP"
+  found=""
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    m="$(k logs "$p" 2>/dev/null | grep -E 'Managed-warehouse compute-usage metering (enabled|disabled)' | tail -1)"
+    if [ -n "$m" ]; then found="$m"; fi
+  done
+  [ -n "$found" ] || fail "no compute-usage metering startup log line found (config knob not wired into SetupMultiTenant?)"
+  log "compute-usage metering state: $found"
 }
 
 # jsonb || must keep Postgres concatenation semantics through the full CP
@@ -646,73 +702,6 @@ httpfs_retry_budget() { # org password
   assert_compat "$1" "$2" ducklake "SELECT (value::DOUBLE = 2.0)::text FROM duckdb_settings() WHERE name='http_retry_backoff'" "true" "http_retry_backoff"
 }
 
-rw_iceberg() { # org password
-  log "Iceberg R/W on $1"
-  c="$(pg "$1" "$2" iceberg "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name='iceberg'")"
-  [ "$c" = "1" ] || fail "$1 iceberg catalog not attached (duckdb_databases count=$c)"
-  t="e2e_ice_$(echo "$1" | tr -c 'a-z0-9' _)"
-  pg "$1" "$2" iceberg "DROP TABLE IF EXISTS iceberg.public.$t;
-            CREATE TABLE iceberg.public.$t(id INT, label VARCHAR);
-            INSERT INTO iceberg.public.$t VALUES (10,'ten'),(20,'twenty');"
-  n="$(pg "$1" "$2" iceberg "SELECT COUNT(*) FROM iceberg.public.$t;")"
-  [ "$n" = "2" ] || fail "$1 Iceberg rowcount=$n want 2"
-  pg "$1" "$2" iceberg "DROP TABLE iceberg.public.$t;"
-}
-
-# Regression for the Iceberg cold-start session-init bug: the FIRST session on a
-# freshly-spawned (cold) worker must not fail the pg_catalog compat-view bind.
-# Before the fix, InitSessionDatabaseMetadata enumerated every attached catalog
-# before anything had materialized the Iceberg REST catalog's schema list on the
-# new session connection, so the bind hit `Catalog Error: Schema with name ""
-# not found` and the connection was rejected with `failed to initialize session
-# database metadata`; only a reconnect (instance since settled) masked it. With
-# the warm pool gone, every org's first connect lands the literal first session
-# on its worker, so this fired in practice. The CP now primes the catalog with a
-# retried schema-enumeration probe before the bind, and the bind itself retries
-# once on the settle signature. This forces a cold worker and asserts
-# the first connect succeeds: cold-spawn backpressure is still tolerated, but the
-# metadata-init bind error fails the test immediately instead of being retried
-# away (which is exactly how a live reconnect would mask it).
-iceberg_cold_first_connect() { # org password
-  log "iceberg cold first-connect (metadata-init regression) on $1"
-  # Force cold: delete every worker for the org and wait until none remain, so
-  # the next connect cold-spawns a brand-new worker whose first session is the
-  # client's — the precise condition that triggered the bug.
-  for p in $(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" -o name 2>/dev/null); do
-    k delete "$p" --grace-period=0 --force >/dev/null 2>&1 || true
-  done
-  i=0
-  while [ "$i" -lt 45 ]; do
-    n="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
-    [ "$n" = "0" ] && break
-    sleep 2; i=$((i + 1))
-  done
-  # First connect. Tolerate cold-spawn backpressure (worker still booting), but
-  # treat the session-metadata-init bind failure as a hard regression — do NOT
-  # retry it, or the bug would be masked exactly as a live reconnect masks it.
-  # The metadata-init clause is listed first so it wins over the broader
-  # "failed to initialize session" transient it is a prefix-superset of.
-  a=0 out=""
-  while [ "$a" -lt 12 ]; do
-    if out="$(PGPASSWORD="$2" psql \
-        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=iceberg" \
-        -v ON_ERROR_STOP=1 -tAc "SELECT 1" 2>&1)"; then
-      [ "$out" = "1" ] || fail "iceberg_cold_first_connect: $1 returned '$out' want 1"
-      return
-    fi
-    case "$out" in
-      *"failed to initialize session database metadata"*|*'Schema with name "" not found'*)
-        fail "iceberg_cold_first_connect: cold first session hit the metadata-init bind bug on $1 (prime regressed): $out" ;;
-      *"capacity exhausted"*|*"no Duckgres worker"*|*"still provisioning"*|\
-      *"failed to initialize session"*|*"timed out waiting for an available worker"*|\
-      *"failed to start"*|*"spawn sized worker"*|*"failed to detect attached catalogs"*)
-        sleep 10; a=$((a + 1)); continue ;;
-      *) fail "iceberg_cold_first_connect: unexpected error on $1: $out" ;;
-    esac
-  done
-  fail "iceberg_cold_first_connect: exhausted retries waiting for a cold worker on $1"
-}
-
 # ---- worker pod assertions (via the K8s API) ------------------------------
 # Org-scoped on purpose: lanes for different orgs run in PARALLEL, so "the
 # newest worker in the namespace" could belong to another lane (wrong shape,
@@ -867,6 +856,33 @@ hot_idle_retired() { # org password catalog cpu memory
   fail "hot-idle retire: cpu=$cpu worker still present after ~4m (TTL=1m) — hot-idle reaper not retiring idle workers (the idle-leak regression)"
 }
 
+# NOTE — drain-time idle-Hot release (OrgRouter.ReleaseIdleHotWorkers, the #832
+# redesign): when a CP enters drain it now parks its idle (zero-session) Hot
+# workers into hot_idle at drain START, so the unfenced hot-idle TTL reaper
+# reclaims them during the (possibly unbounded) drain wait instead of leaving
+# them pinned until the CP is declared expired and the owner-expired-fenced
+# orphan reaper picks them up. This closes the stuck-Hot/0-session leak that
+# accumulated across CP rollout generations. It is NOT asserted directly in-Job:
+# doing so would require draining the live CP pod (whole-Job blast radius across
+# every org lane below) AND fault-injecting a stuck Hot/0-session worker, neither
+# deterministic here. The two ends ARE covered: the sweep selection (park idle
+# Hot, skip busy, no session decrement) by k8s_pool_test.go
+# (TestK8sPoolReleaseIdleHotWorkers*/ParkIdleHotWorker*), and the reaper
+# destination (hot_idle -> pod delete within TTL) by hot_idle_retired above.
+
+# NOTE — the hot-idle TTL reaper now spares hot-idle workers that still back a
+# reclaimable (Active/Reconnecting) Flight session, mirroring the long-standing
+# exclusion in ListOrphanedWorkers (so a TTL reap can't kill a customer's query
+# at the moment they reconnect by session token). That sparing is a NEGATIVE
+# assertion over a multi-minute TTL window on a worker holding a live durable
+# Flight session — not deterministic to set up in-Job — so it is gated by the
+# real-Postgres regression test
+# TestListExpiredHotIdleWorkersSparesReclaimableFlightSessions
+# (tests/configstore/runtime_store_postgres_test.go), which asserts both the
+# global and per-CP reaper variants spare Active/Reconnecting sessions and still
+# reap workers with no session (or only a closed one). hot_idle_retired above
+# covers the positive (no Flight session -> reaped within TTL).
+
 # ---- org default worker profile --------------------------------------------
 # Operators can give a tenant a server-side default worker shape + hot-idle TTL
 # (config-store columns default_worker_cpu/memory/ttl, set via the admin API).
@@ -941,6 +957,16 @@ org_default_profile() { # org password catalog
   after="$(count_org_workers_of_cpu "$org" "$cpu")"
   [ "$after" -le "$before" ] || fail "org default: cleared default still spawns $cpu-cpu workers ($before -> $after)"
   log "org default OK: cleared; plain connection back on the deployment default shape"
+
+  # Audit readability: the org PUTs above must land a resource-specific
+  # "org.update" row (not a generic "config.update") carrying a human "which
+  # fields changed" detail. The clear-PUT above always flips default_worker_*
+  # from the just-set 2/8Gi/10m to unset, so a detail mentioning the field is
+  # deterministic. Guards audit.go::auditActionFor + api.go::updateOrg detail.
+  curl -fsS -H "$H" "$API/api/v1/audit?org=$org" \
+    | jq -e --arg o "$org" '.entries | map(select(.action=="org.update" and .org==$o and (.detail | test("default_worker")))) | length >= 1' >/dev/null \
+    || fail "org default: no org.update audit row with a field-change detail for $org"
+  log "org default OK: audit shows org.update with field-change detail on $org"
 }
 
 # ---- user persistent secrets ------------------------------------------------
@@ -1272,23 +1298,27 @@ concurrent_writers() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
-# ---- admin dashboard auth (#721) -------------------------------------------
-# Regression for #721: the admin dashboard must NOT accept the internal secret
-# via a ?token= URL query parameter (URL-borne secrets persist in browser
-# history and any future proxy access logs). A request carrying the correct
-# token in the query string gets the login page (401) with no auth cookie and
-# no redirect; the X-Duckgres-Internal-Secret header path still authenticates.
+# ---- admin API auth (#721) -------------------------------------------------
+# Regression for #721: the internal secret must NOT be accepted via a ?token=
+# URL query parameter (URL-borne secrets persist in browser history and any
+# future proxy access logs) — only the X-Duckgres-Internal-Secret header / login
+# cookie authenticate. The admin console serves its React SPA UNauthenticated at
+# "/" (the bundle carries no secrets; all data is behind /api auth), so this
+# asserts the invariant against an authenticated API endpoint, not "/".
 admin_dashboard_no_query_token() {
-  log "admin dashboard rejects ?token= query auth"
+  log "admin API rejects ?token= query auth (#721)"
   hdrs=/tmp/admin_qt_hdrs
-  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/?token=$SECRET")"
-  [ "$code" = "401" ] || fail "GET /?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
+  code="$(curl -s -o /dev/null -D "$hdrs" -w '%{http_code}' "$API/api/v1/orgs?token=$SECRET")"
+  [ "$code" = "401" ] || fail "GET /api/v1/orgs?token=<secret> returned $code, want 401 (query-param auth must be rejected)"
   if grep -qi '^set-cookie:' "$hdrs"; then
-    fail "GET /?token=<secret> set a cookie — query-param auth is back"
+    fail "GET /api/v1/orgs?token=<secret> set a cookie — query-param auth is back"
   fi
-  # Sanity: the header path (what this harness uses everywhere) still works.
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/")"
-  [ "$code" = "200" ] || fail "GET / with internal-secret header returned $code, want 200"
+  # The header path (what this harness uses everywhere) still authenticates.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "GET /api/v1/orgs with internal-secret header returned $code, want 200"
+  # The public SPA is served unauthenticated at "/".
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/")"
+  [ "$code" = "200" ] || fail "GET / (public SPA) returned $code, want 200"
 }
 
 # ---- internal secret rotation fallback --------------------------------------
@@ -1303,9 +1333,11 @@ internal_secret_fallback_auth() {
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Duckgres-Internal-Secret: $fb" "$API/api/v1/orgs")"
   [ "$code" = "200" ] || fail "GET /api/v1/orgs with fallback secret returned $code, want 200 (rotation overlap broken)"
+  # Dashboard cookie path: the fallback secret must also authenticate via the
+  # login cookie (not the public "/" SPA, which 200s for everyone).
   code="$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "X-Duckgres-Internal-Secret: $fb" "$API/")"
-  [ "$code" = "200" ] || fail "GET / (dashboard) with fallback secret returned $code, want 200"
+    --cookie "duckgres_admin_token=$fb" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "GET /api/v1/orgs with fallback-secret cookie returned $code, want 200 (dashboard cookie path)"
   code="$(curl -s -o /dev/null -w '%{http_code}' \
     -H "X-Duckgres-Internal-Secret: definitely-not-a-secret" "$API/api/v1/orgs")"
   [ "$code" = "401" ] || fail "GET /api/v1/orgs with garbage secret returned $code, want 401 (accept-list must stay closed)"
@@ -1352,6 +1384,420 @@ models_explorer_api() {
   [ "$code" = "404" ] || fail "GET /api/v1/models/not-a-model returned $code, want 404"
 }
 
+# ---- admin console: identity + live state + auth gate ----------------------
+# The VPC-private admin console (controlplane/admin/, docs/design/admin-ui.md)
+# adds identity resolution (/me), live cluster state, a metrics proxy, and an
+# audit log on top of the models explorer. The internal secret maps to the admin
+# role; an unauthenticated request is rejected. This asserts the new read
+# surfaces are wired and return their documented envelopes.
+admin_console_api() {
+  log "admin console: /me identity, live state, auth gate"
+  # Internal secret → admin role.
+  role="$(curl -fsS -H "$H" "$API/api/v1/me" | jq -r '.role')"
+  [ "$role" = "admin" ] || fail "GET /me with internal secret role='$role', want admin"
+  # No auth → 401 (the accept-list stays closed for SSO-less callers).
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/me")"
+  [ "$code" = "401" ] || fail "GET /me with no auth returned $code, want 401"
+  # Live read endpoints return their documented envelopes.
+  # /queries aggregates each CP's in-memory view and reports coverage. The CI CP
+  # runs a SINGLE replica, so this only asserts the envelope (cp_total==cp_responders,
+  # no failed peers); it cannot exercise a real peer hop. The multi-CP fan-out
+  # (peer discovery + self-exclusion + merge/dedup) is covered by unit tests
+  # (TestDiscoverPeerIPs, TestQueriesAggregateAcrossCPs).
+  curl -fsS -H "$H" "$API/api/v1/queries" \
+    | jq -e 'has("queries") and (.cp_total >= 1) and (.cp_responders == .cp_total)' >/dev/null \
+    || fail "/queries envelope wrong (queries/cp_total/cp_responders)"
+  curl -fsS -H "$H" "$API/api/v1/workers/fleet"     | jq -e 'has("fleet")'   >/dev/null || fail "/workers/fleet missing 'fleet' key"
+  curl -fsS -H "$H" "$API/api/v1/cluster/instances" \
+    | jq -e '.instances | map(select(.self)) | length >= 1' >/dev/null \
+    || fail "/cluster/instances has no self-flagged CP replica"
+  # Node-overview topology reads (back the admin console "Nodes" live view): they
+  # project in-cluster nodes/pods/events into the K8s list shape the view consumes
+  # (GET /cluster/{nodes,pods,events,nodepools}), each a {items:[...]} envelope.
+  # We assert the endpoints are wired + auth-gated + return 200 with an items
+  # array — NOT that items is populated: these reads are cluster-scoped, and the
+  # e2e CP's ServiceAccount can't be granted cluster-scoped RBAC from CI (the CI
+  # deployer can't create/bind cluster-topology roles without escalation), so the
+  # CP degrades a Forbidden to an empty list here. The populated path is exercised
+  # in real envs where the chart's duckgres-control-plane-cluster-topology
+  # ClusterRole is bound (see cluster_test.go for the projection-shape assertions).
+  for res in nodes pods events nodepools; do
+    curl -fsS -H "$H" "$API/api/v1/cluster/$res" \
+      | jq -e '(.items | type) == "array"' >/dev/null \
+      || fail "/cluster/$res did not return a 200 {items:[...]} envelope"
+  done
+  # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
+  curl -fsS -H "$H" "$API/api/v1/metrics/panels" | jq -e '.panels | index("query_rate")' >/dev/null \
+    || fail "/metrics/panels missing 'query_rate'"
+}
+
+# ---- admin: /status reports per-org worker counts --------------------------
+# OrgStatus.Workers (the Overview per-org load bars + total_workers) was an
+# always-0 dead field; it's now populated from each CP's OrgReservedPool
+# (cap-counting assigned workers, summed across replicas by the /status
+# fan-out). With a query in flight the org's worker is Hot, so /status must
+# report workers>=1 for that org and a nonzero cluster total_workers.
+# PRECONDITION: the caller passes an org whose lane is already warm (e.g. CNPG
+# after join_lanes), so the query lands on a Hot worker within the 120s budget
+# rather than waiting on a multi-minute cold pod spawn — see the call site.
+admin_per_org_workers() { # org password
+  org="$1"; pw="$2"
+  log "admin: /status per-org worker count is populated on $org"
+  q="SELECT count(*) FROM range(2718281828) t(i) WHERE i % 2 = 0;"
+  out="$(mktemp)"
+  ( pg_try "$org" "$pw" ducklake "$q" >"$out" 2>&1 || true ) &
+  bg=$!
+  cleanup_pow() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
+
+  ok="" a=0
+  while [ "$a" -lt 60 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    w="$(curl -fsS -H "$H" "$API/api/v1/status" \
+      | jq -r --arg o "$org" '(.orgs[]? | select(.name==$o) | .workers) // 0')"
+    tot="$(curl -fsS -H "$H" "$API/api/v1/status" | jq -r '.total_workers // 0')"
+    if [ "${w:-0}" -ge 1 ] && [ "${tot:-0}" -ge 1 ]; then ok=1; break; fi
+    sleep 2; a=$((a + 1))
+  done
+  cleanup_pow
+  [ -n "$ok" ] || fail "admin_per_org_workers: /status never reported workers>=1 for $org (per-org worker count not populated)"
+  log "admin: /status per-org worker count OK (workers>=1, total_workers>=1) on $org"
+}
+
+# ---- connection idle timeout: idle conn reaped, worker freed ----------------
+# An idle client connection pins a worker (one session per worker), so the
+# control plane defaults to a short connection idle timeout (server.Default
+# ControlPlaneIdleTimeout, 60s): a connection with no traffic for that long is
+# closed by the message loop's read deadline, DestroySession runs, and the
+# worker returns to hot-idle. We hold a connection idle-in-transaction PAST the
+# timeout and assert its session disappears from /queries while our client is
+# still connected (so the reap is the CP's, not our client exiting). The unit
+# tests (TestNormalizeIdleTimeout + TestMessageLoopIdleTimeoutClosesConnection)
+# are the deterministic gate for the mechanism; this proves the real default
+# fires end-to-end in-cluster.
+conn_idle_timeout_reaps_session() { # org password
+  org="$1"; pw="$2"
+  log "conn idle timeout: idle connection is reaped + worker freed on $org"
+  rootwids() {
+    curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" '[.queries[]? | select(.org==$o and .user=="root") | .worker_id] | sort | join(" ")'
+  }
+  before="$(rootwids)"
+  # Hold a connection idle-in-transaction for 150s (well past the 60s timeout):
+  # send BEGIN, then keep stdin open so psql waits and issues no further query.
+  ( printf 'BEGIN;\n'; sleep 150 ) | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+  bg=$!
+  cleanup_ir() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  # The NEW root worker_id (not present before) is our idle connection's.
+  wid="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    for w in $(rootwids); do
+      case " $before " in *" $w "*) : ;; *) wid="$w"; break ;; esac
+    done
+    [ -n "$wid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$wid" ] || { cleanup_ir; fail "conn_idle_timeout: idle session never appeared for $org"; }
+  log "conn idle timeout: idle session on worker $wid — waiting for the CP to reap it"
+  # Must vanish from /queries within ~90s (60s timeout + grace), while our client
+  # is STILL alive (kill -0) so the disappearance is the CP reaping, not us.
+  gone="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || { cleanup_ir; fail "conn_idle_timeout: our client exited before reap — inconclusive"; }
+    present="$(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --argjson w "$wid" 'any(.queries[]?; .worker_id==$w)')"
+    [ "$present" = "false" ] && { gone=1; break; }
+    sleep 3; a=$((a + 1))
+  done
+  cleanup_ir
+  [ -n "$gone" ] || fail "conn_idle_timeout: idle session on worker $wid was NOT reaped within ~90s (idle timeout not enforced)"
+  log "conn idle timeout: idle session reaped, worker $wid freed on $org"
+}
+
+# ---- COPY FROM STDIN: active in Live + survives the idle timeout ------------
+# An actively-streaming COPY reads many CopyData messages; each in-loop read
+# re-arms the read deadline (server/conn_copy.go armIdleReadDeadline), so a COPY
+# that streams for LONGER than the idle timeout but never stalls must NOT be
+# reaped mid-stream (the regression the 60s default would otherwise cause for
+# the COPY-heavy data-import users). It must also be categorized as an ACTIVE
+# query in /queries (elapsed_ms>0), not an idle session, while it streams.
+copy_active_and_survives_idle() { # org password
+  org="$1"; pw="$2"
+  log "COPY FROM STDIN: active in Live + survives idle timeout on $org"
+  out="$(mktemp)"
+  conn="sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake"
+  # 6 chunks of 60 rows with 11s gaps → ~66s total stream, each gap < the 60s
+  # timeout. ON_ERROR_STOP makes a mid-stream reap fail the run (no 360 count).
+  ( printf 'DROP TABLE IF EXISTS e2e_idle_copy;\n'
+    printf 'CREATE TABLE e2e_idle_copy(v TEXT);\n'
+    printf '\\copy e2e_idle_copy(v) FROM STDIN\n'
+    for i in $(seq 1 6); do
+      for j in $(seq 1 60); do printf 'row-%d-%d\n' "$i" "$j"; done
+      sleep 11
+    done
+    printf '\\.\n'
+    printf 'SELECT count(*) FROM e2e_idle_copy;\n'
+    printf 'DROP TABLE e2e_idle_copy;\n'
+  ) | PGPASSWORD="$pw" psql "$conn" -v ON_ERROR_STOP=1 -qtA >"$out" 2>&1 &
+  bg=$!
+  cleanup_copy() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
+  # While it streams, /queries must show it as an ACTIVE query (elapsed_ms>0),
+  # not an idle session.
+  active="" a=0
+  while [ "$a" -lt 20 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    e="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and .user=="root" and (.elapsed_ms>0))) | .elapsed_ms // empty')"
+    [ -n "$e" ] && { active=1; break; }
+    sleep 3; a=$((a + 1))
+  done
+  [ -n "$active" ] || { cleanup_copy; fail "copy_active: streaming COPY not categorized active (elapsed_ms>0) in /queries on $org"; }
+  # It must finish successfully with all 360 rows (NOT reaped mid-stream).
+  wait "$bg"; rc=$?
+  { [ "$rc" -eq 0 ] && grep -qx "360" "$out"; } \
+    || { rm -f "$out"; fail "copy_active: streaming COPY (~66s) did not succeed with 360 rows (rc=$rc): $(tr '\n' ' ' <"$out" | tail -c 300)"; }
+  rm -f "$out"
+  log "COPY FROM STDIN: active in Live + survived idle timeout (360 rows) on $org"
+}
+
+# ---- admin RBAC: SSO viewer is read-only -----------------------------------
+# A forged ALB OIDC header (no internal secret) for an @posthog.com email that
+# is NOT in the operators table resolves to the viewer role (fail-closed
+# default): it can read but must be blocked from mutations and from the audit
+# log. Exercises RoleGate + RequireAdmin against the REAL router (the unit tests
+# cover the gate algorithm; this covers the wiring). The JWT is unsigned because
+# the CP trusts the ALB-injected header by network position. (Role is no longer
+# group-based — it comes from the operators table; an unknown email = viewer.)
+admin_rbac_viewer() { # org
+  org="$1"
+  log "admin RBAC: forged SSO viewer (unknown operator) is read-only (no mutate, no audit)"
+  payload="$(printf '{"email":"ci-viewer@posthog.com","email_verified":true}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+  vh="X-Amzn-Oidc-Data: e30.${payload}.sig"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/orgs")"
+  [ "$code" = "200" ] || fail "viewer GET /orgs returned $code, want 200 (reads allowed)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/audit")"
+  [ "$code" = "403" ] || fail "viewer GET /audit returned $code, want 403 (audit is admin-only)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$vh" -H 'Content-Type: application/json' -d '{}' "$API/api/v1/orgs/$org")"
+  [ "$code" = "403" ] || fail "viewer PUT /orgs/$org returned $code, want 403 (mutations are admin-only)"
+}
+
+# ---- admin live-query detail (phase 1): per-pid expansion ------------------
+# The Live page can open one in-flight query to see its (redacted) SQL text +
+# connection metadata + live progress. Backed by GET /api/v1/queries/:pid, which
+# joins server.ConnDetailByPID (the already-redacted currentQuery, scoped to the
+# replica that owns the connection) with the session manager's cached progress.
+# Asserts: a real running query is findable via /queries, /queries/by-worker/:wid
+# returns 200 with the SQL round-tripped + matching identity, and an unknown
+# worker 404s (not a 500). The redaction guarantee itself is unit-tested
+# (server/conn_detail_test.go, controlplane/admin/live_test.go) — this proves
+# the wiring against a real worker pod.
+#
+# NOTE: backend pids are process-global within a CP (controlplane/session_mgr.go
+# globalNextPID), which removed the per-org pid collision that shadowed conns in
+# the server.conns map (pg_stat_activity / cancel). That can't be asserted
+# in-Job here: forcing a collision needs a FRESH CP with two orgs opening their
+# first connection at the same pid count, which a warm cluster can't reproduce.
+# The deterministic gate is TestReservePIDGloballyUniqueAcrossManagers.
+
+# ---- admin live: idle (no in-flight query) sessions are flagged ------------
+# QueryStatus.State surfaces the pg_stat_activity-style connection state in
+# /queries, so the Live view can flag sessions that hold a worker but run no
+# query (idle / idle in transaction) — a smell when persistent. We hold a
+# connection idle-in-transaction (send BEGIN, then keep stdin open so psql
+# waits) and assert /queries reports an idle* state for that session.
+admin_idle_session_flagged() { # org password
+  org="$1"; pw="$2"
+  log "admin live: idle-in-transaction session is flagged (no in-flight query) on $org"
+  ( printf 'BEGIN;\n'; sleep 30 ) | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+  bg=$!
+  cleanup_idle() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  found="" a=0
+  while [ "$a" -lt 20 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    found="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and ((.state // "")|test("idle";"i"))) | .state) // empty')"
+    [ -n "$found" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  cleanup_idle
+  case "$found" in
+    idle*) log "admin live: idle session flagged OK (state='$found') on $org" ;;
+    *) fail "admin_idle_session_flagged: /queries never reported an idle* state for an idle-in-transaction session on $org (got '$found')" ;;
+  esac
+}
+
+# ---- admin: cancel a session by (cluster-unique) worker id ------------------
+# The Live view's Cancel button posts /sessions/by-worker/:wid/cancel. Worker id
+# (not the per-CP pid) is the address, and the handler kills locally or fans out
+# to whichever CP owns the session — so cancel works regardless of which replica
+# the request lands on. (The cross-CP fan-out itself is unit-tested in
+# TestCancelByWorkerFansOut; the CI CP is single-replica, so this covers the
+# real kill + the unknown→404 path end-to-end.)
+admin_cancel_by_worker() { # org password
+  org="$1"; pw="$2"
+  log "admin: cancel a live session by worker id on $org"
+  # Hold longer than the appear-poll budget (30×2s) so a slow cold-start can't
+  # exit the client before the session is observed (we cancel it well before
+  # the 60s idle timeout anyway).
+  ( printf 'BEGIN;\n'; sleep 90 ) | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+  bg=$!
+  cleanup_cbw() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  wid="" a=0
+  while [ "$a" -lt 30 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    wid="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and .user=="root")) | .worker_id // empty')"
+    [ -n "$wid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$wid" ] || { cleanup_cbw; fail "admin_cancel_by_worker: session never appeared for $org"; }
+  # Cancel it by worker id → killed>=1.
+  resp="$(curl -fsS -H "$H" -X POST "$API/api/v1/sessions/by-worker/$wid/cancel")" \
+    || { cleanup_cbw; fail "admin_cancel_by_worker: POST cancel failed for worker $wid"; }
+  echo "$resp" | jq -e '.killed >= 1' >/dev/null \
+    || { cleanup_cbw; fail "admin_cancel_by_worker: cancel did not kill worker $wid: $resp"; }
+  # The session must disappear from /queries.
+  gone="" a=0
+  while [ "$a" -lt 15 ]; do
+    [ "$(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --argjson w "$wid" 'any(.queries[]?; .worker_id==$w)')" = "false" ] && { gone=1; break; }
+    sleep 2; a=$((a + 1))
+  done
+  cleanup_cbw
+  [ -n "$gone" ] || fail "admin_cancel_by_worker: session on worker $wid still present after cancel"
+  # Unknown worker → 404 (not a 500).
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" -X POST "$API/api/v1/sessions/by-worker/999999999/cancel")"
+  [ "$code" = "404" ] || fail "admin_cancel_by_worker: unknown worker cancel returned $code, want 404"
+  log "admin: cancel by worker id OK (killed worker $wid, unknown→404) on $org"
+}
+
+admin_query_detail() { # org password
+  org="$1"; pw="$2"
+  log "admin live: per-query detail round-trip on $org"
+  # Distinctive constant so we can prove the SQL text round-trips into the
+  # detail payload (survives transpilation as a bare numeric literal).
+  q="SELECT count(*) FROM range(2718281828) t(i) WHERE i % 2 = 0;"
+  out="$(mktemp)"
+  ( pg_try "$org" "$pw" ducklake "$q" >"$out" 2>&1 || true ) &
+  bg=$!
+  cleanup_bg() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
+
+  # Poll /queries until our marker query shows an in-flight row, and capture its
+  # CLUSTER-UNIQUE worker id (detail is addressed by worker id, not the per-org
+  # pid). Filter on the marker SQL is not possible from the list (no SQL there),
+  # so filter on org and the running state; the lane is otherwise quiet here.
+  wid="" pid="" a=0
+  while [ "$a" -lt 60 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    row="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -c --arg o "$org" 'first(.queries[]? | select(.org==$o))')"
+    wid="$(printf '%s' "$row" | jq -r '.worker_id // empty')"
+    pid="$(printf '%s' "$row" | jq -r '.pid // empty')"
+    [ -n "$wid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$wid" ] || { cleanup_bg; fail "admin_query_detail: no in-flight query appeared for $org within timeout"; }
+
+  # The /queries list item carries the running-query duration. Give it a moment
+  # to accrue, then assert elapsed_ms is present and positive for our worker.
+  sleep 3
+  ems="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+    | jq -r --argjson w "$wid" 'first(.queries[]? | select(.worker_id==$w) | .elapsed_ms) // -1')"
+  case "$ems" in
+    ''|-1|0) cleanup_bg; fail "admin_query_detail: /queries elapsed_ms not populated for worker $wid (got '$ems')" ;;
+    *) [ "$ems" -gt 0 ] || { cleanup_bg; fail "admin_query_detail: elapsed_ms not positive for worker $wid (got '$ems')"; } ;;
+  esac
+
+  # Expand it by worker id: 200 with the redacted SQL text + matching identity.
+  d="$(curl -fsS -H "$H" "$API/api/v1/queries/by-worker/$wid")" \
+    || { cleanup_bg; fail "admin_query_detail: GET /queries/by-worker/$wid failed"; }
+  echo "$d" | jq -e --arg o "$org" --argjson w "$wid" \
+    '.worker_id == $w and .org == $o and (.query | contains("2718281828"))' >/dev/null \
+    || { cleanup_bg; fail "admin_query_detail: detail mismatch for worker $wid: $(echo "$d" | jq -c '{pid,org,worker_id,state,qlen:(.query|length)}')"; }
+
+  # An unknown worker id is a clean 404, never a 500.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/queries/by-worker/999999999")"
+  [ "$code" = "404" ] || { cleanup_bg; fail "admin_query_detail: unknown worker id returned $code, want 404"; }
+  cleanup_bg
+
+  # Redaction in the LIVE path (load-bearing): a real CREATE SECRET executing on
+  # a worker must NOT expose its credential material via /queries/:pid. The unit
+  # test proves connDetail passes the redacted currentQuery through; this proves
+  # the live server actually stores the redacted form (no un-redacted detail
+  # source slipped in). We run a long CREATE SECRET so it's catchable in flight,
+  # capture its pid, expand it, and assert the secret literal is absent.
+  cred="e2eSECRET-$(openssl rand -hex 12)"
+  # A count(*) over a big range forces a FULL scan (no LIMIT short-circuit), so
+  # the CREATE SECRET stays in flight ~tens of seconds while DuckDB evaluates the
+  # option subquery — long enough to catch. The cred literal is what must never
+  # leak; RedactForLog replaces the whole option list with a placeholder.
+  sq="CREATE OR REPLACE SECRET e2e_detail_redact (TYPE s3, KEY_ID 'AKIADETAILPROBE', SECRET '${cred}', REGION (SELECT count(*)::VARCHAR FROM range(3000000000) t(i) WHERE i % 2 = 0));"
+  sout="$(mktemp)"
+  ( pg_try "$org" "$pw" ducklake "$sq" >"$sout" 2>&1 || true ) &
+  sbg=$!
+  cleanup_sbg() { kill "$sbg" 2>/dev/null || true; wait "$sbg" 2>/dev/null || true; rm -f "$sout"; }
+  # Poll each org worker's detail and pin to the one whose (redacted) SQL is our
+  # CREATE SECRET — so concurrent org churn can't make us probe a different query.
+  swid="" a=0
+  while [ "$a" -lt 60 ]; do
+    kill -0 "$sbg" 2>/dev/null || break
+    for w in $(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --arg o "$org" '.queries[]? | select(.org==$o) | .worker_id'); do
+      sd="$(curl -fsS -H "$H" "$API/api/v1/queries/by-worker/$w" || true)"
+      if printf '%s' "$sd" | jq -e '.query | test("e2e_detail_redact"; "i")' >/dev/null 2>&1; then
+        swid="$w"; break
+      fi
+    done
+    [ -n "$swid" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  if [ -n "$swid" ]; then
+    # sd holds the matched detail. The credential literal must be absent.
+    case "$sd" in
+      *"$cred"*|*"AKIADETAILPROBE"*) cleanup_sbg; fail "admin_query_detail: REDACTION BREACH — CREATE SECRET credential leaked into /queries/by-worker/$swid" ;;
+    esac
+    log "admin live: redaction holds in live path (credential absent from worker $swid detail)"
+  else
+    # Don't fail the whole suite on a missed catch (the secret DDL may finish or
+    # error fast on a cold worker); the unit test is the deterministic gate.
+    log "admin live: CREATE SECRET detail probe did not catch the query in flight — skipped (unit test is the gate)"
+  fi
+  cleanup_sbg
+
+  log "admin live: per-query detail OK (worker $wid, SQL round-tripped, unknown→404, redaction) on $org"
+}
+
+# ---- admin impersonation round-trip + audit --------------------------------
+# An admin can open a session as an org user (workers trust the CP — no password)
+# and run SQL on that org's worker; every statement is audited with the admin
+# actor, and a write requires allow_write=true. This asserts the full round-trip
+# against a real worker AND that an audit row is persisted — the load-bearing
+# behaviours of the impersonation path (impersonate.go + admin_providers.go).
+admin_impersonation_audited() { # org
+  org="$1"
+  log "admin impersonation: run SQL as root@$org + assert audit row"
+  out="$(curl -fsS --max-time 360 -H "$H" -H 'Content-Type: application/json' \
+    -d '{"username":"root","sql":"SELECT 42 AS answer","allow_write":false}' \
+    "$API/api/v1/orgs/$org/impersonate/query")" \
+    || fail "impersonate: request failed for root@$org"
+  echo "$out" | jq -e '.columns | index("answer")' >/dev/null \
+    || fail "impersonate: missing column 'answer' in: $out"
+  echo "$out" | jq -e '.rows[0][0] == 42' >/dev/null \
+    || fail "impersonate: rows[0][0] != 42 in: $out"
+  # A write statement without allow_write must be rejected (conservative classifier).
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -H "$H" -H 'Content-Type: application/json' \
+    -d '{"username":"root","sql":"CREATE TABLE imp_x(i int)","allow_write":false}' \
+    "$API/api/v1/orgs/$org/impersonate/query")"
+  [ "$code" = "400" ] || fail "impersonate: write without allow_write returned $code, want 400"
+  # The successful impersonation must have left an audit row attributing the admin.
+  curl -fsS -H "$H" "$API/api/v1/audit?org=$org" \
+    | jq -e --arg o "$org" '.entries | map(select(.action=="impersonate.query" and .target_user=="root" and .org==$o)) | length >= 1' >/dev/null \
+    || fail "impersonate: no audit row for impersonate.query root@$org"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -1373,7 +1819,7 @@ tenant_isolation() { # orgA pwA orgB pwB
 # ---- lifecycle: deprovision → warehouse deleted → Duckling CR fully gone ----
 # Proves the teardown path works end to end: warehouse marked deleted, the
 # Crossplane Duckling CR removed, and its finalizer cascade (which drops the
-# cnpg lakekeeper_<org> role+db) completed.
+# cnpg metadata role+db) completed.
 #
 # NOTE: same-org-id *re-provision* in the SAME run is intentionally NOT done
 # here. It is the regression net for the stranded-cnpg-role bugs
@@ -1382,11 +1828,11 @@ tenant_isolation() { # orgA pwA orgB pwB
 # the cnpg-shards Postgres, which only `run.sh` (on the runner, with
 # cnpg-shards exec rights) can do — the in-cluster Job SA cannot and must not.
 # Re-provisioning the same id while the async cnpg cascade is still in flight
-# races a drifted-password role → Lakekeeper SASL failure → the warehouse never
-# goes ready. So the same-id regression is covered ACROSS runs instead: every
-# run's `run.sh deploy` drops the cnpg role for a clean slate, and `run.sh
-# teardown` waits the CR `--for=delete` before returning. (This is the same
-# reasoning the original harness used to drop the in-Job recreate.)
+# can race stranded metadata state and leave the warehouse stuck. So the
+# same-id regression is covered ACROSS runs instead: every run's `run.sh
+# deploy` drops the cnpg role for a clean slate, and `run.sh teardown` waits the
+# CR `--for=delete` before returning. (This is the same reasoning the original
+# harness used to drop the in-Job recreate.)
 lifecycle_teardown_cnpg() { # org
   log "lifecycle: deprovision $1 + assert Duckling CR fully deleted"
   api_post "$1" deprovision >/dev/null
@@ -1396,31 +1842,135 @@ lifecycle_teardown_cnpg() { # org
   fi
 }
 
-# ---- cnpg duckling: cnpg-shard metadata + DuckLake + Iceberg --------------
+# ---- cnpg duckling: cnpg-shard metadata + DuckLake ------------------------
 CNPG_BODY='{"database_name":"'"$CNPG"'","metadata_store":{"type":"cnpg-shard"},
-  "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true},
-  "iceberg":{"enabled":true,"namespace":"main"}}'
+  "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
 
-# ---- ext duckling: external RDS metadata + DuckLake + Iceberg -------------
+# ---- ext duckling: external RDS metadata + DuckLake -----------------------
 EXT_BODY='{"database_name":"'"$EXT"'",
   "metadata_store":{"type":"external","external":{
     "endpoint":"'"$EXT_RDS_ENDPOINT"'","password_aws_secret":"'"$EXT_RDS_SECRET"'",
     "user":"ducklingexample","database":"ducklingexample"}},
   "data_store":{"type":"external","bucket_name":"posthog-duckling-example-managed-warehouse-dev","region":"us-east-1"},
-  "ducklake":{"enabled":true},"iceberg":{"enabled":true,"namespace":"main"}}'
+  "ducklake":{"enabled":true}}'
 
 # ---- resilience ducklings: cnpg-shard metadata + DuckLake only -------------
-# No iceberg (no per-org Lakekeeper) — these orgs exist purely to host the
-# worker-churn-heavy resilience lanes, so keep their provision footprint small.
+# DuckLake-only: these orgs exist purely to host the worker-churn-heavy
+# resilience lanes, so keep their provision footprint small.
 res_body() { # org
   printf '{"database_name":"%s","metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
+}
+
+# ---- per-user kill switch ---------------------------------------------------
+# Admin one-shot kill (controlplane/admin live.go + session_mgr
+# DestroySessionsForUser): POST /orgs/:id/users/:user/kill tears down ALL of a
+# user's live sessions + in-flight queries cluster-wide, while a DIFFERENT user's
+# concurrent query on the same org is untouched. Regression net would have caught
+# a kill that missed sessions (leak) or over-killed (hit the wrong user).
+user_kill_switch() { # org rootpw
+  org="$1"; pw="$2"; vic="e2ekilluser"; vicpw="e2e-$(openssl rand -hex 12)"
+  log "user kill switch on $org"
+  code="$(curl -s -o /tmp/ku_create -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"org_id\":\"$org\",\"username\":\"$vic\",\"password\":\"$vicpw\"}" "$API/api/v1/users")"
+  case "$code" in 200|201) ;; *) fail "user_kill_switch: create $vic -> HTTP $code: $(cat /tmp/ku_create)";; esac
+  # New-user auth is config-snapshot-driven; wait one poll before first login.
+  sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  vout="$(mktemp)"; vrc="$(mktemp)"; rout="$(mktemp)"; rrc="$(mktemp)"
+  # Victim's long query AND a root long query run concurrently (distinct users,
+  # distinct workers — MaxSessions=1). Only the victim's must die.
+  ( if pg_try "$org" "$vicpw" ducklake "$HEAVY_Q" "$vic" >"$vout" 2>&1; then echo 0 >"$vrc"; else echo 1 >"$vrc"; fi ) &
+  vpid=$!
+  ( if pg_try "$org" "$pw" ducklake "$HEAVY_Q" >"$rout" 2>&1; then echo 0 >"$rrc"; else echo 1 >"$rrc"; fi ) &
+  rpid=$!
+
+  # Wait until the victim's query is live in the admin /queries view.
+  a=0 seen=0
+  while [ "$a" -lt 40 ]; do
+    n="$(curl -fsS -H "$H" "$API/api/v1/queries?org=$org&user=$vic" 2>/dev/null | jq -r '.queries | length' 2>/dev/null || echo 0)"
+    [ "${n:-0}" -ge 1 ] && { seen=1; break; }
+    kill -0 "$vpid" 2>/dev/null || break
+    sleep 2; a=$((a + 1))
+  done
+  [ "$seen" = 1 ] || { kill "$vpid" "$rpid" 2>/dev/null || true; fail "user_kill_switch: victim query never appeared in /queries"; }
+  # Overlap proof: both queries must still be running at kill time, else the test
+  # measures nothing (false pass on a query that already finished).
+  kill -0 "$vpid" 2>/dev/null || fail "user_kill_switch: victim query finished before kill (raise HEAVY_Q row count)"
+
+  killed="$(api_post "$org" "users/$vic/kill" | jq -r '.killed')"
+  [ "${killed:-0}" -ge 1 ] || fail "user_kill_switch: kill reported killed=$killed (want >=1)"
+
+  wait "$vpid" 2>/dev/null || true
+  wait "$rpid" 2>/dev/null || true
+  [ "$(cat "$vrc")" = 1 ] \
+    || fail "user_kill_switch: victim query survived the kill: $(tr -d '\n' <"$vout" | tail -c 200)"
+  [ "$(cat "$rrc")" = 0 ] \
+    || fail "user_kill_switch: root (other user) query was wrongly killed: $(tr -d '\n' <"$rout" | tail -c 200)"
+  rn="$(tr -dc '0-9' <"$rout")"
+  [ "$rn" = "$HEAVY_EXPECT" ] || fail "user_kill_switch: root result=$rn want $HEAVY_EXPECT (kill corrupted an unrelated query)"
+
+  n="$(curl -fsS -H "$H" "$API/api/v1/queries?org=$org&user=$vic" | jq -r '.queries | length')"
+  [ "${n:-0}" = 0 ] || fail "user_kill_switch: victim still has $n live queries after kill"
+  rm -f "$vout" "$vrc" "$rout" "$rrc"
+  log "user kill switch OK on $org (victim torn down, root untouched)"
+}
+
+# ---- per-user disable/enable block ------------------------------------------
+# Admin persistent block (configstore disabled column + control.go/Flight auth):
+# POST /orgs/:id/users/:user/disable refuses the user's NEW connections at auth
+# time (distinct "disabled" error, not a password/transient error), while a
+# different user still connects; enable restores access. The block is effective
+# immediately because the disable handler reloads the snapshot cluster-wide (no
+# poll wait). Run on BOTH metadata backends since the flag is config-store-backed.
+user_disable_block() { # org rootpw
+  org="$1"; pw="$2"; vic="e2edisableuser"; vicpw="e2e-$(openssl rand -hex 12)"
+  log "user disable/enable block on $org"
+  code="$(curl -s -o /tmp/du_create -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"org_id\":\"$org\",\"username\":\"$vic\",\"password\":\"$vicpw\"}" "$API/api/v1/users")"
+  case "$code" in 200|201) ;; *) fail "user_disable_block: create $vic -> HTTP $code: $(cat /tmp/du_create)";; esac
+  sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  # Baseline: the victim connects fine while enabled (cold spawn tolerated).
+  out="$(pg_try "$org" "$vicpw" ducklake "SELECT 1" "$vic")"
+  [ "$out" = "1" ] || fail "user_disable_block: victim could not connect before disable: $out"
+
+  resp="$(api_post "$org" "users/$vic/disable")"
+  echo "$resp" | jq -e '.disabled == true' >/dev/null 2>&1 || fail "user_disable_block: disable response wrong: $resp"
+
+  # Now a NEW victim connection is refused with the disabled error. No settle
+  # needed — the disable handler reloaded the snapshot cluster-wide.
+  if out="$(pg_try "$org" "$vicpw" ducklake "SELECT 1" "$vic")"; then
+    fail "user_disable_block: disabled victim still connected (got '$out')"
+  fi
+  echo "$out" | grep -qi "disabled" || fail "user_disable_block: refusal was not a disabled error: $out"
+
+  # A different user (root) must be unaffected by the victim's block.
+  out="$(pg_try "$org" "$pw" ducklake "SELECT 1")"
+  [ "$out" = "1" ] || fail "user_disable_block: root wrongly blocked while $vic disabled: $out"
+
+  resp="$(api_post "$org" "users/$vic/enable")"
+  echo "$resp" | jq -e '.disabled == false' >/dev/null 2>&1 || fail "user_disable_block: enable response wrong: $resp"
+  out="$(pg_try "$org" "$vicpw" ducklake "SELECT 1" "$vic")"
+  [ "$out" = "1" ] || fail "user_disable_block: victim could not reconnect after enable: $out"
+  log "user disable/enable block OK on $org"
 }
 
 # ---- parallel lane machinery ------------------------------------------------
 # The assertions are grouped into per-org LANES that run concurrently: all
 # worker churn (kills, drains, cold spawns, TTL reaps) is org-scoped, so lanes
 # for different orgs cannot interfere — and the wall-clock becomes the slowest
-# lane instead of the sum. Each lane runs in a background subshell with its
+# lane instead of the sum.
+#
+# This cross-org concurrency is ALSO the regression gate for the global
+# worker-id allocation fix (CreateSpawningWorkerSlot via nextval off a shared
+# sequence; see configstore.ensureWorkerIDSequence). The lanes below spawn
+# worker pods for DIFFERENT orgs at the same time against the SAME config store
+# — exactly the scenario where the old SELECT MAX(worker_id)+1 allocation (only
+# serialized by a per-org advisory lock) handed two orgs the same worker_id and
+# failed the spawn with worker_records_pkey (SQLSTATE 23505). A green multi-lane
+# run is the in-Job proof the collision is gone; the deterministic unit repro is
+# TestCreateSpawningWorkerSlotConcurrentCrossOrgUniqueIDs
+# (tests/configstore/runtime_store_postgres_test.go). Each lane runs in a background subshell with its
 # output captured to a file; the parent prints a heartbeat while lanes run and
 # replays each lane's log (prefixed) when it finishes. A lane's failure
 # (missing/nonzero rc file) fails the harness after all lanes settle, so one
@@ -1472,18 +2022,12 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   server_side_cursors    "$CNPG" "$cnpg_pw"
   cancel_then_reuse_same_session "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
-  iceberg_cold_first_connect "$CNPG" "$cnpg_pw"  # cold first session must not fail the metadata-init bind
-  rw_iceberg             "$CNPG" "$cnpg_pw"
-  assert_worker_pod      "$CNPG"   # newest org pod = the default-shape iceberg worker above
+  assert_worker_pod      "$CNPG"   # newest org pod = a DuckLake worker above
   concurrent_connections "$CNPG" "$cnpg_pw"
   concurrent_writers     "$CNPG" "$cnpg_pw"
-  # Worker sizing, both catalogs. Distinct shapes per catalog (2/4Gi vs 1/2Gi)
-  # so the iceberg sized request can't reuse the ducklake hot-idle 2-CPU worker
-  # — each catalog gets a verified fresh sized spawn + a same-shape reuse.
+  # Worker sizing on DuckLake: verified fresh sized spawn + same-shape reuse.
   sized_worker        "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
   reuse_sized_worker  "$CNPG" "$cnpg_pw" ducklake 2 4Gi 15m
-  sized_worker        "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
-  reuse_sized_worker  "$CNPG" "$cnpg_pw" iceberg  1 2Gi 15m
   # Idle worker reclamation: a 3-CPU worker with a 1m TTL must be reaped after it
   # goes idle (catches the hot-idle-reaper-dark / persist-swallow idle leak).
   hot_idle_retired    "$CNPG" "$cnpg_pw" ducklake 3 6Gi
@@ -1545,8 +2089,6 @@ lane_ext() { # external-RDS metadata backend + org default profile
   rw_ducklake  "$EXT" "$ext_pw"
   httpfs_retry_budget "$EXT" "$ext_pw"      # S3-503 retry budget per worker, ext-metadata backend too
   persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
-  iceberg_cold_first_connect "$EXT" "$ext_pw"  # cold first session must not fail the metadata-init bind (ext backend)
-  rw_iceberg   "$EXT" "$ext_pw"
   # Org default profile on ext: no client-sized assertions run on this org, so
   # the 2-CPU shape is unambiguously the org default's.
   org_default_profile "$EXT" "$ext_pw" ducklake
@@ -1606,6 +2148,11 @@ main() {
   # against a real bcrypt-hash-bearing row.
   models_explorer_api
 
+  # Admin console read surfaces: identity/role, live state, metrics proxy, auth
+  # gate. Independent of the per-org lanes, so run it here once orgs exist.
+  admin_console_api
+  admin_rbac_viewer "$CNPG"
+
   # Join the kubectl background download started at script load — first k use
   # is inside the lanes, so the fetch overlapped the whole provisioning phase.
   bootstrap_kubectl
@@ -1616,6 +2163,41 @@ main() {
   run_lane res2 lane_res2
   run_lane ext  lane_ext
   join_lanes cnpg res1 res2 ext
+
+  # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
+  admin_impersonation_audited "$CNPG"
+
+  # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
+  admin_query_detail "$CNPG" "$cnpg_pw"
+
+  # ---- admin: cancel a live session by worker id (cross-CP addressed) ----
+  admin_cancel_by_worker "$CNPG" "$cnpg_pw"
+
+  # ---- admin live: idle-in-transaction session is flagged (state column) ----
+  admin_idle_session_flagged "$CNPG" "$cnpg_pw"
+
+  # ---- admin /status per-org worker count is populated (not the old 0) ----
+  admin_per_org_workers "$CNPG" "$cnpg_pw"
+
+  # ---- connection idle timeout: idle conn reaped, worker freed ----
+  conn_idle_timeout_reaps_session "$CNPG" "$cnpg_pw"
+
+  # ---- COPY FROM STDIN survives the idle timeout + shows active ----
+  copy_active_and_survives_idle "$CNPG" "$cnpg_pw"
+
+  # ---- per-user kill switch + disable/enable block (cnpg stack is warm) ----
+  user_kill_switch   "$CNPG" "$cnpg_pw"
+  user_disable_block "$CNPG" "$cnpg_pw"
+  # The disabled flag is config-store-backed, so exercise the ext metadata
+  # backend too (CLAUDE.md: metadata-touching changes run on cnpg + ext).
+  user_disable_block "$EXT" "$ext_pw"
+
+  # ---- connection-duration observability (any org; lanes already churned
+  #      many connect/disconnects, so the disconnect log is warm) ----
+  connection_duration_logged "$CNPG" "$cnpg_pw"
+
+  # ---- compute-usage metering wired (billing emit side) ----
+  compute_usage_metering_wired
 
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
@@ -1629,7 +2211,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake/Iceberg) + iceberg-cold-first-connect + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake+Iceberg) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

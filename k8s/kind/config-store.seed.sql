@@ -5,6 +5,7 @@ SET updated_at = NOW();
 
 INSERT INTO duckgres_managed_warehouses (
     org_id,
+    duckling_name,
     image,
     warehouse_database_endpoint,
     warehouse_database_port,
@@ -46,6 +47,7 @@ INSERT INTO duckgres_managed_warehouses (
     updated_at
 )
 VALUES (
+    'local',
     'local',
     '',
     'local-warehouse-db',

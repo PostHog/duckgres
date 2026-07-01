@@ -126,7 +126,10 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	if tr.userSecrets != nil {
 		sessions.SetUserSecretLoader(tr.userSecrets.SessionSecretLoader(tc.Name))
 	}
-	sessions.SetMaxConnections(tc.MaxConnections)
+	sessions.SetResourceLimitsProvider(tr.resourceLimitsForOrg(tc.Name))
+	sessions.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
+		return requestedWorkerVCPUs(profile, tr.baseCfg.WorkerCPURequest)
+	})
 	sessions.SetConnectionLimiter(NewRuntimeOrgConnectionLimiter(tr.configStore, tc.Name, tr.baseCfg.CPInstanceID, tr.globalCfg.WorkerQueueTimeout))
 	rebalancer.SetSessionLister(sessions)
 
@@ -161,6 +164,21 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	slog.Info("Org stack created.", "org", tc.Name, "max_workers", maxWorkers)
 	_ = ctx // keep linter happy
 	return stack, nil
+}
+
+func (tr *OrgRouter) resourceLimitsForOrg(orgID string) func(username string) configstore.OrgResourceLimits {
+	return func(username string) configstore.OrgResourceLimits {
+		snap := tr.configStore.Snapshot()
+		if snap == nil {
+			return configstore.OrgResourceLimits{}
+		}
+		limits := configstore.OrgResourceLimits{}
+		if org, ok := snap.Orgs[orgID]; ok && org != nil {
+			limits.OrgMaxVCPUs = org.MaxVCPUs
+		}
+		limits.UserMaxVCPUs = snap.OrgUserMaxVCPUs[configstore.OrgUserKey{OrgID: orgID, Username: username}]
+		return limits
+	}
 }
 
 // DestroyOrgStack drains and cleans up an org's resources.
@@ -297,17 +315,16 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			continue
 		}
 		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers
-		connLimitChanged := oldTC.MaxConnections != newTC.MaxConnections
+		resourceLimitChanged := oldTC.MaxVCPUs != newTC.MaxVCPUs
 		floorChanged := oldTC.DefaultWorkerMinHotIdle != newTC.DefaultWorkerMinHotIdle
 		imageChanged := workerImageForOrg(oldTC, tr.baseCfg.WorkerImage) != workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
 
 		tr.mu.Lock()
 		if stack, ok := tr.orgs[name]; ok {
 			stack.Config = newTC
-			if connLimitChanged {
-				slog.Info("Org connection limit changed.", "org", name,
-					"old_max_connections", oldTC.MaxConnections, "new_max_connections", newTC.MaxConnections)
-				stack.Sessions.SetMaxConnections(newTC.MaxConnections)
+			if resourceLimitChanged {
+				slog.Info("Org resource limit changed.", "org", name,
+					"old_max_vcpus", oldTC.MaxVCPUs, "new_max_vcpus", newTC.MaxVCPUs)
 			}
 			if limitsChanged {
 				slog.Info("Org config changed.", "org", name,
@@ -378,6 +395,17 @@ func (tr *OrgRouter) ShutdownAll() {
 	if tr.sharedPool != nil {
 		tr.sharedPool.ShutdownAll()
 	}
+}
+
+// ReleaseIdleHotWorkers parks this CP's idle (zero-session) Hot workers into
+// hot_idle so the TTL reaper can reclaim them, instead of letting them linger
+// for the whole (possibly unbounded) drain wait. All workers live in the shared
+// pool; per-org reserved pools are slices of it. Returns the number parked.
+func (tr *OrgRouter) ReleaseIdleHotWorkers() int {
+	if tr.sharedPool == nil {
+		return 0
+	}
+	return tr.sharedPool.ReleaseIdleHotWorkers(LifecycleOriginDrainReleaseIdle)
 }
 
 func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {

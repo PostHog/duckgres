@@ -64,7 +64,7 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		return nil, false, nil
 	}
 	org.MaxWorkers = updates.MaxWorkers
-	org.MaxConnections = updates.MaxConnections
+	org.MaxVCPUs = updates.MaxVCPUs
 	// Mirrors gormAPIStore: written unconditionally so "" clears (the handler
 	// presence-merge already preserved omitted fields).
 	org.DefaultWorkerCPU = updates.DefaultWorkerCPU
@@ -120,7 +120,7 @@ func (s *fakeAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &clone, nil
 }
 
-func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error) {
+func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
 	key := orgID + "/" + username
 	user, ok := s.users[key]
 	if !ok {
@@ -134,6 +134,9 @@ func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	}
 	if defaultCatalog != nil {
 		user.DefaultCatalog = *defaultCatalog
+	}
+	if maxVCPUs != nil {
+		user.MaxVCPUs = *maxVCPUs
 	}
 	clone := *user
 	return &clone, true, nil
@@ -213,13 +216,14 @@ func copyOrg(org *configstore.Org) *configstore.Org {
 func newTestAPIRouter(store apiStore) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	registerAPIWithStore(r.Group("/api/v1"), store, nil)
+	registerAPIWithStore(r.Group("/api/v1"), store, nil, nil)
 	return r
 }
 
 func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	warehouse := &configstore.ManagedWarehouse{
-		OrgID: name,
+		OrgID:        name,
+		DucklingName: name,
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			Endpoint: fmt.Sprintf("%s.cluster.example", name),
 			Port:     5432,
@@ -309,6 +313,56 @@ func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
 	}
 }
 
+func TestCreateUserAcceptsMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"org_id": "analytics",
+		"username": "analyst",
+		"password": "secret",
+		"max_vcpus": 8
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	user := store.users["analytics/analyst"]
+	if user == nil {
+		t.Fatal("expected user to be created")
+	}
+	if user.MaxVCPUs != 8 {
+		t.Fatalf("MaxVCPUs = %d, want 8", user.MaxVCPUs)
+	}
+}
+
+func TestCreateUserRejectsNegativeMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"org_id": "analytics",
+		"username": "analyst",
+		"password": "secret",
+		"max_vcpus": -1
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if len(store.users) != 0 {
+		t.Fatalf("expected no users to be created, got %d", len(store.users))
+	}
+}
+
 func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
@@ -329,6 +383,115 @@ func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
 	}
 	if len(store.users) != 0 {
 		t.Fatalf("expected no users to be created, got %d", len(store.users))
+	}
+}
+
+func TestUpdateUserMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":12}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 12 {
+		t.Fatalf("MaxVCPUs = %d, want 12", got)
+	}
+}
+
+func TestUpdateUserMaxVCPUsCanClearToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":0}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 0 {
+		t.Fatalf("MaxVCPUs = %d, want 0", got)
+	}
+}
+
+func TestUpdateUserMaxVCPUsNullClearsToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":null}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 0 {
+		t.Fatalf("MaxVCPUs = %d, want 0", got)
+	}
+}
+
+func TestUpdateUserOmittingMaxVCPUsPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"passthrough":true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 12 {
+		t.Fatalf("MaxVCPUs = %d, want preserved 12", got)
+	}
+}
+
+func TestUpdateUserRejectsNegativeMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":-1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 12 {
+		t.Fatalf("MaxVCPUs changed to %d, want preserved 12", got)
 	}
 }
 
@@ -449,6 +612,7 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"warehouse_database": {
 			"endpoint": "analytics.cluster.example",
 			"port": 5432
@@ -702,6 +866,7 @@ func TestPutWarehouseRejectsSecretRefsWithoutWorkerNamespace(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"iam_role_arn": "arn:aws:iam::123456789012:role/analytics-worker"
 		},
@@ -768,6 +933,7 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"state": "awaiting-human-approval",
 		"metadata_store_state": "vendor-pending",
 		"s3_state": "bucket-handshake",
@@ -803,6 +969,7 @@ func TestPutWarehouseRejectsCrossTenantSecretRefs(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-analytics"
 		},
@@ -832,6 +999,7 @@ func TestPutWarehouseRejectsSecretRefWithoutExplicitNamespace(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-analytics"
 		},
@@ -918,6 +1086,7 @@ func TestPutWarehouseRejectsSecretReferenceWithoutOrgPrefix(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-a"
 		},
@@ -1008,6 +1177,25 @@ func TestGetOrgOmitsMinWorkers(t *testing.T) {
 	}
 	if bytes.Contains(rec.Body.Bytes(), []byte(`"min_workers"`)) {
 		t.Fatalf("expected org response to omit min_workers, got %s", rec.Body.String())
+	}
+}
+
+func TestGetOrgOmitsMaxConnections(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name: "analytics",
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"max_connections"`)) {
+		t.Fatalf("expected org response to omit max_connections, got %s", rec.Body.String())
 	}
 }
 
@@ -1382,17 +1570,17 @@ func TestIsValidDuckLakeSpecVersion(t *testing.T) {
 	}
 }
 
-func TestUpdateOrgMaxConnections(t *testing.T) {
+func TestUpdateOrgMaxVCPUs(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["analytics"] = &configstore.Org{
-		Name:           "analytics",
-		MaxWorkers:     2,
-		MaxConnections: 5,
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   5,
 	}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
-		"max_connections": 10
+		"max_vcpus": 10
 	}`)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader(body))
@@ -1403,11 +1591,107 @@ func TestUpdateOrgMaxConnections(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if store.orgs["analytics"].MaxConnections != 10 {
-		t.Fatalf("expected org max_connections to be updated, got %d", store.orgs["analytics"].MaxConnections)
+	if store.orgs["analytics"].MaxVCPUs != 10 {
+		t.Fatalf("expected org max_vcpus to be updated, got %d", store.orgs["analytics"].MaxVCPUs)
 	}
 	if store.orgs["analytics"].MaxWorkers != 2 {
 		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestUpdateOrgMaxVCPUsCanClearToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   10,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_vcpus":0}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 0 {
+		t.Fatalf("expected org max_vcpus to be cleared, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+	if store.orgs["analytics"].MaxWorkers != 2 {
+		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestUpdateOrgOmittingMaxVCPUsPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   10,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_workers":3}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 10 {
+		t.Fatalf("expected org max_vcpus to be preserved, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+	if store.orgs["analytics"].MaxWorkers != 3 {
+		t.Fatalf("expected max_workers to be updated, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestUpdateOrgMaxVCPUsNullClearsToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   10,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_vcpus":null}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 0 {
+		t.Fatalf("expected org max_vcpus to be cleared, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+	if store.orgs["analytics"].MaxWorkers != 2 {
+		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestUpdateOrgRejectsNegativeMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:     "analytics",
+		MaxVCPUs: 10,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_vcpus":-1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 10 {
+		t.Fatalf("expected org max_vcpus to be preserved, got %d", store.orgs["analytics"].MaxVCPUs)
 	}
 }
 

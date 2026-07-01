@@ -25,6 +25,7 @@ func (r *reconnectTestOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergCo
 
 func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false }
 func (r *reconnectTestOrgRouter) ShutdownAll()                    {}
+func (r *reconnectTestOrgRouter) ReleaseIdleHotWorkers() int      { return 0 }
 
 // recordingOrgRouter records the orgIDs StackForOrg is asked for. It returns no
 // live stack, so CreateSession returns right after recording the routing org.
@@ -44,6 +45,7 @@ func (r *recordingOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig
 }
 func (r *recordingOrgRouter) IsMigratingForOrg(_ string) bool { return false }
 func (r *recordingOrgRouter) ShutdownAll()                    {}
+func (r *recordingOrgRouter) ReleaseIdleHotWorkers() int      { return 0 }
 
 type testFlightOrgKey struct{}
 

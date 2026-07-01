@@ -65,6 +65,7 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | Metric | Type | Description |
 |--------|------|-------------|
 | `duckgres_connections_open` | Gauge | Number of currently open client connections |
+| `duckgres_connection_duration_seconds{org}` | Histogram | Client connection lifetime, accept→disconnect (includes `_count`, `_sum`, `_bucket`); `_sum` is exact total connection-seconds (per org) with no scrape-integral bias. The disconnect log also carries `duration_ms` |
 | `duckgres_query_total{org,outcome}` | Counter | Total number of non-empty query attempts by terminal outcome (`success`, `error`, `canceled`) |
 | `duckgres_query_duration_seconds{org}` | Histogram | Simple/extended query execution latency (includes `_count`, `_sum`, `_bucket`); use `duckgres_query_total` for attempt totals |
 | `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
@@ -75,6 +76,11 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
 | `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
 | `duckgres_control_plane_worker_spawn_seconds` | Histogram | Time spent spawning and health-checking a new worker |
+| `duckgres_org_connection_admission_duration_seconds{outcome}` | Histogram | DB-backed org connection admission scheduler evaluation latency by outcome |
+| `duckgres_org_connection_admission_queue_depth` | Histogram | Pending org connection queue depth observed during admission evaluation |
+| `duckgres_org_connection_admission_user_queues` | Histogram | Number of per-user queue heads considered during admission evaluation |
+| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome |
+| `duckgres_org_connection_admission_user_limit_skips_total` | Counter | Per-user queue heads skipped because that user was at its vCPU limit |
 | `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
 | `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
@@ -262,7 +268,7 @@ Run with config file:
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
-| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org connection-limit queue admission; the managed K8s queue TTL uses this value | `60s` |
+| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
@@ -275,6 +281,8 @@ Run with config file:
 | `DUCKGRES_QUERY_LOG_KAFKA_TOPIC` | Kafka topic for query-log events; required for Kafka mode | - |
 | `DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID` | Kafka client ID used by the query-log producer | `duckgres-query-log` |
 | `DUCKGRES_QUERY_LOG_KAFKA_GROUP_ID` | Kafka consumer group used by `duckgres --mode query-log-writer` | `duckgres-query-log-writer` |
+| `DUCKGRES_BILLING_INGEST_URL` | PostHog public ingestion base URL for managed-warehouse compute-usage events (e.g. `https://us.i.posthog.com`). Remote backend only. Unset (or token unset) disables metering — usage ships nowhere and a query is never failed on its account. | - |
+| `DUCKGRES_BILLING_INGEST_TOKEN` | PostHog project API token stamped on the compute-usage capture event. Remote backend only; both URL and token must be set to enable metering. | - |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
@@ -610,7 +618,8 @@ cfg := server.Config{
 Built-in rate limiting protects against brute-force authentication attacks:
 
 - **Failed attempt tracking**: Bans IPs after too many failed auth attempts
-- **Connection limits**: Limits concurrent connections per IP and, when configured, total concurrent sessions. In K8s multi-tenant mode, org `max_connections` is enforced cluster-wide through runtime-store leases.
+- **Connection limits**: Limits concurrent connections per IP and, when configured, total concurrent sessions in standalone mode.
+- **K8s multi-tenant resource limits**: Org and user `max_vcpus` bound the sum of active worker pod vCPUs admitted through runtime-store leases. 0 means unlimited.
 - **Auto-cleanup**: Expired records are automatically cleaned up
 
 ```yaml
@@ -619,7 +628,7 @@ rate_limit:
   failed_attempt_window: "5m"   # Within 5 minutes
   ban_duration: "15m"           # Ban lasts 15 minutes
   max_connections_per_ip: 100   # Max concurrent connections
-  max_connections: 16           # Max total concurrent sessions (0 = unlimited)
+  max_connections: 16           # Standalone max total concurrent sessions (0 = unlimited)
 ```
 
 ## Usage Examples
@@ -750,7 +759,7 @@ kill -USR2 <control-plane-pid>
 
 ### Remote Worker Backend
 
-In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may reconnect with a durable session token if the worker survives and the token is still valid.
+In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may use a durable session token to create a fresh remote session on the surviving worker if the token is still valid.
 
 Managed-hostname routing is controlled by `--sni-routing-mode` and `--managed-hostname-suffixes`. For Postgres, an explicit startup `database`/`dbname` takes priority, but when SNI matches a managed suffix the hostname prefix and requested database must resolve to the same org. If the startup database is empty, the managed SNI prefix is used as the database fallback. Unknown `--sni-routing-mode` values behave like `off`.
 
@@ -773,7 +782,8 @@ Managed-warehouse contract notes:
 
 - At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
 - The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
-- User rows support an optional `default_catalog` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. The default is empty, which preserves the standard DuckLake-first session behavior. Set `default_catalog` to `iceberg` for users whose sessions should resolve schema-qualified names and compatibility metadata through the Iceberg catalog by default; a client-supplied startup `search_path` still takes precedence.
+- Org rows support optional `max_vcpus` on `POST /api/v1/orgs` and `PUT /api/v1/orgs/:id`. In K8s multi-tenant mode, this caps the org's active admitted worker pod vCPUs; `0` means unlimited.
+- User rows support optional `default_catalog` and `max_vcpus` fields on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. The default catalog is empty, which preserves the standard DuckLake-first session behavior. Set `default_catalog` to `iceberg` for users whose sessions should resolve schema-qualified names and compatibility metadata through the Iceberg catalog by default; a client-supplied startup `search_path` still takes precedence. `max_vcpus` limits the user's active admitted worker pod vCPUs in K8s multi-tenant mode; `0` means unlimited.
 - The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared worker mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
 - Secret references only are stored in the config store. Secret material remains outside the database.
 - The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.

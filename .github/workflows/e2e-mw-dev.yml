@@ -1,10 +1,10 @@
 # Per-PR end-to-end test against the real posthog-mw-dev EKS cluster.
 #
 # Replaces what kind (tests/k8s/) cannot exercise: real Cilium network
-# policies, real Crossplane Duckling provisioning, real cnpg-shard + external
-# RDS metadata stores, and the real per-org Lakekeeper operator — the layers
-# where this quarter's bugs actually lived (Cilium egress, lakekeeper
-# encryption-key drift, cnpg role drift, RBAC delete gaps).
+# policies, real Crossplane Duckling provisioning, and real cnpg-shard +
+# external RDS metadata stores — the production-like layers where this
+# quarter's bugs actually lived (Cilium egress, cnpg role drift, RBAC delete
+# gaps).
 #
 # Flow:
 #   1. build arm64-only worker + control-plane images, tagged pr-<N>-<sha>,
@@ -17,7 +17,7 @@
 #      ClusterIP service (no public DNS / NLB needed). Covers the cnpg-shard
 #      and external metadata backends.
 #   5. always tear the namespace down (and deprovision the ci-pr ducklings so
-#      no S3 / cnpg role / lakekeeper CR leaks on shared infra).
+#      no S3 / cnpg role leaks on shared infra).
 #
 # SECURITY — who can run this:
 #   Same model as the AWS/OIDC job in ci.yml: the gate is the repo setting
@@ -57,8 +57,10 @@ on:
   schedule:
     - cron: "0 */6 * * *"
 
-# One in-flight run per PR; a new push cancels the old run (and its namespace
-# is GC'd by the always() teardown of the cancelled run + the e2e-cleanup sweep).
+# One in-flight run per PR; a new push cancels the old run. The replacement
+# deploy starts by deleting same-PR shared resources and refuses to reuse the
+# PR-scoped names until Duckling CR deletion completes; e2e-cleanup is the
+# backstop for namespaces with no follow-up run.
 concurrency:
   group: e2e-mw-dev-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -87,7 +89,7 @@ jobs:
       # container-image-worker-cd.yml. Keep in lock-step on a version bump.
       build-args: |
         DUCKDB_EXTENSION_VERSION=1.5.3
-        HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh
+        HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry
         DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
         DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
         POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
@@ -116,6 +118,14 @@ jobs:
       CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test e2e harness scripts
+        run: go test -count=1 ./tests/e2e-mw-dev
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
@@ -201,8 +211,8 @@ jobs:
         uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
-      # Deprovision the ci-pr ducklings (so no S3 / cnpg role+db / lakekeeper CR
-      # leaks on shared infra) then delete the namespace.
+      # Deprovision the ci-pr ducklings (so no S3 / cnpg role+db leaks on
+      # shared infra) then delete the namespace.
       - name: Teardown
         run: bash tests/e2e-mw-dev/run.sh teardown
 

@@ -31,7 +31,8 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 		t.Fatalf("create user: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{
-		OrgID: "analytics",
+		OrgID:        "analytics",
+		DucklingName: "analytics",
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			Endpoint: "analytics.cluster.example",
 			Port:     5432,
@@ -84,8 +85,9 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 		t.Fatalf("create cleanup org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{
-		OrgID: "cleanup",
-		State: configstore.ManagedWarehouseStateReady,
+		OrgID:        "cleanup",
+		DucklingName: "cleanup",
+		State:        configstore.ManagedWarehouseStateReady,
 	}).Error; err != nil {
 		t.Fatalf("create cleanup warehouse: %v", err)
 	}

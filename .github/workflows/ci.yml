@@ -106,6 +106,24 @@ jobs:
       - name: Run cache-proxy tests
         run: just test-cache-proxy
 
+  ui-tests:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up just
+        uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: controlplane/admin/ui/package-lock.json
+
+      - name: Run admin UI typecheck + unit tests
+        run: just ui-test
+
   integration-tests:
     needs: unit-tests
     runs-on: ubuntu-24.04-arm

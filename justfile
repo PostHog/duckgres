@@ -46,10 +46,30 @@ run-control-plane: build
 build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
 
+# Build the admin console SPA into controlplane/admin/ui/dist (embedded by the
+# kubernetes build via //go:embed all:ui/dist). dist is a gitignored build
+# artifact (only .gitkeep is tracked); the Docker images rebuild it in a node
+# stage, so run this locally before `go build -tags kubernetes` if you want the
+# real bundle embedded instead of the "UI not built" fallback.
+[group('dev')]
+ui-build:
+    cd controlplane/admin/ui && npm ci && npm run build
+
+# Frontend typecheck + unit tests (Vitest) + production build — the derivation
+# logic guard, and proves the embedded SPA still builds on every PR.
+[group('dev')]
+ui-test:
+    cd controlplane/admin/ui && npm ci && npm run typecheck && npm run test && npm run build
+
+# Live React dev server (HMR) against a port-forwarded control plane. Point
+# VITE_PROXY_TARGET at the CP (or the Go devserver) — default http://127.0.0.1:8080.
+[group('dev')]
+ui-dev-vite target="http://127.0.0.1:8080":
+    cd controlplane/admin/ui && VITE_PROXY_TARGET={{target}} npm run dev
+
 # Serve the admin UI locally for one kube context. The devserver fetches the
 # internal secret, port-forwards that context's control plane, and serves the
-# explorer with a context banner (RED when the context name contains "prod").
-# Edit controlplane/admin/static/*.html and refresh — no rebuild/redeploy.
+# built SPA with a context banner (RED when the context name contains "prod").
 [group('dev')]
 ui-dev context listen="127.0.0.1:5173" namespace="duckgres":
     go run ./controlplane/admin/devserver --context {{context}} --namespace {{namespace}} --listen {{listen}}
@@ -280,6 +300,7 @@ test:
 [group('test')]
 test-unit:
     go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/... ./tests/manifests/...
+    go test -v -count=1 ./tests/e2e-mw-dev/...
 
 # Run scenario runner unit tests
 [group('test')]

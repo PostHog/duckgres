@@ -49,6 +49,12 @@ const (
 	LifecycleOriginJanitorStuckActivating  LifecycleOrigin = "janitor_stuck_activating"
 	LifecycleOriginMismatchedVersionReaper LifecycleOrigin = "mismatched_version_reaper"
 	LifecycleOriginShutdownAll             LifecycleOrigin = "shutdown_all"
+	// LifecycleOriginDrainReleaseIdle marks the hot -> hot_idle park performed
+	// by OrgRouter.ReleaseIdleHotWorkers at CP drain start: idle (zero-session)
+	// Hot workers are released so the unfenced hot-idle TTL reaper reclaims them
+	// during the drain wait instead of pinning vCPU until the CP is declared
+	// expired. A nonzero rate here during a rollout is the leak fix working.
+	LifecycleOriginDrainReleaseIdle LifecycleOrigin = "drain_release_idle"
 	LifecycleOriginHealthCheckCrash        LifecycleOrigin = "health_check_crash"
 	LifecycleOriginWorkerDrain             LifecycleOrigin = "worker_drain"
 	LifecycleOriginSpawnFailure            LifecycleOrigin = "spawn_failure"

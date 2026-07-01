@@ -68,6 +68,7 @@ Key CLI flags for control-plane mode:
 - `--process-min-workers N` / `--process-max-workers N`
 - `--process-retire-on-session-end`
 - `--worker-queue-timeout DURATION` / `--worker-idle-timeout DURATION`
+- `--idle-timeout DURATION` — connection idle timeout: a client connection with no traffic for this long is closed and its worker released to hot-idle (in control-plane mode an idle connection otherwise pins a worker forever). **Control-plane default is `60s`** (`server.DefaultControlPlaneIdleTimeout`; standalone defaults to `24h`); a negative value disables it. `server.New` applies the standalone default, so the control plane sets it explicitly before `InitMinimalServer` (which skips that defaulting).
 - `--memory-budget SIZE` (default 75% RAM) / `--memory-rebalance`
 - `--socket-dir /path` (process backend)
 - `--handover-drain-timeout DURATION` (default `24h` process; **remote default is `0` = unbounded** — the CP waits for active sessions for as long as it takes and the pod's k8s `terminationGracePeriodSeconds` is the only hard wall. cloudflare/tableflip FD passing applies to process/standalone single-host upgrades, not k8s pod replacement.)
@@ -77,6 +78,7 @@ Key CLI flags for control-plane mode:
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
   - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
+  - Compute-usage billing (emit side): `--billing-ingest-url` / `--billing-ingest-token` (env `DUCKGRES_BILLING_INGEST_URL` / `DUCKGRES_BILLING_INGEST_TOKEN`). Both must be set to enable per-org compute-usage metering+emit; either unset disables it (usage ships nowhere, queries never fail). See `docs/design/billing-compute-seconds-plan.md` and "Compute-Usage Billing" below.
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
 
 Key CLI flags for duckdb-service mode:
@@ -301,6 +303,170 @@ Invariants for anyone touching this path:
   `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
   and the `persistent_user_secret`(+`_isolation`) assertions in
   `tests/e2e-mw-dev/harness.sh`.
+
+## Admin Console (VPC-private web UI, `kubernetes` tag)
+
+`controlplane/admin/` serves a React admin console + REST API on `:8080` — the
+operate-everything surface (metrics, live queries/sessions/connections, worker
+fleet, live cluster node/pod topology, full config store, user impersonation,
+audit log; sliceable by org +
+user). Design + decisions: `docs/design/admin-ui.md`; package details:
+`controlplane/admin/README.md`. Exposed VPC-privately via an internal-scheme ALB
++ Cognito (Google SSO) behind Tailscale (charts: `ingress-admin.yaml`). Invariants:
+
+- **Frontend is an embedded React/Vite SPA** (`ui/`, built to `ui/dist/`,
+  `//go:embed all:ui/dist` in `embed_ui.go`, SPA-fallback served by Gin; the SPA
+  owns `/`). `ui/dist` is a **gitignored build artifact** — only `ui/dist/.gitkeep`
+  is tracked, so the embed has a target and `go build` compiles without node
+  (the server then serves a "UI not built" notice). `just ui-build` builds it
+  locally; both `Dockerfile` and `Dockerfile.controlplane` run `npm run build`
+  **before** `go build`. Do not delete `.gitkeep` and do not commit `ui/dist`.
+- **Two-tier authz** (`authz.go`): `AuthMiddleware` resolves every `/api/v1`
+  request to admin (valid `TokenSet` internal secret — service/break-glass) or to
+  an SSO identity from the ALB `X-Amzn-Oidc-Data` JWT. The SSO email
+  (`@posthog.com` + `email_verified != false`, else 401) is mapped to a role
+  **per-request** by a `RoleResolver` backed by the `duckgres_operators` config-schema
+  table (goose migration `000006_create_operators.sql`) — `admin` row → admin, else
+  viewer. Admins manage operators
+  under **Admin → Operators** (`/api/v1/operators`); the first SSO login
+  auto-provisions a create-only **viewer** row, and the first admin is minted by
+  logging in over the break-glass internal token and patching that row to `admin`
+  under **Admin → Operators**. `RoleGate` requires admin for
+  all mutating verbs + the audit GET. `AuditMiddleware` records every mutation.
+  Keep new mutating routes under this gate; never add a write path that bypasses
+  RoleGate/audit.
+- **Impersonation is a real session** (`impersonate.go` + `admin_providers.go`):
+  it reuses `SessionManager.CreateSessionWithProtocol` (workers trust the CP — no
+  password) and **always** `DestroySession` in a defer. Admin-only, every
+  statement audited with the admin actor + `usersecrets.RedactForLog` SQL; writes
+  require `allow_write=true` (conservative classifier — WITH/CTEs count as
+  writes). It consumes a worker under one-session-per-worker and counts against
+  the org's connection limits — do not silently exempt it.
+- **Metrics proxy is allow-listed** (`metrics_proxy.go`): the client passes a
+  panel KEY, PromQL is built server-side from `rangePanels` (never an open PromQL
+  relay) and forwarded to `DUCKGRES_PROMETHEUS_URL`. Org-labelled panels keep
+  slicing enforced.
+- **Env-only knobs**: `DUCKGRES_PROMETHEUS_URL` (read in
+  `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit` is
+  AutoMigrated at startup (operational state, not goose-migrated tenant config).
+  The `duckgres_operators` table is authoritative access-control data, so it lives
+  in the config schema via goose migration `000006_create_operators.sql`, not
+  AutoMigrate.
+- `ManagedSession.Username` is populated at session create so the console can
+  slice live sessions/queries by user; keep it set on every create path.
+- **Per-user kill switch** (`live.go` routes + `admin_providers.go` +
+  `session_mgr.go::DestroySessionsForUser` + `configstore` `disabled` column):
+  - `POST …/users/:username/kill` is a **one-shot** terminate — it tears down all
+    of a user's sessions + in-flight queries but does NOT block reconnects.
+  - `POST …/users/:username/disable` is the **persistent block**: it sets the
+    `duckgres_org_users.disabled` column (goose migration
+    `000011_add_org_user_disabled.sql`), kills the user's live sessions, AND
+    refuses the user's NEW connections at auth time on BOTH front-ends — PG wire
+    (`control.go`, distinct `28000` "account is disabled" error, emitted only
+    after the password checks out so it never leaks account existence) and Flight
+    (`ConfigStore.ValidateOrgUser` / `ValidateOrgUserAndGetPassthrough` return
+    false). `enable` reverses it. The disabled state is read from the in-memory
+    snapshot, so disable/enable call `ConfigStore.ReloadSnapshot()` to make the
+    flip effective immediately instead of one config-poll later.
+  - These are **cluster-wide**: a user's sessions live on whichever CP replica
+    owns each connection, so the handlers fan out the kill/disable/enable to peers
+    via `PeerFetcher.PostPeers` (POST sibling of the read fan-out, same
+    `?scope=local` recursion guard) and sum the per-CP `killed` counts. The
+    snapshot reload is fanned out too so every replica enforces the block at once.
+  - Kill must be **scoped to the target user** — never tear down another user's
+    sessions on the shared org stack (the regression the e2e asserts with a
+    concurrent root query that must survive).
+- **Live Nodes view** (`ui/src/pages/Nodes.tsx` + `pages/nodes/peepernetes.{ts,css}`,
+  a port of the standalone peepernetes visualizer): a full-bleed, animated
+  cluster node/pod TV — nodes grouped by karpenter nodepool (or by namespace /
+  deployment), CPU/MEM request bars, pod chips colored per deployment,
+  placeholder/system-pod classification, Karpenter empty-node reclaim countdown,
+  unscheduled tray, and a synthesized event ticker. It's imperative DOM (mounted
+  by the React page into a `.peeper` root, scoped CSS + `pn-`-prefixed keyframes)
+  and does NOT use native K8s watch — the browser can't reach the API, so it
+  POLLS four **read-only** projected endpoints (`server/`-free; `cluster.go`):
+  `GET /cluster/{nodes,pods,events}` project the in-cluster objects down to the
+  minimal K8s-shaped subset the view reads (annotations trimmed to
+  `kubernetes.io/config.mirror`; no raw objects), and `GET /cluster/nodepools`
+  proxies the karpenter NodePool CRD (v1→v1beta1, degrading to an empty list when
+  karpenter is absent). Backed by the shared K8s pool's clientset
+  (`Extras.ClusterClient`, nil on non-k8s backends → routes unregistered). All
+  four are GETs so RoleGate admits viewers; there is no mutation path. **RBAC:**
+  these reads are cluster-scoped / cross-namespace, which the CP's in-namespace
+  Role doesn't cover — the grant lives on its own `duckgres-control-plane-cluster-topology`
+  ClusterRole in the `charts` repo (`charts/duckgres/templates/rbac.yaml`), bound
+  to the CP SA. It's a *separate* role (not folded into `duckgres-duckling-reader`)
+  so binding duckling-reader elsewhere doesn't drag these broader reads along and
+  trip RBAC escalation-prevention. When the ClusterRole is absent the handlers
+  **degrade a Forbidden to an empty `{items:[]}` (200)** and log a warning, so the
+  view shows nothing rather than 500ing — the e2e CP hits exactly this path (its
+  SA can't be granted cluster-scoped RBAC from CI), so `admin_console_api` only
+  asserts the `{items:[...]}` envelope; projection shape is covered by
+  `cluster_test.go`. Touching
+  the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
+  and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
+  (`tests/e2e-mw-dev/harness.sh`).
+- Touching any of the above → update `controlplane/admin/*_test.go` (esp
+  `authz_test.go`, `kill_switch_test.go`), `controlplane/session_mgr_test.go`
+  (`TestDestroySessionsForUser`), `controlplane/configstore/store_test.go`
+  (`TestDisabledUserEnforcement`) AND the `admin_*` / `impersonation_*` /
+  `user_kill_switch` / `user_disable_block` assertions in
+  `tests/e2e-mw-dev/harness.sh`.
+
+## Compute-Usage Billing (managed-warehouse, remote backend only)
+
+duckgres meters per-org compute usage of worker pods and ships it to PostHog's
+public ingestion as `"managed warehouse compute usage"` capture events (billing
+sums the two raw metrics externally). Full design + decisions:
+`docs/design/billing-compute-seconds-plan.md`. Scope is the **emit side**, and
+**only** the remote/k8s backend (per-org worker pod with a known
+`WorkerProfile` size). Pipeline:
+
+```
+conn end → in-proc per-org counter (best-effort; never fails teardown)
+        │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
+        ▼  duckgres_org_compute_usage / duckgres_org_compute_drain_state
+   leader drain (~60s) → POST {DUCKGRES_BILLING_INGEST_URL}/capture (ship-then-delete)
+```
+
+Two raw metrics per connection over its full lifetime, using the **provisioned**
+worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
+ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
+**MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
+sub-GiB worker. Invariants for anyone touching this path:
+
+- **Metering is strictly best-effort and off the hot path.** A metering error
+  (counter, flush, drain) must NEVER block or fail a query or connection
+  teardown. The connection-end record is added to an in-process per-org counter
+  (map+mutex, microseconds, no I/O); everything downstream is async/retried.
+  `cp.computeMeter` is nil unless the remote backend is configured with both
+  ingest URL+token — every call site is nil-safe.
+- **Enable gate = both `DUCKGRES_BILLING_INGEST_URL` and
+  `DUCKGRES_BILLING_INGEST_TOKEN` set** (`ControlPlaneConfig.BillingMeteringEnabled`).
+  Either unset → metering disabled (logged once at startup, ships nowhere). The
+  env names are fixed (infra wires them); keep them exact.
+- **Worker size is plumbed onto the connection** (`server.SetConnectionWorkerSize`
+  → `clientConn.workerMillicores/workerMiB`, set in `control.go::handleConnection`
+  from `workerBillingSize(workerProfile)`, remote-only). `workerMillicores==0`
+  (non-remote / unknown) → metering skipped. The metric is computed once at the
+  SAME teardown point as `CloseConnectionMetrics` (the `#841` lifetime defer).
+- **Bucket = connection-end time floored to 60s.** Flush carries the sub-unit
+  remainder forward so rounding never loses counts across flushes. Buffer flush
+  is UPSERT-increment so all CP pods sum into one row.
+- **Drain is leader-only** (co-located under the janitor lease via
+  `JanitorLeaderManager.AttachLeaderLoop`), **ship-then-delete / at-least-once**:
+  only buckets `bucket_start ≤ now-60s-30s grace AND > last_drained_bucket` ship;
+  on HTTP 2xx → TXN advance high-water + DELETE row; on failure → keep + retry.
+  `event_uuid = hash(org_id, bucket_start)` + `timestamp = bucket_start` are
+  deterministic so a re-ship collapses onto the same ClickHouse row.
+- **Graceful shutdown does a final flush** after connections drain to their
+  natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
+  last interval before exit.
+- Touching the meter/flush/drain/capture, the worker-size plumbing, or the
+  config knobs → update `controlplane/compute_meter_test.go`,
+  `compute_drain_test.go`, `compute_size_test.go`, the migration assertion in
+  `tests/configstore/migrations_postgres_test.go`, and the
+  `compute_usage_metering_wired` assertion in `tests/e2e-mw-dev/harness.sh`.
 
 ## TODO Reference
 

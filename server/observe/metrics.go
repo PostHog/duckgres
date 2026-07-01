@@ -18,6 +18,26 @@ func IncrementOpenConnections() { connectionsGauge.Inc() }
 // DecrementOpenConnections decrements the open connections gauge.
 func DecrementOpenConnections() { connectionsGauge.Dec() }
 
+// connectionDurationHistogram observes the full lifetime of a client
+// connection (accept → disconnect) in seconds, labelled by org. It complements
+// the duckgres_connections_open gauge: integrating that gauge over time
+// approximates total connection-time, but a coarse scrape interval undercounts
+// connections shorter than the scrape window. This histogram records every
+// connection's true lifetime, so `_sum` gives exact total connection-seconds
+// (per org) with no scrape bias and the buckets give the lifetime distribution.
+// Org is empty for single-tenant/standalone connections. Buckets span 1s
+// (health probes / short clients) to 24h (long-lived pooled connections).
+var connectionDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "duckgres_connection_duration_seconds",
+	Help:    "Client connection lifetime in seconds (accept to disconnect)",
+	Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 18000, 36000, 86400},
+}, []string{"org"})
+
+// ObserveConnectionDuration records one completed connection's lifetime.
+func ObserveConnectionDuration(org string, seconds float64) {
+	connectionDurationHistogram.WithLabelValues(org).Observe(seconds)
+}
+
 // S3BytesReadTotal counts bytes read from S3 by DuckDB, labeled by org.
 // Bumped from EnrichSpanWithProfiling when DuckDB reports total_bytes_read
 // in its profiling output.

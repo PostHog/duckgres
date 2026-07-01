@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/wire"
 )
@@ -76,6 +77,144 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		workerID:        workerID,
 		workerPod:       workerPod,
 	}
+}
+
+// DefaultControlPlaneIdleTimeout is the connection idle timeout the control
+// plane applies when none is configured. In remote/process control-plane mode
+// an idle client connection pins a worker (a scarce k8s pod or local process),
+// so an idle connection is closed after this long — its message loop hits the
+// read deadline, returns, and the worker is released back to the hot-idle pool.
+// Operators override it with --idle-timeout (a negative value disables it).
+const DefaultControlPlaneIdleTimeout = 60 * time.Second
+
+// NormalizeIdleTimeout resolves a configured connection idle timeout: zero means
+// "unset" → use zeroDefault; a negative value means "explicitly disabled" → 0
+// (no timeout); a positive value is used as-is. Shared by standalone (24h
+// default) and the control plane (DefaultControlPlaneIdleTimeout).
+func NormalizeIdleTimeout(configured, zeroDefault time.Duration) time.Duration {
+	switch {
+	case configured == 0:
+		return zeroDefault
+	case configured < 0:
+		return 0
+	default:
+		return configured
+	}
+}
+
+// ConnDetail is a redacted snapshot of one live client connection, for the
+// admin live-query detail view. Query is the ALREADY-redacted current/last
+// query (usersecrets.RedactForLog, same as pg_stat_activity) — callers must
+// never expose raw SQL here.
+type ConnDetail struct {
+	PID             int32
+	OrgID           string
+	Username        string
+	Database        string
+	ApplicationName string
+	ClientAddr      string
+	ClientPort      int32
+	WorkerID        int
+	WorkerPod       string
+	State           string // active | idle | idle in transaction | idle in transaction (aborted)
+	Query           string // redacted current/last query ("" when idle)
+	BackendStart    time.Time
+	QueryStart      time.Time // zero when no query is in flight
+}
+
+// ConnDetailByPID returns a redacted snapshot of the live connection for pid,
+// or ok=false if no such connection is registered on this server. Used by the
+// control-plane admin API to render the live-query detail view.
+func (s *Server) ConnDetailByPID(pid int32) (ConnDetail, bool) {
+	if s == nil {
+		return ConnDetail{}, false
+	}
+	s.connsMu.RLock()
+	c, ok := s.conns[pid]
+	s.connsMu.RUnlock()
+	if !ok {
+		return ConnDetail{}, false
+	}
+	return c.connDetail(), true
+}
+
+// ConnDetailByWorkerID returns a redacted snapshot of the live connection bound
+// to the given control-plane worker id, or ok=false if none is registered here.
+//
+// Worker ids are CLUSTER-UNIQUE (config-store issued) and there is exactly one
+// session per worker, so this is the collision-free address for the admin
+// live-query detail. PID is NOT safe: the CP allocates backend pids per-org
+// (every org's SessionManager starts at 1000), so two orgs can share a pid and a
+// lookup keyed by pid can return the wrong org's connection. A negative workerID
+// (standalone / transient describe conns) never matches.
+func (s *Server) ConnDetailByWorkerID(workerID int) (ConnDetail, bool) {
+	if s == nil || workerID < 0 {
+		return ConnDetail{}, false
+	}
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	for _, c := range s.conns {
+		if c.workerID == workerID {
+			return c.connDetail(), true
+		}
+	}
+	return ConnDetail{}, false
+}
+
+// ConnLiveSummary is the per-connection live state the admin Live list needs:
+// the pg_stat_activity-style State and the current-query start. State is
+// "active" when a query is in flight; anything else means no in-flight query.
+type ConnLiveSummary struct {
+	State      string    // active | idle | idle in transaction | idle in transaction (aborted)
+	QueryStart time.Time // zero when no query is in flight
+}
+
+// ConnSummariesByWorkerID returns a one-pass snapshot of every live connection
+// keyed by cluster-unique worker id: its state and current-query start. Used to
+// attach running-query duration AND the active/idle state to the live list in a
+// single lock acquisition (keyed on worker id, not the collision-prone per-org
+// pid). Connections with no worker (standalone / transient) are omitted.
+func (s *Server) ConnSummariesByWorkerID() map[int]ConnLiveSummary {
+	if s == nil {
+		return nil
+	}
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	out := make(map[int]ConnLiveSummary, len(s.conns))
+	for _, c := range s.conns {
+		if c.workerID < 0 {
+			continue
+		}
+		sum := ConnLiveSummary{State: c.connState()}
+		if qs, ok := c.queryStart.Load().(time.Time); ok && !qs.IsZero() {
+			sum.QueryStart = qs
+		}
+		out[c.workerID] = sum
+	}
+	return out
+}
+
+// SetConnectionWorkerSize records the provisioned worker pod size (in
+// milli-units) on a control-plane connection for compute-usage billing.
+// millicores == 0 means the size is unknown (non-remote / standalone) and
+// metering is skipped. Constant for the connection's life.
+func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
+	if cc != nil {
+		cc.workerMillicores = millicores
+		cc.workerMiB = mib
+	}
+}
+
+// ConnectionBilling returns the data needed to meter one connection's
+// compute-usage at teardown: the org, the provisioned worker size in
+// milli-units, and the connection's elapsed lifetime. millicores == 0 means
+// metering should be skipped (unknown worker size). Call at the same teardown
+// point as CloseConnectionMetrics.
+func ConnectionBilling(cc *clientConn) (orgID string, millicores, mib int64, dur time.Duration) {
+	if cc == nil {
+		return "", 0, 0, 0
+	}
+	return cc.orgID, cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
 }
 
 // CancelClientConn cancels the context of a clientConn.
@@ -148,6 +287,17 @@ func RunMessageLoop(cc *clientConn) error {
 	cc.server.registerConn(cc)
 	defer cc.server.unregisterConn(cc.pid)
 	return cc.messageLoop()
+}
+
+// CloseConnectionMetrics records the completed connection's lifetime in the
+// duckgres_connection_duration_seconds histogram (per org) and returns the
+// elapsed duration so the caller can log it. Call exactly once per connection
+// at teardown. backendStart is always set in NewClientConn, so the duration is
+// always meaningful for control-plane connections.
+func CloseConnectionMetrics(cc *clientConn) time.Duration {
+	d := time.Since(cc.backendStart)
+	observe.ObserveConnectionDuration(cc.orgID, d.Seconds())
+	return d
 }
 
 // InitMinimalServer initializes a Server struct with minimal fields for use

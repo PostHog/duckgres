@@ -107,6 +107,49 @@ func TestIsWorkerSessionCapError(t *testing.T) {
 	}
 }
 
+// TestReservePIDGloballyUniqueAcrossManagers is the regression for the conns-map
+// collision: backend pids must be unique across the whole CP process, not
+// per-org. Two managers (two org stacks) reserving pids must never hand out the
+// same value — otherwise their connections shadow each other in the single
+// server.conns map (keyed by pid), corrupting pg_stat_activity / cancel.
+func TestReservePIDGloballyUniqueAcrossManagers(t *testing.T) {
+	smA := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, nil)
+	smB := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, nil)
+
+	seen := make(map[int32]string)
+	for i := 0; i < 100; i++ {
+		for who, sm := range map[string]*SessionManager{"A": smA, "B": smB} {
+			pid := sm.ReservePID()
+			if prev, dup := seen[pid]; dup {
+				t.Fatalf("pid %d handed out twice (manager %s then %s) — per-org collision regressed", pid, prev, who)
+			}
+			seen[pid] = who
+			if pid <= 1000 {
+				t.Fatalf("pid %d is not above the 1000 floor", pid)
+			}
+		}
+	}
+}
+
+// TestReservePIDSkipsZeroAtWrap covers the int32-wrap edge: when the counter
+// passes through 0 (only after ~2.1B connections), reservePID must skip it so a
+// real pid never looks "unset". Uses a LOCAL counter so it doesn't perturb the
+// process-global one other tests share.
+func TestReservePIDSkipsZeroAtWrap(t *testing.T) {
+	var c atomic.Int32
+	c.Store(-1) // next Add(1) lands exactly on 0
+	if p := reservePID(&c); p == 0 {
+		t.Fatalf("reservePID returned 0 at the wrap point; must skip it")
+	}
+	// Normal range: monotonic, never 0.
+	c.Store(1000)
+	for i := 0; i < 5; i++ {
+		if p := reservePID(&c); p == 0 {
+			t.Fatalf("reservePID returned 0 in the normal range")
+		}
+	}
+}
+
 func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {
 	pool := &FlightWorkerPool{
 		workers: make(map[int]*ManagedWorker),
@@ -200,6 +243,55 @@ func TestOnWorkerCrash_MultipleSessions(t *testing.T) {
 	}
 	if sm.SessionCount() != 0 {
 		t.Fatalf("expected 0 sessions, got %d", sm.SessionCount())
+	}
+}
+
+// TestDestroySessionsForUser proves the per-user kill switch tears down only the
+// target user's sessions (cancelling their executors and closing their client
+// connections) and leaves other users' sessions untouched.
+func TestDestroySessionsForUser(t *testing.T) {
+	pool := &FlightWorkerPool{workers: make(map[int]*ManagedWorker)}
+	sm := NewSessionManager(pool, nil)
+
+	bobExec1 := &flightclient.FlightExecutor{}
+	bobExec2 := &flightclient.FlightExecutor{}
+	aliceExec := &flightclient.FlightExecutor{}
+	bobConn1 := &mockCloser{}
+	bobConn2 := &mockCloser{}
+	aliceConn := &mockCloser{}
+
+	sm.mu.Lock()
+	sm.sessions[1001] = &ManagedSession{PID: 1001, Username: "bob", WorkerID: 1, Executor: bobExec1, connCloser: bobConn1}
+	sm.sessions[1002] = &ManagedSession{PID: 1002, Username: "bob", WorkerID: 2, Executor: bobExec2, connCloser: bobConn2}
+	sm.sessions[1003] = &ManagedSession{PID: 1003, Username: "alice", WorkerID: 3, Executor: aliceExec, connCloser: aliceConn}
+	sm.byWorker[1] = []int32{1001}
+	sm.byWorker[2] = []int32{1002}
+	sm.byWorker[3] = []int32{1003}
+	sm.mu.Unlock()
+
+	n := sm.DestroySessionsForUser("bob")
+	if n != 2 {
+		t.Fatalf("DestroySessionsForUser returned %d, want 2", n)
+	}
+
+	// Bob's sessions are gone; their client connections were force-closed.
+	if !bobConn1.closed.Load() || !bobConn2.closed.Load() {
+		t.Fatal("expected bob's client connections to be closed")
+	}
+	// Alice is untouched.
+	if aliceConn.closed.Load() {
+		t.Fatal("alice's connection must not be closed by a kill scoped to bob")
+	}
+	if sm.SessionCount() != 1 {
+		t.Fatalf("expected 1 surviving session (alice), got %d", sm.SessionCount())
+	}
+	if _, ok := sm.sessions[1003]; !ok {
+		t.Fatal("alice's session (pid 1003) should survive")
+	}
+
+	// Killing a user with no sessions is a no-op returning 0.
+	if got := sm.DestroySessionsForUser("nobody"); got != 0 {
+		t.Fatalf("DestroySessionsForUser(nobody) = %d, want 0", got)
 	}
 }
 

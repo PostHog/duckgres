@@ -47,6 +47,7 @@ const (
 	rotationPassword       = "rotating-pass-12345"
 	rotationNumFiles       = 48
 	rotationRowsPerFile    = 40000
+	rotationDelay          = 2 * time.Second
 )
 
 func runRotationScenario(t *testing.T, sc rotationScenario) rotationResult {
@@ -157,7 +158,8 @@ func runRotationScenario(t *testing.T, sc rotationScenario) rotationResult {
 	}
 
 	// MD5-chain scan: compute-heavy enough that the statement is still
-	// running when we rotate at T+4s, sequentially opening ~1 file at a time.
+	// running when we rotate at T+rotationDelay, sequentially opening ~1 file
+	// at a time.
 	scanQuery := fmt.Sprintf(
 		`SELECT count(*), max(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(md5(s))))))))))))))))))))) FROM read_parquet('s3://%s/data/*.parquet')`,
 		rotationBucket)
@@ -172,12 +174,12 @@ func runRotationScenario(t *testing.T, sc rotationScenario) rotationResult {
 		done <- r
 	}()
 
-	// T+4s: rotate to user B exactly the way the credential-refresh
+	// T+rotationDelay: rotate to user B exactly the way the credential-refresh
 	// scheduler's push lands on a worker (CREATE OR REPLACE SECRET on a side
 	// connection), then kill user A — simulating the old STS token expiring
 	// right after a rotation that any reasonable design would hope protects
 	// the running statement.
-	time.Sleep(4 * time.Second)
+	time.Sleep(rotationDelay)
 	rotated := dlCfg
 	rotated.S3AccessKey = rotationUserB
 	if err := server.RefreshS3Secret(db, rotated, nil); err != nil {
@@ -283,7 +285,7 @@ func TestInFlightScanDiesOnCredentialRotation(t *testing.T) {
 // the credentials it started with.
 //
 // Runs only when DUCKGRES_TEST_PATCHED_HTTPFS points at a locally-built
-// extension binary (see PostHog/duckdb-httpfs branch cred-refresh-read-path):
+// extension binary (see PostHog/duckdb-httpfs v1.5.3-cred-refresh-write-retry):
 //
 //	DUCKGRES_TEST_PATCHED_HTTPFS=/path/to/httpfs.duckdb_extension \
 //	  go test ./tests/integration/ -run SurvivesRotationWithPatchedHTTPFS -v

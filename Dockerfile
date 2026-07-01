@@ -1,3 +1,13 @@
+# Build the admin console SPA (controlplane/admin/ui) so the kubernetes build
+# embeds a FRESH dist/ via //go:embed all:ui/dist, overwriting the committed
+# bundle. Runs before the Go build.
+FROM node:20-bookworm-slim AS uibuilder
+WORKDIR /ui
+COPY controlplane/admin/ui/package.json controlplane/admin/ui/package-lock.json ./
+RUN npm ci
+COPY controlplane/admin/ui/ ./
+RUN npm run build
+
 FROM golang:1.25-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
@@ -13,7 +23,7 @@ RUN go mod download
 # edit.)
 ARG TARGETARCH
 ARG DUCKDB_EXTENSION_VERSION=1.5.3
-ARG HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh
+ARG HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry
 ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # Repository for postgres_scanner specifically. Defaults to the stable
@@ -50,6 +60,9 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
        done
 
 COPY . .
+# Overwrite the committed placeholder with the freshly built SPA so the
+# kubernetes build embeds the real bundle.
+COPY --from=uibuilder /ui/dist ./controlplane/admin/ui/dist
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_TAGS=""

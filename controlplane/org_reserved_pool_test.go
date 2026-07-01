@@ -95,6 +95,44 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	}
 }
 
+// TestOrgReservedPoolWorkerCount covers the per-org worker count surfaced to
+// the admin Overview load bars: it counts this org's cap-counting (Hot)
+// workers, excludes hot-idle (parked, not against cap), and ignores workers
+// assigned to a different org sharing the pool.
+func TestOrgReservedPoolWorkerCount(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 10)
+
+	mk := func(id int, org string, lc WorkerLifecycleState) {
+		w := &ManagedWorker{ID: id, activeSessions: 1, done: make(chan struct{})}
+		w.SetOwnerCPInstanceID(shared.cpInstanceID)
+		w.SetOwnerEpoch(1)
+		if err := w.SetSharedState(SharedWorkerState{
+			Lifecycle:  lc,
+			Assignment: &WorkerAssignment{OrgID: org},
+		}); err != nil {
+			t.Fatalf("SetSharedState(%d): %v", id, err)
+		}
+		shared.workers[id] = w
+	}
+	// Two Hot workers for analytics (counted), one analytics hot-idle (excluded),
+	// one Hot worker for another org (excluded).
+	mk(1, "analytics", WorkerLifecycleHot)
+	mk(2, "analytics", WorkerLifecycleHot)
+	mk(3, "analytics", WorkerLifecycleHotIdle)
+	mk(4, "other", WorkerLifecycleHot)
+
+	pool := NewOrgReservedPool(shared, "analytics", 5, shared.workerImage, nil)
+	if got := pool.WorkerCount(); got != 2 {
+		t.Fatalf("WorkerCount() = %d, want 2 (two Hot analytics workers; hot-idle + other-org excluded)", got)
+	}
+
+	// Empty org → 0, never negative.
+	empty := NewOrgReservedPool(shared, "nobody", 5, shared.workerImage, nil)
+	if got := empty.WorkerCount(); got != 0 {
+		t.Fatalf("WorkerCount() for org with no workers = %d, want 0", got)
+	}
+}
+
 func TestOrgReservedPoolReleaseWorkerTransitionsToHotIdleOnLastSession(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 9, activeSessions: 1, done: make(chan struct{})}

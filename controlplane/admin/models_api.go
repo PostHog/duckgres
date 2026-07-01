@@ -23,6 +23,7 @@ type modelGroup string
 const (
 	modelGroupTenants modelGroup = "Tenants"
 	modelGroupRuntime modelGroup = "Runtime"
+	modelGroupAdmin   modelGroup = "Admin"
 )
 
 // modelDescriptor describes one browsable config-store table for the generic
@@ -89,6 +90,12 @@ func modelDescriptors() []modelDescriptor {
 		mk("flight-session-records", "Flight Session Records", modelGroupRuntime, true, configstore.FlightSessionRecord{}),
 		mk("org-connection-queue", "Org Connection Queue", modelGroupRuntime, true, configstore.OrgConnectionQueueEntry{}),
 		mk("org-connection-leases", "Org Connection Leases", modelGroupRuntime, true, configstore.OrgConnectionLease{}),
+
+		// Admin section after Runtime: operators is a config-schema table
+		// (goose-migrated duckgres_operators, read without schema qualification)
+		// holding the admin-console access list. It stays in this position so the
+		// sidebar order remains Tenants → Runtime → Admin.
+		mk("operators", "Operators", modelGroupAdmin, false, configstore.Operator{}),
 	}
 }
 
