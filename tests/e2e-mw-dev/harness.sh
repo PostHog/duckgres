@@ -300,6 +300,24 @@ pg_compat_functions() { # org password
   assert_compat "$1" "$2" ducklake "SELECT ('{\"a\":1,\"b\":2}'::jsonb @> '{\"a\":1}'::jsonb)::int::text" "1" "jsonb_contains"
   # #>> jsonpath text extraction.
   assert_compat "$1" "$2" ducklake "SELECT '{\"a\":{\"b\":1}}'::json #>> '{a,b}'" "1" "jsonb_path_text"
+  # '$'-prefixed property keys ($ai_session_id, $group_0): DuckDB reads a
+  # '$'-prefixed json_extract path as a (malformed) JSONPath and fails at bind
+  # time ("JSON path error near ..."); the transpiler rewrites such literal keys
+  # to the quoted-member form $."<key>". Regression for the prod
+  # json_extract_string failures. Both the ->> arrow and the direct
+  # json_extract_string(...) call shapes (clients send both) are exercised.
+  assert_compat "$1" "$2" ducklake "SELECT '{\"\$ai_session_id\":\"sess9\"}'::json ->> '\$ai_session_id'" "sess9" "json_dollar_key_arrow"
+  assert_compat "$1" "$2" ducklake "SELECT json_extract_string('{\"\$group_0\":\"team7\"}', '\$group_0')" "team7" "json_dollar_key_func"
+  # duckgres_json_extract_path is the runtime normalization macro the transpiler
+  # wraps around bound-parameter ($N) JSON paths (whose value is unknown at
+  # transpile time). Calling it directly asserts it is registered AND
+  # memory.main-qualified on the live DuckLake worker — the path a parameterized
+  # `json_extract_string(props, $1)` from a HogQL client takes.
+  assert_compat "$1" "$2" ducklake "SELECT json_extract_string('{\"\$ai_session_id\":\"viaMacro\"}', duckgres_json_extract_path('\$ai_session_id'))" "viaMacro" "json_dollar_key_macro"
+  # The macro is type-aware: an integer path argument (Postgres `json ->> int`
+  # array indexing) becomes a $[i] JSONPath rather than being mangled into a
+  # string key. Guards the parameterized-array-index path on the live worker.
+  assert_compat "$1" "$2" ducklake "SELECT json_extract_string('[\"a\",\"b\",\"c\"]', duckgres_json_extract_path(2))" "c" "json_int_index_macro"
   # PG curly-brace array literal cast.
   assert_compat "$1" "$2" ducklake "SELECT array_length('{1,2,3}'::int[],1)::text" "3" "array_literal_cast"
   # set-returning table macro in FROM position (memory.main-qualified).
