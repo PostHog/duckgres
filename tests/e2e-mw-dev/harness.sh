@@ -1614,7 +1614,10 @@ admin_idle_session_flagged() { # org password
 admin_cancel_by_worker() { # org password
   org="$1"; pw="$2"
   log "admin: cancel a live session by worker id on $org"
-  ( printf 'BEGIN;\n'; sleep 45 ) | PGPASSWORD="$pw" psql \
+  # Hold longer than the appear-poll budget (30×2s) so a slow cold-start can't
+  # exit the client before the session is observed (we cancel it well before
+  # the 60s idle timeout anyway).
+  ( printf 'BEGIN;\n'; sleep 90 ) | PGPASSWORD="$pw" psql \
       "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
       -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
   bg=$!

@@ -265,21 +265,20 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher, use
 			return
 		}
 		killed := live.KillSessionByWorkerID(wid)
-		responders, total := 1, 1
 		// A worker hosts exactly one session on exactly one CP: only fan out when
 		// this replica didn't own it (avoids needless peer POSTs on the hit path).
+		// This is a single-owner op, so — unlike the per-user kill — cp coverage
+		// isn't meaningful (non-owning peers 404): the response is just {killed}.
 		if killed == 0 && !localScope(c) && fetcher != nil {
-			bodies, peers := fetcher.PostPeers(c.Request.Context(), "/api/v1/sessions/by-worker/"+strconv.Itoa(wid)+"/cancel")
-			total += peers
-			k, r := sumKilled(bodies)
+			bodies, _ := fetcher.PostPeers(c.Request.Context(), "/api/v1/sessions/by-worker/"+strconv.Itoa(wid)+"/cancel")
+			k, _ := sumKilled(bodies)
 			killed += k
-			responders += r
 		}
 		if killed == 0 {
 			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no active session on worker %d", wid)})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"killed": killed, "cp_responders": responders, "cp_total": total})
+		c.JSON(http.StatusOK, gin.H{"killed": killed})
 	})
 
 	// Per-user kill switch (admin-only via RoleGate — all POSTs). A user's
