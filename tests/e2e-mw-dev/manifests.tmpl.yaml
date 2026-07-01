@@ -181,37 +181,12 @@ subjects:
   - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
 roleRef:
   { kind: ClusterRole, name: duckgres-duckling-reader, apiGroup: rbac.authorization.k8s.io }
----
-# Cluster-scoped read for the admin console's live "Nodes" topology view
-# (GET /api/v1/cluster/{nodes,pods,events,nodepools}). Read-only; per-PR name +
-# binding so it's isolated and swept on teardown by the ci-pr label. Mirrors the
-# reads the chart adds to the CP's duckgres-duckling-reader ClusterRole — granted
-# explicitly here so the e2e passes regardless of when the chart change lands on
-# the shared cluster.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: duckgres-ci-pr-${PR_NUMBER}-cluster-topology
-  labels:
-    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
-rules:
-  - apiGroups: [""]
-    resources: ["nodes", "pods", "events"]
-    verbs: ["get", "list"]
-  - apiGroups: ["karpenter.sh"]
-    resources: ["nodepools"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: duckgres-ci-pr-${PR_NUMBER}-cluster-topology
-  labels:
-    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
-subjects:
-  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
-roleRef:
-  { kind: ClusterRole, name: duckgres-ci-pr-${PR_NUMBER}-cluster-topology, apiGroup: rbac.authorization.k8s.io }
+# NOTE: the admin console "Nodes" view's cluster-scoped reads (nodes/pods/events
+# + karpenter nodepools) ALSO come through this same duckgres-duckling-reader
+# binding — the chart adds those rules to that ClusterRole. The CI deployer can
+# only bind to that pre-existing cluster role, not create new ClusterRoles, so
+# the grant must live on duckgres-duckling-reader (see charts repo,
+# charts/duckgres/templates/rbac.yaml) and be deployed to the cluster.
 ---
 apiVersion: apps/v1
 kind: Deployment

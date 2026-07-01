@@ -394,8 +394,11 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   four are GETs so RoleGate admits viewers; there is no mutation path. **RBAC:**
   these reads are cluster-scoped / cross-namespace, which the CP's in-namespace
   Role doesn't cover — the grant lives on the CP's always-bound cluster role
-  (`duckgres-duckling-reader` in the `charts` repo, `charts/duckgres/templates/rbac.yaml`);
-  the e2e mirrors it per-PR in `tests/e2e-mw-dev/manifests.tmpl.yaml`. Touching
+  (`duckgres-duckling-reader` in the `charts` repo, `charts/duckgres/templates/rbac.yaml`).
+  The e2e CI deployer can only *bind* to that pre-existing ClusterRole (it can't
+  create ClusterRoles), and `manifests.tmpl.yaml` already binds the CI SA to it,
+  so the e2e's `/cluster/*` checks go green once the charts change is deployed to
+  the shared cluster. Touching
   the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
   and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
   (`tests/e2e-mw-dev/harness.sh`).
