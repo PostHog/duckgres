@@ -1401,6 +1401,21 @@ admin_console_api() {
   curl -fsS -H "$H" "$API/api/v1/cluster/instances" \
     | jq -e '.instances | map(select(.self)) | length >= 1' >/dev/null \
     || fail "/cluster/instances has no self-flagged CP replica"
+  # Node-overview topology reads (back the admin console "Nodes" live view). These
+  # project the in-cluster nodes/pods into the K8s list shape the view consumes.
+  # A live cluster always has >=1 node and >=1 pod (the CP itself), so assert the
+  # envelope AND non-empty items, plus that the projection carries the fields the
+  # view keys on (node uid + allocatable; pod uid + namespace).
+  curl -fsS -H "$H" "$API/api/v1/cluster/nodes" \
+    | jq -e '.items | length >= 1 and (.[0] | has("metadata") and has("status") and (.metadata|has("uid")))' >/dev/null \
+    || fail "/cluster/nodes empty or missing projected node fields"
+  curl -fsS -H "$H" "$API/api/v1/cluster/pods" \
+    | jq -e '.items | length >= 1 and (.[0].metadata | has("uid") and has("namespace"))' >/dev/null \
+    || fail "/cluster/pods empty or missing projected pod fields"
+  # Events + karpenter nodepools just need the {items:[...]} envelope (both can be
+  # legitimately empty; nodepools degrades to empty when karpenter isn't present).
+  curl -fsS -H "$H" "$API/api/v1/cluster/events"    | jq -e 'has("items")' >/dev/null || fail "/cluster/events missing 'items'"
+  curl -fsS -H "$H" "$API/api/v1/cluster/nodepools" | jq -e 'has("items")' >/dev/null || fail "/cluster/nodepools missing 'items'"
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
   curl -fsS -H "$H" "$API/api/v1/metrics/panels" | jq -e '.panels | index("query_rate")' >/dev/null \
     || fail "/metrics/panels missing 'query_rate'"
