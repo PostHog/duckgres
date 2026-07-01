@@ -226,8 +226,10 @@ is deleted; the shared-infra footprint is removed by deprovisioning the
 ducklings first.
 
 Each deploy first reaps any existing resources for the same PR number (namespace,
-Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role)
-so a rerun never applies over stale services or network policies.
+Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role).
+It fails before applying manifests if the same-PR Duckling CRs do not fully
+delete, so a rerun never reuses PR-scoped bucket/org names while Crossplane
+finalizers are still running.
 
 ## One-time repo configuration
 
@@ -304,13 +306,17 @@ id committed).
   failed auths (~15 min). The harness uses the provision-time password and
   settles one config-poll interval before connecting — keep it that way; a
   reset-password + tight retry loop will trip the ban.
-- **Teardown / recreate are now CR-synchronous.** `run.sh teardown` and the
-  in-harness same-org recreate both `kubectl wait --for=delete` on the Duckling
-  CR, whose finalizers run the Crossplane DROP of the cnpg role+db, before
-  returning / re-provisioning. `drop_cnpg_role` is still called at deploy + at
-  teardown as a belt-and-suspenders idempotent backstop. (Composition
-  `managementPolicies: ["*"]` from charts#11522 does the drop; the `--for=delete`
-  wait is what makes it synchronous from our side.)
+- **Teardown / recreate are now CR-synchronous.** `run.sh deploy`, `run.sh
+  teardown`, and the in-harness same-org recreate all `kubectl wait --for=delete`
+  on the Duckling CR, whose finalizers run the Crossplane DROP of the cnpg
+  role+db, before returning / re-provisioning. Deploy and teardown fail if the
+  same-PR CRs do not delete within the timeout; the scheduled `e2e-cleanup` sweep
+  logs a narrow stuck-CR summary but keeps going so one old namespace does not
+  block the janitor. `drop_cnpg_role` is still called at deploy + at teardown as a
+  belt-and-suspenders idempotent backstop; it sweeps both current `mdstore_<org>`
+  and legacy `lakekeeper_<org>` identifiers. (Composition `managementPolicies:
+  ["*"]` from charts#11522 does the drop; the `--for=delete` wait is what makes
+  it synchronous from our side.)
 - **Shared-infra contention.** Concurrent PRs provision real ducklings against
   the same cnpg-shards / RDS infra. Org-ID prefix keeps them
   distinct; watch quay.io / cnpg pooler / RDS limits under parallelism.
