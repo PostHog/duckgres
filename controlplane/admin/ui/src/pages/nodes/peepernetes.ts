@@ -288,7 +288,12 @@ export function mountPeepernetes(root: HTMLElement): () => void {
 
   // ── event ticker ───────────────────────────────────────
   const evBox = $("#events");
-  const esc = (s: any): string => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Escapes for BOTH text and attribute contexts (esc(p) is interpolated into a
+  // data-pool="…" attribute), so quotes must be escaped too or a pool/label name
+  // containing a double-quote could break out of the attribute (CodeQL XSS).
+  const esc = (s: any): string => String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   const evLog: any[] = [];
   function renderEvRow(e: any, animate: boolean): HTMLDivElement {
     const row = document.createElement("div");
