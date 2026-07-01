@@ -957,6 +957,16 @@ org_default_profile() { # org password catalog
   after="$(count_org_workers_of_cpu "$org" "$cpu")"
   [ "$after" -le "$before" ] || fail "org default: cleared default still spawns $cpu-cpu workers ($before -> $after)"
   log "org default OK: cleared; plain connection back on the deployment default shape"
+
+  # Audit readability: the org PUTs above must land a resource-specific
+  # "org.update" row (not a generic "config.update") carrying a human "which
+  # fields changed" detail. The clear-PUT above always flips default_worker_*
+  # from the just-set 2/8Gi/10m to unset, so a detail mentioning the field is
+  # deterministic. Guards audit.go::auditActionFor + api.go::updateOrg detail.
+  curl -fsS -H "$H" "$API/api/v1/audit?org=$org" \
+    | jq -e --arg o "$org" '.entries | map(select(.action=="org.update" and .org==$o and (.detail | test("default_worker")))) | length >= 1' >/dev/null \
+    || fail "org default: no org.update audit row with a field-change detail for $org"
+  log "org default OK: audit shows org.update with field-change detail on $org"
 }
 
 # ---- user persistent secrets ------------------------------------------------

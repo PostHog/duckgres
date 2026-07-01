@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -519,6 +521,9 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 	if org.HostnameAlias != nil && *org.HostnameAlias == "" {
 		org.HostnameAlias = nil
 	}
+	// POST /orgs has no :id param, so the audit org column is blank — record the
+	// created org's name here instead.
+	setAuditDetail(c, "created org "+org.Name)
 	if err := h.store.CreateOrg(&org); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -590,6 +595,27 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
+
+	// Audit detail: which fields changed and their old → new values, so the
+	// console shows "max_workers 4 → 10" instead of a bare "org.update". These
+	// are all non-sensitive config columns (no credentials among them).
+	var changes []string
+	addChange := func(key string, old, next any) {
+		if _, ok := fields[key]; ok && old != next {
+			changes = append(changes, fmt.Sprintf("%s %v → %v", key, old, next))
+		}
+	}
+	addChange("max_workers", existing.MaxWorkers, merged.MaxWorkers)
+	addChange("max_vcpus", existing.MaxVCPUs, merged.MaxVCPUs)
+	addChange("default_worker_cpu", orgStr(existing.DefaultWorkerCPU), orgStr(merged.DefaultWorkerCPU))
+	addChange("default_worker_memory", orgStr(existing.DefaultWorkerMemory), orgStr(merged.DefaultWorkerMemory))
+	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
+	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
+	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
+	if len(changes) > 0 {
+		setAuditDetail(c, strings.Join(changes, ", "))
+	}
+
 	org, ok, err := h.store.UpdateOrg(name, merged)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -614,6 +640,40 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
+}
+
+// topLevelJSONKeys returns the sorted top-level object keys of a JSON body, or
+// nil if it isn't a JSON object. Used to audit WHICH warehouse sections a PUT
+// touched without recording their (possibly secret) values.
+func topLevelJSONKeys(body []byte) []string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// orgStr renders an org config string value for audit detail, showing "" as a
+// readable "(unset)" so a cleared field is unambiguous.
+func orgStr(s string) string {
+	if s == "" {
+		return "(unset)"
+	}
+	return s
+}
+
+// orgStrPtr renders an optional org config string (nil == unset) for audit
+// detail.
+func orgStrPtr(s *string) string {
+	if s == nil {
+		return "(unset)"
+	}
+	return orgStr(*s)
 }
 
 func validateOrgMutationPayload(org *configstore.Org) error {
@@ -739,6 +799,14 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		return
 	}
 
+	// Audit detail: the top-level warehouse sections touched by this PUT (field
+	// NAMES only — the values can carry credentials/secret refs, so we never put
+	// them in the audit log). Gives "changed: metadata_store, s3" instead of a
+	// bare "warehouse.update".
+	if changed := topLevelJSONKeys(body); len(changed) > 0 {
+		setAuditDetail(c, "changed: "+strings.Join(changed, ", "))
+	}
+
 	// MutateManagedWarehouse locks the row inside a transaction, runs the
 	// closure, and commits — closing the race where two concurrent PUTs would
 	// otherwise Get + modify different snapshots and silently clobber each
@@ -834,6 +902,16 @@ func (h *apiHandler) patchTenantPinning(c *gin.Context) {
 			return
 		}
 	}
+
+	// Audit detail: image / ducklake_version are safe (non-secret) pins.
+	var pins []string
+	if req.Image != nil {
+		pins = append(pins, "image="+orgStr(*req.Image))
+	}
+	if req.DuckLakeVersion != nil {
+		pins = append(pins, "ducklake_version="+orgStr(*req.DuckLakeVersion))
+	}
+	setAuditDetail(c, strings.Join(pins, ", "))
 
 	stored, ok, err := h.store.MutateManagedWarehouse(orgID, func(w *configstore.ManagedWarehouse) error {
 		if req.Image != nil {
@@ -938,6 +1016,9 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		DefaultCatalog: raw.DefaultCatalog,
 		MaxVCPUs:       raw.MaxVCPUs,
 	}
+	// The audit row's org/target columns come from URL params, but this route is
+	// the top-level POST /users with no params — record who was created here.
+	setAuditDetail(c, "created user "+raw.Username+" in org "+raw.OrgID)
 	if err := h.store.CreateUser(&user); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -1007,6 +1088,25 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
 		return
 	}
+	// Audit detail: which fields the update touched. The password is NEVER
+	// logged — only that it was reset.
+	var changes []string
+	if _, ok := fields["password"]; ok && raw.Password != "" {
+		changes = append(changes, "password reset")
+	}
+	if raw.Passthrough != nil {
+		changes = append(changes, fmt.Sprintf("passthrough=%v", *raw.Passthrough))
+	}
+	if raw.DefaultCatalog != nil {
+		changes = append(changes, "default_catalog="+orgStr(*raw.DefaultCatalog))
+	}
+	if maxVCPUs != nil {
+		changes = append(changes, fmt.Sprintf("max_vcpus=%d", *maxVCPUs))
+	}
+	if len(changes) > 0 {
+		setAuditDetail(c, strings.Join(changes, ", "))
+	}
+
 	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog, maxVCPUs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

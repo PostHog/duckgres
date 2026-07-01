@@ -413,6 +413,9 @@ export interface AuditEntry {
   org?: string;
   target_user?: string;
   sql_redacted?: string;
+  // Optional non-sensitive human context recorded by the handler, e.g.
+  // "role viewer → admin" or "max_workers 4 → 10".
+  detail?: string;
   status: number;
   remote_addr?: string;
 }

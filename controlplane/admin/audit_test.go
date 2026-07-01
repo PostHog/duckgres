@@ -28,9 +28,13 @@ func TestAuditActionFor(t *testing.T) {
 		{"org user enable", http.MethodPost, "/api/v1/orgs/acme/users/bob/enable", "user.enable"},
 		{"warehouse put", http.MethodPut, "/api/v1/orgs/acme/warehouse", "warehouse.update"},
 		{"warehouse pinning patch", http.MethodPatch, "/api/v1/orgs/acme/warehouse/pinning", "warehouse.update"},
-		{"org create", http.MethodPost, "/api/v1/orgs", "config.create"},
-		{"org update", http.MethodPut, "/api/v1/orgs/acme", "config.update"},
-		{"top-level users create", http.MethodPost, "/api/v1/users", "config.create"},
+		{"org create", http.MethodPost, "/api/v1/orgs", "org.create"},
+		{"org update", http.MethodPut, "/api/v1/orgs/acme", "org.update"},
+		{"org delete", http.MethodDelete, "/api/v1/orgs/acme", "org.delete"},
+		{"top-level users create", http.MethodPost, "/api/v1/users", "user.create"},
+		{"user secret delete", http.MethodDelete, "/api/v1/orgs/acme/users/bob/secrets/mysecret", "secret.delete"},
+		{"session cancel", http.MethodPost, "/api/v1/sessions/1234/cancel", "session.cancel"},
+		{"session cancel by worker", http.MethodPost, "/api/v1/sessions/by-worker/w-1/cancel", "session.cancel"},
 		{"unknown resource", http.MethodPost, "/api/v1/something", "config.create"},
 	}
 	for _, tc := range cases {

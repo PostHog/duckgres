@@ -64,28 +64,41 @@ func (h *operatorsHandler) upsertOperator(c *gin.Context) {
 		return
 	}
 
+	// existing is the operator's current role ("" if brand-new); we read it up
+	// front so we can (a) enforce the last-admin guard and (b) record a
+	// human-readable "role X → admin" audit detail.
+	existing, err := h.store.OperatorRole(email)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	// Last-admin guard: refuse to demote the final remaining admin to viewer.
 	// This is a pre-check + write, not a single atomic statement — acceptable
 	// for this tiny, low-traffic, internal-only table where a racing second
 	// admin-demotion is implausible and the worst case (zero admins) is still
 	// recoverable via the break-glass internal-secret path.
-	if role == string(RoleViewer) {
-		existing, err := h.store.OperatorRole(email)
+	if role == string(RoleViewer) && existing == string(RoleAdmin) {
+		admins, err := h.store.CountAdmins()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		if existing == string(RoleAdmin) {
-			admins, err := h.store.CountAdmins()
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-			if admins <= 1 {
-				c.JSON(http.StatusConflict, gin.H{"error": "cannot demote the last remaining admin"})
-				return
-			}
+		if admins <= 1 {
+			c.JSON(http.StatusConflict, gin.H{"error": "cannot demote the last remaining admin"})
+			return
 		}
+	}
+
+	// Audit detail: "granted admin role" for a new operator, "role viewer →
+	// admin" for a role change, or a plain confirmation for an idempotent set.
+	switch {
+	case existing == "":
+		setAuditDetail(c, "granted "+role+" role (new operator)")
+	case existing != role:
+		setAuditDetail(c, "role "+existing+" → "+role)
+	default:
+		setAuditDetail(c, "role unchanged ("+role+")")
 	}
 
 	addedBy := ""
@@ -127,6 +140,9 @@ func (h *operatorsHandler) deleteOperator(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "cannot remove the last remaining admin"})
 			return
 		}
+	}
+	if role != "" {
+		setAuditDetail(c, "removed "+role+" operator")
 	}
 
 	deleted, err := h.store.DeleteOperator(email)
