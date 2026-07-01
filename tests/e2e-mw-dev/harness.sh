@@ -1493,21 +1493,29 @@ conn_idle_timeout_reaps_session() { # org password
 # ---- COPY FROM STDIN: active in Live + survives the idle timeout ------------
 # An actively-streaming COPY reads many CopyData messages; each in-loop read
 # re-arms the read deadline (server/conn_copy.go armIdleReadDeadline), so a COPY
-# that streams for LONGER than the idle timeout but never stalls must NOT be
-# reaped mid-stream (the regression the 60s default would otherwise cause for
-# the COPY-heavy data-import users). It must also be categorized as an ACTIVE
-# query in /queries (elapsed_ms>0), not an idle session, while it streams.
+# that keeps putting bytes ON THE WIRE for LONGER than the idle timeout — while
+# never stalling longer than it between messages — must NOT be reaped mid-stream
+# (the regression the 60s default would otherwise cause for COPY-heavy data
+# imports). It must also be categorized as an ACTIVE query in /queries
+# (elapsed_ms>0), not an idle session, while it streams. The server-side re-arm
+# is unit-tested by TestCopyStreamReArmsIdleDeadline (server/conn_idle_test.go);
+# this asserts the same guarantee end-to-end against a real worker.
 #
-# Pacing (flake hardening): stream 15 chunks of 24 rows (=360) with 5s gaps →
-# ~75s total, comfortably ABOVE the 60s idle timeout (so a broken re-arm is still
-# caught — the stream out-lives the timeout), while every inter-chunk gap is only
-# 5s: ~12x under the 60s deadline. The previous 11s gap / ~66s total sat right on
-# the 60s boundary, so a single stretched gap — CI scheduling jitter, or the
-# just-reaped org's connection cold-spawning a worker whose first-chunk read /
-# DoPut forward stalled — pushed one armed read past 60s and tripped the deadline
-# (observed on ~5 runs/24h as duration_ms≈60001 "read csv stream: … i/o timeout").
-# 5s gaps restore the margin while keeping the assertion honest. The product-side
-# re-arm logic is correct; this is purely a too-tight harness margin.
+# ROOT CAUSE of the earlier flake (do NOT regress this): the old version streamed
+# tiny rows (~12 bytes) with sleeps between them. libpq buffers CopyData in its
+# ~8KB client-side output buffer and only flushes when that buffer fills — so a
+# trickle of small rows was NEVER put on the wire until PQputCopyEnd (the closing
+# "\."), which for a ~75s producer lands well past the 60s idle timeout. The
+# server therefore saw a genuinely IDLE connection (zero bytes for 60s) and
+# correctly reaped it — the observed failure was duration_ms≈60001 on the FIRST
+# read with rows=0 (i.e. nothing ever arrived), NOT a re-arm bug. The producer's
+# sleeps paced the SHELL, not the wire.
+#
+# FIX: send fat chunks (~32KB each, well over libpq's flush threshold) so every
+# 5s interval forces a real flush and the server actually receives a burst of
+# CopyData to re-arm on. 14 chunks × 5s ≈ 70s of genuine wire activity — past the
+# 60s idle timeout (a broken re-arm would still be caught), with each gap ~12x
+# under the deadline. Each row carries a 2000-char pad so ~16 rows = ~32KB/chunk.
 copy_active_and_survives_idle() { # org password
   org="$1"; pw="$2"
   log "COPY FROM STDIN: active in Live + survives idle timeout on $org"
@@ -1516,12 +1524,15 @@ copy_active_and_survives_idle() { # org password
   # bare COPY connection would cold-spawn a worker inside the stream's critical
   # path. Force activation up front so the streamed data never races a cold start.
   wait_worker "$org" "$pw" ducklake
-  # A one-off environmental blip (a >60s CP→worker forward stall, a connection
+  # 2000-char pad → each row line is ~2KB, so a 16-row chunk is ~32KB: bigger than
+  # libpq's ~8KB output buffer, which forces a flush to the wire each interval.
+  pad="$(printf '%02000d' 0)"
+  # A one-off environmental blip (a real CP→worker forward stall, a connection
   # reset) can trip the client read deadline even though the COPY itself never
   # idled — that is NOT the behavior under test, so retry the streaming attempt a
   # bounded number of times on ONLY that transient signature. A genuine re-arm
-  # regression fails EVERY attempt (the stream always out-lives 60s), so this
-  # cannot mask it; a non-transient failure aborts immediately.
+  # regression fails EVERY attempt (the stream always out-lives 60s of real wire
+  # activity), so this cannot mask it; a non-transient failure aborts immediately.
   attempt=0 last=""
   while [ "$attempt" -lt 2 ]; do
     attempt=$((attempt + 1))
@@ -1529,8 +1540,8 @@ copy_active_and_survives_idle() { # org password
     ( printf 'DROP TABLE IF EXISTS e2e_idle_copy;\n'
       printf 'CREATE TABLE e2e_idle_copy(v TEXT);\n'
       printf '\\copy e2e_idle_copy(v) FROM STDIN\n'
-      for i in $(seq 1 15); do
-        for j in $(seq 1 24); do printf 'row-%d-%d\n' "$i" "$j"; done
+      for i in $(seq 1 14); do
+        for j in $(seq 1 16); do printf 'r%d_%d_%s\n' "$i" "$j" "$pad"; done
         sleep 5
       done
       printf '\\.\n'
@@ -1548,15 +1559,18 @@ copy_active_and_survives_idle() { # org password
       [ -n "$e" ] && { active=1; break; }
       sleep 3; a=$((a + 1))
     done
-    # It must finish successfully with all 360 rows (NOT reaped mid-stream).
-    wait "$bg"; rc=$?
-    ok=""; { [ "$rc" -eq 0 ] && grep -qx "360" "$out"; } && ok=1
+    # It must finish successfully with all 224 rows (NOT reaped mid-stream).
+    # NB: `wait; rc=$?` must NOT be a bare statement — under `set -e` a non-zero
+    # psql exit would abort the whole harness at `wait` (the "HARNESS EXIT rc=3,
+    # no FAIL line" seen before) before the retry/branch logic below could run.
+    if wait "$bg"; then rc=0; else rc=$?; fi
+    ok=""; { [ "$rc" -eq 0 ] && grep -qx "224" "$out"; } && ok=1
     body="$(tr '\n' ' ' <"$out" | tail -c 300)"; rm -f "$out"
     if [ -n "$ok" ]; then
-      # Streamed the full ~75s past the idle timeout: now the active-categorization
-      # assertion is the real remaining signal.
+      # Streamed ~70s of real wire traffic past the idle timeout without being
+      # reaped: now the active-categorization assertion is the remaining signal.
       [ -n "$active" ] || fail "copy_active: streaming COPY not categorized active (elapsed_ms>0) in /queries on $org"
-      log "COPY FROM STDIN: active in Live + survived idle timeout (360 rows) on $org"
+      log "COPY FROM STDIN: active in Live + survived idle timeout (224 rows) on $org"
       return 0
     fi
     last="$body"
@@ -1565,10 +1579,10 @@ copy_active_and_survives_idle() { # org password
         log "copy_active: transient stream blip on $org (attempt $attempt/2), retrying: $body"
         continue ;;
       *)
-        fail "copy_active: streaming COPY (~75s) did not succeed with 360 rows (rc=$rc): $body" ;;
+        fail "copy_active: streaming COPY (~70s) did not succeed with 224 rows (rc=$rc): $body" ;;
     esac
   done
-  fail "copy_active: streaming COPY (~75s) failed all $attempt attempts with transient stream errors — likely a real re-arm/reaper regression (last: $last)"
+  fail "copy_active: streaming COPY (~70s) failed all $attempt attempts with transient stream errors — likely a real re-arm/reaper regression (last: $last)"
 }
 
 # ---- admin RBAC: SSO viewer is read-only -----------------------------------
