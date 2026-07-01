@@ -427,7 +427,7 @@ func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, cla
 		// attempt.
 		hotClaimStart := time.Now()
 		worker, reserveErr := p.reserveClaimedWorker(ctx, claim.hotClaimed, assignment)
-		observeAcquirePhase("hot_idle_claim", time.Since(hotClaimStart), reserveErr)
+		observeAcquirePhase("hot_idle_claim", assignment.OrgID, time.Since(hotClaimStart), reserveErr)
 		if reserveErr == nil {
 			worker.hotIdleReclaimed = true
 			return worker, false, nil

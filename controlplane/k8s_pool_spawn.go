@@ -558,7 +558,7 @@ func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, 
 	// connect → reserve. Named-return defer so every failure stage observes.
 	spawnStart := time.Now()
 	defer func() {
-		observeAcquirePhase("spawn", time.Since(spawnStart), err)
+		observeAcquirePhase("spawn", assignment.OrgID, time.Since(spawnStart), err)
 	}()
 	// A default (nil profile) request spawns a default-sized worker: the zero
 	// profile makes workerResourcesForProfile fall back to the pool-global request.

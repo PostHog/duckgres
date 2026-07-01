@@ -1427,8 +1427,15 @@ admin_console_api() {
       || fail "/cluster/$res did not return a 200 {items:[...]} envelope"
   done
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
-  curl -fsS -H "$H" "$API/api/v1/metrics/panels" | jq -e '.panels | index("query_rate")' >/dev/null \
-    || fail "/metrics/panels missing 'query_rate'"
+  # Includes the per-org/per-source worker-acquire-latency panels. (The raw
+  # histogram emission — org+source labels on duckgres_worker_acquire_total_seconds
+  # — is unit-tested, not asserted here: the :9090 metrics port is
+  # NetworkPolicy-blocked from this in-cluster Job.)
+  panels="$(curl -fsS -H "$H" "$API/api/v1/metrics/panels")"
+  for p in query_rate acquire_p95 acquire_by_source; do
+    echo "$panels" | jq -e --arg p "$p" '.panels | index($p)' >/dev/null \
+      || fail "/metrics/panels missing '$p'"
+  done
 }
 
 # ---- admin: /status reports per-org worker counts --------------------------

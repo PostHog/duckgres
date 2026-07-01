@@ -48,8 +48,13 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	// return defer so every exit — reuse, capacity error, ctx cancel — lands in
 	// the same histogram with an outcome label.
 	acquireStart := time.Now()
+	// source records HOW the worker was ultimately obtained (the allocation
+	// "phase" the user sees on the dashboard): idle reuse of this org's own Hot
+	// worker, a hot-idle claim from the shared pool, or a cold spawn. Set at each
+	// success path below; stays "none" when no worker is allocated (cap/cancel).
+	source := acquireSourceNone
 	defer func() {
-		observeAcquireTotal(time.Since(acquireStart), acquireTotalOutcome(err))
+		observeAcquireTotal(time.Since(acquireStart), p.orgID, source, acquireTotalOutcome(err))
 		if worker != nil {
 			// Session assigned: veto voluntary disruption (consolidation/drift)
 			// of the worker's node until release. Freshly spawned pods are
@@ -66,6 +71,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 	// spawned worker that a queued waiter is owed (those are claimed only
 	// via the gated slow path below).
 	if w := p.tryReuseIdleAssigned(profile); w != nil {
+		source = acquireSourceIdleReuse
 		return w, nil
 	}
 
@@ -82,7 +88,15 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 			return nil, err
 		}
 		if worker != nil {
+			source = acquireSourceIdleReuse
 			return worker, nil // reused an idle worker that freed while queued
+		}
+		// Bind source to the claim BEFORE completing it, so a spawn that fails
+		// still attributes its wait to source=spawn (outcome=error).
+		if claim.hotClaimed != nil {
+			source = acquireSourceHotIdleClaim
+		} else {
+			source = acquireSourceSpawn
 		}
 
 		// Execute the multi-minute spawn/adopt + activate OUTSIDE the gate (so a
@@ -122,10 +136,10 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 func (p *OrgReservedPool) acquireDecision(ctx context.Context, profile *WorkerProfile) (*sharedWorkerClaim, *WorkerAssignment, *ManagedWorker, error) {
 	gateStart := time.Now()
 	if err := p.gate.acquire(ctx); err != nil {
-		observeAcquireGateWait(time.Since(gateStart), "canceled")
+		observeAcquireGateWait(time.Since(gateStart), p.orgID, "canceled")
 		return nil, nil, nil, err
 	}
-	observeAcquireGateWait(time.Since(gateStart), "acquired")
+	observeAcquireGateWait(time.Since(gateStart), p.orgID, "acquired")
 	defer p.gate.release()
 
 	// A worker may have freed while we waited for our FIFO turn.
@@ -438,7 +452,7 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 	activateStart := time.Now()
 	defer func() {
 		if worker != nil {
-			observeAcquirePhase("activate", time.Since(activateStart), err)
+			observeAcquirePhase("activate", p.orgID, time.Since(activateStart), err)
 		}
 	}()
 
