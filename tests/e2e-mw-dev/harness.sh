@@ -1411,6 +1411,21 @@ admin_console_api() {
   curl -fsS -H "$H" "$API/api/v1/cluster/instances" \
     | jq -e '.instances | map(select(.self)) | length >= 1' >/dev/null \
     || fail "/cluster/instances has no self-flagged CP replica"
+  # Node-overview topology reads (back the admin console "Nodes" live view): they
+  # project in-cluster nodes/pods/events into the K8s list shape the view consumes
+  # (GET /cluster/{nodes,pods,events,nodepools}), each a {items:[...]} envelope.
+  # We assert the endpoints are wired + auth-gated + return 200 with an items
+  # array — NOT that items is populated: these reads are cluster-scoped, and the
+  # e2e CP's ServiceAccount can't be granted cluster-scoped RBAC from CI (the CI
+  # deployer can't create/bind cluster-topology roles without escalation), so the
+  # CP degrades a Forbidden to an empty list here. The populated path is exercised
+  # in real envs where the chart's duckgres-control-plane-cluster-topology
+  # ClusterRole is bound (see cluster_test.go for the projection-shape assertions).
+  for res in nodes pods events nodepools; do
+    curl -fsS -H "$H" "$API/api/v1/cluster/$res" \
+      | jq -e '(.items | type) == "array"' >/dev/null \
+      || fail "/cluster/$res did not return a 200 {items:[...]} envelope"
+  done
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
   curl -fsS -H "$H" "$API/api/v1/metrics/panels" | jq -e '.panels | index("query_rate")' >/dev/null \
     || fail "/metrics/panels missing 'query_rate'"

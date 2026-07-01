@@ -4,6 +4,7 @@ package admin
 
 import (
 	"github.com/gin-gonic/gin"
+	"k8s.io/client-go/kubernetes"
 )
 
 // Extras bundles the dependencies for the admin endpoints added on top of the
@@ -17,6 +18,10 @@ type Extras struct {
 	Audit        *AuditStore
 	Metrics      *MetricsProxy
 	Fetcher      PeerFetcher // cross-CP live-state aggregation (nil = single-CP)
+	// ClusterClient backs the read-only node-overview topology endpoints
+	// (/cluster/nodes,/pods,/events,/nodepools). nil (non-k8s backends, tests)
+	// leaves those routes unregistered.
+	ClusterClient kubernetes.Interface
 }
 
 // RegisterExtras wires the additional endpoints onto the authenticated /api/v1
@@ -25,6 +30,9 @@ type Extras struct {
 func RegisterExtras(r *gin.RouterGroup, x Extras) {
 	r.GET("/me", meHandler)
 	registerLiveAPI(r, x.Live, x.Fetcher, x.Users)
+	if x.ClusterClient != nil {
+		registerClusterAPI(r, x.ClusterClient)
+	}
 	if x.Store != nil {
 		registerUserSecretsAPI(r, x.Store)
 	}

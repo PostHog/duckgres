@@ -181,6 +181,12 @@ subjects:
   - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
 roleRef:
   { kind: ClusterRole, name: duckgres-duckling-reader, apiGroup: rbac.authorization.k8s.io }
+# NOTE: the admin console "Nodes" view's cluster-scoped reads (nodes/pods/events
+# + karpenter nodepools) ALSO come through this same duckgres-duckling-reader
+# binding — the chart adds those rules to that ClusterRole. The CI deployer can
+# only bind to that pre-existing cluster role, not create new ClusterRoles, so
+# the grant must live on duckgres-duckling-reader (see charts repo,
+# charts/duckgres/templates/rbac.yaml) and be deployed to the cluster.
 ---
 apiVersion: apps/v1
 kind: Deployment
