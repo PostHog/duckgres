@@ -62,7 +62,6 @@ same units as the values:
   "usage": [
     {
       "compute_type": "endpoints" | "standard",
-    compute_type: "endpoints",
       "org_id": "org_abc",
       "team_id": "12345",
       "cpu": 8,
