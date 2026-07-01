@@ -632,6 +632,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	dataReceiveStart := time.Now()
 
 	for {
+		c.armIdleReadDeadline() // per-message: don't kill an actively-streaming COPY
 		msgType, body, err := wire.ReadMessage(c.reader)
 		if err != nil {
 			c.logger().Error("COPY FROM STDIN error reading message.", "error", err)
@@ -845,6 +846,7 @@ func (r *copyDataWireReader) Read(p []byte) (int, error) {
 			}
 			return 0, io.EOF
 		}
+		r.c.armIdleReadDeadline() // per-message: don't kill an actively-streaming COPY
 		msgType, body, err := wire.ReadMessage(r.c.reader)
 		if err != nil {
 			r.done = true
@@ -900,6 +902,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 	// Buffer all CopyData messages into memory (we need to parse CSV, not stream to file)
 	var buf bytes.Buffer
 	for {
+		c.armIdleReadDeadline() // per-message: don't kill an actively-streaming COPY
 		msgType, body, err := wire.ReadMessage(c.reader)
 		if err != nil {
 			return err
@@ -1034,6 +1037,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 	// Collect all CopyData messages into a buffer
 	var buf bytes.Buffer
 	for {
+		c.armIdleReadDeadline() // per-message: don't kill an actively-streaming COPY
 		msgType, body, err := wire.ReadMessage(c.reader)
 		if err != nil {
 			c.logger().Error("COPY FROM STDIN binary: error reading message.", "error", err)

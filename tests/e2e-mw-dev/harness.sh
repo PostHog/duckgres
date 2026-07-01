@@ -1490,6 +1490,52 @@ conn_idle_timeout_reaps_session() { # org password
   log "conn idle timeout: idle session reaped, worker $wid freed on $org"
 }
 
+# ---- COPY FROM STDIN: active in Live + survives the idle timeout ------------
+# An actively-streaming COPY reads many CopyData messages; each in-loop read
+# re-arms the read deadline (server/conn_copy.go armIdleReadDeadline), so a COPY
+# that streams for LONGER than the idle timeout but never stalls must NOT be
+# reaped mid-stream (the regression the 60s default would otherwise cause for
+# the COPY-heavy data-import users). It must also be categorized as an ACTIVE
+# query in /queries (elapsed_ms>0), not an idle session, while it streams.
+copy_active_and_survives_idle() { # org password
+  org="$1"; pw="$2"
+  log "COPY FROM STDIN: active in Live + survives idle timeout on $org"
+  out="$(mktemp)"
+  conn="sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake"
+  # 6 chunks of 60 rows with 11s gaps → ~66s total stream, each gap < the 60s
+  # timeout. ON_ERROR_STOP makes a mid-stream reap fail the run (no 360 count).
+  ( printf 'DROP TABLE IF EXISTS e2e_idle_copy;\n'
+    printf 'CREATE TABLE e2e_idle_copy(v TEXT);\n'
+    printf '\\copy e2e_idle_copy(v) FROM STDIN\n'
+    for i in $(seq 1 6); do
+      for j in $(seq 1 60); do printf 'row-%d-%d\n' "$i" "$j"; done
+      sleep 11
+    done
+    printf '\\.\n'
+    printf 'SELECT count(*) FROM e2e_idle_copy;\n'
+    printf 'DROP TABLE e2e_idle_copy;\n'
+  ) | PGPASSWORD="$pw" psql "$conn" -v ON_ERROR_STOP=1 -qtA >"$out" 2>&1 &
+  bg=$!
+  cleanup_copy() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$out"; }
+  # While it streams, /queries must show it as an ACTIVE query (elapsed_ms>0),
+  # not an idle session.
+  active="" a=0
+  while [ "$a" -lt 20 ]; do
+    kill -0 "$bg" 2>/dev/null || break
+    e="$(curl -fsS -H "$H" "$API/api/v1/queries" \
+      | jq -r --arg o "$org" 'first(.queries[]? | select(.org==$o and .user=="root" and (.elapsed_ms>0))) | .elapsed_ms // empty')"
+    [ -n "$e" ] && { active=1; break; }
+    sleep 3; a=$((a + 1))
+  done
+  [ -n "$active" ] || { cleanup_copy; fail "copy_active: streaming COPY not categorized active (elapsed_ms>0) in /queries on $org"; }
+  # It must finish successfully with all 360 rows (NOT reaped mid-stream).
+  wait "$bg"; rc=$?
+  { [ "$rc" -eq 0 ] && grep -qx "360" "$out"; } \
+    || { rm -f "$out"; fail "copy_active: streaming COPY (~66s) did not succeed with 360 rows (rc=$rc): $(tr '\n' ' ' <"$out" | tail -c 300)"; }
+  rm -f "$out"
+  log "COPY FROM STDIN: active in Live + survived idle timeout (360 rows) on $org"
+}
+
 # ---- admin RBAC: SSO viewer is read-only -----------------------------------
 # A forged ALB OIDC header (no internal secret) for an @posthog.com email that
 # is NOT in the operators table resolves to the viewer role (fail-closed
@@ -2028,6 +2074,9 @@ main() {
 
   # ---- connection idle timeout: idle conn reaped, worker freed ----
   conn_idle_timeout_reaps_session "$CNPG" "$cnpg_pw"
+
+  # ---- COPY FROM STDIN survives the idle timeout + shows active ----
+  copy_active_and_survives_idle "$CNPG" "$cnpg_pw"
 
   # ---- per-user kill switch + disable/enable block (cnpg stack is warm) ----
   user_kill_switch   "$CNPG" "$cnpg_pw"
