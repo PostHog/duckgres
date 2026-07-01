@@ -1,0 +1,285 @@
+/*
+ * peepernetes — live cluster node/pod visualizer, ported into the admin console.
+ *
+ * Original is a standalone single-file app that owns the whole <body>. Here it
+ * mounts inside the admin AppShell content area, so every rule is scoped under
+ * `.peeper` (the root the mount code builds its DOM into) and keyframes are
+ * `pn-`-prefixed so nothing leaks into or collides with the surrounding SPA.
+ */
+
+.peeper {
+  --bg: #07090d;
+  --panel: #0d1117;
+  --panel2: #11161d;
+  --line: #1d2630;
+  --line-bright: #2c3a48;
+  --text: #c9d6e2;
+  --dim: #5a6b7c;
+  --worker: #38e1ff;
+  --headroom: #ffb224;
+  --cp: #c08bff;
+  --duckgres: #4ade80;
+  --system: #46525e;
+  --other: #7e8da0;
+  --bad: #ff4d5e;
+  --pend: #ffd166;
+
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.peeper * { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* faint blueprint grid + vignette */
+.peeper::before {
+  content: "";
+  position: absolute; inset: 0; pointer-events: none; z-index: 0;
+  background:
+    radial-gradient(ellipse at 50% -10%, rgba(56,225,255,.05), transparent 60%),
+    repeating-linear-gradient(0deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px),
+    repeating-linear-gradient(90deg, transparent 0 39px, rgba(56,225,255,.025) 39px 40px);
+}
+
+/* ── header ─────────────────────────────────────── */
+.peeper .hdr {
+  position: relative; z-index: 2;
+  display: flex; align-items: flex-start; gap: 28px;
+  padding: 14px 22px 12px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #0c1118, #090d12);
+  flex: none;
+}
+.peeper .brand { display: flex; flex-direction: column; line-height: 1.05; }
+.peeper .brand .t {
+  font-family: "Chakra Petch", "IBM Plex Mono", sans-serif; font-weight: 700; font-size: 21px;
+  letter-spacing: .14em; color: #eaf6ff;
+  text-shadow: 0 0 18px rgba(56,225,255,.35);
+}
+.peeper .brand .t em { color: var(--worker); font-style: normal; }
+.peeper .brand .s { font-size: 10px; color: var(--dim); letter-spacing: .3em; margin-top: 3px; }
+.peeper .stats { display: flex; gap: 24px; margin-left: 18px; align-items: flex-start; margin-top: 2px; }
+.peeper .stat { display: flex; flex-direction: column; align-items: flex-start; min-width: 72px; }
+.peeper .stat .top { display: flex; align-items: baseline; gap: 6px; }
+.peeper .stat .n {
+  font-family: "IBM Plex Mono", monospace; font-weight: 600; font-size: 19px; line-height: 1.1;
+  font-variant-numeric: tabular-nums; transition: color .3s;
+}
+.peeper .stat .l { font-size: 9px; letter-spacing: .22em; color: var(--dim); }
+.peeper .stat .r { font-size: 9px; min-height: 11px; color: var(--dim); margin-top: 2px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.peeper .stat.bump .n { animation: pn-bump .4s ease; }
+@keyframes pn-bump { 30% { transform: translateY(-3px) scale(1.12); } }
+.peeper #n-nodes .n   { color: #eaf6ff; }
+.peeper #n-pods .n { color: var(--worker); }
+.peeper #n-head .n    { color: var(--headroom); }
+.peeper #n-pend .n    { color: var(--pend); }
+.peeper #n-pend.zero .n { color: var(--dim); }
+
+.peeper .spacer { flex: 1; }
+.peeper .toggles { display: flex; gap: 14px; align-items: flex-end; align-self: center; flex-wrap: wrap; }
+.peeper .fctl { display: flex; flex-direction: column; gap: 3px; }
+.peeper .fctl .fl { font-size: 8.5px; letter-spacing: .18em; color: var(--dim); }
+.peeper #ns-filter, .peeper #sys-mode, .peeper #group-by {
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line-bright); border-radius: 4px;
+  font-family: "IBM Plex Mono", monospace; font-size: 11px;
+  padding: 4px 8px; cursor: pointer; max-width: 180px;
+}
+.peeper #ns-filter:hover, .peeper #ns-filter:focus, .peeper #sys-mode:hover, .peeper #sys-mode:focus, .peeper #group-by:hover, .peeper #group-by:focus { border-color: var(--worker); outline: none; }
+.peeper #ns-filter.active { color: var(--worker); border-color: var(--worker); }
+.peeper .pick { position: relative; }
+.peeper .pick > button {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--line-bright);
+  border-radius: 4px; font-family: "IBM Plex Mono", monospace; font-size: 11px;
+  padding: 4px 8px; cursor: pointer;
+}
+.peeper .pick > button:hover { border-color: var(--worker); }
+.peeper .pick > button.active { color: var(--worker); border-color: var(--worker); }
+.peeper .menu {
+  display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 99;
+  background: var(--panel2); border: 1px solid var(--line-bright); border-radius: 6px;
+  padding: 8px 10px; min-width: 200px; box-shadow: 0 8px 24px rgba(0,0,0,.55);
+}
+.peeper .menu.open { display: block; }
+.peeper .menu label { display: flex; gap: 7px; align-items: center; padding: 3px 0; font-size: 11px; color: var(--text); cursor: pointer; white-space: nowrap; }
+.peeper .menu label:hover { color: var(--worker); }
+.peeper .menu input { accent-color: var(--worker); cursor: pointer; }
+.peeper .menu .sep { border-top: 1px solid var(--line); margin: 5px 0; }
+
+.peeper #conn { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: .15em; align-self: center; }
+.peeper #conn .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); transition: background .3s; }
+.peeper #conn.live .dot { background: var(--duckgres); box-shadow: 0 0 10px var(--duckgres); animation: pn-blink 2.4s infinite; }
+.peeper #conn.live span { color: var(--duckgres); }
+.peeper #conn span { color: var(--bad); }
+@keyframes pn-blink { 50% { opacity: .55; } }
+
+/* ── main ───────────────────────────────────────── */
+.peeper .main { position: relative; z-index: 1; flex: 1; overflow-y: auto; padding: 18px 22px 26px; }
+.peeper .main::-webkit-scrollbar { width: 10px; }
+.peeper .main::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 5px; }
+
+.peeper .pool { margin-bottom: 26px; }
+.peeper .pool-head {
+  display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px;
+  font-family: "Chakra Petch", "IBM Plex Mono", sans-serif;
+}
+.peeper .pool-head .name { font-size: 14px; font-weight: 600; letter-spacing: .2em; color: #9fb4c8; text-transform: uppercase; }
+.peeper .pool-head .name.hot { color: var(--worker); text-shadow: 0 0 12px rgba(56,225,255,.4); }
+.peeper .pool-head .count { font-size: 11px; color: var(--dim); font-family: "IBM Plex Mono", monospace; }
+.peeper .pool-head::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--line-bright), transparent); align-self: center; }
+
+.peeper .nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+
+/* node card */
+.peeper .node {
+  background: linear-gradient(180deg, var(--panel2), var(--panel));
+  border: 1px solid var(--line-bright);
+  border-radius: 6px;
+  padding: 11px 12px 12px;
+  position: relative;
+  overflow: hidden;
+  transition: opacity .6s, transform .6s, border-color .4s;
+}
+.peeper .node.fresh { animation: pn-node-in .9s cubic-bezier(.2,1.4,.3,1); }
+.peeper .node.fresh::after {
+  content: ""; position: absolute; inset: 0; border-radius: 6px; pointer-events: none;
+  box-shadow: inset 0 0 0 1px var(--worker), 0 0 26px rgba(56,225,255,.35);
+  animation: pn-flash 2.8s ease forwards;
+}
+@keyframes pn-node-in { from { transform: scale(.85) translateY(14px); opacity: 0; } }
+@keyframes pn-flash { to { opacity: 0; } }
+.peeper .node.dying { opacity: 0; transform: scale(.92) translateY(8px); border-color: var(--bad); }
+.peeper .node.notready { border-color: var(--bad); }
+.peeper .node.draining { border-color: var(--headroom); }
+.peeper .node.gone { opacity: .45; border-color: var(--bad); filter: saturate(.35); }
+/* node status renders inline in the node-exp slot (no overlay badges) */
+.peeper .node-exp.draining { color: var(--headroom); animation: pn-blink 1.4s infinite; }
+.peeper .node-exp.bad { color: var(--bad); animation: pn-blink 1s infinite; }
+.peeper .node-exp.gone { color: var(--bad); animation: none; }
+.peeper .node-top { display: flex; align-items: baseline; gap: 9px; margin-bottom: 7px; }
+.peeper .node-name { font-family: "Chakra Petch", "IBM Plex Mono", sans-serif; font-weight: 600; font-size: 13.5px; color: #dcebf7; letter-spacing: .03em; }
+.peeper .node-meta { font-size: 10px; color: var(--dim); }
+.peeper .node-age { font-size: 10px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.peeper .node-exp { margin-left: auto; font-size: 10px; color: var(--headroom); font-variant-numeric: tabular-nums; letter-spacing: .04em; white-space: nowrap; }
+.peeper .node-exp.due { color: var(--bad); animation: pn-blink 1s infinite; }
+
+.peeper .bars { display: flex; flex-direction: column; gap: 4px; margin-bottom: 9px; }
+.peeper .bar { display: flex; align-items: center; gap: 8px; font-size: 9px; color: var(--dim); }
+.peeper .bar .lbl { width: 26px; letter-spacing: .15em; }
+.peeper .bar .track { flex: 1; height: 4px; background: #161d26; border-radius: 2px; overflow: hidden; }
+.peeper .bar .fill { height: 100%; border-radius: 2px; background: var(--worker); transition: width .7s cubic-bezier(.3,1,.3,1), background .4s; }
+.peeper .bar .fill.warn { background: var(--headroom); }
+.peeper .bar .fill.crit { background: var(--bad); }
+.peeper .bar .val { width: auto; min-width: 86px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.peeper .pods { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; }
+
+/* pod chip */
+.peeper .pod {
+  --c: var(--other);
+  display: flex; flex-direction: column; justify-content: center;
+  border: 1px solid var(--c);
+  border-radius: 4px;
+  padding: 4px 8px 4px 10px;
+  position: relative;
+  background: color-mix(in srgb, var(--c) 9%, transparent);
+  min-width: 0; max-width: 100%;
+  transition: opacity .5s, transform .5s, border-color .3s, background .3s;
+  cursor: default;
+}
+.peeper .pod::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--c); border-radius: 3px 0 0 3px;
+}
+.peeper .pod .pn { font-size: 10.5px; font-weight: 600; color: color-mix(in srgb, var(--c) 75%, white);
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.peeper .node .pod:not(.dot) { flex: 1 1 calc(50% - 3px); max-width: calc(50% - 3px); }
+/* free-space ghost (real-size mode): hatched unrequested remainder */
+.peeper .pod.free {
+  --c: var(--dim);
+  border-style: dashed; opacity: .55; flex: 1 1 calc(50% - 3px); min-width: 56px;
+  background: repeating-linear-gradient(45deg, transparent 0 7px, rgba(122,140,160,.08) 7px 14px);
+}
+.peeper .pod.free::before { display: none; }
+.peeper .pod.free .pn { color: var(--dim); font-style: italic; font-weight: 400; }
+.peeper #tray .pod:not(.dot) { flex: 0 0 150px; max-width: 150px; }
+.peeper .pods.flat .pod:not(.dot) { flex: 0 0 150px; max-width: 150px; }
+.peeper .pod.dot { flex: 0 0 auto; }
+.peeper .pod .pm { font-size: 9px; color: var(--dim); white-space: nowrap; }
+.peeper .pod.fresh { animation: pn-pod-in .55s cubic-bezier(.2,1.6,.4,1); }
+@keyframes pn-pod-in { from { transform: scale(.4); opacity: 0; } 60% { transform: scale(1.08); } }
+.peeper .pod.fresh::after {
+  content: ""; position: absolute; inset: -1px; border-radius: 4px; pointer-events: none;
+  box-shadow: 0 0 16px var(--c); animation: pn-flash 1.6s ease forwards;
+}
+.peeper .pod.dying { opacity: 0; transform: scale(.6); border-color: var(--bad); }
+.peeper .pod.terminating { border-style: dashed; animation: pn-blink 1.1s infinite; overflow: visible; }
+.peeper .pod.terminating::after {
+  content: "TERMINATING";
+  position: absolute; top: 0; left: 50%; transform: translate(-50%, -50%);
+  font-size: 8px; font-weight: 600; letter-spacing: .14em; line-height: 1.3;
+  color: var(--bad); background: var(--panel);
+  padding: 0 5px; white-space: nowrap; pointer-events: none;
+}
+.peeper .pod.pending {
+  background: repeating-linear-gradient(45deg, transparent 0 6px, color-mix(in srgb, var(--c) 14%, transparent) 6px 12px);
+  background-size: 200% 200%;
+  animation: pn-crawl 1.2s linear infinite;
+}
+@keyframes pn-crawl { to { background-position: -17px 0; } }
+.peeper .pod.failed { --c: var(--bad) !important; }
+
+.peeper .pod.k-app       { /* --c set inline per deployment */ }
+.peeper .pod.k-headroom  { --c: var(--headroom); opacity: .8; border-style: dashed; border-left: 1px solid transparent; }
+.peeper .pod.k-headroom::before { background: repeating-linear-gradient(180deg, var(--headroom) 0 4px, transparent 4px 8px); }
+.peeper .pod.k-system    { --c: var(--system); opacity: .65; }
+
+/* collapsed daemonset/system pod: tiny dot, full info on hover */
+.peeper .pod.dot { min-width: 0; width: 12px; height: 12px; padding: 0; border-radius: 50%; align-self: center; transition: transform .15s; }
+.peeper .pod.dot::before { display: none; }
+.peeper .pod.dot .pn, .peeper .pod.dot .pm { display: none; }
+.peeper .pod.dot:hover { transform: scale(1.7); opacity: 1; }
+
+/* unscheduled tray */
+.peeper #tray { margin-bottom: 26px; display: none; }
+.peeper #tray.show { display: block; }
+.peeper #tray .pool-head .name { color: var(--pend); text-shadow: 0 0 12px rgba(255,209,102,.35); }
+.peeper #tray .pods {
+  border: 1px dashed color-mix(in srgb, var(--pend) 45%, transparent);
+  border-radius: 6px; padding: 10px;
+  background: rgba(255,209,102,.04);
+}
+
+/* ── event ticker ───────────────────────────────── */
+.peeper #ticker {
+  flex: none; height: 138px; border-top: 1px solid var(--line);
+  background: #090c10; position: relative; z-index: 2;
+  display: flex; flex-direction: column;
+}
+.peeper #ticker .th {
+  font-family: "Chakra Petch", "IBM Plex Mono", sans-serif; font-size: 10px; letter-spacing: .3em;
+  color: var(--dim); padding: 7px 22px 4px;
+}
+.peeper #events { flex: 1; overflow-y: auto; padding: 0 22px 8px; }
+.peeper #events::-webkit-scrollbar { width: 8px; }
+.peeper #events::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 4px; }
+.peeper .ev { display: flex; gap: 12px; font-size: 11px; line-height: 1.75; white-space: nowrap; animation: pn-ev-in .3s ease; }
+@keyframes pn-ev-in { from { opacity: 0; transform: translateY(-4px); } }
+.peeper .ev .t { color: var(--dim); font-variant-numeric: tabular-nums; }
+.peeper .ev .a { min-width: 64px; flex: none; font-weight: 600; }
+.peeper .ev.add .a { color: var(--duckgres); }
+.peeper .ev.del .a { color: var(--bad); }
+.peeper .ev.mod .a { color: var(--dim); }
+.peeper .ev.rsn .a { color: var(--headroom); }
+.peeper .ev .o { color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+.peeper .ev .o b { font-weight: 600; }
+
+/* legend */
+.peeper #legend { display: flex; gap: 16px; padding: 4px 22px 8px; font-size: 9.5px; color: var(--dim); letter-spacing: .08em; flex-wrap: wrap; }
+.peeper #legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }

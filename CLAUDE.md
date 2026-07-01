@@ -308,7 +308,8 @@ Invariants for anyone touching this path:
 
 `controlplane/admin/` serves a React admin console + REST API on `:8080` — the
 operate-everything surface (metrics, live queries/sessions/connections, worker
-fleet, full config store, user impersonation, audit log; sliceable by org +
+fleet, live cluster node/pod topology, full config store, user impersonation,
+audit log; sliceable by org +
 user). Design + decisions: `docs/design/admin-ui.md`; package details:
 `controlplane/admin/README.md`. Exposed VPC-privately via an internal-scheme ALB
 + Cognito (Google SSO) behind Tailscale (charts: `ingress-admin.yaml`). Invariants:
@@ -375,6 +376,36 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   - Kill must be **scoped to the target user** — never tear down another user's
     sessions on the shared org stack (the regression the e2e asserts with a
     concurrent root query that must survive).
+- **Live Nodes view** (`ui/src/pages/Nodes.tsx` + `pages/nodes/peepernetes.{ts,css}`,
+  a port of the standalone peepernetes visualizer): a full-bleed, animated
+  cluster node/pod TV — nodes grouped by karpenter nodepool (or by namespace /
+  deployment), CPU/MEM request bars, pod chips colored per deployment,
+  placeholder/system-pod classification, Karpenter empty-node reclaim countdown,
+  unscheduled tray, and a synthesized event ticker. It's imperative DOM (mounted
+  by the React page into a `.peeper` root, scoped CSS + `pn-`-prefixed keyframes)
+  and does NOT use native K8s watch — the browser can't reach the API, so it
+  POLLS four **read-only** projected endpoints (`server/`-free; `cluster.go`):
+  `GET /cluster/{nodes,pods,events}` project the in-cluster objects down to the
+  minimal K8s-shaped subset the view reads (annotations trimmed to
+  `kubernetes.io/config.mirror`; no raw objects), and `GET /cluster/nodepools`
+  proxies the karpenter NodePool CRD (v1→v1beta1, degrading to an empty list when
+  karpenter is absent). Backed by the shared K8s pool's clientset
+  (`Extras.ClusterClient`, nil on non-k8s backends → routes unregistered). All
+  four are GETs so RoleGate admits viewers; there is no mutation path. **RBAC:**
+  these reads are cluster-scoped / cross-namespace, which the CP's in-namespace
+  Role doesn't cover — the grant lives on its own `duckgres-control-plane-cluster-topology`
+  ClusterRole in the `charts` repo (`charts/duckgres/templates/rbac.yaml`), bound
+  to the CP SA. It's a *separate* role (not folded into `duckgres-duckling-reader`)
+  so binding duckling-reader elsewhere doesn't drag these broader reads along and
+  trip RBAC escalation-prevention. When the ClusterRole is absent the handlers
+  **degrade a Forbidden to an empty `{items:[]}` (200)** and log a warning, so the
+  view shows nothing rather than 500ing — the e2e CP hits exactly this path (its
+  SA can't be granted cluster-scoped RBAC from CI), so `admin_console_api` only
+  asserts the `{items:[...]}` envelope; projection shape is covered by
+  `cluster_test.go`. Touching
+  the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
+  and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
+  (`tests/e2e-mw-dev/harness.sh`).
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
   `authz_test.go`, `kill_switch_test.go`), `controlplane/session_mgr_test.go`
   (`TestDestroySessionsForUser`), `controlplane/configstore/store_test.go`

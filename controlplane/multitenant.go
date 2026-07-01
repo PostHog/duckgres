@@ -19,6 +19,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
+	"k8s.io/client-go/kubernetes"
 )
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
@@ -530,14 +531,21 @@ func SetupMultiTenant(
 	)
 	admin.RegisterAPI(api, store, adpt, liveFetcher)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// Node-overview topology reads reuse the shared K8s pool's in-cluster
+	// clientset (nil when there's no shared pool — leaves those routes off).
+	var clusterClient kubernetes.Interface
+	if router.sharedPool != nil {
+		clusterClient = router.sharedPool.clientset
+	}
 	admin.RegisterExtras(api, admin.Extras{
-		Store:        store,
-		Live:         clusterInfo,
-		Users:        store,
-		Fetcher:      liveFetcher,
-		Impersonator: imp,
-		Audit:        auditStore,
-		Metrics:      metricsProxy,
+		Store:         store,
+		Live:          clusterInfo,
+		Users:         store,
+		Fetcher:       liveFetcher,
+		Impersonator:  imp,
+		Audit:         auditStore,
+		Metrics:       metricsProxy,
+		ClusterClient: clusterClient,
 	})
 
 	// Live Duckling drift finder. Reuse the in-cluster Duckling client built

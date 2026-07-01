@@ -8,6 +8,7 @@ import { Orgs } from "@/pages/Orgs";
 import { OrgDetail } from "@/pages/OrgDetail";
 import { UsersPage } from "@/pages/Users";
 import { Live } from "@/pages/Live";
+import { Nodes } from "@/pages/Nodes";
 import { Workers } from "@/pages/Workers";
 import { Metrics } from "@/pages/Metrics";
 import { ConfigStore } from "@/pages/ConfigStore";
@@ -30,6 +31,7 @@ export default function App() {
         <Route path="/orgs/:id" element={<OrgDetail />} />
         <Route path="/users" element={<UsersPage />} />
         <Route path="/live" element={<Live />} />
+        <Route path="/nodes" element={<Nodes />} />
         <Route path="/workers" element={<Workers />} />
         <Route path="/metrics" element={<Metrics />} />
         <Route path="/configstore" element={<ConfigStore />} />
