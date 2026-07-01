@@ -61,6 +61,7 @@ Added for the console:
 | `GET /api/v1/me` | any | caller identity + role (SPA tailors its UI) |
 | `GET /api/v1/queries` | viewer | running queries w/ progress, `?org=&user=` slicing |
 | `GET /api/v1/queries/by-worker/:wid` | viewer | one query's detail: redacted SQL text + conn metadata + progress, addressed by cluster-unique worker id (pid is per-org, not unique). Scatter-gathers like `/queries` — checks locally, else fans out to peer CPs (`?scope=local` guard); 404 only if no replica owns the worker |
+| `GET /api/v1/errors` | viewer | recent redacted query errors (live-triage ring, newest-first), `?org=&user=&sqlstate=&category=&limit=` slicing. Fans out + merges across CPs (each error belongs to one CP — disjoint, no dedup). `query`/`message` redacted server-side |
 | `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
 | `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
 | `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |
@@ -82,7 +83,7 @@ Added for the console:
 Live session/query state is **in-memory per CP** — each replica only knows the
 sessions it owns. Behind the load-balancer that made the dashboard's numbers
 flicker as polls landed on different pods. The session/query endpoints
-(`/queries`, `/sessions`, `/workers`, `/status`) **fan out**: the serving CP
+(`/queries`, `/errors`, `/sessions`, `/workers`, `/status`) **fan out**: the serving CP
 discovers its peer CP pods (K8s pod list, name-prefix match), GETs each peer's
 `?scope=local` view (the recursion guard — a peer returns only its own slice)
 with the internal secret, and concatenates (a session is owned by exactly one

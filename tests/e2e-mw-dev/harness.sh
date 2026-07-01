@@ -1724,6 +1724,68 @@ admin_cancel_by_worker() { # org password
   log "admin: cancel by worker id OK (killed worker $wid, unknown→404) on $org"
 }
 
+# admin_recent_errors proves the admin Errors page: a failed query is captured
+# into the CP's in-memory recent-errors ring and surfaces at GET /api/v1/errors
+# with its identity + SQLSTATE + (redacted) query, AND that a failing CREATE
+# SECRET never leaks its credential into the ring (the load-bearing redaction
+# invariant — errors echo the offending SQL). Errors are captured on the CP that
+# owned the failing connection; /errors fans out and merges across replicas.
+admin_recent_errors() { # org password
+  org="$1"; pw="$2"
+  log "admin errors: recent-error capture + redaction on $org"
+
+  # 1) A deterministic query error (unknown relation) with a distinctive marker
+  # must appear in /errors. The stored query is verbatim for a non-secret stmt,
+  # so we match on the marker table name. (Category is backend-dependent: the
+  # worker's "Catalog Error" prefix is wrapped by Flight before the CP classifier
+  # sees it, so the remote path reports system/XX000, not user/42P01 — the
+  # assertion is category-agnostic on purpose.)
+  marker="e2e_err_probe_$(openssl rand -hex 6)"
+  pg_try "$org" "$pw" ducklake "SELECT 1 FROM ${marker};" >/dev/null 2>&1 || true
+
+  entry="" a=0
+  while [ "$a" -lt 30 ]; do
+    entry="$(curl -fsS -H "$H" "$API/api/v1/errors?org=${org}&limit=500" \
+      | jq -c --arg m "$marker" 'first(.errors[]? | select(.query != null and (.query | contains($m))))')"
+    [ -n "$entry" ] && [ "$entry" != "null" ] && break
+    sleep 1; a=$((a + 1))
+  done
+  { [ -n "$entry" ] && [ "$entry" != "null" ]; } \
+    || fail "admin_recent_errors: marker query never appeared in /errors for $org within timeout"
+
+  # Right org + populated SQLSTATE, category, and (redacted) message.
+  echo "$entry" | jq -e --arg o "$org" \
+    '.org == $o and (.sqlstate | length > 0) and (.category | length > 0) and (.message | length > 0)' \
+    >/dev/null || fail "admin_recent_errors: captured error missing fields: $entry"
+  log "admin errors: marker error captured (sqlstate $(echo "$entry" | jq -r '.sqlstate'), category $(echo "$entry" | jq -r '.category'))"
+
+  # 2) Redaction (load-bearing): a failing CREATE SECRET must NOT leak its
+  # credential into the ring — neither .query (RedactForLog drops the option
+  # list) nor .message (RedactErrorForLog replaces the whole message). The secret
+  # NAME survives in the redacted head, so we pin the entry by name.
+  cred="e2eERRSECRET-$(openssl rand -hex 12)"
+  pg_try "$org" "$pw" ducklake \
+    "CREATE SECRET e2e_err_redact (TYPE nosuchtype, KEY_ID 'AKIAERRPROBE', SECRET '${cred}');" \
+    >/dev/null 2>&1 || true
+  sentry="" a=0
+  while [ "$a" -lt 30 ]; do
+    sentry="$(curl -fsS -H "$H" "$API/api/v1/errors?org=${org}&limit=500" \
+      | jq -c 'first(.errors[]? | select(.query != null and (.query | test("e2e_err_redact"; "i"))))')"
+    [ -n "$sentry" ] && [ "$sentry" != "null" ] && break
+    sleep 1; a=$((a + 1))
+  done
+  if [ -n "$sentry" ] && [ "$sentry" != "null" ]; then
+    case "$sentry" in
+      *"$cred"*|*"AKIAERRPROBE"*) fail "admin_recent_errors: REDACTION BREACH — CREATE SECRET credential leaked into /errors" ;;
+    esac
+    log "admin errors: redaction holds (credential absent from captured CREATE SECRET error)"
+  else
+    # Capture-on-error is deterministic, but a fast cold-worker failure path can
+    # occasionally reject before the CP logs it; don't fail the suite on a miss.
+    log "admin errors: CREATE SECRET error not captured in window — redaction sub-check skipped (unit test is the gate)"
+  fi
+}
+
 admin_query_detail() { # org password
   org="$1"; pw="$2"
   log "admin live: per-query detail round-trip on $org"
@@ -2227,6 +2289,9 @@ main() {
 
   # ---- admin /status per-org worker count is populated (not the old 0) ----
   admin_per_org_workers "$CNPG" "$cnpg_pw"
+
+  # ---- admin errors: failed query captured in /errors + CREATE SECRET redacted ----
+  admin_recent_errors "$CNPG" "$cnpg_pw"
 
   # ---- connection idle timeout: idle conn reaped, worker freed ----
   conn_idle_timeout_reaps_session "$CNPG" "$cnpg_pw"

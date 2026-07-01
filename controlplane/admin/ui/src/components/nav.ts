@@ -1,5 +1,6 @@
 import {
   Activity,
+  AlertTriangle,
   Building2,
   Database,
   GaugeCircle,
@@ -26,6 +27,7 @@ export const NAV: NavItem[] = [
   { to: "/orgs", label: "Organizations", icon: Building2 },
   { to: "/users", label: "Users", icon: Users },
   { to: "/live", label: "Live", icon: Activity },
+  { to: "/errors", label: "Errors", icon: AlertTriangle },
   { to: "/nodes", label: "Nodes", icon: Network },
   { to: "/workers", label: "Workers", icon: Server },
   { to: "/metrics", label: "Metrics", icon: LineChart },

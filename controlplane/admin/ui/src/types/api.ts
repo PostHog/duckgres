@@ -329,6 +329,33 @@ export interface QueryDetail {
   stalled: boolean;
 }
 
+// ErrorEntry is one recent failed query for the Errors page. query + message are
+// redacted server-side (a CREATE SECRET error never carries the credential).
+export interface ErrorEntry {
+  time: string; // RFC3339
+  org: string;
+  user: string;
+  pid: number;
+  worker_id: number;
+  worker_pod: string;
+  sqlstate: string; // Postgres SQLSTATE (e.g. 42P01)
+  category: string; // "user" | "system" | "conflict" | "metadata_connection_lost"
+  message: string; // redacted
+  query: string; // redacted
+  client_addr: string;
+  trace_id: string;
+}
+
+// Optional slicing for the Errors list (all applied server-side after the
+// cross-CP merge).
+export interface ErrorFilters {
+  org?: string;
+  user?: string;
+  sqlstate?: string;
+  category?: string;
+  limit?: number;
+}
+
 // ---- Metrics (raw Prometheus / VictoriaMetrics) ----
 
 // GET /api/v1/metrics/panels → { panels: string[], configured: boolean }.

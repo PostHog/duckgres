@@ -307,10 +307,10 @@ Invariants for anyone touching this path:
 ## Admin Console (VPC-private web UI, `kubernetes` tag)
 
 `controlplane/admin/` serves a React admin console + REST API on `:8080` — the
-operate-everything surface (metrics, live queries/sessions/connections, worker
-fleet, live cluster node/pod topology, full config store, user impersonation,
-audit log; sliceable by org +
-user). Design + decisions: `docs/design/admin-ui.md`; package details:
+operate-everything surface (metrics, live queries/sessions/connections, recent
+errors, worker fleet, live cluster node/pod topology, full config store, user
+impersonation, audit log; sliceable by org + user). Design + decisions:
+`docs/design/admin-ui.md`; package details:
 `controlplane/admin/README.md`. Exposed VPC-privately via an internal-scheme ALB
 + Cognito (Google SSO) behind Tailscale (charts: `ingress-admin.yaml`). Invariants:
 
@@ -354,6 +354,17 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   AutoMigrate.
 - `ManagedSession.Username` is populated at session create so the console can
   slice live sessions/queries by user; keep it set on every create path.
+- **Errors page is a redacted, in-memory live-triage buffer** — NOT durable
+  history. Every failed query is captured into a bounded per-server ring
+  (`server/recent_errors.go`, `DefaultRecentErrorCap=500`) at the single
+  `logQueryError` tap (`server/conn.go`), surfaced at `GET /api/v1/errors` and
+  merged across CP replicas by `PeerFetcher.FetchPeers` (each error belongs to
+  exactly one CP — disjoint union, no worker-id dedup; sorted newest-first, then
+  capped). The ring stores ONLY the redacted forms: `Query` via
+  `RedactForLog`, `Message` via `RedactErrorForLog` — a failed CREATE SECRET
+  must never leak its credential into the ring. Keep the capture behind those
+  redactors; long-term error history lives in the external query-log pipeline
+  (Kafka sink), not here.
 - **Per-user kill switch** (`live.go` routes + `admin_providers.go` +
   `session_mgr.go::DestroySessionsForUser` + `configstore` `disabled` column):
   - `POST …/users/:username/kill` is a **one-shot** terminate — it tears down all

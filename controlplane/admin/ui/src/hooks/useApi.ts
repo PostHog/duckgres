@@ -17,6 +17,8 @@ import type {
   ClusterStatus,
   CreateUserBody,
   DucklingDriftResponse,
+  ErrorEntry,
+  ErrorFilters,
   FleetStat,
   ImpersonateBody,
   ManagedWarehouse,
@@ -261,6 +263,18 @@ export function useSessions() {
     queryKey: ["sessions"],
     queryFn: () => tolerate404<SessionStatus[]>([])(api.listSessions()),
     refetchInterval: POLL.fast,
+  });
+}
+
+// Recent redacted query errors for the Errors page. Filters are applied
+// server-side (after the cross-CP merge) and are part of the query key so a
+// filter change refetches. Polls at the normal cadence — errors accrete slower
+// than live queries.
+export function useErrors(filters: ErrorFilters) {
+  return useQuery<ErrorEntry[]>({
+    queryKey: ["errors", filters],
+    queryFn: () => tolerate404<ErrorEntry[]>([])(api.listErrors(filters)),
+    refetchInterval: POLL.normal,
   });
 }
 
