@@ -456,6 +456,7 @@ type apiHandler struct {
 type managedWarehouseRequest struct {
 	Image                        string                                        `json:"image"`
 	DuckLakeVersion              string                                        `json:"ducklake_version"`
+	DucklingName                 string                                        `json:"duckling_name"`
 	WarehouseDatabase            configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
 	MetadataStore                configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
 	PgBouncer                    configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
@@ -817,6 +818,9 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		// `{"metadata_store":{"database_name":"x"}}`) without wiping siblings.
 		if err := json.Unmarshal(body, w); err != nil {
 			return warehouseBadRequestError{err}
+		}
+		if w.DucklingName == "" {
+			return warehouseBadRequestError{errors.New("duckling_name cannot be empty")}
 		}
 		cfgView := &configstore.ManagedWarehouseConfig{
 			OrgID:                        orgID,

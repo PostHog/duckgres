@@ -274,6 +274,10 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		// we inline it rather than import provisioner into this package.
 		DucklingName: strings.ToLower(orgID),
 	}
+	if warehouse.DucklingName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "duckling_name is required"})
+		return
+	}
 	if icebergEnabled {
 		warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
 			Enabled:   true,

@@ -29,7 +29,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 9)
 	requireGooseMigrationRecorded(t, db, 10)
 	requireGooseMigrationRecorded(t, db, 11)
-	requireGooseLatestVersion(t, db, 11)
+	requireGooseMigrationRecorded(t, db, 12)
+	requireGooseLatestVersion(t, db, 12)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000007 added the compute-usage billing buffer + drain state.
@@ -82,7 +83,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
 			ALTER TABLE duckgres_orgs ADD COLUMN IF NOT EXISTS max_connections BIGINT DEFAULT 0;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11);
+			ALTER TABLE duckgres_managed_warehouses ALTER COLUMN duckling_name DROP NOT NULL;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -104,7 +106,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 9)
 	requireGooseMigrationRecorded(t, upgradedDB, 10)
 	requireGooseMigrationRecorded(t, upgradedDB, 11)
-	requireGooseLatestVersion(t, upgradedDB, 11)
+	requireGooseMigrationRecorded(t, upgradedDB, 12)
+	requireGooseLatestVersion(t, upgradedDB, 12)
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")

@@ -288,14 +288,16 @@ function WarehousePanel({
   const update = useUpdateWarehouse(orgId);
   const [image, setImage] = useState("");
   const [version, setVersion] = useState("");
+  const [ducklingNameInput, setDucklingNameInput] = useState("");
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
 
   useEffect(() => {
     if (data) {
       setImage(data.image ?? "");
       setVersion(data.ducklake_version ?? "");
+      setDucklingNameInput(data.duckling_name || ducklingName(orgId));
     }
-  }, [data]);
+  }, [data, orgId]);
 
   const notFound = error instanceof ApiError && error.status === 404;
   const missing = notFound || !data;
@@ -308,10 +310,20 @@ function WarehousePanel({
         ? `Duckling unhealthy (state: ${data?.state})`
         : null;
 
+  const ducklingNameEmpty = ducklingNameInput.trim() === "";
+
   const save = async () => {
     setMsg(null);
+    if (ducklingNameEmpty) {
+      setMsg({ kind: "err", text: "Duckling name is required." });
+      return;
+    }
     try {
-      await update.mutateAsync({ image, ducklake_version: version });
+      await update.mutateAsync({
+        image,
+        ducklake_version: version,
+        duckling_name: ducklingNameInput,
+      });
       setMsg({ kind: "ok", text: "Saved." });
     } catch (e) {
       setMsg({ kind: "err", text: e instanceof Error ? e.message : "Save failed" });
@@ -374,6 +386,13 @@ function WarehousePanel({
             {/* Editable pinning */}
             <div className="space-y-3 border-t border-border pt-3">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Pinning</p>
+              <Field label="Duckling name">
+                <Input
+                  value={ducklingNameInput}
+                  onChange={(e) => setDucklingNameInput(e.target.value)}
+                  className="font-mono text-xs"
+                />
+              </Field>
               <Field label="Worker image">
                 <Input value={image} onChange={(e) => setImage(e.target.value)} className="font-mono text-xs" />
               </Field>
@@ -387,7 +406,7 @@ function WarehousePanel({
               </Field>
               <div className="flex items-center gap-3">
                 <AdminGate>
-                  <Button size="sm" onClick={save} disabled={update.isPending}>
+                  <Button size="sm" onClick={save} disabled={update.isPending || ducklingNameEmpty}>
                     <Save className="h-4 w-4" /> {update.isPending ? "Saving…" : "Save warehouse"}
                   </Button>
                 </AdminGate>
