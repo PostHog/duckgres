@@ -10,10 +10,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // clusterTestRouter mounts the cluster-topology endpoints on a fresh gin engine
@@ -190,6 +193,25 @@ func TestClusterEventsProjection(t *testing.T) {
 	io := evOut["involvedObject"].(map[string]any)
 	if io["kind"] != "Pod" || io["name"] != "worker-abc" {
 		t.Errorf("involvedObject wrong: %v", io)
+	}
+}
+
+// TestClusterNodesForbiddenDegradesToEmpty asserts an RBAC Forbidden from the
+// API server yields a 200 empty list (not a 500) — the view shows nothing rather
+// than erroring when the cluster-topology ClusterRole isn't granted (e.g. the
+// e2e CP, whose SA can't be given cluster-scoped reads).
+func TestClusterNodesForbiddenDegradesToEmpty(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "nodes"}, "", nil)
+	})
+	gin.SetMode(gin.TestMode)
+	e := gin.New()
+	registerClusterAPI(e.Group("/api/v1"), cs)
+	body := getJSON(t, e, "/api/v1/cluster/nodes")
+	items, ok := body["items"].([]any)
+	if !ok || len(items) != 0 {
+		t.Fatalf("nodes (forbidden): got %v, want 200 empty items list", body)
 	}
 }
 

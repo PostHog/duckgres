@@ -393,12 +393,16 @@ user). Design + decisions: `docs/design/admin-ui.md`; package details:
   (`Extras.ClusterClient`, nil on non-k8s backends → routes unregistered). All
   four are GETs so RoleGate admits viewers; there is no mutation path. **RBAC:**
   these reads are cluster-scoped / cross-namespace, which the CP's in-namespace
-  Role doesn't cover — the grant lives on the CP's always-bound cluster role
-  (`duckgres-duckling-reader` in the `charts` repo, `charts/duckgres/templates/rbac.yaml`).
-  The e2e CI deployer can only *bind* to that pre-existing ClusterRole (it can't
-  create ClusterRoles), and `manifests.tmpl.yaml` already binds the CI SA to it,
-  so the e2e's `/cluster/*` checks go green once the charts change is deployed to
-  the shared cluster. Touching
+  Role doesn't cover — the grant lives on its own `duckgres-control-plane-cluster-topology`
+  ClusterRole in the `charts` repo (`charts/duckgres/templates/rbac.yaml`), bound
+  to the CP SA. It's a *separate* role (not folded into `duckgres-duckling-reader`)
+  so binding duckling-reader elsewhere doesn't drag these broader reads along and
+  trip RBAC escalation-prevention. When the ClusterRole is absent the handlers
+  **degrade a Forbidden to an empty `{items:[]}` (200)** and log a warning, so the
+  view shows nothing rather than 500ing — the e2e CP hits exactly this path (its
+  SA can't be granted cluster-scoped RBAC from CI), so `admin_console_api` only
+  asserts the `{items:[...]}` envelope; projection shape is covered by
+  `cluster_test.go`. Touching
   the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
   and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
   (`tests/e2e-mw-dev/harness.sh`).

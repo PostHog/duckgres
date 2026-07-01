@@ -3,11 +3,13 @@
 package admin
 
 import (
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -178,10 +180,26 @@ func resourceStrings(rl corev1.ResourceList) map[string]string {
 	return out
 }
 
+// clusterListError renders a topology-list error. An RBAC Forbidden degrades to
+// an empty {items:[]} (200) — the view shows nothing rather than erroring — and
+// logs once so a missing ClusterRole is visible in operator logs. Any other
+// error is a real 500. This keeps the read-only view robust when the
+// duckgres-control-plane-cluster-topology ClusterRole hasn't been granted (e.g.
+// the e2e CP, whose SA can't be given cluster-scoped reads).
+func clusterListError(c *gin.Context, resource string, err error) {
+	if apierrors.IsForbidden(err) {
+		slog.Warn("admin: cluster topology read forbidden — grant the duckgres-control-plane-cluster-topology ClusterRole",
+			"resource", resource, "error", err)
+		c.JSON(http.StatusOK, gin.H{"items": []any{}})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+}
+
 func (h *clusterHandler) nodes(c *gin.Context) {
 	list, err := h.client.CoreV1().Nodes().List(c.Request.Context(), metav1.ListOptions{Limit: clusterNodeLimit})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		clusterListError(c, "nodes", err)
 		return
 	}
 	items := make([]nodeProj, 0, len(list.Items))
@@ -213,7 +231,7 @@ func (h *clusterHandler) nodes(c *gin.Context) {
 func (h *clusterHandler) pods(c *gin.Context) {
 	list, err := h.client.CoreV1().Pods(metav1.NamespaceAll).List(c.Request.Context(), metav1.ListOptions{Limit: clusterPodLimit})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		clusterListError(c, "pods", err)
 		return
 	}
 	items := make([]podProj, 0, len(list.Items))
@@ -241,7 +259,7 @@ func (h *clusterHandler) pods(c *gin.Context) {
 func (h *clusterHandler) events(c *gin.Context) {
 	list, err := h.client.CoreV1().Events(metav1.NamespaceAll).List(c.Request.Context(), metav1.ListOptions{Limit: clusterEventLimit})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		clusterListError(c, "events", err)
 		return
 	}
 	items := make([]eventProj, 0, len(list.Items))
