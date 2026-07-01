@@ -5,20 +5,31 @@ import { AlertTriangle, Building2, Search } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { DataTable } from "@/components/DataTable";
 import { Input } from "@/components/ui/input";
-import { Badge, type BadgeProps } from "@/components/ui/badge";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { StateBadge } from "@/components/StateBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useDucklingDrift, useOrgs } from "@/hooks/useApi";
-import { ducklingBroken, ducklingName, fmtInt } from "@/lib/format";
-import type { DucklingDrift, DucklingDriftIssue, Org } from "@/types/api";
+import { ducklingName, fmtInt } from "@/lib/format";
+import type { DucklingDrift, Org } from "@/types/api";
 
 export function Orgs() {
   const orgs = useOrgs();
   const drift = useDucklingDrift();
   const navigate = useNavigate();
   const [filter, setFilter] = useState("");
+
+  // Live drift keyed by org, so a row whose config state is "ready" but whose
+  // Duckling CR is actually missing still gets flagged (config state alone
+  // can't see that).
+  const driftByOrg = useMemo(() => {
+    const m = new Map<string, DucklingDrift>();
+    for (const e of drift.data?.entries ?? []) {
+      if (e.org) m.set(e.org, e);
+    }
+    return m;
+  }, [drift.data]);
 
   const columns = useMemo<ColumnDef<Org, any>[]>(
     () => [
@@ -69,16 +80,19 @@ export function Orgs() {
         cell: ({ row }) => {
           const o = row.original;
           if (!o.warehouse) return <Badge variant="muted">none</Badge>;
-          const broken = ducklingBroken(o.warehouse.state);
+          // Warning is fed from the live drift result (same source as the
+          // banner), NOT config state — so a ready-but-CR-missing row still
+          // flags here. Kept next to the status badge for easy scanning.
+          const d = driftByOrg.get(o.name);
           return (
             <div className="flex items-center gap-1.5">
               <StateBadge state={o.warehouse.state} />
-              {broken && (
+              {d && (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <AlertTriangle className="h-4 w-4 text-warning" />
                   </TooltipTrigger>
-                  <TooltipContent>Duckling unhealthy (state: {o.warehouse.state})</TooltipContent>
+                  <TooltipContent>{d.message}</TooltipContent>
                 </Tooltip>
               )}
             </div>
@@ -91,28 +105,12 @@ export function Orgs() {
         accessorFn: (o) => (o.warehouse ? o.warehouse.duckling_name || ducklingName(o.name) : ""),
         cell: ({ row }) => {
           const o = row.original;
-          if (!o.warehouse) {
-            return (
-              <div className="flex items-center gap-1.5">
-                <span className="text-muted-foreground">—</span>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <AlertTriangle className="h-4 w-4 text-warning" />
-                  </TooltipTrigger>
-                  <TooltipContent>No duckling provisioned for this org</TooltipContent>
-                </Tooltip>
-              </div>
-            );
-          }
-          return (
-            <span className="font-mono text-xs text-muted-foreground">
-              {o.warehouse.duckling_name || ducklingName(o.name)}
-            </span>
-          );
+          const name = o.warehouse ? o.warehouse.duckling_name || ducklingName(o.name) : "";
+          return <span className="font-mono text-xs text-muted-foreground">{name || "—"}</span>;
         },
       },
     ],
-    [],
+    [driftByOrg],
   );
 
   return (
@@ -164,15 +162,60 @@ export function Orgs() {
   );
 }
 
-// missing/orphan are hard breaks (a row or CR is absent) → destructive;
-// not_ready/state_mismatch are transient/soft drift → warning.
-const ISSUE_VARIANT: Record<DucklingDriftIssue, BadgeProps["variant"]> = {
-  missing: "destructive",
-  orphan: "destructive",
-  not_ready: "warning",
-  state_mismatch: "warning",
-  check_error: "destructive",
-};
+
+function DriftRow({ e, onOpenOrg }: { e: DucklingDrift; onOpenOrg: (org: string) => void }) {
+  const label = e.org || e.duckling_name || "orphan";
+  const inner = (
+    <>
+      <span className="shrink-0 font-mono text-xs font-medium" title={label}>
+        {label}
+      </span>
+      <span className="flex-1 truncate text-xs text-muted-foreground" title={e.message}>
+        {e.message || "—"}
+      </span>
+      {e.warehouse_state && (
+        <span className="shrink-0 font-mono text-xs text-muted-foreground">{e.warehouse_state}</span>
+      )}
+    </>
+  );
+  const className =
+    "flex items-center justify-between gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-1.5";
+  return e.org !== "" ? (
+    <button
+      type="button"
+      onClick={() => onOpenOrg(e.org)}
+      className={`${className} w-full text-left hover:bg-background/70`}
+    >
+      {inner}
+    </button>
+  ) : (
+    <div className={className}>{inner}</div>
+  );
+}
+
+function DriftGroup({
+  title,
+  entries,
+  onOpenOrg,
+}: {
+  title: string;
+  entries: DucklingDrift[];
+  onOpenOrg: (org: string) => void;
+}) {
+  if (entries.length === 0) return null;
+  return (
+    <div className="space-y-1">
+      <div className="px-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        {title} ({entries.length})
+      </div>
+      <div className="max-h-56 space-y-1 overflow-y-auto">
+        {entries.map((e, i) => (
+          <DriftRow key={`${e.org}:${e.duckling_name}:${i}`} e={e} onOpenOrg={onOpenOrg} />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function DriftBanner({
   entries,
@@ -181,6 +224,10 @@ function DriftBanner({
   entries: DucklingDrift[];
   onOpenOrg: (org: string) => void;
 }) {
+  // Orphans (CR with no warehouse row) need the opposite fix from drift
+  // (config exists, infra gone) — split them so remediation is obvious.
+  const orphans = entries.filter((e) => e.org === "" || e.issue === "orphan");
+  const drift = entries.filter((e) => !(e.org === "" || e.issue === "orphan"));
   return (
     <Card className="border-warning/40 bg-warning/5">
       <CardHeader className="pb-3">
@@ -189,41 +236,9 @@ function DriftBanner({
           {entries.length} duckling issue{entries.length === 1 ? "" : "s"} detected
         </CardTitle>
       </CardHeader>
-      <CardContent>
-        <div className="max-h-64 space-y-1 overflow-y-auto">
-          {entries.map((e, i) => {
-            const hasOrg = e.org !== "";
-            return (
-              <div
-                key={`${e.org}:${e.duckling_name}:${i}`}
-                className="grid grid-cols-[8rem_1fr_7rem_7rem] items-center gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-1.5"
-              >
-                {hasOrg ? (
-                  <button
-                    type="button"
-                    onClick={() => onOpenOrg(e.org)}
-                    className="truncate text-left font-mono text-xs font-medium hover:underline"
-                    title={e.org}
-                  >
-                    {e.org}
-                  </button>
-                ) : (
-                  <span className="text-xs text-muted-foreground">orphan</span>
-                )}
-                <span className="truncate font-mono text-xs text-muted-foreground" title={e.duckling_name}>
-                  {e.duckling_name || "—"}
-                </span>
-                <Badge variant={ISSUE_VARIANT[e.issue] ?? "warning"}>{e.issue}</Badge>
-                <span className="font-mono text-xs text-muted-foreground">
-                  {e.warehouse_state || "—"}
-                </span>
-                {e.message && (
-                  <span className="col-span-4 text-xs text-muted-foreground">{e.message}</span>
-                )}
-              </div>
-            );
-          })}
-        </div>
+      <CardContent className="space-y-3">
+        <DriftGroup title="Warehouse drift" entries={drift} onOpenOrg={onOpenOrg} />
+        <DriftGroup title="Orphaned ducklings" entries={orphans} onOpenOrg={onOpenOrg} />
       </CardContent>
     </Card>
   );
