@@ -11,6 +11,8 @@ import type {
   CreateUserBody,
   CPInstance,
   DucklingDriftResponse,
+  ErrorEntry,
+  ErrorFilters,
   FleetStat,
   ImpersonateBody,
   Me,
@@ -149,6 +151,15 @@ export const api = {
     get<{ instances: CPInstance[] }>("/cluster/instances").then((r) => r.instances ?? []),
   listSessions: () => get<SessionStatus[]>("/sessions"),
   listQueries: () => get<{ queries: RunningQuery[] }>("/queries").then((r) => r.queries ?? []),
+  // Recent redacted query errors, merged across CP replicas server-side.
+  listErrors: (f?: ErrorFilters) =>
+    get<{ errors: ErrorEntry[] }>("/errors", {
+      org: f?.org,
+      user: f?.user,
+      sqlstate: f?.sqlstate,
+      category: f?.category,
+      limit: f?.limit,
+    }).then((r) => r.errors ?? []),
   // Detail is addressed by cluster-unique worker id (pid is per-org, not unique).
   queryDetail: (workerId: number) => get<QueryDetail>(`/queries/by-worker/${workerId}`),
   // Cancel is addressed by cluster-unique worker id (pid is per-CP and collides

@@ -308,6 +308,7 @@ func InitMinimalServer(s *Server, cfg Config, queryCancelCh <-chan struct{}) {
 	s.duckLakeSem = make(chan struct{}, 1)
 	s.externalCancelCh = queryCancelCh
 	s.conns = make(map[int32]*clientConn)
+	s.recentErrors = newRecentErrorRing(0)
 }
 
 // GenerateSecretKey re-exports wire.GenerateSecretKey so existing callers

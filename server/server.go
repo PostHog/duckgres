@@ -371,6 +371,11 @@ type Server struct {
 	connsMu sync.RWMutex
 	conns   map[int32]*clientConn
 
+	// recentErrors is a bounded in-memory ring of the most recent (redacted)
+	// query errors, for the admin Errors page. Always on, independent of the
+	// query-log sink.
+	recentErrors *recentErrorRing
+
 	// Query logger for DuckLake system.query_log. Kept for existing control
 	// plane call sites that install or inspect the direct DuckLake logger.
 	queryLogger *QueryLogger
@@ -439,6 +444,7 @@ func New(cfg Config) (*Server, error) {
 		duckLakeSem:   make(chan struct{}, 1),
 		conns:         make(map[int32]*clientConn),
 		fileDBs:       make(map[string]*fileDBEntry),
+		recentErrors:  newRecentErrorRing(0),
 	}
 
 	// Configure TLS: ACME DNS-01, ACME HTTP-01, or static certificate files
@@ -741,6 +747,9 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 // named "clientConn" shadows the type name (e.g., in worker.go).
 func (s *Server) initConnsMap() {
 	s.conns = make(map[int32]*clientConn)
+	if s.recentErrors == nil {
+		s.recentErrors = newRecentErrorRing(0)
+	}
 }
 
 // registerConn adds a client connection to the registry for pg_stat_activity.

@@ -470,9 +470,11 @@ func (c *clientConn) logQueryError(query string, err error) {
 	// Engine errors echo the offending SQL, so a failed CREATE SECRET leaks the
 	// credential via the error attribute unless it is redacted too. Classify
 	// against the original query before it is replaced with the redacted form.
+	redactedQuery := usersecrets.RedactForLog(query)
+	redactedErr := usersecrets.RedactErrorForLog(query, err.Error())
 	attrs := []any{
-		"query", usersecrets.RedactForLog(query),
-		"error", usersecrets.RedactErrorForLog(query, err.Error()),
+		"query", redactedQuery,
+		"error", redactedErr,
 	}
 	// category mirrors the severity routing below so the dashboard can split
 	// user-attributable failures from genuine system errors per org.
@@ -487,13 +489,32 @@ func (c *clientConn) logQueryError(query string, err error) {
 	default:
 		category = "system"
 	}
+	sqlState := classifyErrorCode(err)
+	traceID := observe.TraceIDFromContext(c.ctx)
 	// Per-org product analytics. No SQL text or secrets are sent — only the
 	// SQLSTATE and category — so this is unaffected by the redaction above.
 	analytics.Default().Capture("query_failed", c.orgID, map[string]any{
 		"user":           c.username,
-		"trace_id":       observe.TraceIDFromContext(c.ctx),
-		"error_code":     classifyErrorCode(err),
+		"trace_id":       traceID,
+		"error_code":     sqlState,
 		"error_category": category,
+	})
+
+	// Retain a redacted snapshot for the admin Errors page. Both Query and
+	// Message are already redacted above — never store the raw forms here.
+	c.server.recordRecentError(RecentError{
+		Time:       time.Now().UTC(),
+		OrgID:      c.orgID,
+		Username:   c.username,
+		PID:        c.pid,
+		WorkerID:   c.workerID,
+		WorkerPod:  c.workerPod,
+		SQLState:   sqlState,
+		Category:   category,
+		Message:    redactedErr,
+		Query:      redactedQuery,
+		ClientAddr: c.clientIP(),
+		TraceID:    traceID,
 	})
 
 	switch category {
@@ -506,6 +527,18 @@ func (c *clientConn) logQueryError(query string, err error) {
 	default:
 		c.logger().Error("Query execution errored.", attrs...)
 	}
+}
+
+// clientIP returns the connection's client IP as a string, or "" if unavailable
+// (e.g. a non-TCP conn or in tests). Used for the redacted Errors-page snapshot.
+func (c *clientConn) clientIP() string {
+	if c.conn == nil {
+		return ""
+	}
+	if addr, ok := c.conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP.String()
+	}
+	return ""
 }
 
 // safeCleanupDB safely closes the database connection, handling the case where

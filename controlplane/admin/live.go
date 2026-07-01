@@ -8,11 +8,19 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+)
+
+// Errors-page bounds: default page size and a hard cap on any single fetch,
+// mirroring the per-replica ring so a caller can't ask for more than exists.
+const (
+	errorsDefaultLimit = 200
+	errorsMaxLimit     = 500
 )
 
 // QueryStatus is a currently-running query/session with its live progress,
@@ -68,6 +76,25 @@ type QueryDetail struct {
 	Stalled         bool    `json:"stalled"`
 }
 
+// ErrorEntry is one redacted failed query, for the Errors page. Message and
+// Query are redacted at capture on the PG server (usersecrets.RedactErrorForLog
+// / RedactForLog) — raw SQL and secrets never reach this struct. The JSON tags
+// mirror server.RecentError so peer /errors bodies merge without a re-map.
+type ErrorEntry struct {
+	Time       time.Time `json:"time"`
+	Org        string    `json:"org"`
+	User       string    `json:"user"`
+	PID        int32     `json:"pid"`
+	WorkerID   int       `json:"worker_id"`
+	WorkerPod  string    `json:"worker_pod"`
+	SQLState   string    `json:"sqlstate"`
+	Category   string    `json:"category"` // user | system | conflict | metadata_connection_lost
+	Message    string    `json:"message"`  // redacted
+	Query      string    `json:"query"`    // redacted
+	ClientAddr string    `json:"client_addr"`
+	TraceID    string    `json:"trace_id"`
+}
+
 // FleetStat is a cluster-wide worker count grouped by image/state/binding,
 // from the durable runtime store (the source of truth for hot-idle/spawning/
 // draining counts the in-memory session map cannot see).
@@ -116,6 +143,11 @@ type LiveInfo interface {
 	// fans it out to peers so the kill is cluster-wide. 0 (not an error) when the
 	// org/user has no live sessions on this replica.
 	KillUserSessions(orgID, username string) int
+	// RecentErrors returns up to limit of THIS replica's most recent redacted
+	// query errors, newest first. Each error is captured on the CP that owned the
+	// failing connection, so the handler fans out and concatenates across replicas
+	// (no cross-CP dedup needed — an error belongs to exactly one CP).
+	RecentErrors(limit int) []ErrorEntry
 }
 
 // UserAdmin persists the per-user kill switch (the disabled flag) and forces a
@@ -185,6 +217,71 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher, use
 			queries = filtered
 		}
 		c.JSON(http.StatusOK, gin.H{"queries": queries, "cp_responders": responders, "cp_total": total})
+	})
+
+	// /errors returns recent redacted query errors for live triage, merged
+	// across every CP replica (each error is captured on the CP that owned the
+	// failing connection, so the union is disjoint — concat + newest-first sort,
+	// no dedup). Optional org / user / sqlstate / category slicing is applied
+	// AFTER the merge, then the result is capped to the requested limit.
+	//
+	// The FetchPeers path is BARE (no query string): FetchPeers appends
+	// "?scope=local", and a path that already carried "?limit=..." would produce
+	// a malformed "?limit=..?scope=local" where the recursion guard is not parsed
+	// → a cross-CP fan-out storm. So peers are asked for their whole local ring
+	// (up to errorsMaxLimit) and the requesting CP does the limit/filter itself.
+	r.GET("/errors", func(c *gin.Context) {
+		local := localScope(c)
+		// Pull the full local ring. A scope=local (peer) slice must NOT be
+		// pre-capped/filtered — the requesting CP owns the merge, sort, filter,
+		// and limit; pre-capping here could drop a busy peer's older errors.
+		errs := live.RecentErrors(errorsMaxLimit)
+		responders, total := 1, 1
+		if !local && fetcher != nil {
+			bodies, peers := fetcher.FetchPeers(c.Request.Context(), "/api/v1/errors")
+			type env struct {
+				Errors []ErrorEntry `json:"errors"`
+			}
+			responders += mergePeer(&errs, bodies, func(e env) []ErrorEntry { return e.Errors })
+			total += peers
+		}
+		// Newest first across the merged set.
+		sort.Slice(errs, func(i, j int) bool { return errs[i].Time.After(errs[j].Time) })
+		// A scope=local response is an internal peer slice consumed by mergePeer
+		// on the requester — return it whole (sorted). Only the user-facing
+		// (fanned-out) response applies filters + the limit.
+		if local {
+			c.JSON(http.StatusOK, gin.H{"errors": errs, "cp_responders": responders, "cp_total": total})
+			return
+		}
+		org, user, sqlstate, category := c.Query("org"), c.Query("user"), c.Query("sqlstate"), c.Query("category")
+		if org != "" || user != "" || sqlstate != "" || category != "" {
+			filtered := errs[:0:0]
+			for _, e := range errs {
+				if org != "" && e.Org != org {
+					continue
+				}
+				if user != "" && e.User != user {
+					continue
+				}
+				if sqlstate != "" && e.SQLState != sqlstate {
+					continue
+				}
+				if category != "" && e.Category != category {
+					continue
+				}
+				filtered = append(filtered, e)
+			}
+			errs = filtered
+		}
+		limit := errorsDefaultLimit
+		if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 && v <= errorsMaxLimit {
+			limit = v
+		}
+		if len(errs) > limit {
+			errs = errs[:limit]
+		}
+		c.JSON(http.StatusOK, gin.H{"errors": errs, "cp_responders": responders, "cp_total": total})
 	})
 
 	// Expanded detail for a single in-flight query (redacted SQL + metadata),

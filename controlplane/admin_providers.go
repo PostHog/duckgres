@@ -192,6 +192,35 @@ func (p *clusterInfoProvider) KillSessionByWorkerID(workerID int) int {
 	return 0
 }
 
+// RecentErrors returns up to limit of this replica's most recent redacted query
+// errors (newest first), mapped from the PG server's in-memory ring. The admin
+// handler fans this out and concatenates across CPs. Query and Message are
+// already redacted at capture — this path never carries raw SQL or secrets.
+func (p *clusterInfoProvider) RecentErrors(limit int) []admin.ErrorEntry {
+	if p.srv == nil {
+		return nil
+	}
+	src := p.srv.RecentErrors(limit)
+	out := make([]admin.ErrorEntry, 0, len(src))
+	for _, e := range src {
+		out = append(out, admin.ErrorEntry{
+			Time:       e.Time,
+			Org:        e.OrgID,
+			User:       e.Username,
+			PID:        e.PID,
+			WorkerID:   e.WorkerID,
+			WorkerPod:  e.WorkerPod,
+			SQLState:   e.SQLState,
+			Category:   e.Category,
+			Message:    e.Message,
+			Query:      e.Query,
+			ClientAddr: e.ClientAddr,
+			TraceID:    e.TraceID,
+		})
+	}
+	return out
+}
+
 // KillUserSessions tears down every active session for (orgID, username) owned by
 // THIS control-plane replica and returns the count destroyed. It is the local
 // half of the cluster-wide per-user kill switch: the admin handler fans this out

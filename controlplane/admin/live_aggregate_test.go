@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -27,6 +28,8 @@ type fakeLiveInfo struct {
 
 	killByWorkerReturn int   // returned by KillSessionByWorkerID (local kill count)
 	killByWorkerCalls  []int // recorded worker ids
+
+	errors []ErrorEntry // returned by RecentErrors (local recent-errors view)
 }
 
 type killUserCall struct{ org, user string }
@@ -49,6 +52,7 @@ func (f *fakeLiveInfo) KillUserSessions(org, user string) int {
 	f.killUserCalls = append(f.killUserCalls, killUserCall{org, user})
 	return f.killedPerUser
 }
+func (f *fakeLiveInfo) RecentErrors(int) []ErrorEntry { return f.errors }
 
 func (f *fakeLiveInfo) AllOrgStats() []OrgStatus            { return f.orgStats }
 func (f *fakeLiveInfo) AllWorkerStatuses() []WorkerStatus   { return nil }
@@ -189,6 +193,74 @@ func TestSessionsAggregateAcrossCPs(t *testing.T) {
 
 func TestPeerFetcherInterfaceSatisfied(t *testing.T) {
 	var _ PeerFetcher = (*fakePeerFetcher)(nil)
+}
+
+// /errors merges each CP's recent-errors ring (disjoint per CP), returns them
+// newest-first, and honors the scope=local fan-out guard + post-merge filters.
+func TestErrorsAggregateAcrossCPs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t0 := time.Unix(1700000000, 0)
+	local := &fakeLiveInfo{errors: []ErrorEntry{
+		{Org: "a", User: "u1", SQLState: "42P01", Category: "user", Time: t0.Add(1 * time.Second)},
+	}}
+	// Peer error is NEWER than the local one → must sort ahead of it.
+	peerBody, _ := json.Marshal(map[string]any{"errors": []ErrorEntry{
+		{Org: "b", User: "u2", SQLState: "XX000", Category: "system", Time: t0.Add(2 * time.Second)},
+	}})
+	// The peer path MUST be bare "/api/v1/errors" — FetchPeers appends
+	// "?scope=local", so a "?limit=" here would malform the recursion guard.
+	fetcher := &fakePeerFetcher{byPath: map[string][][]byte{
+		"/api/v1/errors": {peerBody},
+	}}
+
+	r := gin.New()
+	registerLiveAPI(r.Group("/api/v1"), local, fetcher, nil)
+
+	// Default: merged (local + peer), newest first.
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/errors", nil))
+	var got struct {
+		Errors     []ErrorEntry `json:"errors"`
+		Responders int          `json:"cp_responders"`
+		Total      int          `json:"cp_total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Errors) != 2 {
+		t.Fatalf("merged errors = %d, want 2 (local + peer): %+v", len(got.Errors), got.Errors)
+	}
+	// Guard the fan-out path is bare (no query string that would corrupt the
+	// appended ?scope=local recursion guard).
+	if atomic.LoadInt32(&fetcher.calls) != 1 {
+		t.Fatalf("expected exactly one bare-path fan-out, got %d calls", fetcher.calls)
+	}
+	if got.Errors[0].Org != "b" || got.Errors[1].Org != "a" {
+		t.Fatalf("order = %s,%s, want b,a (newest first)", got.Errors[0].Org, got.Errors[1].Org)
+	}
+	if got.Responders != 2 || got.Total != 2 {
+		t.Fatalf("coverage = %d/%d, want 2/2", got.Responders, got.Total)
+	}
+
+	// Post-merge filter by sqlstate.
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/errors?sqlstate=XX000", nil))
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if len(got.Errors) != 1 || got.Errors[0].Org != "b" {
+		t.Fatalf("sqlstate filter = %+v, want just org b", got.Errors)
+	}
+
+	// scope=local: local only, no fan-out.
+	fetcher.calls = 0
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/errors?scope=local", nil))
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if len(got.Errors) != 1 || got.Errors[0].Org != "a" {
+		t.Fatalf("scope=local errors = %+v, want 1 (local only)", got.Errors)
+	}
+	if atomic.LoadInt32(&fetcher.calls) != 0 {
+		t.Fatalf("scope=local must NOT fan out, fetcher ran %d times", fetcher.calls)
+	}
 }
 
 // /status merges per-org stats across CPs: active_sessions summed, orgs unioned.
