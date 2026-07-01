@@ -26,16 +26,16 @@ safety:    GC hard-deletes buckets older than 30 days (logged)
 
 Internally, one row per unique key, values accumulated:
 
-- **Key:** `(org_id, team_id, cpu_millicores, mem_mib, bucket_start)`
-  where `bucket_start = floor(connection_end / 60s)`. Worker size is stored as
-  **exact integers** (millicores, MiB) in the key — never a float — so equal sizes
-  always group into the same bucket (float keys risk `16.0 ≠ 16.0` splits).
+- **Key:** `(org_id, team_id, cpu, mem_gib, bucket_start)` where `cpu` is vCPU and
+  `mem_gib` is GiB, `bucket_start = floor(connection_end / 60s)`. Worker size is
+  stored as **exact decimals** (SQL `NUMERIC`, not IEEE floats), so equal sizes
+  always group into the same bucket and fractional sizes keep full precision.
 - **Values:** `cpu_seconds` (vCPU-seconds), `memory_seconds` (GiB-seconds) —
   summed over every connection that falls in that key + minute.
 - `team_id` is looked up from the config store (**org → team mapping**) at
   connection time.
-- Worker size is part of the key, so different worker sizes accumulate — and bill —
-  separately. It is **reported** in GiB/vCPU (see the API) to match the value units.
+- Worker size (`cpu`, `mem_gib`) is part of the key, so different worker sizes
+  accumulate — and bill — separately. Units match the values (vCPU / GiB).
 
 **60-second resolution is kept internally.** The pull API aggregates on read (see
 below), so billing never has to chase individual minutes — but the fine buckets
@@ -72,8 +72,8 @@ same units as the values:
 }
 ```
 
-(`cpu`/`mem_gib` are decimals — e.g. `1.5`, `0.5` — for fractional worker sizes;
-the grouping key behind them is exact integer millicores/MiB.)
+(`cpu`/`mem_gib` are exact decimals — e.g. `1.5`, `0.5` — for fractional worker
+sizes; stored as `NUMERIC` so grouping is exact.)
 
 - Sums all **closed** buckets in `(last_acked, watermark]`, where
   `watermark` = the latest closed minute (`now − grace`).
@@ -124,7 +124,7 @@ the grouping key behind them is exact integer millicores/MiB.)
 - **Remove:** leader drain → `capture()` to PostHog ingestion, and the
   `DUCKGRES_BILLING_INGEST_URL` / `_TOKEN` config.
 - **Keep:** per-connection metering → config-store 60s buckets.
-- **Extend:** the bucket table gains `team_id`, `cpu_millicores`, `mem_mib` in the
+- **Extend:** the bucket table gains `team_id`, `cpu`, `mem_gib` (`NUMERIC`) in the
   key (new migration); add a single `last_acked` cursor row; add the HTTP API
   (aggregate-on-read + watermark ack) + safety GC.
 - **Add:** config-store `org → team` lookup (thread `team_id` onto the connection);
@@ -135,8 +135,8 @@ the grouping key behind them is exact integer millicores/MiB.)
 - Bucket width 60s, grace 30s.
 - Endpoint paths above are indicative — adjust to the control-plane API's house
   style.
-- Values exposed as vCPU-seconds / GiB-seconds; worker size reported as vCPU /
-  GiB (decimals) to match. Internally accumulated + keyed in exact
-  millicore-/MiB-seconds so no precision is lost for fractional worker sizes.
+- Values exposed as vCPU-seconds / GiB-seconds; worker size as vCPU / GiB. All
+  stored as exact decimals (`NUMERIC`), so fractional worker sizes keep full
+  precision with no float-equality issues.
 - Single billing consumer assumed → one server-side `last_acked` cursor. (If a
   second independent consumer is ever needed, give each its own named cursor.)
