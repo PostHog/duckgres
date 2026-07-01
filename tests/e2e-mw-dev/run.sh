@@ -155,6 +155,9 @@ wait_ci_ducklings_deleted() { # pr-number timeout
 delete_ci_bindings() { # pr-number
   local pr="$1"
   "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+  # Per-PR cluster-topology ClusterRole (admin console Nodes view read) is
+  # cluster-scoped too, so sweep it by the same label.
+  "${KUBECTL[@]}" delete clusterrole -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
   # Historical cleanup: older e2e runs created per-PR Lakekeeper RoleBindings.
   # Keep sweeping them by label so stale resources disappear after the workflow
   # stops creating new ones.
