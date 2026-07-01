@@ -13,6 +13,25 @@ import (
 	"time"
 )
 
+func TestNormalizeIdleTimeout(t *testing.T) {
+	const def = 60 * time.Second
+	cases := []struct {
+		name       string
+		configured time.Duration
+		want       time.Duration
+	}{
+		{"unset uses default", 0, def},
+		{"negative disables", -1, 0},
+		{"explicit positive passes through", 90 * time.Second, 90 * time.Second},
+		{"any negative disables", -5 * time.Minute, 0},
+	}
+	for _, tc := range cases {
+		if got := NormalizeIdleTimeout(tc.configured, def); got != tc.want {
+			t.Errorf("%s: NormalizeIdleTimeout(%v, %v) = %v, want %v", tc.name, tc.configured, def, got, tc.want)
+		}
+	}
+}
+
 type mockRefreshExecer struct {
 	mu            sync.Mutex
 	secretCalls   int

@@ -79,6 +79,29 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 	}
 }
 
+// DefaultControlPlaneIdleTimeout is the connection idle timeout the control
+// plane applies when none is configured. In remote/process control-plane mode
+// an idle client connection pins a worker (a scarce k8s pod or local process),
+// so an idle connection is closed after this long — its message loop hits the
+// read deadline, returns, and the worker is released back to the hot-idle pool.
+// Operators override it with --idle-timeout (a negative value disables it).
+const DefaultControlPlaneIdleTimeout = 60 * time.Second
+
+// NormalizeIdleTimeout resolves a configured connection idle timeout: zero means
+// "unset" → use zeroDefault; a negative value means "explicitly disabled" → 0
+// (no timeout); a positive value is used as-is. Shared by standalone (24h
+// default) and the control plane (DefaultControlPlaneIdleTimeout).
+func NormalizeIdleTimeout(configured, zeroDefault time.Duration) time.Duration {
+	switch {
+	case configured == 0:
+		return zeroDefault
+	case configured < 0:
+		return 0
+	default:
+		return configured
+	}
+}
+
 // ConnDetail is a redacted snapshot of one live client connection, for the
 // admin live-query detail view. Query is the ALREADY-redacted current/last
 // query (usersecrets.RedactForLog, same as pg_stat_activity) — callers must
