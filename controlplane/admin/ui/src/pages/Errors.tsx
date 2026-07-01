@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { AlertTriangle, Bug, RefreshCw, ServerCrash } from "lucide-react";
+import { AlertTriangle, Bug, Check, Copy, RefreshCw, ServerCrash } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -39,6 +39,36 @@ function Field({ label, value, mono }: { label: string; value: React.ReactNode; 
   );
 }
 
+// CopyableField renders a value with a copy-to-clipboard affordance — for the
+// trace id (pivot to traces/logs) and other IDs an operator wants to grab.
+function CopyableField({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false);
+  const canCopy = value !== "" && value !== "—";
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</span>
+      <span className="flex items-center gap-1 font-mono text-xs break-all">
+        {value || "—"}
+        {canCopy && (
+          <button
+            type="button"
+            className="text-muted-foreground hover:text-foreground"
+            title="Copy"
+            onClick={() => {
+              void navigator.clipboard?.writeText(value).then(() => {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1200);
+              });
+            }}
+          >
+            {copied ? <Check className="h-3 w-3 text-success" /> : <Copy className="h-3 w-3" />}
+          </button>
+        )}
+      </span>
+    </div>
+  );
+}
+
 // Detail view for one captured error. The list already carries full (redacted)
 // detail, so this reads the passed row directly — no extra fetch. query +
 // message are redacted server-side (a CREATE SECRET error never carries the
@@ -65,7 +95,7 @@ function ErrorDetailDialog({ error, onClose }: { error: ErrorEntry | null; onClo
               <Field label="Worker" value={`#${error.worker_id}`} mono />
               <Field label="Worker pod" value={error.worker_pod || "—"} mono />
               <Field label="Client" value={error.client_addr || "—"} mono />
-              <Field label="Trace ID" value={error.trace_id || "—"} mono />
+              <CopyableField label="Trace ID" value={error.trace_id || "—"} />
             </div>
             <div>
               <span className="text-[10px] uppercase tracking-wide text-muted-foreground">Message</span>
