@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -185,8 +186,30 @@ func (w *QueryLogKafkaWriter) processMessage(ctx context.Context, msg QueryLogKa
 
 func (w *QueryLogKafkaWriter) recordRetryableError(err error) {
 	queryLogKafkaWriterEvents.WithLabelValues("failed").Inc()
-	slog.Error("querylog: kafka writer failed to process event.", "error", err)
+	slog.Error("querylog: kafka writer failed to process event.", "error", RedactQueryLogWriterError(err))
 	queryLogKafkaWriterEvents.WithLabelValues("retried").Inc()
+}
+
+var (
+	queryLogWriterDuckLakeAttachRE = regexp.MustCompile(`(?is)ATTACH\s+'ducklake:(?:''|[^'])*'`)
+	queryLogWriterSecretLiteralRE  = regexp.MustCompile(`(?i)\b(KEY_ID|SECRET|SESSION_TOKEN|CLIENT_SECRET)\s+'(?:''|[^'])*'`)
+	queryLogWriterSecretKVRE       = regexp.MustCompile(`(?i)\b(PASSWORD|TOKEN|ACCESS_KEY_ID|SECRET_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|KEY_ID|SECRET|SESSION_TOKEN|CLIENT_SECRET)(\s*(?:=|:|=>)\s*)("[^"]*"|'(?:''|[^'])*'|[^\s,;)]+)`)
+)
+
+// RedactQueryLogWriterError returns a log-safe error string for the privileged
+// query-log writer. Writer failures can wrap DuckDB/DuckLake errors that echo
+// generated ATTACH or CREATE SECRET SQL, so redact at the logging boundary
+// without changing the original error used for retry/control-flow decisions.
+func RedactQueryLogWriterError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	msg = queryLogWriterDuckLakeAttachRE.ReplaceAllString(msg, "ATTACH 'ducklake:[REDACTED]'")
+	msg = queryLogWriterSecretLiteralRE.ReplaceAllString(msg, "${1} '[REDACTED]'")
+	msg = queryLogWriterSecretKVRE.ReplaceAllString(msg, "${1}${2}[REDACTED]")
+	msg = RedactSecrets(msg)
+	return msg
 }
 
 func (w *QueryLogKafkaWriter) waitBeforeRetry(ctx context.Context) error {
