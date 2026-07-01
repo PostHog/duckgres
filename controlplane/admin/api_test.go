@@ -222,7 +222,8 @@ func newTestAPIRouter(store apiStore) *gin.Engine {
 
 func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	warehouse := &configstore.ManagedWarehouse{
-		OrgID: name,
+		OrgID:        name,
+		DucklingName: name,
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			Endpoint: fmt.Sprintf("%s.cluster.example", name),
 			Port:     5432,
@@ -611,6 +612,7 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"warehouse_database": {
 			"endpoint": "analytics.cluster.example",
 			"port": 5432
@@ -864,6 +866,7 @@ func TestPutWarehouseRejectsSecretRefsWithoutWorkerNamespace(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"iam_role_arn": "arn:aws:iam::123456789012:role/analytics-worker"
 		},
@@ -930,6 +933,7 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"state": "awaiting-human-approval",
 		"metadata_store_state": "vendor-pending",
 		"s3_state": "bucket-handshake",
@@ -965,6 +969,7 @@ func TestPutWarehouseRejectsCrossTenantSecretRefs(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-analytics"
 		},
@@ -994,6 +999,7 @@ func TestPutWarehouseRejectsSecretRefWithoutExplicitNamespace(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-analytics"
 		},
@@ -1080,6 +1086,7 @@ func TestPutWarehouseRejectsSecretReferenceWithoutOrgPrefix(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-a"
 		},
