@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Activity, Ban, RefreshCw, Zap } from "lucide-react";
+import { Activity, Ban, CircleSlash, RefreshCw, Zap } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/dialog";
 import { useCancelSession, useKillUserSessions, useQueries, useSessions } from "@/hooks/useApi";
 import { fmtAge, fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
+import { idleInTransaction, isIdleSession, sessionStateLabel } from "@/lib/session";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
 export function Live() {
@@ -140,6 +141,7 @@ export function Live() {
                     <TableHead>Started</TableHead>
                     <TableHead>Worker</TableHead>
                     <TableHead>Protocol</TableHead>
+                    <TableHead>State</TableHead>
                     <TableHead>Duration</TableHead>
                     <TableHead className="w-56">Progress</TableHead>
                     <TableHead className="text-right">Action</TableHead>
@@ -171,6 +173,23 @@ export function Live() {
                         <TableCell className="font-mono text-xs">#{q.worker_id}</TableCell>
                         <TableCell>
                           <Badge variant="outline">{q.protocol || "pg"}</Badge>
+                        </TableCell>
+                        <TableCell>
+                          {isIdleSession(q.state) ? (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span
+                                  className={idleInTransaction(q.state) ? "text-warning" : "text-muted-foreground"}
+                                  aria-label={`no in-flight query — ${sessionStateLabel(q.state)}`}
+                                >
+                                  <CircleSlash className="h-4 w-4" />
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>No in-flight query — {sessionStateLabel(q.state)}</TooltipContent>
+                            </Tooltip>
+                          ) : (
+                            <span className="text-muted-foreground/30">·</span>
+                          )}
                         </TableCell>
                         <TableCell className="font-mono text-xs tabular-nums">{fmtDurationMs(q.elapsed_ms)}</TableCell>
                         <TableCell>

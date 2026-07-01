@@ -161,25 +161,35 @@ func (s *Server) ConnDetailByWorkerID(workerID int) (ConnDetail, bool) {
 	return ConnDetail{}, false
 }
 
-// QueryStartsByWorkerID returns the current-statement start time of every live
-// connection that has a query in flight, keyed by cluster-unique worker id. Used
-// to attach running-query duration to the live list in one pass (no per-session
-// lookup, and keyed on worker id rather than the collision-prone per-org pid).
-// Idle connections (no query) are omitted.
-func (s *Server) QueryStartsByWorkerID() map[int]time.Time {
+// ConnLiveSummary is the per-connection live state the admin Live list needs:
+// the pg_stat_activity-style State and the current-query start. State is
+// "active" when a query is in flight; anything else means no in-flight query.
+type ConnLiveSummary struct {
+	State      string    // active | idle | idle in transaction | idle in transaction (aborted)
+	QueryStart time.Time // zero when no query is in flight
+}
+
+// ConnSummariesByWorkerID returns a one-pass snapshot of every live connection
+// keyed by cluster-unique worker id: its state and current-query start. Used to
+// attach running-query duration AND the active/idle state to the live list in a
+// single lock acquisition (keyed on worker id, not the collision-prone per-org
+// pid). Connections with no worker (standalone / transient) are omitted.
+func (s *Server) ConnSummariesByWorkerID() map[int]ConnLiveSummary {
 	if s == nil {
 		return nil
 	}
 	s.connsMu.RLock()
 	defer s.connsMu.RUnlock()
-	out := make(map[int]time.Time, len(s.conns))
+	out := make(map[int]ConnLiveSummary, len(s.conns))
 	for _, c := range s.conns {
 		if c.workerID < 0 {
 			continue
 		}
+		sum := ConnLiveSummary{State: c.connState()}
 		if qs, ok := c.queryStart.Load().(time.Time); ok && !qs.IsZero() {
-			out[c.workerID] = qs
+			sum.QueryStart = qs
 		}
+		out[c.workerID] = sum
 	}
 	return out
 }

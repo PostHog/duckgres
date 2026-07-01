@@ -8,6 +8,50 @@ import (
 	"github.com/posthog/duckgres/server/usersecrets"
 )
 
+// TestConnSummariesByWorkerID covers the live-list state snapshot: an active
+// session reports "active" + a query-start; an idle-in-transaction session
+// reports the idle state + zero query-start; worker-less conns are omitted.
+func TestConnSummariesByWorkerID(t *testing.T) {
+	s := &Server{conns: map[int32]*clientConn{}}
+
+	active := &clientConn{pid: 1, workerID: 100}
+	active.currentQuery.Store("SELECT 1")
+	active.queryStart.Store(time.Now())
+	s.conns[1] = active
+
+	idleTx := &clientConn{pid: 2, workerID: 200, txStatus: txStatusTransaction}
+	idleTx.currentQuery.Store("")
+	s.conns[2] = idleTx
+
+	// Worker-less conn (standalone / transient) must be omitted.
+	noWorker := &clientConn{pid: 3, workerID: -1}
+	noWorker.currentQuery.Store("")
+	s.conns[3] = noWorker
+
+	sums := s.ConnSummariesByWorkerID()
+	if len(sums) != 2 {
+		t.Fatalf("expected 2 worker-bound summaries, got %d", len(sums))
+	}
+	if sums[100].State != "active" || sums[100].QueryStart.IsZero() {
+		t.Fatalf("worker 100 should be active with a query-start, got %+v", sums[100])
+	}
+	if sums[200].State != "idle in transaction" {
+		t.Fatalf("worker 200 should be 'idle in transaction', got %q", sums[200].State)
+	}
+	if !sums[200].QueryStart.IsZero() {
+		t.Fatalf("idle session should have zero query-start, got %v", sums[200].QueryStart)
+	}
+	if _, ok := sums[-1]; ok {
+		t.Fatal("worker-less conn must be omitted")
+	}
+
+	// Nil server is safe.
+	var ns *Server
+	if ns.ConnSummariesByWorkerID() != nil {
+		t.Fatal("nil server should return nil")
+	}
+}
+
 // TestConnDetailByPID covers the admin live-query detail snapshot: registry
 // lookup, the (load-bearing) redaction guarantee, and state derivation.
 func TestConnDetailByPID(t *testing.T) {
