@@ -48,6 +48,12 @@ var rangePanels = map[string]string{
 	"s3_bytes_rate":   `sum(rate(duckgres_s3_bytes_read_total$ORG[$WIN]))`,
 	"worker_states":   `sum by (state) (duckgres_worker_lifecycle_count)`,
 	"queue_depth":     `sum(duckgres_control_plane_worker_queue_depth)`,
+	// Worker-acquire latency: how long a pending session waits for a worker,
+	// split by the allocation source (idle_reuse|hot_idle_claim|spawn). p95 for
+	// the tail, plus the rate of acquisitions per source so cold-spawn frequency
+	// is visible. $ORG scopes both to a single org.
+	"acquire_p95":       `histogram_quantile(0.95, sum by (le, source) (rate(duckgres_worker_acquire_total_seconds_bucket$ORG[$WIN])))`,
+	"acquire_by_source": `sum by (source) (rate(duckgres_worker_acquire_total_seconds_count$ORG[$WIN]))`,
 }
 
 // renderPanel substitutes the named tokens into a panel template. $ORGERR is

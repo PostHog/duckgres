@@ -14,7 +14,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { LoadingState } from "@/components/states";
 import { useMetricRange, useMetricsPanels, useOrgs } from "@/hooks/useApi";
-import { promToSeries } from "@/lib/format";
+import { fmtMetricAxis, fmtMetricValue, promToSeries } from "@/lib/format";
 
 // Window selector. The backend caps the step at ~250 points per window.
 const WINDOWS = ["15m", "1h", "6h", "24h"];
@@ -30,6 +30,8 @@ const PANELS: { key: string; title: string; unit: string }[] = [
   { key: "s3_bytes_rate", title: "S3 read bytes rate", unit: "B/s" },
   { key: "worker_states", title: "Workers by state", unit: "" },
   { key: "queue_depth", title: "Connection queue depth", unit: "" },
+  { key: "acquire_p95", title: "Worker acquire p95 by source", unit: "s" },
+  { key: "acquire_by_source", title: "Worker acquire rate by source", unit: "ops/s" },
 ];
 
 export function Metrics() {
@@ -165,7 +167,12 @@ function MetricCard({
                 stroke="hsl(var(--muted-foreground))"
                 fontSize={10}
               />
-              <YAxis stroke="hsl(var(--muted-foreground))" fontSize={10} width={48} />
+              <YAxis
+                stroke="hsl(var(--muted-foreground))"
+                fontSize={10}
+                width={56}
+                tickFormatter={(v: number) => fmtMetricAxis(v, unit)}
+              />
               <RTooltip
                 contentStyle={{
                   background: "hsl(var(--popover))",
@@ -174,7 +181,7 @@ function MetricCard({
                   fontSize: 12,
                 }}
                 labelFormatter={(t) => new Date(t as number).toLocaleString()}
-                formatter={(v: number, name) => [`${v}${unit ? ` ${unit}` : ""}`, name]}
+                formatter={(v: number, name) => [fmtMetricValue(v, unit), name]}
               />
               {keys.map((k, i) => (
                 <Line

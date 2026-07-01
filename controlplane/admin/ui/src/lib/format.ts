@@ -48,6 +48,33 @@ export function fmtBytes(n: number | null | undefined): string {
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+// fmtCompact renders a number in compact SI notation (1.5K, 20M, 3.2B). Keeps a
+// wide-ranging metric axis readable and NARROW — a raw 20000000 would be clipped
+// to "00000" by a fixed-width axis.
+export function fmtCompact(n: number | null | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(n);
+}
+
+// fmtMetricAxis compacts a metric value for a chart Y-axis tick. Byte units use
+// binary prefixes (19 MB); everything else uses compact SI (1.5K, 20M). Returns
+// "" for nullish so recharts skips the tick rather than drawing a dash.
+export function fmtMetricAxis(v: number | null | undefined, unit?: string): string {
+  if (v == null || Number.isNaN(v)) return "";
+  if (unit === "B/s" || unit === "B") return fmtBytes(v);
+  return fmtCompact(v);
+}
+
+// fmtMetricValue is the full "value + unit" string for a metric tooltip: byte
+// units render as bytes (with a /s rate suffix when applicable), everything else
+// as a compact number followed by its unit label.
+export function fmtMetricValue(v: number | null | undefined, unit?: string): string {
+  if (v == null || Number.isNaN(v)) return "—";
+  if (unit === "B/s") return `${fmtBytes(v)}/s`;
+  if (unit === "B") return fmtBytes(v);
+  return `${fmtCompact(v)}${unit ? ` ${unit}` : ""}`;
+}
+
 // fmtDurationMs renders a MILLISECOND duration as a compact human string
 // (250ms, 3.4s, 2m 5s, 1h 3m). <=0 / nullish → "—". Used for running-query
 // elapsed time in the Live view + detail dialog. (fmtDuration below takes

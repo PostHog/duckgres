@@ -34,6 +34,17 @@ const (
 
 	acquireGateOutcomeAcquired = "acquired"
 	acquireGateOutcomeCanceled = "canceled"
+
+	// acquireSource* is how a completed AcquireWorker got its worker — the
+	// "phase that was allocated" dimension on the end-to-end total histogram:
+	// reusing this org's own idle Hot worker (near-instant), claiming a parked
+	// hot-idle worker from the shared pool (fast), or cold-spawning a fresh pod
+	// (slow — EC2 node boot). "none" when no worker was allocated (capacity
+	// backpressure / ctx cancel).
+	acquireSourceIdleReuse    = "idle_reuse"
+	acquireSourceHotIdleClaim = "hot_idle_claim"
+	acquireSourceSpawn        = "spawn"
+	acquireSourceNone         = "none"
 )
 
 // errHotIdleImageMismatch marks a hot-idle claim that yielded a worker of a
@@ -41,34 +52,38 @@ const (
 // error rather than dropped from the phase histogram.
 var errHotIdleImageMismatch = errors.New("hot-idle worker image mismatch")
 
+// All three histograms carry an `org` label so per-org acquire latency is
+// sliceable from a dashboard (which tenant is eating cold-spawn waits). Orgs are
+// bounded managed-warehouse tenants, so the added cardinality is acceptable.
+
 var workerAcquireGateWaitHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_worker_acquire_gate_wait_seconds",
-	Help:    "Time a connection spent blocked in the per-org FIFO acquire gate (orgAcquireGate) before owning the slow acquisition path, partitioned by outcome (acquired|canceled).",
+	Help:    "Time a connection spent blocked in the per-org FIFO acquire gate (orgAcquireGate) before owning the slow acquisition path, partitioned by org and outcome (acquired|canceled).",
 	Buckets: acquirePhaseBuckets,
-}, []string{"outcome"})
+}, []string{"org", "outcome"})
 
 var workerAcquirePhaseHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_worker_acquire_phase_seconds",
-	Help:    "Duration of individual worker-acquire phases on the remote/k8s backend, partitioned by phase (hot_idle_claim|spawn|activate) and outcome (ok|error).",
+	Help:    "Duration of individual worker-acquire phases on the remote/k8s backend, partitioned by org, phase (hot_idle_claim|spawn|activate) and outcome (ok|error).",
 	Buckets: acquirePhaseBuckets,
-}, []string{"phase", "outcome"})
+}, []string{"org", "phase", "outcome"})
 
 var workerAcquireTotalHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_worker_acquire_total_seconds",
-	Help:    "End-to-end OrgReservedPool.AcquireWorker duration, partitioned by outcome (ok|capacity|error|canceled).",
+	Help:    "End-to-end OrgReservedPool.AcquireWorker duration (the time a pending session waits for a worker), partitioned by org, the allocation source (idle_reuse|hot_idle_claim|spawn|none) and outcome (ok|capacity|error|canceled).",
 	Buckets: acquirePhaseBuckets,
-}, []string{"outcome"})
+}, []string{"org", "source", "outcome"})
 
-func observeAcquireGateWait(d time.Duration, outcome string) {
+func observeAcquireGateWait(d time.Duration, org, outcome string) {
 	if d < 0 {
 		d = 0
 	}
-	workerAcquireGateWaitHistogram.WithLabelValues(outcome).Observe(d.Seconds())
+	workerAcquireGateWaitHistogram.WithLabelValues(org, outcome).Observe(d.Seconds())
 }
 
 // observeAcquirePhase records one attempt of a single acquire phase. err==nil
 // observes outcome=ok, otherwise outcome=error.
-func observeAcquirePhase(phase string, d time.Duration, err error) {
+func observeAcquirePhase(phase, org string, d time.Duration, err error) {
 	if d < 0 {
 		d = 0
 	}
@@ -76,14 +91,17 @@ func observeAcquirePhase(phase string, d time.Duration, err error) {
 	if err != nil {
 		outcome = acquireOutcomeError
 	}
-	workerAcquirePhaseHistogram.WithLabelValues(phase, outcome).Observe(d.Seconds())
+	workerAcquirePhaseHistogram.WithLabelValues(org, phase, outcome).Observe(d.Seconds())
 }
 
-func observeAcquireTotal(d time.Duration, outcome string) {
+// observeAcquireTotal records the end-to-end acquire latency for one session,
+// tagged by the org, how the worker was ultimately obtained (source), and the
+// outcome.
+func observeAcquireTotal(d time.Duration, org, source, outcome string) {
 	if d < 0 {
 		d = 0
 	}
-	workerAcquireTotalHistogram.WithLabelValues(outcome).Observe(d.Seconds())
+	workerAcquireTotalHistogram.WithLabelValues(org, source, outcome).Observe(d.Seconds())
 }
 
 // acquireTotalOutcome classifies an AcquireWorker error for the end-to-end
