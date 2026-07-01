@@ -86,7 +86,7 @@ function ErrorDetailDialog({ error, onClose }: { error: ErrorEntry | null; onClo
           <DialogDescription>Redacted snapshot of one failed query captured on the owning control plane.</DialogDescription>
         </DialogHeader>
         {error && (
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               <Field label="Time" value={fmtTime(error.time)} mono />
               <Field label="Org" value={error.org} mono />
@@ -99,13 +99,13 @@ function ErrorDetailDialog({ error, onClose }: { error: ErrorEntry | null; onClo
             </div>
             <div>
               <span className="text-[10px] uppercase tracking-wide text-muted-foreground">Message</span>
-              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 text-xs text-destructive">
+              <pre className="mt-1 max-h-40 w-full overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 text-xs text-destructive">
                 {error.message || "—"}
               </pre>
             </div>
             <div>
               <span className="text-[10px] uppercase tracking-wide text-muted-foreground">Query (redacted)</span>
-              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
+              <pre className="mt-1 max-h-56 w-full overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 font-mono text-xs">
                 {error.query || "—"}
               </pre>
             </div>

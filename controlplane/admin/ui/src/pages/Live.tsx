@@ -21,6 +21,7 @@ import {
 import { useCancelSession, useKillUserSessions, useQueries, useSessions } from "@/hooks/useApi";
 import { fmtAge, fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
 import { idleInTransaction, isIdleSession, sessionStateLabel } from "@/lib/session";
+import { compareByStarted, compareByWorker } from "@/lib/liveSort";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
 export function Live() {
@@ -39,13 +40,16 @@ export function Live() {
   const matchOrg = (o?: string) => !org || (o ?? "").toLowerCase().includes(org.toLowerCase());
   const matchUser = (u?: string) => !user || (u ?? "").toLowerCase().includes(user.toLowerCase());
 
+  // Sort deterministically so the tables don't reshuffle on every 3s poll (the
+  // API returns rows in non-deterministic order). Queries by start time (oldest
+  // first); sessions by worker id (they carry no start time).
   const liveQueries = useMemo(
-    () => (queries.data ?? []).filter((q) => matchOrg(q.org) && matchUser(q.user)),
+    () => (queries.data ?? []).filter((q) => matchOrg(q.org) && matchUser(q.user)).sort(compareByStarted),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [queries.data, org, user],
   );
   const liveSessions = useMemo(
-    () => (sessions.data ?? []).filter((s) => matchOrg(s.org) && matchUser(s.user)),
+    () => (sessions.data ?? []).filter((s) => matchOrg(s.org) && matchUser(s.user)).sort(compareByWorker),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [sessions.data, org, user],
   );
