@@ -10,6 +10,7 @@ import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useAudit } from "@/hooks/useApi";
 import { fmtTime } from "@/lib/format";
+import { auditSummary } from "@/lib/audit";
 import type { AuditEntry } from "@/types/api";
 
 function statusVariant(s: number): "success" | "warning" | "destructive" | "muted" {
@@ -58,9 +59,37 @@ export function Audit() {
         ),
       },
       {
-        accessorKey: "action",
+        id: "action",
         header: "Action",
-        cell: ({ getValue }) => <span className="text-xs">{String(getValue() ?? "")}</span>,
+        // The accessor feeds sort + the free-text search box, so it carries both
+        // the human summary AND the raw code/path — an operator can search
+        // "operator" or "operators.create" or "/operators" and still match.
+        accessorFn: (r) => `${auditSummary(r)} ${r.action} ${r.path}`,
+        cell: ({ row }) => {
+          const e = row.original;
+          return (
+            <div className="flex flex-col gap-0.5">
+              <span className="text-xs font-medium">{auditSummary(e)}</span>
+              <span className="font-mono text-[10px] uppercase tracking-wide text-muted-foreground" title={e.path}>
+                {e.action}
+              </span>
+            </div>
+          );
+        },
+      },
+      {
+        accessorKey: "detail",
+        header: "Detail",
+        cell: ({ getValue }) => {
+          const v = getValue() as string | undefined;
+          return v ? (
+            <span className="block max-w-xs whitespace-normal break-words text-xs" title={v}>
+              {v}
+            </span>
+          ) : (
+            <span className="text-muted-foreground">—</span>
+          );
+        },
       },
       {
         accessorKey: "method",
@@ -68,21 +97,8 @@ export function Audit() {
         cell: ({ getValue }) => <Badge variant={methodVariant(String(getValue() ?? ""))}>{String(getValue() ?? "")}</Badge>,
       },
       {
-        accessorKey: "path",
-        header: "Path",
-        cell: ({ getValue }) => <span className="font-mono text-xs text-muted-foreground">{String(getValue() ?? "")}</span>,
-      },
-      {
         accessorKey: "org",
         header: "Org",
-        cell: ({ getValue }) => {
-          const v = getValue() as string | undefined;
-          return v ? <span className="font-mono text-xs">{v}</span> : <span className="text-muted-foreground">—</span>;
-        },
-      },
-      {
-        accessorKey: "target_user",
-        header: "Target",
         cell: ({ getValue }) => {
           const v = getValue() as string | undefined;
           return v ? <span className="font-mono text-xs">{v}</span> : <span className="text-muted-foreground">—</span>;
@@ -145,7 +161,7 @@ export function Audit() {
       <PageBody>
         <Card className="overflow-hidden">
           {audit.isLoading ? (
-            <TableSkeleton cols={9} />
+            <TableSkeleton cols={8} />
           ) : audit.isError ? (
             <ErrorState error={audit.error} onRetry={() => audit.refetch()} />
           ) : (

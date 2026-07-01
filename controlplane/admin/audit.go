@@ -28,8 +28,12 @@ type AdminAuditEntry struct {
 	Org         string    `gorm:"index" json:"org"`
 	TargetUser  string    `json:"target_user"`
 	SQLRedacted string    `json:"sql_redacted"`
-	Status      int       `json:"status"`
-	RemoteAddr  string    `json:"remote_addr"`
+	// Detail is optional, non-sensitive human context for the action (e.g.
+	// "role viewer → admin" for an operator change). Set by a handler via
+	// ctxAuditDetailKey; NEVER put credentials or raw secret DDL here.
+	Detail     string `json:"detail"`
+	Status     int    `json:"status"`
+	RemoteAddr string `json:"remote_addr"`
 }
 
 // TableName pins the audit table name in the config-store database.
@@ -120,6 +124,9 @@ func AuditMiddleware(store *AuditStore) gin.HandlerFunc {
 			Path:       c.Request.URL.Path,
 			Org:        c.Param("id"),
 			TargetUser: targetUser,
+			// Optional human context a handler recorded (e.g. which org fields
+			// changed). Empty for handlers that don't set it.
+			Detail:     c.GetString(ctxAuditDetailKey),
 			Status:     c.Writer.Status(),
 			RemoteAddr: c.ClientIP(),
 		}
@@ -132,11 +139,27 @@ func AuditMiddleware(store *AuditStore) gin.HandlerFunc {
 
 const ctxAuditHandledKey = "duckgres_audit_handled"
 
+// ctxAuditDetailKey holds an optional, non-sensitive human summary of a
+// mutation that a handler recorded (e.g. "role viewer → admin"). AuditMiddleware
+// copies it into AdminAuditEntry.Detail. NEVER put credentials or raw secret DDL
+// through it — the audit log stores it verbatim and the console shows it.
+const ctxAuditDetailKey = "duckgres_audit_detail"
+
+// setAuditDetail records a human-readable detail string for the current request
+// so AuditMiddleware includes it in the audit row. No-op for the empty string.
+func setAuditDetail(c *gin.Context, detail string) {
+	if detail != "" {
+		c.Set(ctxAuditDetailKey, detail)
+	}
+}
+
 // auditActionFor derives a resource-specific audit Action ("<resource>.<verb>")
 // from the request method and path. It tolerates both the resolved path
 // (c.Request.URL.Path, e.g. "/api/v1/orgs/acme/users/bob") and the route
 // template (c.FullPath()), and an optional "/api/v1" version prefix. Unknown
-// shapes fall back to the generic "config.<verb>".
+// shapes fall back to the generic "config.<verb>". The codes here are the source
+// of truth for the console's human labels (see ui/src/lib/audit.ts) — keep the
+// two in sync.
 func auditActionFor(method, path string) string {
 	verb := actionVerb(method)
 	segs := strings.FieldsFunc(path, func(r rune) bool { return r == '/' })
@@ -147,33 +170,53 @@ func auditActionFor(method, path string) string {
 	if len(segs) == 0 {
 		return "config." + verb
 	}
+	last := segs[len(segs)-1]
 	switch segs[0] {
 	case "operators":
 		return "operators." + verb
-	case "orgs":
-		// Sub-resources under an org get their own action; the org row itself
-		// (and anything else) is generic config.
-		for _, s := range segs[1:] {
-			switch s {
-			case "warehouse":
-				return "warehouse." + verb
-			case "users":
-				// A trailing action segment names the user action explicitly so
-				// the kill switch shows up as user.kill/disable/enable rather than
-				// a generic user.create in the audit log.
-				switch segs[len(segs)-1] {
-				case "kill":
-					return "user.kill"
-				case "disable":
-					return "user.disable"
-				case "enable":
-					return "user.enable"
-				}
-				return "user." + verb
-			}
+	case "users":
+		// Top-level user create (POST /users) — not nested under an org.
+		return "user." + verb
+	case "sessions":
+		// /sessions/:pid/cancel and /sessions/by-worker/:wid/cancel.
+		if last == "cancel" {
+			return "session.cancel"
 		}
+		return "session." + verb
+	case "orgs":
+		// Sub-resources under an org each get their own action; the org row
+		// itself is "org.<verb>". Order matters: the more specific
+		// sub-resources (secret, the user lifecycle verbs) must win over the
+		// generic "users"/"warehouse" segments they nest under.
+		switch {
+		case last == "kill" || last == "disable" || last == "enable":
+			// User kill switch: /orgs/:id/users/:username/{kill,disable,enable}.
+			return "user." + last
+		case hasSeg(segs, "secrets"):
+			// /orgs/:id/users/:username/secrets/:name.
+			return "secret." + verb
+		case hasSeg(segs, "warehouse"):
+			// PUT /warehouse and PATCH /warehouse/pinning both map here.
+			return "warehouse." + verb
+		case hasSeg(segs, "impersonate"):
+			// Impersonation records its own richer row; this is a fallback.
+			return "impersonate." + verb
+		case hasSeg(segs, "users"):
+			return "user." + verb
+		}
+		return "org." + verb
 	}
 	return "config." + verb
+}
+
+// hasSeg reports whether segs contains s.
+func hasSeg(segs []string, s string) bool {
+	for _, seg := range segs {
+		if seg == s {
+			return true
+		}
+	}
+	return false
 }
 
 func actionVerb(method string) string {
