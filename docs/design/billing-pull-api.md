@@ -27,13 +27,15 @@ safety:    GC hard-deletes buckets older than 30 days (logged)
 Internally, one row per unique key, values accumulated:
 
 - **Key:** `(org_id, team_id, cpu_millicores, mem_mib, bucket_start)`
-  where `bucket_start = floor(connection_end / 60s)`.
+  where `bucket_start = floor(connection_end / 60s)`. Worker size is stored as
+  **exact integers** (millicores, MiB) in the key — never a float — so equal sizes
+  always group into the same bucket (float keys risk `16.0 ≠ 16.0` splits).
 - **Values:** `cpu_seconds` (vCPU-seconds), `memory_seconds` (GiB-seconds) —
   summed over every connection that falls in that key + minute.
 - `team_id` is looked up from the config store (**org → team mapping**) at
   connection time.
-- Worker size (`cpu_millicores`, `mem_mib`) is part of the key, so different
-  worker sizes accumulate — and bill — separately.
+- Worker size is part of the key, so different worker sizes accumulate — and bill —
+  separately. It is **reported** in GiB/vCPU (see the API) to match the value units.
 
 **60-second resolution is kept internally.** The pull API aggregates on read (see
 below), so billing never has to chase individual minutes — but the fine buckets
@@ -50,8 +52,9 @@ Auth: `Authorization: Bearer <internal secret>`.
 
 ### `GET /api/billing/usage`
 
-Returns compute usage **aggregated since the last ack**, one row per
-`(org_id, team_id, cpu_millicores, mem_mib)`:
+Returns compute usage **aggregated since the last ack**, one row per worker size
+per `(org_id, team_id)`. Size is reported as `cpu` (vCPU) and `mem_gib` (GiB) —
+same units as the values:
 
 ```json
 {
@@ -60,14 +63,17 @@ Returns compute usage **aggregated since the last ack**, one row per
     {
       "org_id": "org_abc",
       "team_id": "12345",
-      "cpu_millicores": 8000,
-      "mem_mib": 16384,
+      "cpu": 8,
+      "mem_gib": 16,
       "cpu_seconds": 4800,
       "memory_seconds": 9600
     }
   ]
 }
 ```
+
+(`cpu`/`mem_gib` are decimals — e.g. `1.5`, `0.5` — for fractional worker sizes;
+the grouping key behind them is exact integer millicores/MiB.)
 
 - Sums all **closed** buckets in `(last_acked, watermark]`, where
   `watermark` = the latest closed minute (`now − grace`).
@@ -129,7 +135,8 @@ Returns compute usage **aggregated since the last ack**, one row per
 - Bucket width 60s, grace 30s.
 - Endpoint paths above are indicative — adjust to the control-plane API's house
   style.
-- Values are exposed as vCPU-seconds / GiB-seconds; internally accumulated in exact
+- Values exposed as vCPU-seconds / GiB-seconds; worker size reported as vCPU /
+  GiB (decimals) to match. Internally accumulated + keyed in exact
   millicore-/MiB-seconds so no precision is lost for fractional worker sizes.
 - Single billing consumer assumed → one server-side `last_acked` cursor. (If a
   second independent consumer is ever needed, give each its own named cursor.)
