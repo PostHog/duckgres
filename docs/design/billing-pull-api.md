@@ -10,15 +10,15 @@ leaves duckgres changes.
 
 duckgres meters compute usage into 60-second **buckets** in its config store. The
 billing service periodically **pulls** the usage accumulated since its last ack,
-processes it, and **acks a watermark**; duckgres advances a cursor and deletes
-everything up to it. A safety GC caps how long anything can linger. Direction is
+processes it, and **acks the high watermark**; duckgres advances a cursor and
+deletes everything up to it. A safety GC caps how long anything can linger. Direction is
 posthog → mw (billing initiates), which the existing duckgres control-plane
 ingress already supports.
 
 ```
 duckgres:  connection ends → meter → accumulate into 60s config-store buckets
-billing:   GET /usage  → process → POST /ack {watermark}
-                                     → duckgres advances cursor + deletes ≤ watermark
+billing:   GET /usage  → process → POST /ack {watermark_high}
+                                     → duckgres advances cursor + deletes ≤ watermark_high
 safety:    GC hard-deletes buckets older than 30 days (logged)
 ```
 
@@ -63,7 +63,8 @@ Returns every **closed 60s bucket since the last ack** — one row per
 
 ```json
 {
-  "watermark": "2026-07-01T12:40:00Z",
+  "watermark_low":  "2026-07-01T12:30:00Z",
+  "watermark_high": "2026-07-01T12:40:00Z",
   "usage": [
     {
       "bucket_start": "2026-07-01T12:34:00Z",
@@ -82,8 +83,16 @@ Returns every **closed 60s bucket since the last ack** — one row per
 (`cpu`/`mem_gib` are exact decimals — e.g. `1.5`, `0.5` — for fractional worker
 sizes; stored as `NUMERIC` so grouping is exact.)
 
-- Returns every closed bucket in `(last_acked, watermark]`, where `watermark` =
-  the latest closed minute (`now − grace`). Kept at minute granularity.
+- Returns every closed bucket in the window `(watermark_low, watermark_high]`,
+  kept at minute granularity, where:
+  - `watermark_low` = duckgres's current cursor (= the last value billing acked) —
+    the window start.
+  - `watermark_high` = the latest closed minute (`now − grace`) — what billing acks.
+- **Consistency check:** billing should assert `watermark_low` == its own recorded
+  last-acked value before applying. A mismatch means something desynced (a lost/
+  half-applied ack; HTTP and Postgres aren't one transaction) → a potential hole →
+  alert/reconcile instead of silently under-billing. It's a cross-check, not a
+  correctness fix (delete-on-ack already prevents loss); it makes a *bug* visible.
 - **Catch up in one pull.** A single `GET` returns **all** pending minutes since
   the last ack (not one bucket per request), and one `ack` advances past all of
   them — so billing never chases 60s buckets and can't fall behind. Response size
@@ -93,13 +102,13 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 ### `POST /api/billing/ack`
 
 ```json
-{ "watermark": "2026-07-01T12:40:00Z" }
+{ "watermark_high": "2026-07-01T12:40:00Z" }
 ```
 
-- duckgres advances its cursor to `watermark` and **deletes all buckets ≤
-  watermark**. Idempotent — a watermark at or below the current cursor is a no-op,
-  so a retried ack is always safe. Pass back the exact `watermark` from the `GET`
-  response.
+- duckgres advances its cursor to `watermark_high` and **deletes all buckets ≤
+  watermark_high**. Idempotent — a value at or below the current cursor is a no-op,
+  so a retried ack is always safe. Pass back the exact `watermark_high` from the
+  `GET` response (it becomes the next pull's `watermark_low`).
 
 ## No data loss
 
@@ -108,10 +117,10 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   after processing but before acking, the next `GET` returns the same window
   (extended up to a later `now`) — safe to reprocess, because billing finalizes
   only on **ack**: the ack is the commit boundary. Delivery is effectively
-  at-least-once with the watermark as the idempotency edge.
+  at-least-once with `watermark_high` as the idempotency edge.
 - Only **closed** buckets are aggregated, so a minute is never served while it is
   still accumulating.
-- **Cross-org completeness (no TOCTOU on the delete):** the `watermark` is always a
+- **Cross-org completeness (no TOCTOU on the delete):** `watermark_high` is always a
   fully-closed minute (`≤ now − grace`), and `grace` exceeds the flush interval — so
   by the time a minute is served (and later deleted on ack), every replica's buckets
   for **every** org in that minute have already landed. A partially-inserted current
@@ -120,7 +129,7 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 
 ## No infinite accumulation
 
-- Ack deletes everything `≤ watermark` immediately.
+- Ack deletes everything `≤ watermark_high` immediately.
 - **Safety GC:** hard-delete any bucket older than **30 days** regardless of ack,
   logging the dropped count. This bounds table size even if billing stops pulling
   entirely. (A nonzero GC-drop count = billing isn't keeping up — alert on it.)
