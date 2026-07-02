@@ -999,18 +999,18 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	// setup work is observable per statement, not just per outer query.
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
+		stmtQuery, stmtArgs := queryAndArgsForStatement(stmt, args)
+		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmtQuery)
 		setupStart := time.Now()
-		c.logQueryStarted(stmt)
-		stmtArgs := argsForStatement(stmt, args)
-		result, err := c.executor.Exec(stmt, stmtArgs...)
+		c.logQueryStarted(stmtQuery)
+		result, err := c.executor.Exec(stmtQuery, stmtArgs...)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
 		}
-		c.logQueryFinished(stmt, setupStart, setupRows, err)
+		c.logQueryFinished(stmtQuery, setupStart, setupRows, err)
 		if err != nil {
-			c.logger().Error("Multi-stmt-ext setup error.", "query", stmt, "error", err)
+			c.logger().Error("Multi-stmt-ext setup error.", "query", stmtQuery, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -1021,25 +1021,25 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	// Handle final statement
 	finalStmt := statements[len(statements)-1]
+	finalQuery, finalArgs := queryAndArgsForStatement(finalStmt, args)
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	c.logger().Debug("Multi-stmt-ext final.", "stmt", finalStmt, "cmd_type", cmdType)
+	c.logger().Debug("Multi-stmt-ext final.", "stmt", finalQuery, "cmd_type", cmdType)
 
 	finalStart := time.Now()
 	var finalRowsAff int64
 	var finalErr error
-	c.logQueryStarted(finalStmt)
+	c.logQueryStarted(finalQuery)
 	defer func() {
-		c.logQueryFinished(finalStmt, finalStart, finalRowsAff, finalErr)
+		c.logQueryFinished(finalQuery, finalStart, finalRowsAff, finalErr)
 	}()
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		finalArgs := argsForStatement(finalStmt, args)
-		rows, err := c.executor.Query(finalStmt, finalArgs...)
+		rows, err := c.executor.Query(finalQuery, finalArgs...)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt-ext final query error.", "query", finalStmt, "error", err)
+			c.logger().Error("Multi-stmt-ext final query error.", "query", finalQuery, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -1054,15 +1054,14 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// is tracked by streamRowsToClientExtended; the deferred Finished
 		// log uses 0 as an approximation (logQuery still records the
 		// precise count via the structured channel).
-		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
+		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalQuery)
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
-		finalArgs := argsForStatement(finalStmt, args)
-		result, err := c.executor.Exec(finalStmt, finalArgs...)
+		result, err := c.executor.Exec(finalQuery, finalArgs...)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalStmt, "error", err)
+			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalQuery, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())

@@ -30,7 +30,9 @@ type onConflictMergeRewrite struct {
 	merge           *pg_query.MergeStmt
 	sourceSelect    *pg_query.SelectStmt
 	targetRelation  *pg_query.RangeVar
+	insertColumns   []string
 	conflictColumns []string
+	action          pg_query.OnConflictAction
 }
 
 func NewOnConflictTransform() *OnConflictTransform {
@@ -58,12 +60,11 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 			// CONSTRAINT <name> cannot be honored: there is no named constraint to
 			// infer the conflict target from. Reject it with a clean PostgreSQL
 			// error rather than letting it fail opaquely at DuckDB.
-			if t.DuckLakeMode && insert.OnConflictClause != nil &&
-				insert.OnConflictClause.Infer != nil &&
-				strings.TrimSpace(insert.OnConflictClause.Infer.Conname) != "" {
-				result.Error = NewFeatureNotSupported(
-					"ON CONFLICT ON CONSTRAINT is not supported: this catalog does not enforce named constraints")
-				return false, nil
+			if t.DuckLakeMode && insert.OnConflictClause != nil {
+				if unsupported := t.validateDuckLakeConflictTarget(insert.OnConflictClause); unsupported != nil {
+					result.Error = unsupported
+					return false, nil
+				}
 			}
 
 			if rewrite := t.transformInsertToMerge(insert); rewrite != nil {
@@ -86,6 +87,28 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 	}
 
 	return changed, nil
+}
+
+func (t *OnConflictTransform) validateDuckLakeConflictTarget(occ *pg_query.OnConflictClause) error {
+	if occ == nil || occ.Infer == nil {
+		return nil
+	}
+	if strings.TrimSpace(occ.Infer.Conname) != "" {
+		return NewFeatureNotSupported(
+			"ON CONFLICT ON CONSTRAINT is not supported: this catalog does not enforce named constraints")
+	}
+	if occ.Infer.WhereClause != nil {
+		return NewFeatureNotSupported(
+			"ON CONFLICT partial index predicates are not supported: this catalog does not enforce partial unique indexes")
+	}
+	for _, elem := range occ.Infer.IndexElems {
+		indexElem := elem.GetIndexElem()
+		if indexElem == nil || strings.TrimSpace(indexElem.Name) == "" {
+			return NewFeatureNotSupported(
+				"ON CONFLICT expression targets are not supported: use column names")
+		}
+	}
+	return nil
 }
 
 // transformInsertToMerge converts INSERT ... ON CONFLICT to MERGE for DuckLake mode
@@ -179,7 +202,9 @@ func (t *OnConflictTransform) transformInsertToMerge(insert *pg_query.InsertStmt
 		merge:           merge,
 		sourceSelect:    sourceSelect,
 		targetRelation:  insert.Relation,
+		insertColumns:   colNames,
 		conflictColumns: conflictColumns,
+		action:          occ.Action,
 	}
 }
 
@@ -217,15 +242,51 @@ func (t *OnConflictTransform) buildGuardedMergeStatements(rewrite *onConflictMer
 	}
 
 	statements := []string{
-		"CREATE TEMPORARY TABLE " + sourceRelation + " AS " + sourceSQL,
-		t.buildSourceDuplicateGuard(sourceFrom, rewrite.conflictColumns),
+		"BEGIN",
+		t.buildCreateSourceTableStatement(sourceRelation, sourceSQL, rewrite),
+	}
+	if rewrite.action == pg_query.OnConflictAction_ONCONFLICT_UPDATE {
+		statements = append(statements, t.buildSourceDuplicateGuard(sourceFrom, rewrite.conflictColumns))
+	}
+	statements = append(statements,
 		t.buildTargetDuplicateGuard(sourceFrom, rewrite.targetRelation, rewrite.conflictColumns),
 		mergeSQL,
-	}
+	)
 	cleanup := []string{
 		"DROP TABLE IF EXISTS " + sourceRelation,
+		"COMMIT",
 	}
 	return statements, cleanup, nil
+}
+
+func (t *OnConflictTransform) buildCreateSourceTableStatement(sourceRelation string, sourceSQL string, rewrite *onConflictMergeRewrite) string {
+	columnList := quotedColumnList(rewrite.insertColumns)
+	if rewrite.action != pg_query.OnConflictAction_ONCONFLICT_NOTHING {
+		return "CREATE TEMPORARY TABLE " + sourceRelation + " " + columnList + " AS " + sourceSQL
+	}
+
+	return "CREATE TEMPORARY TABLE " + sourceRelation + " " + columnList + " AS " +
+		t.buildDoNothingSourceSQL(sourceSQL, rewrite.insertColumns, rewrite.conflictColumns)
+}
+
+func (t *OnConflictTransform) buildDoNothingSourceSQL(sourceSQL string, insertColumns []string, conflictColumns []string) string {
+	rawAlias := "duckgres_on_conflict_raw"
+	rankedAlias := "duckgres_on_conflict_ranked"
+	rankColumn := "_duckgres_on_conflict_rank"
+
+	insertRefs := qualifiedColumnRefs(rankedAlias, insertColumns)
+	conflictRefs := qualifiedColumnRefs(rawAlias, conflictColumns)
+	preservePredicates := make([]string, 0, len(conflictColumns)+1)
+	for _, ref := range qualifiedColumnRefs(rankedAlias, conflictColumns) {
+		preservePredicates = append(preservePredicates, ref+" IS NULL")
+	}
+	preservePredicates = append(preservePredicates, rankedAlias+"."+quoteIdent(rankColumn)+" = 1")
+
+	return "SELECT " + strings.Join(insertRefs, ", ") + " FROM (" +
+		"SELECT " + rawAlias + ".*, row_number() OVER (PARTITION BY " + strings.Join(conflictRefs, ", ") + ") AS " + quoteIdent(rankColumn) + " " +
+		"FROM (" + sourceSQL + ") AS " + rawAlias + " " + quotedColumnList(insertColumns) +
+		") AS " + rankedAlias + " " +
+		"WHERE " + strings.Join(preservePredicates, " OR ")
 }
 
 func deparseStatement(stmt *pg_query.Node) (string, error) {
@@ -240,6 +301,9 @@ func deparseStatement(stmt *pg_query.Node) (string, error) {
 
 func deparseMergeWithTempSource(merge *pg_query.MergeStmt, sourceTableName string) (string, error) {
 	originalSourceRelation := merge.SourceRelation
+	defer func() {
+		merge.SourceRelation = originalSourceRelation
+	}()
 	merge.SourceRelation = &pg_query.Node{
 		Node: &pg_query.Node_RangeVar{
 			RangeVar: &pg_query.RangeVar{
@@ -249,7 +313,6 @@ func deparseMergeWithTempSource(merge *pg_query.MergeStmt, sourceTableName strin
 		},
 	}
 	sql, err := deparseStatement(&pg_query.Node{Node: &pg_query.Node_MergeStmt{MergeStmt: merge}})
-	merge.SourceRelation = originalSourceRelation
 	return sql, err
 }
 
@@ -316,6 +379,14 @@ func qualifiedColumnRefs(alias string, columns []string) []string {
 		refs[i] = alias + "." + quoteIdent(col)
 	}
 	return refs
+}
+
+func quotedColumnList(columns []string) string {
+	quoted := make([]string, len(columns))
+	for i, col := range columns {
+		quoted[i] = quoteIdent(col)
+	}
+	return "(" + strings.Join(quoted, ", ") + ")"
 }
 
 func notNullPredicates(refs []string) string {

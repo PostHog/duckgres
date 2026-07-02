@@ -1590,15 +1590,104 @@ func countDollarParams(query string) int {
 	return max
 }
 
-func argsForStatement(query string, args []interface{}) []interface{} {
-	paramCount := countDollarParams(query)
-	if paramCount == 0 {
-		return nil
+func queryAndArgsForStatement(query string, args []interface{}) (string, []interface{}) {
+	var out strings.Builder
+	var stmtArgs []interface{}
+	inString := false
+	inIdent := false
+	inLineComment := false
+	inBlockComment := false
+
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+
+		if inBlockComment {
+			out.WriteByte(c)
+			if c == '*' && i+1 < len(query) && query[i+1] == '/' {
+				out.WriteByte(query[i+1])
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+
+		if inLineComment {
+			out.WriteByte(c)
+			if c == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+
+		if inString {
+			out.WriteByte(c)
+			if c == '\'' {
+				if i+1 < len(query) && query[i+1] == '\'' {
+					out.WriteByte(query[i+1])
+					i++
+				} else {
+					inString = false
+				}
+			}
+			continue
+		}
+
+		if inIdent {
+			out.WriteByte(c)
+			if c == '"' {
+				if i+1 < len(query) && query[i+1] == '"' {
+					out.WriteByte(query[i+1])
+					i++
+				} else {
+					inIdent = false
+				}
+			}
+			continue
+		}
+
+		if c == '-' && i+1 < len(query) && query[i+1] == '-' {
+			out.WriteByte(c)
+			out.WriteByte(query[i+1])
+			inLineComment = true
+			i++
+			continue
+		}
+		if c == '/' && i+1 < len(query) && query[i+1] == '*' {
+			out.WriteByte(c)
+			out.WriteByte(query[i+1])
+			inBlockComment = true
+			i++
+			continue
+		}
+		if c == '\'' {
+			out.WriteByte(c)
+			inString = true
+			continue
+		}
+		if c == '"' {
+			out.WriteByte(c)
+			inIdent = true
+			continue
+		}
+
+		if c == '$' && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9' {
+			j := i + 1
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+			}
+			n, err := strconv.Atoi(query[i+1 : j])
+			if err == nil && n >= 1 && n <= len(args) {
+				out.WriteByte('?')
+				stmtArgs = append(stmtArgs, args[n-1])
+				i = j - 1
+				continue
+			}
+		}
+
+		out.WriteByte(c)
 	}
-	if paramCount >= len(args) {
-		return args
-	}
-	return args[:paramCount]
+
+	return out.String(), stmtArgs
 }
 
 // isEmptyQuery and stripLeadingComments moved to server/sqlcore so the

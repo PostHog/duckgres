@@ -3861,48 +3861,87 @@ func TestCountDollarParams(t *testing.T) {
 	}
 }
 
-func TestArgsForStatement(t *testing.T) {
+func TestQueryAndArgsForStatement(t *testing.T) {
 	args := []interface{}{"id_1", "nickname", "unused"}
 
 	tests := []struct {
 		name  string
 		query string
+		wantQ string
 		want  []interface{}
 	}{
 		{
 			name:  "no placeholders",
 			query: "SELECT 1",
+			wantQ: "SELECT 1",
 			want:  nil,
 		},
 		{
 			name:  "uses first placeholder",
 			query: "SELECT $1",
+			wantQ: "SELECT ?",
 			want:  args[:1],
 		},
 		{
 			name:  "uses first two placeholders",
 			query: "INSERT INTO t VALUES ($1, $2)",
+			wantQ: "INSERT INTO t VALUES (?, ?)",
 			want:  args[:2],
 		},
 		{
-			name:  "highest referenced placeholder controls argument count",
-			query: "SELECT $3",
-			want:  args,
+			name:  "sparse placeholders preserve referenced argument numbers",
+			query: "SELECT $3, $1",
+			wantQ: "SELECT ?, ?",
+			want:  []interface{}{args[2], args[0]},
 		},
 		{
-			name:  "placeholder count beyond provided args does not panic",
+			name:  "repeated placeholders duplicate the referenced argument",
+			query: "SELECT $2, $2",
+			wantQ: "SELECT ?, ?",
+			want:  []interface{}{args[1], args[1]},
+		},
+		{
+			name:  "ignores placeholders in literals comments and identifiers",
+			query: "SELECT '$1', \"$2\", $3 -- $1\n/* $2 */",
+			wantQ: "SELECT '$1', \"$2\", ? -- $1\n/* $2 */",
+			want:  []interface{}{args[2]},
+		},
+		{
+			name:  "placeholder beyond provided args is left for downstream validation",
 			query: "SELECT $4",
-			want:  args,
+			wantQ: "SELECT $4",
+			want:  nil,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := argsForStatement(tt.query, args)
+			gotQ, got := queryAndArgsForStatement(tt.query, args)
+			if gotQ != tt.wantQ {
+				t.Fatalf("queryAndArgsForStatement(%q) query = %q, want %q", tt.query, gotQ, tt.wantQ)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("argsForStatement(%q) = %#v, want %#v", tt.query, got, tt.want)
+				t.Fatalf("queryAndArgsForStatement(%q) args = %#v, want %#v", tt.query, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestQueryAndArgsForStatementRunsSparseDollarParams(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	query, args := queryAndArgsForStatement("SELECT $3 || '-' || $1", []interface{}{"first", "second", "third"})
+
+	var got string
+	if err := db.QueryRow(query, args...).Scan(&got); err != nil {
+		t.Fatalf("run rewritten sparse-placeholder query %q args=%v: %v", query, args, err)
+	}
+	if got != "third-first" {
+		t.Fatalf("rewritten sparse-placeholder query returned %q, want third-first", got)
 	}
 }
 
