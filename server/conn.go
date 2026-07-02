@@ -1590,6 +1590,17 @@ func countDollarParams(query string) int {
 	return max
 }
 
+func argsForStatement(query string, args []interface{}) []interface{} {
+	paramCount := countDollarParams(query)
+	if paramCount == 0 {
+		return nil
+	}
+	if paramCount >= len(args) {
+		return args
+	}
+	return args[:paramCount]
+}
+
 // isEmptyQuery and stripLeadingComments moved to server/sqlcore so the
 // Flight client can call them without importing server. Local thin wrappers
 // preserve the unexported call-site spellings used throughout this file.

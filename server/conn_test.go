@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -3857,6 +3858,51 @@ func TestCountDollarParams(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("countDollarParams(%q) = %d, want %d", tt.query, got, tt.expected)
 		}
+	}
+}
+
+func TestArgsForStatement(t *testing.T) {
+	args := []interface{}{"id_1", "nickname", "unused"}
+
+	tests := []struct {
+		name  string
+		query string
+		want  []interface{}
+	}{
+		{
+			name:  "no placeholders",
+			query: "SELECT 1",
+			want:  nil,
+		},
+		{
+			name:  "uses first placeholder",
+			query: "SELECT $1",
+			want:  args[:1],
+		},
+		{
+			name:  "uses first two placeholders",
+			query: "INSERT INTO t VALUES ($1, $2)",
+			want:  args[:2],
+		},
+		{
+			name:  "highest referenced placeholder controls argument count",
+			query: "SELECT $3",
+			want:  args,
+		},
+		{
+			name:  "placeholder count beyond provided args does not panic",
+			query: "SELECT $4",
+			want:  args,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := argsForStatement(tt.query, args)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("argsForStatement(%q) = %#v, want %#v", tt.query, got, tt.want)
+			}
+		})
 	}
 }
 
