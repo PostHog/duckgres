@@ -235,7 +235,7 @@ func TestProvisionPersistsDefaultTeamID(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "team-db", "default_team_id": "12345", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "team-db", "default_team_id": "12345", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/team-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -262,7 +262,7 @@ func TestProvisionWithoutDefaultTeamIDLeavesNull(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "noteam-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "noteam-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/noteam-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

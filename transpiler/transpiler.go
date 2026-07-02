@@ -288,7 +288,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				ParamCount:      transformResult.ParamCount,
 				QuerySourceSet:  transformResult.QuerySourceSet,
 				QuerySourceShow: transformResult.QuerySourceShow,
-				Warnings:        transformResult.Warnings,
 			}, nil
 		}
 
