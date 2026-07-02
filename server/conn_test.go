@@ -3907,6 +3907,24 @@ func TestQueryAndArgsForStatement(t *testing.T) {
 			want:  []interface{}{args[2]},
 		},
 		{
+			name:  "ignores placeholders in escape string literals",
+			query: "SELECT E'foo\\' $1', $2",
+			wantQ: "SELECT E'foo\\' $1', ?",
+			want:  []interface{}{args[1]},
+		},
+		{
+			name:  "ignores placeholders in dollar quoted strings",
+			query: "SELECT $$ $1 $$, $2",
+			wantQ: "SELECT $$ $1 $$, ?",
+			want:  []interface{}{args[1]},
+		},
+		{
+			name:  "ignores placeholders in tagged dollar quoted strings",
+			query: "SELECT $tag$ $1 $tag$, $3",
+			wantQ: "SELECT $tag$ $1 $tag$, ?",
+			want:  []interface{}{args[2]},
+		},
+		{
 			name:  "placeholder beyond provided args is left for downstream validation",
 			query: "SELECT $4",
 			wantQ: "SELECT $4",
@@ -3942,6 +3960,58 @@ func TestQueryAndArgsForStatementRunsSparseDollarParams(t *testing.T) {
 	}
 	if got != "third-first" {
 		t.Fatalf("rewritten sparse-placeholder query returned %q, want third-first", got)
+	}
+}
+
+type cleanupErrorExecutor struct {
+	noopProfiling
+	execQueries []string
+}
+
+func (e *cleanupErrorExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *cleanupErrorExecutor) ExecContext(context.Context, string, ...any) (ExecResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *cleanupErrorExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *cleanupErrorExecutor) Exec(query string, _ ...any) (ExecResult, error) {
+	e.execQueries = append(e.execQueries, query)
+	if strings.TrimSpace(strings.ToUpper(query)) == "COMMIT" {
+		return nil, errors.New("commit failed")
+	}
+	return &fakeExecResult{}, nil
+}
+
+func (e *cleanupErrorExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *cleanupErrorExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *cleanupErrorExecutor) Close() error {
+	return nil
+}
+
+func TestExecuteCleanupAndCommitPropagatesCommitError(t *testing.T) {
+	exec := &cleanupErrorExecutor{}
+	c := &clientConn{executor: exec}
+
+	err := c.executeCleanupAndCommit([]string{"DROP TABLE IF EXISTS _duckgres_tmp", "COMMIT"})
+	if err == nil || !strings.Contains(err.Error(), "commit failed") {
+		t.Fatalf("executeCleanupAndCommit error = %v, want commit failed", err)
+	}
+
+	want := []string{"DROP TABLE IF EXISTS _duckgres_tmp", "COMMIT", "ROLLBACK"}
+	if !reflect.DeepEqual(exec.execQueries, want) {
+		t.Fatalf("exec queries = %#v, want %#v", exec.execQueries, want)
 	}
 }
 

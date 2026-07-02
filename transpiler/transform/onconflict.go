@@ -65,6 +65,10 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 					result.Error = unsupported
 					return false, nil
 				}
+				if unsupported := t.validateDuckLakeInsertColumns(insert); unsupported != nil {
+					result.Error = unsupported
+					return false, nil
+				}
 			}
 
 			if rewrite := t.transformInsertToMerge(insert); rewrite != nil {
@@ -90,8 +94,12 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 }
 
 func (t *OnConflictTransform) validateDuckLakeConflictTarget(occ *pg_query.OnConflictClause) error {
-	if occ == nil || occ.Infer == nil {
+	if occ == nil {
 		return nil
+	}
+	if occ.Infer == nil {
+		return NewFeatureNotSupported(
+			"ON CONFLICT without a conflict target is not supported: this catalog does not enforce unique constraints")
 	}
 	if strings.TrimSpace(occ.Infer.Conname) != "" {
 		return NewFeatureNotSupported(
@@ -106,6 +114,34 @@ func (t *OnConflictTransform) validateDuckLakeConflictTarget(occ *pg_query.OnCon
 		if indexElem == nil || strings.TrimSpace(indexElem.Name) == "" {
 			return NewFeatureNotSupported(
 				"ON CONFLICT expression targets are not supported: use column names")
+		}
+	}
+	return nil
+}
+
+func (t *OnConflictTransform) validateDuckLakeInsertColumns(insert *pg_query.InsertStmt) error {
+	if insert == nil || insert.OnConflictClause == nil {
+		return nil
+	}
+	if len(insert.Cols) == 0 {
+		return NewFeatureNotSupported(
+			"ON CONFLICT without an explicit insert column list is not supported")
+	}
+	insertColumns := make(map[string]struct{}, len(insert.Cols))
+	for _, col := range insert.Cols {
+		rt := col.GetResTarget()
+		if rt == nil || strings.TrimSpace(rt.Name) == "" {
+			return NewFeatureNotSupported(
+				"ON CONFLICT without an explicit insert column list is not supported")
+		}
+		insertColumns[rt.Name] = struct{}{}
+	}
+
+	conflictColumns := t.conflictColumnNames(insert.OnConflictClause.Infer.IndexElems)
+	for _, conflictColumn := range conflictColumns {
+		if _, ok := insertColumns[conflictColumn]; !ok {
+			return NewFeatureNotSupported(
+				"ON CONFLICT conflict columns must be present in the insert column list")
 		}
 	}
 	return nil
@@ -247,9 +283,9 @@ func (t *OnConflictTransform) buildGuardedMergeStatements(rewrite *onConflictMer
 	}
 	if rewrite.action == pg_query.OnConflictAction_ONCONFLICT_UPDATE {
 		statements = append(statements, t.buildSourceDuplicateGuard(sourceFrom, rewrite.conflictColumns))
+		statements = append(statements, t.buildTargetDuplicateGuard(sourceFrom, rewrite.targetRelation, rewrite.conflictColumns))
 	}
 	statements = append(statements,
-		t.buildTargetDuplicateGuard(sourceFrom, rewrite.targetRelation, rewrite.conflictColumns),
 		mergeSQL,
 	)
 	cleanup := []string{

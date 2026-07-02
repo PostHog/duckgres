@@ -1594,6 +1594,7 @@ func queryAndArgsForStatement(query string, args []interface{}) (string, []inter
 	var out strings.Builder
 	var stmtArgs []interface{}
 	inString := false
+	inEscapeString := false
 	inIdent := false
 	inLineComment := false
 	inBlockComment := false
@@ -1621,12 +1622,18 @@ func queryAndArgsForStatement(query string, args []interface{}) (string, []inter
 
 		if inString {
 			out.WriteByte(c)
+			if inEscapeString && c == '\\' && i+1 < len(query) {
+				out.WriteByte(query[i+1])
+				i++
+				continue
+			}
 			if c == '\'' {
 				if i+1 < len(query) && query[i+1] == '\'' {
 					out.WriteByte(query[i+1])
 					i++
 				} else {
 					inString = false
+					inEscapeString = false
 				}
 			}
 			continue
@@ -1659,9 +1666,18 @@ func queryAndArgsForStatement(query string, args []interface{}) (string, []inter
 			i++
 			continue
 		}
+		if isEscapeStringLiteralStart(query, i) {
+			out.WriteByte(c)
+			out.WriteByte(query[i+1])
+			inString = true
+			inEscapeString = true
+			i++
+			continue
+		}
 		if c == '\'' {
 			out.WriteByte(c)
 			inString = true
+			inEscapeString = false
 			continue
 		}
 		if c == '"' {
@@ -1683,11 +1699,55 @@ func queryAndArgsForStatement(query string, args []interface{}) (string, []inter
 				continue
 			}
 		}
+		if c == '$' {
+			if end, ok := dollarQuotedLiteralEnd(query, i); ok {
+				out.WriteString(query[i:end])
+				i = end - 1
+				continue
+			}
+		}
 
 		out.WriteByte(c)
 	}
 
 	return out.String(), stmtArgs
+}
+
+func isEscapeStringLiteralStart(query string, i int) bool {
+	if i+1 >= len(query) || query[i+1] != '\'' || (query[i] != 'E' && query[i] != 'e') {
+		return false
+	}
+	return i == 0 || !isSQLIdentPart(query[i-1])
+}
+
+func dollarQuotedLiteralEnd(query string, start int) (int, bool) {
+	if start >= len(query) || query[start] != '$' {
+		return 0, false
+	}
+	j := start + 1
+	if j < len(query) && query[j] >= '0' && query[j] <= '9' {
+		return 0, false
+	}
+	for j < len(query) && isSQLIdentPart(query[j]) {
+		j++
+	}
+	if j >= len(query) || query[j] != '$' {
+		return 0, false
+	}
+	tag := query[start : j+1]
+	bodyStart := j + 1
+	bodyEnd := strings.Index(query[bodyStart:], tag)
+	if bodyEnd < 0 {
+		return 0, false
+	}
+	return bodyStart + bodyEnd + len(tag), true
+}
+
+func isSQLIdentPart(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '_'
 }
 
 // isEmptyQuery and stripLeadingComments moved to server/sqlcore so the

@@ -458,6 +458,33 @@ func TestTranspile_FeatureNotSupported_Rejected(t *testing.T) {
 			assertFeatureNotSupported(t, result)
 		})
 
+		t.Run(string(backend)+"/ON CONFLICT targetless DO NOTHING", func(t *testing.T) {
+			result, err := tr.Transpile(
+				"INSERT INTO t (id, v) VALUES (1, 2) ON CONFLICT DO NOTHING")
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			assertFeatureNotSupported(t, result)
+		})
+
+		t.Run(string(backend)+"/ON CONFLICT without explicit insert column list", func(t *testing.T) {
+			result, err := tr.Transpile(
+				"INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v")
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			assertFeatureNotSupported(t, result)
+		})
+
+		t.Run(string(backend)+"/ON CONFLICT conflict column omitted from insert column list", func(t *testing.T) {
+			result, err := tr.Transpile(
+				"INSERT INTO t (v) VALUES (2) ON CONFLICT (id) DO NOTHING")
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			assertFeatureNotSupported(t, result)
+		})
+
 		t.Run(string(backend)+"/ALTER COLUMN TYPE USING", func(t *testing.T) {
 			result, err := tr.Transpile(
 				"ALTER TABLE t ALTER COLUMN c TYPE integer USING c::integer")
@@ -2588,6 +2615,46 @@ func TestTranspile_OnConflict_DuckLakeMode_DoNothingDeduplicatesSourceKeys(t *te
 	}
 	if nullRows != 2 {
 		t.Fatalf("DO NOTHING should preserve NULL conflict-key rows, got %d", nullRows)
+	}
+}
+
+func TestTranspile_OnConflict_DuckLakeMode_DoNothingAllowsDuplicateTargetMatches(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`CREATE TABLE target (id VARCHAR, nickname VARCHAR)`); err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE staging (id VARCHAR, nickname VARCHAR)`); err != nil {
+		t.Fatalf("create staging: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO target VALUES ('price_1', 'old a'), ('price_1', 'old b')`); err != nil {
+		t.Fatalf("seed duplicate target rows: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO staging VALUES ('price_1', 'new')`); err != nil {
+		t.Fatalf("seed staging: %v", err)
+	}
+
+	result, err := tr.Transpile(`INSERT INTO target (id, nickname)
+		SELECT id, nickname FROM staging
+		ON CONFLICT (id) DO NOTHING`)
+	if err != nil {
+		t.Fatalf("Transpile do-nothing query: %v", err)
+	}
+	if err := runDuckDBStatements(db, result.Statements, result.CleanupStatements); err != nil {
+		t.Fatalf("DO NOTHING should tolerate duplicate target matches: %v", err)
+	}
+
+	var rows int
+	if err := db.QueryRow(`SELECT count(*) FROM target WHERE id = 'price_1'`).Scan(&rows); err != nil {
+		t.Fatalf("count target rows: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("DO NOTHING should leave duplicate matched target rows unchanged, got %d rows", rows)
 	}
 }
 
