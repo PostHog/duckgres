@@ -21,14 +21,21 @@ type Org struct {
 	// human editability) applied to connections that don't size themselves via
 	// the duckgres.worker_* startup options. Empty = unset. Versioned SQL
 	// migrations add these columns.
-	DefaultWorkerCPU        string            `gorm:"size:32" json:"default_worker_cpu"`
-	DefaultWorkerMemory     string            `gorm:"size:32" json:"default_worker_memory"`
-	DefaultWorkerTTL        string            `gorm:"size:32" json:"default_worker_ttl"`
-	DefaultWorkerMinHotIdle int               `gorm:"default:0" json:"default_worker_min_hot_idle"`
-	Users                   []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse               *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt               time.Time         `json:"created_at"`
-	UpdatedAt               time.Time         `json:"updated_at"`
+	DefaultWorkerCPU        string `gorm:"size:32" json:"default_worker_cpu"`
+	DefaultWorkerMemory     string `gorm:"size:32" json:"default_worker_memory"`
+	DefaultWorkerTTL        string `gorm:"size:32" json:"default_worker_ttl"`
+	DefaultWorkerMinHotIdle int    `gorm:"default:0" json:"default_worker_min_hot_idle"`
+	// DefaultTeamID links the org to its default PostHog team (a team id, kept
+	// as a string). It is a prerequisite for pull-based compute billing —
+	// usage buckets are keyed by team_id = the org's default team. NULLABLE /
+	// optional everywhere: NULL means "unset" (existing orgs are backfilled
+	// separately, a follow-up makes it required). *string so the column is a
+	// nullable VARCHAR; callers must tolerate an empty/absent value.
+	DefaultTeamID *string           `gorm:"size:255" json:"default_team_id,omitempty"`
+	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -540,6 +547,7 @@ type OrgConfig struct {
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
 	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
 	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
+	DefaultTeamID           string            // org's default PostHog team id ("" = unset); prereq for pull-based compute billing
 	Users                   map[string]string // username -> password
 	Warehouse               *ManagedWarehouseConfig
 }

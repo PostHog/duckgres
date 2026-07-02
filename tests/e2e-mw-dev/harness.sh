@@ -969,6 +969,50 @@ org_default_profile() { # org password catalog
   log "org default OK: audit shows org.update with field-change detail on $org"
 }
 
+# ---- org default_team_id (optional, non-breaking) ---------------------------
+# default_team_id links an org to its default PostHog team id (a nullable string
+# config-store column, prereq for pull-based compute billing where usage buckets
+# are keyed by team_id). It is OPTIONAL everywhere: NULL is a valid state.
+# Asserts both halves of the contract on real orgs against the real config store:
+#   1. Set path: the CNPG org was provisioned WITH default_team_id in its body
+#      (see CNPG_BODY); GET /orgs/:id must round-trip exactly that value.
+#   2. Unset path: the EXT org was provisioned WITHOUT it; GET /orgs/:id must
+#      report null (not an error, not a stray value) — proving NULL is tolerated.
+#   3. Mutate path: PUT /orgs/:id can set and clear it (""=NULL) on the EXT org,
+#      round-tripping on GET, so the admin edit path is covered too.
+# get_org_default_team_id prints the raw JSON value ("null" when NULL) so the
+# assertions can distinguish an unset column from an empty string.
+get_org_default_team_id() { # org -> prints default_team_id (jq raw; "null" when unset)
+  curl -fsS -H "$H" "$API/api/v1/orgs/$1" | jq -r '.default_team_id'
+}
+default_team_id_optional() { # cnpg_org ext_org
+  cnpg_org="$1"; ext_org="$2"
+  log "default_team_id: set-at-provision round-trip on $cnpg_org, NULL-tolerated on $ext_org"
+
+  # 1. Set path: CNPG org provisioned WITH default_team_id must read it back.
+  got="$(get_org_default_team_id "$cnpg_org")"
+  [ "$got" = "$CNPG_DEFAULT_TEAM_ID" ] \
+    || fail "default_team_id: GET /orgs/$cnpg_org = '$got' want '$CNPG_DEFAULT_TEAM_ID' (provision default_team_id did not persist)"
+  log "default_team_id OK: $cnpg_org round-tripped '$got' from provision"
+
+  # 2. Unset path: EXT org provisioned WITHOUT it must read back null (no error).
+  got="$(get_org_default_team_id "$ext_org")"
+  [ "$got" = "null" ] \
+    || fail "default_team_id: GET /orgs/$ext_org = '$got' want 'null' (unset must be NULL, not an error/value)"
+  log "default_team_id OK: $ext_org reports NULL (optional/non-breaking honored)"
+
+  # 3. Mutate path: PUT can set then clear ("" -> NULL) on the ext org.
+  code="$(put_org "$ext_org" '{"default_team_id":"424242"}')"
+  [ "$code" = "200" ] || fail "default_team_id: PUT set -> HTTP $code: $(cat /tmp/put_org_out)"
+  got="$(get_org_default_team_id "$ext_org")"
+  [ "$got" = "424242" ] || fail "default_team_id: after PUT set, GET = '$got' want '424242'"
+  code="$(put_org "$ext_org" '{"default_team_id":""}')"
+  [ "$code" = "200" ] || fail "default_team_id: PUT clear -> HTTP $code: $(cat /tmp/put_org_out)"
+  got="$(get_org_default_team_id "$ext_org")"
+  [ "$got" = "null" ] || fail "default_team_id: after PUT clear, GET = '$got' want 'null' (empty must clear to NULL)"
+  log "default_team_id OK: PUT set/clear round-trips on $ext_org (NULL restored)"
+}
+
 # ---- user persistent secrets ------------------------------------------------
 # CREATE PERSISTENT SECRET must survive across sessions: worker pods are
 # ephemeral, so the CP intercepts the statement, stores it encrypted in the
@@ -1961,7 +2005,13 @@ lifecycle_teardown_cnpg() { # org
 }
 
 # ---- cnpg duckling: cnpg-shard metadata + DuckLake ------------------------
+# Carries an optional default_team_id at provision time (prereq for pull-based
+# compute billing: usage buckets keyed by team_id = the org's default team). The
+# EXT org below deliberately omits it, so default_team_id_optional asserts both
+# the set path (round-trips) and the unset path (NULL, no error).
+CNPG_DEFAULT_TEAM_ID='90210'
 CNPG_BODY='{"database_name":"'"$CNPG"'","metadata_store":{"type":"cnpg-shard"},
+  "default_team_id":"'"$CNPG_DEFAULT_TEAM_ID"'",
   "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
 
 # ---- ext duckling: external RDS metadata + DuckLake -----------------------
@@ -2210,6 +2260,10 @@ lane_ext() { # external-RDS metadata backend + org default profile
   # Org default profile on ext: no client-sized assertions run on this org, so
   # the 2-CPU shape is unambiguously the org default's.
   org_default_profile "$EXT" "$ext_pw" ducklake
+  # default_team_id contract: CNPG provisioned WITH one (round-trips), EXT
+  # WITHOUT one (NULL, no error) + PUT set/clear on EXT. Runs here because both
+  # orgs are provisioned by now; it only touches the admin API, no worker/DB.
+  default_team_id_optional "$CNPG" "$EXT"
 }
 
 main() {

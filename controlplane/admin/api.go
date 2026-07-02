@@ -199,6 +199,15 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
+	// DefaultTeamID is *string with the same semantics: nil = preserve, "" =
+	// clear (NULL), "x" = set. Nullable/optional — NULL is always valid.
+	if updates.DefaultTeamID != nil {
+		if *updates.DefaultTeamID == "" {
+			fields["default_team_id"] = nil
+		} else {
+			fields["default_team_id"] = *updates.DefaultTeamID
+		}
+	}
 	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 	if result.Error != nil {
 		return nil, false, result.Error
@@ -596,6 +605,9 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
+	if _, ok := fields["default_team_id"]; ok {
+		merged.DefaultTeamID = updates.DefaultTeamID
+	}
 
 	// Audit detail: which fields changed and their old → new values, so the
 	// console shows "max_workers 4 → 10" instead of a bare "org.update". These
@@ -613,6 +625,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
 	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
 	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
+	addChange("default_team_id", orgStrPtr(existing.DefaultTeamID), orgStrPtr(merged.DefaultTeamID))
 	if len(changes) > 0 {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}

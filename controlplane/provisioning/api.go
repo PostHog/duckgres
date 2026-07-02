@@ -135,7 +135,11 @@ type connectionDetails struct {
 }
 
 type provisionRequest struct {
-	DatabaseName  string                 `json:"database_name"`
+	DatabaseName string `json:"database_name"`
+	// DefaultTeamID optionally links the org to its default PostHog team id.
+	// Optional and non-breaking: absent/empty ⇒ the org's default_team_id is
+	// left NULL (no error). Prerequisite for pull-based compute billing.
+	DefaultTeamID string                 `json:"default_team_id,omitempty"`
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
 	DuckLake      *provisionDuckLakeReq  `json:"ducklake,omitempty"`
@@ -335,10 +339,11 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	// sub-step rolls the others back so the caller's retry sees the same
 	// starting state (no half-provisioned row blocking re-creation).
 	if err := h.store.Provision(ProvisionRequest{
-		OrgID:        orgID,
-		DatabaseName: req.DatabaseName,
-		Warehouse:    warehouse,
-		RootUserHash: hash,
+		OrgID:         orgID,
+		DatabaseName:  req.DatabaseName,
+		DefaultTeamID: req.DefaultTeamID,
+		Warehouse:     warehouse,
+		RootUserHash:  hash,
 	}); err != nil {
 		// The warehouse-already-exists conflict is the only error
 		// shape that maps to 409. Everything else (DB write failure,
