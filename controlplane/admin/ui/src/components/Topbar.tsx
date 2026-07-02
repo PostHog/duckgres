@@ -86,9 +86,13 @@ export function Topbar() {
             {counts && (
               <>
                 <Dot />
-                <Stat n={counts.workers} label="workers" detail={counts.workerReq || undefined} />
+                <Stat n={counts.workers} label="workers" detail={counts.workerDetail || "no worker pods running"} />
                 <Dot />
-                <Stat n={counts.placeholders} label="placeholders" detail={counts.placeholderReq || undefined} muted />
+                <Stat n={counts.cpuCores} label="CPU" detail={counts.workerDetail || undefined} muted />
+                <Dot />
+                <Stat n={counts.memGi} label="Gi" detail={counts.workerDetail || undefined} muted />
+                <Dot />
+                <Stat n={counts.placeholders} label="placeholders" detail={counts.placeholderDetail || undefined} muted />
                 <Dot />
                 <Stat n={counts.pending} label="pending" muted />
               </>
