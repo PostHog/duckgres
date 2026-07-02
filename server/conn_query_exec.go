@@ -855,7 +855,6 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		strings.ToUpper(strings.TrimSpace(statements[0])) == "BEGIN" &&
 		len(cleanup) > 0 &&
 		strings.ToUpper(strings.TrimSpace(cleanup[len(cleanup)-1])) == "COMMIT"
-	ownsTransaction := hasOurTransaction && c.txStatus != txStatusTransaction
 
 	// If already in a transaction, skip our BEGIN/COMMIT wrapper
 	if hasOurTransaction && c.txStatus == txStatusTransaction {
@@ -880,7 +879,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		if err != nil {
 			c.logger().Error("Multi-stmt setup error.", "query", stmt, "error", err)
 			c.setTxError()
-			c.executeCleanupAfterError(cleanup, ownsTransaction)
+			// On error, still try to cleanup (best effort)
+			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
@@ -909,7 +909,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			finalErr = err
 			c.logger().Error("Multi-stmt final query error.", "query", finalStmt, "error", err)
 			c.setTxError()
-			c.executeCleanupAfterError(cleanup, ownsTransaction)
+			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
@@ -919,13 +919,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 		// Execute cleanup while cursor is open (data is materialized in cursor)
 		// DuckDB cursor holds result data even after source tables are dropped
-		if err := c.executeCleanupAndCommit(cleanup); err != nil {
-			finalErr = err
-			c.sendError("ERROR", classifyErrorCode(err), err.Error())
-			_ = c.writeReadyForQuery(c.txStatus)
-			_ = c.flushWriter()
-			return nil
-		}
+		c.executeCleanup(cleanup)
 
 		// Now stream results from cursor. streamRowsToClient counts rows
 		// internally; we approximate Finished's rowsAff with 0 here
@@ -945,7 +939,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			finalErr = err
 			c.logger().Error("Multi-stmt final exec error.", "query", finalStmt, "error", err)
 			c.setTxError()
-			c.executeCleanupAfterError(cleanup, ownsTransaction)
+			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
@@ -955,13 +949,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			finalRowsAff, _ = result.RowsAffected()
 		}
 
-		if err := c.executeCleanupAndCommit(cleanup); err != nil {
-			finalErr = err
-			c.sendError("ERROR", classifyErrorCode(err), err.Error())
-			_ = c.writeReadyForQuery(c.txStatus)
-			_ = c.flushWriter()
-			return nil
-		}
+		// Execute cleanup
+		c.executeCleanup(cleanup)
 
 		// Send completion
 		tag := c.buildCommandTag(cmdType, result)
@@ -984,49 +973,6 @@ func (c *clientConn) executeCleanup(cleanup []string) {
 	}
 }
 
-func (c *clientConn) executeCleanupAndCommit(cleanup []string) error {
-	cleanupBeforeCommit, commitStmt, hasCommit := splitCommitCleanup(cleanup)
-	c.executeCleanup(cleanupBeforeCommit)
-	if !hasCommit {
-		return nil
-	}
-	if err := c.executeTransactionFinalizer(commitStmt); err != nil {
-		c.executeCleanup([]string{"ROLLBACK"})
-		return err
-	}
-	return nil
-}
-
-func (c *clientConn) executeCleanupAfterError(cleanup []string, rollbackOwnedTransaction bool) {
-	if rollbackOwnedTransaction {
-		cleanupBeforeCommit, _, _ := splitCommitCleanup(cleanup)
-		c.executeCleanup(cleanupBeforeCommit)
-		c.executeCleanup([]string{"ROLLBACK"})
-		return
-	}
-	c.executeCleanup(cleanup)
-}
-
-func (c *clientConn) executeTransactionFinalizer(stmt string) error {
-	c.logger().Debug("Multi-stmt transaction finalizer.", "stmt", stmt)
-	_, err := c.executor.Exec(stmt)
-	if err != nil {
-		c.logger().Error("Multi-stmt transaction finalizer error.", "query", stmt, "error", err)
-	}
-	return err
-}
-
-func splitCommitCleanup(cleanup []string) ([]string, string, bool) {
-	if len(cleanup) == 0 {
-		return nil, "", false
-	}
-	last := cleanup[len(cleanup)-1]
-	if strings.ToUpper(strings.TrimSpace(last)) != "COMMIT" {
-		return cleanup, "", false
-	}
-	return cleanup[:len(cleanup)-1], last, true
-}
-
 // executeMultiStatementExtended handles execution of multi-statement query rewrites
 // for the extended query protocol (Parse/Bind/Execute).
 // Unlike executeMultiStatement, this does NOT send ReadyForQuery (that's done by Sync).
@@ -1041,7 +987,6 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		strings.ToUpper(strings.TrimSpace(statements[0])) == "BEGIN" &&
 		len(cleanup) > 0 &&
 		strings.ToUpper(strings.TrimSpace(cleanup[len(cleanup)-1])) == "COMMIT"
-	ownsTransaction := hasOurTransaction && c.txStatus != txStatusTransaction
 
 	// If already in a transaction, skip our BEGIN/COMMIT wrapper
 	if hasOurTransaction && c.txStatus == txStatusTransaction {
@@ -1054,20 +999,20 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	// setup work is observable per statement, not just per outer query.
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		stmtQuery, stmtArgs := queryAndArgsForStatement(stmt, args)
-		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmtQuery)
+		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		setupStart := time.Now()
-		c.logQueryStarted(stmtQuery)
-		result, err := c.executor.Exec(stmtQuery, stmtArgs...)
+		c.logQueryStarted(stmt)
+		result, err := c.executor.Exec(stmt, args...)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
 		}
-		c.logQueryFinished(stmtQuery, setupStart, setupRows, err)
+		c.logQueryFinished(stmt, setupStart, setupRows, err)
 		if err != nil {
-			c.logger().Error("Multi-stmt-ext setup error.", "query", stmtQuery, "error", err)
+			c.logger().Error("Multi-stmt-ext setup error.", "query", stmt, "error", err)
 			c.setTxError()
-			c.executeCleanupAfterError(cleanup, ownsTransaction)
+			// On error, still try to cleanup (best effort)
+			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
 			return
 		}
@@ -1075,53 +1020,48 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	// Handle final statement
 	finalStmt := statements[len(statements)-1]
-	finalQuery, finalArgs := queryAndArgsForStatement(finalStmt, args)
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	c.logger().Debug("Multi-stmt-ext final.", "stmt", finalQuery, "cmd_type", cmdType)
+	c.logger().Debug("Multi-stmt-ext final.", "stmt", finalStmt, "cmd_type", cmdType)
 
 	finalStart := time.Now()
 	var finalRowsAff int64
 	var finalErr error
-	c.logQueryStarted(finalQuery)
+	c.logQueryStarted(finalStmt)
 	defer func() {
-		c.logQueryFinished(finalQuery, finalStart, finalRowsAff, finalErr)
+		c.logQueryFinished(finalStmt, finalStart, finalRowsAff, finalErr)
 	}()
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		rows, err := c.executor.Query(finalQuery, finalArgs...)
+		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt-ext final query error.", "query", finalQuery, "error", err)
+			c.logger().Error("Multi-stmt-ext final query error.", "query", finalStmt, "error", err)
 			c.setTxError()
-			c.executeCleanupAfterError(cleanup, ownsTransaction)
+			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
 			return
 		}
 		defer func() { _ = rows.Close() }()
 
 		// Execute cleanup while cursor is open (data is materialized in cursor)
-		if err := c.executeCleanupAndCommit(cleanup); err != nil {
-			finalErr = err
-			c.sendError("ERROR", classifyErrorCode(err), err.Error())
-			return
-		}
+		c.executeCleanup(cleanup)
 
 		// Stream results from cursor (extended protocol version). Row count
 		// is tracked by streamRowsToClientExtended; the deferred Finished
 		// log uses 0 as an approximation (logQuery still records the
 		// precise count via the structured channel).
-		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalQuery)
+		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
-		result, err := c.executor.Exec(finalQuery, finalArgs...)
+		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalQuery, "error", err)
+			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalStmt, "error", err)
 			c.setTxError()
-			c.executeCleanupAfterError(cleanup, ownsTransaction)
+			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
 			return
 		}
@@ -1129,11 +1069,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 			finalRowsAff, _ = result.RowsAffected()
 		}
 
-		if err := c.executeCleanupAndCommit(cleanup); err != nil {
-			finalErr = err
-			c.sendError("ERROR", classifyErrorCode(err), err.Error())
-			return
-		}
+		// Execute cleanup
+		c.executeCleanup(cleanup)
 
 		// Send completion (no ReadyForQuery - that's done by Sync)
 		tag := c.buildCommandTag(cmdType, result)

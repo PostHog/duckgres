@@ -132,9 +132,9 @@ func New(cfg Config) *Transpiler {
 	// 11. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
 	t.transforms = append(t.transforms, taggedTransform{FlagExpandArray, transform.NewExpandArrayTransform()})
 
-	// 12. ON CONFLICT handling (rewrites ON CONFLICT to MERGE when the backend has
-	// no enforced unique constraints to infer against)
-	t.transforms = append(t.transforms, taggedTransform{FlagOnConflict, transform.NewOnConflictTransformWithConfig(dmlPolicy.ConflictHandling == backend.RewriteToMerge)})
+	// 12. ON CONFLICT handling (rejects ON CONFLICT when the backend has no
+	// enforced unique constraints to infer against)
+	t.transforms = append(t.transforms, taggedTransform{FlagOnConflict, transform.NewOnConflictTransformWithConfig(dmlPolicy.ConflictHandling == backend.RejectOnConflict)})
 
 	// 13. Locking clause removal (FOR UPDATE, FOR SHARE, etc.) - DuckDB doesn't support these
 	t.transforms = append(t.transforms, taggedTransform{FlagLocking, transform.NewLockingTransform()})
@@ -271,15 +271,11 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 		// When a transform produces multiple statements, we skip remaining transforms
 		// and return the statements directly.
 		if len(transformResult.Statements) > 0 {
-			paramCount := transformResult.ParamCount
-			if t.config.ConvertPlaceholders {
-				paramCount = countParametersRegex(sql)
-			}
 			return &Result{
 				SQL:               sql, // Keep original for logging
 				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
 				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
-				ParamCount:        paramCount,
+				ParamCount:        transformResult.ParamCount,
 				Warnings:          transformResult.Warnings,
 			}, nil
 		}

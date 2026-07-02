@@ -721,70 +721,31 @@ func runConcurrencyBenchmarks(t *testing.T, latencyMs int, openConn func(*testin
 		t.Logf("read/write isolation: %d write conflicts, %d read errors", writeConflicts.Load(), readErrors.Load())
 	})
 
-	benchSub(t, "concurrent_upsert_storm", latencyMs, func(t *testing.T, m *metric) {
+	benchSub(t, "on_conflict_rejected", latencyMs, func(t *testing.T, m *metric) {
 		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
-		// DuckLake rewrites ON CONFLICT to MERGE — test it under concurrency
 		mustExec(t, conn, "CREATE TABLE dl_conc_upsert (id INTEGER, counter INTEGER, last_ts BIGINT)")
-		// Seed some rows so upserts hit the update path
-		for i := range 20 {
-			mustExec(t, conn, fmt.Sprintf("INSERT INTO dl_conc_upsert VALUES (%d, 0, 0)", i))
-		}
 		defer func() { _, _ = conn.Exec("DROP TABLE IF EXISTS dl_conc_upsert") }()
 
-		const numWorkers = 8
-		const opsPerWorker = 30
-		var wg sync.WaitGroup
-		var conflicts atomic.Int64
-		var successes atomic.Int64
-		errs := make(chan error, numWorkers*opsPerWorker)
-
-		for w := range numWorkers {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-				wconn := openConn(t)
-				defer func() { _ = wconn.Close() }()
-
-				for i := range opsPerWorker {
-					// Target overlapping rows across workers
-					targetID := (workerID + i*3) % 30 // some IDs don't exist yet -> insert path
-					ts := time.Now().UnixMicro()
-					// Use literal values: ON CONFLICT → MERGE rewriting breaks $N placeholders
-					_, err := wconn.Exec(fmt.Sprintf(
-						`INSERT INTO dl_conc_upsert (id, counter, last_ts) VALUES (%d, 1, %d)
-						 ON CONFLICT (id) DO UPDATE SET counter = dl_conc_upsert.counter + 1, last_ts = %d`,
-						targetID, ts, ts,
-					))
-					if err != nil {
-						if isTransactionConflict(err) || isAbortedTransaction(err) {
-							conflicts.Add(1)
-							recoverConnection(wconn)
-							continue
-						}
-						// ON CONFLICT may not be supported in DuckLake — log and skip
-						if strings.Contains(err.Error(), "Not implemented") ||
-							strings.Contains(err.Error(), "not supported") {
-							t.Logf("upsert not supported: %v", err)
-							return
-						}
-						errs <- fmt.Errorf("worker %d op %d: %w", workerID, i, err)
-						return
-					}
-					successes.Add(1)
-				}
-			}(w)
+		queries := []string{
+			`INSERT INTO dl_conc_upsert (id, counter, last_ts) VALUES (1, 1, 1)
+			 ON CONFLICT (id) DO UPDATE SET counter = dl_conc_upsert.counter + 1, last_ts = 1`,
+			`INSERT INTO dl_conc_upsert (id, counter, last_ts) VALUES (1, 1, 1)
+			 ON CONFLICT (id) DO NOTHING`,
+		}
+		for _, query := range queries {
+			_, err := conn.Exec(query)
+			if err == nil {
+				t.Fatalf("expected ON CONFLICT to be rejected")
+			}
+			if !strings.Contains(err.Error(), "ON CONFLICT is not supported") {
+				t.Fatalf("expected ON CONFLICT unsupported error, got %v", err)
+			}
 		}
 
-		wg.Wait()
-		close(errs)
-		for err := range errs {
-			t.Error(err)
-		}
-
-		m.Successes, m.Conflicts = successes.Load(), conflicts.Load()
-		t.Logf("upsert storm: %d succeeded, %d conflicts", m.Successes, m.Conflicts)
+		m.Successes = int64(len(queries))
+		t.Logf("ON CONFLICT rejection: %d forms rejected", m.Successes)
 	})
 
 	benchSub(t, "concurrent_ddl_while_writing", latencyMs, func(t *testing.T, m *metric) {

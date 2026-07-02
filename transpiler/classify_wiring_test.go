@@ -39,9 +39,6 @@ func transpileSQL(t *testing.T, tr *Transpiler, input string) string {
 	if res.FallbackToNative {
 		t.Fatalf("Transpile(%q) fell back to native, want transpiled SQL", input)
 	}
-	if len(res.Statements) > 0 {
-		return res.Statements[len(res.Statements)-1]
-	}
 	return res.SQL
 }
 
@@ -274,14 +271,17 @@ func TestClassifyWiring_OnConflictWhitespace(t *testing.T) {
 	wantFlags(t, cfg, "INSERT INTO t (a, b) VALUES (1, 2) ON\tCONFLICT (a) DO NOTHING", FlagOnConflict)
 
 	dlTr := New(Config{DuckLakeMode: true})
-	out := transpileSQL(t, dlTr, "INSERT INTO t (a, b) VALUES (1, 2) ON\nCONFLICT (a) DO NOTHING")
-	if !strings.Contains(strings.ToUpper(out), "MERGE INTO") {
-		t.Errorf("DuckLake Transpile(ON\\nCONFLICT) = %q, want MERGE INTO rewrite", out)
+	res, err := dlTr.Transpile("INSERT INTO t (a, b) VALUES (1, 2) ON\nCONFLICT (a) DO NOTHING")
+	if err != nil {
+		t.Fatalf("DuckLake Transpile(ON\\nCONFLICT) error: %v", err)
+	}
+	if res.Error == nil {
+		t.Fatalf("DuckLake Transpile(ON\\nCONFLICT) should reject ON CONFLICT, got SQL=%q", res.SQL)
 	}
 
 	// False positive (CONFLICT in a string literal) must be a harmless no-op.
 	tr := New(cfg)
-	out = transpileSQL(t, tr, "SELECT note FROM audit WHERE note = 'ON CONFLICT'")
+	out := transpileSQL(t, tr, "SELECT note FROM audit WHERE note = 'ON CONFLICT'")
 	if strings.Contains(strings.ToUpper(out), "MERGE") {
 		t.Errorf("Transpile(literal 'ON CONFLICT') = %q, must not rewrite", out)
 	}

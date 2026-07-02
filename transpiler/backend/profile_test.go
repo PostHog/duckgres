@@ -13,8 +13,8 @@ func TestIcebergProfilePolicies(t *testing.T) {
 	if profile.DDL().ConstraintHandling != StripConstraints {
 		t.Fatalf("ConstraintHandling = %v, want StripConstraints", profile.DDL().ConstraintHandling)
 	}
-	if profile.DML().ConflictHandling != RewriteToMerge {
-		t.Fatalf("ConflictHandling = %v, want RewriteToMerge", profile.DML().ConflictHandling)
+	if profile.DML().ConflictHandling != RejectOnConflict {
+		t.Fatalf("ConflictHandling = %v, want RejectOnConflict", profile.DML().ConflictHandling)
 	}
 }
 

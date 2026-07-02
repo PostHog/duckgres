@@ -20,7 +20,7 @@ const (
 	NoOpUnsupportedDDL    UnsupportedDDLHandling = "noop"
 
 	UseInsertOnConflict ConflictHandling = "insert_on_conflict"
-	RewriteToMerge      ConflictHandling = "rewrite_to_merge"
+	RejectOnConflict    ConflictHandling = "reject_on_conflict"
 )
 
 type CatalogPolicy struct {
@@ -138,7 +138,7 @@ func lakeProfile(name Name, physical string, mapPublicToMain, hybridDDLGuards bo
 			WarnOnStrippedConstraints: hybridDDLGuards,
 			ErrorOnSilentNullDefaults: hybridDDLGuards,
 		},
-		dml:      DMLPolicy{ConflictHandling: RewriteToMerge},
+		dml:      DMLPolicy{ConflictHandling: RejectOnConflict},
 		metadata: MetadataPolicy{InterceptShowCreate: true},
 	}
 }

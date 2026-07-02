@@ -74,9 +74,9 @@ why.
 | DELETE (incl. `DELETE…USING`, subquery) | ✅ | `dml_test.go::TestDMLDelete`, `::TestDMLDeleteUsing`; transform `wiring_ops_test.go::TestOperatorTransform_DeleteUsing` | |
 | RETURNING (simple query protocol) | 🟡 | transform `wiring_ops_test.go::TestOperatorTransform_{Insert,Update,Delete}Returning`; `conn_test.go::TestContainsReturning`/`::TestIsDMLReturning` | Differential tests `TestDML{Insert,Update,Delete}Returning` are `skipIfKnown` (stale — passes at unit/client level) |
 | RETURNING (extended query protocol) | ⛔ | `conn_test.go::TestIsDMLReturning` | Rejected at Describe time with `0A000` by design — Describe would execute the mutation. See CLAUDE.md "DML RETURNING Detection" |
-| ON CONFLICT / UPSERT (DO UPDATE) | ✅ | `dml_test.go::TestDMLInsertOnConflict`; transpiler `transform/onconflict_test.go` | Also exercised via DuckLake ON CONFLICT→MERGE rewrite: `ducklake_concurrency_test.go::TestDuckLakeConcurrentTransactions` |
+| ON CONFLICT / UPSERT (DO UPDATE) | ✅ | `dml_test.go::TestDMLInsertOnConflict`; transpiler `transform/onconflict_test.go` | Constraint-less lake catalogs reject ON CONFLICT with `0A000` because they cannot enforce unique constraints |
 | ON CONFLICT DO NOTHING | 🟡 | `dml_test.go::TestDMLInsertOnConflict` (subtest skipped) | |
-| MERGE (user-facing) | ⛔ | — | DuckDB has no MERGE; only internal ON CONFLICT→MERGE rewrite exists |
+| MERGE (user-facing) | ⛔ | — | Not a PostgreSQL compatibility target; Duckgres does not use MERGE to emulate ON CONFLICT |
 | TRUNCATE | ✅ | `ddl_test.go::TestDDLTruncate` | |
 | COPY … FROM STDIN (text/CSV) | ✅ | `copy_test.go::TestCopyFromStdin`, `::TestCopyFromStdinWithSpecialChars`, `::TestCopyFromStdinMultilineJSON` | Escape sequences stored literally (documented DuckDB CSV-parser limitation) |
 | COPY … TO STDOUT | 🟡 | `copy_test.go::TestCopyToStdout` (skipped under lib/pq); `conn_test.go::TestCopyToStdoutRegex`; client-compat `psycopg` COPY suite | Integration skip is a lib/pq driver limitation, not a Duckgres gap |
