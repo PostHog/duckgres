@@ -1,8 +1,10 @@
+import { useSyncExternalStore } from "react";
 import { Circle, ShieldCheck, Eye } from "lucide-react";
 import { useClusterStatus, useModel } from "@/hooks/useApi";
 import { useIdentity } from "@/components/IdentityProvider";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { getClusterCounts, subscribeClusterCounts } from "@/lib/clusterCounts";
 
 function HealthDot({ ok, label, detail }: { ok: boolean; label: string; detail?: string }) {
   return (
@@ -11,6 +13,32 @@ function HealthDot({ ok, label, detail }: { ok: boolean; label: string; detail?:
         className={cn("h-2.5 w-2.5", ok ? "fill-success text-success" : "fill-destructive text-destructive")}
       />
       <span className="text-xs text-muted-foreground">{label}</span>
+    </div>
+  );
+}
+
+// One node/worker/placeholder/pending counter, shown only on the Nodes view
+// (the peepernetes view pushes live counts into the clusterCounts store).
+function CountStat({ n, label, detail, muted }: { n: number; label: string; detail?: string; muted?: boolean }) {
+  return (
+    <div className="flex items-baseline gap-1" title={detail}>
+      <span className={cn("font-mono text-sm tabular-nums", muted && n === 0 ? "text-muted-foreground" : "text-foreground")}>
+        {n}
+      </span>
+      <span className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</span>
+    </div>
+  );
+}
+
+function ClusterCounters() {
+  const counts = useSyncExternalStore(subscribeClusterCounts, getClusterCounts);
+  if (!counts) return null;
+  return (
+    <div className="flex items-center gap-4 border-l border-border pl-4">
+      <CountStat n={counts.nodes} label="nodes" />
+      <CountStat n={counts.workers} label="workers" detail={counts.workerReq || undefined} />
+      <CountStat n={counts.placeholders} label="placeholders" detail={counts.placeholderReq || undefined} muted />
+      <CountStat n={counts.pending} label="pending" muted />
     </div>
   );
 }
@@ -41,6 +69,7 @@ export function Topbar() {
             detail="control-plane instances (cp_instances)"
           />
         )}
+        <ClusterCounters />
       </div>
 
       <div className="flex items-center gap-3">
