@@ -39,6 +39,9 @@ func transpileSQL(t *testing.T, tr *Transpiler, input string) string {
 	if res.FallbackToNative {
 		t.Fatalf("Transpile(%q) fell back to native, want transpiled SQL", input)
 	}
+	if len(res.Statements) > 0 {
+		return res.Statements[len(res.Statements)-1]
+	}
 	return res.SQL
 }
 

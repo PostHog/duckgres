@@ -1002,7 +1002,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		setupStart := time.Now()
 		c.logQueryStarted(stmt)
-		result, err := c.executor.Exec(stmt, args...)
+		stmtArgs := argsForStatement(stmt, args)
+		result, err := c.executor.Exec(stmt, stmtArgs...)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
@@ -1034,7 +1035,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		rows, err := c.executor.Query(finalStmt, args...)
+		finalArgs := argsForStatement(finalStmt, args)
+		rows, err := c.executor.Query(finalStmt, finalArgs...)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt-ext final query error.", "query", finalStmt, "error", err)
@@ -1056,7 +1058,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
-		result, err := c.executor.Exec(finalStmt, args...)
+		finalArgs := argsForStatement(finalStmt, args)
+		result, err := c.executor.Exec(finalStmt, finalArgs...)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalStmt, "error", err)

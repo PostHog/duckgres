@@ -271,11 +271,15 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 		// When a transform produces multiple statements, we skip remaining transforms
 		// and return the statements directly.
 		if len(transformResult.Statements) > 0 {
+			paramCount := transformResult.ParamCount
+			if t.config.ConvertPlaceholders {
+				paramCount = countParametersRegex(sql)
+			}
 			return &Result{
 				SQL:               sql, // Keep original for logging
 				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
 				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
-				ParamCount:        transformResult.ParamCount,
+				ParamCount:        paramCount,
 				Warnings:          transformResult.Warnings,
 			}, nil
 		}

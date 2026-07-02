@@ -1,11 +1,13 @@
 package transpiler
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/transpiler/transform"
 )
 
@@ -2178,8 +2180,10 @@ func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
 			input:     "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO NOTHING",
 			wantMerge: true,
 			contains: []string{
+				"CREATE TEMPORARY TABLE",
+				"AS SELECT 1 AS id, 'test' AS name",
 				"MERGE INTO users",
-				"USING (SELECT 1 AS id, 'test' AS name) excluded",
+				"excluded",
 				"ON excluded.id = users.id",
 				"WHEN NOT MATCHED THEN INSERT",
 			},
@@ -2193,8 +2197,10 @@ func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
 			input:     "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
 			wantMerge: true,
 			contains: []string{
+				"CREATE TEMPORARY TABLE",
+				"AS SELECT 1 AS id, 'test' AS name",
 				"MERGE INTO users",
-				"USING (SELECT 1 AS id, 'test' AS name) excluded",
+				"excluded",
 				"ON excluded.id = users.id",
 				"WHEN MATCHED THEN UPDATE SET name = excluded.name",
 				"WHEN NOT MATCHED THEN INSERT",
@@ -2243,6 +2249,11 @@ func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
 			}
 
 			sql := result.SQL
+			finalSQL := result.SQL
+			if len(result.Statements) > 0 {
+				sql = strings.Join(result.Statements, "\n")
+				finalSQL = result.Statements[len(result.Statements)-1]
+			}
 
 			// Check MERGE statement is generated
 			if tt.wantMerge {
@@ -2260,11 +2271,199 @@ func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
 
 			// Check contents that should not be present
 			for _, notWant := range tt.notContains {
-				if strings.Contains(strings.ToUpper(sql), strings.ToUpper(notWant)) {
-					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, sql, notWant)
+				if strings.Contains(strings.ToUpper(finalSQL), strings.ToUpper(notWant)) {
+					t.Errorf("Transpile(%q) final SQL = %q, should NOT contain %q", tt.input, finalSQL, notWant)
 				}
 			}
 		})
+	}
+}
+
+func TestTranspile_OnConflict_DuckLakeMode_EmitsCardinalityGuards(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+
+	result, err := tr.Transpile(`INSERT INTO "stripe"."price" ("id", "nickname")
+		SELECT "id", "nickname" FROM "stripe_price-staging-test"
+		ON CONFLICT ("id") DO UPDATE SET "nickname" = "excluded"."nickname"`)
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+
+	if len(result.Statements) != 4 {
+		t.Fatalf("got %d statements, want source materialization, source guard, target guard, merge: %v", len(result.Statements), result.Statements)
+	}
+	if len(result.CleanupStatements) != 1 || !strings.Contains(result.CleanupStatements[0], "DROP TABLE IF EXISTS") {
+		t.Fatalf("cleanup = %v, want DROP TABLE for materialized source", result.CleanupStatements)
+	}
+
+	checks := []struct {
+		stmt int
+		want []string
+	}{
+		{
+			stmt: 0,
+			want: []string{
+				"CREATE TEMPORARY TABLE",
+				"AS SELECT id, nickname FROM",
+				"stripe_price-staging-test",
+			},
+		},
+		{
+			stmt: 1,
+			want: []string{
+				"duckgres_on_conflict_source",
+				"GROUP BY duckgres_on_conflict_source.\"id\"",
+				"HAVING count(*) > 1",
+				"ON CONFLICT source rows contain duplicate conflict keys",
+			},
+		},
+		{
+			stmt: 2,
+			want: []string{
+				"FROM \"stripe\".\"price\" AS duckgres_on_conflict_target",
+				"SELECT DISTINCT duckgres_on_conflict_source.\"id\"",
+				"ON duckgres_on_conflict_target.\"id\" = duckgres_on_conflict_keys.\"id\"",
+				"ON CONFLICT target contains duplicate conflict keys",
+			},
+		},
+		{
+			stmt: 3,
+			want: []string{
+				"MERGE INTO stripe.price",
+				"USING",
+				"excluded",
+				"WHEN MATCHED THEN UPDATE",
+				"WHEN NOT MATCHED THEN INSERT",
+			},
+		},
+	}
+
+	for _, check := range checks {
+		for _, want := range check.want {
+			if !strings.Contains(result.Statements[check.stmt], want) {
+				t.Errorf("statement %d should contain %q\nGot: %s", check.stmt, want, result.Statements[check.stmt])
+			}
+		}
+	}
+}
+
+func TestTranspile_OnConflict_DuckLakeMode_GuardsPreserveParamCount(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true, ConvertPlaceholders: true})
+
+	result, err := tr.Transpile(`INSERT INTO users (id, nickname)
+		VALUES ($1, $2)
+		ON CONFLICT (id) DO UPDATE SET nickname = excluded.nickname`)
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+	if len(result.Statements) != 4 {
+		t.Fatalf("expected guarded multi-statement rewrite, got statements=%v sql=%q", result.Statements, result.SQL)
+	}
+	if result.ParamCount != 2 {
+		t.Fatalf("ParamCount = %d, want 2", result.ParamCount)
+	}
+}
+
+func TestTranspile_OnConflict_DuckLakeMode_GuardsPreventDuplicateMerge(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`CREATE TABLE target (id VARCHAR, nickname VARCHAR)`); err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE staging (id VARCHAR, nickname VARCHAR)`); err != nil {
+		t.Fatalf("create staging: %v", err)
+	}
+
+	runStatements := func(t *testing.T, statements []string, cleanup []string) error {
+		t.Helper()
+		for _, stmt := range statements {
+			if _, err := db.Exec(stmt); err != nil {
+				for _, cleanupStmt := range cleanup {
+					_, _ = db.Exec(cleanupStmt)
+				}
+				return err
+			}
+		}
+		for _, cleanupStmt := range cleanup {
+			if _, err := db.Exec(cleanupStmt); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	result, err := tr.Transpile(`INSERT INTO target (id, nickname)
+		SELECT id, nickname FROM staging
+		ON CONFLICT (id) DO UPDATE SET nickname = excluded.nickname`)
+	if err != nil {
+		t.Fatalf("Transpile source duplicate query: %v", err)
+	}
+	if len(result.Statements) == 0 {
+		t.Fatalf("expected guarded multi-statement rewrite, got single SQL: %s", result.SQL)
+	}
+
+	if _, err := db.Exec(`INSERT INTO staging VALUES ('price_1', 'first'), ('price_1', 'second')`); err != nil {
+		t.Fatalf("seed duplicate staging rows: %v", err)
+	}
+	err = runStatements(t, result.Statements, result.CleanupStatements)
+	if err == nil || !strings.Contains(err.Error(), "ON CONFLICT source rows contain duplicate conflict keys") {
+		t.Fatalf("expected source duplicate guard error, got %v", err)
+	}
+
+	var rows int
+	if err := db.QueryRow(`SELECT count(*) FROM target`).Scan(&rows); err != nil {
+		t.Fatalf("count target after source guard: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("source guard should stop before MERGE inserts rows, got %d target rows", rows)
+	}
+
+	if _, err := db.Exec(`DELETE FROM staging`); err != nil {
+		t.Fatalf("clear staging: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO target VALUES ('price_1', 'old a'), ('price_1', 'old b')`); err != nil {
+		t.Fatalf("seed duplicate target rows: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO staging VALUES ('price_1', 'new')`); err != nil {
+		t.Fatalf("seed staging row: %v", err)
+	}
+
+	err = runStatements(t, result.Statements, result.CleanupStatements)
+	if err == nil || !strings.Contains(err.Error(), "ON CONFLICT target contains duplicate conflict keys") {
+		t.Fatalf("expected target duplicate guard error, got %v", err)
+	}
+
+	var updatedRows int
+	if err := db.QueryRow(`SELECT count(*) FROM target WHERE nickname = 'new'`).Scan(&updatedRows); err != nil {
+		t.Fatalf("count updated target rows: %v", err)
+	}
+	if updatedRows != 0 {
+		t.Fatalf("target guard should stop before fanout update, got %d updated rows", updatedRows)
+	}
+
+	if _, err := db.Exec(`DELETE FROM target`); err != nil {
+		t.Fatalf("clear target before success case: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM staging`); err != nil {
+		t.Fatalf("clear staging before success case: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO staging VALUES ('price_2', 'valid')`); err != nil {
+		t.Fatalf("seed valid staging row: %v", err)
+	}
+
+	if err := runStatements(t, result.Statements, result.CleanupStatements); err != nil {
+		t.Fatalf("guarded merge should allow unique source/target keys: %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM target WHERE id = 'price_2' AND nickname = 'valid'`).Scan(&rows); err != nil {
+		t.Fatalf("count inserted target rows: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("guarded merge should insert the unique staging row, got %d rows", rows)
 	}
 }
 
