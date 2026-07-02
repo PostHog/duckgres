@@ -1,6 +1,8 @@
 package transform
 
 import (
+	"fmt"
+	"math/rand/v2"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
@@ -22,6 +24,13 @@ import (
 // which DuckLake supports for upserts.
 type OnConflictTransform struct {
 	DuckLakeMode bool
+}
+
+type onConflictMergeRewrite struct {
+	merge           *pg_query.MergeStmt
+	sourceSelect    *pg_query.SelectStmt
+	targetRelation  *pg_query.RangeVar
+	conflictColumns []string
 }
 
 func NewOnConflictTransform() *OnConflictTransform {
@@ -57,12 +66,19 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 				return false, nil
 			}
 
-			if mergeStmt := t.transformInsertToMerge(insert); mergeStmt != nil {
+			if rewrite := t.transformInsertToMerge(insert); rewrite != nil {
 				// Replace the INSERT statement with MERGE
 				stmt.Stmt = &pg_query.Node{
-					Node: &pg_query.Node_MergeStmt{MergeStmt: mergeStmt},
+					Node: &pg_query.Node_MergeStmt{MergeStmt: rewrite.merge},
 				}
 				changed = true
+
+				if statements, cleanup, err := t.buildGuardedMergeStatements(rewrite); err != nil {
+					return false, err
+				} else if len(statements) > 0 {
+					result.Statements = statements
+					result.CleanupStatements = cleanup
+				}
 			} else if t.transformInsert(insert) {
 				changed = true
 			}
@@ -73,7 +89,7 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 }
 
 // transformInsertToMerge converts INSERT ... ON CONFLICT to MERGE for DuckLake mode
-func (t *OnConflictTransform) transformInsertToMerge(insert *pg_query.InsertStmt) *pg_query.MergeStmt {
+func (t *OnConflictTransform) transformInsertToMerge(insert *pg_query.InsertStmt) *onConflictMergeRewrite {
 	if !t.DuckLakeMode {
 		return nil
 	}
@@ -88,6 +104,7 @@ func (t *OnConflictTransform) transformInsertToMerge(insert *pg_query.InsertStmt
 	if occ.Infer == nil || len(occ.Infer.IndexElems) == 0 {
 		return nil
 	}
+	conflictColumns := t.conflictColumnNames(occ.Infer.IndexElems)
 
 	// Get column names from INSERT
 	colNames := make([]string, len(insert.Cols))
@@ -151,12 +168,182 @@ func (t *OnConflictTransform) transformInsertToMerge(insert *pg_query.InsertStmt
 		Node: &pg_query.Node_MergeWhenClause{MergeWhenClause: insertClause},
 	})
 
-	return &pg_query.MergeStmt{
+	merge := &pg_query.MergeStmt{
 		Relation:         insert.Relation,
 		SourceRelation:   sourceRelation,
 		JoinCondition:    joinCondition,
 		MergeWhenClauses: whenClauses,
 	}
+
+	return &onConflictMergeRewrite{
+		merge:           merge,
+		sourceSelect:    sourceSelect,
+		targetRelation:  insert.Relation,
+		conflictColumns: conflictColumns,
+	}
+}
+
+func (t *OnConflictTransform) conflictColumnNames(indexElems []*pg_query.Node) []string {
+	cols := make([]string, 0, len(indexElems))
+	for _, elem := range indexElems {
+		indexElem := elem.GetIndexElem()
+		if indexElem == nil || strings.TrimSpace(indexElem.Name) == "" {
+			return nil
+		}
+		cols = append(cols, indexElem.Name)
+	}
+	return cols
+}
+
+func (t *OnConflictTransform) buildGuardedMergeStatements(rewrite *onConflictMergeRewrite) ([]string, []string, error) {
+	if rewrite == nil || rewrite.merge == nil || rewrite.sourceSelect == nil || rewrite.targetRelation == nil {
+		return nil, nil, nil
+	}
+	if len(rewrite.conflictColumns) == 0 {
+		return nil, nil, nil
+	}
+
+	sourceSQL, err := deparseStatement(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: rewrite.sourceSelect}})
+	if err != nil {
+		return nil, nil, err
+	}
+	sourceTableName := t.generateOnConflictSourceTableName(rewrite.targetRelation.Relname)
+	sourceRelation := quoteIdent(sourceTableName)
+	sourceFrom := sourceRelation + " AS duckgres_on_conflict_source"
+
+	mergeSQL, err := deparseMergeWithTempSource(rewrite.merge, sourceTableName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	statements := []string{
+		"CREATE TEMPORARY TABLE " + sourceRelation + " AS " + sourceSQL,
+		t.buildSourceDuplicateGuard(sourceFrom, rewrite.conflictColumns),
+		t.buildTargetDuplicateGuard(sourceFrom, rewrite.targetRelation, rewrite.conflictColumns),
+		mergeSQL,
+	}
+	cleanup := []string{
+		"DROP TABLE IF EXISTS " + sourceRelation,
+	}
+	return statements, cleanup, nil
+}
+
+func deparseStatement(stmt *pg_query.Node) (string, error) {
+	sql, err := pg_query.Deparse(&pg_query.ParseResult{
+		Stmts: []*pg_query.RawStmt{{Stmt: stmt}},
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(strings.TrimSpace(sql), ";"), nil
+}
+
+func deparseMergeWithTempSource(merge *pg_query.MergeStmt, sourceTableName string) (string, error) {
+	originalSourceRelation := merge.SourceRelation
+	merge.SourceRelation = &pg_query.Node{
+		Node: &pg_query.Node_RangeVar{
+			RangeVar: &pg_query.RangeVar{
+				Relname: sourceTableName,
+				Alias:   &pg_query.Alias{Aliasname: "excluded"},
+			},
+		},
+	}
+	sql, err := deparseStatement(&pg_query.Node{Node: &pg_query.Node_MergeStmt{MergeStmt: merge}})
+	merge.SourceRelation = originalSourceRelation
+	return sql, err
+}
+
+func (t *OnConflictTransform) buildSourceDuplicateGuard(sourceFrom string, conflictColumns []string) string {
+	sourceRefs := qualifiedColumnRefs("duckgres_on_conflict_source", conflictColumns)
+	notNullPredicates := notNullPredicates(sourceRefs)
+
+	return "SELECT CASE WHEN EXISTS (" +
+		"SELECT 1 FROM " + sourceFrom + " " +
+		"WHERE " + notNullPredicates + " " +
+		"GROUP BY " + strings.Join(sourceRefs, ", ") + " " +
+		"HAVING count(*) > 1 LIMIT 1" +
+		") THEN error(" + quoteStringLiteral("ON CONFLICT source rows contain duplicate conflict keys") + ") ELSE NULL END"
+}
+
+func (t *OnConflictTransform) buildTargetDuplicateGuard(sourceFrom string, target *pg_query.RangeVar, conflictColumns []string) string {
+	sourceRefs := qualifiedColumnRefs("duckgres_on_conflict_source", conflictColumns)
+	keyRefs := qualifiedColumnRefs("duckgres_on_conflict_keys", conflictColumns)
+	targetRefs := qualifiedColumnRefs("duckgres_on_conflict_target", conflictColumns)
+	joinPredicates := make([]string, 0, len(conflictColumns))
+	for i := range conflictColumns {
+		joinPredicates = append(joinPredicates, targetRefs[i]+" = "+keyRefs[i])
+	}
+
+	return "SELECT CASE WHEN EXISTS (" +
+		"SELECT 1 FROM " + formatRangeVar(target) + " AS duckgres_on_conflict_target " +
+		"JOIN (" +
+		"SELECT DISTINCT " + strings.Join(sourceRefs, ", ") + " " +
+		"FROM " + sourceFrom + " " +
+		"WHERE " + notNullPredicates(sourceRefs) +
+		") AS duckgres_on_conflict_keys " +
+		"ON " + strings.Join(joinPredicates, " AND ") + " " +
+		"GROUP BY " + strings.Join(targetRefs, ", ") + " " +
+		"HAVING count(*) > 1 LIMIT 1" +
+		") THEN error(" + quoteStringLiteral("ON CONFLICT target contains duplicate conflict keys") + ") ELSE NULL END"
+}
+
+func (t *OnConflictTransform) generateOnConflictSourceTableName(targetName string) string {
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		if r >= 'A' && r <= 'Z' {
+			return r + 32
+		}
+		return '_'
+	}, targetName)
+	if safe == "" {
+		safe = "source"
+	}
+
+	prefix := "_duckgres_on_conflict_source_"
+	suffix := fmt.Sprintf("%08x", rand.Uint32())
+	maxNameLen := maxIdentifierLength - len(prefix) - len(suffix) - 1
+	if len(safe) > maxNameLen {
+		safe = safe[:maxNameLen]
+	}
+	return fmt.Sprintf("%s%s_%s", prefix, safe, suffix)
+}
+
+func qualifiedColumnRefs(alias string, columns []string) []string {
+	refs := make([]string, len(columns))
+	for i, col := range columns {
+		refs[i] = alias + "." + quoteIdent(col)
+	}
+	return refs
+}
+
+func notNullPredicates(refs []string) string {
+	predicates := make([]string, len(refs))
+	for i, ref := range refs {
+		predicates[i] = ref + " IS NOT NULL"
+	}
+	return strings.Join(predicates, " AND ")
+}
+
+func formatRangeVar(rv *pg_query.RangeVar) string {
+	parts := make([]string, 0, 3)
+	if rv.Catalogname != "" {
+		parts = append(parts, quoteIdent(rv.Catalogname))
+	}
+	if rv.Schemaname != "" {
+		parts = append(parts, quoteIdent(rv.Schemaname))
+	}
+	parts = append(parts, quoteIdent(rv.Relname))
+	return strings.Join(parts, ".")
+}
+
+func quoteIdent(ident string) string {
+	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+}
+
+func quoteStringLiteral(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `''`) + `'`
 }
 
 // buildSourceSelect creates a SELECT statement from VALUES for use as MERGE source
