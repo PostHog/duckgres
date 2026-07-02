@@ -54,7 +54,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
         </select>
       </div>
     </div>
-    <div id="conn"><div class="dot"></div><span>CONNECTING</span></div>
   </div>
 
   <div class="main">
@@ -87,7 +86,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   const nodes = new Map<string, any>();
   const pods = new Map<string, any>();
   let dirty = false;
-  const pollOk = { nodes: false, pods: false };
 
   // ── k8s quantity parsing ───────────────────────────────
   function parseCpu(q: string): number {
@@ -192,13 +190,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     btn.classList.toggle("active", poolSel !== "all");
   }
 
-  // ── connection indicator ───────────────────────────────
-  function setConn(): void {
-    const ok = pollOk.nodes && pollOk.pods;
-    $("#conn").classList.toggle("live", ok);
-    $("#conn span").textContent = ok ? "LIVE" : "RECONNECTING";
-  }
-
   // ── snapshot polling: fetch a projected list, diff vs the store to emit
   //    ADDED/DELETED for the ticker, and replace the store. The FIRST poll of
   //    each stream seeds silently (matches the original watch, whose initial
@@ -207,7 +198,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     path: string,
     store: Map<string, any>,
     onEvent: (type: string, o: any) => void,
-    connKey: "nodes" | "pods" | null,
     intervalMs: number,
   ): void {
     let firstLoad = true;
@@ -236,10 +226,7 @@ export function mountPeepernetes(root: HTMLElement): () => void {
         }
         firstLoad = false;
         dirty = true;
-        if (connKey) { pollOk[connKey] = true; setConn(); }
-      } catch {
-        if (connKey) { pollOk[connKey] = false; setConn(); }
-      } finally {
+      } catch { /* transient fetch error — retry on the next tick */ } finally {
         const i = controllers.indexOf(ctrl);
         if (i >= 0) controllers.splice(i, 1);
       }
@@ -819,9 +806,9 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   $("#pool-menu").addEventListener("change", poolMenuFn);
 
   // ── start the polling streams ──────────────────────────
-  startPoll(`${API}/nodes`, nodes, onNodeEvent, "nodes", 2000);
-  startPoll(`${API}/pods`, pods, onPodEvent, "pods", 2000);
-  startPoll(`${API}/events`, evStore, onK8sEvent, null, 4000);
+  startPoll(`${API}/nodes`, nodes, onNodeEvent, 2000);
+  startPoll(`${API}/pods`, pods, onPodEvent, 2000);
+  startPoll(`${API}/events`, evStore, onK8sEvent, 4000);
 
   // ── cleanup ────────────────────────────────────────────
   return () => {

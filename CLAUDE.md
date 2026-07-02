@@ -394,11 +394,13 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   placeholder/system-pod classification, Karpenter empty-node reclaim countdown,
   draining-duration on nodes (deletion-timestamp or client-tracked first-seen)
   and terminating-duration on pods, each pod's running image, unscheduled tray,
-  and a synthesized event ticker. Its header carries only the filters + live
-  indicator; the nodes/workers/placeholders/pending counters are lifted into the
-  shared admin **Topbar** via a small external store (`ui/src/lib/clusterCounts.ts`
-  → `Topbar.tsx` `useSyncExternalStore`; the view pushes counts each repaint and
-  pushes `null` on unmount so they only show on this page). It's imperative DOM (mounted
+  and a synthesized event ticker. Its header carries only the filters; the
+  nodes/workers/placeholders/pending counters are lifted into the shared admin
+  **Topbar** via a small external store (`ui/src/lib/clusterCounts.ts` →
+  `Topbar.tsx` `useSyncExternalStore`; the view pushes counts each repaint and
+  pushes `null` on unmount so they only show on this page). The view has no
+  separate live indicator — the Topbar's "Connected" dot (admin-API reachability)
+  is the single green pulsing live signal. It's imperative DOM (mounted
   by the React page into a `.peeper` root, scoped CSS + `pn-`-prefixed keyframes)
   and does NOT use native K8s watch — the browser can't reach the API, so it
   POLLS four **read-only** projected endpoints (`server/`-free; `cluster.go`):
