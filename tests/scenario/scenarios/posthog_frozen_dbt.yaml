@@ -6,9 +6,9 @@ steps:
   - id: provision
     type: provision_warehouse
     with:
-      org_id: scenario-frozen-dbt-${run_id_compact}
+      org_id: scenario-frozen-dbt-${run_id_token}
       request:
-        database_name: scenario_frozen_dbt_${run_id_compact}
+        database_name: scenario_frozen_dbt_${run_id_token}
         metadata_store:
           type: cnpg-shard
         ducklake:
@@ -19,14 +19,14 @@ steps:
   - id: wait_ready
     type: wait_warehouse_ready
     with:
-      org_id: scenario-frozen-dbt-${run_id_compact}
+      org_id: scenario-frozen-dbt-${run_id_token}
       timeout: 15m
       poll_interval: 10s
 
   - id: setup_frozen_views
     type: sql
     with:
-      org_id: scenario-frozen-dbt-${run_id_compact}
+      org_id: scenario-frozen-dbt-${run_id_token}
       catalog: ducklake
       file: ../sql/setup_frozen_views.sql
       max_attempts: 12
@@ -35,7 +35,7 @@ steps:
   - id: dbt_models
     type: dbt_run
     with:
-      org_id: scenario-frozen-dbt-${run_id_compact}
+      org_id: scenario-frozen-dbt-${run_id_token}
       catalog: ducklake
       schema: dbt_frozen
       project_dir: ../dbt/posthog_frozen_project
@@ -46,7 +46,7 @@ steps:
     depends_on: [dbt_models]
     always_run: true
     with:
-      org_id: scenario-frozen-dbt-${run_id_compact}
+      org_id: scenario-frozen-dbt-${run_id_token}
       verify_deleted: true
       cleanup_timeout: 15m
       poll_interval: 10s
