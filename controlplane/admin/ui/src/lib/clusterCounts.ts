@@ -8,11 +8,16 @@
 
 export interface ClusterCounts {
   nodes: number;
-  workers: number; // non-placeholder, non-succeeded pods (the view calls these "workers")
+  // Real duckgres worker pods only (label app=duckgres-worker) — NOT every app
+  // pod. This is the number that lines up with the worker chips in the view and
+  // with the control plane's worker accounting.
+  workers: number;
+  cpuCores: number; // sum of worker-pod CPU requests, in cores
+  memGi: number; // sum of worker-pod memory requests, in GiB
   placeholders: number;
   pending: number;
-  workerReq: string; // "12 CPU · 34 Gi" totals, "" when zero — shown as a tooltip
-  placeholderReq: string;
+  workerDetail: string; // "12 CPU · 34 Gi across N pods", "" when none — tooltip
+  placeholderDetail: string;
 }
 
 let current: ClusterCounts | null = null;

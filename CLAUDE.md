@@ -395,8 +395,12 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   draining-duration on nodes (deletion-timestamp or client-tracked first-seen)
   and terminating-duration on pods, each pod's running image, unscheduled tray,
   and a synthesized event ticker. Its header carries only the filters; the
-  nodes/workers/placeholders/pending counters are lifted into the shared admin
-  **Topbar** via a small external store (`ui/src/lib/clusterCounts.ts` →
+  counters — nodes · CP · **workers · CPU · Gi** · placeholders · pending — are
+  lifted into the shared admin **Topbar**. "workers" counts only real duckgres
+  worker pods (label `app=duckgres-worker`, stamped in `k8s_pool_spawn.go`), NOT
+  every app pod — so the number matches the worker chips in the view and the CP's
+  own worker accounting; CPU/Gi are those workers' summed requests. Wiring is a
+  small external store (`ui/src/lib/clusterCounts.ts` →
   `Topbar.tsx` `useSyncExternalStore`; the view pushes counts each repaint and
   pushes `null` on unmount so they only show on this page). The view has no
   separate live indicator — the Topbar's "Connected" dot (admin-API reachability)

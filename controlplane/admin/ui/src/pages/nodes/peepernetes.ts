@@ -154,6 +154,12 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   function nodePool(node: any): string {
     return (node.metadata.labels || {})["karpenter.sh/nodepool"] || "static";
   }
+  // A real duckgres worker pod (spawned per session), by the label the control
+  // plane stamps at spawn (k8s_pool_spawn.go). This is what the "workers" counter
+  // means — NOT every app pod (the control-plane's own pods are not workers).
+  function isWorker(pod: any): boolean {
+    return (pod.metadata.labels || {})["app"] === "duckgres-worker";
+  }
   const POOL_ORDER = (p: string) =>
     p === "duckgres-workers" ? 0 : p === "duckgres-cp" ? 1 : p === "static" ? 9 : 5;
 
@@ -522,8 +528,8 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     const byNode = new Map<string, [any, string][]>();
     const flatPods: [any, string][] = [];
     const unsched: [any, string][] = [];
-    let nPods = 0, nHead = 0, nPend = 0;
-    let pCpu = 0, pMem = 0, hCpu = 0, hMem = 0;
+    let nWorkers = 0, nHead = 0, nPend = 0;
+    let wCpu = 0, wMem = 0, hCpu = 0, hMem = 0;
     for (const p of pods.values()) {
       const k = classify(p);
       if (ns && p.metadata.namespace !== ns) continue;
@@ -533,9 +539,10 @@ export function mountPeepernetes(root: HTMLElement): () => void {
         if (k === "headroom") {
           nHead++;
           const r = podReq(p); hCpu += r.cpu; hMem += r.mem;
-        } else {
-          nPods++;
-          const r = podReq(p); pCpu += r.cpu; pMem += r.mem;
+        } else if (isWorker(p)) {
+          // Only real duckgres worker pods count toward "workers" + its CPU/MEM.
+          nWorkers++;
+          const r = podReq(p); wCpu += r.cpu; wMem += r.mem;
         }
       }
       if (counted && p.status?.phase === "Pending") nPend++;
@@ -552,12 +559,13 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     for (const l of byNode.values()) sortPods(l);
     sortPods(unsched);
 
-    // Header counters now live in the shared admin Topbar; build the CPU/MEM
-    // total strings here and push everything (incl. the node count below) via
-    // setClusterCounts once nNodes is known.
-    const pct = (a: number, b: number) => b ? Math.round(a / b * 100) + "%" : "–";
-    const workerReq = nPods ? `${fmtCpu(pCpu)} · ${fmtMem(pMem)}` : "";
-    const placeholderReq = nHead ? `${fmtCpu(hCpu)} · ${fmtMem(hMem)} · ${pct(hCpu, pCpu)}/${pct(hMem, pMem)} of workers` : "";
+    // Header counters live in the shared admin Topbar; build the CPU/MEM totals
+    // (of the real worker pods) here and push everything (incl. the node count
+    // below) via setClusterCounts once nNodes is known.
+    const cpuCores = Math.round(wCpu / 100) / 10; // millicores → cores, 1 decimal
+    const memGi = Math.round(wMem / 2 ** 30 * 10) / 10;
+    const workerDetail = nWorkers ? `${fmtCpu(wCpu)} · ${fmtMem(wMem)} across ${nWorkers} worker${nWorkers === 1 ? "" : "s"}` : "";
+    const placeholderDetail = nHead ? `${fmtCpu(hCpu)} · ${fmtMem(hMem)}` : "";
 
     $("#tray").classList.toggle("show", unsched.length > 0);
     $("#tray-count").textContent = unsched.length ? unsched.length + " pod(s) waiting for a node" : "";
@@ -583,10 +591,10 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     for (const l of pools.values()) for (const n of l) if (!goneUids.has(n.metadata.uid)) nNodes++;
     // Only publish to the Topbar when a value actually changed (avoids a Topbar
     // re-render on every poll tick when the numbers are unchanged).
-    const countsKey = [nNodes, nPods, nHead, nPend, workerReq, placeholderReq].join("|");
+    const countsKey = [nNodes, nWorkers, cpuCores, memGi, nHead, nPend].join("|");
     if (countsKey !== lastCountsKey) {
       lastCountsKey = countsKey;
-      setClusterCounts({ nodes: nNodes, workers: nPods, placeholders: nHead, pending: nPend, workerReq, placeholderReq });
+      setClusterCounts({ nodes: nNodes, workers: nWorkers, cpuCores, memGi, placeholders: nHead, pending: nPend, workerDetail, placeholderDetail });
     }
     const poolNames = [...pools.keys()].sort((a, b) => (POOL_ORDER(a) - POOL_ORDER(b)) || a.localeCompare(b));
 
