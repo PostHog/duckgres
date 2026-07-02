@@ -458,6 +458,14 @@ func TestTranspile_FeatureNotSupported_Rejected(t *testing.T) {
 			name:  "ON CONFLICT targetless DO NOTHING",
 			input: "INSERT INTO t (id, v) VALUES (1, 2) ON CONFLICT DO NOTHING",
 		},
+		{
+			name: "writable CTE containing ON CONFLICT",
+			input: `WITH up AS (
+				INSERT INTO t (id, v) VALUES (1, 2)
+				ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+				RETURNING id
+			) SELECT * FROM up`,
+		},
 	}
 
 	for _, backend := range []StorageBackend{BackendDuckLake, BackendIceberg} {

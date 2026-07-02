@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -132,6 +133,30 @@ func TestDMLInsertReturning(t *testing.T) {
 
 // TestDMLInsertOnConflict tests INSERT ... ON CONFLICT (UPSERT)
 func TestDMLInsertOnConflict(t *testing.T) {
+	assertOnConflictRejected := func(t *testing.T, query string) {
+		t.Helper()
+		_, err := testHarness.DuckgresDB.Exec(query)
+		if err == nil {
+			t.Fatal("expected ON CONFLICT to be rejected")
+		}
+		if !strings.Contains(err.Error(), "ON CONFLICT is not supported") {
+			t.Fatalf("expected ON CONFLICT unsupported error, got %v", err)
+		}
+	}
+
+	if testHarness.useDuckLake {
+		t.Run("on_conflict_do_nothing", func(t *testing.T) {
+			assertOnConflictRejected(t, "INSERT INTO dml_upsert_test (id, name, counter) VALUES (1, 'Duplicate', 99) ON CONFLICT DO NOTHING")
+		})
+		t.Run("on_conflict_do_update", func(t *testing.T) {
+			assertOnConflictRejected(t, `
+				INSERT INTO dml_upsert_test (id, name, counter) VALUES (1, 'Updated', 20)
+				ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, counter = dml_upsert_test.counter + EXCLUDED.counter
+			`)
+		})
+		return
+	}
+
 	mustExec(t, testHarness.DuckgresDB, "CREATE TABLE dml_upsert_test (id INTEGER PRIMARY KEY, name TEXT, counter INTEGER)")
 	mustExec(t, testHarness.DuckgresDB, "INSERT INTO dml_upsert_test VALUES (1, 'Alice', 10)")
 
@@ -149,10 +174,11 @@ func TestDMLInsertOnConflict(t *testing.T) {
 	})
 
 	t.Run("on_conflict_do_update", func(t *testing.T) {
-		_, err := testHarness.DuckgresDB.Exec(`
+		query := `
 			INSERT INTO dml_upsert_test (id, name, counter) VALUES (1, 'Updated', 20)
 			ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, counter = dml_upsert_test.counter + EXCLUDED.counter
-		`)
+		`
+		_, err := testHarness.DuckgresDB.Exec(query)
 		if err != nil {
 			t.Fatalf("ON CONFLICT DO UPDATE failed: %v", err)
 		}

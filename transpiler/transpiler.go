@@ -85,56 +85,56 @@ func New(cfg Config) *Transpiler {
 	// Core transforms - always registered
 	// Order matters: more specific transforms should come first
 
-	// 0. Writable CTE transform - MUST BE FIRST
+	// 0. ON CONFLICT rejection must run before rewrites that can emit multiple
+	// statements and skip the rest of the transform pipeline.
+	t.transforms = append(t.transforms, taggedTransform{FlagOnConflict, transform.NewOnConflictTransformWithConfig(dmlPolicy.ConflictHandling == backend.RejectOnConflict)})
+
+	// 1. Writable CTE transform - first mutating rewrite.
 	t.transforms = append(t.transforms, taggedTransform{FlagWritableCTE, transform.NewWritableCTETransform()})
 
-	// 1. version() replacement - MUST run before PgCatalogTransform
+	// 2. version() replacement - MUST run before PgCatalogTransform
 	t.transforms = append(t.transforms, taggedTransform{FlagVersion, transform.NewVersionTransform()})
 
-	// 2. pg_catalog schema and view mappings
+	// 3. pg_catalog schema and view mappings
 	t.transforms = append(t.transforms, taggedTransform{FlagPgCatalog, transform.NewPgCatalogTransformWithConfig(catalogPolicy.QualifyMacros)})
 
-	// 3. information_schema mappings to compat views
+	// 4. information_schema mappings to compat views
 	t.transforms = append(t.transforms, taggedTransform{FlagInfoSchema, transform.NewInformationSchemaTransform()})
 
-	// 3.1 Map PostgreSQL "public" schema to DuckDB "main" (backends whose default
+	// 4.1 Map PostgreSQL "public" schema to DuckDB "main" (backends whose default
 	// schema is "main"; disabled for Iceberg whose schema is literally "public")
 	t.transforms = append(t.transforms, taggedTransform{FlagPublicSchema, transform.NewPublicSchemaTransform(catalogPolicy.MapPublicToMain)})
 
-	// 3.2 Map logical database catalog references to the physical backend catalog
+	// 4.2 Map logical database catalog references to the physical backend catalog
 	t.transforms = append(t.transforms, taggedTransform{FlagLogicalCatalog, transform.NewLogicalCatalogTransform(cfg.LogicalDatabaseName, catalogPolicy.PhysicalName, catalogPolicy.MapPublicToMain)})
 
-	// 3.3 Literal rewrites (bytea \x hex, bit-string B'..') — MUST run before
+	// 4.3 Literal rewrites (bytea \x hex, bit-string B'..') — MUST run before
 	// TypeMapping so it still sees the `bytea` type name.
 	t.transforms = append(t.transforms, taggedTransform{FlagLiterals, transform.NewLiteralTransform()})
 
-	// 4. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
+	// 5. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagTypeMapping, transform.NewTypeMappingTransform()})
 
-	// 5. Type casts (::regtype -> ::varchar)
+	// 6. Type casts (::regtype -> ::varchar)
 	t.transforms = append(t.transforms, taggedTransform{FlagTypeCast, transform.NewTypeCastTransform()})
 
-	// 6. Function mappings (array_agg->list, string_to_array->string_split, etc.)
+	// 7. Function mappings (array_agg->list, string_to_array->string_split, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagFunctions, transform.NewFunctionTransform()})
 
-	// 7. Function alias normalization (current_database() -> AS current_database)
+	// 8. Function alias normalization (current_database() -> AS current_database)
 	t.transforms = append(t.transforms, taggedTransform{FlagFuncAlias, transform.NewFuncAliasTransform()})
 
-	// 8. Boolean predicate normalization for DuckLake/worker execution.
+	// 9. Boolean predicate normalization for DuckLake/worker execution.
 	t.transforms = append(t.transforms, taggedTransform{FlagBooleanPredicates, transform.NewBooleanPredicateTransform()})
 
-	// 9. Operator mappings (regex operators, etc.)
+	// 10. Operator mappings (regex operators, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagOperators, transform.NewOperatorTransform()})
 
-	// 10. SET/SHOW command handling
+	// 11. SET/SHOW command handling
 	t.transforms = append(t.transforms, taggedTransform{FlagSetShow, transform.NewSetShowTransform()})
 
-	// 11. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
+	// 12. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
 	t.transforms = append(t.transforms, taggedTransform{FlagExpandArray, transform.NewExpandArrayTransform()})
-
-	// 12. ON CONFLICT handling (rejects ON CONFLICT when the backend has no
-	// enforced unique constraints to infer against)
-	t.transforms = append(t.transforms, taggedTransform{FlagOnConflict, transform.NewOnConflictTransformWithConfig(dmlPolicy.ConflictHandling == backend.RejectOnConflict)})
 
 	// 13. Locking clause removal (FOR UPDATE, FOR SHARE, etc.) - DuckDB doesn't support these
 	t.transforms = append(t.transforms, taggedTransform{FlagLocking, transform.NewLockingTransform()})

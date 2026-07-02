@@ -357,6 +357,9 @@ func walkInsertStmt(stmt *pg_query.InsertStmt, fn func(*pg_query.Node) bool) {
 		walkNode(col, fn)
 	}
 	walkNode(stmt.SelectStmt, fn)
+	if stmt.WithClause != nil {
+		walkNode(&pg_query.Node{Node: &pg_query.Node_WithClause{WithClause: stmt.WithClause}}, fn)
+	}
 	for _, target := range stmt.ReturningList {
 		walkNode(target, fn)
 	}
@@ -377,6 +380,9 @@ func walkUpdateStmt(stmt *pg_query.UpdateStmt, fn func(*pg_query.Node) bool) {
 	for _, from := range stmt.FromClause {
 		walkNode(from, fn)
 	}
+	if stmt.WithClause != nil {
+		walkNode(&pg_query.Node{Node: &pg_query.Node_WithClause{WithClause: stmt.WithClause}}, fn)
+	}
 	for _, target := range stmt.ReturningList {
 		walkNode(target, fn)
 	}
@@ -393,6 +399,9 @@ func walkDeleteStmt(stmt *pg_query.DeleteStmt, fn func(*pg_query.Node) bool) {
 	walkNode(stmt.WhereClause, fn)
 	for _, target := range stmt.ReturningList {
 		walkNode(target, fn)
+	}
+	if stmt.WithClause != nil {
+		walkNode(&pg_query.Node{Node: &pg_query.Node_WithClause{WithClause: stmt.WithClause}}, fn)
 	}
 }
 

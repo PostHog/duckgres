@@ -25,7 +25,7 @@ var knownFailures = map[string]string{
 	"insert_returning_columns": "DuckLake: RETURNING clause not yet supported",
 	"update_returning_star":    "DuckLake: RETURNING clause not yet supported",
 	"delete_returning_star":    "DuckLake: RETURNING clause not yet supported",
-	"on_conflict_do_nothing":   "DuckLake: constraint detection requires explicit columns",
+	"on_conflict_do_nothing":   "DuckDB: targetless DO NOTHING behavior differs",
 
 	// DuckDB missing functions
 	"where_regex_match":                 "DuckDB: ~* operator not available",

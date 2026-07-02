@@ -139,6 +139,73 @@ func TestOnConflictTransform_RejectingModeRejectsAllOnConflict(t *testing.T) {
 	}
 }
 
+func TestOnConflictTransform_RejectingModeRejectsNestedOnConflict(t *testing.T) {
+	tr := NewOnConflictTransformWithConfig(true)
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "writable CTE under SELECT",
+			input: `WITH up AS (
+				INSERT INTO users (id, name) VALUES (1, 'test')
+				ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+				RETURNING id
+			) SELECT * FROM up`,
+		},
+		{
+			name: "writable CTE under INSERT",
+			input: `WITH up AS (
+				INSERT INTO users (id, name) VALUES (1, 'test')
+				ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+				RETURNING id
+			) INSERT INTO audit_users (id) SELECT id FROM up`,
+		},
+		{
+			name: "writable CTE under UPDATE",
+			input: `WITH up AS (
+				INSERT INTO users (id, name) VALUES (1, 'test')
+				ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+				RETURNING id
+			) UPDATE audit_users SET touched = true FROM up WHERE audit_users.id = up.id`,
+		},
+		{
+			name: "writable CTE under DELETE",
+			input: `WITH up AS (
+				INSERT INTO users (id, name) VALUES (1, 'test')
+				ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+				RETURNING id
+			) DELETE FROM audit_users USING up WHERE audit_users.id = up.id`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tree, err := pg_query.Parse(tt.input)
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+
+			result := &Result{}
+			changed, err := tr.Transform(tree, result)
+			if err != nil {
+				t.Fatalf("Transform error: %v", err)
+			}
+
+			if changed {
+				t.Error("Transform should reject without rewriting SQL")
+			}
+			if result.Error == nil {
+				t.Fatal("expected nested ON CONFLICT to be rejected")
+			}
+			if got := transformErrSQLState(result.Error); got != "0A000" {
+				t.Fatalf("SQLSTATE = %q, want 0A000", got)
+			}
+		})
+	}
+}
+
 func TestOnConflictTransform_NoTransformCases(t *testing.T) {
 	tr := NewOnConflictTransformWithConfig(true)
 

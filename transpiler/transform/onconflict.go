@@ -24,22 +24,18 @@ func (t *OnConflictTransform) Name() string {
 }
 
 func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
-	for _, stmt := range tree.Stmts {
-		if stmt.Stmt == nil {
-			continue
-		}
+	if !t.RejectOnConflict {
+		return false, nil
+	}
 
-		insert := stmt.Stmt.GetInsertStmt()
-		if insert == nil || insert.OnConflictClause == nil {
-			continue
-		}
-
-		if t.RejectOnConflict {
+	WalkFunc(tree, func(node *pg_query.Node) bool {
+		if insert := node.GetInsertStmt(); insert != nil && insert.OnConflictClause != nil {
 			result.Error = NewFeatureNotSupported(
 				"ON CONFLICT is not supported: this catalog does not enforce unique constraints")
-			return false, nil
+			return false
 		}
-	}
+		return true
+	})
 
 	return false, nil
 }
