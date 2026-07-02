@@ -286,6 +286,13 @@ assert_compat() { # org password dbname sql expected label
   got="$(pg "$1" "$2" "$3" "$4")"
   [ "$got" = "$5" ] || fail "$1 compat[$6]: '$4' returned '$got', expected '$5'"
 }
+# Like assert_compat but compares only the LAST output line. Use for a batched
+# simple query where an earlier statement emits a psql command tag (e.g. `SET`)
+# on its own line before the row that carries the value being asserted.
+assert_lastline() { # org password dbname sql expected label
+  got="$(pg "$1" "$2" "$3" "$4" | tail -1)"
+  [ "$got" = "$5" ] || fail "$1 compat[$6]: '$4' last line returned '$got', expected '$5'"
+}
 pg_compat_functions() { # org password
   log "pg builtin-compat functions on $1 (DuckLake mode)"
   # set_config: connection-startup unblocker (JDBC/SQLAlchemy/psycopg/poolers).
@@ -340,10 +347,12 @@ pg_compat_functions() { # org password
 # swallowed the batch, the trailing statement's value would be missing.
 query_source_guc() { # org password
   log "duckgres.query_source session GUC on $1"
-  assert_compat "$1" "$2" ducklake "SHOW duckgres.query_source" "standard" "query_source_default"
-  assert_compat "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SHOW duckgres.query_source" "endpoints" "query_source_set"
-  assert_compat "$1" "$2" ducklake "SET duckgres.query_source = 'anything'; SHOW duckgres.query_source" "anything" "query_source_passthrough"
-  assert_compat "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" "1" "query_source_set_then_query"
+  # `SHOW` alone → just the value. The batched `SET …; SHOW/SELECT …` cases print
+  # psql's `SET` command tag on its own line first, so assert only the last line.
+  assert_compat  "$1" "$2" ducklake "SHOW duckgres.query_source" "standard" "query_source_default"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SHOW duckgres.query_source" "endpoints" "query_source_set"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'anything'; SHOW duckgres.query_source" "anything" "query_source_passthrough"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" "1" "query_source_set_then_query"
 }
 
 # Regression for #715: the CP reads the post-TLS startup message with the shared
