@@ -33,9 +33,12 @@ Internally, one row per unique key, values accumulated:
   same bucket and fractional sizes keep full precision.
 - **Values:** `cpu_seconds` (vCPU-seconds), `memory_seconds` (GiB-seconds) —
   summed over every connection that falls in that key + minute.
-- `team_id` (config-store **org → team** lookup) and `query_source` (the worker's
-  role: standard query vs endpoints) are resolved at connection time — both need to
-  be threaded onto the connection.
+- `team_id` is the org's **default team** for now — a fixed value per org (from the
+  config-store org→team default), reported so the shape is right, but **no per-team
+  attribution logic** yet. A "team" is really a schema and one connection can span
+  several, so true per-team split is future work; today every bucket carries the
+  org's default team. `query_source` (the worker's role: standard query vs
+  endpoints) is resolved at connection time and threaded onto the connection.
 - Worker size (`cpu`, `mem_gib`) is part of the key, so different worker sizes
   accumulate — and bill — separately. Units match the values (vCPU / GiB).
 
@@ -149,9 +152,9 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 - **Extend:** the bucket table gains `team_id`, `query_source`, `cpu`, `mem_gib`
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
   the HTTP API (aggregate-on-read into one row per key + watermark ack) + safety GC.
-- **Add:** config-store `org → team` lookup and the connection's `query_source`
-  (standard vs endpoints) — both threaded onto the connection; a bearer secret for
-  the API.
+- **Add:** the org's default `team_id` (fixed per org — no per-team logic yet) and
+  the connection's `query_source` (standard vs endpoints) threaded onto the
+  connection; a bearer secret for the API.
 
 ## Defaults / house-keeping
 
