@@ -66,18 +66,25 @@ export function Topbar() {
           }
         >
           <Circle
-            className={cn("h-2.5 w-2.5", reachable ? "fill-success text-success" : "fill-destructive text-destructive")}
+            className={cn(
+              "h-2.5 w-2.5",
+              // Connected is the live pulse now (moved off the Nodes view's old
+              // in-view "LIVE" indicator): green, pulsing, with a soft glow.
+              reachable
+                ? "fill-success text-success animate-pulse [filter:drop-shadow(0_0_5px_currentColor)]"
+                : "fill-destructive text-destructive",
+            )}
           />
           <span className="text-xs text-muted-foreground">{reachable ? "Connected" : "Unreachable"}</span>
         </div>
 
         {(cpCount !== null || counts) && (
           <div className="flex items-center gap-2.5 border-l border-border pl-3">
+            {counts && <Stat n={counts.nodes} label="nodes" />}
+            {counts && cpCount !== null && <Dot />}
             {cpCount !== null && <Stat n={cpCount} label="CP" detail="live control-plane replicas (cp_instances)" />}
             {counts && (
               <>
-                {cpCount !== null && <Dot />}
-                <Stat n={counts.nodes} label="nodes" />
                 <Dot />
                 <Stat n={counts.workers} label="workers" detail={counts.workerReq || undefined} />
                 <Dot />

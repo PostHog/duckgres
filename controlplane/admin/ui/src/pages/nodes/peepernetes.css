@@ -88,11 +88,6 @@
 .peeper .menu input { accent-color: var(--worker); cursor: pointer; }
 .peeper .menu .sep { border-top: 1px solid var(--line); margin: 5px 0; }
 
-.peeper #conn { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: .15em; align-self: center; }
-.peeper #conn .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); transition: background .3s; }
-.peeper #conn.live .dot { background: var(--duckgres); box-shadow: 0 0 10px var(--duckgres); animation: pn-blink 2.4s infinite; }
-.peeper #conn.live span { color: var(--duckgres); }
-.peeper #conn span { color: var(--bad); }
 @keyframes pn-blink { 50% { opacity: .55; } }
 
 /* ── main ───────────────────────────────────────── */
