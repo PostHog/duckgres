@@ -193,6 +193,8 @@ func (c *clientConn) handleParse(body []byte) {
 		isIgnoredSet:      result.IsIgnoredSet,
 		isNoOp:            result.IsNoOp,
 		noOpTag:           result.NoOpTag,
+		querySourceSet:    result.QuerySourceSet,  // SET duckgres.query_source (custom GUC)
+		querySourceShow:   result.QuerySourceShow, // SHOW duckgres.query_source
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 		warnings:          result.Warnings,          // Surfaced as NoticeResponse at Execute
@@ -269,6 +271,19 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		case cursorOpPgStatActivity:
 			_ = c.sendPgStatActivityRowDescriptionWithFormats(nil)
+			ps.described = true
+			return
+		}
+
+		// duckgres.query_source custom GUC: SET returns no rows; SHOW returns a
+		// single text column answered from session state (never probed against
+		// DuckDB, which does not know this setting).
+		if ps.querySourceSet != nil {
+			_ = wire.WriteNoData(c.writer)
+			return
+		}
+		if ps.querySourceShow {
+			_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 			ps.described = true
 			return
 		}
@@ -576,6 +591,23 @@ func (c *clientConn) handleExecute(body []byte) {
 	// lake catalog) as NoticeResponse before the command result.
 	for _, w := range p.stmt.warnings {
 		c.sendNotice("WARNING", "01000", w)
+	}
+
+	// duckgres.query_source custom GUC (SET / SHOW): intercepted session-side,
+	// never forwarded to DuckDB. Determined by the transpiler during Parse.
+	if p.stmt.querySourceSet != nil {
+		c.setQuerySource(*p.stmt.querySourceSet)
+		c.logger().Debug("Set duckgres.query_source.", "value", c.QuerySource())
+		_ = c.writeCommandComplete("SET")
+		return
+	}
+	if p.stmt.querySourceShow {
+		if !p.described {
+			_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		}
+		_ = c.sendDataRowWithFormats([]interface{}{c.QuerySource()}, p.resultFormats, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return
 	}
 
 	// Check if this is a PostgreSQL-specific SET command that should be ignored

@@ -610,6 +610,19 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return true, nil
 	}
 
+	// duckgres.query_source custom GUC (SET / SHOW): intercepted session-side.
+	if result.QuerySourceSet != nil {
+		c.setQuerySource(*result.QuerySourceSet)
+		_ = c.writeCommandComplete("SET")
+		return false, nil
+	}
+	if result.QuerySourceShow {
+		_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		_ = c.sendDataRowWithFormats([]interface{}{c.QuerySource()}, nil, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return false, nil
+	}
+
 	if result.IsIgnoredSet {
 		_ = c.writeCommandComplete("SET")
 		return false, nil

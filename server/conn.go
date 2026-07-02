@@ -82,6 +82,8 @@ type preparedStmt struct {
 	isIgnoredSet      bool     // True if this is an ignored SET parameter
 	isNoOp            bool     // True if this is a no-op command (CREATE INDEX, etc.)
 	noOpTag           string   // Command tag for no-op commands
+	querySourceSet    *string  // non-nil: SET duckgres.query_source; pointed-to value to store on session
+	querySourceShow   bool     // True if this is SHOW duckgres.query_source (answered from session state)
 	described         bool     // True if Describe(S) was called on this statement
 	statements        []string // Multi-statement rewrite (e.g., writable CTE)
 	cleanupStatements []string // Cleanup statements for multi-statement (DROP temp tables, COMMIT)
@@ -192,6 +194,15 @@ type clientConn struct {
 	workerPod       string       // K8s pod name of the worker, empty for standalone or in-process workers
 	physicalCatalog string       // selected DuckDB catalog for execution, empty for memory/standalone default
 
+	// querySource holds the value of the duckgres-namespaced session GUC
+	// `duckgres.query_source` (a custom config parameter, NOT forwarded to
+	// DuckDB). Empty means unset; readers see the default via QuerySource().
+	// This is a prerequisite for pull-based compute billing (usage buckets are
+	// keyed by query_source). Set via `SET duckgres.query_source = '...'` (or a
+	// `-c duckgres.query_source=...` startup option) and read back via
+	// `SHOW duckgres.query_source` / current_setting.
+	querySource string
+
 	// Provisioned worker pod size for compute-usage billing (remote/k8s backend
 	// only). Counted in milli-units to avoid truncating a fractional-core or
 	// sub-GiB worker. workerMillicores == 0 means "unknown size" (non-remote /
@@ -240,6 +251,34 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 		PhysicalCatalogName: physicalCatalog,
 		ConvertPlaceholders: convertPlaceholders,
 	})
+}
+
+// querySourceGUCName is the fully-qualified name of the duckgres-namespaced
+// session GUC, used as the SHOW result column label.
+const querySourceGUCName = "duckgres.query_source"
+
+// defaultQuerySource is the value reported for `duckgres.query_source` when the
+// session GUC has not been set. Downstream (pull-based compute billing) treats a
+// missing query_source as this bucket.
+const defaultQuerySource = "standard"
+
+// QuerySource returns the current value of the `duckgres.query_source` session
+// GUC, or defaultQuerySource ("standard") if it was never set / set to empty.
+// This never errors on a missing value: an unset GUC is defined to mean
+// "standard". It is the accessor a future compute meter reads to bucket usage.
+func (c *clientConn) QuerySource() string {
+	if c.querySource == "" {
+		return defaultQuerySource
+	}
+	return c.querySource
+}
+
+// setQuerySource records a client-supplied `duckgres.query_source` value on the
+// session. Pass-through: any string is accepted (only "standard"/"endpoints" are
+// meaningful downstream, but other values are stored, not rejected). An empty
+// value resets to the default.
+func (c *clientConn) setQuerySource(value string) {
+	c.querySource = value
 }
 
 // generateSecretKey is a thin alias for wire.GenerateSecretKey kept for the
@@ -1034,6 +1073,14 @@ func (c *clientConn) handleStartup() error {
 		c.database = params["database"]
 		c.applicationName = params["application_name"]
 
+		// Honor a `-c duckgres.query_source=...` startup option (libpq `options`
+		// keyword / PGOPTIONS). Other GUCs in `options` are not applied here.
+		if opts := ParseStartupOptions(params["options"]); len(opts) > 0 {
+			if v, ok := opts[querySourceGUCName]; ok {
+				c.setQuerySource(v)
+			}
+		}
+
 		c.logger().Info("Client startup.", "database", c.database,
 			"application_name", c.applicationName, "remote_addr", c.conn.RemoteAddr())
 
@@ -1368,6 +1415,25 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// lake catalog) as NoticeResponse before the command result.
 	for _, w := range result.Warnings {
 		c.sendNotice("WARNING", "01000", w)
+	}
+
+	// Handle the duckgres.query_source custom GUC (SET / SHOW). Intercepted
+	// session-side; never forwarded to DuckDB.
+	if result.QuerySourceSet != nil {
+		c.setQuerySource(*result.QuerySourceSet)
+		c.logger().Debug("Set duckgres.query_source.", "value", c.QuerySource())
+		_ = c.writeCommandComplete("SET")
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
+	if result.QuerySourceShow {
+		_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		_ = c.sendDataRowWithFormats([]interface{}{c.QuerySource()}, nil, nil)
+		_ = c.writeCommandComplete("SHOW")
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
 	}
 
 	// Handle ignored SET parameters

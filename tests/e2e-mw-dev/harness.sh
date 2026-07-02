@@ -312,6 +312,13 @@ assert_compat() { # org password dbname sql expected label
   got="$(pg "$1" "$2" "$3" "$4")"
   [ "$got" = "$5" ] || fail "$1 compat[$6]: '$4' returned '$got', expected '$5'"
 }
+# Like assert_compat but compares only the LAST output line. Use for a batched
+# simple query where an earlier statement emits a psql command tag (e.g. `SET`)
+# on its own line before the row that carries the value being asserted.
+assert_lastline() { # org password dbname sql expected label
+  got="$(pg "$1" "$2" "$3" "$4" | tail -1)"
+  [ "$got" = "$5" ] || fail "$1 compat[$6]: '$4' last line returned '$got', expected '$5'"
+}
 pg_compat_functions() { # org password
   log "pg builtin-compat functions on $1 (DuckLake mode)"
   # set_config: connection-startup unblocker (JDBC/SQLAlchemy/psycopg/poolers).
@@ -345,6 +352,33 @@ pg_compat_functions() { # org password
   # isfinite(interval): always true (DuckDB lacks the interval overload). The
   # cast happens inside DuckDB, so the textual form is 'true', not PG's 't'.
   assert_compat "$1" "$2" ducklake "SELECT isfinite(INTERVAL '1 day')::text" "true" "isfinite_interval"
+}
+
+# query_source_guc exercises the duckgres.query_source session GUC end-to-end
+# (prerequisite for pull-based compute billing). The CP intercepts the
+# duckgres-namespaced custom GUC in the SET/SHOW path and answers it from
+# session state — it is NEVER forwarded to a DuckDB worker (DuckDB rejects
+# unknown settings). Assertions, each in a single simple-query session:
+#   1. unset SHOW → default "standard" (never errors on a missing value)
+#   2. SET then SHOW in the same session → the value round-trips
+#   3. an arbitrary (non-standard/endpoints) value is accepted pass-through,
+#      not rejected — only "standard"/"endpoints" are meaningful downstream.
+#   4. a batch mixing the GUC SET with a normal statement runs the normal
+#      statement too — the intercepted GUC must NOT swallow the rest of the
+#      batch (regression for the multi-statement-swallow bug).
+# Assertions 2-4 are multi-statement simple queries: the CP splits the batch and
+# runs each statement in order, so the SET applies session-side before the
+# trailing SHOW/SELECT. If any statement forwarded to DuckDB, the query would
+# error ("unrecognized configuration parameter"), failing the assert; if the GUC
+# swallowed the batch, the trailing statement's value would be missing.
+query_source_guc() { # org password
+  log "duckgres.query_source session GUC on $1"
+  # `SHOW` alone → just the value. The batched `SET …; SHOW/SELECT …` cases print
+  # psql's `SET` command tag on its own line first, so assert only the last line.
+  assert_compat  "$1" "$2" ducklake "SHOW duckgres.query_source" "standard" "query_source_default"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SHOW duckgres.query_source" "endpoints" "query_source_set"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'anything'; SHOW duckgres.query_source" "anything" "query_source_passthrough"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" "1" "query_source_set_then_query"
 }
 
 # Regression for #715: the CP reads the post-TLS startup message with the shared
@@ -2205,6 +2239,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   wait_worker "$CNPG" "$cnpg_pw" ducklake
   basic_query            "$CNPG" "$cnpg_pw"
   pg_compat_functions    "$CNPG" "$cnpg_pw"
+  query_source_guc       "$CNPG" "$cnpg_pw"
   malformed_startup_resilience "$CNPG" "$cnpg_pw"
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
@@ -2280,6 +2315,7 @@ lane_ext() { # external-RDS metadata backend + org default profile
   wait_worker "$EXT" "$ext_pw" ducklake
   basic_query  "$EXT" "$ext_pw"
   pg_compat_functions "$EXT" "$ext_pw"
+  query_source_guc    "$EXT" "$ext_pw"
   rw_ducklake  "$EXT" "$ext_pw"
   httpfs_retry_budget "$EXT" "$ext_pw"      # S3-503 retry budget per worker, ext-metadata backend too
   persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
