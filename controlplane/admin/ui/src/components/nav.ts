@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   Building2,
   Database,
-  GaugeCircle,
   LayoutDashboard,
   LineChart,
   Network,
@@ -35,5 +34,3 @@ export const NAV: NavItem[] = [
   { to: "/impersonate", label: "Impersonate", icon: TerminalSquare, adminOnly: true },
   { to: "/audit", label: "Audit", icon: ScrollText, adminOnly: true },
 ];
-
-export const BRAND_ICON = GaugeCircle;
