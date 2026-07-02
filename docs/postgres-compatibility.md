@@ -74,13 +74,21 @@ why.
 | DELETE (incl. `DELETE…USING`, subquery) | ✅ | `dml_test.go::TestDMLDelete`, `::TestDMLDeleteUsing`; transform `wiring_ops_test.go::TestOperatorTransform_DeleteUsing` | |
 | RETURNING (simple query protocol) | 🟡 | transform `wiring_ops_test.go::TestOperatorTransform_{Insert,Update,Delete}Returning`; `conn_test.go::TestContainsReturning`/`::TestIsDMLReturning` | Differential tests `TestDML{Insert,Update,Delete}Returning` are `skipIfKnown` (stale — passes at unit/client level) |
 | RETURNING (extended query protocol) | ⛔ | `conn_test.go::TestIsDMLReturning` | Rejected at Describe time with `0A000` by design — Describe would execute the mutation. See CLAUDE.md "DML RETURNING Detection" |
-| ON CONFLICT / UPSERT (DO UPDATE) | ✅ | `dml_test.go::TestDMLInsertOnConflict`; transpiler `transform/onconflict_test.go` | Also exercised via DuckLake ON CONFLICT→MERGE rewrite: `ducklake_concurrency_test.go::TestDuckLakeConcurrentTransactions` |
+| ON CONFLICT / UPSERT (DO UPDATE) | 🟡 | `dml_test.go::TestDMLInsertOnConflict`; transpiler `transform/onconflict_test.go` | DuckDB-backed tables are covered. DuckLake rewrites ON CONFLICT→MERGE, but this is not PostgreSQL-equivalent when conflict keys are duplicated; see known issue below. |
 | ON CONFLICT DO NOTHING | 🟡 | `dml_test.go::TestDMLInsertOnConflict` (subtest skipped) | |
-| MERGE (user-facing) | ⛔ | — | DuckDB has no MERGE; only internal ON CONFLICT→MERGE rewrite exists |
+| MERGE (user-facing) | ⛔ | — | Not a PostgreSQL compatibility target; Duckgres only uses MERGE internally for DuckLake ON CONFLICT emulation |
 | TRUNCATE | ✅ | `ddl_test.go::TestDDLTruncate` | |
 | COPY … FROM STDIN (text/CSV) | ✅ | `copy_test.go::TestCopyFromStdin`, `::TestCopyFromStdinWithSpecialChars`, `::TestCopyFromStdinMultilineJSON` | Escape sequences stored literally (documented DuckDB CSV-parser limitation) |
 | COPY … TO STDOUT | 🟡 | `copy_test.go::TestCopyToStdout` (skipped under lib/pq); `conn_test.go::TestCopyToStdoutRegex`; client-compat `psycopg` COPY suite | Integration skip is a lib/pq driver limitation, not a Duckgres gap |
 | COPY binary format | 🟡 | `conn_test.go::TestShouldHandleCopyBeforeTranspile`; `types_test.go` encode/decode | Unit-level only |
+
+### Known issue: DuckLake ON CONFLICT with duplicate keys
+
+DuckLake does not enforce `UNIQUE` / `PRIMARY KEY` constraints. Duckgres therefore cannot provide true PostgreSQL `ON CONFLICT` semantics on DuckLake-backed tables.
+
+Today Duckgres rewrites Fivetran-style `INSERT ... ON CONFLICT ...` into `MERGE`. If the staging data or target table already contains duplicate conflict keys, that `MERGE` can match multiple rows and amplify duplicates. The storage-engine fix would be DuckLake uniqueness enforcement, which is not a small compatibility patch.
+
+Operational guidance: allow the import to complete, then manually deduplicate affected tables using the intended business key and retention rule, such as keeping one row per `id` with the latest `_fivetran_synced`, or using `SELECT DISTINCT` when rows are fully identical.
 
 ---
 
@@ -252,21 +260,26 @@ must route them to native DuckDB execution rather than the PG transpiler.
 
 Sorted by what's worth acting on first.
 
-1. **🟡 Stale `skipIfKnown` skips.** Differential RETURNING
+1. **🟡 DuckLake ON CONFLICT duplicate-key caveat.** Fivetran-style
+   `INSERT ... ON CONFLICT ...` is rewritten to `MERGE` on DuckLake, but DuckLake
+   does not enforce unique constraints. Duplicate source or target keys can fan
+   out; affected tables need manual post-import deduplication.
+
+2. **🟡 Stale `skipIfKnown` skips.** Differential RETURNING
    (`TestDML{Insert,Update,Delete}Returning`) and `COPY TO STDOUT`
    (`TestCopyToStdout`) are skipped in `tests/integration/` though the behavior is
    covered at unit/client level. Re-enable or document why they must stay skipped.
 
-2. **🟡 Transpiler-only, no differential assertion:** generated columns, `SELECT FOR
+3. **🟡 Transpiler-only, no differential assertion:** generated columns, `SELECT FOR
    UPDATE/SHARE` (stripped). Add differential cases if these matter to clients.
 
-3. **❌ Unsupported or untested but plausibly reachable — undefined behavior today:** MD5/SCRAM auth,
+4. **❌ Unsupported or untested but plausibly reachable — undefined behavior today:** MD5/SCRAM auth,
    enum/domain/composite/xml types, advisory locks, `LOCK TABLE`,
    GRANT/REVOKE/roles, `information_schema.{key_column_usage,table_constraints,
    referential_constraints}` (ORM FK discovery), `TABLESAMPLE`. Asserting these
    (even as "errors cleanly") would pin the compatibility boundary.
 
-4. **⛔ Out of scope by design (correctly skipped):** SAVEPOINT, MERGE,
+5. **⛔ Out of scope by design (correctly skipped):** SAVEPOINT, MERGE,
    sequences/SERIAL, materialized views, partitioning/inheritance,
    triggers/PL-pgSQL/rules/LISTEN-NOTIFY, RLS, and the network/geometric/range/
    text-search/money types. These are DuckDB or OLTP limitations.
