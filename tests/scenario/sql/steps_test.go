@@ -377,14 +377,14 @@ func TestExecutorUsesProvisionCredentialsInDSN(t *testing.T) {
 		Type: StepTypeSQL,
 		With: map[string]any{
 			"org_id":  "scenario-org",
-			"catalog": "iceberg",
+			"catalog": "ducklake",
 			"sql":     "SELECT 1",
 		},
 	})
 	if err != nil {
 		t.Fatalf("ExecuteStep returned error: %v", err)
 	}
-	for _, want := range []string{"user=custom-root", "password='root password'", "dbname=iceberg"} {
+	for _, want := range []string{"user=custom-root", "password='root password'", "dbname=ducklake"} {
 		if !strings.Contains(gotDSN, want) {
 			t.Fatalf("DSN %q missing %q", gotDSN, want)
 		}

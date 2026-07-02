@@ -102,7 +102,7 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_sequences_compat',
-			'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+			'information_schema_routines_compat', '__duckgres_column_metadata'
 		)
 	`
 	if _, err := db.Exec(pgClassSQL); err != nil {
@@ -1660,11 +1660,6 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			ON c.table_schema = m.table_schema
 			AND c.table_name = m.table_name
 			AND c.column_name = m.column_name
-		WHERE NOT (
-			c.table_catalog = 'iceberg'
-			AND c.column_name = '__'
-			AND UPPER(c.data_type) = 'UNKNOWN'
-		)
 	`
 	if _, err := db.Exec(fmt.Sprintf(columnsViewSQL, infoSchemaPrefix)); err != nil {
 		// If join with metadata table fails, create simpler view without it
@@ -1748,11 +1743,6 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 				NULL AS generation_expression,
 				'YES' AS is_updatable
 			FROM %s.columns
-			WHERE NOT (
-				table_catalog = 'iceberg'
-				AND column_name = '__'
-				AND UPPER(data_type) = 'UNKNOWN'
-			)
 		`
 		if _, err := db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix)); err != nil {
 			slog.Warn("Failed to create information_schema_columns_compat view.", "error", err)
@@ -1780,7 +1770,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		FROM %s.tables t
 		WHERE t.table_name NOT IN (
 			-- Internal duckgres tables
-			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
+			'__duckgres_column_metadata',
 			-- pg_catalog compat views
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
@@ -1979,7 +1969,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', 'information_schema_sequences_compat',
-				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_routines_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
 		-- Views from ducklake catalog
@@ -2030,7 +2020,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', 'information_schema_sequences_compat',
-				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
+				'information_schema_routines_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
 		-- Sequences from ducklake catalog

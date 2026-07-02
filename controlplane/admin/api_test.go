@@ -120,7 +120,7 @@ func (s *fakeAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &clone, nil
 }
 
-func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
+func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
 	key := orgID + "/" + username
 	user, ok := s.users[key]
 	if !ok {
@@ -131,9 +131,6 @@ func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	}
 	if passthrough != nil {
 		user.Passthrough = *passthrough
-	}
-	if defaultCatalog != nil {
-		user.DefaultCatalog = *defaultCatalog
 	}
 	if maxVCPUs != nil {
 		user.MaxVCPUs = *maxVCPUs
@@ -278,13 +275,16 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	store.warehouses[name] = warehouse
 }
 
-func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
+func TestCreateUserIgnoresRemovedDefaultCatalogField(t *testing.T) {
+	// default_catalog was removed with Iceberg support. The users endpoints do
+	// not reject unknown JSON fields, so a legacy body carrying it still
+	// creates the user — the field is just silently ignored.
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
 		"org_id": "analytics",
-		"username": "iceberg_reader",
+		"username": "reader",
 		"password": "secret",
 		"default_catalog": "iceberg"
 	}`)
@@ -296,20 +296,11 @@ func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	user := store.users["analytics/iceberg_reader"]
-	if user == nil {
+	if store.users["analytics/reader"] == nil {
 		t.Fatal("expected user to be created")
 	}
-	if user.DefaultCatalog != "iceberg" {
-		t.Fatalf("DefaultCatalog = %q, want iceberg", user.DefaultCatalog)
-	}
-
-	var response configstore.OrgUser
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-	if response.DefaultCatalog != "iceberg" {
-		t.Fatalf("response DefaultCatalog = %q, want iceberg", response.DefaultCatalog)
+	if bytes.Contains(rec.Body.Bytes(), []byte("default_catalog")) {
+		t.Fatalf("response must not echo removed default_catalog field: %s", rec.Body.String())
 	}
 }
 
@@ -349,29 +340,6 @@ func TestCreateUserRejectsNegativeMaxVCPUs(t *testing.T) {
 		"username": "analyst",
 		"password": "secret",
 		"max_vcpus": -1
-	}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
-	}
-	if len(store.users) != 0 {
-		t.Fatalf("expected no users to be created, got %d", len(store.users))
-	}
-}
-
-func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
-	store := newFakeAPIStore()
-	router := newTestAPIRouter(store)
-
-	body := []byte(`{
-		"org_id": "analytics",
-		"username": "iceberg_reader",
-		"password": "secret",
-		"default_catalog": "iceberg;DROP TABLE x"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -495,47 +463,30 @@ func TestUpdateUserRejectsNegativeMaxVCPUs(t *testing.T) {
 	}
 }
 
-func TestUpdateUserDefaultCatalogPreserveSetAndClear(t *testing.T) {
+func TestUpdateUserIgnoresRemovedDefaultCatalogField(t *testing.T) {
+	// default_catalog was removed with Iceberg support: a legacy update body
+	// carrying it still succeeds (unknown fields are ignored on the users
+	// endpoints) and other fields in the same body are applied.
 	store := newFakeAPIStore()
-	store.users["analytics/iceberg_reader"] = &configstore.OrgUser{
-		OrgID:          "analytics",
-		Username:       "iceberg_reader",
-		Password:       "hash",
-		DefaultCatalog: "iceberg",
+	store.users["analytics/reader"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "reader",
+		Password: "hash",
 	}
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"passthrough":true}`)))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/reader", bytes.NewReader([]byte(`{"default_catalog":"iceberg","passthrough":true}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("preserve status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
-		t.Fatalf("preserved DefaultCatalog = %q, want iceberg", got)
+	if !store.users["analytics/reader"].Passthrough {
+		t.Fatal("expected passthrough=true to be applied alongside the ignored field")
 	}
-
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":"iceberg"}`)))
-	req.Header.Set("Content-Type", "application/json")
-	rec = httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("set status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
-		t.Fatalf("updated DefaultCatalog = %q, want iceberg", got)
-	}
-
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":""}`)))
-	req.Header.Set("Content-Type", "application/json")
-	rec = httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("clear status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "" {
-		t.Fatalf("cleared DefaultCatalog = %q, want empty", got)
+	if bytes.Contains(rec.Body.Bytes(), []byte("default_catalog")) {
+		t.Fatalf("response must not echo removed default_catalog field: %s", rec.Body.String())
 	}
 }
 
@@ -754,7 +705,9 @@ func TestPutWarehouseDisablesPgBouncerWhenSetToFalse(t *testing.T) {
 	}
 }
 
-func TestPutWarehouseEnablesIcebergWhenSetToTrue(t *testing.T) {
+func TestPutWarehouseRejectsRemovedIcebergField(t *testing.T) {
+	// Iceberg support was removed: "iceberg" is no longer a whitelisted field
+	// on the warehouse PUT, so the strict decode rejects it as unknown.
 	store := newFakeAPIStore()
 	seedOrgWithWarehouse(store, "analytics")
 	router := newTestAPIRouter(store)
@@ -765,11 +718,8 @@ func TestPutWarehouseEnablesIcebergWhenSetToTrue(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if !store.warehouses["analytics"].Iceberg.Enabled {
-		t.Fatal("expected iceberg.enabled=true after PUT")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 }
 

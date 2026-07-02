@@ -55,7 +55,7 @@ func TestProvisionEmitsAnalyticsEvent(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "acme-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"database_name": "acme-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/acme/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -75,11 +75,13 @@ func TestProvisionEmitsAnalyticsEvent(t *testing.T) {
 	if e.props["metadata_store"] != "cnpg-shard" {
 		t.Errorf("metadata_store = %v, want cnpg-shard", e.props["metadata_store"])
 	}
-	if e.props["iceberg_enabled"] != true {
-		t.Errorf("iceberg_enabled = %v, want true", e.props["iceberg_enabled"])
+	if e.props["ducklake_enabled"] != true {
+		t.Errorf("ducklake_enabled = %v, want true", e.props["ducklake_enabled"])
 	}
-	if e.props["ducklake_enabled"] != false {
-		t.Errorf("ducklake_enabled = %v, want false", e.props["ducklake_enabled"])
+	// Iceberg support was removed: the provision event no longer carries an
+	// iceberg_enabled prop.
+	if _, ok := e.props["iceberg_enabled"]; ok {
+		t.Errorf("iceberg_enabled prop must be gone, got %v", e.props["iceberg_enabled"])
 	}
 }
 
@@ -89,7 +91,7 @@ func TestProvisionFailureEmitsNoEvent(t *testing.T) {
 	router := newTestRouter(store)
 
 	// Missing database_name → 400, no provisioning happens.
-	body := []byte(`{"metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	body := []byte(`{"metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/acme/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

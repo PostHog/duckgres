@@ -138,13 +138,6 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName, defaultTeamID st
 	warehouse.S3State = configstore.ManagedWarehouseStatePending
 	warehouse.IdentityState = configstore.ManagedWarehouseStatePending
 	warehouse.SecretsState = configstore.ManagedWarehouseStatePending
-	// Track iceberg as a provisioning component only when the tenant opted
-	// in (e.g. cnpg-shard, which is always iceberg-backed). Leaving it
-	// empty for non-iceberg warehouses keeps them out of the iceberg
-	// readiness gate.
-	if warehouse.Iceberg.Enabled {
-		warehouse.IcebergState = configstore.ManagedWarehouseStatePending
-	}
 	return tx.Create(warehouse).Error
 }
 

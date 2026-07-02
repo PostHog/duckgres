@@ -77,14 +77,6 @@ export function UsersPage() {
           getValue() ? <Badge variant="warning">passthrough</Badge> : <span className="text-muted-foreground">—</span>,
       },
       {
-        accessorKey: "default_catalog",
-        header: "Default catalog",
-        cell: ({ getValue }) => {
-          const v = getValue() as string | undefined;
-          return v ? <Badge variant="secondary">{v}</Badge> : <span className="text-muted-foreground">—</span>;
-        },
-      },
-      {
         accessorKey: "max_vcpus",
         header: "Max vCPUs",
         cell: ({ getValue }) => {
@@ -307,7 +299,6 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [passthrough, setPassthrough] = useState(false);
-  const [iceberg, setIceberg] = useState(false);
   const [maxVCPUs, setMaxVCPUs] = useState("0");
   const [err, setErr] = useState<string | null>(null);
 
@@ -319,7 +310,6 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
         username,
         password,
         passthrough,
-        default_catalog: iceberg ? "iceberg" : "",
         max_vcpus: Number(maxVCPUs) || 0,
       });
       onClose();
@@ -358,9 +348,6 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
             <label className="flex items-center gap-2 text-sm">
               <Switch checked={passthrough} onCheckedChange={setPassthrough} /> Passthrough
             </label>
-            <label className="flex items-center gap-2 text-sm">
-              <Switch checked={iceberg} onCheckedChange={setIceberg} /> Default catalog: iceberg
-            </label>
           </div>
           {err && <p className="text-xs text-destructive">{err}</p>}
         </div>
@@ -381,7 +368,6 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
   const update = useUpdateUser();
   const [password, setPassword] = useState("");
   const [passthrough, setPassthrough] = useState(user.passthrough);
-  const [iceberg, setIceberg] = useState(user.default_catalog === "iceberg");
   const [maxVCPUs, setMaxVCPUs] = useState(String(user.max_vcpus));
   const [err, setErr] = useState<string | null>(null);
 
@@ -394,7 +380,6 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
         body: {
           ...(password ? { password } : {}),
           passthrough,
-          default_catalog: iceberg ? "iceberg" : "",
           max_vcpus: Number(maxVCPUs) || 0,
         },
       });
@@ -427,9 +412,6 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
           <div className="flex items-center gap-6">
             <label className="flex items-center gap-2 text-sm">
               <Switch checked={passthrough} onCheckedChange={setPassthrough} /> Passthrough
-            </label>
-            <label className="flex items-center gap-2 text-sm">
-              <Switch checked={iceberg} onCheckedChange={setIceberg} /> Default catalog: iceberg
             </label>
           </div>
           {err && <p className="text-xs text-destructive">{err}</p>}

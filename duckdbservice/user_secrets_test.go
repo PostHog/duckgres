@@ -46,8 +46,8 @@ func secretNames(t *testing.T, db *sql.DB, where string) map[string]bool {
 
 // Wipe must drop ALL user-created secrets — persistent AND non-persistent
 // (plain/TEMPORARY CREATE SECRET) — while leaving the system-managed catalog
-// secrets (ducklake_s3 / iceberg_sigv4 / iceberg_oauth, plus the reserved
-// __default_*/duckgres_* prefixes) untouched.
+// secrets (ducklake_s3, plus the reserved __default_*/duckgres_* prefixes)
+// untouched.
 func TestWipeUserSecrets(t *testing.T) {
 	db := openSecretTestDB(t)
 	mustExec := func(q string) {
@@ -59,7 +59,7 @@ func TestWipeUserSecrets(t *testing.T) {
 	// System-managed secrets (created with plain CREATE OR REPLACE SECRET, so
 	// they land in in-memory/temporary storage). These must survive the wipe.
 	mustExec("CREATE OR REPLACE SECRET ducklake_s3 (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
-	mustExec("CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
+	mustExec("CREATE OR REPLACE SECRET duckgres_internal (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
 	// User secrets: a persistent one and a temporary one. Both must be dropped.
 	mustExec("CREATE PERSISTENT SECRET user_a (TYPE s3, KEY_ID 'a', SECRET 'a')")
 	mustExec(`CREATE PERSISTENT SECRET "user_b" (TYPE gcs, KEY_ID 'b', SECRET 'b')`)
@@ -78,7 +78,7 @@ func TestWipeUserSecrets(t *testing.T) {
 			t.Errorf("user secret %q remains after wipe; remaining: %v", leaked, remaining)
 		}
 	}
-	for _, sys := range []string{"ducklake_s3", "iceberg_sigv4"} {
+	for _, sys := range []string{"ducklake_s3", "duckgres_internal"} {
 		if !remaining[sys] {
 			t.Errorf("system secret %q was wiped; remaining: %v", sys, remaining)
 		}

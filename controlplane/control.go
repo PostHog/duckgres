@@ -272,7 +272,6 @@ type ConfigStoreInterface interface {
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
-	IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool)
 	IsMigratingForOrg(orgID string) bool
 	ShutdownAll()
 	// ReleaseIdleHotWorkers parks idle (zero-session) Hot workers into hot_idle
@@ -949,7 +948,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Honor a client-supplied connect-time search_path from the startup
 	// `options` parameter (libpq `options=-c search_path=...`, PGOPTIONS, or
 	// pgjdbc `currentSchema`), so a session can pick its default catalog at
-	// connect (e.g. iceberg.public). Sanitized here at the trust boundary;
+	// connect (e.g. ducklake.main). Sanitized here at the trust boundary;
 	// empty/invalid falls back to the worker's default search_path.
 	startupOptions := server.ParseStartupOptions(startupParams["options"])
 	var clientSearchPath string
@@ -998,12 +997,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// In multi-tenant mode the org is resolved solely from the managed hostname
 	// (SNI); the user is authenticated within that org. The startup `database`
 	// param no longer identifies the org — it selects which attached catalog
-	// (ducklake/iceberg) the session defaults to.
+	// (ducklake) the session defaults to.
 	var (
 		orgID            string
 		passthroughUser  bool
-		defaultCatalog   string
-		requestedCatalog string // "" | "ducklake" | "iceberg" (validated below)
+		requestedCatalog string // "" | "ducklake" (validated below)
 	)
 	if cp.configStore != nil {
 		sni := tlsConn.ConnectionState().ServerName
@@ -1039,11 +1037,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 		if !resolution.CatalogValid {
 			// The startup `database` is now a catalog selector; only
-			// "ducklake"/"iceberg"/empty are valid. No logical-name masking.
+			// "ducklake"/empty are valid. No logical-name masking.
 			clog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
 				"database", database, "org", resolution.OrgID)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000",
-				fmt.Sprintf("database %q does not exist (connect with \"ducklake\" or \"iceberg\")", database))
+				fmt.Sprintf("database %q does not exist (connect with \"ducklake\")", database))
 			_ = writer.Flush()
 			return
 		}
@@ -1070,7 +1068,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		orgID = resolution.OrgID
 		clog = clog.With("org", orgID)
 		passthroughUser = resolution.Passthrough
-		defaultCatalog = resolution.DefaultCatalog
 		requestedCatalog = resolution.EffectiveCatalog
 		// `database` is finalized post-session to the real catalog the session
 		// defaults to (once worker attachment is known), so logs and the
@@ -1242,16 +1239,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Probe which catalogs the worker actually attached for this session, then
 	// resolve the real catalog the session defaults to. The startup `database`
-	// selected "ducklake"/"iceberg"/"" (default); fail closed (3D000) if the
+	// selected "ducklake"/"" (default); fail closed (3D000) if the
 	// requested catalog isn't attached.
 	attachCtx, attachCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-	duckLakeAttached, dlErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
-	icebergAttached, icErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalIcebergCatalog)
+	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
 	attachCancel()
-	probeErr := dlErr
-	if probeErr == nil {
-		probeErr = icErr
-	}
 	if probeErr != nil {
 		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
@@ -1261,10 +1253,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	var effectiveCatalog string
 	if cp.configStore != nil {
 		var ok bool
-		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, defaultCatalog, duckLakeAttached, icebergAttached)
+		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, duckLakeAttached)
 		if !ok {
 			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
-				"requested", requestedCatalog, "ducklake_attached", duckLakeAttached, "iceberg_attached", icebergAttached)
+				"requested", requestedCatalog, "ducklake_attached", duckLakeAttached)
 			msg := "no catalog is available for this connection"
 			if requestedCatalog != "" {
 				msg = fmt.Sprintf("database %q does not exist", requestedCatalog)
@@ -1277,12 +1269,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// Single-tenant (process backend / static users): de-mask to the real
 		// attached catalog when present; otherwise keep the client's database name
 		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
-		switch {
-		case duckLakeAttached:
+		if duckLakeAttached {
 			effectiveCatalog = physicalDuckLakeCatalog
-		case icebergAttached:
-			effectiveCatalog = physicalIcebergCatalog
-		default:
+		} else {
 			effectiveCatalog = database
 		}
 	}
@@ -1297,19 +1286,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// worker session stays in DuckDB's empty in-memory catalog (see the
 	// passthrough branch below).
 	if !passthroughUser {
-		// Prime the Iceberg REST catalog's schema list on this session connection
-		// before the compat-view bind below enumerates every attached catalog.
-		// Without this, the first session on a freshly-spawned (cold) worker fails
-		// the bind with `Schema with name "" not found` until the instance settles.
-		// Best-effort: if the prime errors, the real failure (if any) surfaces from
-		// InitSessionDatabaseMetadata with its full context.
-		if icebergAttached {
-			primeCtx, primeCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-			if err := sessionmeta.PrimeIcebergCatalog(primeCtx, executor, physicalIcebergCatalog); err != nil {
-				clog.Warn("Failed to prime Iceberg catalog before session metadata init.", "error", err)
-			}
-			primeCancel()
-		}
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, effectiveCatalog); err != nil {
 			initCancel()
@@ -1324,8 +1300,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// It must run here, not on the worker at session create:
 		// InitSessionDatabaseMetadata's defer resets the catalog/search_path, so an
 		// earlier value would be clobbered. A client-supplied search_path is
-		// best-effort; the configured catalog (Iceberg) fails closed because
-		// silently falling back would route the user to the wrong catalog.
+		// best-effort.
 		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
 			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(spCtx, cmd)
@@ -1343,8 +1318,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	} else {
 		// Passthrough: no pg_catalog views and no rewriting, but the session must
 		// still land in its selected catalog instead of the empty in-memory one.
-		// Standalone passthrough does this via server.setDuckLakeDefault/
-		// setIcebergDefault; the remote-worker path issues the equivalent here.
+		// Standalone passthrough does this via server.setDuckLakeDefault;
+		// the remote-worker path issues the equivalent here.
 		if clientSearchPath != "" {
 			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", clientSearchPath)
 		}
@@ -1394,19 +1369,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			}()
 		}
 	}()
-	if cp.orgRouter != nil && orgID != "" {
-		if icebergCfg, ok := cp.orgRouter.IcebergConfigForOrg(orgID); ok {
-			server.SetConnectionIcebergConfig(cc, icebergCfg)
-		}
-	}
 	// Record the resolved physical catalog so the transpiler selects the right
-	// backend profile (DuckLake/Iceberg DDL+DML policy) for this session.
+	// backend profile (DuckLake DDL+DML policy) for this session.
 	server.SetConnectionPhysicalCatalog(cc, effectiveCatalog)
-	// Catalog USE rewriting (expanding bare `USE ducklake`/`USE iceberg` to the
-	// reliable two-part target) is a non-passthrough feature; passthrough sessions
-	// talk raw DuckDB, so keep it disabled for them. Enabled whenever either
+	// Catalog USE rewriting (expanding bare `USE ducklake` to the reliable
+	// two-part target) is a non-passthrough feature; passthrough sessions
+	// talk raw DuckDB, so keep it disabled for them. Enabled whenever the
 	// catalog is attached.
-	server.SetCatalogUseRewrite(cc, (duckLakeAttached || icebergAttached) && !passthroughUser)
+	server.SetCatalogUseRewrite(cc, duckLakeAttached && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)

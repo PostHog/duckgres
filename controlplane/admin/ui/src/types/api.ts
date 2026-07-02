@@ -79,7 +79,6 @@ export interface OrgUser {
   // connect time. Toggled via disableUser/enableUser (which also kill live
   // sessions on disable). Optional for back-compat with older API responses.
   disabled?: boolean;
-  default_catalog?: string;
   max_vcpus: number;
   created_at: string;
   updated_at: string;
@@ -101,14 +100,12 @@ export interface CreateUserBody {
   password: string;
   org_id: string;
   passthrough?: boolean;
-  default_catalog?: string;
   max_vcpus?: number;
 }
 
 export interface UpdateUserBody {
   password?: string;
   passthrough?: boolean;
-  default_catalog?: string;
   max_vcpus?: number;
 }
 
@@ -163,17 +160,6 @@ export interface ManagedWarehouse {
     delta_catalog_path: string;
   };
   ducklake?: { enabled: boolean };
-  iceberg: {
-    enabled: boolean;
-    backend: string;
-    namespace: string;
-    region: string;
-    lakekeeper_endpoint?: string;
-    lakekeeper_warehouse?: string;
-    lakekeeper_client_id?: string;
-    lakekeeper_oauth2_server_uri?: string;
-    lakekeeper_client_credentials?: SecretRef;
-  };
   worker_identity: { namespace: string; iam_role_arn: string };
   warehouse_database_credentials: SecretRef;
   metadata_store_credentials: SecretRef;
@@ -184,7 +170,6 @@ export interface ManagedWarehouse {
   status_message: string;
   metadata_store_state: WarehouseState;
   s3_state: WarehouseState;
-  iceberg_state: WarehouseState;
   identity_state: WarehouseState;
   secrets_state: WarehouseState;
   provisioning_started_at?: string | null;

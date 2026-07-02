@@ -38,7 +38,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	// us — log the cursor metadata phase as rows=0 / err=initial failure.
 	cursorStart := time.Now()
 	c.logQueryStarted(cursor.query)
-	rows, err := c.queryContextWithMetadata(ctx, cursor.query)
+	rows, err := c.executor.QueryContext(ctx, cursor.query)
 	if err != nil {
 		c.logQueryFinished(cursor.query, cursorStart, 0, err)
 		cleanup()
@@ -307,7 +307,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	if cursor.rows == nil {
 		if err := c.openCursor(cursor); err != nil {
 			errCode := "42000"
-			errMsg := friendlyExecError(err)
+			errMsg := err.Error()
 			if c.isCallerCancellation(err) {
 				errCode = "57014"
 				errMsg = "canceling statement due to user request"
@@ -382,7 +382,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 
 	if err := cursor.rows.Err(); err != nil {
 		errCode := "42000"
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"

@@ -186,7 +186,6 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 				},
 				OrgID:    payload.OrgID,
 				DuckLake: payload.DuckLake,
-				Iceberg:  payload.Iceberg,
 			})
 		}
 	}

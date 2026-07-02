@@ -313,8 +313,8 @@ id committed).
   same-PR CRs do not delete within the timeout; the scheduled `e2e-cleanup` sweep
   logs a narrow stuck-CR summary but keeps going so one old namespace does not
   block the janitor. `drop_cnpg_role` is still called at deploy + at teardown as a
-  belt-and-suspenders idempotent backstop; it sweeps both current `mdstore_<org>`
-  and legacy `lakekeeper_<org>` identifiers. (Composition `managementPolicies:
+  belt-and-suspenders idempotent backstop; it sweeps the `mdstore_<org>`
+  identifiers. (Composition `managementPolicies:
   ["*"]` from charts#11522 does the drop; the `--for=delete` wait is what makes
   it synchronous from our side.)
 - **Shared-infra contention.** Concurrent PRs provision real ducklings against

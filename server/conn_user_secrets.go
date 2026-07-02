@@ -149,7 +149,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 				return true, c.buildCommandTag(cmdType, nil), nil
 			}
 		}
-		errMsg := friendlyExecError(execErr)
+		errMsg := execErr.Error()
 		if c.isCallerCancellation(execErr) {
 			errMsg = "canceling statement due to user request"
 		} else {

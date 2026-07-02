@@ -32,7 +32,7 @@ const userSecretOpTimeout = 15 * time.Second
 // duckdb_secrets(). That makes a persistent-only wipe a cross-user isolation
 // leak; this wipe closes it by dropping temporary secrets too.
 //
-// System-managed secrets (ducklake_s3, iceberg_sigv4, iceberg_oauth, plus the
+// System-managed secrets (ducklake_s3, plus the
 // reserved __default_*/duckgres_* prefixes) are preserved: activation
 // re-creates them and dropping them would break the org's own catalog wiring.
 // The allowlist is usersecrets.IsReservedName, the same set the control plane

@@ -703,7 +703,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			if err != nil {
 				queryFinalErr = err
 				errCode := classifyErrorCode(err)
-				errMsg := friendlyExecError(err)
+				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
@@ -729,7 +729,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Result-returning query: use Query with converted query
 	runQuery := func() (RowSet, error) {
-		return c.queryWithArgsWithMetadata(queryCtx, convertedQuery, args...)
+		return c.executor.Query(convertedQuery, args...)
 	}
 
 	execStart := time.Now()
@@ -755,7 +755,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	if err != nil {
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
@@ -829,7 +829,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	if err := rows.Err(); err != nil {
 		queryFinalErr = err
 		errCode := "42000"
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"

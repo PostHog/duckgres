@@ -1,14 +1,13 @@
 package transform
 
 import (
-	"fmt"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/transpiler/backend"
 )
 
-// DDLTransform strips unsupported DDL features for backends (DuckLake, Iceberg)
+// DDLTransform strips unsupported DDL features for backends (DuckLake)
 // that don't support: PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints,
 // SERIAL types, DEFAULT now(), GENERATED columns, or indexes. Which behaviors
 // apply is driven by the backend's capabilities.
@@ -60,7 +59,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 					result.NoOpTag = "DROP INDEX"
 					return true, nil
 				}
-				// DuckLake/Iceberg don't support CASCADE on DROP TABLE/VIEW.
+				// DuckLake doesn't support CASCADE on DROP TABLE/VIEW.
 				// Strip CASCADE by converting to RESTRICT (same approach as dbt-duckdb).
 				// See: https://github.com/duckdb/dbt-duckdb/pull/557
 				// Note: DROP SCHEMA CASCADE is supported by DuckDB natively, so preserve it.
@@ -90,7 +89,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_VacuumStmt:
 			// ANALYZE and VACUUM both parse as VacuumStmt; distinguish the command
-			// tag (DuckDB rejects either against an Iceberg/DuckLake catalog).
+			// tag (DuckDB rejects either against a DuckLake catalog).
 			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "VACUUM"
@@ -145,9 +144,8 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 }
 
 // transformCreateStmt modifies a CREATE TABLE statement for DuckLake compatibility.
-// Unenforceable constraints (PK/UNIQUE/CHECK/FK) are stripped (with a WARNING when
-// WarnOnStrippedConstraints is set); silently-NULL data features (SERIAL, GENERATED
-// STORED, DEFAULT <expr>) raise an error when ErrorOnSilentNullDefaults is set.
+// Unenforceable constraints (PK/UNIQUE/CHECK/FK) and silently-NULL data features
+// (SERIAL, GENERATED STORED, DEFAULT <expr>) are stripped/rewritten.
 func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt, result *Result) bool {
 	changed := false
 
@@ -171,7 +169,6 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt, result *Re
 			if n.Constraint != nil {
 				if t.policy.ConstraintHandling == backend.StripConstraints && t.isUnsupportedConstraint(n.Constraint) {
 					changed = true
-					t.warnStrippedConstraint(result, n.Constraint, "")
 					continue // Skip this constraint
 				}
 				newTableElts = append(newTableElts, elt)
@@ -191,7 +188,6 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt, result *Re
 					newConstraints = append(newConstraints, c)
 				} else {
 					changed = true
-					t.warnStrippedConstraint(result, constraint, "")
 				}
 			} else {
 				newConstraints = append(newConstraints, c)
@@ -203,23 +199,16 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt, result *Re
 	return changed
 }
 
-// transformColumnDef modifies a column definition for DuckLake/Iceberg compatibility.
-// SERIAL, GENERATED STORED, and DEFAULT <expr> would silently produce NULL data on a
-// lake catalog; when ErrorOnSilentNullDefaults is set they raise a feature_not_supported
-// error instead. Unenforceable column constraints (PK/UNIQUE/CHECK/FK) are stripped, with
-// a WARNING when WarnOnStrippedConstraints is set.
+// transformColumnDef modifies a column definition for DuckLake compatibility.
+// SERIAL is rewritten to plain integer types; GENERATED STORED and DEFAULT <expr>
+// (which would silently produce NULL data on a lake catalog) are stripped.
+// Unenforceable column constraints (PK/UNIQUE/CHECK/FK) are stripped.
 func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef, result *Result) bool {
 	changed := false
 
 	// SERIAL/BIGSERIAL: no backing sequence on a lake catalog -> ids silently NULL.
 	if col.TypeName != nil {
-		if serialName := serialTypeName(col.TypeName); serialName != "" {
-			if t.policy.ErrorOnSilentNullDefaults {
-				result.Error = NewFeatureNotSupported(fmt.Sprintf(
-					"%s is not supported on this catalog: there is no backing sequence, so generated ids would be silently NULL; use an explicit INTEGER/BIGINT column and supply values",
-					strings.ToUpper(serialName)))
-				return changed
-			}
+		if serialTypeName(col.TypeName) != "" {
 			if t.policy.RewriteSerial && t.convertSerialType(col.TypeName) {
 				changed = true
 			}
@@ -235,20 +224,13 @@ func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef, result *Resul
 				newConstraints = append(newConstraints, c)
 				continue
 			}
-			// Unenforceable constraints (PK/UNIQUE/CHECK/FK/EXCLUSION): strip + warn.
+			// Unenforceable constraints (PK/UNIQUE/CHECK/FK/EXCLUSION): strip.
 			if t.policy.ConstraintHandling == backend.StripConstraints && t.isUnsupportedColumnConstraint(constraint) {
 				changed = true
-				t.warnStrippedConstraint(result, constraint, col.Colname)
 				continue
 			}
 			// GENERATED ALWAYS AS (...) STORED: computed value would be silently NULL.
 			if constraint.Contype == pg_query.ConstrType_CONSTR_GENERATED {
-				if t.policy.ErrorOnSilentNullDefaults {
-					result.Error = NewFeatureNotSupported(fmt.Sprintf(
-						"GENERATED ALWAYS AS (...) STORED column %q is not supported on this catalog: the computed value would be silently NULL",
-						col.Colname))
-					return changed
-				}
 				if t.policy.StripVolatileDefaults {
 					changed = true
 					continue
@@ -258,12 +240,6 @@ func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef, result *Resul
 			// Literal int/float/string and DEFAULT NULL are not "unsupported" here and
 			// are passed through to the engine.
 			if constraint.Contype == pg_query.ConstrType_CONSTR_DEFAULT && t.isUnsupportedDefault(constraint.RawExpr) {
-				if t.policy.ErrorOnSilentNullDefaults {
-					result.Error = NewFeatureNotSupported(fmt.Sprintf(
-						"DEFAULT <expression> on column %q is not supported on this catalog: the default would be silently dropped and the column left NULL; supply the value explicitly on INSERT",
-						col.Colname))
-					return changed
-				}
 				if t.policy.StripVolatileDefaults {
 					changed = true
 					continue
@@ -365,7 +341,7 @@ func (t *DDLTransform) isUnsupportedDefault(expr *pg_query.Node) bool {
 	// Check for A_Const nodes - allow NULL and Integer/Float/String literals.
 	if aconst := expr.GetAConst(); aconst != nil {
 		// DEFAULT NULL is fine: NULL is the implicit default anyway, so it is
-		// neither stripped nor an error (must not trip ErrorOnSilentNullDefaults).
+		// neither stripped nor an error.
 		if aconst.Isnull {
 			return false
 		}
@@ -417,15 +393,7 @@ func (t *DDLTransform) transformAlterTableStmt(stmt *pg_query.AlterTableStmt, re
 			supported = append(supported, cmd)
 			continue
 		}
-		// DROP COLUMN is allowed through, but warn: on the Iceberg catalog dropping
-		// a column after schema churn can make the table unreadable (see PR3 guard).
-		if alterCmd.Subtype == pg_query.AlterTableType_AT_DropColumn {
-			t.warnDropColumn(result)
-			supported = append(supported, cmd)
-			continue
-		}
 		if t.isUnsupportedAlterCommand(alterCmd) {
-			t.warnDroppedAlterCommand(result, alterCmd)
 			continue
 		}
 		supported = append(supported, cmd)
@@ -522,71 +490,4 @@ func serialTypeName(typeName *pg_query.TypeName) string {
 		return typeStr
 	}
 	return ""
-}
-
-// constraintLabel returns the SQL keyword for a constraint type, for messages.
-func constraintLabel(ct pg_query.ConstrType) string {
-	switch ct {
-	case pg_query.ConstrType_CONSTR_PRIMARY:
-		return "PRIMARY KEY"
-	case pg_query.ConstrType_CONSTR_UNIQUE:
-		return "UNIQUE"
-	case pg_query.ConstrType_CONSTR_FOREIGN:
-		return "FOREIGN KEY"
-	case pg_query.ConstrType_CONSTR_CHECK:
-		return "CHECK"
-	case pg_query.ConstrType_CONSTR_EXCLUSION:
-		return "EXCLUSION"
-	default:
-		return "constraint"
-	}
-}
-
-// warnStrippedConstraint records a WARNING that an unenforceable constraint was
-// accepted-but-ignored, when the policy enables it.
-func (t *DDLTransform) warnStrippedConstraint(result *Result, c *pg_query.Constraint, colName string) {
-	if !t.policy.WarnOnStrippedConstraints || result == nil {
-		return
-	}
-	label := constraintLabel(c.Contype)
-	if colName != "" {
-		result.Warnings = append(result.Warnings, fmt.Sprintf(
-			"%s constraint on column %q is not enforced on this catalog and was ignored", label, colName))
-	} else {
-		result.Warnings = append(result.Warnings, fmt.Sprintf(
-			"%s constraint is not enforced on this catalog and was ignored", label))
-	}
-}
-
-// warnDroppedAlterCommand records a WARNING that an unsupported ALTER TABLE
-// command was silently dropped, when the policy enables it.
-func (t *DDLTransform) warnDroppedAlterCommand(result *Result, cmd *pg_query.AlterTableCmd) {
-	if !t.policy.WarnOnStrippedConstraints || result == nil {
-		return
-	}
-	var msg string
-	switch cmd.Subtype {
-	case pg_query.AlterTableType_AT_AddConstraint,
-		pg_query.AlterTableType_AT_ValidateConstraint,
-		pg_query.AlterTableType_AT_DropConstraint:
-		msg = "ALTER TABLE constraint changes are not enforced on this catalog and were ignored"
-	case pg_query.AlterTableType_AT_SetNotNull,
-		pg_query.AlterTableType_AT_DropNotNull:
-		msg = "ALTER TABLE SET/DROP NOT NULL is not supported on this catalog and was ignored"
-	case pg_query.AlterTableType_AT_ColumnDefault:
-		msg = "ALTER TABLE SET DEFAULT is not supported on this catalog and was ignored"
-	default:
-		return
-	}
-	result.Warnings = append(result.Warnings, msg)
-}
-
-// warnDropColumn records a WARNING that DROP COLUMN may make existing data
-// unreadable on the Iceberg catalog (see the runtime guard in server/conn_errors.go).
-func (t *DDLTransform) warnDropColumn(result *Result) {
-	if !t.policy.WarnOnStrippedConstraints || result == nil {
-		return
-	}
-	result.Warnings = append(result.Warnings,
-		"DROP COLUMN may make existing data unreadable on this catalog after schema changes; prefer recreating the table")
 }

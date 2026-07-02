@@ -66,9 +66,6 @@ type TenantActivationPayload struct {
 	OrgID     string                `json:"org_id"`
 	Usernames []string              `json:"usernames,omitempty"`
 	DuckLake  server.DuckLakeConfig `json:"ducklake"`
-	// Iceberg is the per-tenant Iceberg catalog (AWS S3 Tables) config.
-	// Empty when the tenant has not opted in or hasn't been provisioned yet.
-	Iceberg server.IcebergConfig `json:"iceberg"`
 	// S3CredentialsExpiresAt is the absolute expiration time of the STS
 	// credentials embedded in DuckLake.{S3AccessKey,S3SecretKey,S3SessionToken}.
 	// nil for non-STS payloads (config-store-driven warehouses use static
@@ -171,7 +168,6 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 			},
 			OrgID:    payload.OrgID,
 			DuckLake: payload.DuckLake,
-			Iceberg:  payload.Iceberg,
 		})
 	}
 
@@ -320,7 +316,6 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		},
 		OrgID:    payload.OrgID,
 		DuckLake: payload.DuckLake,
-		Iceberg:  payload.Iceberg,
 	}
 	if err := worker.ActivateTenant(ctx, rpcPayload); err != nil {
 		return fmt.Errorf("activate tenant for refresh: %w", err)
@@ -397,16 +392,10 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
-	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, &org.Warehouse.Iceberg)
-	if err != nil {
-		return TenantActivationPayload{}, err
-	}
-
 	return TenantActivationPayload{
 		OrgID:                  assignment.OrgID,
 		Usernames:              usernames,
 		DuckLake:               dl,
-		Iceberg:                ic,
 		S3CredentialsExpiresAt: expiresAt,
 	}, nil
 }
@@ -435,9 +424,7 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 	// spec.ducklake.enabled is authoritative (decoupled ducklings); legacy CRs
 	// that predate the field fall back to the historical coupling — DuckLake on
 	// for external, off for cnpg-shard. When on, the catalog lives in the
-	// metadata Postgres (the per-tenant lakekeeper_<org> DB on cnpg, or the
-	// metadata DB on external); when off the worker attaches Iceberg only
-	// (server.ActivateDBConnection takes its iceberg-only branch).
+	// metadata Postgres.
 	ducklakeEnabled := status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
 	if status.DuckLakeEnabled != nil {
 		ducklakeEnabled = *status.DuckLakeEnabled
@@ -542,8 +529,7 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 		// session_token is optional in the secret payload — long-term IAM
 		// user keys don't have one. STS-vended temporary credentials
 		// (AccessKeyId starting with ASIA…) require it: AWS rejects the
-		// signing identity without the token and the iceberg REST endpoint
-		// returns 403. Letting the field through lets sandbox/CI fixtures
+		// signing identity without the token. Letting the field through lets sandbox/CI fixtures
 		// that source creds from STS use the same secret-ref schema as
 		// production's long-term keys.
 		dl.S3SessionToken = sessionToken
@@ -585,39 +571,6 @@ func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Inte
 		OrgID: orgName(org),
 	}
 	return activator.BuildActivationRequest(ctx, org, assignment)
-}
-
-// buildIcebergConfig maps a stored ManagedWarehouseIceberg into the wire-level
-// IcebergConfig that ships to workers. Lakekeeper is the only backend, so the
-// fields populated here all describe the per-tenant Lakekeeper REST catalog.
-// Empty Lakekeeper fields are treated as "provisioner hasn't filled this in
-// yet" and the worker returns no-op for that org.
-//
-// With a non-empty LakekeeperClientCredentials SecretRef, the OAuth2
-// client_secret is resolved via readSecretValue just before sending. Empty
-// SecretRef is fine (allowall mode; OIDC SA-token auth supersedes this when
-// configured).
-func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, src *configstore.ManagedWarehouseIceberg) (server.IcebergConfig, error) {
-	ic := server.IcebergConfig{
-		Enabled:   src.Enabled,
-		Backend:   src.Backend,
-		Namespace: src.Namespace,
-		Region:    src.Region,
-	}
-	// Lakekeeper is the only supported backend; populate its fields
-	// unconditionally.
-	ic.LakekeeperEndpoint = src.LakekeeperEndpoint
-	ic.LakekeeperWarehouse = src.LakekeeperWarehouse
-	ic.LakekeeperClientID = src.LakekeeperClientID
-	ic.LakekeeperOAuth2ServerURI = src.LakekeeperOAuth2ServerURI
-	if src.LakekeeperClientCredentials.Name != "" {
-		val, err := a.readSecretValue(ctx, src.LakekeeperClientCredentials)
-		if err != nil {
-			return server.IcebergConfig{}, fmt.Errorf("resolve lakekeeper client credentials for org %q: %w", orgID, err)
-		}
-		ic.LakekeeperClientSecret = val
-	}
-	return ic, nil
 }
 
 func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configstore.SecretRef) (string, error) {

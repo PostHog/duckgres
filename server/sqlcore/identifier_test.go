@@ -12,11 +12,11 @@ func TestParseQualifiedIdentifier(t *testing.T) {
 		want   []string
 		wantOK bool
 	}{
-		{name: "unquoted lowercases", input: "ICEBERG.Fivetran_Testing", want: []string{"iceberg", "fivetran_testing"}, wantOK: true},
-		{name: "quoted preserves case", input: `"iceberg"."MixedSchema"`, want: []string{"iceberg", "MixedSchema"}, wantOK: true},
-		{name: "escaped quote", input: `"iceberg"."quote""schema"`, want: []string{"iceberg", `quote"schema`}, wantOK: true},
-		{name: "empty part", input: "iceberg..schema", wantOK: false},
-		{name: "unterminated quote", input: `"iceberg"."schema`, wantOK: false},
+		{name: "unquoted lowercases", input: "ANALYTICS.Fivetran_Testing", want: []string{"analytics", "fivetran_testing"}, wantOK: true},
+		{name: "quoted preserves case", input: `"analytics"."MixedSchema"`, want: []string{"analytics", "MixedSchema"}, wantOK: true},
+		{name: "escaped quote", input: `"analytics"."quote""schema"`, want: []string{"analytics", `quote"schema`}, wantOK: true},
+		{name: "empty part", input: "analytics..schema", wantOK: false},
+		{name: "unterminated quote", input: `"analytics"."schema`, wantOK: false},
 	}
 
 	for _, tt := range tests {
@@ -38,9 +38,9 @@ func TestCatalogFromSearchPath(t *testing.T) {
 		searchPath string
 		want       string
 	}{
-		{name: "qualified catalog first", searchPath: "iceberg.public,memory.main", want: "iceberg"},
-		{name: "quoted qualified catalog first", searchPath: `"iceberg"."public", memory.main`, want: "iceberg"},
-		{name: "escaped comma inside quoted schema", searchPath: `"iceberg"."pub,lic", memory.main`, want: "iceberg"},
+		{name: "qualified catalog first", searchPath: "analytics.public,memory.main", want: "analytics"},
+		{name: "quoted qualified catalog first", searchPath: `"analytics"."public", memory.main`, want: "analytics"},
+		{name: "escaped comma inside quoted schema", searchPath: `"analytics"."pub,lic", memory.main`, want: "analytics"},
 		{name: "unqualified first entry", searchPath: "main,memory.main", want: ""},
 		{name: "empty", searchPath: "", want: ""},
 	}

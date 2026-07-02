@@ -55,11 +55,10 @@ type OrgUser struct {
 	// Disabled is the per-user kill switch: when true the user is refused at
 	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
 	// user's live sessions (see admin disable endpoint).
-	Disabled       bool      `gorm:"not null;default:false" json:"disabled"`
-	DefaultCatalog string    `gorm:"size:255" json:"default_catalog,omitempty"`
-	MaxVCPUs       int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	Disabled  bool      `gorm:"not null;default:false" json:"disabled"`
+	MaxVCPUs  int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }
@@ -135,12 +134,11 @@ type ManagedWarehouseDatabase struct {
 // and mirrored onto the Duckling CR's spec.metadataStore.type. The control
 // plane provisions two of these:
 //
-//   - "cnpg-shard": the per-tenant Lakekeeper Iceberg catalog Postgres backend
-//     on the shared CloudNativePG shard (always paired with iceberg.enabled).
+//   - "cnpg-shard": the per-tenant Postgres backend on the shared
+//     CloudNativePG shard.
 //   - "external": a pre-existing Postgres (e.g. RDS/Aurora), referenced by
-//     endpoint + an AWS Secrets Manager secret for the password. Backs either a
-//     DuckLake catalog (iceberg disabled) or the Lakekeeper catalog (iceberg
-//     enabled).
+//     endpoint + an AWS Secrets Manager secret for the password. Backs a
+//     DuckLake catalog.
 const (
 	MetadataStoreKindCnpgShard = "cnpg-shard"
 	MetadataStoreKindExternal  = "external"
@@ -210,10 +208,10 @@ type ManagedWarehouseWorkerIdentity struct {
 }
 
 // ManagedWarehouseDuckLake captures whether the org's DuckLake catalog is
-// enabled. Decoupled from the metadata-store type and from Iceberg: a duckling
-// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg /
-// external). The DuckLake catalog lives in the metadata Postgres — the
-// per-tenant database for cnpg-shard, or the metadata database for external.
+// enabled. Decoupled from the metadata-store type: a duckling may run
+// DuckLake on any metadata backend (cnpg / external). The DuckLake catalog
+// lives in the metadata Postgres — the per-tenant database for cnpg-shard,
+// or the metadata database for external.
 //
 // For ducklings created before this field existed the column is absent/false;
 // the worker activator does NOT key off it directly — it reads the Duckling
@@ -221,70 +219,6 @@ type ManagedWarehouseWorkerIdentity struct {
 // implied behavior (external ⇒ DuckLake, cnpg ⇒ none).
 type ManagedWarehouseDuckLake struct {
 	Enabled bool `gorm:"default:false" json:"enabled"`
-}
-
-// ManagedWarehouseIceberg captures per-org Iceberg catalog config. The
-// only supported backend is Lakekeeper: a per-org Lakekeeper instance
-// vends the Iceberg REST catalog. The provisioner creates the Lakekeeper
-// CR + a warehouse pointing at the org's existing S3 bucket (path
-// <s3.path-prefix>/lakekeeper/<orgid>/) and persists the endpoint +
-// OAuth2 client credentials back here. The worker activator reads these
-// and emits a (TYPE ICEBERG, CLIENT_ID/CLIENT_SECRET/OAUTH2_SERVER_URI)
-// DuckDB SECRET + ATTACH at session init.
-//
-// The Backend column is retained for forward-compat / observability; the
-// legacy "s3_tables" value is no longer honored anywhere in the code path.
-type ManagedWarehouseIceberg struct {
-	Enabled bool `gorm:"default:false" json:"enabled"`
-
-	// Backend is retained for schema compat. Empty/unset is treated as
-	// "lakekeeper" by callers; any other value is also treated as
-	// "lakekeeper" since no other backend is implemented.
-	Backend string `gorm:"size:32;default:'lakekeeper'" json:"backend"`
-
-	// Namespace is the default Iceberg namespace inside the catalog.
-	Namespace string `gorm:"size:255" json:"namespace"`
-
-	// Region is the AWS region for the Lakekeeper warehouse storage profile.
-	Region string `gorm:"size:64" json:"region"`
-
-	// Lakekeeper fields. Populated by the provisioner after the per-org
-	// Lakekeeper is ready.
-	LakekeeperEndpoint string `gorm:"size:512" json:"lakekeeper_endpoint,omitempty"`
-
-	// LakekeeperWarehouse is the warehouse NAME (e.g. "org-acme"), not the
-	// UUID. Iceberg REST clients pass this as the `warehouse` parameter to
-	// /v1/config and the server returns the UUID as a prefix for subsequent
-	// calls. PR2's worker-side ATTACH SQL uses this value directly.
-	LakekeeperWarehouse string `gorm:"size:128" json:"lakekeeper_warehouse,omitempty"`
-	LakekeeperClientID  string `gorm:"size:128" json:"lakekeeper_client_id,omitempty"`
-
-	// LakekeeperOAuth2ServerURI is the OAuth2 token endpoint URI for the
-	// duckling-side CREATE SECRET. Empty during PR1 (allowall mode);
-	// populated by PR3 once OIDC SA-token auth is wired. PR2 worker code
-	// must guard against empty and either skip the OAuth2 fields on the
-	// CREATE SECRET statement or emit a different secret shape.
-	LakekeeperOAuth2ServerURI string `gorm:"size:512" json:"lakekeeper_oauth2_server_uri,omitempty"`
-
-	// LakekeeperClientCredentials holds the OAuth2 client_secret used by
-	// the duckling to authenticate to Lakekeeper. The control plane
-	// resolves this just before sending the activation payload.
-	LakekeeperClientCredentials SecretRef `gorm:"embedded;embeddedPrefix:lakekeeper_client_credentials_" json:"lakekeeper_client_credentials"`
-}
-
-// IcebergBackend constants — string-typed to keep the GORM tag happy.
-const (
-	IcebergBackendLakekeeper = "lakekeeper"
-)
-
-// ResolvedBackend returns Backend with the empty-string default applied.
-// Callers should prefer this over reading Backend directly so that rows
-// migrated from earlier schemas (no Backend column) behave correctly.
-func (i ManagedWarehouseIceberg) ResolvedBackend() string {
-	if i.Backend == "" {
-		return IcebergBackendLakekeeper
-	}
-	return i.Backend
 }
 
 // ManagedWarehouse is the config-store source of truth for an org's managed warehouse metadata.
@@ -305,7 +239,6 @@ type ManagedWarehouse struct {
 	PgBouncer         ManagedWarehousePgBouncer      `gorm:"embedded;embeddedPrefix:pgbouncer_" json:"pgbouncer"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
 	DuckLake          ManagedWarehouseDuckLake       `gorm:"embedded;embeddedPrefix:ducklake_" json:"ducklake"`
-	Iceberg           ManagedWarehouseIceberg        `gorm:"embedded;embeddedPrefix:iceberg_" json:"iceberg"`
 	WorkerIdentity    ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
 
 	WarehouseDatabaseCredentials SecretRef `gorm:"embedded;embeddedPrefix:warehouse_database_credentials_" json:"warehouse_database_credentials"`
@@ -322,7 +255,6 @@ type ManagedWarehouse struct {
 	StatusMessage      string                            `gorm:"size:1024" json:"status_message"`
 	MetadataStoreState ManagedWarehouseProvisioningState `gorm:"size:32" json:"metadata_store_state"`
 	S3State            ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
-	IcebergState       ManagedWarehouseProvisioningState `gorm:"size:32" json:"iceberg_state"`
 	IdentityState      ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
 	SecretsState       ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
 
@@ -563,7 +495,6 @@ type ManagedWarehouseConfig struct {
 	MetadataStore     ManagedWarehouseMetadataStore
 	PgBouncer         ManagedWarehousePgBouncer
 	S3                ManagedWarehouseS3
-	Iceberg           ManagedWarehouseIceberg
 	WorkerIdentity    ManagedWarehouseWorkerIdentity
 
 	WarehouseDatabaseCredentials SecretRef
@@ -575,7 +506,6 @@ type ManagedWarehouseConfig struct {
 	StatusMessage      string
 	MetadataStoreState ManagedWarehouseProvisioningState
 	S3State            ManagedWarehouseProvisioningState
-	IcebergState       ManagedWarehouseProvisioningState
 	IdentityState      ManagedWarehouseProvisioningState
 	SecretsState       ManagedWarehouseProvisioningState
 	ReadyAt            *time.Time
@@ -595,7 +525,6 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		MetadataStore:                warehouse.MetadataStore,
 		PgBouncer:                    warehouse.PgBouncer,
 		S3:                           warehouse.S3,
-		Iceberg:                      warehouse.Iceberg,
 		WorkerIdentity:               warehouse.WorkerIdentity,
 		WarehouseDatabaseCredentials: warehouse.WarehouseDatabaseCredentials,
 		MetadataStoreCredentials:     warehouse.MetadataStoreCredentials,
@@ -605,7 +534,6 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		StatusMessage:                warehouse.StatusMessage,
 		MetadataStoreState:           warehouse.MetadataStoreState,
 		S3State:                      warehouse.S3State,
-		IcebergState:                 warehouse.IcebergState,
 		IdentityState:                warehouse.IdentityState,
 		SecretsState:                 warehouse.SecretsState,
 	}

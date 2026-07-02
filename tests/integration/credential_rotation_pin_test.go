@@ -241,7 +241,7 @@ func loadStockHTTPFS(t *testing.T, db *sql.DB) {
 //     request. Glob scans never do: the S3 glob (ListObjectsV2) pre-populates
 //     file_size/etag/last_modified in extended_info, which marks the handle
 //     initialized and skips the HEAD entirely (httpfs httpfs.cpp,
-//     HTTPFileHandle ctor). DuckLake and Iceberg file lists deliberately do
+//     HTTPFileHandle ctor). DuckLake file lists deliberately do
 //     the same with dummy etag/last_modified. The first auth failure
 //     therefore surfaces on a range GET inside the read path, which has no
 //     refresh handling — the statement dies.
