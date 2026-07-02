@@ -39,6 +39,7 @@ interface FormState {
   default_worker_ttl: string;
   default_worker_min_hot_idle: string;
   hostname_alias: string;
+  default_team_id: string;
 }
 
 function orgToForm(o: {
@@ -49,6 +50,7 @@ function orgToForm(o: {
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
   hostname_alias: string | null;
+  default_team_id: string | null;
 }): FormState {
   return {
     max_workers: String(o.max_workers),
@@ -58,6 +60,7 @@ function orgToForm(o: {
     default_worker_ttl: o.default_worker_ttl,
     default_worker_min_hot_idle: String(o.default_worker_min_hot_idle),
     hostname_alias: o.hostname_alias ?? "",
+    default_team_id: o.default_team_id ?? "",
   };
 }
 
@@ -108,6 +111,7 @@ export function OrgDetail() {
       default_worker_ttl: form.default_worker_ttl,
       default_worker_min_hot_idle: Number(form.default_worker_min_hot_idle) || 0,
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
+      default_team_id: form.default_team_id === "" ? "" : form.default_team_id,
     };
     try {
       await update.mutateAsync(body);
@@ -195,6 +199,13 @@ export function OrgDetail() {
                   value={form.hostname_alias}
                   placeholder="single DNS label, e.g. acme"
                   onChange={(e) => set("hostname_alias", e.target.value)}
+                />
+              </Field>
+              <Field label="Default team id (empty clears)">
+                <Input
+                  value={form.default_team_id}
+                  placeholder="PostHog team id, e.g. 12345"
+                  onChange={(e) => set("default_team_id", e.target.value)}
                 />
               </Field>
 
