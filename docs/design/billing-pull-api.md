@@ -152,9 +152,9 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 - **Extend:** the bucket table gains `team_id`, `query_source`, `cpu`, `mem_gib`
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
   the HTTP API (aggregate-on-read into one row per key + watermark ack) + safety GC.
-- **Add:** the org's default `team_id` (fixed per org — no per-team logic yet) and
-  the connection's `query_source` (standard vs endpoints) threaded onto the
-  connection; a bearer secret for the API.
+- **Add:** a `default_team_id` column on the org (used as the bucket `team_id` —
+  fixed per org, no per-team logic yet) and the connection's `query_source`
+  (standard vs endpoints) threaded onto the connection; a bearer secret for the API.
 
 ## Defaults / house-keeping
 
