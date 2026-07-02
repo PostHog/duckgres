@@ -155,6 +155,44 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	}
 }
 
+func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
+	for _, scenarioFile := range []string{
+		"posthog_frozen_metadata.yaml",
+		"posthog_frozen_perf.yaml",
+		"posthog_frozen_dbt.yaml",
+	} {
+		t.Run(scenarioFile, func(t *testing.T) {
+			t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "grpc://flight.example:8815")
+			scenario, err := core.LoadScenario(filepath.Join("scenarios", scenarioFile))
+			if err != nil {
+				t.Fatalf("load scenario: %v", err)
+			}
+			runID := scenario.RunIDPrefix + "-20260701t135927z"
+			resolved, err := resolveRunTemplates(scenario, runID)
+			if err != nil {
+				t.Fatalf("resolve templates: %v", err)
+			}
+			for _, step := range resolved.Steps {
+				if !dispatchSupports(step.Type) {
+					t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+				}
+				if containsTemplate(step.With) {
+					t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+				}
+				if step.Type != provision.StepTypeProvisionWarehouse &&
+					step.Type != provision.StepTypeWaitWarehouseReady &&
+					step.Type != provision.StepTypeDeprovisionWarehouse {
+					continue
+				}
+				orgID, _ := step.With["org_id"].(string)
+				if orgID == "" || len(orgID) > 35 {
+					t.Fatalf("step %s org_id = %q, want valid provisioning slug of at most 35 chars", step.ID, orgID)
+				}
+			}
+		})
+	}
+}
+
 func TestProvisionRejectionScenarioUsesExpectedProvisionFailure(t *testing.T) {
 	scenario, err := core.LoadScenario(filepath.Join("scenarios", "provision_rejection.yaml"))
 	if err != nil {
