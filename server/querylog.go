@@ -137,7 +137,7 @@ func openQueryLogDuckLakeDB(cfg Config) (*sql.DB, error) {
 		return nil, errors.New("querylog: DuckLake metadata store is required")
 	}
 
-	db, err := sql.Open("duckdb", ":memory:")
+	db, err := sql.Open("duckdb", queryLogDuckLakeDBDSN())
 	if err != nil {
 		return nil, fmt.Errorf("querylog: open duckdb: %w", err)
 	}
@@ -203,6 +203,10 @@ func openQueryLogDuckLakeDB(cfg Config) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func queryLogDuckLakeDBDSN() string {
+	return ":memory:?allow_unsigned_extensions=true"
 }
 
 // Log sends an entry to the query log. Non-blocking; drops if channel is full.
