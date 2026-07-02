@@ -5,6 +5,8 @@ package admin
 import (
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -48,6 +50,9 @@ func registerClusterAPI(r *gin.RouterGroup, client kubernetes.Interface) {
 	r.GET("/cluster/pods", h.pods)
 	r.GET("/cluster/events", h.events)
 	r.GET("/cluster/nodepools", h.nodepools)
+	// Aggregated cluster totals for the admin nav (shown on every page, not just
+	// the Nodes view) — computed server-side so no page needs the full pod list.
+	r.GET("/cluster/summary", h.summary)
 }
 
 // --- projection types: the minimal K8s-shaped subset the node view reads ---
@@ -279,6 +284,131 @@ func (h *clusterHandler) events(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }
+
+// clusterSummary is the aggregated cluster state the admin nav shows on every
+// page: worker/placeholder pod counts + their CPU/memory request totals, node
+// count, and pending count. Scoped to the duckgres-relevant universe (duckgres
+// nodepools; worker pods by label; placeholder/headroom pods).
+type clusterSummary struct {
+	Nodes               int     `json:"nodes"`
+	Workers             int     `json:"workers"`
+	WorkerCPUCores      float64 `json:"worker_cpu_cores"`
+	WorkerMemGiB        float64 `json:"worker_mem_gib"`
+	Placeholders        int     `json:"placeholders"`
+	PlaceholderCPUCores float64 `json:"placeholder_cpu_cores"`
+	PlaceholderMemGiB   float64 `json:"placeholder_mem_gib"`
+	Pending             int     `json:"pending"`
+}
+
+const (
+	workerPodLabel      = "app"
+	workerPodLabelValue = "duckgres-worker"
+	overprovisionLabel  = "cluster-autoscaler.kubernetes.io/overprovisioning"
+	duckgresNodePool    = "duckgres" // nodepool name prefix
+)
+
+// pauseImageRe matches the placeholder/headroom pause image (mirrors the node
+// view's PAUSE_IMG regex): the image basename is `pause` with any tag/digest.
+var pauseImageRe = regexp.MustCompile(`(^|/)pause(:|@|$)`)
+
+// isPlaceholderPod classifies a capacity-headroom placeholder: the
+// cluster-autoscaler overprovisioning label, a negative priority, or an
+// all-pause-image pod. Mirrors the frontend isPlaceholder().
+func isPlaceholderPod(p *corev1.Pod) bool {
+	if _, ok := p.Labels[overprovisionLabel]; ok {
+		return true
+	}
+	if p.Spec.Priority != nil && *p.Spec.Priority < 0 {
+		return true
+	}
+	cs := p.Spec.Containers
+	if len(cs) == 0 {
+		return false
+	}
+	for _, c := range cs {
+		if !pauseImageRe.MatchString(c.Image) {
+			return false
+		}
+	}
+	return true
+}
+
+// podRequests sums a pod's container CPU (millicores) + memory (bytes) requests.
+func podRequests(p *corev1.Pod) (milliCPU int64, memBytes int64) {
+	for _, c := range p.Spec.Containers {
+		if q, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+			milliCPU += q.MilliValue()
+		}
+		if q, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+			memBytes += q.Value()
+		}
+	}
+	return
+}
+
+func (h *clusterHandler) summary(c *gin.Context) {
+	ctx := c.Request.Context()
+	var sum clusterSummary
+
+	nodeList, err := h.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: clusterNodeLimit})
+	if err != nil {
+		if apierrors.IsForbidden(err) {
+			slog.Warn("admin: cluster summary node read forbidden — grant the duckgres-control-plane-cluster-topology ClusterRole", "error", err)
+			c.JSON(http.StatusOK, sum)
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for i := range nodeList.Items {
+		if strings.HasPrefix(nodeList.Items[i].Labels["karpenter.sh/nodepool"], duckgresNodePool) {
+			sum.Nodes++
+		}
+	}
+
+	podList, err := h.client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{Limit: clusterPodLimit})
+	if err != nil {
+		if apierrors.IsForbidden(err) {
+			c.JSON(http.StatusOK, sum)
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var workerMilli, workerMem, phMilli, phMem int64
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		phase := p.Status.Phase
+		worker := p.Labels[workerPodLabel] == workerPodLabelValue
+		placeholder := isPlaceholderPod(p)
+		// Count as a worker/placeholder only when actually Running (and not
+		// terminating) — a Pending worker isn't on a node yet, so it belongs in
+		// the separate "pending" tally, not the running-worker count/CPU totals.
+		running := phase == corev1.PodRunning && p.DeletionTimestamp == nil
+		if running && worker {
+			sum.Workers++
+			mc, mb := podRequests(p)
+			workerMilli += mc
+			workerMem += mb
+		} else if running && placeholder {
+			sum.Placeholders++
+			mc, mb := podRequests(p)
+			phMilli += mc
+			phMem += mb
+		}
+		if phase == corev1.PodPending && (worker || placeholder) {
+			sum.Pending++
+		}
+	}
+	sum.WorkerCPUCores = roundCores(workerMilli)
+	sum.WorkerMemGiB = roundGiB(workerMem)
+	sum.PlaceholderCPUCores = roundCores(phMilli)
+	sum.PlaceholderMemGiB = roundGiB(phMem)
+	c.JSON(http.StatusOK, sum)
+}
+
+func roundCores(milli int64) float64 { return float64(milli/100) / 10 }        // 1 decimal
+func roundGiB(bytes int64) float64   { return float64(bytes*10/(1<<30)) / 10 } // bytes → GiB, 1 decimal
 
 // nodepools proxies the karpenter NodePool list (cluster-scoped CRD) verbatim.
 // The view reads spec.disruption.{consolidationPolicy,consolidateAfter} to draw

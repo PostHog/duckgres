@@ -15,6 +15,7 @@ import { useIdentity } from "@/components/IdentityProvider";
 import type {
   AuditEntry,
   ClusterStatus,
+  ClusterSummary,
   CreateUserBody,
   DucklingDriftResponse,
   DucklingMetadataResponse,
@@ -75,6 +76,26 @@ export function useClusterStatus() {
   return useQuery<ClusterStatus>({
     queryKey: ["status"],
     queryFn: () => tolerate404<ClusterStatus>({ total_orgs: 0, total_workers: 0, total_sessions: 0, orgs: [] })(api.status()),
+    refetchInterval: POLL.normal,
+  });
+}
+
+// Cluster totals for the admin nav (shown on every page). 404-tolerant: on a
+// non-k8s backend / missing endpoint it resolves to zeros rather than erroring.
+export function useClusterSummary() {
+  return useQuery<ClusterSummary>({
+    queryKey: ["cluster-summary"],
+    queryFn: () =>
+      tolerate404<ClusterSummary>({
+        nodes: 0,
+        workers: 0,
+        worker_cpu_cores: 0,
+        worker_mem_gib: 0,
+        placeholders: 0,
+        placeholder_cpu_cores: 0,
+        placeholder_mem_gib: 0,
+        pending: 0,
+      })(api.clusterSummary()),
     refetchInterval: POLL.normal,
   });
 }

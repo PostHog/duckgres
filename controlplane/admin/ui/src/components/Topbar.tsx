@@ -1,10 +1,8 @@
-import { useSyncExternalStore } from "react";
 import { Circle, ShieldCheck, Eye } from "lucide-react";
-import { useClusterStatus, useModel } from "@/hooks/useApi";
+import { useClusterStatus, useClusterSummary, useModel } from "@/hooks/useApi";
 import { useIdentity } from "@/components/IdentityProvider";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { getClusterCounts, subscribeClusterCounts } from "@/lib/clusterCounts";
 
 // One counter in the unified header stat row: a value + a small label on the top
 // line, with an optional smaller sub-line beneath (e.g. the workers' vCPU/GiB
@@ -38,12 +36,15 @@ export function Topbar() {
   // cp-instances is a runtime model in the config-store explorer; active rows
   // = live control-plane replicas. Tolerant of the endpoint being absent.
   const cps = useModel("cp-instances");
-  // Live node/worker/placeholder/pending counts, pushed by the Nodes view while
-  // it's mounted (null elsewhere).
-  const counts = useSyncExternalStore(subscribeClusterCounts, getClusterCounts);
+  // Cluster totals shown on EVERY page (not just the Nodes view) — polled
+  // server-side, 404-tolerant to zeros.
+  const summary = useClusterSummary().data;
 
   const cpRows = (cps.data?.rows ?? []) as { state?: string }[];
   const cpCount = cps.isSuccess ? activeOrTotal(cpRows) : null;
+  // Placeholder requests as a % of worker requests (cpu/mem) — "how much of the
+  // worker capacity the headroom placeholders represent".
+  const pct = (a: number, b: number) => (b > 0 ? `${Math.round((a / b) * 100)}%` : "–");
   // "Reachable" reflects only that the admin API answered GET /status — it is NOT
   // a real cluster-health signal (the query even tolerates a 404 as success). So
   // the dot means "the admin API is responding", nothing more; the tooltip spells
@@ -77,22 +78,28 @@ export function Topbar() {
           <span className="text-xs text-muted-foreground">{reachable ? "Connected" : "Unreachable"}</span>
         </div>
 
-        {(cpCount !== null || counts) && (
+        {(cpCount !== null || summary) && (
           <div className="flex items-start gap-4 border-l border-border pl-4">
-            {counts && <Stat n={counts.nodes} label="nodes" />}
+            {summary && <Stat n={summary.nodes} label="nodes" />}
             {cpCount !== null && <Stat n={cpCount} label="CP" detail="live control-plane replicas (cp_instances)" />}
-            {counts && (
+            {summary && (
               <>
-                {/* workers carries the vCPU/GiB totals as a small sub-line — shown
-                    even at zero, like the old peepernetes stat block. */}
+                {/* workers + placeholders each carry their CPU/GiB totals as a
+                    small sub-line (peepernetes style), always shown even at 0. */}
                 <Stat
-                  n={counts.workers}
+                  n={summary.workers}
                   label="workers"
-                  sub={`${counts.cpuCores} vCPU · ${counts.memGi} GiB`}
-                  detail={counts.workerDetail || "no worker pods running"}
+                  sub={`${summary.worker_cpu_cores} vCPU · ${summary.worker_mem_gib} GiB`}
+                  detail="running duckgres worker pods + their requested cpu/mem"
                 />
-                <Stat n={counts.placeholders} label="placeholders" detail={counts.placeholderDetail || undefined} muted />
-                <Stat n={counts.pending} label="pending" muted />
+                <Stat
+                  n={summary.placeholders}
+                  label="placeholders"
+                  sub={`${summary.placeholder_cpu_cores} vCPU · ${summary.placeholder_mem_gib} GiB · ${pct(summary.placeholder_cpu_cores, summary.worker_cpu_cores)}/${pct(summary.placeholder_mem_gib, summary.worker_mem_gib)} of workers`}
+                  detail="capacity-headroom placeholder pods; cpu%/mem% is placeholder requests vs worker requests"
+                  muted
+                />
+                <Stat n={summary.pending} label="pending" detail="worker/placeholder pods in Pending" muted />
               </>
             )}
           </div>

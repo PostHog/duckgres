@@ -394,16 +394,17 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   draining-duration on nodes (deletion-timestamp or client-tracked first-seen)
   and terminating-duration on pods, each pod's running image, unscheduled tray,
   and a synthesized event ticker. Its header carries only the filters; the
-  counters — nodes · CP · **workers · CPU · Gi** · placeholders · pending — are
-  lifted into the shared admin **Topbar**. "workers" counts only real duckgres
-  worker pods (label `app=duckgres-worker`, stamped in `k8s_pool_spawn.go`), NOT
-  every app pod — so the number matches the worker chips in the view and the CP's
-  own worker accounting; CPU/Gi are those workers' summed requests. Wiring is a
-  small external store (`ui/src/lib/clusterCounts.ts` →
-  `Topbar.tsx` `useSyncExternalStore`; the view pushes counts each repaint and
-  pushes `null` on unmount so they only show on this page). The view has no
-  separate live indicator — the Topbar's "Connected" dot (admin-API reachability)
-  is the single green pulsing live signal. It's imperative DOM (mounted
+  cluster counters live in the shared admin **Topbar** and show on EVERY page —
+  the Topbar polls `GET /cluster/summary` (`useClusterSummary`), a server-side
+  aggregate (`cluster.go`) of nodes (duckgres nodepools) · CP replicas · running
+  **workers** (label `app=duckgres-worker`, NOT every app pod — so it matches the
+  worker chips + the CP's own worker accounting) with their vCPU/GiB request
+  totals as a sub-line · **placeholders** with their vCPU/GiB and the cpu%/mem%
+  those headroom pods are OF the worker totals · pending. Computing it server-side
+  (not from the Nodes view's pushed counts) is what lets the totals appear on
+  every page, not just while the view is mounted. The view has no separate live
+  indicator — the Topbar's "Connected" dot (admin-API reachability) is the single
+  green pulsing live signal. It's imperative DOM (mounted
   by the React page into a `.peeper` root, scoped CSS + `pn-`-prefixed keyframes)
   and does NOT use native K8s watch — the browser can't reach the API, so it
   POLLS four **read-only** projected endpoints (`server/`-free; `cluster.go`):

@@ -14,8 +14,6 @@
  * keeping it recognizably the same eases future diffing against upstream.
  */
 
-import { setClusterCounts } from "@/lib/clusterCounts";
-
 const API = "/api/v1/cluster";
 
 // mountPeepernetes builds the whole view inside `root` and starts polling.
@@ -24,9 +22,10 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   const $ = (s: string): any => root.querySelector(s);
 
   root.classList.add("peeper");
-  // Header carries only the filters + live indicator, left-aligned. The brand
-  // and the nodes/workers/placeholders/pending counters were lifted OUT of this
-  // header into the shared admin Topbar (see setClusterCounts + Topbar.tsx).
+  // Header carries only the filters, left-aligned. The brand and the
+  // nodes/workers/placeholders/pending counters live in the shared admin Topbar,
+  // which polls /cluster/summary directly (Topbar.tsx) — so the totals show on
+  // every page, not just while this view is mounted.
   root.innerHTML = `
   <div class="hdr">
     <div class="toggles">
@@ -153,12 +152,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   }
   function nodePool(node: any): string {
     return (node.metadata.labels || {})["karpenter.sh/nodepool"] || "static";
-  }
-  // A real duckgres worker pod (spawned per session), by the label the control
-  // plane stamps at spawn (k8s_pool_spawn.go). This is what the "workers" counter
-  // means — NOT every app pod (the control-plane's own pods are not workers).
-  function isWorker(pod: any): boolean {
-    return (pod.metadata.labels || {})["app"] === "duckgres-worker";
   }
   const POOL_ORDER = (p: string) =>
     p === "duckgres-workers" ? 0 : p === "duckgres-cp" ? 1 : p === "static" ? 9 : 5;
@@ -390,7 +383,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   const poolsBox: HTMLElement = $("#pools");
   const seen = new Set<string>();
   let firstPaint = true;
-  let lastCountsKey = "";
 
   function nodeReady(node: any): boolean {
     return (node.status?.conditions || []).some((c: any) => c.type === "Ready" && c.status === "True");
@@ -523,29 +515,15 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     if (pods.size && !podsLoadedAt) podsLoadedAt = Date.now();
     if (nodes.size && !nodesLoadedAt) nodesLoadedAt = Date.now();
 
-    const poolOfNode = new Map<string, string>();
-    for (const n of nodes.values()) poolOfNode.set(n.metadata.name, nodePool(n));
     const byNode = new Map<string, [any, string][]>();
     const flatPods: [any, string][] = [];
     const unsched: [any, string][] = [];
-    let nWorkers = 0, nHead = 0, nPend = 0;
-    let wCpu = 0, wMem = 0, hCpu = 0, hMem = 0;
+    // Group pods for rendering. The header counters (nodes/workers/…) are NOT
+    // computed here anymore — the admin Topbar polls /cluster/summary directly so
+    // the totals show on every page, not just while this view is mounted.
     for (const p of pods.values()) {
       const k = classify(p);
       if (ns && p.metadata.namespace !== ns) continue;
-      const counted = !(k === "system" && sysMode() === "hide") &&
-        (!p.spec.nodeName || poolVisible(poolOfNode.get(p.spec.nodeName) || "static"));
-      if (counted && !p.metadata.deletionTimestamp && p.status?.phase !== "Succeeded") {
-        if (k === "headroom") {
-          nHead++;
-          const r = podReq(p); hCpu += r.cpu; hMem += r.mem;
-        } else if (isWorker(p)) {
-          // Only real duckgres worker pods count toward "workers" + its CPU/MEM.
-          nWorkers++;
-          const r = podReq(p); wCpu += r.cpu; wMem += r.mem;
-        }
-      }
-      if (counted && p.status?.phase === "Pending") nPend++;
       if (p.status?.phase === "Succeeded") continue;
       if (k === "system" && sysMode() === "hide") continue;
       if (!p.spec.nodeName) { if (p.status?.phase === "Pending") unsched.push([p, k]); continue; }
@@ -558,14 +536,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
       a[0].metadata.name.localeCompare(b[0].metadata.name));
     for (const l of byNode.values()) sortPods(l);
     sortPods(unsched);
-
-    // Header counters live in the shared admin Topbar; build the CPU/MEM totals
-    // (of the real worker pods) here and push everything (incl. the node count
-    // below) via setClusterCounts once nNodes is known.
-    const cpuCores = Math.round(wCpu / 100) / 10; // millicores → cores, 1 decimal
-    const memGi = Math.round(wMem / 2 ** 30 * 10) / 10;
-    const workerDetail = nWorkers ? `${fmtCpu(wCpu)} · ${fmtMem(wMem)} across ${nWorkers} worker${nWorkers === 1 ? "" : "s"}` : "";
-    const placeholderDetail = nHead ? `${fmtCpu(hCpu)} · ${fmtMem(hMem)}` : "";
 
     $("#tray").classList.toggle("show", unsched.length > 0);
     $("#tray-count").textContent = unsched.length ? unsched.length + " pod(s) waiting for a node" : "";
@@ -586,15 +556,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
       if (!poolVisible(pool)) continue;
       if (!pools.has(pool)) pools.set(pool, []);
       pools.get(pool)!.push(n);
-    }
-    let nNodes = 0;
-    for (const l of pools.values()) for (const n of l) if (!goneUids.has(n.metadata.uid)) nNodes++;
-    // Only publish to the Topbar when a value actually changed (avoids a Topbar
-    // re-render on every poll tick when the numbers are unchanged).
-    const countsKey = [nNodes, nWorkers, cpuCores, memGi, nHead, nPend].join("|");
-    if (countsKey !== lastCountsKey) {
-      lastCountsKey = countsKey;
-      setClusterCounts({ nodes: nNodes, workers: nWorkers, cpuCores, memGi, placeholders: nHead, pending: nPend, workerDetail, placeholderDetail });
     }
     const poolNames = [...pools.keys()].sort((a, b) => (POOL_ORDER(a) - POOL_ORDER(b)) || a.localeCompare(b));
 
@@ -824,7 +785,6 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     for (const id of timers) clearInterval(id);
     for (const c of controllers) c.abort();
     document.removeEventListener("click", docClickFn);
-    setClusterCounts(null); // Topbar drops the node/worker counters when we leave
     root.classList.remove("peeper");
     root.innerHTML = "";
   };

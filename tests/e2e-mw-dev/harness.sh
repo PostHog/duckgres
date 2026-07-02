@@ -1530,6 +1530,12 @@ admin_console_api() {
       | jq -e '(.items | type) == "array"' >/dev/null \
       || fail "/cluster/$res did not return a 200 {items:[...]} envelope"
   done
+  # /cluster/summary backs the admin nav totals (shown on every page): assert it
+  # returns the numeric fields the Topbar reads (>=0). Degrades to zeros if the
+  # topology RBAC is missing, so this checks shape, not populated values.
+  curl -fsS -H "$H" "$API/api/v1/cluster/summary" \
+    | jq -e '(.nodes|type=="number") and (.workers|type=="number") and (.worker_cpu_cores|type=="number") and (.worker_mem_gib|type=="number") and (.placeholders|type=="number") and (.pending|type=="number")' >/dev/null \
+    || fail "/cluster/summary missing numeric totals (nodes/workers/cpu/mem/placeholders/pending)"
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
   # Includes the per-org/per-source worker-acquire-latency panels. (The raw
   # histogram emission — org+source labels on duckgres_worker_acquire_total_seconds
