@@ -48,41 +48,17 @@
 }
 
 /* ── header ─────────────────────────────────────── */
+/* Only the filters + live indicator live here now (left-aligned); the brand and
+ * the nodes/workers/placeholders/pending counters moved to the admin Topbar. */
 .peeper .hdr {
   position: relative; z-index: 2;
-  display: flex; align-items: flex-start; gap: 28px;
-  padding: 14px 22px 12px;
+  display: flex; align-items: center; gap: 20px;
+  padding: 10px 22px;
   border-bottom: 1px solid var(--line);
   background: linear-gradient(180deg, #0c1118, #090d12);
   flex: none;
 }
-.peeper .brand { display: flex; flex-direction: column; line-height: 1.05; }
-.peeper .brand .t {
-  font-family: "Chakra Petch", "IBM Plex Mono", sans-serif; font-weight: 700; font-size: 21px;
-  letter-spacing: .14em; color: #eaf6ff;
-  text-shadow: 0 0 18px rgba(56,225,255,.35);
-}
-.peeper .brand .t em { color: var(--worker); font-style: normal; }
-.peeper .brand .s { font-size: 10px; color: var(--dim); letter-spacing: .3em; margin-top: 3px; }
-.peeper .stats { display: flex; gap: 24px; margin-left: 18px; align-items: flex-start; margin-top: 2px; }
-.peeper .stat { display: flex; flex-direction: column; align-items: flex-start; min-width: 72px; }
-.peeper .stat .top { display: flex; align-items: baseline; gap: 6px; }
-.peeper .stat .n {
-  font-family: "IBM Plex Mono", monospace; font-weight: 600; font-size: 19px; line-height: 1.1;
-  font-variant-numeric: tabular-nums; transition: color .3s;
-}
-.peeper .stat .l { font-size: 9px; letter-spacing: .22em; color: var(--dim); }
-.peeper .stat .r { font-size: 9px; min-height: 11px; color: var(--dim); margin-top: 2px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.peeper .stat.bump .n { animation: pn-bump .4s ease; }
-@keyframes pn-bump { 30% { transform: translateY(-3px) scale(1.12); } }
-.peeper #n-nodes .n   { color: #eaf6ff; }
-.peeper #n-pods .n { color: var(--worker); }
-.peeper #n-head .n    { color: var(--headroom); }
-.peeper #n-pend .n    { color: var(--pend); }
-.peeper #n-pend.zero .n { color: var(--dim); }
-
-.peeper .spacer { flex: 1; }
-.peeper .toggles { display: flex; gap: 14px; align-items: flex-end; align-self: center; flex-wrap: wrap; }
+.peeper .toggles { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
 .peeper .fctl { display: flex; flex-direction: column; gap: 3px; }
 .peeper .fctl .fl { font-size: 8.5px; letter-spacing: .18em; color: var(--dim); }
 .peeper #ns-filter, .peeper #sys-mode, .peeper #group-by {
@@ -212,6 +188,13 @@
 .peeper .pods.flat .pod:not(.dot) { flex: 0 0 150px; max-width: 150px; }
 .peeper .pod.dot { flex: 0 0 auto; }
 .peeper .pod .pm { font-size: 9px; color: var(--dim); white-space: nowrap; }
+/* running image (short name:tag); full path in the chip tooltip */
+.peeper .pod .pi {
+  font-size: 8.5px; color: color-mix(in srgb, var(--c) 55%, var(--dim));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.peeper .pod .pi:empty { display: none; }
 .peeper .pod.fresh { animation: pn-pod-in .55s cubic-bezier(.2,1.6,.4,1); }
 @keyframes pn-pod-in { from { transform: scale(.4); opacity: 0; } 60% { transform: scale(1.08); } }
 .peeper .pod.fresh::after {
@@ -243,7 +226,7 @@
 /* collapsed daemonset/system pod: tiny dot, full info on hover */
 .peeper .pod.dot { min-width: 0; width: 12px; height: 12px; padding: 0; border-radius: 50%; align-self: center; transition: transform .15s; }
 .peeper .pod.dot::before { display: none; }
-.peeper .pod.dot .pn, .peeper .pod.dot .pm { display: none; }
+.peeper .pod.dot .pn, .peeper .pod.dot .pm, .peeper .pod.dot .pi { display: none; }
 .peeper .pod.dot:hover { transform: scale(1.7); opacity: 1; }
 
 /* unscheduled tray */

@@ -392,7 +392,13 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   cluster node/pod TV — nodes grouped by karpenter nodepool (or by namespace /
   deployment), CPU/MEM request bars, pod chips colored per deployment,
   placeholder/system-pod classification, Karpenter empty-node reclaim countdown,
-  unscheduled tray, and a synthesized event ticker. It's imperative DOM (mounted
+  draining-duration on nodes (deletion-timestamp or client-tracked first-seen)
+  and terminating-duration on pods, each pod's running image, unscheduled tray,
+  and a synthesized event ticker. Its header carries only the filters + live
+  indicator; the nodes/workers/placeholders/pending counters are lifted into the
+  shared admin **Topbar** via a small external store (`ui/src/lib/clusterCounts.ts`
+  → `Topbar.tsx` `useSyncExternalStore`; the view pushes counts each repaint and
+  pushes `null` on unmount so they only show on this page). It's imperative DOM (mounted
   by the React page into a `.peeper` root, scoped CSS + `pn-`-prefixed keyframes)
   and does NOT use native K8s watch — the browser can't reach the API, so it
   POLLS four **read-only** projected endpoints (`server/`-free; `cluster.go`):
