@@ -439,6 +439,12 @@ func TestQueryLogKafkaWriterCommitsWhenOrgHasNoDuckLakeTarget(t *testing.T) {
 	}
 }
 
+func TestQueryLogDuckLakeDBDSNAllowsUnsignedExtensions(t *testing.T) {
+	if got, want := queryLogDuckLakeDBDSN(), ":memory:?allow_unsigned_extensions=true"; got != want {
+		t.Fatalf("queryLogDuckLakeDBDSN() = %q, want %q", got, want)
+	}
+}
+
 func TestQueryLogKafkaEventInsertIsIdempotentByEventID(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
