@@ -14,6 +14,8 @@
  * keeping it recognizably the same eases future diffing against upstream.
  */
 
+import { setClusterCounts } from "@/lib/clusterCounts";
+
 const API = "/api/v1/cluster";
 
 // mountPeepernetes builds the whole view inside `root` and starts polling.
@@ -22,19 +24,11 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   const $ = (s: string): any => root.querySelector(s);
 
   root.classList.add("peeper");
+  // Header carries only the filters + live indicator, left-aligned. The brand
+  // and the nodes/workers/placeholders/pending counters were lifted OUT of this
+  // header into the shared admin Topbar (see setClusterCounts + Topbar.tsx).
   root.innerHTML = `
   <div class="hdr">
-    <div class="brand">
-      <div class="t">PEEPER<em>NETES</em></div>
-      <div class="s">LIVE CLUSTER WATCH</div>
-    </div>
-    <div class="stats">
-      <div class="stat" id="n-nodes"><span class="top"><span class="n">–</span><span class="l">NODES</span></span><span class="r"></span></div>
-      <div class="stat" id="n-pods"><span class="top"><span class="n">–</span><span class="l">PODS</span></span><span class="r"></span></div>
-      <div class="stat" id="n-head"><span class="top"><span class="n">–</span><span class="l">PLACEHOLDERS</span></span><span class="r"></span></div>
-      <div class="stat" id="n-pend"><span class="top"><span class="n">–</span><span class="l">PENDING</span></span><span class="r"></span></div>
-    </div>
-    <div class="spacer"></div>
     <div class="toggles">
       <div class="fctl"><span class="fl">GROUP BY</span>
         <select id="group-by">
@@ -283,8 +277,35 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   }
   const emptySince = new Map<string, { ts: number; approx: boolean }>();
   try { for (const [k, v] of JSON.parse(sessionStorage.getItem("peepernetes-emptysince") || "[]")) emptySince.set(k, v); } catch { /* ignore */ }
+  // How long a node has been draining. deletionTimestamp is authoritative when a
+  // node is actually being deleted; a cordon / karpenter-disrupt taint has no
+  // server-side start time, so we record first-seen client-side (persisted so it
+  // survives a reload; `approx` when we can't know it started exactly then).
+  const drainSince = new Map<string, { ts: number; approx: boolean }>();
+  try { for (const [k, v] of JSON.parse(sessionStorage.getItem("peepernetes-drainsince") || "[]")) drainSince.set(k, v); } catch { /* ignore */ }
   let podsLoadedAt = 0;
+  let nodesLoadedAt = 0;
   function fmtLeft(ms: number): string { return ms >= 60e3 ? Math.ceil(ms / 60e3) + "m" : Math.ceil(ms / 1e3) + "s"; }
+  // Elapsed duration (floored, s/m/h/d) — for how long something has been in a state.
+  function fmtDur(ms: number): string {
+    const s = Math.max(0, ms / 1000);
+    if (s < 90) return Math.round(s) + "s";
+    if (s < 5400) return Math.round(s / 60) + "m";
+    if (s < 2 * 86400) return (s / 3600).toFixed(1) + "h";
+    return Math.round(s / 86400) + "d";
+  }
+  // Container image(s) a pod runs. Short form drops the registry/repo path and
+  // keeps the final `name:tag` (or `name@sha…`); "+N" when a pod has sidecars.
+  function shortImage(img: string): string { return (img.split("/").pop() || img); }
+  function podImages(pod: any): string[] {
+    return (pod.spec.containers || []).map((c: any) => c.image || "").filter(Boolean);
+  }
+  function imageLabel(pod: any): string {
+    const imgs = podImages(pod);
+    if (!imgs.length) return "";
+    const s = shortImage(imgs[0]);
+    return imgs.length > 1 ? `${s} +${imgs.length - 1}` : s;
+  }
 
   // ── event ticker ───────────────────────────────────────
   const evBox = $("#events");
@@ -376,15 +397,7 @@ export function mountPeepernetes(root: HTMLElement): () => void {
   const poolsBox: HTMLElement = $("#pools");
   const seen = new Set<string>();
   let firstPaint = true;
-
-  function setStat(id: string, v: number): void {
-    const el = $(id), n = el.querySelector(".n");
-    if (n.textContent !== String(v)) {
-      n.textContent = v;
-      el.classList.remove("bump"); void el.offsetWidth; el.classList.add("bump");
-    }
-    el.classList.toggle("zero", v === 0);
-  }
+  let lastCountsKey = "";
 
   function nodeReady(node: any): boolean {
     return (node.status?.conditions || []).some((c: any) => c.type === "Ready" && c.status === "True");
@@ -394,7 +407,7 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     const el = document.createElement("div");
     el.className = "pod " + kindClass(_k);
     el.dataset.uid = pod.metadata.uid;
-    el.innerHTML = `<span class="pn"></span><span class="pm"></span>`;
+    el.innerHTML = `<span class="pn"></span><span class="pi"></span><span class="pm"></span>`;
     if (!firstPaint && !seen.has(pod.metadata.uid)) el.classList.add("fresh");
     seen.add(pod.metadata.uid);
     setTimeout(() => el.classList.remove("fresh"), 1700);
@@ -404,15 +417,25 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     const phase = pod.status?.phase || "?";
     if (k.startsWith("a:")) el.style.setProperty("--c", appColor(k.slice(2)));
     else el.style.removeProperty("--c");
+    const terminating = !!pod.metadata.deletionTimestamp;
     el.classList.toggle("dot", k === "system" && sysMode() === "dot");
-    el.classList.toggle("terminating", !!pod.metadata.deletionTimestamp);
-    el.classList.toggle("pending", phase === "Pending" && !pod.metadata.deletionTimestamp);
+    el.classList.toggle("terminating", terminating);
+    el.classList.toggle("pending", phase === "Pending" && !terminating);
     el.classList.toggle("failed", phase === "Failed");
     const { cpu, mem } = podReq(pod);
     (el.querySelector(".pn") as HTMLElement).textContent = pod.metadata.name;
-    (el.querySelector(".pm") as HTMLElement).textContent =
-      `${cpu || mem ? fmtCpu(cpu) + " · " + fmtMem(mem) : phase.toLowerCase()}${cpu || mem ? " · " + age(pod.metadata.creationTimestamp) : ""}`;
-    el.title = `${pod.metadata.namespace}/${pod.metadata.name}\nphase: ${phase}\nnode: ${pod.spec.nodeName || "—"}\nreq: ${fmtCpu(cpu)} / ${fmtMem(mem)}`;
+    // Every pod shows its running image (short name:tag; full path in the tooltip).
+    const imgs = podImages(pod);
+    (el.querySelector(".pi") as HTMLElement).textContent = imageLabel(pod);
+    // While terminating, the meta line shows how long it's been draining down
+    // (since deletionTimestamp — authoritative). Otherwise req · age as before.
+    (el.querySelector(".pm") as HTMLElement).textContent = terminating
+      ? `terminating ${fmtDur(Date.now() - Date.parse(pod.metadata.deletionTimestamp))}`
+      : `${cpu || mem ? fmtCpu(cpu) + " · " + fmtMem(mem) : phase.toLowerCase()}${cpu || mem ? " · " + age(pod.metadata.creationTimestamp) : ""}`;
+    el.title = `${pod.metadata.namespace}/${pod.metadata.name}\nphase: ${phase}` +
+      (terminating ? ` (terminating ${fmtDur(Date.now() - Date.parse(pod.metadata.deletionTimestamp))})` : "") +
+      `\nnode: ${pod.spec.nodeName || "—"}\nreq: ${fmtCpu(cpu)} / ${fmtMem(mem)}` +
+      (imgs.length ? `\nimage: ${imgs.join("\n       ")}` : "");
   }
 
   // reconcile a flex container of pod chips against a desired pod list
@@ -505,6 +528,7 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     const ns = nsFilter();
 
     if (pods.size && !podsLoadedAt) podsLoadedAt = Date.now();
+    if (nodes.size && !nodesLoadedAt) nodesLoadedAt = Date.now();
 
     const poolOfNode = new Map<string, string>();
     for (const n of nodes.values()) poolOfNode.set(n.metadata.name, nodePool(n));
@@ -541,13 +565,12 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     for (const l of byNode.values()) sortPods(l);
     sortPods(unsched);
 
-    setStat("#n-pods", nPods);
-    setStat("#n-head", nHead);
-    setStat("#n-pend", nPend);
-    $("#n-pods .r").textContent = nPods ? `${fmtCpu(pCpu)} · ${fmtMem(pMem)}` : "";
+    // Header counters now live in the shared admin Topbar; build the CPU/MEM
+    // total strings here and push everything (incl. the node count below) via
+    // setClusterCounts once nNodes is known.
     const pct = (a: number, b: number) => b ? Math.round(a / b * 100) + "%" : "–";
-    $("#n-head .r").textContent = nHead ? `${fmtCpu(hCpu)} · ${fmtMem(hMem)} · ${pct(hCpu, pCpu)}/${pct(hMem, pMem)}` : "";
-    $("#n-head .r").title = "placeholder requests as % of (filtered) pod requests (cpu/mem)";
+    const workerReq = nPods ? `${fmtCpu(pCpu)} · ${fmtMem(pMem)}` : "";
+    const placeholderReq = nHead ? `${fmtCpu(hCpu)} · ${fmtMem(hMem)} · ${pct(hCpu, pCpu)}/${pct(hMem, pMem)} of workers` : "";
 
     $("#tray").classList.toggle("show", unsched.length > 0);
     $("#tray-count").textContent = unsched.length ? unsched.length + " pod(s) waiting for a node" : "";
@@ -571,7 +594,13 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     }
     let nNodes = 0;
     for (const l of pools.values()) for (const n of l) if (!goneUids.has(n.metadata.uid)) nNodes++;
-    setStat("#n-nodes", nNodes);
+    // Only publish to the Topbar when a value actually changed (avoids a Topbar
+    // re-render on every poll tick when the numbers are unchanged).
+    const countsKey = [nNodes, nPods, nHead, nPend, workerReq, placeholderReq].join("|");
+    if (countsKey !== lastCountsKey) {
+      lastCountsKey = countsKey;
+      setClusterCounts({ nodes: nNodes, workers: nPods, placeholders: nHead, pending: nPend, workerReq, placeholderReq });
+    }
     const poolNames = [...pools.keys()].sort((a, b) => (POOL_ORDER(a) - POOL_ORDER(b)) || a.localeCompare(b));
 
     const gmode = $("#group-by").value;
@@ -633,6 +662,7 @@ export function mountPeepernetes(root: HTMLElement): () => void {
           card.classList.toggle("gone", isGone);
           card.classList.toggle("draining", !isGone && nodeDraining(n));
           card.classList.toggle("notready", !isGone && !nodeDraining(n) && !nodeReady(n));
+          if (isGone || !nodeDraining(n)) drainSince.delete(n.metadata.name);
           (card.querySelector(".node-name") as HTMLElement).textContent = n.metadata.name.replace(".ec2.internal", "");
           (card.querySelector(".node-meta") as HTMLElement).textContent =
             (n.metadata.labels?.["node.kubernetes.io/instance-type"] || "") +
@@ -669,9 +699,22 @@ export function mountPeepernetes(root: HTMLElement): () => void {
             expEl.classList.add("gone");
             expEl.title = "node deleted — shown briefly for context";
           } else if (nodeDraining(n)) {
-            expTxt = "DRAINING";
+            // How long it's been draining: deletionTimestamp is authoritative;
+            // otherwise fall back to when we first saw it draining (approx if it
+            // was already draining at load — real start unknown, so mark it "≥").
+            let startMs: number, approx = false;
+            if (n.metadata.deletionTimestamp) {
+              startMs = Date.parse(n.metadata.deletionTimestamp);
+              drainSince.delete(n.metadata.name);
+            } else {
+              let rec = drainSince.get(n.metadata.name);
+              if (!rec) { rec = { ts: Date.now(), approx: !!nodesLoadedAt && Date.now() - nodesLoadedAt < 3000 }; drainSince.set(n.metadata.name, rec); }
+              startMs = rec.ts; approx = rec.approx;
+            }
+            expTxt = `DRAINING ${approx ? "≥" : ""}${fmtDur(Date.now() - startMs)}`;
             expEl.classList.add("draining");
-            expEl.title = "node is cordoned / being disrupted — pods drain, then it terminates";
+            expEl.title = "node is cordoned / being disrupted — pods drain, then it terminates" +
+              (approx ? "\n(was already draining at page load — actual start may be earlier)" : "");
           } else if (!nodeReady(n)) {
             expTxt = "NOT READY";
             expEl.classList.add("bad");
@@ -722,6 +765,7 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     }
     firstPaint = false;
     try { sessionStorage.setItem("peepernetes-emptysince", JSON.stringify([...emptySince])); } catch { /* ignore */ }
+    try { sessionStorage.setItem("peepernetes-drainsince", JSON.stringify([...drainSince])); } catch { /* ignore */ }
   }
 
   // render loop: coalesce bursts, repaint ages every 5s
@@ -785,6 +829,7 @@ export function mountPeepernetes(root: HTMLElement): () => void {
     for (const id of timers) clearInterval(id);
     for (const c of controllers) c.abort();
     document.removeEventListener("click", docClickFn);
+    setClusterCounts(null); // Topbar drops the node/worker counters when we leave
     root.classList.remove("peeper");
     root.innerHTML = "";
   };
