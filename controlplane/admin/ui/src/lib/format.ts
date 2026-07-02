@@ -151,6 +151,23 @@ export function ducklingName(orgName: string): string {
   return orgName.toLowerCase();
 }
 
+// Resolve an org's entry in a Duckling-CR-name-keyed map: the stored
+// duckling_name wins, then the canonical (lowercased) org name, then the
+// legacy hyphen-stripped variant pre-rename CRs still use (mirrors the drift
+// finder's expected-name set).
+export function ducklingEntryFor<T>(
+  entries: Record<string, T> | undefined,
+  orgName: string,
+  ducklingNameOverride?: string,
+): T | undefined {
+  if (!entries) return undefined;
+  const canonical = ducklingName(orgName);
+  for (const name of [ducklingNameOverride, canonical, canonical.replaceAll("-", "")]) {
+    if (name && entries[name] !== undefined) return entries[name];
+  }
+  return undefined;
+}
+
 // A Duckling is broken/unhealthy when its warehouse row exists but the overall
 // state is failed or deleted.
 export function ducklingBroken(state: string | undefined): boolean {

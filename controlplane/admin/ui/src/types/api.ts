@@ -218,6 +218,25 @@ export interface DucklingDriftResponse {
   entries: DucklingDrift[];
 }
 
+// ---- Duckling metadata-store assignment ----
+
+// The live metadata-store backend of one Duckling CR. `cnpg_shard` is the
+// parsed shard name (e.g. "shard-001") for cnpg-shard tenants, absent for
+// external.
+export interface DucklingMetadataEntry {
+  kind: string;
+  endpoint: string;
+  cnpg_shard?: string;
+}
+
+// GET /api/v1/ducklings/metadata → per-CR metadata-store assignment keyed by
+// CR (duckling) name. `available` is false when the Duckling client is
+// unavailable.
+export interface DucklingMetadataResponse {
+  available: boolean;
+  entries: Record<string, DucklingMetadataEntry>;
+}
+
 // ---- Cluster status (confirmed) ----
 
 export interface OrgStatus {

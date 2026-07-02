@@ -21,9 +21,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError } from "@/lib/api";
-import { ducklingBroken, ducklingName, fmtTime } from "@/lib/format";
+import { ducklingBroken, ducklingEntryFor, ducklingName, fmtTime } from "@/lib/format";
+import { ShardBadge } from "@/components/ShardBadge";
 import {
   useDeleteOrg,
+  useDucklingsMetadata,
   useOrg,
   useUpdateOrg,
   useUpdateWarehouse,
@@ -297,6 +299,7 @@ function WarehousePanel({
   error: unknown;
 }) {
   const update = useUpdateWarehouse(orgId);
+  const metadata = useDucklingsMetadata();
   const [image, setImage] = useState("");
   const [version, setVersion] = useState("");
   const [ducklingNameInput, setDucklingNameInput] = useState("");
@@ -354,6 +357,13 @@ function WarehousePanel({
           <div>
             <div className="text-[10px] uppercase text-muted-foreground">Duckling</div>
             <div className="font-mono text-xs">{data?.duckling_name || ducklingName(orgId)}</div>
+          </div>
+          {/* Live metadata-store assignment from the Duckling CR status — the
+              cnpg shard the tenant's metadata actually lives on (the config
+              store doesn't hold this; the composition assigns it). */}
+          <div className="text-right">
+            <div className="text-[10px] uppercase text-muted-foreground">Metadata shard</div>
+            <ShardBadge meta={ducklingEntryFor(metadata.data?.entries, orgId, data?.duckling_name)} />
           </div>
           {ducklingWarning && (
             <Tooltip>

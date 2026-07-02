@@ -17,6 +17,7 @@ import type {
   ClusterStatus,
   CreateUserBody,
   DucklingDriftResponse,
+  DucklingMetadataResponse,
   ErrorEntry,
   ErrorFilters,
   FleetStat,
@@ -146,6 +147,21 @@ export function useDucklingDrift() {
       ),
     enabled: isAdmin,
     refetchInterval: POLL.normal,
+  });
+}
+
+const EMPTY_DUCKLING_METADATA: DucklingMetadataResponse = { available: false, entries: {} };
+
+// Live per-Duckling metadata-store assignment (which cnpg shard each tenant is
+// on). Viewer-accessible; a pre-rollout backend without the endpoint → empty.
+export function useDucklingsMetadata() {
+  return useQuery<DucklingMetadataResponse>({
+    queryKey: ["ducklings", "metadata"],
+    queryFn: () =>
+      tolerateStatus<DucklingMetadataResponse>(EMPTY_DUCKLING_METADATA, 403, 404, 503)(
+        api.getDucklingsMetadata(),
+      ).catch(() => EMPTY_DUCKLING_METADATA),
+    refetchInterval: POLL.slow,
   });
 }
 

@@ -11,6 +11,7 @@ import type {
   CreateUserBody,
   CPInstance,
   DucklingDriftResponse,
+  DucklingMetadataResponse,
   ErrorEntry,
   ErrorFilters,
   FleetStat,
@@ -129,6 +130,7 @@ export const api = {
 
   // ducklings (admin-only)
   getDucklingDrift: () => get<DucklingDriftResponse>("/ducklings/drift"),
+  getDucklingsMetadata: () => get<DucklingMetadataResponse>("/ducklings/metadata"),
 
   // users
   listUsers: () => get<OrgUser[]>("/users"),

@@ -311,6 +311,39 @@ func (d *DucklingClient) ListCRNames(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
+// CRMetadataStore is the metadata-store slice of one Duckling CR's status —
+// the live (composition-assigned) backend, notably which cnpg shard a
+// cnpg-shard tenant landed on. The config store does not hold this (the
+// composition picks the active shard at provision time and only the CR status
+// carries the endpoint), so the admin console reads it from here.
+type CRMetadataStore struct {
+	Type     string // "cnpg-shard" | "external"
+	Endpoint string // Postgres host, e.g. "shard-001-pooler.cnpg-shards.svc.cluster.local"
+}
+
+// CRMetadataStores lists every Duckling CR and returns each one's
+// status.metadataStore type + endpoint, keyed by CR name. CRs whose status is
+// not yet populated (still provisioning) are skipped rather than failing the
+// whole listing.
+func (d *DucklingClient) CRMetadataStores(ctx context.Context) (map[string]CRMetadataStore, error) {
+	list, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list duckling CRs: %w", err)
+	}
+	out := make(map[string]CRMetadataStore, len(list.Items))
+	for i := range list.Items {
+		status, perr := parseDucklingStatus(&list.Items[i])
+		if perr != nil || status.MetadataStore.Endpoint == "" {
+			continue
+		}
+		out[list.Items[i].GetName()] = CRMetadataStore{
+			Type:     status.MetadataStore.Type,
+			Endpoint: status.MetadataStore.Endpoint,
+		}
+	}
+	return out, nil
+}
+
 // CRStatus reports whether the org's Duckling CR exists and, if so, whether it
 // is Ready — without treating absence as an error. A NotFound resolves to
 // (false, false, nil) so the drift finder can classify a missing CR rather than

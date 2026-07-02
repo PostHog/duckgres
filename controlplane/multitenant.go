@@ -558,6 +558,15 @@ func SetupMultiTenant(
 	}
 	admin.RegisterDucklingsDrift(api, store, ducklingChecker)
 
+	// Live per-Duckling metadata-store assignment (which cnpg shard each
+	// tenant landed on) for the org overview/detail pages. Same nil-degrade
+	// contract as the drift finder.
+	var ducklingMetadata admin.DucklingMetadataLister
+	if dcErr == nil && dc != nil {
+		ducklingMetadata = ducklingMetadataAdapter{dc: dc}
+	}
+	admin.RegisterDucklingsMetadata(api, ducklingMetadata)
+
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)
 
@@ -597,6 +606,26 @@ func SetupMultiTenant(
 	}
 
 	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
+}
+
+// ducklingMetadataAdapter converts provisioner.CRMetadataStore into the
+// admin package's DucklingMetadataStore so admin does not import provisioner
+// (same decoupling as DucklingChecker, which needs no adapter only because
+// its method signatures carry no provisioner types).
+type ducklingMetadataAdapter struct {
+	dc *provisioner.DucklingClient
+}
+
+func (a ducklingMetadataAdapter) CRMetadataStores(ctx context.Context) (map[string]admin.DucklingMetadataStore, error) {
+	stores, err := a.dc.CRMetadataStores(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]admin.DucklingMetadataStore, len(stores))
+	for name, ms := range stores {
+		out[name] = admin.DucklingMetadataStore{Kind: ms.Type, Endpoint: ms.Endpoint}
+	}
+	return out, nil
 }
 
 type workerLifecycleStatsLister interface {
