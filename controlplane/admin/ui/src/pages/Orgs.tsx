@@ -9,14 +9,16 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { StateBadge } from "@/components/StateBadge";
+import { ShardBadge } from "@/components/ShardBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
-import { useDucklingDrift, useOrgs } from "@/hooks/useApi";
-import { ducklingName, fmtInt } from "@/lib/format";
+import { useDucklingDrift, useDucklingsMetadata, useOrgs } from "@/hooks/useApi";
+import { ducklingEntryFor, ducklingName, fmtInt } from "@/lib/format";
 import type { DucklingDrift, Org } from "@/types/api";
 
 export function Orgs() {
   const orgs = useOrgs();
   const drift = useDucklingDrift();
+  const metadata = useDucklingsMetadata();
   const navigate = useNavigate();
   const [filter, setFilter] = useState("");
 
@@ -109,8 +111,22 @@ export function Orgs() {
           return <span className="font-mono text-xs text-muted-foreground">{name || "—"}</span>;
         },
       },
+      {
+        id: "shard",
+        header: "Shard",
+        // Live CR status (composition-assigned), not config — the shard an
+        // org's metadata actually lives on. Sorting/filtering keys off the
+        // shard name so orgs on one shard group together.
+        accessorFn: (o) =>
+          ducklingEntryFor(metadata.data?.entries, o.name, o.warehouse?.duckling_name)?.cnpg_shard ?? "",
+        cell: ({ row }) => {
+          const o = row.original;
+          if (!o.warehouse) return <span className="text-muted-foreground">—</span>;
+          return <ShardBadge meta={ducklingEntryFor(metadata.data?.entries, o.name, o.warehouse.duckling_name)} />;
+        },
+      },
     ],
-    [driftByOrg],
+    [driftByOrg, metadata.data],
   );
 
   return (
@@ -136,7 +152,7 @@ export function Orgs() {
         )}
         <Card className="overflow-hidden">
           {orgs.isLoading ? (
-            <TableSkeleton cols={8} />
+            <TableSkeleton cols={9} />
           ) : orgs.isError ? (
             <ErrorState error={orgs.error} onRetry={() => orgs.refetch()} />
           ) : (
