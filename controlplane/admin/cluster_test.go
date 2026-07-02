@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -212,6 +213,71 @@ func TestClusterNodesForbiddenDegradesToEmpty(t *testing.T) {
 	items, ok := body["items"].([]any)
 	if !ok || len(items) != 0 {
 		t.Fatalf("nodes (forbidden): got %v, want 200 empty items list", body)
+	}
+}
+
+// TestClusterSummary asserts the aggregated nav totals: worker vs placeholder
+// pods are counted separately with their CPU/mem request sums, control-plane
+// pods are NOT counted as workers, and only duckgres-nodepool nodes count.
+func TestClusterSummary(t *testing.T) {
+	negPrio := int32(-1)
+	node := func(name, pool string) *corev1.Node {
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name),
+			Labels: map[string]string{"karpenter.sh/nodepool": pool}}}
+	}
+	pod := func(name string, labels map[string]string, prio *int32, image, cpu, mem string, phase corev1.PodPhase) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "duckgres", UID: types.UID(name), Labels: labels},
+			Spec: corev1.PodSpec{Priority: prio, Containers: []corev1.Container{{
+				Image: image,
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(cpu),
+					corev1.ResourceMemory: resource.MustParse(mem),
+				}},
+			}}},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+	}
+	e := clusterTestRouter(
+		node("ip-a", "duckgres-workers"), node("ip-b", "duckgres-cp"), node("ip-c", "trino"),
+		pod("worker-1", map[string]string{"app": "duckgres-worker"}, nil, "duckgres:latest", "2", "8Gi", corev1.PodRunning),
+		pod("worker-2", map[string]string{"app": "duckgres-worker"}, nil, "duckgres:latest", "2", "8Gi", corev1.PodRunning),
+		pod("cp-1", map[string]string{"app": "duckgres-control-plane"}, nil, "duckgres:latest", "1", "2Gi", corev1.PodRunning),
+		pod("ph-1", nil, &negPrio, "registry.k8s.io/pause:3.9", "1", "4Gi", corev1.PodRunning),
+		pod("pending-worker", map[string]string{"app": "duckgres-worker"}, nil, "duckgres:latest", "2", "8Gi", corev1.PodPending),
+	)
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/cluster/summary", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("summary = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	var s struct {
+		Nodes               int     `json:"nodes"`
+		Workers             int     `json:"workers"`
+		WorkerCPUCores      float64 `json:"worker_cpu_cores"`
+		WorkerMemGiB        float64 `json:"worker_mem_gib"`
+		Placeholders        int     `json:"placeholders"`
+		PlaceholderCPUCores float64 `json:"placeholder_cpu_cores"`
+		PlaceholderMemGiB   float64 `json:"placeholder_mem_gib"`
+		Pending             int     `json:"pending"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &s); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if s.Nodes != 2 { // duckgres-workers + duckgres-cp, NOT trino
+		t.Errorf("nodes = %d, want 2", s.Nodes)
+	}
+	if s.Workers != 2 { // two running worker pods; the control-plane pod is NOT a worker
+		t.Errorf("workers = %d, want 2 (control-plane pod must not count)", s.Workers)
+	}
+	if s.WorkerCPUCores != 4 || s.WorkerMemGiB != 16 {
+		t.Errorf("worker totals = %v cores / %v GiB, want 4 / 16", s.WorkerCPUCores, s.WorkerMemGiB)
+	}
+	if s.Placeholders != 1 || s.PlaceholderCPUCores != 1 || s.PlaceholderMemGiB != 4 {
+		t.Errorf("placeholder = %d (%v/%v), want 1 (1/4)", s.Placeholders, s.PlaceholderCPUCores, s.PlaceholderMemGiB)
+	}
+	if s.Pending != 1 { // the pending worker pod
+		t.Errorf("pending = %d, want 1", s.Pending)
 	}
 }
 

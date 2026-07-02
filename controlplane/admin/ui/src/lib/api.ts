@@ -8,6 +8,7 @@
 import type {
   AuditEntry,
   ClusterStatus,
+  ClusterSummary,
   CreateUserBody,
   CPInstance,
   DucklingDriftResponse,
@@ -118,6 +119,7 @@ export const api = {
 
   // overview
   status: () => get<ClusterStatus>("/status"),
+  clusterSummary: () => get<ClusterSummary>("/cluster/summary"),
 
   // orgs
   listOrgs: () => get<Org[]>("/orgs"),

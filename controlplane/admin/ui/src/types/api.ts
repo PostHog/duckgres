@@ -253,6 +253,19 @@ export interface ClusterStatus {
   orgs: OrgStatus[];
 }
 
+// GET /api/v1/cluster/summary → aggregated cluster totals for the admin nav
+// (node/worker/placeholder/pending counts + worker & placeholder CPU/mem totals).
+export interface ClusterSummary {
+  nodes: number;
+  workers: number;
+  worker_cpu_cores: number;
+  worker_mem_gib: number;
+  placeholders: number;
+  placeholder_cpu_cores: number;
+  placeholder_mem_gib: number;
+  pending: number;
+}
+
 // ---- Workers & sessions (confirmed) ----
 
 // GET /api/v1/workers → WorkerStatus[] (only session-holding workers).
