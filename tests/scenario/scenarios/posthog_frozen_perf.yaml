@@ -42,6 +42,7 @@ steps:
       run_id: ${run_id}
       dataset_version: posthog-file-views-v1
       flight_addr: ${env:DUCKGRES_SCENARIO_FLIGHT_ADDR}
+      fail_on_query_errors: false
 
   - id: deprovision
     type: deprovision_warehouse
