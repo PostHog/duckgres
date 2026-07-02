@@ -1,15 +1,16 @@
 import { NavLink } from "react-router-dom";
 import { Lock } from "lucide-react";
-import { BRAND_ICON, NAV } from "@/components/nav";
+import { NAV } from "@/components/nav";
 import { useIdentity } from "@/components/IdentityProvider";
 import { cn } from "@/lib/utils";
+import brandLogo from "@/assets/hotdog.png";
 
 export function Sidebar() {
   const { isAdmin } = useIdentity();
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r border-border bg-card/40">
       <div className="flex h-14 items-center gap-2 border-b border-border px-4">
-        <BRAND_ICON className="h-5 w-5 text-primary" />
+        <img src={brandLogo} alt="Duckgres" className="mt-1 h-6 w-6" />
         <div className="leading-tight">
           <div className="text-sm font-semibold">Duckgres</div>
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Control Plane</div>
