@@ -1157,6 +1157,15 @@ func TestRowsToRecordExplainUsesPlanValueColumn(t *testing.T) {
 					t.Fatalf("plan row %d = %q, want rendered plan text", i, got)
 				}
 			}
+
+			next, err := RowsToRecord(memory.NewGoAllocator(), rows, schema, 1024)
+			if err != nil {
+				t.Fatalf("RowsToRecord at EOF: %v", err)
+			}
+			if next != nil {
+				defer next.Release()
+				t.Fatal("RowsToRecord at EOF returned a record, want nil")
+			}
 			if tc.after != nil {
 				tc.after(t)
 			}

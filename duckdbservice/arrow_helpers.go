@@ -36,10 +36,9 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 	builder := array.NewRecordBuilder(alloc, schema)
 	defer builder.Release()
 
-	scanFields, explainValueColumn, err := rowScanShape(rows, schema)
-	if err != nil {
-		return nil, err
-	}
+	scanFields := schema.NumFields()
+	explainValueColumn := -1
+	scanShapeResolved := false
 	count := 0
 	// Order matters: check `count < batchSize` first, then call rows.Next().
 	// The reverse (rows.Next() && count < batchSize) advances the cursor once
@@ -50,6 +49,17 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 	// parquet-metadata row count, so the discrepancy was invisible to
 	// aggregation queries. See TestRowsToRecordNoRowsLostAtBatchBoundary.
 	for count < batchSize && rows.Next() {
+		// Resolve the physical scan shape only after Next succeeds. Some drivers
+		// close rows automatically at EOF; calling Columns after that would turn
+		// normal completion into "sql: Rows are closed".
+		if !scanShapeResolved {
+			var err error
+			scanFields, explainValueColumn, err = rowScanShape(rows, schema)
+			if err != nil {
+				return nil, err
+			}
+			scanShapeResolved = true
+		}
 		values := make([]interface{}, scanFields)
 		valuePtrs := make([]interface{}, scanFields)
 		for i := range values {
