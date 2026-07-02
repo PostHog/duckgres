@@ -2020,6 +2020,29 @@ admin_impersonation_audited() { # org
     || fail "impersonate: no audit row for impersonate.query root@$org"
 }
 
+# ---- admin ducklings metadata: live cnpg shard assignment ------------------
+# GET /ducklings/metadata surfaces each Duckling CR's status.metadataStore for
+# the org overview/detail pages — notably WHICH cnpg shard a cnpg tenant's
+# metadata landed on (composition-assigned; not in the config store). Asserts
+# the cnpg org's entry is kind=cnpg-shard with a parsed shard name, and the ext
+# org's entry is kind=external with no shard. Guards
+# provisioner.CRMetadataStores + admin/ducklings_metadata.go.
+admin_ducklings_metadata() { # cnpgOrg extOrg
+  cnpg_d="$(echo "$1" | tr 'A-Z' 'a-z')"; ext_d="$(echo "$2" | tr 'A-Z' 'a-z')"
+  log "admin ducklings metadata: shard assignment for $cnpg_d + $ext_d"
+  out="$(curl -fsS -H "$H" "$API/api/v1/ducklings/metadata")" \
+    || fail "ducklings metadata: request failed"
+  echo "$out" | jq -e '.available == true' >/dev/null \
+    || fail "ducklings metadata: available != true: $out"
+  echo "$out" | jq -e --arg d "$cnpg_d" \
+    '.entries[$d] | .kind == "cnpg-shard" and (.cnpg_shard | test("^shard-"))' >/dev/null \
+    || fail "ducklings metadata: no cnpg-shard entry with parsed shard for $cnpg_d: $(echo "$out" | jq -c --arg d "$cnpg_d" '.entries[$d]')"
+  echo "$out" | jq -e --arg d "$ext_d" \
+    '.entries[$d] | .kind == "external" and (has("cnpg_shard") | not)' >/dev/null \
+    || fail "ducklings metadata: ext entry wrong for $ext_d: $(echo "$out" | jq -c --arg d "$ext_d" '.entries[$d]')"
+  log "admin ducklings metadata OK ($cnpg_d on $(echo "$out" | jq -r --arg d "$cnpg_d" '.entries[$d].cnpg_shard'))"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -2400,6 +2423,9 @@ main() {
 
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
+
+  # ---- admin ducklings metadata: live cnpg shard assignment ----------------
+  admin_ducklings_metadata "$CNPG" "$EXT"
 
   # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
   admin_query_detail "$CNPG" "$cnpg_pw"
