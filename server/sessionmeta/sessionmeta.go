@@ -228,7 +228,12 @@ func internalCompatRelationNamesSQL() string {
 		'information_schema_columns_compat', 'information_schema_tables_compat',
 		'information_schema_schemata_compat', 'information_schema_views_compat',
 		'information_schema_sequences_compat', 'information_schema_routines_compat',
-		'__duckgres_column_metadata'
+		'__duckgres_column_metadata',
+		-- Legacy: created by pre-Iceberg-removal versions (CREATE TABLE IF NOT
+		-- EXISTS, instance-lifetime). Keep excluded so a hot-idle worker warmed
+		-- by an older binary doesn't surface it as a user table during a
+		-- rolling deploy; drop once no pre-removal workers remain.
+		'__duckgres_iceberg_column_metadata'
 	`
 }
 
@@ -812,7 +817,7 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 			NULL AS commit_action
 		FROM information_schema.tables t
 		WHERE t.table_name NOT IN (
-			'__duckgres_column_metadata',
+			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',

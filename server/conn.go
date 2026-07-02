@@ -91,7 +91,6 @@ type preparedStmt struct {
 	cursorQuery       string   // Transpiled inner SELECT (for DECLARE)
 	fetchCount        int64    // FETCH row count
 	cursorIsMove      bool     // FETCH is a MOVE: advance position without returning rows
-	warnings          []string // Transpiler warnings to surface as NoticeResponse at Execute
 }
 
 type portal struct {
@@ -1354,12 +1353,6 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		return nil
 	}
 
-	// Surface any transpiler warnings (e.g. an unenforced constraint stripped on a
-	// lake catalog) as NoticeResponse before the command result.
-	for _, w := range result.Warnings {
-		c.sendNotice("WARNING", "01000", w)
-	}
-
 	// Handle the duckgres.query_source custom GUC (SET / SHOW). Intercepted
 	// session-side; never forwarded to DuckDB.
 	if result.QuerySourceSet != nil {
@@ -1445,7 +1438,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
-				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(ctx, query, err, func(fallbackQuery string) (ExecResult, error) {
+				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(query, err, func(fallbackQuery string) (ExecResult, error) {
 					return c.executor.ExecContext(ctx, fallbackQuery)
 				})
 				if handled {

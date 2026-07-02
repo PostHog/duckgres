@@ -1,14 +1,12 @@
 package server
 
 import (
-	"context"
-
 	"github.com/posthog/duckgres/transpiler"
 )
 
 type execFallbackRunner func(string) (ExecResult, error)
 
-func (c *clientConn) execCompatibilityFallback(ctx context.Context, query string, execErr error, exec execFallbackRunner) (ExecResult, bool, error) {
+func (c *clientConn) execCompatibilityFallback(query string, execErr error, exec execFallbackRunner) (ExecResult, bool, error) {
 	if isAlterTableNotTableError(execErr) {
 		if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
 			result, err := exec(alteredQuery)

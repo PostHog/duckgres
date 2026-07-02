@@ -276,7 +276,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
 				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
 				ParamCount:        transformResult.ParamCount,
-				Warnings:          transformResult.Warnings,
 			}, nil
 		}
 
@@ -302,7 +301,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				IsNoOp:       transformResult.IsNoOp,
 				NoOpTag:      transformResult.NoOpTag,
 				IsIgnoredSet: transformResult.IsIgnoredSet,
-				Warnings:     transformResult.Warnings,
 			}, nil
 		}
 
@@ -319,7 +317,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 			IsNoOp:       transformResult.IsNoOp,
 			NoOpTag:      transformResult.NoOpTag,
 			IsIgnoredSet: transformResult.IsIgnoredSet,
-			Warnings:     transformResult.Warnings,
 		}, nil
 	}
 
@@ -336,7 +333,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 		IsNoOp:       transformResult.IsNoOp,
 		NoOpTag:      transformResult.NoOpTag,
 		IsIgnoredSet: transformResult.IsIgnoredSet,
-		Warnings:     transformResult.Warnings,
 	}, nil
 }
 

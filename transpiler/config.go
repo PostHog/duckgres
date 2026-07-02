@@ -108,9 +108,4 @@ type Result struct {
 	// should be attempted directly against DuckDB. This enables two-tier query
 	// processing where DuckDB-specific syntax works automatically.
 	FallbackToNative bool
-
-	// Warnings holds human-readable messages to surface to the client as
-	// NoticeResponse (WARNING) while still executing the statement (e.g. an
-	// unenforced constraint that was stripped on a lake catalog).
-	Warnings []string
 }

@@ -610,7 +610,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, executedQuery)
 			if err != nil {
-				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(ctx, executedQuery, err, func(fallbackQuery string) (ExecResult, error) {
+				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(executedQuery, err, func(fallbackQuery string) (ExecResult, error) {
 					return c.executor.ExecContext(ctx, fallbackQuery)
 				})
 				if handled {

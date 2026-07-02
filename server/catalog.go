@@ -102,7 +102,7 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_sequences_compat',
-			'information_schema_routines_compat', '__duckgres_column_metadata'
+			'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		)
 	`
 	if _, err := db.Exec(pgClassSQL); err != nil {
@@ -1769,8 +1769,9 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			NULL AS commit_action
 		FROM %s.tables t
 		WHERE t.table_name NOT IN (
-			-- Internal duckgres tables
-			'__duckgres_column_metadata',
+			-- Internal duckgres tables ('__duckgres_iceberg_column_metadata' is
+			-- legacy, left behind on workers warmed by pre-Iceberg-removal binaries)
+			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
 			-- pg_catalog compat views
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
@@ -1969,7 +1970,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', 'information_schema_sequences_compat',
-				'information_schema_routines_compat', '__duckgres_column_metadata'
+				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		  )
 		UNION ALL
 		-- Views from ducklake catalog
@@ -2020,7 +2021,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', 'information_schema_sequences_compat',
-				'information_schema_routines_compat', '__duckgres_column_metadata'
+				'information_schema_routines_compat', '__duckgres_column_metadata', '__duckgres_iceberg_column_metadata'
 		  )
 		UNION ALL
 		-- Sequences from ducklake catalog

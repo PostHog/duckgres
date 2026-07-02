@@ -50,9 +50,6 @@ func TestDDL_ConstraintsStrippedSilently(t *testing.T) {
 			if result.Error != nil {
 				t.Fatalf("expected no error, got %v", result.Error)
 			}
-			if len(result.Warnings) != 0 {
-				t.Fatalf("constraints must be stripped silently, got warnings %v", result.Warnings)
-			}
 			if strings.Contains(strings.ToUpper(deparsed), tc.gone) {
 				t.Errorf("constraint not stripped: %q", deparsed)
 			}
@@ -81,9 +78,6 @@ func TestDDL_SilentNullFeaturesStripped(t *testing.T) {
 			result, deparsed := runDDL(t, policy, tc.sql)
 			if result.Error != nil {
 				t.Fatalf("expected silent strip/rewrite, got error %v", result.Error)
-			}
-			if len(result.Warnings) != 0 {
-				t.Fatalf("expected silent strip/rewrite, got warnings %v", result.Warnings)
 			}
 			if strings.Contains(strings.ToLower(deparsed), tc.gone) {
 				t.Errorf("%q not stripped/rewritten: %q", tc.gone, deparsed)
@@ -155,9 +149,6 @@ func TestDDL_MemoryProfileUnaffected(t *testing.T) {
 	if result.Error != nil {
 		t.Errorf("memory profile should not error on PK/serial/default now(), got %v", result.Error)
 	}
-	if len(result.Warnings) != 0 {
-		t.Errorf("memory profile should not warn, got %v", result.Warnings)
-	}
 	if !strings.Contains(strings.ToUpper(deparsed), "PRIMARY KEY") {
 		t.Errorf("memory profile should preserve PRIMARY KEY, got %q", deparsed)
 	}
@@ -170,9 +161,6 @@ func TestDDL_DuckLakeStripsSilently(t *testing.T) {
 	result, _ := runDDL(t, policy, "CREATE TABLE t (id bigserial PRIMARY KEY, ts timestamp DEFAULT now())")
 	if result.Error != nil {
 		t.Errorf("DuckLake should not error on serial/default now(), got %v", result.Error)
-	}
-	if len(result.Warnings) != 0 {
-		t.Errorf("DuckLake should not warn, got %v", result.Warnings)
 	}
 }
 
@@ -191,9 +179,6 @@ func TestDDL_AlterAddColumnSilentNullStripped(t *testing.T) {
 			result, deparsed := runDDL(t, policy, tc.sql)
 			if result.Error != nil {
 				t.Fatalf("expected silent strip/rewrite for %q, got error %v", tc.sql, result.Error)
-			}
-			if len(result.Warnings) != 0 {
-				t.Fatalf("expected no warnings, got %v", result.Warnings)
 			}
 			if strings.Contains(strings.ToLower(deparsed), tc.gone) {
 				t.Errorf("%q not stripped/rewritten: %q", tc.gone, deparsed)
@@ -218,9 +203,6 @@ func TestDDL_AlterDropColumnPassesThrough(t *testing.T) {
 	result, deparsed := runDDL(t, policy, "ALTER TABLE t DROP COLUMN x")
 	if result.Error != nil {
 		t.Fatalf("DROP COLUMN should not error, got %v", result.Error)
-	}
-	if len(result.Warnings) != 0 {
-		t.Errorf("DROP COLUMN should pass through without warnings, got %v", result.Warnings)
 	}
 	// pg_query deparses "DROP COLUMN x" as "DROP x"; both are the same command.
 	if !strings.Contains(strings.ToUpper(deparsed), "DROP X") {
