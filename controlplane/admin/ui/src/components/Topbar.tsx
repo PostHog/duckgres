@@ -6,24 +6,23 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { getClusterCounts, subscribeClusterCounts } from "@/lib/clusterCounts";
 
-// One counter in the unified header stat row: a value + a small label, styled
-// identically for every metric (CP replicas, nodes, workers, …) so they read as
-// one design instead of a mix of health pills and counters. `muted` dims a zero
-// value for metrics where 0 is the boring/expected state (placeholders/pending).
-function Stat({ n, label, detail, muted }: { n: number; label: string; detail?: string; muted?: boolean }) {
+// One counter in the unified header stat row: a value + a small label on the top
+// line, with an optional smaller sub-line beneath (e.g. the workers' vCPU/GiB
+// totals — like the old peepernetes stat blocks). Styled identically for every
+// metric so they read as one design. `muted` dims a zero value for metrics where
+// 0 is the boring/expected state (placeholders/pending).
+function Stat({ n, label, sub, detail, muted }: { n: number; label: string; sub?: string; detail?: string; muted?: boolean }) {
   return (
-    <div className="flex items-baseline gap-1" title={detail}>
-      <span className={cn("font-mono text-sm tabular-nums", muted && n === 0 ? "text-muted-foreground" : "text-foreground")}>
-        {n}
-      </span>
-      <span className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</span>
+    <div className="flex flex-col justify-center leading-none" title={detail}>
+      <div className="flex items-baseline gap-1">
+        <span className={cn("font-mono text-sm tabular-nums", muted && n === 0 ? "text-muted-foreground" : "text-foreground")}>
+          {n}
+        </span>
+        <span className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</span>
+      </div>
+      {sub !== undefined && <span className="mt-0.5 text-[10px] tabular-nums text-muted-foreground/70">{sub}</span>}
     </div>
   );
-}
-
-// Middot divider between stats.
-function Dot() {
-  return <span className="text-xs text-muted-foreground/40">·</span>;
 }
 
 // Count of live CP replicas: prefer rows explicitly marked "active", falling
@@ -79,21 +78,20 @@ export function Topbar() {
         </div>
 
         {(cpCount !== null || counts) && (
-          <div className="flex items-center gap-2.5 border-l border-border pl-3">
+          <div className="flex items-start gap-4 border-l border-border pl-4">
             {counts && <Stat n={counts.nodes} label="nodes" />}
-            {counts && cpCount !== null && <Dot />}
             {cpCount !== null && <Stat n={cpCount} label="CP" detail="live control-plane replicas (cp_instances)" />}
             {counts && (
               <>
-                <Dot />
-                <Stat n={counts.workers} label="workers" detail={counts.workerDetail || "no worker pods running"} />
-                <Dot />
-                <Stat n={counts.cpuCores} label="CPU" detail={counts.workerDetail || undefined} muted />
-                <Dot />
-                <Stat n={counts.memGi} label="Gi" detail={counts.workerDetail || undefined} muted />
-                <Dot />
+                {/* workers carries the vCPU/GiB totals as a small sub-line — shown
+                    even at zero, like the old peepernetes stat block. */}
+                <Stat
+                  n={counts.workers}
+                  label="workers"
+                  sub={`${counts.cpuCores} vCPU · ${counts.memGi} GiB`}
+                  detail={counts.workerDetail || "no worker pods running"}
+                />
                 <Stat n={counts.placeholders} label="placeholders" detail={counts.placeholderDetail || undefined} muted />
-                <Dot />
                 <Stat n={counts.pending} label="pending" muted />
               </>
             )}
