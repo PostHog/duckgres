@@ -1082,39 +1082,94 @@ func TestRowsToRecordExplainUsesPlanValueColumn(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 
 	ctx := context.Background()
-	query := "EXPLAIN SELECT 1"
-	schema, err := GetQuerySchema(ctx, conn, query, nil)
-	if err != nil {
-		t.Fatalf("GetQuerySchema: %v", err)
+	if _, err := conn.ExecContext(ctx, "PRAGMA explain_output='all'"); err != nil {
+		t.Fatalf("set explain output: %v", err)
 	}
-	if got := schema.NumFields(); got != 1 {
-		t.Fatalf("schema fields = %d, want 1", got)
-	}
-	if got := schema.Field(0).Name; got != "physical_plan" {
-		t.Fatalf("schema field = %q, want physical_plan", got)
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE explain_write_once (id INTEGER)"); err != nil {
+		t.Fatalf("create write table: %v", err)
 	}
 
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		t.Fatalf("query: %v", err)
+	cases := []struct {
+		name        string
+		query       string
+		wantCol     string
+		minPlanRows int
+		after       func(t *testing.T)
+	}{
+		{
+			name:        "explain",
+			query:       "EXPLAIN SELECT 1",
+			wantCol:     "physical_plan",
+			minPlanRows: 2,
+		},
+		{
+			name:        "explain analyze",
+			query:       "EXPLAIN ANALYZE INSERT INTO explain_write_once VALUES (1)",
+			wantCol:     "analyzed_plan",
+			minPlanRows: 1,
+			after: func(t *testing.T) {
+				t.Helper()
+				var n int
+				if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM explain_write_once").Scan(&n); err != nil {
+					t.Fatalf("count write table: %v", err)
+				}
+				if n != 1 {
+					t.Fatalf("EXPLAIN ANALYZE write count = %d, want 1", n)
+				}
+			},
+		},
 	}
-	defer func() { _ = rows.Close() }()
 
-	rec, err := RowsToRecord(memory.NewGoAllocator(), rows, schema, 1024)
-	if err != nil {
-		t.Fatalf("RowsToRecord: %v", err)
-	}
-	if rec == nil {
-		t.Fatal("RowsToRecord returned nil")
-	}
-	defer rec.Release()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := GetQuerySchema(ctx, conn, tc.query, nil)
+			if err != nil {
+				t.Fatalf("GetQuerySchema: %v", err)
+			}
+			if got := schema.NumFields(); got != 1 {
+				t.Fatalf("schema fields = %d, want 1", got)
+			}
+			if got := schema.Field(0).Name; got != tc.wantCol {
+				t.Fatalf("schema field = %q, want %s", got, tc.wantCol)
+			}
 
-	plans := rec.Column(0).(*array.String)
-	if plans.Len() == 0 {
-		t.Fatal("EXPLAIN returned no plan rows")
+			rows, err := conn.QueryContext(ctx, tc.query)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			defer func() { _ = rows.Close() }()
+
+			rec, err := RowsToRecord(memory.NewGoAllocator(), rows, schema, 1024)
+			if err != nil {
+				t.Fatalf("RowsToRecord: %v", err)
+			}
+			if rec == nil {
+				t.Fatal("RowsToRecord returned nil")
+			}
+			defer rec.Release()
+
+			plans := rec.Column(0).(*array.String)
+			if plans.Len() < tc.minPlanRows {
+				t.Fatalf("EXPLAIN returned %d plan rows, want at least %d", plans.Len(), tc.minPlanRows)
+			}
+			for i := 0; i < plans.Len(); i++ {
+				if got := plans.Value(i); got == "" || isExplainKey(got) {
+					t.Fatalf("plan row %d = %q, want rendered plan text", i, got)
+				}
+			}
+			if tc.after != nil {
+				tc.after(t)
+			}
+		})
 	}
-	if got := plans.Value(0); got == "" || got == "physical_plan" {
-		t.Fatalf("first plan row = %q, want rendered plan text", got)
+}
+
+func isExplainKey(value string) bool {
+	switch value {
+	case "logical_plan", "logical_opt", "physical_plan", "analyzed_plan":
+		return true
+	default:
+		return false
 	}
 }
 
