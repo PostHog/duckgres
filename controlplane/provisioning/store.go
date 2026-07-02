@@ -29,7 +29,11 @@ var ErrWarehouseNonTerminal = errors.New("warehouse already exists in non-termin
 type ProvisionRequest struct {
 	OrgID        string
 	DatabaseName string
-	Warehouse    *configstore.ManagedWarehouse
+	// DefaultTeamID optionally links the org to its default PostHog team id.
+	// Optional/non-breaking: empty ⇒ the org's default_team_id is left NULL
+	// (unset), never an error. Prerequisite for pull-based compute billing.
+	DefaultTeamID string
+	Warehouse     *configstore.ManagedWarehouse
 	// RootUserHash is the bcrypt hash of the freshly-generated root
 	// password. Plaintext stays in the handler (returned to the
 	// caller); only the hash is persisted, same as before.
@@ -72,7 +76,8 @@ func (s *gormStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 
 func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
-		return createPendingWarehouseTx(tx, orgID, databaseName, warehouse)
+		// No default_team_id on this standalone path — leave the column as-is.
+		return createPendingWarehouseTx(tx, orgID, databaseName, "", warehouse)
 	})
 }
 
@@ -85,15 +90,29 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // Returns a sentinel-comparable error string ("warehouse already
 // exists in non-terminal state") so HTTP handlers can map to 409
 // without an extra error type.
-func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
+func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName, defaultTeamID string, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres creates everything)
 	org := configstore.Org{Name: orgID, DatabaseName: databaseName}
+	if defaultTeamID != "" {
+		// Set default_team_id on create. Optional/non-breaking: an empty value
+		// leaves the column NULL (unset), and re-provisioning without it does
+		// NOT wipe an existing value (see the explicit update below).
+		org.DefaultTeamID = &defaultTeamID
+	}
 	if err := tx.Where("name = ?", orgID).FirstOrCreate(&org).Error; err != nil {
 		return err
 	}
 	// Update database name if org already existed with a different one
 	if org.DatabaseName != databaseName {
 		if err := tx.Model(&org).Update("database_name", databaseName).Error; err != nil {
+			return err
+		}
+	}
+	// If a default_team_id was supplied, persist it even when the org already
+	// existed (FirstOrCreate only sets fields on insert). Only ever set, never
+	// cleared here, so an omitted value is a no-op rather than a wipe.
+	if defaultTeamID != "" {
+		if err := tx.Model(&org).Update("default_team_id", defaultTeamID).Error; err != nil {
 			return err
 		}
 	}
@@ -161,7 +180,7 @@ func (s *gormStore) Provision(req ProvisionRequest) error {
 	}
 	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
 		// 1. Warehouse + Org (extracted helper).
-		if err := createPendingWarehouseTx(tx, req.OrgID, req.DatabaseName, req.Warehouse); err != nil {
+		if err := createPendingWarehouseTx(tx, req.OrgID, req.DatabaseName, req.DefaultTeamID, req.Warehouse); err != nil {
 			return err
 		}
 

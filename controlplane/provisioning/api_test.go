@@ -112,6 +112,12 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	if _, ok := s.orgs[req.OrgID]; !ok {
 		s.orgs[req.OrgID] = &configstore.Org{Name: req.OrgID, DatabaseName: req.DatabaseName}
 	}
+	// default_team_id is optional/non-breaking: set it only when supplied,
+	// mirroring createPendingWarehouseTx (empty ⇒ leave NULL, never wipe).
+	if req.DefaultTeamID != "" {
+		teamID := req.DefaultTeamID
+		s.orgs[req.OrgID].DefaultTeamID = &teamID
+	}
 	clone := *req.Warehouse
 	clone.OrgID = req.OrgID
 	clone.State = configstore.ManagedWarehouseStatePending
@@ -220,6 +226,57 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	}
 	if store.warehouses["new-org"] == nil {
 		t.Fatal("expected warehouse to be created")
+	}
+}
+
+// TestProvisionPersistsDefaultTeamID checks the optional default_team_id in the
+// provision body is threaded through to the org record.
+func TestProvisionPersistsDefaultTeamID(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "team-db", "default_team_id": "12345", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/team-org/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	org, ok := store.orgs["team-org"]
+	if !ok {
+		t.Fatal("expected org to be auto-created")
+	}
+	if org.DefaultTeamID == nil {
+		t.Fatal("expected default_team_id to be set, got nil")
+	}
+	if *org.DefaultTeamID != "12345" {
+		t.Fatalf("default_team_id = %q, want %q", *org.DefaultTeamID, "12345")
+	}
+}
+
+// TestProvisionWithoutDefaultTeamIDLeavesNull checks default_team_id is optional:
+// an absent field leaves the org's default_team_id NULL with no error.
+func TestProvisionWithoutDefaultTeamIDLeavesNull(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "noteam-db", "metadata_store": {"type": "cnpg-shard"}, "iceberg": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/noteam-org/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	org, ok := store.orgs["noteam-org"]
+	if !ok {
+		t.Fatal("expected org to be auto-created")
+	}
+	if org.DefaultTeamID != nil {
+		t.Fatalf("expected default_team_id to be nil (NULL), got %q", *org.DefaultTeamID)
 	}
 }
 

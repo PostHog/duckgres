@@ -202,6 +202,10 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		if o.HostnameAlias != nil {
 			alias = *o.HostnameAlias
 		}
+		defaultTeamID := ""
+		if o.DefaultTeamID != nil {
+			defaultTeamID = *o.DefaultTeamID
+		}
 		oc := &OrgConfig{
 			Name:                    o.Name,
 			DatabaseName:            o.DatabaseName,
@@ -212,6 +216,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			DefaultWorkerMemory:     o.DefaultWorkerMemory,
 			DefaultWorkerTTL:        o.DefaultWorkerTTL,
 			DefaultWorkerMinHotIdle: o.DefaultWorkerMinHotIdle,
+			DefaultTeamID:           defaultTeamID,
 			Users:                   make(map[string]string),
 			Warehouse:               copyManagedWarehouseConfig(o.Warehouse),
 		}
@@ -489,6 +494,24 @@ func (cs *ConfigStore) OrgDefaultWorkerMinHotIdle(orgID string) int {
 		return 0
 	}
 	return oc.DefaultWorkerMinHotIdle
+}
+
+// OrgDefaultTeamID returns the org's default PostHog team id from the current
+// snapshot, or "" when unset (including unknown orgs and a not-yet-loaded
+// snapshot). NULLABLE/optional: an empty return is a valid, non-error state —
+// callers must tolerate it and MUST NOT fail a connection or activation on it.
+// Prerequisite for pull-based compute billing (usage keyed by team id).
+func (cs *ConfigStore) OrgDefaultTeamID(orgID string) string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return ""
+	}
+	oc, ok := cs.snapshot.Orgs[orgID]
+	if !ok {
+		return ""
+	}
+	return oc.DefaultTeamID
 }
 
 // ValidateOrgUser checks username/password scoped to a specific org.
