@@ -505,11 +505,17 @@ func queryLogColumnExists(db *sql.DB, fullTableName, tableSchema, tableName, col
 }
 
 func queryLogColumnType(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (string, error) {
-	query := fmt.Sprintf("SELECT data_type FROM %s WHERE table_name = $1 AND column_name = $2", queryLogColumnsTable(fullTableName))
+	query := "SELECT data_type FROM information_schema.columns WHERE table_name = $1 AND column_name = $2"
 	args := []any{tableName, columnName}
+	nextParam := 3
 	if strings.TrimSpace(tableSchema) != "" {
-		query += " AND table_schema = $3"
+		query += fmt.Sprintf(" AND table_schema = $%d", nextParam)
 		args = append(args, tableSchema)
+		nextParam++
+	}
+	if catalogName := queryLogCatalogName(fullTableName); catalogName != "" {
+		query += fmt.Sprintf(" AND table_catalog = $%d", nextParam)
+		args = append(args, catalogName)
 	}
 
 	var colType string
@@ -517,12 +523,12 @@ func queryLogColumnType(db *sql.DB, fullTableName, tableSchema, tableName, colum
 	return colType, err
 }
 
-func queryLogColumnsTable(fullTableName string) string {
+func queryLogCatalogName(fullTableName string) string {
 	parts := strings.Split(fullTableName, ".")
 	if len(parts) == 3 {
-		return parts[0] + ".information_schema.columns"
+		return strings.TrimSpace(parts[0])
 	}
-	return "information_schema.columns"
+	return ""
 }
 
 func escapeSQLStringLiteral(s string) string {

@@ -419,6 +419,33 @@ func TestEnsureQueryLogTableCreatesResourceUsageColumns(t *testing.T) {
 	}
 }
 
+func TestEnsureQueryLogTableWithAttachedCatalog(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("ATTACH ':memory:' AS ducklake"); err != nil {
+		t.Fatalf("attach ducklake catalog: %v", err)
+	}
+	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
+		t.Fatalf("create attached schema: %v", err)
+	}
+
+	if err := ensureQueryLogTable(db, "system", "query_log", "ducklake.system.query_log"); err != nil {
+		t.Fatalf("ensureQueryLogTable: %v", err)
+	}
+
+	got, err := queryLogColumnType(db, "ducklake.system.query_log", "system", "query_log", "cpu_time_s")
+	if err != nil {
+		t.Fatalf("queryLogColumnType(cpu_time_s): %v", err)
+	}
+	if got != "DOUBLE" {
+		t.Fatalf("expected cpu_time_s type DOUBLE, got %s", got)
+	}
+}
+
 func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
