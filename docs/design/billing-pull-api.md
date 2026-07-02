@@ -37,8 +37,10 @@ Internally, one row per unique key, values accumulated:
   config-store org→team default), reported so the shape is right, but **no per-team
   attribution logic** yet. A "team" is really a schema and one connection can span
   several, so true per-team split is future work; today every bucket carries the
-  org's default team. `query_source` (the worker's role: standard query vs
-  endpoints) is resolved at connection time and threaded onto the connection.
+  org's default team. `query_source` (`standard` | `endpoints`) is set by a session
+  GUC (`duckgres.query_source`), defaulting to `standard` when unset; the meter
+  reads it per connection. (If it's changed mid-connection the per-connection meter
+  uses a single value — same future refinement as team.)
 - Worker size (`cpu`, `mem_gib`) is part of the key, so different worker sizes
   accumulate — and bill — separately. Units match the values (vCPU / GiB).
 
@@ -153,8 +155,9 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
   the HTTP API (aggregate-on-read into one row per key + watermark ack) + safety GC.
 - **Add:** a `default_team_id` column on the org (used as the bucket `team_id` —
-  fixed per org, no per-team logic yet) and the connection's `query_source`
-  (standard vs endpoints) threaded onto the connection; a bearer secret for the API.
+  fixed per org, no per-team logic yet); a `duckgres.query_source` session GUC
+  (`standard` | `endpoints`, default `standard`) read by the meter; a bearer secret
+  for the API.
 
 ## Defaults / house-keeping
 
