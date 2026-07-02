@@ -50,6 +50,8 @@ type configStoreQueryLogDuckLakeConfigResolver struct {
 	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
 }
 
+const queryLogWriterEmptyMetadataSecretRefError = "metadata store credentials: secret ref requires name and key"
+
 func (r *configStoreQueryLogDuckLakeConfigResolver) ResolveQueryLogDuckLakeConfig(ctx context.Context, orgID string) (server.QueryLogDuckLakeResolvedConfig, error) {
 	snap := r.store.Snapshot()
 	if snap == nil {
@@ -57,7 +59,7 @@ func (r *configStoreQueryLogDuckLakeConfigResolver) ResolveQueryLogDuckLakeConfi
 	}
 	org, ok := snap.Orgs[orgID]
 	if !ok || org == nil {
-		return server.QueryLogDuckLakeResolvedConfig{}, fmt.Errorf("querylog: org %q not found in config snapshot", orgID)
+		return server.QueryLogDuckLakeResolvedConfig{}, fmt.Errorf("%w: org %q not found in config snapshot", server.ErrQueryLogNoDuckLakeTarget, orgID)
 	}
 	payload, err := controlplane.BuildTenantActivationPayloadWithResolver(
 		ctx,
@@ -69,6 +71,9 @@ func (r *configStoreQueryLogDuckLakeConfigResolver) ResolveQueryLogDuckLakeConfi
 		r.resolveDucklingStatus,
 	)
 	if err != nil {
+		if queryLogWriterActivationErrorIsNoDuckLakeTarget(err) {
+			return server.QueryLogDuckLakeResolvedConfig{}, fmt.Errorf("%w: %v", server.ErrQueryLogNoDuckLakeTarget, err)
+		}
 		return server.QueryLogDuckLakeResolvedConfig{}, err
 	}
 	cfg := r.base
@@ -79,6 +84,13 @@ func (r *configStoreQueryLogDuckLakeConfigResolver) ResolveQueryLogDuckLakeConfi
 		Config:               cfg,
 		CredentialsExpiresAt: payload.S3CredentialsExpiresAt,
 	}, nil
+}
+
+func queryLogWriterActivationErrorIsNoDuckLakeTarget(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), queryLogWriterEmptyMetadataSecretRefError)
 }
 
 func runQueryLogWriter(ctx context.Context, cfg server.Config, resolved configresolve.Resolved) error {
