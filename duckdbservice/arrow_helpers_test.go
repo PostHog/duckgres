@@ -1069,6 +1069,55 @@ func TestGetQuerySchemaExplainDoesNotExecute(t *testing.T) {
 	}
 }
 
+func TestRowsToRecordExplainUsesPlanValueColumn(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx := context.Background()
+	query := "EXPLAIN SELECT 1"
+	schema, err := GetQuerySchema(ctx, conn, query, nil)
+	if err != nil {
+		t.Fatalf("GetQuerySchema: %v", err)
+	}
+	if got := schema.NumFields(); got != 1 {
+		t.Fatalf("schema fields = %d, want 1", got)
+	}
+	if got := schema.Field(0).Name; got != "physical_plan" {
+		t.Fatalf("schema field = %q, want physical_plan", got)
+	}
+
+	rows, err := conn.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	rec, err := RowsToRecord(memory.NewGoAllocator(), rows, schema, 1024)
+	if err != nil {
+		t.Fatalf("RowsToRecord: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("RowsToRecord returned nil")
+	}
+	defer rec.Release()
+
+	plans := rec.Column(0).(*array.String)
+	if plans.Len() == 0 {
+		t.Fatal("EXPLAIN returned no plan rows")
+	}
+	if got := plans.Value(0); got == "" || got == "physical_plan" {
+		t.Fatalf("first plan row = %q, want rendered plan text", got)
+	}
+}
+
 func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 	// Regression test: queries ending with ";" caused "syntax error at or near LIMIT"
 	// because GetQuerySchema appended " LIMIT 0" after the semicolon, producing "; LIMIT 0".
@@ -1206,4 +1255,3 @@ func TestRowsToRecordNoRowsLostAtBatchBoundary(t *testing.T) {
 		})
 	}
 }
-
