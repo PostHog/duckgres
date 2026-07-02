@@ -308,9 +308,7 @@ spec:
             # worker image is arm64-only and the default pool is mixed-arch, so
             # pin the arch (no toleration needed — the default pool is untainted).
             - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"kubernetes.io/arch":"arm64"}' }
-            # Lakekeeper/Iceberg provisioning is intentionally not wired into
-            # the PR e2e stack; the product direction moved back to DuckLake.
-            # The harness still provisions real cnpg-shard and external
+            # The harness provisions real cnpg-shard and external
             # metadata-store orgs.
             # Org identity is resolved from the TLS SNI hostname
             # <org-id>.<managed-suffix> (the server rejects connections without

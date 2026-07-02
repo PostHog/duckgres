@@ -131,7 +131,7 @@ type apiStore interface {
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
-	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error)
+	UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
@@ -261,16 +261,13 @@ func (s *gormAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
 	}
 	if passthrough != nil {
 		updates["passthrough"] = *passthrough
-	}
-	if defaultCatalog != nil {
-		updates["default_catalog"] = *defaultCatalog
 	}
 	if maxVCPUs != nil {
 		updates["max_vcpus"] = *maxVCPUs
@@ -419,9 +416,6 @@ func managedWarehouseUpsertColumns() []string {
 		"s3_url_style",
 		"s3_delta_catalog_enabled",
 		"s3_delta_catalog_path",
-		"iceberg_enabled",
-		"iceberg_region",
-		"iceberg_namespace",
 		"worker_identity_namespace",
 		"worker_identity_iam_role_arn",
 		"warehouse_database_credentials_namespace",
@@ -440,7 +434,6 @@ func managedWarehouseUpsertColumns() []string {
 		"status_message",
 		"metadata_store_state",
 		"s3_state",
-		"iceberg_state",
 		"identity_state",
 		"secrets_state",
 		"ready_at",
@@ -470,7 +463,6 @@ type managedWarehouseRequest struct {
 	MetadataStore                configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
 	PgBouncer                    configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
 	S3                           configstore.ManagedWarehouseS3                `json:"s3"`
-	Iceberg                      configstore.ManagedWarehouseIceberg           `json:"iceberg"`
 	WorkerIdentity               configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
 	WarehouseDatabaseCredentials configstore.SecretRef                         `json:"warehouse_database_credentials"`
 	MetadataStoreCredentials     configstore.SecretRef                         `json:"metadata_store_credentials"`
@@ -480,7 +472,6 @@ type managedWarehouseRequest struct {
 	StatusMessage                string                                        `json:"status_message"`
 	MetadataStoreState           configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
 	S3State                      configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
-	IcebergState                 configstore.ManagedWarehouseProvisioningState `json:"iceberg_state"`
 	IdentityState                configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
 	SecretsState                 configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
 	ReadyAt                      *time.Time                                    `json:"ready_at"`
@@ -991,12 +982,11 @@ func (h *apiHandler) listUsers(c *gin.Context) {
 func (h *apiHandler) createUser(c *gin.Context) {
 	// Use a raw struct because OrgUser.Password has json:"-"
 	var raw struct {
-		Username       string `json:"username"`
-		Password       string `json:"password"`
-		OrgID          string `json:"org_id"`
-		Passthrough    bool   `json:"passthrough"`
-		DefaultCatalog string `json:"default_catalog"`
-		MaxVCPUs       int    `json:"max_vcpus"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		OrgID       string `json:"org_id"`
+		Passthrough bool   `json:"passthrough"`
+		MaxVCPUs    int    `json:"max_vcpus"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1010,12 +1000,6 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
 		return
 	}
-	if catalog, err := validateDefaultCatalog(raw.DefaultCatalog); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	} else {
-		raw.DefaultCatalog = catalog
-	}
 	if raw.MaxVCPUs < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
 		return
@@ -1026,12 +1010,11 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		return
 	}
 	user := configstore.OrgUser{
-		Username:       raw.Username,
-		Password:       hash,
-		OrgID:          raw.OrgID,
-		Passthrough:    raw.Passthrough,
-		DefaultCatalog: raw.DefaultCatalog,
-		MaxVCPUs:       raw.MaxVCPUs,
+		Username:    raw.Username,
+		Password:    hash,
+		OrgID:       raw.OrgID,
+		Passthrough: raw.Passthrough,
+		MaxVCPUs:    raw.MaxVCPUs,
 	}
 	// The audit row's org/target columns come from URL params, but this route is
 	// the top-level POST /users with no params — record who was created here.
@@ -1060,10 +1043,9 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 	// Passthrough is *bool so omitting it preserves the stored value; sending
 	// `false` explicitly clears the flag.
 	var raw struct {
-		Password       string  `json:"password"`
-		Passthrough    *bool   `json:"passthrough,omitempty"`
-		DefaultCatalog *string `json:"default_catalog,omitempty"`
-		MaxVCPUs       *int    `json:"max_vcpus,omitempty"`
+		Password    string `json:"password"`
+		Passthrough *bool  `json:"passthrough,omitempty"`
+		MaxVCPUs    *int   `json:"max_vcpus,omitempty"`
 	}
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -1093,14 +1075,6 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		passwordHash = hash
 	}
-	if raw.DefaultCatalog != nil {
-		catalog, err := validateDefaultCatalog(*raw.DefaultCatalog)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		raw.DefaultCatalog = &catalog
-	}
 	if maxVCPUs != nil && *maxVCPUs < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
 		return
@@ -1114,9 +1088,6 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 	if raw.Passthrough != nil {
 		changes = append(changes, fmt.Sprintf("passthrough=%v", *raw.Passthrough))
 	}
-	if raw.DefaultCatalog != nil {
-		changes = append(changes, "default_catalog="+orgStr(*raw.DefaultCatalog))
-	}
 	if maxVCPUs != nil {
 		changes = append(changes, fmt.Sprintf("max_vcpus=%d", *maxVCPUs))
 	}
@@ -1124,7 +1095,7 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}
 
-	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog, maxVCPUs)
+	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, maxVCPUs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1134,16 +1105,6 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, user)
-}
-
-func validateDefaultCatalog(raw string) (string, error) {
-	if raw == "" {
-		return "", nil
-	}
-	if raw == "iceberg" {
-		return raw, nil
-	}
-	return "", errors.New("default_catalog must be empty or iceberg")
 }
 
 func (h *apiHandler) deleteUser(c *gin.Context) {

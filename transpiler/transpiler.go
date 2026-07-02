@@ -98,7 +98,7 @@ func New(cfg Config) *Transpiler {
 	t.transforms = append(t.transforms, taggedTransform{FlagInfoSchema, transform.NewInformationSchemaTransform()})
 
 	// 3.1 Map PostgreSQL "public" schema to DuckDB "main" (backends whose default
-	// schema is "main"; disabled for Iceberg whose schema is literally "public")
+	// schema is "main"; disabled for backends whose schema is literally "public")
 	t.transforms = append(t.transforms, taggedTransform{FlagPublicSchema, transform.NewPublicSchemaTransform(catalogPolicy.MapPublicToMain)})
 
 	// 3.2 Map logical database catalog references to the physical backend catalog
@@ -276,7 +276,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
 				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
 				ParamCount:        transformResult.ParamCount,
-				Warnings:          transformResult.Warnings,
 			}, nil
 		}
 
@@ -289,7 +288,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				ParamCount:      transformResult.ParamCount,
 				QuerySourceSet:  transformResult.QuerySourceSet,
 				QuerySourceShow: transformResult.QuerySourceShow,
-				Warnings:        transformResult.Warnings,
 			}, nil
 		}
 
@@ -302,7 +300,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 				IsNoOp:       transformResult.IsNoOp,
 				NoOpTag:      transformResult.NoOpTag,
 				IsIgnoredSet: transformResult.IsIgnoredSet,
-				Warnings:     transformResult.Warnings,
 			}, nil
 		}
 
@@ -319,7 +316,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 			IsNoOp:       transformResult.IsNoOp,
 			NoOpTag:      transformResult.NoOpTag,
 			IsIgnoredSet: transformResult.IsIgnoredSet,
-			Warnings:     transformResult.Warnings,
 		}, nil
 	}
 
@@ -336,7 +332,6 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 		IsNoOp:       transformResult.IsNoOp,
 		NoOpTag:      transformResult.NoOpTag,
 		IsIgnoredSet: transformResult.IsIgnoredSet,
-		Warnings:     transformResult.Warnings,
 	}, nil
 }
 

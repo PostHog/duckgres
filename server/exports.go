@@ -225,8 +225,8 @@ func CancelClientConn(cc *clientConn) {
 }
 
 // SetCatalogUseRewrite records whether this session should expand a bare
-// `USE ducklake`/`USE iceberg` into its reliable two-part target. This is not
-// masking — the catalog names are real; it only works around DuckDB's
+// `USE ducklake` into its reliable two-part target. This is not
+// masking — the catalog name is real; it only works around DuckDB's
 // bare-catalog `USE` resolution.
 func SetCatalogUseRewrite(cc *clientConn, enabled bool) {
 	if cc != nil {
@@ -242,16 +242,6 @@ func SetCatalogUseRewrite(cc *clientConn, enabled bool) {
 func SetPassthrough(cc *clientConn, enabled bool) {
 	if cc != nil {
 		cc.passthrough = enabled
-	}
-}
-
-// SetConnectionIcebergConfig records the per-tenant Iceberg config for
-// control-plane proxy connections. The proxy server's global config is not
-// tenant-specific, so query-time metadata loading must use this override.
-func SetConnectionIcebergConfig(cc *clientConn, cfg IcebergConfig) {
-	if cc != nil {
-		cc.tenantIcebergConfig = cfg
-		cc.hasTenantIcebergConfig = true
 	}
 }
 

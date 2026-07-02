@@ -9,11 +9,11 @@ func TestParseStartupOptions(t *testing.T) {
 		key     string
 		want    string
 	}{
-		{"space-separated -c", "-c search_path=iceberg.public", "search_path", "iceberg.public"},
-		{"combined -c", "-csearch_path=iceberg.public", "search_path", "iceberg.public"},
-		{"double-dash", "--search_path=iceberg.public", "search_path", "iceberg.public"},
-		{"multiple settings", "-c search_path=iceberg.public -c work_mem=64MB", "work_mem", "64MB"},
-		{"escaped space in value", `-c search_path=iceberg.public,\ memory.main`, "search_path", "iceberg.public, memory.main"},
+		{"space-separated -c", "-c search_path=analytics.public", "search_path", "analytics.public"},
+		{"combined -c", "-csearch_path=analytics.public", "search_path", "analytics.public"},
+		{"double-dash", "--search_path=analytics.public", "search_path", "analytics.public"},
+		{"multiple settings", "-c search_path=analytics.public -c work_mem=64MB", "work_mem", "64MB"},
+		{"escaped space in value", `-c search_path=analytics.public,\ memory.main`, "search_path", "analytics.public, memory.main"},
 		{"empty", "", "search_path", ""},
 		{"unrelated", "-c work_mem=64MB", "search_path", ""},
 	}
@@ -28,9 +28,9 @@ func TestParseStartupOptions(t *testing.T) {
 
 func TestSanitizeSearchPath(t *testing.T) {
 	ok := []string{
-		"iceberg.public",
-		"iceberg.public, memory.main",
-		`"iceberg"."public"`,
+		"analytics.public",
+		"analytics.public, memory.main",
+		`"analytics"."public"`,
 		"ducklake.main",
 		"my_schema",
 	}
@@ -42,8 +42,8 @@ func TestSanitizeSearchPath(t *testing.T) {
 
 	bad := []string{
 		"",
-		"iceberg.public'; DROP SCHEMA x; --",
-		"iceberg.public; SELECT 1",
+		"analytics.public'; DROP SCHEMA x; --",
+		"analytics.public; SELECT 1",
 		"foo' || (SELECT 1)",
 		"a(b)",
 		// Standalone metacharacters: these guard that the `\-` in the allowlist

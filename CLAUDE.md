@@ -128,7 +128,7 @@ exercises it (and update it if the path moved) — a refactor that quietly drops
 e2e coverage is a regression in the test suite even if behavior is unchanged. Unit/package tests are necessary but not sufficient: a
 change is only "done" once it is exercised against the real mw-dev cluster —
 real worker pods, real Crossplane ducklings, real cnpg/RDS metadata, real
-Lakekeeper, real S3/Iceberg/STS. "Solid" means a deterministic pass/fail
+S3/STS. "Solid" means a deterministic pass/fail
 assertion of the actual user-visible behavior (not just "it didn't error"), with
 transient/cold-pool conditions handled, on both metadata backends (cnpg + ext)
 where it touches metadata. A bugfix gets a regression assertion that would have
@@ -141,20 +141,19 @@ Three test lanes worth knowing about, in increasing order of blast radius:
 
 - **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives. Includes `tests/manifests/` (static-manifest artifact asserts for `k8s/rbac.yaml` + `k8s/networkpolicy.yaml`).
 - **`tests/integration/`** (`just test-integration`): spins up the standalone server binary against a real MinIO + Postgres metadata store via docker compose. Covers wire protocol, DuckLake on real S3-compatible storage, transpilation against a live server.
-- **`tests/e2e-mw-dev/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real per-org Lakekeeper, real AWS S3/Iceberg. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/e2e-mw-dev/README.md`.
+- **`tests/e2e-mw-dev/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real AWS S3. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/e2e-mw-dev/README.md`.
 
 ### When code changes obligate test changes
 
 `tests/e2e-mw-dev/` is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating the harness as part of the change, not a follow-up:
 
-- `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`, `server.IcebergConfig`)
-- `server/server.go::AttachDeltaCatalog`, `server.AttachIcebergCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
-- `server/iceberg/` (config, dispatcher, backend implementations) — the harness provisions iceberg-enabled ducklings on both cnpg + ext backends and asserts the catalog attaches + reads/writes
+- `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`)
+- `server/server.go::AttachDeltaCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
 - `controlplane/configstore/models.go` — new columns flow through the provisioning API the harness calls; exercise them via a provision body field
 - `duckdbservice/activation.go`, `worker_activation.go` — worker-side activation order
 - Any code path that wires AWS credentials through to DuckDB SECRETs
 
-The contract: if the harness no longer exercises a path you changed, **update `harness.sh`**; if your change removes a path it asserts against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers / iceberg activation checks in `harness.sh` are the load-bearing ones for catalog wiring — keep them honest.
+The contract: if the harness no longer exercises a path you changed, **update `harness.sh`**; if your change removes a path it asserts against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers checks in `harness.sh` are the load-bearing ones for catalog wiring — keep them honest.
 
 ## Dependencies
 
@@ -273,7 +272,7 @@ Invariants for anyone touching this path:
   secrets — persistent ones AND non-persistent (plain/TEMPORARY `CREATE
   SECRET`) ones, which pass through to the worker and would otherwise leak to
   the next user. It preserves only the system-managed allowlist
-  (`usersecrets.IsReservedName`: `ducklake_s3`/`iceberg_sigv4`/`iceberg_oauth`
+  (`usersecrets.IsReservedName`: `ducklake_s3`
   + the `__default_*`/`duckgres_*` prefixes, which activation re-creates). It
   MUST run before replay on every CreateSession in shared-warm mode, and a
   wipe failure MUST fail the session.

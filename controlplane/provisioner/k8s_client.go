@@ -45,14 +45,6 @@ type DucklingStatus struct {
 		BucketName string
 		S3Region   string
 	}
-	// Iceberg is populated when spec.iceberg.enabled=true. The
-	// composition provisions a per-org Lakekeeper instance; the
-	// Lakekeeper provisioner extension drives readiness off the
-	// Lakekeeper CR itself, so we only need namespace/region here.
-	Iceberg struct {
-		NamespaceName string
-		Region        string
-	}
 	IAMRoleARN         string
 	ReadyCondition     bool
 	SyncedFalseMessage string
@@ -88,8 +80,8 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 }
 
 // ducklingName is the k8s/AWS resource name derived from an org ID, used for
-// the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, the
-// Lakekeeper CR/SA/Secret, etc. Org IDs are validated as DNS-1123 labels at
+// the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, etc. Org IDs
+// are validated as DNS-1123 labels at
 // provision time (lowercase alphanumerics + hyphens), so this only lowercases:
 // hyphens are preserved, keeping in-cluster names human-readable and injective
 // with the org ID.
@@ -110,7 +102,7 @@ var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
 // mapped to '_'. Postgres identifiers can't contain hyphens unquoted, so PG
 // object names can't preserve them the way k8s names do. This mirrors the
 // Crossplane composition's $pgIdent transform for cnpg-shard, so the external
-// (provisioner-created) and cnpg-shard (composition-created) Lakekeeper
+// (provisioner-created) and cnpg-shard (composition-created)
 // databases follow the same convention. Injective for org IDs restricted to
 // [a-z0-9-], which the provision-time validation guarantees.
 func pgIdentSuffix(orgID string) string {
@@ -150,18 +142,8 @@ type CreateOptions struct {
 	DataStoreBucket string
 	DataStoreRegion string
 
-	// IcebergEnabled toggles spec.iceberg.enabled on the Duckling CR. The
-	// composition only provisions the per-tenant Lakekeeper Iceberg catalog
-	// when this is true; flipping it post-create is handled by the controller's
-	// Ready-state drift logic.
-	IcebergEnabled bool
-	// IcebergNamespace is the Iceberg namespace within the tenant's catalog.
-	// Empty falls back to the XRD default ("main").
-	IcebergNamespace string
-
-	// DuckLakeEnabled toggles spec.ducklake.enabled. Independent of Iceberg and
-	// of the metadata-store type; at least one of DuckLakeEnabled/IcebergEnabled
-	// must be true (Create rejects a CR with neither).
+	// DuckLakeEnabled toggles spec.ducklake.enabled. Independent of the
+	// metadata-store type; must be true (Create rejects a CR without a catalog).
 	DuckLakeEnabled bool
 }
 
@@ -175,11 +157,10 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		// The cnpg-shard metadata store is the per-tenant Postgres on the shared
 		// CloudNativePG shard, provisioned via provider-sql. It carries no
 		// per-claim config — the composition reads the active shard from chart
-		// values. It hosts the DuckLake catalog and/or the Lakekeeper PG
-		// depending on the catalog flags; a CR with neither catalog has nothing
-		// to attach, so refuse it.
-		if !opts.IcebergEnabled && !opts.DuckLakeEnabled {
-			return fmt.Errorf("create duckling CR %q: metadata store type %q requires at least one of ducklake or iceberg enabled", name, configstore.MetadataStoreKindCnpgShard)
+		// values. It hosts the DuckLake catalog; a CR without a catalog has
+		// nothing to attach, so refuse it.
+		if !opts.DuckLakeEnabled {
+			return fmt.Errorf("create duckling CR %q: metadata store type %q requires ducklake enabled", name, configstore.MetadataStoreKindCnpgShard)
 		}
 		// No pgbouncer block: cnpg-shard tenants reach Postgres through the
 		// shard's own session-mode Pooler, not a per-Duckling PgBouncer.
@@ -187,9 +168,8 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	case configstore.MetadataStoreKindExternal:
 		// A pre-existing Postgres (e.g. RDS), referenced by endpoint + an AWS
 		// Secrets Manager secret name for the password (resolved by the
-		// composition via ESO). Backs a DuckLake catalog (iceberg disabled) or
-		// the Lakekeeper catalog (iceberg enabled). User/Database are omitted
-		// when empty so the XRD defaults ("postgres") apply.
+		// composition via ESO). Backs a DuckLake catalog. User/Database are
+		// omitted when empty so the XRD defaults ("postgres") apply.
 		if opts.ExternalEndpoint == "" || opts.ExternalPasswordAWSSecret == "" {
 			return fmt.Errorf("create duckling CR %q: metadata store type %q requires endpoint and passwordAwsSecret", name, configstore.MetadataStoreKindExternal)
 		}
@@ -251,13 +231,6 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		// and only falls back to the legacy type-based default when the field is
 		// absent (i.e. for ducklings created before decoupling).
 		"ducklake": map[string]interface{}{"enabled": opts.DuckLakeEnabled},
-	}
-	if opts.IcebergEnabled {
-		iceberg := map[string]interface{}{"enabled": true}
-		if ns := opts.IcebergNamespace; ns != "" {
-			iceberg["namespace"] = ns
-		}
-		spec["iceberg"] = iceberg
 	}
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -441,59 +414,6 @@ func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, 
 	return nil
 }
 
-// GetIcebergEnabled reads spec.iceberg.enabled from the Duckling CR. Missing
-// blocks (composition at an older schema, CR predates iceberg support) are
-// reported as false — same as an explicit opt-out — so the caller can just
-// compare against the desired value.
-func (d *DucklingClient) GetIcebergEnabled(ctx context.Context, orgID string) (bool, error) {
-	cr, name, err := d.getCR(ctx, orgID)
-	if err != nil {
-		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
-	}
-	spec, ok := cr.Object["spec"].(map[string]interface{})
-	if !ok {
-		return false, nil
-	}
-	iceberg, ok := spec["iceberg"].(map[string]interface{})
-	if !ok {
-		return false, nil
-	}
-	enabled, _ := iceberg["enabled"].(bool)
-	return enabled, nil
-}
-
-// SetIcebergEnabled patches spec.iceberg.enabled on the Duckling CR for the
-// given org. Uses a JSON merge patch (RFC 7396) so the call is idempotent and
-// only touches the iceberg block — sibling fields under spec (metadataStore,
-// dataStore) are left untouched.
-//
-// Note: iceberg.namespace is enforced immutable by the XRD's CEL rule, so
-// this method intentionally only patches enabled — namespace changes have
-// to go through warehouse re-creation.
-func (d *DucklingClient) SetIcebergEnabled(ctx context.Context, orgID string, enabled bool) error {
-	_, name, err := d.getCR(ctx, orgID)
-	if err != nil {
-		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
-	}
-	patch, err := json.Marshal(map[string]interface{}{
-		"spec": map[string]interface{}{
-			"iceberg": map[string]interface{}{
-				"enabled": enabled,
-			},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("marshal iceberg patch for %q: %w", name, err)
-	}
-	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
-		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("patch duckling CR %q iceberg: %w", name, err)
-	}
-	return nil
-}
-
 // GetDataStoreBucketName reads spec.dataStore.bucketName from the Duckling CR.
 // Empty (missing block / missing key) means the CR predates CP-owned naming
 // and the composition is still deriving the name — the signal the backfill in
@@ -597,12 +517,6 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		ds.DataStore.Type = getNestedString(store, "type")
 		ds.DataStore.BucketName = getNestedString(store, "bucketName")
 		ds.DataStore.S3Region = getNestedString(store, "s3Region")
-	}
-
-	// Parse status.iceberg (only populated when spec.iceberg.enabled=true)
-	if ic, ok := status["iceberg"].(map[string]interface{}); ok {
-		ds.Iceberg.NamespaceName = getNestedString(ic, "namespaceName")
-		ds.Iceberg.Region = getNestedString(ic, "region")
 	}
 
 	// Parse conditions

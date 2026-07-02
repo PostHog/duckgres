@@ -12,7 +12,7 @@ type LogicalCatalogTransform struct {
 	LogicalDatabaseName string
 	PhysicalCatalogName string
 	// MapPublicToMain rewrites a "public" schema reference to "main" when
-	// rewriting the catalog. False for Iceberg, whose physical schema is "public".
+	// rewriting the catalog. False for backends whose physical schema is "public".
 	MapPublicToMain bool
 }
 

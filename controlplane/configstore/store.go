@@ -38,14 +38,13 @@ var ErrOrgUserNotFound = errors.New("org user not found")
 
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
-	Orgs                  map[string]*OrgConfig
-	DatabaseOrg           map[string]string     // database name -> org ID
-	HostnameAliasOrg      map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
-	OrgUserPassword       map[OrgUserKey]string // (orgID, username) -> bcrypt hash
-	OrgUserPassthrough    map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
-	OrgUserDisabled       map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
-	OrgUserDefaultCatalog map[OrgUserKey]string // (orgID, username) -> default session catalog
-	OrgUserMaxVCPUs       map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
+	Orgs               map[string]*OrgConfig
+	DatabaseOrg        map[string]string     // database name -> org ID
+	HostnameAliasOrg   map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
+	OrgUserPassword    map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
+	OrgUserDisabled    map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
+	OrgUserMaxVCPUs    map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
 }
 
 // Selectable catalog names. The startup `database` param now names the catalog
@@ -53,7 +52,6 @@ type Snapshot struct {
 // non-empty values a client may request.
 const (
 	catalogDuckLake = "ducklake"
-	catalogIceberg  = "iceberg"
 )
 
 // PostgresConnectionResolution is the result of resolving and authenticating a
@@ -73,17 +71,15 @@ type PostgresConnectionResolution struct {
 	// SNIResolved is true when the managed hostname resolved to a known org.
 	SNIResolved bool
 	// EffectiveCatalog is the catalog the session should default to, selected by
-	// the startup `database` param: "" (use the per-user/attached default),
-	// "ducklake", or "iceberg".
+	// the startup `database` param: "" (use the attached default) or "ducklake".
 	EffectiveCatalog string
 	// CatalogValid is false when the requested `database` is not a selectable
-	// catalog name (anything other than "", "ducklake", "iceberg").
+	// catalog name (anything other than "" or "ducklake").
 	CatalogValid bool
 	// Valid is true when (OrgID, username, password) authenticated.
 	Valid bool
-	// Passthrough / DefaultCatalog are the per-user flags for the resolved user.
-	Passthrough    bool
-	DefaultCatalog string
+	// Passthrough is the per-user flag for the resolved user.
+	Passthrough bool
 	// Disabled is true when the resolved user authenticated but is administratively
 	// disabled (kill switch). Callers must refuse the connection. It is only ever
 	// set together with Valid=true — a wrong password / unknown user returns
@@ -187,14 +183,13 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	}
 
 	snap := &Snapshot{
-		Orgs:                  make(map[string]*OrgConfig),
-		DatabaseOrg:           make(map[string]string),
-		HostnameAliasOrg:      make(map[string]string),
-		OrgUserPassword:       make(map[OrgUserKey]string),
-		OrgUserPassthrough:    make(map[OrgUserKey]bool),
-		OrgUserDisabled:       make(map[OrgUserKey]bool),
-		OrgUserDefaultCatalog: make(map[OrgUserKey]string),
-		OrgUserMaxVCPUs:       make(map[OrgUserKey]int),
+		Orgs:               make(map[string]*OrgConfig),
+		DatabaseOrg:        make(map[string]string),
+		HostnameAliasOrg:   make(map[string]string),
+		OrgUserPassword:    make(map[OrgUserKey]string),
+		OrgUserPassthrough: make(map[OrgUserKey]bool),
+		OrgUserDisabled:    make(map[OrgUserKey]bool),
+		OrgUserMaxVCPUs:    make(map[OrgUserKey]int),
 	}
 
 	for _, o := range orgs {
@@ -235,9 +230,6 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			}
 			if u.Disabled {
 				snap.OrgUserDisabled[key] = true
-			}
-			if u.DefaultCatalog != "" {
-				snap.OrgUserDefaultCatalog[key] = u.DefaultCatalog
 			}
 			if u.MaxVCPUs > 0 {
 				snap.OrgUserMaxVCPUs[key] = u.MaxVCPUs
@@ -377,17 +369,14 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result := PostgresConnectionResolution{}
 
 	// The startup `database` param is now pure catalog selection, not identity.
-	// Valid values: "" (use the per-user/attached default), "ducklake", or
-	// "iceberg". Anything else fails closed — there is no logical-name masking,
-	// so an arbitrary name no longer routes anywhere.
+	// Valid values: "" (use the attached default) or "ducklake". Anything else
+	// fails closed — there is no logical-name masking, so an arbitrary name no
+	// longer routes anywhere.
 	switch strings.ToLower(strings.TrimSpace(startupDatabase)) {
 	case "":
 		result.CatalogValid = true
 	case catalogDuckLake:
 		result.EffectiveCatalog = catalogDuckLake
-		result.CatalogValid = true
-	case catalogIceberg:
-		result.EffectiveCatalog = catalogIceberg
 		result.CatalogValid = true
 	}
 
@@ -425,7 +414,6 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	}
 	result.Valid = true
 	result.Passthrough = cs.snapshot.OrgUserPassthrough[key]
-	result.DefaultCatalog = cs.snapshot.OrgUserDefaultCatalog[key]
 	// Disabled is only meaningful (and only revealed) once credentials check out,
 	// so a disabled user gets a distinct "account disabled" error while a wrong
 	// password still looks identical to an unknown user.
@@ -683,28 +671,6 @@ var ErrWarehouseStateMismatch = errors.New("warehouse not in expected state")
 // has no row in duckgres_managed_warehouses.
 var ErrWarehouseNotFound = errors.New("warehouse not found")
 
-// UpdateIcebergConfig writes the supplied column updates to the org's
-// warehouse row without CAS'ing on the top-level state. Used by the
-// Lakekeeper provisioner — Iceberg sub-state runs in parallel with the
-// main warehouse state machine, so persisting the Lakekeeper endpoint
-// after a top-level state transition shouldn't silently no-op.
-//
-// Caller-side discipline: the updates map should only contain
-// iceberg_* columns. Untyped to keep the controller's WarehouseStore
-// interface independent of the column list.
-func (cs *ConfigStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
-	result := cs.db.Model(&ManagedWarehouse{}).
-		Where("org_id = ?", orgID).
-		Updates(updates)
-	if result.Error != nil {
-		return fmt.Errorf("update iceberg config: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("warehouse %q: %w", orgID, ErrWarehouseNotFound)
-	}
-	return nil
-}
-
 func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	result := cs.db.Model(&ManagedWarehouse{}).
 		Where("org_id = ? AND state = ?", orgID, expectedState).
@@ -716,22 +682,6 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("warehouse %q expected state %q: %w", orgID, expectedState, ErrWarehouseStateMismatch)
 	}
 	return nil
-}
-
-// GetManagedWarehouseIceberg reads the embedded Iceberg config for an
-// org. Returns (nil, nil) when the org has no warehouse row so callers
-// can distinguish "never provisioned" from a DB error.
-func (cs *ConfigStore) GetManagedWarehouseIceberg(orgID string) (*ManagedWarehouseIceberg, error) {
-	var warehouse ManagedWarehouse
-	err := cs.db.First(&warehouse, "org_id = ?", orgID).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get iceberg config for %q: %w", orgID, err)
-	}
-	ic := warehouse.Iceberg
-	return &ic, nil
 }
 
 func resolveRuntimeSchema(db *gorm.DB) (string, error) {

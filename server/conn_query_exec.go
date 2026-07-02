@@ -8,8 +8,6 @@ import (
 	"time"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
-	"github.com/posthog/duckgres/server/iceberg"
-	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/wire"
 	"github.com/posthog/duckgres/transpiler"
@@ -71,7 +69,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		if err != nil {
 			queryFinalErr = err
 			errCode := classifyErrorCode(err)
-			errMsg := friendlyExecError(err)
+			errMsg := err.Error()
 			if c.isCallerCancellation(err) {
 				errMsg = "canceling statement due to user request"
 			} else {
@@ -99,13 +97,12 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 	return err
 }
 
-// rewriteDirectQuery expands a bare `USE ducklake`/`USE iceberg` to its reliable
-// two-part `catalog.schema` target. This is NOT logical-name masking — the
-// catalog names are real; the rewrite only works around DuckDB's bare-catalog
-// `USE` resolution (a bare `USE ducklake` issued while the session is in the
-// iceberg catalog resolves `ducklake` as a *schema* within iceberg, landing on a
-// bogus `iceberg.ducklake`). Any other `USE <name>` and all other statements are
-// passed through unchanged.
+// rewriteDirectQuery expands a bare `USE ducklake` to its reliable two-part
+// `catalog.schema` target. This is NOT logical-name masking — the catalog name
+// is real; the rewrite only works around DuckDB's bare-catalog `USE`
+// resolution (a bare `USE ducklake` issued while the session is in another
+// catalog resolves `ducklake` as a *schema* within that catalog). Any other
+// `USE <name>` and all other statements are passed through unchanged.
 func (c *clientConn) rewriteDirectQuery(query string) string {
 	if c == nil || c.server == nil || c.passthrough || !c.catalogUseRewrite {
 		return query
@@ -133,86 +130,17 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		unquoted = strings.ReplaceAll(target[1:len(target)-1], `""`, `"`)
 	}
 
-	var target2part string
-	switch {
-	case strings.EqualFold(unquoted, physicalDuckLakeCatalog):
-		// `USE ducklake` -> ducklake.main (DuckLake's real schema is `main`).
-		target2part = physicalDuckLakeCatalog + ".main"
-	case strings.EqualFold(unquoted, iceberg.CatalogName):
-		// `USE iceberg` -> iceberg.<DefaultSchema>. DuckDB can't `USE` a bare REST
-		// catalog (it targets <catalog>.main, which it shadows), so land on the
-		// guaranteed default schema (ensured by attachLakekeeperCatalog).
-		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
-	default:
+	if !strings.EqualFold(unquoted, physicalDuckLakeCatalog) {
 		return query
 	}
+	// `USE ducklake` -> ducklake.main (DuckLake's real schema is `main`).
+	target2part := physicalDuckLakeCatalog + ".main"
 
 	rewritten := "USE " + target2part
 	if hasSemicolon {
 		rewritten += ";"
 	}
 	return rewritten
-}
-
-func (c *clientConn) loadIcebergColumnMetadata(ctx context.Context, query string) error {
-	if c == nil {
-		return nil
-	}
-	cfg := c.effectiveIcebergConfig()
-	if !shouldLoadIcebergColumnMetadata(cfg, c.physicalCatalog, c.passthrough) {
-		return nil
-	}
-	return icebergmeta.LoadColumns(ctx, c.executor, query, icebergmeta.Config{
-		LakekeeperEndpoint:        cfg.LakekeeperEndpoint,
-		LakekeeperWarehouse:       cfg.LakekeeperWarehouse,
-		LakekeeperOAuth2ServerURI: cfg.LakekeeperOAuth2ServerURI,
-	})
-}
-
-func (c *clientConn) effectiveIcebergConfig() IcebergConfig {
-	if c != nil && c.hasTenantIcebergConfig {
-		return c.tenantIcebergConfig
-	}
-	if c != nil && c.server != nil {
-		return c.server.cfg.Iceberg
-	}
-	return IcebergConfig{}
-}
-
-// shouldLoadIcebergColumnMetadata reports whether a query should trigger the
-// on-demand Iceberg column-metadata load. physicalCatalog is the session's
-// resolved DuckDB catalog (set during session init, and via
-// SetConnectionPhysicalCatalog on the control plane). The metadata load issues
-// Lakekeeper REST calls and DELETE/INSERT against the shared
-// memory.main.__duckgres_iceberg_column_metadata table, so it must only run for
-// Iceberg sessions — otherwise a DuckLake session on a dual-catalog worker would
-// trigger cross-catalog REST I/O and churn shared state it can never read (the
-// compat views gate reads on current_database()='iceberg').
-func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, physicalCatalog string, passthrough bool) bool {
-	return !passthrough &&
-		physicalCatalog == iceberg.CatalogName &&
-		cfg.Enabled &&
-		cfg.ResolvedBackend() == iceberg.BackendLakekeeper &&
-		cfg.LakekeeperOAuth2ServerURI == ""
-}
-
-func (c *clientConn) queryWithMetadata(ctx context.Context, query string, run func() (RowSet, error)) (RowSet, error) {
-	if err := c.loadIcebergColumnMetadata(ctx, query); err != nil {
-		return nil, err
-	}
-	return run()
-}
-
-func (c *clientConn) queryContextWithMetadata(ctx context.Context, query string) (RowSet, error) {
-	return c.queryWithMetadata(ctx, query, func() (RowSet, error) {
-		return c.executor.QueryContext(ctx, query)
-	})
-}
-
-func (c *clientConn) queryWithArgsWithMetadata(ctx context.Context, query string, args ...interface{}) (RowSet, error) {
-	return c.queryWithMetadata(ctx, query, func() (RowSet, error) {
-		return c.executor.Query(query, args...)
-	})
 }
 
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
@@ -239,7 +167,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		c.logQueryFinished(query, execStart, queryRowsAff, queryFinalErr)
 	}()
 	runQuery := func() (RowSet, error) {
-		return c.queryContextWithMetadata(ctx, query)
+		return c.executor.QueryContext(ctx, query)
 	}
 
 	rows, err := runQuery()
@@ -265,7 +193,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	if err != nil {
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
@@ -283,7 +211,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	if err != nil {
 		queryFinalErr = err
 		errCode := "42000"
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if !c.isCallerCancellation(err) {
 			c.logQueryError(query, err)
 		}
@@ -298,7 +226,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	if err != nil {
 		queryFinalErr = err
 		errCode := "42000"
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if !c.isCallerCancellation(err) {
 			c.logQueryError(query, err)
 		}
@@ -343,7 +271,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		if err := rows.Scan(valuePtrs...); err != nil {
 			queryFinalErr = err
 			errCode := "42000"
-			errMsg := friendlyExecError(err)
+			errMsg := err.Error()
 			if !c.isCallerCancellation(err) {
 				c.logQueryError(query, err)
 			}
@@ -368,7 +296,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	if err := rows.Err(); err != nil {
 		queryFinalErr = err
 		errCode := "42000"
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"
@@ -682,7 +610,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, executedQuery)
 			if err != nil {
-				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(ctx, executedQuery, err, func(fallbackQuery string) (ExecResult, error) {
+				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(executedQuery, err, func(fallbackQuery string) (ExecResult, error) {
 					return c.executor.ExecContext(ctx, fallbackQuery)
 				})
 				if handled {
@@ -712,7 +640,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			if err != nil {
 				queryFinalErr = err
 				errCode := classifyErrorCode(err)
-				errMsg := friendlyExecError(err)
+				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
@@ -742,7 +670,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	defer cleanup()
 
 	runQuery := func() (RowSet, error) {
-		return c.queryContextWithMetadata(ctx, executedQuery)
+		return c.executor.QueryContext(ctx, executedQuery)
 	}
 
 	rows, err := runQuery()
@@ -764,7 +692,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	if err != nil {
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errMsg = "canceling statement due to user request"
 		} else {

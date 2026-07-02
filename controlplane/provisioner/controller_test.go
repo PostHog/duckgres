@@ -88,68 +88,6 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 		case "provisioning_started_at":
 			t := v.(time.Time)
 			w.ProvisioningStartedAt = &t
-		case "iceberg_region":
-			w.Iceberg.Region = v.(string)
-		case "iceberg_namespace":
-			w.Iceberg.Namespace = v.(string)
-		case "iceberg_state":
-			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
-		case "iceberg_enabled":
-			w.Iceberg.Enabled = v.(bool)
-		case "iceberg_backend":
-			w.Iceberg.Backend = v.(string)
-		case "iceberg_lakekeeper_endpoint":
-			w.Iceberg.LakekeeperEndpoint = v.(string)
-		case "iceberg_lakekeeper_warehouse":
-			w.Iceberg.LakekeeperWarehouse = v.(string)
-		case "iceberg_lakekeeper_client_id":
-			w.Iceberg.LakekeeperClientID = v.(string)
-		case "iceberg_lakekeeper_oauth2_server_uri":
-			w.Iceberg.LakekeeperOAuth2ServerURI = v.(string)
-		case "iceberg_lakekeeper_client_credentials_namespace":
-			w.Iceberg.LakekeeperClientCredentials.Namespace = v.(string)
-		case "iceberg_lakekeeper_client_credentials_name":
-			w.Iceberg.LakekeeperClientCredentials.Name = v.(string)
-		case "iceberg_lakekeeper_client_credentials_key":
-			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
-		}
-	}
-	return nil
-}
-
-// UpdateIcebergConfig writes per-org Iceberg/Lakekeeper fields without a
-// top-level state CAS. Mirrors the real configstore method's contract.
-func (s *fakeStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
-	w, ok := s.warehouses[orgID]
-	if !ok {
-		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseNotFound)
-	}
-	for k, v := range updates {
-		switch k {
-		case "iceberg_enabled":
-			w.Iceberg.Enabled = v.(bool)
-		case "iceberg_backend":
-			w.Iceberg.Backend = v.(string)
-		case "iceberg_namespace":
-			w.Iceberg.Namespace = v.(string)
-		case "iceberg_region":
-			w.Iceberg.Region = v.(string)
-		case "iceberg_state":
-			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
-		case "iceberg_lakekeeper_endpoint":
-			w.Iceberg.LakekeeperEndpoint = v.(string)
-		case "iceberg_lakekeeper_warehouse":
-			w.Iceberg.LakekeeperWarehouse = v.(string)
-		case "iceberg_lakekeeper_client_id":
-			w.Iceberg.LakekeeperClientID = v.(string)
-		case "iceberg_lakekeeper_oauth2_server_uri":
-			w.Iceberg.LakekeeperOAuth2ServerURI = v.(string)
-		case "iceberg_lakekeeper_client_credentials_namespace":
-			w.Iceberg.LakekeeperClientCredentials.Namespace = v.(string)
-		case "iceberg_lakekeeper_client_credentials_name":
-			w.Iceberg.LakekeeperClientCredentials.Name = v.(string)
-		case "iceberg_lakekeeper_client_credentials_key":
-			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
 		}
 	}
 	return nil
@@ -367,102 +305,6 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOff(t *testing.T) {
 	pgb := ms["pgbouncer"].(map[string]interface{})
 	if pgb["enabled"] != false {
 		t.Fatalf("expected pgbouncer.enabled=false after drift patch, got %v", pgb["enabled"])
-	}
-}
-
-func TestReconcileReadyPatchesCRWhenIcebergFlippedOn(t *testing.T) {
-	dc, fakeK8s := newFakeDucklingClient()
-	fs := newFakeStore()
-	fs.warehouses["org-iceberg-on"] = &configstore.ManagedWarehouse{
-		OrgID:   "org-iceberg-on",
-		State:   configstore.ManagedWarehouseStateReady,
-		Iceberg: configstore.ManagedWarehouseIceberg{Enabled: true},
-	}
-	// Seed a CR with no iceberg block — represents a warehouse that
-	// existed before iceberg was opted into.
-	cr := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "k8s.posthog.com/v1alpha1",
-		"kind":       "Duckling",
-		"metadata": map[string]interface{}{
-			"name":      ducklingName("org-iceberg-on"),
-			"namespace": ducklingNamespace,
-		},
-		"spec": map[string]interface{}{
-			"metadataStore": map[string]interface{}{
-				"type": "external",
-				"external": map[string]interface{}{
-					"endpoint":          "ext.example.internal",
-					"passwordAwsSecret": "ext-secret",
-				},
-			},
-			"dataStore": map[string]interface{}{"type": "s3bucket"},
-		},
-	}}
-	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed CR: %v", err)
-	}
-
-	ctrl := NewControllerWithClient(fs, dc, time.Second)
-	ctrl.reconcile(context.Background())
-
-	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-iceberg-on"), metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("re-fetch CR: %v", err)
-	}
-	spec := got.Object["spec"].(map[string]interface{})
-	iceberg, ok := spec["iceberg"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected iceberg block after drift patch, got spec=%v", spec)
-	}
-	if iceberg["enabled"] != true {
-		t.Fatalf("expected iceberg.enabled=true, got %v", iceberg["enabled"])
-	}
-	// Merge-patch must not wipe sibling spec fields (metadataStore / dataStore).
-	if _, ok := spec["metadataStore"].(map[string]interface{}); !ok {
-		t.Fatalf("expected metadataStore preserved after iceberg patch")
-	}
-	if _, ok := spec["dataStore"].(map[string]interface{}); !ok {
-		t.Fatalf("expected dataStore preserved after iceberg patch")
-	}
-}
-
-func TestReconcileReadyPatchesCRWhenIcebergFlippedOff(t *testing.T) {
-	dc, fakeK8s := newFakeDucklingClient()
-	fs := newFakeStore()
-	fs.warehouses["org-iceberg-off"] = &configstore.ManagedWarehouse{
-		OrgID:   "org-iceberg-off",
-		State:   configstore.ManagedWarehouseStateReady,
-		Iceberg: configstore.ManagedWarehouseIceberg{Enabled: false},
-	}
-	// Seed a CR that currently has iceberg enabled — expect drift back to false.
-	cr := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "k8s.posthog.com/v1alpha1",
-		"kind":       "Duckling",
-		"metadata": map[string]interface{}{
-			"name":      ducklingName("org-iceberg-off"),
-			"namespace": ducklingNamespace,
-		},
-		"spec": map[string]interface{}{
-			"metadataStore": map[string]interface{}{"type": "external"},
-			"dataStore":     map[string]interface{}{"type": "s3bucket"},
-			"iceberg":       map[string]interface{}{"enabled": true},
-		},
-	}}
-	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed CR: %v", err)
-	}
-
-	ctrl := NewControllerWithClient(fs, dc, time.Second)
-	ctrl.reconcile(context.Background())
-
-	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-iceberg-off"), metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("re-fetch CR: %v", err)
-	}
-	spec := got.Object["spec"].(map[string]interface{})
-	iceberg := spec["iceberg"].(map[string]interface{})
-	if iceberg["enabled"] != false {
-		t.Fatalf("expected iceberg.enabled=false after drift patch, got %v", iceberg["enabled"])
 	}
 }
 
@@ -908,9 +750,8 @@ func TestFakeStoreUpdateWarehouseState(t *testing.T) {
 
 // TestReconcilePendingCreatesCnpgShardCR verifies that a warehouse whose
 // metadata-store kind is cnpg-shard produces a Duckling CR with
-// metadataStore.type=cnpg-shard, no external/pgbouncer blocks, and the iceberg
-// block enabled — the shape the composition expects for a Lakekeeper-backed
-// shard tenant.
+// metadataStore.type=cnpg-shard, no external/pgbouncer blocks, and
+// ducklake.enabled=true — the shape the composition expects for a shard tenant.
 func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
@@ -920,10 +761,7 @@ func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind: configstore.MetadataStoreKindCnpgShard,
 		},
-		Iceberg: configstore.ManagedWarehouseIceberg{
-			Enabled: true,
-			Backend: configstore.IcebergBackendLakekeeper,
-		},
+		DuckLake: configstore.ManagedWarehouseDuckLake{Enabled: true},
 	}
 
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
@@ -945,62 +783,33 @@ func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
 	if _, present := metadataStore["pgbouncer"]; present {
 		t.Errorf("cnpg-shard CR must not carry a pgbouncer block, got %v", metadataStore["pgbouncer"])
 	}
-	iceberg, ok := spec["iceberg"].(map[string]interface{})
-	if !ok || iceberg["enabled"] != true {
-		t.Errorf("expected iceberg.enabled=true on cnpg-shard CR, got %v", spec["iceberg"])
+	if dl, ok := spec["ducklake"].(map[string]interface{}); !ok || dl["enabled"] != true {
+		t.Errorf("expected ducklake.enabled=true on cnpg-shard CR, got %v", spec["ducklake"])
 	}
-	// DuckLake is emitted explicitly (false here — iceberg-only cnpg).
-	ducklake, ok := spec["ducklake"].(map[string]interface{})
-	if !ok || ducklake["enabled"] != false {
-		t.Errorf("expected ducklake.enabled=false on iceberg-only cnpg-shard CR, got %v", spec["ducklake"])
+	// Iceberg support was removed: no CR may carry an iceberg block.
+	if _, present := spec["iceberg"]; present {
+		t.Errorf("CR must not carry an iceberg block, got %v", spec["iceberg"])
 	}
 	if fs.warehouses["org-cnpg"].State != configstore.ManagedWarehouseStateProvisioning {
 		t.Fatalf("expected provisioning state, got %q", fs.warehouses["org-cnpg"].State)
 	}
 }
 
-// TestReconcilePendingCreatesDuckLakeOnlyCnpgCR verifies the decoupled combo:
-// cnpg-shard with DuckLake on and Iceberg off → ducklake.enabled=true, no
-// iceberg block.
-func TestReconcilePendingCreatesDuckLakeOnlyCnpgCR(t *testing.T) {
-	dc, fakeK8s := newFakeDucklingClient()
-	fs := newFakeStore()
-	fs.warehouses["org-dlcnpg"] = &configstore.ManagedWarehouse{
-		OrgID:         "org-dlcnpg",
-		State:         configstore.ManagedWarehouseStatePending,
-		MetadataStore: configstore.ManagedWarehouseMetadataStore{Kind: configstore.MetadataStoreKindCnpgShard},
-		DuckLake:      configstore.ManagedWarehouseDuckLake{Enabled: true},
-	}
-	ctx := context.Background()
-	NewControllerWithClient(fs, dc, time.Second).reconcile(ctx)
-
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-dlcnpg"), metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("expected CR to exist: %v", err)
-	}
-	spec := cr.Object["spec"].(map[string]interface{})
-	if dl, ok := spec["ducklake"].(map[string]interface{}); !ok || dl["enabled"] != true {
-		t.Errorf("expected ducklake.enabled=true, got %v", spec["ducklake"])
-	}
-	if _, present := spec["iceberg"]; present {
-		t.Errorf("ducklake-only cnpg CR must not carry an iceberg block, got %v", spec["iceberg"])
-	}
-}
-
-// TestDucklingCreateCnpgShardRequiresCatalog verifies the Create guard: a
-// cnpg-shard CR with neither DuckLake nor Iceberg has nothing to attach and is
-// rejected.
-func TestDucklingCreateCnpgShardRequiresCatalog(t *testing.T) {
+// TestDucklingCreateCnpgShardRequiresDuckLake verifies the Create guard: a
+// cnpg-shard CR without DuckLake has nothing to attach and is rejected.
+func TestDucklingCreateCnpgShardRequiresDuckLake(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	ctx := context.Background()
 
 	err := dc.Create(ctx, "no-catalog", CreateOptions{
 		MetadataStoreType: configstore.MetadataStoreKindCnpgShard,
-		IcebergEnabled:    false,
 		DuckLakeEnabled:   false,
 	})
 	if err == nil {
 		t.Fatal("expected error creating cnpg-shard CR with no catalog enabled")
+	}
+	if !strings.Contains(err.Error(), "requires ducklake enabled") {
+		t.Fatalf("error = %v, want 'requires ducklake enabled'", err)
 	}
 	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("no-catalog"), metav1.GetOptions{}); getErr == nil {
 		t.Error("CR should not have been created when validation failed")
@@ -1016,13 +825,11 @@ func TestDucklingCreateRejectsUnsupportedType(t *testing.T) {
 	}
 }
 
-// TestReconcileProvisioningCnpgShardGatedOnIceberg verifies a cnpg-shard
-// warehouse does not flip to Ready while iceberg_state is unset (the Lakekeeper
-// catalog isn't up yet), then reaches Ready once iceberg_state is Ready. This
-// is the gating that the reconcileProvisioning -> reconcileLakekeeper call
-// satisfies in production; here we drive iceberg_state directly since no
-// Lakekeeper provisioner is wired.
-func TestReconcileProvisioningCnpgShardGatedOnIceberg(t *testing.T) {
+// TestReconcileProvisioningCnpgShardReadiness verifies a cnpg-shard warehouse
+// flips to Ready once the Duckling infra is ready. (Readiness previously also
+// gated on iceberg_state / Lakekeeper — that gate is gone with the Iceberg
+// removal, so a single reconcile pass suffices.)
+func TestReconcileProvisioningCnpgShardReadiness(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-cs"] = &configstore.ManagedWarehouse{
@@ -1032,10 +839,7 @@ func TestReconcileProvisioningCnpgShardGatedOnIceberg(t *testing.T) {
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind: configstore.MetadataStoreKindCnpgShard,
 		},
-		Iceberg: configstore.ManagedWarehouseIceberg{
-			Enabled: true,
-			Backend: configstore.IcebergBackendLakekeeper,
-		},
+		DuckLake: configstore.ManagedWarehouseDuckLake{Enabled: true},
 	}
 
 	cr := &unstructured.Unstructured{
@@ -1051,8 +855,8 @@ func TestReconcileProvisioningCnpgShardGatedOnIceberg(t *testing.T) {
 					"type":     configstore.MetadataStoreKindCnpgShard,
 					"endpoint": "shard-001-pooler.cnpg-shards.svc.cluster.local",
 					"password": "from-provider-sql",
-					"user":     "lakekeeper_org_cs",
-					"database": "lakekeeper_org_cs",
+					"user":     "duckgres_org_cs",
+					"database": "duckgres_org_cs",
 				},
 				"dataStore": map[string]interface{}{
 					"type":       "s3bucket",
@@ -1074,43 +878,28 @@ func TestReconcileProvisioningCnpgShardGatedOnIceberg(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
 
-	// First pass: infra is ready but iceberg_state is still pending (no
-	// Lakekeeper provisioner wired), so the warehouse must stay in provisioning.
 	ctrl.reconcile(ctx)
 	w := fs.warehouses["org-cs"]
 	if w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("expected metadata_store_state ready, got %q", w.MetadataStoreState)
 	}
-	if w.State == configstore.ManagedWarehouseStateReady {
-		t.Fatal("warehouse must not be Ready while iceberg (Lakekeeper) is unprovisioned")
-	}
-
-	// Simulate the Lakekeeper provisioner having completed.
-	if err := fs.UpdateIcebergConfig("org-cs", map[string]interface{}{
-		"iceberg_state":               configstore.ManagedWarehouseStateReady,
-		"iceberg_lakekeeper_endpoint": "http://lakekeeper-org-cs.lakekeeper.svc/catalog",
-	}); err != nil {
-		t.Fatalf("update iceberg config: %v", err)
-	}
-
-	// Second pass: now all components incl. iceberg are ready -> Ready.
-	ctrl.reconcile(ctx)
-	if fs.warehouses["org-cs"].State != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("expected ready state after iceberg ready, got %q", fs.warehouses["org-cs"].State)
+	if w.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected ready state once infra is ready, got %q", w.State)
 	}
 }
 
-// --- external metadata store (iceberg+external and ducklake+external) ---
+// --- external metadata store (ducklake+external) ---
 
-// TestReconcilePendingCreatesIcebergExternalCR verifies a warehouse with an
-// external metadata store + iceberg produces a Duckling CR with
-// metadataStore.type=external (carrying endpoint/passwordAwsSecret/user/
-// database), an external dataStore reusing the named bucket, and iceberg on.
-func TestReconcilePendingCreatesIcebergExternalCR(t *testing.T) {
+// TestReconcilePendingCreatesDuckLakeExternalCR verifies a warehouse with an
+// external metadata store produces a Duckling CR with metadataStore.type=external
+// (carrying endpoint/passwordAwsSecret/user/database), an external dataStore
+// reusing the named bucket, and ducklake on — with no iceberg block (Iceberg
+// support was removed).
+func TestReconcilePendingCreatesDuckLakeExternalCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
-	fs.warehouses["org-ext"] = &configstore.ManagedWarehouse{
-		OrgID: "org-ext",
+	fs.warehouses["org-dl"] = &configstore.ManagedWarehouse{
+		OrgID: "org-dl",
 		State: configstore.ManagedWarehouseStatePending,
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:              configstore.MetadataStoreKindExternal,
@@ -1124,17 +913,14 @@ func TestReconcilePendingCreatesIcebergExternalCR(t *testing.T) {
 			BucketName: "posthog-duckling-example",
 			Region:     "us-east-1",
 		},
-		Iceberg: configstore.ManagedWarehouseIceberg{
-			Enabled: true,
-			Backend: configstore.IcebergBackendLakekeeper,
-		},
+		DuckLake: configstore.ManagedWarehouseDuckLake{Enabled: true},
 	}
 
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctx := context.Background()
 	ctrl.reconcile(ctx)
 
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-ext"), metav1.GetOptions{})
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-dl"), metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected CR to exist: %v", err)
 	}
@@ -1161,44 +947,11 @@ func TestReconcilePendingCreatesIcebergExternalCR(t *testing.T) {
 	if !ok || dsExt["bucketName"] != "posthog-duckling-example" || dsExt["region"] != "us-east-1" {
 		t.Errorf("dataStore.external wrong: %v", ds["external"])
 	}
-	iceberg, ok := spec["iceberg"].(map[string]interface{})
-	if !ok || iceberg["enabled"] != true {
-		t.Errorf("expected iceberg.enabled=true, got %v", spec["iceberg"])
-	}
-}
-
-// TestReconcilePendingCreatesDuckLakeExternalCR verifies external metadata
-// WITHOUT iceberg yields a CR with no iceberg block (DuckLake-on-external).
-func TestReconcilePendingCreatesDuckLakeExternalCR(t *testing.T) {
-	dc, fakeK8s := newFakeDucklingClient()
-	fs := newFakeStore()
-	fs.warehouses["org-dl"] = &configstore.ManagedWarehouse{
-		OrgID: "org-dl",
-		State: configstore.ManagedWarehouseStatePending,
-		MetadataStore: configstore.ManagedWarehouseMetadataStore{
-			Kind:              configstore.MetadataStoreKindExternal,
-			Endpoint:          "rds.example.us-east-1.rds.amazonaws.com",
-			PasswordAWSSecret: "duckling-example-rds-password",
-		},
-		DataStore: configstore.ManagedWarehouseDataStore{
-			Kind: "external", BucketName: "posthog-duckling-example", Region: "us-east-1",
-		},
-	}
-
-	ctrl := NewControllerWithClient(fs, dc, time.Second)
-	ctx := context.Background()
-	ctrl.reconcile(ctx)
-
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-dl"), metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("expected CR to exist: %v", err)
-	}
-	spec := cr.Object["spec"].(map[string]interface{})
-	if spec["metadataStore"].(map[string]interface{})["type"] != configstore.MetadataStoreKindExternal {
-		t.Fatalf("metadataStore.type wrong: %v", spec["metadataStore"])
+	if dl, ok := spec["ducklake"].(map[string]interface{}); !ok || dl["enabled"] != true {
+		t.Errorf("expected ducklake.enabled=true, got %v", spec["ducklake"])
 	}
 	if _, present := spec["iceberg"]; present {
-		t.Errorf("ducklake+external CR must not carry an iceberg block, got %v", spec["iceberg"])
+		t.Errorf("CR must not carry an iceberg block, got %v", spec["iceberg"])
 	}
 }
 
@@ -1264,9 +1017,9 @@ func TestDucklingGetFallsBackToLegacyName(t *testing.T) {
 		t.Error("expected to parse the legacy CR's status")
 	}
 
-	// And iceberg/pgbouncer reads + delete must resolve it too.
-	if _, err := dc.GetIcebergEnabled(ctx, org); err != nil {
-		t.Errorf("GetIcebergEnabled fallback: %v", err)
+	// And pgbouncer reads + delete must resolve it too.
+	if _, err := dc.GetPgBouncerEnabled(ctx, org); err != nil {
+		t.Errorf("GetPgBouncerEnabled fallback: %v", err)
 	}
 	if err := dc.Delete(ctx, org); err != nil {
 		t.Errorf("Delete fallback: %v", err)

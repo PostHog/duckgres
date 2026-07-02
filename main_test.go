@@ -298,33 +298,6 @@ func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 	}
 }
 
-func TestResolveEffectiveConfigIceberg(t *testing.T) {
-	// Default-off: with no overrides, Iceberg stays disabled (opt-in unlike Delta).
-	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
-	if resolved.Server.Iceberg.Enabled {
-		t.Fatal("expected Iceberg.Enabled to default to false")
-	}
-
-	// File config opts in; remaining knobs (region/namespace) flow through.
-	fileEnabled := true
-	resolved = configresolve.ResolveEffective(&FileConfig{
-		Iceberg: IcebergFileConfig{
-			Enabled:   &fileEnabled,
-			Region:    "us-east-1",
-			Namespace: "main",
-		},
-	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
-	if !resolved.Server.Iceberg.Enabled {
-		t.Fatal("expected YAML iceberg.enabled=true to enable Iceberg")
-	}
-	if got, want := resolved.Server.Iceberg.Region, "us-east-1"; got != want {
-		t.Fatalf("expected YAML iceberg region %q, got %q", want, got)
-	}
-	if got, want := resolved.Server.Iceberg.Namespace, "main"; got != want {
-		t.Fatalf("expected YAML iceberg namespace %q, got %q", want, got)
-	}
-}
-
 func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL":   "0s",

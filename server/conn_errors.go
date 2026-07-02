@@ -81,16 +81,9 @@ func classifyErrorCode(err error) string {
 	// Workers reach the control plane over Arrow Flight SQL, so DuckDB errors
 	// arrive wrapped as "flight execute update: rpc error: code = X desc = <msg>".
 	// Unwrap to recover the underlying DuckDB exception message so the prefix
-	// classifiers below apply; otherwise every Iceberg/DuckLake worker error
+	// classifiers below apply; otherwise every DuckLake worker error
 	// would fall through to XX000 and the client would see the raw rpc string.
 	msg := unwrapFlightError(err.Error())
-	// Iceberg schema-evolution failure: after a column is dropped (or other
-	// schema churn) DuckDB's iceberg extension can fail every scan with
-	// "Tried to scan a snapshot created with a newer schema id ...". Surface it
-	// as feature_not_supported with an actionable message rather than XX000.
-	if isSchemaEvolutionErrorMsg(msg) {
-		return "0A000"
-	}
 	switch {
 	case strings.HasPrefix(msg, "Catalog Error:"):
 		return catalogErrorCode(msg)
@@ -135,24 +128,6 @@ func transformErrorSQLState(err error) string {
 		return coded.SQLState()
 	}
 	return "42704"
-}
-
-// isSchemaEvolutionErrorMsg reports whether an (already Flight-unwrapped) DuckDB
-// error message is the Iceberg "newer schema id" scan failure that a DROP COLUMN
-// can leave a table in. Matched on a stable substring; if the wording changes
-// the error simply falls back to its generic class (still safe).
-func isSchemaEvolutionErrorMsg(msg string) bool {
-	return strings.Contains(msg, "newer schema id")
-}
-
-// friendlyExecError rewrites known-cryptic DuckDB/Iceberg execution errors into
-// actionable client messages. Returns the original message unchanged otherwise.
-func friendlyExecError(err error) string {
-	msg := err.Error()
-	if isSchemaEvolutionErrorMsg(unwrapFlightError(msg)) {
-		return "reading this table failed because a column was dropped: DROP COLUMN is not safely supported on this catalog (it can leave the table unreadable after schema changes); recreate the table instead"
-	}
-	return msg
 }
 
 // unwrapFlightError recovers the underlying error message from an Arrow Flight /

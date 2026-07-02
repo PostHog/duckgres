@@ -47,7 +47,7 @@ bench-results/
 /cache-proxy
 /cmd/cache-proxy/cache-proxy
 
-# Local prototype/scratch dirs (e.g. tmp/lakekeeper-proto/)
+# Local prototype/scratch dirs
 tmp/
 
 # Built Go binaries (build artifacts, never commit)

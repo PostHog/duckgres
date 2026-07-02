@@ -31,7 +31,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 11)
 	requireGooseMigrationRecorded(t, db, 12)
 	requireGooseMigrationRecorded(t, db, 13)
-	requireGooseLatestVersion(t, db, 13)
+	requireGooseMigrationRecorded(t, db, 14)
+	requireGooseLatestVersion(t, db, 14)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000013 added the nullable per-org default_team_id column.
@@ -69,6 +70,12 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	// Migration 000011 added the per-user kill-switch column.
 	requireColumnDefault(t, db, "duckgres_org_users", "disabled", "false")
 	requireColumnAbsent(t, db, "duckgres_orgs", "max_connections")
+	// Migration 000014 dropped the Iceberg/Lakekeeper columns and the per-user
+	// default_catalog selector.
+	requireColumnAbsent(t, db, "duckgres_managed_warehouses", "iceberg_enabled")
+	requireColumnAbsent(t, db, "duckgres_managed_warehouses", "iceberg_lakekeeper_endpoint")
+	requireColumnAbsent(t, db, "duckgres_managed_warehouses", "iceberg_state")
+	requireColumnAbsent(t, db, "duckgres_org_users", "default_catalog")
 }
 
 func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
@@ -89,7 +96,10 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_orgs ADD COLUMN IF NOT EXISTS max_connections BIGINT DEFAULT 0;
 			ALTER TABLE duckgres_managed_warehouses ALTER COLUMN duckling_name DROP NOT NULL;
 			ALTER TABLE duckgres_orgs DROP COLUMN default_team_id;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13);
+			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_enabled BOOLEAN DEFAULT false;
+			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
+			ALTER TABLE duckgres_org_users ADD COLUMN IF NOT EXISTS default_catalog VARCHAR(255);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -98,6 +108,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireColumnAbsent(t, baselineDB, "duckgres_org_users", "disabled")
 	requireColumnAbsent(t, baselineDB, "duckgres_orgs", "default_team_id")
 	requireColumnPresent(t, baselineDB, "duckgres_orgs", "max_connections")
+	requireColumnPresent(t, baselineDB, "duckgres_managed_warehouses", "iceberg_enabled")
+	requireColumnPresent(t, baselineDB, "duckgres_org_users", "default_catalog")
 	requireGooseLatestVersion(t, baselineDB, 8)
 
 	upgradedStore, err := cpconfigStoreNew(connStr)
@@ -114,12 +126,15 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 11)
 	requireGooseMigrationRecorded(t, upgradedDB, 12)
 	requireGooseMigrationRecorded(t, upgradedDB, 13)
-	requireGooseLatestVersion(t, upgradedDB, 13)
+	requireGooseMigrationRecorded(t, upgradedDB, 14)
+	requireGooseLatestVersion(t, upgradedDB, 14)
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")
 	requireColumnPresent(t, upgradedDB, "duckgres_orgs", "default_team_id")
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "max_connections")
+	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
+	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "default_catalog")
 }
 
 func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {

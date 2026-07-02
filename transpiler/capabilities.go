@@ -9,5 +9,4 @@ type StorageBackend = backend.Name
 const (
 	BackendMemory   = backend.Memory
 	BackendDuckLake = backend.DuckLake
-	BackendIceberg  = backend.Iceberg
 )

@@ -319,98 +319,6 @@ func TestTranspile_LogicalCatalogMapping_DuckLakeMode(t *testing.T) {
 	}
 }
 
-func TestTranspile_PublicSchema_Iceberg(t *testing.T) {
-	// Iceberg's physical schema is literally "public" (DuckDB shadows "main" on
-	// REST catalogs), so the public→main rewrite must be DISABLED for Iceberg.
-	// Iceberg sessions are wired with an empty LogicalDatabaseName (newTranspiler),
-	// so three-part references pass through untouched.
-	tests := []struct {
-		name     string
-		input    string
-		contains string
-		excludes string
-	}{
-		{
-			name:     "two-part public reference stays public (not rewritten to main)",
-			input:    "SELECT * FROM public.users",
-			contains: "public.users",
-			excludes: "main.users",
-		},
-		{
-			name:     "explicit iceberg catalog is preserved",
-			input:    "SELECT * FROM iceberg.public.users",
-			contains: "iceberg.public.users",
-			excludes: "iceberg.main.users",
-		},
-		{
-			name:     "arbitrary three-part reference is left untouched",
-			input:    "SELECT * FROM analytics.public.users",
-			contains: "analytics.public.users",
-			excludes: "analytics.main.users",
-		},
-	}
-
-	tr := New(Config{Backend: BackendIceberg})
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := tr.Transpile(tt.input)
-			if err != nil {
-				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
-			}
-			if !strings.Contains(result.SQL, tt.contains) {
-				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
-			}
-			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
-				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
-			}
-		})
-	}
-}
-
-func TestTranspile_DDL_Iceberg(t *testing.T) {
-	// The Iceberg backend strips unenforceable constraints (with a WARNING) and
-	// no-ops unsupported DDL, but ERRORs on silently-NULL data features (SERIAL,
-	// GENERATED STORED, DEFAULT <expr>).
-	tr := New(Config{Backend: BackendIceberg})
-
-	t.Run("strip PRIMARY KEY with a warning", func(t *testing.T) {
-		result, err := tr.Transpile("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-		if err != nil {
-			t.Fatalf("Transpile error: %v", err)
-		}
-		if result.Error != nil {
-			t.Fatalf("expected no error, got %v", result.Error)
-		}
-		if strings.Contains(strings.ToUpper(result.SQL), "PRIMARY KEY") {
-			t.Errorf("PRIMARY KEY not stripped: %q", result.SQL)
-		}
-		if len(result.Warnings) == 0 {
-			t.Errorf("expected a PRIMARY KEY warning, got none")
-		}
-	})
-
-	t.Run("SERIAL is rejected", func(t *testing.T) {
-		result, err := tr.Transpile("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)")
-		if err != nil {
-			t.Fatalf("Transpile error: %v", err)
-		}
-		if result.Error == nil {
-			t.Errorf("expected SERIAL to be rejected, got SQL=%q", result.SQL)
-		}
-	})
-
-	t.Run("CREATE INDEX is a no-op", func(t *testing.T) {
-		result, err := tr.Transpile("CREATE INDEX idx ON t (id)")
-		if err != nil {
-			t.Fatalf("Transpile error: %v", err)
-		}
-		if !result.IsNoOp || result.NoOpTag != "CREATE INDEX" {
-			t.Errorf("expected CREATE INDEX no-op, got IsNoOp=%v tag=%q", result.IsNoOp, result.NoOpTag)
-		}
-	})
-}
-
 func TestTranspile_FeatureNotSupported_Rejected(t *testing.T) {
 	assertFeatureNotSupported := func(t *testing.T, result *Result) {
 		t.Helper()
@@ -426,7 +334,7 @@ func TestTranspile_FeatureNotSupported_Rejected(t *testing.T) {
 		}
 	}
 
-	for _, backend := range []StorageBackend{BackendDuckLake, BackendIceberg} {
+	for _, backend := range []StorageBackend{BackendDuckLake} {
 		tr := New(Config{Backend: backend})
 
 		t.Run(string(backend)+"/ON CONFLICT ON CONSTRAINT", func(t *testing.T) {
@@ -1131,7 +1039,7 @@ func TestTranspile_DDL_DuckLakeMode(t *testing.T) {
 }
 
 func TestTranspile_AlterColumnTypeUsingRejected(t *testing.T) {
-	tr := New(ConfigForBackend(BackendIceberg))
+	tr := New(ConfigForBackend(BackendDuckLake))
 	result, err := tr.Transpile("ALTER TABLE public.users ALTER COLUMN id TYPE text USING id::text")
 	if err != nil {
 		t.Fatalf("Transpile returned error: %v", err)

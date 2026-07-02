@@ -197,7 +197,6 @@ func (c *clientConn) handleParse(body []byte) {
 		querySourceShow:   result.QuerySourceShow, // SHOW duckgres.query_source
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
-		warnings:          result.Warnings,          // Surfaced as NoticeResponse at Execute
 	}
 
 	c.logger().Debug("Prepared statement.", "name", stmtName, "query", usersecrets.RedactForLog(query))
@@ -587,12 +586,6 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	c.logger().Debug("Execute portal.", "portal", portalName, "params", len(args), "query", loggableQuery)
 
-	// Surface any transpiler warnings (e.g. an unenforced constraint stripped on a
-	// lake catalog) as NoticeResponse before the command result.
-	for _, w := range p.stmt.warnings {
-		c.sendNotice("WARNING", "01000", w)
-	}
-
 	// duckgres.query_source custom GUC (SET / SHOW): intercepted session-side,
 	// never forwarded to DuckDB. Determined by the transpiler during Parse.
 	if p.stmt.querySourceSet != nil {
@@ -670,7 +663,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		runExec := func() (ExecResult, error) {
 			result, err := c.executor.Exec(convertedQuery, args...)
 			if err != nil {
-				if fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(queryCtx, convertedQuery, err, func(fallbackQuery string) (ExecResult, error) {
+				if fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(convertedQuery, err, func(fallbackQuery string) (ExecResult, error) {
 					return c.executor.Exec(fallbackQuery, args...)
 				}); handled {
 					return fallbackResult, fallbackErr
@@ -703,7 +696,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			if err != nil {
 				queryFinalErr = err
 				errCode := classifyErrorCode(err)
-				errMsg := friendlyExecError(err)
+				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
@@ -729,7 +722,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Result-returning query: use Query with converted query
 	runQuery := func() (RowSet, error) {
-		return c.queryWithArgsWithMetadata(queryCtx, convertedQuery, args...)
+		return c.executor.Query(convertedQuery, args...)
 	}
 
 	execStart := time.Now()
@@ -755,7 +748,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	if err != nil {
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
@@ -829,7 +822,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	if err := rows.Err(); err != nil {
 		queryFinalErr = err
 		errCode := "42000"
-		errMsg := friendlyExecError(err)
+		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"

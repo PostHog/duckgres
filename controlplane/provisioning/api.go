@@ -39,7 +39,7 @@ const (
 	//
 	// S3 caps bucket names at 63 chars, leaving 35 chars for <slug>. That cap
 	// also leaves enough room for the other request-driven names derived from
-	// org ID today (Duckling/Lakekeeper k8s names, IAM roles, PgBouncer names,
+	// org ID today (Duckling k8s names, IAM roles, PgBouncer names,
 	// and Postgres identifiers). Canonical UUID org IDs are allowed separately
 	// because configstore.DucklingBucketName compacts them from 36 to 32 chars
 	// before building the S3 bucket name. If the managed bucket suffix grows
@@ -143,7 +143,6 @@ type provisionRequest struct {
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
 	DuckLake      *provisionDuckLakeReq  `json:"ducklake,omitempty"`
-	Iceberg       *provisionIcebergReq   `json:"iceberg,omitempty"`
 }
 
 type provisionMetadataReq struct {
@@ -153,9 +152,9 @@ type provisionMetadataReq struct {
 	External *provisionExternalReq `json:"external,omitempty"`
 }
 
-// provisionDuckLakeReq toggles the DuckLake catalog. Independent of Iceberg and
-// of the metadata-store type: enable DuckLake, Iceberg, or both. At least one
-// catalog must be enabled.
+// provisionDuckLakeReq toggles the DuckLake catalog. Independent of the
+// metadata-store type; it must be enabled (a warehouse without a catalog has
+// nothing to attach).
 type provisionDuckLakeReq struct {
 	Enabled bool `json:"enabled"`
 }
@@ -178,23 +177,6 @@ type provisionDataStoreReq struct {
 	Type       string `json:"type"`
 	BucketName string `json:"bucket_name,omitempty"`
 	Region     string `json:"region,omitempty"`
-}
-
-// provisionIcebergReq toggles the per-tenant Lakekeeper Iceberg catalog. For
-// external metadata stores it's optional (enabled → iceberg+external, omitted
-// → ducklake+external); for cnpg-shard it's implied and always enabled.
-type provisionIcebergReq struct {
-	Enabled   bool   `json:"enabled"`
-	Namespace string `json:"namespace,omitempty"`
-}
-
-// icebergNamespace returns the requested Iceberg namespace, or "" to let the
-// XRD default ("main") apply.
-func icebergNamespace(req *provisionIcebergReq) string {
-	if req == nil {
-		return ""
-	}
-	return req.Namespace
 }
 
 // resolveDataStore validates and normalizes the data-store request into the
@@ -241,14 +223,12 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Catalogs are decoupled from the metadata backend: a duckling can run
-	// DuckLake, Iceberg, or both, on any of the three metadata stores. At least
-	// one catalog must be enabled (a warehouse with neither has nothing to
-	// attach).
+	// The catalog is decoupled from the metadata backend: a duckling runs
+	// DuckLake on any of the metadata stores. It must be enabled (a warehouse
+	// without a catalog has nothing to attach).
 	ducklakeEnabled := req.DuckLake != nil && req.DuckLake.Enabled
-	icebergEnabled := req.Iceberg != nil && req.Iceberg.Enabled
-	if !ducklakeEnabled && !icebergEnabled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of ducklake.enabled or iceberg.enabled must be true"})
+	if !ducklakeEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ducklake.enabled must be true"})
 		return
 	}
 
@@ -282,17 +262,9 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "duckling_name is required"})
 		return
 	}
-	if icebergEnabled {
-		warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
-			Enabled:   true,
-			Backend:   configstore.IcebergBackendLakekeeper,
-			Namespace: icebergNamespace(req.Iceberg),
-		}
-	}
-
-	// Metadata backend (the Postgres that hosts the DuckLake catalog and/or the
-	// Lakekeeper PG). Provisioning shape differs per type; the catalog choice
-	// above is orthogonal.
+	// Metadata backend (the Postgres that hosts the DuckLake catalog).
+	// Provisioning shape differs per type; the catalog choice above is
+	// orthogonal.
 	switch req.MetadataStore.Type {
 	case configstore.MetadataStoreKindCnpgShard:
 		// No per-claim config — the composition picks the active shard from
@@ -374,7 +346,6 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		"database_name":    req.DatabaseName,
 		"metadata_store":   string(req.MetadataStore.Type),
 		"ducklake_enabled": ducklakeEnabled,
-		"iceberg_enabled":  icebergEnabled,
 	})
 
 	resp := gin.H{

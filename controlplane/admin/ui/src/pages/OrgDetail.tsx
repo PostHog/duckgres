@@ -282,7 +282,6 @@ const STATE_FIELDS: { key: keyof ManagedWarehouse; label: string }[] = [
   { key: "state", label: "Overall" },
   { key: "metadata_store_state", label: "Metadata store" },
   { key: "s3_state", label: "S3" },
-  { key: "iceberg_state", label: "Iceberg" },
   { key: "identity_state", label: "Identity" },
   { key: "secrets_state", label: "Secrets" },
 ];
@@ -444,14 +443,10 @@ function WarehousePanel({
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Configuration</p>
               <ReadRow label="metadata_store" value={data.metadata_store} />
               <ReadRow label="s3" value={data.s3} />
-              <ReadRow label="iceberg" value={data.iceberg} />
               <ReadRow label="worker_identity" value={data.worker_identity} />
               <div className="flex flex-wrap gap-2 pt-1">
                 <Badge variant={data.pgbouncer?.enabled ? "success" : "muted"}>
                   pgbouncer {data.pgbouncer?.enabled ? "on" : "off"}
-                </Badge>
-                <Badge variant={data.iceberg?.enabled ? "success" : "muted"}>
-                  iceberg {data.iceberg?.enabled ? "on" : "off"}
                 </Badge>
                 <Badge variant={data.ducklake?.enabled ? "success" : "muted"}>
                   ducklake {data.ducklake?.enabled ? "on" : "off"}

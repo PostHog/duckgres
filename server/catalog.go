@@ -1660,11 +1660,6 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			ON c.table_schema = m.table_schema
 			AND c.table_name = m.table_name
 			AND c.column_name = m.column_name
-		WHERE NOT (
-			c.table_catalog = 'iceberg'
-			AND c.column_name = '__'
-			AND UPPER(c.data_type) = 'UNKNOWN'
-		)
 	`
 	if _, err := db.Exec(fmt.Sprintf(columnsViewSQL, infoSchemaPrefix)); err != nil {
 		// If join with metadata table fails, create simpler view without it
@@ -1748,11 +1743,6 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 				NULL AS generation_expression,
 				'YES' AS is_updatable
 			FROM %s.columns
-			WHERE NOT (
-				table_catalog = 'iceberg'
-				AND column_name = '__'
-				AND UPPER(data_type) = 'UNKNOWN'
-			)
 		`
 		if _, err := db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix)); err != nil {
 			slog.Warn("Failed to create information_schema_columns_compat view.", "error", err)
@@ -1779,7 +1769,8 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			NULL AS commit_action
 		FROM %s.tables t
 		WHERE t.table_name NOT IN (
-			-- Internal duckgres tables
+			-- Internal duckgres tables ('__duckgres_iceberg_column_metadata' is
+			-- legacy, left behind on workers warmed by pre-Iceberg-removal binaries)
 			'__duckgres_column_metadata', '__duckgres_iceberg_column_metadata',
 			-- pg_catalog compat views
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
