@@ -12,6 +12,12 @@ import (
 // (lowercase letters, digits, and underscores, starting with a letter)
 var configParamPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+// querySourceParam is the duckgres-namespaced custom session GUC that carries
+// the pull-based-compute-billing query source. It is intercepted here and
+// stored session-side by the connection layer; it is NEVER forwarded to DuckDB
+// (DuckDB rejects unknown settings). See clientConn.QuerySource in server/.
+const querySourceParam = "duckgres.query_source"
+
 // duckdbShowCommands are DuckDB-specific SHOW commands that should be passed
 // through to DuckDB rather than treated as PostgreSQL config parameters.
 var duckdbShowCommands = map[string]bool{
@@ -231,6 +237,25 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 
 				paramName := strings.ToLower(n.VariableSetStmt.Name)
 
+				// duckgres.query_source: a duckgres-namespaced custom GUC. Intercept
+				// and hand the value to the connection layer to store on the session;
+				// do NOT forward to DuckDB (it would reject the unknown setting).
+				// RESET restores the default (empty value). SET LOCAL is treated the
+				// same as SET here (there is no transaction-scoped restore for this
+				// billing GUC).
+				if paramName == querySourceParam {
+					value := ""
+					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
+						if len(n.VariableSetStmt.Args) == 1 {
+							if v, ok := searchPathValue(n.VariableSetStmt.Args[0]); ok {
+								value = v
+							}
+						}
+					}
+					result.QuerySourceSet = &value
+					return true, nil
+				}
+
 				if paramName == "search_path" {
 					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt); ok {
 						result.SQLOverride = sql
@@ -282,6 +307,13 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 		case *pg_query.Node_VariableShowStmt:
 			if n.VariableShowStmt != nil {
 				paramName := strings.ToLower(n.VariableShowStmt.Name)
+
+				// duckgres.query_source: answered from session state by the
+				// connection layer (defaulting to "standard"), not DuckDB.
+				if paramName == querySourceParam {
+					result.QuerySourceShow = true
+					return true, nil
+				}
 
 				// Passthrough params: SHOW → SELECT value FROM duckdb_settings() WHERE name = '...'
 				// (DuckDB's SHOW <name> describes a table, not a setting)

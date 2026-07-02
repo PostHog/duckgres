@@ -23,6 +23,18 @@ type Result struct {
 	// IsIgnoredSet indicates a SET command for an unsupported parameter
 	IsIgnoredSet bool
 
+	// QuerySourceSet, when non-nil, indicates the statement is
+	// `SET duckgres.query_source = '<value>'` (a duckgres-namespaced custom GUC
+	// that must NOT be forwarded to DuckDB). The pointed-to string is the value
+	// to store on the session; the connection layer intercepts and acknowledges
+	// it as "SET" without executing anything against DuckDB.
+	QuerySourceSet *string
+
+	// QuerySourceShow indicates the statement is `SHOW duckgres.query_source`.
+	// The connection layer answers it from session state (or "standard" if
+	// unset) rather than DuckDB.
+	QuerySourceShow bool
+
 	// Error is set when a transform detects an error that should be returned to the client
 	// (e.g., unrecognized configuration parameter in SHOW command)
 	Error error
