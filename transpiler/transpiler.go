@@ -280,6 +280,19 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 			}, nil
 		}
 
+		// duckgres-namespaced custom GUC (duckgres.query_source): intercepted
+		// session-side, never deparsed/forwarded to DuckDB. Return early so the
+		// connection layer can store/echo it.
+		if transformResult.QuerySourceSet != nil || transformResult.QuerySourceShow {
+			return &Result{
+				SQL:             sql,
+				ParamCount:      transformResult.ParamCount,
+				QuerySourceSet:  transformResult.QuerySourceSet,
+				QuerySourceShow: transformResult.QuerySourceShow,
+				Warnings:        transformResult.Warnings,
+			}, nil
+		}
+
 		// Check for early exit conditions
 		if transformResult.IsNoOp || transformResult.IsIgnoredSet {
 			// For no-op commands, return the original SQL (it won't be executed)

@@ -12,6 +12,12 @@ import (
 // (lowercase letters, digits, and underscores, starting with a letter)
 var configParamPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+// querySourceParam is the duckgres-namespaced custom session GUC that carries
+// the pull-based-compute-billing query source. It is intercepted here and
+// stored session-side by the connection layer; it is NEVER forwarded to DuckDB
+// (DuckDB rejects unknown settings). See clientConn.QuerySource in server/.
+const querySourceParam = "duckgres.query_source"
+
 // duckdbShowCommands are DuckDB-specific SHOW commands that should be passed
 // through to DuckDB rather than treated as PostgreSQL config parameters.
 var duckdbShowCommands = map[string]bool{
@@ -201,6 +207,17 @@ func (t *SetShowTransform) Name() string {
 func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
 	changed := false
 
+	// The duckgres.query_source custom GUC is intercepted session-side and
+	// surfaced on the whole-batch Result (QuerySourceSet/QuerySourceShow), which
+	// makes the transpiler return early for the ENTIRE batch. That is only safe
+	// for a single-statement batch: for a multi-statement simple query
+	// (e.g. `SET duckgres.query_source='x'; SHOW duckgres.query_source`) an early
+	// return would swallow every statement after the GUC one. When the batch has
+	// more than one statement we DON'T intercept here — the connection layer
+	// splits the batch and re-transpiles each statement on its own, and the
+	// single-statement transpile then intercepts the GUC correctly.
+	multiStatement := len(tree.Stmts) > 1
+
 	for i, stmt := range tree.Stmts {
 		if stmt.Stmt == nil {
 			continue
@@ -230,6 +247,25 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				}
 
 				paramName := strings.ToLower(n.VariableSetStmt.Name)
+
+				// duckgres.query_source: a duckgres-namespaced custom GUC. Intercept
+				// and hand the value to the connection layer to store on the session;
+				// do NOT forward to DuckDB (it would reject the unknown setting).
+				// RESET restores the default (empty value). SET LOCAL is treated the
+				// same as SET here (there is no transaction-scoped restore for this
+				// billing GUC).
+				if paramName == querySourceParam && !multiStatement {
+					value := ""
+					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
+						if len(n.VariableSetStmt.Args) == 1 {
+							if v, ok := searchPathValue(n.VariableSetStmt.Args[0]); ok {
+								value = v
+							}
+						}
+					}
+					result.QuerySourceSet = &value
+					return true, nil
+				}
 
 				if paramName == "search_path" {
 					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt); ok {
@@ -282,6 +318,13 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 		case *pg_query.Node_VariableShowStmt:
 			if n.VariableShowStmt != nil {
 				paramName := strings.ToLower(n.VariableShowStmt.Name)
+
+				// duckgres.query_source: answered from session state by the
+				// connection layer (defaulting to "standard"), not DuckDB.
+				if paramName == querySourceParam && !multiStatement {
+					result.QuerySourceShow = true
+					return true, nil
+				}
 
 				// Passthrough params: SHOW → SELECT value FROM duckdb_settings() WHERE name = '...'
 				// (DuckDB's SHOW <name> describes a table, not a setting)
