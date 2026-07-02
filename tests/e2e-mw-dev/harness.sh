@@ -330,13 +330,20 @@ pg_compat_functions() { # org password
 #   2. SET then SHOW in the same session → the value round-trips
 #   3. an arbitrary (non-standard/endpoints) value is accepted pass-through,
 #      not rejected — only "standard"/"endpoints" are meaningful downstream.
-# If any of these forwarded to DuckDB, the query would error ("unrecognized
-# configuration parameter"), failing the assert.
+#   4. a batch mixing the GUC SET with a normal statement runs the normal
+#      statement too — the intercepted GUC must NOT swallow the rest of the
+#      batch (regression for the multi-statement-swallow bug).
+# Assertions 2-4 are multi-statement simple queries: the CP splits the batch and
+# runs each statement in order, so the SET applies session-side before the
+# trailing SHOW/SELECT. If any statement forwarded to DuckDB, the query would
+# error ("unrecognized configuration parameter"), failing the assert; if the GUC
+# swallowed the batch, the trailing statement's value would be missing.
 query_source_guc() { # org password
   log "duckgres.query_source session GUC on $1"
   assert_compat "$1" "$2" ducklake "SHOW duckgres.query_source" "standard" "query_source_default"
   assert_compat "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SHOW duckgres.query_source" "endpoints" "query_source_set"
   assert_compat "$1" "$2" ducklake "SET duckgres.query_source = 'anything'; SHOW duckgres.query_source" "anything" "query_source_passthrough"
+  assert_compat "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" "1" "query_source_set_then_query"
 }
 
 # Regression for #715: the CP reads the post-TLS startup message with the shared

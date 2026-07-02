@@ -207,6 +207,17 @@ func (t *SetShowTransform) Name() string {
 func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
 	changed := false
 
+	// The duckgres.query_source custom GUC is intercepted session-side and
+	// surfaced on the whole-batch Result (QuerySourceSet/QuerySourceShow), which
+	// makes the transpiler return early for the ENTIRE batch. That is only safe
+	// for a single-statement batch: for a multi-statement simple query
+	// (e.g. `SET duckgres.query_source='x'; SHOW duckgres.query_source`) an early
+	// return would swallow every statement after the GUC one. When the batch has
+	// more than one statement we DON'T intercept here — the connection layer
+	// splits the batch and re-transpiles each statement on its own, and the
+	// single-statement transpile then intercepts the GUC correctly.
+	multiStatement := len(tree.Stmts) > 1
+
 	for i, stmt := range tree.Stmts {
 		if stmt.Stmt == nil {
 			continue
@@ -243,7 +254,7 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				// RESET restores the default (empty value). SET LOCAL is treated the
 				// same as SET here (there is no transaction-scoped restore for this
 				// billing GUC).
-				if paramName == querySourceParam {
+				if paramName == querySourceParam && !multiStatement {
 					value := ""
 					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
 						if len(n.VariableSetStmt.Args) == 1 {
@@ -310,7 +321,7 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 
 				// duckgres.query_source: answered from session state by the
 				// connection layer (defaulting to "standard"), not DuckDB.
-				if paramName == querySourceParam {
+				if paramName == querySourceParam && !multiStatement {
 					result.QuerySourceShow = true
 					return true, nil
 				}

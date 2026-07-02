@@ -79,3 +79,34 @@ func TestTranspile_OtherSetNotQuerySource(t *testing.T) {
 		t.Errorf("IsIgnoredSet = false, want true for application_name")
 	}
 }
+
+// TestTranspile_QuerySourceMultiStatementNotIntercepted guards the fix for the
+// e2e bug: transpiling a MULTI-statement batch that starts with a
+// duckgres.query_source statement must NOT surface QuerySourceSet/QuerySourceShow
+// on the whole-batch Result. Surfacing it would make the transpiler return early
+// for the entire batch, swallowing every statement after the GUC one. The
+// connection layer splits multi-statement simple queries and re-transpiles each
+// statement individually — where the single-statement interception then fires.
+func TestTranspile_QuerySourceMultiStatementNotIntercepted(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	cases := []string{
+		"SET duckgres.query_source = 'endpoints'; SHOW duckgres.query_source",
+		"SET duckgres.query_source = 'endpoints'; SELECT 1",
+		"SHOW duckgres.query_source; SELECT 1",
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			result, err := tr.Transpile(in)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", in, err)
+			}
+			if result.QuerySourceSet != nil {
+				t.Errorf("Transpile(%q): QuerySourceSet = %v, want nil for a multi-statement batch (would swallow trailing statements)", in, *result.QuerySourceSet)
+			}
+			if result.QuerySourceShow {
+				t.Errorf("Transpile(%q): QuerySourceShow = true, want false for a multi-statement batch (would swallow trailing statements)", in)
+			}
+		})
+	}
+}
