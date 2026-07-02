@@ -39,10 +39,10 @@ Internally, one row per unique key, values accumulated:
 - Worker size (`cpu`, `mem_gib`) is part of the key, so different worker sizes
   accumulate — and bill — separately. Units match the values (vCPU / GiB).
 
-**60-second resolution is preserved end to end** — the API serves these minute
-buckets directly (one row per closed minute per key). The watermark ack (below)
-lets billing pull all pending minutes at once, so minute granularity doesn't mean
-chasing buckets.
+**60-second resolution is kept internally** (source of truth), but the API
+**aggregates on read**: a `GET` sums all closed buckets in the window into **one
+row per key** (below). The fine buckets stay internally; billing gets one
+compacted row per key per pull.
 
 A bucket is **closed** (eligible to serve) once `now ≥ bucket_start + 60s + grace`
 (grace ≈ 30s). `grace` must exceed the in-process→config-store flush interval so
@@ -57,9 +57,10 @@ Auth: `Authorization: Bearer <internal secret>`.
 
 ### `GET /api/billing/usage`
 
-Returns every **closed 60s bucket since the last ack** — one row per
-`(org_id, team_id, query_source, cpu, mem_gib, bucket_start)`. Size is reported as
-`cpu` (vCPU) and `mem_gib` (GiB) — same units as the values:
+Returns compute usage **aggregated since the last ack — one row per key**
+`(org_id, team_id, query_source, cpu, mem_gib)`, summing every closed bucket in the
+window. Size is reported as `cpu` (vCPU) and `mem_gib` (GiB) — same units as the
+values:
 
 ```json
 {
@@ -67,14 +68,13 @@ Returns every **closed 60s bucket since the last ack** — one row per
   "watermark_high": "2026-07-01T12:40:00Z",
   "usage": [
     {
-      "bucket_start": "2026-07-01T12:34:00Z",
       "query_source": "endpoints" | "standard",
       "org_id": "org_abc",
       "team_id": "12345",
       "cpu": 8,
       "mem_gib": 16,
-      "cpu_seconds": 480,
-      "memory_seconds": 960
+      "cpu_seconds": 4800,
+      "memory_seconds": 9600
     }
   ]
 }
@@ -83,8 +83,8 @@ Returns every **closed 60s bucket since the last ack** — one row per
 (`cpu`/`mem_gib` are exact decimals — e.g. `1.5`, `0.5` — for fractional worker
 sizes; stored as `NUMERIC` so grouping is exact.)
 
-- Returns every closed bucket in the window `(watermark_low, watermark_high]`,
-  kept at minute granularity, where:
+- Sums every closed bucket in the window `(watermark_low, watermark_high]` into one
+  row per key, where:
   - `watermark_low` = duckgres's current cursor (= the last value billing acked) —
     the window start.
   - `watermark_high` = the latest closed minute (`now − grace`) — what billing acks.
@@ -93,11 +93,10 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   half-applied ack; HTTP and Postgres aren't one transaction) → a potential hole →
   alert/reconcile instead of silently under-billing. It's a cross-check, not a
   correctness fix (delete-on-ack already prevents loss); it makes a *bug* visible.
-- **Catch up in one pull.** A single `GET` returns **all** pending minutes since
-  the last ack (not one bucket per request), and one `ack` advances past all of
-  them — so billing never chases 60s buckets and can't fall behind. Response size
-  is bounded by active-keys × minutes-since-ack; pull on a sane cadence and it
-  stays small.
+- **Can't fall behind.** Everything since the last ack is aggregated into one row
+  per key, so the response size is bounded by the **number of active keys** —
+  independent of how long billing was away. A week of downtime returns the same row
+  count, just larger sums. One `ack` advances past all of it.
 
 ### `POST /api/billing/ack`
 
@@ -149,7 +148,7 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 - **Keep:** per-connection metering → config-store 60s buckets.
 - **Extend:** the bucket table gains `team_id`, `query_source`, `cpu`, `mem_gib`
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
-  the HTTP API (serve closed minute buckets + watermark ack) + safety GC.
+  the HTTP API (aggregate-on-read into one row per key + watermark ack) + safety GC.
 - **Add:** config-store `org → team` lookup and the connection's `query_source`
   (standard vs endpoints) — both threaded onto the connection; a bearer secret for
   the API.
