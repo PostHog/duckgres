@@ -62,10 +62,12 @@ Auth: `Authorization: Bearer <internal secret>`.
 
 ### `GET /api/billing/usage`
 
-Returns compute usage **aggregated since the last ack — one row per key**
-`(org_id, team_id, query_source, cpu, mem_gib)`, summing every closed bucket in the
-window. Size is reported as `cpu` (vCPU) and `mem_gib` (GiB) — same units as the
-values:
+Returns compute usage **aggregated since the last ack — one row per key per day**
+`(org_id, team_id, query_source, cpu, mem_gib, date)`, summing every closed bucket
+in the window. `date` is the **UTC** calendar day, so each row belongs to exactly
+one billing day (a window that straddles midnight yields two rows per key — one
+per day; a same-day window yields one). Size is reported as `cpu` (vCPU) and
+`mem_gib` (GiB) — same units as the values:
 
 ```json
 {
@@ -73,6 +75,7 @@ values:
   "watermark_high": "2026-07-01T12:40:00Z",
   "usage": [
     {
+      "date": "2026-07-01",
       "query_source": "endpoints" | "standard",
       "org_id": "org_abc",
       "team_id": "12345",
@@ -89,7 +92,8 @@ values:
 sizes; stored as `NUMERIC` so grouping is exact.)
 
 - Sums every closed bucket in the window `(watermark_low, watermark_high]` into one
-  row per key, where:
+  row per key **per UTC day** (so cross-midnight windows split into per-day rows),
+  where:
   - `watermark_low` = duckgres's current cursor (= the last value billing acked) —
     the window start.
   - `watermark_high` = the latest closed minute (`now − grace`) — what billing acks.
@@ -99,9 +103,10 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   alert/reconcile instead of silently under-billing. It's a cross-check, not a
   correctness fix (delete-on-ack already prevents loss); it makes a *bug* visible.
 - **Can't fall behind.** Everything since the last ack is aggregated into one row
-  per key, so the response size is bounded by the **number of active keys** —
-  independent of how long billing was away. A week of downtime returns the same row
-  count, just larger sums. One `ack` advances past all of it.
+  per key per day, so the response size is bounded by **active keys × days in the
+  window** — independent of how *busy* billing-downtime was. A week of downtime
+  returns ~7 rows per key (one per day), not thousands of minute-buckets. One `ack`
+  advances past all of it.
 
 ### `POST /api/billing/ack`
 
@@ -153,7 +158,8 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 - **Keep:** per-connection metering → config-store 60s buckets.
 - **Extend:** the bucket table gains `team_id`, `query_source`, `cpu`, `mem_gib`
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
-  the HTTP API (aggregate-on-read into one row per key + watermark ack) + safety GC.
+  the HTTP API (aggregate-on-read into one row per key per UTC day + watermark ack)
+  + safety GC.
 - **Add:** a `default_team_id` column on the org (used as the bucket `team_id` —
   fixed per org, no per-team logic yet); a `duckgres.query_source` session GUC
   (`standard` | `endpoints`, default `standard`) read by the meter; a bearer secret
