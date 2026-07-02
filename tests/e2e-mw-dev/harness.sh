@@ -81,6 +81,32 @@ EXT="ci-pr-${PR_NUMBER}-ext"
 RES1="ci-pr-${PR_NUMBER}-res1"
 RES2="ci-pr-${PR_NUMBER}-res2"
 
+# How long each org may take to reach warehouse state=ready (wait_state below).
+# All four orgs are cnpg-shard/DuckLake ducklings, and "ready" is a PROVISIONING
+# gate, not a worker-spawn one: the CP provisioner only flips ready after the
+# Crossplane Duckling is Ready (bucket + shard role/DB + IAM + secrets), the
+# per-org Lakekeeper catalog has bootstrapped, AND an end-to-end SELECT 1 probe
+# against the metadata store actually connects (controller.go reconcileProvisioning).
+#
+# 600s was too tight for that last probe. All four ducklings share ONE cnpg
+# shard cluster (shard-001-pooler), and after Crossplane reports the role/DB
+# Available there is a credential-propagation tail before the freshly-set role
+# password is accepted at the pooler — the probe fails "SASL authentication
+# failed (SQLSTATE 08P01)" and the org correctly stays in `provisioning` while
+# the reconcile loop retries every 10s. Observed on a single org (e.g. res1)
+# while its three siblings went ready inside 600s: the probe kept failing SASL
+# for ~9 min, right up to the old 600s deadline, then the harness gave up
+# (last=provisioning) even though the CP had NOT failed it — the CP's own
+# provisioning hard-timeout is 30 min (controller.go), so we were failing the
+# run well inside the window the system considers still-healthy.
+#
+# Give the shared-shard propagation transient room to self-heal while staying
+# safely under the CP's 30-min terminal timeout. Env-overridable if the cluster
+# drifts. This is a legitimately-slow provision, not a hang — a real stuck
+# warehouse still trips `failed` (wait_state) or the 30-min CP timeout long
+# before this budget.
+READY_TIMEOUT="${READY_TIMEOUT:-1200}"
+
 # The bundled extensions MUST be the PostHog forks. These are the short commit
 # SHAs duckdb_extensions() reports for the tags the image pins
 # (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry).
@@ -2247,10 +2273,10 @@ main() {
   for v in "$cnpg_pw" "$ext_pw" "$res1_pw" "$res2_pw"; do
     case "$v" in ""|null) fail "a provision call returned no password" ;; esac
   done
-  run_lane ready_cnpg wait_state "$CNPG" ready 600
-  run_lane ready_ext  wait_state "$EXT"  ready 600
-  run_lane ready_res1 wait_state "$RES1" ready 600
-  run_lane ready_res2 wait_state "$RES2" ready 600
+  run_lane ready_cnpg wait_state "$CNPG" ready "$READY_TIMEOUT"
+  run_lane ready_ext  wait_state "$EXT"  ready "$READY_TIMEOUT"
+  run_lane ready_res1 wait_state "$RES1" ready "$READY_TIMEOUT"
+  run_lane ready_res2 wait_state "$RES2" ready "$READY_TIMEOUT"
   join_lanes ready_cnpg ready_ext ready_res1 ready_res2
 
   # Settle: let the CP's config-store poll pick up the provisioned orgs/users

@@ -286,7 +286,17 @@ YAML
   # --for=condition=complete` alone hangs the full timeout when the Job
   # FAILED (the condition it waits for never becomes true), which is what
   # made a one-second harness failure stall the step for 20 minutes.
-  deadline=$(( $(date +%s) + 1200 ))
+  #
+  # This watch window must exceed the harness's total wall time: the ready-wait
+  # (harness.sh READY_TIMEOUT, up to 1200s while a cnpg-shard org's metadata
+  # probe waits out the shared-shard credential-propagation transient) PLUS the
+  # assertion lanes that run after. 1200s used to be the whole budget, which
+  # meant a slow provision left no room for the lanes and this loop returned a
+  # false "did not reach a terminal state" even though the harness would pass.
+  # The Job has no activeDeadlineSeconds, so this loop is the only cap; size it
+  # generously above READY_TIMEOUT and stay under the CP's 30-min provisioning
+  # hard-timeout. Env-overridable to keep it in lockstep with READY_TIMEOUT.
+  deadline=$(( $(date +%s) + ${HARNESS_WATCH_TIMEOUT:-1800} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if [ "$("${KUBECTL[@]}" -n "$NS" get job duckgres-harness -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)" = "True" ]; then
       echo "harness Job complete."; return 0
