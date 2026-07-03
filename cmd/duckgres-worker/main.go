@@ -21,6 +21,7 @@ import (
 	"github.com/posthog/duckgres/configresolve"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/crashhandler"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -44,6 +45,13 @@ func main() {
 	// DuckLake) don't crash the process when a network connection drops
 	// mid-query. Same rationale as the all-in-one binary.
 	signal.Ignore(syscall.SIGPIPE)
+
+	// The native crash handler self-installs from a C constructor (importing
+	// the package links it in): a SIGSEGV on a DuckDB-created thread must kill
+	// the worker with a native backtrace, not wedge it forever holding locks.
+	if !crashhandler.Installed() {
+		slog.Warn("Native crash handler NOT installed; fatal signals on native threads may wedge the process.")
+	}
 
 	// Worker-relevant flag subset. The all-in-one duckgres binary registers
 	// ~60 flags covering standalone / control-plane / duckdb-service. The
@@ -253,4 +261,3 @@ func main() {
 		MaxSessions:  maxSessions,
 	})
 }
-

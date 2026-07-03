@@ -17,6 +17,7 @@ import (
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/crashhandler"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -54,6 +55,15 @@ func main() {
 	// drops mid-query. Go already converts EPIPE to errors on Write; the
 	// default SIGPIPE handler is a legacy Unix footgun that kills the process.
 	signal.Ignore(syscall.SIGPIPE)
+
+	// The native crash handler self-installs from a C constructor (importing
+	// the package is what links it in). Without it, a SIGSEGV on a
+	// DuckDB-created thread can wedge the process forever instead of killing
+	// it — see the package doc. Surface its state early so a missing handler
+	// is visible in logs.
+	if !crashhandler.Installed() {
+		slog.Warn("Native crash handler NOT installed; fatal signals on native threads may wedge the process.")
+	}
 
 	// Set version on server package so catalog macros can expose it
 	server.SetProcessVersion(version)
