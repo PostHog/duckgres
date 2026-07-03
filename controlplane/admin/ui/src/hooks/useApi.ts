@@ -151,6 +151,20 @@ export function useUpdateWarehouse(id: string) {
   });
 }
 
+// POST /orgs/:id/deprovision — asynchronous duckling teardown. Invalidate the
+// warehouse (state flips to deleting) and the org queries (warehouse presence
+// gates org deletion).
+export function useDeprovisionWarehouse(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.deprovisionWarehouse(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["orgs", id, "warehouse"] });
+      qc.invalidateQueries({ queryKey: ["orgs"] });
+    },
+  });
+}
+
 // ---- ducklings (admin-only) ----
 
 const EMPTY_DRIFT: DucklingDriftResponse = { available: false, checked: 0, entries: [] };

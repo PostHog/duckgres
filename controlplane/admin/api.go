@@ -22,6 +22,8 @@ import (
 
 var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
 
+var errWarehouseStillExists = errors.New("managed warehouse still exists for org")
+
 // maxWarehousePutBodyBytes caps the admin PUT body. Warehouse payloads are
 // under 10 KB in practice; 1 MiB leaves room for future fields while keeping
 // the handler from loading unbounded input into memory.
@@ -225,6 +227,16 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 	returnRows := int64(0)
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		// Deleting an org while its managed warehouse row still exists would
+		// cascade the row away and leak the Duckling CR + infra behind it. The
+		// warehouse must be deprovisioned (which removes the row) first.
+		var warehouses int64
+		if err := tx.Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", name).Count(&warehouses).Error; err != nil {
+			return err
+		}
+		if warehouses > 0 {
+			return errWarehouseStillExists
+		}
 		if err := tx.Where("org_id = ?", name).Delete(&configstore.OrgUser{}).Error; err != nil {
 			return err
 		}
@@ -638,6 +650,10 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 	name := c.Param("id")
 	ok, err := h.store.DeleteOrg(name)
 	if err != nil {
+		if errors.Is(err, errWarehouseStillExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": "warehouse still exists — deprovision it and wait for teardown to complete before deleting the org"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

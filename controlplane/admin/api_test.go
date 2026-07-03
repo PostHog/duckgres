@@ -86,8 +86,10 @@ func (s *fakeAPIStore) DeleteOrg(name string) (bool, error) {
 	if _, ok := s.orgs[name]; !ok {
 		return false, nil
 	}
+	if _, ok := s.warehouses[name]; ok {
+		return false, errWarehouseStillExists
+	}
 	delete(s.orgs, name)
-	delete(s.warehouses, name)
 	return true, nil
 }
 
@@ -1107,6 +1109,47 @@ func TestUpdateOrgRejectsNestedWarehousePayload(t *testing.T) {
 	}
 	if store.orgs["analytics"].MaxWorkers != 2 {
 		t.Fatalf("expected org update to be rejected, max_workers = %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestDeleteOrgRejectsWhenWarehouseStillExists(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "deprovision") {
+		t.Fatalf("expected error to mention deprovision, got: %s", rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; !ok {
+		t.Fatal("expected org to survive a rejected delete")
+	}
+	if _, ok := store.warehouses["analytics"]; !ok {
+		t.Fatal("expected warehouse to survive a rejected delete")
+	}
+}
+
+func TestDeleteOrgSucceedsAfterWarehouseRemoved(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	delete(store.warehouses, "analytics")
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("expected org to be deleted once the warehouse is gone")
 	}
 }
 

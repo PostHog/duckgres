@@ -25,6 +25,7 @@ import { ducklingBroken, ducklingEntryFor, fmtTime } from "@/lib/format";
 import { ShardBadge } from "@/components/ShardBadge";
 import {
   useDeleteOrg,
+  useDeprovisionWarehouse,
   useDucklingsMetadata,
   useOrg,
   useUpdateOrg,
@@ -77,6 +78,7 @@ export function OrgDetail() {
   const [form, setForm] = useState<FormState | null>(null);
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
 
   useEffect(() => {
     if (org.data) setForm(orgToForm(org.data));
@@ -123,13 +125,23 @@ export function OrgDetail() {
     }
   };
 
+  // Org deletion is blocked while a managed warehouse still exists: the correct
+  // flow is deprovision → provisioner tears down the duckling and removes the
+  // warehouse row → then delete. The backend 409s too; this is belt-and-suspenders.
+  const orgHasWarehouse = Boolean(org.data?.warehouse) || Boolean(warehouse.data);
+
+  const closeDelete = () => {
+    setConfirmDelete(false);
+    setDeleteConfirmText("");
+  };
+
   const doDelete = async () => {
     try {
       await del.mutateAsync(id);
       navigate("/orgs");
     } catch (e) {
       setMsg({ kind: "err", text: e instanceof Error ? e.message : "Delete failed" });
-      setConfirmDelete(false);
+      closeDelete();
     }
   };
 
@@ -139,9 +151,26 @@ export function OrgDetail() {
         id={id}
         actions={
           <AdminGate>
-            <Button variant="destructive" size="sm" onClick={() => setConfirmDelete(true)}>
-              <Trash2 className="h-4 w-4" /> Delete org
-            </Button>
+            {orgHasWarehouse ? (
+              // Disabled buttons swallow pointer events, so the tooltip
+              // triggers on a wrapping span. delayDuration 0 = immediate.
+              <Tooltip delayDuration={0}>
+                <TooltipTrigger asChild>
+                  <span tabIndex={0}>
+                    <Button variant="destructive" size="sm" disabled className="pointer-events-none">
+                      <Trash2 className="h-4 w-4" /> Delete org
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                  Deprovision the warehouse first — org delete is blocked while it exists.
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              <Button variant="destructive" size="sm" onClick={() => setConfirmDelete(true)}>
+                <Trash2 className="h-4 w-4" /> Delete org
+              </Button>
+            )}
           </AdminGate>
         }
       />
@@ -230,7 +259,7 @@ export function OrgDetail() {
         </div>
       </PageBody>
 
-      <Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+      <Dialog open={confirmDelete} onOpenChange={(open) => (open ? setConfirmDelete(true) : closeDelete())}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Delete org "{id}"?</DialogTitle>
@@ -238,11 +267,35 @@ export function OrgDetail() {
               This removes the org and all of its users from the config store. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
+          <div className="space-y-3">
+            {orgHasWarehouse && (
+              <p className="flex items-start gap-2 text-xs text-warning">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  This org still has a managed warehouse. Deletion is blocked until the warehouse is
+                  deprovisioned and fully gone — deprovision it from the warehouse panel first.
+                </span>
+              </p>
+            )}
+            <Field label="Type the org id to confirm">
+              <Input
+                value={deleteConfirmText}
+                onChange={(e) => setDeleteConfirmText(e.target.value)}
+                placeholder={id}
+                className="font-mono text-xs"
+              />
+            </Field>
+          </div>
           <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setConfirmDelete(false)}>
+            <Button variant="outline" size="sm" onClick={closeDelete}>
               Cancel
             </Button>
-            <Button variant="destructive" size="sm" onClick={doDelete} disabled={del.isPending}>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={doDelete}
+              disabled={del.isPending || orgHasWarehouse || deleteConfirmText.trim() !== id}
+            >
               {del.isPending ? "Deleting…" : "Delete"}
             </Button>
           </DialogFooter>
@@ -298,10 +351,13 @@ function WarehousePanel({
   error: unknown;
 }) {
   const update = useUpdateWarehouse(orgId);
+  const deprovision = useDeprovisionWarehouse(orgId);
   const metadata = useDucklingsMetadata();
   const [image, setImage] = useState("");
   const [version, setVersion] = useState("");
   const [ducklingNameInput, setDucklingNameInput] = useState("");
+  const [confirmDeprovision, setConfirmDeprovision] = useState(false);
+  const [deprovisionConfirmText, setDeprovisionConfirmText] = useState("");
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
 
   useEffect(() => {
@@ -350,6 +406,26 @@ function WarehousePanel({
     } catch (e) {
       setMsg({ kind: "err", text: e instanceof Error ? e.message : "Save failed" });
     }
+  };
+
+  // Already deleting/deleted (or no warehouse at all) → nothing to deprovision.
+  const canDeprovision = !missing && data != null && data.state !== "deleting" && data.state !== "deleted";
+
+  const closeDeprovision = () => {
+    setConfirmDeprovision(false);
+    setDeprovisionConfirmText("");
+  };
+
+  const doDeprovision = async () => {
+    setMsg(null);
+    try {
+      await deprovision.mutateAsync();
+      setMsg({ kind: "ok", text: "Deprovisioning started." });
+    } catch (e) {
+      // A 409 (wrong warehouse state) surfaces its backend message as-is.
+      setMsg({ kind: "err", text: e instanceof Error ? e.message : "Deprovision failed" });
+    }
+    closeDeprovision();
   };
 
   return (
@@ -462,9 +538,60 @@ function WarehousePanel({
                 </Badge>
               </div>
             </div>
+
+            {/* Teardown */}
+            {canDeprovision && (
+              <div className="space-y-2 border-t border-border pt-3">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Danger zone</p>
+                <div className="flex items-center gap-3">
+                  <AdminGate>
+                    <Button variant="destructive" size="sm" onClick={() => setConfirmDeprovision(true)}>
+                      <Trash2 className="h-4 w-4" /> Deprovision warehouse
+                    </Button>
+                  </AdminGate>
+                  <span className="text-xs text-muted-foreground">
+                    Required before the org can be deleted.
+                  </span>
+                </div>
+              </div>
+            )}
           </>
         )}
       </CardContent>
+
+      <Dialog open={confirmDeprovision} onOpenChange={(open) => (open ? setConfirmDeprovision(true) : closeDeprovision())}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Deprovision warehouse for "{orgId}"?</DialogTitle>
+            <DialogDescription>
+              This permanently tears down the org's duckling — the Duckling CR, the S3 data bucket, the
+              metadata database, and the IAM role. Teardown runs asynchronously; the org itself is not
+              deleted. This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <Field label="Type the org id to confirm">
+            <Input
+              value={deprovisionConfirmText}
+              onChange={(e) => setDeprovisionConfirmText(e.target.value)}
+              placeholder={orgId}
+              className="font-mono text-xs"
+            />
+          </Field>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={closeDeprovision}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={doDeprovision}
+              disabled={deprovision.isPending || deprovisionConfirmText.trim() !== orgId}
+            >
+              {deprovision.isPending ? "Deprovisioning…" : "Deprovision"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }
