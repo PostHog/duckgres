@@ -247,7 +247,18 @@ func SetupMultiTenant(
 		slog.Warn("Duckling client unavailable, will use config store for infrastructure details.", "error", dcErr)
 	} else {
 		resolveDucklingStatus = func(ctx context.Context, orgID string) (*provisioner.DucklingStatus, error) {
-			return dc.Get(ctx, orgID)
+			// The CR name is the warehouse row's duckling_name (authoritative,
+			// never derived). The column is NOT NULL and backfilled; the org-ID
+			// fallback only covers legacy in-flight rows with an empty value.
+			warehouse, err := store.GetManagedWarehouse(orgID)
+			if err != nil {
+				return nil, fmt.Errorf("resolve duckling name for org %q: %w", orgID, err)
+			}
+			name := warehouse.DucklingName
+			if name == "" {
+				name = orgID
+			}
+			return dc.Get(ctx, name)
 		}
 	}
 

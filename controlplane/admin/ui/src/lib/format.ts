@@ -145,27 +145,17 @@ export function isZeroTime(ts: string | null | undefined): boolean {
   return !ts || ts.startsWith(ZERO_TIME);
 }
 
-// The Duckling (managed warehouse) CR name is the org ID lowercased, hyphens
-// preserved.
-export function ducklingName(orgName: string): string {
-  return orgName.toLowerCase();
-}
-
-// Resolve an org's entry in a Duckling-CR-name-keyed map: the stored
-// duckling_name wins, then the canonical (lowercased) org name, then the
-// legacy hyphen-stripped variant pre-rename CRs still use (mirrors the drift
-// finder's expected-name set).
+// Resolve an org's entry in a Duckling-CR-name-keyed map by exact match only:
+// the warehouse's stored duckling_name (authoritative, NOT NULL in the DB)
+// wins, then the org name itself. No client-side derivation of CR names.
 export function ducklingEntryFor<T>(
   entries: Record<string, T> | undefined,
   orgName: string,
-  ducklingNameOverride?: string,
+  ducklingName: string | undefined,
 ): T | undefined {
   if (!entries) return undefined;
-  const canonical = ducklingName(orgName);
-  for (const name of [ducklingNameOverride, canonical, canonical.replaceAll("-", "")]) {
-    if (name && entries[name] !== undefined) return entries[name];
-  }
-  return undefined;
+  if (ducklingName && entries[ducklingName] !== undefined) return entries[ducklingName];
+  return entries[orgName];
 }
 
 // A Duckling is broken/unhealthy when its warehouse row exists but the overall

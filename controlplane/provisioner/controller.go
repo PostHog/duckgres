@@ -37,6 +37,18 @@ func captureProvisionFailed(w *configstore.ManagedWarehouse, reason string, upda
 	analytics.Default().Capture("warehouse_provision_failed", w.OrgID, props)
 }
 
+// ducklingCRName returns the Duckling CR name for a warehouse row: the stored
+// duckling_name, which is authoritative (the control plane never derives it).
+// The column is NOT NULL and backfilled in the database, so the org-ID
+// fallback only covers zero-value test fixtures and legacy in-flight rows
+// constructed in memory before the column existed.
+func ducklingCRName(w *configstore.ManagedWarehouse) string {
+	if w.DucklingName != "" {
+		return w.DucklingName
+	}
+	return w.OrgID
+}
+
 // WarehouseStore is the subset of configstore.ConfigStore that the controller needs.
 type WarehouseStore interface {
 	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
@@ -162,7 +174,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 	now := time.Now().UTC()
 
 	// Check if a Duckling CR already exists (e.g., controller restart)
-	_, err := c.duckling.Get(ctx, w.OrgID)
+	_, err := c.duckling.Get(ctx, ducklingCRName(w))
 	if err == nil {
 		// CR exists — transition directly to provisioning
 		log.Info("Duckling CR already exists, transitioning to provisioning.")
@@ -179,7 +191,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 	// Create the Duckling CR
 	log.Info("Creating Duckling CR.",
 		"pgbouncer_enabled", w.PgBouncer.Enabled)
-	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
+	if err := c.duckling.Create(ctx, ducklingCRName(w), CreateOptions{
 		MetadataStoreType:         w.MetadataStore.Kind,
 		PgBouncerEnabled:          w.PgBouncer.Enabled,
 		ExternalEndpoint:          w.MetadataStore.Endpoint,
@@ -231,7 +243,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		return
 	}
 
-	status, err := c.duckling.Get(ctx, w.OrgID)
+	status, err := c.duckling.Get(ctx, ducklingCRName(w))
 	if err != nil {
 		log.Warn("Failed to get Duckling CR status.", "error", err)
 		return
@@ -352,7 +364,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "ready")
 
-	currentPgB, err := c.duckling.GetPgBouncerEnabled(ctx, w.OrgID)
+	currentPgB, err := c.duckling.GetPgBouncerEnabled(ctx, ducklingCRName(w))
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// CR is gone but the warehouse is still marked Ready. Don't try
@@ -367,7 +379,7 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 	if currentPgB != w.PgBouncer.Enabled {
 		log.Info("PgBouncer drift detected, patching Duckling CR.",
 			"desired", w.PgBouncer.Enabled, "current", currentPgB)
-		if err := c.duckling.SetPgBouncerEnabled(ctx, w.OrgID, w.PgBouncer.Enabled); err != nil {
+		if err := c.duckling.SetPgBouncerEnabled(ctx, ducklingCRName(w), w.PgBouncer.Enabled); err != nil {
 			log.Warn("Failed to patch Duckling CR pgbouncer.enabled.", "error", err)
 		}
 	}
@@ -401,7 +413,7 @@ func (c *Controller) reconcileBucketName(ctx context.Context, w *configstore.Man
 		return
 	}
 
-	current, err := c.duckling.GetDataStoreBucketName(ctx, w.OrgID)
+	current, err := c.duckling.GetDataStoreBucketName(ctx, ducklingCRName(w))
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return
@@ -417,7 +429,7 @@ func (c *Controller) reconcileBucketName(ctx context.Context, w *configstore.Man
 
 	if current == "" {
 		log.Info("Backfilling CP-owned bucket name onto Duckling CR.", "bucket", desired)
-		if err := c.duckling.SetDataStoreBucketName(ctx, w.OrgID, desired); err != nil {
+		if err := c.duckling.SetDataStoreBucketName(ctx, ducklingCRName(w), desired); err != nil {
 			log.Warn("Failed to patch Duckling CR dataStore.bucketName.", "error", err)
 			return
 		}
@@ -438,7 +450,7 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 	log := slog.With("org", w.OrgID, "phase", "deleting")
 
 	log.Info("Deleting Duckling CR.")
-	if err := c.duckling.Delete(ctx, w.OrgID); err != nil {
+	if err := c.duckling.Delete(ctx, ducklingCRName(w)); err != nil {
 		// Only proceed if the CR is already gone (NotFound). For other errors
 		// (network, RBAC, etc.) we retry on the next reconcile pass to avoid
 		// marking as deleted while AWS resources still exist.

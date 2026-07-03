@@ -21,13 +21,14 @@ describe("hashColor", () => {
 });
 
 describe("ducklingEntryFor", () => {
-  const entries = { "acme-corp": 1, acmecorp: 2, custom: 3 };
+  const entries = { "acme-corp": 1, custom: 3 };
 
-  it("prefers the stored duckling_name, then canonical, then legacy", () => {
+  it("matches the stored duckling_name or the org name exactly — no derivation", () => {
     expect(ducklingEntryFor(entries, "Acme-Corp", "custom")).toBe(3);
-    expect(ducklingEntryFor(entries, "Acme-Corp")).toBe(1);
-    expect(ducklingEntryFor({ acmecorp: 2 }, "Acme-Corp")).toBe(2);
-    expect(ducklingEntryFor(entries, "unknown-org")).toBeUndefined();
-    expect(ducklingEntryFor(undefined, "Acme-Corp")).toBeUndefined();
+    expect(ducklingEntryFor(entries, "acme-corp", undefined)).toBe(1);
+    // No lowercasing or hyphen-stripping of the org name anymore.
+    expect(ducklingEntryFor(entries, "Acme-Corp", undefined)).toBeUndefined();
+    expect(ducklingEntryFor(entries, "unknown-org", undefined)).toBeUndefined();
+    expect(ducklingEntryFor(undefined, "acme-corp", "custom")).toBeUndefined();
   });
 });

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -252,11 +251,10 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	warehouse := &configstore.ManagedWarehouse{
 		DataStore: ds,
 		DuckLake:  configstore.ManagedWarehouseDuckLake{Enabled: ducklakeEnabled},
-		// Stamp the canonical Duckling CR name now so lookups never have to
-		// re-derive it. lower(orgID) mirrors provisioner.ducklingName (org IDs
-		// are validated DNS-1123 labels, so lowercasing is the whole transform);
-		// we inline it rather than import provisioner into this package.
-		DucklingName: strings.ToLower(orgID),
+		// Stamp the authoritative Duckling CR name: the org ID verbatim. Org IDs
+		// are validated as lowercase DNS-1123 labels at this endpoint, so no
+		// transform is needed — and nothing downstream ever derives the name.
+		DucklingName: orgID,
 	}
 	if warehouse.DucklingName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "duckling_name is required"})

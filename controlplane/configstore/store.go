@@ -650,6 +650,18 @@ func (cs *ConfigStore) ListWarehouses() ([]ManagedWarehouse, error) {
 	return warehouses, nil
 }
 
+// GetManagedWarehouse returns the managed-warehouse row for an org. Direct DB
+// query (not snapshot-based); returns gorm.ErrRecordNotFound when the org has
+// no warehouse row. Callers use it to resolve the authoritative duckling_name
+// before talking to the Duckling CR API.
+func (cs *ConfigStore) GetManagedWarehouse(orgID string) (*ManagedWarehouse, error) {
+	var warehouse ManagedWarehouse
+	if err := cs.db.First(&warehouse, "org_id = ?", orgID).Error; err != nil {
+		return nil, err
+	}
+	return &warehouse, nil
+}
+
 func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvisioningState) ([]ManagedWarehouse, error) {
 	var warehouses []ManagedWarehouse
 	if err := cs.db.Where("state IN ?", states).Find(&warehouses).Error; err != nil {
