@@ -129,6 +129,10 @@ export const api = {
   getWarehouse: (id: string) => get<ManagedWarehouse>(`/orgs/${enc(id)}/warehouse`),
   updateWarehouse: (id: string, body: Partial<ManagedWarehouse>) =>
     put<ManagedWarehouse>(`/orgs/${enc(id)}/warehouse`, body),
+  // Kicks off asynchronous teardown of the org's duckling (202). 409s when the
+  // warehouse state isn't ready/failed/provisioning.
+  deprovisionWarehouse: (id: string) =>
+    post<{ status: string; org: string }>(`/orgs/${enc(id)}/deprovision`, {}),
 
   // ducklings (admin-only)
   getDucklingDrift: () => get<DucklingDriftResponse>("/ducklings/drift"),
