@@ -21,7 +21,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError } from "@/lib/api";
-import { ducklingBroken, ducklingEntryFor, ducklingName, fmtTime } from "@/lib/format";
+import { ducklingBroken, ducklingEntryFor, fmtTime } from "@/lib/format";
 import { ShardBadge } from "@/components/ShardBadge";
 import {
   useDeleteOrg,
@@ -308,9 +308,9 @@ function WarehousePanel({
     if (data) {
       setImage(data.image ?? "");
       setVersion(data.ducklake_version ?? "");
-      setDucklingNameInput(data.duckling_name || ducklingName(orgId));
+      setDucklingNameInput(data.duckling_name ?? "");
     }
-  }, [data, orgId]);
+  }, [data]);
 
   const notFound = error instanceof ApiError && error.status === 404;
   const missing = notFound || !data;
@@ -337,7 +337,7 @@ function WarehousePanel({
     const body: Partial<ManagedWarehouse> = {};
     if (image !== (data?.image ?? "")) body.image = image;
     if (version !== (data?.ducklake_version ?? "")) body.ducklake_version = version;
-    if (ducklingNameInput !== (data?.duckling_name || ducklingName(orgId))) {
+    if (ducklingNameInput !== (data?.duckling_name ?? "")) {
       body.duckling_name = ducklingNameInput;
     }
     if (Object.keys(body).length === 0) {
@@ -364,7 +364,7 @@ function WarehousePanel({
         <div className="flex items-center justify-between rounded-md border border-border bg-background/40 px-3 py-2">
           <div>
             <div className="text-[10px] uppercase text-muted-foreground">Duckling</div>
-            <div className="font-mono text-xs">{data?.duckling_name || ducklingName(orgId)}</div>
+            <div className="font-mono text-xs">{data?.duckling_name ?? "—"}</div>
           </div>
           {/* Live metadata-store assignment from the Duckling CR status — the
               cnpg shard the tenant's metadata actually lives on (the config

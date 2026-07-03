@@ -117,8 +117,9 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-a"] = &configstore.ManagedWarehouse{
-		OrgID: "org-a",
-		State: configstore.ManagedWarehouseStatePending,
+		OrgID:        "org-a",
+		DucklingName: "org-a",
+		State:        configstore.ManagedWarehouseStatePending,
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:              configstore.MetadataStoreKindExternal,
 			Endpoint:          "ext.example.internal",
@@ -133,7 +134,7 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	ctrl.reconcile(ctx)
 
 	// Verify CR was created
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-a"), metav1.GetOptions{})
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-a", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected CR to exist: %v", err)
 	}
@@ -178,8 +179,9 @@ func TestReconcilePendingEmitsPgBouncerBlock(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-pgb"] = &configstore.ManagedWarehouse{
-		OrgID: "org-pgb",
-		State: configstore.ManagedWarehouseStatePending,
+		OrgID:        "org-pgb",
+		DucklingName: "org-pgb",
+		State:        configstore.ManagedWarehouseStatePending,
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:              configstore.MetadataStoreKindExternal,
 			Endpoint:          "ext.example.internal",
@@ -193,7 +195,7 @@ func TestReconcilePendingEmitsPgBouncerBlock(t *testing.T) {
 	ctx := context.Background()
 	ctrl.reconcile(ctx)
 
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-pgb"), metav1.GetOptions{})
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-pgb", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected CR to exist: %v", err)
 	}
@@ -212,16 +214,17 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOn(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-flip"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-flip",
-		State:     configstore.ManagedWarehouseStateReady,
-		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
+		OrgID:        "org-flip",
+		DucklingName: "org-flip",
+		State:        configstore.ManagedWarehouseStateReady,
+		PgBouncer:    configstore.ManagedWarehousePgBouncer{Enabled: true},
 	}
 	// Seed a CR whose spec still reflects the pre-flip world (no pgbouncer block).
 	cr := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "k8s.posthog.com/v1alpha1",
 		"kind":       "Duckling",
 		"metadata": map[string]interface{}{
-			"name":      ducklingName("org-flip"),
+			"name":      "org-flip",
 			"namespace": ducklingNamespace,
 		},
 		"spec": map[string]interface{}{
@@ -241,7 +244,7 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOn(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctrl.reconcile(context.Background())
 
-	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-flip"), metav1.GetOptions{})
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), "org-flip", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("re-fetch CR: %v", err)
 	}
@@ -267,9 +270,10 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOff(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-off"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-off",
-		State:     configstore.ManagedWarehouseStateReady,
-		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: false},
+		OrgID:        "org-off",
+		DucklingName: "org-off",
+		State:        configstore.ManagedWarehouseStateReady,
+		PgBouncer:    configstore.ManagedWarehousePgBouncer{Enabled: false},
 	}
 	// Seed a CR that currently has pgbouncer enabled — expect it to be
 	// patched back to false to match the config store.
@@ -277,7 +281,7 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOff(t *testing.T) {
 		"apiVersion": "k8s.posthog.com/v1alpha1",
 		"kind":       "Duckling",
 		"metadata": map[string]interface{}{
-			"name":      ducklingName("org-off"),
+			"name":      "org-off",
 			"namespace": ducklingNamespace,
 		},
 		"spec": map[string]interface{}{
@@ -296,7 +300,7 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOff(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctrl.reconcile(context.Background())
 
-	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-off"), metav1.GetOptions{})
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), "org-off", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("re-fetch CR: %v", err)
 	}
@@ -312,15 +316,16 @@ func TestReconcileReadyNoDriftDoesNotPatch(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-sync"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-sync",
-		State:     configstore.ManagedWarehouseStateReady,
-		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
+		OrgID:        "org-sync",
+		DucklingName: "org-sync",
+		State:        configstore.ManagedWarehouseStateReady,
+		PgBouncer:    configstore.ManagedWarehousePgBouncer{Enabled: true},
 	}
 	cr := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "k8s.posthog.com/v1alpha1",
 		"kind":       "Duckling",
 		"metadata": map[string]interface{}{
-			"name":            ducklingName("org-sync"),
+			"name":            "org-sync",
 			"namespace":       ducklingNamespace,
 			"resourceVersion": "42",
 		},
@@ -339,7 +344,7 @@ func TestReconcileReadyNoDriftDoesNotPatch(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctrl.reconcile(context.Background())
 
-	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-sync"), metav1.GetOptions{})
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), "org-sync", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("re-fetch CR: %v", err)
 	}
@@ -352,9 +357,10 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-b"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-b",
-		State:     configstore.ManagedWarehouseStateProvisioning,
-		CreatedAt: time.Now(),
+		OrgID:        "org-b",
+		DucklingName: "org-b",
+		State:        configstore.ManagedWarehouseStateProvisioning,
+		CreatedAt:    time.Now(),
 	}
 
 	// Create a Duckling CR with all status fields populated
@@ -363,7 +369,7 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      ducklingName("org-b"),
+				"name":      "org-b",
 				"namespace": ducklingNamespace,
 			},
 			"status": map[string]interface{}{
@@ -437,9 +443,10 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-probe"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-probe",
-		State:     configstore.ManagedWarehouseStateProvisioning,
-		CreatedAt: time.Now(),
+		OrgID:        "org-probe",
+		DucklingName: "org-probe",
+		State:        configstore.ManagedWarehouseStateProvisioning,
+		CreatedAt:    time.Now(),
 	}
 
 	cr := &unstructured.Unstructured{
@@ -447,7 +454,7 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      ducklingName("org-probe"),
+				"name":      "org-probe",
 				"namespace": ducklingNamespace,
 			},
 			"status": map[string]interface{}{
@@ -526,10 +533,11 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-pgb"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-pgb",
-		State:     configstore.ManagedWarehouseStateProvisioning,
-		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
-		CreatedAt: time.Now(),
+		OrgID:        "org-pgb",
+		DucklingName: "org-pgb",
+		State:        configstore.ManagedWarehouseStateProvisioning,
+		PgBouncer:    configstore.ManagedWarehousePgBouncer{Enabled: true},
+		CreatedAt:    time.Now(),
 	}
 
 	cr := &unstructured.Unstructured{
@@ -537,7 +545,7 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      ducklingName("org-pgb"),
+				"name":      "org-pgb",
 				"namespace": ducklingNamespace,
 			},
 			"status": map[string]interface{}{
@@ -587,8 +595,9 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-c"] = &configstore.ManagedWarehouse{
-		OrgID: "org-c",
-		State: configstore.ManagedWarehouseStateDeleting,
+		OrgID:        "org-c",
+		DucklingName: "org-c",
+		State:        configstore.ManagedWarehouseStateDeleting,
 	}
 	ctx := context.Background()
 
@@ -598,7 +607,7 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      ducklingName("org-c"),
+				"name":      "org-c",
 				"namespace": ducklingNamespace,
 			},
 		},
@@ -612,7 +621,7 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 	ctrl.reconcile(ctx)
 
 	// Verify CR is gone
-	_, err = fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-c"), metav1.GetOptions{})
+	_, err = fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-c", metav1.GetOptions{})
 	if err == nil {
 		t.Fatal("expected CR to be deleted")
 		return
@@ -630,8 +639,9 @@ func TestReconcileDeletingRetriesOnNonNotFoundError(t *testing.T) {
 	dc, _ := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-d"] = &configstore.ManagedWarehouse{
-		OrgID: "org-d",
-		State: configstore.ManagedWarehouseStateDeleting,
+		OrgID:        "org-d",
+		DucklingName: "org-d",
+		State:        configstore.ManagedWarehouseStateDeleting,
 	}
 	ctx := context.Background()
 
@@ -717,8 +727,9 @@ func TestParseDucklingStatusEmpty(t *testing.T) {
 func TestFakeStoreUpdateWarehouseState(t *testing.T) {
 	fs := newFakeStore()
 	fs.warehouses["org-x"] = &configstore.ManagedWarehouse{
-		OrgID: "org-x",
-		State: configstore.ManagedWarehouseStatePending,
+		OrgID:        "org-x",
+		DucklingName: "org-x",
+		State:        configstore.ManagedWarehouseStatePending,
 	}
 
 	// CAS update should succeed
@@ -756,8 +767,9 @@ func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-cnpg"] = &configstore.ManagedWarehouse{
-		OrgID: "org-cnpg",
-		State: configstore.ManagedWarehouseStatePending,
+		OrgID:        "org-cnpg",
+		DucklingName: "org-cnpg",
+		State:        configstore.ManagedWarehouseStatePending,
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind: configstore.MetadataStoreKindCnpgShard,
 		},
@@ -768,7 +780,7 @@ func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
 	ctx := context.Background()
 	ctrl.reconcile(ctx)
 
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-cnpg"), metav1.GetOptions{})
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-cnpg", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected CR to exist: %v", err)
 	}
@@ -811,7 +823,7 @@ func TestDucklingCreateCnpgShardRequiresDuckLake(t *testing.T) {
 	if !strings.Contains(err.Error(), "requires ducklake enabled") {
 		t.Fatalf("error = %v, want 'requires ducklake enabled'", err)
 	}
-	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("no-catalog"), metav1.GetOptions{}); getErr == nil {
+	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "no-catalog", metav1.GetOptions{}); getErr == nil {
 		t.Error("CR should not have been created when validation failed")
 	}
 }
@@ -833,9 +845,10 @@ func TestReconcileProvisioningCnpgShardReadiness(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-cs"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-cs",
-		State:     configstore.ManagedWarehouseStateProvisioning,
-		CreatedAt: time.Now(),
+		OrgID:        "org-cs",
+		DucklingName: "org-cs",
+		State:        configstore.ManagedWarehouseStateProvisioning,
+		CreatedAt:    time.Now(),
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind: configstore.MetadataStoreKindCnpgShard,
 		},
@@ -847,7 +860,7 @@ func TestReconcileProvisioningCnpgShardReadiness(t *testing.T) {
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      ducklingName("org-cs"),
+				"name":      "org-cs",
 				"namespace": ducklingNamespace,
 			},
 			"status": map[string]interface{}{
@@ -899,8 +912,9 @@ func TestReconcilePendingCreatesDuckLakeExternalCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-dl"] = &configstore.ManagedWarehouse{
-		OrgID: "org-dl",
-		State: configstore.ManagedWarehouseStatePending,
+		OrgID:        "org-dl",
+		DucklingName: "org-dl",
+		State:        configstore.ManagedWarehouseStatePending,
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:              configstore.MetadataStoreKindExternal,
 			Endpoint:          "rds.example.us-east-1.rds.amazonaws.com",
@@ -920,7 +934,7 @@ func TestReconcilePendingCreatesDuckLakeExternalCR(t *testing.T) {
 	ctx := context.Background()
 	ctrl.reconcile(ctx)
 
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-dl"), metav1.GetOptions{})
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-dl", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected CR to exist: %v", err)
 	}
@@ -963,7 +977,7 @@ func TestDucklingCreateExternalRequiresFields(t *testing.T) {
 	if err := dc.Create(ctx, "ext-bad", CreateOptions{MetadataStoreType: configstore.MetadataStoreKindExternal}); err == nil {
 		t.Fatal("expected error creating external CR without endpoint/passwordAwsSecret")
 	}
-	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("ext-bad"), metav1.GetOptions{}); getErr == nil {
+	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "ext-bad", metav1.GetOptions{}); getErr == nil {
 		t.Error("CR should not have been created when external validation failed")
 	}
 }
@@ -983,49 +997,79 @@ func TestDucklingCreateExternalDataStoreRequiresBucket(t *testing.T) {
 	}
 }
 
-// TestDucklingGetFallsBackToLegacyName verifies the backward-compat path: a CR
-// created before ducklingName preserved hyphens (i.e. named with hyphens
-// stripped) is still found when looked up by its hyphenated org ID. Without
-// this, switching ducklingName to keep hyphens would orphan existing prod
-// ducklings whose org IDs contain hyphens (e.g. UUID-named tenants).
-func TestDucklingGetFallsBackToLegacyName(t *testing.T) {
+// TestDucklingCreateUsesNameVerbatim locks in the naming contract: Create
+// names the CR exactly the passed name — no lowercasing, hyphen-stripping, or
+// any other derivation. The name comes from the warehouse row's duckling_name.
+func TestDucklingCreateUsesNameVerbatim(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	ctx := context.Background()
 
-	org := "018d351a-9ff7-0000-eaff-4628875ad045"
-	legacy := legacyDucklingName(org) // "018d351a9ff70000eaff4628875ad045"
-	if ducklingName(org) == legacy {
-		t.Fatal("test premise: hyphenated org id must differ from its legacy de-hyphenated name")
+	name := "018d351a-9ff7-0000-eaff-4628875ad045"
+	if err := dc.Create(ctx, name, CreateOptions{
+		MetadataStoreType: configstore.MetadataStoreKindCnpgShard,
+		DuckLakeEnabled:   true,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
 	}
-
-	// Seed a CR under the legacy (de-hyphenated) name, as the old code would have.
-	cr := &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "k8s.posthog.com/v1alpha1",
-		"kind":       "Duckling",
-		"metadata":   map[string]interface{}{"name": legacy, "namespace": ducklingNamespace},
-		"status":     map[string]interface{}{"iamRoleArn": "arn:aws:iam::123:role/duckling-" + legacy},
-	}}
-	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed legacy CR: %v", err)
-	}
-
-	st, err := dc.Get(ctx, org)
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("Get must fall back to the legacy de-hyphenated name, got: %v", err)
+		t.Fatalf("expected CR named exactly %q: %v", name, err)
 	}
-	if st.IAMRoleARN == "" {
-		t.Error("expected to parse the legacy CR's status")
+	if cr.GetName() != name {
+		t.Fatalf("CR name = %q, want %q verbatim", cr.GetName(), name)
 	}
 
-	// And pgbouncer reads + delete must resolve it too.
-	if _, err := dc.GetPgBouncerEnabled(ctx, org); err != nil {
-		t.Errorf("GetPgBouncerEnabled fallback: %v", err)
+	// Lookups, mutation, and delete all take the same exact name.
+	if _, err := dc.Get(ctx, name); err != nil {
+		t.Errorf("Get by exact name: %v", err)
 	}
-	if err := dc.Delete(ctx, org); err != nil {
-		t.Errorf("Delete fallback: %v", err)
+	if _, err := dc.GetPgBouncerEnabled(ctx, name); err != nil {
+		t.Errorf("GetPgBouncerEnabled by exact name: %v", err)
 	}
-	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); getErr == nil {
-		t.Error("legacy CR should have been deleted via the fallback")
+	if err := dc.Delete(ctx, name); err != nil {
+		t.Errorf("Delete by exact name: %v", err)
+	}
+	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{}); getErr == nil {
+		t.Error("CR should have been deleted")
+	}
+}
+
+// TestReconcileUsesStoredDucklingName verifies the controller addresses the
+// Duckling CR by the warehouse row's stored duckling_name — not anything
+// derived from the org ID — across the create and delete flows.
+func TestReconcileUsesStoredDucklingName(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-stored"] = &configstore.ManagedWarehouse{
+		OrgID:        "org-stored",
+		DucklingName: "custom-cr-name",
+		State:        configstore.ManagedWarehouseStatePending,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind: configstore.MetadataStoreKindCnpgShard,
+		},
+		DuckLake: configstore.ManagedWarehouseDuckLake{Enabled: true},
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctx := context.Background()
+	ctrl.reconcile(ctx)
+
+	// The CR must be created under the stored name, not the org ID.
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "custom-cr-name", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected CR under stored duckling_name: %v", err)
+	}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-stored", metav1.GetOptions{}); err == nil {
+		t.Fatal("no CR should exist under the org ID when duckling_name differs")
+	}
+
+	// Deletion resolves through the same stored name.
+	fs.warehouses["org-stored"].State = configstore.ManagedWarehouseStateDeleting
+	ctrl.reconcile(ctx)
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "custom-cr-name", metav1.GetOptions{}); err == nil {
+		t.Fatal("expected CR deleted via stored duckling_name")
+	}
+	if fs.warehouses["org-stored"].State != configstore.ManagedWarehouseStateDeleted {
+		t.Fatalf("expected deleted state, got %q", fs.warehouses["org-stored"].State)
 	}
 }
 

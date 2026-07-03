@@ -132,8 +132,8 @@ export type WarehouseState =
 
 export interface ManagedWarehouse {
   org_id: string;
-  // The explicit Duckling CR name (provisioner-owned). May be "" on legacy rows
-  // that predate the field — callers fall back to ducklingName(org) in that case.
+  // The explicit Duckling CR name (provisioner-owned). Authoritative and always
+  // set — NOT NULL in the DB since migration 000012; no client-side derivation.
   duckling_name: string;
   image: string;
   ducklake_version: string;
