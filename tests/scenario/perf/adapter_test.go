@@ -140,6 +140,56 @@ func TestExecutorFailsPerfStepWhenMeasuredQueryErrors(t *testing.T) {
 	}
 }
 
+func TestExecutorCanReportPerfQueryErrorsWithoutFailingStep(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir: t.TempDir(),
+		DriverFactory: &fakeDriverFactory{
+			pgwireErr: errors.New("query failed"),
+		},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":               "scenario-org",
+			"catalog_file":         catalogPath,
+			"run_id":               "scenario-run-1",
+			"fail_on_query_errors": false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	result, ok := executor.State().Result("perf_queries")
+	if !ok {
+		t.Fatal("expected perf result to be recorded")
+	}
+	if result.Summary.TotalErrors != 1 {
+		t.Fatalf("summary errors = %d, want reported query error", result.Summary.TotalErrors)
+	}
+	csvBytes, err := os.ReadFile(filepath.Join(executor.OutputDir(), "perf", "query_results.csv"))
+	if err != nil {
+		t.Fatalf("read query_results.csv: %v", err)
+	}
+	if !strings.Contains(string(csvBytes), ",pgwire,error,query failed,execution_error,") {
+		t.Fatalf("query_results.csv should report query failure: %q", string(csvBytes))
+	}
+}
+
 func TestExecutorRequiresFlightAddrWhenCatalogTargetsFlight(t *testing.T) {
 	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolFlight})
 	provisionState := provision.NewState()

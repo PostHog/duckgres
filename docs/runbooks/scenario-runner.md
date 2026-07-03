@@ -44,6 +44,9 @@ export DUCKGRES_SCENARIO_FLIGHT_ADDR="<flight-sql-address>"
 export DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY="true"
 ```
 
+Frozen perf records per-query success and failure rows in `query_results.csv`.
+The scenario is configured to preserve those query failures as reported perf results instead of failing the scenario step.
+
 Do not commit concrete dev endpoints, secrets, org IDs, or private bucket names.
 
 ## Run

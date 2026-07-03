@@ -333,6 +333,12 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-perf-20260102t030405z" {
 			t.Fatalf("perf run_id = %q, want scenario run id", runID)
 		}
+		if flightAddr, _ := step.With["flight_addr"].(string); flightAddr != "flight.dev.example:443" {
+			t.Fatalf("perf flight_addr = %q, want env-provided Flight address", flightAddr)
+		}
+		if failOnQueryErrors, _ := step.With["fail_on_query_errors"].(bool); failOnQueryErrors {
+			t.Fatal("frozen perf scenario should report query errors without failing the scenario")
+		}
 		if _, ok := step.With["flight_insecure_skip_verify"]; ok {
 			t.Fatal("perf scenario should use DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY default instead of hardcoding TLS behavior")
 		}
