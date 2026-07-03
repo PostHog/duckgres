@@ -108,12 +108,15 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	shadowWarehouse := s.warehouses[req.OrgID]
 	shadowUserHash, hadUser := s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}]
 
-	// 1. Warehouse + Org
+	// 1. Warehouse + Org. Mirrors createPendingWarehouseTx: a NEW org
+	// requires default_team_id (rejected before any write); an existing org
+	// keeps its stored value when the field is omitted (set-only, never wipe).
 	if _, ok := s.orgs[req.OrgID]; !ok {
+		if req.DefaultTeamID == "" {
+			return ErrDefaultTeamIDRequired
+		}
 		s.orgs[req.OrgID] = &configstore.Org{Name: req.OrgID, DatabaseName: req.DatabaseName}
 	}
-	// default_team_id is optional/non-breaking: set it only when supplied,
-	// mirroring createPendingWarehouseTx (empty ⇒ leave NULL, never wipe).
 	if req.DefaultTeamID != "" {
 		teamID := req.DefaultTeamID
 		s.orgs[req.OrgID].DefaultTeamID = &teamID
@@ -212,7 +215,7 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	body := []byte(`{"database_name": "test-db", "default_team_id": "1", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -229,7 +232,7 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	}
 }
 
-// TestProvisionPersistsDefaultTeamID checks the optional default_team_id in the
+// TestProvisionPersistsDefaultTeamID checks the default_team_id in the
 // provision body is threaded through to the org record.
 func TestProvisionPersistsDefaultTeamID(t *testing.T) {
 	store := newFakeStore()
@@ -256,9 +259,11 @@ func TestProvisionPersistsDefaultTeamID(t *testing.T) {
 	}
 }
 
-// TestProvisionWithoutDefaultTeamIDLeavesNull checks default_team_id is optional:
-// an absent field leaves the org's default_team_id NULL with no error.
-func TestProvisionWithoutDefaultTeamIDLeavesNull(t *testing.T) {
+// TestProvisionNewOrgRequiresDefaultTeamID locks in the mandatory contract:
+// provisioning a NEW org without default_team_id is rejected with 400 and
+// creates nothing (no org, no warehouse) — every org carries its default team
+// id from birth.
+func TestProvisionNewOrgRequiresDefaultTeamID(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
@@ -268,15 +273,41 @@ func TestProvisionWithoutDefaultTeamIDLeavesNull(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "default_team_id") {
+		t.Fatalf("error body should name default_team_id: %s", rec.Body.String())
+	}
+	if _, ok := store.orgs["noteam-org"]; ok {
+		t.Fatal("org must not be created when default_team_id is missing")
+	}
+	if store.warehouses["noteam-org"] != nil {
+		t.Fatal("warehouse must not be created when default_team_id is missing")
+	}
+}
+
+// TestReprovisionExistingOrgKeepsDefaultTeamID: re-provisioning an EXISTING org
+// without default_team_id stays valid (not the new-org 400) and keeps the
+// stored value — the field is set-only, never wiped by omission.
+func TestReprovisionExistingOrgKeepsDefaultTeamID(t *testing.T) {
+	store := newFakeStore()
+	teamID := "777"
+	store.orgs["backfilled"] = &configstore.Org{Name: "backfilled", DefaultTeamID: &teamID}
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "backfilled-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/backfilled/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	org, ok := store.orgs["noteam-org"]
-	if !ok {
-		t.Fatal("expected org to be auto-created")
-	}
-	if org.DefaultTeamID != nil {
-		t.Fatalf("expected default_team_id to be nil (NULL), got %q", *org.DefaultTeamID)
+	org := store.orgs["backfilled"]
+	if org.DefaultTeamID == nil || *org.DefaultTeamID != teamID {
+		t.Fatalf("default_team_id must survive re-provision without the field, got %v", org.DefaultTeamID)
 	}
 }
 
@@ -495,7 +526,7 @@ func TestProvisionTransactionRollsBackOnUserFailure(t *testing.T) {
 	store.setProvisionUserFailHook(errors.New("simulated DB write failure"))
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "team-7-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	body := []byte(`{"database_name": "team-7-db", "default_team_id": "7", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/7/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -617,6 +648,7 @@ func TestProvisionDuckLakeExternal(t *testing.T) {
 
 	body := []byte(`{
 		"database_name": "extdl-db",
+		"default_team_id": "1",
 		"metadata_store": {"type": "external", "external": {
 			"endpoint": "rds.example.us-east-1.rds.amazonaws.com",
 			"password_aws_secret": "duckling-example-rds-password",
@@ -667,6 +699,7 @@ func TestProvisionComputesS3BucketName(t *testing.T) {
 	wantBucket := "posthog-duckling-0194d6405db400006cde48d6114c0f99-mw-prod-us"
 	body := []byte(`{
 		"database_name": "db",
+		"default_team_id": "1",
 		"metadata_store": {"type": "cnpg-shard"},
 		"data_store": {"type": "s3bucket"},
 		"ducklake": {"enabled": true}
@@ -705,6 +738,7 @@ func TestProvisionNoBucketSuffixLeavesNameEmpty(t *testing.T) {
 
 	body := []byte(`{
 		"database_name": "db",
+		"default_team_id": "1",
 		"metadata_store": {"type": "cnpg-shard"},
 		"data_store": {"type": "s3bucket"},
 		"ducklake": {"enabled": true}
@@ -828,7 +862,7 @@ func TestProvisionRejectsOverlongSlugOrgID(t *testing.T) {
 func TestProvisionAcceptsHyphenatedOrgID(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
-	body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`)
+	body := []byte(`{"database_name":"d","default_team_id":"1","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/my-org-cnpg/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
