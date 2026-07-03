@@ -331,12 +331,21 @@ function WarehousePanel({
       setMsg({ kind: "err", text: "Duckling name is required." });
       return;
     }
+    // Send only fields that actually changed: the PUT is a merge-patch and
+    // the audit log records the body's keys as "changed", so carrying
+    // untouched fields would log phantom changes.
+    const body: Partial<ManagedWarehouse> = {};
+    if (image !== (data?.image ?? "")) body.image = image;
+    if (version !== (data?.ducklake_version ?? "")) body.ducklake_version = version;
+    if (ducklingNameInput !== (data?.duckling_name || ducklingName(orgId))) {
+      body.duckling_name = ducklingNameInput;
+    }
+    if (Object.keys(body).length === 0) {
+      setMsg({ kind: "ok", text: "No changes." });
+      return;
+    }
     try {
-      await update.mutateAsync({
-        image,
-        ducklake_version: version,
-        duckling_name: ducklingNameInput,
-      });
+      await update.mutateAsync(body);
       setMsg({ kind: "ok", text: "Saved." });
     } catch (e) {
       setMsg({ kind: "err", text: e instanceof Error ? e.message : "Save failed" });
