@@ -3,6 +3,7 @@ package crashhandler
 import (
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -80,10 +81,16 @@ func TestCThreadSegfaultDiesLoudly(t *testing.T) {
 	if !strings.Contains(stderr, "SIGSEGV") {
 		t.Fatalf("stderr does not name the signal:\n%s", stderr)
 	}
-	// backtrace_symbols_fd emits one line per frame containing the binary
-	// path or a hex address; require at least a few frames.
-	if strings.Count(stderr, "0x") < 3 {
-		t.Fatalf("stderr does not look like a native backtrace:\n%s", stderr)
+	// backtrace_symbols_fd's frame format differs per platform
+	// ("binary[0xADDR]" on glibc, "N binary 0xADDR symbol + off" on macOS)
+	// and the unwind depth through a signal frame varies (glibc on
+	// linux/amd64 can produce as few as two frames), so require just one
+	// frame address plus the fault-address line the handler prints itself.
+	if !regexp.MustCompile(`0x[0-9a-f]{4,}`).MatchString(stderr) {
+		t.Fatalf("stderr does not contain a backtrace frame address:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "fault addr 0x") {
+		t.Fatalf("stderr does not report the fault address:\n%s", stderr)
 	}
 }
 
