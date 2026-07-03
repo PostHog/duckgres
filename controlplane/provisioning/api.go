@@ -136,9 +136,11 @@ type connectionDetails struct {
 
 type provisionRequest struct {
 	DatabaseName string `json:"database_name"`
-	// DefaultTeamID optionally links the org to its default PostHog team id.
-	// Optional and non-breaking: absent/empty ⇒ the org's default_team_id is
-	// left NULL (no error). Prerequisite for pull-based compute billing.
+	// DefaultTeamID links the org to its default PostHog team id. REQUIRED
+	// when the provision creates a NEW org (400 otherwise — every org carries
+	// its team id from birth; pull-based compute billing keys usage buckets by
+	// it). Optional on re-provision of an existing org: absent/empty keeps the
+	// stored value, never wipes it.
 	DefaultTeamID string                 `json:"default_team_id,omitempty"`
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
@@ -325,6 +327,13 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		// branch.
 		if errors.Is(err, ErrWarehouseNonTerminal) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		// Creating a NEW org requires default_team_id — a caller input
+		// problem, not a server failure. Decided in the store (only it knows
+		// whether the org exists), surfaced here as 400.
+		if errors.Is(err, ErrDefaultTeamIDRequired) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 		if isUniqueViolation(err) {
