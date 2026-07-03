@@ -106,10 +106,11 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 
 	createdAt := time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC)
 	original := &configstore.ManagedWarehouse{
-		OrgID:     "analytics",
-		State:     configstore.ManagedWarehouseStatePending,
-		CreatedAt: createdAt,
-		UpdatedAt: createdAt,
+		OrgID:        "analytics",
+		DucklingName: "analytics",
+		State:        configstore.ManagedWarehouseStatePending,
+		CreatedAt:    createdAt,
+		UpdatedAt:    createdAt,
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			Endpoint: "analytics-wh.cluster.example",
 		},
@@ -124,8 +125,11 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 
 	replacementCreatedAt := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
 	stored, ok, err := apiStore.UpsertManagedWarehouse("analytics", &configstore.ManagedWarehouse{
-		CreatedAt:     replacementCreatedAt,
-		UpdatedAt:     replacementCreatedAt,
+		CreatedAt: replacementCreatedAt,
+		UpdatedAt: replacementCreatedAt,
+		// Changed vs the seeded row: the ON CONFLICT assignment-column list
+		// must carry duckling_name or this change is silently dropped.
+		DucklingName:  "analytics-renamed",
 		State:         configstore.ManagedWarehouseStateReady,
 		StatusMessage: "ready",
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
@@ -151,6 +155,9 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	}
 	if stored.MetadataStore.DatabaseName != "ducklake_metadata" {
 		t.Fatalf("expected updated metadata db name, got %q", stored.MetadataStore.DatabaseName)
+	}
+	if stored.DucklingName != "analytics-renamed" {
+		t.Fatalf("expected updated duckling_name analytics-renamed, got %q", stored.DucklingName)
 	}
 }
 

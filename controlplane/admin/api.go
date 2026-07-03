@@ -399,6 +399,7 @@ func managedWarehouseUpsertColumns() []string {
 		// DB column name. Mismatching this against the actual column makes
 		// the ON CONFLICT … DO UPDATE clause throw 42703.
 		"duck_lake_version",
+		"duckling_name",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",
 		"metadata_store_kind",
