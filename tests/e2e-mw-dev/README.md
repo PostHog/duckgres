@@ -151,6 +151,15 @@ normal `go test ./...` lane.
   pooler but not a denied destination needs a stable exec-into-worker probe;
   deferred (high flake risk). The policies themselves are asserted statically
   in `tests/manifests/`.
+- **Native crash handler (`internal/crashhandler`)** — a SIGSEGV on a
+  DuckDB-created thread must kill the worker with a native backtrace on stderr
+  instead of wedging the process (the Go runtime's badsignal path can leave a
+  crashed C thread's locks held forever). Asserting this in-Job would require
+  deterministically segfaulting a real worker pod — there is no SQL statement
+  that does that on purpose. Covered by `internal/crashhandler` package tests,
+  which re-exec the test binary and crash it on a C-created thread, in a cgo
+  call, and in pure Go code, asserting death-by-signal + the stderr marker
+  (and that Go panics stay ordinary panics).
 - **Oversized Bind-parameter rejection (#717)** — rejecting a Bind message whose
   declared parameter length exceeds the remaining message body requires crafting
   a malformed wire-protocol packet on a raw socket (through TLS + auth); libpq
