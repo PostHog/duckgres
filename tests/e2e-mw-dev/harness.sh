@@ -451,30 +451,65 @@ connection_duration_logged() { # org password
   [ "$ms" -gt 0 ] || fail "disconnect duration_ms is $ms (want > 0 — backendStart not honoured?)"
 }
 
-# Managed-warehouse compute-usage metering (billing emit side). At connection
-# teardown the CP meters cpu_seconds/memory_seconds from the provisioned worker
-# size over the connection lifetime into an in-proc per-org counter (best-effort),
-# flushes it to the durable config-store buffer (~15s), and the leader drains
-# closed buckets to PostHog ingestion (~60s, ship-then-delete). The :9090 metrics
-# port + the ingestion HTTP path are not observable from this in-cluster Job, so
-# we assert the CP's startup log line that proves the metering config knob is
-# wired and reports its enabled/disabled state. When the deploy sets
-# DUCKGRES_BILLING_INGEST_URL/TOKEN this line reads "enabled"; otherwise
-# "disabled" — either way the knob is present and the emit path is compiled in.
-# (NOTE: a full end-to-end "the event landed in PostHog ClickHouse" assertion
-# needs a billing-analytics token + CH read access from the Job, which this lane
-# does not have — see README. The buffer UPSERT/drain SQL is exercised by the
-# tests/configstore Postgres migration test, and the meter/drain logic by the
-# controlplane/ unit tests.)
-compute_usage_metering_wired() {
-  log "compute-usage metering config knob wired in CP"
-  found=""
-  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
-    m="$(k logs "$p" 2>/dev/null | grep -E 'Managed-warehouse compute-usage metering (enabled|disabled)' | tail -1)"
-    if [ -n "$m" ]; then found="$m"; fi
+# Managed-warehouse compute-usage billing (pull API, docs/design/billing-pull-api.md).
+# At connection teardown the CP meters cpu_seconds/memory_seconds from the
+# provisioned worker size over the connection lifetime into an in-proc counter
+# keyed (org, default team, query_source, worker size), flushes it to the
+# durable config-store buffer (~15s), and serves it aggregated over
+# GET /api/v1/billing/usage; POST /api/v1/billing/ack advances the cursor and
+# deletes acked buckets. This asserts the FULL round-trip against the real
+# stack: two real connections (one standard, one with the duckgres.query_source
+# GUC set to endpoints) must surface as separate usage rows carrying the org's
+# provisioned default_team_id and a positive worker size, then an ack of the
+# served watermark_high must 200 and the next GET's watermark_low must equal it
+# (cursor advanced, acked buckets deleted). A bucket closes ~90s after the
+# connection ends (60s width + 30s grace) plus ≤15s flush, so the poll allows
+# ~4 minutes. This e2e stack has its own config store, so acking here cannot
+# eat production usage.
+compute_usage_pull_api() { # org password
+  org="$1"; pw="$2"
+  log "compute-usage pull API round-trip on $org"
+
+  # Generate usage under both query sources. Each pg call is one connection;
+  # the batched SET applies to the SELECT's session (split-path, see #868).
+  pg "$org" "$pw" ducklake 'SELECT 1' >/dev/null
+  pg "$org" "$pw" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" >/dev/null
+
+  # Poll until both rows are served (bucket close + flush lag).
+  a=0 body=""
+  while [ "$a" -lt 30 ]; do
+    body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
+    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --arg t "$CNPG_DEFAULT_TEAM_ID" '
+        (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="standard"  and .cpu_seconds>0 and .cpu>0 and .mem_gib>0)) | length >= 1)
+        and
+        (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="endpoints" and .cpu_seconds>0)) | length >= 1)' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 10; a=$((a + 1))
   done
-  [ -n "$found" ] || fail "no compute-usage metering startup log line found (config knob not wired into SetupMultiTenant?)"
-  log "compute-usage metering state: $found"
+  [ "$a" -lt 30 ] || fail "compute-usage: rows for $org (standard+endpoints, team=$CNPG_DEFAULT_TEAM_ID) never appeared in GET /billing/usage: $(echo "$body" | head -c 600)"
+  wl="$(echo "$body" | jq -r '.watermark_low')"
+  wh="$(echo "$body" | jq -r '.watermark_high')"
+  log "compute-usage OK: usage served (low=$wl high=$wh)"
+
+  # Ack the served watermark; the cursor must advance and acked buckets die.
+  ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"watermark_high\":\"$wh\"}" "$API/api/v1/billing/ack")" \
+    || fail "compute-usage: ack POST failed"
+  deleted="$(echo "$ack" | jq -r '.deleted')"
+  [ "${deleted:-0}" -ge 1 ] || fail "compute-usage: ack deleted=$deleted (want >=1): $ack"
+  low2="$(curl -fsS -H "$H" "$API/api/v1/billing/usage" | jq -r '.watermark_low')"
+  [ "$low2" = "$wh" ] || fail "compute-usage: after ack, watermark_low='$low2' want '$wh' (cursor did not advance)"
+  # Idempotency: re-acking the same watermark is a safe no-op (200).
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"watermark_high\":\"$wh\"}" "$API/api/v1/billing/ack" >/dev/null \
+    || fail "compute-usage: re-ack of the same watermark failed (must be idempotent)"
+  # Acking into the still-open present must be rejected (400), never delete.
+  future="$(jq -rn 'now + 3600 | todate')"
+  code="$(curl -s -o /tmp/ack_future -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"watermark_high\":\"$future\"}" "$API/api/v1/billing/ack")"
+  [ "$code" = "400" ] || fail "compute-usage: future ack -> HTTP $code want 400: $(cat /tmp/ack_future)"
+  log "compute-usage OK: ack advanced cursor (deleted=$deleted), idempotent re-ack, future ack rejected"
 }
 
 # jsonb || must keep Postgres concatenation semantics through the full CP
@@ -2486,8 +2521,8 @@ main() {
   #      many connect/disconnects, so the disconnect log is warm) ----
   connection_duration_logged "$CNPG" "$cnpg_pw"
 
-  # ---- compute-usage metering wired (billing emit side) ----
-  compute_usage_metering_wired
+  # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
+  compute_usage_pull_api "$CNPG" "$cnpg_pw"
 
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
@@ -2501,7 +2536,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
