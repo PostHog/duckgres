@@ -135,12 +135,13 @@ type connectionDetails struct {
 
 type provisionRequest struct {
 	DatabaseName string `json:"database_name"`
-	// DefaultTeamID links the org to its default PostHog team id. REQUIRED
-	// when the provision creates a NEW org (400 otherwise — every org carries
-	// its team id from birth; pull-based compute billing keys usage buckets by
-	// it). Optional on re-provision of an existing org: absent/empty keeps the
-	// stored value, never wipes it.
-	DefaultTeamID string                 `json:"default_team_id,omitempty"`
+	// DefaultTeamID links the org to its default PostHog team id — a JSON
+	// NUMBER, matching PostHog's integer Team.id (a quoted string is a 400 at
+	// decode time). REQUIRED when the provision creates a NEW org (400
+	// otherwise — every org carries its team id from birth; pull-based compute
+	// billing keys usage buckets by it). Optional on re-provision of an
+	// existing org: absent/0 keeps the stored value, never wipes it.
+	DefaultTeamID int64                  `json:"default_team_id,omitempty"`
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
 	DuckLake      *provisionDuckLakeReq  `json:"ducklake,omitempty"`

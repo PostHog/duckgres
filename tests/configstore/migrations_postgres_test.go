@@ -34,7 +34,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 14)
 	requireGooseMigrationRecorded(t, db, 15)
 	requireGooseMigrationRecorded(t, db, 16)
-	requireGooseLatestVersion(t, db, 16)
+	requireGooseMigrationRecorded(t, db, 17)
+	requireGooseLatestVersion(t, db, 17)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000016 added the worker spawn log that feeds dynamic headroom
@@ -44,8 +45,12 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnPresent(t, db, "duckgres_worker_spawn_log", "mem_bytes")
 	requireColumnPresent(t, db, "duckgres_worker_spawn_log", "spawned_at")
 
-	// Migration 000013 added the nullable per-org default_team_id column.
+	// Migration 000013 added the nullable per-org default_team_id column;
+	// 000017 converted it (and the usage-bucket team_id below) to BIGINT to
+	// match PostHog's integer team ids.
 	requireColumnPresent(t, db, "duckgres_orgs", "default_team_id")
+	requireColumnType(t, db, "duckgres_orgs", "default_team_id", "bigint")
+	requireColumnType(t, db, "duckgres_org_compute_usage", "team_id", "bigint")
 
 	// Migration 000007 added the compute-usage billing buffer; 000015 widened
 	// its key for pull-based billing (team_id, query_source, worker size),
@@ -116,7 +121,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
 			ALTER TABLE duckgres_org_users ADD COLUMN IF NOT EXISTS default_catalog VARCHAR(255);
 			DROP TABLE duckgres_worker_spawn_log;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -146,7 +151,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 14)
 	requireGooseMigrationRecorded(t, upgradedDB, 15)
 	requireGooseMigrationRecorded(t, upgradedDB, 16)
-	requireGooseLatestVersion(t, upgradedDB, 16)
+	requireGooseMigrationRecorded(t, upgradedDB, 17)
+	requireGooseLatestVersion(t, upgradedDB, 17)
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
@@ -502,6 +508,28 @@ type foreignKeyMetadata struct {
 	ForeignTableName   string
 	ForeignColumnNames string
 	DeleteRule         string
+}
+
+func requireColumnType(t *testing.T, db *sql.DB, tableName, columnName, wantType string) {
+	t.Helper()
+
+	var got string
+	err := db.QueryRow(`
+		SELECT data_type
+		FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = $1
+		  AND column_name = $2
+	`, tableName, columnName).Scan(&got)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			t.Fatalf("%s.%s column missing", tableName, columnName)
+		}
+		t.Fatalf("query %s.%s column type: %v", tableName, columnName, err)
+	}
+	if got != wantType {
+		t.Fatalf("%s.%s type = %q, want %q", tableName, columnName, got, wantType)
+	}
 }
 
 func requireColumnDefault(t *testing.T, db *sql.DB, tableName, columnName, wantDefault string) {

@@ -20,7 +20,7 @@ import (
 // float-equality issues.
 type ComputeUsageDelta struct {
 	OrgID         string
-	TeamID        string
+	TeamID        int64
 	QuerySource   string
 	Millicores    int64
 	MiB           int64
@@ -36,7 +36,7 @@ type ComputeUsageDelta struct {
 type ComputeUsageRow struct {
 	Date          string      `json:"date"`
 	OrgID         string      `json:"org_id"`
-	TeamID        string      `json:"team_id"`
+	TeamID        int64       `json:"team_id"`
 	QuerySource   string      `json:"query_source"`
 	CPU           json.Number `json:"cpu"`
 	MemGiB        json.Number `json:"mem_gib"`

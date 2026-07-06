@@ -37,12 +37,13 @@ var ErrDefaultTeamIDRequired = errors.New("default_team_id is required when crea
 type ProvisionRequest struct {
 	OrgID        string
 	DatabaseName string
-	// DefaultTeamID links the org to its default PostHog team id. REQUIRED
-	// when the org does not exist yet (Provision returns
-	// ErrDefaultTeamIDRequired otherwise); optional on re-provision of an
-	// existing org, where empty keeps the stored value (never a wipe).
-	// Prerequisite for pull-based compute billing.
-	DefaultTeamID string
+	// DefaultTeamID links the org to its default PostHog team id (an
+	// integer, matching PostHog's Team.id). REQUIRED when the org does not
+	// exist yet (Provision returns ErrDefaultTeamIDRequired otherwise);
+	// optional (0) on re-provision of an existing org, where it keeps the
+	// stored value (never a wipe). Prerequisite for pull-based compute
+	// billing.
+	DefaultTeamID int64
 	Warehouse     *configstore.ManagedWarehouse
 	// RootUserHash is the bcrypt hash of the freshly-generated root
 	// password. Plaintext stays in the handler (returned to the
@@ -89,7 +90,7 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 		// No default_team_id on this standalone path — an existing org keeps
 		// its column as-is; creating a NEW org through here now fails with
 		// ErrDefaultTeamIDRequired (same invariant as Provision).
-		return createPendingWarehouseTx(tx, orgID, databaseName, "", warehouse)
+		return createPendingWarehouseTx(tx, orgID, databaseName, 0, warehouse)
 	})
 }
 
@@ -102,7 +103,7 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // Returns a sentinel-comparable error string ("warehouse already
 // exists in non-terminal state") so HTTP handlers can map to 409
 // without an extra error type.
-func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName, defaultTeamID string, warehouse *configstore.ManagedWarehouse) error {
+func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTeamID int64, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
 	// creates everything). A NEW org MUST carry default_team_id (pull-based
 	// compute billing keys usage buckets by it; all pre-existing orgs are
@@ -112,7 +113,7 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName, defaultTeamID st
 	err := tx.Where("name = ?", orgID).First(&org).Error
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):
-		if defaultTeamID == "" {
+		if defaultTeamID == 0 {
 			return ErrDefaultTeamIDRequired
 		}
 		org = configstore.Org{Name: orgID, DatabaseName: databaseName, DefaultTeamID: &defaultTeamID}
@@ -131,7 +132,7 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName, defaultTeamID st
 	// If a default_team_id was supplied, persist it even when the org already
 	// existed (the create branch above only runs on insert). Only ever set,
 	// never cleared here, so an omitted value is a no-op rather than a wipe.
-	if defaultTeamID != "" {
+	if defaultTeamID != 0 {
 		if err := tx.Model(&org).Update("default_team_id", defaultTeamID).Error; err != nil {
 			return err
 		}

@@ -124,7 +124,7 @@ func TestBillingUsageWindowAndRows(t *testing.T) {
 	store := &fakeBillingStore{
 		cursor: cursor, hasAck: true,
 		rows: []configstore.ComputeUsageRow{{
-			Date: "2026-07-01", OrgID: "org_abc", TeamID: "12345", QuerySource: "standard",
+			Date: "2026-07-01", OrgID: "org_abc", TeamID: 12345, QuerySource: "standard",
 			CPU: "8", MemGiB: "16", CPUSeconds: 4800, MemorySeconds: 9600,
 		}},
 	}

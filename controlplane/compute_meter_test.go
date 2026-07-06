@@ -58,23 +58,23 @@ func TestComputeConnectionUsage(t *testing.T) {
 // keyA is the billing key most tests share: orgA's default team, standard
 // source, an 8-vCPU/16-GiB worker.
 func keyA(bucket time.Time) computeUsageKey {
-	return computeUsageKey{orgID: "orgA", teamID: "42", querySource: "standard", millicores: 8000, mib: 16 * 1024, bucket: bucket}
+	return computeUsageKey{orgID: "orgA", teamID: 42, querySource: "standard", millicores: 8000, mib: 16 * 1024, bucket: bucket}
 }
 
 func TestComputeUsageCounterBucketing(t *testing.T) {
 	c := newComputeUsageCounter()
 	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
 	// Two connections in the same minute-bucket for the same key accumulate.
-	c.Record("orgA", "42", "standard", 8000, 16*1024, base.Add(5*time.Second), 10*time.Second)  // 80 cpu-s, 160 gib-s
-	c.Record("orgA", "42", "standard", 8000, 16*1024, base.Add(40*time.Second), 10*time.Second) // +80, +160
+	c.Record("orgA", "standard", 42, 8000, 16*1024, base.Add(5*time.Second), 10*time.Second)  // 80 cpu-s, 160 gib-s
+	c.Record("orgA", "standard", 42, 8000, 16*1024, base.Add(40*time.Second), 10*time.Second) // +80, +160
 	// A connection in the next bucket is separate.
-	c.Record("orgA", "42", "standard", 8000, 16*1024, base.Add(65*time.Second), 5*time.Second) // 40 cpu-s, 80 gib-s
+	c.Record("orgA", "standard", 42, 8000, 16*1024, base.Add(65*time.Second), 5*time.Second) // 40 cpu-s, 80 gib-s
 	// Different org, same bucket.
-	c.Record("orgB", "7", "standard", 1000, 1024, base.Add(5*time.Second), 2*time.Second) // 2 cpu-s, 2 gib-s
+	c.Record("orgB", "standard", 7, 1000, 1024, base.Add(5*time.Second), 2*time.Second) // 2 cpu-s, 2 gib-s
 	// Same org+bucket but a different query source is a separate key.
-	c.Record("orgA", "42", "endpoints", 8000, 16*1024, base.Add(10*time.Second), 10*time.Second) // 80, 160
+	c.Record("orgA", "endpoints", 42, 8000, 16*1024, base.Add(10*time.Second), 10*time.Second) // 80, 160
 	// Same org+bucket but a different worker size is a separate key.
-	c.Record("orgA", "42", "standard", 2000, 4*1024, base.Add(10*time.Second), 10*time.Second) // 20, 40
+	c.Record("orgA", "standard", 42, 2000, 4*1024, base.Add(10*time.Second), 10*time.Second) // 20, 40
 
 	deltas := c.drainWholeUnits()
 	got := map[computeUsageKey]configstore.ComputeUsageDelta{}
@@ -92,7 +92,7 @@ func TestComputeUsageCounterBucketing(t *testing.T) {
 	if d := got[keyA(bucket1)]; d.CPUSeconds != 40 || d.MemorySeconds != 80 {
 		t.Errorf("orgA bucket1 = (%d,%d), want (40,80)", d.CPUSeconds, d.MemorySeconds)
 	}
-	if d := got[computeUsageKey{orgID: "orgB", teamID: "7", querySource: "standard", millicores: 1000, mib: 1024, bucket: bucket0}]; d.CPUSeconds != 2 || d.MemorySeconds != 2 {
+	if d := got[computeUsageKey{orgID: "orgB", teamID: 7, querySource: "standard", millicores: 1000, mib: 1024, bucket: bucket0}]; d.CPUSeconds != 2 || d.MemorySeconds != 2 {
 		t.Errorf("orgB bucket0 = (%d,%d), want (2,2)", d.CPUSeconds, d.MemorySeconds)
 	}
 	endpointsKey := keyA(bucket0)
@@ -112,12 +112,12 @@ func TestComputeUsageCounterRemainderCarry(t *testing.T) {
 	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
 	// 500 millicores × 1s = 500 milli-cpu-seconds = 0 whole vCPU-seconds yet,
 	// and 512 MiB × 1s = 512 MiB-seconds = 0 whole GiB-seconds yet.
-	c.Record("orgA", "42", "standard", 500, 512, base, 1*time.Second)
+	c.Record("orgA", "standard", 42, 500, 512, base, 1*time.Second)
 	if deltas := c.drainWholeUnits(); len(deltas) != 0 {
 		t.Fatalf("expected no whole units yet, got %v", deltas)
 	}
 	// Add another 500 milli-cpu-s (→ 1000 = 1 vCPU-s) and 512 MiB-s (→ 1024 = 1 GiB-s).
-	c.Record("orgA", "42", "standard", 500, 512, base, 1*time.Second)
+	c.Record("orgA", "standard", 42, 500, 512, base, 1*time.Second)
 	deltas := c.drainWholeUnits()
 	if len(deltas) != 1 || deltas[0].CPUSeconds != 1 || deltas[0].MemorySeconds != 1 {
 		t.Fatalf("expected exactly 1 vCPU-s + 1 GiB-s after carry, got %v", deltas)
@@ -146,11 +146,11 @@ func (f *fakeFlushStore) FlushComputeUsage(d []configstore.ComputeUsageDelta) er
 	return nil
 }
 
-func teamResolverA(orgID string) string {
+func teamResolverA(orgID string) int64 {
 	if orgID == "orgA" {
-		return "42"
+		return 42
 	}
-	return ""
+	return 0
 }
 
 func TestComputeMeterFlush(t *testing.T) {
@@ -166,8 +166,8 @@ func TestComputeMeterFlush(t *testing.T) {
 		t.Fatalf("flushed = %v, want one (80,160)", store.flushed)
 	}
 	// The meter resolves the org's default team at record time.
-	if store.flushed[0].TeamID != "42" || store.flushed[0].QuerySource != "standard" {
-		t.Fatalf("flushed key = (team=%q, source=%q), want (42, standard)", store.flushed[0].TeamID, store.flushed[0].QuerySource)
+	if store.flushed[0].TeamID != 42 || store.flushed[0].QuerySource != "standard" {
+		t.Fatalf("flushed key = (team=%d, source=%q), want (42, standard)", store.flushed[0].TeamID, store.flushed[0].QuerySource)
 	}
 	// Nothing left to flush.
 	if n := m.Flush(); n != 0 {
@@ -177,15 +177,15 @@ func TestComputeMeterFlush(t *testing.T) {
 
 func TestComputeMeterUnknownTeamTolerated(t *testing.T) {
 	// An org with no default_team_id (or a nil resolver) still meters — the
-	// bucket carries an empty team_id rather than dropping usage.
+	// bucket carries team_id 0 rather than dropping usage.
 	store := &fakeFlushStore{}
 	m := newComputeMeter(store, teamResolverA)
 	m.Record("orgB", "standard", 1000, 1024, time.Now(), 2*time.Second)
 	if n := m.Flush(); n != 1 {
 		t.Fatalf("Flush rows = %d, want 1", n)
 	}
-	if store.flushed[0].TeamID != "" {
-		t.Fatalf("team = %q, want empty for unknown org", store.flushed[0].TeamID)
+	if store.flushed[0].TeamID != 0 {
+		t.Fatalf("team = %d, want 0 for unknown org", store.flushed[0].TeamID)
 	}
 }
 

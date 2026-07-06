@@ -197,7 +197,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		if o.HostnameAlias != nil {
 			alias = *o.HostnameAlias
 		}
-		defaultTeamID := ""
+		defaultTeamID := int64(0)
 		if o.DefaultTeamID != nil {
 			defaultTeamID = *o.DefaultTeamID
 		}
@@ -485,19 +485,19 @@ func (cs *ConfigStore) OrgDefaultWorkerMinHotIdle(orgID string) int {
 }
 
 // OrgDefaultTeamID returns the org's default PostHog team id from the current
-// snapshot, or "" when unset (including unknown orgs and a not-yet-loaded
-// snapshot). NULLABLE/optional: an empty return is a valid, non-error state —
-// callers must tolerate it and MUST NOT fail a connection or activation on it.
+// snapshot, or 0 when unset (including unknown orgs and a not-yet-loaded
+// snapshot). A zero return is a valid, non-error state — callers must
+// tolerate it and MUST NOT fail a connection or activation on it.
 // Prerequisite for pull-based compute billing (usage keyed by team id).
-func (cs *ConfigStore) OrgDefaultTeamID(orgID string) string {
+func (cs *ConfigStore) OrgDefaultTeamID(orgID string) int64 {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if cs.snapshot == nil {
-		return ""
+		return 0
 	}
 	oc, ok := cs.snapshot.Orgs[orgID]
 	if !ok {
-		return ""
+		return 0
 	}
 	return oc.DefaultTeamID
 }
