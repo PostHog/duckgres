@@ -7,6 +7,7 @@ steps:
       org_id: scenario-smoke-${run_id_token}
       request:
         database_name: scenario_smoke_${run_id_token}
+        default_team_id: 1
         metadata_store:
           type: cnpg-shard
         ducklake:

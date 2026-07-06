@@ -77,6 +77,162 @@ func TestExecutorRetriesTransientStartupErrors(t *testing.T) {
 	}
 }
 
+func TestExecutorRetriesEOFStartupErrors(t *testing.T) {
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	var attempts int
+	driver := &fakeDriver{
+		executeFunc: func(context.Context, QueryRequest) (QueryResult, error) {
+			attempts++
+			if attempts == 1 {
+				return QueryResult{}, errors.New("EOF")
+			}
+			return QueryResult{Rows: 1}, nil
+		},
+	}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			Port:      5432,
+			SSLMode:   "require",
+		},
+		Driver: driver,
+		Retry: RetryConfig{
+			MaxAttempts:  2,
+			RetryBackoff: time.Millisecond,
+			Sleep: func(context.Context, time.Duration) error {
+				return nil
+			},
+		},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "setup_frozen_views",
+		Type: StepTypeSQL,
+		With: map[string]any{
+			"org_id":  "scenario-org",
+			"catalog": "ducklake",
+			"sql":     "CREATE VIEW frozen_v1.events_file_view AS SELECT 1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestExecutorRetriesConnectionResetStartupErrors(t *testing.T) {
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	var attempts int
+	driver := &fakeDriver{
+		executeFunc: func(context.Context, QueryRequest) (QueryResult, error) {
+			attempts++
+			if attempts == 1 {
+				return QueryResult{}, errors.New("read tcp 127.0.0.1:5432: read: connection reset by peer")
+			}
+			return QueryResult{Rows: 1}, nil
+		},
+	}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			Port:      5432,
+			SSLMode:   "require",
+		},
+		Driver: driver,
+		Retry: RetryConfig{
+			MaxAttempts:  2,
+			RetryBackoff: time.Millisecond,
+			Sleep: func(context.Context, time.Duration) error {
+				return nil
+			},
+		},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "setup_frozen_views",
+		Type: StepTypeSQL,
+		With: map[string]any{
+			"org_id":  "scenario-org",
+			"catalog": "ducklake",
+			"sql":     "CREATE VIEW frozen_v1.events_file_view AS SELECT 1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestExecutorRetriesIOTimeoutStartupErrors(t *testing.T) {
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	var attempts int
+	driver := &fakeDriver{
+		executeFunc: func(context.Context, QueryRequest) (QueryResult, error) {
+			attempts++
+			if attempts == 1 {
+				return QueryResult{}, errors.New("read tcp 127.0.0.1:5432: i/o timeout")
+			}
+			return QueryResult{Rows: 1}, nil
+		},
+	}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			Port:      5432,
+			SSLMode:   "require",
+		},
+		Driver: driver,
+		Retry: RetryConfig{
+			MaxAttempts:  2,
+			RetryBackoff: time.Millisecond,
+			Sleep: func(context.Context, time.Duration) error {
+				return nil
+			},
+		},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "setup_frozen_views",
+		Type: StepTypeSQL,
+		With: map[string]any{
+			"org_id":  "scenario-org",
+			"catalog": "ducklake",
+			"sql":     "CREATE VIEW frozen_v1.events_file_view AS SELECT 1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
 func TestExecutorDoesNotRetryNonTransientSQLErrors(t *testing.T) {
 	provisionState := provision.NewState()
 	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{

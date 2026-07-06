@@ -10,6 +10,7 @@ steps:
       org_id: scenario-frozen-perf-${run_id_token}
       request:
         database_name: scenario_frozen_perf_${run_id_token}
+        default_team_id: 1
         metadata_store:
           type: cnpg-shard
         ducklake:

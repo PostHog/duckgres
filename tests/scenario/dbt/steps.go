@@ -151,17 +151,21 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 
 	commandsRun := 0
 	for _, command := range spec.Commands {
+		args := append([]string{}, command.Args...)
+		args = append(args,
+			"--project-dir", spec.ProjectDir,
+			"--profiles-dir", spec.ProfilesDir,
+			"--log-path", filepath.Join(dbtDir, "logs"),
+		)
+		if command.Name != "debug" {
+			args = append(args, "--target-path", filepath.Join(dbtDir, "target"))
+		}
 		req := CommandRequest{
 			Binary:      spec.DBTBinary,
 			CommandName: command.Name,
-			Args: append(append([]string{}, command.Args...),
-				"--project-dir", spec.ProjectDir,
-				"--profiles-dir", spec.ProfilesDir,
-				"--target-path", filepath.Join(dbtDir, "target"),
-				"--log-path", filepath.Join(dbtDir, "logs"),
-			),
-			Env: e.commandEnv(spec),
-			Dir: spec.ProjectDir,
+			Args:        args,
+			Env:         e.commandEnv(spec),
+			Dir:         spec.ProjectDir,
 		}
 		result := e.commandRunner.Run(ctx, req)
 		commandsRun++
@@ -241,7 +245,6 @@ func (e *Executor) commandEnv(spec stepSpec) []string {
 	}
 	return []string{
 		"DUCKGRES_DBT_HOST=" + spec.OrgID + e.connection.SNISuffix,
-		"DUCKGRES_DBT_HOSTADDR=" + e.connection.HostAddr,
 		"DUCKGRES_DBT_PORT=" + strconv.Itoa(port),
 		"DUCKGRES_DBT_USER=" + spec.Username,
 		"DBT_ENV_SECRET_DUCKGRES_PASSWORD=" + spec.Password,
@@ -249,7 +252,6 @@ func (e *Executor) commandEnv(spec stepSpec) []string {
 		"DUCKGRES_DBT_SCHEMA=" + spec.Schema,
 		"DUCKGRES_DBT_SSLMODE=" + spec.SSLMode,
 		"DUCKGRES_DBT_CONNECT_TIMEOUT=" + strconv.Itoa(connectTimeout),
-		"PGHOSTADDR=" + e.connection.HostAddr,
 	}
 }
 
