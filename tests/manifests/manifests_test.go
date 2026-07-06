@@ -223,7 +223,7 @@ func TestQueryLogWriterAlertsReferenceWriterMetrics(t *testing.T) {
 		"DuckgresQueryLogWriterDrops",
 		"DuckgresQueryLogWriterRetriesHigh",
 		`duckgres_query_log_kafka_writer_events_total{outcome="failed"}`,
-		`duckgres_query_log_kafka_writer_events_total{outcome="dropped"}`,
+		`duckgres_query_log_kafka_writer_events_total{outcome="dropped",reason=~"no_target|resolve_failed|write_failed"}`,
 		`duckgres_query_log_kafka_writer_events_total{outcome="retried"}`,
 	} {
 		if !strings.Contains(content, want) {

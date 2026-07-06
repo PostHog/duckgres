@@ -276,6 +276,8 @@ Run with config file:
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
 | `DUCKGRES_QUERY_LOG_ENABLED` | Enable per-query logging | `true` |
 | `DUCKGRES_QUERY_LOG_SINK` | Query-log destination: `ducklake` writes `ducklake.system.query_log`; `kafka` publishes JSON events | `ducklake` |
+| `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval. In Kafka mode this controls producer publish flushes and query-log-writer per-org DuckLake flushes. | `5s` |
+| `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size. In Kafka mode this controls producer Kafka batches and query-log-writer per-org DuckLake insert batches. | `1000` |
 | `DUCKGRES_QUERY_LOG_KAFKA_BROKERS` | Comma-separated Kafka bootstrap brokers used when `DUCKGRES_QUERY_LOG_SINK=kafka` | - |
 | `DUCKGRES_QUERY_LOG_KAFKA_TOPIC` | Kafka topic for query-log events; required for Kafka mode | - |
 | `DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID` | Kafka client ID used by the query-log producer | `duckgres-query-log` |

@@ -7,5 +7,5 @@ import (
 
 var queryLogKafkaWriterEvents = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_query_log_kafka_writer_events_total",
-	Help: "Query-log Kafka writer events by outcome.",
-}, []string{"outcome"})
+	Help: "Query-log Kafka writer events by outcome and bounded reason.",
+}, []string{"outcome", "reason"})

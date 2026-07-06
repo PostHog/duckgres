@@ -11,13 +11,29 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 type fakeQueryLogKafkaConsumer struct {
-	messages   []QueryLogKafkaConsumedMessage
-	commits    []QueryLogKafkaConsumedMessage
-	commitErrs []error
-	closed     bool
+	messages      []QueryLogKafkaConsumedMessage
+	commits       []QueryLogKafkaConsumedMessage
+	commitBatches [][]QueryLogKafkaConsumedMessage
+	commitErrs    []error
+	onCommit      func()
+	closed        bool
+}
+
+func queryLogKafkaWriterEventMetricValue(t *testing.T, outcome, reason string) float64 {
+	t.Helper()
+	var metric dto.Metric
+	if err := queryLogKafkaWriterEvents.WithLabelValues(outcome, reason).Write(&metric); err != nil {
+		t.Fatalf("read query-log writer metric %s/%s: %v", outcome, reason, err)
+	}
+	if metric.Counter == nil {
+		t.Fatalf("query-log writer metric %s/%s is not a counter", outcome, reason)
+	}
+	return metric.Counter.GetValue()
 }
 
 func (c *fakeQueryLogKafkaConsumer) FetchMessage(context.Context) (QueryLogKafkaConsumedMessage, error) {
@@ -37,7 +53,12 @@ func (c *fakeQueryLogKafkaConsumer) CommitMessages(_ context.Context, messages .
 			return err
 		}
 	}
+	batch := append([]QueryLogKafkaConsumedMessage(nil), messages...)
+	c.commitBatches = append(c.commitBatches, batch)
 	c.commits = append(c.commits, messages...)
+	if c.onCommit != nil {
+		c.onCommit()
+	}
 	return nil
 }
 
@@ -46,8 +67,23 @@ func (c *fakeQueryLogKafkaConsumer) Close() error {
 	return nil
 }
 
+type blockingAfterMessagesQueryLogKafkaConsumer struct {
+	fakeQueryLogKafkaConsumer
+}
+
+func (c *blockingAfterMessagesQueryLogKafkaConsumer) FetchMessage(ctx context.Context) (QueryLogKafkaConsumedMessage, error) {
+	if len(c.messages) > 0 {
+		msg := c.messages[0]
+		c.messages = c.messages[1:]
+		return msg, nil
+	}
+	<-ctx.Done()
+	return QueryLogKafkaConsumedMessage{}, ctx.Err()
+}
+
 type fakeQueryLogEntryWriterResolver struct {
 	writer      *fakeQueryLogEntryWriter
+	writers     map[string]*fakeQueryLogEntryWriter
 	orgs        []string
 	invalidated []struct {
 		orgID  string
@@ -57,6 +93,11 @@ type fakeQueryLogEntryWriterResolver struct {
 
 func (r *fakeQueryLogEntryWriterResolver) ResolveQueryLogEntryWriter(_ context.Context, orgID string) (QueryLogEntryWriter, error) {
 	r.orgs = append(r.orgs, orgID)
+	if r.writers != nil {
+		if writer, ok := r.writers[orgID]; ok {
+			return writer, nil
+		}
+	}
 	return r.writer, nil
 }
 
@@ -69,6 +110,7 @@ func (r *fakeQueryLogEntryWriterResolver) InvalidateQueryLogEntryWriter(orgID st
 
 type fakeQueryLogEntryWriter struct {
 	entries []QueryLogEntry
+	batches [][]QueryLogEntry
 	err     error
 	errs    []error
 	closed  int
@@ -85,6 +127,8 @@ func (w *fakeQueryLogEntryWriter) WriteQueryLogEntries(_ context.Context, entrie
 	if w.err != nil {
 		return w.err
 	}
+	batch := append([]QueryLogEntry(nil), entries...)
+	w.batches = append(w.batches, batch)
 	w.entries = append(w.entries, entries...)
 	return nil
 }
@@ -155,7 +199,7 @@ func TestQueryLogKafkaWriterWritesAndCommitsAfterSuccess(t *testing.T) {
 	}
 }
 
-func TestQueryLogKafkaWriterDoesNotCommitWhenWriteFails(t *testing.T) {
+func TestQueryLogKafkaWriterCommitsDroppedWriteFailure(t *testing.T) {
 	payload, err := json.Marshal(QueryLogKafkaEvent{
 		SchemaVersion: queryLogKafkaSchemaVersion,
 		EventID:       "evt-1",
@@ -178,17 +222,61 @@ func TestQueryLogKafkaWriterDoesNotCommitWhenWriteFails(t *testing.T) {
 		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
 	}
 
-	if err := writer.ProcessOne(context.Background()); err == nil {
-		t.Fatal("expected ProcessOne to fail")
+	if err := writer.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("expected ProcessOne to drop and commit write failure, got %v", err)
 	}
-	if len(consumer.commits) != 0 {
-		t.Fatalf("expected no commits after write failure, got %d", len(consumer.commits))
+	if len(entryWriter.entries) != 0 {
+		t.Fatalf("expected failed event to be dropped, got %d written entries", len(entryWriter.entries))
+	}
+	if len(consumer.commits) != 1 {
+		t.Fatalf("expected dropped write failure to commit, got %d commits", len(consumer.commits))
 	}
 	if len(resolver.invalidated) != 1 {
 		t.Fatalf("expected failed writer to be invalidated, got %d invalidations", len(resolver.invalidated))
 	}
 	if resolver.invalidated[0].orgID != "org-a" || resolver.invalidated[0].writer != entryWriter {
 		t.Fatalf("unexpected invalidation: %#v", resolver.invalidated[0])
+	}
+}
+
+func TestQueryLogKafkaWriterDroppedWriteFailureMetricHasReason(t *testing.T) {
+	beforeDroppedWriteFailed := queryLogKafkaWriterEventMetricValue(t, "dropped", "write_failed")
+	beforeFailedWriteFailed := queryLogKafkaWriterEventMetricValue(t, "failed", "write_failed")
+	beforeDroppedInvalid := queryLogKafkaWriterEventMetricValue(t, "dropped", "invalid_event")
+
+	payload, err := json.Marshal(QueryLogKafkaEvent{
+		SchemaVersion: queryLogKafkaSchemaVersion,
+		EventID:       "evt-1",
+		EventTime:     time.Unix(1700000000, 0).UTC(),
+		Type:          "QueryFinish",
+		Query:         "SELECT 1",
+		UserName:      "alice",
+		OrgID:         "org-a",
+	})
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	consumer := &fakeQueryLogKafkaConsumer{
+		messages: []QueryLogKafkaConsumedMessage{{Value: payload}},
+	}
+	entryWriter := &fakeQueryLogEntryWriter{err: errors.New("write failed")}
+	writer, err := NewQueryLogKafkaWriter(consumer, &fakeQueryLogEntryWriterResolver{writer: entryWriter})
+	if err != nil {
+		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
+	}
+
+	if err := writer.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+
+	if got := queryLogKafkaWriterEventMetricValue(t, "dropped", "write_failed"); got != beforeDroppedWriteFailed+1 {
+		t.Fatalf("dropped/write_failed = %v, want %v", got, beforeDroppedWriteFailed+1)
+	}
+	if got := queryLogKafkaWriterEventMetricValue(t, "failed", "write_failed"); got != beforeFailedWriteFailed+1 {
+		t.Fatalf("failed/write_failed = %v, want %v", got, beforeFailedWriteFailed+1)
+	}
+	if got := queryLogKafkaWriterEventMetricValue(t, "dropped", "invalid_event"); got != beforeDroppedInvalid {
+		t.Fatalf("dropped/invalid_event = %v, want unchanged %v", got, beforeDroppedInvalid)
 	}
 }
 
@@ -220,7 +308,7 @@ func TestQueryLogKafkaWriterRetryLogRedactsSecrets(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	writer := &QueryLogKafkaWriter{}
-	writer.recordRetryableError(errors.New("write failed: ATTACH 'ducklake:postgres:host=db user=metadata password=metadata-secret dbname=ducklake' AS ducklake; CREATE SECRET ducklake_s3 (TYPE s3, SECRET 's3-secret', SESSION_TOKEN 'session-token')"))
+	writer.recordRetryableError(queryLogKafkaWriterReasonWriteFailed, errors.New("write failed: ATTACH 'ducklake:postgres:host=db user=metadata password=metadata-secret dbname=ducklake' AS ducklake; CREATE SECRET ducklake_s3 (TYPE s3, SECRET 's3-secret', SESSION_TOKEN 'session-token')"))
 
 	got := buf.String()
 	for _, secret := range []string{"metadata-secret", "s3-secret", "session-token", "ducklake:postgres:host=db"} {
@@ -233,7 +321,7 @@ func TestQueryLogKafkaWriterRetryLogRedactsSecrets(t *testing.T) {
 	}
 }
 
-func TestQueryLogKafkaWriterRunRetriesFailedMessageBeforeFetchingNext(t *testing.T) {
+func TestQueryLogKafkaWriterRunDropsFailedWriteBeforeFetchingNext(t *testing.T) {
 	first := QueryLogKafkaEvent{
 		SchemaVersion: queryLogKafkaSchemaVersion,
 		EventID:       "evt-first",
@@ -269,24 +357,29 @@ func TestQueryLogKafkaWriterRunRetriesFailedMessageBeforeFetchingNext(t *testing
 	entryWriter := &fakeQueryLogEntryWriter{
 		errs: []error{errors.New("transient write failure"), nil, nil},
 	}
-	writer, err := NewQueryLogKafkaWriter(consumer, &fakeQueryLogEntryWriterResolver{writer: entryWriter})
+	resolver := &fakeQueryLogEntryWriterResolver{writer: entryWriter}
+	writer, err := NewQueryLogKafkaWriter(consumer, resolver)
 	if err != nil {
 		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
 	}
+	writer.batchSize = 1
 	writer.retryDelay = 0
 
 	err = writer.Run(context.Background())
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want context.Canceled after fake consumer drains", err)
 	}
-	if len(entryWriter.entries) != 2 {
-		t.Fatalf("expected both events to be written after retry, got %d entries", len(entryWriter.entries))
+	if len(entryWriter.entries) != 1 {
+		t.Fatalf("expected failed event to be dropped and second event to be written, got %d entries", len(entryWriter.entries))
 	}
-	if entryWriter.entries[0].EventID != "evt-first" || entryWriter.entries[1].EventID != "evt-second" {
+	if entryWriter.entries[0].EventID != "evt-second" {
 		t.Fatalf("unexpected write order: %#v", entryWriter.entries)
 	}
+	if len(resolver.invalidated) != 1 || resolver.invalidated[0].orgID != "org-a" {
+		t.Fatalf("expected failed writer to be invalidated once, got %#v", resolver.invalidated)
+	}
 	if len(consumer.commits) != 2 {
-		t.Fatalf("expected both messages to be committed after writes, got %d commits", len(consumer.commits))
+		t.Fatalf("expected dropped and written messages to be committed, got %d commits", len(consumer.commits))
 	}
 }
 
@@ -329,6 +422,7 @@ func TestQueryLogKafkaWriterRunRetriesCommitFailureBeforeFetchingNext(t *testing
 	if err != nil {
 		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
 	}
+	writer.batchSize = 1
 	writer.retryDelay = 0
 
 	err = writer.Run(context.Background())
@@ -343,6 +437,297 @@ func TestQueryLogKafkaWriterRunRetriesCommitFailureBeforeFetchingNext(t *testing
 	}
 	if len(consumer.commits) != 2 {
 		t.Fatalf("expected two successful commits after retry, got %d commits", len(consumer.commits))
+	}
+}
+
+func TestQueryLogKafkaWriterRunBatchesMessagesByOrg(t *testing.T) {
+	events := []QueryLogKafkaEvent{
+		{
+			SchemaVersion: queryLogKafkaSchemaVersion,
+			EventID:       "evt-a-1",
+			EventTime:     time.Unix(1700000000, 0).UTC(),
+			Type:          "QueryFinish",
+			Query:         "SELECT 1",
+			UserName:      "alice",
+			OrgID:         "org-a",
+		},
+		{
+			SchemaVersion: queryLogKafkaSchemaVersion,
+			EventID:       "evt-b-1",
+			EventTime:     time.Unix(1700000001, 0).UTC(),
+			Type:          "QueryFinish",
+			Query:         "SELECT 2",
+			UserName:      "bob",
+			OrgID:         "org-b",
+		},
+		{
+			SchemaVersion: queryLogKafkaSchemaVersion,
+			EventID:       "evt-a-2",
+			EventTime:     time.Unix(1700000002, 0).UTC(),
+			Type:          "QueryFinish",
+			Query:         "SELECT 3",
+			UserName:      "alice",
+			OrgID:         "org-a",
+		},
+	}
+
+	messages := make([]QueryLogKafkaConsumedMessage, 0, len(events))
+	for _, event := range events {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("marshal event %q: %v", event.EventID, err)
+		}
+		messages = append(messages, QueryLogKafkaConsumedMessage{Value: payload, Partition: 0, Offset: int64(len(messages))})
+	}
+	consumer := &fakeQueryLogKafkaConsumer{messages: messages}
+	writerA := &fakeQueryLogEntryWriter{}
+	writerB := &fakeQueryLogEntryWriter{}
+	resolver := &fakeQueryLogEntryWriterResolver{
+		writers: map[string]*fakeQueryLogEntryWriter{
+			"org-a": writerA,
+			"org-b": writerB,
+		},
+	}
+	writer, err := NewQueryLogKafkaWriter(consumer, resolver)
+	if err != nil {
+		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
+	}
+	writer.batchSize = 2
+	writer.flushInterval = time.Hour
+	writer.retryDelay = 0
+
+	err = writer.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled after fake consumer drains", err)
+	}
+
+	if len(writerA.batches) != 1 {
+		t.Fatalf("expected org-a to be written in one batch, got %d batches: %#v", len(writerA.batches), writerA.batches)
+	}
+	if got := []string{writerA.batches[0][0].EventID, writerA.batches[0][1].EventID}; got[0] != "evt-a-1" || got[1] != "evt-a-2" {
+		t.Fatalf("unexpected org-a batch event IDs: %#v", got)
+	}
+	if len(writerB.batches) != 1 || len(writerB.batches[0]) != 1 || writerB.batches[0][0].EventID != "evt-b-1" {
+		t.Fatalf("unexpected org-b batches: %#v", writerB.batches)
+	}
+	if len(consumer.commitBatches) != 1 {
+		t.Fatalf("expected one partition-safe Kafka commit call, got %d", len(consumer.commitBatches))
+	}
+	if len(consumer.commitBatches[0]) != 3 {
+		t.Fatalf("expected all buffered partition messages to commit together, got %d messages", len(consumer.commitBatches[0]))
+	}
+}
+
+func TestQueryLogKafkaWriterRunKeepsKafkaPartitionsIndependent(t *testing.T) {
+	events := []struct {
+		event     QueryLogKafkaEvent
+		partition int
+		offset    int64
+	}{
+		{
+			event: QueryLogKafkaEvent{
+				SchemaVersion: queryLogKafkaSchemaVersion,
+				EventID:       "evt-a-1",
+				EventTime:     time.Unix(1700000000, 0).UTC(),
+				Type:          "QueryFinish",
+				Query:         "SELECT 1",
+				UserName:      "alice",
+				OrgID:         "org-a",
+			},
+			partition: 0,
+			offset:    0,
+		},
+		{
+			event: QueryLogKafkaEvent{
+				SchemaVersion: queryLogKafkaSchemaVersion,
+				EventID:       "evt-b-1",
+				EventTime:     time.Unix(1700000001, 0).UTC(),
+				Type:          "QueryFinish",
+				Query:         "SELECT 2",
+				UserName:      "bob",
+				OrgID:         "org-b",
+			},
+			partition: 1,
+			offset:    0,
+		},
+		{
+			event: QueryLogKafkaEvent{
+				SchemaVersion: queryLogKafkaSchemaVersion,
+				EventID:       "evt-a-2",
+				EventTime:     time.Unix(1700000002, 0).UTC(),
+				Type:          "QueryFinish",
+				Query:         "SELECT 3",
+				UserName:      "alice",
+				OrgID:         "org-a",
+			},
+			partition: 0,
+			offset:    1,
+		},
+	}
+
+	messages := make([]QueryLogKafkaConsumedMessage, 0, len(events))
+	for _, item := range events {
+		payload, err := json.Marshal(item.event)
+		if err != nil {
+			t.Fatalf("marshal event %q: %v", item.event.EventID, err)
+		}
+		messages = append(messages, QueryLogKafkaConsumedMessage{Value: payload, Partition: item.partition, Offset: item.offset})
+	}
+	consumer := &fakeQueryLogKafkaConsumer{messages: messages}
+	writerA := &fakeQueryLogEntryWriter{}
+	writerB := &fakeQueryLogEntryWriter{}
+	resolver := &fakeQueryLogEntryWriterResolver{
+		writers: map[string]*fakeQueryLogEntryWriter{
+			"org-a": writerA,
+			"org-b": writerB,
+		},
+	}
+	writer, err := NewQueryLogKafkaWriter(consumer, resolver)
+	if err != nil {
+		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
+	}
+	writer.batchSize = 2
+	writer.flushInterval = time.Hour
+	writer.retryDelay = 0
+
+	err = writer.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled after fake consumer drains", err)
+	}
+
+	if len(writerA.batches) != 1 || len(writerA.batches[0]) != 2 {
+		t.Fatalf("expected org-a partition 0 batch to write first, got %#v", writerA.batches)
+	}
+	if len(writerB.batches) != 1 || len(writerB.batches[0]) != 1 {
+		t.Fatalf("expected org-b partition 1 batch to write on drain, got %#v", writerB.batches)
+	}
+	if len(consumer.commitBatches) != 2 {
+		t.Fatalf("expected one commit per partition, got %#v", consumer.commitBatches)
+	}
+	if got := consumer.commitBatches[0]; len(got) != 2 || got[0].Partition != 0 || got[1].Partition != 0 {
+		t.Fatalf("expected first commit to contain only partition 0 messages, got %#v", got)
+	}
+	if got := consumer.commitBatches[1]; len(got) != 1 || got[0].Partition != 1 {
+		t.Fatalf("expected second commit to contain only partition 1 message, got %#v", got)
+	}
+}
+
+func TestQueryLogKafkaWriterRunDropsFailedOrgBatchAndCommitsPartition(t *testing.T) {
+	events := []QueryLogKafkaEvent{
+		{
+			SchemaVersion: queryLogKafkaSchemaVersion,
+			EventID:       "evt-a-1",
+			EventTime:     time.Unix(1700000000, 0).UTC(),
+			Type:          "QueryFinish",
+			Query:         "SELECT 1",
+			UserName:      "alice",
+			OrgID:         "org-a",
+		},
+		{
+			SchemaVersion: queryLogKafkaSchemaVersion,
+			EventID:       "evt-b-1",
+			EventTime:     time.Unix(1700000001, 0).UTC(),
+			Type:          "QueryFinish",
+			Query:         "SELECT 2",
+			UserName:      "bob",
+			OrgID:         "org-b",
+		},
+		{
+			SchemaVersion: queryLogKafkaSchemaVersion,
+			EventID:       "evt-a-2",
+			EventTime:     time.Unix(1700000002, 0).UTC(),
+			Type:          "QueryFinish",
+			Query:         "SELECT 3",
+			UserName:      "alice",
+			OrgID:         "org-a",
+		},
+	}
+
+	messages := make([]QueryLogKafkaConsumedMessage, 0, len(events))
+	for _, event := range events {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("marshal event %q: %v", event.EventID, err)
+		}
+		messages = append(messages, QueryLogKafkaConsumedMessage{Value: payload, Partition: 0, Offset: int64(len(messages))})
+	}
+	consumer := &fakeQueryLogKafkaConsumer{messages: messages}
+	writerA := &fakeQueryLogEntryWriter{err: errors.New("ducklake write failed")}
+	writerB := &fakeQueryLogEntryWriter{}
+	resolver := &fakeQueryLogEntryWriterResolver{
+		writers: map[string]*fakeQueryLogEntryWriter{
+			"org-a": writerA,
+			"org-b": writerB,
+		},
+	}
+	writer, err := NewQueryLogKafkaWriter(consumer, resolver)
+	if err != nil {
+		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
+	}
+	writer.batchSize = 2
+	writer.flushInterval = time.Hour
+	writer.retryDelay = 0
+
+	err = writer.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled after fake consumer drains", err)
+	}
+
+	if len(writerA.entries) != 0 {
+		t.Fatalf("expected failed org-a batch to be dropped, got %d written entries", len(writerA.entries))
+	}
+	if len(writerB.batches) != 1 || len(writerB.batches[0]) != 1 || writerB.batches[0][0].EventID != "evt-b-1" {
+		t.Fatalf("expected org-b batch to write despite org-a failure, got %#v", writerB.batches)
+	}
+	if len(resolver.invalidated) != 1 || resolver.invalidated[0].orgID != "org-a" {
+		t.Fatalf("expected failed org-a writer to be invalidated, got %#v", resolver.invalidated)
+	}
+	if len(consumer.commitBatches) != 1 || len(consumer.commitBatches[0]) != 3 {
+		t.Fatalf("expected whole partition to commit after write/drop handling, got %#v", consumer.commitBatches)
+	}
+}
+
+func TestQueryLogKafkaWriterRunFlushesOrgBatchOnInterval(t *testing.T) {
+	event := QueryLogKafkaEvent{
+		SchemaVersion: queryLogKafkaSchemaVersion,
+		EventID:       "evt-a-1",
+		EventTime:     time.Unix(1700000000, 0).UTC(),
+		Type:          "QueryFinish",
+		Query:         "SELECT 1",
+		UserName:      "alice",
+		OrgID:         "org-a",
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	consumer := &blockingAfterMessagesQueryLogKafkaConsumer{
+		fakeQueryLogKafkaConsumer: fakeQueryLogKafkaConsumer{
+			messages: []QueryLogKafkaConsumedMessage{{Value: payload}},
+			onCommit: cancel,
+		},
+	}
+	entryWriter := &fakeQueryLogEntryWriter{}
+	writer, err := NewQueryLogKafkaWriter(consumer, &fakeQueryLogEntryWriterResolver{writer: entryWriter})
+	if err != nil {
+		t.Fatalf("NewQueryLogKafkaWriter: %v", err)
+	}
+	writer.batchSize = 1000
+	writer.flushInterval = time.Millisecond
+	writer.retryDelay = 0
+
+	err = writer.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled after test cancel", err)
+	}
+	if len(entryWriter.batches) != 1 || len(entryWriter.batches[0]) != 1 {
+		t.Fatalf("expected one time-flushed entry batch, got %#v", entryWriter.batches)
+	}
+	if len(consumer.commitBatches) != 1 || len(consumer.commitBatches[0]) != 1 {
+		t.Fatalf("expected one committed Kafka batch, got %#v", consumer.commitBatches)
 	}
 }
 
@@ -490,6 +875,123 @@ func TestQueryLogKafkaEventInsertIsIdempotentByEventID(t *testing.T) {
 	}
 	if eventID != "evt-duplicate" {
 		t.Fatalf("expected event_id to persist, got %q", eventID)
+	}
+}
+
+func TestQueryLogKafkaEventBatchInsertIsIdempotentByEventID(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
+		t.Fatalf("ensureQueryLogTable: %v", err)
+	}
+	writer := &QueryLogDuckLakeEntryWriter{db: db, table: "query_log"}
+	events := []QueryLogKafkaEvent{
+		{
+			SchemaVersion:         queryLogKafkaSchemaVersion,
+			EventID:               "evt-batch-1",
+			EventTime:             time.Unix(1700000000, 0).UTC(),
+			QueryDurationMs:       42,
+			Type:                  "QueryFinish",
+			Query:                 "SELECT 1",
+			QueryKind:             "Select",
+			UserName:              "alice",
+			OrgID:                 "org-a",
+			CPUTimeSeconds:        1.25,
+			PeakBufferMemoryBytes: 2048,
+		},
+		{
+			SchemaVersion:         queryLogKafkaSchemaVersion,
+			EventID:               "evt-batch-2",
+			EventTime:             time.Unix(1700000001, 0).UTC(),
+			QueryDurationMs:       84,
+			Type:                  "QueryFinish",
+			Query:                 "SELECT 2",
+			QueryKind:             "Select",
+			UserName:              "alice",
+			OrgID:                 "org-a",
+			CPUTimeSeconds:        2.5,
+			PeakBufferMemoryBytes: 4096,
+		},
+	}
+
+	if err := writer.WriteQueryLogKafkaEvents(context.Background(), events); err != nil {
+		t.Fatalf("first WriteQueryLogKafkaEvents: %v", err)
+	}
+	if err := writer.WriteQueryLogKafkaEvents(context.Background(), events); err != nil {
+		t.Fatalf("second WriteQueryLogKafkaEvents: %v", err)
+	}
+
+	var rows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM query_log").Scan(&rows); err != nil {
+		t.Fatalf("count query_log: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("expected duplicate event_ids to insert two rows, got %d", rows)
+	}
+}
+
+func TestQueryLogKafkaEventBatchInsertDeduplicatesEventIDsWithinBatch(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
+		t.Fatalf("ensureQueryLogTable: %v", err)
+	}
+	writer := &QueryLogDuckLakeEntryWriter{db: db, table: "query_log"}
+	events := []QueryLogKafkaEvent{
+		{
+			SchemaVersion:         queryLogKafkaSchemaVersion,
+			EventID:               "evt-duplicate-in-batch",
+			EventTime:             time.Unix(1700000000, 0).UTC(),
+			QueryDurationMs:       42,
+			Type:                  "QueryFinish",
+			Query:                 "SELECT 1",
+			QueryKind:             "Select",
+			UserName:              "alice",
+			OrgID:                 "org-a",
+			CPUTimeSeconds:        1.25,
+			PeakBufferMemoryBytes: 2048,
+		},
+		{
+			SchemaVersion:         queryLogKafkaSchemaVersion,
+			EventID:               "evt-duplicate-in-batch",
+			EventTime:             time.Unix(1700000001, 0).UTC(),
+			QueryDurationMs:       84,
+			Type:                  "QueryFinish",
+			Query:                 "SELECT 2",
+			QueryKind:             "Select",
+			UserName:              "alice",
+			OrgID:                 "org-a",
+			CPUTimeSeconds:        2.5,
+			PeakBufferMemoryBytes: 4096,
+		},
+	}
+
+	if err := writer.WriteQueryLogKafkaEvents(context.Background(), events); err != nil {
+		t.Fatalf("WriteQueryLogKafkaEvents: %v", err)
+	}
+
+	var rows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM query_log").Scan(&rows); err != nil {
+		t.Fatalf("count query_log: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("expected duplicate event_ids within a batch to insert one row, got %d", rows)
+	}
+
+	var query string
+	if err := db.QueryRow("SELECT query FROM query_log").Scan(&query); err != nil {
+		t.Fatalf("query inserted row: %v", err)
+	}
+	if query != "SELECT 1" {
+		t.Fatalf("expected first duplicate event to win, got query %q", query)
 	}
 }
 

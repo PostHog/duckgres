@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,26 @@ const defaultQueryLogWriterIdleTTL = 15 * time.Minute
 const defaultQueryLogWriterPruneInterval = time.Minute
 const defaultQueryLogWriterMaxCachedWriters = 128
 const defaultQueryLogKafkaWriterRetryDelay = time.Second
+const defaultQueryLogKafkaWriterBatchSize = 1000
+const defaultQueryLogKafkaWriterFlushInterval = 5 * time.Second
+
+const (
+	queryLogKafkaWriterOutcomeConsumed  = "consumed"
+	queryLogKafkaWriterOutcomeInserted  = "inserted"
+	queryLogKafkaWriterOutcomeCommitted = "committed"
+	queryLogKafkaWriterOutcomeDropped   = "dropped"
+	queryLogKafkaWriterOutcomeFailed    = "failed"
+	queryLogKafkaWriterOutcomeRetried   = "retried"
+
+	queryLogKafkaWriterReasonOK            = "ok"
+	queryLogKafkaWriterReasonInvalidEvent  = "invalid_event"
+	queryLogKafkaWriterReasonNoTarget      = "no_target"
+	queryLogKafkaWriterReasonResolveFailed = "resolve_failed"
+	queryLogKafkaWriterReasonWriteFailed   = "write_failed"
+	queryLogKafkaWriterReasonCommitFailed  = "commit_failed"
+	queryLogKafkaWriterReasonFetchFailed   = "fetch_failed"
+	queryLogKafkaWriterReasonBufferFailed  = "buffer_failed"
+)
 
 // ErrQueryLogNoDuckLakeTarget means an org has no DuckLake table that can store
 // query-log events.
@@ -28,11 +49,14 @@ var ErrQueryLogNoDuckLakeTarget = errors.New("querylog: no DuckLake metadata sto
 
 // QueryLogKafkaConsumedMessage is the minimal Kafka message shape needed by
 // the query-log writer. The concrete kafka-go reader keeps offsets internally;
-// tests use this value to prove commits happen only after durable writes.
+// tests use this value to prove commits happen only after durable writes or
+// explicit drops.
 type QueryLogKafkaConsumedMessage struct {
-	Key   []byte
-	Value []byte
-	raw   kafka.Message
+	Key       []byte
+	Value     []byte
+	Partition int
+	Offset    int64
+	raw       kafka.Message
 }
 
 type QueryLogKafkaConsumer interface {
@@ -49,6 +73,11 @@ type QueryLogEntryWriter interface {
 type QueryLogKafkaEventWriter interface {
 	QueryLogEntryWriter
 	WriteQueryLogKafkaEvent(context.Context, QueryLogKafkaEvent) error
+}
+
+type QueryLogKafkaEventBatchWriter interface {
+	QueryLogEntryWriter
+	WriteQueryLogKafkaEvents(context.Context, []QueryLogKafkaEvent) error
 }
 
 type QueryLogEntryWriterResolver interface {
@@ -76,10 +105,24 @@ type QueryLogDuckLakeConfigResolver interface {
 	ResolveQueryLogDuckLakeConfig(context.Context, string) (QueryLogDuckLakeResolvedConfig, error)
 }
 
+func recordQueryLogKafkaWriterEvent(outcome, reason string) {
+	recordQueryLogKafkaWriterEvents(outcome, reason, 1)
+}
+
+func recordQueryLogKafkaWriterEvents(outcome, reason string, count float64) {
+	if count <= 0 {
+		return
+	}
+	queryLogKafkaWriterEvents.WithLabelValues(outcome, reason).Add(count)
+}
+
 type QueryLogKafkaWriter struct {
-	consumer   QueryLogKafkaConsumer
-	resolver   QueryLogEntryWriterResolver
-	retryDelay time.Duration
+	consumer      QueryLogKafkaConsumer
+	resolver      QueryLogEntryWriterResolver
+	retryDelay    time.Duration
+	batchSize     int
+	flushInterval time.Duration
+	now           func() time.Time
 }
 
 func NewQueryLogKafkaWriter(consumer QueryLogKafkaConsumer, resolver QueryLogEntryWriterResolver) (*QueryLogKafkaWriter, error) {
@@ -89,20 +132,53 @@ func NewQueryLogKafkaWriter(consumer QueryLogKafkaConsumer, resolver QueryLogEnt
 	if resolver == nil {
 		return nil, errors.New("querylog: entry writer resolver is nil")
 	}
-	return &QueryLogKafkaWriter{consumer: consumer, resolver: resolver, retryDelay: defaultQueryLogKafkaWriterRetryDelay}, nil
+	return &QueryLogKafkaWriter{
+		consumer:      consumer,
+		resolver:      resolver,
+		retryDelay:    defaultQueryLogKafkaWriterRetryDelay,
+		batchSize:     defaultQueryLogKafkaWriterBatchSize,
+		flushInterval: defaultQueryLogKafkaWriterFlushInterval,
+		now:           func() time.Time { return time.Now().UTC() },
+	}, nil
+}
+
+func (w *QueryLogKafkaWriter) ConfigureBatching(batchSize int, flushInterval time.Duration) {
+	if w == nil {
+		return
+	}
+	if batchSize <= 0 {
+		batchSize = defaultQueryLogKafkaWriterBatchSize
+	}
+	if flushInterval <= 0 {
+		flushInterval = defaultQueryLogKafkaWriterFlushInterval
+	}
+	w.batchSize = batchSize
+	w.flushInterval = flushInterval
 }
 
 func (w *QueryLogKafkaWriter) Run(ctx context.Context) error {
 	if w == nil {
 		return nil
 	}
+	batches := newQueryLogKafkaPartitionBatches()
 	for {
-		msg, err := w.fetchMessage(ctx)
+		msg, err := w.fetchMessageBeforeNextFlush(ctx, batches)
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && batches.hasPending() {
+				if err := w.flushDuePartitionsWithRetry(ctx, batches); err != nil {
+					return err
+				}
+				continue
+			}
+			if isQueryLogKafkaWriterStopError(err) && ctx.Err() == nil && batches.hasPending() {
+				if flushErr := w.flushAllPartitionsWithRetry(ctx, batches); flushErr != nil {
+					return flushErr
+				}
+			}
 			if isQueryLogKafkaWriterStopError(err) {
 				return err
 			}
-			w.recordRetryableError(err)
+			w.recordRetryableError(queryLogKafkaWriterReasonFetchFailed, err)
 			if err := w.waitBeforeRetry(ctx); err != nil {
 				return err
 			}
@@ -110,15 +186,21 @@ func (w *QueryLogKafkaWriter) Run(ctx context.Context) error {
 		}
 
 		for {
-			if err := w.processMessage(ctx, msg); err != nil {
+			partition, ready, err := w.bufferMessage(batches, msg)
+			if err != nil {
 				if isQueryLogKafkaWriterStopError(err) {
 					return err
 				}
-				w.recordRetryableError(err)
+				w.recordRetryableError(queryLogKafkaWriterReasonBufferFailed, err)
 				if err := w.waitBeforeRetry(ctx); err != nil {
 					return err
 				}
 				continue
+			}
+			if ready {
+				if err := w.flushPartitionWithRetry(ctx, batches, partition); err != nil {
+					return err
+				}
 			}
 			break
 		}
@@ -141,53 +223,189 @@ func (w *QueryLogKafkaWriter) fetchMessage(ctx context.Context) (QueryLogKafkaCo
 	if err != nil {
 		return QueryLogKafkaConsumedMessage{}, err
 	}
-	queryLogKafkaWriterEvents.WithLabelValues("consumed").Inc()
+	recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeConsumed, queryLogKafkaWriterReasonOK)
 	return msg, nil
+}
+
+func (w *QueryLogKafkaWriter) fetchMessageBeforeNextFlush(ctx context.Context, batches *queryLogKafkaPartitionBatches) (QueryLogKafkaConsumedMessage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if batches == nil || !batches.hasPending() {
+		return w.fetchMessage(ctx)
+	}
+
+	now := w.currentTime()
+	nextFlush := batches.nextFlushAt(w.effectiveFlushInterval())
+	wait := nextFlush.Sub(now)
+	if wait <= 0 {
+		return QueryLogKafkaConsumedMessage{}, context.DeadlineExceeded
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	return w.fetchMessage(fetchCtx)
+}
+
+func (w *QueryLogKafkaWriter) bufferMessage(batches *queryLogKafkaPartitionBatches, msg QueryLogKafkaConsumedMessage) (int, bool, error) {
+	var event QueryLogKafkaEvent
+	if err := json.Unmarshal(msg.Value, &event); err != nil {
+		recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeDropped, queryLogKafkaWriterReasonInvalidEvent)
+		batches.addDropped(msg, fmt.Errorf("decode query log kafka event: %w", err), w.currentTime())
+		return msg.Partition, true, nil
+	}
+	if err := validateQueryLogKafkaEvent(event); err != nil {
+		recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeDropped, queryLogKafkaWriterReasonInvalidEvent)
+		batches.addDropped(msg, err, w.currentTime())
+		return msg.Partition, true, nil
+	}
+
+	orgID := strings.TrimSpace(event.OrgID)
+	batches.addEvent(msg.Partition, orgID, queryLogKafkaBufferedEvent{
+		event:   event,
+		entry:   queryLogEntryFromKafkaEvent(event),
+		message: msg,
+	}, w.currentTime())
+	return msg.Partition, batches.orgLen(msg.Partition, orgID) >= w.effectiveBatchSize(), nil
 }
 
 func (w *QueryLogKafkaWriter) processMessage(ctx context.Context, msg QueryLogKafkaConsumedMessage) error {
 	var event QueryLogKafkaEvent
 	if err := json.Unmarshal(msg.Value, &event); err != nil {
-		queryLogKafkaWriterEvents.WithLabelValues("dropped").Inc()
+		recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeDropped, queryLogKafkaWriterReasonInvalidEvent)
 		return w.dropAndCommit(ctx, msg, fmt.Errorf("decode query log kafka event: %w", err))
 	}
 	if err := validateQueryLogKafkaEvent(event); err != nil {
-		queryLogKafkaWriterEvents.WithLabelValues("dropped").Inc()
+		recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeDropped, queryLogKafkaWriterReasonInvalidEvent)
 		return w.dropAndCommit(ctx, msg, err)
 	}
 
-	entryWriter, err := w.resolver.ResolveQueryLogEntryWriter(ctx, event.OrgID)
-	if err != nil {
-		if errors.Is(err, ErrQueryLogNoDuckLakeTarget) {
-			queryLogKafkaWriterEvents.WithLabelValues("dropped").Inc()
-			return w.dropAndCommit(ctx, msg, err)
-		}
-		return fmt.Errorf("resolve query log writer for org %q: %w", event.OrgID, err)
+	orgID := strings.TrimSpace(event.OrgID)
+	if err := w.writeOrgBatchOrDrop(ctx, orgID, []queryLogKafkaBufferedEvent{{
+		event:   event,
+		entry:   queryLogEntryFromKafkaEvent(event),
+		message: msg,
+	}}); err != nil {
+		return err
 	}
-	if eventWriter, ok := entryWriter.(QueryLogKafkaEventWriter); ok {
-		err = eventWriter.WriteQueryLogKafkaEvent(ctx, event)
-	} else {
-		err = entryWriter.WriteQueryLogEntries(ctx, []QueryLogEntry{queryLogEntryFromKafkaEvent(event)})
-	}
-	if err != nil {
-		if invalidator, ok := w.resolver.(QueryLogEntryWriterInvalidator); ok {
-			invalidator.InvalidateQueryLogEntryWriter(event.OrgID, entryWriter)
-		}
-		return fmt.Errorf("write query log event %q for org %q: %w", event.EventID, event.OrgID, err)
-	}
-	queryLogKafkaWriterEvents.WithLabelValues("inserted").Inc()
 
 	if err := w.consumer.CommitMessages(ctx, msg); err != nil {
 		return fmt.Errorf("commit query log kafka event %q: %w", event.EventID, err)
 	}
-	queryLogKafkaWriterEvents.WithLabelValues("committed").Inc()
+	recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeCommitted, queryLogKafkaWriterReasonOK)
 	return nil
 }
 
-func (w *QueryLogKafkaWriter) recordRetryableError(err error) {
-	queryLogKafkaWriterEvents.WithLabelValues("failed").Inc()
+func (w *QueryLogKafkaWriter) flushDuePartitionsWithRetry(ctx context.Context, batches *queryLogKafkaPartitionBatches) error {
+	for _, partition := range batches.duePartitions(w.currentTime(), w.effectiveFlushInterval()) {
+		if err := w.flushPartitionWithRetry(ctx, batches, partition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *QueryLogKafkaWriter) flushAllPartitionsWithRetry(ctx context.Context, batches *queryLogKafkaPartitionBatches) error {
+	for _, partition := range batches.partitions() {
+		if err := w.flushPartitionWithRetry(ctx, batches, partition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *QueryLogKafkaWriter) flushPartitionWithRetry(ctx context.Context, batches *queryLogKafkaPartitionBatches, partition int) error {
+	for {
+		if err := w.flushPartition(ctx, batches, partition); err != nil {
+			if isQueryLogKafkaWriterStopError(err) {
+				return err
+			}
+			w.recordRetryableError(queryLogKafkaWriterReasonCommitFailed, err)
+			if err := w.waitBeforeRetry(ctx); err != nil {
+				return err
+			}
+			continue
+		}
+		return nil
+	}
+}
+
+func (w *QueryLogKafkaWriter) flushPartition(ctx context.Context, batches *queryLogKafkaPartitionBatches, partition int) error {
+	batch := batches.get(partition)
+	if batch == nil || len(batch.messages) == 0 {
+		return nil
+	}
+
+	for _, dropped := range batch.dropped {
+		slog.Warn("querylog: dropped invalid kafka event.", "error", dropped.err, "partition", partition, "offset", dropped.message.Offset)
+	}
+	for _, orgID := range batch.orgIDs() {
+		if err := w.writeOrgBatchOrDrop(ctx, orgID, batch.byOrg[orgID]); err != nil {
+			return err
+		}
+	}
+
+	if err := w.consumer.CommitMessages(ctx, batch.messages...); err != nil {
+		return fmt.Errorf("commit query log kafka partition %d batch: %w", partition, err)
+	}
+	recordQueryLogKafkaWriterEvents(queryLogKafkaWriterOutcomeCommitted, queryLogKafkaWriterReasonOK, float64(len(batch.messages)))
+	batches.remove(partition)
+	return nil
+}
+
+func (w *QueryLogKafkaWriter) writeOrgBatchOrDrop(ctx context.Context, orgID string, batch []queryLogKafkaBufferedEvent) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	entryWriter, err := w.resolver.ResolveQueryLogEntryWriter(ctx, orgID)
+	if err != nil {
+		if errors.Is(err, ErrQueryLogNoDuckLakeTarget) {
+			recordQueryLogKafkaWriterEvents(queryLogKafkaWriterOutcomeDropped, queryLogKafkaWriterReasonNoTarget, float64(len(batch)))
+			slog.Warn("querylog: dropped kafka events for org without DuckLake query-log target.", "org_id", orgID, "batch_size", len(batch))
+			return nil
+		}
+		if isQueryLogKafkaWriterStopError(err) {
+			return err
+		}
+		w.recordDroppedOrgBatchError(queryLogKafkaWriterReasonResolveFailed, orgID, len(batch), fmt.Errorf("resolve query log writer for org %q: %w", orgID, err))
+		return nil
+	}
+
+	if eventBatchWriter, ok := entryWriter.(QueryLogKafkaEventBatchWriter); ok {
+		err = eventBatchWriter.WriteQueryLogKafkaEvents(ctx, queryLogKafkaEvents(batch))
+	} else if eventWriter, ok := entryWriter.(QueryLogKafkaEventWriter); ok {
+		for _, item := range batch {
+			if err = eventWriter.WriteQueryLogKafkaEvent(ctx, item.event); err != nil {
+				break
+			}
+		}
+	} else {
+		err = entryWriter.WriteQueryLogEntries(ctx, queryLogKafkaEntries(batch))
+	}
+	if err != nil {
+		if invalidator, ok := w.resolver.(QueryLogEntryWriterInvalidator); ok {
+			invalidator.InvalidateQueryLogEntryWriter(orgID, entryWriter)
+		}
+		if isQueryLogKafkaWriterStopError(err) {
+			return err
+		}
+		w.recordDroppedOrgBatchError(queryLogKafkaWriterReasonWriteFailed, orgID, len(batch), fmt.Errorf("write query log batch for org %q: %w", orgID, err))
+		return nil
+	}
+	recordQueryLogKafkaWriterEvents(queryLogKafkaWriterOutcomeInserted, queryLogKafkaWriterReasonOK, float64(len(batch)))
+	return nil
+}
+
+func (w *QueryLogKafkaWriter) recordDroppedOrgBatchError(reason, orgID string, batchSize int, err error) {
+	recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeFailed, reason)
+	recordQueryLogKafkaWriterEvents(queryLogKafkaWriterOutcomeDropped, reason, float64(batchSize))
+	slog.Error("querylog: dropped query-log batch after write failure.", "org_id", orgID, "batch_size", batchSize, "error", RedactQueryLogWriterError(err))
+}
+
+func (w *QueryLogKafkaWriter) recordRetryableError(reason string, err error) {
+	recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeFailed, reason)
 	slog.Error("querylog: kafka writer failed to process event.", "error", RedactQueryLogWriterError(err))
-	queryLogKafkaWriterEvents.WithLabelValues("retried").Inc()
+	recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeRetried, reason)
 }
 
 var (
@@ -241,8 +459,170 @@ func (w *QueryLogKafkaWriter) dropAndCommit(ctx context.Context, msg QueryLogKaf
 		return fmt.Errorf("%w; commit dropped kafka message: %v", dropErr, err)
 	}
 	slog.Warn("querylog: dropped invalid kafka event.", "error", dropErr)
-	queryLogKafkaWriterEvents.WithLabelValues("committed").Inc()
+	recordQueryLogKafkaWriterEvent(queryLogKafkaWriterOutcomeCommitted, queryLogKafkaWriterReasonOK)
 	return nil
+}
+
+func (w *QueryLogKafkaWriter) effectiveBatchSize() int {
+	if w == nil || w.batchSize <= 0 {
+		return defaultQueryLogKafkaWriterBatchSize
+	}
+	return w.batchSize
+}
+
+func (w *QueryLogKafkaWriter) effectiveFlushInterval() time.Duration {
+	if w == nil || w.flushInterval <= 0 {
+		return defaultQueryLogKafkaWriterFlushInterval
+	}
+	return w.flushInterval
+}
+
+func (w *QueryLogKafkaWriter) currentTime() time.Time {
+	if w == nil || w.now == nil {
+		return time.Now().UTC()
+	}
+	return w.now()
+}
+
+type queryLogKafkaBufferedEvent struct {
+	event   QueryLogKafkaEvent
+	entry   QueryLogEntry
+	message QueryLogKafkaConsumedMessage
+}
+
+type queryLogKafkaDroppedMessage struct {
+	message QueryLogKafkaConsumedMessage
+	err     error
+}
+
+type queryLogKafkaPartitionBatch struct {
+	firstBufferedAt time.Time
+	messages        []QueryLogKafkaConsumedMessage
+	byOrg           map[string][]queryLogKafkaBufferedEvent
+	dropped         []queryLogKafkaDroppedMessage
+}
+
+func (b *queryLogKafkaPartitionBatch) orgIDs() []string {
+	orgIDs := make([]string, 0, len(b.byOrg))
+	for orgID, events := range b.byOrg {
+		if len(events) > 0 {
+			orgIDs = append(orgIDs, orgID)
+		}
+	}
+	sort.Strings(orgIDs)
+	return orgIDs
+}
+
+type queryLogKafkaPartitionBatches struct {
+	byPartition map[int]*queryLogKafkaPartitionBatch
+}
+
+func newQueryLogKafkaPartitionBatches() *queryLogKafkaPartitionBatches {
+	return &queryLogKafkaPartitionBatches{byPartition: make(map[int]*queryLogKafkaPartitionBatch)}
+}
+
+func (b *queryLogKafkaPartitionBatches) partitionBatch(partition int, now time.Time) *queryLogKafkaPartitionBatch {
+	batch := b.byPartition[partition]
+	if batch == nil {
+		batch = &queryLogKafkaPartitionBatch{
+			firstBufferedAt: now,
+			byOrg:           make(map[string][]queryLogKafkaBufferedEvent),
+		}
+		b.byPartition[partition] = batch
+	}
+	return batch
+}
+
+func (b *queryLogKafkaPartitionBatches) addEvent(partition int, orgID string, item queryLogKafkaBufferedEvent, now time.Time) {
+	batch := b.partitionBatch(partition, now)
+	batch.messages = append(batch.messages, item.message)
+	batch.byOrg[orgID] = append(batch.byOrg[orgID], item)
+}
+
+func (b *queryLogKafkaPartitionBatches) addDropped(msg QueryLogKafkaConsumedMessage, err error, now time.Time) {
+	batch := b.partitionBatch(msg.Partition, now)
+	batch.messages = append(batch.messages, msg)
+	batch.dropped = append(batch.dropped, queryLogKafkaDroppedMessage{message: msg, err: err})
+}
+
+func (b *queryLogKafkaPartitionBatches) orgLen(partition int, orgID string) int {
+	batch := b.byPartition[partition]
+	if batch == nil {
+		return 0
+	}
+	return len(batch.byOrg[orgID])
+}
+
+func (b *queryLogKafkaPartitionBatches) hasPending() bool {
+	for _, batch := range b.byPartition {
+		if len(batch.messages) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *queryLogKafkaPartitionBatches) get(partition int) *queryLogKafkaPartitionBatch {
+	return b.byPartition[partition]
+}
+
+func (b *queryLogKafkaPartitionBatches) remove(partition int) {
+	delete(b.byPartition, partition)
+}
+
+func (b *queryLogKafkaPartitionBatches) nextFlushAt(flushInterval time.Duration) time.Time {
+	var next time.Time
+	for _, batch := range b.byPartition {
+		if len(batch.messages) == 0 {
+			continue
+		}
+		flushAt := batch.firstBufferedAt.Add(flushInterval)
+		if next.IsZero() || flushAt.Before(next) {
+			next = flushAt
+		}
+	}
+	return next
+}
+
+func (b *queryLogKafkaPartitionBatches) duePartitions(now time.Time, flushInterval time.Duration) []int {
+	partitions := make([]int, 0, len(b.byPartition))
+	for partition, batch := range b.byPartition {
+		if len(batch.messages) == 0 {
+			continue
+		}
+		if !now.Before(batch.firstBufferedAt.Add(flushInterval)) {
+			partitions = append(partitions, partition)
+		}
+	}
+	sort.Ints(partitions)
+	return partitions
+}
+
+func (b *queryLogKafkaPartitionBatches) partitions() []int {
+	partitions := make([]int, 0, len(b.byPartition))
+	for partition, batch := range b.byPartition {
+		if len(batch.messages) > 0 {
+			partitions = append(partitions, partition)
+		}
+	}
+	sort.Ints(partitions)
+	return partitions
+}
+
+func queryLogKafkaEvents(batch []queryLogKafkaBufferedEvent) []QueryLogKafkaEvent {
+	events := make([]QueryLogKafkaEvent, 0, len(batch))
+	for _, item := range batch {
+		events = append(events, item.event)
+	}
+	return events
+}
+
+func queryLogKafkaEntries(batch []queryLogKafkaBufferedEvent) []QueryLogEntry {
+	entries := make([]QueryLogEntry, 0, len(batch))
+	for _, item := range batch {
+		entries = append(entries, item.entry)
+	}
+	return entries
 }
 
 func (w *QueryLogKafkaWriter) Close() error {
@@ -331,6 +711,17 @@ func (w *QueryLogDuckLakeEntryWriter) WriteQueryLogKafkaEvent(ctx context.Contex
 	return insertQueryLogKafkaEvent(ctx, w.db, w.table, entry)
 }
 
+func (w *QueryLogDuckLakeEntryWriter) WriteQueryLogKafkaEvents(ctx context.Context, events []QueryLogKafkaEvent) error {
+	if w == nil || w.db == nil {
+		return errors.New("querylog: ducklake entry writer is nil")
+	}
+	entries := make([]QueryLogEntry, 0, len(events))
+	for _, event := range events {
+		entries = append(entries, queryLogEntryFromKafkaEvent(event))
+	}
+	return insertQueryLogKafkaEvents(ctx, w.db, w.table, entries)
+}
+
 func (w *QueryLogDuckLakeEntryWriter) Close() error {
 	if w == nil || w.db == nil {
 		return nil
@@ -342,6 +733,17 @@ func (w *QueryLogDuckLakeEntryWriter) Close() error {
 // normal single-consumer Kafka replays idempotent, but it is not a storage-level
 // unique constraint across multiple independent writer groups.
 func insertQueryLogKafkaEvent(ctx context.Context, db *sql.DB, table string, entry QueryLogEntry) error {
+	if err := insertQueryLogKafkaEvents(ctx, db, table, []QueryLogEntry{entry}); err != nil {
+		return fmt.Errorf("insert query_log kafka event: %w", err)
+	}
+	return nil
+}
+
+func insertQueryLogKafkaEvents(ctx context.Context, db *sql.DB, table string, entries []QueryLogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	entries = dedupeQueryLogEntriesByEventID(entries)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -353,22 +755,46 @@ func insertQueryLogKafkaEvent(ctx context.Context, db *sql.DB, table string, ent
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
 	sb.WriteString(" (event_id, event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms, cpu_time_s, peak_buffer_memory_bytes) ")
-	sb.WriteString("SELECT ")
-	for i := 1; i <= 27; i++ {
-		if i > 1 {
-			sb.WriteString(",")
+	sb.WriteString("SELECT incoming.event_id, incoming.event_time, incoming.query_duration_ms, incoming.type, incoming.query, incoming.transpiled_query, incoming.query_kind, incoming.normalized_query_hash, incoming.result_rows, incoming.written_rows, incoming.exception_code, incoming.exception, incoming.user_name, incoming.org_id, incoming.current_database, incoming.client_address, incoming.client_port, incoming.application_name, incoming.pid, incoming.worker_id, incoming.is_transpiled, incoming.protocol, incoming.trace_id, incoming.span_id, incoming.postgres_scan_ms, incoming.cpu_time_s, incoming.peak_buffer_memory_bytes FROM (VALUES ")
+
+	const colsPerKafkaRow = 27
+	args := make([]any, 0, len(entries)*colsPerKafkaRow)
+	for i, entry := range entries {
+		if i > 0 {
+			sb.WriteString(", ")
 		}
-		fmt.Fprintf(&sb, "$%d", i)
+		base := i * colsPerKafkaRow
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
+			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20,
+			base+21, base+22, base+23, base+24, base+25, base+26, base+27)
+		args = append(args, append([]any{entry.EventID}, queryLogEntryInsertArgs(entry)...)...)
 	}
+	sb.WriteString(") AS incoming(event_id, event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms, cpu_time_s, peak_buffer_memory_bytes)")
 	sb.WriteString(" WHERE NOT EXISTS (SELECT 1 FROM ")
 	sb.WriteString(table)
-	sb.WriteString(" WHERE event_id = $1)")
+	sb.WriteString(" AS existing WHERE existing.event_id = incoming.event_id)")
 
-	args := append([]any{entry.EventID}, queryLogEntryInsertArgs(entry)...)
 	if _, err := db.ExecContext(ctx, sb.String(), args...); err != nil {
-		return fmt.Errorf("insert query_log kafka event: %w", err)
+		return fmt.Errorf("insert query_log kafka events: %w", err)
 	}
 	return nil
+}
+
+func dedupeQueryLogEntriesByEventID(entries []QueryLogEntry) []QueryLogEntry {
+	if len(entries) < 2 {
+		return entries
+	}
+	deduped := make([]QueryLogEntry, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if _, ok := seen[entry.EventID]; ok {
+			continue
+		}
+		seen[entry.EventID] = struct{}{}
+		deduped = append(deduped, entry)
+	}
+	return deduped
 }
 
 type QueryLogDuckLakeEntryWriterResolver struct {
@@ -601,7 +1027,7 @@ func (c *kafkaGoQueryLogConsumer) FetchMessage(ctx context.Context) (QueryLogKaf
 	if err != nil {
 		return QueryLogKafkaConsumedMessage{}, err
 	}
-	return QueryLogKafkaConsumedMessage{Key: msg.Key, Value: msg.Value, raw: msg}, nil
+	return QueryLogKafkaConsumedMessage{Key: msg.Key, Value: msg.Value, Partition: msg.Partition, Offset: msg.Offset, raw: msg}, nil
 }
 
 func (c *kafkaGoQueryLogConsumer) CommitMessages(ctx context.Context, messages ...QueryLogKafkaConsumedMessage) error {

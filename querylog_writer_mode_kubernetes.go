@@ -128,11 +128,14 @@ func runQueryLogWriter(ctx context.Context, cfg server.Config, resolved configre
 	if err != nil {
 		return err
 	}
+	writer.ConfigureBatching(cfg.QueryLog.BatchSize, cfg.QueryLog.FlushInterval)
 
 	slog.Info("Starting query-log Kafka writer.",
 		"topic", cfg.QueryLog.Kafka.Topic,
 		"brokers", len(cfg.QueryLog.Kafka.Brokers),
 		"group_id", cfg.QueryLog.Kafka.GroupID,
+		"flush_interval", cfg.QueryLog.FlushInterval,
+		"batch_size", cfg.QueryLog.BatchSize,
 	)
 	if err := writer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
