@@ -27,6 +27,7 @@ import (
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/sessionmeta"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -1050,7 +1051,24 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 	}
 	slog.Debug("Acquired DB connection from pool.", "user", username, "duration", time.Since(start))
 
-	// Initialize the session connection with username-specific state if needed.
+	sessionCfg, cfgErr := p.currentSessionConfig()
+	if cfgErr != nil {
+		_ = conn.Close()
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
+		return nil, nil, cfgErr
+	}
+
+	if err := initAttachedDuckLakeSessionMetadata(conn, db, sessionCfg); err != nil {
+		_ = conn.Close()
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
+		return nil, nil, err
+	}
+	// Initialize the session connection with username-specific state after any
+	// catalog setup; DuckLake metadata init restores the default search_path.
 	// Since the DB is shared, we must set session-local parameters here.
 	initSearchPath(conn, username)
 
@@ -1139,15 +1157,6 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
-	cfg, cfgErr := p.currentSessionConfig()
-	if cfgErr != nil {
-		_ = conn.Close()
-		p.mu.Lock()
-		p.reserved--
-		p.mu.Unlock()
-		return nil, nil, cfgErr
-	}
-
 	// In shared-warm (multi-tenant) mode the control plane drives credential
 	// refresh by re-activating the worker with a freshly-brokered STS payload
 	// before the current creds expire (see controlplane/janitor scheduler +
@@ -1168,7 +1177,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 	if p.sharedWarmMode {
 		stop = func() {}
 	} else {
-		stop = server.StartCredentialRefresh(conn, cfg.DuckLake, func() bool {
+		stop = server.StartCredentialRefresh(conn, sessionCfg.DuckLake, func() bool {
 			session.mu.Lock()
 			defer session.mu.Unlock()
 			return len(session.txns) > 0
@@ -1670,6 +1679,28 @@ func initSearchPath(conn *sql.Conn, username string) {
 			slog.Warn("Failed to set search_path for session.", "user", username, "error", err)
 		}
 	}
+}
+
+func initAttachedDuckLakeSessionMetadata(conn *sql.Conn, db *sql.DB, cfg server.Config) error {
+	initTimeout := cfg.SessionInitTimeout
+	if initTimeout == 0 {
+		initTimeout = server.DefaultSessionInitTimeout
+	}
+	initCtx, initCancel := context.WithTimeout(context.Background(), initTimeout)
+	defer initCancel()
+
+	executor := server.NewPinnedExecutor(conn, db)
+	duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
+	if err != nil {
+		return fmt.Errorf("detect ducklake catalog attachment: %w", err)
+	}
+	if !duckLakeAttached {
+		return nil
+	}
+	if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, "ducklake"); err != nil {
+		return fmt.Errorf("initialize ducklake session metadata: %w", err)
+	}
+	return nil
 }
 
 func generateSessionToken() string {
