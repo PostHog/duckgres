@@ -852,6 +852,19 @@ assert_worker_pod() { # org
   dmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
   [ "$dcpu" = "750m" ] || fail "default worker $pod requests.cpu='$dcpu' want '750m' (pool default; BestEffort regression?)"
   [ "$dmem" = "1536Mi" ] || fail "default worker $pod requests.memory='$dmem' want '1536Mi'"
+
+  # Pre-session memory hygiene env (workerMemoryHygieneEnv): the CP must stamp
+  # a pod-derived DuckDB memory_limit, a Go soft memory ceiling, and the thread
+  # count at spawn — otherwise the worker sizes its base DB off the NODE's
+  # /proc/meminfo and all pre-session work (DuckLake ATTACH, activation) runs
+  # effectively unbounded. Values derive from the 750m/1536Mi pool default:
+  # 75% of 1536Mi floors to 1GB; GOMEMLIMIT is 1/8 pod = 192MiB; 750m -> 1.
+  dml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_MEMORY_LIMIT\")].value}")"
+  [ "$dml" = "1GB" ] || fail "default worker $pod DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of 1536Mi, GB-floored)"
+  gml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"GOMEMLIMIT\")].value}")"
+  [ "$gml" = "192MiB" ] || fail "default worker $pod GOMEMLIMIT='$gml' want '192MiB' (1/8 of 1536Mi)"
+  thr="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_THREADS\")].value}")"
+  [ "$thr" = "1" ] || fail "default worker $pod DUCKGRES_THREADS='$thr' want '1' (750m rounds up)"
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------

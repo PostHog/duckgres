@@ -20,6 +20,7 @@ import (
 	"github.com/posthog/duckgres/server"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -3001,7 +3002,9 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	foundTLSCertEnv := false
 	foundTLSKeyEnv := false
 	foundMaxSessionsEnv := false
+	envByName := map[string]string{}
 	for _, env := range c.Env {
+		envByName[env.Name] = env.Value
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
 			env.ValueFrom.SecretKeyRef.Name == "test-secret-duckgres-worker-test-cp-0" {
@@ -3031,6 +3034,22 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	}
 	if !foundMaxSessionsEnv {
 		t.Fatal("expected DUCKGRES_DUCKDB_MAX_SESSIONS=1 (one query session per worker)")
+	}
+
+	// Pre-session memory hygiene: the worker process must know the POD's
+	// memory shape from the start. Without these, ConfigureMainDB sizes the
+	// base DB off the NODE's /proc/meminfo (sysinfo.AutoMemoryLimit) and all
+	// pre-session work (DuckLake ATTACH, activation) runs effectively
+	// unbounded, and the Go runtime has no ceiling at all.
+	// Default pool shape is 16Gi/8cpu -> 75% = 12GB, GOMEMLIMIT = 1/8 pod.
+	if got := envByName["DUCKGRES_MEMORY_LIMIT"]; got != "12GB" {
+		t.Fatalf("expected DUCKGRES_MEMORY_LIMIT=12GB (75%% of 16Gi pod), got %q", got)
+	}
+	if got := envByName["DUCKGRES_THREADS"]; got != "8" {
+		t.Fatalf("expected DUCKGRES_THREADS=8 (pod CPU request), got %q", got)
+	}
+	if got := envByName["GOMEMLIMIT"]; got != "2048MiB" {
+		t.Fatalf("expected GOMEMLIMIT=2048MiB (1/8 of 16Gi pod), got %q", got)
 	}
 
 	if len(pod.Spec.Volumes) == 0 {
@@ -4612,5 +4631,47 @@ func TestWorkerDoNotDisruptLifecycle(t *testing.T) {
 	pool.markWorkerProtected(w)
 	if v, ok := annotation(); !ok || v != "true" {
 		t.Fatalf("do-not-disrupt annotation = %q,%v after protect, want \"true\"", v, ok)
+	}
+}
+
+func TestWorkerMemoryHygieneEnv(t *testing.T) {
+	mk := func(cpu, mem string) corev1.ResourceRequirements {
+		req := corev1.ResourceList{}
+		if cpu != "" {
+			req[corev1.ResourceCPU] = resource.MustParse(cpu)
+		}
+		if mem != "" {
+			req[corev1.ResourceMemory] = resource.MustParse(mem)
+		}
+		return corev1.ResourceRequirements{Requests: req}
+	}
+	cases := []struct {
+		name     string
+		res      corev1.ResourceRequirements
+		expected map[string]string
+	}{
+		{"prod-like 15/120Gi", mk("15", "120Gi"), map[string]string{
+			"DUCKGRES_MEMORY_LIMIT": "90GB", "GOMEMLIMIT": "15360MiB", "DUCKGRES_THREADS": "15"}},
+		{"dev 15/64Gi", mk("15", "64Gi"), map[string]string{
+			"DUCKGRES_MEMORY_LIMIT": "48GB", "GOMEMLIMIT": "8192MiB", "DUCKGRES_THREADS": "15"}},
+		{"sub-GB pod formats MB", mk("500m", "512Mi"), map[string]string{
+			"DUCKGRES_MEMORY_LIMIT": "384MB", "GOMEMLIMIT": "64MiB", "DUCKGRES_THREADS": "1"}},
+		{"no requests -> no env", corev1.ResourceRequirements{}, map[string]string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := map[string]string{}
+			for _, e := range workerMemoryHygieneEnv(tc.res) {
+				got[e.Name] = e.Value
+			}
+			if len(got) != len(tc.expected) {
+				t.Fatalf("env mismatch: got %v want %v", got, tc.expected)
+			}
+			for k, v := range tc.expected {
+				if got[k] != v {
+					t.Fatalf("%s = %q, want %q (all: %v)", k, got[k], v, got)
+				}
+			}
+		})
 	}
 }
