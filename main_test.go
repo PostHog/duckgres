@@ -14,20 +14,20 @@ func envFromMap(values map[string]string) func(string) string {
 	}
 }
 
-func TestValidateRunModeRejectsRemovedQueryLogWriter(t *testing.T) {
+func TestValidateRunModeRejectsUnsupportedMode(t *testing.T) {
 	for _, mode := range []string{"standalone", "control-plane", "duckdb-service"} {
 		if err := validateRunMode(mode); err != nil {
 			t.Fatalf("expected mode %q to be valid: %v", mode, err)
 		}
 	}
 
-	err := validateRunMode("query-log-writer")
+	err := validateRunMode("unsupported-mode")
 	if err == nil {
-		t.Fatal("expected removed query-log-writer mode to be rejected")
+		t.Fatal("expected unsupported mode to be rejected")
 	}
 	if !strings.Contains(err.Error(), "unsupported --mode") ||
 		!strings.Contains(err.Error(), "standalone, control-plane, duckdb-service") {
-		t.Fatalf("unexpected error for removed mode: %v", err)
+		t.Fatalf("unexpected error for unsupported mode: %v", err)
 	}
 }
 
