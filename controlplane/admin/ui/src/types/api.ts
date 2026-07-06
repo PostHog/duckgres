@@ -44,7 +44,7 @@ export interface Org {
   name: string;
   database_name: string;
   hostname_alias: string | null;
-  default_team_id: string | null;
+  default_team_id: number | null;
   max_workers: number;
   max_vcpus: number;
   default_worker_cpu: string;
@@ -66,7 +66,8 @@ export interface OrgUpdate {
   default_worker_ttl?: string;
   default_worker_min_hot_idle?: number;
   hostname_alias?: string | null;
-  default_team_id?: string | null;
+  // Number sets, 0 clears (backend maps 0 → NULL), absent preserves.
+  default_team_id?: number;
 }
 
 // ---- Users (confirmed) ----

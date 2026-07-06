@@ -201,10 +201,11 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
-	// DefaultTeamID is *string with the same semantics: nil = preserve, "" =
-	// clear (NULL), "x" = set. Nullable/optional — NULL is always valid.
+	// DefaultTeamID is *int64: nil = preserve, 0 = clear (NULL), n = set.
+	// (PostHog team ids start at 1, so 0 is a safe clear sentinel; the
+	// handler also maps an explicit JSON null onto it.)
 	if updates.DefaultTeamID != nil {
-		if *updates.DefaultTeamID == "" {
+		if *updates.DefaultTeamID == 0 {
 			fields["default_team_id"] = nil
 		} else {
 			fields["default_team_id"] = *updates.DefaultTeamID
@@ -610,7 +611,15 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
 	if _, ok := fields["default_team_id"]; ok {
-		merged.DefaultTeamID = updates.DefaultTeamID
+		// Key present: a number sets, and an explicit JSON null (which
+		// unmarshals to a nil pointer) clears — normalize null onto the 0
+		// clear-sentinel so the store layer sees one shape.
+		if updates.DefaultTeamID == nil {
+			zero := int64(0)
+			merged.DefaultTeamID = &zero
+		} else {
+			merged.DefaultTeamID = updates.DefaultTeamID
+		}
 	}
 
 	// Audit detail: which fields changed and their old → new values, so the
@@ -629,7 +638,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
 	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
 	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
-	addChange("default_team_id", orgStrPtr(existing.DefaultTeamID), orgStrPtr(merged.DefaultTeamID))
+	addChange("default_team_id", orgInt64Ptr(existing.DefaultTeamID), orgInt64Ptr(merged.DefaultTeamID))
 	if len(changes) > 0 {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}
@@ -696,6 +705,15 @@ func orgStrPtr(s *string) string {
 		return "(unset)"
 	}
 	return orgStr(*s)
+}
+
+// orgInt64Ptr renders an optional org config integer (nil or 0 == unset) for
+// audit detail.
+func orgInt64Ptr(v *int64) string {
+	if v == nil || *v == 0 {
+		return "(unset)"
+	}
+	return fmt.Sprintf("%d", *v)
 }
 
 func validateOrgMutationPayload(org *configstore.Org) error {

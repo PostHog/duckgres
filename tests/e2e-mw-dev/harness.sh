@@ -479,7 +479,7 @@ compute_usage_pull_api() { # org password
   a=0 body=""
   while [ "$a" -lt 30 ]; do
     body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
-    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --arg t "$CNPG_DEFAULT_TEAM_ID" '
+    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_DEFAULT_TEAM_ID" '
         (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="standard"  and .cpu_seconds>0 and .cpu>0 and .mem_gib>0)) | length >= 1)
         and
         (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="endpoints" and .cpu_seconds>0)) | length >= 1)' >/dev/null 2>&1; then
@@ -852,6 +852,19 @@ assert_worker_pod() { # org
   dmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
   [ "$dcpu" = "750m" ] || fail "default worker $pod requests.cpu='$dcpu' want '750m' (pool default; BestEffort regression?)"
   [ "$dmem" = "1536Mi" ] || fail "default worker $pod requests.memory='$dmem' want '1536Mi'"
+
+  # Pre-session memory hygiene env (workerMemoryHygieneEnv): the CP must stamp
+  # a pod-derived DuckDB memory_limit, a Go soft memory ceiling, and the thread
+  # count at spawn — otherwise the worker sizes its base DB off the NODE's
+  # /proc/meminfo and all pre-session work (DuckLake ATTACH, activation) runs
+  # effectively unbounded. Values derive from the 750m/1536Mi pool default:
+  # 75% of 1536Mi floors to 1GB; GOMEMLIMIT is 1/8 pod = 192MiB; 750m -> 1.
+  dml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_MEMORY_LIMIT\")].value}")"
+  [ "$dml" = "1GB" ] || fail "default worker $pod DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of 1536Mi, GB-floored)"
+  gml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"GOMEMLIMIT\")].value}")"
+  [ "$gml" = "192MiB" ] || fail "default worker $pod GOMEMLIMIT='$gml' want '192MiB' (1/8 of 1536Mi)"
+  thr="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_THREADS\")].value}")"
+  [ "$thr" = "1" ] || fail "default worker $pod DUCKGRES_THREADS='$thr' want '1' (750m rounds up)"
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------
@@ -1065,9 +1078,10 @@ org_default_profile() { # org password catalog
 }
 
 # ---- org default_team_id (mandatory on new orgs) ----------------------------
-# default_team_id links an org to its default PostHog team id (config-store
-# column, prereq for pull-based compute billing where usage buckets are keyed by
-# team_id). Contract: MANDATORY when a provision creates a NEW org (400, nothing
+# default_team_id links an org to its default PostHog team id (a BIGINT
+# config-store column — a JSON NUMBER on the wire, matching PostHog's integer
+# Team.id; prereq for pull-based compute billing where usage buckets are keyed
+# by team_id). Contract: MANDATORY when a provision creates a NEW org (400, nothing
 # created); optional on re-provision of an existing org, where omission keeps
 # the stored value (set-only, never a wipe — the keep path is covered by
 # TestReprovisionExistingOrgKeepsDefaultTeamID, since same-id re-provision
@@ -1077,7 +1091,7 @@ org_default_profile() { # org password catalog
 #      bodies (mandatory now); GET /orgs/:id must round-trip exactly each value.
 #   2. Reject path: provisioning a brand-new org WITHOUT default_team_id must be
 #      400 naming the field, and must create nothing (org GET stays 404).
-#   3. Mutate path: PUT /orgs/:id can set and clear it (""=NULL) on the EXT org
+#   3. Mutate path: PUT /orgs/:id can set and clear it (0=NULL) on the EXT org
 #      (admin escape hatch), round-tripping on GET; the provisioned value is
 #      restored afterwards so the org stays contract-conformant.
 # get_org_default_team_id prints the raw JSON value ("null" when NULL) so the
@@ -1113,15 +1127,15 @@ default_team_id_mandatory() { # cnpg_org ext_org
   log "default_team_id OK: new org without it rejected with 400, nothing created"
 
   # 3. Mutate path: PUT can set, clear ("" -> NULL), then restore on the ext org.
-  code="$(put_org "$ext_org" '{"default_team_id":"424242"}')"
+  code="$(put_org "$ext_org" '{"default_team_id":424242}')"
   [ "$code" = "200" ] || fail "default_team_id: PUT set -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
   [ "$got" = "424242" ] || fail "default_team_id: after PUT set, GET = '$got' want '424242'"
-  code="$(put_org "$ext_org" '{"default_team_id":""}')"
+  code="$(put_org "$ext_org" '{"default_team_id":0}')"
   [ "$code" = "200" ] || fail "default_team_id: PUT clear -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
-  [ "$got" = "null" ] || fail "default_team_id: after PUT clear, GET = '$got' want 'null' (empty must clear to NULL)"
-  code="$(put_org "$ext_org" "{\"default_team_id\":\"$EXT_DEFAULT_TEAM_ID\"}")"
+  [ "$got" = "null" ] || fail "default_team_id: after PUT clear, GET = '$got' want 'null' (0 must clear to NULL)"
+  code="$(put_org "$ext_org" "{\"default_team_id\":$EXT_DEFAULT_TEAM_ID}")"
   [ "$code" = "200" ] || fail "default_team_id: PUT restore -> HTTP $code: $(cat /tmp/put_org_out)"
   log "default_team_id OK: PUT set/clear/restore round-trips on $ext_org"
 }
@@ -2153,13 +2167,13 @@ lifecycle_teardown_cnpg() { # org
 # asserts the round-trips and that omitting it on a new org is rejected.
 CNPG_DEFAULT_TEAM_ID='90210'
 CNPG_BODY='{"database_name":"'"$CNPG"'","metadata_store":{"type":"cnpg-shard"},
-  "default_team_id":"'"$CNPG_DEFAULT_TEAM_ID"'",
+  "default_team_id":'"$CNPG_DEFAULT_TEAM_ID"',
   "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
 
 # ---- ext duckling: external RDS metadata + DuckLake -----------------------
 EXT_DEFAULT_TEAM_ID='31337'
 EXT_BODY='{"database_name":"'"$EXT"'",
-  "default_team_id":"'"$EXT_DEFAULT_TEAM_ID"'",
+  "default_team_id":'"$EXT_DEFAULT_TEAM_ID"',
   "metadata_store":{"type":"external","external":{
     "endpoint":"'"$EXT_RDS_ENDPOINT"'","password_aws_secret":"'"$EXT_RDS_SECRET"'",
     "user":"ducklingexample","database":"ducklingexample"}},
@@ -2170,7 +2184,7 @@ EXT_BODY='{"database_name":"'"$EXT"'",
 # DuckLake-only: these orgs exist purely to host the worker-churn-heavy
 # resilience lanes, so keep their provision footprint small.
 res_body() { # org
-  printf '{"database_name":"%s","default_team_id":"1","metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
+  printf '{"database_name":"%s","default_team_id":1,"metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
 }
 
 # ---- per-user kill switch ---------------------------------------------------

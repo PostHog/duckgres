@@ -36,8 +36,9 @@ Internally, one row per unique key, values accumulated:
 - **Values:** `cpu_seconds` (vCPU-seconds), `memory_seconds` (GiB-seconds) —
   summed over every connection that falls in that key + minute.
 - `team_id` is the org's **default team** for now — a fixed value per org (from the
-  config-store org→team default), reported so the shape is right, but **no per-team
-  attribution logic** yet. A "team" is really a schema and one connection can span
+  config-store org→team default; an **integer**, matching PostHog's `Team.id` —
+  the provisioning/admin APIs and this response all carry it as a JSON number),
+  reported so the shape is right, but **no per-team attribution logic** yet. A "team" is really a schema and one connection can span
   several, so true per-team split is future work; today every bucket carries the
   org's default team. `query_source` (`standard` | `endpoints`) is set by a session
   GUC (`duckgres.query_source`), defaulting to `standard` when unset; the meter
@@ -80,7 +81,7 @@ per day; a same-day window yields one). Size is reported as `cpu` (vCPU) and
       "date": "2026-07-01",
       "query_source": "endpoints" | "standard",
       "org_id": "org_abc",
-      "team_id": "12345",
+      "team_id": 12345,
       "cpu": 8,
       "mem_gib": 16,
       "cpu_seconds": 4800,
@@ -162,8 +163,8 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
   the HTTP API (aggregate-on-read into one row per key per UTC day + watermark ack)
   + safety GC.
-- **Add:** a `default_team_id` column on the org (used as the bucket `team_id` —
-  fixed per org, no per-team logic yet); a `duckgres.query_source` session GUC
+- **Add:** a `default_team_id` column on the org (BIGINT; used as the bucket
+  `team_id` — fixed per org, no per-team logic yet); a `duckgres.query_source` session GUC
   (`standard` | `endpoints`, default `standard`) read by the meter; a bearer secret
   for the API.
 

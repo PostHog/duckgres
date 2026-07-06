@@ -74,6 +74,10 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		podLabels["duckgres/org"] = p.orgID
 	}
 
+	// Resolve the pod's resource shape once: the container Resources AND the
+	// memory-hygiene env vars below must derive from the same values.
+	workerResources := p.workerResourcesForProfile(profile)
+
 	// Build pod spec
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -152,7 +156,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: boolPtr(false),
 					},
-					Resources: p.workerResourcesForProfile(profile),
+					Resources: workerResources,
 				},
 			},
 		},
@@ -161,6 +165,18 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		Name:  "DUCKGRES_SHARED_WARM_WORKER",
 		Value: "true",
 	})
+
+	// Pre-session memory hygiene. Without an explicit DUCKGRES_MEMORY_LIMIT the
+	// worker's ConfigureMainDB falls back to sysinfo.AutoMemoryLimit(), which
+	// reads the NODE's /proc/meminfo — so all pre-session work (DuckLake
+	// ATTACH, activation, warmup, controlDB) runs with a memory_limit sized to
+	// the node, not the pod cgroup. Pass the pod-derived limit (same 75% the
+	// per-session SET uses, via duckdbMemoryLimitForPodMemory) and the pod's
+	// CPU count so the base DB is correctly bounded from process start.
+	// GOMEMLIMIT (read by the Go runtime directly) gives the Go side a soft
+	// ceiling at 1/8 of the pod so GC pushes back before the cgroup OOM-kills;
+	// DuckDB's buffer manager is unaffected (C allocations are untracked by Go).
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, workerMemoryHygieneEnv(workerResources)...)
 
 	// Stamp every log line with pod and node identifiers via the Downward API.
 	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
@@ -294,6 +310,11 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		observeSpawnFailure(SpawnFailureReasonPodCreate, image)
 		return err
 	}
+
+	// Feed the dynamic headroom controller: log this spawn's shape so the
+	// leader sizes the placeholder pool from real recent spawns. Strictly
+	// best-effort — a log failure must never fail the spawn.
+	p.recordSpawnForHeadroom(pod)
 
 	// Wait for pod to get an IP via informer (no polling).
 	ready, err := p.waitForPodReady(ctx, podName, workerPodReadyTimeout)
@@ -619,6 +640,29 @@ func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, 
 // When set, limits are equal to requests (Guaranteed QoS).
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	return p.workerResourcesForProfile(WorkerProfile{})
+}
+
+// workerMemoryHygieneEnv derives the memory/thread env vars for a worker pod
+// from its resolved resource requests. See the call site comment in
+// spawnWorker for why these must be set before any session exists.
+func workerMemoryHygieneEnv(res corev1.ResourceRequirements) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	if mem, ok := res.Requests[corev1.ResourceMemory]; ok {
+		memBytes := uint64(mem.Value())
+		if lim := duckdbMemoryLimitForPodMemory(memBytes); lim != "" {
+			env = append(env, corev1.EnvVar{Name: "DUCKGRES_MEMORY_LIMIT", Value: lim})
+		}
+		if goLimitMiB := memBytes / 8 / (1 << 20); goLimitMiB > 0 {
+			env = append(env, corev1.EnvVar{Name: "GOMEMLIMIT", Value: fmt.Sprintf("%dMiB", goLimitMiB)})
+		}
+	}
+	if cpu, ok := res.Requests[corev1.ResourceCPU]; ok {
+		// Value() rounds fractional cores up, so a "500m" worker gets 1 thread.
+		if threads := cpu.Value(); threads > 0 {
+			env = append(env, corev1.EnvVar{Name: "DUCKGRES_THREADS", Value: strconv.FormatInt(threads, 10)})
+		}
+	}
+	return env
 }
 
 // workerResourcesForProfile builds the pod resource requirements for a worker of

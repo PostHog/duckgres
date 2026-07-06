@@ -26,7 +26,7 @@ const (
 // bill) separately.
 type computeUsageKey struct {
 	orgID       string
-	teamID      string
+	teamID      int64
 	querySource string
 	millicores  int64
 	mib         int64
@@ -81,7 +81,7 @@ func computeConnectionUsage(millicores, mib int64, dur time.Duration) (milliCPUS
 // Record adds one connection's usage to the in-process counter, bucketed by
 // connection-end time. Best-effort: a zero/unknown size is a no-op. Never
 // errors.
-func (c *computeUsageCounter) Record(orgID, teamID, querySource string, millicores, mib int64, endTime time.Time, dur time.Duration) {
+func (c *computeUsageCounter) Record(orgID, querySource string, teamID, millicores, mib int64, endTime time.Time, dur time.Duration) {
 	if c == nil || orgID == "" || millicores <= 0 {
 		return
 	}
@@ -152,15 +152,15 @@ type computeUsageStore interface {
 // computeMeter wires the per-org counter to a flusher. Nil-safe: a disabled
 // meter (non-remote backend) leaves this nil and every call site no-ops.
 // resolveTeam maps an org to its default PostHog team id at record time (a
-// config-snapshot read — no I/O); empty is tolerated per the OrgDefaultTeamID
-// contract and the bucket then carries an empty team_id.
+// config-snapshot read — no I/O); 0 is tolerated per the OrgDefaultTeamID
+// contract and the bucket then carries team_id 0 ("no default team").
 type computeMeter struct {
 	counter     *computeUsageCounter
 	store       computeUsageStore
-	resolveTeam func(orgID string) string
+	resolveTeam func(orgID string) int64
 }
 
-func newComputeMeter(store computeUsageStore, resolveTeam func(orgID string) string) *computeMeter {
+func newComputeMeter(store computeUsageStore, resolveTeam func(orgID string) int64) *computeMeter {
 	return &computeMeter{counter: newComputeUsageCounter(), store: store, resolveTeam: resolveTeam}
 }
 
@@ -169,11 +169,11 @@ func (m *computeMeter) Record(orgID, querySource string, millicores, mib int64, 
 	if m == nil {
 		return
 	}
-	teamID := ""
+	teamID := int64(0)
 	if m.resolveTeam != nil {
 		teamID = m.resolveTeam(orgID)
 	}
-	m.counter.Record(orgID, teamID, querySource, millicores, mib, endTime, dur)
+	m.counter.Record(orgID, querySource, teamID, millicores, mib, endTime, dur)
 }
 
 // Flush drains the in-process counter into the durable buffer once. Best-effort:
