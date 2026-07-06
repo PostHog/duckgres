@@ -153,6 +153,7 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "scenario_smoke_") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
 	}
+	requireScenarioDefaultTeamID(t, request)
 }
 
 func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
@@ -187,6 +188,13 @@ func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
 				orgID, _ := step.With["org_id"].(string)
 				if orgID == "" || len(orgID) > 35 {
 					t.Fatalf("step %s org_id = %q, want valid provisioning slug of at most 35 chars", step.ID, orgID)
+				}
+				if step.Type == provision.StepTypeProvisionWarehouse {
+					request, ok := step.With["request"].(map[string]any)
+					if !ok {
+						t.Fatalf("provision request = %#v, want map", step.With["request"])
+					}
+					requireScenarioDefaultTeamID(t, request)
 				}
 			}
 		})
@@ -225,6 +233,11 @@ func TestProvisionRejectionScenarioUsesExpectedProvisionFailure(t *testing.T) {
 	if got := strings.Join(expected.Contains, "\n"); !strings.Contains(got, "HTTP 400") || !strings.Contains(got, "slug of at most 35 characters") {
 		t.Fatalf("expected error contains = %#v, want HTTP 400 and slug limit", expected.Contains)
 	}
+	request, ok := provisionStep.With["request"].(map[string]any)
+	if !ok {
+		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
+	}
+	requireScenarioDefaultTeamID(t, request)
 }
 
 func TestFrozenMetadataScenarioRequiresDatasetURI(t *testing.T) {
@@ -440,6 +453,17 @@ func dispatchSupports(stepType string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func requireScenarioDefaultTeamID(t *testing.T, request map[string]any) {
+	t.Helper()
+	defaultTeamID, ok := request["default_team_id"]
+	if !ok {
+		t.Fatal("provision request should include default_team_id")
+	}
+	if fmt.Sprint(defaultTeamID) != "1" {
+		t.Fatalf("default_team_id = %#v, want numeric 1", defaultTeamID)
 	}
 }
 

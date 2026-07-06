@@ -370,6 +370,9 @@ func IsTransientStartupError(err error) bool {
 		"failed to start",
 		"spawn sized worker",
 		"failed to detect attached catalogs",
+		"eof",
+		"connection reset by peer",
+		"i/o timeout",
 	} {
 		if strings.Contains(msg, marker) {
 			return true

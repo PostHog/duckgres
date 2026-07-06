@@ -78,17 +78,24 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 	if !containsAll(first.Args, "--project-dir", projectDir, "--profiles-dir", projectDir) {
 		t.Fatalf("dbt args = %#v, want project/profiles dirs", first.Args)
 	}
-	if targetPath := argValue(first.Args, "--target-path"); targetPath != filepath.Join(executor.OutputDir(), "dbt", "target") {
-		t.Fatalf("target path = %q", targetPath)
+	if targetPath := argValue(first.Args, "--target-path"); targetPath != "" {
+		t.Fatalf("debug target path = %q, want omitted because dbt debug does not support --target-path", targetPath)
 	}
 	if logPath := argValue(first.Args, "--log-path"); logPath != filepath.Join(executor.OutputDir(), "dbt", "logs") {
 		t.Fatalf("log path = %q", logPath)
 	}
+	runReq := runner.requests[1]
+	if targetPath := argValue(runReq.Args, "--target-path"); targetPath != filepath.Join(executor.OutputDir(), "dbt", "target") {
+		t.Fatalf("run target path = %q", targetPath)
+	}
 	if envValue(first.Env, "DUCKGRES_DBT_HOST") != "scenario-org.dev.example" {
 		t.Fatalf("DUCKGRES_DBT_HOST = %q", envValue(first.Env, "DUCKGRES_DBT_HOST"))
 	}
-	if envValue(first.Env, "PGHOSTADDR") != "10.0.0.10" {
-		t.Fatalf("PGHOSTADDR = %q", envValue(first.Env, "PGHOSTADDR"))
+	if envValue(first.Env, "DUCKGRES_DBT_HOSTADDR") != "" {
+		t.Fatal("expected command environment to avoid DUCKGRES_DBT_HOSTADDR because dbt-postgres expects hostaddr to be numeric")
+	}
+	if envValue(first.Env, "PGHOSTADDR") != "" {
+		t.Fatal("expected command environment to avoid PGHOSTADDR because dbt-postgres expects hostaddr to be numeric")
 	}
 	if envValue(first.Env, "DBT_ENV_SECRET_DUCKGRES_PASSWORD") != "root-password" {
 		t.Fatal("expected command environment to include provision password as a dbt secret")
