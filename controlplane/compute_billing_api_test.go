@@ -83,6 +83,35 @@ func newBillingTestRouter(store *fakeBillingStore, now time.Time) *gin.Engine {
 	return r
 }
 
+// TestRegisterBillingAPIGatesBothRoutes exercises the real registration used
+// by multitenant.go: both routes are mounted and BOTH pass through the
+// admin-gating middleware (a viewer/billing-secret mixup must never reach the
+// ack mutation or raw usage).
+func TestRegisterBillingAPIGatesBothRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	gateHits := 0
+	deny := func(c *gin.Context) {
+		gateHits++
+		c.AbortWithStatus(http.StatusForbidden)
+	}
+	registerBillingAPI(r.Group("/api/v1"), &fakeBillingStore{}, deny)
+
+	for _, req := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/api/v1/billing/usage", nil),
+		httptest.NewRequest(http.MethodPost, "/api/v1/billing/ack", bytes.NewReader([]byte(`{"watermark_high":"2026-07-01T12:39:00Z"}`))),
+	} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s %s = %d, want 403 from the admin gate", req.Method, req.URL.Path, rec.Code)
+		}
+	}
+	if gateHits != 2 {
+		t.Fatalf("admin gate ran %d times, want 2 (every billing route must be gated)", gateHits)
+	}
+}
+
 type usageResponse struct {
 	WatermarkLow  time.Time                     `json:"watermark_low"`
 	WatermarkHigh time.Time                     `json:"watermark_high"`
