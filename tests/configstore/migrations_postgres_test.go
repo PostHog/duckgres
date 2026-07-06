@@ -32,15 +32,23 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 12)
 	requireGooseMigrationRecorded(t, db, 13)
 	requireGooseMigrationRecorded(t, db, 14)
-	requireGooseLatestVersion(t, db, 14)
+	requireGooseMigrationRecorded(t, db, 15)
+	requireGooseLatestVersion(t, db, 15)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000013 added the nullable per-org default_team_id column.
 	requireColumnPresent(t, db, "duckgres_orgs", "default_team_id")
 
-	// Migration 000007 added the compute-usage billing buffer + drain state.
+	// Migration 000007 added the compute-usage billing buffer; 000015 widened
+	// its key for pull-based billing (team_id, query_source, worker size),
+	// added the single ack cursor and dropped the push-drain state table.
 	requireTablePresent(t, db, "duckgres_org_compute_usage")
-	requireTablePresent(t, db, "duckgres_org_compute_drain_state")
+	requireColumnPresent(t, db, "duckgres_org_compute_usage", "team_id")
+	requireColumnPresent(t, db, "duckgres_org_compute_usage", "query_source")
+	requireColumnPresent(t, db, "duckgres_org_compute_usage", "cpu")
+	requireColumnPresent(t, db, "duckgres_org_compute_usage", "mem_gib")
+	requireTablePresent(t, db, "duckgres_compute_billing_cursor")
+	requireTableAbsent(t, db, "duckgres_org_compute_drain_state")
 
 	// Migration 000008 added the explicit Duckling CR name column on
 	// managed warehouses, backfilled from lower(org_id).
@@ -99,7 +107,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_enabled BOOLEAN DEFAULT false;
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
 			ALTER TABLE duckgres_org_users ADD COLUMN IF NOT EXISTS default_catalog VARCHAR(255);
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -127,7 +135,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 12)
 	requireGooseMigrationRecorded(t, upgradedDB, 13)
 	requireGooseMigrationRecorded(t, upgradedDB, 14)
-	requireGooseLatestVersion(t, upgradedDB, 14)
+	requireGooseMigrationRecorded(t, upgradedDB, 15)
+	requireGooseLatestVersion(t, upgradedDB, 15)
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")

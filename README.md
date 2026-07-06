@@ -280,8 +280,6 @@ Run with config file:
 | `DUCKGRES_QUERY_LOG_KAFKA_TOPIC` | Kafka topic for query-log events; required for Kafka mode | - |
 | `DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID` | Kafka client ID used by the query-log producer | `duckgres-query-log` |
 | `DUCKGRES_QUERY_LOG_KAFKA_GROUP_ID` | Kafka consumer group used by `duckgres --mode query-log-writer` | `duckgres-query-log-writer` |
-| `DUCKGRES_BILLING_INGEST_URL` | PostHog public ingestion base URL for managed-warehouse compute-usage events (e.g. `https://us.i.posthog.com`). Remote backend only. Unset (or token unset) disables metering — usage ships nowhere and a query is never failed on its account. | - |
-| `DUCKGRES_BILLING_INGEST_TOKEN` | PostHog project API token stamped on the compute-usage capture event. Remote backend only; both URL and token must be set to enable metering. | - |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |

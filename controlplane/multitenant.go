@@ -525,6 +525,10 @@ func SetupMultiTenant(
 	)
 	admin.RegisterAPI(api, store, adpt, liveFetcher)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// Pull-based compute-billing API (GET /billing/usage + POST /billing/ack).
+	// The billing service authenticates with the internal secret (→ admin);
+	// RequireAdmin keeps SSO viewers away from raw usage + the ack mutation.
+	registerBillingAPI(api, store, admin.RequireAdmin())
 	// Node-overview topology reads reuse the shared K8s pool's in-cluster
 	// clientset (nil when there's no shared pool — leaves those routes off).
 	var clusterClient kubernetes.Interface
@@ -580,24 +584,19 @@ func SetupMultiTenant(
 		}
 	}()
 
-	// Compute-usage metering (managed-warehouse billing). Enabled only when both
-	// ingest URL and token are configured; otherwise the meter is nil and every
-	// call site no-ops (queries are NEVER failed on its account). The flusher
-	// runs on every CP pod (cross-pod UPSERT-increment); the drain loop is
-	// leader-only, co-located under the janitor lease so exactly one CP ships.
-	var meter *computeMeter
-	if cfg.BillingMeteringEnabled() {
-		meter = newComputeMeter(store)
-		go meter.Run(context.Background())
-
-		drainer := newComputeDrainer(store, newComputeCaptureClient(cfg.BillingIngestURL, cfg.BillingIngestToken))
-		if janitorLeader != nil {
-			janitorLeader.AttachLeaderLoop(drainer.Run)
-		}
-		slog.Info("Managed-warehouse compute-usage metering enabled.", "ingest_url", cfg.BillingIngestURL)
-	} else {
-		slog.Info("Managed-warehouse compute-usage metering disabled (DUCKGRES_BILLING_INGEST_URL/TOKEN not both set).")
+	// Compute-usage metering (managed-warehouse billing, pull model — see
+	// docs/design/billing-pull-api.md). Always on for the remote backend: every
+	// CP pod meters connection-end usage and flushes it into the config-store
+	// buffer (cross-pod UPSERT-increment); billing pulls it via the
+	// GET/ack API registered above. Best-effort throughout — queries are NEVER
+	// failed on its account. The 30-day safety GC is leader-only, co-located
+	// under the janitor lease so exactly one CP pod sweeps.
+	meter := newComputeMeter(store, store.OrgDefaultTeamID)
+	go meter.Run(context.Background())
+	if janitorLeader != nil {
+		janitorLeader.AttachLeaderLoop(func(ctx context.Context) { runComputeUsageGC(ctx, store) })
 	}
+	slog.Info("Managed-warehouse compute-usage metering enabled (pull API).")
 
 	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
 }

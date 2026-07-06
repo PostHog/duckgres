@@ -117,23 +117,6 @@ type ControlPlaneConfig struct {
 	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
 	// used for migration checks when an org doesn't specify an override.
 	DuckLakeDefaultSpecVersion string
-
-	// BillingIngestURL and BillingIngestToken configure managed-warehouse
-	// compute-usage metering (remote/k8s backend only). The URL is PostHog's
-	// public ingestion base (e.g. https://us.i.posthog.com); the token is the
-	// project API write key, stamped on the capture event's `token` property.
-	// If EITHER is empty, metering is disabled: usage is never shipped and a
-	// query is NEVER failed on its account. See
-	// docs/design/billing-compute-seconds-plan.md.
-	BillingIngestURL   string
-	BillingIngestToken string
-}
-
-// BillingMeteringEnabled reports whether compute-usage metering is configured.
-// Metering also requires the remote backend; this only checks the ingest
-// config (both URL and token present).
-func (c ControlPlaneConfig) BillingMeteringEnabled() bool {
-	return c.BillingIngestURL != "" && c.BillingIngestToken != ""
 }
 
 type ProcessConfig struct {
@@ -1357,15 +1340,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	defer func() {
 		dur := server.CloseConnectionMetrics(cc)
 		clog.Info("Client disconnected.", "duration_ms", dur.Milliseconds())
-		// Best-effort compute-usage metering. cp.computeMeter is nil unless the
-		// remote backend is configured with billing ingest; Record is nil-safe
-		// and a zero worker size (non-remote/unknown) is a no-op. A panic here
-		// must never escape teardown.
+		// Best-effort compute-usage metering. cp.computeMeter is nil outside the
+		// remote backend; Record is nil-safe and a zero worker size
+		// (non-remote/unknown) is a no-op. A panic here must never escape
+		// teardown.
 		if cp.computeMeter != nil {
 			func() {
 				defer func() { _ = recover() }()
-				billOrg, millicores, mib, billDur := server.ConnectionBilling(cc)
-				cp.computeMeter.Record(billOrg, millicores, mib, time.Now(), billDur)
+				billOrg, billSource, millicores, mib, billDur := server.ConnectionBilling(cc)
+				cp.computeMeter.Record(billOrg, billSource, millicores, mib, time.Now(), billDur)
 			}()
 		}
 	}()

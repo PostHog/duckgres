@@ -1,6 +1,8 @@
 # Managed-warehouse compute billing — pull API
 
-Status: **DRAFT**. Supersedes the reporting hop of
+Status: **IMPLEMENTED** (duckgres side; endpoints live at
+`GET /api/v1/billing/usage` + `POST /api/v1/billing/ack`, internal-secret
+bearer auth). Supersedes the reporting hop of
 [`billing-compute-seconds-plan.md`](./billing-compute-seconds-plan.md): billing
 now **pulls** usage from duckgres instead of duckgres pushing capture events to
 PostHog ingestion. The per-connection metering is unchanged — only how the data
