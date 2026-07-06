@@ -165,33 +165,6 @@ func DefaultServerConfig() server.Config {
 	}
 }
 
-func deprecatedKafkaQueryLogSink(source, sink string, warn func(string)) bool {
-	normalized := strings.ToLower(strings.TrimSpace(sink))
-	if normalized == "" || normalized == "ducklake" {
-		return false
-	}
-	if normalized == "kafka" {
-		warn(source + "=kafka is no longer supported; disabling query log until stale Kafka configuration is removed")
-		return true
-	}
-	warn(source + " is no longer supported and will be ignored; direct DuckLake query log is the only supported sink")
-	return false
-}
-
-func deprecatedKafkaQueryLogEnvConfigured(getenv func(string) string) bool {
-	for _, key := range []string{
-		"DUCKGRES_QUERY_LOG_KAFKA_BROKERS",
-		"DUCKGRES_QUERY_LOG_KAFKA_TOPIC",
-		"DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID",
-		"DUCKGRES_QUERY_LOG_KAFKA_GROUP_ID",
-	} {
-		if getenv(key) != "" {
-			return true
-		}
-	}
-	return false
-}
-
 // ResolveEffective layers CLI inputs on top of env vars on top of YAML on
 // top of built-in defaults to produce the runtime config every duckgres
 // binary boots from. getenv and warn are pluggable so unit tests can run
@@ -225,7 +198,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
-	var deprecatedKafkaQueryLog bool
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var awsRegion string
@@ -443,12 +415,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		// Query log configuration
 		if fileCfg.QueryLog.Enabled != nil {
 			cfg.QueryLog.Enabled = *fileCfg.QueryLog.Enabled
-		}
-		if deprecatedKafkaQueryLogSink("query_log.sink", fileCfg.QueryLog.DeprecatedSink, warn) {
-			deprecatedKafkaQueryLog = true
-		}
-		if fileCfg.QueryLog.DeprecatedKafka != nil {
-			warn("query_log.kafka is no longer supported and will be ignored")
 		}
 		if fileCfg.QueryLog.FlushInterval != "" {
 			if d, err := time.ParseDuration(fileCfg.QueryLog.FlushInterval); err == nil {
@@ -900,12 +866,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_QUERY_LOG_ENABLED: " + err.Error())
 		}
 	}
-	if deprecatedKafkaQueryLogSink("DUCKGRES_QUERY_LOG_SINK", getenv("DUCKGRES_QUERY_LOG_SINK"), warn) {
-		deprecatedKafkaQueryLog = true
-	}
-	if deprecatedKafkaQueryLogEnvConfigured(getenv) {
-		warn("DUCKGRES_QUERY_LOG_KAFKA_* is no longer supported and will be ignored")
-	}
 	if v := getenv("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.QueryLog.FlushInterval = d
@@ -1134,9 +1094,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog
-	}
-	if deprecatedKafkaQueryLog {
-		cfg.QueryLog.Enabled = false
 	}
 
 	if cfg.FilePersistence && cfg.DataDir == "" {
