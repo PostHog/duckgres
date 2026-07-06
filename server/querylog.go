@@ -78,33 +78,18 @@ type QueryLogSink interface {
 const (
 	queryLogChannelSize = 10000
 	maxQueryLength      = 4096
-
-	QueryLogSinkDuckLake = "ducklake"
-	QueryLogSinkKafka    = "kafka"
 )
 
-// NewQueryLogSink creates the configured query-log sink. The default sink is
-// the historical DuckLake-backed system.query_log table.
+// NewQueryLogSink creates the DuckLake-backed system.query_log sink.
 func NewQueryLogSink(cfg Config) (QueryLogSink, error) {
 	if !cfg.QueryLog.Enabled {
 		return nil, nil
 	}
-	sink := strings.TrimSpace(strings.ToLower(cfg.QueryLog.Sink))
-	if sink == "" {
-		sink = QueryLogSinkDuckLake
+	ql, err := NewQueryLogger(cfg)
+	if ql == nil {
+		return nil, err
 	}
-	switch sink {
-	case QueryLogSinkDuckLake:
-		ql, err := NewQueryLogger(cfg)
-		if ql == nil {
-			return nil, err
-		}
-		return ql, err
-	case QueryLogSinkKafka:
-		return NewKafkaQueryLogSink(cfg.QueryLog)
-	default:
-		return nil, fmt.Errorf("querylog: unsupported sink %q", cfg.QueryLog.Sink)
-	}
+	return ql, err
 }
 
 // NewQueryLogger opens a dedicated :memory: DuckDB, attaches DuckLake,
@@ -257,6 +242,16 @@ func (ql *QueryLogger) StopContext(ctx context.Context) error {
 		}
 	})
 	return stopErr
+}
+
+func queryLogStopContext(ctx context.Context, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultTimeout)
 }
 
 func (ql *QueryLogger) flushLoop() {
@@ -421,7 +416,8 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 		}
 	}
 
-	// Add columns for OTEL tracing correlation and Kafka writer idempotency.
+	// Add columns for OTEL tracing correlation and compatibility with tables
+	// created while distributed query-log delivery was supported.
 	for _, col := range []string{"trace_id", "span_id", "event_id"} {
 		hasCol, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, col)
 		if err != nil {

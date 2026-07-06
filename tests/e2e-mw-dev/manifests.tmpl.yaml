@@ -278,17 +278,6 @@ spec:
             # settle and two org-default-profile propagation waits — which drop
             # from 40s each to CONFIG_POLL_SETTLE (12s) on the back of it.
             - { name: DUCKGRES_CONFIG_POLL_INTERVAL, value: "5s" }
-            # Optional query-log Kafka producer wiring. The ConfigMap is not
-            # created by default, so the harness keeps direct DuckLake query-log
-            # writes unless a follow-up e2e path explicitly enables Kafka.
-            - name: DUCKGRES_QUERY_LOG_SINK
-              valueFrom: { configMapKeyRef: { name: duckgres-query-log-kafka, key: sink, optional: true } }
-            - name: DUCKGRES_QUERY_LOG_KAFKA_BROKERS
-              valueFrom: { configMapKeyRef: { name: duckgres-query-log-kafka, key: brokers, optional: true } }
-            - name: DUCKGRES_QUERY_LOG_KAFKA_TOPIC
-              valueFrom: { configMapKeyRef: { name: duckgres-query-log-kafka, key: topic, optional: true } }
-            - name: DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID
-              valueFrom: { configMapKeyRef: { name: duckgres-query-log-kafka, key: client_id, optional: true } }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             # Previous internal secrets still accepted during rotation; the

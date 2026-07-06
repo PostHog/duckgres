@@ -302,20 +302,10 @@ type Config struct {
 // QueryLogConfig configures the query log feature.
 type QueryLogConfig struct {
 	Enabled              bool
-	Sink                 string
 	FlushInterval        time.Duration
 	BatchSize            int
 	CompactInterval      time.Duration
 	DataInliningRowLimit int
-	Kafka                QueryLogKafkaConfig
-}
-
-// QueryLogKafkaConfig configures Kafka publishing for query log events.
-type QueryLogKafkaConfig struct {
-	Brokers  []string
-	Topic    string
-	ClientID string
-	GroupID  string
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
@@ -368,8 +358,8 @@ type Server struct {
 	// Query logger for DuckLake system.query_log. Kept for existing control
 	// plane call sites that install or inspect the direct DuckLake logger.
 	queryLogger *QueryLogger
-	// Query-log sink used by query execution. Defaults to queryLogger for the
-	// direct DuckLake path, or a Kafka sink when configured.
+	// Query-log sink used by query execution. It is the direct DuckLake logger
+	// when query logging is enabled.
 	queryLogSink QueryLogSink
 
 	// Per-user shared DB pool for file persistence mode.

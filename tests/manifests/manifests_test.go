@@ -93,141 +93,72 @@ func TestNetworkPolicyAllowsControlPlaneToReachWorkerGRPC(t *testing.T) {
 	}
 }
 
-func TestQueryLogWriterManifestDefinesDeployment(t *testing.T) {
-	content := readManifest(t, "k8s", "query-log-writer.yaml")
-	for _, want := range []string{
-		"kind: Deployment",
-		"name: duckgres-query-log-writer",
-		"serviceAccountName: duckgres-query-log-writer",
-		"- \"--mode\"",
-		"- \"query-log-writer\"",
-		"name: metrics",
-		"containerPort: 9090",
-		"name: DUCKGRES_CONFIG_STORE",
-		"name: DUCKGRES_QUERY_LOG_KAFKA_BROKERS",
-		"name: DUCKGRES_QUERY_LOG_KAFKA_TOPIC",
-		"name: DUCKGRES_QUERY_LOG_KAFKA_GROUP_ID",
-		"name: config",
-		"mountPath: /etc/duckgres",
-		"name: data",
-		"mountPath: /data",
+func TestQueryLogKafkaWriterManifestsRemoved(t *testing.T) {
+	for _, parts := range [][]string{
+		{"k8s", "query-log-writer.yaml"},
+		{"k8s", "query-log-writer-alerts.example.yaml"},
+		{"k8s", "query-log-kafka-config.example.yaml"},
 	} {
-		if !strings.Contains(content, want) {
-			t.Fatalf("expected %q in k8s/query-log-writer.yaml", want)
+		path := filepath.Join(append([]string{projectRoot(t)}, parts...)...)
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed", filepath.Join(parts...))
 		}
 	}
 }
 
-func TestQueryLogWriterManifestRequiresRuntimeConfig(t *testing.T) {
-	content := readManifest(t, "k8s", "query-log-writer.yaml")
-	for _, name := range []string{
-		"DUCKGRES_CONFIG_STORE",
-		"DUCKGRES_QUERY_LOG_KAFKA_BROKERS",
-		"DUCKGRES_QUERY_LOG_KAFKA_TOPIC",
-	} {
-		block := envBlock(t, content, name)
-		if strings.Contains(block, "optional: true") {
-			t.Fatalf("expected %s to be required in k8s/query-log-writer.yaml", name)
-		}
-	}
-}
-
-func TestControlPlaneManifestsExposeOptionalKafkaQueryLogEnv(t *testing.T) {
+func TestControlPlaneManifestsDoNotExposeKafkaQueryLogEnv(t *testing.T) {
 	for _, parts := range [][]string{
 		{"k8s", "control-plane-multitenant-local.yaml"},
 		{"k8s", "kind", "control-plane.yaml"},
+		{"tests", "e2e-mw-dev", "manifests.tmpl.yaml"},
 	} {
 		content := readManifest(t, parts...)
-		for _, want := range []string{
-			"name: DUCKGRES_QUERY_LOG_SINK",
-			"name: DUCKGRES_QUERY_LOG_KAFKA_BROKERS",
-			"name: DUCKGRES_QUERY_LOG_KAFKA_TOPIC",
-			"name: DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID",
-			"optional: true",
+		for _, forbidden := range []string{
+			"DUCKGRES_QUERY_LOG_SINK",
+			"DUCKGRES_QUERY_LOG_KAFKA",
+			"duckgres-query-log-kafka",
 		} {
-			if !strings.Contains(content, want) {
-				t.Fatalf("expected %q in %s", want, filepath.Join(parts...))
+			if strings.Contains(content, forbidden) {
+				t.Fatalf("expected %s not to contain %q", filepath.Join(parts...), forbidden)
 			}
 		}
 	}
 }
 
-func TestRBACIncludesQueryLogWriterAccess(t *testing.T) {
+func TestRBACDoesNotIncludeQueryLogWriterAccess(t *testing.T) {
 	content := readManifest(t, "k8s", "rbac.yaml")
-	for _, want := range []string{
+	for _, forbidden := range []string{
 		"name: duckgres-query-log-writer",
 		"name: duckgres-query-log-writer-runtime",
-		`resources: ["secrets"]`,
-		`verbs: ["get"]`,
 		"name: duckgres-query-log-writer-ducklings",
-		"namespace: ducklings",
-		`apiGroups: ["k8s.posthog.com"]`,
-		`resources: ["ducklings"]`,
-		`verbs: ["get"]`,
 	} {
-		if !strings.Contains(content, want) {
-			t.Fatalf("expected %q in k8s/rbac.yaml", want)
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("expected k8s/rbac.yaml not to contain %q", forbidden)
 		}
-	}
-	if strings.Contains(content, "kind: ClusterRole\nmetadata:\n  name: duckgres-query-log-writer-ducklings") ||
-		strings.Contains(content, "kind: ClusterRoleBinding\nmetadata:\n  name: duckgres-query-log-writer-ducklings") {
-		t.Fatal("expected query-log writer Duckling access to be namespace-scoped")
 	}
 }
 
-func TestNetworkPolicyAllowsQueryLogKafkaTraffic(t *testing.T) {
+func TestNetworkPolicyDoesNotAllowQueryLogKafkaTraffic(t *testing.T) {
 	manifest := readManifest(t, "k8s", "networkpolicy.yaml")
 
 	var controlPlaneDoc string
-	var writerDoc string
 	for _, doc := range strings.Split(manifest, "---") {
-		switch {
-		case strings.Contains(doc, "name: duckgres-control-plane-boundaries"):
+		if strings.Contains(doc, "name: duckgres-control-plane-boundaries") {
 			controlPlaneDoc = doc
-		case strings.Contains(doc, "name: duckgres-query-log-writer-boundaries"):
-			writerDoc = doc
 		}
 	}
 	if controlPlaneDoc == "" {
 		t.Fatal("could not find control-plane network policy in k8s/networkpolicy.yaml")
 	}
-	if writerDoc == "" {
-		t.Fatal("could not find query-log writer network policy in k8s/networkpolicy.yaml")
-	}
-	for _, doc := range []struct {
-		name string
-		body string
-	}{
-		{name: "control-plane", body: controlPlaneDoc},
-		{name: "query-log-writer", body: writerDoc},
+	for _, forbidden := range []string{
+		"duckgres-query-log-writer-boundaries",
+		"Kafka query-log",
+		"- port: 9092",
+		"- port: 9093",
+		"- port: 9094",
 	} {
-		for _, want := range []string{
-			"- port: 9092",
-			"protocol: TCP",
-		} {
-			if !strings.Contains(doc.body, want) {
-				t.Fatalf("expected %q in %s network policy", want, doc.name)
-			}
-		}
-	}
-	if !strings.Contains(writerDoc, "- port: 80") {
-		t.Fatal("expected query-log writer network policy to allow HTTP extension bootstrap/object-store egress")
-	}
-}
-
-func TestQueryLogWriterAlertsReferenceWriterMetrics(t *testing.T) {
-	content := readManifest(t, "k8s", "query-log-writer-alerts.example.yaml")
-	for _, want := range []string{
-		"kind: PrometheusRule",
-		"DuckgresQueryLogWriterFailures",
-		"DuckgresQueryLogWriterDrops",
-		"DuckgresQueryLogWriterRetriesHigh",
-		`duckgres_query_log_kafka_writer_events_total{outcome="failed"}`,
-		`duckgres_query_log_kafka_writer_events_total{outcome="dropped",reason=~"no_target|resolve_failed|write_failed"}`,
-		`duckgres_query_log_kafka_writer_events_total{outcome="retried"}`,
-	} {
-		if !strings.Contains(content, want) {
-			t.Fatalf("expected %q in k8s/query-log-writer-alerts.example.yaml", want)
+		if strings.Contains(manifest, forbidden) {
+			t.Fatalf("expected k8s/networkpolicy.yaml not to contain %q", forbidden)
 		}
 	}
 }
@@ -267,17 +198,4 @@ func projectRoot(t *testing.T) string {
 		}
 		dir = parent
 	}
-}
-
-func envBlock(t *testing.T, content, name string) string {
-	t.Helper()
-	start := strings.Index(content, "name: "+name)
-	if start == -1 {
-		t.Fatalf("could not find env var %s", name)
-	}
-	rest := content[start:]
-	if next := strings.Index(rest[len("name: "+name):], "\n            - name: "); next != -1 {
-		return rest[:len("name: "+name)+next]
-	}
-	return rest
 }

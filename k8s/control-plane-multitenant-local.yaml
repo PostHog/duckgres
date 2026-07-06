@@ -42,30 +42,6 @@ spec:
               value: "500m"
             - name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST
               value: "512Mi"
-            - name: DUCKGRES_QUERY_LOG_SINK
-              valueFrom:
-                configMapKeyRef:
-                  name: duckgres-query-log-kafka
-                  key: sink
-                  optional: true
-            - name: DUCKGRES_QUERY_LOG_KAFKA_BROKERS
-              valueFrom:
-                configMapKeyRef:
-                  name: duckgres-query-log-kafka
-                  key: brokers
-                  optional: true
-            - name: DUCKGRES_QUERY_LOG_KAFKA_TOPIC
-              valueFrom:
-                configMapKeyRef:
-                  name: duckgres-query-log-kafka
-                  key: topic
-                  optional: true
-            - name: DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID
-              valueFrom:
-                configMapKeyRef:
-                  name: duckgres-query-log-kafka
-                  key: client_id
-                  optional: true
           args:
             - "--mode"
             - "control-plane"
