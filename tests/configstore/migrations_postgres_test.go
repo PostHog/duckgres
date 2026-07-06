@@ -33,8 +33,16 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 13)
 	requireGooseMigrationRecorded(t, db, 14)
 	requireGooseMigrationRecorded(t, db, 15)
-	requireGooseLatestVersion(t, db, 15)
+	requireGooseMigrationRecorded(t, db, 16)
+	requireGooseLatestVersion(t, db, 16)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
+
+	// Migration 000016 added the worker spawn log that feeds dynamic headroom
+	// slot count/size.
+	requireTablePresent(t, db, "duckgres_worker_spawn_log")
+	requireColumnPresent(t, db, "duckgres_worker_spawn_log", "cpu_millis")
+	requireColumnPresent(t, db, "duckgres_worker_spawn_log", "mem_bytes")
+	requireColumnPresent(t, db, "duckgres_worker_spawn_log", "spawned_at")
 
 	// Migration 000013 added the nullable per-org default_team_id column.
 	requireColumnPresent(t, db, "duckgres_orgs", "default_team_id")
@@ -107,7 +115,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_enabled BOOLEAN DEFAULT false;
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
 			ALTER TABLE duckgres_org_users ADD COLUMN IF NOT EXISTS default_catalog VARCHAR(255);
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15);
+			DROP TABLE duckgres_worker_spawn_log;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -136,7 +145,9 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 13)
 	requireGooseMigrationRecorded(t, upgradedDB, 14)
 	requireGooseMigrationRecorded(t, upgradedDB, 15)
-	requireGooseLatestVersion(t, upgradedDB, 15)
+	requireGooseMigrationRecorded(t, upgradedDB, 16)
+	requireGooseLatestVersion(t, upgradedDB, 16)
+	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")

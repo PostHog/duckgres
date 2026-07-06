@@ -21,9 +21,9 @@ predictable model:
 - **TTL** = how long a worker stays alive after its last query finishes. Every
   query resets the worker's TTL to its initial value. The user picks it (and pays
   for the idle time).
-- A **headroom controller** in the control plane keeps a configurable % of
-  cluster-allocatable CPU+memory free by running low-priority placeholder
-  ("pause") pods, so a real worker spawn schedules immediately (preempting the
+- A **headroom controller** in the control plane runs low-priority placeholder
+  ("pause") pods — count and size derived dynamically from recent worker
+  spawns — so a real worker spawn schedules immediately (preempting the
   placeholders) instead of waiting on a fresh Karpenter node.
 
 Removed concepts: warm pool / neutral pool / shared-warm-target, worker
@@ -129,27 +129,31 @@ Implemented as a **janitor reconcile hook** (`reconcileHeadroom`), invoked from
 there is no new loop, goroutine, or leader election. On each tick (leader CP
 only) it:
 
-- reads node allocatable CPU+memory (k8s API, the worker nodepool) and current
-  worker+placeholder usage;
-- maintains low-priority **placeholder pods** so that ≥ `HeadroomPercent` of
-  cluster-allocatable CPU and memory is held by placeholders (preemptible);
+- maintains low-priority **placeholder pods** ("slots") whose count and size
+  are derived DYNAMICALLY from the worker spawn log
+  (`duckgres_worker_spawn_log`, written best-effort by every CP replica at pod
+  create) — there is no configured count or size;
+- slot COUNT = `clamp(peak spawn burst, 1, cap)`: the peak number of spawns in
+  any one 5-minute bucket of the last hour (serial spawns reuse one warm slot;
+  only burst concurrency needs parallel warm capacity), floored at 1 (never
+  zero while enabled — one warm slot is the point of the feature) and capped
+  at `max(4, ceil(25% × live worker pods))`. The cap is fleet-RELATIVE so it
+  grows with the deployment without anyone bumping a constant, and it bounds a
+  spawn-storm bug's placeholder cost. Fleet size is only the CEILING, never
+  the target — an idle-worker leak cannot pull the placeholder count up (the
+  amplification failure of the retired demand-proportional mode);
+- slot SIZE = the componentwise max worker shape spawned in the last 7 days,
+  falling back to the live fleet's max shape, then to the pool's
+  configured/default worker request (fresh empty cluster). Client-sized (GUC)
+  workers can exceed any configured maximum, so sizing from observed spawns is
+  the only honest source. A spawn larger than one slot preempts several
+  placeholders — wrong sizing degrades to Karpenter latency, never a failure;
+- scale-up/refill is immediate; scale-down is LAZY (one slot per 10 minutes
+  while above target) and shape changes >20% replace placeholders in place, so
+  target/shape flapping never thrashes pods;
 - placeholder pods use a PriorityClass **below** the worker PriorityClass, so a
   real worker spawn preempts them and schedules immediately; the evicted
   placeholder triggers Karpenter to add a node in the background.
-- the placeholder target is sized against **current worker demand** (the
-  summed requests of live worker pods), floor one placeholder while enabled.
-  Node allocatable is the wrong baseline in any form: even with the
-  placeholders' own share subtracted it counts FREE node capacity as
-  "capacity needing headroom" (free capacity IS headroom), so one stray
-  oversized node inflates the target and the placeholders pin it alive.
-  Keyed to worker demand the target tracks load by construction and node
-  geometry drops out entirely.
-- placeholders are sized to the pool's **default worker shape**
-  (`DUCKGRES_K8S_WORKER_CPU_REQUEST`/`_MEMORY_REQUEST`, else the built-in
-  default) — there is no separate placeholder sizing knob
-  (`DUCKGRES_K8S_PLACEHOLDER_CPU`/`_MEMORY` are removed). One preempted
-  placeholder always frees exactly one default-worker slot, identically in
-  every environment.
 - workers carry `karpenter.sh/do-not-disrupt` **only while busy** (set at pod
   create — covering spawn/activate and the first session — re-added per
   session, removed when parked hot-idle). With the worker nodepool on
@@ -158,13 +162,19 @@ only) it:
   disrupted; pinning is bounded by query lifetime, not the worker TTL (which
   would stall drift rollouts).
 
-Config: `DUCKGRES_K8S_HEADROOM_NODES` (preferred — a CONSTANT number of
-node-sized placeholders, demand-independent, the prod default) or the legacy
-`DUCKGRES_K8S_HEADROOM_PERCENT` (demand-proportional, used only when
-HEADROOM_NODES is 0); 0 on both = disabled (existing placeholders are deleted).
-Plus the two PriorityClass names. Manifests add the PriorityClasses. The
-constant mode exists because the percent mode counted hot_idle (idle-but-alive)
-workers as demand and so amplified any idle-worker leak into extra placeholders.
+Config: NONE beyond the PriorityClass names — headroom is enabled iff
+`DUCKGRES_K8S_PLACEHOLDER_PRIORITY_CLASS` is set (placeholders without a
+priority below the worker class would never be preempted, so the class is a
+hard prerequisite anyway); unset = disabled, existing placeholders are deleted.
+`DUCKGRES_K8S_HEADROOM_NODES` (constant node-sized mode) and
+`DUCKGRES_K8S_HEADROOM_PERCENT` (demand-proportional mode) are REMOVED: the
+constant mode hardcoded an r6gd node shape that over-reserved ~3× once workers
+shrank below node size, and the percent mode counted hot_idle workers as
+demand and so amplified any idle-worker leak into extra placeholders.
+Observability: `duckgres_headroom_slots_desired` / `_slots_cap` /
+`_peak_spawn_burst` / `_slot_cpu_millicores` / `_slot_memory_bytes` gauges —
+desired pinned at the cap means demand wants more headroom than the fleet
+ratio allows.
 
 ## Config knobs (env-only K8s, per existing convention)
 
@@ -174,10 +184,9 @@ options), `DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/
 `_MAX_MEMORY` (clamps), `DUCKGRES_K8S_WORKER_MAX_TTL` (clamp ceiling) and
 `DUCKGRES_K8S_WORKER_DEFAULT_TTL` (the default for requests that specify no
 ttl — see the TTL resolution chain above),
-`DUCKGRES_K8S_HEADROOM_NODES` (constant node-headroom; preferred) /
-`DUCKGRES_K8S_HEADROOM_PERCENT` (legacy demand-%), `DUCKGRES_K8S_PLACEHOLDER_IMAGE`/`_PRIORITY_CLASS`
-(`_PLACEHOLDER_CPU`/`_MEMORY` are removed — percent-mode placeholders take the
-default worker shape; constant-mode placeholders are node-sized).
+`DUCKGRES_K8S_PLACEHOLDER_IMAGE`/`_PRIORITY_CLASS` (the priority class doubles
+as the headroom enable switch; count/size knobs do not exist — both are
+derived from the spawn log, see "Headroom reconcile" above).
 
 Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_TIERS*`,
 `*ALLOW_CLIENT_EXCLUSIVE_NODE*`, `*SHARED_WARM_TARGET*`,
@@ -191,12 +200,17 @@ workers cannot overcommit a node).
 ## Testing
 
 - Unit: GUC parse/clamp/default; smallest-fitting reuse vs spawn; TTL reset on
-  query + reap after deadline; headroom controller target math (placeholder
-  count from allocatable + percent); gate/clamp.
+  query + reap after deadline; headroom controller target math (burst → count,
+  spawn-log → size, fleet-relative cap, lazy scale-down, shape-drift
+  replacement); gate/clamp. Spawn-log SQL: postgres round-trip in
+  `tests/configstore/spawn_log_postgres_test.go`.
 - e2e `harness.sh`: a query with `worker_cpu/memory/ttl` lands on a worker of
   that size; a second query of a smaller size reuses it; after ttl the worker is
-  reaped; one-session-per-worker still holds; placeholder pods exist at the
-  configured headroom. Verified on cnpg + ext backends.
+  reaped; one-session-per-worker still holds. Headroom placeholders are NOT
+  exercised in the e2e job: the e2e CP deliberately sets no placeholder
+  PriorityClass — real placeholder pods would consume Karpenter capacity in the
+  shared mw-dev cluster and outlive the per-PR CP that owns them (nothing
+  deletes them after teardown). Covered by the fake-clientset unit tests above.
 
 ## Rollout
 

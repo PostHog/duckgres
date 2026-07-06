@@ -144,14 +144,12 @@ type K8sConfig struct {
 
 	// Node-headroom controller holds preemptible low-priority placeholder pods so
 	// a worker spawn schedules immediately (preempting a placeholder) rather than
-	// waiting on a fresh Karpenter node. HeadroomNodes>0 selects the constant
-	// mode (a fixed number of node-sized placeholders, demand-independent — the
-	// prod default); HeadroomPercent is the legacy demand-proportional fallback.
-	// Both 0 = disabled.
-	HeadroomNodes                int    // CONSTANT node-headroom: number of node-sized placeholder pods (0 = use HeadroomPercent)
-	HeadroomPercent              int    // legacy demand-% headroom, used only when HeadroomNodes==0 (0 = disabled)
+	// waiting on a fresh Karpenter node. Slot count and size are derived
+	// dynamically from recent worker spawns (see controlplane/headroom.go) —
+	// there is no configured count. Enabled iff PlaceholderPriorityClassName is
+	// set; empty = disabled (existing placeholders converge to zero).
 	PlaceholderImage             string // Image for placeholder pods (a pause image)
-	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName
+	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName. Empty = headroom disabled.
 
 	// Connection-string worker sizing (duckgres.worker_cpu / worker_memory /
 	// worker_ttl). All default to the off/empty state, so absent config = the

@@ -213,8 +213,6 @@ func SetupMultiTenant(
 		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,
 		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
-		HeadroomNodes:                cfg.K8s.HeadroomNodes,
-		HeadroomPercent:              cfg.K8s.HeadroomPercent,
 		PlaceholderImage:             cfg.K8s.PlaceholderImage,
 		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
@@ -351,9 +349,10 @@ func SetupMultiTenant(
 	// Node-headroom controller: keep low-priority placeholder pods as warm,
 	// preemptible spare capacity so worker spawns schedule immediately.
 	// Leader-only (runs on the janitor tick). Always wired — reconcileHeadroom
-	// itself decides the target (constant HeadroomNodes, legacy HeadroomPercent,
-	// or disabled). It must run even when disabled so a pool that had headroom
-	// turned off converges its placeholders to zero instead of stranding them.
+	// itself decides the target (dynamic, from the worker spawn log; disabled
+	// when no placeholder PriorityClass is configured). It must run even when
+	// disabled so a pool that had headroom turned off converges its
+	// placeholders to zero instead of stranding them.
 	janitor.reconcileHeadroom = func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()

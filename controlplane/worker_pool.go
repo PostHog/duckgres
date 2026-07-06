@@ -108,8 +108,6 @@ type K8sWorkerPoolConfig struct {
 	WorkerTolerationKey          string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
 	WorkerTolerationValue        string                                       // Taint value for worker pod NoSchedule toleration.
 	WorkerPriorityClassName      string                                       // PriorityClass for worker pods (so they preempt overprovision pause pods). Empty = none.
-	HeadroomNodes                int                                          // CONSTANT node-headroom: keep this many node-sized preemptible placeholder pods, independent of demand. >0 takes precedence over HeadroomPercent.
-	HeadroomPercent              int                                          // Legacy demand-proportional headroom: keep this % of worker demand free via placeholder pods. Used only when HeadroomNodes==0. 0 = disabled.
 	PlaceholderImage             string                                       // Image for headroom placeholder pods (a pause image).
 	PlaceholderPriorityClassName string                                       // PriorityClass for placeholder pods — MUST be below WorkerPriorityClassName so workers preempt them.
 	OrgID                        string                                       // Org ID for pod labels (multi-tenant mode)

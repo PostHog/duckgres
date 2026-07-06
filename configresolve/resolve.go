@@ -109,8 +109,6 @@ type Resolved struct {
 	K8sWorkerTolerationValue        string
 	K8sAllowClientWorkerProfile     bool
 	K8sWorkerPriorityClassName      string
-	K8sHeadroomNodes                int
-	K8sHeadroomPercent              int
 	K8sPlaceholderImage             string
 	K8sPlaceholderPriorityClassName string
 	K8sWorkerProfileMinCPU          string
@@ -200,8 +198,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
 	var k8sWorkerMaxTTL, k8sWorkerDefaultTTL time.Duration
 	var k8sWorkerPriorityClassName string
-	var k8sHeadroomNodes int
-	var k8sHeadroomPercent int
 	var k8sPlaceholderImage, k8sPlaceholderPriorityClassName string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
@@ -871,16 +867,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
 		k8sWorkerPriorityClassName = v
 	}
-	if v := getenv("DUCKGRES_K8S_HEADROOM_NODES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sHeadroomNodes = n
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_HEADROOM_PERCENT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sHeadroomPercent = n
-		}
-	}
 	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_IMAGE"); v != "" {
 		k8sPlaceholderImage = v
 	}
@@ -1233,8 +1219,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerTolerationValue:        k8sWorkerTolerationValue,
 		K8sAllowClientWorkerProfile:     k8sAllowClientWorkerProfile,
 		K8sWorkerPriorityClassName:      k8sWorkerPriorityClassName,
-		K8sHeadroomNodes:                k8sHeadroomNodes,
-		K8sHeadroomPercent:              k8sHeadroomPercent,
 		K8sPlaceholderImage:             k8sPlaceholderImage,
 		K8sPlaceholderPriorityClassName: k8sPlaceholderPriorityClassName,
 		K8sWorkerProfileMinCPU:          k8sWorkerProfileMinCPU,
