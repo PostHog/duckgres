@@ -63,7 +63,8 @@ client-go:
   / `timed out waiting for an available worker`) rather than a hang/500/drop, and
   the pool must then serve a retrying connection. The harness logs whether
   backpressure was observed **and** handles it (queries retry through it).
-- **activation** — DuckLake catalogs attach and read/write on cnpg and ext.
+- **activation** — DuckLake catalogs attach, read/write, and run
+  `EXPLAIN`/`EXPLAIN ANALYZE` on cnpg and ext.
 - **worker sizing** (TTL-pool model, `docs/design/worker-ttl-pool.md`) — a
   client-sized connection (`duckgres.worker_cpu`/`worker_memory`/`worker_ttl`
   startup options, sent via `PGOPTIONS`; CP runs `allowClientWorkerProfile=true`

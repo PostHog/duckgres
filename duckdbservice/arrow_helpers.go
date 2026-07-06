@@ -36,7 +36,9 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 	builder := array.NewRecordBuilder(alloc, schema)
 	defer builder.Release()
 
-	numFields := schema.NumFields()
+	scanFields := schema.NumFields()
+	explainValueColumn := -1
+	scanShapeResolved := false
 	count := 0
 	// Order matters: check `count < batchSize` first, then call rows.Next().
 	// The reverse (rows.Next() && count < batchSize) advances the cursor once
@@ -47,8 +49,19 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 	// parquet-metadata row count, so the discrepancy was invisible to
 	// aggregation queries. See TestRowsToRecordNoRowsLostAtBatchBoundary.
 	for count < batchSize && rows.Next() {
-		values := make([]interface{}, numFields)
-		valuePtrs := make([]interface{}, numFields)
+		// Resolve the physical scan shape only after Next succeeds. Some drivers
+		// close rows automatically at EOF; calling Columns after that would turn
+		// normal completion into "sql: Rows are closed".
+		if !scanShapeResolved {
+			var err error
+			scanFields, explainValueColumn, err = rowScanShape(rows, schema)
+			if err != nil {
+				return nil, err
+			}
+			scanShapeResolved = true
+		}
+		values := make([]interface{}, scanFields)
+		valuePtrs := make([]interface{}, scanFields)
 		for i := range values {
 			valuePtrs[i] = &values[i]
 		}
@@ -57,8 +70,12 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 			return nil, err
 		}
 
-		for i, val := range values {
-			AppendValue(builder.Field(i), val)
+		if explainValueColumn >= 0 {
+			AppendValue(builder.Field(0), values[explainValueColumn])
+		} else {
+			for i, val := range values {
+				AppendValue(builder.Field(i), val)
+			}
 		}
 		count++
 	}
@@ -70,6 +87,32 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 		return nil, nil
 	}
 	return builder.NewRecordBatch(), nil
+}
+
+func rowScanShape(rows *sql.Rows, schema *arrow.Schema) (scanFields int, explainValueColumn int, err error) {
+	scanFields = schema.NumFields()
+	explainValueColumn = -1
+	if !isExplainPlanSchema(schema) {
+		return scanFields, explainValueColumn, nil
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return 0, -1, err
+	}
+	if len(cols) == 2 &&
+		strings.EqualFold(cols[0], "explain_key") &&
+		strings.EqualFold(cols[1], "explain_value") {
+		return 2, 1, nil
+	}
+	return scanFields, explainValueColumn, nil
+}
+
+func isExplainPlanSchema(schema *arrow.Schema) bool {
+	if schema == nil || schema.NumFields() != 1 {
+		return false
+	}
+	name := schema.Field(0).Name
+	return name == "physical_plan" || name == "analyzed_plan"
 }
 
 type contextQueryer interface {

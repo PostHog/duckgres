@@ -26,7 +26,7 @@
 #                  transpilation (#716), and a pipelined extended-query error
 #                  discards queued messages until Sync (#718). A same pgwire
 #                  session remains usable immediately after CancelRequest.
-#   activation   : DuckLake catalogs attach and read/write on cnpg + ext.
+#   activation   : DuckLake catalogs attach, read/write, and EXPLAIN/ANALYZE on cnpg + ext.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
@@ -768,6 +768,17 @@ rw_ducklake() { # org password
             INSERT INTO $t VALUES (1,'one'),(2,'two'),(3,'three');"
   n="$(pg "$1" "$2" ducklake "SELECT COUNT(*) FROM $t;")"
   [ "$n" = "3" ] || fail "$1 DuckLake rowcount=$n want 3"
+  pg "$1" "$2" ducklake "DROP TABLE $t;"
+}
+
+explain_ducklake() { # org password
+  log "EXPLAIN on DuckLake table on $1"
+  t="e2e_explain_$(echo "$1" | tr -c 'a-z0-9' _)"
+  pg "$1" "$2" ducklake "DROP TABLE IF EXISTS $t; CREATE TABLE $t AS SELECT i AS id FROM generate_series(1,3) t(i);"
+  out="$(pg "$1" "$2" ducklake "EXPLAIN SELECT count(*) FROM $t WHERE id > 1;")"
+  [ -n "$out" ] || fail "$1 EXPLAIN returned empty output"
+  out="$(pg "$1" "$2" ducklake "EXPLAIN ANALYZE SELECT count(*) FROM $t WHERE id > 1;")"
+  [ -n "$out" ] || fail "$1 EXPLAIN ANALYZE returned empty output"
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
@@ -2342,6 +2353,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  explain_ducklake       "$CNPG" "$cnpg_pw"
   httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
   persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
   persistent_user_secret_isolation "$CNPG" "$cnpg_pw"
@@ -2414,8 +2426,9 @@ lane_ext() { # external-RDS metadata backend + org default profile
   basic_query  "$EXT" "$ext_pw"
   pg_compat_functions "$EXT" "$ext_pw"
   query_source_guc    "$EXT" "$ext_pw"
-  rw_ducklake  "$EXT" "$ext_pw"
-  httpfs_retry_budget "$EXT" "$ext_pw"      # S3-503 retry budget per worker, ext-metadata backend too
+  rw_ducklake         "$EXT" "$ext_pw"
+  explain_ducklake    "$EXT" "$ext_pw"
+  httpfs_retry_budget "$EXT" "$ext_pw"    # S3-503 retry budget per worker, ext-metadata backend too
   persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
   # Org default profile on ext: no client-sized assertions run on this org, so
   # the 2-CPU shape is unambiguously the org default's.
@@ -2550,7 +2563,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
