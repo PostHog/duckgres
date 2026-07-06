@@ -15,7 +15,10 @@ ALTER TABLE duckgres_orgs
 -- The compute-usage bucket key mirrors the org column. team_id sits in the
 -- PRIMARY KEY so it must stay NOT NULL: 0 = "org had no default team" (PostHog
 -- team ids start at 1), replacing the old '' sentinel.
+-- Drop the old '' default before the type change — Postgres refuses to
+-- auto-cast a column default during ALTER TYPE (42804).
 ALTER TABLE duckgres_org_compute_usage
+    ALTER COLUMN team_id DROP DEFAULT,
     ALTER COLUMN team_id TYPE BIGINT USING COALESCE(NULLIF(team_id::text, ''), '0')::bigint,
     ALTER COLUMN team_id SET DEFAULT 0;
 
@@ -24,6 +27,7 @@ ALTER TABLE duckgres_org_compute_usage
 -- Best-effort reversal: the 0 sentinel downgrades to '0' (not the old ''),
 -- which is fine for a transient buffer.
 ALTER TABLE duckgres_org_compute_usage
+    ALTER COLUMN team_id DROP DEFAULT,
     ALTER COLUMN team_id TYPE TEXT USING team_id::text,
     ALTER COLUMN team_id SET DEFAULT '';
 

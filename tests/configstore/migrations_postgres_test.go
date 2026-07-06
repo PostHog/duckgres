@@ -121,6 +121,20 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
 			ALTER TABLE duckgres_org_users ADD COLUMN IF NOT EXISTS default_catalog VARCHAR(255);
 			DROP TABLE duckgres_worker_spawn_log;
+			-- Reverse 000015 + 000017 on the compute-usage buffer (widened
+			-- pull-billing key → the original v7 (org_id, bucket_start) shape;
+			-- dropping the PK columns drops the composite PK with them), and
+			-- restore the push-drain state table 000015 removed. Without this
+			-- the replay of 000015's backfill hits a BIGINT team_id with a ''
+			-- comparison and fails.
+			ALTER TABLE duckgres_org_compute_usage
+				DROP COLUMN team_id, DROP COLUMN query_source, DROP COLUMN cpu, DROP COLUMN mem_gib;
+			ALTER TABLE duckgres_org_compute_usage ADD PRIMARY KEY (org_id, bucket_start);
+			DROP TABLE IF EXISTS duckgres_compute_billing_cursor;
+			CREATE TABLE IF NOT EXISTS duckgres_org_compute_drain_state (
+				org_id TEXT PRIMARY KEY,
+				last_drained_bucket TIMESTAMPTZ NOT NULL
+			);
 			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
