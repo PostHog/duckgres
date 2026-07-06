@@ -12,6 +12,7 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/posthog/duckgres/server"
 )
 
 func TestReapIdleRawSQLRollbackUsesBoundedContext(t *testing.T) {
@@ -208,6 +209,73 @@ func TestInitSearchPath(t *testing.T) {
 			t.Errorf("expected search_path 'myuser,main,memory.main', got %q", searchPath)
 		}
 	})
+}
+
+func TestCreateSessionDefaultsToAttachedDuckLakeCatalog(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	for _, stmt := range []string{
+		"ATTACH ':memory:' AS ducklake",
+		"CREATE SCHEMA ducklake.frozen_v1",
+		"CREATE TABLE ducklake.frozen_v1.persons_file_view (id INTEGER)",
+		"INSERT INTO ducklake.frozen_v1.persons_file_view VALUES (1)",
+		"CREATE SCHEMA ducklake.root",
+		"CREATE TABLE ducklake.root.user_scoped (id INTEGER)",
+		"INSERT INTO ducklake.root.user_scoped VALUES (1)",
+		"USE memory",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDB:       db,
+		warmupDone:     make(chan struct{}),
+		cfg:            server.Config{SessionInitTimeout: time.Second},
+		maxSessions:    1,
+		sharedWarmMode: true,
+		activation:     &activatedTenantRuntime{payload: ActivationPayload{OrgID: "scenario-org"}, db: db},
+	}
+	close(pool.warmupDone)
+
+	session, _, err := pool.CreateSession("root", "", 0, nil)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	defer func() { _ = pool.DestroySession(session.ID) }()
+
+	var currentDB string
+	if err := session.Conn.QueryRowContext(context.Background(), "SELECT current_database()").Scan(&currentDB); err != nil {
+		t.Fatalf("current_database: %v", err)
+	}
+	if currentDB != "ducklake" {
+		t.Fatalf("current_database() = %q, want ducklake", currentDB)
+	}
+
+	var count int
+	if err := session.Conn.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM frozen_v1.persons_file_view").Scan(&count); err != nil {
+		t.Fatalf("unqualified frozen_v1 query should use ducklake catalog: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+
+	var userScopedCount int
+	if err := session.Conn.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM user_scoped").Scan(&userScopedCount); err != nil {
+		t.Fatalf("unqualified user schema query should preserve username search_path: %v", err)
+	}
+	if userScopedCount != 1 {
+		t.Fatalf("userScopedCount = %d, want 1", userScopedCount)
+	}
 }
 
 func TestCleanupSessionState(t *testing.T) {
