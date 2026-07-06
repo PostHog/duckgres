@@ -82,8 +82,6 @@ type CLIInputs struct {
 	K8sWorkerTolerationValue    string
 	AWSRegion                   string
 	QueryLog                    bool
-	BillingIngestURL            string
-	BillingIngestToken          string
 }
 
 type Resolved struct {
@@ -111,8 +109,6 @@ type Resolved struct {
 	K8sWorkerTolerationValue        string
 	K8sAllowClientWorkerProfile     bool
 	K8sWorkerPriorityClassName      string
-	K8sHeadroomNodes                int
-	K8sHeadroomPercent              int
 	K8sPlaceholderImage             string
 	K8sPlaceholderPriorityClassName string
 	K8sWorkerProfileMinCPU          string
@@ -131,8 +127,6 @@ type Resolved struct {
 	ManagedHostnameSuffixes         []string
 	DucklingBucketSuffix            string
 	DuckLakeDefaultSpecVersion      string
-	BillingIngestURL                string
-	BillingIngestToken              string
 }
 
 func intPtr(n int) *int    { return &n }
@@ -204,8 +198,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
 	var k8sWorkerMaxTTL, k8sWorkerDefaultTTL time.Duration
 	var k8sWorkerPriorityClassName string
-	var k8sHeadroomNodes int
-	var k8sHeadroomPercent int
 	var k8sPlaceholderImage, k8sPlaceholderPriorityClassName string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
@@ -222,7 +214,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var sniRoutingMode string
 	var managedHostnameSuffixes []string
 	var ducklingBucketSuffix string
-	var billingIngestURL, billingIngestToken string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -792,15 +783,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_DUCKLING_BUCKET_SUFFIX"); v != "" {
 		ducklingBucketSuffix = v
 	}
-	// Managed-warehouse compute-usage billing ingest (remote backend only). Both
-	// must be set for metering to ship anything; either unset disables metering.
-	// Env names are fixed — infra wires these exact keys.
-	if v := getenv("DUCKGRES_BILLING_INGEST_URL"); v != "" {
-		billingIngestURL = v
-	}
-	if v := getenv("DUCKGRES_BILLING_INGEST_TOKEN"); v != "" {
-		billingIngestToken = v
-	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -884,16 +866,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
 		k8sWorkerPriorityClassName = v
-	}
-	if v := getenv("DUCKGRES_K8S_HEADROOM_NODES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sHeadroomNodes = n
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_HEADROOM_PERCENT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sHeadroomPercent = n
-		}
 	}
 	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_IMAGE"); v != "" {
 		k8sPlaceholderImage = v
@@ -1112,12 +1084,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		// JWT_SIGNING_KEY_FALLBACKS.
 		internalSecretFallbacks = splitAndTrim(cli.InternalSecretFallbacks, ",")
 	}
-	if cli.Set["billing-ingest-url"] {
-		billingIngestURL = cli.BillingIngestURL
-	}
-	if cli.Set["billing-ingest-token"] {
-		billingIngestToken = cli.BillingIngestToken
-	}
 	if cli.Set["sni-routing-mode"] {
 		sniRoutingMode = cli.SNIRoutingMode
 	}
@@ -1253,8 +1219,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerTolerationValue:        k8sWorkerTolerationValue,
 		K8sAllowClientWorkerProfile:     k8sAllowClientWorkerProfile,
 		K8sWorkerPriorityClassName:      k8sWorkerPriorityClassName,
-		K8sHeadroomNodes:                k8sHeadroomNodes,
-		K8sHeadroomPercent:              k8sHeadroomPercent,
 		K8sPlaceholderImage:             k8sPlaceholderImage,
 		K8sPlaceholderPriorityClassName: k8sPlaceholderPriorityClassName,
 		K8sWorkerProfileMinCPU:          k8sWorkerProfileMinCPU,
@@ -1273,8 +1237,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,
 		DucklingBucketSuffix:            ducklingBucketSuffix,
 		DuckLakeDefaultSpecVersion:      cfg.DuckLake.SpecVersion,
-		BillingIngestURL:                billingIngestURL,
-		BillingIngestToken:              billingIngestToken,
 	}
 }
 

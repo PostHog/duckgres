@@ -451,30 +451,65 @@ connection_duration_logged() { # org password
   [ "$ms" -gt 0 ] || fail "disconnect duration_ms is $ms (want > 0 — backendStart not honoured?)"
 }
 
-# Managed-warehouse compute-usage metering (billing emit side). At connection
-# teardown the CP meters cpu_seconds/memory_seconds from the provisioned worker
-# size over the connection lifetime into an in-proc per-org counter (best-effort),
-# flushes it to the durable config-store buffer (~15s), and the leader drains
-# closed buckets to PostHog ingestion (~60s, ship-then-delete). The :9090 metrics
-# port + the ingestion HTTP path are not observable from this in-cluster Job, so
-# we assert the CP's startup log line that proves the metering config knob is
-# wired and reports its enabled/disabled state. When the deploy sets
-# DUCKGRES_BILLING_INGEST_URL/TOKEN this line reads "enabled"; otherwise
-# "disabled" — either way the knob is present and the emit path is compiled in.
-# (NOTE: a full end-to-end "the event landed in PostHog ClickHouse" assertion
-# needs a billing-analytics token + CH read access from the Job, which this lane
-# does not have — see README. The buffer UPSERT/drain SQL is exercised by the
-# tests/configstore Postgres migration test, and the meter/drain logic by the
-# controlplane/ unit tests.)
-compute_usage_metering_wired() {
-  log "compute-usage metering config knob wired in CP"
-  found=""
-  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
-    m="$(k logs "$p" 2>/dev/null | grep -E 'Managed-warehouse compute-usage metering (enabled|disabled)' | tail -1)"
-    if [ -n "$m" ]; then found="$m"; fi
+# Managed-warehouse compute-usage billing (pull API, docs/design/billing-pull-api.md).
+# At connection teardown the CP meters cpu_seconds/memory_seconds from the
+# provisioned worker size over the connection lifetime into an in-proc counter
+# keyed (org, default team, query_source, worker size), flushes it to the
+# durable config-store buffer (~15s), and serves it aggregated over
+# GET /api/v1/billing/usage; POST /api/v1/billing/ack advances the cursor and
+# deletes acked buckets. This asserts the FULL round-trip against the real
+# stack: two real connections (one standard, one with the duckgres.query_source
+# GUC set to endpoints) must surface as separate usage rows carrying the org's
+# provisioned default_team_id and a positive worker size, then an ack of the
+# served watermark_high must 200 and the next GET's watermark_low must equal it
+# (cursor advanced, acked buckets deleted). A bucket closes ~90s after the
+# connection ends (60s width + 30s grace) plus ≤15s flush, so the poll allows
+# ~4 minutes. This e2e stack has its own config store, so acking here cannot
+# eat production usage.
+compute_usage_pull_api() { # org password
+  org="$1"; pw="$2"
+  log "compute-usage pull API round-trip on $org"
+
+  # Generate usage under both query sources. Each pg call is one connection;
+  # the batched SET applies to the SELECT's session (split-path, see #868).
+  pg "$org" "$pw" ducklake 'SELECT 1' >/dev/null
+  pg "$org" "$pw" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" >/dev/null
+
+  # Poll until both rows are served (bucket close + flush lag).
+  a=0 body=""
+  while [ "$a" -lt 30 ]; do
+    body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
+    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_DEFAULT_TEAM_ID" '
+        (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="standard"  and .cpu_seconds>0 and .cpu>0 and .mem_gib>0)) | length >= 1)
+        and
+        (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="endpoints" and .cpu_seconds>0)) | length >= 1)' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 10; a=$((a + 1))
   done
-  [ -n "$found" ] || fail "no compute-usage metering startup log line found (config knob not wired into SetupMultiTenant?)"
-  log "compute-usage metering state: $found"
+  [ "$a" -lt 30 ] || fail "compute-usage: rows for $org (standard+endpoints, team=$CNPG_DEFAULT_TEAM_ID) never appeared in GET /billing/usage: $(echo "$body" | head -c 600)"
+  wl="$(echo "$body" | jq -r '.watermark_low')"
+  wh="$(echo "$body" | jq -r '.watermark_high')"
+  log "compute-usage OK: usage served (low=$wl high=$wh)"
+
+  # Ack the served watermark; the cursor must advance and acked buckets die.
+  ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"watermark_high\":\"$wh\"}" "$API/api/v1/billing/ack")" \
+    || fail "compute-usage: ack POST failed"
+  deleted="$(echo "$ack" | jq -r '.deleted')"
+  [ "${deleted:-0}" -ge 1 ] || fail "compute-usage: ack deleted=$deleted (want >=1): $ack"
+  low2="$(curl -fsS -H "$H" "$API/api/v1/billing/usage" | jq -r '.watermark_low')"
+  [ "$low2" = "$wh" ] || fail "compute-usage: after ack, watermark_low='$low2' want '$wh' (cursor did not advance)"
+  # Idempotency: re-acking the same watermark is a safe no-op (200).
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"watermark_high\":\"$wh\"}" "$API/api/v1/billing/ack" >/dev/null \
+    || fail "compute-usage: re-ack of the same watermark failed (must be idempotent)"
+  # Acking into the still-open present must be rejected (400), never delete.
+  future="$(jq -rn 'now + 3600 | todate')"
+  code="$(curl -s -o /tmp/ack_future -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"watermark_high\":\"$future\"}" "$API/api/v1/billing/ack")"
+  [ "$code" = "400" ] || fail "compute-usage: future ack -> HTTP $code want 400: $(cat /tmp/ack_future)"
+  log "compute-usage OK: ack advanced cursor (deleted=$deleted), idempotent re-ack, future ack rejected"
 }
 
 # jsonb || must keep Postgres concatenation semantics through the full CP
@@ -828,6 +863,19 @@ assert_worker_pod() { # org
   dmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
   [ "$dcpu" = "750m" ] || fail "default worker $pod requests.cpu='$dcpu' want '750m' (pool default; BestEffort regression?)"
   [ "$dmem" = "1536Mi" ] || fail "default worker $pod requests.memory='$dmem' want '1536Mi'"
+
+  # Pre-session memory hygiene env (workerMemoryHygieneEnv): the CP must stamp
+  # a pod-derived DuckDB memory_limit, a Go soft memory ceiling, and the thread
+  # count at spawn — otherwise the worker sizes its base DB off the NODE's
+  # /proc/meminfo and all pre-session work (DuckLake ATTACH, activation) runs
+  # effectively unbounded. Values derive from the 750m/1536Mi pool default:
+  # 75% of 1536Mi floors to 1GB; GOMEMLIMIT is 1/8 pod = 192MiB; 750m -> 1.
+  dml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_MEMORY_LIMIT\")].value}")"
+  [ "$dml" = "1GB" ] || fail "default worker $pod DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of 1536Mi, GB-floored)"
+  gml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"GOMEMLIMIT\")].value}")"
+  [ "$gml" = "192MiB" ] || fail "default worker $pod GOMEMLIMIT='$gml' want '192MiB' (1/8 of 1536Mi)"
+  thr="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_THREADS\")].value}")"
+  [ "$thr" = "1" ] || fail "default worker $pod DUCKGRES_THREADS='$thr' want '1' (750m rounds up)"
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------
@@ -1040,48 +1088,67 @@ org_default_profile() { # org password catalog
   log "org default OK: audit shows org.update with field-change detail on $org"
 }
 
-# ---- org default_team_id (optional, non-breaking) ---------------------------
-# default_team_id links an org to its default PostHog team id (a nullable string
-# config-store column, prereq for pull-based compute billing where usage buckets
-# are keyed by team_id). It is OPTIONAL everywhere: NULL is a valid state.
-# Asserts both halves of the contract on real orgs against the real config store:
-#   1. Set path: the CNPG org was provisioned WITH default_team_id in its body
-#      (see CNPG_BODY); GET /orgs/:id must round-trip exactly that value.
-#   2. Unset path: the EXT org was provisioned WITHOUT it; GET /orgs/:id must
-#      report null (not an error, not a stray value) — proving NULL is tolerated.
-#   3. Mutate path: PUT /orgs/:id can set and clear it (""=NULL) on the EXT org,
-#      round-tripping on GET, so the admin edit path is covered too.
+# ---- org default_team_id (mandatory on new orgs) ----------------------------
+# default_team_id links an org to its default PostHog team id (a BIGINT
+# config-store column — a JSON NUMBER on the wire, matching PostHog's integer
+# Team.id; prereq for pull-based compute billing where usage buckets are keyed
+# by team_id). Contract: MANDATORY when a provision creates a NEW org (400, nothing
+# created); optional on re-provision of an existing org, where omission keeps
+# the stored value (set-only, never a wipe — the keep path is covered by
+# TestReprovisionExistingOrgKeepsDefaultTeamID, since same-id re-provision
+# in-run is off-limits here, see the lifecycle NOTE below). Asserts on real orgs
+# against the real config store:
+#   1. Set path: CNPG + EXT orgs were provisioned WITH default_team_id in their
+#      bodies (mandatory now); GET /orgs/:id must round-trip exactly each value.
+#   2. Reject path: provisioning a brand-new org WITHOUT default_team_id must be
+#      400 naming the field, and must create nothing (org GET stays 404).
+#   3. Mutate path: PUT /orgs/:id can set and clear it (0=NULL) on the EXT org
+#      (admin escape hatch), round-tripping on GET; the provisioned value is
+#      restored afterwards so the org stays contract-conformant.
 # get_org_default_team_id prints the raw JSON value ("null" when NULL) so the
 # assertions can distinguish an unset column from an empty string.
 get_org_default_team_id() { # org -> prints default_team_id (jq raw; "null" when unset)
   curl -fsS -H "$H" "$API/api/v1/orgs/$1" | jq -r '.default_team_id'
 }
-default_team_id_optional() { # cnpg_org ext_org
+default_team_id_mandatory() { # cnpg_org ext_org
   cnpg_org="$1"; ext_org="$2"
-  log "default_team_id: set-at-provision round-trip on $cnpg_org, NULL-tolerated on $ext_org"
+  log "default_team_id: provision round-trips on $cnpg_org/$ext_org, new-org-without rejected"
 
-  # 1. Set path: CNPG org provisioned WITH default_team_id must read it back.
+  # 1. Set path: both orgs provisioned WITH default_team_id must read it back.
   got="$(get_org_default_team_id "$cnpg_org")"
   [ "$got" = "$CNPG_DEFAULT_TEAM_ID" ] \
     || fail "default_team_id: GET /orgs/$cnpg_org = '$got' want '$CNPG_DEFAULT_TEAM_ID' (provision default_team_id did not persist)"
-  log "default_team_id OK: $cnpg_org round-tripped '$got' from provision"
-
-  # 2. Unset path: EXT org provisioned WITHOUT it must read back null (no error).
   got="$(get_org_default_team_id "$ext_org")"
-  [ "$got" = "null" ] \
-    || fail "default_team_id: GET /orgs/$ext_org = '$got' want 'null' (unset must be NULL, not an error/value)"
-  log "default_team_id OK: $ext_org reports NULL (optional/non-breaking honored)"
+  [ "$got" = "$EXT_DEFAULT_TEAM_ID" ] \
+    || fail "default_team_id: GET /orgs/$ext_org = '$got' want '$EXT_DEFAULT_TEAM_ID' (provision default_team_id did not persist)"
+  log "default_team_id OK: $cnpg_org/$ext_org round-tripped from provision"
 
-  # 3. Mutate path: PUT can set then clear ("" -> NULL) on the ext org.
-  code="$(put_org "$ext_org" '{"default_team_id":"424242"}')"
+  # 2. Reject path: a NEW org without default_team_id must 400 and create nothing.
+  noteam="e2e-noteam"
+  code="$(curl -s -o /tmp/noteam_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d '{"database_name":"e2enoteamdb","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}' \
+    "$API/api/v1/orgs/$noteam/provision")"
+  [ "$code" = "400" ] \
+    || fail "default_team_id: new-org provision without it -> HTTP $code want 400: $(cat /tmp/noteam_out)"
+  grep -q "default_team_id" /tmp/noteam_out \
+    || fail "default_team_id: rejection error should name the field: $(cat /tmp/noteam_out)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs/$noteam")"
+  [ "$code" = "404" ] \
+    || fail "default_team_id: rejected provision must create nothing, GET /orgs/$noteam -> HTTP $code want 404"
+  log "default_team_id OK: new org without it rejected with 400, nothing created"
+
+  # 3. Mutate path: PUT can set, clear ("" -> NULL), then restore on the ext org.
+  code="$(put_org "$ext_org" '{"default_team_id":424242}')"
   [ "$code" = "200" ] || fail "default_team_id: PUT set -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
   [ "$got" = "424242" ] || fail "default_team_id: after PUT set, GET = '$got' want '424242'"
-  code="$(put_org "$ext_org" '{"default_team_id":""}')"
+  code="$(put_org "$ext_org" '{"default_team_id":0}')"
   [ "$code" = "200" ] || fail "default_team_id: PUT clear -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
-  [ "$got" = "null" ] || fail "default_team_id: after PUT clear, GET = '$got' want 'null' (empty must clear to NULL)"
-  log "default_team_id OK: PUT set/clear round-trips on $ext_org (NULL restored)"
+  [ "$got" = "null" ] || fail "default_team_id: after PUT clear, GET = '$got' want 'null' (0 must clear to NULL)"
+  code="$(put_org "$ext_org" "{\"default_team_id\":$EXT_DEFAULT_TEAM_ID}")"
+  [ "$code" = "200" ] || fail "default_team_id: PUT restore -> HTTP $code: $(cat /tmp/put_org_out)"
+  log "default_team_id OK: PUT set/clear/restore round-trips on $ext_org"
 }
 
 # ---- user persistent secrets ------------------------------------------------
@@ -2105,17 +2172,19 @@ lifecycle_teardown_cnpg() { # org
 }
 
 # ---- cnpg duckling: cnpg-shard metadata + DuckLake ------------------------
-# Carries an optional default_team_id at provision time (prereq for pull-based
-# compute billing: usage buckets keyed by team_id = the org's default team). The
-# EXT org below deliberately omits it, so default_team_id_optional asserts both
-# the set path (round-trips) and the unset path (NULL, no error).
+# default_team_id is MANDATORY at provision time for new orgs (prereq for
+# pull-based compute billing: usage buckets keyed by team_id = the org's default
+# team) — every provision body below carries one; default_team_id_mandatory
+# asserts the round-trips and that omitting it on a new org is rejected.
 CNPG_DEFAULT_TEAM_ID='90210'
 CNPG_BODY='{"database_name":"'"$CNPG"'","metadata_store":{"type":"cnpg-shard"},
-  "default_team_id":"'"$CNPG_DEFAULT_TEAM_ID"'",
+  "default_team_id":'"$CNPG_DEFAULT_TEAM_ID"',
   "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
 
 # ---- ext duckling: external RDS metadata + DuckLake -----------------------
+EXT_DEFAULT_TEAM_ID='31337'
 EXT_BODY='{"database_name":"'"$EXT"'",
+  "default_team_id":'"$EXT_DEFAULT_TEAM_ID"',
   "metadata_store":{"type":"external","external":{
     "endpoint":"'"$EXT_RDS_ENDPOINT"'","password_aws_secret":"'"$EXT_RDS_SECRET"'",
     "user":"ducklingexample","database":"ducklingexample"}},
@@ -2126,7 +2195,7 @@ EXT_BODY='{"database_name":"'"$EXT"'",
 # DuckLake-only: these orgs exist purely to host the worker-churn-heavy
 # resilience lanes, so keep their provision footprint small.
 res_body() { # org
-  printf '{"database_name":"%s","metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
+  printf '{"database_name":"%s","default_team_id":1,"metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
 }
 
 # ---- per-user kill switch ---------------------------------------------------
@@ -2364,10 +2433,11 @@ lane_ext() { # external-RDS metadata backend + org default profile
   # Org default profile on ext: no client-sized assertions run on this org, so
   # the 2-CPU shape is unambiguously the org default's.
   org_default_profile "$EXT" "$ext_pw" ducklake
-  # default_team_id contract: CNPG provisioned WITH one (round-trips), EXT
-  # WITHOUT one (NULL, no error) + PUT set/clear on EXT. Runs here because both
-  # orgs are provisioned by now; it only touches the admin API, no worker/DB.
-  default_team_id_optional "$CNPG" "$EXT"
+  # default_team_id contract: both orgs provisioned WITH one (round-trips), a
+  # NEW org WITHOUT one is rejected (400, nothing created) + PUT set/clear/
+  # restore on EXT. Runs here because both orgs are provisioned by now; it only
+  # touches the provisioning + admin APIs, no worker/DB.
+  default_team_id_mandatory "$CNPG" "$EXT"
 }
 
 main() {
@@ -2478,8 +2548,8 @@ main() {
   #      many connect/disconnects, so the disconnect log is warm) ----
   connection_duration_logged "$CNPG" "$cnpg_pw"
 
-  # ---- compute-usage metering wired (billing emit side) ----
-  compute_usage_metering_wired
+  # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
+  compute_usage_pull_api "$CNPG" "$cnpg_pw"
 
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
@@ -2493,7 +2563,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

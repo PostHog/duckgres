@@ -55,7 +55,7 @@ func TestProvisionEmitsAnalyticsEvent(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "acme-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	body := []byte(`{"database_name": "acme-db", "default_team_id": 1, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/acme/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

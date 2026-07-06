@@ -19,11 +19,18 @@ const (
 	computeFlushInterval = 15 * time.Second
 )
 
-// computeUsageKey identifies one accumulator bucket: an org and an aligned
-// time-bucket (connection-end time floored to computeBucketWidth).
+// computeUsageKey identifies one accumulator bucket: the full billing key —
+// org, the org's default team, the session's query source and the provisioned
+// worker size (milli-units) — plus an aligned time-bucket (connection-end time
+// floored to computeBucketWidth). Distinct sizes/teams/sources accumulate (and
+// bill) separately.
 type computeUsageKey struct {
-	orgID  string
-	bucket time.Time
+	orgID       string
+	teamID      int64
+	querySource string
+	millicores  int64
+	mib         int64
+	bucket      time.Time
 }
 
 // computeUsageCounter is the in-process, best-effort per-org compute-usage
@@ -74,7 +81,7 @@ func computeConnectionUsage(millicores, mib int64, dur time.Duration) (milliCPUS
 // Record adds one connection's usage to the in-process counter, bucketed by
 // connection-end time. Best-effort: a zero/unknown size is a no-op. Never
 // errors.
-func (c *computeUsageCounter) Record(orgID string, millicores, mib int64, endTime time.Time, dur time.Duration) {
+func (c *computeUsageCounter) Record(orgID, querySource string, teamID, millicores, mib int64, endTime time.Time, dur time.Duration) {
 	if c == nil || orgID == "" || millicores <= 0 {
 		return
 	}
@@ -82,7 +89,14 @@ func (c *computeUsageCounter) Record(orgID string, millicores, mib int64, endTim
 	if milliCPU == 0 && mibSec == 0 {
 		return
 	}
-	key := computeUsageKey{orgID: orgID, bucket: endTime.UTC().Truncate(computeBucketWidth)}
+	key := computeUsageKey{
+		orgID:       orgID,
+		teamID:      teamID,
+		querySource: querySource,
+		millicores:  millicores,
+		mib:         mib,
+		bucket:      endTime.UTC().Truncate(computeBucketWidth),
+	}
 
 	c.mu.Lock()
 	a := c.buckets[key]
@@ -112,6 +126,10 @@ func (c *computeUsageCounter) drainWholeUnits() []configstore.ComputeUsageDelta 
 		}
 		out = append(out, configstore.ComputeUsageDelta{
 			OrgID:         key.orgID,
+			TeamID:        key.teamID,
+			QuerySource:   key.querySource,
+			Millicores:    key.millicores,
+			MiB:           key.mib,
 			BucketStart:   key.bucket,
 			CPUSeconds:    cpuWhole,
 			MemorySeconds: memWhole,
@@ -132,23 +150,30 @@ type computeUsageStore interface {
 }
 
 // computeMeter wires the per-org counter to a flusher. Nil-safe: a disabled
-// meter (no ingest config / non-remote backend) leaves this nil and every call
-// site no-ops.
+// meter (non-remote backend) leaves this nil and every call site no-ops.
+// resolveTeam maps an org to its default PostHog team id at record time (a
+// config-snapshot read — no I/O); 0 is tolerated per the OrgDefaultTeamID
+// contract and the bucket then carries team_id 0 ("no default team").
 type computeMeter struct {
-	counter *computeUsageCounter
-	store   computeUsageStore
+	counter     *computeUsageCounter
+	store       computeUsageStore
+	resolveTeam func(orgID string) int64
 }
 
-func newComputeMeter(store computeUsageStore) *computeMeter {
-	return &computeMeter{counter: newComputeUsageCounter(), store: store}
+func newComputeMeter(store computeUsageStore, resolveTeam func(orgID string) int64) *computeMeter {
+	return &computeMeter{counter: newComputeUsageCounter(), store: store, resolveTeam: resolveTeam}
 }
 
 // Record forwards a connection-end record to the in-process counter. Best-effort.
-func (m *computeMeter) Record(orgID string, millicores, mib int64, endTime time.Time, dur time.Duration) {
+func (m *computeMeter) Record(orgID, querySource string, millicores, mib int64, endTime time.Time, dur time.Duration) {
 	if m == nil {
 		return
 	}
-	m.counter.Record(orgID, millicores, mib, endTime, dur)
+	teamID := int64(0)
+	if m.resolveTeam != nil {
+		teamID = m.resolveTeam(orgID)
+	}
+	m.counter.Record(orgID, querySource, teamID, millicores, mib, endTime, dur)
 }
 
 // Flush drains the in-process counter into the durable buffer once. Best-effort:

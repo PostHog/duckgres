@@ -79,20 +79,6 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 	return &DucklingClient{client: client}
 }
 
-// ducklingName is the k8s/AWS resource name derived from an org ID, used for
-// the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, etc. Org IDs
-// are validated as DNS-1123 labels at
-// provision time (lowercase alphanumerics + hyphens), so this only lowercases:
-// hyphens are preserved, keeping in-cluster names human-readable and injective
-// with the org ID.
-//
-// (It used to strip hyphens to keep per-org Aurora RDS cluster identifiers
-// short, but the control plane no longer provisions per-org Aurora clusters,
-// and stripping was lossy — "a-b" and "ab" collided.)
-func ducklingName(orgID string) string {
-	return strings.ToLower(orgID)
-}
-
 // pgIdentSanitizeRe matches characters not allowed in an unquoted Postgres
 // identifier fragment.
 var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
@@ -107,15 +93,6 @@ var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
 // [a-z0-9-], which the provision-time validation guarantees.
 func pgIdentSuffix(orgID string) string {
 	return pgIdentSanitizeRe.ReplaceAllString(strings.ToLower(orgID), "_")
-}
-
-// legacyDucklingName is the pre-hyphen-preservation transform (hyphens
-// stripped). Retained ONLY so lookups can still find Duckling CRs created
-// before ducklingName started preserving hyphens — e.g. a CR named
-// "018d351a9ff70000eaff4628875ad045" for org "018d351a-9ff7-0000-eaff-...".
-// New CRs are always created under ducklingName (hyphen-preserving).
-func legacyDucklingName(orgID string) string {
-	return strings.ReplaceAll(strings.ToLower(orgID), "-", "")
 }
 
 // CreateOptions carries per-org knobs that shape the generated Duckling CR.
@@ -147,10 +124,10 @@ type CreateOptions struct {
 	DuckLakeEnabled bool
 }
 
-// Create creates a Duckling CR for the given org.
-func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOptions) error {
-	name := ducklingName(orgID)
-
+// Create creates a Duckling CR named exactly `name`. The name comes from the
+// warehouse row's duckling_name (authoritative; the control plane never
+// derives it) and is used verbatim.
+func (d *DucklingClient) Create(ctx context.Context, name string, opts CreateOptions) error {
 	var metadataStore map[string]interface{}
 	switch opts.MetadataStoreType {
 	case configstore.MetadataStoreKindCnpgShard:
@@ -251,23 +228,10 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	return nil
 }
 
-// getCR fetches the org's Duckling CR, trying the current hyphen-preserving
-// name first and falling back to the legacy de-hyphenated name for CRs created
-// before ducklingName preserved hyphens. Returns the CR and the name it was
-// found under (callers that mutate need the actual name). When neither exists,
-// returns the current-name NotFound error so callers see the new scheme.
-func (d *DucklingClient) getCR(ctx context.Context, orgID string) (*unstructured.Unstructured, string, error) {
-	name := ducklingName(orgID)
-	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
-	if err == nil {
-		return cr, name, nil
-	}
-	if legacy := legacyDucklingName(orgID); legacy != name && apierrors.IsNotFound(err) {
-		if lcr, lerr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); lerr == nil {
-			return lcr, legacy, nil
-		}
-	}
-	return nil, name, err
+// getCR fetches a Duckling CR by its exact name — the warehouse row's
+// duckling_name. The control plane never derives or re-maps the name.
+func (d *DucklingClient) getCR(ctx context.Context, name string) (*unstructured.Unstructured, error) {
+	return d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
 }
 
 // ListCRNames returns the names of every Duckling CR in the namespace. Used by
@@ -317,12 +281,12 @@ func (d *DucklingClient) CRMetadataStores(ctx context.Context) (map[string]CRMet
 	return out, nil
 }
 
-// CRStatus reports whether the org's Duckling CR exists and, if so, whether it
+// CRStatus reports whether the named Duckling CR exists and, if so, whether it
 // is Ready — without treating absence as an error. A NotFound resolves to
 // (false, false, nil) so the drift finder can classify a missing CR rather than
 // surfacing a 500. Any other error is returned as-is.
-func (d *DucklingClient) CRStatus(ctx context.Context, orgID string) (present bool, ready bool, err error) {
-	cr, _, gerr := d.getCR(ctx, orgID)
+func (d *DucklingClient) CRStatus(ctx context.Context, name string) (present bool, ready bool, err error) {
+	cr, gerr := d.getCR(ctx, name)
 	if gerr != nil {
 		if apierrors.IsNotFound(gerr) {
 			return false, false, nil
@@ -336,35 +300,33 @@ func (d *DucklingClient) CRStatus(ctx context.Context, orgID string) (present bo
 	return true, status.ReadyCondition, nil
 }
 
-// Get fetches the Duckling CR and parses its status.
-func (d *DucklingClient) Get(ctx context.Context, orgID string) (*DucklingStatus, error) {
-	cr, name, err := d.getCR(ctx, orgID)
+// Get fetches the named Duckling CR and parses its status.
+func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus, error) {
+	cr, err := d.getCR(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
 	return parseDucklingStatus(cr)
 }
 
-// Delete removes the Duckling CR for the given org. Resolves the legacy name so
-// pre-rename CRs are still deletable.
-func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
-	_, name, err := d.getCR(ctx, orgID)
-	if apierrors.IsNotFound(err) {
-		// Already gone — nothing to delete. (reconcileDeleting treats this as success.)
-		return err
-	}
+// Delete removes the named Duckling CR.
+func (d *DucklingClient) Delete(ctx context.Context, name string) error {
 	if derr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{}); derr != nil {
+		if apierrors.IsNotFound(derr) {
+			// Already gone — nothing to delete. (reconcileDeleting treats this as success.)
+			return derr
+		}
 		return fmt.Errorf("delete duckling CR %q: %w", name, derr)
 	}
 	return nil
 }
 
 // GetPgBouncerEnabled reads spec.metadataStore.pgbouncer.enabled from the
-// Duckling CR. Missing blocks (composition at an older schema, CR never
+// named Duckling CR. Missing blocks (composition at an older schema, CR never
 // carried a pgbouncer section) are reported as false — same as an explicit
 // opt-out — so the caller just needs to compare against the desired value.
-func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) (bool, error) {
-	cr, name, err := d.getCR(ctx, orgID)
+func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, name string) (bool, error) {
+	cr, err := d.getCR(ctx, name)
 	if err != nil {
 		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
@@ -385,14 +347,10 @@ func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) 
 }
 
 // SetPgBouncerEnabled patches spec.metadataStore.pgbouncer.enabled on the
-// Duckling CR for the given org. Uses a JSON merge patch (RFC 7396) so the
+// named Duckling CR. Uses a JSON merge patch (RFC 7396) so the
 // call is idempotent and only touches the pgbouncer block — sibling fields
 // under metadataStore (type, external) are left untouched.
-func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, enabled bool) error {
-	_, name, err := d.getCR(ctx, orgID)
-	if err != nil {
-		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
-	}
+func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, name string, enabled bool) error {
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
@@ -414,12 +372,12 @@ func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, 
 	return nil
 }
 
-// GetDataStoreBucketName reads spec.dataStore.bucketName from the Duckling CR.
-// Empty (missing block / missing key) means the CR predates CP-owned naming
-// and the composition is still deriving the name — the signal the backfill in
-// reconcileReady uses to decide whether to patch.
-func (d *DucklingClient) GetDataStoreBucketName(ctx context.Context, orgID string) (string, error) {
-	cr, name, err := d.getCR(ctx, orgID)
+// GetDataStoreBucketName reads spec.dataStore.bucketName from the named
+// Duckling CR. Empty (missing block / missing key) means the CR predates
+// CP-owned naming and the composition is still deriving the name — the signal
+// the backfill in reconcileReady uses to decide whether to patch.
+func (d *DucklingClient) GetDataStoreBucketName(ctx context.Context, name string) (string, error) {
+	cr, err := d.getCR(ctx, name)
 	if err != nil {
 		return "", fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
@@ -435,19 +393,15 @@ func (d *DucklingClient) GetDataStoreBucketName(ctx context.Context, orgID strin
 	return bucket, nil
 }
 
-// SetDataStoreBucketName patches spec.dataStore.bucketName on the Duckling CR.
-// JSON merge patch (RFC 7396) so it's idempotent and only touches dataStore —
-// the type field and any sibling under spec are left untouched. Used to backfill
-// the CP-owned name onto ducklings created before this field existed (their
-// spec.dataStore carries only {type: s3bucket}); the name supplied here is the
-// same string the composition was already deriving into status, so the patch
-// causes no bucket churn — it just moves the name from a derived output into a
-// durable input so the composition stops deriving.
-func (d *DucklingClient) SetDataStoreBucketName(ctx context.Context, orgID, bucket string) error {
-	_, name, err := d.getCR(ctx, orgID)
-	if err != nil {
-		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
-	}
+// SetDataStoreBucketName patches spec.dataStore.bucketName on the named
+// Duckling CR. JSON merge patch (RFC 7396) so it's idempotent and only touches
+// dataStore — the type field and any sibling under spec are left untouched.
+// Used to backfill the CP-owned name onto ducklings created before this field
+// existed (their spec.dataStore carries only {type: s3bucket}); the name
+// supplied here is the same string the composition was already deriving into
+// status, so the patch causes no bucket churn — it just moves the name from a
+// derived output into a durable input so the composition stops deriving.
+func (d *DucklingClient) SetDataStoreBucketName(ctx context.Context, name, bucket string) error {
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"dataStore": map[string]interface{}{

@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,7 +16,9 @@ import (
 // needs. Declared here so the admin package doesn't import provisioner;
 // *provisioner.DucklingClient satisfies it.
 type DucklingChecker interface {
-	CRStatus(ctx context.Context, orgID string) (present, ready bool, err error)
+	// CRStatus takes the Duckling CR name — the warehouse row's duckling_name,
+	// never a derived value.
+	CRStatus(ctx context.Context, name string) (present, ready bool, err error)
 	ListCRNames(ctx context.Context) ([]string, error)
 }
 
@@ -71,27 +72,23 @@ func (h *driftHandler) findDrift(c *gin.Context) {
 	}
 
 	entries := make([]driftEntry, 0)
-	// expected holds every CR name a warehouse legitimately maps to, so the
-	// orphan pass below doesn't flag a CR that simply uses the legacy
-	// (hyphen-stripped) name.
-	expected := make(map[string]struct{}, len(warehouses)*2)
+	// expected holds exactly the stored duckling_name of every warehouse row,
+	// so the orphan pass below flags any CR not claimed by a row.
+	expected := make(map[string]struct{}, len(warehouses))
 
 	for i := range warehouses {
 		wh := warehouses[i]
 		orgID := wh.OrgID
+		// The stored duckling_name is the authoritative CR name. The column is
+		// NOT NULL and backfilled; the org-ID fallback only covers legacy rows
+		// with an empty value (the CR name defaults to the org ID verbatim).
 		name := wh.DucklingName
 		if name == "" {
-			// Fallback for rows the backfill missed; mirrors
-			// provisioner.ducklingName (lowercased org ID).
-			name = strings.ToLower(orgID)
+			name = orgID
 		}
 		expected[name] = struct{}{}
-		// Also expect the canonical and legacy (hyphen-stripped) variants so
-		// pre-rename CRs aren't misreported as orphans.
-		expected[strings.ToLower(orgID)] = struct{}{}
-		expected[strings.ReplaceAll(strings.ToLower(orgID), "-", "")] = struct{}{}
 
-		present, ready, cerr := h.checker.CRStatus(ctx, orgID)
+		present, ready, cerr := h.checker.CRStatus(ctx, name)
 		if cerr != nil {
 			entries = append(entries, driftEntry{
 				Org:            orgID,

@@ -40,7 +40,7 @@ type ControlPlaneJanitor struct {
 	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
-	reconcileHeadroom             func() // maintains low-priority placeholder pods at the configured headroom target (constant HeadroomNodes or legacy percent; leader-only)
+	reconcileHeadroom             func() // maintains low-priority placeholder pods at the dynamic headroom target (spawn-log-derived count/size; leader-only)
 	hotIdleFloor                  func(configstore.WorkerSnapshot) int
 }
 

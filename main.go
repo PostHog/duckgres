@@ -17,6 +17,7 @@ import (
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/crashhandler"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -54,6 +55,15 @@ func main() {
 	// drops mid-query. Go already converts EPIPE to errors on Write; the
 	// default SIGPIPE handler is a legacy Unix footgun that kills the process.
 	signal.Ignore(syscall.SIGPIPE)
+
+	// The native crash handler self-installs from a C constructor (importing
+	// the package is what links it in). Without it, a SIGSEGV on a
+	// DuckDB-created thread can wedge the process forever instead of killing
+	// it — see the package doc. Surface its state early so a missing handler
+	// is visible in logs.
+	if !crashhandler.Installed() {
+		slog.Warn("Native crash handler NOT installed; fatal signals on native threads may wedge the process.")
+	}
 
 	// Set version on server package so catalog macros can expose it
 	server.SetProcessVersion(version)
@@ -357,8 +367,6 @@ func main() {
 			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 			DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 			DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
-			BillingIngestURL:           resolved.BillingIngestURL,
-			BillingIngestToken:         resolved.BillingIngestToken,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:                  resolved.K8sWorkerImage,
 				WorkerNamespace:              resolved.K8sWorkerNamespace,
@@ -375,8 +383,6 @@ func main() {
 				WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
 				AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
 				WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
-				HeadroomNodes:                resolved.K8sHeadroomNodes,
-				HeadroomPercent:              resolved.K8sHeadroomPercent,
 				PlaceholderImage:             resolved.K8sPlaceholderImage,
 				PlaceholderPriorityClassName: resolved.K8sPlaceholderPriorityClassName,
 				WorkerProfileMinCPU:          resolved.K8sWorkerProfileMinCPU,

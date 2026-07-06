@@ -117,23 +117,6 @@ type ControlPlaneConfig struct {
 	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
 	// used for migration checks when an org doesn't specify an override.
 	DuckLakeDefaultSpecVersion string
-
-	// BillingIngestURL and BillingIngestToken configure managed-warehouse
-	// compute-usage metering (remote/k8s backend only). The URL is PostHog's
-	// public ingestion base (e.g. https://us.i.posthog.com); the token is the
-	// project API write key, stamped on the capture event's `token` property.
-	// If EITHER is empty, metering is disabled: usage is never shipped and a
-	// query is NEVER failed on its account. See
-	// docs/design/billing-compute-seconds-plan.md.
-	BillingIngestURL   string
-	BillingIngestToken string
-}
-
-// BillingMeteringEnabled reports whether compute-usage metering is configured.
-// Metering also requires the remote backend; this only checks the ingest
-// config (both URL and token present).
-func (c ControlPlaneConfig) BillingMeteringEnabled() bool {
-	return c.BillingIngestURL != "" && c.BillingIngestToken != ""
 }
 
 type ProcessConfig struct {
@@ -161,14 +144,12 @@ type K8sConfig struct {
 
 	// Node-headroom controller holds preemptible low-priority placeholder pods so
 	// a worker spawn schedules immediately (preempting a placeholder) rather than
-	// waiting on a fresh Karpenter node. HeadroomNodes>0 selects the constant
-	// mode (a fixed number of node-sized placeholders, demand-independent — the
-	// prod default); HeadroomPercent is the legacy demand-proportional fallback.
-	// Both 0 = disabled.
-	HeadroomNodes                int    // CONSTANT node-headroom: number of node-sized placeholder pods (0 = use HeadroomPercent)
-	HeadroomPercent              int    // legacy demand-% headroom, used only when HeadroomNodes==0 (0 = disabled)
+	// waiting on a fresh Karpenter node. Slot count and size are derived
+	// dynamically from recent worker spawns (see controlplane/headroom.go) —
+	// there is no configured count. Enabled iff PlaceholderPriorityClassName is
+	// set; empty = disabled (existing placeholders converge to zero).
 	PlaceholderImage             string // Image for placeholder pods (a pause image)
-	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName
+	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName. Empty = headroom disabled.
 
 	// Connection-string worker sizing (duckgres.worker_cpu / worker_memory /
 	// worker_ttl). All default to the off/empty state, so absent config = the
@@ -1357,15 +1338,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	defer func() {
 		dur := server.CloseConnectionMetrics(cc)
 		clog.Info("Client disconnected.", "duration_ms", dur.Milliseconds())
-		// Best-effort compute-usage metering. cp.computeMeter is nil unless the
-		// remote backend is configured with billing ingest; Record is nil-safe
-		// and a zero worker size (non-remote/unknown) is a no-op. A panic here
-		// must never escape teardown.
+		// Best-effort compute-usage metering. cp.computeMeter is nil outside the
+		// remote backend; Record is nil-safe and a zero worker size
+		// (non-remote/unknown) is a no-op. A panic here must never escape
+		// teardown.
 		if cp.computeMeter != nil {
 			func() {
 				defer func() { _ = recover() }()
-				billOrg, millicores, mib, billDur := server.ConnectionBilling(cc)
-				cp.computeMeter.Record(billOrg, millicores, mib, time.Now(), billDur)
+				billOrg, billSource, millicores, mib, billDur := server.ConnectionBilling(cc)
+				cp.computeMeter.Record(billOrg, billSource, millicores, mib, time.Now(), billDur)
 			}()
 		}
 	}()
@@ -1420,17 +1401,7 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	if memReq != "" {
-		memBytes := parseK8sMemory(memReq)
-		if memBytes > 0 {
-			duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
-			const gb = 1024 * 1024 * 1024
-			const mb = 1024 * 1024
-			if duckdbBytes >= gb {
-				memLimit = fmt.Sprintf("%dGB", duckdbBytes/gb)
-			} else {
-				memLimit = fmt.Sprintf("%dMB", duckdbBytes/mb)
-			}
-		}
+		memLimit = duckdbMemoryLimitForPodMemory(parseK8sMemory(memReq))
 	}
 
 	if cpuReq != "" {
@@ -1438,6 +1409,26 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	return memLimit, threads
+}
+
+// duckdbMemoryLimitForPodMemory formats the DuckDB memory_limit for a worker
+// pod of the given memory size: 75% of the pod, leaving the remainder as
+// headroom for everything memory_limit does NOT govern (DuckDB C++ catalog
+// objects, postgres_scanner/libpq result buffers, the Go runtime, page cache).
+// Returns "" when memBytes is 0/unparseable (DuckDB then auto-detects).
+// Shared between session sizing (workerDuckDBLimits) and the spawn-time
+// DUCKGRES_MEMORY_LIMIT env so the two can never disagree.
+func duckdbMemoryLimitForPodMemory(memBytes uint64) string {
+	if memBytes == 0 {
+		return ""
+	}
+	duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
+	const gb = 1024 * 1024 * 1024
+	const mb = 1024 * 1024
+	if duckdbBytes >= gb {
+		return fmt.Sprintf("%dGB", duckdbBytes/gb)
+	}
+	return fmt.Sprintf("%dMB", duckdbBytes/mb)
 }
 
 // workerBillingSize returns the provisioned worker pod size for compute-usage

@@ -78,7 +78,7 @@ Key CLI flags for control-plane mode:
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
   - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
-  - Compute-usage billing (emit side): `--billing-ingest-url` / `--billing-ingest-token` (env `DUCKGRES_BILLING_INGEST_URL` / `DUCKGRES_BILLING_INGEST_TOKEN`). Both must be set to enable per-org compute-usage metering+emit; either unset disables it (usage ships nowhere, queries never fail). See `docs/design/billing-compute-seconds-plan.md` and "Compute-Usage Billing" below.
+  - Compute-usage billing needs no config: metering is always on for the remote backend and billing PULLS usage over the internal-secret-authed HTTP API (`GET /api/v1/billing/usage` + `POST /api/v1/billing/ack`). See `docs/design/billing-pull-api.md` and "Compute-Usage Billing" below.
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
 
 Key CLI flags for duckdb-service mode:
@@ -438,58 +438,75 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
 
 ## Compute-Usage Billing (managed-warehouse, remote backend only)
 
-duckgres meters per-org compute usage of worker pods and ships it to PostHog's
-public ingestion as `"managed warehouse compute usage"` capture events (billing
-sums the two raw metrics externally). Full design + decisions:
-`docs/design/billing-compute-seconds-plan.md`. Scope is the **emit side**, and
-**only** the remote/k8s backend (per-org worker pod with a known
-`WorkerProfile` size). Pipeline:
+duckgres meters per-org compute usage of worker pods into 60s buckets in the
+config store; the billing service **pulls** the accumulated usage over an HTTP
+API and acks a watermark, at which point duckgres deletes the acked buckets.
+Full design + decisions: `docs/design/billing-pull-api.md` (supersedes the
+push/capture reporting hop of `billing-compute-seconds-plan.md`; the metering
+side of that doc still applies). Scope is **only** the remote/k8s backend
+(per-org worker pod with a known `WorkerProfile` size). Pipeline:
 
 ```
-conn end → in-proc per-org counter (best-effort; never fails teardown)
+conn end → in-proc counter keyed (org, default team, query_source, worker size)
         │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
-        ▼  duckgres_org_compute_usage / duckgres_org_compute_drain_state
-   leader drain (~60s) → POST {DUCKGRES_BILLING_INGEST_URL}/capture (ship-then-delete)
+        ▼  duckgres_org_compute_usage (+ duckgres_compute_billing_cursor)
+billing: GET /api/v1/billing/usage (aggregated per key per UTC day, watermarks)
+       → POST /api/v1/billing/ack {watermark_high} → cursor advance + delete ≤ it
+safety:  leader-only GC hard-deletes buckets older than 30 days (WARN, alertable)
 ```
 
 Two raw metrics per connection over its full lifetime, using the **provisioned**
 worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
 ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
 **MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
-sub-GiB worker. Invariants for anyone touching this path:
+sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
+decimals (vCPU / GiB). `team_id` is the org's `default_team_id` (an integer —
+PostHog's `Team.id`; a JSON NUMBER on every API surface, BIGINT in the config
+store, 0 = "no default team"; resolved from the config snapshot at connection
+end); `query_source` is the
+`duckgres.query_source` session GUC (`standard` unless set; a mid-connection
+change bills the whole connection under the final value). Invariants for anyone
+touching this path:
 
 - **Metering is strictly best-effort and off the hot path.** A metering error
-  (counter, flush, drain) must NEVER block or fail a query or connection
-  teardown. The connection-end record is added to an in-process per-org counter
-  (map+mutex, microseconds, no I/O); everything downstream is async/retried.
-  `cp.computeMeter` is nil unless the remote backend is configured with both
-  ingest URL+token — every call site is nil-safe.
-- **Enable gate = both `DUCKGRES_BILLING_INGEST_URL` and
-  `DUCKGRES_BILLING_INGEST_TOKEN` set** (`ControlPlaneConfig.BillingMeteringEnabled`).
-  Either unset → metering disabled (logged once at startup, ships nowhere). The
-  env names are fixed (infra wires them); keep them exact.
+  (counter, flush) must NEVER block or fail a query or connection teardown. The
+  connection-end record is added to an in-process counter (map+mutex,
+  microseconds, no I/O); the flush is async. `cp.computeMeter` is nil outside
+  the remote backend — every call site is nil-safe. There is no enable knob:
+  the remote backend always meters.
 - **Worker size is plumbed onto the connection** (`server.SetConnectionWorkerSize`
   → `clientConn.workerMillicores/workerMiB`, set in `control.go::handleConnection`
   from `workerBillingSize(workerProfile)`, remote-only). `workerMillicores==0`
   (non-remote / unknown) → metering skipped. The metric is computed once at the
-  SAME teardown point as `CloseConnectionMetrics` (the `#841` lifetime defer).
+  SAME teardown point as `CloseConnectionMetrics` (the `#841` lifetime defer),
+  via `server.ConnectionBilling` (which also carries the query source).
 - **Bucket = connection-end time floored to 60s.** Flush carries the sub-unit
   remainder forward so rounding never loses counts across flushes. Buffer flush
-  is UPSERT-increment so all CP pods sum into one row.
-- **Drain is leader-only** (co-located under the janitor lease via
-  `JanitorLeaderManager.AttachLeaderLoop`), **ship-then-delete / at-least-once**:
-  only buckets `bucket_start ≤ now-60s-30s grace AND > last_drained_bucket` ship;
-  on HTTP 2xx → TXN advance high-water + DELETE row; on failure → keep + retry.
-  `event_uuid = hash(org_id, bucket_start)` + `timestamp = bucket_start` are
-  deterministic so a re-ship collapses onto the same ClickHouse row.
+  is UPSERT-increment so all CP pods sum into one row per key.
+- **Serve only closed buckets.** `watermark_high` = the newest bucket with
+  `bucket_start ≤ now − 60s − 30s grace` (grace > flush interval, so every
+  CP's contribution has landed before a minute is served). The GET aggregates
+  the window `(cursor, watermark_high]` into one row per
+  `(org, team, query_source, cpu, mem_gib)` per **UTC day** — response size is
+  bounded by active keys × days, so billing downtime can't make it explode.
+- **Ack is the only deletion path (plus the 30d GC).** `POST /billing/ack`
+  advances the single global cursor monotonically and deletes buckets
+  `≤ watermark_high` in one TXN (`AckComputeUsage`). Idempotent — re-acks and
+  stale acks are no-ops. An ack beyond the latest closed bucket is rejected
+  (400) so it can never delete buckets that were never served. Auth is the
+  admin internal secret (`RequireAdmin` on both routes, registered inside the
+  audited `/api/v1` group in `multitenant.go`).
+- **Safety GC is leader-only** (`runComputeUsageGC`, attached under the janitor
+  lease): hard-deletes buckets older than 30 days regardless of ack and logs a
+  WARN with the dropped count — nonzero means billing stopped pulling (alert).
 - **Graceful shutdown does a final flush** after connections drain to their
   natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
   last interval before exit.
-- Touching the meter/flush/drain/capture, the worker-size plumbing, or the
-  config knobs → update `controlplane/compute_meter_test.go`,
-  `compute_drain_test.go`, `compute_size_test.go`, the migration assertion in
-  `tests/configstore/migrations_postgres_test.go`, and the
-  `compute_usage_metering_wired` assertion in `tests/e2e-mw-dev/harness.sh`.
+- Touching the meter/flush/API/GC, the worker-size or query-source plumbing, or
+  the bucket key → update `controlplane/compute_meter_test.go`,
+  `compute_billing_api_test.go`, `compute_size_test.go`, the migration assertion
+  in `tests/configstore/migrations_postgres_test.go`, and the
+  `compute_usage_pull_api` assertion in `tests/e2e-mw-dev/harness.sh`.
 
 ## TODO Reference
 

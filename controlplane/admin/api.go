@@ -22,6 +22,8 @@ import (
 
 var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
 
+var errWarehouseStillExists = errors.New("managed warehouse still exists for org")
+
 // maxWarehousePutBodyBytes caps the admin PUT body. Warehouse payloads are
 // under 10 KB in practice; 1 MiB leaves room for future fields while keeping
 // the handler from loading unbounded input into memory.
@@ -199,10 +201,11 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
-	// DefaultTeamID is *string with the same semantics: nil = preserve, "" =
-	// clear (NULL), "x" = set. Nullable/optional — NULL is always valid.
+	// DefaultTeamID is *int64: nil = preserve, 0 = clear (NULL), n = set.
+	// (PostHog team ids start at 1, so 0 is a safe clear sentinel; the
+	// handler also maps an explicit JSON null onto it.)
 	if updates.DefaultTeamID != nil {
-		if *updates.DefaultTeamID == "" {
+		if *updates.DefaultTeamID == 0 {
 			fields["default_team_id"] = nil
 		} else {
 			fields["default_team_id"] = *updates.DefaultTeamID
@@ -225,6 +228,16 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 	returnRows := int64(0)
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		// Deleting an org while its managed warehouse row still exists would
+		// cascade the row away and leak the Duckling CR + infra behind it. The
+		// warehouse must be deprovisioned (which removes the row) first.
+		var warehouses int64
+		if err := tx.Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", name).Count(&warehouses).Error; err != nil {
+			return err
+		}
+		if warehouses > 0 {
+			return errWarehouseStillExists
+		}
 		if err := tx.Where("org_id = ?", name).Delete(&configstore.OrgUser{}).Error; err != nil {
 			return err
 		}
@@ -399,6 +412,7 @@ func managedWarehouseUpsertColumns() []string {
 		// DB column name. Mismatching this against the actual column makes
 		// the ON CONFLICT … DO UPDATE clause throw 42703.
 		"duck_lake_version",
+		"duckling_name",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",
 		"metadata_store_kind",
@@ -597,7 +611,15 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
 	if _, ok := fields["default_team_id"]; ok {
-		merged.DefaultTeamID = updates.DefaultTeamID
+		// Key present: a number sets, and an explicit JSON null (which
+		// unmarshals to a nil pointer) clears — normalize null onto the 0
+		// clear-sentinel so the store layer sees one shape.
+		if updates.DefaultTeamID == nil {
+			zero := int64(0)
+			merged.DefaultTeamID = &zero
+		} else {
+			merged.DefaultTeamID = updates.DefaultTeamID
+		}
 	}
 
 	// Audit detail: which fields changed and their old → new values, so the
@@ -616,7 +638,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
 	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
 	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
-	addChange("default_team_id", orgStrPtr(existing.DefaultTeamID), orgStrPtr(merged.DefaultTeamID))
+	addChange("default_team_id", orgInt64Ptr(existing.DefaultTeamID), orgInt64Ptr(merged.DefaultTeamID))
 	if len(changes) > 0 {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}
@@ -637,6 +659,10 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 	name := c.Param("id")
 	ok, err := h.store.DeleteOrg(name)
 	if err != nil {
+		if errors.Is(err, errWarehouseStillExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": "warehouse still exists — deprovision it and wait for teardown to complete before deleting the org"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -679,6 +705,15 @@ func orgStrPtr(s *string) string {
 		return "(unset)"
 	}
 	return orgStr(*s)
+}
+
+// orgInt64Ptr renders an optional org config integer (nil or 0 == unset) for
+// audit detail.
+func orgInt64Ptr(v *int64) string {
+	if v == nil || *v == 0 {
+		return "(unset)"
+	}
+	return fmt.Sprintf("%d", *v)
 }
 
 func validateOrgMutationPayload(org *configstore.Org) error {

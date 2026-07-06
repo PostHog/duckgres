@@ -77,14 +77,15 @@ type K8sWorkerPool struct {
 
 	// Headroom controller holds preemptible low-priority placeholder pods so a
 	// worker spawn schedules immediately (preempting a placeholder) instead of
-	// waiting on a fresh Karpenter node. headroomNodes>0 selects the CONSTANT
-	// mode (a fixed number of node-sized placeholders, demand-independent — the
-	// prod default); otherwise headroomPercent selects the legacy
-	// demand-proportional mode. Both 0 = disabled (placeholders converge to 0).
-	headroomNodes                int
-	headroomPercent              int
+	// waiting on a fresh Karpenter node. Slot count and size are derived
+	// dynamically from the worker spawn log (see headroom.go) — enabled iff
+	// placeholderPriorityClassName is set, disabled pools converge to zero.
 	placeholderImage             string
 	placeholderPriorityClassName string
+	// headroomDownSince marks when the reconcile first saw more placeholders
+	// than the target — the lazy scale-down timer. Touched only by the
+	// leader-gated reconcileHeadroom (single goroutine).
+	headroomDownSince time.Time
 
 	// activatingHBInterval overrides the activating-row heartbeat cadence
 	// (0 = activatingHeartbeatInterval). Set small in tests; not configured in prod.
@@ -196,8 +197,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerTolerationValue:   cfg.WorkerTolerationValue,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
 
-		headroomNodes:                cfg.HeadroomNodes,
-		headroomPercent:              cfg.HeadroomPercent,
 		placeholderImage:             cfg.PlaceholderImage,
 		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
 

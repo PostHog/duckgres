@@ -206,15 +206,18 @@ func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 }
 
 // ConnectionBilling returns the data needed to meter one connection's
-// compute-usage at teardown: the org, the provisioned worker size in
-// milli-units, and the connection's elapsed lifetime. millicores == 0 means
-// metering should be skipped (unknown worker size). Call at the same teardown
-// point as CloseConnectionMetrics.
-func ConnectionBilling(cc *clientConn) (orgID string, millicores, mib int64, dur time.Duration) {
+// compute-usage at teardown: the org, the session's query source (the
+// `duckgres.query_source` GUC — "standard" unless the client set it), the
+// provisioned worker size in milli-units, and the connection's elapsed
+// lifetime. millicores == 0 means metering should be skipped (unknown worker
+// size). Call at the same teardown point as CloseConnectionMetrics. A
+// mid-connection GUC change is not split: the whole connection is metered
+// under the final value (documented in docs/design/billing-pull-api.md).
+func ConnectionBilling(cc *clientConn) (orgID, querySource string, millicores, mib int64, dur time.Duration) {
 	if cc == nil {
-		return "", 0, 0, 0
+		return "", "", 0, 0, 0
 	}
-	return cc.orgID, cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
+	return cc.orgID, cc.QuerySource(), cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
 }
 
 // CancelClientConn cancels the context of a clientConn.

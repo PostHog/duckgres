@@ -80,6 +80,7 @@ func TestReconcileProvisioningSuccessEmitsEvent(t *testing.T) {
 	fs := newFakeStore()
 	fs.warehouses["org-ok"] = &configstore.ManagedWarehouse{
 		OrgID:         "org-ok",
+		DucklingName:  "org-ok",
 		State:         configstore.ManagedWarehouseStateProvisioning,
 		CreatedAt:     time.Now(),
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{Kind: configstore.MetadataStoreKindExternal},
@@ -89,7 +90,7 @@ func TestReconcileProvisioningSuccessEmitsEvent(t *testing.T) {
 	cr := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "k8s.posthog.com/v1alpha1",
 		"kind":       "Duckling",
-		"metadata":   map[string]interface{}{"name": ducklingName("org-ok"), "namespace": ducklingNamespace},
+		"metadata":   map[string]interface{}{"name": "org-ok", "namespace": ducklingNamespace},
 		"status": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
 				"type": "external", "endpoint": "rds.example", "password": "secret", "user": "postgres", "database": "postgres",
@@ -148,6 +149,7 @@ func TestReconcileProvisioningTimeoutEmitsFailure(t *testing.T) {
 	fs := newFakeStore()
 	fs.warehouses["org-slow"] = &configstore.ManagedWarehouse{
 		OrgID:         "org-slow",
+		DucklingName:  "org-slow",
 		State:         configstore.ManagedWarehouseStateProvisioning,
 		CreatedAt:     time.Now().Add(-31 * time.Minute),
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{Kind: configstore.MetadataStoreKindCnpgShard},
@@ -180,6 +182,7 @@ func TestReconcileProvisioningCrossplaneFailureEmitsFailure(t *testing.T) {
 	fs := newFakeStore()
 	fs.warehouses["org-xp"] = &configstore.ManagedWarehouse{
 		OrgID:         "org-xp",
+		DucklingName:  "org-xp",
 		State:         configstore.ManagedWarehouseStateProvisioning,
 		CreatedAt:     time.Now().Add(-15 * time.Minute), // past the 10-min Crossplane grace, under the 30-min timeout
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{Kind: configstore.MetadataStoreKindExternal},
@@ -188,7 +191,7 @@ func TestReconcileProvisioningCrossplaneFailureEmitsFailure(t *testing.T) {
 	cr := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "k8s.posthog.com/v1alpha1",
 		"kind":       "Duckling",
-		"metadata":   map[string]interface{}{"name": ducklingName("org-xp"), "namespace": ducklingNamespace},
+		"metadata":   map[string]interface{}{"name": "org-xp", "namespace": ducklingNamespace},
 		"status": map[string]interface{}{
 			"conditions": []interface{}{
 				map[string]interface{}{"type": "Synced", "status": "False", "message": "cannot create metadata store: InvalidParameterException"},
@@ -222,14 +225,15 @@ func TestReconcileDeletingSuccessEmitsEvent(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-del"] = &configstore.ManagedWarehouse{
-		OrgID: "org-del",
-		State: configstore.ManagedWarehouseStateDeleting,
+		OrgID:        "org-del",
+		DucklingName: "org-del",
+		State:        configstore.ManagedWarehouseStateDeleting,
 	}
 	ctx := context.Background()
 	cr := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "k8s.posthog.com/v1alpha1",
 		"kind":       "Duckling",
-		"metadata":   map[string]interface{}{"name": ducklingName("org-del"), "namespace": ducklingNamespace},
+		"metadata":   map[string]interface{}{"name": "org-del", "namespace": ducklingNamespace},
 	}}
 	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create CR: %v", err)
@@ -257,14 +261,15 @@ func TestReconcileDeletingFailureEmitsEvent(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-stuck"] = &configstore.ManagedWarehouse{
-		OrgID: "org-stuck",
-		State: configstore.ManagedWarehouseStateDeleting,
+		OrgID:        "org-stuck",
+		DucklingName: "org-stuck",
+		State:        configstore.ManagedWarehouseStateDeleting,
 	}
 	ctx := context.Background()
 	cr := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "k8s.posthog.com/v1alpha1",
 		"kind":       "Duckling",
-		"metadata":   map[string]interface{}{"name": ducklingName("org-stuck"), "namespace": ducklingNamespace},
+		"metadata":   map[string]interface{}{"name": "org-stuck", "namespace": ducklingNamespace},
 	}}
 	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create CR: %v", err)

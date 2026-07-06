@@ -26,6 +26,7 @@ import (
 	"github.com/posthog/duckgres/configresolve"
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/crashhandler"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -50,6 +51,13 @@ func main() {
 	// process on dropped network connections. Same rationale as the
 	// all-in-one binary.
 	signal.Ignore(syscall.SIGPIPE)
+
+	// The native crash handler self-installs from a C constructor (importing
+	// the package links it in): a fatal signal on a native (cgo) thread must
+	// kill the process with a native backtrace, not wedge it forever.
+	if !crashhandler.Installed() {
+		slog.Warn("Native crash handler NOT installed; fatal signals on native threads may wedge the process.")
+	}
 
 	// CLIInputs-backed flags are registered via the shared helper so this
 	// binary and the all-in-one duckgres binary cannot drift on the
@@ -235,8 +243,6 @@ func main() {
 			WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
 			AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
 			WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
-			HeadroomNodes:                resolved.K8sHeadroomNodes,
-			HeadroomPercent:              resolved.K8sHeadroomPercent,
 			PlaceholderImage:             resolved.K8sPlaceholderImage,
 			PlaceholderPriorityClassName: resolved.K8sPlaceholderPriorityClassName,
 			WorkerProfileMinCPU:          resolved.K8sWorkerProfileMinCPU,

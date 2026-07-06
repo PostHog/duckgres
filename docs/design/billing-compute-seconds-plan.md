@@ -1,6 +1,10 @@
 # Compute-Seconds Billing — Design / Implementation Plan
 
-Status: **DRAFT — iterating**. Last updated 2026-06-16.
+Status: **PARTIALLY SUPERSEDED**. The metering side (connection wall-clock ×
+provisioned worker size → 60s config-store buckets) shipped and still applies;
+the reporting hop (leader drain → PostHog ingestion capture events,
+`DUCKGRES_BILLING_INGEST_URL/_TOKEN`) was replaced by the pull API — see
+[`billing-pull-api.md`](./billing-pull-api.md). Last updated 2026-07-06.
 
 This is a living design doc. Decisions marked ✅ are locked; ❓ are open forks.
 

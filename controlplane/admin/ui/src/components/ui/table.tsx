@@ -40,7 +40,7 @@ const TableHead = React.forwardRef<HTMLTableCellElement, React.ThHTMLAttributes<
     <th
       ref={ref}
       className={cn(
-        "h-9 px-3 text-left align-middle text-xs font-medium uppercase tracking-wide text-muted-foreground [&:has([role=checkbox])]:pr-0",
+        "h-9 whitespace-nowrap px-3 text-left align-middle text-xs font-medium uppercase tracking-wide text-muted-foreground [&:has([role=checkbox])]:pr-0",
         className,
       )}
       {...props}
@@ -51,7 +51,11 @@ TableHead.displayName = "TableHead";
 
 const TableCell = React.forwardRef<HTMLTableCellElement, React.TdHTMLAttributes<HTMLTableCellElement>>(
   ({ className, ...props }, ref) => (
-    <td ref={ref} className={cn("px-3 py-2 align-middle", className)} {...props} />
+    // whitespace-nowrap: cell content (UUIDs, hostnames, timestamps) must never
+    // wrap and grow the row — the Table wrapper is overflow-auto, so wide
+    // content horizontal-scrolls instead. Override per-cell via className when
+    // a column genuinely needs to wrap.
+    <td ref={ref} className={cn("whitespace-nowrap px-3 py-2 align-middle", className)} {...props} />
   ),
 );
 TableCell.displayName = "TableCell";

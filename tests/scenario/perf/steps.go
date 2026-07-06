@@ -66,6 +66,7 @@ type stepSpec struct {
 	Database                 string
 	OutputSubdir             string
 	ReadOnly                 bool
+	FailOnQueryErrors        bool
 	FlightAddr               string
 	FlightServerName         string
 	FlightInsecureSkipVerify bool
@@ -179,7 +180,7 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		Summary:   summary,
 	}
 	e.state.StoreResult(result)
-	if summary.TotalErrors > 0 {
+	if spec.FailOnQueryErrors && summary.TotalErrors > 0 {
 		return classified(ErrorClassPerf, fmt.Errorf("perf step %s recorded %d query error(s)", step.ID, summary.TotalErrors))
 	}
 	return nil
@@ -241,6 +242,7 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		Database:                 stringFromWith(step, "catalog", "ducklake"),
 		OutputSubdir:             stringFromWith(step, "output_subdir", "perf"),
 		ReadOnly:                 boolFromWith(step, "read_only", true),
+		FailOnQueryErrors:        boolFromWith(step, "fail_on_query_errors", true),
 		FlightAddr:               stringFromWith(step, "flight_addr", e.flightAddr),
 		FlightServerName:         stringFromWith(step, "flight_server_name", e.defaultFlightServerName(orgID)),
 		FlightInsecureSkipVerify: boolFromWith(step, "flight_insecure_skip_verify", e.flightInsecureSkipVerify),

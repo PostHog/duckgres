@@ -12,7 +12,7 @@ import { StateBadge } from "@/components/StateBadge";
 import { ShardBadge } from "@/components/ShardBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useDucklingDrift, useDucklingsMetadata, useOrgs } from "@/hooks/useApi";
-import { ducklingEntryFor, ducklingName, fmtInt } from "@/lib/format";
+import { ducklingEntryFor, fmtInt } from "@/lib/format";
 import type { DucklingDrift, Org } from "@/types/api";
 
 export function Orgs() {
@@ -57,7 +57,7 @@ export function Orgs() {
         accessorKey: "default_team_id",
         header: "Default team",
         cell: ({ getValue }) => {
-          const v = getValue() as string | null;
+          const v = getValue() as number | null;
           return v ? <span className="font-mono text-xs">{v}</span> : <span className="text-muted-foreground">—</span>;
         },
       },
@@ -112,12 +112,12 @@ export function Orgs() {
       {
         id: "duckling",
         header: "Duckling",
-        accessorFn: (o) => (o.warehouse ? o.warehouse.duckling_name || ducklingName(o.name) : ""),
-        cell: ({ row }) => {
-          const o = row.original;
-          const name = o.warehouse ? o.warehouse.duckling_name || ducklingName(o.name) : "";
-          return <span className="font-mono text-xs text-muted-foreground">{name || "—"}</span>;
-        },
+        accessorFn: (o) => o.warehouse?.duckling_name ?? "",
+        cell: ({ row }) => (
+          <span className="font-mono text-xs text-muted-foreground">
+            {row.original.warehouse?.duckling_name || "—"}
+          </span>
+        ),
       },
       {
         id: "shard",
