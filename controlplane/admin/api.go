@@ -228,15 +228,26 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 	returnRows := int64(0)
 	err := s.db().Transaction(func(tx *gorm.DB) error {
-		// Deleting an org while its managed warehouse row still exists would
-		// cascade the row away and leak the Duckling CR + infra behind it. The
-		// warehouse must be deprovisioned (which removes the row) first.
-		var warehouses int64
-		if err := tx.Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", name).Count(&warehouses).Error; err != nil {
+		// Deleting an org while a managed warehouse row is in a non-terminal
+		// state would leak the Duckling CR + AWS infra behind it, so those
+		// still block deletion. But deprovisioning does NOT remove the
+		// warehouse row — the provisioner tears the infra down and leaves the
+		// row in the terminal "deleted" state (controller.go reconcileDeleting).
+		// A "deleted" row means the infra is gone, so cascade it away here and
+		// let the org (and its unique database_name) be released. Without this,
+		// a fully deprovisioned org could never be deleted and its
+		// database_name would be squatted forever.
+		var liveWarehouses int64
+		if err := tx.Model(&configstore.ManagedWarehouse{}).
+			Where("org_id = ? AND state <> ?", name, configstore.ManagedWarehouseStateDeleted).
+			Count(&liveWarehouses).Error; err != nil {
 			return err
 		}
-		if warehouses > 0 {
+		if liveWarehouses > 0 {
 			return errWarehouseStillExists
+		}
+		if err := tx.Where("org_id = ?", name).Delete(&configstore.ManagedWarehouse{}).Error; err != nil {
+			return err
 		}
 		if err := tx.Where("org_id = ?", name).Delete(&configstore.OrgUser{}).Error; err != nil {
 			return err

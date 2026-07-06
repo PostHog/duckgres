@@ -116,7 +116,11 @@ client-go:
   cross-tenant read is denied.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling
   CR **fully** deletes (`kubectl wait --for=delete`, asserting the finalizer
-  cascade that drops the cnpg role+db completed). Same-id **re-provision** is
+  cascade that drops the cnpg role+db completed). Then `DELETE /orgs/:id`
+  cascades the terminal `deleted` warehouse row + the org row away and the org's
+  `database_name` becomes available again (`database-name/check` flips
+  `false`→`true`) — the regression net for the name being squatted forever after
+  a completed deprovision. Same-id **re-provision** is
   *not* done in-Job: a clean slate needs DROPping a possibly-stranded cnpg role,
   which only `run.sh` (on the runner, with cnpg-shards exec) can do — so the
   stranded-cnpg-role regression (#649/#650/#11518/#11522) is covered **across
