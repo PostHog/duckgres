@@ -460,8 +460,10 @@ worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
 ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
 **MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
 sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
-decimals (vCPU / GiB). `team_id` is the org\'s `default_team_id` (resolved from
-the config snapshot at connection end); `query_source` is the
+decimals (vCPU / GiB). `team_id` is the org's `default_team_id` (an integer —
+PostHog's `Team.id`; a JSON NUMBER on every API surface, BIGINT in the config
+store, 0 = "no default team"; resolved from the config snapshot at connection
+end); `query_source` is the
 `duckgres.query_source` session GUC (`standard` unless set; a mid-connection
 change bills the whole connection under the final value). Invariants for anyone
 touching this path:
@@ -483,10 +485,10 @@ touching this path:
   is UPSERT-increment so all CP pods sum into one row per key.
 - **Serve only closed buckets.** `watermark_high` = the newest bucket with
   `bucket_start ≤ now − 60s − 30s grace` (grace > flush interval, so every
-  CP\'s contribution has landed before a minute is served). The GET aggregates
+  CP's contribution has landed before a minute is served). The GET aggregates
   the window `(cursor, watermark_high]` into one row per
   `(org, team, query_source, cpu, mem_gib)` per **UTC day** — response size is
-  bounded by active keys × days, so billing downtime can\'t make it explode.
+  bounded by active keys × days, so billing downtime can't make it explode.
 - **Ack is the only deletion path (plus the 30d GC).** `POST /billing/ack`
   advances the single global cursor monotonically and deletes buckets
   `≤ watermark_high` in one TXN (`AckComputeUsage`). Idempotent — re-acks and

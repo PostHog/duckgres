@@ -53,7 +53,7 @@ function orgToForm(o: {
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
   hostname_alias: string | null;
-  default_team_id: string | null;
+  default_team_id: number | null;
 }): FormState {
   return {
     max_workers: String(o.max_workers),
@@ -63,7 +63,7 @@ function orgToForm(o: {
     default_worker_ttl: o.default_worker_ttl,
     default_worker_min_hot_idle: String(o.default_worker_min_hot_idle),
     hostname_alias: o.hostname_alias ?? "",
-    default_team_id: o.default_team_id ?? "",
+    default_team_id: o.default_team_id == null ? "" : String(o.default_team_id),
   };
 }
 
@@ -107,6 +107,13 @@ export function OrgDetail() {
 
   const save = async () => {
     setMsg(null);
+    // default_team_id is an integer on the wire (PostHog team id); the text
+    // input needs a digits-only guard so junk can't silently clear it.
+    const teamIdText = form.default_team_id.trim();
+    if (teamIdText !== "" && !/^\d+$/.test(teamIdText)) {
+      setMsg({ kind: "err", text: "Default team id must be a number (or empty to clear)." });
+      return;
+    }
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
       max_vcpus: Number(form.max_vcpus) || 0,
@@ -115,7 +122,7 @@ export function OrgDetail() {
       default_worker_ttl: form.default_worker_ttl,
       default_worker_min_hot_idle: Number(form.default_worker_min_hot_idle) || 0,
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
-      default_team_id: form.default_team_id === "" ? "" : form.default_team_id,
+      default_team_id: teamIdText === "" ? 0 : Number(teamIdText),
     };
     try {
       await update.mutateAsync(body);
