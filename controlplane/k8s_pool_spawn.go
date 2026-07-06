@@ -295,6 +295,11 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		return err
 	}
 
+	// Feed the dynamic headroom controller: log this spawn's shape so the
+	// leader sizes the placeholder pool from real recent spawns. Strictly
+	// best-effort — a log failure must never fail the spawn.
+	p.recordSpawnForHeadroom(pod)
+
 	// Wait for pod to get an IP via informer (no polling).
 	ready, err := p.waitForPodReady(ctx, podName, workerPodReadyTimeout)
 	if err != nil {

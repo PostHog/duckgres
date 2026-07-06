@@ -160,6 +160,16 @@ normal `go test ./...` lane.
   which re-exec the test binary and crash it on a C-created thread, in a cgo
   call, and in pure Go code, asserting death-by-signal + the stderr marker
   (and that Go panics stay ordinary panics).
+- **Dynamic headroom placeholders (`controlplane/headroom.go`)** — the e2e CP
+  deliberately sets no `DUCKGRES_K8S_PLACEHOLDER_PRIORITY_CLASS`, so headroom
+  stays disabled in-Job: real placeholder pods would consume Karpenter capacity
+  in the shared mw-dev cluster and outlive the per-PR CP that owns them
+  (nothing deletes them after teardown — the reconcile that converges them to
+  zero dies with the CP). Slot-count/size/cap/scale-down behavior is covered by
+  the fake-clientset unit tests in `controlplane/headroom_test.go`; the
+  spawn-log SQL by `tests/configstore/spawn_log_postgres_test.go` (real
+  postgres); spawn recording itself runs in-Job on every worker spawn
+  (best-effort, so it cannot fail activation).
 - **Oversized Bind-parameter rejection (#717)** — rejecting a Bind message whose
   declared parameter length exceeds the remaining message body requires crafting
   a malformed wire-protocol packet on a raw socket (through TLS + auth); libpq
