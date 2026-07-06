@@ -229,9 +229,17 @@ func (s *gormStore) IsDatabaseNameAvailable(name string) (bool, error) {
 // SetWarehouseDeleting atomically transitions a warehouse from expectedState to deleting.
 // Returns gorm.ErrRecordNotFound if no warehouse exists, or an error if the CAS fails.
 func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
+	// Also stamp a status_message so a client polling warehouse/status sees a
+	// live "Deprovisioning..." message during teardown — mirroring how the
+	// provisioning phases stamp status_message. Without this the message stays
+	// stale (e.g. "Infrastructure ready") until the provisioner flips it to
+	// "Resources deleted" at the very end.
 	result := s.cs.DB().Model(&configstore.ManagedWarehouse{}).
 		Where("org_id = ? AND state = ?", orgID, expectedState).
-		Update("state", configstore.ManagedWarehouseStateDeleting)
+		Updates(map[string]interface{}{
+			"state":          configstore.ManagedWarehouseStateDeleting,
+			"status_message": "Deprovisioning...",
+		})
 	if result.Error != nil {
 		return result.Error
 	}

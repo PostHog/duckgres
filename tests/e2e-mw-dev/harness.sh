@@ -2167,6 +2167,22 @@ tenant_isolation() { # orgA pwA orgB pwB
 lifecycle_teardown_cnpg() { # org
   log "lifecycle: deprovision $1 + assert Duckling CR fully deleted"
   api_post "$1" deprovision >/dev/null
+  # The status endpoint is watchable throughout teardown: right after the 202
+  # the warehouse reports a deprovisioning state (deleting, or deleted if the
+  # async provisioner already finished), never still-ready — so /data-ops can
+  # poll warehouse/status until it reaches "deleted", then send the delete.
+  # While deleting, status_message reads "Deprovisioning..." (the deprovision
+  # analogue of the provisioning-phase messages) rather than a stale ready line.
+  status_json="$(api_get "$1" warehouse/status)"
+  st="$(printf '%s' "$status_json" | jq -r '.state')"
+  msg="$(printf '%s' "$status_json" | jq -r '.status_message')"
+  case "$st" in
+    deleting)
+      [ "$msg" = "Deprovisioning..." ] \
+        || fail "warehouse $1 deleting but status_message=$msg (expected 'Deprovisioning...')";;
+    deleted) ;;
+    *) fail "warehouse $1 status=$st right after deprovision (expected deleting/deleted — status not watchable)";;
+  esac
   wait_state "$1" deleted 600
   if ! "$KUBECTL" -n ducklings wait --for=delete "duckling/$1" --timeout=420s >/dev/null 2>&1; then
     fail "Duckling CR $1 did not fully delete within 420s (finalizer/cnpg cascade stuck)"

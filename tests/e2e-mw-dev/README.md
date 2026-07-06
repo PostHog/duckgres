@@ -116,7 +116,10 @@ client-go:
   cross-tenant read is denied.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling
   CR **fully** deletes (`kubectl wait --for=delete`, asserting the finalizer
-  cascade that drops the cnpg role+db completed). Then `DELETE /orgs/:id`
+  cascade that drops the cnpg role+db completed). Right after the deprovision
+  202 the warehouse status is watchable — state `deleting` with
+  `status_message="Deprovisioning..."` — so a UI can poll `warehouse/status`
+  until `deleted`. Then `DELETE /orgs/:id`
   cascades the terminal `deleted` warehouse row + the org row away and the org's
   `database_name` becomes available again (`database-name/check` flips
   `false`→`true`) — the regression net for the name being squatted forever after

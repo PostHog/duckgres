@@ -171,6 +171,7 @@ func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore
 		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
 	}
 	w.State = configstore.ManagedWarehouseStateDeleting
+	w.StatusMessage = "Deprovisioning..."
 	return nil
 }
 
@@ -409,6 +410,11 @@ func TestDeprovisionReadyWarehouse(t *testing.T) {
 	}
 	if store.warehouses["analytics"].State != configstore.ManagedWarehouseStateDeleting {
 		t.Fatalf("expected deleting state, got %q", store.warehouses["analytics"].State)
+	}
+	// The status_message flips to a live "Deprovisioning..." so a client polling
+	// warehouse/status sees progress rather than the stale ready message.
+	if got := store.warehouses["analytics"].StatusMessage; got != "Deprovisioning..." {
+		t.Fatalf("expected status_message %q, got %q", "Deprovisioning...", got)
 	}
 }
 
