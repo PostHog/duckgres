@@ -48,6 +48,15 @@ var (
 	env            = configloader.Env
 )
 
+func validateRunMode(mode string) error {
+	switch mode {
+	case "standalone", "control-plane", "duckdb-service":
+		return nil
+	default:
+		return fmt.Errorf("unsupported --mode %q; supported modes: standalone, control-plane, duckdb-service", mode)
+	}
+}
+
 func main() {
 	// Ignore SIGPIPE to prevent DuckDB's C++ code (and libraries like libpq
 	// inside DuckLake) from crashing the process when a network connection
@@ -216,6 +225,9 @@ func main() {
 	if *showHelp {
 		flag.Usage()
 		os.Exit(0)
+	}
+	if err := validateRunMode(*mode); err != nil {
+		fatal(err.Error())
 	}
 
 	resolved := configresolve.ResolveEffective(fileCfg, harvestCLIInputs(), os.Getenv, func(msg string) {

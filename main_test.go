@@ -14,6 +14,23 @@ func envFromMap(values map[string]string) func(string) string {
 	}
 }
 
+func TestValidateRunModeRejectsRemovedQueryLogWriter(t *testing.T) {
+	for _, mode := range []string{"standalone", "control-plane", "duckdb-service"} {
+		if err := validateRunMode(mode); err != nil {
+			t.Fatalf("expected mode %q to be valid: %v", mode, err)
+		}
+	}
+
+	err := validateRunMode("query-log-writer")
+	if err == nil {
+		t.Fatal("expected removed query-log-writer mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "unsupported --mode") ||
+		!strings.Contains(err.Error(), "standalone, control-plane, duckdb-service") {
+		t.Fatalf("unexpected error for removed mode: %v", err)
+	}
+}
+
 func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	fileCfg := &FileConfig{
 		Host:       "file-host",
@@ -335,6 +352,81 @@ func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("expected warning containing %q, warnings: %v", w, warns)
+		}
+	}
+}
+
+func TestResolveEffectiveConfigDeprecatedKafkaQueryLogEnvDisablesLogging(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_QUERY_LOG_SINK":          "kafka",
+		"DUCKGRES_QUERY_LOG_KAFKA_BROKERS": "redpanda:9092",
+		"DUCKGRES_QUERY_LOG_KAFKA_TOPIC":   "duckgres_query_log",
+	}
+
+	var warns []string
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{
+		Set:      map[string]bool{"query-log": true},
+		QueryLog: true,
+	}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.QueryLog.Enabled {
+		t.Fatal("expected deprecated Kafka query-log sink env to disable query logging")
+	}
+	wantWarnings := []string{
+		"DUCKGRES_QUERY_LOG_SINK=kafka is no longer supported",
+		"DUCKGRES_QUERY_LOG_KAFKA_* is no longer supported",
+	}
+	for _, want := range wantWarnings {
+		found := false
+		for _, got := range warns {
+			if strings.Contains(got, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected warning containing %q, warnings: %v", want, warns)
+		}
+	}
+}
+
+func TestResolveEffectiveConfigDeprecatedKafkaQueryLogFileDisablesLogging(t *testing.T) {
+	enabled := true
+	fileCfg := &FileConfig{
+		QueryLog: QueryLogFileConfig{
+			Enabled:        &enabled,
+			DeprecatedSink: "kafka",
+			DeprecatedKafka: map[string]any{
+				"brokers": []string{"redpanda:9092"},
+				"topic":   "duckgres_query_log",
+			},
+		},
+	}
+
+	var warns []string
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.QueryLog.Enabled {
+		t.Fatal("expected deprecated Kafka query-log sink config to disable query logging")
+	}
+	wantWarnings := []string{
+		"query_log.sink=kafka is no longer supported",
+		"query_log.kafka is no longer supported",
+	}
+	for _, want := range wantWarnings {
+		found := false
+		for _, got := range warns {
+			if strings.Contains(got, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected warning containing %q, warnings: %v", want, warns)
 		}
 	}
 }

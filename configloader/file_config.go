@@ -71,6 +71,8 @@ type QueryLogFileConfig struct {
 	BatchSize            int    `yaml:"batch_size"`
 	CompactInterval      string `yaml:"compact_interval"`
 	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"`
+	DeprecatedSink       string `yaml:"sink"`  // Only retained to reject stale Kafka query-log config.
+	DeprecatedKafka      any    `yaml:"kafka"` // Only retained to reject stale Kafka query-log config.
 }
 
 type TLSConfig struct {
