@@ -1403,17 +1403,7 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	if memReq != "" {
-		memBytes := parseK8sMemory(memReq)
-		if memBytes > 0 {
-			duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
-			const gb = 1024 * 1024 * 1024
-			const mb = 1024 * 1024
-			if duckdbBytes >= gb {
-				memLimit = fmt.Sprintf("%dGB", duckdbBytes/gb)
-			} else {
-				memLimit = fmt.Sprintf("%dMB", duckdbBytes/mb)
-			}
-		}
+		memLimit = duckdbMemoryLimitForPodMemory(parseK8sMemory(memReq))
 	}
 
 	if cpuReq != "" {
@@ -1421,6 +1411,26 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	return memLimit, threads
+}
+
+// duckdbMemoryLimitForPodMemory formats the DuckDB memory_limit for a worker
+// pod of the given memory size: 75% of the pod, leaving the remainder as
+// headroom for everything memory_limit does NOT govern (DuckDB C++ catalog
+// objects, postgres_scanner/libpq result buffers, the Go runtime, page cache).
+// Returns "" when memBytes is 0/unparseable (DuckDB then auto-detects).
+// Shared between session sizing (workerDuckDBLimits) and the spawn-time
+// DUCKGRES_MEMORY_LIMIT env so the two can never disagree.
+func duckdbMemoryLimitForPodMemory(memBytes uint64) string {
+	if memBytes == 0 {
+		return ""
+	}
+	duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
+	const gb = 1024 * 1024 * 1024
+	const mb = 1024 * 1024
+	if duckdbBytes >= gb {
+		return fmt.Sprintf("%dGB", duckdbBytes/gb)
+	}
+	return fmt.Sprintf("%dMB", duckdbBytes/mb)
 }
 
 // workerBillingSize returns the provisioned worker pod size for compute-usage
