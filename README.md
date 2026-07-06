@@ -103,16 +103,6 @@ and profiling-derived resource usage. `cpu_time_s` is DuckDB cumulative
 CPU/thread time in seconds, and `peak_buffer_memory_bytes` is DuckDB's
 `system_peak_buffer_memory` in bytes, not process RSS.
 
-The default `query_log.sink` is `ducklake`, which writes directly to
-`ducklake.system.query_log`. Set `query_log.sink: kafka` to publish JSON query
-log events to Kafka instead; the Kafka message key is `org_id`, and each
-payload includes `schema_version`, `event_id`, and `emitted_at`. Run
-`duckgres --mode query-log-writer` from a Kubernetes build as a separate
-DuckDB-linking process to consume those events and write them into each
-tenant's `ducklake.system.query_log`. The writer stores `event_id` and uses it
-to skip duplicates during normal single-consumer Kafka replay; it is not a
-storage-level unique constraint.
-
 ```sql
 SELECT event_time, user_name, org_id, query_duration_ms, cpu_time_s,
        peak_buffer_memory_bytes, postgres_scan_ms, query
@@ -225,19 +215,8 @@ rate_limit:
 
 query_log:
   enabled: true
-  # Default: ducklake. Set to kafka to publish per-query events for an
-  # external query-log writer (`duckgres --mode query-log-writer`, Kubernetes build).
-  sink: ducklake
   flush_interval: "5s"
   batch_size: 1000
-  kafka:
-    brokers:
-      - "redpanda:9092"
-    topic: "duckgres_query_log"
-    # Default: duckgres-query-log
-    client_id: "duckgres-query-log"
-    # Default: duckgres-query-log-writer
-    group_id: "duckgres-query-log-writer"
 ```
 
 Run with config file:
@@ -275,13 +254,8 @@ Run with config file:
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
 | `DUCKGRES_QUERY_LOG_ENABLED` | Enable per-query logging | `true` |
-| `DUCKGRES_QUERY_LOG_SINK` | Query-log destination: `ducklake` writes `ducklake.system.query_log`; `kafka` publishes JSON events | `ducklake` |
-| `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval. In Kafka mode this controls producer publish flushes and query-log-writer per-org DuckLake flushes. | `5s` |
-| `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size. In Kafka mode this controls producer Kafka batches and query-log-writer per-org DuckLake insert batches. | `1000` |
-| `DUCKGRES_QUERY_LOG_KAFKA_BROKERS` | Comma-separated Kafka bootstrap brokers used when `DUCKGRES_QUERY_LOG_SINK=kafka` | - |
-| `DUCKGRES_QUERY_LOG_KAFKA_TOPIC` | Kafka topic for query-log events; required for Kafka mode | - |
-| `DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID` | Kafka client ID used by the query-log producer | `duckgres-query-log` |
-| `DUCKGRES_QUERY_LOG_KAFKA_GROUP_ID` | Kafka consumer group used by `duckgres --mode query-log-writer` | `duckgres-query-log-writer` |
+| `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval for direct DuckLake writes | `5s` |
+| `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size for direct DuckLake inserts | `1000` |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
@@ -376,7 +350,7 @@ Options:
   -threads int             DuckDB threads per session
   -process-isolation       Enable process isolation (spawn child process per connection)
   -idle-timeout string     Connection idle timeout (e.g., '30m', '1h', '-1' to disable)
-  -mode string             Run mode: standalone (default), control-plane, duckdb-service, or query-log-writer (Kubernetes build)
+  -mode string             Run mode: standalone (default), control-plane, or duckdb-service
   -process-min-workers int Pre-warm process worker count at startup (control-plane mode, default 0)
   -process-max-workers int Max process workers, 0=auto-derived (control-plane mode)
   -process-retire-on-session-end
@@ -657,7 +631,7 @@ GROUP BY name;
 
 ## Architecture
 
-Duckgres supports four run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), **duckdb-service** (worker process mode used by the control plane), and **query-log-writer** (Kubernetes-build service mode that drains Kafka query-log events into tenant DuckLakes).
+Duckgres supports three run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), and **duckdb-service** (worker process mode used by the control plane).
 
 ### Standalone Mode
 

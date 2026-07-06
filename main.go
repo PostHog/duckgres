@@ -31,14 +31,13 @@ type FileConfig = configloader.FileConfig
 // the configloader. prefix on every line. The actual resolver now lives in
 // the configresolve package and takes *configloader.FileConfig directly.
 type (
-	ProcessFileConfig       = configloader.ProcessFileConfig
-	K8sFileConfig           = configloader.K8sFileConfig
-	QueryLogFileConfig      = configloader.QueryLogFileConfig
-	QueryLogKafkaFileConfig = configloader.QueryLogKafkaFileConfig
-	TLSConfig               = configloader.TLSConfig
-	ACMEConfig              = configloader.ACMEConfig
-	RateLimitFileConfig     = configloader.RateLimitFileConfig
-	DuckLakeFileConfig      = configloader.DuckLakeFileConfig
+	ProcessFileConfig   = configloader.ProcessFileConfig
+	K8sFileConfig       = configloader.K8sFileConfig
+	QueryLogFileConfig  = configloader.QueryLogFileConfig
+	TLSConfig           = configloader.TLSConfig
+	ACMEConfig          = configloader.ACMEConfig
+	RateLimitFileConfig = configloader.RateLimitFileConfig
+	DuckLakeFileConfig  = configloader.DuckLakeFileConfig
 )
 
 // loadConfigFile + env are thin wrappers around configloader for back-compat
@@ -48,6 +47,15 @@ var (
 	loadConfigFile = configloader.LoadFile
 	env            = configloader.Env
 )
+
+func validateRunMode(mode string) error {
+	switch mode {
+	case "standalone", "control-plane", "duckdb-service":
+		return nil
+	default:
+		return fmt.Errorf("unsupported --mode %q; supported modes: standalone, control-plane, duckdb-service", mode)
+	}
+}
 
 func main() {
 	// Ignore SIGPIPE to prevent DuckDB's C++ code (and libraries like libpq
@@ -96,7 +104,7 @@ func main() {
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
-	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, duckdb-service, or query-log-writer")
+	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
 	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
@@ -218,6 +226,9 @@ func main() {
 		flag.Usage()
 		os.Exit(0)
 	}
+	if err := validateRunMode(*mode); err != nil {
+		fatal(err.Error())
+	}
 
 	resolved := configresolve.ResolveEffective(fileCfg, harvestCLIInputs(), os.Getenv, func(msg string) {
 		slog.Warn(msg)
@@ -302,15 +313,6 @@ func main() {
 			BearerToken:  token,
 			MaxSessions:  maxSessions,
 		})
-		return
-	}
-
-	// Handle query-log-writer mode. This consumes Kafka query-log events and
-	// writes them to each tenant's DuckLake-backed system.query_log table.
-	if *mode == "query-log-writer" {
-		if err := runQueryLogWriter(context.Background(), cfg, resolved); err != nil {
-			fatal("Query-log writer error: " + server.RedactQueryLogWriterError(err))
-		}
 		return
 	}
 

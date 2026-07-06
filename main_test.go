@@ -14,6 +14,23 @@ func envFromMap(values map[string]string) func(string) string {
 	}
 }
 
+func TestValidateRunModeRejectsUnsupportedMode(t *testing.T) {
+	for _, mode := range []string{"standalone", "control-plane", "duckdb-service"} {
+		if err := validateRunMode(mode); err != nil {
+			t.Fatalf("expected mode %q to be valid: %v", mode, err)
+		}
+	}
+
+	err := validateRunMode("unsupported-mode")
+	if err == nil {
+		t.Fatal("expected unsupported mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "unsupported --mode") ||
+		!strings.Contains(err.Error(), "standalone, control-plane, duckdb-service") {
+		t.Fatalf("unexpected error for unsupported mode: %v", err)
+	}
+}
+
 func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	fileCfg := &FileConfig{
 		Host:       "file-host",
@@ -336,40 +353,6 @@ func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 		if !found {
 			t.Fatalf("expected warning containing %q, warnings: %v", w, warns)
 		}
-	}
-}
-
-func TestResolveEffectiveConfigQueryLogKafka(t *testing.T) {
-	fileCfg := &FileConfig{
-		QueryLog: QueryLogFileConfig{
-			Sink: "ducklake",
-			Kafka: QueryLogKafkaFileConfig{
-				Brokers:  []string{"file-a:9092"},
-				Topic:    "file-topic",
-				ClientID: "file-client",
-			},
-		},
-	}
-
-	env := map[string]string{
-		"DUCKGRES_QUERY_LOG_SINK":            "kafka",
-		"DUCKGRES_QUERY_LOG_KAFKA_BROKERS":   "env-a:9092, env-b:9092",
-		"DUCKGRES_QUERY_LOG_KAFKA_TOPIC":     "env-topic",
-		"DUCKGRES_QUERY_LOG_KAFKA_CLIENT_ID": "env-client",
-	}
-
-	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
-	if got, want := resolved.Server.QueryLog.Sink, "kafka"; got != want {
-		t.Fatalf("query log sink mismatch: got %q want %q", got, want)
-	}
-	if got, want := strings.Join(resolved.Server.QueryLog.Kafka.Brokers, ","), "env-a:9092,env-b:9092"; got != want {
-		t.Fatalf("query log kafka brokers mismatch: got %q want %q", got, want)
-	}
-	if got, want := resolved.Server.QueryLog.Kafka.Topic, "env-topic"; got != want {
-		t.Fatalf("query log kafka topic mismatch: got %q want %q", got, want)
-	}
-	if got, want := resolved.Server.QueryLog.Kafka.ClientID, "env-client"; got != want {
-		t.Fatalf("query log kafka client_id mismatch: got %q want %q", got, want)
 	}
 }
 
