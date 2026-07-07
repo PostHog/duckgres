@@ -944,16 +944,115 @@ func TestLogQueryActionRejectsAfterDrainCompleted(t *testing.T) {
 	}
 }
 
-func TestLogQueryActionSinkInitUsesStreamContext(t *testing.T) {
+func TestSharedWarmQueryLogSinkUsesPostgresWithoutDuckDBHandle(t *testing.T) {
+	oldNewWorkerPostgresQueryLogger := newWorkerPostgresQueryLogger
 	oldNewAttachedQueryLogger := newAttachedQueryLogger
-	started := make(chan struct{})
+	workerCalled := false
+	attachedCalled := false
+	newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
+		workerCalled = true
+		if cfg.DuckLake.MetadataStore != "postgres:host=metadata.internal dbname=ducklake" {
+			t.Fatalf("metadata store = %q, want activation metadata store", cfg.DuckLake.MetadataStore)
+		}
+		return &captureWorkerQueryLogSink{}, nil
+	}
 	newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
+		attachedCalled = true
+		return &captureWorkerQueryLogSink{}, nil
+	}
+	t.Cleanup(func() {
+		newWorkerPostgresQueryLogger = oldNewWorkerPostgresQueryLogger
+		newAttachedQueryLogger = oldNewAttachedQueryLogger
+	})
+
+	pool := &SessionPool{
+		workerID:       17,
+		sharedWarmMode: true,
+		cfg: server.Config{
+			QueryLog: server.QueryLogConfig{Enabled: true},
+		},
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+			DuckLake: server.DuckLakeConfig{
+				MetadataStore: "postgres:host=metadata.internal dbname=ducklake",
+			},
+		}},
+	}
+
+	sink, err := pool.queryLogSinkForCurrentRuntime(context.Background())
+	if err != nil {
+		t.Fatalf("queryLogSinkForCurrentRuntime: %v", err)
+	}
+	if sink == nil {
+		t.Fatal("expected query-log sink")
+	}
+	if !workerCalled {
+		t.Fatal("expected shared-warm worker to initialize Postgres query-log sink")
+	}
+	if attachedCalled {
+		t.Fatal("shared-warm worker should not initialize attached DuckDB query-log sink")
+	}
+}
+
+func TestNonSharedQueryLogSinkKeepsAttachedDuckDBLogger(t *testing.T) {
+	oldNewWorkerPostgresQueryLogger := newWorkerPostgresQueryLogger
+	oldNewAttachedQueryLogger := newAttachedQueryLogger
+	workerCalled := false
+	attachedCalled := false
+	newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
+		workerCalled = true
+		return &captureWorkerQueryLogSink{}, nil
+	}
+	newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
+		attachedCalled = true
+		if db == nil {
+			t.Fatal("expected attached DuckDB handle")
+		}
+		return &captureWorkerQueryLogSink{}, nil
+	}
+	t.Cleanup(func() {
+		newWorkerPostgresQueryLogger = oldNewWorkerPostgresQueryLogger
+		newAttachedQueryLogger = oldNewAttachedQueryLogger
+	})
+
+	pool := &SessionPool{
+		controlDB: &sql.DB{},
+		cfg: server.Config{
+			QueryLog: server.QueryLogConfig{Enabled: true},
+			DuckLake: server.DuckLakeConfig{
+				MetadataStore: "postgres:host=metadata.internal dbname=ducklake",
+			},
+		},
+	}
+
+	sink, err := pool.queryLogSinkForCurrentRuntime(context.Background())
+	if err != nil {
+		t.Fatalf("queryLogSinkForCurrentRuntime: %v", err)
+	}
+	if sink == nil {
+		t.Fatal("expected query-log sink")
+	}
+	if !attachedCalled {
+		t.Fatal("expected non-shared worker to initialize attached DuckDB query-log sink")
+	}
+	if workerCalled {
+		t.Fatal("non-shared worker should not initialize Postgres query-log sink")
+	}
+}
+
+func TestLogQueryActionSinkInitUsesStreamContext(t *testing.T) {
+	oldNewWorkerPostgresQueryLogger := newWorkerPostgresQueryLogger
+	started := make(chan struct{})
+	gotMetadataStore := make(chan string, 1)
+	newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
+		gotMetadataStore <- cfg.DuckLake.MetadataStore
 		close(started)
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 	t.Cleanup(func() {
-		newAttachedQueryLogger = oldNewAttachedQueryLogger
+		newWorkerPostgresQueryLogger = oldNewWorkerPostgresQueryLogger
 	})
 
 	pool := &SessionPool{
@@ -967,7 +1066,7 @@ func TestLogQueryActionSinkInitUsesStreamContext(t *testing.T) {
 			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
 			OrgID:                 "analytics",
 			DuckLake: server.DuckLakeConfig{
-				MetadataStore: "metadata.db",
+				MetadataStore: "postgres:host=metadata.internal dbname=ducklake",
 			},
 		}},
 	}
@@ -991,6 +1090,9 @@ func TestLogQueryActionSinkInitUsesStreamContext(t *testing.T) {
 	case <-started:
 	case <-time.After(time.Second):
 		t.Fatal("query-log sink initialization did not start")
+	}
+	if got := <-gotMetadataStore; got != "postgres:host=metadata.internal dbname=ducklake" {
+		t.Fatalf("query-log sink metadata store = %q, want activation metadata store", got)
 	}
 	if got := pool.ActiveDrainWork(); got != 1 {
 		t.Fatalf("active drain work while query-log init is blocked = %d, want 1", got)
@@ -1039,10 +1141,12 @@ func TestQueryLogSinkInitWaitRespectsContext(t *testing.T) {
 }
 
 func TestQueryLogSinkInitDoesNotBlockShutdown(t *testing.T) {
-	oldNewAttachedQueryLogger := newAttachedQueryLogger
+	oldNewWorkerPostgresQueryLogger := newWorkerPostgresQueryLogger
 	started := make(chan struct{})
 	release := make(chan struct{})
-	newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
+	gotMetadataStore := make(chan string, 1)
+	newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
+		gotMetadataStore <- cfg.DuckLake.MetadataStore
 		close(started)
 		select {
 		case <-release:
@@ -1052,7 +1156,7 @@ func TestQueryLogSinkInitDoesNotBlockShutdown(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		newAttachedQueryLogger = oldNewAttachedQueryLogger
+		newWorkerPostgresQueryLogger = oldNewWorkerPostgresQueryLogger
 	})
 
 	stopCh := make(chan struct{})
@@ -1064,14 +1168,14 @@ func TestQueryLogSinkInitDoesNotBlockShutdown(t *testing.T) {
 		cfg: server.Config{
 			QueryLog: server.QueryLogConfig{Enabled: true},
 			DuckLake: server.DuckLakeConfig{
-				MetadataStore: "metadata.db",
+				MetadataStore: "postgres:host=global.invalid dbname=wrong",
 			},
 		},
 		activation: &activatedTenantRuntime{payload: ActivationPayload{
 			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
 			OrgID:                 "analytics",
 			DuckLake: server.DuckLakeConfig{
-				MetadataStore: "metadata.db",
+				MetadataStore: "postgres:host=metadata.internal dbname=ducklake",
 			},
 		}},
 	}
@@ -1086,6 +1190,9 @@ func TestQueryLogSinkInitDoesNotBlockShutdown(t *testing.T) {
 	case <-started:
 	case <-time.After(time.Second):
 		t.Fatal("query-log sink initialization did not start")
+	}
+	if got := <-gotMetadataStore; got != "postgres:host=metadata.internal dbname=ducklake" {
+		t.Fatalf("query-log sink metadata store = %q, want activation metadata store", got)
 	}
 
 	close(stopCh)

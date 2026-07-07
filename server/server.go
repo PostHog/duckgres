@@ -295,7 +295,7 @@ type Config struct {
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool
 
-	// QueryLog configures the DuckLake query log (system.query_log table).
+	// QueryLog configures query-log collection and flushing.
 	QueryLog QueryLogConfig
 }
 
@@ -355,11 +355,10 @@ type Server struct {
 	// query-log sink.
 	recentErrors *recentErrorRing
 
-	// Query logger for DuckLake system.query_log. Kept for existing control
-	// plane call sites that install or inspect the direct DuckLake logger.
+	// Query logger kept for existing call sites that install or inspect the
+	// concrete batched logger.
 	queryLogger *QueryLogger
-	// Query-log sink used by query execution. It is the direct DuckLake logger
-	// when query logging is enabled.
+	// Query-log sink used by query execution.
 	queryLogSink QueryLogSink
 
 	// Per-user shared DB pool for file persistence mode.

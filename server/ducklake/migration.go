@@ -626,6 +626,40 @@ func injectPostgresApplicationName(metadataStore, name string) string {
 	return metadataStore + " application_name='" + strings.ReplaceAll(name, "'", "''") + "'"
 }
 
+func injectPgxSimpleProtocol(metadataStore string) string {
+	if !strings.HasPrefix(metadataStore, "postgres:") {
+		return metadataStore
+	}
+	connPart := metadataStore[len("postgres:"):]
+	if strings.Contains(connPart, "default_query_exec_mode") {
+		return metadataStore
+	}
+	return metadataStore + " default_query_exec_mode=simple_protocol"
+}
+
+// PostgresMetadataStoreConnString converts a DuckLake postgres: metadata store
+// into a native pgx connection string, preserving the connection hardening used
+// by DuckLake ATTACH callers.
+func PostgresMetadataStoreConnString(metadataStore, applicationName string) (string, error) {
+	metadataStore = strings.TrimSpace(metadataStore)
+	if metadataStore == "" {
+		return "", fmt.Errorf("metadata Postgres store is required")
+	}
+	if !strings.HasPrefix(metadataStore, "postgres:") {
+		return "", fmt.Errorf("metadata store must use postgres: DSN")
+	}
+	if strings.TrimSpace(strings.TrimPrefix(metadataStore, "postgres:")) == "" {
+		return "", fmt.Errorf("metadata Postgres DSN is empty")
+	}
+	metadataStore = injectPostgresApplicationName(
+		injectPostgresKeepalive(metadataStore),
+		applicationName,
+	)
+	metadataStore = injectPgxSimpleProtocol(metadataStore)
+	connStr := strings.TrimSpace(strings.TrimPrefix(metadataStore, "postgres:"))
+	return connStr, nil
+}
+
 // BuildAttachStmt builds the ATTACH statement for DuckLake.
 // If migrate is true, adds AUTOMATIC_MIGRATION TRUE to the options.
 func BuildAttachStmt(dlCfg Config, migrate bool) string {

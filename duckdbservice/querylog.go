@@ -24,6 +24,10 @@ var newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.Qu
 	return server.NewAttachedQueryLoggerContext(ctx, db, cfg)
 }
 
+var newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
+	return server.NewPostgresQueryLoggerContext(ctx, cfg.DuckLake, cfg.QueryLog)
+}
+
 func (p *SessionPool) LogQueryEntries(ctx context.Context, entries []server.QueryLogEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -67,7 +71,7 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime(ctx context.Context) (server
 	p.queryLogMu.Unlock()
 
 	cfg, db, ok := p.queryLogRuntime()
-	if !ok || !cfg.QueryLog.Enabled || db == nil || cfg.DuckLake.MetadataStore == "" {
+	if !ok || !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
 		return nil, nil
 	}
 
@@ -91,7 +95,15 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime(ctx context.Context) (server
 
 	ctx, cancel := context.WithTimeout(ctx, queryLogSinkInitTimeout)
 	defer cancel()
-	ql, err := newAttachedQueryLogger(ctx, db, cfg.QueryLog)
+	var ql server.QueryLogSink
+	if p.sharedWarmMode {
+		ql, err = newWorkerPostgresQueryLogger(ctx, cfg)
+	} else {
+		if db == nil {
+			return nil, nil
+		}
+		ql, err = newAttachedQueryLogger(ctx, db, cfg.QueryLog)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("initialize worker query log: %w", err)
 	}
