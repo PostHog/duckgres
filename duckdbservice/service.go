@@ -71,7 +71,9 @@ type SessionPool struct {
 	// controlDB is activePair.Control, surfaced for direct use by control-side
 	// ops (CREATE OR REPLACE SECRET on STS rotation). Always nil before
 	// activation; nil-check before use and fall back to the main DB.
-	controlDB *sql.DB
+	controlDB    *sql.DB
+	queryLogMu   sync.Mutex
+	queryLogSink server.QueryLogSink
 
 	sharedWarmMode       bool
 	activation           *activatedTenantRuntime
@@ -1503,6 +1505,8 @@ func (p *SessionPool) CloseAll() {
 		}
 	}
 
+	p.stopQueryLogSink(context.Background())
+
 	if p.warmupDB != nil {
 		cleanupWorkerCatalogs(p.warmupDB)
 	}
@@ -1733,6 +1737,8 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 		return s.handler.doWaitSessionIdle(cmd.Body, stream)
 	case "ReleaseQueryHandle":
 		return s.handler.doReleaseQueryHandle(cmd.Body, stream)
+	case "LogQuery":
+		return s.handler.doLogQuery(cmd.Body, stream)
 	default:
 		// Fall through to standard flightsql action router (BeginTransaction, etc.)
 		return s.FlightServer.DoAction(cmd, stream)

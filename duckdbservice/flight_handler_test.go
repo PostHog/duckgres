@@ -52,6 +52,18 @@ type testEndTransactionRequest struct {
 	action        flightsql.EndTransactionRequestType
 }
 
+type captureWorkerQueryLogSink struct {
+	entries []server.QueryLogEntry
+}
+
+func (s *captureWorkerQueryLogSink) Log(entry server.QueryLogEntry) {
+	s.entries = append(s.entries, entry)
+}
+
+func (s *captureWorkerQueryLogSink) StopContext(context.Context) error {
+	return nil
+}
+
 func (r testEndTransactionRequest) GetTransactionId() []byte {
 	return r.transactionID
 }
@@ -622,6 +634,168 @@ func TestCreateSessionSendFailureDestroysSession(t *testing.T) {
 	}
 	if got := len(pool.sessions); got != 0 {
 		t.Fatalf("expected failed response to destroy created session, got %d sessions", got)
+	}
+}
+
+func TestLogQueryActionEnqueuesEntries(t *testing.T) {
+	sink := &captureWorkerQueryLogSink{}
+	pool := &SessionPool{
+		queryLogSink:   sink,
+		sharedWarmMode: true,
+		workerID:       17,
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+		}},
+	}
+	handler := NewFlightSQLHandler(pool)
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+		Entries: []server.QueryLogEntry{{
+			Query:                 "SELECT 1",
+			UserName:              "alice",
+			OrgID:                 "analytics",
+			WorkerID:              17,
+			CPUTimeSeconds:        1.25,
+			PeakBufferMemoryBytes: 4096,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	stream := &mockDoActionStream{}
+	if err := handler.doLogQuery(body, stream); err != nil {
+		t.Fatalf("doLogQuery: %v", err)
+	}
+	if len(stream.results) != 1 {
+		t.Fatalf("expected one action response, got %d", len(stream.results))
+	}
+	if len(sink.entries) != 1 {
+		t.Fatalf("expected one query-log entry, got %d", len(sink.entries))
+	}
+	if got := sink.entries[0]; got.Query != "SELECT 1" || got.UserName != "alice" || got.OrgID != "analytics" {
+		t.Fatalf("unexpected entry: %#v", got)
+	}
+}
+
+func TestLogQueryActionRejectsStaleWorkerMetadata(t *testing.T) {
+	sink := &captureWorkerQueryLogSink{}
+	pool := &SessionPool{
+		queryLogSink:   sink,
+		sharedWarmMode: true,
+		workerID:       17,
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+		}},
+	}
+	handler := NewFlightSQLHandler(pool)
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 18},
+		Entries:               []server.QueryLogEntry{{Query: "SELECT 1", OrgID: "analytics", WorkerID: 17}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	err = handler.doLogQuery(body, &mockDoActionStream{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("status code = %v, want FailedPrecondition (err=%v)", status.Code(err), err)
+	}
+	if len(sink.entries) != 0 {
+		t.Fatalf("expected stale action not to enqueue entries, got %d", len(sink.entries))
+	}
+}
+
+func TestLogQueryActionRejectsMismatchedEntryOrg(t *testing.T) {
+	sink := &captureWorkerQueryLogSink{}
+	pool := &SessionPool{
+		queryLogSink:   sink,
+		sharedWarmMode: true,
+		workerID:       17,
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+		}},
+	}
+	handler := NewFlightSQLHandler(pool)
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+		Entries:               []server.QueryLogEntry{{Query: "SELECT 1", OrgID: "other-org", WorkerID: 17}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	err = handler.doLogQuery(body, &mockDoActionStream{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("status code = %v, want FailedPrecondition (err=%v)", status.Code(err), err)
+	}
+	if len(sink.entries) != 0 {
+		t.Fatalf("expected mismatched entry not to enqueue, got %d", len(sink.entries))
+	}
+}
+
+func TestLogQueryActionRejectsUnactivatedSharedWarmWorker(t *testing.T) {
+	sink := &captureWorkerQueryLogSink{}
+	pool := &SessionPool{
+		queryLogSink:   sink,
+		sharedWarmMode: true,
+		workerID:       17,
+	}
+	handler := NewFlightSQLHandler(pool)
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+		Entries:               []server.QueryLogEntry{{Query: "SELECT 1", OrgID: "analytics", WorkerID: 17}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	err = handler.doLogQuery(body, &mockDoActionStream{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("status code = %v, want FailedPrecondition (err=%v)", status.Code(err), err)
+	}
+	if len(sink.entries) != 0 {
+		t.Fatalf("expected unactivated worker not to enqueue, got %d", len(sink.entries))
+	}
+}
+
+func TestLogQueryActionRejectsClosedWorker(t *testing.T) {
+	sink := &captureWorkerQueryLogSink{}
+	stopCh := make(chan struct{})
+	close(stopCh)
+	pool := &SessionPool{
+		stopCh:         stopCh,
+		queryLogSink:   sink,
+		workerID:       17,
+		sharedWarmMode: true,
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+		}},
+	}
+	handler := NewFlightSQLHandler(pool)
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+		Entries:               []server.QueryLogEntry{{Query: "SELECT 1", OrgID: "analytics", WorkerID: 17}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	err = handler.doLogQuery(body, &mockDoActionStream{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("status code = %v, want Unavailable (err=%v)", status.Code(err), err)
+	}
+	if len(sink.entries) != 0 {
+		t.Fatalf("expected closed worker not to enqueue, got %d", len(sink.entries))
 	}
 }
 

@@ -691,3 +691,34 @@ func TestLogQueryCopiesProfilingSummaryToQueryLogEntry(t *testing.T) {
 		t.Fatalf("expected profiling summary to be reset, got %#v", c.lastProfilingSummary)
 	}
 }
+
+type captureQueryLogExecutor struct {
+	feedbackExecutor
+	entries []QueryLogEntry
+}
+
+func (e *captureQueryLogExecutor) Log(entry QueryLogEntry) {
+	e.entries = append(e.entries, entry)
+}
+
+func TestLogQueryPrefersExecutorQueryLogSink(t *testing.T) {
+	c, ql, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected executor query-log sink to receive one entry, got %d", len(exec.entries))
+	}
+	if exec.entries[0].Query != "SELECT 1" {
+		t.Fatalf("unexpected forwarded query-log entry: %#v", exec.entries[0])
+	}
+	select {
+	case entry := <-ql.ch:
+		t.Fatalf("server query logger should not receive entry when executor sink is available: %#v", entry)
+	default:
+	}
+}

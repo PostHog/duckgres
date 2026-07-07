@@ -2,9 +2,47 @@ package observe
 
 import (
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
+
+func gaugeValue(t *testing.T, gauge prometheus.Gauge) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := gauge.Write(m); err != nil {
+		t.Fatalf("gauge write: %v", err)
+	}
+	return m.GetGauge().GetValue()
+}
+
+func counterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := counter.Write(m); err != nil {
+		t.Fatalf("counter write: %v", err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+func counterVecValue(t *testing.T, counterVec *prometheus.CounterVec, labels ...string) float64 {
+	t.Helper()
+	counter, err := counterVec.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		t.Fatalf("counter labels %v: %v", labels, err)
+	}
+	return counterValue(t, counter)
+}
+
+func histogramSampleCount(t *testing.T, histogram prometheus.Histogram) uint64 {
+	t.Helper()
+	m := &dto.Metric{}
+	if err := histogram.Write(m); err != nil {
+		t.Fatalf("histogram write: %v", err)
+	}
+	return m.GetHistogram().GetSampleCount()
+}
 
 func connDurationSample(t *testing.T, org string) (count uint64, sum float64) {
 	t.Helper()
@@ -41,5 +79,45 @@ func TestObserveConnectionDurationRecordsPerOrgSample(t *testing.T) {
 	// A different org must not see those samples (label isolation).
 	if c, _ := connDurationSample(t, "conn-duration-other-org"); c != 0 {
 		t.Fatalf("unrelated org sample count = %d, want 0", c)
+	}
+}
+
+func TestQueryLogMetricsHelpersRecordBufferFlushAndDrops(t *testing.T) {
+	enqueuedBefore := counterValue(t, queryLogEnqueuedEntriesTotal)
+	flushedBefore := counterValue(t, queryLogFlushedEntriesTotal)
+	droppedFullBefore := counterVecValue(t, queryLogDroppedEntriesTotal, "buffer_full")
+	droppedFlushBefore := counterVecValue(t, queryLogDroppedEntriesTotal, "flush_error")
+	errorsBefore := counterValue(t, queryLogFlushErrorsTotal)
+	flushSamplesBefore := histogramSampleCount(t, queryLogFlushDurationHistogram)
+
+	SetQueryLogBufferedEntries(7)
+	if got := gaugeValue(t, queryLogBufferedEntries); got != 7 {
+		t.Fatalf("buffered entries gauge = %v, want 7", got)
+	}
+
+	IncQueryLogEnqueuedEntries()
+	AddQueryLogFlushedEntries(3)
+	AddQueryLogDroppedEntries("buffer_full", 2)
+	AddQueryLogDroppedEntries("flush_error", 4)
+	IncQueryLogFlushErrors()
+	ObserveQueryLogFlushDuration(125 * time.Millisecond)
+
+	if got := counterValue(t, queryLogEnqueuedEntriesTotal) - enqueuedBefore; got != 1 {
+		t.Fatalf("enqueued delta = %v, want 1", got)
+	}
+	if got := counterValue(t, queryLogFlushedEntriesTotal) - flushedBefore; got != 3 {
+		t.Fatalf("flushed delta = %v, want 3", got)
+	}
+	if got := counterVecValue(t, queryLogDroppedEntriesTotal, "buffer_full") - droppedFullBefore; got != 2 {
+		t.Fatalf("buffer_full dropped delta = %v, want 2", got)
+	}
+	if got := counterVecValue(t, queryLogDroppedEntriesTotal, "flush_error") - droppedFlushBefore; got != 4 {
+		t.Fatalf("flush_error dropped delta = %v, want 4", got)
+	}
+	if got := counterValue(t, queryLogFlushErrorsTotal) - errorsBefore; got != 1 {
+		t.Fatalf("flush errors delta = %v, want 1", got)
+	}
+	if got := histogramSampleCount(t, queryLogFlushDurationHistogram) - flushSamplesBefore; got != 1 {
+		t.Fatalf("flush duration sample delta = %d, want 1", got)
 	}
 }

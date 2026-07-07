@@ -11,53 +11,21 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/usersecrets"
+	"github.com/posthog/duckgres/server/wire"
 )
 
 // QueryLogEntry represents a single entry in the query log.
-type QueryLogEntry struct {
-	EventID         string
-	EventTime       time.Time
-	QueryDurationMs int64
-	Type            string // "QueryFinish" or "ExceptionWhileProcessing"
-	Query           string
-	TranspiledQuery *string // nil if unchanged
-	QueryKind       string  // "Select","Insert","Update","Delete","DDL","Utility","Copy","Cursor"
-	NormalizedHash  int64
-	ResultRows      int64
-	WrittenRows     int64
-	ExceptionCode   string
-	Exception       string
-	UserName        string
-	OrgID           string
-	CurrentDatabase string
-	ClientAddress   string
-	ClientPort      int
-	ApplicationName string
-	PID             int32
-	WorkerID        int
-	IsTranspiled    bool
-	Protocol        string // "simple" or "extended"
-	TraceID         string // OTEL trace ID (empty when tracing is off)
-	SpanID          string // OTEL span ID (empty when tracing is off)
-	// PostgresScanMs is the thread-time spent in postgres_scan operators
-	// during this query — DuckLake metadata DB roundtrips. Zero when DuckDB
-	// returned no profiling output (cancelled / errored before exec /
-	// profiling disabled). Lets us answer "which query shape pounds the
-	// metadata DB?" against `system.query_log` without re-parsing profiling.
-	PostgresScanMs int64
-	// CPUTimeSeconds is DuckDB's cumulative query CPU/thread time in seconds.
-	// Zero when DuckDB returned no profiling output.
-	CPUTimeSeconds float64
-	// PeakBufferMemoryBytes is DuckDB's system_peak_buffer_memory value in
-	// bytes. This is DuckDB buffer memory, not process RSS.
-	PeakBufferMemoryBytes int64
-}
+//
+// The concrete shape lives in server/wire so the DuckDB-free Flight client can
+// forward entries to worker pods without importing the full server package.
+type QueryLogEntry = wire.QueryLogEntry
 
 // QueryLogger batches query log entries and writes them to a DuckLake table.
 type QueryLogger struct {
@@ -67,12 +35,20 @@ type QueryLogger struct {
 	ch       chan QueryLogEntry
 	done     chan struct{}
 	stopOnce sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	buffered atomic.Int64
+	closeDB  bool
 }
 
 // QueryLogSink accepts query log entries and drains them during shutdown.
 type QueryLogSink interface {
 	Log(QueryLogEntry)
 	StopContext(context.Context) error
+}
+
+type queryLogEntrySink interface {
+	Log(QueryLogEntry)
 }
 
 const (
@@ -104,17 +80,62 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	ql := &QueryLogger{
-		db:    db,
-		cfg:   cfg.QueryLog,
-		table: "ducklake.system.query_log",
-		ch:    make(chan QueryLogEntry, queryLogChannelSize),
-		done:  make(chan struct{}),
+		db:      db,
+		cfg:     cfg.QueryLog,
+		table:   "ducklake.system.query_log",
+		ch:      make(chan QueryLogEntry, queryLogChannelSize),
+		done:    make(chan struct{}),
+		ctx:     ctx,
+		cancel:  cancel,
+		closeDB: true,
 	}
 
 	go ql.flushLoop()
 	slog.Info("Query log enabled.", "flush_interval", cfg.QueryLog.FlushInterval, "batch_size", cfg.QueryLog.BatchSize)
 	return ql, nil
+}
+
+// NewAttachedQueryLogger creates a query logger using a DuckDB handle that
+// already sees the tenant DuckLake catalog. The logger does not own db; callers
+// must close the handle after StopContext returns.
+func NewAttachedQueryLogger(db *sql.DB, cfg QueryLogConfig) (*QueryLogger, error) {
+	if !cfg.Enabled || db == nil {
+		return nil, nil
+	}
+	if err := ensureAttachedQueryLogTable(db, cfg); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ql := &QueryLogger{
+		db:     db,
+		cfg:    cfg,
+		table:  "ducklake.system.query_log",
+		ch:     make(chan QueryLogEntry, queryLogChannelSize),
+		done:   make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	go ql.flushLoop()
+	slog.Info("Query log enabled on attached DuckLake.", "flush_interval", cfg.FlushInterval, "batch_size", cfg.BatchSize)
+	return ql, nil
+}
+
+func ensureAttachedQueryLogTable(db *sql.DB, cfg QueryLogConfig) error {
+	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
+		return fmt.Errorf("querylog: create schema: %w", err)
+	}
+	if err := ensureQueryLogTable(db, "system", "query_log", "ducklake.system.query_log"); err != nil {
+		return fmt.Errorf("querylog: ensure table: %w", err)
+	}
+	inlineStmt := fmt.Sprintf(
+		"CALL ducklake.set_option('data_inlining_row_limit', %d, schema => 'system', table_name => 'query_log')",
+		cfg.DataInliningRowLimit)
+	if _, err := db.Exec(inlineStmt); err != nil {
+		slog.Warn("querylog: failed to set data_inlining_row_limit, continuing without it.", "error", err)
+	}
+	return nil
 }
 
 func openQueryLogDuckLakeDB(cfg Config) (*sql.DB, error) {
@@ -199,14 +220,24 @@ func (ql *QueryLogger) Log(entry QueryLogEntry) {
 	if ql == nil || ql.ch == nil {
 		return
 	}
+	ql.addBufferedEntries(1)
+	queued := false
 	defer func() {
 		if r := recover(); r != nil {
+			if !queued {
+				ql.addBufferedEntries(-1)
+				observe.AddQueryLogDroppedEntries("logger_closed", 1)
+			}
 			slog.Warn("querylog: logger stopped while writing entry; dropping entry.")
 		}
 	}()
 	select {
 	case ql.ch <- entry:
+		queued = true
+		observe.IncQueryLogEnqueuedEntries()
 	default:
+		ql.addBufferedEntries(-1)
+		observe.AddQueryLogDroppedEntries("buffer_full", 1)
 		slog.Warn("querylog: channel full, dropping entry.")
 	}
 }
@@ -216,8 +247,9 @@ func (ql *QueryLogger) Stop() {
 	_ = ql.StopContext(context.Background())
 }
 
-// StopContext drains remaining entries until ctx expires, then closes the DB to
-// unblock any in-flight flush.
+// StopContext drains remaining entries until ctx expires. If the deadline is
+// reached, it cancels in-flight DuckDB work; standalone loggers also close
+// their owned DB handle to unblock shutdown.
 func (ql *QueryLogger) StopContext(ctx context.Context) error {
 	if ql == nil {
 		return nil
@@ -235,9 +267,15 @@ func (ql *QueryLogger) StopContext(ctx context.Context) error {
 			case <-ql.done:
 			case <-ctx.Done():
 				stopErr = ctx.Err()
+				if ql.cancel != nil {
+					ql.cancel()
+				}
 			}
 		}
-		if ql.db != nil {
+		if ql.cancel != nil {
+			ql.cancel()
+		}
+		if ql.db != nil && ql.closeDB {
 			_ = ql.db.Close()
 		}
 	})
@@ -256,6 +294,7 @@ func queryLogStopContext(ctx context.Context, defaultTimeout time.Duration) (con
 
 func (ql *QueryLogger) flushLoop() {
 	defer close(ql.done)
+	defer observe.SetQueryLogBufferedEntries(0)
 
 	batch := make([]QueryLogEntry, 0, ql.cfg.BatchSize)
 	flushTicker := time.NewTicker(ql.cfg.FlushInterval)
@@ -295,10 +334,41 @@ func (ql *QueryLogger) flushLoop() {
 	}
 }
 
-func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
-	if err := insertQueryLogEntries(context.Background(), ql.db, ql.table, batch); err != nil {
-		slog.Error("querylog: flush failed.", "error", err, "batch_size", len(batch))
+func (ql *QueryLogger) addBufferedEntries(delta int64) {
+	if ql == nil {
+		return
 	}
+	buffered := ql.buffered.Add(delta)
+	if buffered < 0 {
+		ql.buffered.Store(0)
+		buffered = 0
+	}
+	observe.SetQueryLogBufferedEntries(int(buffered))
+}
+
+func (ql *QueryLogger) context() context.Context {
+	if ql == nil {
+		return context.Background()
+	}
+	ctx := ql.ctx
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
+	defer ql.addBufferedEntries(-int64(len(batch)))
+	start := time.Now()
+	err := insertQueryLogEntries(ql.context(), ql.db, ql.table, batch)
+	observe.ObserveQueryLogFlushDuration(time.Since(start))
+	if err != nil {
+		observe.IncQueryLogFlushErrors()
+		observe.AddQueryLogDroppedEntries("flush_error", len(batch))
+		slog.Error("querylog: flush failed.", "error", err, "batch_size", len(batch))
+		return
+	}
+	observe.AddQueryLogFlushedEntries(len(batch))
 }
 
 func insertQueryLogEntries(ctx context.Context, db *sql.DB, table string, batch []QueryLogEntry) error {
@@ -369,7 +439,7 @@ func queryLogEntryInsertArgs(e QueryLogEntry) []any {
 }
 
 func (ql *QueryLogger) compactParquet() {
-	_, err := ql.db.Exec("CALL ducklake_flush_inlined_data('ducklake', schema_name => 'system', table_name => 'query_log')")
+	_, err := ql.db.ExecContext(ql.context(), "CALL ducklake_flush_inlined_data('ducklake', schema_name => 'system', table_name => 'query_log')")
 	if err != nil {
 		slog.Warn("querylog: compact failed.", "error", err)
 	}
@@ -599,11 +669,16 @@ func isQueryLogSelfReferential(query string) bool {
 func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType string,
 	resultRows, writtenRows int64, errCode, errMsg, protocol string) {
 
-	var ql QueryLogSink
-	if c.server.queryLogSink != nil {
+	var ql queryLogEntrySink
+	if c.server != nil && c.server.cfg.QueryLog.Enabled && c.executor != nil {
+		if sink, ok := c.executor.(queryLogEntrySink); ok {
+			ql = sink
+		}
+	}
+	if ql == nil && c.server != nil && c.server.queryLogSink != nil {
 		ql = c.server.queryLogSink
 	}
-	if ql == nil && c.server.queryLogger != nil {
+	if ql == nil && c.server != nil && c.server.queryLogger != nil {
 		ql = c.server.queryLogger
 	}
 	if ql == nil {

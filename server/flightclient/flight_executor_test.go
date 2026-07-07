@@ -25,6 +25,7 @@ import (
 
 func TestFlightExecutorWithSessionAddsOwnerEpochHeader(t *testing.T) {
 	exec := NewFlightExecutorFromClient(nil, "session-1")
+	defer func() { _ = exec.Close() }()
 	exec.SetOwnerEpoch(7)
 	exec.SetControlMetadata(17, "cp-live:boot-a", 7)
 
@@ -61,6 +62,9 @@ type closeWaitFlightServer struct {
 	releaseActionCalled   chan struct{}
 	releaseActionOnce     sync.Once
 	releaseTicket         []byte
+	logQueryCalled        chan struct{}
+	logQueryOnce          sync.Once
+	logQueryPayload       wire.WorkerQueryLogPayload
 	waitBeforeDoGetCancel chan struct{}
 	waitBeforeOnce        sync.Once
 	closeAfterFirstBatch  bool
@@ -78,6 +82,7 @@ func newCloseWaitFlightServer() *closeWaitFlightServer {
 		doGetDone:            make(chan struct{}),
 		doActionCalled:       make(chan struct{}),
 		releaseActionCalled:  make(chan struct{}),
+		logQueryCalled:       make(chan struct{}),
 	}
 }
 
@@ -142,6 +147,14 @@ func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.Flight
 		}
 		s.releaseTicket = payload.Ticket
 		return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
+	case logQueryAction:
+		s.logQueryOnce.Do(func() {
+			close(s.logQueryCalled)
+		})
+		if err := json.Unmarshal(action.Body, &s.logQueryPayload); err != nil {
+			return err
+		}
+		return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
 	case waitSessionIdleAction:
 	default:
 		return s.UnimplementedFlightServiceServer.DoAction(action, stream)
@@ -195,6 +208,48 @@ func newCloseWaitExecutor(t *testing.T, srv *closeWaitFlightServer) (*FlightExec
 	exec := NewFlightExecutorFromClient(&flightsql.Client{Client: flightCli}, "session-1")
 	t.Cleanup(func() { _ = exec.Close() })
 	return exec, ctx
+}
+
+func TestFlightExecutorLogForwardsQueryLogBatch(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+	exec, _ := newCloseWaitExecutor(t, srv)
+	exec.SetControlMetadata(17, "cp-live:boot-a", 7)
+
+	exec.Log(wire.QueryLogEntry{
+		Query:                 "SELECT 1",
+		UserName:              "alice",
+		OrgID:                 "analytics",
+		CPUTimeSeconds:        1.5,
+		PeakBufferMemoryBytes: 2048,
+	})
+	if err := exec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case <-srv.logQueryCalled:
+	case <-time.After(time.Second):
+		t.Fatal("LogQuery action was not sent")
+	}
+	if got := srv.logQueryPayload.WorkerID; got != 17 {
+		t.Fatalf("worker_id = %d, want 17", got)
+	}
+	if got := srv.logQueryPayload.OwnerEpoch; got != 7 {
+		t.Fatalf("owner_epoch = %d, want 7", got)
+	}
+	if got := srv.logQueryPayload.CPInstanceID; got != "cp-live:boot-a" {
+		t.Fatalf("cp_instance_id = %q, want cp-live:boot-a", got)
+	}
+	if len(srv.logQueryPayload.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(srv.logQueryPayload.Entries))
+	}
+	entry := srv.logQueryPayload.Entries[0]
+	if entry.Query != "SELECT 1" || entry.UserName != "alice" || entry.OrgID != "analytics" {
+		t.Fatalf("unexpected forwarded entry: %#v", entry)
+	}
+	if entry.CPUTimeSeconds != 1.5 || entry.PeakBufferMemoryBytes != 2048 {
+		t.Fatalf("resource fields not forwarded: %#v", entry)
+	}
 }
 
 func TestFlightRowSetCloseWaitsForWorkerDoGetCleanup(t *testing.T) {
