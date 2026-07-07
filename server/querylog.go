@@ -27,17 +27,16 @@ type QueryLogEntry = wire.QueryLogEntry
 
 // QueryLogger batches query log entries and writes them to durable storage.
 type QueryLogger struct {
-	db           *sql.DB
-	cfg          QueryLogConfig
-	table        string
-	ch           chan QueryLogEntry
-	done         chan struct{}
-	stopOnce     sync.Once
-	ctx          context.Context
-	cancel       context.CancelFunc
-	buffered     atomic.Int64
-	closeDB      bool
-	prepareBatch func(context.Context, *sql.DB, []QueryLogEntry) error
+	db       *sql.DB
+	cfg      QueryLogConfig
+	table    string
+	ch       chan QueryLogEntry
+	done     chan struct{}
+	stopOnce sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	buffered atomic.Int64
+	closeDB  bool
 }
 
 // QueryLogSink accepts query log entries and drains them during shutdown.
@@ -205,14 +204,7 @@ func (ql *QueryLogger) context() context.Context {
 func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 	defer ql.addBufferedEntries(-int64(len(batch)))
 	start := time.Now()
-	ctx := ql.context()
-	var err error
-	if ql.prepareBatch != nil {
-		err = ql.prepareBatch(ctx, ql.db, batch)
-	}
-	if err == nil {
-		err = insertQueryLogEntries(ctx, ql.db, ql.table, batch)
-	}
+	err := insertQueryLogEntries(ql.context(), ql.db, ql.table, batch)
 	observe.ObserveQueryLogFlushDuration(time.Since(start))
 	if err != nil {
 		observe.IncQueryLogFlushErrors()
