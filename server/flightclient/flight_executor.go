@@ -417,7 +417,8 @@ func (e *FlightExecutor) queryLogForwardLoop() {
 		if len(batch) == 0 {
 			return
 		}
-		e.forwardQueryLogBatch(batch)
+		// forwardQueryLogBatch records dropped-entry metrics for failed batches.
+		_ = e.forwardQueryLogBatch(batch)
 		batch = batch[:0]
 	}
 

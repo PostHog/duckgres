@@ -129,10 +129,6 @@ func NewAttachedQueryLoggerContext(ctx context.Context, db *sql.DB, cfg QueryLog
 	return ql, nil
 }
 
-func ensureAttachedQueryLogTable(db *sql.DB, cfg QueryLogConfig) error {
-	return ensureAttachedQueryLogTableContext(context.Background(), db, cfg)
-}
-
 func ensureAttachedQueryLogTableContext(ctx context.Context, db *sql.DB, cfg QueryLogConfig) error {
 	if ctx == nil {
 		ctx = context.Background()
