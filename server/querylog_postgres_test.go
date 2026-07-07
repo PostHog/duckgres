@@ -1,9 +1,14 @@
 package server
 
 import (
+	"context"
+	"database/sql"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestPostgresQueryLogDSN(t *testing.T) {
@@ -119,9 +124,246 @@ func TestPostgresQueryLogSchemaSQL(t *testing.T) {
 	if strings.Contains(sql, "(org_id,") {
 		t.Fatalf("Postgres query-log indexes should not lead with org_id:\n%s", sql)
 	}
-	currentPartition := strings.Index(sql, "querylog.query_log_entries_202607")
 	defaultPartition := strings.Index(sql, "querylog.query_log_entries_default")
-	if currentPartition < 0 || defaultPartition < 0 || currentPartition > defaultPartition {
-		t.Fatalf("month partitions should be created before default partition:\n%s", sql)
+	firstIndex := strings.Index(sql, "idx_query_log_entries_event_time")
+	if defaultPartition < 0 || firstIndex < 0 || defaultPartition > firstIndex {
+		t.Fatalf("default partition should be created before parent indexes:\n%s", sql)
+	}
+}
+
+func TestPostgresQueryLogBatchPartitionStarts(t *testing.T) {
+	batch := []QueryLogEntry{
+		{EventTime: time.Date(2026, 7, 7, 12, 0, 0, 0, time.FixedZone("offset", -4*60*60))},
+		{EventTime: time.Date(2026, 7, 31, 23, 59, 0, 0, time.UTC)},
+		{EventTime: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)},
+		{EventTime: time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)},
+	}
+
+	got := postgresQueryLogBatchPartitionStarts(batch)
+	want := []time.Time{
+		time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("partition starts = %v, want %v", got, want)
+	}
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Fatalf("partition start %d = %s, want %s", i, got[i], want[i])
+		}
+	}
+}
+
+func TestPostgresQueryLogRepairPartitionSQL(t *testing.T) {
+	start := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+
+	create := postgresQueryLogCreateStandaloneMonthPartitionSQL(start)
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202610",
+		"LIKE querylog.query_log_entries",
+		"INCLUDING IDENTITY",
+	} {
+		if !strings.Contains(create, want) {
+			t.Fatalf("standalone partition SQL missing %q:\n%s", want, create)
+		}
+	}
+
+	move := postgresQueryLogMoveDefaultRowsSQL(start)
+	for _, want := range []string{
+		"INSERT INTO querylog.query_log_entries_202610",
+		"SELECT " + postgresQueryLogColumns + " FROM querylog.query_log_entries_default",
+		"WHERE event_time >= $1 AND event_time < $2",
+	} {
+		if !strings.Contains(move, want) {
+			t.Fatalf("move default rows SQL missing %q:\n%s", want, move)
+		}
+	}
+
+	deleteRows := postgresQueryLogDeleteDefaultRowsSQL()
+	if !strings.Contains(deleteRows, "DELETE FROM querylog.query_log_entries_default WHERE event_time >= $1 AND event_time < $2") {
+		t.Fatalf("delete default rows SQL is wrong:\n%s", deleteRows)
+	}
+
+	attach := postgresQueryLogAttachMonthPartitionSQL(start)
+	for _, want := range []string{
+		"ALTER TABLE querylog.query_log_entries ATTACH PARTITION querylog.query_log_entries_202610",
+		"FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')",
+	} {
+		if !strings.Contains(attach, want) {
+			t.Fatalf("attach partition SQL missing %q:\n%s", want, attach)
+		}
+	}
+}
+
+func TestPostgresQueryLogCreateMonthPartitionSQLNormalizesMonth(t *testing.T) {
+	got := postgresQueryLogCreateMonthPartitionSQL(time.Date(2026, 9, 30, 23, 59, 0, 0, time.FixedZone("offset", -4*60*60)))
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202610",
+		"FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("partition SQL missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestPostgresQueryLogRepairsDirtyDefaultPartitionIntegration(t *testing.T) {
+	ctx := context.Background()
+	db := openLocalQueryLogIntegrationDB(t)
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS querylog CASCADE") })
+	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS querylog CASCADE"); err != nil {
+		t.Fatalf("drop querylog schema: %v", err)
+	}
+	if err := ensurePostgresQueryLogTableContext(ctx, db); err != nil {
+		t.Fatalf("ensure query-log table: %v", err)
+	}
+
+	eventTime := time.Date(2099, 10, 15, 12, 0, 0, 0, time.UTC)
+	dirtyEntry := QueryLogEntry{
+		EventTime:       eventTime,
+		QueryDurationMs: 1,
+		Type:            "QueryFinish",
+		Query:           "SELECT dirty_default",
+		UserName:        "postgres",
+	}
+	if err := insertQueryLogEntries(ctx, db, postgresQueryLogTable, []QueryLogEntry{dirtyEntry}); err != nil {
+		t.Fatalf("seed default partition through parent: %v", err)
+	}
+	assertQueryLogTableOID(t, db, dirtyEntry.Query, "querylog.query_log_entries_default")
+
+	if err := ensurePostgresQueryLogPartitionsForBatchContext(ctx, db, []QueryLogEntry{{EventTime: eventTime}}); err != nil {
+		t.Fatalf("repair dirty default partition: %v", err)
+	}
+	assertQueryLogTableOID(t, db, dirtyEntry.Query, "querylog.query_log_entries_209910")
+	assertQueryLogDefaultRowsForMonth(t, db, eventTime, 0)
+
+	nextEntry := dirtyEntry
+	nextEntry.Query = "SELECT after_repair"
+	if err := insertQueryLogEntries(ctx, db, postgresQueryLogTable, []QueryLogEntry{nextEntry}); err != nil {
+		t.Fatalf("insert after partition repair: %v", err)
+	}
+	assertQueryLogTableOID(t, db, nextEntry.Query, "querylog.query_log_entries_209910")
+}
+
+func TestPostgresQueryLogInitRepairsDirtyDefaultPartitionIntegration(t *testing.T) {
+	ctx := context.Background()
+	db := openLocalQueryLogIntegrationDB(t)
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS querylog CASCADE") })
+	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS querylog CASCADE"); err != nil {
+		t.Fatalf("drop querylog schema: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE SCHEMA IF NOT EXISTS querylog`,
+		postgresQueryLogCreateTableSQL(),
+		`CREATE TABLE IF NOT EXISTS querylog.query_log_entries_default PARTITION OF querylog.query_log_entries DEFAULT`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed pre-repair schema: %v", err)
+		}
+	}
+
+	eventTime := time.Now().UTC()
+	dirtyEntry := QueryLogEntry{
+		EventTime:       eventTime,
+		QueryDurationMs: 1,
+		Type:            "QueryFinish",
+		Query:           "SELECT dirty_init_default",
+		UserName:        "postgres",
+	}
+	if err := insertQueryLogEntries(ctx, db, postgresQueryLogTable, []QueryLogEntry{dirtyEntry}); err != nil {
+		t.Fatalf("seed default partition through parent: %v", err)
+	}
+	assertQueryLogTableOID(t, db, dirtyEntry.Query, "querylog.query_log_entries_default")
+
+	if err := ensurePostgresQueryLogTableContext(ctx, db); err != nil {
+		t.Fatalf("init should repair dirty default partition: %v", err)
+	}
+	assertQueryLogTableOID(t, db, dirtyEntry.Query, postgresQueryLogPartitionName(eventTime))
+	assertQueryLogDefaultRowsForMonth(t, db, eventTime, 0)
+}
+
+func TestPostgresQueryLogAttachesExistingStandalonePartitionIntegration(t *testing.T) {
+	ctx := context.Background()
+	db := openLocalQueryLogIntegrationDB(t)
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS querylog CASCADE") })
+	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS querylog CASCADE"); err != nil {
+		t.Fatalf("drop querylog schema: %v", err)
+	}
+	if err := ensurePostgresQueryLogTableContext(ctx, db); err != nil {
+		t.Fatalf("ensure query-log table: %v", err)
+	}
+
+	eventTime := time.Date(2099, 11, 15, 12, 0, 0, 0, time.UTC)
+	if _, err := db.ExecContext(ctx, postgresQueryLogCreateStandaloneMonthPartitionSQL(eventTime)); err != nil {
+		t.Fatalf("seed standalone partition table: %v", err)
+	}
+	if err := ensurePostgresQueryLogPartitionsForBatchContext(ctx, db, []QueryLogEntry{{EventTime: eventTime}}); err != nil {
+		t.Fatalf("attach standalone partition table: %v", err)
+	}
+
+	entry := QueryLogEntry{
+		EventTime:       eventTime,
+		QueryDurationMs: 1,
+		Type:            "QueryFinish",
+		Query:           "SELECT standalone_attach",
+		UserName:        "postgres",
+	}
+	if err := insertQueryLogEntries(ctx, db, postgresQueryLogTable, []QueryLogEntry{entry}); err != nil {
+		t.Fatalf("insert after standalone partition attach: %v", err)
+	}
+	assertQueryLogTableOID(t, db, entry.Query, "querylog.query_log_entries_209911")
+}
+
+func openLocalQueryLogIntegrationDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("DUCKGRES_TEST_QUERYLOG_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("DUCKGRES_TEST_QUERYLOG_POSTGRES_DSN not set")
+	}
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse DUCKGRES_TEST_QUERYLOG_POSTGRES_DSN: %v", err)
+	}
+	if cfg.Host != "127.0.0.1" && cfg.Host != "localhost" && cfg.Host != "::1" {
+		t.Skipf("DUCKGRES_TEST_QUERYLOG_POSTGRES_DSN host %q is not local; test drops schema querylog", cfg.Host)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func assertQueryLogTableOID(t *testing.T, db *sql.DB, query, want string) {
+	t.Helper()
+	var got string
+	if err := db.QueryRow(
+		"SELECT tableoid::regclass::text FROM querylog.query_log_entries WHERE query = $1",
+		query,
+	).Scan(&got); err != nil {
+		t.Fatalf("query tableoid for %q: %v", query, err)
+	}
+	if got != want {
+		t.Fatalf("tableoid for %q = %q, want %q", query, got, want)
+	}
+}
+
+func assertQueryLogDefaultRowsForMonth(t *testing.T, db *sql.DB, eventTime time.Time, want int) {
+	t.Helper()
+	start := postgresQueryLogMonthStart(eventTime)
+	end := start.AddDate(0, 1, 0)
+	var got int
+	if err := db.QueryRow(
+		"SELECT count(*) FROM querylog.query_log_entries_default WHERE event_time >= $1 AND event_time < $2",
+		start,
+		end,
+	).Scan(&got); err != nil {
+		t.Fatalf("count default rows: %v", err)
+	}
+	if got != want {
+		t.Fatalf("default rows for %s = %d, want %d", postgresQueryLogPartitionKey(eventTime), got, want)
 	}
 }

@@ -55,6 +55,11 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
+	if QueryReferencesHiddenDuckLakeMetadataCatalog(query) {
+		c.observeExtendedParseQueryError("42501", HiddenDuckLakeMetadataCatalogAccessError)
+		return
+	}
+
 	// Detect cursor operations before passthrough or transpilation.
 	// DuckDB doesn't support DECLARE/FETCH/CLOSE natively, so cursor
 	// emulation is needed for all users including passthrough.
@@ -193,8 +198,8 @@ func (c *clientConn) handleParse(body []byte) {
 		isIgnoredSet:      result.IsIgnoredSet,
 		isNoOp:            result.IsNoOp,
 		noOpTag:           result.NoOpTag,
-		querySourceSet:    result.QuerySourceSet,  // SET duckgres.query_source (custom GUC)
-		querySourceShow:   result.QuerySourceShow, // SHOW duckgres.query_source
+		querySourceSet:    result.QuerySourceSet,    // SET duckgres.query_source (custom GUC)
+		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}

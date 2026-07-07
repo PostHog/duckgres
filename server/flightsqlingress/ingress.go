@@ -340,6 +340,13 @@ func (h *ControlPlaneFlightSQLHandler) checkUserSecretDDL(query string) error {
 	return nil
 }
 
+func rejectHiddenDuckLakeMetadataCatalogQuery(query string) error {
+	if server.QueryReferencesHiddenDuckLakeMetadataCatalog(query) {
+		return status.Error(codes.PermissionDenied, server.HiddenDuckLakeMetadataCatalogAccessError)
+	}
+	return nil
+}
+
 func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, validator CredentialValidator) (*ControlPlaneFlightSQLHandler, error) {
 	h := &ControlPlaneFlightSQLHandler{
 		validator: validator,
@@ -550,6 +557,10 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoStatement(ctx context.Contex
 		}, nil
 	}
 
+	if err := rejectHiddenDuckLakeMetadataCatalogQuery(query); err != nil {
+		return nil, err
+	}
+
 	if err := h.checkUserSecretDDL(query); err != nil {
 		return nil, err
 	}
@@ -649,6 +660,10 @@ func (h *ControlPlaneFlightSQLHandler) DoPutCommandStatementUpdate(ctx context.C
 	query := cmd.GetQuery()
 	if server.IsEmptyQuery(query) {
 		return 0, nil
+	}
+
+	if err := rejectHiddenDuckLakeMetadataCatalogQuery(query); err != nil {
+		return 0, err
 	}
 
 	if err := h.checkUserSecretDDL(query); err != nil {
@@ -756,6 +771,10 @@ func (h *ControlPlaneFlightSQLHandler) CreatePreparedStatement(ctx context.Conte
 			Handle:        []byte(handleID),
 			DatasetSchema: emptySchema,
 		}, nil
+	}
+
+	if err := rejectHiddenDuckLakeMetadataCatalogQuery(query); err != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
 
 	if err := h.checkUserSecretDDL(query); err != nil {

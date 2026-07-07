@@ -1241,6 +1241,14 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	c.logger().Debug("Query received.", "query", loggableQuery)
 
+	if QueryReferencesHiddenDuckLakeMetadataCatalog(query) {
+		c.sendError("ERROR", "42501", HiddenDuckLakeMetadataCatalogAccessError)
+		observeQueryOutcome(c.orgID, queryOutcomeError)
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
+
 	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
 	// or transpilation. DuckDB doesn't support these natively, so cursor
 	// emulation is needed for all users including passthrough.

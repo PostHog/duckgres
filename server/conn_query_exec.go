@@ -372,6 +372,12 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
 	start := time.Now()
 
+	if QueryReferencesHiddenDuckLakeMetadataCatalog(query) {
+		c.sendError("ERROR", "42501", HiddenDuckLakeMetadataCatalogAccessError)
+		observeQueryOutcome(c.orgID, queryOutcomeError)
+		return true, nil
+	}
+
 	// Check for cursor operations before transpilation
 	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) == 1 {

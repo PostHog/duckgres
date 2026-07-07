@@ -1214,6 +1214,13 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	} else if cfg.DuckLake.MetadataStore != "" {
 		duckLakeMode = true
 
+		queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogInitTimeout)
+		if err := ensureDuckLakeQueryLogSurface(queryLogCtx, db, cfg); err != nil {
+			queryLogCancel()
+			return fmt.Errorf("failed to initialize DuckLake query-log view: %w", err)
+		}
+		queryLogCancel()
+
 		// Recreate pg_class_full to source from DuckLake metadata instead of DuckDB's pg_catalog.
 		// This ensures consistent PostgreSQL-compatible OIDs across all pg_class queries.
 		if err := recreatePgClassForDuckLake(db); err != nil {
@@ -1271,6 +1278,13 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 		return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
 	}
 
+	queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogInitTimeout)
+	if err := ensureDuckLakeQueryLogSurface(queryLogCtx, db, cfg); err != nil {
+		queryLogCancel()
+		return fmt.Errorf("failed to initialize DuckLake query-log view: %w", err)
+	}
+	queryLogCancel()
+
 	// Catalog-scoped pg_class/pg_namespace/pg_attribute views are installed by
 	// sessionmeta.InitSessionDatabaseMetadata for each Postgres session. Do not
 	// install DuckLake-only global pg_catalog views here.
@@ -1314,6 +1328,14 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 		}
 		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
 	} else if cfg.DuckLake.MetadataStore != "" {
+		queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogInitTimeout)
+		if err := ensureDuckLakeQueryLogSurface(queryLogCtx, db, cfg); err != nil {
+			queryLogCancel()
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to initialize DuckLake query-log view: %w", err)
+		}
+		queryLogCancel()
+
 		if err := setDuckLakeDefault(db); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)

@@ -98,11 +98,14 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 
 When DuckLake uses a Postgres metadata store, Duckgres writes durable per-query
 history to the native Postgres table `querylog.query_log_entries`. The query
-log records SQL user
-(`user_name`), org, query text, duration, row counts, errors, trace/span IDs,
-and profiling-derived resource usage. `cpu_time_s` is DuckDB cumulative
-CPU/thread time in seconds, and `peak_buffer_memory_bytes` is DuckDB's
-`system_peak_buffer_memory` in bytes, not process RSS.
+log is queryable through `ducklake.system.query_log`, a live view over that
+native Postgres table. The view is not DuckLake snapshot data, and Duckgres
+blocks direct user SQL references to DuckLake's hidden metadata catalogs.
+
+Rows record SQL user (`user_name`), org, query text, duration, row counts,
+errors, trace/span IDs, and profiling-derived resource usage. `cpu_time_s` is
+DuckDB cumulative CPU/thread time in seconds, and `peak_buffer_memory_bytes` is
+DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
 
 ## Runbooks
 

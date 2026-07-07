@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"testing"
 	"time"
@@ -392,6 +393,28 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	}
 	if peakBufferMemoryBytes != 2048 {
 		t.Fatalf("expected peak_buffer_memory_bytes 2048, got %d", peakBufferMemoryBytes)
+	}
+}
+
+func TestQueryLoggerFlushBatchStopsOnPrepareError(t *testing.T) {
+	prepareCalled := false
+	ql := &QueryLogger{
+		prepareBatch: func(ctx context.Context, db *sql.DB, batch []QueryLogEntry) error {
+			prepareCalled = true
+			return sql.ErrNoRows
+		},
+	}
+
+	ql.flushBatch([]QueryLogEntry{{
+		EventTime:       time.Unix(1700000000, 0).UTC(),
+		QueryDurationMs: 42,
+		Type:            "QueryFinish",
+		Query:           "SELECT 1",
+		UserName:        "alice",
+	}})
+
+	if !prepareCalled {
+		t.Fatal("expected prepareBatch to be called")
 	}
 }
 
