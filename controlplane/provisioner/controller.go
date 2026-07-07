@@ -73,6 +73,13 @@ type Controller struct {
 	// ducklings that predate CP-owned naming. Empty ⇒ backfill is a no-op and
 	// the composition keeps deriving the name.
 	bucketSuffix string
+
+	// cnpgShardFieldUnsupported latches when a cnpg-shard backfill read-back
+	// shows the API server pruned spec.metadataStore.cnpgShard — i.e. the
+	// cluster's Duckling XRD predates the field. Cluster-wide condition, so
+	// one latch disables the backfill (not per-org) until restart; the
+	// reconcile loop is single-goroutine so no locking. See reconcileCnpgShard.
+	cnpgShardFieldUnsupported bool
 }
 
 // NewController creates a provisioning controller. Returns an error if the
@@ -390,6 +397,17 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 	// has been deriving into status, so the patch moves it from a derived output
 	// into a durable input without changing the actual bucket. No-op once set.
 	c.reconcileBucketName(ctx, w, log)
+
+	// Backfill the composition-pinned cnpg shard onto the Duckling spec
+	// (spec.metadataStore.cnpgShard) for cnpg-shard ducklings provisioned
+	// before the field existed. Same derived-output → durable-input move as
+	// the bucket name: the value written is exactly the CR's own
+	// status.metadataStore.assignedShard, so the composition re-renders
+	// identically and nothing moves. Once every duckling carries it, the
+	// shard a tenant lives on is explicit, schema-validated spec — the
+	// prerequisite for shard-migration cutovers, which patch this field to a
+	// DIFFERENT shard (an explicitly operator-driven step, never done here).
+	c.reconcileCnpgShard(ctx, w, log)
 }
 
 // reconcileBucketName backfills spec.dataStore.bucketName (and the config-store
@@ -443,6 +461,59 @@ func (c *Controller) reconcileBucketName(ctx context.Context, w *configstore.Man
 		}); err != nil {
 			log.Warn("Failed to persist dataStore bucket name to config store.", "error", err)
 		}
+	}
+}
+
+// reconcileCnpgShard backfills spec.metadataStore.cnpgShard with the CR's own
+// pinned status.metadataStore.assignedShard for ready cnpg-shard ducklings
+// that don't carry the field yet. Idempotent and self-limiting: a no-op for
+// non-cnpg metadata stores, while the pin isn't stamped yet, and once the
+// spec carries ANY value — an existing (different) spec value is an
+// operator-set migration override we must never stomp.
+//
+// The read-back after the patch detects a cluster whose Duckling XRD predates
+// the field (the API server then silently prunes it): that disables the
+// backfill for the rest of this controller's lifetime — cluster-wide
+// condition, one WARN, no per-tick patch churn.
+func (c *Controller) reconcileCnpgShard(ctx context.Context, w *configstore.ManagedWarehouse, log *slog.Logger) {
+	if c.cnpgShardFieldUnsupported {
+		return
+	}
+	if w.MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
+		return
+	}
+
+	specShard, assignedShard, err := c.duckling.GetCnpgShardState(ctx, ducklingCRName(w))
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		log.Warn("Failed to read Duckling CR cnpg shard state for backfill.", "error", err)
+		return
+	}
+	if specShard != "" {
+		// Already backfilled, or an operator-set migration override.
+		return
+	}
+	if assignedShard == "" {
+		// Composition hasn't stamped the pin yet.
+		return
+	}
+
+	log.Info("Backfilling pinned cnpg shard onto Duckling CR spec.", "shard", assignedShard)
+	if err := c.duckling.SetMetadataStoreCnpgShard(ctx, ducklingCRName(w), assignedShard); err != nil {
+		log.Warn("Failed to patch Duckling CR metadataStore.cnpgShard.", "error", err)
+		return
+	}
+	readBack, _, err := c.duckling.GetCnpgShardState(ctx, ducklingCRName(w))
+	if err != nil {
+		log.Warn("Failed to read back Duckling CR cnpg shard after backfill.", "error", err)
+		return
+	}
+	if readBack != assignedShard {
+		c.cnpgShardFieldUnsupported = true
+		log.Warn("Duckling XRD pruned spec.metadataStore.cnpgShard — the cluster's XRD predates the field; disabling the shard backfill until this control plane restarts.",
+			"wrote", assignedShard, "readBack", readBack)
 	}
 }
 
