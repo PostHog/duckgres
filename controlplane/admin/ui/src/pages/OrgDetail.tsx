@@ -132,10 +132,14 @@ export function OrgDetail() {
     }
   };
 
-  // Org deletion is blocked while a managed warehouse still exists: the correct
-  // flow is deprovision → provisioner tears down the duckling and removes the
-  // warehouse row → then delete. The backend 409s too; this is belt-and-suspenders.
-  const orgHasWarehouse = Boolean(org.data?.warehouse) || Boolean(warehouse.data);
+  // Org deletion is blocked while a managed warehouse is still LIVE: the
+  // correct flow is deprovision → provisioner tears down the duckling → then
+  // delete. Deprovisioning does not remove the warehouse row — it parks it in
+  // the terminal "deleted" state (infra gone), which must NOT block deletion
+  // or a fully deprovisioned org becomes undeletable. The backend applies the
+  // same state<>deleted rule and sweeps the dead row; this is belt-and-suspenders.
+  const liveWarehouse = (w?: { state?: string } | null) => Boolean(w) && w?.state !== "deleted";
+  const orgHasWarehouse = liveWarehouse(org.data?.warehouse) || liveWarehouse(warehouse.data);
 
   const closeDelete = () => {
     setConfirmDelete(false);
