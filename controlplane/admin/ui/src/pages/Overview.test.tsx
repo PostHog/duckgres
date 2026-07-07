@@ -10,6 +10,7 @@ const hooks = vi.hoisted(() => ({
   useFleet: vi.fn(),
   useModel: vi.fn(),
   useMetricRange: vi.fn(),
+  useOrgs: vi.fn(),
 }));
 
 vi.mock("@/hooks/useApi", () => hooks);
@@ -18,11 +19,17 @@ import { Overview } from "./Overview";
 
 const ok = <T,>(data: T) => ({ data, isSuccess: true, isLoading: false, isError: false });
 
-function setup(fleet: FleetStat[], opts?: { sessions?: number; orgs?: number }) {
+function setup(fleet: FleetStat[], opts?: { sessions?: number; orgs?: number; statusOrgs?: unknown[]; orgRows?: unknown[] }) {
   hooks.useFleet.mockReturnValue(ok(fleet));
   hooks.useClusterStatus.mockReturnValue(
-    ok({ total_orgs: opts?.orgs ?? 11, total_sessions: opts?.sessions ?? 0, total_workers: 0, orgs: [] }),
+    ok({
+      total_orgs: opts?.orgs ?? 11,
+      total_sessions: opts?.sessions ?? 0,
+      total_workers: 0,
+      orgs: opts?.statusOrgs ?? [],
+    }),
   );
+  hooks.useOrgs.mockReturnValue(ok(opts?.orgRows ?? []));
   hooks.useModel.mockReturnValue(ok({ rows: [] }));
   hooks.useMetricRange.mockReturnValue(ok(undefined));
 }
@@ -66,5 +73,34 @@ describe("Overview Workers card", () => {
 
     expect(within(card("Workers")).getByText("4 hot · 25 idle")).toBeInTheDocument();
     expect(screen.getByText(/reserving vCPU/i)).toBeInTheDocument();
+  });
+});
+
+describe("Overview per-org load", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("shows the readable org database name when org metadata is available", () => {
+    setup([], {
+      statusOrgs: [
+        {
+          name: "019740a8-ac01-0000-cad1-26dbbe0cde55",
+          workers: 7,
+          active_sessions: 3,
+          max_workers: 10,
+        },
+      ],
+      orgRows: [
+        {
+          name: "019740a8-ac01-0000-cad1-26dbbe0cde55",
+          database_name: "product_analytics",
+          hostname_alias: null,
+        },
+      ],
+    });
+
+    render(<Overview />);
+
+    expect(screen.getByText("product_analytics")).toBeInTheDocument();
+    expect(screen.getByText("019740a8-ac01-0000-cad1-26dbbe0cde55")).toBeInTheDocument();
   });
 });
