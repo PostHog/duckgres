@@ -2129,6 +2129,43 @@ admin_ducklings_metadata() { # cnpgOrg extOrg
   log "admin ducklings metadata OK ($cnpg_d on $(echo "$out" | jq -r --arg d "$cnpg_d" '.entries[$d].cnpg_shard'))"
 }
 
+# ---- duckling shard backfill (provisioner reconcileCnpgShard) --------------
+# The CP backfills the composition-pinned shard (status.metadataStore.
+# assignedShard) of a ready cnpg-shard duckling into
+# spec.metadataStore.cnpgShard, making the tenant's shard explicit,
+# schema-validated spec — the precondition for shard-migration cutovers.
+# Provisioner tick is 10s and the warehouse has been ready for a while by the
+# time this runs, so 120s is generous.
+#
+# The spec field only exists once the cluster's Duckling XRD carries it
+# (charts PR #12918); an older XRD silently prunes the patch and the CP
+# latches its backfill off. That state is EXPECTED until that PR deploys, so
+# on timeout this probes XRD support by patching the field itself (the Job SA
+# has ducklings patch via duckgres-duckling-reader): probe pruned → loud SKIP,
+# not a failure; probe sticks → the field works and the CP failed to backfill
+# → real failure.
+duckling_shard_backfill() { # cnpgOrg
+  d="$(echo "$1" | tr 'A-Z' 'a-z')"
+  log "duckling shard backfill: spec.metadataStore.cnpgShard on duckling/$d"
+  assigned="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.status.metadataStore.assignedShard}')"
+  [ -n "$assigned" ] || fail "duckling shard backfill: duckling/$d has no status.metadataStore.assignedShard"
+  spec=""
+  for _ in $(seq 1 12); do
+    spec="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.cnpgShard}')"
+    [ "$spec" = "$assigned" ] && { log "duckling shard backfill OK (spec.cnpgShard=$spec)"; return 0; }
+    sleep 10
+  done
+  "$KUBECTL" -n ducklings patch duckling "$d" --type merge \
+    -p "{\"spec\":{\"metadataStore\":{\"cnpgShard\":\"$assigned\"}}}" >/dev/null \
+    || fail "duckling shard backfill: probe patch failed"
+  probe="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.cnpgShard}')"
+  if [ -z "$probe" ]; then
+    log "SKIP: duckling shard backfill — cluster XRD predates spec.metadataStore.cnpgShard (charts #12918 not deployed); the CP latches the backfill off, nothing to assert yet"
+    return 0
+  fi
+  fail "duckling shard backfill: XRD supports the field (probe stuck: $probe) but the CP never backfilled it (spec=$spec assigned=$assigned)"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -2550,6 +2587,9 @@ main() {
   # ---- admin ducklings metadata: live cnpg shard assignment ----------------
   admin_ducklings_metadata "$CNPG" "$EXT"
 
+  # ---- provisioner backfills pinned shard into duckling spec (cnpg) --------
+  duckling_shard_backfill "$CNPG"
+
   # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
   admin_query_detail "$CNPG" "$cnpg_pw"
 
@@ -2597,7 +2637,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

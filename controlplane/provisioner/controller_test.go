@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
@@ -350,6 +351,155 @@ func TestReconcileReadyNoDriftDoesNotPatch(t *testing.T) {
 	}
 	if got.GetResourceVersion() != seededRV {
 		t.Fatalf("expected no patch when in sync, resourceVersion went %q -> %q", seededRV, got.GetResourceVersion())
+	}
+}
+
+// seedCnpgCR creates a cnpg-shard Duckling CR with the given spec override and
+// status-pinned shard (either may be empty to omit the field).
+func seedCnpgCR(t *testing.T, fakeK8s *dynamicfake.FakeDynamicClient, name, specShard, assignedShard string) {
+	t.Helper()
+	ms := map[string]interface{}{"type": "cnpg-shard"}
+	if specShard != "" {
+		ms["cnpgShard"] = specShard
+	}
+	obj := map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":      name,
+			"namespace": ducklingNamespace,
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": ms,
+		},
+	}
+	if assignedShard != "" {
+		obj["status"] = map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":          "cnpg-shard",
+				"assignedShard": assignedShard,
+			},
+		}
+	}
+	cr := &unstructured.Unstructured{Object: obj}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+}
+
+func cnpgWarehouse(org string) *configstore.ManagedWarehouse {
+	return &configstore.ManagedWarehouse{
+		OrgID:         org,
+		DucklingName:  org,
+		State:         configstore.ManagedWarehouseStateReady,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{Kind: configstore.MetadataStoreKindCnpgShard},
+	}
+}
+
+func specCnpgShardOf(t *testing.T, fakeK8s *dynamicfake.FakeDynamicClient, name string) string {
+	t.Helper()
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	spec, _ := got.Object["spec"].(map[string]interface{})
+	ms, _ := spec["metadataStore"].(map[string]interface{})
+	shard, _ := ms["cnpgShard"].(string)
+	return shard
+}
+
+// TestReconcileReadyBackfillsCnpgShard pins the derived-output → durable-input
+// backfill: a ready cnpg-shard duckling with no spec override gets its own
+// status-pinned assignedShard stamped into spec.metadataStore.cnpgShard, with
+// sibling fields preserved.
+func TestReconcileReadyBackfillsCnpgShard(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-bf"] = cnpgWarehouse("org-bf")
+	seedCnpgCR(t, fakeK8s, "org-bf", "", "shard-001")
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	if got := specCnpgShardOf(t, fakeK8s, "org-bf"); got != "shard-001" {
+		t.Fatalf("spec.metadataStore.cnpgShard = %q, want shard-001", got)
+	}
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), "org-bf", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	ms := got.Object["spec"].(map[string]interface{})["metadataStore"].(map[string]interface{})
+	if ms["type"] != "cnpg-shard" {
+		t.Fatalf("merge patch must preserve metadataStore.type, got %v", ms["type"])
+	}
+}
+
+// TestReconcileCnpgShardSkips pins every no-op path: an existing spec value
+// (an operator-set migration override pointing at a DIFFERENT shard) is never
+// stomped, a not-yet-stamped pin defers, and non-cnpg metadata stores are
+// ignored entirely.
+func TestReconcileCnpgShardSkips(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+
+	// Operator override present — must survive untouched.
+	fs.warehouses["org-override"] = cnpgWarehouse("org-override")
+	seedCnpgCR(t, fakeK8s, "org-override", "shard-002", "shard-001")
+
+	// Pin not stamped yet (composition still rendering) — nothing to backfill.
+	fs.warehouses["org-unpinned"] = cnpgWarehouse("org-unpinned")
+	seedCnpgCR(t, fakeK8s, "org-unpinned", "", "")
+
+	// External metadata store — no shard concept.
+	fs.warehouses["org-ext"] = &configstore.ManagedWarehouse{
+		OrgID:         "org-ext",
+		DucklingName:  "org-ext",
+		State:         configstore.ManagedWarehouseStateReady,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{Kind: configstore.MetadataStoreKindExternal},
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	if got := specCnpgShardOf(t, fakeK8s, "org-override"); got != "shard-002" {
+		t.Fatalf("operator override was stomped: cnpgShard = %q, want shard-002", got)
+	}
+	if got := specCnpgShardOf(t, fakeK8s, "org-unpinned"); got != "" {
+		t.Fatalf("unpinned CR was patched: cnpgShard = %q, want empty", got)
+	}
+}
+
+// TestReconcileCnpgShardLatchesOnPrunedPatch pins the XRD-drift guard: when
+// the API server prunes the field (Duckling XRD predates it — simulated by a
+// reactor that swallows the patch), the read-back mismatch latches the
+// backfill off so it doesn't churn a patch per tick until the XRD ships.
+func TestReconcileCnpgShardLatchesOnPrunedPatch(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-prune"] = cnpgWarehouse("org-prune")
+	seedCnpgCR(t, fakeK8s, "org-prune", "", "shard-001")
+
+	patches := 0
+	fakeK8s.PrependReactor("patch", "ducklings", func(k8stesting.Action) (bool, runtime.Object, error) {
+		patches++
+		// Swallow the patch: return the stored object unmodified, like an API
+		// server whose XRD prunes the unknown field.
+		obj, err := fakeK8s.Tracker().Get(ducklingGVR, ducklingNamespace, "org-prune")
+		return true, obj, err
+	})
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+	if patches != 1 {
+		t.Fatalf("first tick patches = %d, want 1", patches)
+	}
+	if !ctrl.cnpgShardFieldUnsupported {
+		t.Fatal("pruned patch did not latch cnpgShardFieldUnsupported")
+	}
+
+	ctrl.reconcile(context.Background())
+	if patches != 1 {
+		t.Fatalf("latched backfill still patched: patches = %d, want 1", patches)
 	}
 }
 

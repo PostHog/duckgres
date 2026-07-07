@@ -421,6 +421,64 @@ func (d *DucklingClient) SetDataStoreBucketName(ctx context.Context, name, bucke
 	return nil
 }
 
+// GetCnpgShardState reads, in one CR read, the explicit shard override
+// (spec.metadataStore.cnpgShard) and the composition-pinned assignment
+// (status.metadataStore.assignedShard) of the named Duckling CR. An empty
+// specShard means no override is set (pre-backfill CR, or an XRD that pruned
+// the field); an empty assignedShard means the composition hasn't stamped the
+// pin yet (still provisioning) or the CR isn't cnpg-shard.
+func (d *DucklingClient) GetCnpgShardState(ctx context.Context, name string) (specShard, assignedShard string, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return "", "", fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	if spec, ok := cr.Object["spec"].(map[string]interface{}); ok {
+		if ms, ok := spec["metadataStore"].(map[string]interface{}); ok {
+			specShard, _ = ms["cnpgShard"].(string)
+		}
+	}
+	if status, ok := cr.Object["status"].(map[string]interface{}); ok {
+		if ms, ok := status["metadataStore"].(map[string]interface{}); ok {
+			assignedShard, _ = ms["assignedShard"].(string)
+		}
+	}
+	return specShard, assignedShard, nil
+}
+
+// SetMetadataStoreCnpgShard patches spec.metadataStore.cnpgShard on the named
+// Duckling CR. JSON merge patch (RFC 7396) so it's idempotent and only touches
+// that one field — type/external/pgbouncer siblings are left untouched.
+//
+// Setting it to the CR's own status.metadataStore.assignedShard (the backfill
+// in reconcileReady) is a pure no-op for the composition. Setting a DIFFERENT
+// shard is the cutover step of a metadata-store migration: the composition
+// re-points the per-tenant provider-sql Role/Database at the new shard's
+// ProviderConfig IN PLACE (same pgIdent, same pinned password; the old
+// shard's role/database are orphaned, not dropped) and does NOT copy any
+// catalog data — the caller is responsible for having restored the catalog
+// on the target shard first. Callers should read the value back with
+// GetCnpgShardState: an XRD that predates the field silently prunes the
+// patch, so a successful Patch alone does not mean the override applied.
+func (d *DucklingClient) SetMetadataStoreCnpgShard(ctx context.Context, name, shard string) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"cnpgShard": shard,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cnpgShard patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadataStore cnpgShard: %w", name, err)
+	}
+	return nil
+}
+
 // readSpecDuckLakeEnabled returns spec.ducklake.enabled as *bool — nil when the
 // ducklake block (or its enabled key) is absent, so callers can distinguish a
 // legacy CR (apply the type-based default) from an explicit true/false.
