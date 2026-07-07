@@ -301,11 +301,9 @@ type Config struct {
 
 // QueryLogConfig configures the query log feature.
 type QueryLogConfig struct {
-	Enabled              bool
-	FlushInterval        time.Duration
-	BatchSize            int
-	CompactInterval      time.Duration
-	DataInliningRowLimit int
+	Enabled       bool
+	FlushInterval time.Duration
+	BatchSize     int
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.

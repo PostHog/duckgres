@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -15,7 +14,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/wire"
@@ -29,17 +27,16 @@ type QueryLogEntry = wire.QueryLogEntry
 
 // QueryLogger batches query log entries and writes them to durable storage.
 type QueryLogger struct {
-	db              *sql.DB
-	cfg             QueryLogConfig
-	table           string
-	ch              chan QueryLogEntry
-	done            chan struct{}
-	stopOnce        sync.Once
-	ctx             context.Context
-	cancel          context.CancelFunc
-	buffered        atomic.Int64
-	closeDB         bool
-	compactDuckLake bool
+	db       *sql.DB
+	cfg      QueryLogConfig
+	table    string
+	ch       chan QueryLogEntry
+	done     chan struct{}
+	stopOnce sync.Once
+	ctx      context.Context
+	cancel   context.CancelFunc
+	buffered atomic.Int64
+	closeDB  bool
 }
 
 // QueryLogSink accepts query log entries and drains them during shutdown.
@@ -54,178 +51,22 @@ type queryLogEntrySink interface {
 
 const (
 	queryLogChannelSize = 10000
+	queryLogInitTimeout = 30 * time.Second
 	maxQueryLength      = 4096
 )
 
-// NewQueryLogSink creates the DuckLake-backed system.query_log sink.
-func NewQueryLogSink(cfg Config) (QueryLogSink, error) {
-	if !cfg.QueryLog.Enabled {
-		return nil, nil
-	}
-	ql, err := NewQueryLogger(cfg)
-	if ql == nil {
-		return nil, err
-	}
-	return ql, err
+var newPostgresQueryLogSink = func(ctx context.Context, cfg Config) (QueryLogSink, error) {
+	return NewPostgresQueryLoggerContext(ctx, cfg.DuckLake, cfg.QueryLog)
 }
 
-// NewQueryLogger opens a dedicated :memory: DuckDB, attaches DuckLake,
-// creates the system.query_log table, and starts the background flush goroutine.
-func NewQueryLogger(cfg Config) (*QueryLogger, error) {
+// NewQueryLogSink creates the native Postgres-backed query-log sink.
+func NewQueryLogSink(cfg Config) (QueryLogSink, error) {
 	if !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
 		return nil, nil
 	}
-
-	db, err := openQueryLogDuckLakeDB(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ql := &QueryLogger{
-		db:              db,
-		cfg:             cfg.QueryLog,
-		table:           "ducklake.system.query_log",
-		ch:              make(chan QueryLogEntry, queryLogChannelSize),
-		done:            make(chan struct{}),
-		ctx:             ctx,
-		cancel:          cancel,
-		closeDB:         true,
-		compactDuckLake: true,
-	}
-
-	go ql.flushLoop()
-	slog.Info("Query log enabled.", "flush_interval", cfg.QueryLog.FlushInterval, "batch_size", cfg.QueryLog.BatchSize)
-	return ql, nil
-}
-
-// NewAttachedQueryLogger creates a query logger using a DuckDB handle that
-// already sees the tenant DuckLake catalog. The logger does not own db; callers
-// must close the handle after StopContext returns.
-func NewAttachedQueryLogger(db *sql.DB, cfg QueryLogConfig) (*QueryLogger, error) {
-	return NewAttachedQueryLoggerContext(context.Background(), db, cfg)
-}
-
-func NewAttachedQueryLoggerContext(ctx context.Context, db *sql.DB, cfg QueryLogConfig) (*QueryLogger, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if !cfg.Enabled || db == nil {
-		return nil, nil
-	}
-	if err := ensureAttachedQueryLogTableContext(ctx, db, cfg); err != nil {
-		return nil, err
-	}
-	loggerCtx, cancel := context.WithCancel(context.Background())
-	ql := &QueryLogger{
-		db:              db,
-		cfg:             cfg,
-		table:           "ducklake.system.query_log",
-		ch:              make(chan QueryLogEntry, queryLogChannelSize),
-		done:            make(chan struct{}),
-		ctx:             loggerCtx,
-		cancel:          cancel,
-		compactDuckLake: true,
-	}
-	go ql.flushLoop()
-	slog.Info("Query log enabled on attached DuckLake.", "flush_interval", cfg.FlushInterval, "batch_size", cfg.BatchSize)
-	return ql, nil
-}
-
-func ensureAttachedQueryLogTableContext(ctx context.Context, db *sql.DB, cfg QueryLogConfig) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, err := db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
-		return fmt.Errorf("querylog: create schema: %w", err)
-	}
-	if err := ensureQueryLogTableContext(ctx, db, "system", "query_log", "ducklake.system.query_log"); err != nil {
-		return fmt.Errorf("querylog: ensure table: %w", err)
-	}
-	inlineStmt := fmt.Sprintf(
-		"CALL ducklake.set_option('data_inlining_row_limit', %d, schema => 'system', table_name => 'query_log')",
-		cfg.DataInliningRowLimit)
-	if _, err := db.ExecContext(ctx, inlineStmt); err != nil {
-		slog.Warn("querylog: failed to set data_inlining_row_limit, continuing without it.", "error", err)
-	}
-	return nil
-}
-
-func openQueryLogDuckLakeDB(cfg Config) (*sql.DB, error) {
-	if cfg.DuckLake.MetadataStore == "" {
-		return nil, errors.New("querylog: DuckLake metadata store is required")
-	}
-
-	db, err := sql.Open("duckdb", queryLogDuckLakeDBDSN())
-	if err != nil {
-		return nil, fmt.Errorf("querylog: open duckdb: %w", err)
-	}
-
-	if err := setExtensionDirectory(db, cfg.DataDir); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: set extension directory: %w", err)
-	}
-
-	if err := LoadExtensions(db, []string{"ducklake"}); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: load ducklake: %w", err)
-	}
-
-	// Create S3 secret if needed (reuse the same logic as AttachDuckLake)
-	dlCfg := cfg.DuckLake
-	if dlCfg.ObjectStore != "" {
-		needsSecret := dlCfg.S3Endpoint != "" ||
-			dlCfg.S3AccessKey != "" ||
-			dlCfg.S3Provider == "credential_chain" ||
-			dlCfg.S3Provider == "aws_sdk" ||
-			dlCfg.S3Chain != "" ||
-			dlCfg.S3Profile != ""
-		if needsSecret {
-			if err := createS3Secret(db, dlCfg); err != nil {
-				_ = db.Close()
-				return nil, fmt.Errorf("querylog: create S3 secret: %w", err)
-			}
-		}
-	}
-
-	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: pre-attach settings: %w", err)
-	}
-
-	// Attach DuckLake
-	attachStmt := ducklake.BuildAttachStmt(dlCfg, ducklake.MigrationNeeded(dlCfg.MetadataStore))
-	if _, err := db.Exec(attachStmt); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: attach ducklake: %w", err)
-	}
-
-	configureDuckLakeMetadataPool(db)
-
-	// Create schema and table
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: create schema: %w", err)
-	}
-
-	if err := ensureQueryLogTable(db, "system", "query_log", "ducklake.system.query_log"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: ensure table: %w", err)
-	}
-
-	// Configure data inlining
-	inlineStmt := fmt.Sprintf(
-		"CALL ducklake.set_option('data_inlining_row_limit', %d, schema => 'system', table_name => 'query_log')",
-		cfg.QueryLog.DataInliningRowLimit)
-	if _, err := db.Exec(inlineStmt); err != nil {
-		slog.Warn("querylog: failed to set data_inlining_row_limit, continuing without it.", "error", err)
-	}
-
-	return db, nil
-}
-
-func queryLogDuckLakeDBDSN() string {
-	return ":memory:?allow_unsigned_extensions=true"
+	ctx, cancel := context.WithTimeout(context.Background(), queryLogInitTimeout)
+	defer cancel()
+	return newPostgresQueryLogSink(ctx, cfg)
 }
 
 // Log sends an entry to the query log. Non-blocking; drops if channel is full.
@@ -261,8 +102,8 @@ func (ql *QueryLogger) Stop() {
 }
 
 // StopContext drains remaining entries until ctx expires. If the deadline is
-// reached, it cancels in-flight DuckDB work; standalone loggers also close
-// their owned DB handle to unblock shutdown.
+// reached, it cancels in-flight storage work; loggers that own a DB handle also
+// close it to unblock shutdown.
 func (ql *QueryLogger) StopContext(ctx context.Context) error {
 	if ql == nil {
 		return nil
@@ -313,14 +154,6 @@ func (ql *QueryLogger) flushLoop() {
 	flushTicker := time.NewTicker(ql.cfg.FlushInterval)
 	defer flushTicker.Stop()
 
-	var compactC <-chan time.Time
-	var compactTicker *time.Ticker
-	if ql.compactDuckLake && ql.cfg.CompactInterval > 0 {
-		compactTicker = time.NewTicker(ql.cfg.CompactInterval)
-		compactC = compactTicker.C
-		defer compactTicker.Stop()
-	}
-
 	for {
 		select {
 		case entry, ok := <-ql.ch:
@@ -329,7 +162,6 @@ func (ql *QueryLogger) flushLoop() {
 				if len(batch) > 0 {
 					ql.flushBatch(batch)
 				}
-				ql.compactParquet()
 				return
 			}
 			batch = append(batch, entry)
@@ -342,12 +174,6 @@ func (ql *QueryLogger) flushLoop() {
 				ql.flushBatch(batch)
 				batch = batch[:0]
 			}
-		case <-compactC:
-			if len(batch) > 0 {
-				ql.flushBatch(batch)
-				batch = batch[:0]
-			}
-			ql.compactParquet()
 		}
 	}
 }
@@ -456,16 +282,6 @@ func queryLogEntryInsertArgs(e QueryLogEntry) []any {
 	}
 }
 
-func (ql *QueryLogger) compactParquet() {
-	if ql == nil || !ql.compactDuckLake || ql.db == nil {
-		return
-	}
-	_, err := ql.db.ExecContext(ql.context(), "CALL ducklake_flush_inlined_data('ducklake', schema_name => 'system', table_name => 'query_log')")
-	if err != nil {
-		slog.Warn("querylog: compact failed.", "error", err)
-	}
-}
-
 // truncateQuery truncates a query string to maxQueryLength.
 func truncateQuery(q string) string {
 	if len(q) > maxQueryLength {
@@ -480,164 +296,6 @@ func truncateNullableQuery(q *string) *string {
 	}
 	truncated := truncateQuery(*q)
 	return &truncated
-}
-
-func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName string) error {
-	return ensureQueryLogTableContext(context.Background(), db, tableSchema, tableName, fullTableName)
-}
-
-func ensureQueryLogTableContext(ctx context.Context, db *sql.DB, tableSchema, tableName, fullTableName string) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	colType, err := queryLogColumnTypeContext(ctx, db, fullTableName, tableSchema, tableName, "normalized_query_hash")
-	if err == nil && strings.ToUpper(colType) != "BIGINT" {
-		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
-		if _, dropErr := db.ExecContext(ctx, "DROP TABLE "+fullTableName); dropErr != nil {
-			return fmt.Errorf("drop query_log for normalized_query_hash migration: %w", dropErr)
-		}
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("inspect normalized_query_hash column: %w", err)
-	}
-
-	if _, err := db.ExecContext(ctx, queryLogCreateTableSQL(fullTableName)); err != nil {
-		return fmt.Errorf("create query_log table: %w", err)
-	}
-
-	hasOrgID, err := queryLogColumnExistsContext(ctx, db, fullTableName, tableSchema, tableName, "org_id")
-	if err != nil {
-		return fmt.Errorf("inspect org_id column: %w", err)
-	}
-	if !hasOrgID {
-		if _, err := db.ExecContext(ctx, "ALTER TABLE "+fullTableName+" ADD COLUMN org_id VARCHAR"); err != nil {
-			return fmt.Errorf("add org_id column: %w", err)
-		}
-	}
-
-	// Add columns for OTEL tracing correlation and compatibility with tables
-	// created while distributed query-log delivery was supported.
-	for _, col := range []string{"trace_id", "span_id", "event_id"} {
-		hasCol, err := queryLogColumnExistsContext(ctx, db, fullTableName, tableSchema, tableName, col)
-		if err != nil {
-			return fmt.Errorf("inspect %s column: %w", col, err)
-		}
-		if !hasCol {
-			if _, err := db.ExecContext(ctx, "ALTER TABLE "+fullTableName+" ADD COLUMN "+col+" VARCHAR"); err != nil {
-				return fmt.Errorf("add %s column: %w", col, err)
-			}
-		}
-	}
-
-	// Backfill profiling-derived columns on tables created before these
-	// observability fields landed. New tables already get them from CREATE TABLE.
-	for _, col := range []struct {
-		name string
-		typ  string
-	}{
-		{name: "postgres_scan_ms", typ: "BIGINT"},
-		{name: "cpu_time_s", typ: "DOUBLE"},
-		{name: "peak_buffer_memory_bytes", typ: "BIGINT"},
-	} {
-		hasCol, err := queryLogColumnExistsContext(ctx, db, fullTableName, tableSchema, tableName, col.name)
-		if err != nil {
-			return fmt.Errorf("inspect %s column: %w", col.name, err)
-		}
-		if !hasCol {
-			if _, err := db.ExecContext(ctx, "ALTER TABLE "+fullTableName+" ADD COLUMN "+col.name+" "+col.typ+" DEFAULT 0"); err != nil {
-				return fmt.Errorf("add %s column: %w", col.name, err)
-			}
-		}
-		if _, err := db.ExecContext(ctx, "UPDATE "+fullTableName+" SET "+col.name+" = 0 WHERE "+col.name+" IS NULL"); err != nil {
-			return fmt.Errorf("backfill %s column: %w", col.name, err)
-		}
-	}
-
-	return nil
-}
-
-func queryLogCreateTableSQL(fullTableName string) string {
-	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-		event_time          TIMESTAMPTZ NOT NULL,
-		query_duration_ms   BIGINT NOT NULL,
-		type                VARCHAR NOT NULL,
-		query               VARCHAR NOT NULL,
-		transpiled_query    VARCHAR,
-		query_kind          VARCHAR,
-		normalized_query_hash BIGINT,
-		result_rows         BIGINT,
-		written_rows        BIGINT,
-		exception_code      VARCHAR,
-		exception           VARCHAR,
-		user_name           VARCHAR NOT NULL,
-		org_id              VARCHAR,
-		current_database    VARCHAR,
-		client_address      VARCHAR,
-		client_port         INTEGER,
-		application_name    VARCHAR,
-		pid                 INTEGER,
-		worker_id           INTEGER,
-		is_transpiled       BOOLEAN,
-		protocol            VARCHAR,
-		trace_id            VARCHAR,
-		span_id             VARCHAR,
-		event_id            VARCHAR,
-		postgres_scan_ms    BIGINT DEFAULT 0,
-		cpu_time_s          DOUBLE DEFAULT 0,
-		peak_buffer_memory_bytes BIGINT DEFAULT 0
-	)`, fullTableName)
-}
-
-func queryLogColumnExists(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (bool, error) {
-	return queryLogColumnExistsContext(context.Background(), db, fullTableName, tableSchema, tableName, columnName)
-}
-
-func queryLogColumnExistsContext(ctx context.Context, db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (bool, error) {
-	_, err := queryLogColumnTypeContext(ctx, db, fullTableName, tableSchema, tableName, columnName)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func queryLogColumnType(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (string, error) {
-	return queryLogColumnTypeContext(context.Background(), db, fullTableName, tableSchema, tableName, columnName)
-}
-
-func queryLogColumnTypeContext(ctx context.Context, db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	query := "SELECT data_type FROM information_schema.columns WHERE table_name = $1 AND column_name = $2"
-	args := []any{tableName, columnName}
-	nextParam := 3
-	if strings.TrimSpace(tableSchema) != "" {
-		query += fmt.Sprintf(" AND table_schema = $%d", nextParam)
-		args = append(args, tableSchema)
-		nextParam++
-	}
-	if catalogName := queryLogCatalogName(fullTableName); catalogName != "" {
-		query += fmt.Sprintf(" AND table_catalog = $%d", nextParam)
-		args = append(args, catalogName)
-	}
-
-	var colType string
-	err := db.QueryRowContext(ctx, query, args...).Scan(&colType)
-	return colType, err
-}
-
-func queryLogCatalogName(fullTableName string) string {
-	parts := strings.Split(fullTableName, ".")
-	if len(parts) == 3 {
-		return strings.TrimSpace(parts[0])
-	}
-	return ""
-}
-
-func escapeSQLStringLiteral(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
 }
 
 // classifyQuery maps a command type string to a query_kind value.

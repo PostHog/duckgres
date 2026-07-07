@@ -168,9 +168,8 @@ func TestQueryLoggerStopIsIdempotent(t *testing.T) {
 	ql := &QueryLogger{
 		db: db,
 		cfg: QueryLogConfig{
-			BatchSize:       1,
-			FlushInterval:   time.Hour,
-			CompactInterval: time.Hour,
+			BatchSize:     1,
+			FlushInterval: time.Hour,
 		},
 		ch:   make(chan QueryLogEntry, 1),
 		done: make(chan struct{}),
@@ -238,66 +237,6 @@ func TestHighBitHashRejectsUbigint(t *testing.T) {
 	}
 }
 
-// TestUbigintToBigintMigrationViaDrop simulates the migration path: an existing
-// table with a UBIGINT column is dropped and recreated as BIGINT, after which
-// negative int64 hash values insert successfully.
-func TestUbigintToBigintMigrationViaDrop(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	// Start with the old schema (UBIGINT)
-	_, err = db.Exec("CREATE TABLE query_log (normalized_query_hash UBIGINT)")
-	if err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-
-	// Verify negative int64 fails with UBIGINT (the bug)
-	var highBitHash int64 = -2949375574818077459
-	_, err = db.Exec("INSERT INTO query_log VALUES ($1)", highBitHash)
-	if err == nil {
-		t.Fatal("expected UBIGINT to reject negative int64")
-		return
-	}
-
-	// Check column type via information_schema (simulates the migration check)
-	var colType string
-	err = db.QueryRow("SELECT data_type FROM information_schema.columns WHERE table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
-	if err != nil {
-		t.Fatalf("query information_schema: %v", err)
-	}
-	if colType != "UBIGINT" {
-		t.Fatalf("expected UBIGINT, got %s", colType)
-	}
-
-	// Simulate migration: drop and recreate with BIGINT
-	_, err = db.Exec("DROP TABLE query_log")
-	if err != nil {
-		t.Fatalf("drop table: %v", err)
-	}
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS query_log (normalized_query_hash BIGINT)")
-	if err != nil {
-		t.Fatalf("recreate table: %v", err)
-	}
-
-	// Now the insert should succeed
-	_, err = db.Exec("INSERT INTO query_log VALUES ($1)", highBitHash)
-	if err != nil {
-		t.Fatalf("insert after migration failed: %v", err)
-	}
-
-	var stored int64
-	err = db.QueryRow("SELECT normalized_query_hash FROM query_log").Scan(&stored)
-	if err != nil {
-		t.Fatalf("query failed: %v", err)
-	}
-	if stored != highBitHash {
-		t.Errorf("round-trip mismatch: got %d, want %d", stored, highBitHash)
-	}
-}
-
 func TestSplitHostPort(t *testing.T) {
 	host, port, err := splitHostPort("192.168.1.1:5432")
 	if err != nil {
@@ -361,88 +300,6 @@ func TestTruncateNullableQuery(t *testing.T) {
 		return
 	} else if len(*got) != maxQueryLength {
 		t.Fatalf("expected truncated length %d, got %d", maxQueryLength, len(*got))
-	}
-}
-
-func TestEscapeSQLStringLiteral(t *testing.T) {
-	got := escapeSQLStringLiteral("postgres:host=localhost password=pa'ss")
-	want := "postgres:host=localhost password=pa''ss"
-	if got != want {
-		t.Fatalf("escapeSQLStringLiteral() = %q, want %q", got, want)
-	}
-}
-
-func TestEnsureQueryLogTableCreatesResourceUsageColumns(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
-		t.Fatalf("ensureQueryLogTable: %v", err)
-	}
-
-	tests := []struct {
-		column string
-		want   string
-	}{
-		{column: "cpu_time_s", want: "DOUBLE"},
-		{column: "peak_buffer_memory_bytes", want: "BIGINT"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.column, func(t *testing.T) {
-			got, err := queryLogColumnType(db, "query_log", "", "query_log", tt.column)
-			if err != nil {
-				t.Fatalf("queryLogColumnType(%s): %v", tt.column, err)
-			}
-			if got != tt.want {
-				t.Fatalf("expected %s type %s, got %s", tt.column, tt.want, got)
-			}
-		})
-	}
-
-	if _, err := db.Exec(`INSERT INTO query_log (event_time, query_duration_ms, type, query, user_name)
-		VALUES (?, ?, ?, ?, ?)`, time.Unix(1700000000, 0).UTC(), int64(1), "QueryFinish", "SELECT 1", "alice"); err != nil {
-		t.Fatalf("insert without resource usage columns: %v", err)
-	}
-	var cpuTimeS sql.NullFloat64
-	var peakBufferMemoryBytes sql.NullInt64
-	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log").Scan(&cpuTimeS, &peakBufferMemoryBytes); err != nil {
-		t.Fatalf("query default resource usage columns: %v", err)
-	}
-	if !cpuTimeS.Valid || cpuTimeS.Float64 != 0 {
-		t.Fatalf("expected cpu_time_s default 0, got valid=%t value=%f", cpuTimeS.Valid, cpuTimeS.Float64)
-	}
-	if !peakBufferMemoryBytes.Valid || peakBufferMemoryBytes.Int64 != 0 {
-		t.Fatalf("expected peak_buffer_memory_bytes default 0, got valid=%t value=%d", peakBufferMemoryBytes.Valid, peakBufferMemoryBytes.Int64)
-	}
-}
-
-func TestEnsureQueryLogTableWithAttachedCatalog(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	if _, err := db.Exec("ATTACH ':memory:' AS ducklake"); err != nil {
-		t.Fatalf("attach ducklake catalog: %v", err)
-	}
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
-		t.Fatalf("create attached schema: %v", err)
-	}
-
-	if err := ensureQueryLogTable(db, "system", "query_log", "ducklake.system.query_log"); err != nil {
-		t.Fatalf("ensureQueryLogTable: %v", err)
-	}
-
-	got, err := queryLogColumnType(db, "ducklake.system.query_log", "system", "query_log", "cpu_time_s")
-	if err != nil {
-		t.Fatalf("queryLogColumnType(cpu_time_s): %v", err)
-	}
-	if got != "DOUBLE" {
-		t.Fatalf("expected cpu_time_s type DOUBLE, got %s", got)
 	}
 }
 
@@ -535,128 +392,6 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	}
 	if peakBufferMemoryBytes != 2048 {
 		t.Fatalf("expected peak_buffer_memory_bytes 2048, got %d", peakBufferMemoryBytes)
-	}
-}
-
-func TestEnsureQueryLogTableAddsOrgIDToExistingTable(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	_, err = db.Exec(`CREATE TABLE query_log (
-		event_time TIMESTAMPTZ,
-		query_duration_ms BIGINT,
-		type VARCHAR,
-		query VARCHAR,
-		transpiled_query VARCHAR,
-		query_kind VARCHAR,
-		normalized_query_hash BIGINT,
-		result_rows BIGINT,
-		written_rows BIGINT,
-		exception_code VARCHAR,
-		exception VARCHAR,
-		user_name VARCHAR,
-		current_database VARCHAR,
-		client_address VARCHAR,
-		client_port INTEGER,
-		application_name VARCHAR,
-		pid INTEGER,
-		worker_id INTEGER,
-		is_transpiled BOOLEAN,
-		protocol VARCHAR,
-		trace_id VARCHAR,
-		span_id VARCHAR
-	)`)
-	if err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO query_log (event_time, query_duration_ms, type, query, user_name)
-		VALUES (?, ?, ?, ?, ?)`, time.Unix(1699999999, 0).UTC(), int64(1), "QueryFinish", "SELECT old", "bob"); err != nil {
-		t.Fatalf("insert existing row before migration: %v", err)
-	}
-
-	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
-		t.Fatalf("ensureQueryLogTable: %v", err)
-	}
-	for _, col := range []string{"org_id", "postgres_scan_ms", "cpu_time_s", "peak_buffer_memory_bytes"} {
-		exists, err := queryLogColumnExists(db, "query_log", "", "query_log", col)
-		if err != nil {
-			t.Fatalf("inspect %s: %v", col, err)
-		}
-		if !exists {
-			t.Fatalf("expected %s column to be added", col)
-		}
-	}
-	var existingCPU sql.NullFloat64
-	var existingPeak sql.NullInt64
-	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log WHERE query = 'SELECT old'").Scan(&existingCPU, &existingPeak); err != nil {
-		t.Fatalf("query migrated existing row resource usage: %v", err)
-	}
-	if !existingCPU.Valid || existingCPU.Float64 != 0 {
-		t.Fatalf("expected migrated existing cpu_time_s 0, got valid=%t value=%f", existingCPU.Valid, existingCPU.Float64)
-	}
-	if !existingPeak.Valid || existingPeak.Int64 != 0 {
-		t.Fatalf("expected migrated existing peak_buffer_memory_bytes 0, got valid=%t value=%d", existingPeak.Valid, existingPeak.Int64)
-	}
-	if _, err := db.Exec(`INSERT INTO query_log (event_time, query_duration_ms, type, query, user_name)
-		VALUES (?, ?, ?, ?, ?)`, time.Unix(1700000001, 0).UTC(), int64(1), "QueryFinish", "SELECT legacy insert", "carol"); err != nil {
-		t.Fatalf("insert old-style row after migration: %v", err)
-	}
-	var defaultCPU sql.NullFloat64
-	var defaultPeak sql.NullInt64
-	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log WHERE query = 'SELECT legacy insert'").Scan(&defaultCPU, &defaultPeak); err != nil {
-		t.Fatalf("query old-style insert resource usage: %v", err)
-	}
-	if !defaultCPU.Valid || defaultCPU.Float64 != 0 {
-		t.Fatalf("expected old-style insert cpu_time_s default 0, got valid=%t value=%f", defaultCPU.Valid, defaultCPU.Float64)
-	}
-	if !defaultPeak.Valid || defaultPeak.Int64 != 0 {
-		t.Fatalf("expected old-style insert peak_buffer_memory_bytes default 0, got valid=%t value=%d", defaultPeak.Valid, defaultPeak.Int64)
-	}
-
-	ql := &QueryLogger{db: db}
-	ql.flushBatch([]QueryLogEntry{{
-		EventTime:             time.Unix(1700000000, 0).UTC(),
-		QueryDurationMs:       42,
-		Type:                  "QueryFinish",
-		Query:                 "SELECT 1",
-		QueryKind:             "Select",
-		NormalizedHash:        17,
-		ResultRows:            1,
-		UserName:              "alice",
-		OrgID:                 "analytics",
-		CurrentDatabase:       "analytics_db",
-		ClientAddress:         "127.0.0.1",
-		ClientPort:            5432,
-		ApplicationName:       "psql",
-		PID:                   99,
-		WorkerID:              7,
-		Protocol:              "simple",
-		CPUTimeSeconds:        1.5,
-		PeakBufferMemoryBytes: 4096,
-	}})
-
-	var got string
-	err = db.QueryRow("SELECT org_id FROM query_log WHERE query = 'SELECT 1'").Scan(&got)
-	if err != nil {
-		t.Fatalf("query org_id: %v", err)
-	}
-	if got != "analytics" {
-		t.Fatalf("expected org_id analytics, got %q", got)
-	}
-
-	var cpuTimeS float64
-	var peakBufferMemoryBytes int64
-	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log WHERE query = 'SELECT 1'").Scan(&cpuTimeS, &peakBufferMemoryBytes); err != nil {
-		t.Fatalf("query backfilled resource usage columns: %v", err)
-	}
-	if cpuTimeS != 1.5 {
-		t.Fatalf("expected cpu_time_s 1.5, got %f", cpuTimeS)
-	}
-	if peakBufferMemoryBytes != 4096 {
-		t.Fatalf("expected peak_buffer_memory_bytes 4096, got %d", peakBufferMemoryBytes)
 	}
 }
 

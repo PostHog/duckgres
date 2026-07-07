@@ -66,11 +66,9 @@ type K8sFileConfig struct {
 }
 
 type QueryLogFileConfig struct {
-	Enabled              *bool  `yaml:"enabled"`
-	FlushInterval        string `yaml:"flush_interval"`
-	BatchSize            int    `yaml:"batch_size"`
-	CompactInterval      string `yaml:"compact_interval"`
-	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"`
+	Enabled       *bool  `yaml:"enabled"`
+	FlushInterval string `yaml:"flush_interval"`
+	BatchSize     int    `yaml:"batch_size"`
 }
 
 type TLSConfig struct {

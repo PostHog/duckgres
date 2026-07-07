@@ -317,9 +317,8 @@ func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 
 func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	env := map[string]string{
-		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL":   "0s",
-		"DUCKGRES_QUERY_LOG_BATCH_SIZE":       "-1",
-		"DUCKGRES_QUERY_LOG_COMPACT_INTERVAL": "-1s",
+		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL": "0s",
+		"DUCKGRES_QUERY_LOG_BATCH_SIZE":     "-1",
 	}
 
 	var warns []string
@@ -333,14 +332,9 @@ func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	if resolved.Server.QueryLog.BatchSize != 1000 {
 		t.Fatalf("expected default batch_size 1000, got %d", resolved.Server.QueryLog.BatchSize)
 	}
-	if resolved.Server.QueryLog.CompactInterval != 10*time.Minute {
-		t.Fatalf("expected default compact_interval 10m, got %s", resolved.Server.QueryLog.CompactInterval)
-	}
-
 	wantWarnings := []string{
 		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL must be > 0",
 		"DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0",
-		"DUCKGRES_QUERY_LOG_COMPACT_INTERVAL must be > 0",
 	}
 	for _, w := range wantWarnings {
 		found := false
