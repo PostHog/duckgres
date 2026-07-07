@@ -946,9 +946,7 @@ func TestLogQueryActionRejectsAfterDrainCompleted(t *testing.T) {
 
 func TestSharedWarmQueryLogSinkUsesPostgresWithoutDuckDBHandle(t *testing.T) {
 	oldNewWorkerPostgresQueryLogger := newWorkerPostgresQueryLogger
-	oldNewAttachedQueryLogger := newAttachedQueryLogger
 	workerCalled := false
-	attachedCalled := false
 	newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
 		workerCalled = true
 		if cfg.DuckLake.MetadataStore != "postgres:host=metadata.internal dbname=ducklake" {
@@ -956,13 +954,8 @@ func TestSharedWarmQueryLogSinkUsesPostgresWithoutDuckDBHandle(t *testing.T) {
 		}
 		return &captureWorkerQueryLogSink{}, nil
 	}
-	newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
-		attachedCalled = true
-		return &captureWorkerQueryLogSink{}, nil
-	}
 	t.Cleanup(func() {
 		newWorkerPostgresQueryLogger = oldNewWorkerPostgresQueryLogger
-		newAttachedQueryLogger = oldNewAttachedQueryLogger
 	})
 
 	pool := &SessionPool{
@@ -990,34 +983,23 @@ func TestSharedWarmQueryLogSinkUsesPostgresWithoutDuckDBHandle(t *testing.T) {
 	if !workerCalled {
 		t.Fatal("expected shared-warm worker to initialize Postgres query-log sink")
 	}
-	if attachedCalled {
-		t.Fatal("shared-warm worker should not initialize attached DuckDB query-log sink")
-	}
 }
 
-func TestNonSharedQueryLogSinkKeepsAttachedDuckDBLogger(t *testing.T) {
+func TestNonSharedQueryLogSinkUsesPostgresWithoutDuckDBHandle(t *testing.T) {
 	oldNewWorkerPostgresQueryLogger := newWorkerPostgresQueryLogger
-	oldNewAttachedQueryLogger := newAttachedQueryLogger
 	workerCalled := false
-	attachedCalled := false
 	newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
 		workerCalled = true
-		return &captureWorkerQueryLogSink{}, nil
-	}
-	newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
-		attachedCalled = true
-		if db == nil {
-			t.Fatal("expected attached DuckDB handle")
+		if cfg.DuckLake.MetadataStore != "postgres:host=metadata.internal dbname=ducklake" {
+			t.Fatalf("metadata store = %q, want configured metadata store", cfg.DuckLake.MetadataStore)
 		}
 		return &captureWorkerQueryLogSink{}, nil
 	}
 	t.Cleanup(func() {
 		newWorkerPostgresQueryLogger = oldNewWorkerPostgresQueryLogger
-		newAttachedQueryLogger = oldNewAttachedQueryLogger
 	})
 
 	pool := &SessionPool{
-		controlDB: &sql.DB{},
 		cfg: server.Config{
 			QueryLog: server.QueryLogConfig{Enabled: true},
 			DuckLake: server.DuckLakeConfig{
@@ -1033,11 +1015,8 @@ func TestNonSharedQueryLogSinkKeepsAttachedDuckDBLogger(t *testing.T) {
 	if sink == nil {
 		t.Fatal("expected query-log sink")
 	}
-	if !attachedCalled {
-		t.Fatal("expected non-shared worker to initialize attached DuckDB query-log sink")
-	}
-	if workerCalled {
-		t.Fatal("non-shared worker should not initialize Postgres query-log sink")
+	if !workerCalled {
+		t.Fatal("expected non-shared worker to initialize Postgres query-log sink")
 	}
 }
 

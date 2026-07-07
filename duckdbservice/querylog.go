@@ -2,7 +2,6 @@ package duckdbservice
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,10 +18,6 @@ const (
 	queryLogInitLockPollInterval  = 10 * time.Millisecond
 	queryLogUnusedSinkStopTimeout = 5 * time.Second
 )
-
-var newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
-	return server.NewAttachedQueryLoggerContext(ctx, db, cfg)
-}
 
 var newWorkerPostgresQueryLogger = func(ctx context.Context, cfg server.Config) (server.QueryLogSink, error) {
 	return server.NewPostgresQueryLoggerContext(ctx, cfg.DuckLake, cfg.QueryLog)
@@ -70,7 +65,7 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime(ctx context.Context) (server
 	}
 	p.queryLogMu.Unlock()
 
-	cfg, db, ok := p.queryLogRuntime()
+	cfg, ok := p.queryLogRuntime()
 	if !ok || !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
 		return nil, nil
 	}
@@ -95,15 +90,7 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime(ctx context.Context) (server
 
 	ctx, cancel := context.WithTimeout(ctx, queryLogSinkInitTimeout)
 	defer cancel()
-	var ql server.QueryLogSink
-	if p.sharedWarmMode {
-		ql, err = newWorkerPostgresQueryLogger(ctx, cfg)
-	} else {
-		if db == nil {
-			return nil, nil
-		}
-		ql, err = newAttachedQueryLogger(ctx, db, cfg.QueryLog)
-	}
+	ql, err := newWorkerPostgresQueryLogger(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("initialize worker query log: %w", err)
 	}
@@ -196,35 +183,22 @@ func (p *SessionPool) queryLogClosed() bool {
 	}
 }
 
-func (p *SessionPool) queryLogRuntime() (server.Config, *sql.DB, bool) {
+func (p *SessionPool) queryLogRuntime() (server.Config, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	cfg := p.cfg
-	var db *sql.DB
 	if p.sharedWarmMode {
 		if p.activation == nil {
-			return server.Config{}, nil, false
+			return server.Config{}, false
 		}
 		cfg.DuckLake = p.activation.payload.DuckLake
 		overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 		if cfg.DuckLake.ApplicationName == "" && p.activation.payload.OrgID != "" {
 			cfg.DuckLake.ApplicationName = "duckgres/" + p.activation.payload.OrgID
 		}
-		db = p.controlDB
-		if db == nil {
-			db = p.activation.db
-		}
-	} else {
-		db = p.controlDB
 	}
-	if db == nil {
-		db = p.warmupDB
-	}
-	if db == nil {
-		db = p.fallbackDB
-	}
-	return cfg, db, true
+	return cfg, true
 }
 
 func (p *SessionPool) stopQueryLogSink(ctx context.Context) {

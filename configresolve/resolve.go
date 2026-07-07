@@ -156,11 +156,9 @@ func DefaultServerConfig() server.Config {
 			DeltaCatalogEnabled:             true,
 		},
 		QueryLog: server.QueryLogConfig{
-			Enabled:              true,
-			FlushInterval:        5 * time.Second,
-			BatchSize:            1000,
-			CompactInterval:      10 * time.Minute,
-			DataInliningRowLimit: 1000,
+			Enabled:       true,
+			FlushInterval: 5 * time.Second,
+			BatchSize:     1000,
 		},
 	}
 }
@@ -425,16 +423,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.QueryLog.BatchSize > 0 {
 			cfg.QueryLog.BatchSize = fileCfg.QueryLog.BatchSize
-		}
-		if fileCfg.QueryLog.CompactInterval != "" {
-			if d, err := time.ParseDuration(fileCfg.QueryLog.CompactInterval); err == nil {
-				cfg.QueryLog.CompactInterval = d
-			} else {
-				warn("Invalid query_log.compact_interval duration: " + err.Error())
-			}
-		}
-		if fileCfg.QueryLog.DataInliningRowLimit > 0 {
-			cfg.QueryLog.DataInliningRowLimit = fileCfg.QueryLog.DataInliningRowLimit
 		}
 
 		if fileCfg.TLS.ACME.Domain != "" {
@@ -880,20 +868,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_QUERY_LOG_BATCH_SIZE: " + err.Error())
 		}
 	}
-	if v := getenv("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.QueryLog.CompactInterval = d
-		} else {
-			warn("Invalid DUCKGRES_QUERY_LOG_COMPACT_INTERVAL duration: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.QueryLog.DataInliningRowLimit = n
-		} else {
-			warn("Invalid DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT: " + err.Error())
-		}
-	}
 
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
@@ -1142,10 +1116,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cfg.QueryLog.BatchSize <= 0 {
 		warn("DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0; using default")
 		cfg.QueryLog.BatchSize = defaultQueryLog.BatchSize
-	}
-	if cfg.QueryLog.CompactInterval <= 0 {
-		warn("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL must be > 0; using default")
-		cfg.QueryLog.CompactInterval = defaultQueryLog.CompactInterval
 	}
 	if cfg.DuckLake.DeltaCatalogEnabled && cfg.DuckLake.DeltaCatalogPath == "" {
 		cfg.DuckLake.DeltaCatalogPath = ducklake.DefaultDeltaCatalogPath(cfg.DuckLake)

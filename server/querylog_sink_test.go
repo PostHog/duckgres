@@ -31,7 +31,7 @@ func TestServerShutdownStopsQueryLogSink(t *testing.T) {
 	}
 }
 
-func TestNewQueryLogSinkDefaultsToDuckLake(t *testing.T) {
+func TestNewQueryLogSinkRequiresDuckLakeMetadataStore(t *testing.T) {
 	cfg := Config{
 		QueryLog: QueryLogConfig{
 			Enabled: true,
@@ -42,6 +42,6 @@ func TestNewQueryLogSinkDefaultsToDuckLake(t *testing.T) {
 		t.Fatalf("NewQueryLogSink: %v", err)
 	}
 	if sink != nil {
-		t.Fatalf("expected nil sink without DuckLake metadata store, got %T", sink)
+		t.Fatalf("expected nil sink without metadata store, got %T", sink)
 	}
 }
