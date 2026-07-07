@@ -260,6 +260,10 @@ Run with config file:
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
 | `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` in PostHog logs (e.g., `duckgres-acme`); only used when `POSTHOG_API_KEY` is set | - |
+| `DUCKGRES_SLACK_WEBHOOK_URL` | Slack incoming webhook URL for operational notifications. Env-only because it is secret-bearing. | - |
+| `DUCKGRES_NOTIFICATION_HASH_KEY` | Optional secret key used to include a stable HMAC org reference in Slack notifications. Env-only because it is secret-bearing. | - |
+| `DUCKGRES_NOTIFICATION_QUEUE_SIZE` | In-process notification queue size before events are dropped instead of blocking user requests | `100` |
+| `DUCKGRES_NOTIFICATION_TIMEOUT` | Per-notification delivery timeout | `2s` |
 
 ### PostHog Logging
 
@@ -328,6 +332,29 @@ teardown), so you can build a provisioning funnel and alert on failures.
 > Note: `query_initiated` fires once per query with no sampling, so its volume
 > scales 1:1 with query throughput. Capture is asynchronous and batched, so it
 > stays off the query latency path.
+
+### Slack Operational Notifications
+
+Set `DUCKGRES_SLACK_WEBHOOK_URL` to enable fire-and-forget Slack notifications
+for org and managed-warehouse lifecycle events. Delivery is asynchronous:
+Duckgres queues events in memory, applies `DUCKGRES_NOTIFICATION_TIMEOUT`
+(default `2s`) per webhook call, and drops notifications when the bounded queue
+is full (default size `100`) rather than blocking signup, provisioning, or
+admin requests. Shutdown does not drain the in-memory notification queue; this
+preserves the best-effort contract during process exit.
+
+Slack messages intentionally do **not** include raw org IDs, customer names,
+database names, endpoints, SQL text, credentials, secret names, or bucket
+names. They include the event name and a small allowlist of low-risk properties
+such as `metadata_store`, `ducklake_enabled`, `source`, and stable failure
+`reason`. Set `DUCKGRES_NOTIFICATION_HASH_KEY` to add a stable
+`hmac-sha256` org reference for Slack-side correlation.
+
+See [`docs/runbooks/slack-notifications.md`](docs/runbooks/slack-notifications.md)
+for local testing and failure recovery.
+
+Notification health is exposed through `duckgres_notifications_dropped_total`
+and `duckgres_notification_delivery_failures_total`.
 
 ### CLI Flags
 

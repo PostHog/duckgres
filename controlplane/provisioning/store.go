@@ -51,6 +51,10 @@ type ProvisionRequest struct {
 	RootUserHash string
 }
 
+type ProvisionResult struct {
+	OrgCreated bool
+}
+
 // gormStore implements Store using a ConfigStore's GORM DB.
 type gormStore struct {
 	cs *configstore.ConfigStore
@@ -90,7 +94,8 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 		// No default_team_id on this standalone path — an existing org keeps
 		// its column as-is; creating a NEW org through here now fails with
 		// ErrDefaultTeamIDRequired (same invariant as Provision).
-		return createPendingWarehouseTx(tx, orgID, databaseName, 0, warehouse)
+		_, err := createPendingWarehouseTx(tx, orgID, databaseName, 0, warehouse)
+		return err
 	})
 }
 
@@ -103,7 +108,8 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // Returns a sentinel-comparable error string ("warehouse already
 // exists in non-terminal state") so HTTP handlers can map to 409
 // without an extra error type.
-func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTeamID int64, warehouse *configstore.ManagedWarehouse) error {
+func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTeamID int64, warehouse *configstore.ManagedWarehouse) (bool, error) {
+	orgCreated := false
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
 	// creates everything). A NEW org MUST carry default_team_id (pull-based
 	// compute billing keys usage buckets by it; all pre-existing orgs are
@@ -114,19 +120,20 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		if defaultTeamID == 0 {
-			return ErrDefaultTeamIDRequired
+			return false, ErrDefaultTeamIDRequired
 		}
 		org = configstore.Org{Name: orgID, DatabaseName: databaseName, DefaultTeamID: &defaultTeamID}
 		if err := tx.Create(&org).Error; err != nil {
-			return err
+			return false, err
 		}
+		orgCreated = true
 	case err != nil:
-		return err
+		return false, err
 	}
 	// Update database name if org already existed with a different one
 	if org.DatabaseName != databaseName {
 		if err := tx.Model(&org).Update("database_name", databaseName).Error; err != nil {
-			return err
+			return false, err
 		}
 	}
 	// If a default_team_id was supplied, persist it even when the org already
@@ -134,7 +141,7 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 	// never cleared here, so an omitted value is a no-op rather than a wipe.
 	if defaultTeamID != 0 {
 		if err := tx.Model(&org).Update("default_team_id", defaultTeamID).Error; err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -144,13 +151,13 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 	if err == nil {
 		if existing.State != configstore.ManagedWarehouseStateFailed &&
 			existing.State != configstore.ManagedWarehouseStateDeleted {
-			return ErrWarehouseNonTerminal
+			return false, ErrWarehouseNonTerminal
 		}
 		if err := tx.Delete(&existing).Error; err != nil {
-			return err
+			return false, err
 		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return err
+		return false, err
 	}
 
 	warehouse.OrgID = orgID
@@ -159,7 +166,7 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 	warehouse.S3State = configstore.ManagedWarehouseStatePending
 	warehouse.IdentityState = configstore.ManagedWarehouseStatePending
 	warehouse.SecretsState = configstore.ManagedWarehouseStatePending
-	return tx.Create(warehouse).Error
+	return orgCreated, tx.Create(warehouse).Error
 }
 
 // Provision is the all-or-nothing entrypoint for POST /provision: one
@@ -179,24 +186,27 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 // The "warehouse already exists in non-terminal state" error is
 // passed through verbatim from createPendingWarehouseTx so the HTTP
 // handler can map it to 409.
-func (s *gormStore) Provision(req ProvisionRequest) error {
+func (s *gormStore) Provision(req ProvisionRequest) (ProvisionResult, error) {
 	if req.OrgID == "" {
-		return errors.New("Provision: OrgID is required")
+		return ProvisionResult{}, errors.New("Provision: OrgID is required")
 	}
 	if req.DatabaseName == "" {
-		return errors.New("Provision: DatabaseName is required")
+		return ProvisionResult{}, errors.New("Provision: DatabaseName is required")
 	}
 	if req.Warehouse == nil {
-		return errors.New("Provision: Warehouse is required")
+		return ProvisionResult{}, errors.New("Provision: Warehouse is required")
 	}
 	if req.RootUserHash == "" {
-		return errors.New("Provision: RootUserHash is required")
+		return ProvisionResult{}, errors.New("Provision: RootUserHash is required")
 	}
-	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
+	var result ProvisionResult
+	err := s.cs.DB().Transaction(func(tx *gorm.DB) error {
 		// 1. Warehouse + Org (extracted helper).
-		if err := createPendingWarehouseTx(tx, req.OrgID, req.DatabaseName, req.DefaultTeamID, req.Warehouse); err != nil {
+		orgCreated, err := createPendingWarehouseTx(tx, req.OrgID, req.DatabaseName, req.DefaultTeamID, req.Warehouse)
+		if err != nil {
 			return err
 		}
+		result.OrgCreated = orgCreated
 
 		// 2. Root user. Same OnConflict semantics as
 		// ConfigStore.CreateOrgUser so a retry overwrites the prior
@@ -216,6 +226,7 @@ func (s *gormStore) Provision(req ProvisionRequest) error {
 
 		return nil
 	})
+	return result, err
 }
 
 func (s *gormStore) IsDatabaseNameAvailable(name string) (bool, error) {

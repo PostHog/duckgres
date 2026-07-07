@@ -16,6 +16,7 @@ import (
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/internal/analytics"
+	"github.com/posthog/duckgres/internal/notifications"
 )
 
 // capturedEvent records one analytics.Capture call.
@@ -42,6 +43,53 @@ func installFakeTracker(t *testing.T) *fakeTracker {
 	analytics.SetDefault(fake)
 	t.Cleanup(func() { analytics.SetDefault(nil) })
 	return fake
+}
+
+type capturedNotification struct {
+	event string
+	orgID string
+	props map[string]any
+}
+
+type fakeNotifier struct {
+	events []capturedNotification
+}
+
+func (f *fakeNotifier) Notify(event notifications.Event) {
+	f.events = append(f.events, capturedNotification{event: event.Name, orgID: event.OrgID, props: event.Props})
+}
+func (f *fakeNotifier) Close() {}
+
+func installFakeNotifier(t *testing.T) *fakeNotifier {
+	t.Helper()
+	fake := &fakeNotifier{}
+	notifications.SetDefault(fake)
+	t.Cleanup(func() { notifications.SetDefault(nil) })
+	return fake
+}
+
+func (f *fakeNotifier) only(t *testing.T, event string) capturedNotification {
+	t.Helper()
+	var found []capturedNotification
+	for _, e := range f.events {
+		if e.event == event {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("expected exactly one %q notification, got %d (all: %+v)", event, len(found), f.events)
+	}
+	return found[0]
+}
+
+func (f *fakeNotifier) count(event string) int {
+	n := 0
+	for _, e := range f.events {
+		if e.event == event {
+			n++
+		}
+	}
+	return n
 }
 
 // only returns the single event with the given name, failing if there isn't
@@ -76,6 +124,7 @@ func (f *fakeTracker) count(event string) int {
 // warehouse metadata, and no failure event.
 func TestReconcileProvisioningSuccessEmitsEvent(t *testing.T) {
 	fake := installFakeTracker(t)
+	notifier := installFakeNotifier(t)
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-ok"] = &configstore.ManagedWarehouse{
@@ -132,6 +181,13 @@ func TestReconcileProvisioningSuccessEmitsEvent(t *testing.T) {
 	if n := fake.count("warehouse_provision_failed"); n != 0 {
 		t.Errorf("expected no failure event, got %d", n)
 	}
+	notification := notifier.only(t, "warehouse_provision_success")
+	if notification.orgID != "org-ok" {
+		t.Errorf("notification orgID = %q, want org-ok", notification.orgID)
+	}
+	if notification.props["metadata_store"] != string(configstore.MetadataStoreKindExternal) {
+		t.Errorf("notification metadata_store = %v, want external", notification.props["metadata_store"])
+	}
 
 	// A second reconcile finds the warehouse already Ready (routed to
 	// reconcileReady), so the success event must not fire again.
@@ -139,12 +195,16 @@ func TestReconcileProvisioningSuccessEmitsEvent(t *testing.T) {
 	if n := fake.count("warehouse_provision_success"); n != 1 {
 		t.Errorf("expected exactly one success event across two reconciles, got %d", n)
 	}
+	if n := notifier.count("warehouse_provision_success"); n != 1 {
+		t.Errorf("expected exactly one success notification across two reconciles, got %d", n)
+	}
 }
 
 // TestReconcileProvisioningTimeoutEmitsFailure asserts the 30-minute timeout
 // path emits warehouse_provision_failed with reason=provisioning_timeout.
 func TestReconcileProvisioningTimeoutEmitsFailure(t *testing.T) {
 	fake := installFakeTracker(t)
+	notifier := installFakeNotifier(t)
 	dc, _ := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-slow"] = &configstore.ManagedWarehouse{
@@ -171,6 +231,10 @@ func TestReconcileProvisioningTimeoutEmitsFailure(t *testing.T) {
 	if e.props["metadata_store"] != string(configstore.MetadataStoreKindCnpgShard) {
 		t.Errorf("metadata_store = %v, want cnpg-shard", e.props["metadata_store"])
 	}
+	notification := notifier.only(t, "warehouse_provision_failed")
+	if notification.props["reason"] != "provisioning_timeout" {
+		t.Errorf("notification reason = %v, want provisioning_timeout", notification.props["reason"])
+	}
 }
 
 // TestReconcileProvisioningCrossplaneFailureEmitsFailure asserts that a
@@ -178,6 +242,7 @@ func TestReconcileProvisioningTimeoutEmitsFailure(t *testing.T) {
 // with reason=crossplane_sync_failure.
 func TestReconcileProvisioningCrossplaneFailureEmitsFailure(t *testing.T) {
 	fake := installFakeTracker(t)
+	notifier := installFakeNotifier(t)
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-xp"] = &configstore.ManagedWarehouse{
@@ -216,12 +281,17 @@ func TestReconcileProvisioningCrossplaneFailureEmitsFailure(t *testing.T) {
 	if n := fake.count("warehouse_provision_success"); n != 0 {
 		t.Errorf("expected no success event, got %d", n)
 	}
+	notification := notifier.only(t, "warehouse_provision_failed")
+	if notification.props["reason"] != "crossplane_sync_failure" {
+		t.Errorf("notification reason = %v, want crossplane_sync_failure", notification.props["reason"])
+	}
 }
 
 // TestReconcileDeletingSuccessEmitsEvent asserts that a completed teardown
 // emits exactly one warehouse_deprovision_success and no failure event.
 func TestReconcileDeletingSuccessEmitsEvent(t *testing.T) {
 	fake := installFakeTracker(t)
+	notifier := installFakeNotifier(t)
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-del"] = &configstore.ManagedWarehouse{
@@ -251,6 +321,9 @@ func TestReconcileDeletingSuccessEmitsEvent(t *testing.T) {
 	if n := fake.count("warehouse_deprovision_failed"); n != 0 {
 		t.Errorf("expected no failure event, got %d", n)
 	}
+	if e := notifier.only(t, "warehouse_deprovision_success"); e.orgID != "org-del" {
+		t.Errorf("notification orgID = %q, want org-del", e.orgID)
+	}
 }
 
 // TestReconcileDeletingFailureEmitsEvent asserts that a non-NotFound error
@@ -258,6 +331,7 @@ func TestReconcileDeletingSuccessEmitsEvent(t *testing.T) {
 // warehouse in Deleting (so the controller retries).
 func TestReconcileDeletingFailureEmitsEvent(t *testing.T) {
 	fake := installFakeTracker(t)
+	notifier := installFakeNotifier(t)
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-stuck"] = &configstore.ManagedWarehouse{
@@ -296,5 +370,9 @@ func TestReconcileDeletingFailureEmitsEvent(t *testing.T) {
 	}
 	if n := fake.count("warehouse_deprovision_success"); n != 0 {
 		t.Errorf("expected no success event, got %d", n)
+	}
+	notification := notifier.only(t, "warehouse_deprovision_failed")
+	if notification.props["reason"] != "duckling_delete_failed" {
+		t.Errorf("notification reason = %v, want duckling_delete_failed", notification.props["reason"])
 	}
 }
