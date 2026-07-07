@@ -65,7 +65,7 @@ type WorkerReleaseQueryHandlePayload struct {
 }
 
 // QueryLogEntry represents a completed client query event that the control
-// plane asks the activated worker to persist in the tenant DuckLake.
+// plane asks the activated worker to persist in tenant query-log storage.
 type QueryLogEntry struct {
 	EventID               string
 	EventTime             time.Time
@@ -97,7 +97,7 @@ type QueryLogEntry struct {
 }
 
 // WorkerQueryLogPayload carries a batch of completed query-log entries to the
-// activated worker that owns the tenant DuckLake.
+// activated worker that owns the tenant runtime.
 type WorkerQueryLogPayload struct {
 	WorkerControlMetadata
 	Entries []QueryLogEntry `json:"entries"`

@@ -88,7 +88,7 @@ var MetadataPoolMaxConnections = promauto.NewGaugeVec(prometheus.GaugeOpts{
 
 var queryLogBufferedEntries = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "duckgres_query_log_buffered_entries",
-	Help: "Current number of query-log entries buffered in memory before DuckLake flush.",
+	Help: "Current number of query-log entries buffered in memory before storage flush.",
 })
 
 var queryLogEnqueuedEntriesTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -98,22 +98,22 @@ var queryLogEnqueuedEntriesTotal = promauto.NewCounter(prometheus.CounterOpts{
 
 var queryLogFlushedEntriesTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_query_log_flushed_entries_total",
-	Help: "Total number of query-log entries flushed successfully to DuckLake.",
+	Help: "Total number of query-log entries flushed successfully to durable storage.",
 })
 
 var queryLogDroppedEntriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_query_log_dropped_entries_total",
-	Help: "Total number of query-log entries dropped before reaching DuckLake.",
+	Help: "Total number of query-log entries dropped before reaching durable storage.",
 }, []string{"reason"})
 
 var queryLogFlushErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_query_log_flush_errors_total",
-	Help: "Total number of failed query-log DuckLake flush attempts.",
+	Help: "Total number of failed query-log storage flush attempts.",
 })
 
 var queryLogFlushDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "duckgres_query_log_flush_duration_seconds",
-	Help:    "Duration of query-log DuckLake flush attempts in seconds.",
+	Help:    "Duration of query-log storage flush attempts in seconds.",
 	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10},
 })
 

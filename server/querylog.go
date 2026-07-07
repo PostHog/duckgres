@@ -27,18 +27,19 @@ import (
 // forward entries to worker pods without importing the full server package.
 type QueryLogEntry = wire.QueryLogEntry
 
-// QueryLogger batches query log entries and writes them to a DuckLake table.
+// QueryLogger batches query log entries and writes them to durable storage.
 type QueryLogger struct {
-	db       *sql.DB
-	cfg      QueryLogConfig
-	table    string
-	ch       chan QueryLogEntry
-	done     chan struct{}
-	stopOnce sync.Once
-	ctx      context.Context
-	cancel   context.CancelFunc
-	buffered atomic.Int64
-	closeDB  bool
+	db              *sql.DB
+	cfg             QueryLogConfig
+	table           string
+	ch              chan QueryLogEntry
+	done            chan struct{}
+	stopOnce        sync.Once
+	ctx             context.Context
+	cancel          context.CancelFunc
+	buffered        atomic.Int64
+	closeDB         bool
+	compactDuckLake bool
 }
 
 // QueryLogSink accepts query log entries and drains them during shutdown.
@@ -82,14 +83,15 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ql := &QueryLogger{
-		db:      db,
-		cfg:     cfg.QueryLog,
-		table:   "ducklake.system.query_log",
-		ch:      make(chan QueryLogEntry, queryLogChannelSize),
-		done:    make(chan struct{}),
-		ctx:     ctx,
-		cancel:  cancel,
-		closeDB: true,
+		db:              db,
+		cfg:             cfg.QueryLog,
+		table:           "ducklake.system.query_log",
+		ch:              make(chan QueryLogEntry, queryLogChannelSize),
+		done:            make(chan struct{}),
+		ctx:             ctx,
+		cancel:          cancel,
+		closeDB:         true,
+		compactDuckLake: true,
 	}
 
 	go ql.flushLoop()
@@ -116,13 +118,14 @@ func NewAttachedQueryLoggerContext(ctx context.Context, db *sql.DB, cfg QueryLog
 	}
 	loggerCtx, cancel := context.WithCancel(context.Background())
 	ql := &QueryLogger{
-		db:     db,
-		cfg:    cfg,
-		table:  "ducklake.system.query_log",
-		ch:     make(chan QueryLogEntry, queryLogChannelSize),
-		done:   make(chan struct{}),
-		ctx:    loggerCtx,
-		cancel: cancel,
+		db:              db,
+		cfg:             cfg,
+		table:           "ducklake.system.query_log",
+		ch:              make(chan QueryLogEntry, queryLogChannelSize),
+		done:            make(chan struct{}),
+		ctx:             loggerCtx,
+		cancel:          cancel,
+		compactDuckLake: true,
 	}
 	go ql.flushLoop()
 	slog.Info("Query log enabled on attached DuckLake.", "flush_interval", cfg.FlushInterval, "batch_size", cfg.BatchSize)
@@ -310,8 +313,13 @@ func (ql *QueryLogger) flushLoop() {
 	flushTicker := time.NewTicker(ql.cfg.FlushInterval)
 	defer flushTicker.Stop()
 
-	compactTicker := time.NewTicker(ql.cfg.CompactInterval)
-	defer compactTicker.Stop()
+	var compactC <-chan time.Time
+	var compactTicker *time.Ticker
+	if ql.compactDuckLake && ql.cfg.CompactInterval > 0 {
+		compactTicker = time.NewTicker(ql.cfg.CompactInterval)
+		compactC = compactTicker.C
+		defer compactTicker.Stop()
+	}
 
 	for {
 		select {
@@ -334,7 +342,7 @@ func (ql *QueryLogger) flushLoop() {
 				ql.flushBatch(batch)
 				batch = batch[:0]
 			}
-		case <-compactTicker.C:
+		case <-compactC:
 			if len(batch) > 0 {
 				ql.flushBatch(batch)
 				batch = batch[:0]
@@ -449,6 +457,9 @@ func queryLogEntryInsertArgs(e QueryLogEntry) []any {
 }
 
 func (ql *QueryLogger) compactParquet() {
+	if ql == nil || !ql.compactDuckLake || ql.db == nil {
+		return
+	}
 	_, err := ql.db.ExecContext(ql.context(), "CALL ducklake_flush_inlined_data('ducklake', schema_name => 'system', table_name => 'query_log')")
 	if err != nil {
 		slog.Warn("querylog: compact failed.", "error", err)
