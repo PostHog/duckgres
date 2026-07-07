@@ -493,6 +493,43 @@ func (h *FlightSQLHandler) doReleaseQueryHandle(body []byte, stream flight.Fligh
 	return sendActionResult(stream, &flight.Result{Body: resp})
 }
 
+func (h *FlightSQLHandler) doLogQuery(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerQueryLogPayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid LogQuery request: %v", err)
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+	finishDrain, err := h.pool.beginDrainWork(true)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return drainErr
+	}
+	if err != nil {
+		return status.Errorf(codes.Internal, "start query-log drain tracking: %v", err)
+	}
+	defer finishDrain()
+
+	if err := h.pool.LogQueryEntries(stream.Context(), req.Entries); err != nil {
+		if drainErr := workerDrainingStatus(err); drainErr != nil {
+			return drainErr
+		}
+		if errors.Is(err, ErrQueryLogRejected) {
+			return status.Errorf(codes.FailedPrecondition, "log query: %v", err)
+		}
+		if errors.Is(err, context.Canceled) {
+			return status.Errorf(codes.Canceled, "log query: %v", err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return status.Errorf(codes.DeadlineExceeded, "log query: %v", err)
+		}
+		return status.Errorf(codes.Internal, "log query: %v", err)
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
+	return sendActionResult(stream, &flight.Result{Body: resp})
+}
+
 // Flight SQL method implementations
 
 func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery,

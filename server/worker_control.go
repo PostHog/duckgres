@@ -13,4 +13,5 @@ type (
 	WorkerHealthCheckPayload        = wire.WorkerHealthCheckPayload
 	WorkerWaitSessionIdlePayload    = wire.WorkerWaitSessionIdlePayload
 	WorkerReleaseQueryHandlePayload = wire.WorkerReleaseQueryHandlePayload
+	WorkerQueryLogPayload           = wire.WorkerQueryLogPayload
 )
