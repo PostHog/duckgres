@@ -16,6 +16,7 @@ var ErrQueryLogRejected = errors.New("query log rejected")
 
 const (
 	queryLogSinkInitTimeout       = 30 * time.Second
+	queryLogInitLockPollInterval  = 10 * time.Millisecond
 	queryLogUnusedSinkStopTimeout = 5 * time.Second
 )
 
@@ -23,7 +24,7 @@ var newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.Qu
 	return server.NewAttachedQueryLoggerContext(ctx, db, cfg)
 }
 
-func (p *SessionPool) LogQueryEntries(entries []server.QueryLogEntry) error {
+func (p *SessionPool) LogQueryEntries(ctx context.Context, entries []server.QueryLogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -35,7 +36,7 @@ func (p *SessionPool) LogQueryEntries(entries []server.QueryLogEntry) error {
 		observe.AddQueryLogDroppedEntries("worker_rejected", len(entries))
 		return err
 	}
-	sink, err := p.queryLogSinkForCurrentRuntime()
+	sink, err := p.queryLogSinkForCurrentRuntime(ctx)
 	if err != nil {
 		observe.AddQueryLogDroppedEntries("worker_sink_init_error", len(entries))
 		return err
@@ -50,7 +51,10 @@ func (p *SessionPool) LogQueryEntries(entries []server.QueryLogEntry) error {
 	return nil
 }
 
-func (p *SessionPool) queryLogSinkForCurrentRuntime() (server.QueryLogSink, error) {
+func (p *SessionPool) queryLogSinkForCurrentRuntime(ctx context.Context) (server.QueryLogSink, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if p.queryLogClosed() {
 		return nil, ErrWorkerDraining
 	}
@@ -67,8 +71,11 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime() (server.QueryLogSink, erro
 		return nil, nil
 	}
 
-	p.queryLogInit.Lock()
-	defer p.queryLogInit.Unlock()
+	unlockInit, err := p.lockQueryLogInit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockInit()
 
 	p.queryLogMu.Lock()
 	if p.queryLogClosed() {
@@ -82,7 +89,7 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime() (server.QueryLogSink, erro
 	}
 	p.queryLogMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), queryLogSinkInitTimeout)
+	ctx, cancel := context.WithTimeout(ctx, queryLogSinkInitTimeout)
 	defer cancel()
 	ql, err := newAttachedQueryLogger(ctx, db, cfg.QueryLog)
 	if err != nil {
@@ -107,6 +114,25 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime() (server.QueryLogSink, erro
 	p.queryLogSink = ql
 	p.queryLogMu.Unlock()
 	return ql, nil
+}
+
+func (p *SessionPool) lockQueryLogInit(ctx context.Context) (func(), error) {
+	if p.queryLogInit.TryLock() {
+		return p.queryLogInit.Unlock, nil
+	}
+
+	ticker := time.NewTicker(queryLogInitLockPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			if p.queryLogInit.TryLock() {
+				return p.queryLogInit.Unlock, nil
+			}
+		}
+	}
 }
 
 func stopUnusedQueryLogSink(sink server.QueryLogSink) {

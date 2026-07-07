@@ -501,12 +501,27 @@ func (h *FlightSQLHandler) doLogQuery(body []byte, stream flight.FlightService_D
 	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
 	}
-	if err := h.pool.LogQueryEntries(req.Entries); err != nil {
+	finishDrain, err := h.pool.beginDrainWork(true)
+	if drainErr := workerDrainingStatus(err); drainErr != nil {
+		return drainErr
+	}
+	if err != nil {
+		return status.Errorf(codes.Internal, "start query-log drain tracking: %v", err)
+	}
+	defer finishDrain()
+
+	if err := h.pool.LogQueryEntries(stream.Context(), req.Entries); err != nil {
 		if drainErr := workerDrainingStatus(err); drainErr != nil {
 			return drainErr
 		}
 		if errors.Is(err, ErrQueryLogRejected) {
 			return status.Errorf(codes.FailedPrecondition, "log query: %v", err)
+		}
+		if errors.Is(err, context.Canceled) {
+			return status.Errorf(codes.Canceled, "log query: %v", err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return status.Errorf(codes.DeadlineExceeded, "log query: %v", err)
 		}
 		return status.Errorf(codes.Internal, "log query: %v", err)
 	}

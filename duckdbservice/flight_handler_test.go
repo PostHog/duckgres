@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,6 +63,32 @@ func (s *captureWorkerQueryLogSink) Log(entry server.QueryLogEntry) {
 
 func (s *captureWorkerQueryLogSink) StopContext(context.Context) error {
 	return nil
+}
+
+type blockingWorkerQueryLogSink struct {
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	mu        sync.Mutex
+	entries   []server.QueryLogEntry
+}
+
+func (s *blockingWorkerQueryLogSink) Log(entry server.QueryLogEntry) {
+	s.mu.Lock()
+	s.entries = append(s.entries, entry)
+	s.mu.Unlock()
+	s.startOnce.Do(func() { close(s.started) })
+	<-s.release
+}
+
+func (s *blockingWorkerQueryLogSink) StopContext(context.Context) error {
+	return nil
+}
+
+func (s *blockingWorkerQueryLogSink) entryCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.entries)
 }
 
 func (r testEndTransactionRequest) GetTransactionId() []byte {
@@ -799,6 +826,218 @@ func TestLogQueryActionRejectsClosedWorker(t *testing.T) {
 	}
 }
 
+func TestLogQueryActionContinuesDuringDrainAndTracksDrainWork(t *testing.T) {
+	sink := &blockingWorkerQueryLogSink{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	pool := &SessionPool{
+		queryLogSink:   sink,
+		workerID:       17,
+		sharedWarmMode: true,
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+		}},
+	}
+	handler := NewFlightSQLHandler(pool)
+	finishExistingWork, err := pool.beginDrainWork(false)
+	if err != nil {
+		t.Fatalf("begin existing drain work: %v", err)
+	}
+	pool.BeginDrain()
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+		Entries:               []server.QueryLogEntry{{Query: "SELECT 1", OrgID: "analytics", WorkerID: 17}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.doLogQuery(body, &mockDoActionStream{})
+	}()
+
+	select {
+	case <-sink.started:
+	case <-time.After(time.Second):
+		t.Fatal("LogQuery did not reach query-log sink")
+	}
+	if got := pool.ActiveDrainWork(); got != 2 {
+		t.Fatalf("active drain work while LogQuery is blocked = %d, want 2", got)
+	}
+
+	finishExistingWork()
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("active drain work after existing work finished = %d, want 1", got)
+	}
+	shortCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if pool.WaitForDrain(shortCtx) {
+		t.Fatal("expected blocked LogQuery to keep drain active")
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("LogQuery returned before sink was released: %v", err)
+	default:
+	}
+
+	close(sink.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("doLogQuery: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LogQuery did not finish after sink release")
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected drain to complete after LogQuery finished")
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work after LogQuery finished = %d, want 0", got)
+	}
+	if got := sink.entryCount(); got != 1 {
+		t.Fatalf("logged entries = %d, want 1", got)
+	}
+}
+
+func TestLogQueryActionRejectsAfterDrainCompleted(t *testing.T) {
+	sink := &captureWorkerQueryLogSink{}
+	pool := &SessionPool{
+		queryLogSink:   sink,
+		workerID:       17,
+		sharedWarmMode: true,
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+		}},
+	}
+	handler := NewFlightSQLHandler(pool)
+
+	pool.BeginDrain()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !pool.WaitForDrain(waitCtx) {
+		t.Fatal("expected drain with no active work to complete")
+	}
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+		Entries:               []server.QueryLogEntry{{Query: "SELECT 1", OrgID: "analytics", WorkerID: 17}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	err = handler.doLogQuery(body, &mockDoActionStream{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("status code = %v, want Unavailable (err=%v)", status.Code(err), err)
+	}
+	if len(sink.entries) != 0 {
+		t.Fatalf("expected completed drain not to enqueue entries, got %d", len(sink.entries))
+	}
+}
+
+func TestLogQueryActionSinkInitUsesStreamContext(t *testing.T) {
+	oldNewAttachedQueryLogger := newAttachedQueryLogger
+	started := make(chan struct{})
+	newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() {
+		newAttachedQueryLogger = oldNewAttachedQueryLogger
+	})
+
+	pool := &SessionPool{
+		controlDB:      &sql.DB{},
+		workerID:       17,
+		sharedWarmMode: true,
+		cfg: server.Config{
+			QueryLog: server.QueryLogConfig{Enabled: true},
+		},
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+			DuckLake: server.DuckLakeConfig{
+				MetadataStore: "metadata.db",
+			},
+		}},
+	}
+	handler := NewFlightSQLHandler(pool)
+
+	body, err := json.Marshal(server.WorkerQueryLogPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+		Entries:               []server.QueryLogEntry{{Query: "SELECT 1", OrgID: "analytics", WorkerID: 17}},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.doLogQuery(body, &mockDoActionStream{ctx: streamCtx})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("query-log sink initialization did not start")
+	}
+	if got := pool.ActiveDrainWork(); got != 1 {
+		t.Fatalf("active drain work while query-log init is blocked = %d, want 1", got)
+	}
+	cancelStream()
+
+	select {
+	case err := <-done:
+		if status.Code(err) != codes.Canceled {
+			t.Fatalf("status code = %v, want Canceled (err=%v)", status.Code(err), err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LogQuery did not return after stream context cancellation")
+	}
+	if got := pool.ActiveDrainWork(); got != 0 {
+		t.Fatalf("active drain work after canceled query-log init = %d, want 0", got)
+	}
+}
+
+func TestQueryLogSinkInitWaitRespectsContext(t *testing.T) {
+	pool := &SessionPool{
+		controlDB:      &sql.DB{},
+		workerID:       17,
+		sharedWarmMode: true,
+		cfg: server.Config{
+			QueryLog: server.QueryLogConfig{Enabled: true},
+		},
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+			DuckLake: server.DuckLakeConfig{
+				MetadataStore: "metadata.db",
+			},
+		}},
+	}
+
+	pool.queryLogInit.Lock()
+	defer pool.queryLogInit.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := pool.queryLogSinkForCurrentRuntime(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("queryLogSinkForCurrentRuntime error = %v, want context.Canceled", err)
+	}
+}
+
 func TestQueryLogSinkInitDoesNotBlockShutdown(t *testing.T) {
 	oldNewAttachedQueryLogger := newAttachedQueryLogger
 	started := make(chan struct{})
@@ -839,7 +1078,7 @@ func TestQueryLogSinkInitDoesNotBlockShutdown(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := pool.queryLogSinkForCurrentRuntime()
+		_, err := pool.queryLogSinkForCurrentRuntime(context.Background())
 		errCh <- err
 	}()
 
