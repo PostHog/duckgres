@@ -86,9 +86,12 @@ func (s *fakeAPIStore) DeleteOrg(name string) (bool, error) {
 	if _, ok := s.orgs[name]; !ok {
 		return false, nil
 	}
-	if _, ok := s.warehouses[name]; ok {
+	// Only a non-terminal warehouse row blocks deletion; a "deleted" row (infra
+	// torn down by the provisioner) is cascaded away so the name is released.
+	if wh, ok := s.warehouses[name]; ok && wh.State != configstore.ManagedWarehouseStateDeleted {
 		return false, errWarehouseStillExists
 	}
+	delete(s.warehouses, name)
 	delete(s.orgs, name)
 	return true, nil
 }
@@ -1150,6 +1153,29 @@ func TestDeleteOrgSucceedsAfterWarehouseRemoved(t *testing.T) {
 	}
 	if _, ok := store.orgs["analytics"]; ok {
 		t.Fatal("expected org to be deleted once the warehouse is gone")
+	}
+}
+
+func TestDeleteOrgCascadesDeletedWarehouse(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	// Simulate a completed deprovision: the provisioner leaves the warehouse
+	// row behind in the terminal "deleted" state rather than removing it.
+	store.warehouses["analytics"].State = configstore.ManagedWarehouseStateDeleted
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("expected org to be deleted once its warehouse is fully deprovisioned")
+	}
+	if _, ok := store.warehouses["analytics"]; ok {
+		t.Fatal("expected the deleted warehouse row to be cascaded away")
 	}
 }
 

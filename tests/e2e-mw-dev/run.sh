@@ -349,9 +349,14 @@ cmd_teardown() {
       for _ in $(seq 1 30); do
         gone=1
         for org in $(ci_orgs "$PR_NUMBER"); do
+          # A 404 here means the org was fully deleted (row cascaded away, e.g.
+          # the lifecycle test's DELETE /orgs/:id) — that counts as gone. Under
+          # `set -euo pipefail` an unguarded curl -f 404 (exit 22) would abort
+          # teardown, so tolerate it and let the empty-state check below treat
+          # it as gone.
           st="$(curl -fsS -H "X-Duckgres-Internal-Secret: $secret" \
             "http://localhost:18080/api/v1/orgs/$org/warehouse/status" 2>/dev/null \
-            | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+            | sed -n 's/.*"state":"\([^"]*\)".*/\1/p' || true)"
           [ "$st" = "deleted" ] || [ -z "$st" ] || gone=0
         done
         [ "$gone" = 1 ] && break

@@ -54,7 +54,9 @@
 #                  columns (GET /api/v1/models/:model), redacting secret-bearing
 #                  columns (org_users.password must never appear in the UI).
 #   lifecycle    : deprovision → warehouse deleted → Duckling CR fully gone
-#                  (finalizer cascade that drops the cnpg role+db completed).
+#                  (finalizer cascade that drops the cnpg role+db completed),
+#                  then DELETE /orgs/:id cascades the terminal deleted-warehouse
+#                  row + org row away and frees the database_name (no squat).
 #                  Same-id re-provision is covered across runs by run.sh, not
 #                  in-Job — see lifecycle_teardown_cnpg for why.
 #
@@ -2165,10 +2167,42 @@ tenant_isolation() { # orgA pwA orgB pwB
 lifecycle_teardown_cnpg() { # org
   log "lifecycle: deprovision $1 + assert Duckling CR fully deleted"
   api_post "$1" deprovision >/dev/null
+  # The status endpoint is watchable throughout teardown: right after the 202
+  # the warehouse reports a deprovisioning state (deleting, or deleted if the
+  # async provisioner already finished), never still-ready — so /data-ops can
+  # poll warehouse/status until it reaches "deleted", then send the delete.
+  # While deleting, status_message reads "Deprovisioning..." (the deprovision
+  # analogue of the provisioning-phase messages) rather than a stale ready line.
+  status_json="$(api_get "$1" warehouse/status)"
+  st="$(printf '%s' "$status_json" | jq -r '.state')"
+  msg="$(printf '%s' "$status_json" | jq -r '.status_message')"
+  case "$st" in
+    deleting)
+      [ "$msg" = "Deprovisioning..." ] \
+        || fail "warehouse $1 deleting but status_message=$msg (expected 'Deprovisioning...')";;
+    deleted) ;;
+    *) fail "warehouse $1 status=$st right after deprovision (expected deleting/deleted — status not watchable)";;
+  esac
   wait_state "$1" deleted 600
   if ! "$KUBECTL" -n ducklings wait --for=delete "duckling/$1" --timeout=420s >/dev/null 2>&1; then
     fail "Duckling CR $1 did not fully delete within 420s (finalizer/cnpg cascade stuck)"
   fi
+
+  # Deprovision leaves the org row + a terminal "deleted" warehouse row behind;
+  # DELETE /orgs/:id must now cascade both away and release the org's
+  # database_name. Without this the name is squatted forever (org row's unique
+  # database_name index survives, so no future org can reuse it).
+  dbname="$(curl -fsS -H "$H" "$API/api/v1/orgs/$1" | jq -r '.database_name // empty')"
+  [ -n "$dbname" ] || fail "could not read database_name for $1 before delete"
+  [ "$(curl -fsS -H "$H" "$API/api/v1/database-name/check?name=$dbname" | jq -r '.available')" = "false" ] \
+    || fail "database_name $dbname unexpectedly free while org $1 still exists"
+  curl -fsS -X DELETE -H "$H" "$API/api/v1/orgs/$1" >/dev/null \
+    || fail "DELETE /orgs/$1 failed after a completed deprovision (name would stay squatted)"
+  if api_get "$1" warehouse/status >/dev/null 2>&1; then
+    fail "warehouse row for $1 survived org deletion — deleted-state row not cascaded"
+  fi
+  [ "$(curl -fsS -H "$H" "$API/api/v1/database-name/check?name=$dbname" | jq -r '.available')" = "true" ] \
+    || fail "database_name $dbname still squatted after org deletion"
 }
 
 # ---- cnpg duckling: cnpg-shard metadata + DuckLake ------------------------
@@ -2563,7 +2597,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + isolation + lifecycle-teardown, on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

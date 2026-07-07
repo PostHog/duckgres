@@ -161,6 +161,55 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	}
 }
 
+func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics_db"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	wh := &configstore.ManagedWarehouse{OrgID: "analytics", State: configstore.ManagedWarehouseStateReady}
+	if err := store.DB().Create(wh).Error; err != nil {
+		t.Fatalf("create warehouse: %v", err)
+	}
+
+	// A non-terminal warehouse row must still block org deletion — the infra is
+	// live and deleting the org would orphan the Duckling CR.
+	if _, err := apiStore.DeleteOrg("analytics"); err != errWarehouseStillExists {
+		t.Fatalf("DeleteOrg with a ready warehouse: got %v, want errWarehouseStillExists", err)
+	}
+
+	// Simulate a completed deprovision: the provisioner leaves the row behind in
+	// the terminal "deleted" state. The org must now delete, cascading the row
+	// away so the database_name is released (no longer squatted).
+	if err := store.DB().Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", "analytics").
+		Update("state", configstore.ManagedWarehouseStateDeleted).Error; err != nil {
+		t.Fatalf("mark warehouse deleted: %v", err)
+	}
+	deleted, err := apiStore.DeleteOrg("analytics")
+	if err != nil {
+		t.Fatalf("DeleteOrg after deprovision: %v", err)
+	}
+	if !deleted {
+		t.Fatal("expected org row to be deleted")
+	}
+
+	var orgs, warehouses int64
+	store.DB().Model(&configstore.Org{}).Where("name = ?", "analytics").Count(&orgs)
+	store.DB().Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", "analytics").Count(&warehouses)
+	if orgs != 0 {
+		t.Fatalf("expected org row gone, found %d", orgs)
+	}
+	if warehouses != 0 {
+		t.Fatalf("expected deleted warehouse row cascaded away, found %d", warehouses)
+	}
+
+	// The database_name is now free for reuse (no unique-index squat).
+	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db"}).Error; err != nil {
+		t.Fatalf("expected database_name to be reusable after org deletion: %v", err)
+	}
+}
+
 func TestMutateManagedWarehouseSerializesConcurrentWriters(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
