@@ -51,15 +51,22 @@ type queryLogEntrySink interface {
 
 const (
 	queryLogChannelSize = 10000
+	queryLogInitTimeout = 30 * time.Second
 	maxQueryLength      = 4096
 )
+
+var newPostgresQueryLogSink = func(ctx context.Context, cfg Config) (QueryLogSink, error) {
+	return NewPostgresQueryLoggerContext(ctx, cfg.DuckLake, cfg.QueryLog)
+}
 
 // NewQueryLogSink creates the native Postgres-backed query-log sink.
 func NewQueryLogSink(cfg Config) (QueryLogSink, error) {
 	if !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
 		return nil, nil
 	}
-	return NewPostgresQueryLoggerContext(context.Background(), cfg.DuckLake, cfg.QueryLog)
+	ctx, cancel := context.WithTimeout(context.Background(), queryLogInitTimeout)
+	defer cancel()
+	return newPostgresQueryLogSink(ctx, cfg)
 }
 
 // Log sends an entry to the query log. Non-blocking; drops if channel is full.

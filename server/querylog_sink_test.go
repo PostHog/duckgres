@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type captureQueryLogSink struct {
@@ -43,5 +44,38 @@ func TestNewQueryLogSinkRequiresDuckLakeMetadataStore(t *testing.T) {
 	}
 	if sink != nil {
 		t.Fatalf("expected nil sink without metadata store, got %T", sink)
+	}
+}
+
+func TestNewQueryLogSinkUsesInitializationTimeout(t *testing.T) {
+	oldNewPostgresQueryLogSink := newPostgresQueryLogSink
+	newPostgresQueryLogSink = func(ctx context.Context, cfg Config) (QueryLogSink, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected initialization context deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > queryLogInitTimeout {
+			t.Fatalf("deadline in %s, want within %s", remaining, queryLogInitTimeout)
+		}
+		return &captureQueryLogSink{}, nil
+	}
+	t.Cleanup(func() {
+		newPostgresQueryLogSink = oldNewPostgresQueryLogSink
+	})
+
+	sink, err := NewQueryLogSink(Config{
+		DuckLake: DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal dbname=ducklake",
+		},
+		QueryLog: QueryLogConfig{
+			Enabled: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewQueryLogSink: %v", err)
+	}
+	if sink == nil {
+		t.Fatal("expected query-log sink")
 	}
 }
