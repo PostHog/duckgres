@@ -799,6 +799,80 @@ func TestLogQueryActionRejectsClosedWorker(t *testing.T) {
 	}
 }
 
+func TestQueryLogSinkInitDoesNotBlockShutdown(t *testing.T) {
+	oldNewAttachedQueryLogger := newAttachedQueryLogger
+	started := make(chan struct{})
+	release := make(chan struct{})
+	newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
+		close(started)
+		select {
+		case <-release:
+			return &captureWorkerQueryLogSink{}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	t.Cleanup(func() {
+		newAttachedQueryLogger = oldNewAttachedQueryLogger
+	})
+
+	stopCh := make(chan struct{})
+	pool := &SessionPool{
+		stopCh:         stopCh,
+		controlDB:      &sql.DB{},
+		workerID:       17,
+		sharedWarmMode: true,
+		cfg: server.Config{
+			QueryLog: server.QueryLogConfig{Enabled: true},
+			DuckLake: server.DuckLakeConfig{
+				MetadataStore: "metadata.db",
+			},
+		},
+		activation: &activatedTenantRuntime{payload: ActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{WorkerID: 17},
+			OrgID:                 "analytics",
+			DuckLake: server.DuckLakeConfig{
+				MetadataStore: "metadata.db",
+			},
+		}},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := pool.queryLogSinkForCurrentRuntime()
+		errCh <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("query-log sink initialization did not start")
+	}
+
+	close(stopCh)
+	stopped := make(chan struct{})
+	go func() {
+		pool.stopQueryLogSink(context.Background())
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("stopQueryLogSink blocked behind query-log sink initialization")
+	}
+
+	close(release)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrWorkerDraining) {
+			t.Fatalf("queryLogSinkForCurrentRuntime error = %v, want ErrWorkerDraining", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("query-log sink initialization did not finish")
+	}
+}
+
 func TestCreateSessionRequiresActivationForSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
 		sessions:       make(map[string]*Session),

@@ -73,6 +73,7 @@ type SessionPool struct {
 	// activation; nil-check before use and fall back to the main DB.
 	controlDB    *sql.DB
 	queryLogMu   sync.Mutex
+	queryLogInit sync.Mutex
 	queryLogSink server.QueryLogSink
 
 	sharedWarmMode       bool

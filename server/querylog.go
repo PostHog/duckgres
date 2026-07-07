@@ -101,20 +101,27 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 // already sees the tenant DuckLake catalog. The logger does not own db; callers
 // must close the handle after StopContext returns.
 func NewAttachedQueryLogger(db *sql.DB, cfg QueryLogConfig) (*QueryLogger, error) {
+	return NewAttachedQueryLoggerContext(context.Background(), db, cfg)
+}
+
+func NewAttachedQueryLoggerContext(ctx context.Context, db *sql.DB, cfg QueryLogConfig) (*QueryLogger, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !cfg.Enabled || db == nil {
 		return nil, nil
 	}
-	if err := ensureAttachedQueryLogTable(db, cfg); err != nil {
+	if err := ensureAttachedQueryLogTableContext(ctx, db, cfg); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	loggerCtx, cancel := context.WithCancel(context.Background())
 	ql := &QueryLogger{
 		db:     db,
 		cfg:    cfg,
 		table:  "ducklake.system.query_log",
 		ch:     make(chan QueryLogEntry, queryLogChannelSize),
 		done:   make(chan struct{}),
-		ctx:    ctx,
+		ctx:    loggerCtx,
 		cancel: cancel,
 	}
 	go ql.flushLoop()
@@ -123,16 +130,23 @@ func NewAttachedQueryLogger(db *sql.DB, cfg QueryLogConfig) (*QueryLogger, error
 }
 
 func ensureAttachedQueryLogTable(db *sql.DB, cfg QueryLogConfig) error {
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
+	return ensureAttachedQueryLogTableContext(context.Background(), db, cfg)
+}
+
+func ensureAttachedQueryLogTableContext(ctx context.Context, db *sql.DB, cfg QueryLogConfig) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
 		return fmt.Errorf("querylog: create schema: %w", err)
 	}
-	if err := ensureQueryLogTable(db, "system", "query_log", "ducklake.system.query_log"); err != nil {
+	if err := ensureQueryLogTableContext(ctx, db, "system", "query_log", "ducklake.system.query_log"); err != nil {
 		return fmt.Errorf("querylog: ensure table: %w", err)
 	}
 	inlineStmt := fmt.Sprintf(
 		"CALL ducklake.set_option('data_inlining_row_limit', %d, schema => 'system', table_name => 'query_log')",
 		cfg.DataInliningRowLimit)
-	if _, err := db.Exec(inlineStmt); err != nil {
+	if _, err := db.ExecContext(ctx, inlineStmt); err != nil {
 		slog.Warn("querylog: failed to set data_inlining_row_limit, continuing without it.", "error", err)
 	}
 	return nil
@@ -462,26 +476,33 @@ func truncateNullableQuery(q *string) *string {
 }
 
 func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName string) error {
-	colType, err := queryLogColumnType(db, fullTableName, tableSchema, tableName, "normalized_query_hash")
+	return ensureQueryLogTableContext(context.Background(), db, tableSchema, tableName, fullTableName)
+}
+
+func ensureQueryLogTableContext(ctx context.Context, db *sql.DB, tableSchema, tableName, fullTableName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	colType, err := queryLogColumnTypeContext(ctx, db, fullTableName, tableSchema, tableName, "normalized_query_hash")
 	if err == nil && strings.ToUpper(colType) != "BIGINT" {
 		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
-		if _, dropErr := db.Exec("DROP TABLE " + fullTableName); dropErr != nil {
+		if _, dropErr := db.ExecContext(ctx, "DROP TABLE "+fullTableName); dropErr != nil {
 			return fmt.Errorf("drop query_log for normalized_query_hash migration: %w", dropErr)
 		}
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("inspect normalized_query_hash column: %w", err)
 	}
 
-	if _, err := db.Exec(queryLogCreateTableSQL(fullTableName)); err != nil {
+	if _, err := db.ExecContext(ctx, queryLogCreateTableSQL(fullTableName)); err != nil {
 		return fmt.Errorf("create query_log table: %w", err)
 	}
 
-	hasOrgID, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, "org_id")
+	hasOrgID, err := queryLogColumnExistsContext(ctx, db, fullTableName, tableSchema, tableName, "org_id")
 	if err != nil {
 		return fmt.Errorf("inspect org_id column: %w", err)
 	}
 	if !hasOrgID {
-		if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN org_id VARCHAR"); err != nil {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE "+fullTableName+" ADD COLUMN org_id VARCHAR"); err != nil {
 			return fmt.Errorf("add org_id column: %w", err)
 		}
 	}
@@ -489,12 +510,12 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 	// Add columns for OTEL tracing correlation and compatibility with tables
 	// created while distributed query-log delivery was supported.
 	for _, col := range []string{"trace_id", "span_id", "event_id"} {
-		hasCol, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, col)
+		hasCol, err := queryLogColumnExistsContext(ctx, db, fullTableName, tableSchema, tableName, col)
 		if err != nil {
 			return fmt.Errorf("inspect %s column: %w", col, err)
 		}
 		if !hasCol {
-			if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN " + col + " VARCHAR"); err != nil {
+			if _, err := db.ExecContext(ctx, "ALTER TABLE "+fullTableName+" ADD COLUMN "+col+" VARCHAR"); err != nil {
 				return fmt.Errorf("add %s column: %w", col, err)
 			}
 		}
@@ -510,16 +531,16 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 		{name: "cpu_time_s", typ: "DOUBLE"},
 		{name: "peak_buffer_memory_bytes", typ: "BIGINT"},
 	} {
-		hasCol, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, col.name)
+		hasCol, err := queryLogColumnExistsContext(ctx, db, fullTableName, tableSchema, tableName, col.name)
 		if err != nil {
 			return fmt.Errorf("inspect %s column: %w", col.name, err)
 		}
 		if !hasCol {
-			if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN " + col.name + " " + col.typ + " DEFAULT 0"); err != nil {
+			if _, err := db.ExecContext(ctx, "ALTER TABLE "+fullTableName+" ADD COLUMN "+col.name+" "+col.typ+" DEFAULT 0"); err != nil {
 				return fmt.Errorf("add %s column: %w", col.name, err)
 			}
 		}
-		if _, err := db.Exec("UPDATE " + fullTableName + " SET " + col.name + " = 0 WHERE " + col.name + " IS NULL"); err != nil {
+		if _, err := db.ExecContext(ctx, "UPDATE "+fullTableName+" SET "+col.name+" = 0 WHERE "+col.name+" IS NULL"); err != nil {
 			return fmt.Errorf("backfill %s column: %w", col.name, err)
 		}
 	}
@@ -560,7 +581,11 @@ func queryLogCreateTableSQL(fullTableName string) string {
 }
 
 func queryLogColumnExists(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (bool, error) {
-	_, err := queryLogColumnType(db, fullTableName, tableSchema, tableName, columnName)
+	return queryLogColumnExistsContext(context.Background(), db, fullTableName, tableSchema, tableName, columnName)
+}
+
+func queryLogColumnExistsContext(ctx context.Context, db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (bool, error) {
+	_, err := queryLogColumnTypeContext(ctx, db, fullTableName, tableSchema, tableName, columnName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -571,6 +596,13 @@ func queryLogColumnExists(db *sql.DB, fullTableName, tableSchema, tableName, col
 }
 
 func queryLogColumnType(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (string, error) {
+	return queryLogColumnTypeContext(context.Background(), db, fullTableName, tableSchema, tableName, columnName)
+}
+
+func queryLogColumnTypeContext(ctx context.Context, db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	query := "SELECT data_type FROM information_schema.columns WHERE table_name = $1 AND column_name = $2"
 	args := []any{tableName, columnName}
 	nextParam := 3
@@ -585,7 +617,7 @@ func queryLogColumnType(db *sql.DB, fullTableName, tableSchema, tableName, colum
 	}
 
 	var colType string
-	err := db.QueryRow(query, args...).Scan(&colType)
+	err := db.QueryRowContext(ctx, query, args...).Scan(&colType)
 	return colType, err
 }
 

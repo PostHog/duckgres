@@ -14,6 +14,15 @@ import (
 
 var ErrQueryLogRejected = errors.New("query log rejected")
 
+const (
+	queryLogSinkInitTimeout       = 30 * time.Second
+	queryLogUnusedSinkStopTimeout = 5 * time.Second
+)
+
+var newAttachedQueryLogger = func(ctx context.Context, db *sql.DB, cfg server.QueryLogConfig) (server.QueryLogSink, error) {
+	return server.NewAttachedQueryLoggerContext(ctx, db, cfg)
+}
+
 func (p *SessionPool) LogQueryEntries(entries []server.QueryLogEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -58,20 +67,57 @@ func (p *SessionPool) queryLogSinkForCurrentRuntime() (server.QueryLogSink, erro
 		return nil, nil
 	}
 
+	p.queryLogInit.Lock()
+	defer p.queryLogInit.Unlock()
+
 	p.queryLogMu.Lock()
-	defer p.queryLogMu.Unlock()
 	if p.queryLogClosed() {
+		p.queryLogMu.Unlock()
 		return nil, ErrWorkerDraining
 	}
 	if p.queryLogSink != nil {
-		return p.queryLogSink, nil
+		sink := p.queryLogSink
+		p.queryLogMu.Unlock()
+		return sink, nil
 	}
-	ql, err := server.NewAttachedQueryLogger(db, cfg.QueryLog)
+	p.queryLogMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryLogSinkInitTimeout)
+	defer cancel()
+	ql, err := newAttachedQueryLogger(ctx, db, cfg.QueryLog)
 	if err != nil {
 		return nil, fmt.Errorf("initialize worker query log: %w", err)
 	}
+	if ql == nil {
+		return nil, nil
+	}
+
+	p.queryLogMu.Lock()
+	if p.queryLogClosed() {
+		p.queryLogMu.Unlock()
+		stopUnusedQueryLogSink(ql)
+		return nil, ErrWorkerDraining
+	}
+	if p.queryLogSink != nil {
+		sink := p.queryLogSink
+		p.queryLogMu.Unlock()
+		stopUnusedQueryLogSink(ql)
+		return sink, nil
+	}
 	p.queryLogSink = ql
-	return p.queryLogSink, nil
+	p.queryLogMu.Unlock()
+	return ql, nil
+}
+
+func stopUnusedQueryLogSink(sink server.QueryLogSink) {
+	if sink == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), queryLogUnusedSinkStopTimeout)
+	defer cancel()
+	if err := sink.StopContext(ctx); err != nil {
+		slog.Warn("Failed to stop unused worker query log sink.", "error", err)
+	}
 }
 
 func (p *SessionPool) validateQueryLogEntryIdentities(entries []server.QueryLogEntry) error {
