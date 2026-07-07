@@ -6,7 +6,7 @@ import { Sparkline } from "@/components/Sparkline";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
-import { useClusterStatus, useFleet, useMetricRange, useModel } from "@/hooks/useApi";
+import { useClusterStatus, useFleet, useMetricRange, useModel, useOrgs } from "@/hooks/useApi";
 import { fmtInt, fmtPercent, promToSeries } from "@/lib/format";
 import { isIdleLeak, orgLoadPercent, summarizeFleet, topOrgsByLoad } from "@/lib/fleet";
 import type { WorkerLifecycleState } from "@/types/api";
@@ -22,6 +22,7 @@ const LIFECYCLE: WorkerLifecycleState[] = [
 export function Overview() {
   const status = useClusterStatus();
   const fleet = useFleet();
+  const orgs = useOrgs();
   const queue = useModel("org-connection-queue");
   const cps = useModel("cp-instances");
   const qTotal = useMetricRange("query_rate", undefined, "1h");
@@ -62,6 +63,13 @@ export function Overview() {
   // (warm, reserving the pod but running no query).
   const busyWorkers = fleetSummary.busy;
   const idleWorkers = fleetSummary.idle;
+  const orgLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    for (const org of orgs.data ?? []) {
+      labels.set(org.name, org.database_name || org.hostname_alias || org.name);
+    }
+    return labels;
+  }, [orgs.data]);
 
   return (
     <>
@@ -165,9 +173,19 @@ export function Overview() {
               <div className="space-y-1.5">
                 {topOrgsByLoad(status.data?.orgs, 12).map((o) => {
                   const pct = orgLoadPercent(o.workers, o.max_workers);
+                  const label = orgLabels.get(o.name) ?? o.name;
                   return (
                     <div key={o.name} className="flex items-center gap-3 text-sm">
-                      <span className="w-44 truncate font-mono text-xs">{o.name}</span>
+                      <span className="w-52 min-w-0">
+                        <span className="block truncate text-xs font-medium text-foreground" title={label}>
+                          {label}
+                        </span>
+                        {label !== o.name ? (
+                          <span className="block truncate font-mono text-[11px] text-muted-foreground" title={o.name}>
+                            {o.name}
+                          </span>
+                        ) : null}
+                      </span>
                       <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
                         <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
                       </div>
