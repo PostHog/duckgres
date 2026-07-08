@@ -100,11 +100,17 @@ func newStorageSampler(store storageUsageStore, interval time.Duration, listOrgs
 // Run samples every interval until ctx is cancelled. Leader-only: the caller
 // attaches it under the janitor leader lease so exactly one CP pod credits
 // each interval (a double writer would double-bill — the UPSERT is additive).
+//
+// Deliberately NO sample on entry: Run re-enters on every leadership
+// acquisition, and each successful sample credits a full interval regardless
+// of elapsed time — sampling immediately would credit an extra interval per
+// leader change (deploys, lease flaps), i.e. systematic over-billing. Waiting
+// one full interval for the first tick keeps failover in the documented
+// direction: a leadership change under-bills at most one interval.
 func (s *storageSampler) Run(ctx context.Context) {
 	if s == nil || s.store == nil || s.listOrgs == nil || s.resolveDSN == nil {
 		return
 	}
-	s.sampleAll(ctx)
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 	for {

@@ -101,28 +101,19 @@ func TestStorageSamplerStoreErrorIsBestEffort(t *testing.T) {
 
 func TestStorageSamplerRunStopsOnCancel(t *testing.T) {
 	store := &fakeStorageStore{}
-	s := newTestStorageSampler(store,
-		[]storageOrg{{OrgID: "orgA", TeamID: 42}},
-		func(_ context.Context, _ string) (int64, int64, error) { return 2048, 0, nil })
+	// Short interval: the first pass fires after one tick (never on entry —
+	// see TestStorageSamplerLeadershipChurnNeverOverCredits).
+	s := newStorageSampler(store, 20*time.Millisecond,
+		func() []storageOrg { return []storageOrg{{OrgID: "orgA", TeamID: 42}} },
+		func(_ context.Context, orgID string) (string, error) { return "postgres://meta/" + orgID, nil },
+	)
+	s.queryFootprint = func(_ context.Context, _ string) (int64, int64, error) { return 2048, 0, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { s.Run(ctx); close(done) }()
-	// The first pass runs immediately.
-	deadline := time.After(2 * time.Second)
-	for {
-		store.mu.Lock()
-		n := len(store.samples)
-		store.mu.Unlock()
-		if n >= 1 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("first sample pass never ran")
-		default:
-			time.Sleep(5 * time.Millisecond)
-		}
+	if got := waitForSamples(store, 1, 2*time.Second); got < 1 {
+		t.Fatal("ticker sample pass never ran")
 	}
 	cancel()
 	select {
@@ -144,5 +135,64 @@ func TestStorageSampleIntervalFromEnv(t *testing.T) {
 	t.Setenv("DUCKGRES_STORAGE_SAMPLE_INTERVAL", "banana")
 	if got := storageSampleIntervalFromEnv(); got != defaultStorageSampleInterval {
 		t.Fatalf("invalid = %v, want default", got)
+	}
+}
+
+// waitForSamples polls until the store holds at least n samples or the
+// deadline passes; returns the count seen last.
+func waitForSamples(store *fakeStorageStore, n int, deadline time.Duration) int {
+	stop := time.After(deadline)
+	for {
+		store.mu.Lock()
+		got := len(store.samples)
+		store.mu.Unlock()
+		if got >= n {
+			return got
+		}
+		select {
+		case <-stop:
+			return got
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+func TestStorageSamplerLeadershipChurnNeverOverCredits(t *testing.T) {
+	// Every leadership acquisition re-enters Run (leader_loop.go). Each
+	// successful sample credits a FULL interval of byte-seconds regardless of
+	// elapsed wall time, so sampling on acquisition over-bills: leader A
+	// samples, loses the lease seconds later (deploy, lease flap), leader B
+	// samples again -> two full intervals credited for seconds of real time.
+	// The documented contract is the opposite direction ("a missed sample
+	// (org unreachable, leader failover) under-bills one interval").
+	store := &fakeStorageStore{}
+	s := newTestStorageSampler(store,
+		[]storageOrg{{OrgID: "orgA", TeamID: 42}},
+		func(_ context.Context, _ string) (int64, int64, error) { return 1024, 0, nil })
+
+	churns := 2
+	for i := 0; i < churns; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { s.Run(ctx); close(done) }()
+		// Give an eager implementation ample time to (wrongly) sample; the
+		// 30-minute ticker cannot fire in this window either way.
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("sampler did not stop on cancel")
+		}
+	}
+
+	store.mu.Lock()
+	credited := len(store.samples)
+	store.mu.Unlock()
+	// Seconds of wall time may never credit more than one interval, however
+	// many times leadership changes hands.
+	if credited > 1 {
+		t.Fatalf("leadership churn credited %d full intervals for ~0.3s of wall time (over-billing); want <= 1", credited)
 	}
 }
