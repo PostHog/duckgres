@@ -221,7 +221,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 
 	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 		"state":                   configstore.ManagedWarehouseStateProvisioning,
-		"status_message":          "Your warehouse is being provisioned...",
+		"status_message":          "Provisioning in progress...",
 		"provisioning_started_at": now,
 	}); err != nil {
 		log.Warn("Failed to update state to provisioning.", "error", err)
