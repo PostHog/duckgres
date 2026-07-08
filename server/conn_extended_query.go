@@ -55,11 +55,6 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
-	if QueryReferencesHiddenDuckLakeMetadataCatalog(query) {
-		c.observeExtendedParseQueryError("42501", HiddenDuckLakeMetadataCatalogAccessError)
-		return
-	}
-
 	// Detect cursor operations before passthrough or transpilation.
 	// DuckDB doesn't support DECLARE/FETCH/CLOSE natively, so cursor
 	// emulation is needed for all users including passthrough.

@@ -2118,17 +2118,26 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 	pgNamespaceSQL := `
 		CREATE OR REPLACE VIEW pg_namespace AS
-		SELECT DISTINCT
-			schema_oid AS oid,
-			CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname,
-			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
-			NULL AS nspacl
-		FROM (
+		WITH user_namespaces AS (
 			SELECT schema_oid, schema_name FROM duckdb_tables() WHERE database_name = 'ducklake'
 			UNION
 			SELECT schema_oid, schema_name FROM duckdb_views() WHERE database_name = 'ducklake'
+		),
+		display_namespaces AS (
+			SELECT
+				schema_oid,
+				CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname
+			FROM user_namespaces
+			WHERE schema_name NOT LIKE '__ducklake_metadata_%'
+				AND schema_name <> 'system'
 		)
-		WHERE schema_name NOT LIKE '__ducklake_metadata_%'
+		SELECT
+			MIN(schema_oid) AS oid,
+			nspname,
+			CASE WHEN nspname = 'public' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
+			NULL AS nspacl
+		FROM display_namespaces
+		GROUP BY nspname
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err
