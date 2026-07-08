@@ -158,7 +158,6 @@ func (s *Server) spawnChildForTLS(conn net.Conn) (*ChildProcess, error) {
 		TLSCertFile:      s.cfg.TLSCertFile,
 		TLSKeyFile:       s.cfg.TLSKeyFile,
 		DuckLake:         s.cfg.DuckLake,
-		QueryLog:         s.cfg.QueryLog,
 		Users:            s.cfg.Users, // Pass all users - child will look up after getting username
 		BackendSecretKey: backendSecretKey,
 		ServerStartTime:  processStartTime.UnixNano(),

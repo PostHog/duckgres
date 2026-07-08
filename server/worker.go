@@ -48,9 +48,6 @@ type ChildConfig struct {
 	// DuckLake config
 	DuckLake DuckLakeConfig `json:"ducklake"`
 
-	// QueryLog config
-	QueryLog QueryLogConfig `json:"query_log"`
-
 	// Authentication - map of username -> password
 	// Child will look up after reading username from startup message
 	Users map[string]string `json:"users"`
@@ -297,7 +294,6 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		DataDir:     cfg.DataDir,
 		Extensions:  cfg.Extensions,
 		DuckLake:    cfg.DuckLake,
-		QueryLog:    cfg.QueryLog,
 		IdleTimeout: time.Duration(cfg.IdleTimeout),
 		TLSCertFile: cfg.TLSCertFile,
 		TLSKeyFile:  cfg.TLSKeyFile,
@@ -368,8 +364,6 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		externalCancelCh: queryCancelCh, // Wire signal-based cancellation to query context
 	}
 	srv.initConnsMap()
-	startChildQueryLogSink(srv, username)
-	defer stopChildQueryLogSink(srv, username)
 	clientConn.server = srv
 
 	// Register this connection for pg_stat_activity visibility.
@@ -425,30 +419,5 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		slog.Info("Worker shutting down due to signal", "user", username)
 		_ = tlsConn.Close()
 		return ExitSuccess
-	}
-}
-
-func startChildQueryLogSink(srv *Server, username string) {
-	if srv == nil || !srv.cfg.QueryLog.Enabled || srv.cfg.DuckLake.MetadataStore == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), queryLogSurfaceInitTimeout)
-	defer cancel()
-	sink, err := newPostgresQueryLogSink(ctx, srv.cfg)
-	if err != nil {
-		slog.Warn("Failed to initialize child query log, continuing without it.", "user", username, "error", err)
-		return
-	}
-	SetQueryLogSink(srv, sink)
-}
-
-func stopChildQueryLogSink(srv *Server, username string) {
-	if srv == nil || srv.queryLogSink == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), queryLogSurfaceInitTimeout)
-	defer cancel()
-	if err := srv.StopQueryLogging(ctx); err != nil {
-		slog.Warn("Child query log shutdown deadline exceeded.", "user", username, "error", err)
 	}
 }
