@@ -1,38 +1,210 @@
 version: 2
 
 models:
-  - name: stg_persons_daily
-    columns:
-      - name: person_day
-        tests:
-          - not_null
-      - name: persons
-        tests:
-          - not_null
-
   - name: stg_events
+    description: Normalized raw events with product analytics classifications.
     columns:
+      - name: event_row_id
+        tests:
+          - not_null
       - name: event
         tests:
           - not_null
       - name: event_timestamp
         tests:
           - not_null
+      - name: event_day
+        tests:
+          - not_null
+      - name: event_category
+        tests:
+          - not_null
+      - name: feature_area
+        tests:
+          - not_null
 
-  - name: daily_event_counts
+  - name: stg_persons
+    description: Person snapshot timestamps from the frozen persons dataset.
     columns:
+      - name: person_snapshot_id
+        tests:
+          - not_null
+      - name: person_created_at
+        tests:
+          - not_null
+      - name: person_day
+        tests:
+          - not_null
+
+  - name: int_person_first_seen
+    description: One row per event person with first-seen and lifetime activity metrics.
+    columns:
+      - name: person_id
+        tests:
+          - not_null
+          - unique
+      - name: first_event_timestamp
+        tests:
+          - not_null
+      - name: first_seen_timestamp
+        tests:
+          - not_null
+
+  - name: int_sessionized_events
+    description: Event stream annotated with 30-minute inactivity session boundaries.
+    columns:
+      - name: session_id
+        tests:
+          - not_null
+      - name: session_number
+        tests:
+          - not_null
+      - name: person_id
+        tests:
+          - not_null
+      - name: event_timestamp
+        tests:
+          - not_null
+
+  - name: int_event_days
+    description: One row per event day, materialized to avoid repeated raw event scans for daily facts.
+    columns:
+      - name: event_day
+        tests:
+          - not_null
+          - unique
+      - name: events
+        tests:
+          - not_null
+      - name: pageview_events
+        tests:
+          - not_null
+
+  - name: int_person_activity_daily
+    description: One row per active person per event day.
+    columns:
+      - name: person_id
+        tests:
+          - not_null
       - name: event_day
         tests:
           - not_null
       - name: events
         tests:
           - not_null
+      - name: feature_events
+        tests:
+          - not_null
 
-  - name: person_event_rollup
+  - name: int_person_feature_usage_daily
+    description: One row per person, day, and feature area for reusable feature usage aggregation.
     columns:
       - name: person_id
         tests:
           - not_null
+      - name: event_day
+        tests:
+          - not_null
+      - name: feature_area
+        tests:
+          - not_null
       - name: events
+        tests:
+          - not_null
+
+  - name: fct_sessions
+    description: Session-level fact table for product usage analysis.
+    columns:
+      - name: session_id
+        tests:
+          - not_null
+          - unique
+      - name: person_id
+        tests:
+          - not_null
+      - name: session_start
+        tests:
+          - not_null
+      - name: session_day
+        tests:
+          - not_null
+      - name: events
+        tests:
+          - not_null
+
+  - name: fct_user_activity_daily
+    description: Daily active user and event-volume aggregate.
+    columns:
+      - name: event_day
+        tests:
+          - not_null
+          - unique
+      - name: active_persons
+        tests:
+          - not_null
+      - name: events
+        tests:
+          - not_null
+
+  - name: fct_activation_funnel
+    description: Per-person activation funnel from first seen to pageview/product action.
+    columns:
+      - name: person_id
+        tests:
+          - not_null
+          - unique
+      - name: first_seen_timestamp
+        tests:
+          - not_null
+      - name: activated
+        tests:
+          - not_null
+
+  - name: fct_retention_daily
+    description: Cohort retention rows by cohort day and activity day.
+    columns:
+      - name: cohort_day
+        tests:
+          - not_null
+      - name: activity_day
+        tests:
+          - not_null
+      - name: days_since_first_seen
+        tests:
+          - not_null
+      - name: retained_persons
+        tests:
+          - not_null
+
+  - name: fct_feature_usage_daily
+    description: Daily feature-area usage metrics.
+    columns:
+      - name: event_day
+        tests:
+          - not_null
+      - name: feature_area
+        tests:
+          - not_null
+      - name: users
+        tests:
+          - not_null
+      - name: events
+        tests:
+          - not_null
+
+  - name: mart_product_kpis_daily
+    description: Product analytics KPI mart combining activity, sessions, activation, retention, and person snapshots.
+    columns:
+      - name: metric_day
+        tests:
+          - not_null
+          - unique
+      - name: daily_active_users
+        tests:
+          - not_null
+      - name: activated_users
+        tests:
+          - not_null
+      - name: retained_users
         tests:
           - not_null

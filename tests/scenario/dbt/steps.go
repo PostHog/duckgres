@@ -61,9 +61,13 @@ type State struct {
 }
 
 type StepResult struct {
-	StepID      string
-	OutputDir   string
-	CommandsRun int
+	StepID         string
+	OutputDir      string
+	CommandsRun    int
+	Attempts       int
+	FailedAttempts int
+	Recovered      bool
+	AttemptResults []core.StepAttemptResult
 }
 
 type stepSpec struct {
@@ -79,11 +83,17 @@ type stepSpec struct {
 	SSLMode        string
 	ConnectTimeout int
 	Commands       []commandSpec
+	Retry          retrySpec
 }
 
 type commandSpec struct {
 	Name string
 	Args []string
+}
+
+type retrySpec struct {
+	Enabled     bool
+	MaxAttempts int
 }
 
 type defaultCommandRunner struct{}
@@ -136,6 +146,19 @@ func (s *State) Result(stepID string) (StepResult, bool) {
 	return result, ok
 }
 
+func (e *Executor) StepResultMetadata(stepID string) (core.StepResultMetadata, bool) {
+	result, ok := e.state.Result(stepID)
+	if !ok {
+		return core.StepResultMetadata{}, false
+	}
+	return core.StepResultMetadata{
+		Attempts:       result.Attempts,
+		FailedAttempts: result.FailedAttempts,
+		Recovered:      result.Recovered,
+		AttemptDetails: result.AttemptResults,
+	}, true
+}
+
 func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 	if step.Type != StepTypeDBTRun {
 		return classified(ErrorClassUnsupportedStep, fmt.Errorf("unsupported dbt step type %q", step.Type))
@@ -150,39 +173,69 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 	}
 
 	commandsRun := 0
+	failedAttempts := 0
+	recovered := false
+	attemptResults := []core.StepAttemptResult{}
 	for _, command := range spec.Commands {
-		args := append([]string{}, command.Args...)
-		args = append(args,
-			"--project-dir", spec.ProjectDir,
-			"--profiles-dir", spec.ProfilesDir,
-			"--log-path", filepath.Join(dbtDir, "logs"),
-		)
-		if command.Name != "debug" {
-			args = append(args, "--target-path", filepath.Join(dbtDir, "target"))
-		}
-		req := CommandRequest{
-			Binary:      spec.DBTBinary,
-			CommandName: command.Name,
-			Args:        args,
-			Env:         e.commandEnv(spec),
-			Dir:         spec.ProjectDir,
-		}
-		result := e.commandRunner.Run(ctx, req)
+		result, attempt, err := e.runCommandAttempt(ctx, spec, dbtDir, command, "", 1)
 		commandsRun++
-		if err := writeCommandLogs(dbtDir, command.Name, result, spec.Password); err != nil {
+		attemptResults = append(attemptResults, attempt)
+		if err != nil {
 			return err
 		}
 		if result.Err != nil {
-			e.state.StoreResult(StepResult{StepID: step.ID, OutputDir: dbtDir, CommandsRun: commandsRun})
+			failedAttempts++
+			e.state.StoreResult(stepResult(step.ID, dbtDir, commandsRun, failedAttempts, recovered, attemptResults))
 			return classified(ErrorClassDBT, fmt.Errorf("dbt command %s failed: %w", command.Name, result.Err))
 		}
 		if result.ExitCode != 0 {
-			e.state.StoreResult(StepResult{StepID: step.ID, OutputDir: dbtDir, CommandsRun: commandsRun})
+			failedAttempts++
+			if spec.Retry.Enabled && spec.Retry.MaxAttempts > 1 && commandSupportsRetry(command.Name) {
+				var retryResult CommandResult
+				recoveredThisCommand := false
+				for attemptNumber := 2; attemptNumber <= spec.Retry.MaxAttempts; attemptNumber++ {
+					var retryAttempt core.StepAttemptResult
+					var err error
+					retryResult, retryAttempt, err = e.runCommandAttempt(ctx, spec, dbtDir, commandSpec{Name: "retry", Args: []string{"retry"}}, command.Name, attemptNumber)
+					commandsRun++
+					attemptResults = append(attemptResults, retryAttempt)
+					if err != nil {
+						return err
+					}
+					if retryResult.Err == nil && retryResult.ExitCode == 0 {
+						recoveredThisCommand = true
+						break
+					}
+					failedAttempts++
+				}
+				if recoveredThisCommand {
+					recovered = true
+					continue
+				}
+				e.state.StoreResult(stepResult(step.ID, dbtDir, commandsRun, failedAttempts, recovered, attemptResults))
+				if retryResult.Err != nil {
+					return classified(ErrorClassDBT, fmt.Errorf("dbt command %s failed with exit code %d; retry failed: %w", command.Name, result.ExitCode, retryResult.Err))
+				}
+				return classified(ErrorClassDBT, fmt.Errorf("dbt command %s failed with exit code %d; retry failed with exit code %d", command.Name, result.ExitCode, retryResult.ExitCode))
+			}
+			e.state.StoreResult(stepResult(step.ID, dbtDir, commandsRun, failedAttempts, recovered, attemptResults))
 			return classified(ErrorClassDBT, fmt.Errorf("dbt command %s failed with exit code %d", command.Name, result.ExitCode))
 		}
 	}
-	e.state.StoreResult(StepResult{StepID: step.ID, OutputDir: dbtDir, CommandsRun: commandsRun})
+	e.state.StoreResult(stepResult(step.ID, dbtDir, commandsRun, failedAttempts, recovered, attemptResults))
 	return nil
+}
+
+func stepResult(stepID, dbtDir string, commandsRun, failedAttempts int, recovered bool, attemptResults []core.StepAttemptResult) StepResult {
+	return StepResult{
+		StepID:         stepID,
+		OutputDir:      dbtDir,
+		CommandsRun:    commandsRun,
+		Attempts:       len(attemptResults),
+		FailedAttempts: failedAttempts,
+		Recovered:      recovered,
+		AttemptResults: append([]core.StepAttemptResult{}, attemptResults...),
+	}
 }
 
 func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
@@ -218,6 +271,10 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	if err != nil {
 		return stepSpec{}, err
 	}
+	retry, err := retryFromStep(step)
+	if err != nil {
+		return stepSpec{}, err
+	}
 	return stepSpec{
 		OrgID:          orgID,
 		Username:       username,
@@ -231,6 +288,56 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		SSLMode:        stringFromWith(step, "sslmode", "require"),
 		ConnectTimeout: intFromWith(step, "connect_timeout", e.connection.ConnectTimeout),
 		Commands:       commands,
+		Retry:          retry,
+	}, nil
+}
+
+func (e *Executor) runCommandAttempt(ctx context.Context, spec stepSpec, dbtDir string, command commandSpec, retryOf string, attemptNumber int) (CommandResult, core.StepAttemptResult, error) {
+	args := append([]string{}, command.Args...)
+	args = append(args,
+		"--project-dir", spec.ProjectDir,
+		"--profiles-dir", spec.ProfilesDir,
+		"--log-path", filepath.Join(dbtDir, "logs"),
+	)
+	if command.Name != "debug" {
+		args = append(args, "--target-path", filepath.Join(dbtDir, "target"))
+	}
+	req := CommandRequest{
+		Binary:      spec.DBTBinary,
+		CommandName: command.Name,
+		Args:        args,
+		Env:         e.commandEnv(spec),
+		Dir:         spec.ProjectDir,
+	}
+	result := e.commandRunner.Run(ctx, req)
+	if err := writeCommandLogs(dbtDir, command.Name, result, spec.Password); err != nil {
+		return result, core.StepAttemptResult{}, err
+	}
+
+	status := "ok"
+	message := ""
+	if result.Err != nil {
+		status = "failed"
+		message = result.Err.Error()
+	} else if result.ExitCode != 0 {
+		status = "failed"
+		message = fmt.Sprintf("exit code %d", result.ExitCode)
+	}
+	attemptDir := filepath.Join(dbtDir, "attempts", attemptRoot(command.Name, retryOf), fmt.Sprintf("attempt_%d", attemptNumber))
+	if err := writeCommandLogs(attemptDir, command.Name, result, spec.Password); err != nil {
+		return result, core.StepAttemptResult{}, err
+	}
+	if err := snapshotDBTArtifacts(dbtDir, attemptDir); err != nil {
+		return result, core.StepAttemptResult{}, err
+	}
+	return result, core.StepAttemptResult{
+		Attempt:     attemptNumber,
+		CommandName: command.Name,
+		Status:      status,
+		ExitCode:    result.ExitCode,
+		Error:       message,
+		RetryOf:     retryOf,
+		OutputDir:   attemptDir,
 	}, nil
 }
 
@@ -284,6 +391,32 @@ func commandsFromStep(step core.Step) ([]commandSpec, error) {
 	return commands, nil
 }
 
+func retryFromStep(step core.Step) (retrySpec, error) {
+	raw, ok := step.With["retry"]
+	if !ok {
+		return retrySpec{MaxAttempts: 1}, nil
+	}
+	values, ok := raw.(map[string]any)
+	if !ok {
+		return retrySpec{}, classified(ErrorClassConfig, fmt.Errorf("step %s with.retry must be an object", step.ID))
+	}
+	enabled := boolFromMap(values, "enabled", false)
+	maxAttempts := intFromMap(values, "max_attempts", 2)
+	if enabled && maxAttempts < 2 {
+		return retrySpec{}, classified(ErrorClassConfig, fmt.Errorf("step %s with.retry.max_attempts must be at least 2 when retry is enabled", step.ID))
+	}
+	return retrySpec{Enabled: enabled, MaxAttempts: maxAttempts}, nil
+}
+
+func commandSupportsRetry(name string) bool {
+	switch name {
+	case "run", "test", "docs_generate":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseCommandName(name string) (commandSpec, error) {
 	switch name {
 	case "debug":
@@ -300,6 +433,9 @@ func parseCommandName(name string) (commandSpec, error) {
 }
 
 func writeCommandLogs(dir, commandName string, result CommandResult, secret string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return classified(ErrorClassConfig, fmt.Errorf("create dbt log dir: %w", err))
+	}
 	for suffix, body := range map[string]string{
 		"stdout": result.Stdout,
 		"stderr": result.Stderr,
@@ -308,6 +444,64 @@ func writeCommandLogs(dir, commandName string, result CommandResult, secret stri
 		redacted := redactSecret(body, secret)
 		if err := os.WriteFile(path, []byte(redacted), 0o644); err != nil {
 			return classified(ErrorClassConfig, fmt.Errorf("write dbt %s log: %w", suffix, err))
+		}
+	}
+	return nil
+}
+
+func attemptRoot(commandName, retryOf string) string {
+	if retryOf != "" {
+		return retryOf
+	}
+	return commandName
+}
+
+func snapshotDBTArtifacts(dbtDir, attemptDir string) error {
+	for _, name := range []string{"target", "logs"} {
+		src := filepath.Join(dbtDir, name)
+		if _, err := os.Stat(src); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return classified(ErrorClassConfig, fmt.Errorf("stat dbt artifact %s: %w", name, err))
+		}
+		if err := copyDir(src, filepath.Join(attemptDir, name)); err != nil {
+			return classified(ErrorClassConfig, fmt.Errorf("snapshot dbt artifact %s: %w", name, err))
+		}
+	}
+	return nil
+}
+
+func copyDir(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		body, err := os.ReadFile(srcPath)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(dstPath, body, info.Mode().Perm()); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -374,6 +568,44 @@ func intFromWith(step core.Step, key string, fallback int) int {
 		return int(value)
 	case string:
 		parsed, err := strconv.Atoi(value)
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func intFromMap(values map[string]any, key string, fallback int) int {
+	raw, ok := values[key]
+	if !ok {
+		return fallback
+	}
+	switch value := raw.(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case string:
+		parsed, err := strconv.Atoi(value)
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func boolFromMap(values map[string]any, key string, fallback bool) bool {
+	raw, ok := values[key]
+	if !ok {
+		return fallback
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		parsed, err := strconv.ParseBool(value)
 		if err == nil {
 			return parsed
 		}

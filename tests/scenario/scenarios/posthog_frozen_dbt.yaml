@@ -41,6 +41,9 @@ steps:
       schema: dbt_frozen
       project_dir: ../dbt/posthog_frozen_project
       commands: [debug, run, test, docs_generate]
+      retry:
+        enabled: true
+        max_attempts: 2
 
   - id: deprovision
     type: deprovision_warehouse

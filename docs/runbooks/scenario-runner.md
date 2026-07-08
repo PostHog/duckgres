@@ -109,6 +109,16 @@ The frozen dbt scenario uses:
 
 dbt artifacts are written under `artifacts/scenario/<run_id>/dbt/`, including per-command stdout/stderr logs, `target/` artifacts, and dbt logs. Install `dbt-postgres` locally or set `DUCKGRES_SCENARIO_DBT_BIN` to the dbt executable to use.
 
+dbt retry is opt-in per scenario step:
+
+```yaml
+retry:
+  enabled: true
+  max_attempts: 2
+```
+
+When enabled, a failed `run`, `test`, or `docs_generate` command is retried with `dbt retry`. The scenario records the original failure and retry as separate attempts in `events.jsonl`, marks the step `success_after_retry` if recovery succeeds, and writes per-attempt logs under `artifacts/scenario/<run_id>/dbt/attempts/<command>/attempt_<n>/`. `retry.enabled` defaults to `false`; `max_attempts` counts the original command attempt.
+
 `DUCKGRES_SCENARIO_FROZEN_S3_URI` must point at a dev-owned frozen dataset prefix with `persons/` and `events/` parquet children.
 The provisioned Duckgres worker role also needs read/list access to that prefix; the runner process only supplies the URI, while the worker performs the S3 reads during `read_parquet`.
 

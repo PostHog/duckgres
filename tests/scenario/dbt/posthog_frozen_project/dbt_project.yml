@@ -8,6 +8,10 @@ test-paths: ["tests"]
 models:
   posthog_frozen_scenario:
     staging:
-      +materialized: view
+      +materialized: table
+    intermediate:
+      +materialized: table
+    facts:
+      +materialized: table
     marts:
       +materialized: table

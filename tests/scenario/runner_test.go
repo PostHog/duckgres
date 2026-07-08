@@ -392,9 +392,140 @@ func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(projectDir, "dbt_project.yml")); err != nil {
 			t.Fatalf("dbt project should exist at %q: %v", projectDir, err)
 		}
+		retry, ok := step.With["retry"].(map[string]any)
+		if !ok {
+			t.Fatal("frozen dbt scenario should enable dbt retry metadata")
+		}
+		if enabled, _ := retry["enabled"].(bool); !enabled {
+			t.Fatalf("frozen dbt retry enabled = %#v, want true", retry["enabled"])
+		}
+		if maxAttempts := fmt.Sprint(retry["max_attempts"]); maxAttempts != "2" {
+			t.Fatalf("frozen dbt retry max_attempts = %#v, want 2", retry["max_attempts"])
+		}
 	}
 	if !foundDBT {
 		t.Fatal("expected frozen dbt scenario to include a dbt_run step")
+	}
+}
+
+func TestFrozenDBTProjectModelsRealisticProductAnalyticsWorkload(t *testing.T) {
+	projectDir := filepath.Join("dbt", "posthog_frozen_project")
+	requiredModels := map[string][]string{
+		"models/staging/stg_events.sql": {
+			"event_timestamp",
+			"person_id",
+			"event_category",
+		},
+		"models/staging/stg_persons.sql": {
+			"person_created_at",
+			"person_day",
+		},
+		"models/intermediate/int_person_first_seen.sql": {
+			"first_event_timestamp",
+			"first_person_timestamp",
+			"first_seen_timestamp",
+		},
+		"models/intermediate/int_sessionized_events.sql": {
+			"lag(event_timestamp)",
+			"session_number",
+			"session_id",
+		},
+		"models/intermediate/int_event_days.sql": {
+			"event_day",
+			"events",
+			"pageview_events",
+		},
+		"models/intermediate/int_person_activity_daily.sql": {
+			"person_id",
+			"event_day",
+			"feature_events",
+		},
+		"models/intermediate/int_person_feature_usage_daily.sql": {
+			"person_id",
+			"feature_area",
+			"events",
+		},
+		"models/facts/fct_sessions.sql": {
+			"session_start",
+			"session_duration_seconds",
+			"pageview_events",
+		},
+		"models/facts/fct_user_activity_daily.sql": {
+			"int_person_activity_daily",
+			"active_persons",
+			"pageview_events",
+			"feature_events",
+		},
+		"models/facts/fct_activation_funnel.sql": {
+			"saw_pageview",
+			"used_feature",
+			"activated",
+		},
+		"models/facts/fct_retention_daily.sql": {
+			"cohort_day",
+			"days_since_first_seen",
+			"retained_persons",
+		},
+		"models/facts/fct_feature_usage_daily.sql": {
+			"int_person_feature_usage_daily",
+			"feature_area",
+			"users",
+			"events",
+		},
+		"models/marts/mart_product_kpis_daily.sql": {
+			"daily_active_users",
+			"activated_users",
+			"retained_users",
+		},
+	}
+
+	for modelPath, requiredSnippets := range requiredModels {
+		body, err := os.ReadFile(filepath.Join(projectDir, modelPath))
+		if err != nil {
+			t.Fatalf("expected realistic dbt model %s: %v", modelPath, err)
+		}
+		sql := strings.ToLower(string(body))
+		for _, snippet := range requiredSnippets {
+			if !strings.Contains(sql, strings.ToLower(snippet)) {
+				t.Fatalf("model %s missing realistic analytics snippet %q", modelPath, snippet)
+			}
+		}
+	}
+
+	schema, err := os.ReadFile(filepath.Join(projectDir, "models", "schema.yml"))
+	if err != nil {
+		t.Fatalf("read dbt schema.yml: %v", err)
+	}
+	for _, modelName := range []string{
+		"stg_events",
+		"stg_persons",
+		"int_person_first_seen",
+		"int_sessionized_events",
+		"int_event_days",
+		"int_person_activity_daily",
+		"int_person_feature_usage_daily",
+		"fct_sessions",
+		"fct_user_activity_daily",
+		"fct_activation_funnel",
+		"fct_retention_daily",
+		"fct_feature_usage_daily",
+		"mart_product_kpis_daily",
+	} {
+		if !strings.Contains(string(schema), "name: "+modelName) {
+			t.Fatalf("schema.yml should document and test model %s", modelName)
+		}
+	}
+
+	project, err := os.ReadFile(filepath.Join(projectDir, "dbt_project.yml"))
+	if err != nil {
+		t.Fatalf("read dbt_project.yml: %v", err)
+	}
+	projectYAML := string(project)
+	if !strings.Contains(projectYAML, "staging:\n      +materialized: table") {
+		t.Fatal("frozen dbt staging models should be materialized as tables so downstream facts do not repeatedly scan raw parquet")
+	}
+	if !strings.Contains(projectYAML, "intermediate:\n      +materialized: table") {
+		t.Fatal("frozen dbt intermediate models should be materialized as tables to reuse reduced-grain aggregates")
 	}
 }
 
@@ -439,6 +570,13 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 	default:
 		return fmt.Errorf("unsupported scenario step type %q", step.Type)
 	}
+}
+
+func (e dispatchExecutor) StepResultMetadata(stepID string) (core.StepResultMetadata, bool) {
+	if e.dbt == nil {
+		return core.StepResultMetadata{}, false
+	}
+	return e.dbt.StepResultMetadata(stepID)
 }
 
 func dispatchSupports(stepType string) bool {

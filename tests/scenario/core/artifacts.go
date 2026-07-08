@@ -13,27 +13,50 @@ import (
 type RunSummary struct {
 	RunID          string    `json:"run_id"`
 	ScenarioName   string    `json:"scenario_name"`
+	Status         RunStatus `json:"status"`
 	StartedAt      time.Time `json:"started_at"`
 	FinishedAt     time.Time `json:"finished_at"`
 	TotalSteps     int       `json:"total_steps"`
 	SucceededSteps int       `json:"succeeded_steps"`
 	FailedSteps    int       `json:"failed_steps"`
 	SkippedSteps   int       `json:"skipped_steps"`
+	RecoveredSteps int       `json:"recovered_steps"`
+	FailedAttempts int       `json:"failed_attempts"`
 }
 
 type StepResult struct {
-	RunID        string        `json:"run_id"`
-	ScenarioName string        `json:"scenario_name"`
-	StepID       string        `json:"step_id"`
-	StepType     string        `json:"step_type"`
-	Status       StepStatus    `json:"status"`
-	ErrorClass   string        `json:"error_class,omitempty"`
-	Error        string        `json:"error,omitempty"`
-	StartedAt    time.Time     `json:"started_at"`
-	FinishedAt   time.Time     `json:"finished_at"`
-	Duration     time.Duration `json:"duration_ns"`
-	Attempts     int           `json:"attempts"`
-	Err          error         `json:"-"`
+	RunID          string              `json:"run_id"`
+	ScenarioName   string              `json:"scenario_name"`
+	StepID         string              `json:"step_id"`
+	StepType       string              `json:"step_type"`
+	Status         StepStatus          `json:"status"`
+	ErrorClass     string              `json:"error_class,omitempty"`
+	Error          string              `json:"error,omitempty"`
+	StartedAt      time.Time           `json:"started_at"`
+	FinishedAt     time.Time           `json:"finished_at"`
+	Duration       time.Duration       `json:"duration_ns"`
+	Attempts       int                 `json:"attempts"`
+	FailedAttempts int                 `json:"failed_attempts"`
+	Recovered      bool                `json:"recovered"`
+	AttemptDetails []StepAttemptResult `json:"attempt_details,omitempty"`
+	Err            error               `json:"-"`
+}
+
+type StepResultMetadata struct {
+	Attempts       int
+	FailedAttempts int
+	Recovered      bool
+	AttemptDetails []StepAttemptResult
+}
+
+type StepAttemptResult struct {
+	Attempt     int    `json:"attempt"`
+	CommandName string `json:"command_name"`
+	Status      string `json:"status"`
+	ExitCode    int    `json:"exit_code,omitempty"`
+	Error       string `json:"error,omitempty"`
+	RetryOf     string `json:"retry_of,omitempty"`
+	OutputDir   string `json:"output_dir,omitempty"`
 }
 
 var stepResultsHeader = []string{
@@ -48,6 +71,8 @@ var stepResultsHeader = []string{
 	"finished_at",
 	"duration_ms",
 	"attempts",
+	"failed_attempts",
+	"recovered",
 }
 
 func WriteArtifacts(dir string, summary RunSummary, results []StepResult) error {
@@ -133,6 +158,8 @@ func stepResultRecord(result StepResult) []string {
 		result.FinishedAt.UTC().Format(time.RFC3339Nano),
 		strconv.FormatFloat(float64(result.Duration)/float64(time.Millisecond), 'f', 6, 64),
 		strconv.Itoa(result.Attempts),
+		strconv.Itoa(result.FailedAttempts),
+		strconv.FormatBool(result.Recovered),
 	}
 }
 
