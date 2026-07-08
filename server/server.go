@@ -1202,14 +1202,11 @@ func tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg Config, username s
 	// predate managed query-log storage. Remove it once org metadata
 	// provisioning/migrations create querylog.query_log_entries before any
 	// DuckLake attach, and all existing tenants have been migrated.
-	if err := ensurePostgresQueryLogStorageForDuckLakeAttach(queryLogCtx, cfg); err != nil {
-		reason := "unavailable"
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(queryLogCtx.Err(), context.DeadlineExceeded) {
-			reason = "timeout"
-		}
-		// Do not log err here: metadata-store connection errors can carry DSNs
-		// with credentials. The setup is best-effort, so a coarse reason is enough.
-		slog.Warn("Failed to initialize native Postgres query-log storage before DuckLake attach.", "user", username, "reason", reason)
+	if ensurePostgresQueryLogStorageForDuckLakeAttach(queryLogCtx, cfg) != nil {
+		// Do not log or classify the error here: metadata-store connection
+		// errors can carry DSNs with credentials, and even derived log fields can
+		// be treated as sensitive by static analysis. The setup is best-effort.
+		slog.Warn("Failed to initialize native Postgres query-log storage before DuckLake attach.", "user", username)
 	}
 }
 
