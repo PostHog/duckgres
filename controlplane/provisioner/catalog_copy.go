@@ -392,8 +392,10 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // applyConstraints replays the source table's constraints (PK, unique, check,
 // FK) via pg_get_constraintdef, sorted so PKs/uniques come before FKs.
 func applyConstraints(ctx context.Context, srcTx pgx.Tx, dst *pgx.Conn, table string) error {
+	// contype is the internal "char" type (OID 18), which pgx cannot scan in
+	// binary format into a string — cast it.
 	rows, err := srcTx.Query(ctx, `
-SELECT conname, contype, pg_get_constraintdef(oid)
+SELECT conname, contype::text, pg_get_constraintdef(oid)
 FROM pg_constraint
 WHERE conrelid = ('public.' || quote_ident($1))::regclass
 ORDER BY conname`, table)
