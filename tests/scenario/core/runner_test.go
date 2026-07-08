@@ -189,6 +189,143 @@ steps:
 	}
 }
 
+func TestRunnerMarksRecoveredAttemptFailuresAsSuccessfulWithRetries(t *testing.T) {
+	scenario, err := ParseScenario([]byte(`
+name: recovered
+steps:
+  - id: dbt_models
+    type: dbt_run
+  - id: downstream
+    type: fake
+`))
+	if err != nil {
+		t.Fatalf("ParseScenario returned error: %v", err)
+	}
+
+	executor := &metadataExecutor{
+		results: map[string]StepResultMetadata{
+			"dbt_models": {
+				Attempts:       2,
+				FailedAttempts: 1,
+				Recovered:      true,
+				AttemptDetails: []StepAttemptResult{{
+					Attempt:     1,
+					CommandName: "run",
+					Status:      "failed",
+					ExitCode:    2,
+					Error:       "flight EOF",
+				}, {
+					Attempt:     2,
+					CommandName: "retry",
+					Status:      "ok",
+					RetryOf:     "run",
+				}},
+			},
+		},
+	}
+	runner := NewRunner(RunnerConfig{
+		RunID:    "run-recovered",
+		Scenario: scenario,
+		Executor: executor,
+		Now:      fixedClock(time.Unix(1700000000, 0)),
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error for recovered failure: %v", err)
+	}
+	if summary.SucceededSteps != 2 || summary.RecoveredSteps != 1 || summary.FailedAttempts != 1 || summary.Status != RunStatusSuccessWithRetries {
+		t.Fatalf("summary = %+v", summary)
+	}
+	results := runner.Results()
+	if results[0].Status != StepStatusSuccessAfterRetry || !results[0].Recovered || results[0].FailedAttempts != 1 {
+		t.Fatalf("dbt result = %+v", results[0])
+	}
+	if len(results[0].AttemptDetails) != 2 || results[0].AttemptDetails[0].Status != "failed" {
+		t.Fatalf("attempt details = %+v", results[0].AttemptDetails)
+	}
+	if results[1].StepID != "downstream" || results[1].Status != StepStatusOK {
+		t.Fatalf("downstream should run after recovered step, got %+v", results[1])
+	}
+}
+
+func TestRunnerIncludesAttemptMetadataForExpectedErrors(t *testing.T) {
+	scenario, err := ParseScenario([]byte(`
+name: expected-error-attempts
+steps:
+  - id: dbt_models
+    type: dbt_run
+    expect_error:
+      error_class: dbt_execution
+      contains: ["exit code 2"]
+`))
+	if err != nil {
+		t.Fatalf("ParseScenario returned error: %v", err)
+	}
+
+	executor := &metadataExecutor{
+		errs: map[string]error{
+			"dbt_models": classifiedTestError{class: "dbt_execution", message: "dbt command run failed with exit code 2"},
+		},
+		results: map[string]StepResultMetadata{
+			"dbt_models": {
+				Attempts:       2,
+				FailedAttempts: 2,
+				AttemptDetails: []StepAttemptResult{{
+					Attempt:     1,
+					CommandName: "run",
+					Status:      "failed",
+					ExitCode:    2,
+				}, {
+					Attempt:     2,
+					CommandName: "retry",
+					Status:      "failed",
+					ExitCode:    2,
+					RetryOf:     "run",
+				}},
+			},
+		},
+	}
+	runner := NewRunner(RunnerConfig{
+		RunID:    "run-expected-error-attempts",
+		Scenario: scenario,
+		Executor: executor,
+		Now:      fixedClock(time.Unix(1700000000, 0)),
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error for expected dbt failure: %v", err)
+	}
+	if summary.SucceededSteps != 1 || summary.FailedAttempts != 2 || summary.Status != RunStatusSuccessWithRetries {
+		t.Fatalf("summary = %+v", summary)
+	}
+	results := runner.Results()
+	if len(results) != 1 {
+		t.Fatalf("results = %+v", results)
+	}
+	if results[0].Status != StepStatusOK || results[0].Attempts != 2 || results[0].FailedAttempts != 2 {
+		t.Fatalf("result = %+v", results[0])
+	}
+	if len(results[0].AttemptDetails) != 2 || results[0].AttemptDetails[1].RetryOf != "run" {
+		t.Fatalf("attempt details = %+v", results[0].AttemptDetails)
+	}
+}
+
+type metadataExecutor struct {
+	errs    map[string]error
+	results map[string]StepResultMetadata
+}
+
+func (e *metadataExecutor) ExecuteStep(_ context.Context, step Step) error {
+	return e.errs[step.ID]
+}
+
+func (e *metadataExecutor) StepResultMetadata(stepID string) (StepResultMetadata, bool) {
+	result, ok := e.results[stepID]
+	return result, ok
+}
+
 func TestRunnerRecordsClassifiedExecutorError(t *testing.T) {
 	sentinel := classifiedTestError{class: "cleanup_timeout", message: "cleanup timed out"}
 	scenario, err := ParseScenario([]byte(`

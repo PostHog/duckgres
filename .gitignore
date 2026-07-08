@@ -36,6 +36,9 @@ duckgres_local_test.yaml
 artifacts/perf/
 /artifacts/
 
+# dbt local user identity
+.user.yml
+
 .gemini/
 gha-creds-*.json
 data-test/

@@ -181,6 +181,97 @@ func TestExecutorStopsAfterFailedDBTCommand(t *testing.T) {
 	}
 }
 
+func TestExecutorRetriesFailedDBTCommandAndRecordsRecoveredFailure(t *testing.T) {
+	projectDir := writeDBTProject(t)
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	runAttempts := 0
+	runner := &fakeCommandRunner{
+		onRun: func(req CommandRequest) CommandResult {
+			switch req.CommandName {
+			case "run":
+				runAttempts++
+				return CommandResult{ExitCode: 2, Stderr: "flight EOF"}
+			case "retry":
+				return CommandResult{Stdout: "retry recovered"}
+			default:
+				return CommandResult{}
+			}
+		},
+	}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			HostAddr:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir:     t.TempDir(),
+		CommandRunner: runner,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "dbt_models",
+		Type: StepTypeDBTRun,
+		With: map[string]any{
+			"org_id":      "scenario-org",
+			"project_dir": projectDir,
+			"commands":    []any{"debug", "run", "test"},
+			"retry": map[string]any{
+				"enabled":      true,
+				"max_attempts": 2,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error after retry recovered: %v", err)
+	}
+	if got := runner.commandNames(); !reflect.DeepEqual(got, []string{"debug", "run", "retry", "test"}) {
+		t.Fatalf("commands = %#v, want debug/run/retry/test", got)
+	}
+	if runAttempts != 1 {
+		t.Fatalf("dbt run attempts = %d, want 1 plus dbt retry", runAttempts)
+	}
+	retryReq := runner.requests[2]
+	if retryReq.CommandName != "retry" || !reflect.DeepEqual(retryReq.Args[:1], []string{"retry"}) {
+		t.Fatalf("retry request = %+v", retryReq)
+	}
+	if targetPath := argValue(retryReq.Args, "--target-path"); targetPath != filepath.Join(executor.OutputDir(), "dbt", "target") {
+		t.Fatalf("retry target path = %q", targetPath)
+	}
+
+	result, ok := executor.State().Result("dbt_models")
+	if !ok {
+		t.Fatal("expected dbt result to be recorded")
+	}
+	if result.CommandsRun != 4 || result.Attempts != 4 || result.FailedAttempts != 1 || !result.Recovered {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(result.AttemptResults) != 4 {
+		t.Fatalf("attempt results = %+v", result.AttemptResults)
+	}
+	if got := result.AttemptResults[1]; got.CommandName != "run" || got.Status != "failed" || got.ExitCode != 2 {
+		t.Fatalf("failed attempt = %+v", got)
+	}
+	if got := result.AttemptResults[2]; got.CommandName != "retry" || got.Status != "ok" || got.RetryOf != "run" {
+		t.Fatalf("retry attempt = %+v", got)
+	}
+
+	dbtDir := filepath.Join(executor.OutputDir(), "dbt")
+	for _, path := range []string{
+		filepath.Join(dbtDir, "attempts", "run", "attempt_1", "run.stderr.log"),
+		filepath.Join(dbtDir, "attempts", "run", "attempt_2", "retry.stdout.log"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected attempt artifact %s: %v", path, err)
+		}
+	}
+}
+
 func writeDBTProject(t *testing.T) string {
 	t.Helper()
 	projectDir := t.TempDir()

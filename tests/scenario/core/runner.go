@@ -11,16 +11,27 @@ import (
 type StepStatus string
 
 const (
-	StepStatusOK      StepStatus = "ok"
-	StepStatusFailed  StepStatus = "failed"
-	StepStatusSkipped StepStatus = "skipped"
+	StepStatusOK                StepStatus = "ok"
+	StepStatusSuccessAfterRetry StepStatus = "success_after_retry"
+	StepStatusFailed            StepStatus = "failed"
+	StepStatusSkipped           StepStatus = "skipped"
+
+	RunStatusSuccess            RunStatus = "success"
+	RunStatusSuccessWithRetries RunStatus = "success_with_retries"
+	RunStatusFailed             RunStatus = "failed"
 
 	errorClassExpectedErrorMissing  = "expected_error_missing"
 	errorClassExpectedErrorMismatch = "expected_error_mismatch"
 )
 
+type RunStatus string
+
 type StepExecutor interface {
 	ExecuteStep(context.Context, Step) error
+}
+
+type StepMetadataProvider interface {
+	StepResultMetadata(stepID string) (StepResultMetadata, bool)
 }
 
 type ClassifiedError interface {
@@ -68,6 +79,7 @@ func (r *Runner) Run(ctx context.Context) (RunSummary, error) {
 	summary := RunSummary{
 		RunID:        runID,
 		ScenarioName: r.cfg.Scenario.Name,
+		Status:       RunStatusSuccess,
 		StartedAt:    startedAt,
 		FinishedAt:   startedAt,
 		TotalSteps:   len(r.cfg.Scenario.Steps),
@@ -94,19 +106,24 @@ func (r *Runner) Run(ctx context.Context) (RunSummary, error) {
 		if result.Err != nil {
 			runErrs = append(runErrs, result.Err)
 		}
-		if !step.AlwaysRun && result.Status != StepStatusOK {
+		if !step.AlwaysRun && !isSuccessfulStepStatus(result.Status) {
 			normalStepsBlocked = true
 		}
 		switch result.Status {
-		case StepStatusOK:
+		case StepStatusOK, StepStatusSuccessAfterRetry:
 			summary.SucceededSteps++
+			if result.Status == StepStatusSuccessAfterRetry {
+				summary.RecoveredSteps++
+			}
 		case StepStatusFailed:
 			summary.FailedSteps++
 		case StepStatusSkipped:
 			summary.SkippedSteps++
 		}
+		summary.FailedAttempts += result.FailedAttempts
 	}
 	summary.FinishedAt = r.cfg.Now()
+	summary.Status = summaryStatus(summary)
 
 	if r.cfg.WriteFiles {
 		if err := WriteArtifacts(r.cfg.OutputDir, summary, r.results); err != nil {
@@ -156,6 +173,7 @@ func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByS
 	}
 	if step.ExpectError != nil {
 		r.applyExpectedError(step, err, &result)
+		r.applyStepMetadata(step.ID, &result)
 		return result
 	}
 	if err != nil {
@@ -164,7 +182,28 @@ func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByS
 		result.Error = err.Error()
 		result.Err = err
 	}
+	r.applyStepMetadata(step.ID, &result)
 	return result
+}
+
+func (r *Runner) applyStepMetadata(stepID string, result *StepResult) {
+	provider, ok := r.cfg.Executor.(StepMetadataProvider)
+	if !ok {
+		return
+	}
+	metadata, ok := provider.StepResultMetadata(stepID)
+	if !ok {
+		return
+	}
+	if metadata.Attempts > 0 {
+		result.Attempts = metadata.Attempts
+	}
+	result.FailedAttempts = metadata.FailedAttempts
+	result.Recovered = metadata.Recovered
+	result.AttemptDetails = metadata.AttemptDetails
+	if metadata.Recovered && result.Status == StepStatusOK {
+		result.Status = StepStatusSuccessAfterRetry
+	}
 }
 
 func (r *Runner) applyExpectedError(step Step, err error, result *StepResult) {
@@ -232,11 +271,25 @@ func (r *Runner) contextForStep(ctx context.Context, step Step) (context.Context
 
 func firstUnsuccessfulDependency(step Step, statusByStep map[string]StepStatus) (string, bool) {
 	for _, dep := range step.DependsOn {
-		if statusByStep[dep] != StepStatusOK {
+		if !isSuccessfulStepStatus(statusByStep[dep]) {
 			return dep, true
 		}
 	}
 	return "", false
+}
+
+func isSuccessfulStepStatus(status StepStatus) bool {
+	return status == StepStatusOK || status == StepStatusSuccessAfterRetry
+}
+
+func summaryStatus(summary RunSummary) RunStatus {
+	if summary.FailedSteps > 0 || summary.SkippedSteps > 0 {
+		return RunStatusFailed
+	}
+	if summary.RecoveredSteps > 0 || summary.FailedAttempts > 0 {
+		return RunStatusSuccessWithRetries
+	}
+	return RunStatusSuccess
 }
 
 func classifyStepError(err error) string {
