@@ -1,6 +1,8 @@
 package observe
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -83,3 +85,70 @@ var MetadataPoolMaxConnections = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_ducklake_metadata_pool_max_connections",
 	Help: "Configured postgres_scanner pool ceiling for DuckLake metadata (pg_pool_max_connections).",
 }, []string{"org"})
+
+var queryLogBufferedEntries = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_query_log_buffered_entries",
+	Help: "Current number of query-log entries buffered in memory before storage flush.",
+})
+
+var queryLogEnqueuedEntriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_log_enqueued_entries_total",
+	Help: "Total number of query-log entries accepted into the in-memory buffer.",
+})
+
+var queryLogFlushedEntriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_log_flushed_entries_total",
+	Help: "Total number of query-log entries flushed successfully to durable storage.",
+})
+
+var queryLogDroppedEntriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_query_log_dropped_entries_total",
+	Help: "Total number of query-log entries dropped before reaching durable storage.",
+}, []string{"reason"})
+
+var queryLogFlushErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_log_flush_errors_total",
+	Help: "Total number of failed query-log storage flush attempts.",
+})
+
+var queryLogFlushDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "duckgres_query_log_flush_duration_seconds",
+	Help:    "Duration of query-log storage flush attempts in seconds.",
+	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10},
+})
+
+func SetQueryLogBufferedEntries(entries int) {
+	if entries < 0 {
+		entries = 0
+	}
+	queryLogBufferedEntries.Set(float64(entries))
+}
+
+func IncQueryLogEnqueuedEntries() {
+	queryLogEnqueuedEntriesTotal.Inc()
+}
+
+func AddQueryLogFlushedEntries(entries int) {
+	if entries <= 0 {
+		return
+	}
+	queryLogFlushedEntriesTotal.Add(float64(entries))
+}
+
+func AddQueryLogDroppedEntries(reason string, entries int) {
+	if entries <= 0 {
+		return
+	}
+	queryLogDroppedEntriesTotal.WithLabelValues(reason).Add(float64(entries))
+}
+
+func IncQueryLogFlushErrors() {
+	queryLogFlushErrorsTotal.Inc()
+}
+
+func ObserveQueryLogFlushDuration(duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	queryLogFlushDurationHistogram.Observe(duration.Seconds())
+}

@@ -211,7 +211,7 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 | pg_roles | ✅ | `catalog_test.go::TestCatalogPgRoles` | single hardcoded superuser |
 | pg_settings | ✅ | `catalog_test.go::TestCatalogPgSettings` | |
 | pg_stat_activity | ✅ | `pg_stat_activity_test.go::TestPgStatActivity`/`::TestPgStatActivityFromSecondConnection`/`::TestPgStatActivityExtendedQuery`/`::TestPgStatActivityStubView` | intercepted at query time for live data |
-| system.query_log | ✅ | `querylog_test.go` | DuckLake-backed durable query history with `event_id`, `user_name`, timing, errors, trace IDs, `cpu_time_s`, `peak_buffer_memory_bytes`, and `postgres_scan_ms` |
+| system.query_log | ❌ | — | Direct DuckLake writer removed; query rows are stored in native Postgres `querylog.query_log_entries`. SQL surface pending the Postgres-backed DuckLake view. |
 | information_schema (tables/columns/views/schemata) | ✅ | `catalog_test.go::TestCatalogInformationSchema{Tables,Columns,Views,Schemata}` | |
 | information_schema key_column_usage / table_constraints / referential_constraints | ❌ | — | Missing; used by ORMs for FK introspection |
 | System functions (format_type, pg_get_userbyid, pg_table_is_visible, has_*_privilege, pg_encoding_to_char, size fns, quote_*) | ✅ | `catalog_test.go::TestCatalogSystemFunctions`, `::TestFormatTypeTimePrecision`; server `pg_compat_macros_test.go` | many return permissive/stub values |

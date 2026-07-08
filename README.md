@@ -96,20 +96,13 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 
 ### Query Log
 
-When DuckLake is configured, Duckgres writes a durable per-query history to
-`ducklake.system.query_log` by default. The query log records SQL user
+When DuckLake uses a Postgres metadata store, Duckgres writes durable per-query
+history to the native Postgres table `querylog.query_log_entries`. The query
+log records SQL user
 (`user_name`), org, query text, duration, row counts, errors, trace/span IDs,
 and profiling-derived resource usage. `cpu_time_s` is DuckDB cumulative
 CPU/thread time in seconds, and `peak_buffer_memory_bytes` is DuckDB's
 `system_peak_buffer_memory` in bytes, not process RSS.
-
-```sql
-SELECT event_time, user_name, org_id, query_duration_ms, cpu_time_s,
-       peak_buffer_memory_bytes, postgres_scan_ms, query
-FROM ducklake.system.query_log
-ORDER BY cpu_time_s DESC, peak_buffer_memory_bytes DESC
-LIMIT 20;
-```
 
 ## Runbooks
 
@@ -254,8 +247,8 @@ Run with config file:
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
 | `DUCKGRES_QUERY_LOG_ENABLED` | Enable per-query logging | `true` |
-| `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval for direct DuckLake writes | `5s` |
-| `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size for direct DuckLake inserts | `1000` |
+| `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval for native Postgres writes | `5s` |
+| `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size for native Postgres inserts | `1000` |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |

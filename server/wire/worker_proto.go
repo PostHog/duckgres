@@ -1,6 +1,8 @@
 package wire
 
 import (
+	"time"
+
 	"github.com/posthog/duckgres/server/ducklake"
 )
 
@@ -60,4 +62,43 @@ type WorkerWaitSessionIdlePayload struct {
 type WorkerReleaseQueryHandlePayload struct {
 	WorkerControlMetadata
 	Ticket []byte `json:"ticket"`
+}
+
+// QueryLogEntry represents a completed client query event that the control
+// plane asks the activated worker to persist in tenant query-log storage.
+type QueryLogEntry struct {
+	EventID               string
+	EventTime             time.Time
+	QueryDurationMs       int64
+	Type                  string
+	Query                 string
+	TranspiledQuery       *string
+	QueryKind             string
+	NormalizedHash        int64
+	ResultRows            int64
+	WrittenRows           int64
+	ExceptionCode         string
+	Exception             string
+	UserName              string
+	OrgID                 string
+	CurrentDatabase       string
+	ClientAddress         string
+	ClientPort            int
+	ApplicationName       string
+	PID                   int32
+	WorkerID              int
+	IsTranspiled          bool
+	Protocol              string
+	TraceID               string
+	SpanID                string
+	PostgresScanMs        int64
+	CPUTimeSeconds        float64
+	PeakBufferMemoryBytes int64
+}
+
+// WorkerQueryLogPayload carries a batch of completed query-log entries to the
+// activated worker that owns the tenant runtime.
+type WorkerQueryLogPayload struct {
+	WorkerControlMetadata
+	Entries []QueryLogEntry `json:"entries"`
 }

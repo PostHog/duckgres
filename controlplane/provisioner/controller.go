@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -112,10 +113,6 @@ func (c *Controller) SetProbe(p MetadataProbe) {
 	c.probe = p
 }
 
-// WithBucketSuffix sets the env suffix used to compute and backfill the
-// CP-owned per-org s3bucket name onto existing ready ducklings. Empty leaves
-// backfill disabled (composition keeps deriving). Returns the controller for
-// chaining.
 // DucklingClient exposes the controller's Duckling CR client so co-located
 // components (the reshard runner) share one client instead of re-resolving
 // in-cluster config.
@@ -123,6 +120,10 @@ func (c *Controller) DucklingClient() *DucklingClient {
 	return c.duckling
 }
 
+// WithBucketSuffix sets the env suffix used to compute and backfill the
+// CP-owned per-org s3bucket name onto existing ready ducklings. Empty leaves
+// backfill disabled (composition keeps deriving). Returns the controller for
+// chaining.
 func (c *Controller) WithBucketSuffix(suffix string) *Controller {
 	c.bucketSuffix = suffix
 	return c
@@ -194,7 +195,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		log.Info("Duckling CR already exists, transitioning to provisioning.")
 		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 			"state":                   configstore.ManagedWarehouseStateProvisioning,
-			"status_message":          "Duckling CR exists, polling status",
+			"status_message":          "Provisioning in progress...",
 			"provisioning_started_at": now,
 		}); err != nil {
 			log.Warn("Failed to update state to provisioning.", "error", err)
@@ -228,7 +229,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 
 	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 		"state":                   configstore.ManagedWarehouseStateProvisioning,
-		"status_message":          "Duckling CR created, waiting for resources",
+		"status_message":          "Provisioning in progress...",
 		"provisioning_started_at": now,
 	}); err != nil {
 		log.Warn("Failed to update state to provisioning.", "error", err)
@@ -278,36 +279,33 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		return
 	}
 
-	// Track per-component readiness based on Duckling CR status fields.
-	// Infrastructure details (endpoint, password, bucket, etc.) are read directly
-	// from the Duckling CR by the worker activator at activation time — only
-	// state transitions are stored in the config store.
+	// Track per-component readiness. A component is ready only once the XR's
+	// Ready condition is True — NOT merely because its status field
+	// (bucketName, endpoint, password, iamRoleArn) is populated. The
+	// composition sets those fields as soon as it *renders* the composed
+	// resource, which happens well before that resource actually reconciles, so
+	// keying readiness on field presence alone reported a component (notably S3)
+	// green while its underlying managed resource was still failing — e.g. a
+	// bucket stuck on BucketNotEmpty. Ready is Crossplane's aggregate "all
+	// composed resources reconciled" signal, so gate on it and recompute every
+	// tick: a component that regresses is revoked, not latched on.
 	updates := map[string]interface{}{}
 
-	if status.DataStore.BucketName != "" && w.S3State != configstore.ManagedWarehouseStateReady {
-		updates["s3_state"] = configstore.ManagedWarehouseStateReady
+	setComponent := func(key string, current configstore.ManagedWarehouseProvisioningState, present bool) bool {
+		desired := configstore.ManagedWarehouseStateProvisioning
+		if present && status.ReadyCondition {
+			desired = configstore.ManagedWarehouseStateReady
+		}
+		if current != desired {
+			updates[key] = desired
+		}
+		return desired == configstore.ManagedWarehouseStateReady
 	}
 
-	if status.MetadataStore.Endpoint != "" && w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
-		updates["metadata_store_state"] = configstore.ManagedWarehouseStateReady
-	}
-
-	if status.MetadataStore.Password != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
-		updates["secrets_state"] = configstore.ManagedWarehouseStateReady
-	}
-
-	if status.IAMRoleARN != "" && w.IdentityState != configstore.ManagedWarehouseStateReady {
-		updates["identity_state"] = configstore.ManagedWarehouseStateReady
-	}
-
-	// Infrastructure is ready when all components are provisioned AND the
-	// Crossplane Ready condition is True. The Ready condition ensures all
-	// composed resources (including the metadata store) are fully reconciled,
-	// not just that individual status fields are populated.
-	s3Ready := w.S3State == configstore.ManagedWarehouseStateReady || updates["s3_state"] == configstore.ManagedWarehouseStateReady
-	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
-	secretsReady := w.SecretsState == configstore.ManagedWarehouseStateReady || updates["secrets_state"] == configstore.ManagedWarehouseStateReady
-	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
+	s3Ready := setComponent("s3_state", w.S3State, status.DataStore.BucketName != "")
+	metaReady := setComponent("metadata_store_state", w.MetadataStoreState, status.MetadataStore.Endpoint != "")
+	secretsReady := setComponent("secrets_state", w.SecretsState, status.MetadataStore.Password != "")
+	identReady := setComponent("identity_state", w.IdentityState, status.IAMRoleARN != "")
 
 	if s3Ready && metaReady && secretsReady && identReady && status.ReadyCondition {
 		// End-to-end probe: AWS reports the metadata store (RDS) Available before
@@ -343,13 +341,23 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		); err != nil {
 			log.Info("Infrastructure provisioned but end-to-end probe still failing — staying in provisioning.",
 				"pgbouncer_enabled", w.PgBouncer.Enabled, "error", err)
-			updates["status_message"] = fmt.Sprintf("Waiting for metadata store reachability: %v", err)
+			updates["status_message"] = "Provisioning in progress..."
 		} else {
 			now := time.Now().UTC()
 			updates["state"] = configstore.ManagedWarehouseStateReady
 			updates["status_message"] = "Infrastructure ready"
 			updates["ready_at"] = now
 			log.Info("Infrastructure ready, transitioning to ready.", "pgbouncer_enabled", w.PgBouncer.Enabled)
+		}
+	} else if !status.ReadyCondition {
+		// Still provisioning and the XR is not Ready — surface *why*. Prefer the
+		// concrete provider error from a failing composed resource (e.g. the S3
+		// bucket's BucketNotEmpty) over the XR's generic "Unready resources:
+		// <name>" roll-up, so the admin UI shows the actual blocker instead of a
+		// stale message. Guarded to the not-Ready branch so it never overwrites
+		// the probe-wait / ready messages set above.
+		if msg := c.diagnoseNotReady(ctx, w, status); msg != "" && msg != w.StatusMessage {
+			updates["status_message"] = msg
 		}
 	}
 
@@ -365,6 +373,35 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		}
 	}
 
+}
+
+// statusMessageMaxLen bounds the diagnostic status message so a verbose provider
+// error can't overflow the status_message column (VARCHAR(1024)).
+const statusMessageMaxLen = 1000
+
+// diagnoseNotReady builds a human-facing explanation of why a still-provisioning
+// warehouse is not Ready. It asks Kubernetes for the failing composed resources
+// and joins their provider errors (the actual blocker, e.g. a bucket's
+// BucketNotEmpty); if none report an error — or the lookup fails — it falls back
+// to the XR's own Ready-condition roll-up ("Unready resources: <name>"). Returns
+// "" when there is nothing more specific to say.
+func (c *Controller) diagnoseNotReady(ctx context.Context, w *configstore.ManagedWarehouse, status *DucklingStatus) string {
+	errs, err := c.duckling.ComposedResourceErrors(ctx, ducklingCRName(w))
+	if err == nil && len(errs) > 0 {
+		parts := make([]string, 0, len(errs))
+		for _, e := range errs {
+			parts = append(parts, fmt.Sprintf("%s %s: %s", e.Kind, e.Name, e.Message))
+		}
+		return truncate(strings.Join(parts, "; "), statusMessageMaxLen)
+	}
+	return truncate(status.ReadyFalseMessage, statusMessageMaxLen)
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
 }
 
 // reconcileReady handles drift correction for Ready warehouses. The

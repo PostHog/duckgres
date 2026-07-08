@@ -22,6 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/wire"
 	"google.golang.org/grpc"
@@ -38,7 +39,12 @@ const MaxGRPCMessageSize = 1 << 30 // 1GB
 const (
 	waitSessionIdleAction    = "WaitSessionIdle"
 	releaseQueryHandleAction = "ReleaseQueryHandle"
+	logQueryAction           = "LogQuery"
 	queryCloseWaitTimeout    = 30 * time.Second
+	queryLogForwardTimeout   = 5 * time.Second
+	queryLogForwardBatchSize = 100
+	queryLogForwardInterval  = 1 * time.Second
+	queryLogForwardQueueSize = 10000
 )
 
 // ErrWorkerDead is returned when the backing worker process has crashed.
@@ -65,6 +71,10 @@ type FlightExecutor struct {
 	// lastProfiling stores the most recent DuckDB profiling output received
 	// from the worker via gRPC trailing metadata.
 	lastProfiling atomic.Value // stores string
+
+	queryLogCh       chan wire.QueryLogEntry
+	queryLogDone     chan struct{}
+	queryLogStopOnce sync.Once
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -93,7 +103,7 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &FlightExecutor{
+	e := &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		ownerEpoch:   0,
@@ -101,7 +111,9 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 		ownsClient:   true,
 		ctx:          ctx,
 		cancel:       cancel,
-	}, nil
+	}
+	e.startQueryLogForwarder()
+	return e, nil
 }
 
 // NewFlightExecutorFromClient creates a FlightExecutor that shares an existing
@@ -109,7 +121,7 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 // This avoids creating a new gRPC connection per session.
 func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) *FlightExecutor {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &FlightExecutor{
+	e := &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		ownerEpoch:   0,
@@ -118,6 +130,8 @@ func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) 
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+	e.startQueryLogForwarder()
+	return e
 }
 
 // MarkDead marks this executor's backing worker as dead. All subsequent RPC
@@ -325,6 +339,10 @@ func (e *FlightExecutor) mergedContext(ctx context.Context) (context.Context, co
 }
 
 func (e *FlightExecutor) Close() error {
+	if !e.stopQueryLogForwarder() && e.cancel != nil {
+		e.cancel()
+		e.waitQueryLogForwarder()
+	}
 	if e.cancel != nil {
 		e.cancel()
 	}
@@ -332,6 +350,151 @@ func (e *FlightExecutor) Close() error {
 		return e.client.Close()
 	}
 	return nil
+}
+
+// Log implements the server query-log forwarding hook without making query
+// completion wait on worker RPC or DuckLake writes.
+func (e *FlightExecutor) Log(entry wire.QueryLogEntry) {
+	if e == nil {
+		return
+	}
+	if e.dead.Load() {
+		observe.AddQueryLogDroppedEntries("forward_worker_dead", 1)
+		return
+	}
+	if e.queryLogCh == nil {
+		observe.AddQueryLogDroppedEntries("forward_unavailable", 1)
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			observe.AddQueryLogDroppedEntries("forward_closed", 1)
+		}
+	}()
+	select {
+	case e.queryLogCh <- entry:
+	default:
+		observe.AddQueryLogDroppedEntries("forward_buffer_full", 1)
+	}
+}
+
+func (e *FlightExecutor) startQueryLogForwarder() {
+	e.queryLogCh = make(chan wire.QueryLogEntry, queryLogForwardQueueSize)
+	e.queryLogDone = make(chan struct{})
+	go e.queryLogForwardLoop()
+}
+
+func (e *FlightExecutor) stopQueryLogForwarder() bool {
+	stopped := true
+	e.queryLogStopOnce.Do(func() {
+		if e.queryLogCh != nil {
+			close(e.queryLogCh)
+		}
+		stopped = e.waitQueryLogForwarder()
+	})
+	return stopped
+}
+
+func (e *FlightExecutor) waitQueryLogForwarder() bool {
+	if e.queryLogDone == nil {
+		return true
+	}
+	select {
+	case <-e.queryLogDone:
+		return true
+	case <-time.After(queryLogForwardTimeout):
+		return false
+	}
+}
+
+func (e *FlightExecutor) queryLogForwardLoop() {
+	defer close(e.queryLogDone)
+	ticker := time.NewTicker(queryLogForwardInterval)
+	defer ticker.Stop()
+
+	batch := make([]wire.QueryLogEntry, 0, queryLogForwardBatchSize)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		// forwardQueryLogBatch records dropped-entry metrics for failed batches.
+		_ = e.forwardQueryLogBatch(batch)
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case entry, ok := <-e.queryLogCh:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, entry)
+			if len(batch) >= queryLogForwardBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-e.ctx.Done():
+			observe.AddQueryLogDroppedEntries("forward_context_done", len(batch)+len(e.queryLogCh))
+			return
+		}
+	}
+}
+
+func (e *FlightExecutor) forwardQueryLogBatch(entries []wire.QueryLogEntry) (err error) {
+	if len(entries) == 0 {
+		return nil
+	}
+	if e.dead.Load() {
+		observe.AddQueryLogDroppedEntries("forward_worker_dead", len(entries))
+		return nil
+	}
+	if e.client == nil || e.client.Client == nil {
+		observe.AddQueryLogDroppedEntries("forward_unavailable", len(entries))
+		return nil
+	}
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil {
+			observe.AddQueryLogDroppedEntries("forward_error", len(entries))
+		}
+	}()
+
+	payload, err := json.Marshal(wire.WorkerQueryLogPayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Entries: entries,
+	})
+	if err != nil {
+		return err
+	}
+
+	baseCtx := context.Background()
+	if e.ctx != nil {
+		baseCtx = e.ctx
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, queryLogForwardTimeout)
+	defer cancel()
+	stream, err := e.client.Client.DoAction(
+		e.withSession(ctx),
+		&flight.Action{Type: logQueryAction, Body: payload},
+	)
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 func isTerminalSessionIdleWaitError(err error) bool {
@@ -948,7 +1111,7 @@ func interpolateArgs(query string, args []any) string {
 }
 
 // scanQuoted returns the index just past a quoted region starting at start
-// (query[start] == quote), treating a doubled quote ('' or "") as an escape.
+// (query[start] == quote), treating a doubled quote (” or "") as an escape.
 func scanQuoted(query string, start int, quote byte) int {
 	for i := start + 1; i < len(query); i++ {
 		if query[i] != quote {

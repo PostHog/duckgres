@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -381,10 +382,12 @@ func (l *blockingAcquireLimiter) Acquire(ctx context.Context, request connection
 }
 
 type blockingCreateSessionFlightClient struct {
-	createStarted chan struct{}
-	allowCreate   chan struct{}
-	startOnce     sync.Once
-	destroyCalls  atomic.Int32
+	createStarted   chan struct{}
+	allowCreate     chan struct{}
+	createSucceeded chan struct{}
+	startOnce       sync.Once
+	successOnce     sync.Once
+	destroyCalls    atomic.Int32
 }
 
 func (c *blockingCreateSessionFlightClient) DoAction(ctx context.Context, action *flight.Action, opts ...grpc.CallOption) (flight.FlightService_DoActionClient, error) {
@@ -482,6 +485,11 @@ func (c *blockingCreateSessionActionClient) Recv() (*flight.Result, error) {
 		return nil, c.ctx.Err()
 	}
 	c.sent = true
+	c.client.successOnce.Do(func() {
+		if c.client.createSucceeded != nil {
+			close(c.client.createSucceeded)
+		}
+	})
 	return &flight.Result{Body: []byte(`{"session_token":"session-1"}`)}, nil
 }
 
@@ -710,9 +718,11 @@ func TestDestroyAllSessions_ReleasesAllLeasesAndClearsSessions(t *testing.T) {
 }
 
 func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T) {
+	queryLogForwardersBefore := countFlightExecutorQueryLogForwarders()
 	flightClient := &blockingCreateSessionFlightClient{
-		createStarted: make(chan struct{}),
-		allowCreate:   make(chan struct{}),
+		createStarted:   make(chan struct{}),
+		allowCreate:     make(chan struct{}),
+		createSucceeded: make(chan struct{}),
 	}
 	lease := &countingConnectionLease{}
 	worker := &ManagedWorker{
@@ -723,6 +733,13 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	pool := &blockingCreateSessionPool{worker: worker}
 	sm := NewSessionManager(pool, nil)
 	sm.SetConnectionLimiter(&blockingCreateSessionLimiter{lease: lease})
+
+	registrationLocked := false
+	defer func() {
+		if registrationLocked {
+			sm.mu.Unlock()
+		}
+	}()
 
 	createErr := make(chan error, 1)
 	go func() {
@@ -735,6 +752,14 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for CreateSession RPC to start")
 	}
+	sm.mu.Lock()
+	registrationLocked = true
+	close(flightClient.allowCreate)
+	select {
+	case <-flightClient.createSucceeded:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for worker CreateSession to succeed")
+	}
 
 	destroyDone := make(chan struct{})
 	go func() {
@@ -742,12 +767,13 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 		close(destroyDone)
 	}()
 	waitForSessionManagerDraining(t, sm)
-	close(flightClient.allowCreate)
+	sm.mu.Unlock()
+	registrationLocked = false
 
 	select {
 	case err := <-createErr:
-		if err == nil {
-			t.Fatal("expected in-flight CreateSession to fail once draining starts")
+		if !errors.Is(err, ErrSessionManagerDraining) {
+			t.Fatalf("CreateSessionWithProtocol error = %v, want %v", err, ErrSessionManagerDraining)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for CreateSession to return")
@@ -763,6 +789,10 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	if got := lease.releases.Load(); got != 1 {
 		t.Fatalf("expected acquired lease to be released once, got %d", got)
 	}
+	if got := flightClient.destroyCalls.Load(); got != 1 {
+		t.Fatalf("expected worker session to be destroyed once, got %d", got)
+	}
+	waitForFlightExecutorQueryLogForwardersAtMost(t, queryLogForwardersBefore)
 }
 
 func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
@@ -947,6 +977,24 @@ func waitForSessionManagerDraining(t *testing.T, sm *SessionManager) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for session manager to start draining")
+}
+
+func waitForFlightExecutorQueryLogForwardersAtMost(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := countFlightExecutorQueryLogForwarders(); got <= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("flight executor query-log forwarder count = %d, want <= %d", countFlightExecutorQueryLogForwarders(), want)
+}
+
+func countFlightExecutorQueryLogForwarders() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "(*FlightExecutor).queryLogForwardLoop")
 }
 
 func countEvents(events []string, want string) int {

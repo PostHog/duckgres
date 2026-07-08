@@ -606,7 +606,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	sm.mu.Lock()
 	if sm.lifecycle.isClosed() {
 		sm.mu.Unlock()
-		sm.cleanupUnregisteredWorkerSession(worker, session.SessionToken)
+		sm.cleanupUnregisteredWorkerSession(worker, session)
 		return 0, nil, ErrSessionManagerDraining
 	}
 	sm.sessions[pid] = session
@@ -632,13 +632,16 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	return pid, executor, nil
 }
 
-func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker, sessionToken string) {
+func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker, session *ManagedSession) {
+	if session.Executor != nil {
+		_ = session.Executor.Close()
+	}
 	if worker != nil {
 		select {
 		case <-worker.done:
 		default:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := worker.DestroySession(ctx, sessionToken); err != nil {
+			if err := worker.DestroySession(ctx, session.SessionToken); err != nil {
 				sm.log.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", err)
 			}
 			cancel()
