@@ -38,6 +38,10 @@ func runConfigStoreMigrations(db *gorm.DB) error {
 		migrationFS,
 		goose.WithSessionLocker(locker),
 		goose.WithSlog(slog.Default()),
+		// Compatibility bridge for the 000018/000019 ordering bug shipped on
+		// 2026-07-08. Remove this once every environment has recorded 000018 so
+		// future out-of-order configstore migrations fail at startup again.
+		goose.WithAllowOutofOrder(true),
 	)
 	if err != nil {
 		return fmt.Errorf("configstore migration provider: %w", err)
