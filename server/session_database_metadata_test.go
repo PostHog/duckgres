@@ -356,12 +356,6 @@ func TestPgCatalogCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 	if _, err := db.Exec("CREATE TABLE shared.duck_only(id INTEGER, payload VARCHAR)"); err != nil {
 		t.Fatalf("create ducklake table: %v", err)
 	}
-	if _, err := db.Exec("CREATE SCHEMA ducklake.system"); err != nil {
-		t.Fatalf("create ducklake system schema: %v", err)
-	}
-	if _, err := db.Exec("CREATE VIEW ducklake.system.query_log AS SELECT 1 AS id"); err != nil {
-		t.Fatalf("create ducklake system view: %v", err)
-	}
 
 	if _, err := db.Exec("CREATE SCHEMA other.shared"); err != nil {
 		t.Fatalf("create other schema: %v", err)
@@ -394,18 +388,6 @@ func TestPgCatalogCompatViewsOnlyExposeSelectedCatalog(t *testing.T) {
 	}
 	if schemaCount != 1 {
 		t.Fatalf("shared schema count = %d, want 1", schemaCount)
-	}
-
-	var systemSchemaCount int
-	if err := db.QueryRow(`
-		SELECT COUNT(*)
-		FROM memory.main.pg_namespace
-		WHERE nspname = 'system'
-	`).Scan(&systemSchemaCount); err != nil {
-		t.Fatalf("query system pg_namespace: %v", err)
-	}
-	if systemSchemaCount != 0 {
-		t.Fatalf("system schema count = %d, want 0", systemSchemaCount)
 	}
 
 	var tables string

@@ -193,8 +193,8 @@ func (c *clientConn) handleParse(body []byte) {
 		isIgnoredSet:      result.IsIgnoredSet,
 		isNoOp:            result.IsNoOp,
 		noOpTag:           result.NoOpTag,
-		querySourceSet:    result.QuerySourceSet,    // SET duckgres.query_source (custom GUC)
-		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
+		querySourceSet:    result.QuerySourceSet,  // SET duckgres.query_source (custom GUC)
+		querySourceShow:   result.QuerySourceShow, // SHOW duckgres.query_source
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}

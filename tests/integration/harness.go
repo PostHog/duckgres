@@ -599,7 +599,6 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.bill CASCADE")
 	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.ddl_schema_test CASCADE")
 	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.dbt_test CASCADE")
-	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.merge_debug CASCADE")
 
 	return nil
 }

@@ -438,24 +438,16 @@ func buildSessionPgNamespaceViewSQL() string {
 			SELECT schema_oid AS oid, schema_name, database_name FROM duckdb_sequences()
 			UNION
 			SELECT schema_oid AS oid, schema_name, database_name FROM duckdb_indexes()
-		),
-		display_namespaces AS (
-			SELECT
-				oid,
-				CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname
-			FROM user_namespaces n
-			CROSS JOIN active_catalog ac
-			WHERE n.database_name = ac.catalog
-				AND n.schema_name NOT LIKE '__ducklake_metadata_%'
-				AND n.schema_name <> 'system'
 		)
-		SELECT
-			MIN(oid) AS oid,
-			nspname,
-			CASE WHEN nspname = 'public' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
+		SELECT DISTINCT
+			oid,
+			CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname,
+			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
 			NULL AS nspacl
-		FROM display_namespaces
-		GROUP BY nspname
+		FROM user_namespaces n
+		CROSS JOIN active_catalog ac
+		WHERE n.database_name = ac.catalog
+			AND n.schema_name NOT LIKE '__ducklake_metadata_%'
 		UNION ALL
 		SELECT 11::BIGINT AS oid, 'pg_catalog' AS nspname, 10::BIGINT AS nspowner, NULL AS nspacl
 		UNION ALL
