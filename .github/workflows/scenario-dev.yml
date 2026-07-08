@@ -1,0 +1,109 @@
+name: scenario-dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_slow:
+        description: Skip slow scenarios
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scenario-dev-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scenarios:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 270
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: provision-smoke
+            file: tests/scenario/scenarios/provision_smoke.yaml
+            max_runtime: 30m
+            go_test_timeout: 45m
+            slow: false
+            needs_dbt: false
+          - name: provision-rejection
+            file: tests/scenario/scenarios/provision_rejection.yaml
+            max_runtime: 30m
+            go_test_timeout: 45m
+            slow: false
+            needs_dbt: false
+          - name: frozen-metadata
+            file: tests/scenario/scenarios/posthog_frozen_metadata.yaml
+            max_runtime: 45m
+            go_test_timeout: 60m
+            slow: false
+            needs_dbt: false
+          - name: frozen-perf
+            file: tests/scenario/scenarios/posthog_frozen_perf.yaml
+            max_runtime: 45m
+            go_test_timeout: 60m
+            slow: false
+            needs_dbt: false
+          - name: frozen-dbt
+            file: tests/scenario/scenarios/posthog_frozen_dbt.yaml
+            max_runtime: 4h
+            go_test_timeout: 4h15m
+            slow: true
+            needs_dbt: true
+    env:
+      DUCKGRES_SCENARIO_API_BASE: ${{ secrets.DUCKGRES_SCENARIO_API_BASE_DEV }}
+      DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.DUCKGRES_SCENARIO_INTERNAL_SECRET_DEV }}
+      DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.DUCKGRES_SCENARIO_PG_HOST_DEV }}
+      DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.DUCKGRES_SCENARIO_SNI_SUFFIX_DEV }}
+      DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.DUCKGRES_SCENARIO_FROZEN_S3_URI_DEV }}
+      DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.DUCKGRES_SCENARIO_FLIGHT_ADDR_DEV }}
+      DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY: ${{ vars.DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY_DEV || 'true' }}
+      DUCKGRES_SCENARIO_DBT_BIN: dbt
+      DUCKGRES_SCENARIO_OUTPUT_BASE: artifacts/scenario-dev
+      DUCKGRES_SCENARIO_MAX_RUNTIME: ${{ matrix.max_runtime }}
+      DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: ${{ matrix.go_test_timeout }}
+      DUCKGRES_SCENARIO_RUN_ID: scenario-dev-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Skip slow scenario
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_slow && matrix.slow }}
+        run: echo "Skipping slow scenario because skip_slow is true."
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+
+      - name: Set up Go
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install dbt
+        if: ${{ matrix.needs_dbt && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
+        run: python -m pip install --user dbt-postgres
+
+      - name: Add user Python bin to PATH
+        if: ${{ matrix.needs_dbt && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check scenario environment
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+        run: scripts/scenario_run.sh --check-env "${{ matrix.file }}"
+
+      - name: Run scenario
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+        run: scripts/scenario_run.sh "${{ matrix.file }}"
+
+      - name: Upload scenario artifacts
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scenario-dev-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/scenario-dev/
+          if-no-files-found: warn
+          retention-days: 14

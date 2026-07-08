@@ -13,6 +13,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Runbooks](#runbooks)
   - [Perf Runbook](docs/perf-harness-runbook.md)
   - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md)
+  - [Dev Scenario Runner](docs/runbooks/scenario-dev.md)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
   - [YAML Configuration](#yaml-configuration)
@@ -110,6 +111,7 @@ DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
 
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
+- [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 

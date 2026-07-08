@@ -55,3 +55,51 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 		}
 	}
 }
+
+func TestDevScenarioWorkflowRunsScheduledSecretBackedScenarios(t *testing.T) {
+	workflowPath := filepath.Join("..", "..", ".github", "workflows", "scenario-dev.yml")
+	raw, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatalf("read dev scenario workflow: %v", err)
+	}
+	workflow := string(raw)
+
+	for _, required := range []string{
+		"name: scenario-dev",
+		"workflow_dispatch:",
+		"skip_slow:",
+		"default: false",
+		"schedule:",
+		"scripts/scenario_run.sh",
+		"actions/upload-artifact@",
+		"tests/scenario/scenarios/provision_smoke.yaml",
+		"tests/scenario/scenarios/provision_rejection.yaml",
+		"tests/scenario/scenarios/posthog_frozen_metadata.yaml",
+		"tests/scenario/scenarios/posthog_frozen_perf.yaml",
+		"tests/scenario/scenarios/posthog_frozen_dbt.yaml",
+		"if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}",
+		"slow: true",
+		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.DUCKGRES_SCENARIO_API_BASE_DEV }}",
+		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.DUCKGRES_SCENARIO_INTERNAL_SECRET_DEV }}",
+		"DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.DUCKGRES_SCENARIO_PG_HOST_DEV }}",
+		"DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.DUCKGRES_SCENARIO_SNI_SUFFIX_DEV }}",
+		"DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.DUCKGRES_SCENARIO_FROZEN_S3_URI_DEV }}",
+		"DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.DUCKGRES_SCENARIO_FLIGHT_ADDR_DEV }}",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("workflow missing %q", required)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"posthog-mw-dev",
+		"373313242555",
+		"645773004826",
+		"posthog-duckgres-scenario-frozen-data",
+		"posthog-duckling-perfprodus",
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("workflow contains internal detail %q", forbidden)
+		}
+	}
+}
