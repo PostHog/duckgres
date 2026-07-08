@@ -146,9 +146,11 @@ func (cs *ConfigStore) ComputeBillingCursor() (cursor time.Time, ok bool, err er
 
 // AckComputeUsage commits billing's watermark: it advances the cursor to
 // watermarkHigh (monotonically — an older value never moves it backwards) and
-// deletes every buffered bucket at or below it, atomically. Idempotent: a
-// retried ack at or below the current cursor deletes nothing and leaves the
-// cursor unchanged. Returns the number of buffer rows deleted.
+// deletes every buffered bucket at or below it — BOTH metric families
+// (compute and storage share the one cursor and ack) — atomically.
+// Idempotent: a retried ack at or below the current cursor deletes nothing
+// and leaves the cursor unchanged. Returns the number of buffer rows deleted
+// across both tables.
 func (cs *ConfigStore) AckComputeUsage(watermarkHigh time.Time) (int64, error) {
 	high := watermarkHigh.UTC()
 	var deleted int64
@@ -166,6 +168,11 @@ DO UPDATE SET last_acked = GREATEST(duckgres_compute_billing_cursor.last_acked, 
 			return fmt.Errorf("delete acked compute buckets: %w", res.Error)
 		}
 		deleted = res.RowsAffected
+		res = tx.Exec(`DELETE FROM duckgres_org_storage_usage WHERE bucket_start <= ?`, high)
+		if res.Error != nil {
+			return fmt.Errorf("delete acked storage buckets: %w", res.Error)
+		}
+		deleted += res.RowsAffected
 		return nil
 	})
 	return deleted, err

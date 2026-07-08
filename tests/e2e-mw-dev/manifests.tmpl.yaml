@@ -241,6 +241,10 @@ spec:
             # The harness sized_worker assertion connects with these and verifies the
             # spawned pod carries the requested CPU+memory.
             - { name: DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE, value: "true" }
+            # Storage-billing sampler: production cadence is 30m, far beyond the
+            # Job's patience — sample every 60s so compute_usage_pull_api can
+            # assert the storage rows in-Job.
+            - { name: DUCKGRES_STORAGE_SAMPLE_INTERVAL, value: "60s" }
             # Pool-default worker shape for connections that send no sizing GUCs.
             # Workers are never BestEffort (no pod anti-affinity anymore — resource
             # requests are the only node-overcommit guard); without this the binary

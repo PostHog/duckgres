@@ -12,6 +12,13 @@ import (
 
 func seedReadyWarehouse(t *testing.T, store *cpconfigstore.ConfigStore, orgID string) {
 	t.Helper()
+	// The warehouse row has an FK to the org row (fk_duckgres_orgs_warehouse).
+	if err := store.DB().Create(&cpconfigstore.Org{
+		Name:         orgID,
+		DatabaseName: orgID,
+	}).Error; err != nil {
+		t.Fatalf("seed org: %v", err)
+	}
 	wh := &cpconfigstore.ManagedWarehouse{
 		OrgID:        orgID,
 		DucklingName: orgID,

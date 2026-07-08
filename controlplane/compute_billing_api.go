@@ -10,8 +10,11 @@ import (
 )
 
 // billingUsageStore is the config-store surface the billing pull API needs.
+// Compute and storage share one watermark window and one ack (AckComputeUsage
+// deletes both families).
 type billingUsageStore interface {
 	AggregateComputeUsage(low, high time.Time) ([]configstore.ComputeUsageRow, error)
+	AggregateStorageUsage(low, high time.Time) ([]configstore.StorageUsageRow, error)
 	ComputeBillingCursor() (time.Time, bool, error)
 	AckComputeUsage(watermarkHigh time.Time) (int64, error)
 }
@@ -42,9 +45,9 @@ func (h *billingAPIHandler) latestClosedBucket() time.Time {
 	return h.now().UTC().Add(-computeBucketWidth - computeBucketGrace).Truncate(computeBucketWidth)
 }
 
-// getUsage returns usage aggregated since the last ack — one row per key
-// (org, team, query_source, worker size) per UTC day — plus the watermark
-// window. watermark_low is the server cursor (what billing last acked;
+// getUsage returns usage aggregated since the last ack — compute: one row per
+// key (org, team, query_source, worker size) per UTC day; storage: one row
+// per (org, team) per UTC day — plus the shared watermark window. watermark_low is the server cursor (what billing last acked;
 // billing should cross-check it against its own record), watermark_high is
 // what billing acks after processing.
 func (h *billingAPIHandler) getUsage(c *gin.Context) {
@@ -64,6 +67,7 @@ func (h *billingAPIHandler) getUsage(c *gin.Context) {
 			"watermark_low":  low.Format(time.RFC3339),
 			"watermark_high": low.Format(time.RFC3339),
 			"usage":          []configstore.ComputeUsageRow{},
+			"storage":        []configstore.StorageUsageRow{},
 		})
 		return
 	}
@@ -76,10 +80,19 @@ func (h *billingAPIHandler) getUsage(c *gin.Context) {
 	if rows == nil {
 		rows = []configstore.ComputeUsageRow{}
 	}
+	storageRows, err := h.store.AggregateStorageUsage(low, high)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "aggregate storage usage: " + err.Error()})
+		return
+	}
+	if storageRows == nil {
+		storageRows = []configstore.StorageUsageRow{}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"watermark_low":  low.Format(time.RFC3339),
 		"watermark_high": high.Format(time.RFC3339),
 		"usage":          rows,
+		"storage":        storageRows,
 	})
 }
 
@@ -88,7 +101,7 @@ type billingAckRequest struct {
 }
 
 // postAck advances the cursor to watermark_high and deletes every buffered
-// bucket at or below it. Idempotent: re-acking an already-acked (or older)
+// bucket at or below it, across BOTH metric families (compute + storage). Idempotent: re-acking an already-acked (or older)
 // watermark is a no-op. The watermark must be a closed bucket boundary the
 // server could have served — acking into the still-accumulating present is
 // rejected so an ack can never delete buckets that were never returned.
