@@ -1195,7 +1195,7 @@ func tryEnsureDuckLakeQueryLogSurface(db *sql.DB, cfg Config, username string) {
 	}
 }
 
-func tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg Config, username string) {
+func tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg Config) {
 	queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogSurfaceInitTimeout)
 	defer queryLogCancel()
 	// Runtime pre-attach DDL is a compatibility bridge for existing orgs that
@@ -1206,7 +1206,7 @@ func tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg Config, username s
 		// Do not log or classify the error here: metadata-store connection
 		// errors can carry DSNs with credentials, and even derived log fields can
 		// be treated as sensitive by static analysis. The setup is best-effort.
-		slog.Warn("Failed to initialize native Postgres query-log storage before DuckLake attach.", "user", username)
+		slog.Warn("Failed to initialize native Postgres query-log storage before DuckLake attach.")
 	}
 }
 
@@ -1226,7 +1226,7 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
-	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg, username)
+	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
@@ -1290,7 +1290,7 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 		return fmt.Errorf("tenant activation requires a ducklake metadata_store")
 	}
 
-	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg, username)
+	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 	}
@@ -1336,7 +1336,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	chsql.InitMacros(db)
 
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
-	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg, username)
+	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		if cfg.DuckLake.MetadataStore != "" {
 			_ = db.Close()
