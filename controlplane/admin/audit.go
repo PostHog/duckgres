@@ -201,10 +201,19 @@ func auditActionFor(method, path string) string {
 		case hasSeg(segs, "impersonate"):
 			// Impersonation records its own richer row; this is a fallback.
 			return "impersonate." + verb
+		case last == "reshard":
+			// POST /orgs/:id/reshard.
+			return "reshard.create"
 		case hasSeg(segs, "users"):
 			return "user." + verb
 		}
 		return "org." + verb
+	case "reshards":
+		// POST /reshards/:opid/cancel (reads aren't audited).
+		if last == "cancel" {
+			return "reshard.cancel"
+		}
+		return "reshard." + verb
 	}
 	return "config." + verb
 }

@@ -108,6 +108,11 @@ func (h *driftHandler) findDrift(c *gin.Context) {
 			CRReady:        ready,
 		}
 		switch {
+		case wh.State == configstore.ManagedWarehouseStateResharding:
+			// A reshard in flight legitimately holds the warehouse out of
+			// ready (and the CR may flap Ready during the cutover) — that is
+			// the operation working, not drift.
+			continue
 		case !present:
 			entry.Issue = "missing"
 			entry.Message = "warehouse exists but Duckling CR not found"

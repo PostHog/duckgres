@@ -35,9 +35,22 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 15)
 	requireGooseMigrationRecorded(t, db, 16)
 	requireGooseMigrationRecorded(t, db, 17)
+	requireGooseMigrationRecorded(t, db, 18)
 	requireGooseMigrationRecorded(t, db, 19)
 	requireGooseLatestVersion(t, db, 19)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
+
+	// Migration 000018 added the reshard operation + verbose log tables.
+	requireTablePresent(t, db, "duckgres_reshard_operations")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "source_kind")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "to_shard")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "runner_epoch")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "cancel_requested")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "cutover_timeout_seconds")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "blocked_at")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "compaction_was_present")
+	requireTablePresent(t, db, "duckgres_reshard_operation_log")
+	requireColumnPresent(t, db, "duckgres_reshard_operation_log", "operation_id")
 
 	// Migration 000016 added the worker spawn log that feeds dynamic headroom
 	// slot count/size.
@@ -142,7 +155,9 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 				org_id TEXT PRIMARY KEY,
 				last_drained_bucket TIMESTAMPTZ NOT NULL
 			);
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 19);
+			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
+			DROP TABLE IF EXISTS duckgres_reshard_operations;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -173,6 +188,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 15)
 	requireGooseMigrationRecorded(t, upgradedDB, 16)
 	requireGooseMigrationRecorded(t, upgradedDB, 17)
+	requireGooseMigrationRecorded(t, upgradedDB, 18)
 	requireGooseMigrationRecorded(t, upgradedDB, 19)
 	requireGooseLatestVersion(t, upgradedDB, 19)
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")

@@ -113,6 +113,13 @@ func (c *Controller) SetProbe(p MetadataProbe) {
 	c.probe = p
 }
 
+// DucklingClient exposes the controller's Duckling CR client so co-located
+// components (the reshard runner) share one client instead of re-resolving
+// in-cluster config.
+func (c *Controller) DucklingClient() *DucklingClient {
+	return c.duckling
+}
+
 // WithBucketSuffix sets the env suffix used to compute and backfill the
 // CP-owned per-org s3bucket name onto existing ready ducklings. Empty leaves
 // backfill disabled (composition keeps deriving). Returns the controller for

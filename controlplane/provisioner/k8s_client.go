@@ -598,6 +598,145 @@ func (d *DucklingClient) SetMetadataStoreCnpgShard(ctx context.Context, name, sh
 	return nil
 }
 
+// GetCompactionSetting reads spec.ducklake.maintenance.compaction.enabled,
+// distinguishing key-absent (present=false) from an explicit value. The
+// distinction is load-bearing for the reshard compaction pause: the chart's
+// name-list rollout can enable compaction when the key is ABSENT, so restoring
+// "absent" vs "false" after a reshard are different states.
+func (d *DucklingClient) GetCompactionSetting(ctx context.Context, name string) (enabled, present bool, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return false, false, fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	dl, ok := spec["ducklake"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	maint, ok := dl["maintenance"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	comp, ok := maint["compaction"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	v, ok := comp["enabled"].(bool)
+	return v, ok, nil
+}
+
+// SetCompactionEnabled patches spec.ducklake.maintenance.compaction.enabled
+// to an explicit value. enabled=nil REMOVES the key (JSON merge patch null),
+// restoring the pre-reshard "absent" state.
+func (d *DucklingClient) SetCompactionEnabled(ctx context.Context, name string, enabled *bool) error {
+	var value interface{}
+	if enabled != nil {
+		value = *enabled
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"ducklake": map[string]interface{}{
+				"maintenance": map[string]interface{}{
+					"compaction": map[string]interface{}{
+						"enabled": value,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal compaction patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q compaction enabled: %w", name, err)
+	}
+	return nil
+}
+
+// SetMetadataStoreCnpg patches the metadata store to a cnpg shard in one merge
+// patch: {type: cnpg-shard, cnpgShard: shard}. Used both for cnpg→cnpg shard
+// cutovers (type already cnpg-shard — idempotent) and for the ext→cnpg flip.
+// Any external block left in spec is ignored by the composition for the
+// cnpg-shard type.
+func (d *DucklingClient) SetMetadataStoreCnpg(ctx context.Context, name, shard string) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":      configstore.MetadataStoreKindCnpgShard,
+				"cnpgShard": shard,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cnpg metadata patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadata store to cnpg: %w", name, err)
+	}
+	return nil
+}
+
+// ExternalMetadataStoreSpec is the spec.metadataStore.external block for
+// SetMetadataStoreExternal.
+type ExternalMetadataStoreSpec struct {
+	Endpoint          string
+	PasswordAWSSecret string
+	User              string
+	Database          string
+}
+
+// SetMetadataStoreExternal patches the metadata store to external in one
+// merge patch, REMOVING cnpgShard (JSON merge patch null) — the XRD's CEL
+// forbids cnpgShard on the external type, so leaving the key would fail
+// admission. Used for the cnpg→ext escape-hatch flip and as the ext→cnpg
+// rollback patch. NOTE: this flip makes the composition STOP rendering the
+// cnpg Role/Database managed resources — Crossplane then DELETES the cnpg
+// role/database. Callers sequence this only after the catalog has been
+// copied and verified elsewhere.
+func (d *DucklingClient) SetMetadataStoreExternal(ctx context.Context, name string, ext ExternalMetadataStoreSpec) error {
+	if ext.Endpoint == "" || ext.PasswordAWSSecret == "" {
+		return fmt.Errorf("patch duckling CR %q metadata store to external: endpoint and passwordAwsSecret are required", name)
+	}
+	external := map[string]interface{}{
+		"endpoint":          ext.Endpoint,
+		"passwordAwsSecret": ext.PasswordAWSSecret,
+	}
+	if ext.User != "" {
+		external["user"] = ext.User
+	}
+	if ext.Database != "" {
+		external["database"] = ext.Database
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":      configstore.MetadataStoreKindExternal,
+				"cnpgShard": nil,
+				"external":  external,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal external metadata patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadata store to external: %w", name, err)
+	}
+	return nil
+}
+
 // readSpecDuckLakeEnabled returns spec.ducklake.enabled as *bool — nil when the
 // ducklake block (or its enabled key) is absent, so callers can distinguish a
 // legacy CR (apply the type-based default) from an explicit true/false.

@@ -3,6 +3,7 @@
 // Read hooks for endpoints that may not exist yet (`*Optional`) swallow 404 and
 // return an empty value so pages render an empty state instead of crashing.
 
+import { useEffect, useState } from "react";
 import {
   useMutation,
   useQuery,
@@ -35,8 +36,11 @@ import type {
   OrgUserSecret,
   PromRangeResponse,
   QueryDetail,
+  ReshardLogEntry,
+  ReshardOperation,
   RunningQuery,
   SessionStatus,
+  StartReshardBody,
   UpdateUserBody,
   WorkerStatus,
 } from "@/types/api";
@@ -453,5 +457,80 @@ export function useAudit(params: { actor?: string; org?: string }) {
     queryKey: ["audit", params.actor ?? "", params.org ?? ""],
     queryFn: () =>
       tolerate404<AuditEntry[]>([])(api.audit({ actor: params.actor, org: params.org, limit: 500 })),
+  });
+}
+
+// ---- reshard operations ----
+
+const RESHARD_TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
+
+// Start a reshard; caller navigates to the returned operation's page.
+export function useStartReshard(org: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: StartReshardBody) => api.startReshard(org, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["reshards", org] }),
+  });
+}
+
+export function useOrgReshards(org: string | undefined) {
+  return useQuery<ReshardOperation[]>({
+    queryKey: ["reshards", org],
+    queryFn: () => tolerateStatus<ReshardOperation[]>([], 403, 404, 503)(api.listReshards(org!)),
+    enabled: !!org,
+    refetchInterval: POLL.normal,
+  });
+}
+
+// One operation, polled fast until it reaches a terminal state.
+export function useReshard(opId: number | null) {
+  return useQuery<ReshardOperation>({
+    queryKey: ["reshard", opId],
+    queryFn: () => api.getReshard(opId as number),
+    enabled: opId != null,
+    retry: false,
+    refetchInterval: (q) => {
+      if (q.state.error) return false;
+      const op = q.state.data;
+      return op && RESHARD_TERMINAL.has(op.state) ? false : POLL.fast;
+    },
+  });
+}
+
+// Incremental log accumulation: polls /log?after_id=<last seen> and appends.
+// Keeps polling (slower) even after the op is terminal so the final report
+// lines always land; the page unmount stops it.
+export function useReshardLog(opId: number | null, opState: string | undefined) {
+  const [entries, setEntries] = useState<ReshardLogEntry[]>([]);
+  const lastID = entries.length > 0 ? entries[entries.length - 1].id : 0;
+  const terminal = opState != null && RESHARD_TERMINAL.has(opState);
+
+  const poll = useQuery<ReshardLogEntry[]>({
+    queryKey: ["reshardLog", opId, lastID],
+    queryFn: () => api.getReshardLog(opId as number, lastID),
+    enabled: opId != null,
+    retry: false,
+    refetchInterval: terminal ? POLL.slow : POLL.fast,
+  });
+
+  useEffect(() => {
+    const fresh = poll.data;
+    if (fresh && fresh.length > 0) {
+      setEntries((prev) => {
+        const seen = prev.length > 0 ? prev[prev.length - 1].id : 0;
+        const append = fresh.filter((e) => e.id > seen);
+        return append.length > 0 ? [...prev, ...append] : prev;
+      });
+    }
+  }, [poll.data]);
+
+  return entries;
+}
+
+export function useCancelReshard() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (opId: number) => api.cancelReshard(opId),
+    onSuccess: (_data, opId) => qc.invalidateQueries({ queryKey: ["reshard", opId] }),
   });
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, Save, Trash2, Warehouse } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Database, Save, Trash2, Warehouse } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,7 @@ import {
   useDeprovisionWarehouse,
   useDucklingsMetadata,
   useOrg,
+  useOrgReshards,
   useUpdateOrg,
   useUpdateWarehouse,
   useWarehouse,
@@ -550,7 +551,7 @@ function WarehousePanel({
               </div>
             </div>
 
-            {/* Teardown */}
+            {/* Teardown + reshard */}
             {canDeprovision && (
               <div className="space-y-2 border-t border-border pt-3">
                 <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Danger zone</p>
@@ -564,8 +565,24 @@ function WarehousePanel({
                     Required before the org can be deleted.
                   </span>
                 </div>
+                {data.state === "ready" && (
+                  <div className="flex items-center gap-3">
+                    <AdminGate>
+                      <Button variant="outline" size="sm" asChild>
+                        <Link to={`/orgs/${encodeURIComponent(orgId)}/reshard`}>
+                          <Database className="h-4 w-4" /> Reshard metadata store…
+                        </Link>
+                      </Button>
+                    </AdminGate>
+                    <span className="text-xs text-muted-foreground">
+                      Move the DuckLake catalog to another cnpg shard or an external Postgres.
+                    </span>
+                  </div>
+                )}
               </div>
             )}
+
+            <ReshardHistory orgId={orgId} />
           </>
         )}
       </CardContent>
@@ -604,6 +621,40 @@ function WarehousePanel({
         </DialogContent>
       </Dialog>
     </Card>
+  );
+}
+
+// ReshardHistory lists the org's reshard operations with links to each
+// operation's live overview/log page. Hidden while the org has none.
+function ReshardHistory({ orgId }: { orgId: string }) {
+  const reshards = useOrgReshards(orgId);
+  const ops = reshards.data ?? [];
+  if (ops.length === 0) return null;
+  return (
+    <div className="space-y-2 border-t border-border pt-3">
+      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Reshard operations
+      </p>
+      <div className="space-y-1">
+        {ops.slice(0, 5).map((op) => (
+          <Link
+            key={op.id}
+            to={`/reshards/${op.id}`}
+            className="flex items-center justify-between rounded-md border border-border bg-background/40 px-3 py-1.5 hover:bg-background"
+          >
+            <span className="font-mono text-xs">
+              #{op.id}{" "}
+              {op.source_kind === "cnpg-shard" ? op.from_shard || "cnpg" : "external"} →{" "}
+              {op.target_kind === "cnpg-shard" ? op.to_shard : "external"}
+            </span>
+            <span className="flex items-center gap-2 text-xs text-muted-foreground">
+              {fmtTime(op.created_at)}
+              <StateBadge state={op.state} />
+            </span>
+          </Link>
+        ))}
+      </div>
+    </div>
   );
 }
 

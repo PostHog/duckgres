@@ -6,6 +6,8 @@ import { NotFound } from "@/pages/NotFound";
 import { Overview } from "@/pages/Overview";
 import { Orgs } from "@/pages/Orgs";
 import { OrgDetail } from "@/pages/OrgDetail";
+import { ReshardForm } from "@/pages/ReshardForm";
+import { ReshardOperation } from "@/pages/ReshardOperation";
 import { UsersPage } from "@/pages/Users";
 import { Live } from "@/pages/Live";
 import { Errors } from "@/pages/Errors";
@@ -30,6 +32,8 @@ export default function App() {
         <Route path="/" element={<Overview />} />
         <Route path="/orgs" element={<Orgs />} />
         <Route path="/orgs/:id" element={<OrgDetail />} />
+        <Route path="/orgs/:id/reshard" element={<ReshardForm />} />
+        <Route path="/reshards/:opId" element={<ReshardOperation />} />
         <Route path="/users" element={<UsersPage />} />
         <Route path="/live" element={<Live />} />
         <Route path="/errors" element={<Errors />} />

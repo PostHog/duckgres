@@ -423,6 +423,7 @@ func SetupMultiTenant(
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
+	var reshardRunner *provisioner.ReshardRunner
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		slog.Warn("Provisioning controller unavailable.", "error", err)
@@ -432,6 +433,12 @@ func SetupMultiTenant(
 		// it disabled (composition keeps deriving).
 		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
 		go provCtrl.Run(context.Background())
+
+		// Reshard runner: drives operator-initiated metadata-store migrations
+		// (admin console → op row → claim/execute). Every replica runs one;
+		// a single replica wins each op via the claim CAS.
+		reshardRunner = provisioner.NewReshardRunner(store, provCtrl.DucklingClient(), cpInstanceID, pollInterval)
+		go reshardRunner.Run(context.Background())
 	}
 
 	// Register config change handler
@@ -563,6 +570,14 @@ func SetupMultiTenant(
 		ducklingMetadata = ducklingMetadataAdapter{dc: dc}
 	}
 	admin.RegisterDucklingsMetadata(api, ducklingMetadata)
+
+	// Reshard operations (metadata-store migrations). The runner may be nil
+	// (no k8s API) — reads still work, starts fail with a clear error.
+	var reshardStash admin.ReshardPasswordStash
+	if reshardRunner != nil {
+		reshardStash = reshardRunner
+	}
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardStash)
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)

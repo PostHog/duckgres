@@ -131,6 +131,22 @@ func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, limitL
 		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:org-connections:"+orgID)).Error; err != nil {
 			return err
 		}
+		// LOAD-BEARING reshard barrier: refuse to grant any lease while the
+		// org's warehouse is resharding. The connect-time 57P03 gate alone is
+		// unsound — a request that passed it can be granted a lease up to a
+		// queue-timeout later. Checking here, under the same advisory lock
+		// SetWarehouseResharding takes for the ready→resharding CAS, makes
+		// "no new session after the flip commits" exact: any grant either
+		// committed before the flip (visible to the drain as a lease) or runs
+		// after it and sees state=resharding.
+		resharding, err := cs.warehouseReshardingLocked(tx, orgID)
+		if err != nil {
+			return err
+		}
+		if resharding {
+			outcome = orgConnectionAdmissionOutcomeResharding
+			return nil
+		}
 		now, err := cs.orgConnectionDatabaseNow(tx)
 		if err != nil {
 			return err
@@ -179,6 +195,20 @@ func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, limitL
 		return nil
 	})
 	return lease, retryWithFreshOrg, stats, outcome, err
+}
+
+// warehouseReshardingLocked reports whether the org's managed warehouse is in
+// the resharding state. Read inside the grant transaction (under the org's
+// connection advisory lock) so it serializes against SetWarehouseResharding.
+// Orgs without a warehouse row are not resharding.
+func (cs *ConfigStore) warehouseReshardingLocked(tx *gorm.DB, orgID string) (bool, error) {
+	var count int64
+	if err := tx.Model(&ManagedWarehouse{}).
+		Where("org_id = ? AND state = ?", orgID, ManagedWarehouseStateResharding).
+		Count(&count).Error; err != nil {
+		return false, fmt.Errorf("warehouse resharding check: %w", err)
+	}
+	return count > 0, nil
 }
 
 func (cs *ConfigStore) orgConnectionDatabaseNow(tx *gorm.DB) (time.Time, error) {
