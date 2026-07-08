@@ -2212,8 +2212,8 @@ duckling_shard_backfill() { # cnpgOrg
 #   * cancel during drain (a held session keeps the drain waiting; new
 #     connections are 57P03-blocked; cancel rolls back; org healthy)
 #   * bogus-shard rollback (flip → Synced=False → flip-timeout → rollback;
-#     data intact, spec.cnpgShard patched back — needs the short
-#     DUCKGRES_RESHARD_FLIP_TIMEOUT set in manifests.tmpl.yaml)
+#     data intact, spec.cnpgShard patched back; short per-op
+#     cutover_timeout_seconds keeps it fast)
 #   * ext→cnpg POSITIVE path (real catalog copy off the harness RDS onto
 #     shard-001, data intact after, report in the log)
 # cnpg→ext stays unit-test-only: the harness knows the RDS SM secret NAME but
@@ -2321,12 +2321,14 @@ reshard_bogus_shard_rollback() { # org password
   log "reshard rollback: bogus target shard → flip-timeout → rollback, data intact"
   pg "$org" "$pw" ducklake "DROP TABLE IF EXISTS reshard_marker; CREATE TABLE reshard_marker AS SELECT 42 AS v;"
 
-  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-099"},"drain_timeout_seconds":300}')" \
+  # Short per-op cutover timeout: the bogus shard can never converge, so the
+  # flip wait is pure dead time before the rollback we're here to assert.
+  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-099"},"drain_timeout_seconds":300,"cutover_timeout_seconds":90}')" \
     || fail "reshard rollback: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
 
-  # Budget: drain + snapshot-propagation waits + DUCKGRES_RESHARD_FLIP_TIMEOUT
-  # (90s, manifests) + rollback convergence.
+  # Budget: drain + snapshot-propagation waits + the 90s per-op cutover
+  # timeout + rollback convergence.
   st="$(reshard_wait_terminal "$opid" 600)"
   [ "$st" = "failed" ] || { reshard_dump_log "$opid"; fail "reshard rollback: final state $st, want failed"; }
   reshard_log_has "$opid" "rolling back" || fail "reshard rollback: no rollback log"
@@ -2349,7 +2351,9 @@ reshard_ext_to_cnpg() { # ext-org password
   log "reshard ext→cnpg POSITIVE path: move $org off the RDS onto shard-001 with data intact"
   pg "$org" "$pw" ducklake "DROP TABLE IF EXISTS reshard_move; CREATE TABLE reshard_move AS SELECT range AS v FROM range(100);"
 
-  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"},"drain_timeout_seconds":300}')" \
+  # Real cutover: provider-sql role/DB creation + cnpg SASL propagation can
+  # take minutes (same tail READY_TIMEOUT covers at provision time).
+  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"},"drain_timeout_seconds":300,"cutover_timeout_seconds":600}')" \
     || fail "reshard ext→cnpg: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
 

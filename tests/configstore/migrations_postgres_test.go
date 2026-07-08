@@ -46,6 +46,7 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "to_shard")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "runner_epoch")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "cancel_requested")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "cutover_timeout_seconds")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "blocked_at")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "compaction_was_present")
 	requireTablePresent(t, db, "duckgres_reshard_operation_log")

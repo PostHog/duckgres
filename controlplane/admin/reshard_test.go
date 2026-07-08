@@ -151,7 +151,7 @@ func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder
 func TestReshardStartCnpg(t *testing.T) {
 	store := newFakeReshardStore()
 	w := doJSON(reshardRouter(store), http.MethodPost, "/api/v1/orgs/acme/reshard",
-		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"},"drain_timeout_seconds":120}`)
+		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"},"drain_timeout_seconds":120,"cutover_timeout_seconds":45}`)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body %s, want 202", w.Code, w.Body.String())
 	}
@@ -159,7 +159,7 @@ func TestReshardStartCnpg(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &op); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if op.SourceKind != "cnpg-shard" || op.FromShard != "shard-001" || op.ToShard != "shard-002" || op.DrainTimeoutSeconds != 120 {
+	if op.SourceKind != "cnpg-shard" || op.FromShard != "shard-001" || op.ToShard != "shard-002" || op.DrainTimeoutSeconds != 120 || op.CutoverTimeoutSeconds != 45 {
 		t.Fatalf("op = %+v", op)
 	}
 }

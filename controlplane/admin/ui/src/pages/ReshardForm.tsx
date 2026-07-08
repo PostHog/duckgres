@@ -46,6 +46,7 @@ export function ReshardForm() {
   const [passwordSecret, setPasswordSecret] = useState("");
   const [password, setPassword] = useState("");
   const [drainTimeoutMin, setDrainTimeoutMin] = useState("30");
+  const [cutoverTimeoutMin, setCutoverTimeoutMin] = useState("15");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmText, setConfirmText] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -86,6 +87,7 @@ export function ReshardForm() {
     setErr(null);
     const body: StartReshardBody = {
       drain_timeout_seconds: Math.max(60, (Number(drainTimeoutMin) || 30) * 60),
+      cutover_timeout_seconds: Math.max(60, (Number(cutoverTimeoutMin) || 15) * 60),
       target:
         targetType === "cnpg-shard"
           ? { type: "cnpg-shard", cnpg_shard: effectiveShard }
@@ -240,19 +242,35 @@ export function ReshardForm() {
               </div>
             )}
 
-            <div className="space-y-1">
-              <Label>Drain timeout (minutes)</Label>
-              <Input
-                type="number"
-                min={1}
-                value={drainTimeoutMin}
-                onChange={(e) => setDrainTimeoutMin(e.target.value)}
-                className="w-32"
-              />
-              <p className="text-xs text-muted-foreground">
-                New connections are blocked immediately; existing sessions get this long to finish
-                before the operation rolls back. In-flight queries are never killed.
-              </p>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <Label>Drain timeout (minutes)</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  value={drainTimeoutMin}
+                  onChange={(e) => setDrainTimeoutMin(e.target.value)}
+                  className="w-32"
+                />
+                <p className="text-xs text-muted-foreground">
+                  New connections are blocked immediately; existing sessions get this long to
+                  finish before the operation rolls back. In-flight queries are never killed.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <Label>Cutover timeout (minutes)</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  value={cutoverTimeoutMin}
+                  onChange={(e) => setCutoverTimeoutMin(e.target.value)}
+                  className="w-32"
+                />
+                <p className="text-xs text-muted-foreground">
+                  How long to wait for the target store to come up before rolling back. Role/DB
+                  creation on a cnpg shard can take several minutes.
+                </p>
+              </div>
             </div>
 
             <div className="flex items-center gap-3 border-t border-border pt-3">

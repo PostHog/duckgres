@@ -69,6 +69,10 @@ type ReshardOperation struct {
 	CancelRequested bool         `gorm:"not null;default:false" json:"cancel_requested"`
 
 	DrainTimeoutSeconds int64 `gorm:"not null;default:1800" json:"drain_timeout_seconds"`
+	// CutoverTimeoutSeconds bounds how long the flip waits for the
+	// composition to converge + the target to answer before rolling back.
+	// 0 = the runner default (15m, DUCKGRES_RESHARD_FLIP_TIMEOUT override).
+	CutoverTimeoutSeconds int64 `gorm:"not null;default:0" json:"cutover_timeout_seconds"`
 
 	// Runner fencing: claiming CP instance + monotonically bumped epoch. Every
 	// runner-side write is CAS-fenced on (runner_cp, runner_epoch) so a zombie

@@ -68,7 +68,10 @@ blocking → draining → pausing_compaction → cutover → copying → verifyi
 4. **cutover** — record the FULL source connection info from CR status first,
    then patch `cnpgShard` (and `type` for ext→cnpg; the external block is
    left in spec, ignored). Wait: CR status endpoint on the target pooler,
-   Ready condition, `SELECT 1` with tenant creds. Timeout → rollback.
+   Ready condition, `SELECT 1` with tenant creds. Timeout → rollback. The
+   wait is bounded per-op by `cutover_timeout_seconds` (0 = default 15m /
+   `DUCKGRES_RESHARD_FLIP_TIMEOUT`); real cnpg cutovers need minutes —
+   provider-sql role/DB creation plus cnpg SASL credential propagation.
 5. **copying** — source read via its recorded pre-flip endpoint (the orphaned
    role/DB survives a shard flip; an ext source is reached direct-to-RDS with
    TLS because the flip deletes its ESO sync + pgbouncer). One

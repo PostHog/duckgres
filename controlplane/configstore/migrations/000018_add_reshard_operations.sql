@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS duckgres_reshard_operations (
     error                  TEXT        NOT NULL DEFAULT '',
     cancel_requested       BOOLEAN     NOT NULL DEFAULT false,
     drain_timeout_seconds  BIGINT      NOT NULL DEFAULT 1800,
+    -- 0 = use the runner default (15m / DUCKGRES_RESHARD_FLIP_TIMEOUT).
+    cutover_timeout_seconds BIGINT     NOT NULL DEFAULT 0,
     -- Runner fencing: the claiming CP + a monotonically bumped epoch; every
     -- runner-side write is CAS-fenced on (runner_cp, runner_epoch) so a
     -- zombie ex-runner's writes fail after a takeover.

@@ -524,4 +524,7 @@ export interface StartReshardBody {
     password?: string;
   };
   drain_timeout_seconds?: number;
+  // 0/omitted = server default (15m): how long the cutover waits for the
+  // duckling to converge before rolling back.
+  cutover_timeout_seconds?: number;
 }

@@ -549,14 +549,18 @@ func TestReshardDrainTimeoutRollsBack(t *testing.T) {
 // flip that never converges: the SOURCE shard value is patched back (the key
 // is never removed) and the org is unblocked.
 func TestReshardFlipTimeoutRollsBackShardValue(t *testing.T) {
-	store := newFakeReshardStore(cnpgOp())
+	op := cnpgOp()
+	op.CutoverTimeoutSeconds = 1 // per-op override; the runner default below is far larger
+	store := newFakeReshardStore(op)
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}
 	// Break convergence: Set keeps the CR pointing at the SOURCE (simulates a
 	// bogus target shard the composition can't render).
 	stuck := &stuckCnpgDuckling{fakeDuckling: duckling}
 	copier := &fakeCopier{}
 
-	runOp(t, testRunner(store, stuck, copier), store)
+	r := testRunner(store, stuck, copier)
+	r.flipTimeout = time.Hour // must NOT bound the wait — the per-op value does
+	runOp(t, r, store)
 
 	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "did not become ready") {
 		t.Fatalf("state=%s err=%q, want flip-timeout failure", store.op.State, store.op.Error)

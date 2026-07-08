@@ -89,10 +89,11 @@ type reshardDucklingClient interface {
 // client. configPollInterval must match the CP fleet's snapshot poll so the
 // post-block propagation wait is honest.
 //
-// Env-only knob DUCKGRES_RESHARD_FLIP_TIMEOUT (Go duration) overrides how
-// long a cutover waits for the composition to converge before rolling back
-// (default 15m). The e2e sets it short so the bogus-shard rollback assertion
-// completes in minutes.
+// Env-only knob DUCKGRES_RESHARD_FLIP_TIMEOUT (Go duration) overrides the
+// DEFAULT cutover wait (15m) — how long a flip waits for the composition to
+// converge before rolling back. Individual operations override it per-op via
+// cutover_timeout_seconds (what the e2e's bogus-shard rollback uses to stay
+// fast without shortening real cutovers).
 func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, cpID string, configPollInterval time.Duration) *ReshardRunner {
 	flipTimeout := 15 * time.Minute
 	if v := os.Getenv("DUCKGRES_RESHARD_FLIP_TIMEOUT"); v != "" {
@@ -194,6 +195,15 @@ func (o *opRun) logf(level, format string, args ...any) {
 	if err := o.r.store.AppendReshardLog(o.op.ID, level, msg); err != nil {
 		slog.Warn("Reshard: appending log entry failed.", "op", o.op.ID, "error", err)
 	}
+}
+
+// flipTimeout is the per-op cutover bound, falling back to the runner
+// default (15m / DUCKGRES_RESHARD_FLIP_TIMEOUT).
+func (o *opRun) flipTimeout() time.Duration {
+	if o.op.CutoverTimeoutSeconds > 0 {
+		return time.Duration(o.op.CutoverTimeoutSeconds) * time.Second
+	}
+	return o.r.flipTimeout
 }
 
 func (o *opRun) step(step string) error {
@@ -577,7 +587,7 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 	o.flipped = true
 
 	targetPrefix := o.op.ToShard + "-pooler."
-	deadline := time.Now().Add(o.r.flipTimeout)
+	deadline := time.Now().Add(o.flipTimeout())
 	lastLog := time.Time{}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -587,7 +597,7 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 			return errReshardCancelled
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("target shard %s did not become ready within %s", o.op.ToShard, o.r.flipTimeout)
+			return fmt.Errorf("target shard %s did not become ready within %s", o.op.ToShard, o.flipTimeout())
 		}
 
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -638,7 +648,7 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 	o.flipped = true
 
 	providedPassword := o.target.Password
-	deadline := time.Now().Add(o.r.flipTimeout)
+	deadline := time.Now().Add(o.flipTimeout())
 	lastLog := time.Time{}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -647,7 +657,7 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 		// No cancel check: past this flip the only ways out are forward or
 		// the copy-back recovery in rollback().
 		if time.Now().After(deadline) {
-			return fmt.Errorf("external target did not become ready within %s (ESO secret %q missing or wrong?)", o.r.flipTimeout, o.op.TargetPasswordSecret)
+			return fmt.Errorf("external target did not become ready within %s (ESO secret %q missing or wrong?)", o.flipTimeout(), o.op.TargetPasswordSecret)
 		}
 
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -936,11 +946,11 @@ func (o *opRun) recoverFromExternal(ctx context.Context) {
 	// Wait for the composition to re-create the (empty) role/DB on the
 	// source shard.
 	sourcePrefix := o.op.FromShard + "-pooler."
-	deadline := time.Now().Add(o.r.flipTimeout)
+	deadline := time.Now().Add(o.flipTimeout())
 	var restored CatalogEndpoint
 	for {
 		if time.Now().After(deadline) {
-			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate", o.r.flipTimeout)
+			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate", o.flipTimeout())
 			return
 		}
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)

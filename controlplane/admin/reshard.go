@@ -66,6 +66,9 @@ type reshardTargetRequest struct {
 type startReshardRequest struct {
 	Target              reshardTargetRequest `json:"target"`
 	DrainTimeoutSeconds int64                `json:"drain_timeout_seconds"`
+	// 0 = runner default (15m): how long the cutover waits for the
+	// composition to converge before rolling back.
+	CutoverTimeoutSeconds int64 `json:"cutover_timeout_seconds"`
 }
 
 // RegisterReshardAPI wires the reshard endpoints. lister may be nil (duckling
@@ -117,10 +120,14 @@ func (h *reshardHandler) start(c *gin.Context) {
 	}
 
 	op := &configstore.ReshardOperation{
-		OrgID:               orgID,
-		DucklingName:        wh.DucklingName,
-		SourceKind:          sourceKind,
-		DrainTimeoutSeconds: req.DrainTimeoutSeconds,
+		OrgID:                 orgID,
+		DucklingName:          wh.DucklingName,
+		SourceKind:            sourceKind,
+		DrainTimeoutSeconds:   req.DrainTimeoutSeconds,
+		CutoverTimeoutSeconds: req.CutoverTimeoutSeconds,
+	}
+	if op.CutoverTimeoutSeconds < 0 {
+		op.CutoverTimeoutSeconds = 0
 	}
 	if op.DucklingName == "" {
 		op.DucklingName = orgID
