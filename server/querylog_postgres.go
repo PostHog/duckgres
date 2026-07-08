@@ -333,8 +333,8 @@ func postgresQueryLogCreateMonthPartitionSQL(start time.Time) string {
 	return fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS %s PARTITION OF querylog.query_log_entries FOR VALUES FROM ('%s') TO ('%s')",
 		postgresQueryLogPartitionName(start),
-		start.Format("2006-01-02"),
-		end.Format("2006-01-02"),
+		postgresQueryLogPartitionBound(start),
+		postgresQueryLogPartitionBound(end),
 	)
 }
 
@@ -364,9 +364,13 @@ func postgresQueryLogAttachMonthPartitionSQL(start time.Time) string {
 	return fmt.Sprintf(
 		"ALTER TABLE querylog.query_log_entries ATTACH PARTITION %s FOR VALUES FROM ('%s') TO ('%s')",
 		postgresQueryLogPartitionName(start),
-		start.Format("2006-01-02"),
-		end.Format("2006-01-02"),
+		postgresQueryLogPartitionBound(start),
+		postgresQueryLogPartitionBound(end),
 	)
+}
+
+func postgresQueryLogPartitionBound(t time.Time) string {
+	return postgresQueryLogMonthStart(t).Format("2006-01-02 15:04:05") + "+00"
 }
 
 func postgresQueryLogPartitionRelName(start time.Time) string {

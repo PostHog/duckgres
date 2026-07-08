@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -38,6 +39,28 @@ FROM ducklake.system.query_log
 	}
 	if !viewExists {
 		t.Fatal("expected ducklake.system.query_log view to exist")
+	}
+}
+
+func TestEnsureDuckLakeQueryLogSurfaceFastPathSkipsPostgresDSN(t *testing.T) {
+	resetQueryLogSurfaceCacheForTest()
+	t.Cleanup(resetQueryLogSurfaceCacheForTest)
+	db := openQueryLogViewTestDB(t)
+
+	if err := ensureDuckLakeQueryLogViewContext(context.Background(), db); err != nil {
+		t.Fatalf("ensure query log view: %v", err)
+	}
+
+	err := ensureDuckLakeQueryLogSurface(context.Background(), db, Config{
+		DuckLake: DuckLakeConfig{
+			MetadataStore: "not-a-postgres-metadata-store",
+		},
+		QueryLog: QueryLogConfig{
+			Enabled: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("existing view should skip native Postgres setup: %v", err)
 	}
 }
 
@@ -83,6 +106,43 @@ func TestEnsureDuckLakeQueryLogViewContextRenamesLegacyTable(t *testing.T) {
 	}
 }
 
+func TestEnsureDuckLakeQueryLogViewContextPreflightsBeforeRenamingLegacyTable(t *testing.T) {
+	db := openQueryLogViewTestDBWithoutHiddenSource(t)
+
+	if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS ducklake.system`); err != nil {
+		t.Fatalf("create ducklake system schema: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ducklake.system.query_log (event_time TIMESTAMP, query VARCHAR)`); err != nil {
+		t.Fatalf("create legacy query_log table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO ducklake.system.query_log VALUES (TIMESTAMP '2026-07-01 00:00:00', 'legacy row')`); err != nil {
+		t.Fatalf("insert legacy query_log row: %v", err)
+	}
+
+	err := ensureDuckLakeQueryLogViewContext(context.Background(), db)
+	if err == nil {
+		t.Fatal("expected hidden-source preflight error")
+	}
+	if !strings.Contains(err.Error(), "preflight ducklake query_log source") {
+		t.Fatalf("expected preflight error, got %v", err)
+	}
+
+	var legacyQuery string
+	if err := db.QueryRow(`SELECT query FROM ducklake.system.query_log`).Scan(&legacyQuery); err != nil {
+		t.Fatalf("legacy query_log table should remain in place: %v", err)
+	}
+	if legacyQuery != "legacy row" {
+		t.Fatalf("legacy row mismatch: got %q", legacyQuery)
+	}
+	legacyBackupExists, err := duckLakeQueryLogTableExistsContext(context.Background(), db, duckLakeLegacyQueryLogTable)
+	if err != nil {
+		t.Fatalf("check legacy backup table exists: %v", err)
+	}
+	if legacyBackupExists {
+		t.Fatalf("legacy backup table should not be created before source preflight succeeds")
+	}
+}
+
 func TestEnsureDuckLakeQueryLogViewContextErrorsWhenLegacyNameExists(t *testing.T) {
 	db := openQueryLogViewTestDB(t)
 
@@ -103,6 +163,23 @@ func TestEnsureDuckLakeQueryLogViewContextErrorsWhenLegacyNameExists(t *testing.
 
 func openQueryLogViewTestDB(t *testing.T) *sql.DB {
 	t.Helper()
+	db := openQueryLogViewTestDBWithoutHiddenSource(t)
+
+	if _, err := db.Exec(`CREATE SCHEMA "__ducklake_metadata_ducklake".querylog`); err != nil {
+		t.Fatalf("create hidden querylog schema: %v", err)
+	}
+	if _, err := db.Exec(queryLogViewHiddenTableTestSQL()); err != nil {
+		t.Fatalf("create hidden querylog table: %v", err)
+	}
+	if _, err := db.Exec(queryLogViewHiddenRowTestSQL()); err != nil {
+		t.Fatalf("insert hidden querylog row: %v", err)
+	}
+
+	return db
+}
+
+func openQueryLogViewTestDBWithoutHiddenSource(t *testing.T) *sql.DB {
+	t.Helper()
 
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
@@ -115,15 +192,6 @@ func openQueryLogViewTestDB(t *testing.T) *sql.DB {
 	}
 	if _, err := db.Exec(`ATTACH ':memory:' AS __ducklake_metadata_ducklake`); err != nil {
 		t.Fatalf("attach hidden metadata catalog: %v", err)
-	}
-	if _, err := db.Exec(`CREATE SCHEMA "__ducklake_metadata_ducklake".querylog`); err != nil {
-		t.Fatalf("create hidden querylog schema: %v", err)
-	}
-	if _, err := db.Exec(queryLogViewHiddenTableTestSQL()); err != nil {
-		t.Fatalf("create hidden querylog table: %v", err)
-	}
-	if _, err := db.Exec(queryLogViewHiddenRowTestSQL()); err != nil {
-		t.Fatalf("insert hidden querylog row: %v", err)
 	}
 
 	return db

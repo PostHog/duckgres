@@ -118,9 +118,9 @@ func TestPostgresQueryLogSchemaSQL(t *testing.T) {
 		"CREATE SCHEMA IF NOT EXISTS querylog",
 		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries",
 		"PARTITION BY RANGE (event_time)",
-		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202606 PARTITION OF querylog.query_log_entries FOR VALUES FROM ('2026-06-01') TO ('2026-07-01')",
-		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202607 PARTITION OF querylog.query_log_entries FOR VALUES FROM ('2026-07-01') TO ('2026-08-01')",
-		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202608 PARTITION OF querylog.query_log_entries FOR VALUES FROM ('2026-08-01') TO ('2026-09-01')",
+		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202606 PARTITION OF querylog.query_log_entries FOR VALUES FROM ('2026-06-01 00:00:00+00') TO ('2026-07-01 00:00:00+00')",
+		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202607 PARTITION OF querylog.query_log_entries FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00')",
+		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202608 PARTITION OF querylog.query_log_entries FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')",
 		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_default PARTITION OF querylog.query_log_entries DEFAULT",
 		"idx_query_log_entries_event_time",
 		"idx_query_log_entries_user_time",
@@ -203,7 +203,7 @@ func TestPostgresQueryLogRepairPartitionSQL(t *testing.T) {
 	attach := postgresQueryLogAttachMonthPartitionSQL(start)
 	for _, want := range []string{
 		"ALTER TABLE querylog.query_log_entries ATTACH PARTITION querylog.query_log_entries_202610",
-		"FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')",
+		"FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2026-11-01 00:00:00+00')",
 	} {
 		if !strings.Contains(attach, want) {
 			t.Fatalf("attach partition SQL missing %q:\n%s", want, attach)
@@ -215,7 +215,7 @@ func TestPostgresQueryLogCreateMonthPartitionSQLNormalizesMonth(t *testing.T) {
 	got := postgresQueryLogCreateMonthPartitionSQL(time.Date(2026, 9, 30, 23, 59, 0, 0, time.FixedZone("offset", -4*60*60)))
 	for _, want := range []string{
 		"CREATE TABLE IF NOT EXISTS querylog.query_log_entries_202610",
-		"FOR VALUES FROM ('2026-10-01') TO ('2026-11-01')",
+		"FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2026-11-01 00:00:00+00')",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("partition SQL missing %q:\n%s", want, got)
