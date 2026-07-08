@@ -229,14 +229,20 @@ _pg_exec() { # org password dbname sql [user=root]  -> prints output; rc 0 ok / 
       *"capacity exhausted"*|*"no Duckgres worker"*|\
       *"still provisioning"*|*"failed to initialize session"*|\
       *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
-      *"failed to detect attached catalogs"*)
-        # The last three cover an on-demand cold spawn that needed a fresh node
-        # (sized worker too big for the warm node): the first connect can hit the
-        # spawn ceiling while the pod is still pulling/booting; by the retry it is
-        # hot-idle and the reconnect reuses it. Same transient class as a cold pool.
+      *"failed to detect attached catalogs"*|*"reshard in progress"*)
+        # The cold-spawn trio covers an on-demand cold spawn that needed a fresh
+        # node (sized worker too big for the warm node): the first connect can hit
+        # the spawn ceiling while the pod is still pulling/booting; by the retry it
+        # is hot-idle and the reconnect reuses it. Same transient class as a cold pool.
         # "failed to detect attached catalogs" is the session-init catalog probe
         # racing a freshly-spawned worker whose ATTACH is still settling — it fires
         # BEFORE any user SQL runs, so retrying the whole command is safe.
+        # "reshard in progress" (57P03, "please retry shortly") is the connect gate
+        # on a CP whose config snapshot hasn't polled the resharding→ready flip
+        # yet — one poll interval of lag right after a reshard finishes or rolls
+        # back, exactly when the reshard assertions reconnect. The negative
+        # mid-reshard connect check deliberately uses a one-shot psql instead
+        # of this helper so it observes the rejection instead of retrying it.
         sleep 10; a=$((a + 1)); continue ;;
       *) printf %s "$out" >&2; return 1 ;;
     esac
@@ -2286,12 +2292,16 @@ reshard_cancel_during_drain() { # org password
     sleep 3
   done
 
-  # New connections are refused while resharding.
-  if out2="$(pg_try "$org" "$pw" ducklake "SELECT 1")"; then
+  # New connections are refused while resharding. One-shot psql (NOT pg_try:
+  # its transient-retry list now includes the reshard rejection, so it would
+  # spin for the full retry budget before reporting the expected failure).
+  if out2="$(PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -tAc "SELECT 1" 2>&1)"; then
     fail "reshard cancel: new connection succeeded during reshard drain (got '$out2')"
   fi
   echo "$out2" | grep -qi "reshard" \
-    || log "WARN: blocked-connection error did not mention reshard: $out2"
+    || fail "reshard cancel: blocked-connection error did not mention reshard: $out2"
 
   curl -fsS -X POST -H "$H" "$API/api/v1/reshards/$opid/cancel" >/dev/null \
     || fail "reshard cancel: cancel POST failed"
