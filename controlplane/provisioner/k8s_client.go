@@ -48,6 +48,12 @@ type DucklingStatus struct {
 	IAMRoleARN         string
 	ReadyCondition     bool
 	SyncedFalseMessage string
+	// ReadyFalseMessage is the Ready condition's message when Ready=False — the
+	// XR's roll-up of what is still unready (e.g. "Unready resources:
+	// s3-bucket"). Distinct from SyncedFalseMessage: the XR can be Synced=True
+	// (composed successfully) yet Ready=False (a composed resource has not
+	// reconciled), which is exactly the state a stuck S3 bucket produces.
+	ReadyFalseMessage string
 
 	// DuckLakeEnabled is spec.ducklake.enabled, read present/absent: nil when
 	// the CR predates the decoupled ducklake field (the worker activator then
@@ -309,6 +315,119 @@ func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus,
 	return parseDucklingStatus(cr)
 }
 
+// ComposedResourceError describes one composed managed resource that is not
+// healthy — Crossplane could not sync it to the provider (Synced=False) or the
+// provider reports it not ready (Ready=False) — along with that condition's
+// message. It lets the provisioner surface the *actual* failure (e.g. an S3
+// "BucketNotEmpty" delete conflict) instead of only the Duckling XR's generic
+// "Unready resources: <name>" roll-up.
+type ComposedResourceError struct {
+	Kind    string
+	Name    string
+	Message string
+}
+
+// ComposedResourceErrors returns the unhealthy composed resources of the named
+// Duckling XR: it reads spec.crossplane.resourceRefs (the composition's composed
+// resources), fetches each, and reports any whose Synced or Ready condition is
+// False, with that condition's message.
+//
+// Best-effort and diagnostic-only: a ref that can't be fetched (already gone, or
+// an unexpected GVR) is skipped rather than failing the whole call, since the
+// result only feeds the human-facing status message. protection.crossplane.io
+// Usage guards are skipped — internal dependency ordering, not tenant infra.
+func (d *DucklingClient) ComposedResourceErrors(ctx context.Context, name string) ([]ComposedResourceError, error) {
+	cr, err := d.getCR(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	var out []ComposedResourceError
+	for _, ref := range nestedComposedRefs(cr) {
+		gvr, kind, refName, ok := composedRefGVR(ref)
+		if !ok || gvr.Group == "protection.crossplane.io" {
+			continue
+		}
+		obj, gerr := d.client.Resource(gvr).Namespace(ducklingNamespace).Get(ctx, refName, metav1.GetOptions{})
+		if gerr != nil {
+			continue
+		}
+		if msg, unhealthy := unhealthyConditionMessage(obj); unhealthy {
+			out = append(out, ComposedResourceError{Kind: kind, Name: refName, Message: msg})
+		}
+	}
+	return out, nil
+}
+
+// nestedComposedRefs pulls spec.crossplane.resourceRefs (the Crossplane v2
+// composed-resource references) off a Duckling XR. Missing or wrongly-typed
+// yields nil.
+func nestedComposedRefs(cr *unstructured.Unstructured) []map[string]interface{} {
+	spec, _ := cr.Object["spec"].(map[string]interface{})
+	xp, _ := spec["crossplane"].(map[string]interface{})
+	raw, _ := xp["resourceRefs"].([]interface{})
+	refs := make([]map[string]interface{}, 0, len(raw))
+	for _, r := range raw {
+		if m, ok := r.(map[string]interface{}); ok {
+			refs = append(refs, m)
+		}
+	}
+	return refs
+}
+
+// composedRefGVR turns a resourceRef ({apiVersion, kind, name}) into the GVR to
+// fetch it by. Resource is the lowercased plural of Kind — see kindToResource.
+func composedRefGVR(ref map[string]interface{}) (gvr schema.GroupVersionResource, kind, name string, ok bool) {
+	apiVersion := getNestedString(ref, "apiVersion")
+	kind = getNestedString(ref, "kind")
+	name = getNestedString(ref, "name")
+	if apiVersion == "" || kind == "" || name == "" {
+		return schema.GroupVersionResource{}, "", "", false
+	}
+	gv, err := schema.ParseGroupVersion(apiVersion)
+	if err != nil {
+		return schema.GroupVersionResource{}, "", "", false
+	}
+	return gv.WithResource(kindToResource(kind)), kind, name, true
+}
+
+// kindToResource lowercases a Kind and pluralizes it to the resource segment of
+// a GVR. It implements only the rules the Duckling composition's composed kinds
+// need (…y→…ies, otherwise +s): Bucket→buckets, BucketPolicy→bucketpolicies,
+// Role→roles, RolePolicy→rolepolicies, Database→databases, Object→objects,
+// Usage→usages. None of those end in s/x/z/ch/sh, so no -es rule is needed.
+func kindToResource(kind string) string {
+	lower := strings.ToLower(kind)
+	if strings.HasSuffix(lower, "y") {
+		return lower[:len(lower)-1] + "ies"
+	}
+	return lower + "s"
+}
+
+// unhealthyConditionMessage reports whether a composed managed resource has a
+// Synced=False or Ready=False condition, returning that condition's message.
+// Synced is preferred: a provider sync error (e.g. BucketNotEmpty) is the
+// actionable cause, whereas Ready=False is often just its downstream symptom.
+func unhealthyConditionMessage(obj *unstructured.Unstructured) (string, bool) {
+	status, _ := obj.Object["status"].(map[string]interface{})
+	conditions, _ := status["conditions"].([]interface{})
+	readyMsg := ""
+	readyBad := false
+	for _, c := range conditions {
+		cm, ok := c.(map[string]interface{})
+		if !ok || getNestedString(cm, "status") != "False" {
+			continue
+		}
+		switch getNestedString(cm, "type") {
+		case "Synced":
+			return getNestedString(cm, "message"), true
+		case "Ready":
+			readyMsg = getNestedString(cm, "message")
+			readyBad = true
+		}
+	}
+	return readyMsg, readyBad
+}
+
 // Delete removes the named Duckling CR.
 func (d *DucklingClient) Delete(ctx context.Context, name string) error {
 	if derr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{}); derr != nil {
@@ -544,6 +663,9 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		switch condType {
 		case "Ready":
 			ds.ReadyCondition = condStatus == "True"
+			if condStatus == "False" {
+				ds.ReadyFalseMessage = getNestedString(condMap, "message")
+			}
 		case "Synced":
 			if condStatus == "False" {
 				ds.SyncedFalseMessage = getNestedString(condMap, "message")

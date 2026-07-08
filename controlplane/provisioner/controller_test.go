@@ -907,6 +907,155 @@ func TestFakeStoreUpdateWarehouseState(t *testing.T) {
 	}
 }
 
+func TestParseDucklingStatusReadyFalseMessage(t *testing.T) {
+	// A wedged S3 bucket produces exactly this: the XR composed fine
+	// (Synced=True) but a composed resource has not reconciled, so Ready=False
+	// carries the roll-up of what is unready.
+	cr := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"status": map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{"type": "Synced", "status": "True"},
+					map[string]interface{}{
+						"type":    "Ready",
+						"status":  "False",
+						"message": "Unready resources: s3-bucket",
+					},
+				},
+			},
+		},
+	}
+
+	status, err := parseDucklingStatus(cr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status.ReadyCondition {
+		t.Fatal("expected Ready to be false")
+	}
+	if status.SyncedFalseMessage != "" {
+		t.Fatalf("expected no synced-false message, got %q", status.SyncedFalseMessage)
+	}
+	if status.ReadyFalseMessage != "Unready resources: s3-bucket" {
+		t.Fatalf("expected ready-false roll-up, got %q", status.ReadyFalseMessage)
+	}
+}
+
+func TestKindToResource(t *testing.T) {
+	// Guards the pluralization the composed-resource GVR mapping depends on —
+	// every Kind the Duckling composition composes must map to the right
+	// resource segment, or ComposedResourceErrors silently skips it.
+	cases := map[string]string{
+		"Bucket":       "buckets",
+		"BucketPolicy": "bucketpolicies",
+		"Role":         "roles",
+		"RolePolicy":   "rolepolicies",
+		"Database":     "databases",
+		"Object":       "objects",
+		"Usage":        "usages",
+	}
+	for kind, want := range cases {
+		if got := kindToResource(kind); got != want {
+			t.Errorf("kindToResource(%q) = %q, want %q", kind, got, want)
+		}
+	}
+}
+
+// bucketGVR is the composed S3 bucket's GVR — the resource a stuck bucket lives
+// at, referenced from the Duckling XR's spec.crossplane.resourceRefs.
+var bucketGVR = schema.GroupVersionResource{
+	Group:    "s3.aws.m.upbound.io",
+	Version:  "v1beta1",
+	Resource: "buckets",
+}
+
+// newFakeDucklingClientWithComposed builds a fake dynamic client that serves
+// both Duckling CRs and composed S3 Bucket resources, so a reconcile can read a
+// failing composed resource's condition through ComposedResourceErrors.
+func newFakeDucklingClientWithComposed(objects ...runtime.Object) *DucklingClient {
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "k8s.posthog.com", Version: "v1alpha1", Kind: "Duckling"}, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "s3.aws.m.upbound.io", Version: "v1beta1", Kind: "Bucket"}, &unstructured.Unstructured{})
+	listKinds := map[schema.GroupVersionResource]string{
+		ducklingGVR: "DucklingList",
+		bucketGVR:   "BucketList",
+	}
+	fake := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objects...)
+	return NewDucklingClientWithDynamic(fake)
+}
+
+// TestReconcileProvisioningStuckBucketSurfacesError is the regression for the
+// false-green S3 badge: a Duckling whose bucket is wedged on BucketNotEmpty
+// reported status.dataStore.bucketName populated, so the old code latched
+// s3_state=ready. It asserts the fix on all three facets — the component is NOT
+// marked ready, a previously-ready component is revoked, and the exact provider
+// error reaches status_message.
+func TestReconcileProvisioningStuckBucketSurfacesError(t *testing.T) {
+	const bucketName = "posthog-duckling-orgstuck-mw-prod-us"
+	bucketErr := "async delete failed: failed to delete the resource: deleting S3 Bucket: " +
+		"api error BucketNotEmpty: The bucket you tried to delete is not empty"
+
+	duckling := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata":   map[string]interface{}{"name": "org-stuck", "namespace": ducklingNamespace},
+		"spec": map[string]interface{}{
+			"crossplane": map[string]interface{}{
+				"resourceRefs": []interface{}{
+					map[string]interface{}{"apiVersion": "s3.aws.m.upbound.io/v1beta1", "kind": "Bucket", "name": bucketName},
+				},
+			},
+		},
+		"status": map[string]interface{}{
+			// Populated infra fields — what fooled the old presence check.
+			"metadataStore": map[string]interface{}{"type": "external", "endpoint": "org-stuck.rds.amazonaws.com", "password": "pw", "user": "postgres", "database": "postgres"},
+			"dataStore":     map[string]interface{}{"type": "s3bucket", "bucketName": bucketName},
+			"iamRoleArn":    "arn:aws:iam::123456789012:role/duckling-org-stuck",
+			// XR composed fine but the bucket never reconciled.
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Synced", "status": "True"},
+				map[string]interface{}{"type": "Ready", "status": "False", "reason": "Creating", "message": "Unready resources: s3-bucket"},
+			},
+		},
+	}}
+	bucket := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "s3.aws.m.upbound.io/v1beta1",
+		"kind":       "Bucket",
+		"metadata":   map[string]interface{}{"name": bucketName, "namespace": ducklingNamespace},
+		"status": map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Synced", "status": "False", "reason": "ReconcileError", "message": bucketErr},
+			},
+		},
+	}}
+
+	dc := newFakeDucklingClientWithComposed(duckling, bucket)
+	fs := newFakeStore()
+	fs.warehouses["org-stuck"] = &configstore.ManagedWarehouse{
+		OrgID:        "org-stuck",
+		DucklingName: "org-stuck",
+		State:        configstore.ManagedWarehouseStateProvisioning,
+		// Previously latched ready — must be revoked now the bucket is failing.
+		S3State:   configstore.ManagedWarehouseStateReady,
+		CreatedAt: time.Now(),
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
+	ctrl.reconcile(context.Background())
+
+	w := fs.warehouses["org-stuck"]
+	if w.State == configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse must not be ready while the bucket is stuck")
+	}
+	if w.S3State == configstore.ManagedWarehouseStateReady {
+		t.Fatalf("s3_state must be revoked from ready, got %q", w.S3State)
+	}
+	if !strings.Contains(w.StatusMessage, "BucketNotEmpty") {
+		t.Fatalf("status_message should surface the exact provider error, got %q", w.StatusMessage)
+	}
+}
+
 // --- cnpg-shard metadata store ---
 
 // TestReconcilePendingCreatesCnpgShardCR verifies that a warehouse whose
