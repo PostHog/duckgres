@@ -96,6 +96,21 @@ func TestOpenPostgresQueryLogDBUsesSingleConnectionPool(t *testing.T) {
 	}
 }
 
+func TestPostgresQueryLogPGXConfigStripsUnsupportedRuntimeParams(t *testing.T) {
+	cfg, err := postgresQueryLogPGXConfig("host=metadata.internal dbname=ducklake keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5 application_name=custom default_query_exec_mode=simple_protocol")
+	if err != nil {
+		t.Fatalf("postgresQueryLogPGXConfig: %v", err)
+	}
+	for _, param := range postgresQueryLogUnsupportedRuntimeParams {
+		if _, ok := cfg.RuntimeParams[param]; ok {
+			t.Fatalf("RuntimeParams[%q] should be stripped before pgx startup", param)
+		}
+	}
+	if got := cfg.RuntimeParams["application_name"]; got != "custom" {
+		t.Fatalf("application_name runtime param = %q, want custom", got)
+	}
+}
+
 func TestPostgresQueryLogSchemaSQL(t *testing.T) {
 	sql := strings.Join(postgresQueryLogSchemaSQLForTime(time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)), "\n")
 

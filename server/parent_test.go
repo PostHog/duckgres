@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"syscall"
 	"testing"
@@ -20,6 +21,11 @@ func TestChildConfigSerialization(t *testing.T) {
 		DuckLake: DuckLakeConfig{
 			MetadataStore: "postgres:host=localhost",
 			S3Region:      "us-east-1",
+		},
+		QueryLog: QueryLogConfig{
+			Enabled:       true,
+			FlushInterval: 5 * time.Second,
+			BatchSize:     42,
 		},
 	}
 
@@ -59,6 +65,47 @@ func TestChildConfigSerialization(t *testing.T) {
 	}
 	if cfg2.DuckLake.MetadataStore != cfg.DuckLake.MetadataStore {
 		t.Errorf("DuckLake.MetadataStore mismatch: got %q, want %q", cfg2.DuckLake.MetadataStore, cfg.DuckLake.MetadataStore)
+	}
+	if cfg2.QueryLog != cfg.QueryLog {
+		t.Errorf("QueryLog mismatch: got %+v, want %+v", cfg2.QueryLog, cfg.QueryLog)
+	}
+}
+
+func TestChildQueryLogSinkUsesShortInitializationTimeout(t *testing.T) {
+	oldNewPostgresQueryLogSink := newPostgresQueryLogSink
+	defer func() {
+		newPostgresQueryLogSink = oldNewPostgresQueryLogSink
+	}()
+
+	newPostgresQueryLogSink = func(ctx context.Context, cfg Config) (QueryLogSink, error) {
+		if !cfg.QueryLog.Enabled {
+			t.Fatalf("QueryLog.Enabled = false, want true")
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatalf("child query-log sink context has no deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > queryLogSurfaceInitTimeout {
+			t.Fatalf("deadline in %s, want within %s", remaining, queryLogSurfaceInitTimeout)
+		}
+		return &captureQueryLogSink{}, nil
+	}
+
+	srv := &Server{
+		cfg: Config{
+			DuckLake: DuckLakeConfig{
+				MetadataStore: "postgres:host=metadata",
+			},
+			QueryLog: QueryLogConfig{
+				Enabled: true,
+			},
+		},
+	}
+	startChildQueryLogSink(srv, "postgres")
+
+	if srv.queryLogSink == nil {
+		t.Fatalf("child query-log sink was not installed")
 	}
 }
 

@@ -7,20 +7,29 @@ import (
 
 const (
 	hiddenDuckLakeMetadataCatalogPrefix      = "__ducklake_metadata_"
-	HiddenDuckLakeMetadataCatalogAccessError = "direct access to DuckLake metadata catalogs is not allowed"
+	HiddenDuckLakeMetadataCatalogAccessError = "direct access to DuckLake metadata catalogs or dynamic SQL functions is not allowed"
 )
 
 // QueryReferencesHiddenDuckLakeMetadataCatalog reports whether user-authored SQL
-// names DuckLake's hidden metadata catalog. It intentionally ignores comments
-// and string literals so diagnostic text does not trip the access guard.
+// names DuckLake's hidden metadata catalog, or uses a dynamic SQL function that
+// could construct such a reference. It intentionally ignores comments, but it
+// does inspect string literals because DuckDB can execute SQL passed to dynamic
+// functions such as query().
 func QueryReferencesHiddenDuckLakeMetadataCatalog(query string) bool {
 	for i := 0; i < len(query); {
 		switch query[i] {
 		case '\'':
-			i = skipSQLSingleQuotedString(query, i+1)
+			literal, next := readSQLSingleQuotedString(query, i+1)
+			if containsHiddenDuckLakeMetadataCatalogPrefix(literal) {
+				return true
+			}
+			i = next
 		case '"':
 			ident, next := readSQLDoubleQuotedIdentifier(query, i+1)
 			if hasHiddenDuckLakeMetadataCatalogPrefix(ident) {
+				return true
+			}
+			if isDynamicDuckDBSQLFunctionCall(ident, query, next) {
 				return true
 			}
 			i = next
@@ -38,7 +47,11 @@ func QueryReferencesHiddenDuckLakeMetadataCatalog(query string) bool {
 			}
 		case '$':
 			if tag, ok := readSQLDollarQuoteTag(query, i); ok {
-				i = skipSQLDollarQuotedString(query, i+len(tag), tag)
+				literal, next := readSQLDollarQuotedString(query, i+len(tag), tag)
+				if containsHiddenDuckLakeMetadataCatalogPrefix(literal) {
+					return true
+				}
+				i = next
 			} else {
 				i++
 			}
@@ -50,6 +63,9 @@ func QueryReferencesHiddenDuckLakeMetadataCatalog(query string) bool {
 					i++
 				}
 				if hasHiddenDuckLakeMetadataCatalogPrefix(query[start:i]) {
+					return true
+				}
+				if isDynamicDuckDBSQLFunctionCall(query[start:i], query, i) {
 					return true
 				}
 			} else {
@@ -64,18 +80,49 @@ func hasHiddenDuckLakeMetadataCatalogPrefix(identifier string) bool {
 	return strings.HasPrefix(strings.ToLower(identifier), hiddenDuckLakeMetadataCatalogPrefix)
 }
 
-func skipSQLSingleQuotedString(query string, i int) int {
+func containsHiddenDuckLakeMetadataCatalogPrefix(text string) bool {
+	return strings.Contains(strings.ToLower(text), hiddenDuckLakeMetadataCatalogPrefix)
+}
+
+func isDynamicDuckDBSQLFunctionCall(identifier, query string, i int) bool {
+	if !strings.EqualFold(identifier, "query") && !strings.EqualFold(identifier, "query_table") {
+		return false
+	}
+	next := nextSQLNonWhitespaceOrComment(query, i)
+	return next < len(query) && query[next] == '('
+}
+
+func nextSQLNonWhitespaceOrComment(query string, i int) int {
+	for i < len(query) {
+		switch {
+		case unicode.IsSpace(rune(query[i])):
+			i++
+		case i+1 < len(query) && query[i] == '-' && query[i+1] == '-':
+			i = skipSQLLineComment(query, i+2)
+		case i+1 < len(query) && query[i] == '/' && query[i+1] == '*':
+			i = skipSQLBlockComment(query, i+2)
+		default:
+			return i
+		}
+	}
+	return len(query)
+}
+
+func readSQLSingleQuotedString(query string, i int) (string, int) {
+	var b strings.Builder
 	for i < len(query) {
 		if query[i] == '\'' {
 			if i+1 < len(query) && query[i+1] == '\'' {
+				b.WriteByte('\'')
 				i += 2
 				continue
 			}
-			return i + 1
+			return b.String(), i + 1
 		}
+		b.WriteByte(query[i])
 		i++
 	}
-	return len(query)
+	return b.String(), len(query)
 }
 
 func readSQLDoubleQuotedIdentifier(query string, i int) (string, int) {
@@ -127,14 +174,14 @@ func readSQLDollarQuoteTag(query string, i int) (string, bool) {
 	return "", false
 }
 
-func skipSQLDollarQuotedString(query string, i int, tag string) int {
+func readSQLDollarQuotedString(query string, i int, tag string) (string, int) {
 	if tag == "" {
-		return i
+		return "", i
 	}
 	if end := strings.Index(query[i:], tag); end >= 0 {
-		return i + end + len(tag)
+		return query[i : i+end], i + end + len(tag)
 	}
-	return len(query)
+	return query[i:], len(query)
 }
 
 func isSQLIdentifierStart(r rune) bool {

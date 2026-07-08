@@ -29,13 +29,43 @@ func TestQueryReferencesHiddenDuckLakeMetadataCatalog(t *testing.T) {
 			want:  false,
 		},
 		{
-			name:  "single-quoted diagnostic string",
+			name:  "single-quoted hidden catalog string",
 			query: "SELECT '__ducklake_metadata_ducklake'",
-			want:  false,
+			want:  true,
 		},
 		{
-			name:  "dollar-quoted diagnostic string",
+			name:  "dollar-quoted hidden catalog string",
 			query: "SELECT $tag$__ducklake_metadata_ducklake$tag$",
+			want:  true,
+		},
+		{
+			name:  "dynamic sql query string",
+			query: `SELECT * FROM query('SELECT * FROM "__ducklake_metadata_ducklake".querylog.query_log_entries')`,
+			want:  true,
+		},
+		{
+			name:  "dynamic table name string",
+			query: `SELECT * FROM query_table('__ducklake_metadata_ducklake.querylog.query_log_entries')`,
+			want:  true,
+		},
+		{
+			name:  "dynamic sql constructed string",
+			query: `SELECT * FROM query('SELECT * FROM "__ducklake_metadata_' || 'ducklake".querylog.query_log_entries')`,
+			want:  true,
+		},
+		{
+			name:  "dynamic sql without hidden catalog",
+			query: `SELECT * FROM query('SELECT 1')`,
+			want:  true,
+		},
+		{
+			name:  "dynamic table function with comment before call",
+			query: `SELECT * FROM query_table /* comment */ ('safe_table')`,
+			want:  true,
+		},
+		{
+			name:  "ordinary query identifier",
+			query: "SELECT query FROM querylog.query_log_entries",
 			want:  false,
 		},
 		{

@@ -8,7 +8,8 @@ import (
 	"hash/fnv"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/posthog/duckgres/server/ducklake"
 )
 
@@ -19,6 +20,13 @@ const (
 	postgresQueryLogDefaultPartition = postgresQueryLogSchema + ".query_log_entries_default"
 	postgresQueryLogColumns          = "id, event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms, cpu_time_s, peak_buffer_memory_bytes"
 )
+
+var postgresQueryLogUnsupportedRuntimeParams = []string{
+	"keepalives",
+	"keepalives_idle",
+	"keepalives_interval",
+	"keepalives_count",
+}
 
 // NewPostgresQueryLoggerContext creates a worker-local query-log sink backed by
 // the tenant metadata Postgres database. The caller owns query-log routing; this
@@ -63,13 +71,25 @@ func NewPostgresQueryLoggerContext(ctx context.Context, dlCfg DuckLakeConfig, cf
 }
 
 func openPostgresQueryLogDB(connStr string) (*sql.DB, error) {
-	db, err := sql.Open("pgx", connStr)
+	config, err := postgresQueryLogPGXConfig(connStr)
 	if err != nil {
-		return nil, fmt.Errorf("querylog: open postgres: %w", err)
+		return nil, err
 	}
+	db := stdlib.OpenDB(*config)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	return db, nil
+}
+
+func postgresQueryLogPGXConfig(connStr string) (*pgx.ConnConfig, error) {
+	config, err := pgx.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("querylog: parse postgres config: %w", err)
+	}
+	for _, param := range postgresQueryLogUnsupportedRuntimeParams {
+		delete(config.RuntimeParams, param)
+	}
+	return config, nil
 }
 
 func postgresQueryLogDSN(dlCfg DuckLakeConfig) (string, error) {

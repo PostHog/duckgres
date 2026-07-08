@@ -42,6 +42,8 @@ const (
 	defaultFlightHandleIdleTTL    = 15 * time.Minute
 	defaultFlightSessionTokenTTL  = 1 * time.Hour
 	defaultFlightSessionHeaderKey = "x-duckgres-session"
+
+	hiddenDuckLakeMetadataCatalogLikePatternSQL = `'\_\_ducklake\_metadata\_%' ESCAPE '\'`
 )
 
 var ErrDurableReconnectTerminal = errors.New("durable reconnect terminal")
@@ -916,7 +918,8 @@ func (h *ControlPlaneFlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd f
 	}
 
 	schema := schema_ref.DBSchemas
-	query := "SELECT catalog_name, schema_name AS db_schema_name FROM information_schema.schemata WHERE 1=1"
+	query := "SELECT catalog_name, schema_name AS db_schema_name FROM information_schema.schemata WHERE 1=1" +
+		excludeHiddenDuckLakeMetadataCatalogSQL("catalog_name")
 	args := make([]any, 0, 2)
 	if catalog := cmd.GetCatalog(); catalog != nil && *catalog != "" {
 		args = append(args, *catalog)
@@ -998,7 +1001,8 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 		schema = schema_ref.TablesWithIncludedSchema
 	}
 
-	query := "SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables WHERE 1=1"
+	query := "SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables WHERE 1=1" +
+		excludeHiddenDuckLakeMetadataCatalogSQL("table_catalog")
 	args := make([]any, 0, 6)
 	if catalog := cmd.GetCatalog(); catalog != nil && *catalog != "" {
 		args = append(args, *catalog)
@@ -2156,6 +2160,10 @@ func sendStreamChunk(ctx context.Context, ch chan<- flight.StreamChunk, chunk fl
 	}
 }
 
+func excludeHiddenDuckLakeMetadataCatalogSQL(column string) string {
+	return fmt.Sprintf(" AND lower(%s) NOT LIKE %s", column, hiddenDuckLakeMetadataCatalogLikePatternSQL)
+}
+
 type tableSchemaKey struct {
 	catalog    string
 	hasCatalog bool
@@ -2166,7 +2174,8 @@ type tableSchemaKey struct {
 
 func loadTableSchemas(ctx context.Context, s *flightClientSession, cmd flightsql.GetTables) (map[tableSchemaKey]*arrow.Schema, error) {
 	query := "SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable " +
-		"FROM information_schema.columns WHERE 1=1"
+		"FROM information_schema.columns WHERE 1=1" +
+		excludeHiddenDuckLakeMetadataCatalogSQL("table_catalog")
 	args := make([]any, 0, 3)
 	if catalog := cmd.GetCatalog(); catalog != nil && *catalog != "" {
 		args = append(args, *catalog)

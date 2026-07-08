@@ -51,9 +51,10 @@ type queryLogEntrySink interface {
 }
 
 const (
-	queryLogChannelSize = 10000
-	queryLogInitTimeout = 30 * time.Second
-	maxQueryLength      = 4096
+	queryLogChannelSize        = 10000
+	queryLogInitTimeout        = 30 * time.Second
+	queryLogSurfaceInitTimeout = 2 * time.Second
+	maxQueryLength             = 4096
 )
 
 var newPostgresQueryLogSink = func(ctx context.Context, cfg Config) (QueryLogSink, error) {
