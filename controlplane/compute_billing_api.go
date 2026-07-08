@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	gingzip "github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -34,7 +35,11 @@ type billingAPIHandler struct {
 // authenticates with the internal secret, which resolves to admin).
 func registerBillingAPI(r gin.IRouter, store billingUsageStore, requireAdmin gin.HandlerFunc) {
 	h := &billingAPIHandler{store: store, now: time.Now}
-	r.GET("/billing/usage", requireAdmin, h.getUsage)
+	// gzip on the usage read: rows scale with total adoption (one per
+	// storage-holding org per day, several per compute-active org) and the
+	// repetitive JSON compresses well. Negotiated per request — clients that
+	// don't send Accept-Encoding: gzip get plain JSON.
+	r.GET("/billing/usage", requireAdmin, gingzip.Gzip(gingzip.DefaultCompression), h.getUsage)
 	r.POST("/billing/ack", requireAdmin, h.postAck)
 }
 

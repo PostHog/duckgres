@@ -11,6 +11,7 @@ require (
 	github.com/cloudflare/tableflip v1.2.3
 	github.com/duckdb/duckdb-go-bindings v0.10503.0
 	github.com/duckdb/duckdb-go/v2 v2.10503.0
+	github.com/gin-contrib/gzip v1.2.6
 	github.com/gin-gonic/gin v1.12.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/lib/pq v1.10.9
