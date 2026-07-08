@@ -464,7 +464,9 @@ connection_duration_logged() { # org password
 # GUC set to endpoints) must surface as separate usage rows carrying the org's
 # provisioned default_team_id and a positive worker size, then an ack of the
 # served watermark_high must 200 and the next GET's watermark_low must equal it
-# (cursor advanced, acked buckets deleted). A bucket closes ~90s after the
+# (cursor advanced, acked buckets deleted). The storage family is asserted in
+# the same round-trip: the leader's sampler (60s here) must serve a storage row
+# with gib_seconds > 0 for the org, and the shared ack must advance past it. A bucket closes ~90s after the
 # connection ends (60s width + 30s grace) plus ≤15s flush, so the poll allows
 # ~4 minutes. This e2e stack has its own config store, so acking here cannot
 # eat production usage.
@@ -512,6 +514,35 @@ compute_usage_pull_api() { # org password
     -d "{\"watermark_high\":\"$future\"}" "$API/api/v1/billing/ack")"
   [ "$code" = "400" ] || fail "compute-usage: future ack -> HTTP $code want 400: $(cat /tmp/ack_future)"
   log "compute-usage OK: ack advanced cursor (deleted=$deleted), idempotent re-ack, future ack rejected"
+
+  # ---- storage metric (same pipeline, second family) ----
+  # The leader samples each Ready warehouse's tracked DuckLake footprint every
+  # 60s here (DUCKGRES_STORAGE_SAMPLE_INTERVAL in manifests.tmpl.yaml; 30m in
+  # prod) and credits bytes×interval byte-seconds. The org has real Parquet
+  # data by now (the lane's earlier writes), so a storage row with
+  # gib_seconds > 0 and the provisioned team id must appear once a sampled
+  # minute closes (sample 60s + close 90s → poll ~4min covers cold start).
+  a=0
+  while [ "$a" -lt 30 ]; do
+    body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
+    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_DEFAULT_TEAM_ID" '
+        .storage | map(select(.org_id==$o and .team_id==$t and .gib_seconds>0)) | length >= 1' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 10; a=$((a + 1))
+  done
+  [ "$a" -lt 30 ] || fail "storage-usage: no storage row for $org (team=$CNPG_DEFAULT_TEAM_ID, gib_seconds>0) in GET /billing/usage: $(echo "$body" | head -c 600)"
+  gib="$(echo "$body" | jq -r --arg o "$org" '[.storage[] | select(.org_id==$o)][0].gib_seconds')"
+  wh2="$(echo "$body" | jq -r '.watermark_high')"
+  log "storage-usage OK: $org gib_seconds=$gib served"
+
+  # The shared ack must clear storage buckets too: ack the served watermark,
+  # then the next GET's storage array must not contain rows ≤ it for this org
+  # (watermark_low advanced past them; new samples land in newer buckets).
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json'     -d "{\"watermark_high\":\"$wh2\"}" "$API/api/v1/billing/ack" >/dev/null     || fail "storage-usage: ack POST failed"
+  low3="$(curl -fsS -H "$H" "$API/api/v1/billing/usage" | jq -r '.watermark_low')"
+  [ "$low3" = "$wh2" ] || fail "storage-usage: after ack, watermark_low='$low3' want '$wh2'"
+  log "storage-usage OK: shared ack advanced the cursor past storage buckets"
 }
 
 # jsonb || must keep Postgres concatenation semantics through the full CP
@@ -2637,7 +2668,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

@@ -168,6 +168,69 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   (`standard` | `endpoints`, default `standard`) read by the meter; a bearer secret
   for the API.
 
+## Storage metric
+
+Third raw metric: **`managed_warehouse_storage_gib_seconds`** — bytes stored ×
+seconds, the integral of the warehouse's tracked S3 footprint. Billing divides
+externally (÷3600 = GiB-hours, ÷2,592,000 = GiB-months), exactly as it already
+sums `cpu_seconds` / `memory_seconds`.
+
+**Source of truth:** the org's DuckLake metadata Postgres — DuckLake records
+`file_size_bytes` for every Parquet file it writes, so the tracked footprint is
+one SQL query, zero S3 calls:
+
+```sql
+SELECT COALESCE((SELECT SUM(file_size_bytes) FROM ducklake_data_file), 0)
+     + COALESCE((SELECT SUM(file_size_bytes) FROM ducklake_delete_file), 0),
+       (SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion);
+```
+
+(No snapshot filter — time-travel-retained files stay billable until snapshot
+expiry, which is correct. `ducklake_table_info()` / `ducklake_table_stats` are
+NOT used: the former filters to the current snapshot, the latter is
+approximate.)
+
+**Sampling contract (level → flow):** a leader-only sampler visits every org
+with a Ready DuckLake warehouse every **30 minutes** (env-only override
+`DUCKGRES_STORAGE_SAMPLE_INTERVAL`, used by e2e). Each successful sample
+credits exactly `tracked_bytes × interval_seconds` byte-seconds into the
+sample-minute's bucket, keyed `(org_id, team_id, bucket_start)` — no
+query_source or worker size (compute dimensions). No elapsed-time tracking: a
+missed sample (org unreachable, leader failover) under-bills one interval and
+is deliberately best-effort, like compute. Values accumulate as NUMERIC
+byte-seconds; the API serves exact-decimal GiB-seconds (÷2³⁰ is a finite
+decimal).
+
+**API shape:** the same `GET /usage` response gains a `storage` array over the
+same watermark window; the same `ack` deletes both metric families ≤
+`watermark_high` atomically, and the 30-day safety GC covers both:
+
+```json
+{
+  "watermark_low":  "…",
+  "watermark_high": "…",
+  "usage":   [ { …compute rows as above… } ],
+  "storage": [
+    {
+      "date": "2026-07-08",
+      "org_id": "org_abc",
+      "team_id": 12345,
+      "gib_seconds": 18000000.5
+    }
+  ]
+}
+```
+
+**Known drift vs true bucket bytes** (tracked footprint ≠ `aws s3 ls`):
+orphans from crashed writes, incomplete multipart uploads (need a bucket
+lifecycle `AbortIncompleteMultipartUpload` rule — composition change), and
+files between `expire_snapshots` and `cleanup_old_files` whose size row is
+already gone. The sampler exports
+`duckgres_org_storage_pending_delete_files` as the drift gauge (alert on
+sustained nonzero) plus `duckgres_org_storage_tracked_bytes` for
+observability; a periodic S3-Inventory reconcile is an ops runbook item, not
+part of the meter.
+
 ## Defaults / house-keeping
 
 - Bucket width 60s, grace 30s.
@@ -176,5 +239,7 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 - Values exposed as vCPU-seconds / GiB-seconds; worker size as vCPU / GiB. All
   stored as exact decimals (`NUMERIC`), so fractional worker sizes keep full
   precision with no float-equality issues.
-- Single billing consumer assumed → one server-side `last_acked` cursor. (If a
-  second independent consumer is ever needed, give each its own named cursor.)
+- Single billing consumer assumed → one server-side `last_acked` cursor shared
+  by both metric families. (If a second independent consumer is ever needed,
+  give each its own named cursor.)
+- Storage sampling every 30 minutes; each sample credits exactly one interval.

@@ -18,17 +18,20 @@ import (
 
 // fakeBillingStore implements billingUsageStore + computeGCStore in memory.
 type fakeBillingStore struct {
-	mu       sync.Mutex
-	cursor   time.Time
-	hasAck   bool
-	rows     []configstore.ComputeUsageRow
-	aggLow   time.Time
-	aggHigh  time.Time
-	ackedTo  time.Time
-	deleted  int64
-	gcCutoff time.Time
-	gcDrop   int64
-	failWith error
+	mu          sync.Mutex
+	cursor      time.Time
+	hasAck      bool
+	rows        []configstore.ComputeUsageRow
+	storageRows []configstore.StorageUsageRow
+	aggLow      time.Time
+	aggHigh     time.Time
+	stAggLow    time.Time
+	stAggHigh   time.Time
+	ackedTo     time.Time
+	deleted     int64
+	gcCutoff    time.Time
+	gcDrop      int64
+	failWith    error
 }
 
 func (f *fakeBillingStore) AggregateComputeUsage(low, high time.Time) ([]configstore.ComputeUsageRow, error) {
@@ -39,6 +42,16 @@ func (f *fakeBillingStore) AggregateComputeUsage(low, high time.Time) ([]configs
 	}
 	f.aggLow, f.aggHigh = low, high
 	return f.rows, nil
+}
+
+func (f *fakeBillingStore) AggregateStorageUsage(low, high time.Time) ([]configstore.StorageUsageRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	f.stAggLow, f.stAggHigh = low, high
+	return f.storageRows, nil
 }
 
 func (f *fakeBillingStore) ComputeBillingCursor() (time.Time, bool, error) {
@@ -116,6 +129,7 @@ type usageResponse struct {
 	WatermarkLow  time.Time                     `json:"watermark_low"`
 	WatermarkHigh time.Time                     `json:"watermark_high"`
 	Usage         []configstore.ComputeUsageRow `json:"usage"`
+	Storage       []configstore.StorageUsageRow `json:"storage"`
 }
 
 func TestBillingUsageWindowAndRows(t *testing.T) {
@@ -126,6 +140,9 @@ func TestBillingUsageWindowAndRows(t *testing.T) {
 		rows: []configstore.ComputeUsageRow{{
 			Date: "2026-07-01", OrgID: "org_abc", TeamID: 12345, QuerySource: "standard",
 			CPU: "8", MemGiB: "16", CPUSeconds: 4800, MemorySeconds: 9600,
+		}},
+		storageRows: []configstore.StorageUsageRow{{
+			Date: "2026-07-01", OrgID: "org_abc", TeamID: 12345, GiBSeconds: "18000000.5",
 		}},
 	}
 	router := newBillingTestRouter(store, now)
@@ -158,6 +175,17 @@ func TestBillingUsageWindowAndRows(t *testing.T) {
 	// The exact-decimal sizes must serialize as unquoted JSON numbers.
 	if !bytes.Contains(rec.Body.Bytes(), []byte(`"cpu":8`)) || !bytes.Contains(rec.Body.Bytes(), []byte(`"mem_gib":16`)) {
 		t.Fatalf("cpu/mem_gib not serialized as JSON numbers: %s", rec.Body.String())
+	}
+	// Storage rides the same window: same aggregate bounds, rows served, and
+	// gib_seconds as an unquoted JSON number.
+	if !store.stAggLow.Equal(cursor) || !store.stAggHigh.Equal(wantHigh) {
+		t.Fatalf("storage aggregate window = (%v, %v], want (%v, %v]", store.stAggLow, store.stAggHigh, cursor, wantHigh)
+	}
+	if len(resp.Storage) != 1 || resp.Storage[0].OrgID != "org_abc" || resp.Storage[0].TeamID != 12345 {
+		t.Fatalf("storage = %+v", resp.Storage)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"gib_seconds":18000000.5`)) {
+		t.Fatalf("gib_seconds not serialized as a JSON number: %s", rec.Body.String())
 	}
 }
 
@@ -198,11 +226,11 @@ func TestBillingUsageEmptyWindowWhenCursorCurrent(t *testing.T) {
 	if !resp.WatermarkHigh.Equal(resp.WatermarkLow) || !resp.WatermarkLow.Equal(cursor) {
 		t.Fatalf("want empty window at cursor, got (%v, %v]", resp.WatermarkLow, resp.WatermarkHigh)
 	}
-	if len(resp.Usage) != 0 {
-		t.Fatalf("usage = %+v, want empty", resp.Usage)
+	if len(resp.Usage) != 0 || len(resp.Storage) != 0 {
+		t.Fatalf("usage/storage = %+v / %+v, want empty", resp.Usage, resp.Storage)
 	}
-	if !store.aggLow.IsZero() || !store.aggHigh.IsZero() {
-		t.Fatal("aggregate must not run for an empty window")
+	if !store.aggLow.IsZero() || !store.aggHigh.IsZero() || !store.stAggLow.IsZero() {
+		t.Fatal("aggregates must not run for an empty window")
 	}
 }
 

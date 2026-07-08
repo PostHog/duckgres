@@ -447,11 +447,13 @@ side of that doc still applies). Scope is **only** the remote/k8s backend
 (per-org worker pod with a known `WorkerProfile` size). Pipeline:
 
 ```
-conn end → in-proc counter keyed (org, default team, query_source, worker size)
-        │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
-        ▼  duckgres_org_compute_usage (+ duckgres_compute_billing_cursor)
-billing: GET /api/v1/billing/usage (aggregated per key per UTC day, watermarks)
-       → POST /api/v1/billing/ack {watermark_high} → cursor advance + delete ≤ it
+compute: conn end → in-proc counter keyed (org, default team, query_source, worker size)
+              │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
+              ▼  duckgres_org_compute_usage (+ duckgres_compute_billing_cursor)
+storage: leader sampler (~30m) → org's DuckLake metadata Postgres
+              SUM(data+delete file sizes) × interval → duckgres_org_storage_usage
+billing: GET /api/v1/billing/usage (usage + storage arrays, per key per UTC day, watermarks)
+       → POST /api/v1/billing/ack {watermark_high} → cursor advance + delete ≤ it (BOTH tables)
 safety:  leader-only GC hard-deletes buckets older than 30 days (WARN, alertable)
 ```
 
@@ -502,11 +504,29 @@ touching this path:
 - **Graceful shutdown does a final flush** after connections drain to their
   natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
   last interval before exit.
-- Touching the meter/flush/API/GC, the worker-size or query-source plumbing, or
-  the bucket key → update `controlplane/compute_meter_test.go`,
-  `compute_billing_api_test.go`, `compute_size_test.go`, the migration assertion
-  in `tests/configstore/migrations_postgres_test.go`, and the
-  `compute_usage_pull_api` assertion in `tests/e2e-mw-dev/harness.sh`.
+- **Storage metric** (`managed_warehouse_storage_gib_seconds`,
+  `storage_meter.go`): a LEADER-ONLY sampler (double writers would
+  double-bill — the UPSERT is additive) visits each Ready warehouse's DuckLake
+  metadata Postgres every 30m (env-only `DUCKGRES_STORAGE_SAMPLE_INTERVAL`;
+  e2e uses 60s) and credits exactly `tracked_bytes × interval` byte-seconds —
+  no elapsed-time tracking, a missed sample under-bills one interval. The SUM
+  is over `ducklake_data_file` + `ducklake_delete_file` with NO snapshot
+  filter (never `ducklake_table_info()`/`ducklake_table_stats` — current-
+  snapshot-only / approximate). byte-seconds are NUMERIC (BIGINT overflows);
+  served as exact-decimal GiB-seconds (÷2³⁰ terminates;
+  `byteSecondsToGiBSeconds` big-int math). Connection resolution reuses the
+  cross-org activator (`MetadataPostgresURL`: duckling pgbouncer → sslmode
+  disable, direct RDS → require). Drift gauges:
+  `duckgres_org_storage_pending_delete_files` (alert on sustained nonzero) +
+  `duckgres_org_storage_tracked_bytes`.
+- Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
+  the storage sampler, or the bucket keys → update
+  `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,
+  `compute_size_test.go`, `storage_meter_test.go`,
+  `configstore/storage_usage_test.go`, the migration assertion in
+  `tests/configstore/migrations_postgres_test.go`, and the
+  `compute_usage_pull_api` assertion (compute + storage) in
+  `tests/e2e-mw-dev/harness.sh`.
 
 ## TODO Reference
 
