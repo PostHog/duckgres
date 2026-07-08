@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -673,4 +674,72 @@ func orgName(org *configstore.OrgConfig) string {
 		return ""
 	}
 	return org.Name
+}
+
+// MetadataPostgresURL resolves a standard postgres:// URL for an org's
+// DuckLake metadata Postgres, for CP-side read-only queries (the storage
+// sampler — see storage_meter.go). Mirrors the resolution the worker
+// activation uses: prefer the Duckling CR (pgbouncer endpoint when present,
+// else the direct metadata endpoint), fall back to the config-store warehouse
+// shape. sslmode follows provisioner.ProbeMetadataStore's rules: "disable"
+// through the duckling's pgbouncer (plaintext worker↔pooler; the pooler
+// carries TLS to RDS), "require" against a direct RDS endpoint, "prefer" for
+// config-store warehouses (matches the DuckDB ATTACH default there).
+// Returns an error when the org has no DuckLake-enabled warehouse.
+func (a *SharedWorkerActivator) MetadataPostgresURL(ctx context.Context, orgID string) (string, error) {
+	if a.resolveDucklingStatus != nil {
+		status, err := a.resolveDucklingStatus(ctx, orgID)
+		if err == nil {
+			ducklakeEnabled := status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
+			if status.DuckLakeEnabled != nil {
+				ducklakeEnabled = *status.DuckLakeEnabled
+			}
+			if !ducklakeEnabled {
+				return "", fmt.Errorf("org %q has DuckLake disabled", orgID)
+			}
+			if status.MetadataStore.Password == "" {
+				return "", fmt.Errorf("duckling CR %q has no metadata store password", orgID)
+			}
+			host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
+			if err != nil {
+				return "", err
+			}
+			sslMode := "require"
+			if viaPgBouncer {
+				sslMode = "disable"
+			}
+			return metadataPostgresURL(host, port, status.MetadataStore.User, status.MetadataStore.Password, status.MetadataStore.Database, sslMode), nil
+		}
+		slog.Debug("Duckling CR metadata resolution failed, falling back to config store.", "org", orgID, "error", err)
+	}
+
+	org, err := a.lookupOrgConfig(orgID)
+	if err != nil {
+		return "", err
+	}
+	if org.Warehouse == nil {
+		return "", fmt.Errorf("org %q has no managed warehouse", orgID)
+	}
+	password, err := a.readSecretValue(ctx, org.Warehouse.MetadataStoreCredentials)
+	if err != nil {
+		return "", fmt.Errorf("metadata store credentials for org %q: %w", orgID, err)
+	}
+	ms := org.Warehouse.MetadataStore
+	return metadataPostgresURL(ms.Endpoint, ms.Port, ms.Username, password, ms.DatabaseName, "prefer"), nil
+}
+
+// metadataPostgresURL builds a postgres:// URL for database/sql ("pgx") from
+// the same fields the DuckDB ATTACH DSN uses. url.URL handles credential
+// escaping.
+func metadataPostgresURL(host string, port int, username, password, database, sslMode string) string {
+	if port == 0 {
+		port = 5432
+	}
+	return (&url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(username, password),
+		Host:     net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:     "/" + database,
+		RawQuery: "sslmode=" + sslMode + "&connect_timeout=5",
+	}).String()
 }

@@ -249,6 +249,7 @@ Run with config file:
 | `DUCKGRES_QUERY_LOG_ENABLED` | Enable per-query logging | `true` |
 | `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval for native Postgres writes | `5s` |
 | `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size for native Postgres inserts | `1000` |
+| `DUCKGRES_STORAGE_SAMPLE_INTERVAL` | Storage-billing sampling cadence (Go duration): how often the leader CP reads each warehouse's tracked DuckLake footprint and credits byte-seconds. Env-only. | `30m` |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |

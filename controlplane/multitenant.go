@@ -597,6 +597,34 @@ func SetupMultiTenant(
 	}
 	slog.Info("Managed-warehouse compute-usage metering enabled (pull API).")
 
+	// Storage-billing sampler (leader-only, so exactly one CP credits each
+	// interval): every ~30min it reads each Ready warehouse's tracked DuckLake
+	// footprint straight from the org's metadata Postgres (via the same
+	// cross-org resolution the credential refresher uses) and credits
+	// bytes × interval into the storage buffer; billing pulls it alongside
+	// compute. Best-effort — a failed sample under-bills one interval, never
+	// affects anything user-facing.
+	storageSamplerLoop := newStorageSampler(store, storageSampleIntervalFromEnv(),
+		func() []storageOrg {
+			snap := store.Snapshot()
+			if snap == nil {
+				return nil
+			}
+			var orgs []storageOrg
+			for _, org := range snap.Orgs {
+				if org.Warehouse != nil && org.Warehouse.State == configstore.ManagedWarehouseStateReady {
+					orgs = append(orgs, storageOrg{OrgID: org.Name, TeamID: org.DefaultTeamID})
+				}
+			}
+			return orgs
+		},
+		refreshActivator.MetadataPostgresURL,
+	)
+	if janitorLeader != nil {
+		janitorLeader.AttachLeaderLoop(storageSamplerLoop.Run)
+	}
+	slog.Info("Managed-warehouse storage-usage sampling enabled.", "interval", storageSamplerLoop.interval.String())
+
 	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
 }
 
