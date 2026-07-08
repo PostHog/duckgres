@@ -187,7 +187,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		log.Info("Duckling CR already exists, transitioning to provisioning.")
 		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 			"state":                   configstore.ManagedWarehouseStateProvisioning,
-			"status_message":          "Duckling CR exists, polling status",
+			"status_message":          "Provisioning in progress...",
 			"provisioning_started_at": now,
 		}); err != nil {
 			log.Warn("Failed to update state to provisioning.", "error", err)
@@ -221,7 +221,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 
 	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 		"state":                   configstore.ManagedWarehouseStateProvisioning,
-		"status_message":          "Duckling CR created, waiting for resources",
+		"status_message":          "Provisioning in progress...",
 		"provisioning_started_at": now,
 	}); err != nil {
 		log.Warn("Failed to update state to provisioning.", "error", err)
@@ -336,7 +336,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		); err != nil {
 			log.Info("Infrastructure provisioned but end-to-end probe still failing — staying in provisioning.",
 				"pgbouncer_enabled", w.PgBouncer.Enabled, "error", err)
-			updates["status_message"] = fmt.Sprintf("Waiting for metadata store reachability: %v", err)
+			updates["status_message"] = "Provisioning in progress..."
 		} else {
 			now := time.Now().UTC()
 			updates["state"] = configstore.ManagedWarehouseStateReady

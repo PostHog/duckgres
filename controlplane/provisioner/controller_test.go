@@ -660,8 +660,8 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 	if w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("expected metadata_store_state ready, got %q", w.MetadataStoreState)
 	}
-	if w.StatusMessage == "" || !strings.Contains(w.StatusMessage, "reachability") {
-		t.Fatalf("expected status_message to mention reachability, got %q", w.StatusMessage)
+	if w.StatusMessage != "Provisioning in progress..." {
+		t.Fatalf("expected status_message to stay %q, got %q", "Provisioning in progress...", w.StatusMessage)
 	}
 	if w.ReadyAt != nil {
 		t.Fatalf("expected ready_at to remain unset, got %v", w.ReadyAt)
