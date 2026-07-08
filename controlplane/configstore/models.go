@@ -112,6 +112,14 @@ const (
 	ManagedWarehouseStateFailed       ManagedWarehouseProvisioningState = "failed"
 	ManagedWarehouseStateDeleting     ManagedWarehouseProvisioningState = "deleting"
 	ManagedWarehouseStateDeleted      ManagedWarehouseProvisioningState = "deleted"
+	// Resharding: an operator-driven metadata-store migration is in flight
+	// (configstore/reshard.go + the provisioner reshard runner). New
+	// connections are refused with 57P03 and — load-bearing — the
+	// connection-lease GRANT path refuses grants for resharding orgs; the
+	// connect-time gate alone is unsound because a lease can be granted up to
+	// a queue-timeout after the gate ran. The org's stack stays up so
+	// in-flight sessions drain naturally.
+	ManagedWarehouseStateResharding ManagedWarehouseProvisioningState = "resharding"
 )
 
 // SecretRef identifies a secret key without storing secret material in the config store.

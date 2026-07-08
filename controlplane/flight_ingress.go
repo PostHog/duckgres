@@ -94,6 +94,11 @@ func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username s
 		return 0, nil, fmt.Errorf("could not resolve organization for flight session")
 	}
 
+	if p.orgResharding(orgID) {
+		slog.Info("Flight SQL session rejected during metadata-store reshard.", "org", orgID)
+		return 0, nil, fmt.Errorf("metadata-store reshard in progress for your organization, please retry shortly")
+	}
+
 	_, sessions, _, ok := p.orgRouter.StackForOrg(orgID)
 	if !ok {
 		slog.Warn("Flight SQL session: no org stack for org.", "username", username, "org", orgID)
@@ -112,6 +117,17 @@ func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username s
 	p.mu.Unlock()
 
 	return workerPID, executor, nil
+}
+
+// orgResharding reports whether the org's warehouse is mid-reshard (from the
+// polled config snapshot). Create/reconnect are refused then — the org's live
+// sessions drain and new work waits for the cutover.
+func (p *orgRoutedSessionProvider) orgResharding(orgID string) bool {
+	if p.configStore == nil {
+		return false
+	}
+	state, ok := p.configStore.OrgWarehouseStatus(orgID)
+	return ok && state == string(configstore.ManagedWarehouseStateResharding)
 }
 
 func (p *orgRoutedSessionProvider) DestroySession(pid int32) {
@@ -155,6 +171,13 @@ func (p *orgRoutedSessionProvider) DurableSessionMetadata(pid int32, username st
 }
 
 func (p *orgRoutedSessionProvider) ReconnectSession(ctx context.Context, record flightsqlingress.DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
+	if p.orgResharding(record.OrgID) {
+		// Terminal, not retry-later: the reshard runner drains parked flight
+		// sessions; letting a reconnect re-acquire a worker mid-reshard would
+		// re-pin the source catalog.
+		return 0, nil, flightsqlingress.MarkDurableReconnectTerminal(
+			fmt.Errorf("metadata-store reshard in progress for your organization, please retry shortly"))
+	}
 	_, sessions, _, ok := p.orgRouter.StackForOrg(record.OrgID)
 	if !ok {
 		return 0, nil, fmt.Errorf("no org stack for org %q", record.OrgID)

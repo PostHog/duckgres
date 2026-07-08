@@ -2166,6 +2166,172 @@ duckling_shard_backfill() { # cnpgOrg
   fail "duckling shard backfill: XRD supports the field (probe stuck: $probe) but the CP never backfilled it (spec=$spec assigned=$assigned)"
 }
 
+# ---- reshard operations (metadata-store migrations) -------------------------
+# Backed by controlplane/admin/reshard.go + provisioner/reshard_runner.go +
+# configstore/reshard.go. mw-dev has ONE cnpg shard, so the shard→shard
+# positive path can't run here; these exercise what matters against the real
+# cluster instead:
+#   * validation 400s (same shard, bad targets)
+#   * cancel during drain (a held session keeps the drain waiting; new
+#     connections are 57P03-blocked; cancel rolls back; org healthy)
+#   * bogus-shard rollback (flip → Synced=False → flip-timeout → rollback;
+#     data intact, spec.cnpgShard patched back — needs the short
+#     DUCKGRES_RESHARD_FLIP_TIMEOUT set in manifests.tmpl.yaml)
+#   * ext→cnpg POSITIVE path (real catalog copy off the harness RDS onto
+#     shard-001, data intact after, report in the log)
+# cnpg→ext stays unit-test-only: the harness knows the RDS SM secret NAME but
+# not the password, and the start API requires the password (ephemerally).
+
+reshard_post() { # org body
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
+    "$API/api/v1/orgs/$1/reshard"
+}
+
+reshard_wait_terminal() { # opid timeout_s -> echoes final state
+  deadline=$(( $(date +%s) + ${2:-600} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    st="$(curl -fsS -H "$H" "$API/api/v1/reshards/$1" | jq -r .state)"
+    case "$st" in succeeded|failed|cancelled) echo "$st"; return 0;; esac
+    sleep 5
+  done
+  echo "timeout"
+}
+
+reshard_wait_step() { # opid step timeout_s
+  cur=""
+  deadline=$(( $(date +%s) + ${3:-120} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    cur="$(curl -fsS -H "$H" "$API/api/v1/reshards/$1" | jq -r .step)"
+    [ "$cur" = "$2" ] && return 0
+    sleep 2
+  done
+  fail "reshard op $1 never reached step $2 (last=$cur)"
+}
+
+reshard_log_has() { # opid substr
+  curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=0&limit=2000" \
+    | jq -r '.entries[].message' | grep -qF "$2"
+}
+
+reshard_dump_log() { # opid
+  curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=0&limit=2000" \
+    | jq -r '.entries[] | "\(.level): \(.message)"' | tail -30 || true
+}
+
+reshard_validation() { # cnpg-org currently on shard-001
+  log "reshard validation: same-shard + bad targets are 400"
+  for body in \
+    '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"}}' \
+    '{"target":{"type":"cnpg-shard","cnpg_shard":"Bad_Shard"}}' \
+    '{"target":{"type":"nonsense"}}' \
+    '{"target":{"type":"external","endpoint":"x"}}'; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+      -d "$body" "$API/api/v1/orgs/$1/reshard")"
+    [ "$code" = "400" ] || fail "reshard validation: body $body -> $code, want 400"
+  done
+  log "reshard validation OK"
+}
+
+reshard_cancel_during_drain() { # org password
+  org="$1"; pw="$2"
+  log "reshard cancel: hold a session, start a reshard, assert drain-wait + connection block, cancel, assert healthy"
+  # Hold a session: the sleep keeps an active connection lease the drain must
+  # wait for (drain-not-kill: the runner never terminates it).
+  ( PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -tAc "SELECT pg_sleep(240)" >/dev/null 2>&1 ) &
+  holder=$!
+  sleep 5
+
+  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-009"},"drain_timeout_seconds":600}')" \
+    || fail "reshard cancel: start failed: $out"
+  opid="$(echo "$out" | jq -r .id)"
+  [ -n "$opid" ] && [ "$opid" != "null" ] || fail "reshard cancel: no op id: $out"
+
+  reshard_wait_step "$opid" draining 120
+  deadline=$(( $(date +%s) + 90 ))
+  until reshard_log_has "$opid" "waiting for connections to drain"; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "reshard cancel: no drain-wait log line"
+    sleep 3
+  done
+
+  # New connections are refused while resharding.
+  if out2="$(pg_try "$org" "$pw" ducklake "SELECT 1")"; then
+    fail "reshard cancel: new connection succeeded during reshard drain (got '$out2')"
+  fi
+  echo "$out2" | grep -qi "reshard" \
+    || log "WARN: blocked-connection error did not mention reshard: $out2"
+
+  curl -fsS -X POST -H "$H" "$API/api/v1/reshards/$opid/cancel" >/dev/null \
+    || fail "reshard cancel: cancel POST failed"
+  st="$(reshard_wait_terminal "$opid" 180)"
+  [ "$st" = "cancelled" ] || { reshard_dump_log "$opid"; fail "reshard cancel: final state $st, want cancelled"; }
+  reshard_log_has "$opid" "reshard report (cancelled)" || fail "reshard cancel: report missing"
+
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ "$(state_of "$org")" = "ready" ] || fail "reshard cancel: warehouse state $(state_of "$org"), want ready"
+  pg "$org" "$pw" ducklake "SELECT 1" >/dev/null
+  log "reshard cancel OK (op $opid)"
+}
+
+reshard_bogus_shard_rollback() { # org password
+  org="$1"; pw="$2"; d="$(echo "$org" | tr 'A-Z' 'a-z')"
+  log "reshard rollback: bogus target shard → flip-timeout → rollback, data intact"
+  pg "$org" "$pw" ducklake "DROP TABLE IF EXISTS reshard_marker; CREATE TABLE reshard_marker AS SELECT 42 AS v;"
+
+  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-099"},"drain_timeout_seconds":300}')" \
+    || fail "reshard rollback: start failed: $out"
+  opid="$(echo "$out" | jq -r .id)"
+
+  # Budget: drain + snapshot-propagation waits + DUCKGRES_RESHARD_FLIP_TIMEOUT
+  # (90s, manifests) + rollback convergence.
+  st="$(reshard_wait_terminal "$opid" 600)"
+  [ "$st" = "failed" ] || { reshard_dump_log "$opid"; fail "reshard rollback: final state $st, want failed"; }
+  reshard_log_has "$opid" "rolling back" || fail "reshard rollback: no rollback log"
+  reshard_log_has "$opid" "reshard report (failed)" || fail "reshard rollback: report missing"
+
+  # The duckling spec must be back on the real shard (the rollback patches the
+  # VALUE back — it never removes the key).
+  spec="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.cnpgShard}')"
+  [ "$spec" = "shard-001" ] || fail "reshard rollback: spec.cnpgShard=$spec, want shard-001"
+  [ "$(state_of "$org")" = "ready" ] || fail "reshard rollback: warehouse $(state_of "$org"), want ready"
+
+  got="$(pg "$org" "$pw" ducklake "SELECT v FROM reshard_marker")"
+  echo "$got" | grep -q 42 || fail "reshard rollback: marker data lost (got '$got')"
+  pg "$org" "$pw" ducklake "DROP TABLE reshard_marker;"
+  log "reshard rollback OK (op $opid)"
+}
+
+reshard_ext_to_cnpg() { # ext-org password
+  org="$1"; pw="$2"; d="$(echo "$org" | tr 'A-Z' 'a-z')"
+  log "reshard ext→cnpg POSITIVE path: move $org off the RDS onto shard-001 with data intact"
+  pg "$org" "$pw" ducklake "DROP TABLE IF EXISTS reshard_move; CREATE TABLE reshard_move AS SELECT range AS v FROM range(100);"
+
+  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"},"drain_timeout_seconds":300}')" \
+    || fail "reshard ext→cnpg: start failed: $out"
+  opid="$(echo "$out" | jq -r .id)"
+
+  # Budget: drain (org quiet) + provider-sql role/db create on the shard (the
+  # cnpg SASL propagation tail can add minutes — see READY_TIMEOUT) + copy +
+  # verify.
+  st="$(reshard_wait_terminal "$opid" 900)"
+  [ "$st" = "succeeded" ] || { reshard_dump_log "$opid"; fail "reshard ext→cnpg: final state $st, want succeeded"; }
+  reshard_log_has "$opid" "reshard report (succeeded)" || fail "reshard ext→cnpg: report missing"
+  reshard_log_has "$opid" "maintenance mode (connections blocked)" || fail "reshard ext→cnpg: maintenance duration missing from report"
+  reshard_log_has "$opid" "external source left untouched" || fail "reshard ext→cnpg: missing ext-source-untouched line"
+
+  # The duckling is now a cnpg-shard tenant…
+  typ="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.type}')"
+  [ "$typ" = "cnpg-shard" ] || fail "reshard ext→cnpg: duckling type $typ, want cnpg-shard"
+  # …and the data reads back from the moved catalog (cold worker spawn against
+  # the new store happens implicitly on this connect).
+  got="$(pg "$org" "$pw" ducklake "SELECT COUNT(*) || ':' || SUM(v) FROM reshard_move")"
+  echo "$got" | grep -q "100:4950" || fail "reshard ext→cnpg: data mismatch after move (got '$got')"
+  pg "$org" "$pw" ducklake "DROP TABLE reshard_move;"
+  log "reshard ext→cnpg OK (op $opid): catalog moved, data intact"
+}
+
 # ---- tenant isolation -----------------------------------------------------
 # Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
@@ -2628,6 +2794,14 @@ main() {
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
 
+  # ---- reshard operations (validation, cancel, rollback on res2; then the
+  #      ext→cnpg POSITIVE path on the ext org — must run AFTER every assert
+  #      that needs the ext org on the RDS, notably tenant_isolation) ----
+  reshard_validation "$CNPG"
+  reshard_cancel_during_drain "$RES2" "$res2_pw"
+  reshard_bogus_shard_rollback "$RES2" "$res2_pw"
+  reshard_ext_to_cnpg "$EXT" "$ext_pw"
+
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
   # (res1/res2/ext are deprovisioned by run.sh teardown; the cascade assertion
   # only needs one cnpg-shard org.)
@@ -2637,7 +2811,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg) + duckling-shard-backfill(cnpg) + isolation + reshard(validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

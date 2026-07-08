@@ -18,6 +18,11 @@ const VARIANT: Record<string, BadgeProps["variant"]> = {
   deleted: "muted",
   lost: "destructive",
   failed: "destructive",
+  // reshard operations
+  running: "warning",
+  resharding: "warning",
+  succeeded: "success",
+  cancelled: "muted",
 };
 
 export function StateBadge({ state }: { state: string | undefined }) {

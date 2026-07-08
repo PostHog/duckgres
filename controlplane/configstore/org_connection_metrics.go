@@ -18,6 +18,7 @@ const (
 	orgConnectionAdmissionOutcomeRetry           = "retry"
 	orgConnectionAdmissionOutcomeWaiting         = "waiting"
 	orgConnectionAdmissionOutcomeError           = "error"
+	orgConnectionAdmissionOutcomeResharding      = "blocked_resharding"
 )
 
 var orgConnectionAdmissionDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{

@@ -30,8 +30,11 @@ import type {
   PromRangeResponse,
   QueryDetail,
   QueryResult,
+  ReshardLogEntry,
+  ReshardOperation,
   RunningQuery,
   SessionStatus,
+  StartReshardBody,
   UpdateUserBody,
   UserKillResult,
   WorkerStatus,
@@ -218,4 +221,20 @@ export const api = {
   // audit
   audit: (params?: { actor?: string; org?: string; limit?: number }) =>
     get<{ entries: AuditEntry[] }>("/audit", params).then((r) => r.entries ?? []),
+
+  // reshard operations (metadata-store migrations; POSTs are admin-only)
+  startReshard: (org: string, body: StartReshardBody) =>
+    post<ReshardOperation>(`/orgs/${enc(org)}/reshard`, body),
+  listReshards: (org: string) =>
+    get<{ operations: ReshardOperation[] }>(`/orgs/${enc(org)}/reshards`).then(
+      (r) => r.operations ?? [],
+    ),
+  getReshard: (opId: number) => get<ReshardOperation>(`/reshards/${opId}`),
+  // Incremental log poll: pass the last seen entry id.
+  getReshardLog: (opId: number, afterId: number) =>
+    get<{ entries: ReshardLogEntry[] }>(`/reshards/${opId}/log`, { after_id: afterId }).then(
+      (r) => r.entries ?? [],
+    ),
+  cancelReshard: (opId: number) =>
+    post<{ cancel_requested?: boolean; state?: string }>(`/reshards/${opId}/cancel`, {}),
 };

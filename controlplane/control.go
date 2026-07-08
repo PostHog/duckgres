@@ -1118,6 +1118,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 
+		// Reject connections while the org's metadata store is being resharded.
+		// The org stack stays up so in-flight sessions drain naturally; this
+		// gate stops NEW connections. (UX only — the sound cluster-wide barrier
+		// is the lease-grant check in configstore/org_connections.go, which
+		// serializes against the ready→resharding CAS under the org's
+		// connection advisory lock.)
+		if whState, ok := cp.configStore.OrgWarehouseStatus(orgID); ok &&
+			whState == string(configstore.ManagedWarehouseStateResharding) {
+			clog.Info("Connection rejected during metadata-store reshard.")
+			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+				"metadata-store reshard in progress for your organization, please retry shortly")
+			_ = writer.Flush()
+			return
+		}
+
 		_, sess, rebal, ok := cp.orgRouter.StackForOrg(orgID)
 		if !ok {
 			// Distinguish "no such org" from "warehouse still provisioning". The
@@ -1140,6 +1155,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				whState == string(configstore.ManagedWarehouseStateDeleted):
 				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 					"warehouse is being deleted")
+			case whState == string(configstore.ManagedWarehouseStateResharding):
+				// CP restarted mid-reshard: no stack was rebuilt for the
+				// non-ready warehouse, but the client-facing message should
+				// still say reshard, not "provisioning".
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"metadata-store reshard in progress for your organization, please retry shortly")
 			default:
 				// pending / provisioning
 				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
@@ -2084,6 +2105,20 @@ func (cp *ControlPlane) startFlightIngress() {
 		// over Flight it would execute, never persist, and be wiped at the
 		// next session — reject it up front instead.
 		RejectPersistentSecretDDL: cp.srv != nil && cp.srv.UserSecretManager() != nil,
+	}
+	// Reshard drain: parked reconnectable Flight sessions hold their
+	// connection lease for up to the token TTL and would stall a reshard's
+	// drain step forever. Mark sessions of resharding orgs drain-requested so
+	// the periodic reap destroys them once truly parked (no txn/stream/query
+	// — in-flight work still finishes). Each CP handles only its own parked
+	// sessions; the resharding state arrives via the config snapshot.
+	if orgProvider, ok := provider.(*orgRoutedSessionProvider); ok {
+		flightCfg.ForceDrainSession = func(pid int32) bool {
+			orgProvider.mu.RLock()
+			owned, ok := orgProvider.pidSession[pid]
+			orgProvider.mu.RUnlock()
+			return ok && orgProvider.orgResharding(owned.orgID)
+		}
 	}
 
 	var (

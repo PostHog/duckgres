@@ -466,3 +466,62 @@ export interface AuditEntry {
   status: number;
   remote_addr?: string;
 }
+
+// ---- Reshard operations (metadata-store migrations) ----
+
+// Backed by configstore.ReshardOperation. The external target password is
+// never persisted or returned — only the AWS SM secret NAME appears here.
+export interface ReshardOperation {
+  id: number;
+  org_id: string;
+  duckling_name: string;
+  source_kind: "cnpg-shard" | "external";
+  from_shard: string;
+  source_endpoint: string;
+  source_user: string;
+  source_database: string;
+  target_kind: "cnpg-shard" | "external";
+  to_shard: string;
+  target_endpoint: string;
+  target_password_secret: string;
+  target_user: string;
+  target_database: string;
+  state: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+  step: string;
+  error: string;
+  cancel_requested: boolean;
+  drain_timeout_seconds: number;
+  runner_cp: string;
+  blocked_at: string | null;
+  unblocked_at: string | null;
+  tables_copied: number;
+  rows_copied: number;
+  bytes_copied: number;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+// One verbose operator-facing log line; polled incrementally by id.
+export interface ReshardLogEntry {
+  id: number;
+  operation_id: number;
+  ts: string;
+  level: string;
+  message: string;
+}
+
+// POST /api/v1/orgs/:id/reshard body. For external targets the password is
+// sent ONCE for the copy and never stored anywhere.
+export interface StartReshardBody {
+  target: {
+    type: "cnpg-shard" | "external";
+    cnpg_shard?: string;
+    endpoint?: string;
+    user?: string;
+    database?: string;
+    password_aws_secret?: string;
+    password?: string;
+  };
+  drain_timeout_seconds?: number;
+}

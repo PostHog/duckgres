@@ -35,8 +35,20 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 15)
 	requireGooseMigrationRecorded(t, db, 16)
 	requireGooseMigrationRecorded(t, db, 17)
-	requireGooseLatestVersion(t, db, 17)
+	requireGooseMigrationRecorded(t, db, 18)
+	requireGooseLatestVersion(t, db, 18)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
+
+	// Migration 000018 added the reshard operation + verbose log tables.
+	requireTablePresent(t, db, "duckgres_reshard_operations")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "source_kind")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "to_shard")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "runner_epoch")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "cancel_requested")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "blocked_at")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "compaction_was_present")
+	requireTablePresent(t, db, "duckgres_reshard_operation_log")
+	requireColumnPresent(t, db, "duckgres_reshard_operation_log", "operation_id")
 
 	// Migration 000016 added the worker spawn log that feeds dynamic headroom
 	// slot count/size.
@@ -166,7 +178,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 15)
 	requireGooseMigrationRecorded(t, upgradedDB, 16)
 	requireGooseMigrationRecorded(t, upgradedDB, 17)
-	requireGooseLatestVersion(t, upgradedDB, 17)
+	requireGooseLatestVersion(t, upgradedDB, 18)
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")

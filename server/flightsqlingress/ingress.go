@@ -73,6 +73,16 @@ type Config struct {
 	// — rejecting up front is the honest behavior until Flight gets its own
 	// interception.
 	RejectPersistentSecretDDL bool
+
+	// ForceDrainSession, when non-nil, marks a session as drain-requested by
+	// its worker pid: the periodic reap then destroys it regardless of the
+	// idle TTL — but ONLY when it is truly parked (no open transaction, no
+	// active stream, no running query), so in-flight work always finishes.
+	// The control plane wires this to "the session's org is resharding":
+	// parked reconnectable Flight sessions otherwise hold their connection
+	// lease for up to the session token TTL (1h) and would deterministically
+	// stall a reshard drain.
+	ForceDrainSession func(pid int32) bool
 }
 
 type SessionProvider interface {
@@ -229,6 +239,7 @@ func NewFlightIngressFromListener(baseListener net.Listener, tlsConfig *tls.Conf
 	}
 
 	store := newFlightAuthSessionStore(provider, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL, cfg.SessionTokenTTL, cfg.WorkerQueueTimeout, opts)
+	store.forceDrainSession = cfg.ForceDrainSession
 	handler, err := NewControlPlaneFlightSQLHandler(store, validator)
 	if err != nil {
 		_ = baseListener.Close()
@@ -1452,11 +1463,12 @@ type flightAuthSessionStore struct {
 	workerQueueTimeout time.Duration
 	hooks              Hooks
 
-	createSessionFn  func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error)
-	destroySessionFn func(int32)
-	metadataProvider sessionMetadataProvider
-	reconnector      sessionReconnector
-	durableStore     DurableSessionStore
+	createSessionFn   func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error)
+	destroySessionFn  func(int32)
+	metadataProvider  sessionMetadataProvider
+	reconnector       sessionReconnector
+	durableStore      DurableSessionStore
+	forceDrainSession func(pid int32) bool
 
 	mu       sync.RWMutex
 	sessions map[string]*flightClientSession // session token -> session
@@ -1868,8 +1880,12 @@ func (s *flightAuthSessionStore) reapIdle(now time.Time, trigger string) int {
 	for token, cs := range s.sessions {
 		cs.reapStaleHandles(now, s.handleIdleTTL)
 
+		// Drain-requested sessions (e.g. their org is resharding) skip the
+		// idle TTL but still must be truly parked — the guards below keep
+		// in-flight transactions/streams/queries alive until they finish.
+		forceDrain := s.forceDrainSession != nil && s.forceDrainSession(cs.pid)
 		last := time.Unix(0, cs.lastUsed.Load())
-		if now.Sub(last) < s.idleTTL {
+		if !forceDrain && now.Sub(last) < s.idleTTL {
 			continue
 		}
 		if cs.txnCount() > 0 {

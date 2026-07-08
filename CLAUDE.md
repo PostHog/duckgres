@@ -508,6 +508,47 @@ touching this path:
   in `tests/configstore/migrations_postgres_test.go`, and the
   `compute_usage_pull_api` assertion in `tests/e2e-mw-dev/harness.sh`.
 
+## Resharding (metadata-store migrations) — LOAD-BEARING CONTRACT
+
+Operator-driven moves of an org's DuckLake catalog between metadata stores
+(cnpg↔cnpg, ext→cnpg, cnpg→ext escape hatch), admin-console-driven with a
+verbose op log. Full design: `docs/design/resharding.md`. Pieces:
+`configstore/reshard.go` (+ migration `000018`),
+`provisioner/reshard_runner.go` + `catalog_copy.go`, `admin/reshard.go`, UI
+`ReshardForm.tsx`/`ReshardOperation.tsx`. Invariants:
+
+- **The sound connection barrier is the lease-GRANT check**, not the
+  connect-time 57P03 gates: the grant transaction refuses `resharding` orgs
+  under the same per-org advisory lock `SetWarehouseResharding` takes for the
+  `ready→resharding` CAS. Never rely on the snapshot-polled connect gate
+  alone — a lease can be granted up to a queue-timeout after it ran.
+- **Drain, never kill**: live queries always finish. Drain = leases==0 AND
+  queue==0 (one tx) AND zero live org workers (each runs a catalog-writing
+  `DuckLakeCheckpointer`). Lingering hot-idle workers are retired via the
+  standard CAS retire path only — never raw pod deletes. Parked reconnectable
+  Flight sessions are destroyed locally per CP (they'd hold leases ~1h).
+- **Flip semantics differ by direction**: a `cnpgShard` change re-points
+  role/DB in place (source ORPHANED — explicit cleanup after verify); a TYPE
+  flip to external makes Crossplane DELETE the cnpg role/DB → cnpg→ext runs
+  **copy-before-flip** (the flip IS the cleanup, only after verify).
+  **External stores are never modified/deleted.**
+- **Rollback patches the source shard VALUE back — never removes the key**
+  (precedence would fall through to the freshly-stamped bogus status pin);
+  ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
+- **The ext target password is ephemeral**: request → in-process stash →
+  runner memory; never in the op row, log, or audit. Takeover mid-copy fails
+  with a clear re-run message instead of proceeding without it.
+- **Runner fencing**: claim bumps `runner_epoch`; every runner write is
+  CAS-fenced on (runner, epoch); stale-heartbeat (>5m) ops are takeover-able;
+  the copy holds a target-DB advisory lock.
+- Touching any of this → update `tests/configstore/reshard_postgres_test.go`,
+  `provisioner/reshard_runner_test.go`, `admin/reshard_test.go`, the
+  migration asserts in `tests/configstore/migrations_postgres_test.go`, AND
+  the `reshard_*` assertions in `tests/e2e-mw-dev/harness.sh` (validation,
+  cancel-during-drain, bogus-shard-rollback, ext→cnpg positive path).
+  cnpg→ext positive path is unit-only (harness lacks the RDS password);
+  cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
+
 ## TODO Reference
 
 `TODO.md` is a lightweight backlog for ideas that do not yet have a better

@@ -278,6 +278,10 @@ spec:
             # settle and two org-default-profile propagation waits — which drop
             # from 40s each to CONFIG_POLL_SETTLE (12s) on the back of it.
             - { name: DUCKGRES_CONFIG_POLL_INTERVAL, value: "5s" }
+            # Short reshard cutover wait for CI only (default 15m): the
+            # bogus-shard rollback assertion needs the flip to time out and
+            # roll back within the test budget.
+            - { name: DUCKGRES_RESHARD_FLIP_TIMEOUT, value: "90s" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             # Previous internal secrets still accepted during rotation; the
