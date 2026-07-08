@@ -17,6 +17,44 @@ const (
 )
 
 var queryLogSurfaceCache = newQueryLogSurfaceCache()
+var queryLogStorageCache = newQueryLogSurfaceCache()
+
+// ensurePostgresQueryLogStorageForDuckLakeAttach must run before DuckLake
+// ATTACH. DuckLake's hidden metadata catalog may not see Postgres schemas
+// created after attach, so the storage schema must exist before the hidden
+// catalog is bound.
+func ensurePostgresQueryLogStorageForDuckLakeAttach(ctx context.Context, cfg Config) error {
+	if !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	cacheKey := cfg.DuckLake.MetadataStore
+	// Cache successes only. A transient pre-attach failure should be retried by
+	// the next activation/connect attempt because this is the only point where
+	// the querylog schema can become visible to DuckLake's hidden metadata catalog.
+	if queryLogStorageCache.ready(cacheKey) {
+		return nil
+	}
+
+	connStr, err := postgresQueryLogDSN(cfg.DuckLake)
+	if err != nil {
+		return err
+	}
+	pgDB, err := openPostgresQueryLogDB(connStr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = pgDB.Close() }()
+
+	if err := ensurePostgresQueryLogTableContext(ctx, pgDB); err != nil {
+		return err
+	}
+	queryLogStorageCache.recordSuccess(cacheKey)
+	return nil
+}
 
 func ensureDuckLakeQueryLogSurface(ctx context.Context, db *sql.DB, cfg Config) error {
 	if !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
@@ -41,22 +79,6 @@ func ensureDuckLakeQueryLogSurface(ctx context.Context, db *sql.DB, cfg Config) 
 		return nil
 	}
 
-	connStr, err := postgresQueryLogDSN(cfg.DuckLake)
-	if err != nil {
-		queryLogSurfaceCache.recordFailure(cacheKey, time.Now())
-		return err
-	}
-	pgDB, err := openPostgresQueryLogDB(connStr)
-	if err != nil {
-		queryLogSurfaceCache.recordFailure(cacheKey, time.Now())
-		return err
-	}
-	defer func() { _ = pgDB.Close() }()
-
-	if err := ensurePostgresQueryLogTableContext(ctx, pgDB); err != nil {
-		queryLogSurfaceCache.recordFailure(cacheKey, time.Now())
-		return err
-	}
 	if err := ensureDuckLakeQueryLogViewContext(ctx, db); err != nil {
 		queryLogSurfaceCache.recordFailure(cacheKey, time.Now())
 		return fmt.Errorf("querylog: ensure ducklake view: %w", err)
@@ -253,4 +275,5 @@ func (c *queryLogSurfaceStateCache) recordFailure(key string, now time.Time) {
 
 func resetQueryLogSurfaceCacheForTest() {
 	queryLogSurfaceCache = newQueryLogSurfaceCache()
+	queryLogStorageCache = newQueryLogSurfaceCache()
 }

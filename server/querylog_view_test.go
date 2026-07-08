@@ -64,6 +64,50 @@ func TestEnsureDuckLakeQueryLogSurfaceFastPathSkipsPostgresDSN(t *testing.T) {
 	}
 }
 
+func TestEnsureDuckLakeQueryLogSurfaceDoesNotCreateStorageAfterAttach(t *testing.T) {
+	resetQueryLogSurfaceCacheForTest()
+	t.Cleanup(resetQueryLogSurfaceCacheForTest)
+	db := openQueryLogViewTestDBWithoutHiddenSource(t)
+
+	err := ensureDuckLakeQueryLogSurface(context.Background(), db, Config{
+		DuckLake: DuckLakeConfig{
+			MetadataStore: "not-a-postgres-metadata-store",
+		},
+		QueryLog: QueryLogConfig{
+			Enabled: true,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected hidden-source preflight error")
+	}
+	if !strings.Contains(err.Error(), "preflight ducklake query_log source") {
+		t.Fatalf("expected post-attach view preflight error, got %v", err)
+	}
+}
+
+func TestEnsurePostgresQueryLogStorageForDuckLakeAttachRetriesAfterFailure(t *testing.T) {
+	resetQueryLogSurfaceCacheForTest()
+	t.Cleanup(resetQueryLogSurfaceCacheForTest)
+
+	cfg := Config{
+		DuckLake: DuckLakeConfig{
+			MetadataStore: "not-a-postgres-metadata-store",
+		},
+		QueryLog: QueryLogConfig{
+			Enabled: true,
+		},
+	}
+
+	err := ensurePostgresQueryLogStorageForDuckLakeAttach(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("expected first invalid metadata store failure")
+	}
+	err = ensurePostgresQueryLogStorageForDuckLakeAttach(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("expected second invalid metadata store failure; pre-attach storage failures must not be cached")
+	}
+}
+
 func TestEnsureDuckLakeQueryLogViewContextRenamesLegacyTable(t *testing.T) {
 	db := openQueryLogViewTestDB(t)
 
