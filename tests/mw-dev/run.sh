@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Orchestrate the per-PR mw-dev e2e stack from the CI runner (kubectl reaches
-# the private API via Tailscale). Subcommands: deploy | test | diagnostics |
-# teardown. All kubectl calls pin --context explicitly — never rely on the
-# current-context default.
+# Orchestrate isolated mw-dev test stacks from CI (kubectl reaches the private
+# API via Tailscale). Payloads are selected by subcommand; deploy/teardown and
+# diagnostics are shared by e2e and scenario runs.
 #
-# Required env (set by .github/workflows/e2e-mw-dev.yml):
+# Required env (set by .github/workflows/*mw-dev.yml):
 #   NAMESPACE, PR_NUMBER, WORKER_IMAGE, CONTROLPLANE_IMAGE, KUBE_CONTEXT,
 #   CP_POD_IDENTITY_ROLE (the duckgres-control-plane-dev role ARN — the per-PR
 #   CP assumes the SAME EKS Pod Identity as the real mw-dev control plane, so
@@ -21,6 +20,9 @@ KUBECTL=(kubectl --context "$CTX")
 EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-posthog-mw-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SA_NAME="duckgres"
+FROZEN_S3_URI="${DUCKGRES_SCENARIO_FROZEN_S3_URI:-s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/}"
+SCENARIO_JOB_WATCH_TIMEOUT_SECONDS="${SCENARIO_JOB_WATCH_TIMEOUT_SECONDS:-16200}"
+SCENARIO_FULL_FILES="${SCENARIO_FULL_FILES:-tests/mw-dev/scenario/scenarios/provision_rejection.yaml tests/mw-dev/scenario/scenarios/provision_smoke.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_dbt.yaml}"
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -222,12 +224,12 @@ cmd_deploy() {
   restart_cp_with_identity
 }
 
-cmd_test() {
+cmd_test_e2e() {
   # Ship harness.sh into the namespace as a ConfigMap and run it as a Job that
   # talks to the control-plane ClusterIP service. The Job SA is `duckgres`,
   # which can delete worker pods in-namespace (durability test).
   "${KUBECTL[@]}" -n "$NS" create configmap duckgres-harness \
-    --from-file=harness.sh="$HERE/harness.sh" \
+    --from-file=harness.sh="$HERE/e2e/harness.sh" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
@@ -304,6 +306,117 @@ YAML
   return 1
 }
 
+scenario_name_for_file() {
+  basename "$1" .yaml | tr '_' '-'
+}
+
+scenario_job_name() {
+  local name="$1" run_hash
+  run_hash="$(printf '%s' "${DUCKGRES_SCENARIO_RUN_ID:?DUCKGRES_SCENARIO_RUN_ID is required}" | cksum | awk '{print $1}')"
+  printf 'duckgres-scenario-%s-%s\n' "$name" "$run_hash" | tr '_' '-'
+}
+
+cmd_test_scenario_full() {
+  local scenario_file scenario_name scenario_rc rc=0
+  : "${SCENARIO_RUNNER_IMAGE:?SCENARIO_RUNNER_IMAGE is required}"
+
+  for scenario_file in $SCENARIO_FULL_FILES; do
+    scenario_name="$(scenario_name_for_file "$scenario_file")"
+    DUCKGRES_SCENARIO_RUN_ID="scenario-dev-${scenario_name}-${PR_NUMBER}" \
+      run_scenario "$scenario_name" "$scenario_file" || {
+        scenario_rc=$?
+        [ "$rc" -ne 0 ] || rc="$scenario_rc"
+      }
+  done
+  return "$rc"
+}
+
+run_scenario() {
+  local scenario_name="$1" scenario_file="$2" job api_base pg flight suffix internal_secret rc=0
+  api_base="http://duckgres-control-plane.$NS.svc:8080"
+  pg="$("${KUBECTL[@]}" -n "$NS" get svc duckgres-control-plane -o jsonpath='{.spec.clusterIP}')"
+  flight="duckgres-control-plane.$NS.svc:8815"
+  suffix=".ci.duckgres.local"
+  internal_secret="$(cat "$internal_secret_file")"
+  job="$(scenario_job_name "$scenario_name")"
+
+  "${KUBECTL[@]}" -n "$NS" delete job "$job" --ignore-not-found
+  cat <<YAML | "${KUBECTL[@]}" -n "$NS" apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $job
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: $SCENARIO_JOB_WATCH_TIMEOUT_SECONDS
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: scenario
+          image: $SCENARIO_RUNNER_IMAGE
+          imagePullPolicy: IfNotPresent
+          args: ["$scenario_file"]
+          env:
+            - { name: DUCKGRES_SCENARIO_API_BASE, value: "$api_base" }
+            - { name: DUCKGRES_SCENARIO_INTERNAL_SECRET, value: "$internal_secret" }
+            - { name: DUCKGRES_SCENARIO_PG_HOST, value: "$pg" }
+            - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
+            - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
+            - { name: DUCKGRES_SCENARIO_FLIGHT_ADDR, value: "$flight" }
+            - { name: DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY, value: "true" }
+            - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
+            - { name: DUCKGRES_SCENARIO_OUTPUT_BASE, value: "/artifacts/scenario-dev" }
+            - { name: DUCKGRES_SCENARIO_RUN_ID, value: "$DUCKGRES_SCENARIO_RUN_ID" }
+            - { name: DUCKGRES_SCENARIO_MAX_RUNTIME, value: "${DUCKGRES_SCENARIO_MAX_RUNTIME:-4h}" }
+            - { name: DUCKGRES_SCENARIO_GO_TEST_TIMEOUT, value: "${DUCKGRES_SCENARIO_GO_TEST_TIMEOUT:-4h15m}" }
+            - { name: GOCACHE, value: "/tmp/go-cache" }
+          resources:
+            requests: { cpu: "1", memory: "2Gi" }
+            limits: { memory: "6Gi" }
+          volumeMounts:
+            - { name: artifacts, mountPath: /artifacts }
+      volumes:
+        - { name: artifacts, emptyDir: {} }
+YAML
+
+  echo "Streaming scenario logs for $job..."
+  "${KUBECTL[@]}" -n "$NS" wait --for=condition=ready pod -l "job-name=$job" --timeout=180s || true
+  "${KUBECTL[@]}" -n "$NS" logs -f "job/$job" || true
+  wait_for_scenario_job "$job" || rc=$?
+  copy_scenario_artifacts "$scenario_name" "$job"
+  return "$rc"
+}
+
+wait_for_scenario_job() {
+  local job="$1" deadline
+  deadline=$(( $(date +%s) + SCENARIO_JOB_WATCH_TIMEOUT_SECONDS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$("${KUBECTL[@]}" -n "$NS" get job "$job" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)" = "True" ]; then
+      echo "scenario Job $job complete."
+      return 0
+    fi
+    if [ "$("${KUBECTL[@]}" -n "$NS" get job "$job" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)" = "True" ]; then
+      echo "scenario Job $job failed." >&2
+      return 1
+    fi
+    sleep 10
+  done
+  echo "scenario Job $job did not reach a terminal state in time." >&2
+  return 1
+}
+
+copy_scenario_artifacts() {
+  local scenario_name="$1" job="$2" pod dest
+  pod="$("${KUBECTL[@]}" -n "$NS" get pod -l "job-name=$job" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  [ -n "$pod" ] || return 0
+  dest="$HERE/../../artifacts/scenario-dev/${scenario_name}"
+  mkdir -p "$dest"
+  "${KUBECTL[@]}" -n "$NS" cp "$pod:/artifacts/scenario-dev" "$dest" >/dev/null 2>&1 || true
+}
+
 cmd_diagnostics() {
   echo "::group::namespace state"
   "${KUBECTL[@]}" -n "$NS" get pods,svc,job -o wide || true
@@ -318,6 +431,9 @@ cmd_diagnostics() {
   echo "::endgroup::"
   echo "::group::worker pods"
   "${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-worker -o wide || true
+  echo "::endgroup::"
+  echo "::group::scenario jobs"
+  "${KUBECTL[@]}" -n "$NS" get job,pod -l job-name -o wide || true
   echo "::endgroup::"
 }
 
@@ -422,9 +538,10 @@ cmd_e2e_cleanup() {
     done
 }
 
-case "${1:?usage: run.sh deploy|test|diagnostics|teardown|e2e-cleanup}" in
+case "${1:?usage: run.sh deploy|test-e2e|test-scenario-full|diagnostics|teardown|e2e-cleanup}" in
   deploy) : "${NAMESPACE:?}"; require_pr_identity; cmd_deploy ;;
-  test) : "${NAMESPACE:?}"; require_pr_identity; cmd_test ;;
+  test-e2e|test) : "${NAMESPACE:?}"; require_pr_identity; cmd_test_e2e ;;
+  test-scenario-full) : "${NAMESPACE:?}"; require_pr_identity; cmd_test_scenario_full ;;
   diagnostics) : "${NAMESPACE:?}"; require_pr_identity; cmd_diagnostics ;;
   teardown) : "${NAMESPACE:?}"; require_pr_identity; cmd_teardown ;;
   e2e-cleanup) cmd_e2e_cleanup ;;

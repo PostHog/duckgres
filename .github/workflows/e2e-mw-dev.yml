@@ -28,7 +28,7 @@
 #   required-reviewer Environment — that would either block external PRs even
 #   after approval, or force an approval click on every maintainer push.)
 #
-# Required repo configuration (one-time, see tests/e2e-mw-dev/README.md):
+# Required repo configuration (one-time, see tests/mw-dev/README.md):
 #   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV
 #   secrets: AWS_ECR_PUBLISH_IAM_ROLE (already exists, used by CD),
 #            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it)
@@ -47,7 +47,7 @@ on:
       - "go.mod"
       - "go.sum"
       - "Dockerfile*"
-      - "tests/e2e-mw-dev/**"
+      - "tests/mw-dev/**"
       - ".github/workflows/e2e-mw-dev.yml"
       - ".github/workflows/_image-build.yml"
   workflow_dispatch:
@@ -125,7 +125,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Test e2e harness scripts
-        run: go test -count=1 ./tests/e2e-mw-dev
+        run: go test -count=1 ./tests/mw-dev
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
@@ -160,17 +160,17 @@ jobs:
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
 
       - name: Deploy isolated namespace
-        run: bash tests/e2e-mw-dev/run.sh deploy
+        run: bash tests/mw-dev/run.sh deploy
 
       - name: Run e2e harness (in-cluster Job)
-        run: bash tests/e2e-mw-dev/run.sh test
+        run: bash tests/mw-dev/run.sh test-e2e
 
       # Diagnostics are only worth collecting (and only get read) when the
       # harness failed — on green runs this step just added ~15s to the gating
       # check. failure() also covers a failed deploy step.
       - name: Collect diagnostics
         if: failure()
-        run: bash tests/e2e-mw-dev/run.sh diagnostics
+        run: bash tests/mw-dev/run.sh diagnostics
 
   # Teardown runs as its OWN job so the gating `e2e` check completes the moment
   # the harness verdict is known instead of waiting ~1min for deprovision +
@@ -214,7 +214,7 @@ jobs:
       # Deprovision the ci-pr ducklings (so no S3 / cnpg role+db leaks on
       # shared infra) then delete the namespace.
       - name: Teardown
-        run: bash tests/e2e-mw-dev/run.sh teardown
+        run: bash tests/mw-dev/run.sh teardown
 
   # Backstop sweep of orphaned per-PR namespaces. Scheduled-trigger only (the
   # PR/manual triggers run build+e2e instead). Reuses the same Tailscale + e2e
@@ -248,4 +248,4 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
       - name: Sweep stale per-PR namespaces
-        run: bash tests/e2e-mw-dev/run.sh e2e-cleanup
+        run: bash tests/mw-dev/run.sh e2e-cleanup

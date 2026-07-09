@@ -39,7 +39,7 @@ steps:
     with:
       org_id: scenario-frozen-perf-${run_id_token}
       catalog: ducklake
-      catalog_file: ../../perf/queries/ducklake_frozen.yaml
+      catalog_file: ../../../perf/queries/ducklake_frozen.yaml
       run_id: ${run_id}
       dataset_version: posthog-file-views-v1
       flight_addr: ${env:DUCKGRES_SCENARIO_FLIGHT_ADDR}

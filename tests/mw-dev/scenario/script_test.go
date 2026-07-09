@@ -9,7 +9,7 @@ import (
 )
 
 func TestScenarioRunScriptValidatesRequiredEnvVars(t *testing.T) {
-	script := filepath.Join("..", "..", "scripts", "scenario_run.sh")
+	script := filepath.Join("..", "..", "..", "scripts", "scenario_run.sh")
 	cmd := exec.Command("bash", script, "--check-env")
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 
@@ -31,8 +31,8 @@ func TestScenarioRunScriptValidatesRequiredEnvVars(t *testing.T) {
 }
 
 func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
-	script := filepath.Join("..", "..", "scripts", "scenario_run.sh")
-	cmd := exec.Command("bash", script, "--check-env", "tests/scenario/scenarios/posthog_frozen_perf.yaml")
+	script := filepath.Join("..", "..", "..", "scripts", "scenario_run.sh")
+	cmd := exec.Command("bash", script, "--check-env", "tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml")
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"DUCKGRES_SCENARIO_API_BASE=http://127.0.0.1",
@@ -56,8 +56,8 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	}
 }
 
-func TestDevScenarioWorkflowDefaultsToIsolatedDeploymentWithSharedDevOverride(t *testing.T) {
-	workflowPath := filepath.Join("..", "..", ".github", "workflows", "scenario-dev.yml")
+func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
+	workflowPath := filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml")
 	raw, err := os.ReadFile(workflowPath)
 	if err != nil {
 		t.Fatalf("read dev scenario workflow: %v", err)
@@ -68,7 +68,6 @@ func TestDevScenarioWorkflowDefaultsToIsolatedDeploymentWithSharedDevOverride(t 
 		"name: scenario-dev",
 		"workflow_dispatch:",
 		"skip_slow:",
-		"use_shared_dev:",
 		"default: false",
 		"schedule:",
 		"id-token: write",
@@ -77,20 +76,15 @@ func TestDevScenarioWorkflowDefaultsToIsolatedDeploymentWithSharedDevOverride(t 
 		"tag: scenario-runner-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
 		"tag: scenario-duckgres-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
 		"inputs.duckgres_image != ''",
-		"tests/scenario-dev/run.sh deploy",
-		"tests/scenario-dev/run.sh test",
-		"tests/scenario-dev/run.sh diagnostics",
-		"tests/scenario-dev/run.sh teardown",
-		"tests/scenario/scenarios/provision_smoke.yaml",
-		"tests/scenario/scenarios/provision_rejection.yaml",
-		"tests/scenario/scenarios/posthog_frozen_metadata.yaml",
-		"tests/scenario/scenarios/posthog_frozen_perf.yaml",
-		"tests/scenario/scenarios/posthog_frozen_dbt.yaml",
-		"if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}",
-		"if: ${{ github.event_name != 'workflow_dispatch' || !inputs.use_shared_dev }}",
-		"if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_shared_dev }}",
-		"slow: true",
-		"go test -count=1 ./tests/scenario ./tests/scenario-dev ./tests/e2e-mw-dev",
+		"KUBE_CONTEXT: posthog-mw-dev",
+		"CLUSTER_NAME: posthog-mw-dev",
+		"EKS_CLUSTER_NAME: posthog-mw-dev",
+		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
+		"tests/mw-dev/run.sh deploy",
+		"tests/mw-dev/run.sh test-scenario-full",
+		"tests/mw-dev/run.sh diagnostics",
+		"tests/mw-dev/run.sh teardown",
+		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("workflow missing %q", required)
@@ -98,16 +92,24 @@ func TestDevScenarioWorkflowDefaultsToIsolatedDeploymentWithSharedDevOverride(t 
 	}
 
 	for _, forbidden := range []string{
+		"use_shared_dev:",
+		"USE_SHARED_DEV",
+		"SCENARIO_SHARED_",
+		"DUCKGRES_SCENARIO_KUBE_CONTEXT",
+		"DUCKGRES_SCENARIO_EKS_CLUSTER_NAME",
+		"DUCKGRES_SCENARIO_CP_POD_IDENTITY_ROLE",
+		"DUCKGRES_SCENARIO_CONFIG_SECRET",
+		"DUCKGRES_SCENARIO_INTERNAL_SECRET_NAME",
+		"DUCKGRES_SCENARIO_INTERNAL_SECRET_KEY",
+		"matrix:",
 		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.",
 		"DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.",
 		"DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.",
 		"DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.",
-		"posthog-mw-dev",
 		"373313242555",
 		"645773004826",
-		"posthog-duckgres-scenario-frozen-data",
 		"posthog-duckling-perfprodus",
 	} {
 		if strings.Contains(workflow, forbidden) {
@@ -126,7 +128,7 @@ func TestScenarioRunnerImageCachesGoDependencies(t *testing.T) {
 
 	for _, required := range []string{
 		"go mod download",
-		"go test -run '^$' ./tests/scenario",
+		"go test -run '^$' ./tests/mw-dev/scenario",
 	} {
 		if !strings.Contains(dockerfile, required) {
 			t.Fatalf("scenario runner Dockerfile missing %q", required)

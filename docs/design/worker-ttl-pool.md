@@ -215,4 +215,4 @@ workers cannot overcommit a node).
 ## Rollout
 
 Build arm64 control-plane + worker images, push to ECR, deploy to **mw-dev only**
-(`tests/e2e-mw-dev/run.sh`), run harness, iterate. Never prod.
+(`tests/mw-dev/run.sh`), run harness, iterate. Never prod.

@@ -118,6 +118,88 @@ func TestDeployRejectsMissingPRNumberBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestScenarioFullRunsScenarioJobsAgainstIsolatedStack(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_FULL_FILES=tests/mw-dev/scenario/scenarios/provision_smoke.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("scenario full failed: %v\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	for _, want := range []string{
+		"kubectl --context test-context -n duckgres-ci-pr-123 get svc duckgres-control-plane -o jsonpath={.spec.clusterIP}",
+		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-provision-smoke-",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-metadata-",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("scenario full missing expected call %q; calls:\n%s", want, calls)
+		}
+	}
+	if !strings.Contains(calls, "s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/") {
+		t.Fatalf("scenario full did not pass the frozen dataset URI in the Job manifest; calls:\n%s", calls)
+	}
+	if strings.Contains(calls, "get secret duckgres-scenario-config") {
+		t.Fatalf("scenario full still reads a scenario config secret; calls:\n%s", calls)
+	}
+}
+
+func TestScenarioFullContinuesAfterScenarioFailure(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_FULL_FILES=tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml",
+		"SCENARIO_DEV_FAIL_JOB=posthog-frozen-metadata",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario full succeeded despite a failed subscenario; output:\n%s", out)
+	}
+
+	calls := fakes.calls(t)
+	for _, want := range []string{
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-metadata-",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-perf-",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("scenario full did not continue through expected call %q; calls:\n%s", want, calls)
+		}
+	}
+}
+
+func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	for _, want := range []string{
+		"$HERE/e2e/harness.sh",
+		"test-scenario-full",
+		"SCENARIO_FULL_FILES",
+		".ci.duckgres.local",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("run.sh missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"USE_SHARED_DEV",
+		"SCENARIO_SHARED_",
+		"SCENARIO_CONFIG_SECRET",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("run.sh still contains shared-dev/config-secret path %q", forbidden)
+		}
+	}
+}
+
 type runSHFakes struct {
 	binDir  string
 	logPath string
@@ -137,7 +219,28 @@ func newRunSHFakes(t *testing.T) runSHFakes {
 printf 'kubectl %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
 
 if [[ "$*" == *" apply -f -"* ]]; then
-  cat >/dev/null
+  tee -a "$RUN_SH_TEST_CALLS" >/dev/null
+  exit 0
+fi
+if [[ "$*" == *" get svc duckgres-control-plane "* ]]; then
+  printf '10.96.0.20'
+  exit 0
+fi
+if [[ "$*" == *" get job duckgres-scenario-"* ]]; then
+  if [[ -n "${SCENARIO_DEV_FAIL_JOB:-}" && "$*" == *"duckgres-scenario-${SCENARIO_DEV_FAIL_JOB}-"* ]]; then
+    if [[ "$*" == *'@.type=="Failed"'* ]]; then
+      printf 'True'
+    fi
+    exit 0
+  fi
+  if [[ "$*" == *'@.type=="Failed"'* ]]; then
+    exit 0
+  fi
+  printf 'True'
+  exit 0
+fi
+if [[ "$*" == *" get pod -l job-name=duckgres-scenario-"* ]]; then
+  printf 'duckgres-scenario-pod'
   exit 0
 fi
 if [[ "$*" == *" wait --for=delete duckling/ci-pr-123-"* ]]; then

@@ -155,6 +155,6 @@ and the admin Google-group name via values. Ship to `mw-dev` first, then `mw-pro
 Unit (`-tags kubernetes`): RBAC gate (viewer blocked from writes/impersonation; TokenSet
 bypass), Prometheus proxy allow-list, impersonation round-trip with a fake stack +
 session-destroy-on-defer, audit row written per mutation, new configstore writes.
-e2e (`tests/e2e-mw-dev/harness.sh`): admin UI reachable in-cluster, RBAC enforced,
+e2e (`tests/mw-dev/e2e/harness.sh`): admin UI reachable in-cluster, RBAC enforced,
 impersonation SQL round-trip against a real org worker is audited, a config-store edit via
 the API is observed by a subsequent connection. Update CLAUDE.md + admin/README.md.

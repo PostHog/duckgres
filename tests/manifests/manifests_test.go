@@ -2,7 +2,7 @@
 // k8s/ manifests — no cluster, no build tag, runs in the normal `go test ./...`
 // lane. These four asserts were rescued from the retired kind suite
 // (tests/k8s/setup_config_test.go) when its end-to-end coverage moved to the
-// real-cluster harness in tests/e2e-mw-dev/. They guard real shipped config
+// real-cluster harness in tests/mw-dev/. They guard real shipped config
 // (k8s/rbac.yaml, k8s/networkpolicy.yaml), so they keep earning their place;
 // the rest of that file tested the kind-harness loader and went with it.
 package manifests_test

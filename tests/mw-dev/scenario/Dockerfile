@@ -11,7 +11,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN go test -run '^$' ./tests/scenario
+RUN go test -run '^$' ./tests/mw-dev/scenario
 
 ENV DUCKGRES_SCENARIO_DBT_BIN=dbt
 

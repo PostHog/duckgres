@@ -8,11 +8,6 @@ on:
         required: true
         default: false
         type: boolean
-      use_shared_dev:
-        description: Skip isolated deploy and run against the shared dev stack
-        required: true
-        default: false
-        type: boolean
       duckgres_image:
         description: Existing Duckgres image to deploy instead of building this SHA
         required: false
@@ -31,9 +26,10 @@ concurrency:
 
 jobs:
   scenario-runner-image:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow }}
     uses: ./.github/workflows/_image-build.yml
     with:
-      dockerfile: tests/scenario/Dockerfile
+      dockerfile: tests/mw-dev/scenario/Dockerfile
       image-name: duckgres
       tag: scenario-runner-${{ github.run_id }}-${{ github.run_attempt }}-arm64
       platform: linux/arm64
@@ -42,7 +38,7 @@ jobs:
       ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
   duckgres-image:
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.use_shared_dev && inputs.duckgres_image == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.skip_slow && inputs.duckgres_image == '') }}
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
@@ -59,114 +55,45 @@ jobs:
     secrets:
       ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
-  scenarios:
+  scenario-full:
     needs: [scenario-runner-image, duckgres-image]
-    if: ${{ always() && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && (inputs.use_shared_dev || inputs.duckgres_image != ''))) }}
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow) && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        include:
-          - name: provision-smoke
-            slot: 1
-            file: tests/scenario/scenarios/provision_smoke.yaml
-            max_runtime: 30m
-            go_test_timeout: 45m
-            slow: false
-            needs_dbt: false
-          - name: provision-rejection
-            slot: 2
-            file: tests/scenario/scenarios/provision_rejection.yaml
-            max_runtime: 30m
-            go_test_timeout: 45m
-            slow: false
-            needs_dbt: false
-          - name: frozen-metadata
-            slot: 3
-            file: tests/scenario/scenarios/posthog_frozen_metadata.yaml
-            max_runtime: 45m
-            go_test_timeout: 60m
-            slow: false
-            needs_dbt: false
-          - name: frozen-perf
-            slot: 4
-            file: tests/scenario/scenarios/posthog_frozen_perf.yaml
-            max_runtime: 45m
-            go_test_timeout: 60m
-            slow: false
-            needs_dbt: false
-          - name: frozen-dbt
-            slot: 5
-            file: tests/scenario/scenarios/posthog_frozen_dbt.yaml
-            max_runtime: 4h
-            go_test_timeout: 4h15m
-            slow: true
-            needs_dbt: true
     env:
-      USE_SHARED_DEV: ${{ github.event_name == 'workflow_dispatch' && inputs.use_shared_dev }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
       WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
-      KUBE_CONTEXT: ${{ vars.DUCKGRES_SCENARIO_KUBE_CONTEXT }}
-      CLUSTER_NAME: ${{ vars.DUCKGRES_SCENARIO_EKS_CLUSTER_NAME }}
-      EKS_CLUSTER_NAME: ${{ vars.DUCKGRES_SCENARIO_EKS_CLUSTER_NAME }}
-      AWS_REGION: ${{ vars.DUCKGRES_SCENARIO_AWS_REGION || 'us-east-1' }}
-      CP_POD_IDENTITY_ROLE: ${{ secrets.DUCKGRES_SCENARIO_CP_POD_IDENTITY_ROLE }}
-      PR_NUMBER: ${{ github.run_id }}${{ matrix.slot }}
-      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.slot }}
-      SCENARIO_NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.slot }}
-      SCENARIO_NAME: ${{ matrix.name }}
-      SCENARIO_FILE: ${{ matrix.file }}
-      SCENARIO_SHARED_NAMESPACE: ${{ vars.DUCKGRES_SCENARIO_SHARED_NAMESPACE }}
-      SCENARIO_SHARED_API_BASE: ${{ vars.DUCKGRES_SCENARIO_SHARED_API_BASE }}
-      SCENARIO_SHARED_PG_HOST: ${{ vars.DUCKGRES_SCENARIO_SHARED_PG_HOST }}
-      SCENARIO_SHARED_FLIGHT_ADDR: ${{ vars.DUCKGRES_SCENARIO_SHARED_FLIGHT_ADDR }}
-      SCENARIO_CONFIG_SECRET_NAMESPACE: ${{ vars.DUCKGRES_SCENARIO_CONFIG_SECRET_NAMESPACE }}
-      SCENARIO_CONFIG_SECRET_NAME: ${{ vars.DUCKGRES_SCENARIO_CONFIG_SECRET_NAME }}
-      SCENARIO_INTERNAL_SECRET_NAME: ${{ vars.DUCKGRES_SCENARIO_INTERNAL_SECRET_NAME }}
-      SCENARIO_INTERNAL_SECRET_KEY: ${{ vars.DUCKGRES_SCENARIO_INTERNAL_SECRET_KEY }}
-      SCENARIO_ISOLATED_SNI_SUFFIX: .ci.duckgres.local
-      SCENARIO_SHARED_SNI_SUFFIX: ${{ vars.DUCKGRES_SCENARIO_SHARED_SNI_SUFFIX || vars.DUCKGRES_SCENARIO_SNI_SUFFIX }}
-      DUCKGRES_SCENARIO_MAX_RUNTIME: ${{ matrix.max_runtime }}
-      DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: ${{ matrix.go_test_timeout }}
-      DUCKGRES_SCENARIO_RUN_ID: scenario-dev-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBE_CONTEXT: posthog-mw-dev
+      CLUSTER_NAME: posthog-mw-dev
+      EKS_CLUSTER_NAME: posthog-mw-dev
+      AWS_REGION: us-east-1
+      CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
+      PR_NUMBER: ${{ github.run_id }}
+      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
+      DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
+      DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
     steps:
-      - name: Skip slow scenario
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_slow && matrix.slow }}
-        run: echo "Skipping slow scenario because skip_slow is true."
-
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
 
-      - name: Isolated dev target selected
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.use_shared_dev }}
-        run: echo "Deploying an isolated Duckgres stack for this scenario."
-
-      - name: Shared dev target selected
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_shared_dev }}
-        run: echo "Skipping isolated deploy and targeting the shared dev stack."
+      - name: Scenario dev target selected
+        run: echo "Deploying an isolated Duckgres stack for scenario.full."
 
       - name: Set up Go
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
         uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
           go-version-file: go.mod
 
       - name: Test scenario workflow scripts
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
-        run: go test -count=1 ./tests/scenario ./tests/scenario-dev ./tests/e2e-mw-dev
+        run: go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev
 
       - name: Configure AWS credentials (OIDC)
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
 
       - name: Connect to Tailscale
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
         with:
           oauth-client-id: ${{ vars.TS_WIF_CLIENT_ID_MW_DEV }}
@@ -174,34 +101,36 @@ jobs:
           tags: tag:github-runner
 
       - name: Install kubectl
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
         uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
 
       - name: Update kubeconfig
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
 
       - name: Deploy isolated Duckgres stack
-        if: ${{ (github.event_name != 'workflow_dispatch' || !inputs.use_shared_dev) && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
-        run: tests/scenario-dev/run.sh deploy
+        run: tests/mw-dev/run.sh deploy
 
-      - name: Run scenario
-        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
-        run: tests/scenario-dev/run.sh test
+      - name: Run scenario.full
+        run: tests/mw-dev/run.sh test-scenario-full
 
       - name: Collect diagnostics
-        if: ${{ failure() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
-        run: tests/scenario-dev/run.sh diagnostics
+        if: failure()
+        run: tests/mw-dev/run.sh diagnostics
 
       - name: Teardown
-        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
-        run: tests/scenario-dev/run.sh teardown
+        if: always()
+        run: tests/mw-dev/run.sh teardown
 
       - name: Upload scenario artifacts
-        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: scenario-dev-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scenario-dev-full-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/scenario-dev/
           if-no-files-found: warn
           retention-days: 14
+
+  scenario-skipped:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_slow }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Skipping scenario.full because skip_slow is true."
