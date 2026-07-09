@@ -391,6 +391,11 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 
 // applyConstraints replays the source table's constraints (PK, unique, check,
 // FK) via pg_get_constraintdef, sorted so PKs/uniques come before FKs.
+// NOT NULL constraints (contype 'n' — catalogued rows on PG 18+ sources) are
+// skipped: the CREATE TABLE already carried NOT NULL from pg_attribute, and
+// their constraintdef renders as "NOT NULL <col>", whose ADD CONSTRAINT form
+// only parses on PG 18+ — an older target (external RDS) rejects it with a
+// syntax error at "NOT".
 func applyConstraints(ctx context.Context, srcTx pgx.Tx, dst *pgx.Conn, table string) error {
 	// contype is the internal "char" type (OID 18), which pgx cannot scan in
 	// binary format into a string — cast it.
@@ -421,6 +426,9 @@ ORDER BY conname`, table)
 	// Foreign keys last (they may reference other tables' PKs).
 	sort.SliceStable(cons, func(i, j int) bool { return cons[i].typ != "f" && cons[j].typ == "f" })
 	for _, c := range cons {
+		if !shouldReplayConstraint(c.typ) {
+			continue
+		}
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", quoteIdent(table), quoteIdent(c.name), c.def)
 		if _, err := dst.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("apply constraint %s on %s: %w", c.name, table, err)
@@ -457,4 +465,12 @@ ORDER BY i.indexname`, table)
 
 func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// shouldReplayConstraint reports whether a pg_constraint row of the given
+// contype is replayed on the target. 'n' (catalogued NOT NULL, PG 18+) is
+// redundant with the column-level NOT NULL the CREATE TABLE already applied
+// and its ADD CONSTRAINT syntax doesn't parse on older targets.
+func shouldReplayConstraint(contype string) bool {
+	return contype != "n"
 }
