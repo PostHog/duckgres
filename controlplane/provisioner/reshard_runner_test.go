@@ -416,6 +416,20 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 			t.Fatalf("copy read from %q, want the recorded shard-001 source", call.source.Host)
 		}
 	}
+	// Regression (#observed in prod): the source drop must name the database
+	// recorded from the duckling status. The op row's SourceDatabase is unset
+	// for cnpg sources (the admin handler only fills it for external), so a
+	// runner reading only op.SourceDatabase issued `DROP DATABASE ""`.
+	for _, call := range copier.calls {
+		if call.kind == "dropdb" {
+			if call.dbName != "mdstore_org" {
+				t.Fatalf("dropdb database = %q, want %q (the recorded source database)", call.dbName, "mdstore_org")
+			}
+			if !strings.HasPrefix(call.target.Host, "shard-001-pooler") {
+				t.Fatalf("dropdb ran against %q, want the recorded shard-001 source", call.target.Host)
+			}
+		}
+	}
 	// Compaction paused (false) then restored to explicit true.
 	dkinds := duckling.callKinds()
 	if fmt.Sprint(dkinds) != fmt.Sprint([]string{"compaction", "cnpg", "compaction"}) {
