@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  ArrowLeftRight,
   Building2,
   Database,
   LayoutDashboard,
@@ -30,6 +31,7 @@ export const NAV: NavItem[] = [
   { to: "/nodes", label: "Nodes", icon: Network },
   { to: "/workers", label: "Workers", icon: Server },
   { to: "/metrics", label: "Metrics", icon: LineChart },
+  { to: "/reshards", label: "Reshards", icon: ArrowLeftRight },
   { to: "/configstore", label: "Config Store", icon: Database },
   { to: "/impersonate", label: "Impersonate", icon: TerminalSquare, adminOnly: true },
   { to: "/audit", label: "Audit", icon: ScrollText, adminOnly: true },

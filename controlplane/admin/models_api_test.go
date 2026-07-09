@@ -150,4 +150,66 @@ func TestModelsAPIPostgres(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("GET /models/nope = %d, want 404", rec.Code)
 	}
+
+	// ---- auto-discovery: the explorer is a database explorer, not a curated
+	// list. Tables with no typed descriptor (goose bookkeeping, migrations
+	// added later) must show up under "Other" with information_schema columns,
+	// and credential-shaped column VALUES must come back redacted.
+	if err := store.DB().Exec(`
+		CREATE TABLE explorer_probe (
+			id BIGSERIAL PRIMARY KEY,
+			note TEXT NOT NULL,
+			api_password TEXT NOT NULL
+		);
+		INSERT INTO explorer_probe (note, api_password) VALUES ('visible', 'super-secret-value');
+	`).Error; err != nil {
+		t.Fatalf("seed probe table: %v", err)
+	}
+
+	rec, body = get("/api/v1/models")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /models (post-probe) = %d", rec.Code)
+	}
+	if err := json.Unmarshal(body["models"], &summaries); err != nil {
+		t.Fatalf("decode summaries: %v", err)
+	}
+	probeKey := ""
+	gooseSeen := false
+	for _, s := range summaries {
+		if strings.HasSuffix(s.Key, ".explorer_probe") && s.Group == "Other" {
+			probeKey = s.Key
+			if s.Count != 1 {
+				t.Errorf("probe table count = %d, want 1", s.Count)
+			}
+		}
+		if strings.HasSuffix(s.Key, ".goose_db_version") {
+			gooseSeen = true
+		}
+	}
+	if probeKey == "" {
+		t.Fatalf("auto-discovery missed explorer_probe; sidebar: %v", summaries)
+	}
+	if !gooseSeen {
+		t.Fatalf("auto-discovery missed goose_db_version; sidebar: %v", summaries)
+	}
+
+	rec, _ = get("/api/v1/models/" + probeKey)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET auto table = %d body %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "super-secret-value") {
+		t.Fatalf("auto table leaked a credential-shaped column value:\n%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "[redacted]") || !strings.Contains(rec.Body.String(), "visible") {
+		t.Fatalf("auto table body missing redaction marker or plain column:\n%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"api_password"`) {
+		t.Fatalf("auto table columns missing api_password header:\n%s", rec.Body.String())
+	}
+
+	// A crafted auto key that information_schema does not return → 404, never SQL.
+	rec, _ = get("/api/v1/models/auto:public.pg_shadow%3B--")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("crafted auto key = %d, want 404", rec.Code)
+	}
 }

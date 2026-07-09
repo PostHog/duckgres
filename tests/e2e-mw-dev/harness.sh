@@ -1603,6 +1603,16 @@ models_explorer_api() {
   # Unknown model → 404.
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/models/not-a-model")"
   [ "$code" = "404" ] || fail "GET /api/v1/models/not-a-model returned $code, want 404"
+  # Auto-discovery: tables with no typed descriptor (goose bookkeeping, the
+  # reshard tables) must appear under "Other" and list with columns.
+  out="$(curl -fsS -H "$H" "$API/api/v1/models")" || fail "models: request failed"
+  echo "$out" | jq -e '.models[] | select(.group == "Other" and (.key | endswith(".goose_db_version")))' >/dev/null \
+    || fail "models: auto-discovered goose_db_version missing: $out"
+  rk="$(echo "$out" | jq -r '.models[] | select(.group == "Other" and (.key | endswith(".duckgres_reshard_operations"))) | .key')"
+  [ -n "$rk" ] || fail "models: auto-discovered duckgres_reshard_operations missing"
+  curl -fsS -H "$H" "$API/api/v1/models/$rk" | jq -e '.columns | index("org_id") != null' >/dev/null \
+    || fail "models: auto table listing lacks org_id column"
+  log "models explorer auto-discovery OK ($rk)"
 }
 
 # ---- admin console: identity + live state + auth gate ----------------------
@@ -2282,6 +2292,9 @@ reshard_validation() { # cnpg-org currently on shard-001
       -d "$body" "$API/api/v1/orgs/$1/reshard")"
     [ "$code" = "400" ] || fail "reshard validation: body $body -> $code, want 400"
   done
+  # Global list (Reshards nav page): envelope across all orgs.
+  curl -fsS -H "$H" "$API/api/v1/reshards" | jq -e '.operations | type == "array"' >/dev/null \
+    || fail "reshard validation: global list envelope wrong"
   log "reshard validation OK"
 }
 

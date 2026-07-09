@@ -5,6 +5,8 @@ package admin
 import (
 	"net/http"
 	"reflect"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -24,12 +26,20 @@ const (
 	modelGroupTenants modelGroup = "Tenants"
 	modelGroupRuntime modelGroup = "Runtime"
 	modelGroupAdmin   modelGroup = "Admin"
+	// Other holds AUTO-DISCOVERED tables: everything information_schema shows
+	// in the config + runtime schemas that no typed descriptor covers. New
+	// tables (migrations, AutoMigrated operational state) appear here with no
+	// registry edit — the explorer is a database explorer, not a curated list.
+	modelGroupOther modelGroup = "Other"
 )
 
 // modelDescriptor describes one browsable config-store table for the generic
-// models explorer. The descriptors are the single source of truth the sidebar,
-// the listing endpoint, and the column derivation all read from — adding a new
-// config-store model is one entry here.
+// models explorer. A typed descriptor gives a table PRECISE redaction (fields
+// tagged json:"-" vanish) plus a human label/group; every table WITHOUT a
+// descriptor is still browsable via information_schema auto-discovery (group
+// "Other"), where credential-shaped column values are redacted by name
+// pattern. Add a descriptor when a table needs exact redaction or a curated
+// spot in the sidebar — nothing breaks if you don't.
 type modelDescriptor struct {
 	// Key is the URL slug and stable identifier (e.g. "orgs").
 	Key string
@@ -55,10 +65,9 @@ type modelDescriptor struct {
 	elem reflect.Type
 }
 
-// modelDescriptors returns the ordered registry of browsable models. Order is
-// the sidebar order. Every persisted configstore model that an operator might
-// want to inspect belongs here; if you add a model in configstore/models.go,
-// add it here too (and assert it in models_api_test.go).
+// modelDescriptors returns the ordered registry of typed models. Order is the
+// sidebar order for the curated groups; tables not listed here surface
+// automatically under "Other" via information_schema discovery.
 func modelDescriptors() []modelDescriptor {
 	mk := func(key, label string, group modelGroup, runtime bool, sample any) modelDescriptor {
 		// table name from the model's TableName() via the gorm Tabler contract.
@@ -101,6 +110,92 @@ func modelDescriptors() []modelDescriptor {
 
 type modelsHandler struct {
 	store *configstore.ConfigStore
+}
+
+// autoKeyPrefix namespaces the keys of auto-discovered tables ("auto:<schema>.<table>").
+const autoKeyPrefix = "auto:"
+
+// sensitiveColumnRe redacts VALUES of auto-discovered columns whose name looks
+// credential-shaped. The typed descriptors above redact precisely via json
+// tags; auto-discovered tables have no type to consult, so err toward
+// redaction — a bcrypt hash or ciphertext leaking is fatal, an over-redacted
+// secret NAME is a shrug. (Matches e.g. password, password_aws_secret,
+// ciphertext, token, nonce, credential.)
+var sensitiveColumnRe = regexp.MustCompile(`(?i)(password|secret|ciphertext|token|nonce|credential)`)
+
+// autoTable is one information_schema-discovered table.
+type autoTable struct {
+	Schema string
+	Name   string
+}
+
+func (a autoTable) key() string   { return autoKeyPrefix + a.Schema + "." + a.Name }
+func (a autoTable) label() string { return a.Name }
+
+// discoverTables lists every base table in the config schema (current_schema)
+// and the CP runtime schema that is NOT already covered by a typed descriptor.
+// Reading information_schema fresh per request keeps the explorer honest: a
+// table created by a migration or AutoMigrate after boot appears immediately.
+func (h *modelsHandler) discoverTables() ([]autoTable, error) {
+	covered := map[string]struct{}{}
+	for _, d := range modelDescriptors() {
+		covered[d.Table] = struct{}{}
+	}
+	runtimeSchema := h.store.RuntimeSchema()
+
+	type row struct {
+		TableSchema string
+		TableName   string
+	}
+	var rows []row
+	err := h.store.DB().Raw(`
+		SELECT table_schema, table_name
+		FROM information_schema.tables
+		WHERE table_type = 'BASE TABLE'
+		  AND table_schema IN (current_schema(), ?)
+		ORDER BY table_schema, table_name`, runtimeSchema).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	var out []autoTable
+	for _, r := range rows {
+		if _, ok := covered[r.TableName]; ok {
+			continue
+		}
+		out = append(out, autoTable{Schema: r.TableSchema, Name: r.TableName})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	return out, nil
+}
+
+// resolveAutoTable validates an auto key against a FRESH discovery — the only
+// table names ever interpolated into SQL are ones information_schema just
+// returned, so a crafted key can't smuggle SQL.
+func (h *modelsHandler) resolveAutoTable(key string) (autoTable, bool) {
+	if !strings.HasPrefix(key, autoKeyPrefix) {
+		return autoTable{}, false
+	}
+	tables, err := h.discoverTables()
+	if err != nil {
+		return autoTable{}, false
+	}
+	for _, t := range tables {
+		if t.key() == key {
+			return t, true
+		}
+	}
+	return autoTable{}, false
+}
+
+// autoColumns returns the table's column names in ordinal order.
+func (h *modelsHandler) autoColumns(t autoTable) ([]string, error) {
+	var cols []string
+	err := h.store.DB().Raw(`
+		SELECT column_name
+		FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ?
+		ORDER BY ordinal_position`, t.Schema, t.Name).Scan(&cols).Error
+	return cols, err
 }
 
 // registerModelsAPI registers the read-only generic models explorer used by the
@@ -146,6 +241,21 @@ func (h *modelsHandler) listModels(c *gin.Context) {
 			Count: count,
 		})
 	}
+	autoTables, err := h.discoverTables()
+	if err == nil {
+		for _, t := range autoTables {
+			var count int64
+			if err := db.Table(t.Schema + "." + t.Name).Count(&count).Error; err != nil {
+				count = -1
+			}
+			out = append(out, modelSummary{
+				Key:   t.key(),
+				Label: t.label(),
+				Group: string(modelGroupOther),
+				Count: count,
+			})
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"models": out})
 }
 
@@ -172,6 +282,10 @@ func (h *modelsHandler) getModel(c *gin.Context) {
 		}
 	}
 	if desc == nil {
+		if t, ok := h.resolveAutoTable(key); ok {
+			h.getAutoTable(c, t)
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "unknown model: " + key})
 		return
 	}
@@ -239,4 +353,57 @@ func jsonFieldOrder(t reflect.Type) []string {
 		cols = append(cols, name)
 	}
 	return cols
+}
+
+// getAutoTable lists an auto-discovered table: columns from
+// information_schema, rows as generic maps, values of credential-shaped
+// columns redacted (see sensitiveColumnRe — auto tables have no typed model
+// whose json tags could redact precisely).
+func (h *modelsHandler) getAutoTable(c *gin.Context, t autoTable) {
+	db := h.store.DB()
+	table := t.Schema + "." + t.Name
+
+	columns, err := h.autoColumns(t)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var total int64
+	if err := db.Table(table).Count(&total).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var rows []map[string]interface{}
+	if err := db.Table(table).Limit(modelsRowLimit + 1).Find(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	truncated := false
+	if len(rows) > modelsRowLimit {
+		truncated = true
+		rows = rows[:modelsRowLimit]
+	}
+	for _, row := range rows {
+		for col, v := range row {
+			if v != nil && sensitiveColumnRe.MatchString(col) {
+				row[col] = "[redacted]"
+			}
+		}
+	}
+	if rows == nil {
+		rows = []map[string]interface{}{}
+	}
+
+	c.JSON(http.StatusOK, modelListing{
+		Key:       t.key(),
+		Label:     t.label(),
+		Group:     string(modelGroupOther),
+		Table:     table,
+		Columns:   columns,
+		Count:     total,
+		Truncated: truncated,
+		Rows:      rows,
+	})
 }

@@ -76,6 +76,14 @@ func (f *fakeReshardStore) ListReshardOperationsForOrg(orgID string, _ int) ([]c
 	return out, nil
 }
 
+func (f *fakeReshardStore) ListReshardOperations(_ int) ([]configstore.ReshardOperation, error) {
+	var out []configstore.ReshardOperation
+	for _, op := range f.ops {
+		out = append(out, *op)
+	}
+	return out, nil
+}
+
 func (f *fakeReshardStore) ListReshardLog(opID, afterID int64, _ int) ([]configstore.ReshardLogEntry, error) {
 	var out []configstore.ReshardLogEntry
 	for _, e := range f.logs {
@@ -274,6 +282,11 @@ func TestReshardGetListLogCancel(t *testing.T) {
 	w = doJSON(r, http.MethodGet, "/api/v1/orgs/acme/reshards", "")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"operations"`) {
 		t.Fatalf("list status = %d body %s", w.Code, w.Body.String())
+	}
+	// Global list (nav page): same envelope, all orgs.
+	w = doJSON(r, http.MethodGet, "/api/v1/reshards", "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"operations"`) {
+		t.Fatalf("global list status = %d body %s", w.Code, w.Body.String())
 	}
 
 	// Incremental log poll.
