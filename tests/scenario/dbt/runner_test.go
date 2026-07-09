@@ -92,10 +92,10 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 		t.Fatalf("DUCKGRES_DBT_HOST = %q", envValue(first.Env, "DUCKGRES_DBT_HOST"))
 	}
 	if envValue(first.Env, "DUCKGRES_DBT_HOSTADDR") != "" {
-		t.Fatal("expected command environment to avoid DUCKGRES_DBT_HOSTADDR because dbt-postgres expects hostaddr to be numeric")
+		t.Fatal("expected command environment to avoid unsupported dbt profile hostaddr")
 	}
-	if envValue(first.Env, "PGHOSTADDR") != "" {
-		t.Fatal("expected command environment to avoid PGHOSTADDR because dbt-postgres expects hostaddr to be numeric")
+	if envValue(first.Env, "PGHOSTADDR") != "10.0.0.10" {
+		t.Fatalf("PGHOSTADDR = %q", envValue(first.Env, "PGHOSTADDR"))
 	}
 	if envValue(first.Env, "DBT_ENV_SECRET_DUCKGRES_PASSWORD") != "root-password" {
 		t.Fatal("expected command environment to include provision password as a dbt secret")
@@ -127,6 +127,43 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 	}
 	if result.CommandsRun != 4 || result.OutputDir != dbtDir {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestExecutorOmitsPGHostAddrWhenConnectionHostAddrIsNotNumeric(t *testing.T) {
+	projectDir := writeDBTProject(t)
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	runner := &fakeCommandRunner{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			HostAddr:  "duckgres-control-plane.test.svc",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir:     t.TempDir(),
+		CommandRunner: runner,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "dbt_models",
+		Type: StepTypeDBTRun,
+		With: map[string]any{
+			"org_id":      "scenario-org",
+			"project_dir": projectDir,
+			"commands":    []any{"debug"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if envValue(runner.requests[0].Env, "PGHOSTADDR") != "" {
+		t.Fatalf("expected non-numeric hostaddr to be omitted, env=%#v", runner.requests[0].Env)
 	}
 }
 

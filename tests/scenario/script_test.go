@@ -56,7 +56,7 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	}
 }
 
-func TestDevScenarioWorkflowRunsScheduledSecretBackedScenarios(t *testing.T) {
+func TestDevScenarioWorkflowDefaultsToIsolatedDeploymentWithSharedDevOverride(t *testing.T) {
 	workflowPath := filepath.Join("..", "..", ".github", "workflows", "scenario-dev.yml")
 	raw, err := os.ReadFile(workflowPath)
 	if err != nil {
@@ -68,23 +68,29 @@ func TestDevScenarioWorkflowRunsScheduledSecretBackedScenarios(t *testing.T) {
 		"name: scenario-dev",
 		"workflow_dispatch:",
 		"skip_slow:",
+		"use_shared_dev:",
 		"default: false",
 		"schedule:",
-		"scripts/scenario_run.sh",
-		"actions/upload-artifact@",
+		"id-token: write",
+		"uses: ./.github/workflows/_image-build.yml",
+		"image-name: duckgres",
+		"tag: scenario-runner-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
+		"tag: scenario-duckgres-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
+		"inputs.duckgres_image != ''",
+		"tests/scenario-dev/run.sh deploy",
+		"tests/scenario-dev/run.sh test",
+		"tests/scenario-dev/run.sh diagnostics",
+		"tests/scenario-dev/run.sh teardown",
 		"tests/scenario/scenarios/provision_smoke.yaml",
 		"tests/scenario/scenarios/provision_rejection.yaml",
 		"tests/scenario/scenarios/posthog_frozen_metadata.yaml",
 		"tests/scenario/scenarios/posthog_frozen_perf.yaml",
 		"tests/scenario/scenarios/posthog_frozen_dbt.yaml",
 		"if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}",
+		"if: ${{ github.event_name != 'workflow_dispatch' || !inputs.use_shared_dev }}",
+		"if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_shared_dev }}",
 		"slow: true",
-		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.DUCKGRES_SCENARIO_API_BASE_DEV }}",
-		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.DUCKGRES_SCENARIO_INTERNAL_SECRET_DEV }}",
-		"DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.DUCKGRES_SCENARIO_PG_HOST_DEV }}",
-		"DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.DUCKGRES_SCENARIO_SNI_SUFFIX_DEV }}",
-		"DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.DUCKGRES_SCENARIO_FROZEN_S3_URI_DEV }}",
-		"DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.DUCKGRES_SCENARIO_FLIGHT_ADDR_DEV }}",
+		"go test -count=1 ./tests/scenario ./tests/scenario-dev ./tests/e2e-mw-dev",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("workflow missing %q", required)
@@ -92,6 +98,12 @@ func TestDevScenarioWorkflowRunsScheduledSecretBackedScenarios(t *testing.T) {
 	}
 
 	for _, forbidden := range []string{
+		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.",
+		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.",
+		"DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.",
+		"DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.",
+		"DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.",
+		"DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.",
 		"posthog-mw-dev",
 		"373313242555",
 		"645773004826",
@@ -100,6 +112,24 @@ func TestDevScenarioWorkflowRunsScheduledSecretBackedScenarios(t *testing.T) {
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("workflow contains internal detail %q", forbidden)
+		}
+	}
+}
+
+func TestScenarioRunnerImageCachesGoDependencies(t *testing.T) {
+	dockerfilePath := filepath.Join("Dockerfile")
+	raw, err := os.ReadFile(dockerfilePath)
+	if err != nil {
+		t.Fatalf("read scenario runner Dockerfile: %v", err)
+	}
+	dockerfile := string(raw)
+
+	for _, required := range []string{
+		"go mod download",
+		"go test -run '^$' ./tests/scenario",
+	} {
+		if !strings.Contains(dockerfile, required) {
+			t.Fatalf("scenario runner Dockerfile missing %q", required)
 		}
 	}
 }
