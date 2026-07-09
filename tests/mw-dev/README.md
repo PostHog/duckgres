@@ -1,27 +1,23 @@
-# mw-dev per-PR e2e harness
+# mw-dev harness
 
-Replaces what `tests/k8s/` (kind) cannot exercise — real Cilium network
-policies, real Crossplane Duckling provisioning, and real cnpg-shard +
-external RDS metadata stores. Those are the layers where this quarter's
-production bugs lived.
+Shared isolated-stack harness for dev-backed e2e and scenario tests. It owns
+the real mw-dev infrastructure boundary that `tests/k8s/` (kind) cannot model:
+real Cilium network policies, real Crossplane Duckling provisioning, real
+cnpg-shard metadata stores, and external metadata fixtures.
 
-## Flow (`.github/workflows/e2e-mw-dev.yml`)
+## Flow
 
 1. **Build** the arm64-only all-in-one `duckgres` image (`_image-build.yml`),
-   tagged `pr-<N>-<sha>-arm64`, pushed to ECR. mw-dev runs ONE image for both
-   the control plane (`--mode control-plane`) and the workers
-   (`DUCKGRES_K8S_WORKER_IMAGE` = same image), so the PR builds just that.
-   One arch suffices (mw-dev is arm64); merge-to-main keeps the full
-   multi-arch + worker/CP-split matrices in the existing CD workflows.
+   pushed to ECR. mw-dev runs ONE image for both the control plane
+   (`--mode control-plane`) and the workers (`DUCKGRES_K8S_WORKER_IMAGE` =
+   same image), so the harness deploys one image for both roles.
 2. **Tailscale** join via OIDC/WIF → reach the private mw-dev EKS API.
-3. **Deploy** an isolated `duckgres-ci-pr-<N>` namespace: throwaway
-   config-store Postgres + a control-plane Deployment on the PR image, spawning
-   worker pods in the same namespace.
-4. **Test** via an in-cluster Job hitting the CP ClusterIP service. Covers
-   the **cnpg + ext** metadata backends. Assertions run in four **parallel
-   per-org lanes** (cnpg core suite, two resilience orgs, ext) — worker churn
-   is org-scoped, so lanes can't interfere and the wall-clock is the slowest
-   lane, not the sum.
+3. **Deploy** an isolated `duckgres-ci-pr-<N>` namespace: throwaway config-store
+   Postgres + a control-plane Deployment on the test image, spawning worker pods
+   in the same namespace.
+4. **Test** via an in-cluster payload Job hitting the CP ClusterIP service.
+   `test-e2e` runs `e2e/harness.sh`; `test-scenario-full` runs the scenario
+   runner over the full dev workload group.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
 
@@ -30,7 +26,7 @@ reaps any `duckgres-ci-pr-*` namespace older than 6h — a backstop for runs tha
 died hard before their `always()` teardown could fire. (Named e2e-cleanup, not
 "janitor", to avoid colliding with duckgres's own control-plane janitor.)
 
-## What the harness asserts (`harness.sh`)
+## What the e2e payload asserts (`e2e/harness.sh`)
 
 This suite is the **successor to the retired kind suite** (`tests/k8s/`): every
 behavior that suite asserted against a fake kind cluster is re-asserted here
@@ -366,5 +362,5 @@ AWS_PROFILE=mw-dev \
 NAMESPACE=duckgres-ci-pr-0 PR_NUMBER=0 KUBE_CONTEXT=posthog-mw-dev \
   WORKER_IMAGE=$IMG CONTROLPLANE_IMAGE=$IMG \
   CP_POD_IDENTITY_ROLE=arn:aws:iam::<mw-dev-account-id>:role/duckgres-control-plane-dev \
-  bash tests/e2e-mw-dev/run.sh deploy
+  bash tests/mw-dev/run.sh deploy
 ```

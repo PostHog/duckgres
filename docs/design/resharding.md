@@ -139,7 +139,7 @@ Unit: `configstore` (tests/configstore/reshard_postgres_test.go — claim CAS,
 takeover fencing, cancel, log pagination, the grant-path gate),
 `provisioner/reshard_runner_test.go` (all three directions, rollbacks, cancel,
 ephemeral-password loss), `admin/reshard_test.go` (validation, secrets never
-persisted). e2e (`tests/e2e-mw-dev/harness.sh`): validation 400s,
+persisted). e2e (`tests/mw-dev/e2e/harness.sh`): validation 400s,
 cancel-during-drain (drain-not-kill + 57P03 visible), bogus-shard rollback
 (real flip → Synced=False → rollback, data intact), and the **ext→cnpg
 positive path** (real catalog move off the harness RDS onto shard-001).

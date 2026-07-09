@@ -431,7 +431,7 @@ plumbing exists and can be wired later. Out of scope now.)
   Flush UPSERT-increment of both columns + drain ship-then-delete + high-water +
   idempotent uuid.
 
-### duckgres (e2e — `tests/e2e-mw-dev/harness.sh`, required per CLAUDE.md)
+### duckgres (e2e — `tests/mw-dev/e2e/harness.sh`, required per CLAUDE.md)
 Provision an org with a known worker profile, then assert the emitted event's
 `cpu_seconds` ≈ cores × ceil(conn) and `memory_seconds` ≈ gib × ceil(conn):
 - run a query, disconnect → both metrics ≈ size × ceil(connection wall-clock).
