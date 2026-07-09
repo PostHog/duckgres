@@ -149,6 +149,30 @@ func TestScenarioFullRunsScenarioJobsAgainstIsolatedStack(t *testing.T) {
 	}
 }
 
+func TestScenarioFullContinuesAfterScenarioFailure(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_FULL_FILES=tests/scenario/scenarios/posthog_frozen_metadata.yaml tests/scenario/scenarios/posthog_frozen_perf.yaml",
+		"SCENARIO_DEV_FAIL_JOB=posthog-frozen-metadata",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario full succeeded despite a failed subscenario; output:\n%s", out)
+	}
+
+	calls := fakes.calls(t)
+	for _, want := range []string{
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-metadata-",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-perf-",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("scenario full did not continue through expected call %q; calls:\n%s", want, calls)
+		}
+	}
+}
+
 func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 	raw, err := os.ReadFile("run.sh")
 	if err != nil {
@@ -203,6 +227,15 @@ if [[ "$*" == *" get svc duckgres-control-plane "* ]]; then
   exit 0
 fi
 if [[ "$*" == *" get job duckgres-scenario-"* ]]; then
+  if [[ -n "${SCENARIO_DEV_FAIL_JOB:-}" && "$*" == *"duckgres-scenario-${SCENARIO_DEV_FAIL_JOB}-"* ]]; then
+    if [[ "$*" == *'@.type=="Failed"'* ]]; then
+      printf 'True'
+    fi
+    exit 0
+  fi
+  if [[ "$*" == *'@.type=="Failed"'* ]]; then
+    exit 0
+  fi
   printf 'True'
   exit 0
 fi

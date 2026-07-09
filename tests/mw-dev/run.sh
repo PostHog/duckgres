@@ -317,17 +317,18 @@ scenario_job_name() {
 }
 
 cmd_test_scenario_full() {
-  local scenario_file scenario_name rc=0
+  local scenario_file scenario_name scenario_rc rc=0
   : "${SCENARIO_RUNNER_IMAGE:?SCENARIO_RUNNER_IMAGE is required}"
 
   for scenario_file in $SCENARIO_FULL_FILES; do
     scenario_name="$(scenario_name_for_file "$scenario_file")"
     DUCKGRES_SCENARIO_RUN_ID="scenario-dev-${scenario_name}-${PR_NUMBER}" \
-      run_scenario "$scenario_name" "$scenario_file" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-      return "$rc"
-    fi
+      run_scenario "$scenario_name" "$scenario_file" || {
+        scenario_rc=$?
+        [ "$rc" -ne 0 ] || rc="$scenario_rc"
+      }
   done
+  return "$rc"
 }
 
 run_scenario() {
