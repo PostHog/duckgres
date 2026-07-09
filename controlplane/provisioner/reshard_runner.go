@@ -570,6 +570,12 @@ func (o *opRun) recordSource(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	// Mirror the persisted fields onto the in-memory op so every later reader
+	// (cleanup logging, the report, the ext→cnpg rollback) sees them too. For
+	// cnpg sources the admin handler leaves these empty at create time.
+	o.op.SourceEndpoint = ms.Endpoint
+	o.op.SourceUser = ms.User
+	o.op.SourceDatabase = ms.Database
 	o.logf("info", "recorded source metadata store: %s", o.source.Redacted())
 	return nil
 }
@@ -778,8 +784,15 @@ func (o *opRun) cleanupSource(ctx context.Context) error {
 		o.logf("info", "external source left untouched (never deleted)")
 		return nil
 	}
-	o.logf("info", "dropping source database %s on %s (WITH FORCE)", o.op.SourceDatabase, o.op.FromShard)
-	if err := o.r.copier.DropDatabase(ctx, o.source, o.op.SourceDatabase); err != nil {
+	// o.source is the copy-path source of truth (recorded from the duckling
+	// status pre-flip); o.op.SourceDatabase mirrors it since recordSource.
+	// Never issue a zero-length identifier: skip loudly instead.
+	if o.source.Database == "" {
+		o.logf("error", "source database name is empty (recordSource did not run?) — skipping DROP DATABASE; the old catalog database on %s must be dropped manually", o.op.FromShard)
+		return nil
+	}
+	o.logf("info", "dropping source database %s on %s (WITH FORCE)", o.source.Database, o.op.FromShard)
+	if err := o.r.copier.DropDatabase(ctx, o.source, o.source.Database); err != nil {
 		// Loud but non-fatal: the copy is verified and live; a leftover
 		// source DB is cruft plus a weaker fence, not data loss.
 		o.logf("error", "DROP DATABASE on the source failed — old catalog database still exists on %s and must be dropped manually: %v", o.op.FromShard, err)
