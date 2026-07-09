@@ -406,3 +406,31 @@ func (cs *ConfigStore) OrgConnectionDrainState(orgID string) (OrgConnectionDrain
 	}
 	return status, nil
 }
+
+// ExternalMetadataStoreInfo is one distinct external Postgres metadata store
+// currently referenced by a live managed warehouse — offered by the reshard
+// form as a known cnpg→external target (endpoint + SM secret NAME only; the
+// password is never stored anywhere in duckgres).
+type ExternalMetadataStoreInfo struct {
+	Endpoint          string `json:"endpoint"`
+	PasswordAWSSecret string `json:"password_aws_secret"`
+	User              string `json:"user"`
+	Database          string `json:"database"`
+}
+
+// ListExternalMetadataStores returns the distinct external metadata stores of
+// non-deleted warehouses, ordered by endpoint.
+func (cs *ConfigStore) ListExternalMetadataStores() ([]ExternalMetadataStoreInfo, error) {
+	var stores []ExternalMetadataStoreInfo
+	err := cs.db.Model(&ManagedWarehouse{}).
+		Select("DISTINCT metadata_store_endpoint AS endpoint, metadata_store_password_aws_secret AS password_aws_secret, metadata_store_username AS user, metadata_store_database_name AS database").
+		Where("metadata_store_kind = ? AND metadata_store_endpoint <> '' AND state NOT IN ?",
+			MetadataStoreKindExternal,
+			[]ManagedWarehouseProvisioningState{ManagedWarehouseStateDeleting, ManagedWarehouseStateDeleted}).
+		Order("endpoint").
+		Scan(&stores).Error
+	if err != nil {
+		return nil, fmt.Errorf("list external metadata stores: %w", err)
+	}
+	return stores, nil
+}

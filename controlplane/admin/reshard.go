@@ -7,11 +7,15 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
@@ -38,6 +42,7 @@ type ReshardStore interface {
 	FinishPendingReshardOperation(id int64, state configstore.ReshardState, errMsg string) (bool, error)
 	AppendReshardLog(opID int64, level, message string) error
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
+	ListExternalMetadataStores() ([]configstore.ExternalMetadataStoreInfo, error)
 }
 
 // ReshardPasswordStash hands the runner the ephemeral external password for
@@ -74,21 +79,98 @@ type startReshardRequest struct {
 
 // RegisterReshardAPI wires the reshard endpoints. lister may be nil (duckling
 // client unavailable) — starting a reshard then 503s; reads still work.
-// stash may be nil (no local runner) — external targets then 503.
-func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, stash ReshardPasswordStash) {
-	h := &reshardHandler{store: store, lister: lister, stash: stash}
+// stash may be nil (no local runner) — external targets then 503. cluster may
+// be nil (non-k8s) — shard discovery then falls back to the shards tenants
+// already occupy.
+func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, stash ReshardPasswordStash, cluster kubernetes.Interface) {
+	h := &reshardHandler{store: store, lister: lister, stash: stash, cluster: cluster}
 	r.POST("/orgs/:id/reshard", h.start)
 	r.GET("/orgs/:id/reshards", h.listForOrg)
 	r.GET("/reshards", h.listAll)
 	r.GET("/reshards/:opid", h.get)
 	r.GET("/reshards/:opid/log", h.log)
+	r.GET("/reshards/targets", h.targets)
 	r.POST("/reshards/:opid/cancel", h.cancel)
 }
 
 type reshardHandler struct {
-	store  ReshardStore
-	lister DucklingMetadataLister
-	stash  ReshardPasswordStash
+	store   ReshardStore
+	lister  DucklingMetadataLister
+	stash   ReshardPasswordStash
+	cluster kubernetes.Interface
+}
+
+// cnpgShardsNamespace is where the shared CNPG metadata shards run; instance
+// pods carry the operator's cnpg.io/cluster=<shard> label.
+const cnpgShardsNamespace = "cnpg-shards"
+
+// targets returns everything the reshard form can offer as a destination:
+// every cnpg shard (including EMPTY ones no tenant occupies yet — discovered
+// from the CNPG instance pods via the cluster-topology read the Nodes view
+// already uses; an RBAC Forbidden degrades to the shards tenants occupy, read
+// from the duckling statuses) and every external metadata store a live
+// warehouse references (endpoint + SM secret NAME only — never a password).
+func (h *reshardHandler) targets(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), ducklingMetadataTimeout)
+	defer cancel()
+
+	shardSet := map[string]struct{}{}
+	clusterAvailable := false
+	if h.cluster != nil {
+		pods, err := h.cluster.CoreV1().Pods(cnpgShardsNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "cnpg.io/cluster",
+		})
+		switch {
+		case err == nil:
+			clusterAvailable = true
+			for i := range pods.Items {
+				if shard := pods.Items[i].Labels["cnpg.io/cluster"]; shard != "" {
+					shardSet[shard] = struct{}{}
+				}
+			}
+		case apierrors.IsForbidden(err):
+			// Same degrade contract as the cluster topology endpoints: the
+			// e2e CP has no cluster-scoped RBAC; fall back to occupied shards.
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if h.lister != nil {
+		stores, err := h.lister.CRMetadataStores(ctx)
+		if err == nil {
+			for _, ms := range stores {
+				if ms.Kind == configstore.MetadataStoreKindCnpgShard {
+					if shard := cnpgShardFromEndpoint(ms.Endpoint); shard != "" {
+						shardSet[shard] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	shards := make([]string, 0, len(shardSet))
+	for s := range shardSet {
+		shards = append(shards, s)
+	}
+	sort.Strings(shards)
+
+	external, err := h.store.ListExternalMetadataStores()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if external == nil {
+		external = []configstore.ExternalMetadataStoreInfo{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"shards": shards,
+		// cluster_discovery=false means the shard list only contains shards
+		// tenants already occupy (RBAC degrade / non-k8s) — a brand-new empty
+		// shard would be missing and needs manual entry.
+		"cluster_discovery": clusterAvailable,
+		"external_stores":   external,
+	})
 }
 
 func (h *reshardHandler) start(c *gin.Context) {

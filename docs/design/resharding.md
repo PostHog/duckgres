@@ -21,7 +21,7 @@ those stay valid because the bucket is untouched.
 | Runner (claims + executes ops) | `controlplane/provisioner/reshard_runner.go` |
 | Catalog copier (schema + rows + verify) | `controlplane/provisioner/catalog_copy.go` |
 | Duckling CR patches (flip, compaction pause) | `controlplane/provisioner/k8s_client.go` |
-| Admin REST API | `controlplane/admin/reshard.go` |
+| Admin REST API (start/read/cancel + `GET /reshards/targets` destination discovery: all cnpg shards incl. empty ones via the cluster-topology pod read, RBAC-degrading to occupied shards; known external stores from live warehouse rows) | `controlplane/admin/reshard.go` |
 | Console UI (form + operation page with live log) | `admin/ui/src/pages/ReshardForm.tsx`, `ReshardOperation.tsx` |
 | Connection gates | `controlplane/control.go` (57P03), `flight_ingress.go`, grant-path check in `configstore/org_connections.go` |
 

@@ -32,6 +32,7 @@ import type {
   QueryResult,
   ReshardLogEntry,
   ReshardOperation,
+  ReshardTargetsResponse,
   RunningQuery,
   SessionStatus,
   StartReshardBody,
@@ -240,4 +241,7 @@ export const api = {
   // Global operation list (all orgs, newest first) for the Reshards nav page.
   listAllReshards: () =>
     get<{ operations: ReshardOperation[] }>("/reshards").then((r) => r.operations ?? []),
+  // Destination discovery for the reshard form: all cnpg shards (incl. empty
+  // ones) + known external stores.
+  getReshardTargets: () => get<ReshardTargetsResponse>("/reshards/targets"),
 };

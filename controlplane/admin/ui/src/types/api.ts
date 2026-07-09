@@ -528,3 +528,21 @@ export interface StartReshardBody {
   // duckling to converge before rolling back.
   cutover_timeout_seconds?: number;
 }
+
+// GET /api/v1/reshards/targets — everything the reshard form can offer as a
+// destination. cluster_discovery=false means the shard list only holds shards
+// tenants already occupy (RBAC degrade) — a brand-new empty shard needs
+// manual entry then.
+export interface ReshardTargetsResponse {
+  shards: string[];
+  cluster_discovery: boolean;
+  external_stores: ExternalMetadataStoreInfo[];
+}
+
+// One known external metadata store (SM secret NAME only — never a password).
+export interface ExternalMetadataStoreInfo {
+  endpoint: string;
+  password_aws_secret: string;
+  user: string;
+  database: string;
+}
