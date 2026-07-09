@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -350,7 +351,7 @@ func (e *Executor) commandEnv(spec stepSpec) []string {
 	if connectTimeout == 0 {
 		connectTimeout = 10
 	}
-	return []string{
+	env := []string{
 		"DUCKGRES_DBT_HOST=" + spec.OrgID + e.connection.SNISuffix,
 		"DUCKGRES_DBT_PORT=" + strconv.Itoa(port),
 		"DUCKGRES_DBT_USER=" + spec.Username,
@@ -360,6 +361,10 @@ func (e *Executor) commandEnv(spec stepSpec) []string {
 		"DUCKGRES_DBT_SSLMODE=" + spec.SSLMode,
 		"DUCKGRES_DBT_CONNECT_TIMEOUT=" + strconv.Itoa(connectTimeout),
 	}
+	if _, err := netip.ParseAddr(e.connection.HostAddr); err == nil {
+		env = append(env, "PGHOSTADDR="+e.connection.HostAddr)
+	}
+	return env
 }
 
 func commandsFromStep(step core.Step) ([]commandSpec, error) {

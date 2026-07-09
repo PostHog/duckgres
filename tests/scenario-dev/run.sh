@@ -14,7 +14,8 @@ SCENARIO_CONFIG_SECRET_NAME="${SCENARIO_CONFIG_SECRET_NAME:-duckgres-scenario-co
 SCENARIO_CONFIG_SECRET_NAMESPACE="${SCENARIO_CONFIG_SECRET_NAMESPACE:-$SCENARIO_SHARED_NAMESPACE}"
 SCENARIO_INTERNAL_SECRET_NAME="${SCENARIO_INTERNAL_SECRET_NAME:-duckgres-tokens}"
 SCENARIO_INTERNAL_SECRET_KEY="${SCENARIO_INTERNAL_SECRET_KEY:-internal-secret}"
-SCENARIO_SNI_SUFFIX="${SCENARIO_SNI_SUFFIX:-.ci.duckgres.local}"
+SCENARIO_ISOLATED_SNI_SUFFIX="${SCENARIO_ISOLATED_SNI_SUFFIX:-.ci.duckgres.local}"
+SCENARIO_SHARED_SNI_SUFFIX="${SCENARIO_SHARED_SNI_SUFFIX:-${SCENARIO_SNI_SUFFIX:-}}"
 SCENARIO_JOB_WATCH_TIMEOUT_SECONDS="${SCENARIO_JOB_WATCH_TIMEOUT_SECONDS:-16200}"
 
 target_namespace() {
@@ -42,7 +43,7 @@ pg_host() {
   if [ "$USE_SHARED_DEV" = "true" ]; then
     printf '%s\n' "${SCENARIO_SHARED_PG_HOST:?SCENARIO_SHARED_PG_HOST is required when USE_SHARED_DEV=true}"
   else
-    printf 'duckgres-control-plane.%s.svc\n' "$ns"
+    "${KUBECTL[@]}" -n "$ns" get svc duckgres-control-plane -o jsonpath='{.spec.clusterIP}'
   fi
 }
 
@@ -53,6 +54,14 @@ flight_addr() {
     printf '%s\n' "${SCENARIO_SHARED_FLIGHT_ADDR:?SCENARIO_SHARED_FLIGHT_ADDR is required when USE_SHARED_DEV=true}"
   else
     printf 'duckgres-control-plane.%s.svc:8815\n' "$ns"
+  fi
+}
+
+sni_suffix() {
+  if [ "$USE_SHARED_DEV" = "true" ]; then
+    printf '%s\n' "${SCENARIO_SHARED_SNI_SUFFIX:?SCENARIO_SHARED_SNI_SUFFIX is required when USE_SHARED_DEV=true}"
+  else
+    printf '%s\n' "$SCENARIO_ISOLATED_SNI_SUFFIX"
   fi
 }
 
@@ -85,9 +94,10 @@ scenario_requires_frozen_config() {
 }
 
 job_name() {
-  local name
+  local name run_hash
   name="${SCENARIO_NAME:?SCENARIO_NAME is required}"
-  printf 'duckgres-scenario-%s\n' "$name" | tr '_' '-'
+  run_hash="$(printf '%s' "${DUCKGRES_SCENARIO_RUN_ID:?DUCKGRES_SCENARIO_RUN_ID is required}" | cksum | awk '{print $1}')"
+  printf 'duckgres-scenario-%s-%s\n' "$name" "$run_hash" | tr '_' '-'
 }
 
 cmd_deploy() {
@@ -99,7 +109,7 @@ cmd_deploy() {
 }
 
 cmd_test() {
-  local ns job api_base pg flight rc
+  local ns job api_base pg flight suffix rc
   : "${SCENARIO_RUNNER_IMAGE:?SCENARIO_RUNNER_IMAGE is required}"
   : "${SCENARIO_FILE:?SCENARIO_FILE is required}"
   : "${DUCKGRES_SCENARIO_RUN_ID:?DUCKGRES_SCENARIO_RUN_ID is required}"
@@ -111,6 +121,7 @@ cmd_test() {
   api_base="$(control_plane_api_base)"
   pg="$(pg_host)"
   flight="$(flight_addr)"
+  suffix="$(sni_suffix)"
   if scenario_requires_frozen_config; then
     ensure_config_secret
   fi
@@ -127,6 +138,8 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: arm64
       containers:
         - name: scenario
           image: $SCENARIO_RUNNER_IMAGE
@@ -140,7 +153,7 @@ spec:
                   name: $SCENARIO_INTERNAL_SECRET_NAME
                   key: $SCENARIO_INTERNAL_SECRET_KEY
             - { name: DUCKGRES_SCENARIO_PG_HOST, value: "$pg" }
-            - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$SCENARIO_SNI_SUFFIX" }
+            - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, valueFrom: { secretKeyRef: { name: $SCENARIO_CONFIG_SECRET_NAME, key: frozen-s3-uri, optional: true } } }
             - { name: DUCKGRES_SCENARIO_FLIGHT_ADDR, value: "$flight" }
             - { name: DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY, value: "true" }

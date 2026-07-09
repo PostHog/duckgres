@@ -46,7 +46,6 @@ Configure these repository variables:
 - `DUCKGRES_SCENARIO_CONFIG_SECRET_NAME`
 - `DUCKGRES_SCENARIO_INTERNAL_SECRET_NAME`
 - `DUCKGRES_SCENARIO_INTERNAL_SECRET_KEY`
-- `DUCKGRES_SCENARIO_SNI_SUFFIX`
 
 The Kubernetes scenario config secret must include `frozen-s3-uri` for frozen
 dataset scenarios. Shared-dev mode additionally requires:
@@ -55,6 +54,7 @@ dataset scenarios. Shared-dev mode additionally requires:
 - `DUCKGRES_SCENARIO_SHARED_API_BASE`
 - `DUCKGRES_SCENARIO_SHARED_PG_HOST`
 - `DUCKGRES_SCENARIO_SHARED_FLIGHT_ADDR`
+- `DUCKGRES_SCENARIO_SHARED_SNI_SUFFIX`
 
 Do not commit concrete dev endpoints, account ids, S3 bucket names, internal
 cluster names, or secret values to this repository. Keep them in repository

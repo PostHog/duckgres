@@ -82,6 +82,41 @@ func TestProvisionScenarioDoesNotRequireFrozenConfigSecret(t *testing.T) {
 	}
 }
 
+func TestScenarioJobPinsArm64RunnerImage(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"nodeSelector:",
+		"kubernetes.io/arch: arm64",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("scenario job manifest missing %q", required)
+		}
+	}
+}
+
+func TestScenarioDevScriptUsesRunSpecificJobNameAndClusterIPHostaddr(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"DUCKGRES_SCENARIO_RUN_ID",
+		"cksum",
+		"jsonpath='{.spec.clusterIP}'",
+		"SCENARIO_ISOLATED_SNI_SUFFIX",
+		"SCENARIO_SHARED_SNI_SUFFIX",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("scenario-dev script missing %q", required)
+		}
+	}
+}
+
 func newFakeBin(t *testing.T) (string, string) {
 	t.Helper()
 
@@ -98,15 +133,19 @@ if [[ "$*" == *" get secret duckgres-scenario-config "* ]]; then
   printf 'frozen config secret should not be required for this scenario\n' >&2
   exit 1
 fi
+if [[ "$*" == *" get svc duckgres-control-plane "* ]]; then
+  printf '10.96.0.20'
+  exit 0
+fi
 if [[ "$*" == *" apply -f -"* ]]; then
   cat >/dev/null
   exit 0
 fi
-if [[ "$*" == *" get job duckgres-scenario-provision-smoke "* ]]; then
+if [[ "$*" == *" get job duckgres-scenario-provision-smoke-"* ]]; then
   printf 'True'
   exit 0
 fi
-if [[ "$*" == *" get pod -l job-name=duckgres-scenario-provision-smoke "* ]]; then
+if [[ "$*" == *" get pod -l job-name=duckgres-scenario-provision-smoke-"* ]]; then
   printf 'duckgres-scenario-provision-smoke-pod'
   exit 0
 fi
