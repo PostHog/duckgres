@@ -577,7 +577,7 @@ func SetupMultiTenant(
 	if reshardRunner != nil {
 		reshardStash = reshardRunner
 	}
-	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardStash)
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardStash, clusterClient)
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)

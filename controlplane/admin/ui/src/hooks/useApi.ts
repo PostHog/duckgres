@@ -38,6 +38,7 @@ import type {
   QueryDetail,
   ReshardLogEntry,
   ReshardOperation,
+  ReshardTargetsResponse,
   RunningQuery,
   SessionStatus,
   StartReshardBody,
@@ -525,6 +526,25 @@ export function useReshardLog(opId: number | null, opState: string | undefined) 
   }, [poll.data]);
 
   return entries;
+}
+
+const EMPTY_RESHARD_TARGETS: ReshardTargetsResponse = {
+  shards: [],
+  cluster_discovery: false,
+  external_stores: [],
+};
+
+// Destination discovery for the reshard form. Pre-rollout backends without
+// the endpoint degrade to empty (the form still allows manual entry).
+export function useReshardTargets() {
+  return useQuery<ReshardTargetsResponse>({
+    queryKey: ["reshardTargets"],
+    queryFn: () =>
+      tolerateStatus<ReshardTargetsResponse>(EMPTY_RESHARD_TARGETS, 403, 404, 503)(
+        api.getReshardTargets(),
+      ).catch(() => EMPTY_RESHARD_TARGETS),
+    refetchInterval: POLL.slow,
+  });
 }
 
 export function useCancelReshard() {

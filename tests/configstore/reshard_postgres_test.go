@@ -325,3 +325,41 @@ func TestListWorkerRecordsForOrgPostgres(t *testing.T) {
 		t.Fatalf("got %d records, want 2 (hot + hot_idle; terminal states excluded)", len(records))
 	}
 }
+
+// TestListExternalMetadataStoresPostgres pins the reshard form's external
+// target discovery: distinct external stores of live warehouses only.
+func TestListExternalMetadataStoresPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	seed := func(org, endpoint string, state cpconfigstore.ManagedWarehouseProvisioningState) {
+		t.Helper()
+		if err := store.DB().Create(&cpconfigstore.Org{Name: org, DatabaseName: org}).Error; err != nil {
+			t.Fatalf("seed org %s: %v", org, err)
+		}
+		wh := &cpconfigstore.ManagedWarehouse{OrgID: org, DucklingName: org, State: state}
+		wh.MetadataStore.Kind = cpconfigstore.MetadataStoreKindExternal
+		wh.MetadataStore.Endpoint = endpoint
+		wh.MetadataStore.PasswordAWSSecret = "secret-" + org
+		wh.MetadataStore.Username = "postgres"
+		wh.MetadataStore.DatabaseName = "postgres"
+		if err := store.DB().Create(wh).Error; err != nil {
+			t.Fatalf("seed warehouse %s: %v", org, err)
+		}
+	}
+	seed("ext-a", "a.rds.example.com", cpconfigstore.ManagedWarehouseStateReady)
+	seed("ext-b", "b.rds.example.com", cpconfigstore.ManagedWarehouseStateReady)
+	seed("ext-gone", "gone.rds.example.com", cpconfigstore.ManagedWarehouseStateDeleted)
+	// A cnpg warehouse must not appear.
+	seedReadyWarehouse(t, store, "cnpg-org")
+
+	stores, err := store.ListExternalMetadataStores()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(stores) != 2 || stores[0].Endpoint != "a.rds.example.com" || stores[1].Endpoint != "b.rds.example.com" {
+		t.Fatalf("stores = %+v, want a + b only (deleted + cnpg excluded)", stores)
+	}
+	if stores[0].PasswordAWSSecret != "secret-ext-a" || stores[0].User != "postgres" || stores[0].Database != "postgres" {
+		t.Fatalf("store[0] = %+v", stores[0])
+	}
+}
