@@ -124,7 +124,7 @@ func New(cfg Config) *Transpiler {
 	t.transforms = append(t.transforms, taggedTransform{FlagBooleanPredicates, transform.NewBooleanPredicateTransform()})
 
 	// 9. Operator mappings (regex operators, etc.)
-	t.transforms = append(t.transforms, taggedTransform{FlagOperators, transform.NewOperatorTransform()})
+	t.transforms = append(t.transforms, taggedTransform{FlagOperators, transform.NewOperatorTransformWithConfig(catalogPolicy.QualifyMacros)})
 
 	// 10. SET/SHOW command handling
 	t.transforms = append(t.transforms, taggedTransform{FlagSetShow, transform.NewSetShowTransform()})
@@ -576,6 +576,13 @@ func Classify(sql string, cfg Config) Classification {
 	// COLLATE pg_catalog."default" is handled by operators/pgcatalog
 	if strings.Contains(upper, "COLLATE") {
 		flags |= FlagOperators | FlagPgCatalog
+	}
+	// Direct json_extract / json_extract_string calls (no arrow operator) also
+	// need the operator transform, which normalizes '$'-prefixed Postgres keys
+	// (e.g. "$ai_session_id") that DuckDB would otherwise mis-parse as a
+	// JSONPath and reject at bind time. The arrow check above misses these.
+	if strings.Contains(upper, "JSON_EXTRACT") {
+		flags |= FlagOperators
 	}
 
 	// FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE locking clauses (upperNorm so

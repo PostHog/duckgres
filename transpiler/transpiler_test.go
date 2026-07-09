@@ -2377,6 +2377,225 @@ func TestTranspile_JSONOperators_CreateTableAs(t *testing.T) {
 	}
 }
 
+// TestTranspile_JSONExtract_DollarPrefixedKeys is the regression test for the
+// production "Binder Error: JSON path error near 'ai_session_id'" failures.
+//
+// PostHog/HogQL property keys frequently start with '$' ($ai_session_id,
+// $group_0, ...). Postgres `properties ->> '$ai_session_id'` means "extract the
+// value at the literal key named $ai_session_id". But DuckDB's
+// json_extract[_string] treats a '$'-prefixed second argument as a JSONPath,
+// and "$ai_session_id" is not a valid JSONPath ('$' must be followed by '.' or
+// '['), so DuckDB fails at bind time. The fix rewrites such literal keys to an
+// explicit quoted-member path: $."$ai_session_id".
+//
+// Keys that are already valid navigating JSONPaths ($.foo, $."foo", $.a[0],
+// $[0]) and plain keys (key) — which DuckDB looks up literally — must be left
+// untouched.
+func TestTranspile_JSONExtract_DollarPrefixedKeys(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		// --- The broken production cases ---
+		{
+			name:     "dollar-prefixed key via ->> is wrapped as quoted member",
+			input:    "SELECT properties->>'$ai_session_id' FROM events",
+			expected: `SELECT json_extract_string(properties, '$."$ai_session_id"') FROM events`,
+		},
+		{
+			name:     "group_0 key via ->> is wrapped",
+			input:    "SELECT properties->>'$group_0' FROM events",
+			expected: `SELECT json_extract_string(properties, '$."$group_0"') FROM events`,
+		},
+		{
+			name:     "dollar-prefixed key via -> (json) is wrapped",
+			input:    "SELECT data->'$ai_session_id' FROM t",
+			expected: `SELECT json_extract(data, '$."$ai_session_id"') FROM t`,
+		},
+		{
+			name:     "lone dollar key is wrapped",
+			input:    "SELECT data->>'$' FROM t",
+			expected: `SELECT json_extract_string(data, '$."$"') FROM t`,
+		},
+		// --- Must be preserved: normal keys ---
+		{
+			name:     "plain key is left as a literal key",
+			input:    "SELECT data->>'key' FROM t",
+			expected: "SELECT json_extract_string(data, 'key') FROM t",
+		},
+		{
+			name:     "plain key with a dot is left literal (DuckDB looks it up literally)",
+			input:    "SELECT data->>'foo.bar' FROM t",
+			expected: "SELECT json_extract_string(data, 'foo.bar') FROM t",
+		},
+		// --- Must be preserved: already-valid JSONPaths ---
+		{
+			name:     "valid dotted JSONPath is preserved",
+			input:    "SELECT data->>'$.foo' FROM t",
+			expected: "SELECT json_extract_string(data, '$.foo') FROM t",
+		},
+		{
+			name:     "valid quoted-member JSONPath is preserved (idempotent)",
+			input:    `SELECT data->>'$."foo"' FROM t`,
+			expected: `SELECT json_extract_string(data, '$."foo"') FROM t`,
+		},
+		{
+			name:     "valid array-index JSONPath is preserved",
+			input:    "SELECT data->>'$.a[0]' FROM t",
+			expected: "SELECT json_extract_string(data, '$.a[0]') FROM t",
+		},
+		{
+			name:     "valid root-bracket JSONPath is preserved",
+			input:    "SELECT data->'$[0]' FROM t",
+			expected: "SELECT json_extract(data, '$[0]') FROM t",
+		},
+		// --- Direct json_extract_string(...) func call (the exact production shape) ---
+		{
+			name:     "direct json_extract_string with dollar literal key is wrapped",
+			input:    "SELECT json_extract_string(events.properties, '$ai_session_id') AS ai_session_id FROM events",
+			expected: `SELECT json_extract_string(events.properties, '$."$ai_session_id"') AS ai_session_id FROM events`,
+		},
+		{
+			name:     "direct json_extract with valid path is preserved",
+			input:    "SELECT json_extract(data, '$.a') FROM t",
+			expected: "SELECT json_extract(data, '$.a') FROM t",
+		},
+		{
+			// A literal key wrapped in an explicit ::text cast: the cast must be
+			// looked through and the inner literal rewritten, preserving the cast.
+			name:     "dollar literal key wrapped in a text cast is rewritten",
+			input:    "SELECT json_extract_string(props, '$ai_session_id'::text) FROM events",
+			expected: `SELECT json_extract_string(props, '$."$ai_session_id"'::text) FROM events`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if result.SQL != tt.expected {
+				t.Errorf("Transpile(%q)\n  got:  %q\n  want: %q", tt.input, result.SQL, tt.expected)
+			}
+		})
+	}
+}
+
+// TestTranspile_JSONExtract_ParameterPath covers the parameterized form of the
+// production bug: the JSON key arrives as a bound parameter ($1) whose value is
+// unknown at transpile time (e.g. `properties ->> $1` with $1 = '$ai_session_id'
+// at execute). We cannot rewrite the literal, so the path argument is wrapped in
+// the duckgres_json_extract_path() macro, which normalizes the key to a valid
+// DuckDB JSONPath at runtime — before DuckDB's binder sees it.
+//
+// Only JSON-extraction path arguments are wrapped; ordinary string parameters
+// must be left completely alone.
+func TestTranspile_JSONExtract_ParameterPath(t *testing.T) {
+	tr := New(Config{ConvertPlaceholders: true})
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "arrow ->> with parameter path is wrapped in the macro",
+			input:    "SELECT properties->>$1 FROM events",
+			expected: "SELECT json_extract_string(properties, duckgres_json_extract_path($1)) FROM events",
+		},
+		{
+			name:     "arrow -> (json) with parameter path is wrapped in the macro",
+			input:    "SELECT data->$1 FROM t",
+			expected: "SELECT json_extract(data, duckgres_json_extract_path($1)) FROM t",
+		},
+		{
+			name:     "direct json_extract_string with parameter path is wrapped (production shape)",
+			input:    "SELECT json_extract_string(events.properties, $1) AS ai_session_id FROM events",
+			expected: "SELECT json_extract_string(events.properties, duckgres_json_extract_path($1)) AS ai_session_id FROM events",
+		},
+		{
+			// A param wrapped in an explicit ::text cast (clients/drivers add
+			// these) must still be wrapped — the cast is preserved inside the macro
+			// call so the param's wire type is unchanged.
+			name:     "direct func param with ::text cast is wrapped",
+			input:    "SELECT json_extract_string(props, $1::text) FROM events",
+			expected: "SELECT json_extract_string(props, duckgres_json_extract_path($1::text)) FROM events",
+		},
+		{
+			name:     "arrow ->> param with ::text cast is wrapped",
+			input:    "SELECT props->>$1::text FROM events",
+			expected: "SELECT json_extract_string(props, duckgres_json_extract_path($1::text)) FROM events",
+		},
+		{
+			name:     "ordinary string parameter is NOT wrapped",
+			input:    "SELECT * FROM events WHERE name = $1",
+			expected: "SELECT * FROM events WHERE name = $1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if result.SQL != tt.expected {
+				t.Errorf("Transpile(%q)\n  got:  %q\n  want: %q", tt.input, result.SQL, tt.expected)
+			}
+			if result.ParamCount != 1 {
+				t.Errorf("Transpile(%q) ParamCount = %d, want 1 (wrapping must not change param count)", tt.input, result.ParamCount)
+			}
+		})
+	}
+}
+
+// TestTranspile_JSONExtract_ParameterPath_DuckLake verifies that in DuckLake
+// mode (the worker/remote backend) the duckgres_json_extract_path macro call is
+// emitted memory.main-qualified. The macro is created in memory.main but the
+// default catalog is the lake catalog, so an unqualified call would fail to
+// resolve. The PgCatalogTransform that qualifies other custom macros runs before
+// the operator transform and never sees this emitted call.
+func TestTranspile_JSONExtract_ParameterPath_DuckLake(t *testing.T) {
+	tr := New(Config{ConvertPlaceholders: true, DuckLakeMode: true})
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "arrow ->> param path is wrapped in the qualified macro",
+			input:    "SELECT properties->>$1 FROM events",
+			expected: "SELECT json_extract_string(properties, memory.main.duckgres_json_extract_path($1)) FROM events",
+		},
+		{
+			name:     "direct json_extract_string param path is wrapped in the qualified macro",
+			input:    "SELECT json_extract_string(properties, $1) FROM events",
+			expected: "SELECT json_extract_string(properties, memory.main.duckgres_json_extract_path($1)) FROM events",
+		},
+		{
+			name:     "param path with a ::text cast is wrapped in the qualified macro",
+			input:    "SELECT json_extract_string(properties, $1::text) FROM events",
+			expected: "SELECT json_extract_string(properties, memory.main.duckgres_json_extract_path($1::text)) FROM events",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if result.SQL != tt.expected {
+				t.Errorf("Transpile(%q)\n  got:  %q\n  want: %q", tt.input, result.SQL, tt.expected)
+			}
+		})
+	}
+}
+
 func TestTranspile_ExpandArray(t *testing.T) {
 	tests := []struct {
 		name     string
