@@ -27,7 +27,7 @@ Optional environment:
 USAGE
 }
 
-scenario_file="${DUCKGRES_SCENARIO_FILE:-tests/scenario/scenarios/provision_smoke.yaml}"
+scenario_file="${DUCKGRES_SCENARIO_FILE:-tests/mw-dev/scenario/scenarios/provision_smoke.yaml}"
 output_base="${DUCKGRES_SCENARIO_OUTPUT_BASE:-artifacts/scenario}"
 run_id="${DUCKGRES_SCENARIO_RUN_ID:-}"
 max_runtime="${DUCKGRES_SCENARIO_MAX_RUNTIME:-30m}"
@@ -129,7 +129,7 @@ if [ "$check_env_only" -eq 1 ]; then
 fi
 
 args=(
-  go test -count=1 ./tests/scenario
+  go test -count=1 ./tests/mw-dev/scenario
   -timeout "$go_test_timeout"
   -run TestScenarioRunner
   -scenario-run

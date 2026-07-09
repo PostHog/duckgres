@@ -9,7 +9,7 @@ import (
 )
 
 func TestScenarioRunScriptValidatesRequiredEnvVars(t *testing.T) {
-	script := filepath.Join("..", "..", "scripts", "scenario_run.sh")
+	script := filepath.Join("..", "..", "..", "scripts", "scenario_run.sh")
 	cmd := exec.Command("bash", script, "--check-env")
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 
@@ -31,8 +31,8 @@ func TestScenarioRunScriptValidatesRequiredEnvVars(t *testing.T) {
 }
 
 func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
-	script := filepath.Join("..", "..", "scripts", "scenario_run.sh")
-	cmd := exec.Command("bash", script, "--check-env", "tests/scenario/scenarios/posthog_frozen_perf.yaml")
+	script := filepath.Join("..", "..", "..", "scripts", "scenario_run.sh")
+	cmd := exec.Command("bash", script, "--check-env", "tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml")
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"DUCKGRES_SCENARIO_API_BASE=http://127.0.0.1",
@@ -57,7 +57,7 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 }
 
 func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
-	workflowPath := filepath.Join("..", "..", ".github", "workflows", "scenario-dev.yml")
+	workflowPath := filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml")
 	raw, err := os.ReadFile(workflowPath)
 	if err != nil {
 		t.Fatalf("read dev scenario workflow: %v", err)
@@ -84,7 +84,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"tests/mw-dev/run.sh test-scenario-full",
 		"tests/mw-dev/run.sh diagnostics",
 		"tests/mw-dev/run.sh teardown",
-		"go test -count=1 ./tests/scenario ./tests/mw-dev",
+		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("workflow missing %q", required)
@@ -128,7 +128,7 @@ func TestScenarioRunnerImageCachesGoDependencies(t *testing.T) {
 
 	for _, required := range []string{
 		"go mod download",
-		"go test -run '^$' ./tests/scenario",
+		"go test -run '^$' ./tests/mw-dev/scenario",
 	} {
 		if !strings.Contains(dockerfile, required) {
 			t.Fatalf("scenario runner Dockerfile missing %q", required)

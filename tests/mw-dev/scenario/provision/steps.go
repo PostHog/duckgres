@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/posthog/duckgres/tests/scenario/core"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 )
 
 const (

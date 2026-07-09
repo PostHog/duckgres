@@ -84,28 +84,28 @@ just scenario-frozen-dbt
 Run a specific scenario file:
 
 ```bash
-just scenario scenario=tests/scenario/scenarios/provision_smoke.yaml
+just scenario scenario=tests/mw-dev/scenario/scenarios/provision_smoke.yaml
 ```
 
 Artifacts are written under `artifacts/scenario/<run_id>/`.
 
 The frozen metadata scenario uses:
 
-- `tests/scenario/scenarios/posthog_frozen_metadata.yaml`
-- `tests/scenario/sql/setup_frozen_views.sql`
-- `tests/scenario/sql/metadata_catalog.yaml`
+- `tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml`
+- `tests/mw-dev/scenario/sql/setup_frozen_views.sql`
+- `tests/mw-dev/scenario/sql/metadata_catalog.yaml`
 
 The frozen perf scenario uses:
 
-- `tests/scenario/scenarios/posthog_frozen_perf.yaml`
+- `tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml`
 - `tests/perf/queries/ducklake_frozen.yaml`
 
 Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `summary.json`, and `server_metrics.prom`.
 
 The frozen dbt scenario uses:
 
-- `tests/scenario/scenarios/posthog_frozen_dbt.yaml`
-- `tests/scenario/dbt/posthog_frozen_project/`
+- `tests/mw-dev/scenario/scenarios/posthog_frozen_dbt.yaml`
+- `tests/mw-dev/scenario/dbt/posthog_frozen_project/`
 
 dbt artifacts are written under `artifacts/scenario/<run_id>/dbt/`, including per-command stdout/stderr logs, `target/` artifacts, and dbt logs. Install `dbt-postgres` locally or set `DUCKGRES_SCENARIO_DBT_BIN` to the dbt executable to use.
 

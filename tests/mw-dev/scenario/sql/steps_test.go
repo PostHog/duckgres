@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/posthog/duckgres/tests/scenario/core"
-	"github.com/posthog/duckgres/tests/scenario/provision"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 )
 
 func TestExecutorRetriesTransientStartupErrors(t *testing.T) {

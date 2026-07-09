@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
+	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
 	flightdriver "github.com/posthog/duckgres/tests/perf/drivers/flight"
 	pgdriver "github.com/posthog/duckgres/tests/perf/drivers/pgwire"
-	"github.com/posthog/duckgres/tests/scenario/core"
-	"github.com/posthog/duckgres/tests/scenario/provision"
-	scenariosql "github.com/posthog/duckgres/tests/scenario/sql"
 )
 
 const StepTypePerfQueries = "perf_queries"

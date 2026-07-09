@@ -123,7 +123,7 @@ func TestScenarioFullRunsScenarioJobsAgainstIsolatedStack(t *testing.T) {
 
 	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
-		"SCENARIO_FULL_FILES=tests/scenario/scenarios/provision_smoke.yaml tests/scenario/scenarios/posthog_frozen_metadata.yaml",
+		"SCENARIO_FULL_FILES=tests/mw-dev/scenario/scenarios/provision_smoke.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -154,7 +154,7 @@ func TestScenarioFullContinuesAfterScenarioFailure(t *testing.T) {
 
 	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
-		"SCENARIO_FULL_FILES=tests/scenario/scenarios/posthog_frozen_metadata.yaml tests/scenario/scenarios/posthog_frozen_perf.yaml",
+		"SCENARIO_FULL_FILES=tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml",
 		"SCENARIO_DEV_FAIL_JOB=posthog-frozen-metadata",
 	)
 	out, err := cmd.CombinedOutput()

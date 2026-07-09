@@ -305,7 +305,7 @@ test-unit:
 # Run scenario runner unit tests
 [group('test')]
 test-scenario:
-    go test -v -count=1 ./tests/scenario/...
+    go test -v -count=1 ./tests/mw-dev/scenario/...
 
 # Run cache-proxy tests
 [group('test')]
@@ -405,7 +405,7 @@ perf-nightly:
 
 # Run a Duckgres scenario file against a configured dev environment
 [group('test')]
-scenario scenario="tests/scenario/scenarios/provision_smoke.yaml":
+scenario scenario="tests/mw-dev/scenario/scenarios/provision_smoke.yaml":
     ./scripts/scenario_run.sh {{scenario}}
 
 # Run the dev provision smoke scenario
@@ -416,27 +416,27 @@ scenario-smoke:
 # Run the dev provision success scenario
 [group('test')]
 scenario-provision-success:
-    ./scripts/scenario_run.sh tests/scenario/scenarios/provision_smoke.yaml
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/provision_smoke.yaml
 
 # Run the dev provision rejection scenario
 [group('test')]
 scenario-provision-rejection:
-    ./scripts/scenario_run.sh tests/scenario/scenarios/provision_rejection.yaml
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/provision_rejection.yaml
 
 # Run the dev frozen dataset metadata exploration scenario
 [group('test')]
 scenario-frozen-metadata:
-    ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_metadata.yaml
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml
 
 # Run the dev frozen dataset perf scenario
 [group('test')]
 scenario-frozen-perf:
-    ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_perf.yaml
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml
 
 # Run the dev frozen dataset dbt scenario
 [group('test')]
 scenario-frozen-dbt:
-    ./scripts/scenario_run.sh tests/scenario/scenarios/posthog_frozen_dbt.yaml
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_dbt.yaml
 
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]

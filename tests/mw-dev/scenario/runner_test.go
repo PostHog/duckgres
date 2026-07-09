@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/posthog/duckgres/tests/scenario/core"
-	scenariodbt "github.com/posthog/duckgres/tests/scenario/dbt"
-	scenarioperf "github.com/posthog/duckgres/tests/scenario/perf"
-	"github.com/posthog/duckgres/tests/scenario/provision"
-	scenariosql "github.com/posthog/duckgres/tests/scenario/sql"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
+	scenariodbt "github.com/posthog/duckgres/tests/mw-dev/scenario/dbt"
+	scenarioperf "github.com/posthog/duckgres/tests/mw-dev/scenario/perf"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
+	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 )
 
 var (

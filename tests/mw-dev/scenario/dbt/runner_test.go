@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/posthog/duckgres/tests/scenario/core"
-	"github.com/posthog/duckgres/tests/scenario/provision"
-	scenariosql "github.com/posthog/duckgres/tests/scenario/sql"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
+	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 )
 
 func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) {

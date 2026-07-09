@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
+	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
-	"github.com/posthog/duckgres/tests/scenario/core"
-	"github.com/posthog/duckgres/tests/scenario/provision"
-	scenariosql "github.com/posthog/duckgres/tests/scenario/sql"
 )
 
 func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {

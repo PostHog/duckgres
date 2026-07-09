@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/posthog/duckgres/tests/scenario/core"
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 )
 
 func TestExecutorProvisionStepStoresPasswordForLaterSteps(t *testing.T) {
