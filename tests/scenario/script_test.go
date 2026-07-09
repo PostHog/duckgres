@@ -76,6 +76,7 @@ func TestDevScenarioWorkflowDefaultsToIsolatedDeploymentWithSharedDevOverride(t 
 		"image-name: duckgres",
 		"tag: scenario-runner-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
 		"tag: scenario-duckgres-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
+		"inputs.duckgres_image != ''",
 		"tests/scenario-dev/run.sh deploy",
 		"tests/scenario-dev/run.sh test",
 		"tests/scenario-dev/run.sh diagnostics",
@@ -111,6 +112,24 @@ func TestDevScenarioWorkflowDefaultsToIsolatedDeploymentWithSharedDevOverride(t 
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("workflow contains internal detail %q", forbidden)
+		}
+	}
+}
+
+func TestScenarioRunnerImageCachesGoDependencies(t *testing.T) {
+	dockerfilePath := filepath.Join("Dockerfile")
+	raw, err := os.ReadFile(dockerfilePath)
+	if err != nil {
+		t.Fatalf("read scenario runner Dockerfile: %v", err)
+	}
+	dockerfile := string(raw)
+
+	for _, required := range []string{
+		"go mod download",
+		"go test -run '^$' ./tests/scenario",
+	} {
+		if !strings.Contains(dockerfile, required) {
+			t.Fatalf("scenario runner Dockerfile missing %q", required)
 		}
 	}
 }

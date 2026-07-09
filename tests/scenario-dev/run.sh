@@ -75,6 +75,15 @@ ensure_config_secret() {
     | "${KUBECTL[@]}" apply -f -
 }
 
+scenario_requires_frozen_config() {
+  local scenario_path
+  case "$SCENARIO_FILE" in
+    /*) scenario_path="$SCENARIO_FILE" ;;
+    *) scenario_path="$ROOT/$SCENARIO_FILE" ;;
+  esac
+  [ -f "$scenario_path" ] && grep -q 'DUCKGRES_SCENARIO_FROZEN_S3_URI' "$scenario_path"
+}
+
 job_name() {
   local name
   name="${SCENARIO_NAME:?SCENARIO_NAME is required}"
@@ -102,7 +111,9 @@ cmd_test() {
   api_base="$(control_plane_api_base)"
   pg="$(pg_host)"
   flight="$(flight_addr)"
-  ensure_config_secret
+  if scenario_requires_frozen_config; then
+    ensure_config_secret
+  fi
 
   "${KUBECTL[@]}" -n "$ns" delete job "$job" --ignore-not-found
   cat <<YAML | "${KUBECTL[@]}" -n "$ns" apply -f -
