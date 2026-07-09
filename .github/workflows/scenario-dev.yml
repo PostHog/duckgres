@@ -8,10 +8,21 @@ on:
         required: true
         default: false
         type: boolean
+      use_shared_dev:
+        description: Skip isolated deploy and run against the shared dev stack
+        required: true
+        default: false
+        type: boolean
+      duckgres_image:
+        description: Existing Duckgres image to deploy instead of building this SHA
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "17 8 * * *"
 
 permissions:
+  id-token: write
   contents: read
 
 concurrency:
@@ -19,53 +30,104 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  scenario-runner-image:
+    uses: ./.github/workflows/_image-build.yml
+    with:
+      dockerfile: tests/scenario/Dockerfile
+      image-name: duckgres
+      tag: scenario-runner-${{ github.run_id }}-${{ github.run_attempt }}-arm64
+      platform: linux/arm64
+      cache-scope: scenario-runner-arm64
+    secrets:
+      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+
+  duckgres-image:
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.use_shared_dev && inputs.duckgres_image == '') }}
+    uses: ./.github/workflows/_image-build.yml
+    with:
+      dockerfile: Dockerfile
+      image-name: duckgres
+      tag: scenario-duckgres-${{ github.run_id }}-${{ github.run_attempt }}-arm64
+      platform: linux/arm64
+      cache-scope: scenario-duckgres-arm64
+      build-args: |
+        DUCKDB_EXTENSION_VERSION=1.5.3
+        HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry
+        DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
+        DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
+        POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
+    secrets:
+      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+
   scenarios:
+    needs: [scenario-runner-image, duckgres-image]
+    if: ${{ always() && needs.scenario-runner-image.result == 'success' && ((github.event_name == 'workflow_dispatch' && inputs.use_shared_dev) || needs.duckgres-image.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - name: provision-smoke
+            slot: 1
             file: tests/scenario/scenarios/provision_smoke.yaml
             max_runtime: 30m
             go_test_timeout: 45m
             slow: false
             needs_dbt: false
           - name: provision-rejection
+            slot: 2
             file: tests/scenario/scenarios/provision_rejection.yaml
             max_runtime: 30m
             go_test_timeout: 45m
             slow: false
             needs_dbt: false
           - name: frozen-metadata
+            slot: 3
             file: tests/scenario/scenarios/posthog_frozen_metadata.yaml
             max_runtime: 45m
             go_test_timeout: 60m
             slow: false
             needs_dbt: false
           - name: frozen-perf
+            slot: 4
             file: tests/scenario/scenarios/posthog_frozen_perf.yaml
             max_runtime: 45m
             go_test_timeout: 60m
             slow: false
             needs_dbt: false
           - name: frozen-dbt
+            slot: 5
             file: tests/scenario/scenarios/posthog_frozen_dbt.yaml
             max_runtime: 4h
             go_test_timeout: 4h15m
             slow: true
             needs_dbt: true
     env:
-      DUCKGRES_SCENARIO_API_BASE: ${{ secrets.DUCKGRES_SCENARIO_API_BASE_DEV }}
-      DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.DUCKGRES_SCENARIO_INTERNAL_SECRET_DEV }}
-      DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.DUCKGRES_SCENARIO_PG_HOST_DEV }}
-      DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.DUCKGRES_SCENARIO_SNI_SUFFIX_DEV }}
-      DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.DUCKGRES_SCENARIO_FROZEN_S3_URI_DEV }}
-      DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.DUCKGRES_SCENARIO_FLIGHT_ADDR_DEV }}
-      DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY: ${{ vars.DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY_DEV || 'true' }}
-      DUCKGRES_SCENARIO_DBT_BIN: dbt
-      DUCKGRES_SCENARIO_OUTPUT_BASE: artifacts/scenario-dev
+      USE_SHARED_DEV: ${{ github.event_name == 'workflow_dispatch' && inputs.use_shared_dev }}
+      SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
+      WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
+      CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
+      KUBE_CONTEXT: ${{ vars.DUCKGRES_SCENARIO_KUBE_CONTEXT }}
+      CLUSTER_NAME: ${{ vars.DUCKGRES_SCENARIO_EKS_CLUSTER_NAME }}
+      EKS_CLUSTER_NAME: ${{ vars.DUCKGRES_SCENARIO_EKS_CLUSTER_NAME }}
+      AWS_REGION: ${{ vars.DUCKGRES_SCENARIO_AWS_REGION || 'us-east-1' }}
+      CP_POD_IDENTITY_ROLE: ${{ secrets.DUCKGRES_SCENARIO_CP_POD_IDENTITY_ROLE }}
+      PR_NUMBER: ${{ github.run_id }}${{ matrix.slot }}
+      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.slot }}
+      SCENARIO_NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.slot }}
+      SCENARIO_NAME: ${{ matrix.name }}
+      SCENARIO_FILE: ${{ matrix.file }}
+      SCENARIO_SHARED_NAMESPACE: ${{ vars.DUCKGRES_SCENARIO_SHARED_NAMESPACE }}
+      SCENARIO_SHARED_API_BASE: ${{ vars.DUCKGRES_SCENARIO_SHARED_API_BASE }}
+      SCENARIO_SHARED_PG_HOST: ${{ vars.DUCKGRES_SCENARIO_SHARED_PG_HOST }}
+      SCENARIO_SHARED_FLIGHT_ADDR: ${{ vars.DUCKGRES_SCENARIO_SHARED_FLIGHT_ADDR }}
+      SCENARIO_CONFIG_SECRET_NAMESPACE: ${{ vars.DUCKGRES_SCENARIO_CONFIG_SECRET_NAMESPACE }}
+      SCENARIO_CONFIG_SECRET_NAME: ${{ vars.DUCKGRES_SCENARIO_CONFIG_SECRET_NAME }}
+      SCENARIO_INTERNAL_SECRET_NAME: ${{ vars.DUCKGRES_SCENARIO_INTERNAL_SECRET_NAME }}
+      SCENARIO_INTERNAL_SECRET_KEY: ${{ vars.DUCKGRES_SCENARIO_INTERNAL_SECRET_KEY }}
+      SCENARIO_SNI_SUFFIX: ${{ vars.DUCKGRES_SCENARIO_SNI_SUFFIX || '.ci.duckgres.local' }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: ${{ matrix.max_runtime }}
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: ${{ matrix.go_test_timeout }}
       DUCKGRES_SCENARIO_RUN_ID: scenario-dev-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -77,27 +139,62 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
 
+      - name: Isolated dev target selected
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.use_shared_dev }}
+        run: echo "Deploying an isolated Duckgres stack for this scenario."
+
+      - name: Shared dev target selected
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.use_shared_dev }}
+        run: echo "Skipping isolated deploy and targeting the shared dev stack."
+
       - name: Set up Go
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
         uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
           go-version-file: go.mod
 
-      - name: Install dbt
-        if: ${{ matrix.needs_dbt && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
-        run: python -m pip install --user dbt-postgres
-
-      - name: Add user Python bin to PATH
-        if: ${{ matrix.needs_dbt && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
-        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Check scenario environment
+      - name: Test scenario workflow scripts
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
-        run: scripts/scenario_run.sh --check-env "${{ matrix.file }}"
+        run: go test -count=1 ./tests/scenario ./tests/scenario-dev ./tests/e2e-mw-dev
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
+          aws-region: us-east-1
+
+      - name: Connect to Tailscale
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
+        with:
+          oauth-client-id: ${{ vars.TS_WIF_CLIENT_ID_MW_DEV }}
+          audience: ${{ vars.TS_WIF_AUDIENCE_MW_DEV }}
+          tags: tag:github-runner
+
+      - name: Install kubectl
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+
+      - name: Update kubeconfig
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
+
+      - name: Deploy isolated Duckgres stack
+        if: ${{ (github.event_name != 'workflow_dispatch' || !inputs.use_shared_dev) && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
+        run: tests/scenario-dev/run.sh deploy
 
       - name: Run scenario
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow }}
-        run: scripts/scenario_run.sh "${{ matrix.file }}"
+        run: tests/scenario-dev/run.sh test
+
+      - name: Collect diagnostics
+        if: ${{ failure() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
+        run: tests/scenario-dev/run.sh diagnostics
+
+      - name: Teardown
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
+        run: tests/scenario-dev/run.sh teardown
 
       - name: Upload scenario artifacts
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow || !matrix.slow) }}
