@@ -32,6 +32,7 @@ import type {
   QueryResult,
   ReshardLogEntry,
   ReshardOperation,
+  ReshardTargetsResponse,
   RunningQuery,
   SessionStatus,
   StartReshardBody,
@@ -237,4 +238,7 @@ export const api = {
     ),
   cancelReshard: (opId: number) =>
     post<{ cancel_requested?: boolean; state?: string }>(`/reshards/${opId}/cancel`, {}),
+  // Destination discovery for the reshard form: all cnpg shards (incl. empty
+  // ones) + known external stores.
+  getReshardTargets: () => get<ReshardTargetsResponse>("/reshards/targets"),
 };

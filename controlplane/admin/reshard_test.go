@@ -13,6 +13,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
@@ -113,6 +121,12 @@ func (f *fakeReshardStore) GetManagedWarehouse(orgID string) (*configstore.Manag
 	return &cp, nil
 }
 
+func (f *fakeReshardStore) ListExternalMetadataStores() ([]configstore.ExternalMetadataStoreInfo, error) {
+	return []configstore.ExternalMetadataStoreInfo{
+		{Endpoint: "known.rds.example.com", PasswordAWSSecret: "known-secret", User: "postgres", Database: "postgres"},
+	}, nil
+}
+
 func (f *fakeReshardStore) StashExternalPassword(opID int64, password string) {
 	if f.stashed == nil {
 		f.stashed = map[int64]string{}
@@ -129,12 +143,16 @@ func (f fakeShardLister) CRMetadataStores(context.Context) (map[string]DucklingM
 }
 
 func reshardRouter(store *fakeReshardStore) *gin.Engine {
+	return reshardRouterWithCluster(store, nil)
+}
+
+func reshardRouterWithCluster(store *fakeReshardStore, cluster kubernetes.Interface) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	lister := fakeShardLister{stores: map[string]DucklingMetadataStore{
 		"acme": {Kind: "cnpg-shard", Endpoint: "shard-001-pooler.cnpg-shards.svc.cluster.local"},
 	}}
-	RegisterReshardAPI(r.Group("/api/v1"), store, lister, store)
+	RegisterReshardAPI(r.Group("/api/v1"), store, lister, store, cluster)
 	return r
 }
 
@@ -302,4 +320,71 @@ func TestReshardGetListLogCancel(t *testing.T) {
 
 func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
+}
+
+func cnpgPod(name, shard string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:      name,
+		Namespace: cnpgShardsNamespace,
+		Labels:    map[string]string{"cnpg.io/cluster": shard},
+	}}
+}
+
+type reshardTargets struct {
+	Shards           []string                                `json:"shards"`
+	ClusterDiscovery bool                                    `json:"cluster_discovery"`
+	ExternalStores   []configstore.ExternalMetadataStoreInfo `json:"external_stores"`
+}
+
+// TestReshardTargetsClusterDiscovery pins the load-bearing property of the
+// endpoint: an EMPTY shard (no tenant on it yet) shows up, discovered from the
+// CNPG instance pods, unioned with the occupied shards from duckling statuses.
+func TestReshardTargetsClusterDiscovery(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset(
+		cnpgPod("shard-001-1", "shard-001"),
+		cnpgPod("shard-002-1", "shard-002"), // empty shard: no duckling on it
+	)
+	w := doJSON(reshardRouterWithCluster(newFakeReshardStore(), cs), http.MethodGet, "/api/v1/reshards/targets", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	var resp reshardTargets
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.ClusterDiscovery {
+		t.Fatal("cluster_discovery = false, want true")
+	}
+	if strings.Join(resp.Shards, ",") != "shard-001,shard-002" {
+		t.Fatalf("shards = %v, want [shard-001 shard-002]", resp.Shards)
+	}
+	if len(resp.ExternalStores) != 1 || resp.ExternalStores[0].Endpoint != "known.rds.example.com" {
+		t.Fatalf("external stores = %+v", resp.ExternalStores)
+	}
+}
+
+// TestReshardTargetsDegrades pins the fallbacks: an RBAC Forbidden (the e2e
+// CP) degrades to the occupied shards with cluster_discovery=false, and a nil
+// cluster client behaves the same.
+func TestReshardTargetsDegrades(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", nil)
+	})
+	for _, cluster := range []kubernetes.Interface{cs, nil} {
+		w := doJSON(reshardRouterWithCluster(newFakeReshardStore(), cluster), http.MethodGet, "/api/v1/reshards/targets", "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+		}
+		var resp reshardTargets
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if resp.ClusterDiscovery {
+			t.Fatal("cluster_discovery = true, want false on degrade")
+		}
+		if strings.Join(resp.Shards, ",") != "shard-001" {
+			t.Fatalf("shards = %v, want the occupied [shard-001] fallback", resp.Shards)
+		}
+	}
 }

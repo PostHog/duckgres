@@ -2255,6 +2255,22 @@ reshard_dump_log() { # opid
     | jq -r '.entries[] | "\(.level): \(.message)"' | tail -30 || true
 }
 
+reshard_targets() { # destination discovery; ext org's RDS must appear too
+  log "reshard targets: destination discovery"
+  out="$(curl -fsS -H "$H" "$API/api/v1/reshards/targets")" \
+    || fail "reshard targets: request failed"
+  # The e2e CP has no cluster-scoped RBAC (Forbidden degrade), so the shard
+  # list is the occupied fallback — the cnpg org's shard must be in it. On a
+  # real deployment cluster_discovery=true additionally surfaces EMPTY shards.
+  echo "$out" | jq -e '.shards | index("shard-001") != null' >/dev/null \
+    || fail "reshard targets: shard-001 missing: $out"
+  echo "$out" | jq -e '.external_stores | length >= 1 and (.[0].endpoint | length > 0) and (.[0].password_aws_secret | length > 0)' >/dev/null \
+    || fail "reshard targets: external store from the ext org missing: $out"
+  echo "$out" | jq -e '.external_stores | all(has("password") | not)' >/dev/null \
+    || fail "reshard targets: response carries a password field: $out"
+  log "reshard targets OK ($(echo "$out" | jq -c '{shards, cluster_discovery}'))"
+}
+
 reshard_validation() { # cnpg-org currently on shard-001
   log "reshard validation: same-shard + bad targets are 400"
   for body in \
@@ -2842,6 +2858,7 @@ main() {
   # ---- reshard operations (validation, cancel, rollback on res2; then the
   #      ext→cnpg POSITIVE path on the ext org — must run AFTER every assert
   #      that needs the ext org on the RDS, notably tenant_isolation) ----
+  reshard_targets
   reshard_validation "$CNPG"
   reshard_cancel_during_drain "$RES2" "$res2_pw"
   reshard_bogus_shard_rollback "$RES2" "$res2_pw"
@@ -2856,7 +2873,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

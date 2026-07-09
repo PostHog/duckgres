@@ -24,7 +24,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ducklingEntryFor } from "@/lib/format";
-import { useDucklingsMetadata, useStartReshard, useWarehouse } from "@/hooks/useApi";
+import { useDucklingsMetadata, useReshardTargets, useStartReshard, useWarehouse } from "@/hooks/useApi";
 import type { StartReshardBody } from "@/types/api";
 
 // Reshard start form: pick a target metadata store for the org, confirm, run.
@@ -55,15 +55,20 @@ export function ReshardForm() {
   const sourceKind = entry?.kind ?? warehouse.data?.metadata_store?.kind ?? "cnpg-shard";
   const currentShard = entry?.cnpg_shard ?? "";
 
-  // Known shards: the distinct set the fleet is already using. Free-text
-  // covers a brand-new shard no tenant landed on yet.
+  // Destination discovery: every cnpg shard in the cluster (including EMPTY
+  // ones no tenant occupies yet) + known external stores, from
+  // /reshards/targets. Unioned with the shards tenants occupy (duckling
+  // metadata) as a belt-and-suspenders fallback; free-text still covers a
+  // shard the server can't see (cluster_discovery=false on an RBAC degrade).
+  const targets = useReshardTargets();
   const knownShards = useMemo(() => {
-    const s = new Set<string>();
+    const s = new Set<string>(targets.data?.shards ?? []);
     for (const e of Object.values(metadata.data?.entries ?? {})) {
       if (e.kind === "cnpg-shard" && e.cnpg_shard) s.add(e.cnpg_shard);
     }
     return [...s].sort();
-  }, [metadata.data]);
+  }, [targets.data, metadata.data]);
+  const knownExternal = targets.data?.external_stores ?? [];
 
   const effectiveShard = shard === "__custom__" ? shardCustom.trim() : shard;
   const targetLabel =
@@ -180,6 +185,12 @@ export function ReshardForm() {
                     </SelectContent>
                   </Select>
                 </div>
+                {targets.data && !targets.data.cluster_discovery && (
+                  <p className="col-span-2 text-xs text-muted-foreground">
+                    Shard list limited to shards tenants already occupy (no cluster read access) —
+                    use "other…" for a new empty shard.
+                  </p>
+                )}
                 {shard === "__custom__" && (
                   <div className="space-y-1">
                     <Label>Shard name</Label>
@@ -194,6 +205,36 @@ export function ReshardForm() {
               </div>
             ) : (
               <div className="space-y-3">
+                {knownExternal.length > 0 && (
+                  <div className="space-y-1">
+                    <Label>Known external stores</Label>
+                    <Select
+                      onValueChange={(v) => {
+                        const st = knownExternal[Number(v)];
+                        if (!st) return;
+                        setEndpoint(st.endpoint);
+                        setPasswordSecret(st.password_aws_secret);
+                        setUser(st.user || "postgres");
+                        setDatabase(st.database || "postgres");
+                      }}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Prefill from a store already in use…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {knownExternal.map((st, i) => (
+                          <SelectItem key={st.endpoint + st.database} value={String(i)}>
+                            {st.endpoint}/{st.database || "postgres"}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Prefills endpoint/secret/user/database from an external store another
+                      warehouse already uses — the password below is still required.
+                    </p>
+                  </div>
+                )}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
                     <Label>Endpoint (RDS host)</Label>
