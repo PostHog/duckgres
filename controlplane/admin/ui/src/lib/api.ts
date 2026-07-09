@@ -237,4 +237,7 @@ export const api = {
     ),
   cancelReshard: (opId: number) =>
     post<{ cancel_requested?: boolean; state?: string }>(`/reshards/${opId}/cancel`, {}),
+  // Global operation list (all orgs, newest first) for the Reshards nav page.
+  listAllReshards: () =>
+    get<{ operations: ReshardOperation[] }>("/reshards").then((r) => r.operations ?? []),
 };

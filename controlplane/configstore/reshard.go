@@ -162,6 +162,19 @@ func (cs *ConfigStore) ListReshardOperationsForOrg(orgID string, limit int) ([]R
 	return ops, nil
 }
 
+// ListReshardOperations returns operations across ALL orgs, newest first —
+// the admin console's global reshards page.
+func (cs *ConfigStore) ListReshardOperations(limit int) ([]ReshardOperation, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var ops []ReshardOperation
+	if err := cs.db.Order("id DESC").Limit(limit).Find(&ops).Error; err != nil {
+		return nil, fmt.Errorf("list reshard operations: %w", err)
+	}
+	return ops, nil
+}
+
 // ClaimReshardOperation atomically claims a claimable operation for a runner:
 // state pending, or state running with a heartbeat older than staleAfter (a
 // takeover of a dead runner). The claim bumps runner_epoch — the fence that

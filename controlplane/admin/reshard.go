@@ -32,6 +32,7 @@ type ReshardStore interface {
 	CreateReshardOperation(op *configstore.ReshardOperation) error
 	GetReshardOperation(id int64) (*configstore.ReshardOperation, error)
 	ListReshardOperationsForOrg(orgID string, limit int) ([]configstore.ReshardOperation, error)
+	ListReshardOperations(limit int) ([]configstore.ReshardOperation, error)
 	ListReshardLog(opID, afterID int64, limit int) ([]configstore.ReshardLogEntry, error)
 	RequestReshardCancel(id int64) (bool, error)
 	FinishPendingReshardOperation(id int64, state configstore.ReshardState, errMsg string) (bool, error)
@@ -78,6 +79,7 @@ func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingM
 	h := &reshardHandler{store: store, lister: lister, stash: stash}
 	r.POST("/orgs/:id/reshard", h.start)
 	r.GET("/orgs/:id/reshards", h.listForOrg)
+	r.GET("/reshards", h.listAll)
 	r.GET("/reshards/:opid", h.get)
 	r.GET("/reshards/:opid/log", h.log)
 	r.POST("/reshards/:opid/cancel", h.cancel)
@@ -243,6 +245,20 @@ func (h *reshardHandler) currentShard(c *gin.Context, ducklingName string) strin
 		return ""
 	}
 	return cnpgShardFromEndpoint(ms.Endpoint)
+}
+
+// listAll returns operations across every org, newest first — the console's
+// global Reshards page.
+func (h *reshardHandler) listAll(c *gin.Context) {
+	ops, err := h.store.ListReshardOperations(parseIntDefault(c.Query("limit"), 100))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if ops == nil {
+		ops = []configstore.ReshardOperation{}
+	}
+	c.JSON(http.StatusOK, gin.H{"operations": ops})
 }
 
 func (h *reshardHandler) listForOrg(c *gin.Context) {

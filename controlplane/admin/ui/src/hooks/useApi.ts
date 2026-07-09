@@ -527,6 +527,16 @@ export function useReshardLog(opId: number | null, opState: string | undefined) 
   return entries;
 }
 
+// Global operation list for the Reshards nav page. Polls at the normal
+// cadence; running ops keep their live detail on the op page itself.
+export function useAllReshards() {
+  return useQuery<ReshardOperation[]>({
+    queryKey: ["reshards", "all"],
+    queryFn: () => tolerateStatus<ReshardOperation[]>([], 403, 404, 503)(api.listAllReshards()),
+    refetchInterval: POLL.normal,
+  });
+}
+
 export function useCancelReshard() {
   const qc = useQueryClient();
   return useMutation({
