@@ -22,10 +22,14 @@ type DucklingChecker interface {
 	ListCRNames(ctx context.Context) ([]string, error)
 }
 
+type driftWarehouseLister interface {
+	ListWarehouses() ([]configstore.ManagedWarehouse, error)
+}
+
 // driftHandler finds drift between config-store warehouses and live Duckling
 // CRs in the cluster.
 type driftHandler struct {
-	store   *configstore.ConfigStore
+	store   driftWarehouseLister
 	checker DucklingChecker
 }
 
@@ -72,12 +76,19 @@ func (h *driftHandler) findDrift(c *gin.Context) {
 	}
 
 	entries := make([]driftEntry, 0)
-	// expected holds exactly the stored duckling_name of every warehouse row,
-	// so the orphan pass below flags any CR not claimed by a row.
+	// expected holds exactly the stored duckling_name of every non-deleted
+	// warehouse row, so the orphan pass below flags any CR not claimed by an
+	// active row.
 	expected := make(map[string]struct{}, len(warehouses))
+	checked := 0
 
 	for i := range warehouses {
 		wh := warehouses[i]
+		if wh.State == configstore.ManagedWarehouseStateDeleted {
+			continue
+		}
+		checked++
+
 		orgID := wh.OrgID
 		// The stored duckling_name is the authoritative CR name. The column is
 		// NOT NULL and backfilled; the org-ID fallback only covers legacy rows
@@ -129,7 +140,7 @@ func (h *driftHandler) findDrift(c *gin.Context) {
 		entries = append(entries, entry)
 	}
 
-	// Orphan pass: any live CR not mapped by some warehouse row.
+	// Orphan pass: any live CR not mapped by a non-deleted warehouse row.
 	names, err := h.checker.ListCRNames(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -150,7 +161,7 @@ func (h *driftHandler) findDrift(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"available": true,
-		"checked":   len(warehouses),
+		"checked":   checked,
 		"entries":   entries,
 	})
 }
