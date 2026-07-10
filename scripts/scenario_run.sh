@@ -10,7 +10,7 @@ Runs a Duckgres scenario through the Go test entry point.
 Required environment:
   DUCKGRES_SCENARIO_API_BASE
   DUCKGRES_SCENARIO_INTERNAL_SECRET
-  DUCKGRES_SCENARIO_PG_HOST        (libpq hostaddr / direct TCP address)
+  DUCKGRES_SCENARIO_PG_HOST        (direct PGWire TCP host)
   DUCKGRES_SCENARIO_SNI_SUFFIX
 
 Optional environment:

@@ -27,7 +27,7 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:        "10.0.0.10",
+			DialHost:        "10.0.0.10",
 			SNISuffix:       ".dev.example",
 			Port:            5432,
 			SSLMode:         "require",
@@ -63,8 +63,15 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	if result.Summary.RunID != "scenario-run-1" || result.Summary.TotalQueries != 2 || result.Summary.TotalErrors != 0 {
 		t.Fatalf("summary = %+v", result.Summary)
 	}
-	if got := factory.pgwireDSN; !strings.Contains(got, "host=scenario-org.dev.example") || !strings.Contains(got, "password=root-password") {
-		t.Fatalf("pgwire dsn = %q, want scenario org host and provision password", got)
+	pgwireDSN := factory.pgwireConnection.DSN
+	if !strings.Contains(pgwireDSN, "host=scenario-org.dev.example") || !strings.Contains(pgwireDSN, "password=root-password") {
+		t.Fatalf("pgwire dsn = %q, want scenario org host and provision password", pgwireDSN)
+	}
+	if strings.Contains(pgwireDSN, "hostaddr=") {
+		t.Fatalf("pgwire dsn = %q, should not use unsupported lib/pq hostaddr", pgwireDSN)
+	}
+	if factory.pgwireConnection.DialAddress != "10.0.0.10:5432" {
+		t.Fatalf("pgwire direct address = %q, want 10.0.0.10:5432", factory.pgwireConnection.DialAddress)
 	}
 	if factory.flightAddr != "flight.dev.example:443" || factory.flightUsername != "root" || factory.flightPassword != "root-password" {
 		t.Fatalf("flight config = %q/%q/%q", factory.flightAddr, factory.flightUsername, factory.flightPassword)
@@ -106,7 +113,7 @@ func TestExecutorFailsPerfStepWhenMeasuredQueryErrors(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			SSLMode:   "require",
 		},
@@ -151,7 +158,7 @@ func TestExecutorCanReportPerfQueryErrorsWithoutFailingStep(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			SSLMode:   "require",
 		},
@@ -201,7 +208,7 @@ func TestExecutorRequiresFlightAddrWhenCatalogTargetsFlight(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			SSLMode:   "require",
 		},
@@ -235,7 +242,7 @@ func TestExecutorClosesCreatedDriversWhenLaterDriverCreationFails(t *testing.T) 
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			SSLMode:   "require",
 		},
@@ -291,7 +298,7 @@ func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 }
 
 type fakeDriverFactory struct {
-	pgwireDSN                string
+	pgwireConnection         scenariosql.PGWireConnection
 	pgwireErr                error
 	pgwireDriver             *fakeProtocolDriver
 	flightAddr               string
@@ -302,8 +309,8 @@ type fakeDriverFactory struct {
 	flightErr                error
 }
 
-func (f *fakeDriverFactory) NewPGWire(dsn string) (perfcore.ProtocolDriver, error) {
-	f.pgwireDSN = dsn
+func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
+	f.pgwireConnection = connection
 	f.pgwireDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolPGWire, err: f.pgwireErr}
 	return f.pgwireDriver, nil
 }

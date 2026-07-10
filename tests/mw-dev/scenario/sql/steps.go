@@ -216,7 +216,7 @@ func (e *Executor) queryRequest(step core.Step, spec querySpec, resultID string)
 	cfg.Database = spec.Catalog
 	cfg.Username = username
 	cfg.Password = password
-	dsn, err := cfg.DSN()
+	connection, err := cfg.PGWire()
 	if err != nil {
 		return QueryRequest{}, err
 	}
@@ -226,7 +226,7 @@ func (e *Executor) queryRequest(step core.Step, spec querySpec, resultID string)
 		OrgID:   orgID,
 		Catalog: spec.Catalog,
 		SQL:     spec.SQL,
-		DSN:     dsn,
+		PGWire:  connection,
 	}, nil
 }
 

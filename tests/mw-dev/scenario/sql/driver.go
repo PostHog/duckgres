@@ -2,11 +2,8 @@ package sql
 
 import (
 	"context"
-	stdsql "database/sql"
 	"fmt"
 	"time"
-
-	_ "github.com/lib/pq"
 )
 
 type Driver interface {
@@ -19,7 +16,7 @@ type QueryRequest struct {
 	OrgID   string
 	Catalog string
 	SQL     string
-	DSN     string
+	PGWire  PGWireConnection
 }
 
 type QueryResult struct {
@@ -35,7 +32,7 @@ func NewDatabaseDriver() *DatabaseDriver {
 
 func (d *DatabaseDriver) Execute(ctx context.Context, req QueryRequest) (QueryResult, error) {
 	started := time.Now()
-	db, err := stdsql.Open("postgres", req.DSN)
+	db, err := req.PGWire.OpenDB()
 	if err != nil {
 		return QueryResult{}, fmt.Errorf("open pgwire connection: %w", err)
 	}

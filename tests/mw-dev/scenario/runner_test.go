@@ -71,7 +71,7 @@ func TestScenarioRunner(t *testing.T) {
 	sqlExecutor := scenariosql.NewExecutor(scenariosql.ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
+			DialHost:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
 			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),
 			Port:            intEnv(t, "DUCKGRES_SCENARIO_PG_PORT", 5432),
 			SSLMode:         "require",
@@ -83,7 +83,7 @@ func TestScenarioRunner(t *testing.T) {
 	perfExecutor := scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
+			DialHost:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
 			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),
 			Port:            intEnv(t, "DUCKGRES_SCENARIO_PG_PORT", 5432),
 			SSLMode:         "require",
@@ -97,7 +97,7 @@ func TestScenarioRunner(t *testing.T) {
 	dbtExecutor := scenariodbt.NewExecutor(scenariodbt.ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
+			DialHost:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
 			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),
 			Port:            intEnv(t, "DUCKGRES_SCENARIO_PG_PORT", 5432),
 			SSLMode:         "require",
