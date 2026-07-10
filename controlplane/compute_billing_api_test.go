@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -323,5 +324,65 @@ func TestComputeUsageGCRunsAndStops(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("gc loop did not stop on cancel")
+	}
+}
+
+func newRegisteredBillingRouter(store *fakeBillingStore) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	allow := func(c *gin.Context) { c.Next() }
+	registerBillingAPI(r.Group("/api/v1"), store, allow)
+	return r
+}
+
+func TestBillingUsageGzipsWhenAccepted(t *testing.T) {
+	// Usage responses scale with total adoption (one row per storage-holding
+	// org per day) and the JSON compresses well — serve gzip to any client that
+	// accepts it. Not optional: the billing poller always accepts.
+	router := newRegisteredBillingRouter(&fakeBillingStore{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/billing/usage", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	gz, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(gz).Decode(&body); err != nil {
+		t.Fatalf("decode gzipped body: %v", err)
+	}
+	for _, key := range []string{"watermark_low", "watermark_high", "usage", "storage"} {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("gzipped body missing %q", key)
+		}
+	}
+}
+
+func TestBillingUsagePlainWhenGzipNotAccepted(t *testing.T) {
+	router := newRegisteredBillingRouter(&fakeBillingStore{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/billing/usage", nil)
+	req.Header.Del("Accept-Encoding")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got == "gzip" {
+		t.Fatal("plain client got gzip")
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
 	}
 }
