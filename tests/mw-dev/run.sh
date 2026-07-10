@@ -22,7 +22,7 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 SA_NAME="duckgres"
 FROZEN_S3_URI="${DUCKGRES_SCENARIO_FROZEN_S3_URI:-s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/}"
 SCENARIO_JOB_WATCH_TIMEOUT_SECONDS="${SCENARIO_JOB_WATCH_TIMEOUT_SECONDS:-16200}"
-SCENARIO_FULL_FILES="${SCENARIO_FULL_FILES:-tests/mw-dev/scenario/scenarios/provision_rejection.yaml tests/mw-dev/scenario/scenarios/provision_smoke.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_dbt.yaml}"
+SCENARIO_FULL_FILES="${SCENARIO_FULL_FILES:-tests/mw-dev/scenario/scenarios/provision_rejection.yaml tests/mw-dev/scenario/scenarios/provision_smoke.yaml tests/mw-dev/scenario/scenarios/full-suite.yaml}"
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
