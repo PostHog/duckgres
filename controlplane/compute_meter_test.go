@@ -175,17 +175,19 @@ func TestComputeMeterFlush(t *testing.T) {
 	}
 }
 
-func TestComputeMeterUnknownTeamTolerated(t *testing.T) {
-	// An org with no default_team_id (or a nil resolver) still meters — the
-	// bucket carries team_id 0 rather than dropping usage.
+func TestComputeMeterSkipsUnresolvedTeam(t *testing.T) {
+	// An org with no default_team_id resolves to team 0 — unattributable usage.
+	// We don't meter it: recording nothing keeps a team_id 0 bucket out of the
+	// billing pull entirely (billing keys usage by team, and 0 collides across
+	// orgs). Losing an unattributable interval is the accepted tradeoff.
 	store := &fakeFlushStore{}
 	m := newComputeMeter(store, teamResolverA)
 	m.Record("orgB", "standard", 1000, 1024, time.Now(), 2*time.Second)
-	if n := m.Flush(); n != 1 {
-		t.Fatalf("Flush rows = %d, want 1", n)
+	if n := m.Flush(); n != 0 {
+		t.Fatalf("Flush rows = %d, want 0 (unresolved-team usage must not be metered)", n)
 	}
-	if store.flushed[0].TeamID != 0 {
-		t.Fatalf("team = %d, want 0 for unknown org", store.flushed[0].TeamID)
+	if len(store.flushed) != 0 {
+		t.Fatalf("flushed = %v, want nothing for an unresolved team", store.flushed)
 	}
 }
 

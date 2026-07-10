@@ -190,6 +190,43 @@ func TestBillingUsageWindowAndRows(t *testing.T) {
 	}
 }
 
+func TestBillingUsageExcludesUnresolvedTeam(t *testing.T) {
+	// The serve-side guard for the window before the meter-level skip shipped:
+	// any usage/storage row with an unresolved team (team_id 0) is dropped from
+	// the pull, so billing can never receive a row that would collide across
+	// orgs on its team-keyed mirror.
+	now := time.Date(2026, 7, 1, 12, 40, 47, 0, time.UTC)
+	cursor := time.Date(2026, 7, 1, 12, 30, 0, 0, time.UTC)
+	store := &fakeBillingStore{
+		cursor: cursor, hasAck: true,
+		rows: []configstore.ComputeUsageRow{
+			{Date: "2026-07-01", OrgID: "org_real", TeamID: 12345, QuerySource: "standard", CPU: "8", MemGiB: "16", CPUSeconds: 4800, MemorySeconds: 9600},
+			{Date: "2026-07-01", OrgID: "org_noteam", TeamID: 0, QuerySource: "standard", CPU: "8", MemGiB: "16", CPUSeconds: 100, MemorySeconds: 200},
+		},
+		storageRows: []configstore.StorageUsageRow{
+			{Date: "2026-07-01", OrgID: "org_real", TeamID: 12345, GiBSeconds: "18000000.5"},
+			{Date: "2026-07-01", OrgID: "org_noteam", TeamID: 0, GiBSeconds: "999"},
+		},
+	}
+	router := newBillingTestRouter(store, now)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/billing/usage", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp usageResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Usage) != 1 || resp.Usage[0].OrgID != "org_real" {
+		t.Fatalf("usage = %+v, want only the resolved-team row", resp.Usage)
+	}
+	if len(resp.Storage) != 1 || resp.Storage[0].OrgID != "org_real" {
+		t.Fatalf("storage = %+v, want only the resolved-team row", resp.Storage)
+	}
+}
+
 func TestBillingUsageNeverAckedServesEverything(t *testing.T) {
 	// No cursor row yet → the window starts at the zero time (serves all
 	// buffered history).

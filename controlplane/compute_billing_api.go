@@ -93,12 +93,42 @@ func (h *billingAPIHandler) getUsage(c *gin.Context) {
 	if storageRows == nil {
 		storageRows = []configstore.StorageUsageRow{}
 	}
+	// Never serve usage for an unresolved default team (team_id 0): it can't be
+	// attributed to a billable team and would collide across orgs on billing's
+	// team-keyed mirror. The meter no longer records such usage; this is the
+	// serve-side guard for any rows written before that shipped.
+	rows = resolvedComputeRows(rows)
+	storageRows = resolvedStorageRows(storageRows)
 	c.JSON(http.StatusOK, gin.H{
 		"watermark_low":  low.Format(time.RFC3339),
 		"watermark_high": high.Format(time.RFC3339),
 		"usage":          rows,
 		"storage":        storageRows,
 	})
+}
+
+// resolvedComputeRows drops compute rows with an unresolved team (team_id <= 0).
+// Returns a non-nil slice so an all-dropped result still serializes as [].
+func resolvedComputeRows(rows []configstore.ComputeUsageRow) []configstore.ComputeUsageRow {
+	out := make([]configstore.ComputeUsageRow, 0, len(rows))
+	for _, r := range rows {
+		if r.TeamID > 0 {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// resolvedStorageRows drops storage rows with an unresolved team (team_id <= 0).
+// Returns a non-nil slice so an all-dropped result still serializes as [].
+func resolvedStorageRows(rows []configstore.StorageUsageRow) []configstore.StorageUsageRow {
+	out := make([]configstore.StorageUsageRow, 0, len(rows))
+	for _, r := range rows {
+		if r.TeamID > 0 {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 type billingAckRequest struct {

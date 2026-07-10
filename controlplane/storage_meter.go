@@ -54,8 +54,15 @@ var storageSampleErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Storage-billing samples skipped due to an error (org unreachable, query failed). Each miss under-bills one interval.",
 }, []string{"org"})
 
+var storageSamplesSkippedNoTeamCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_storage_samples_skipped_no_team_total",
+	Help: "Storage-billing samples dropped because the org has no resolved default team (team_id 0). Unattributable storage that is deliberately not sampled; should stay flat at zero once every billable org has a default team.",
+}, []string{"org"})
+
 // storageOrg is one samplable org: a Ready DuckLake warehouse and its default
-// team (the storage bucket key's team_id; 0 = no default team).
+// team (the storage bucket key's team_id). TeamID 0 means "no default team" —
+// such an org is skipped, not sampled (unattributable storage stays out of the
+// pull; 0 collides across orgs on billing's team-keyed mirror).
 type storageOrg struct {
 	OrgID  string
 	TeamID int64
@@ -125,10 +132,18 @@ func (s *storageSampler) Run(ctx context.Context) {
 
 func (s *storageSampler) sampleAll(ctx context.Context) {
 	orgs := s.listOrgs()
-	var sampled, failed int
+	var sampled, skipped, failed int
 	for _, org := range orgs {
 		if ctx.Err() != nil {
 			return
+		}
+		if org.TeamID <= 0 {
+			// No resolved default team: unattributable storage, keep it out of
+			// the pull (team_id 0 collides across orgs). Count for alerting —
+			// post-backfill this should stay flat at zero.
+			storageSamplesSkippedNoTeamCounter.WithLabelValues(org.OrgID).Inc()
+			skipped++
+			continue
 		}
 		if err := s.sampleOrg(ctx, org); err != nil {
 			slog.Warn("Storage-billing sample failed; interval under-billed for this org.", "org", org.OrgID, "error", err)
@@ -138,8 +153,8 @@ func (s *storageSampler) sampleAll(ctx context.Context) {
 		}
 		sampled++
 	}
-	if sampled > 0 || failed > 0 {
-		slog.Info("Storage-billing sample pass complete.", "sampled", sampled, "failed", failed)
+	if sampled > 0 || failed > 0 || skipped > 0 {
+		slog.Info("Storage-billing sample pass complete.", "sampled", sampled, "failed", failed, "skipped_no_team", skipped)
 	}
 }
 

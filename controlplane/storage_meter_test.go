@@ -44,7 +44,7 @@ func newTestStorageSampler(store storageUsageStore, orgs []storageOrg, footprint
 func TestStorageSamplerCreditsOneIntervalPerOrg(t *testing.T) {
 	store := &fakeStorageStore{}
 	s := newTestStorageSampler(store,
-		[]storageOrg{{OrgID: "orgA", TeamID: 42}, {OrgID: "orgB", TeamID: 0}},
+		[]storageOrg{{OrgID: "orgA", TeamID: 42}, {OrgID: "orgB", TeamID: 7}},
 		func(_ context.Context, dsn string) (int64, int64, error) {
 			if dsn == "postgres://meta/orgA" {
 				return 10 * 1024 * 1024 * 1024, 0, nil // 10 GiB
@@ -66,8 +66,24 @@ func TestStorageSamplerCreditsOneIntervalPerOrg(t *testing.T) {
 	if want := int64(10*1024*1024*1024) * 1800; a.byteSeconds != want {
 		t.Fatalf("orgA byteSeconds = %d, want %d (bytes × interval)", a.byteSeconds, want)
 	}
-	if b := store.samples[1]; b.orgID != "orgB" || b.teamID != 0 || b.byteSeconds != 512*1800 {
+	if b := store.samples[1]; b.orgID != "orgB" || b.teamID != 7 || b.byteSeconds != 512*1800 {
 		t.Fatalf("orgB sample = %+v", b)
+	}
+}
+
+func TestStorageSamplerSkipsUnresolvedTeam(t *testing.T) {
+	// An org whose default team is unresolved (TeamID 0) is not sampled: its
+	// storage can't be attributed to a billable team, so it stays out of the
+	// pull (team_id 0 collides across orgs on billing's team-keyed mirror).
+	store := &fakeStorageStore{}
+	s := newTestStorageSampler(store,
+		[]storageOrg{{OrgID: "noteam", TeamID: 0}, {OrgID: "healthy", TeamID: 5}},
+		func(_ context.Context, _ string) (int64, int64, error) { return 1024 * 1024 * 1024, 0, nil })
+
+	s.sampleAll(context.Background())
+
+	if len(store.samples) != 1 || store.samples[0].orgID != "healthy" {
+		t.Fatalf("samples = %+v, want exactly the resolved-team org", store.samples)
 	}
 }
 

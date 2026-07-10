@@ -7,8 +7,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
+
+var computeUsageSkippedNoTeamCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_compute_usage_skipped_no_team_total",
+	Help: "Compute-usage records dropped because the org has no resolved default team (team_id 0). Unattributable usage that is deliberately not metered; should stay flat at zero once every billable org has a default team.",
+}, []string{"org"})
 
 // Compute-seconds billing intervals (see docs/design/billing-compute-seconds-plan.md).
 const (
@@ -152,8 +160,9 @@ type computeUsageStore interface {
 // computeMeter wires the per-org counter to a flusher. Nil-safe: a disabled
 // meter (non-remote backend) leaves this nil and every call site no-ops.
 // resolveTeam maps an org to its default PostHog team id at record time (a
-// config-snapshot read — no I/O); 0 is tolerated per the OrgDefaultTeamID
-// contract and the bucket then carries team_id 0 ("no default team").
+// config-snapshot read — no I/O). An org with no resolved default team yields
+// 0; that usage is unattributable (billing keys buckets by team, and 0 collides
+// across orgs), so Record skips it rather than emit a team_id 0 bucket.
 type computeMeter struct {
 	counter     *computeUsageCounter
 	store       computeUsageStore
@@ -172,6 +181,13 @@ func (m *computeMeter) Record(orgID, querySource string, millicores, mib int64, 
 	teamID := int64(0)
 	if m.resolveTeam != nil {
 		teamID = m.resolveTeam(orgID)
+	}
+	if teamID <= 0 {
+		// No resolved default team: usage can't be attributed to a billable
+		// team. Skip it (never emit a team_id 0 bucket) and count it so an
+		// operator can alert — post-backfill this should stay flat at zero.
+		computeUsageSkippedNoTeamCounter.WithLabelValues(orgID).Inc()
+		return
 	}
 	m.counter.Record(orgID, querySource, teamID, millicores, mib, endTime, dur)
 }
