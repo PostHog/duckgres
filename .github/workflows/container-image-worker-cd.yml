@@ -78,7 +78,7 @@ jobs:
                       # as the credential-refresh scheduler keeps rotating the
                       # ducklake_s3 secret.
                       httpfs: "v1.5.3-cred-refresh-write-retry"
-                      ducklake: "v1.0-posthog.4"
+                      ducklake: "v1.0-posthog.5"
                       # Stable repo hosts postgres_scanner for 1.5.3; nightly
                       # does not. See scripts/ducklake_version_matrix.sh
                       # commit history for the rationale on each row.
