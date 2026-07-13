@@ -1,0 +1,82 @@
+name: full-suite
+run_id_prefix: scenario-full-suite
+required_env:
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
+  - DUCKGRES_SCENARIO_FLIGHT_ADDR
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: scenario-full-suite-${run_id_token}
+      request:
+        database_name: scenario_full_suite_${run_id_token}
+        default_team_id: 1
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    depends_on: [provision]
+    with:
+      org_id: scenario-full-suite-${run_id_token}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: setup_frozen_views
+    type: sql
+    depends_on: [wait_ready]
+    with:
+      org_id: scenario-full-suite-${run_id_token}
+      catalog: ducklake
+      file: ../sql/setup_frozen_views.sql
+      max_attempts: 12
+      retry_interval: 10s
+
+  - id: metadata_exploration
+    type: sql_catalog
+    depends_on: [setup_frozen_views]
+    with:
+      org_id: scenario-full-suite-${run_id_token}
+      catalog: ducklake
+      file: ../sql/metadata_catalog.yaml
+      max_attempts: 3
+      retry_interval: 5s
+
+  - id: perf_queries
+    type: perf_queries
+    depends_on: [setup_frozen_views]
+    with:
+      org_id: scenario-full-suite-${run_id_token}
+      catalog: ducklake
+      catalog_file: ../../../perf/queries/ducklake_frozen.yaml
+      run_id: ${run_id}
+      dataset_version: posthog-file-views-v1
+      flight_addr: ${env:DUCKGRES_SCENARIO_FLIGHT_ADDR}
+      fail_on_query_errors: false
+
+  - id: dbt_models
+    type: dbt_run
+    depends_on: [setup_frozen_views]
+    with:
+      org_id: scenario-full-suite-${run_id_token}
+      catalog: ducklake
+      schema: dbt_frozen
+      project_dir: ../dbt/posthog_frozen_project
+      commands: [debug, run, test, docs_generate]
+      retry:
+        enabled: true
+        max_attempts: 2
+
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [metadata_exploration, perf_queries, dbt_models]
+    always_run: true
+    with:
+      org_id: scenario-full-suite-${run_id_token}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s

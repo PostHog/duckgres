@@ -123,7 +123,6 @@ func TestScenarioFullRunsScenarioJobsAgainstIsolatedStack(t *testing.T) {
 
 	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
-		"SCENARIO_FULL_FILES=tests/mw-dev/scenario/scenarios/provision_smoke.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -134,8 +133,9 @@ func TestScenarioFullRunsScenarioJobsAgainstIsolatedStack(t *testing.T) {
 	for _, want := range []string{
 		"kubectl --context test-context -n duckgres-ci-pr-123 get svc duckgres-control-plane -o jsonpath={.spec.clusterIP}",
 		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-provision-rejection-",
 		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-provision-smoke-",
-		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-metadata-",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-full-suite-",
 	} {
 		if !strings.Contains(calls, want) {
 			t.Fatalf("scenario full missing expected call %q; calls:\n%s", want, calls)

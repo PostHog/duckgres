@@ -9,19 +9,27 @@ import (
 
 type contextKey string
 
-func TestRunnerRunsAlwaysRunStepAfterFailureAndSkipsDependents(t *testing.T) {
+func TestRunnerRunsIndependentDAGBranchesAfterSiblingFailure(t *testing.T) {
 	scenario, err := ParseScenario([]byte(`
-name: failure-cleanup
+name: independent-dag-branches
 steps:
   - id: provision
     type: fake
-  - id: query
+  - id: setup
     type: fake
-  - id: downstream
+    depends_on: [provision]
+  - id: metadata
     type: fake
+    depends_on: [setup]
+  - id: perf
+    type: fake
+    depends_on: [setup]
+  - id: dbt
+    type: fake
+    depends_on: [setup]
   - id: deprovision
     type: fake
-    depends_on: [query]
+    depends_on: [metadata, perf, dbt]
     always_run: true
 `))
 	if err != nil {
@@ -34,8 +42,8 @@ steps:
 		Scenario: scenario,
 		Executor: StepExecutorFunc(func(_ context.Context, step Step) error {
 			executed = append(executed, step.ID)
-			if step.ID == "query" {
-				return errors.New("query failed")
+			if step.ID == "metadata" {
+				return errors.New("metadata failed")
 			}
 			return nil
 		}),
@@ -46,36 +54,49 @@ steps:
 	if err == nil {
 		t.Fatal("expected runner to return failure")
 	}
-	wantExecuted := []string{"provision", "query", "deprovision"}
+	wantExecuted := []string{"provision", "setup", "metadata", "perf", "dbt", "deprovision"}
 	if !equalStrings(executed, wantExecuted) {
 		t.Fatalf("executed steps = %#v, want %#v", executed, wantExecuted)
 	}
-	if summary.TotalSteps != 4 || summary.SucceededSteps != 2 || summary.FailedSteps != 1 || summary.SkippedSteps != 1 {
+	if summary.TotalSteps != 6 || summary.SucceededSteps != 5 || summary.FailedSteps != 1 || summary.SkippedSteps != 0 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
 	results := runner.Results()
-	if len(results) != 4 {
-		t.Fatalf("expected 4 step results, got %d", len(results))
+	if len(results) != 6 {
+		t.Fatalf("expected 6 step results, got %d", len(results))
 	}
-	if results[2].StepID != "downstream" || results[2].Status != StepStatusSkipped {
-		t.Fatalf("expected downstream to be skipped, got %+v", results[2])
+	for _, result := range results[3:5] {
+		if result.Status != StepStatusOK {
+			t.Fatalf("independent branch %s should run successfully, got %+v", result.StepID, result)
+		}
 	}
-	if results[3].StepID != "deprovision" || results[3].Status != StepStatusOK {
-		t.Fatalf("expected deprovision to run successfully, got %+v", results[3])
+	if results[5].StepID != "deprovision" || results[5].Status != StepStatusOK {
+		t.Fatalf("expected deprovision to run successfully, got %+v", results[5])
 	}
 }
 
-func TestRunnerDoesNotLetAlwaysRunCleanupUnblockLaterNormalSteps(t *testing.T) {
+func TestRunnerSkipsDAGDependentsAfterDependencyFailureAndRunsCleanup(t *testing.T) {
 	scenario, err := ParseScenario([]byte(`
-name: cleanup-does-not-unblock
+name: dependency-failure-cleanup
 steps:
-  - id: query
+  - id: provision
     type: fake
-  - id: cleanup
+  - id: setup
     type: fake
+    depends_on: [provision]
+  - id: metadata
+    type: fake
+    depends_on: [setup]
+  - id: perf
+    type: fake
+    depends_on: [setup]
+  - id: dbt
+    type: fake
+    depends_on: [setup]
+  - id: deprovision
+    type: fake
+    depends_on: [metadata, perf, dbt]
     always_run: true
-  - id: after_cleanup
-    type: fake
 `))
 	if err != nil {
 		t.Fatalf("ParseScenario returned error: %v", err)
@@ -87,8 +108,8 @@ steps:
 		Scenario: scenario,
 		Executor: StepExecutorFunc(func(_ context.Context, step Step) error {
 			executed = append(executed, step.ID)
-			if step.ID == "query" {
-				return errors.New("query failed")
+			if step.ID == "setup" {
+				return errors.New("setup failed")
 			}
 			return nil
 		}),
@@ -99,15 +120,20 @@ steps:
 	if err == nil {
 		t.Fatal("expected runner to return failure")
 	}
-	if want := []string{"query", "cleanup"}; !equalStrings(executed, want) {
+	if want := []string{"provision", "setup", "deprovision"}; !equalStrings(executed, want) {
 		t.Fatalf("executed steps = %#v, want %#v", executed, want)
 	}
-	if summary.FailedSteps != 1 || summary.SkippedSteps != 1 {
+	if summary.FailedSteps != 1 || summary.SkippedSteps != 3 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
 	results := runner.Results()
-	if results[2].StepID != "after_cleanup" || results[2].Status != StepStatusSkipped {
-		t.Fatalf("expected after_cleanup to be skipped, got %+v", results[2])
+	for _, result := range results[2:5] {
+		if result.Status != StepStatusSkipped || result.ErrorClass != "dependency_failed" {
+			t.Fatalf("dependent step %s should be skipped for its failed dependency, got %+v", result.StepID, result)
+		}
+	}
+	if result := results[5]; result.StepID != "deprovision" || result.Status != StepStatusOK {
+		t.Fatalf("expected deprovision to run successfully, got %+v", result)
 	}
 }
 
