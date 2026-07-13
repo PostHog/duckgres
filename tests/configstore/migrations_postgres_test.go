@@ -39,7 +39,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 18)
 	requireGooseMigrationRecorded(t, db, 19)
 	requireGooseMigrationRecorded(t, db, 20)
-	requireGooseLatestVersion(t, db, 20)
+	requireGooseMigrationRecorded(t, db, 21)
+	requireGooseLatestVersion(t, db, 21)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -51,6 +52,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "cutover_timeout_seconds")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "blocked_at")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "compaction_was_present")
+	// Migration 000021 added the pre-flip catalog backup artifact URI.
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "backup_s3_uri")
 	requireTablePresent(t, db, "duckgres_reshard_operation_log")
 	requireColumnPresent(t, db, "duckgres_reshard_operation_log", "operation_id")
 
