@@ -562,11 +562,10 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   policy only allows `posthog-*`/`duckling-*` names (RDS-managed
   `rds!…`/`rds/…/master` secrets never work → start handler 400s them,
   `rdsManagedSecretNamePattern`), and the composition's ExternalSecret copies
-  the whole value verbatim (no JSON property). During the cutover wait the
-  runner surfaces a failing ExternalSecret sync condition into the op log at
-  warn (`ExternalSecretSyncError`, deduped by content); a diagnostic read
-  error degrades quietly — it must never fail the op. The form teaches the
-  same rules (`ui/src/lib/reshard.ts::classifySecretName`).
+  the whole value verbatim (no JSON property). An unreadable name that slips
+  through just hangs the cutover wait until the per-op timeout, then recovers
+  (flip-back + copy-back). The form teaches the same rules
+  (`ui/src/lib/reshard.ts::classifySecretName`).
 - **Runner fencing**: claim bumps `runner_epoch`; every runner write is
   CAS-fenced on (runner, epoch); stale-heartbeat (>5m) ops are takeover-able;
   the copy holds a target-DB advisory lock.
