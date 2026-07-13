@@ -27,11 +27,14 @@ import (
 // re-points the provider-sql MRs in place, orphaning the old role/DB) → verify
 // stability → cleanup source (cnpg sources only) → finalize.
 //
-// cnpg→external inverts copy and flip: the type flip makes the composition
-// stop rendering the cnpg Role/Database MRs and Crossplane DELETES them, so
-// the flip IS the source cleanup and only runs after the copy verified. The
-// pre-flip backup still runs first, and for THIS destructive direction it is a
-// HARD prerequisite (a backup failure fails the op before the flip).
+// cnpg→external inverts copy and flip: copy → verify source → ORPHAN the cnpg
+// source (retainCnpgOnFlip=true, so the type flip un-renders the cnpg MRs
+// WITHOUT deleting the role/DB) → flip type to external → verify the external
+// catalog is complete → only THEN drop the orphaned cnpg source. Any failure
+// before that drop flips back to cnpg-shard and re-adopts the still-present
+// role/DB by external-name — instant recovery, no empty-recreate, no copy-back.
+// The pre-flip backup still runs first, and for THIS destructive direction it
+// is a HARD prerequisite (a backup failure fails the op before the flip).
 type ReshardRunner struct {
 	store    reshardStore
 	duckling reshardDucklingClient
@@ -94,6 +97,11 @@ type reshardDucklingClient interface {
 	SetCompactionEnabled(ctx context.Context, name string, enabled *bool) error
 	SetMetadataStoreCnpg(ctx context.Context, name, shard string) error
 	SetMetadataStoreExternal(ctx context.Context, name string, ext ExternalMetadataStoreSpec) error
+	// cnpg→external orphan-adopt escape hatch:
+	SetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string, retain bool) error
+	GetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string) (retain, present bool, err error)
+	CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, err error)
+	SetMetadataStoreCnpgAdopt(ctx context.Context, name, shard string) error
 }
 
 // NewReshardRunner builds a runner over the real config store + duckling
@@ -230,6 +238,11 @@ type opRun struct {
 	blocked          bool
 	compactionPaused bool
 	flipped          bool
+	// retainRequested: we set retainCnpgOnFlip=true on the source (cnpg→ext
+	// orphan step). If we roll back BEFORE the flip, reset it to false so the
+	// still-cnpg source keeps full-lifecycle (Delete) MRs and deprovision stays
+	// clean. (After the flip, recoverFromExternal's adopt patch clears it.)
+	retainRequested bool
 
 	// resolved source/target connection info (source recorded pre-flip)
 	source CatalogEndpoint
@@ -394,17 +407,34 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 	}
 
 	toExternal := o.op.TargetKind == configstore.MetadataStoreKindExternal
+	cnpgSource := o.op.SourceKind == configstore.MetadataStoreKindCnpgShard
 	if toExternal {
-		// Escape hatch: copy BEFORE flip — the type flip deletes the cnpg
-		// source role/DB, so it doubles as the cleanup and must come last.
+		// Escape hatch (orphan-adopt then verified-delete): copy BEFORE flip,
+		// orphan the cnpg source so the flip does NOT delete it, flip, verify
+		// the external target caught the full catalog, and only THEN drop the
+		// orphaned cnpg source. Any failure before the drop flips back and
+		// re-adopts the still-present role/DB.
 		if err := o.copyCatalog(ctx); err != nil {
 			return err
 		}
 		if err := o.verifySourceStable(ctx); err != nil {
 			return err
 		}
+		if cnpgSource {
+			if err := o.orphanCnpgSource(ctx); err != nil {
+				return err
+			}
+		}
 		if err := o.flipToExternal(ctx); err != nil {
 			return err
+		}
+		if err := o.verifyExternalCatalog(ctx); err != nil {
+			return err
+		}
+		if cnpgSource {
+			if err := o.dropOrphanedCnpgSource(ctx); err != nil {
+				return err
+			}
 		}
 	} else {
 		if err := o.flipToCnpg(ctx); err != nil {
@@ -775,13 +805,82 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 	}
 }
 
-// flipToExternal is the cnpg→ext cutover: runs only AFTER copy+verify (the
-// flip deletes the cnpg source role/DB — it IS the cleanup).
+// orphanCnpgSource makes the cnpg source role/DB survive the upcoming type
+// flip: it sets spec.metadataStore.retainCnpgOnFlip=true (composition renders
+// the cnpg Role/Database MRs WITHOUT Delete) and waits until BOTH MRs reflect
+// that no-Delete policy before returning — so the subsequent flip orphans them
+// instead of deleting them. Two guards make this safe:
+//   - XRD-compat: after the patch we read the flag back; if it did not stick
+//     (present=false / retain=false) the cluster's Duckling XRD predates the
+//     field, so we REFUSE the flip — the destructive delete-on-flip with no
+//     orphan-adopt safety net is exactly what this whole change avoids.
+//   - Race close: we poll the actual Role/Database MRs' managementPolicies and
+//     only proceed once both are no-Delete, so the flip can never un-render the
+//     MRs before the retain policy propagated.
+func (o *opRun) orphanCnpgSource(ctx context.Context) error {
+	if err := o.step("orphaning_source"); err != nil {
+		return err
+	}
+	o.logf("info", "retaining the cnpg source role/DB across the flip (retainCnpgOnFlip=true) so the type flip ORPHANS them instead of deleting them")
+	if err := o.r.duckling.SetMetadataStoreRetainCnpgOnFlip(ctx, o.op.DucklingName, true); err != nil {
+		return fmt.Errorf("set retainCnpgOnFlip: %w", err)
+	}
+	o.retainRequested = true
+
+	// XRD-compat read-back: a cluster whose Duckling XRD predates the field
+	// silently prunes the patch. Refuse rather than risk delete-on-flip.
+	retain, present, err := o.r.duckling.GetMetadataStoreRetainCnpgOnFlip(ctx, o.op.DucklingName)
+	if err != nil {
+		return fmt.Errorf("read back retainCnpgOnFlip: %w", err)
+	}
+	if !present || !retain {
+		return fmt.Errorf("the cluster's Duckling XRD does not support spec.metadataStore.retainCnpgOnFlip (patch pruned) — deploy the crossplane-config charts carrying that field BEFORE running a cnpg→external reshard; refusing to flip because the type change would DELETE the cnpg source catalog with no orphan-adopt safety net")
+	}
+
+	// Wait until the cnpg Role+Database MRs reflect the no-Delete policy, so the
+	// type flip orphans (not deletes) them. Closes the race where the flip
+	// un-renders the MRs before the retain policy propagated.
+	deadline := time.Now().Add(o.flipTimeout())
+	lastLog := time.Time{}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if o.cancelRequested() {
+			return errReshardCancelled
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cnpg source role/DB did not reflect the retain (no-Delete) policy within %s — refusing to flip (the composition may not honor retainCnpgOnFlip; charts/composition skew?)", o.flipTimeout())
+		}
+		orphaned, mrsPresent, err := o.r.duckling.CnpgSourceMRsOrphaned(ctx, o.op.DucklingName)
+		if err == nil && mrsPresent && orphaned {
+			o.logf("info", "cnpg source role/DB now carry the retain (no-Delete) policy — safe to flip")
+			return nil
+		}
+		if time.Since(lastLog) >= 15*time.Second {
+			switch {
+			case err != nil:
+				o.logf("info", "waiting for the cnpg source MRs to reflect the retain policy: read failed: %v", err)
+			case !mrsPresent:
+				o.logf("info", "waiting for the cnpg source MRs to reflect the retain policy: Role/Database MRs not both observed yet")
+			default:
+				o.logf("info", "waiting for the cnpg source MRs to reflect the retain (no-Delete) policy")
+			}
+			lastLog = time.Now()
+		}
+		time.Sleep(o.r.loopPoll)
+	}
+}
+
+// flipToExternal is the cnpg→ext cutover: runs only AFTER copy+verify and the
+// orphan step (retainCnpgOnFlip=true), so the type flip ORPHANS the cnpg source
+// role/DB rather than deleting them. The explicit drop happens later, only once
+// the external catalog is verified complete.
 func (o *opRun) flipToExternal(ctx context.Context) error {
 	if err := o.step("cutover"); err != nil {
 		return err
 	}
-	o.logf("info", "flipping duckling metadata store to external %s — Crossplane will DELETE the cnpg source role/DB (%s)", o.op.TargetEndpoint, o.op.SourceDatabase)
+	o.logf("info", "flipping duckling metadata store to external %s — the cnpg source role/DB (%s) are RETAINED (orphaned, not deleted) so this flip is recoverable", o.op.TargetEndpoint, o.op.SourceDatabase)
 	ext := ExternalMetadataStoreSpec{
 		Endpoint:          o.op.TargetEndpoint,
 		PasswordAWSSecret: o.op.TargetPasswordSecret,
@@ -801,7 +900,7 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 			return err
 		}
 		// No cancel check: past this flip the only ways out are forward or
-		// the copy-back recovery in rollback().
+		// the orphan-adopt recovery in rollback().
 		if time.Now().After(deadline) {
 			return fmt.Errorf("external target did not become ready within %s (ESO secret %q missing, unreadable, or wrong? the ESO role can only read allowed secret NAME patterns — e.g. duckling-*/posthog-* — and the value must be the raw password string)", o.flipTimeout(), o.op.TargetPasswordSecret)
 		}
@@ -829,6 +928,64 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 		}
 		time.Sleep(o.r.loopPoll)
 	}
+}
+
+// verifyExternalCatalog is the cnpg→ext gate BEFORE dropping the orphaned cnpg
+// source: it re-reads the live external target's per-table ducklake_* row
+// counts and requires an EXACT match against the copy snapshot
+// (o.copied.PerTableRows). An incomplete/diverged target fails here — the cnpg
+// source is still present (orphaned), so rollback flips back and re-adopts it
+// with no data loss. Only a clean match lets dropOrphanedCnpgSource run.
+func (o *opRun) verifyExternalCatalog(ctx context.Context) error {
+	if err := o.step("verifying_external"); err != nil {
+		return err
+	}
+	current, err := o.r.copier.SnapshotCounts(ctx, o.target)
+	if err != nil {
+		return fmt.Errorf("re-reading external target counts: %w", err)
+	}
+	if len(current) != len(o.copied.PerTableRows) {
+		return fmt.Errorf("external target table set differs from the copy (%d tables now, %d copied) — catalog incomplete; NOT dropping the retained cnpg source", len(current), len(o.copied.PerTableRows))
+	}
+	for table, want := range o.copied.PerTableRows {
+		got, ok := current[table]
+		if !ok {
+			return fmt.Errorf("external target is missing table %s — catalog incomplete; NOT dropping the retained cnpg source", table)
+		}
+		if got != want {
+			return fmt.Errorf("external target table %s row count %d != copied %d — catalog incomplete; NOT dropping the retained cnpg source", table, got, want)
+		}
+	}
+	o.logf("info", "verified external target catalog: %d tables match the copied row counts exactly — safe to drop the retained cnpg source", len(current))
+	return nil
+}
+
+// dropOrphanedCnpgSource drops the retained (orphaned) cnpg source database —
+// cnpg→ext only, and only after verifyExternalCatalog passed. It mirrors
+// cleanupSource: DROP DATABASE … WITH (FORCE) via the source pooler, best-effort
+// (a leftover DB is cruft, not data loss, since the external target is verified
+// live); the source role is left (orphaned, harmless — roles cannot drop
+// themselves). It then clears retainCnpgOnFlip: harmless on the now-external
+// tenant, but it keeps a later ext→cnpg reshard from inheriting a no-Delete cnpg
+// MR that would leak on deprovision.
+func (o *opRun) dropOrphanedCnpgSource(ctx context.Context) error {
+	if err := o.step("cleaning_up"); err != nil {
+		return err
+	}
+	if o.source.Database == "" {
+		o.logf("error", "source database name is empty (recordSource did not run?) — skipping DROP DATABASE; the orphaned cnpg database on %s must be dropped manually", o.op.FromShard)
+	} else {
+		o.logf("info", "dropping the orphaned cnpg source database %s on %s (WITH FORCE) — external catalog verified complete", o.source.Database, o.op.FromShard)
+		if err := o.r.copier.DropDatabase(ctx, o.source, o.source.Database); err != nil {
+			o.logf("error", "DROP DATABASE on the orphaned cnpg source failed — it still exists on %s and must be dropped manually: %v", o.op.FromShard, err)
+		} else {
+			o.logf("info", "orphaned cnpg source database dropped (the source role remains — orphaned, harmless; roles cannot drop themselves)")
+		}
+	}
+	if err := o.r.duckling.SetMetadataStoreRetainCnpgOnFlip(ctx, o.op.DucklingName, false); err != nil {
+		o.logf("warn", "clearing retainCnpgOnFlip after cnpg→ext completion failed: %v — harmless while on external; a later ext→cnpg reshard should ensure it is false", err)
+	}
+	return nil
 }
 
 // copyCatalog resolves the target endpoint (for →cnpg it was resolved by the
@@ -1040,17 +1197,27 @@ func (o *opRun) rollback(ctx context.Context) {
 			}
 			o.dropPartialTarget(ctx)
 		case o.op.TargetKind == configstore.MetadataStoreKindExternal:
-			// cnpg→ext flipped means copy+verify already PASSED (flip is
-			// last). The cnpg source is being deleted by Crossplane; recovery
-			// is flip-back + copy-back from the verified external target.
+			// cnpg→ext flipped: the cnpg source was ORPHANED (retained), not
+			// deleted, so recovery flips back and re-ADOPTS it — no copy-back.
 			o.recoverFromExternal(ctx)
 		}
-	} else if o.op.TargetKind == configstore.MetadataStoreKindExternal && o.copied.Tables > 0 {
-		// cnpg→ext failed before the flip: source untouched; drop what we
-		// copied onto the external target (best-effort).
-		o.logf("warn", "rolling back: dropping partially copied tables from the external target")
-		if err := o.r.copier.DropCatalogTables(ctx, o.target, func(level, msg string) { o.logf(level, "%s", msg) }); err != nil {
-			o.logf("warn", "dropping copied tables from the external target failed: %v (harmless leftover)", err)
+	} else if o.op.TargetKind == configstore.MetadataStoreKindExternal {
+		// cnpg→ext failed BEFORE the flip: source untouched.
+		if o.retainRequested {
+			// We set retainCnpgOnFlip=true but never flipped — reset it so the
+			// still-cnpg source keeps full-lifecycle (Delete) MRs and a later
+			// deprovision stays clean.
+			o.logf("warn", "rolling back: clearing retainCnpgOnFlip on the still-cnpg source (restores full-lifecycle Delete so deprovision stays clean)")
+			if err := o.r.duckling.SetMetadataStoreRetainCnpgOnFlip(ctx, o.op.DucklingName, false); err != nil {
+				o.logf("error", "clearing retainCnpgOnFlip failed: %v — the cnpg role/DB MRs may lack Delete and a deprovision could ORPHAN (leak) them; fix by setting spec.metadataStore.retainCnpgOnFlip=false", err)
+			}
+		}
+		if o.copied.Tables > 0 {
+			// Drop what we copied onto the external target (best-effort).
+			o.logf("warn", "rolling back: dropping partially copied tables from the external target")
+			if err := o.r.copier.DropCatalogTables(ctx, o.target, func(level, msg string) { o.logf(level, "%s", msg) }); err != nil {
+				o.logf("warn", "dropping copied tables from the external target failed: %v (harmless leftover)", err)
+			}
 		}
 	}
 
@@ -1083,50 +1250,45 @@ func (o *opRun) dropPartialTarget(ctx context.Context) {
 	}
 }
 
-// recoverFromExternal handles the one genuinely hairy rollback: cnpg→ext
-// flipped, then the external target never became Ready (ESO secret missing/
-// mismatched). Crossplane already deleted the cnpg source role/DB, so we flip
-// back (provider-sql re-creates them EMPTY) and copy back from the external
-// target — whose data passed verify before the flip.
+// recoverFromExternal handles the cnpg→ext post-flip rollback: the external
+// target never became Ready, or the external-catalog verify failed. Because the
+// orphan step retained the cnpg source, the role/DB are STILL PRESENT on the
+// shard — so recovery flips the type back to cnpg-shard AND clears
+// retainCnpgOnFlip in one patch (SetMetadataStoreCnpgAdopt), and provider-sql
+// re-ADOPTS the role/DB by external-name (same pgIdent, same pinned password).
+// No empty-recreate, no copy-back — the catalog never left the source. This is
+// the whole point of the orphan-adopt escape hatch.
 func (o *opRun) recoverFromExternal(ctx context.Context) {
-	o.logf("error", "cnpg→external cutover failed AFTER the flip — the cnpg source was deleted by the flip; recovering by flipping back and copying back from the external target")
+	o.logf("warn", "cnpg→external cutover failed AFTER the flip — the cnpg source role/DB were RETAINED (orphaned), not deleted; recovering by flipping back to shard %s and re-adopting them (no data copy)", o.op.FromShard)
 
-	if err := o.r.duckling.SetMetadataStoreCnpg(ctx, o.op.DucklingName, o.op.FromShard); err != nil {
-		o.logf("error", "recovery flip-back failed: %v — duckling still points at the external target; fix manually", err)
+	if err := o.r.duckling.SetMetadataStoreCnpgAdopt(ctx, o.op.DucklingName, o.op.FromShard); err != nil {
+		o.logf("error", "recovery flip-back failed: %v — duckling still points at the external target; the orphaned cnpg role/DB survive on %s and can be re-adopted manually (patch spec.metadataStore to {type: cnpg-shard, cnpgShard: %s, retainCnpgOnFlip: false}); fix manually", err, o.op.FromShard, o.op.FromShard)
 		return
 	}
 
-	// Wait for the composition to re-create the (empty) role/DB on the
-	// source shard.
+	// Wait for the composition to re-adopt the role/DB on the source shard and
+	// the tenant role to answer again.
 	sourcePrefix := o.op.FromShard + "-pooler."
 	deadline := time.Now().Add(o.flipTimeout())
-	var restored CatalogEndpoint
 	for {
 		if time.Now().After(deadline) {
-			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate", o.flipTimeout())
+			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s)", o.flipTimeout(), o.op.FromShard)
 			return
 		}
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
 		if err == nil && strings.HasPrefix(st.MetadataStore.Endpoint, sourcePrefix) && st.ReadyCondition {
-			restored = CatalogEndpoint{
+			restored := CatalogEndpoint{
 				Host: st.MetadataStore.Endpoint, Port: 5432,
 				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
 				SSLMode: "disable",
 			}
 			if o.r.copier.Probe(ctx, restored) == nil {
-				break
+				o.logf("info", "recovery complete: duckling re-adopted the orphaned cnpg role/DB on %s and the tenant role answers — no data was copied back (the catalog never left the source)", o.op.FromShard)
+				return
 			}
 		}
 		time.Sleep(o.r.loopPoll)
 	}
-
-	o.logf("warn", "recovery: copying the catalog back from the external target into the re-created source database")
-	result, err := o.r.copier.Copy(ctx, o.target, restored, func(level, msg string) { o.logf(level, "%s", msg) })
-	if err != nil {
-		o.logf("error", "recovery copy-back FAILED: %v — the verified catalog lives on the external target %s; restore manually before unblocking", err, o.op.TargetEndpoint)
-		return
-	}
-	o.logf("info", "recovery copy-back complete: %d tables, %d rows — org is back on %s", result.Tables, result.Rows, o.op.FromShard)
 }
 
 // report writes the end-of-op report to the log — also on failure/cancel.

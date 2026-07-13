@@ -551,25 +551,46 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   Flight sessions are destroyed locally per CP (they'd hold leases ~1h).
 - **Flip semantics differ by direction**: a `cnpgShard` change re-points
   role/DB in place (source ORPHANED — explicit cleanup after verify); a TYPE
-  flip to external makes Crossplane DELETE the cnpg role/DB → cnpg→ext runs
-  **copy-before-flip** (the flip IS the cleanup, only after verify).
-  **External stores are never modified/deleted.**
+  flip to external un-renders the cnpg MRs, and whether Crossplane then DELETES
+  or ORPHANS the role/DB depends on `spec.metadataStore.retainCnpgOnFlip`
+  (charts). **External stores are never modified/deleted.**
+- **cnpg→ext escape hatch = orphan-adopt then verified-delete** (charts
+  `retainCnpgOnFlip`): copy → verify source → set `retainCnpgOnFlip=true` AND
+  poll the cnpg Role/Database MRs until they carry the no-Delete policy (two-step
+  flip, closes the un-render-before-policy race) → flip type to external (now
+  ORPHANS, not deletes, the cnpg role/DB) → verify the external catalog row
+  counts match the copy EXACTLY → only THEN `DROP DATABASE` the retained source +
+  clear the flag. ANY failure before that drop → flip back to cnpg-shard +
+  clear flag in one patch (`SetMetadataStoreCnpgAdopt`), provider-sql re-ADOPTS
+  the still-present role/DB by external-name — NO copy-back, NO empty-recreate
+  (replaces the old recreate+copy-back recovery that caused a data-loss
+  incident). **XRD-compat**: if the read-back shows the cluster's XRD lacks
+  `retainCnpgOnFlip` (patch pruned), REFUSE the reshard ("deploy charts first")
+  — safer than the destructive delete-on-flip.
+- **DEPROVISION-UNAFFECTED (non-negotiable)**: `retainCnpgOnFlip` defaults false
+  and is true only transiently mid-reshard; a normal never-resharded cnpg tenant
+  always has it false → its cnpg Role/DB render with full lifecycle `["*"]`
+  (Delete) → deprovision (Duckling delete → finalizer) drops them exactly as
+  before. The orphan is bound to the reshard type-flip, NEVER to Duckling
+  deletion. `lifecycle_teardown_cnpg` in the e2e is the regression net.
 - **Pre-flip catalog backup (safety net, `backup_catalog` step,
-  `catalog_backup.go`)**: after drain + pause-compaction and BEFORE any flip,
-  the runner `pg_dump`s the SOURCE catalog to the org's OWN S3 data bucket under
+  `catalog_backup.go`)**: after drain + pause-compaction + `recordSource` and
+  BEFORE any flip (for EVERY direction), the runner `pg_dump`s the SOURCE catalog
+  to the org's OWN S3 data bucket under
   `s3://<bucket>/_reshard_catalog_backups/op-<id>-<ts>.dump` (custom format →
   `pg_restore`; password via `PGPASSWORD`, never argv; bucket/region/IAM-role
   from the duckling CR status; upload creds via STS AssumeRole of the org's own
   role, injected as an `AssumeRoleFunc` from `multitenant.go` to avoid the
   import cycle). **Gate by direction**: the destructive cnpg→external direction
-  HARD-FAILS the op before the flip if the backup fails; non-destructive
-  directions (source survives) log a warning and continue. The URI is recorded
-  on `backup_s3_uri` (migration `000021`) + the op log, with the exact
-  `pg_restore` recovery command. Retention is an S3 lifecycle rule on the
-  tagged/prefixed objects (30d suggested) — no in-app GC; backups are kept on
-  success. pg_dump/pg_restore ship in the CP image (`postgresql-client-18`, PGDG
-  repo, in BOTH `Dockerfile` and `Dockerfile.controlplane`). Full design +
-  restore procedure: `docs/design/resharding.md`.
+  (its verified-delete drops the source) HARD-FAILS the op before the flip if the
+  backup fails; non-destructive directions (source survives) log a warning and
+  continue. The URI is recorded on `backup_s3_uri` (migration `000021`) + the op
+  log, with the exact `pg_restore` recovery command. Retention is an S3 lifecycle
+  rule on the tagged/prefixed objects (30d suggested) — no in-app GC; backups are
+  kept on success. pg_dump/pg_restore ship in the CP image
+  (`postgresql-client-18`, PGDG repo, in BOTH `Dockerfile` and
+  `Dockerfile.controlplane`). Full design + restore procedure:
+  `docs/design/resharding.md`.
 - **Rollback patches the source shard VALUE back — never removes the key**
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
@@ -610,9 +631,13 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   `provisioner/reshard_runner_test.go` (incl. the `TestReshardBackup*` cases),
   `admin/reshard_test.go`, the
   migration asserts in `tests/configstore/migrations_postgres_test.go`, AND
-  the `reshard_*` assertions in `tests/mw-dev/e2e/harness.sh` (validation,
-  cancel-during-drain, bogus-shard-rollback, ext→cnpg positive path incl. the
-  pre-flip backup assertion).
+  the `reshard_*` + `lifecycle_teardown_cnpg` assertions in
+  `tests/mw-dev/e2e/harness.sh` (validation, cancel-during-drain,
+  bogus-shard-rollback, ext→cnpg positive path incl. the pre-flip backup
+  assertion, and the deprovision-unaffected net). The cnpg→ext orphan-adopt
+  charts side (composition managementPolicies + `retainCnpgOnFlip` XRD field)
+  lives in the `charts` repo and is covered by
+  `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh`.
   cnpg→ext positive path is unit-only (harness lacks the RDS password);
   cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
 
