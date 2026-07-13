@@ -24,6 +24,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ducklingEntryFor } from "@/lib/format";
+import { classifySecretName } from "@/lib/reshard";
 import { useDucklingsMetadata, useReshardTargets, useStartReshard, useWarehouse } from "@/hooks/useApi";
 import type { StartReshardBody } from "@/types/api";
 
@@ -71,6 +72,7 @@ export function ReshardForm() {
   const knownExternal = targets.data?.external_stores ?? [];
 
   const effectiveShard = shard === "__custom__" ? shardCustom.trim() : shard;
+  const secretVerdict = classifySecretName(passwordSecret);
   const targetLabel =
     targetType === "cnpg-shard" ? `cnpg ${effectiveShard || "?"}` : `external ${endpoint || "?"}`;
   const sourceLabel =
@@ -250,9 +252,24 @@ export function ReshardForm() {
                     <Input
                       value={passwordSecret}
                       onChange={(e) => setPasswordSecret(e.target.value)}
-                      placeholder="posthog-warehouse-…"
+                      placeholder="duckling-<name>-…-rds-password"
                       className="font-mono text-xs"
                     />
+                    {secretVerdict === "rds-managed" && (
+                      <p className="flex items-start gap-1 text-xs text-destructive">
+                        <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                        This looks like the RDS-managed master secret (rds/…/master or rds!…) — the
+                        ESO role can NOT read it, so the cutover would hang and roll back. Create a
+                        secret named duckling-…-rds-password holding the same password and use that.
+                      </p>
+                    )}
+                    {secretVerdict === "unknown-prefix" && (
+                      <p className="flex items-start gap-1 text-xs text-warning">
+                        <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                        Name doesn't start with duckling- or posthog- — the ESO role can only read
+                        secrets matching its allowed name prefixes. Double-check before running.
+                      </p>
+                    )}
                   </div>
                   <div className="space-y-1">
                     <Label>User</Label>
@@ -267,6 +284,18 @@ export function ReshardForm() {
                     />
                   </div>
                 </div>
+                <p className="rounded-md border border-border bg-background/40 px-3 py-2 text-xs text-muted-foreground">
+                  The secret must live in this account's Secrets Manager with a{" "}
+                  <span className="font-mono">duckling-*</span> or{" "}
+                  <span className="font-mono">posthog-*</span> name (the only prefixes the
+                  external-secrets role may read — e.g.{" "}
+                  <span className="font-mono">duckling-&lt;name&gt;-&lt;env&gt;-&lt;region&gt;-rds-password</span>
+                  ), and its value must be the <strong>raw password string</strong> — ESO copies the
+                  whole value verbatim, so JSON like{" "}
+                  <span className="font-mono">{'{"password": …}'}</span> will not work. The
+                  RDS-managed master secret (<span className="font-mono">rds/…/master</span>) will
+                  NOT work — the ESO role can't read it.
+                </p>
                 <div className="space-y-1">
                   <Label>Password (sent once, never stored)</Label>
                   <Input
@@ -276,8 +305,9 @@ export function ReshardForm() {
                     className="font-mono text-xs"
                   />
                   <p className="text-xs text-muted-foreground">
-                    Used directly for the catalog copy. The AWS secret above must contain the same
-                    value — the duckling reads it via ESO after the cutover.
+                    Used directly for the catalog copy. The AWS secret above must contain exactly
+                    this value as a plain string — the duckling reads it via ESO after the cutover
+                    and the runner refuses to finish if they differ.
                   </p>
                 </div>
               </div>

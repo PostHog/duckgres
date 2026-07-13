@@ -175,14 +175,19 @@ func (f *fakeReshardStore) RetireHotIdleWorker(record *configstore.WorkerRecord)
 }
 
 func (f *fakeReshardStore) hasLog(substr string) bool {
+	return f.countLog(substr) > 0
+}
+
+func (f *fakeReshardStore) countLog(substr string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	n := 0
 	for _, l := range f.logs {
 		if strings.Contains(l, substr) {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 type ducklingCall struct {
@@ -247,6 +252,10 @@ func (f *fakeDuckling) SetMetadataStoreExternal(_ context.Context, _ string, ext
 	f.status.MetadataStore.Password = "ext-pw" // what "ESO" synced
 	f.status.ReadyCondition = true
 	return nil
+}
+
+func (f *fakeDuckling) ExternalSecretSyncError(context.Context, string) (string, error) {
+	return "", nil
 }
 
 func (f *fakeDuckling) callKinds() []string {
@@ -671,6 +680,124 @@ func TestReshardExtTargetWithoutPasswordFails(t *testing.T) {
 	}
 	if store.warehouseState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("warehouse state = %s, want ready after rollback", store.warehouseState)
+	}
+}
+
+// stuckExternalDuckling flips the type but never populates the status
+// password (ESO never syncs), and scripts ExternalSecretSyncError.
+type stuckExternalDuckling struct {
+	*fakeDuckling
+	esoErr   error  // non-nil: every diagnostic read fails (degrade path)
+	esoMsgA  string // returned for the first esoSwitchAt calls
+	esoMsgB  string // returned after (empty = keep A)
+	esoCalls int
+	// esoSwitchAt is the call count after which esoMsgB is returned.
+	esoSwitchAt int
+}
+
+func (s *stuckExternalDuckling) SetMetadataStoreExternal(_ context.Context, _ string, ext ExternalMetadataStoreSpec) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, ducklingCall{kind: "external", ext: ext})
+	s.status.MetadataStore.Type = configstore.MetadataStoreKindExternal
+	s.status.MetadataStore.Endpoint = ext.Endpoint
+	s.status.MetadataStore.Password = "" // ESO never syncs
+	s.status.ReadyCondition = false
+	return nil
+}
+
+func (s *stuckExternalDuckling) ExternalSecretSyncError(context.Context, string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.esoErr != nil {
+		return "", s.esoErr
+	}
+	s.esoCalls++
+	if s.esoMsgB != "" && s.esoCalls > s.esoSwitchAt {
+		return s.esoMsgB, nil
+	}
+	return s.esoMsgA, nil
+}
+
+func stuckExtOp() *configstore.ReshardOperation {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "rds/duckling-example/master"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	op.CutoverTimeoutSeconds = 1
+	return op
+}
+
+// TestReshardExtFlipSurfacesESOSyncError pins the diagnostic added for the
+// hung cnpg→ext cutover: when the status password never lands and the
+// tenant's ExternalSecret reports a sync failure (e.g. AccessDenied on an SM
+// secret name outside the ESO policy), the failure is logged at warn —
+// exactly once per distinct message (deduped across the poll loop), again
+// when the message changes.
+func TestReshardExtFlipSurfacesESOSyncError(t *testing.T) {
+	store := newFakeReshardStore(stuckExtOp())
+	duckling := &stuckExternalDuckling{
+		fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()},
+		esoMsgA:      "SecretSyncedError: AccessDeniedException: not authorized to perform secretsmanager:GetSecretValue",
+		esoMsgB:      "SecretSyncedError: some other failure",
+		esoSwitchAt:  10,
+	}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	r := testRunner(store, duckling, copier)
+	r.StashExternalPassword(store.op.ID, "ext-pw")
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "did not become ready") {
+		t.Fatalf("state=%s err=%q, want flip-timeout failure", store.op.State, store.op.Error)
+	}
+	// The poll loop saw each message dozens of times; the warn must appear
+	// exactly once per distinct message.
+	if n := store.countLog("AccessDeniedException"); n != 1 {
+		t.Fatalf("AccessDenied ESO warn logged %d times, want exactly 1 (deduped): %v", n, store.logs)
+	}
+	if n := store.countLog("some other failure"); n != 1 {
+		t.Fatalf("changed ESO message logged %d times, want exactly 1: %v", n, store.logs)
+	}
+	if !store.hasLog(`ExternalSecret "duckling-org-a-password" is failing to sync`) {
+		t.Fatalf("ESO warn missing the ExternalSecret name: %v", store.logs)
+	}
+	// The op still recovers (flip-back + copy-back) and unblocks.
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after recovery", store.warehouseState)
+	}
+}
+
+// TestReshardExtFlipESOReadErrorDegrades pins the degrade contract: when the
+// ExternalSecret can't be read at all (RBAC Forbidden, CRD absent), the
+// runner keeps the generic waiting line, never logs a bogus ESO warn, and
+// the diagnostic never fails or blocks the operation.
+func TestReshardExtFlipESOReadErrorDegrades(t *testing.T) {
+	store := newFakeReshardStore(stuckExtOp())
+	duckling := &stuckExternalDuckling{
+		fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()},
+		esoErr:       fmt.Errorf("externalsecrets.external-secrets.io is forbidden"),
+	}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	r := testRunner(store, duckling, copier)
+	r.StashExternalPassword(store.op.ID, "ext-pw")
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "did not become ready") {
+		t.Fatalf("state=%s err=%q, want flip-timeout failure", store.op.State, store.op.Error)
+	}
+	if store.hasLog("failing to sync") {
+		t.Fatalf("ESO warn logged despite the read failing: %v", store.logs)
+	}
+	if !store.hasLog("waiting for external target") {
+		t.Fatalf("generic waiting line missing: %v", store.logs)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after recovery", store.warehouseState)
 	}
 }
 

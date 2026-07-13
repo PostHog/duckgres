@@ -25,7 +25,24 @@ var ducklingGVR = schema.GroupVersionResource{
 	Resource: "ducklings",
 }
 
+// externalSecretGVR is the ESO ExternalSecret CRD. The Duckling composition
+// renders one per external-metadata-store tenant (apiVersion
+// external-secrets.io/v1 in the charts repo's crossplane-config composition).
+var externalSecretGVR = schema.GroupVersionResource{
+	Group:    "external-secrets.io",
+	Version:  "v1",
+	Resource: "externalsecrets",
+}
+
 const ducklingNamespace = "ducklings"
+
+// ExternalSecretName is the composition's name for the ESO object that syncs
+// a tenant's external metadata-store password from AWS Secrets Manager into
+// the duckling namespace (charts: crossplane-config composition.yaml renders
+// `printf "duckling-%s-password" <duckling name>`).
+func ExternalSecretName(ducklingName string) string {
+	return fmt.Sprintf("duckling-%s-password", ducklingName)
+}
 
 // DucklingStatus holds the parsed status from a Duckling CR.
 // The Duckling composition provisions AWS infrastructure (S3, IAM) and the
@@ -313,6 +330,44 @@ func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus,
 		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
 	return parseDucklingStatus(cr)
+}
+
+// ExternalSecretSyncError reads the tenant's password ExternalSecret
+// (duckling-<name>-password) and reports its sync failure, if any: a
+// Ready=False condition yields "<reason>: <message>" (e.g. the
+// AccessDeniedException ESO gets when the SM secret name is outside its IAM
+// policy's allowed patterns). Returns "" when the object is healthy or
+// carries no failing condition. A read error (RBAC Forbidden, CRD absent,
+// object not created yet) is returned as err — callers treat the whole call
+// as best-effort diagnostics and MUST degrade quietly, never fail an
+// operation on it.
+func (d *DucklingClient) ExternalSecretSyncError(ctx context.Context, name string) (string, error) {
+	es, err := d.client.Resource(externalSecretGVR).Namespace(ducklingNamespace).Get(ctx, ExternalSecretName(name), metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	status, _ := es.Object["status"].(map[string]interface{})
+	conditions, _ := status["conditions"].([]interface{})
+	for _, c := range conditions {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if getNestedString(cm, "type") != "Ready" || getNestedString(cm, "status") == "True" {
+			continue
+		}
+		reason := getNestedString(cm, "reason")
+		msg := getNestedString(cm, "message")
+		switch {
+		case reason != "" && msg != "":
+			return reason + ": " + msg, nil
+		case msg != "":
+			return msg, nil
+		default:
+			return reason, nil
+		}
+	}
+	return "", nil
 }
 
 // ComposedResourceError describes one composed managed resource that is not

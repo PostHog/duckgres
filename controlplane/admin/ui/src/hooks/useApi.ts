@@ -3,7 +3,7 @@
 // Read hooks for endpoints that may not exist yet (`*Optional`) swallow 404 and
 // return an empty value so pages render an empty state instead of crashing.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   useMutation,
   useQuery,
@@ -12,6 +12,7 @@ import {
 } from "@tanstack/react-query";
 import { api, ApiError } from "@/lib/api";
 import { POLL } from "@/lib/query";
+import { useRevealedCount } from "@/lib/logReplay";
 import { useIdentity } from "@/components/IdentityProvider";
 import type {
   AuditEntry,
@@ -500,7 +501,10 @@ export function useReshard(opId: number | null) {
 
 // Incremental log accumulation: polls /log?after_id=<last seen> and appends.
 // Keeps polling (slower) even after the op is terminal so the final report
-// lines always land; the page unmount stops it.
+// lines always land; the page unmount stops it. Returned entries are revealed
+// PROGRESSIVELY (useRevealedCount): opening the page of a running or finished
+// op replays the accumulated backlog line-by-line over a few seconds like a
+// live terminal, then live-appends new lines as they arrive.
 export function useReshardLog(opId: number | null, opState: string | undefined) {
   const [entries, setEntries] = useState<ReshardLogEntry[]>([]);
   const lastID = entries.length > 0 ? entries[entries.length - 1].id : 0;
@@ -525,7 +529,8 @@ export function useReshardLog(opId: number | null, opState: string | undefined) 
     }
   }, [poll.data]);
 
-  return entries;
+  const revealed = useRevealedCount(entries.length);
+  return useMemo(() => entries.slice(0, revealed), [entries, revealed]);
 }
 
 // Global operation list for the Reshards nav page. Polls at the normal

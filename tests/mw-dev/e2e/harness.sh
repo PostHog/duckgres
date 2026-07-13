@@ -2228,6 +2228,11 @@ duckling_shard_backfill() { # cnpgOrg
 #     shard-001, data intact after, report in the log)
 # cnpg→ext stays unit-test-only: the harness knows the RDS SM secret NAME but
 # not the password, and the start API requires the password (ephemerally).
+# That also keeps the in-cutover ESO-sync-error surfacing (the deduped warn in
+# flipToExternal when the ExternalSecret is SecretSyncedError) unit-test-only
+# (provisioner/reshard_runner_test.go): asserting it live needs a real
+# cnpg→ext flip against an unreadable secret. The validation loop below does
+# pin the rds-master-name 400, the up-front defense for the same failure.
 
 reshard_post() { # org body
   curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
@@ -2283,11 +2288,17 @@ reshard_targets() { # destination discovery; ext org's RDS must appear too
 
 reshard_validation() { # cnpg-org currently on shard-001
   log "reshard validation: same-shard + bad targets are 400"
+  # The last two pin the RDS-managed-master-secret rejection: names matching
+  # rds/… or rds!… are outside the ESO IAM policy's allowed prefixes
+  # (posthog-*/duckling-*), so a cutover pointed at one would hang on an ESO
+  # AccessDenied — the start handler refuses them up front.
   for body in \
     '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"}}' \
     '{"target":{"type":"cnpg-shard","cnpg_shard":"Bad_Shard"}}' \
     '{"target":{"type":"nonsense"}}' \
-    '{"target":{"type":"external","endpoint":"x"}}'; do
+    '{"target":{"type":"external","endpoint":"x"}}' \
+    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds/some-db/master","password":"p"}}' \
+    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds!db-0000-1111","password":"p"}}'; do
     code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
       -d "$body" "$API/api/v1/orgs/$1/reshard")"
     [ "$code" = "400" ] || fail "reshard validation: body $body -> $code, want 400"

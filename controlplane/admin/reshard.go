@@ -55,6 +55,17 @@ type ReshardPasswordStash interface {
 // reshardShardNamePattern mirrors the Duckling XRD's cnpgShard pattern.
 var reshardShardNamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
+// rdsManagedSecretNamePattern matches AWS RDS-managed master-password secret
+// names: the `rds!db-…`/`rds!cluster-…` names RDS creates for
+// manage_master_user_password, and the `rds/<db>/master` alias console paths.
+// The external-secrets IAM policy only allows `secretsmanager:GetSecretValue`
+// on a per-env prefix allowlist (posthog-*, duckling-*, … — see the
+// external-secrets-pod-identity terraform module in posthog-cloud-infra); no
+// environment allows `rds…`, so a reshard pointed at one of these would pass
+// the catalog copy and then hang the cutover on an ESO AccessDenied. Reject
+// it up front.
+var rdsManagedSecretNamePattern = regexp.MustCompile(`^rds[!/]`)
+
 type reshardTargetRequest struct {
 	Type string `json:"type"` // "cnpg-shard" | "external"
 
@@ -249,6 +260,10 @@ func (h *reshardHandler) start(c *gin.Context) {
 		}
 		if strings.TrimSpace(req.Target.Endpoint) == "" || strings.TrimSpace(req.Target.PasswordAWSSecret) == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "external target requires endpoint and password_aws_secret"})
+			return
+		}
+		if rdsManagedSecretNamePattern.MatchString(strings.TrimSpace(req.Target.PasswordAWSSecret)) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "password_aws_secret looks like an RDS-managed master secret (rds!… / rds/…) — the external-secrets role cannot read those, so the cutover would hang on an ESO AccessDenied. Create a Secrets Manager secret whose name the ESO policy allows (e.g. duckling-<name>-…-rds-password) with the raw password string as its value, and use that name"})
 			return
 		}
 		if req.Target.Password == "" {
