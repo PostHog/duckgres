@@ -463,9 +463,11 @@ ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
 **MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
 sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
 decimals (vCPU / GiB). `team_id` is the org's `default_team_id` (an integer —
-PostHog's `Team.id`; a JSON NUMBER on every API surface, BIGINT in the config
-store, 0 = "no default team"; resolved from the config snapshot at connection
-end); `query_source` is the
+PostHog's `Team.id`; a JSON NUMBER on every API surface, a **NOT NULL** BIGINT
+in the config store — required at org creation on both the provisioning and
+admin APIs, never clearable via the admin API, so every org always has one;
+resolved from the config snapshot at connection end, where 0 can still appear
+only for an unknown org / stale snapshot); `query_source` is the
 `duckgres.query_source` session GUC (`standard` unless set; a mid-connection
 change bills the whole connection under the final value). Invariants for anyone
 touching this path:

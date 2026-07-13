@@ -109,10 +109,12 @@ export function OrgDetail() {
   const save = async () => {
     setMsg(null);
     // default_team_id is an integer on the wire (PostHog team id); the text
-    // input needs a digits-only guard so junk can't silently clear it.
+    // input needs a digits-only guard so junk can't reach the backend. It is
+    // required (NOT NULL) server-side and cannot be cleared, so only a
+    // positive value is ever sent.
     const teamIdText = form.default_team_id.trim();
-    if (teamIdText !== "" && !/^\d+$/.test(teamIdText)) {
-      setMsg({ kind: "err", text: "Default team id must be a number (or empty to clear)." });
+    if (teamIdText !== "" && (!/^\d+$/.test(teamIdText) || Number(teamIdText) === 0)) {
+      setMsg({ kind: "err", text: "Default team id must be a positive number." });
       return;
     }
     const body: OrgUpdate = {
@@ -123,8 +125,12 @@ export function OrgDetail() {
       default_worker_ttl: form.default_worker_ttl,
       default_worker_min_hot_idle: Number(form.default_worker_min_hot_idle) || 0,
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
-      default_team_id: teamIdText === "" ? 0 : Number(teamIdText),
     };
+    // Empty input = preserve the stored value (omit the field). Sending 0 or
+    // null would be a clear, which the backend now rejects with a 400.
+    if (teamIdText !== "") {
+      body.default_team_id = Number(teamIdText);
+    }
     try {
       await update.mutateAsync(body);
       setMsg({ kind: "ok", text: "Saved." });
@@ -244,7 +250,7 @@ export function OrgDetail() {
                   onChange={(e) => set("hostname_alias", e.target.value)}
                 />
               </Field>
-              <Field label="Default team id (empty clears)">
+              <Field label="Default team id (required)">
                 <Input
                   value={form.default_team_id}
                   placeholder="PostHog team id, e.g. 12345"

@@ -1141,9 +1141,12 @@ org_default_profile() { # org password catalog
 #      bodies (mandatory now); GET /orgs/:id must round-trip exactly each value.
 #   2. Reject path: provisioning a brand-new org WITHOUT default_team_id must be
 #      400 naming the field, and must create nothing (org GET stays 404).
-#   3. Mutate path: PUT /orgs/:id can set and clear it (0=NULL) on the EXT org
-#      (admin escape hatch), round-tripping on GET; the provisioned value is
-#      restored afterwards so the org stays contract-conformant.
+#   3. Mutate path: PUT /orgs/:id can set it to a positive team id on the EXT
+#      org, round-tripping on GET; clearing (0 or null) is REJECTED with a 400
+#      and must leave the stored value untouched — the column is NOT NULL
+#      (migration 000020) and every org must keep its default team (the
+#      billing bucket key). The provisioned value is restored afterwards so
+#      the org stays contract-conformant.
 # get_org_default_team_id prints the raw JSON value ("null" when NULL) so the
 # assertions can distinguish an unset column from an empty string.
 get_org_default_team_id() { # org -> prints default_team_id (jq raw; "null" when unset)
@@ -1176,18 +1179,28 @@ default_team_id_mandatory() { # cnpg_org ext_org
     || fail "default_team_id: rejected provision must create nothing, GET /orgs/$noteam -> HTTP $code want 404"
   log "default_team_id OK: new org without it rejected with 400, nothing created"
 
-  # 3. Mutate path: PUT can set, clear ("" -> NULL), then restore on the ext org.
+  # 3. Mutate path: PUT with a positive value sets; clearing (0 or JSON null)
+  # is rejected with a 400 and must not change the stored value (the column is
+  # NOT NULL — every org must keep a default team).
   code="$(put_org "$ext_org" '{"default_team_id":424242}')"
   [ "$code" = "200" ] || fail "default_team_id: PUT set -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
   [ "$got" = "424242" ] || fail "default_team_id: after PUT set, GET = '$got' want '424242'"
   code="$(put_org "$ext_org" '{"default_team_id":0}')"
-  [ "$code" = "200" ] || fail "default_team_id: PUT clear -> HTTP $code: $(cat /tmp/put_org_out)"
+  [ "$code" = "400" ] || fail "default_team_id: PUT clear (0) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
+  grep -q "default_team_id" /tmp/put_org_out \
+    || fail "default_team_id: PUT clear rejection should name the field: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
-  [ "$got" = "null" ] || fail "default_team_id: after PUT clear, GET = '$got' want 'null' (0 must clear to NULL)"
+  [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT clear, GET = '$got' want '424242' (stored value must be unchanged)"
+  code="$(put_org "$ext_org" '{"default_team_id":null}')"
+  [ "$code" = "400" ] || fail "default_team_id: PUT clear (null) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
+  got="$(get_org_default_team_id "$ext_org")"
+  [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT null, GET = '$got' want '424242' (stored value must be unchanged)"
   code="$(put_org "$ext_org" "{\"default_team_id\":$EXT_DEFAULT_TEAM_ID}")"
   [ "$code" = "200" ] || fail "default_team_id: PUT restore -> HTTP $code: $(cat /tmp/put_org_out)"
-  log "default_team_id OK: PUT set/clear/restore round-trips on $ext_org"
+  got="$(get_org_default_team_id "$ext_org")"
+  [ "$got" = "$EXT_DEFAULT_TEAM_ID" ] || fail "default_team_id: after PUT restore, GET = '$got' want '$EXT_DEFAULT_TEAM_ID'"
+  log "default_team_id OK: PUT set round-trips, clear (0/null) rejected 400, value preserved on $ext_org"
 }
 
 # ---- user persistent secrets ------------------------------------------------

@@ -17,6 +17,14 @@ import (
 
 const testConfigStoreConnString = "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable"
 
+// testDefaultTeamID returns a pointer to a placeholder PostHog team id for
+// seeded org rows — default_team_id is NOT NULL (migration 000020), so every
+// test fixture that inserts an org must carry one.
+func testDefaultTeamID() *int64 {
+	teamID := int64(1)
+	return &teamID
+}
+
 func newPostgresConfigStore(t *testing.T) *configstore.ConfigStore {
 	t.Helper()
 
@@ -100,7 +108,7 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 
@@ -165,7 +173,7 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics_db"}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 	wh := &configstore.ManagedWarehouse{OrgID: "analytics", State: configstore.ManagedWarehouseStateReady}
@@ -205,7 +213,7 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 	}
 
 	// The database_name is now free for reuse (no unique-index squat).
-	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db"}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
 		t.Fatalf("expected database_name to be reusable after org deletion: %v", err)
 	}
 }
@@ -214,7 +222,7 @@ func TestMutateManagedWarehouseSerializesConcurrentWriters(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{

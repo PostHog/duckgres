@@ -14,8 +14,9 @@ func seedReadyWarehouse(t *testing.T, store *cpconfigstore.ConfigStore, orgID st
 	t.Helper()
 	// The warehouse row has an FK to the org row (fk_duckgres_orgs_warehouse).
 	if err := store.DB().Create(&cpconfigstore.Org{
-		Name:         orgID,
-		DatabaseName: orgID,
+		Name:          orgID,
+		DatabaseName:  orgID,
+		DefaultTeamID: testDefaultTeamID(),
 	}).Error; err != nil {
 		t.Fatalf("seed org: %v", err)
 	}
@@ -333,7 +334,7 @@ func TestListExternalMetadataStoresPostgres(t *testing.T) {
 
 	seed := func(org, endpoint string, state cpconfigstore.ManagedWarehouseProvisioningState) {
 		t.Helper()
-		if err := store.DB().Create(&cpconfigstore.Org{Name: org, DatabaseName: org}).Error; err != nil {
+		if err := store.DB().Create(&cpconfigstore.Org{Name: org, DatabaseName: org, DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
 			t.Fatalf("seed org %s: %v", org, err)
 		}
 		wh := &cpconfigstore.ManagedWarehouse{OrgID: org, DucklingName: org, State: state}

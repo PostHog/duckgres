@@ -1,7 +1,7 @@
-INSERT INTO duckgres_orgs (name, database_name, max_workers, created_at, updated_at)
+INSERT INTO duckgres_orgs (name, database_name, max_workers, default_team_id, created_at, updated_at)
 VALUES
-    ('analytics', 'analytics', 0, NOW(), NOW()),
-    ('billing', 'billing', 0, NOW(), NOW())
+    ('analytics', 'analytics', 0, 1, NOW(), NOW()),
+    ('billing', 'billing', 0, 2, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET database_name = EXCLUDED.database_name,
     updated_at = NOW();

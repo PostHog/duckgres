@@ -201,15 +201,12 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
-	// DefaultTeamID is *int64: nil = preserve, 0 = clear (NULL), n = set.
-	// (PostHog team ids start at 1, so 0 is a safe clear sentinel; the
-	// handler also maps an explicit JSON null onto it.)
+	// DefaultTeamID is *int64: nil = preserve, n = set. There is no clear
+	// path — the column is NOT NULL (every org must keep a default team; it
+	// is the billing bucket key) and the handler rejects 0/null/negative
+	// before this runs.
 	if updates.DefaultTeamID != nil {
-		if *updates.DefaultTeamID == 0 {
-			fields["default_team_id"] = nil
-		} else {
-			fields["default_team_id"] = *updates.DefaultTeamID
-		}
+		fields["default_team_id"] = *updates.DefaultTeamID
 	}
 	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 	if result.Error != nil {
@@ -540,6 +537,14 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	// Every org must be born with its default PostHog team id — it is the
+	// billing bucket key and the column is NOT NULL (same invariant as the
+	// provisioning API's ErrDefaultTeamIDRequired). Positivity of a present
+	// value is enforced by validateOrgMutationPayload above.
+	if org.DefaultTeamID == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id is required (the org's default PostHog team id)"})
+		return
+	}
 	// Normalize empty hostname_alias to NULL on insert so the unique index
 	// doesn't reject a second org with an explicit empty string. Centralizing
 	// the rule at the handler layer keeps any future store impl from having
@@ -622,15 +627,15 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
 	if _, ok := fields["default_team_id"]; ok {
-		// Key present: a number sets, and an explicit JSON null (which
-		// unmarshals to a nil pointer) clears — normalize null onto the 0
-		// clear-sentinel so the store layer sees one shape.
+		// Key present: a positive number sets. Clearing is rejected — the
+		// column is NOT NULL (the org's default team is the billing bucket
+		// key). An explicit JSON null unmarshals to a nil pointer here; 0 and
+		// negatives are already rejected by validateOrgMutationPayload above.
 		if updates.DefaultTeamID == nil {
-			zero := int64(0)
-			merged.DefaultTeamID = &zero
-		} else {
-			merged.DefaultTeamID = updates.DefaultTeamID
+			c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id cannot be cleared (every org must keep a default team); pass a valid team id"})
+			return
 		}
+		merged.DefaultTeamID = updates.DefaultTeamID
 	}
 
 	// Audit detail: which fields changed and their old → new values, so the
@@ -719,7 +724,8 @@ func orgStrPtr(s *string) string {
 }
 
 // orgInt64Ptr renders an optional org config integer (nil or 0 == unset) for
-// audit detail.
+// audit detail. default_team_id is NOT NULL and never 0 nowadays, so
+// "(unset)" only ever renders for legacy display of rows predating that.
 func orgInt64Ptr(v *int64) string {
 	if v == nil || *v == 0 {
 		return "(unset)"
@@ -747,6 +753,13 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	if org.MaxVCPUs < 0 {
 		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
+	}
+	// Shared by create and update: nil stays allowed here (create requires
+	// the field itself; update treats an absent field as "preserve"), but a
+	// present value must be a positive PostHog team id — the column is NOT
+	// NULL and 0 is never stored, so there is no clear sentinel.
+	if org.DefaultTeamID != nil && *org.DefaultTeamID <= 0 {
+		return fmt.Errorf("default_team_id: value %d must be a positive PostHog team id (it cannot be cleared — every org must keep a default team)", *org.DefaultTeamID)
 	}
 	return nil
 }

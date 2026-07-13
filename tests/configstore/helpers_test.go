@@ -64,6 +64,14 @@ func newIsolatedConfigStoreSchema(t *testing.T) (*sql.DB, string) {
 	return adminDB, connStr
 }
 
+// testDefaultTeamID returns a pointer to a placeholder PostHog team id for
+// seeded org rows — default_team_id is NOT NULL (migration 000020), so every
+// test fixture that inserts an org must carry one.
+func testDefaultTeamID() *int64 {
+	teamID := int64(1)
+	return &teamID
+}
+
 func cpconfigStoreNew(connStr string) (*cpconfigstore.ConfigStore, error) {
 	return cpconfigstore.NewConfigStore(connStr, time.Hour)
 }
