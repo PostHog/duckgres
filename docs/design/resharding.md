@@ -20,7 +20,7 @@ those stay valid because the bucket is untouched.
 | Operation row + verbose log (config store) | `controlplane/configstore/reshard.go`, migration `000018` |
 | Runner (claims + executes ops) | `controlplane/provisioner/reshard_runner.go` |
 | Catalog copier (schema + rows + verify) | `controlplane/provisioner/catalog_copy.go` |
-| Duckling CR patches (flip, compaction pause) | `controlplane/provisioner/k8s_client.go` |
+| Duckling CR patches (flip, compaction pause, cnpg-orphan/adopt: `SetMetadataStoreRetainCnpgOnFlip`, `CnpgSourceMRsOrphaned`, `SetMetadataStoreCnpgAdopt`) | `controlplane/provisioner/k8s_client.go` |
 | Admin REST API (start/read/cancel + `GET /reshards/targets` destination discovery: all cnpg shards incl. empty ones via the cluster-topology pod read, RBAC-degrading to occupied shards; known external stores from live warehouse rows) | `controlplane/admin/reshard.go` |
 | Console UI (form + operation page with live log) | `admin/ui/src/pages/ReshardForm.tsx`, `ReshardOperation.tsx` |
 | Connection gates | `controlplane/control.go` (57P03), `flight_ingress.go`, grant-path check in `configstore/org_connections.go` |
@@ -30,8 +30,30 @@ Duckling CR (charts #12918): changing it re-points the provider-sql
 Role/Database at the target shard's ProviderConfig **in place** — same
 role/database name (pinned `pgIdentPrefix`), same pinned password, old shard's
 role/DB **orphaned, not dropped**, no data copied. A **type** flip
-(cnpg↔external) is different: the composition stops rendering the cnpg MRs and
-Crossplane **deletes** the cnpg role/DB (`managementPolicies: ["*"]`).
+(cnpg↔external) is different: the composition stops rendering the cnpg MRs, and
+what Crossplane does with the underlying role/DB then depends on those MRs'
+`managementPolicies` — which the composition renders conditionally on
+`spec.metadataStore.retainCnpgOnFlip` (charts):
+
+- `retainCnpgOnFlip=false` (default, every normal tenant): the cnpg
+  Role/Database render with **full lifecycle** `["*"]` (Delete included), so the
+  un-render **deletes** the role/DB. This is also what makes a normal
+  **deprovision** (delete the whole Duckling → finalizer cascade) cleanly DROP
+  them — the clean-slate-on-recreate guarantee.
+- `retainCnpgOnFlip=true` (set ONLY by the reshard runner, ONLY for the
+  cnpg→external escape hatch): they render **without Delete**
+  `["Observe","Create","Update"]` (the v2 Orphan equivalent), so the un-render
+  **orphans** the role/DB (they survive on the shard) — the orphan-adopt safety
+  net below.
+
+**Deprovision-unaffected invariant (non-negotiable):** `retainCnpgOnFlip` is a
+per-Duckling spec field defaulting to false, flipped true only transiently
+during a cnpg→ext reshard (and cleared again on success/recovery/rollback). A
+normal never-resharded tenant always has it false, so provisioning and
+deprovisioning drop/create the cnpg role/DB exactly as before. The orphan
+behavior is bound to the reshard type-flip, never to Duckling deletion. The e2e
+`lifecycle_teardown_cnpg` asserts the finalizer cascade still fully deletes the
+CR (and its cnpg role/DB) on a normal deprovision.
 
 ## Step machine (→cnpg targets)
 
@@ -97,12 +119,47 @@ blocking → draining → pausing_compaction → cutover → copying → verifyi
    (`migrationChecked` is orgID-keyed and endpoint-independent;
    `ducklake.migrations` is DSN-keyed → new endpoint = new entry).
 
-## cnpg→external (escape hatch): copy-before-flip
+## cnpg→external (escape hatch): orphan-adopt then verified-delete
 
-The type flip DELETES the cnpg source role/DB, so this direction inverts the
-order: `blocking → draining → pausing_compaction → copying → verifying →
-cutover → finalizing`. The flip IS the source cleanup and only runs after
-verify passed.
+This direction never destroys the cnpg copy coupled to the flip. Instead it
+retains the cnpg role/DB across the flip (so a bad flip is instantly
+recoverable), verifies the external target actually caught the full catalog, and
+only THEN drops the retained source:
+
+```
+blocking → draining → pausing_compaction → copying → verifying
+        → orphaning_source → cutover → verifying_external → cleaning_up
+        → finalizing
+```
+
+1. **copying / verifying** — as for →cnpg, but the source is read via its
+   recorded pre-flip cnpg pooler endpoint (unchanged by the flip since the
+   role/DB are retained).
+2. **orphaning_source** — patch `spec.metadataStore.retainCnpgOnFlip=true`
+   *while type is still cnpg-shard*, then WAIT until the cnpg Role AND Database
+   MRs actually reflect the no-Delete policy (poll their
+   `spec.managementPolicies` via `CnpgSourceMRsOrphaned`) before proceeding.
+   This two-step-flip closes the race where the type flip un-renders the MRs
+   before the retain policy propagated. **XRD-compat:** after the patch the
+   runner reads the flag back; if it did not stick (the cluster's Duckling XRD
+   predates the field → the API server pruned the patch) the runner **REFUSES**
+   the reshard with a clear "deploy the charts first" error rather than risk the
+   old destructive delete-on-flip. (Refuse is safer than silently falling back
+   to data-loss risk.)
+3. **cutover** — flip `type` to external (`cnpgShard: null`, external block set;
+   `retainCnpgOnFlip` left true). The un-render now ORPHANS the cnpg role/DB.
+   Wait for external Ready + ESO password synced + matching the typed password.
+4. **verifying_external** — connect to the now-live external target and require
+   its per-table `ducklake_*` row counts to match the copy snapshot
+   (`CatalogCopyResult.PerTableRows`) EXACTLY. A missing table / count mismatch
+   fails here — the cnpg source is still present (orphaned), so recovery adopts
+   it back with no data loss.
+5. **cleaning_up** — only after external verify passes: `DROP DATABASE … WITH
+   (FORCE)` the retained cnpg source database via the source pooler (best-effort;
+   a leftover DB is cruft, not data loss — the external target is verified live),
+   then clear `retainCnpgOnFlip` (harmless on the now-external tenant; keeps a
+   later ext→cnpg reshard from inheriting a no-Delete cnpg MR). The role is left
+   (orphaned, harmless — roles cannot drop themselves).
 
 The target password is **ephemeral**: sent once in the start request,
 validated by connecting, handed in-process to the local runner, never
@@ -157,34 +214,42 @@ own AccessDenied into the op log would need an `external-secrets.io` read
 grant on the CP SA, which it does not have; not worth the extra RBAC.)
 
 **Pre-flight connection check (fail before the destructive flip).** The
-cnpg→ext flip is destructive — Crossplane DELETEs the cnpg source role/DB on
+cnpg→ext flip is destructive — Crossplane un-renders the cnpg source role/DB on
 the TYPE change, so a doomed external target that only fails *after* the flip
-forces the flip-back + copy-back recovery, which can wedge a Crossplane Role
-MR for a long time. Two submit-time gates make a doomed op fail fast with a
-400 (nothing created): Fix 1 above (the ESO-readable name allowlist), and a
-bounded `SELECT 1` against the target Postgres (`ExternalTargetProber`, an
-adapter over `provisioner.PGCatalogCopier.Probe` wired in `multitenant.go`)
-that proves endpoint reachability + the user/database/password all work,
-before any maintenance window or flip. External RDS uses `sslmode=require`
-(matches the runner's copy). The whole check is bounded (~8s) so a black-holed
-endpoint can't hang the handler; a timeout counts as a connect failure. The
-400 message is redacted (never echoes the password). The prober nil-degrades
-in tests / non-k8s builds — the check is then skipped and the runner's copy
-step still catches a bad credential later (fail-fast optimization, not the
-only line of defense). When the prober IS present and the connect fails, the
-op is refused.
+forces the flip-back adopt recovery. Two submit-time gates make a doomed op
+fail fast with a 400 (nothing created): Fix 1 above (the ESO-readable name
+allowlist), and a bounded `SELECT 1` against the target Postgres
+(`ExternalTargetProber`, an adapter over `provisioner.PGCatalogCopier.Probe`
+wired in `multitenant.go`) that proves endpoint reachability + the
+user/database/password all work, before any maintenance window or flip.
+External RDS uses `sslmode=require` (matches the runner's copy). The whole
+check is bounded (~8s) so a black-holed endpoint can't hang the handler; a
+timeout counts as a connect failure. The 400 message is redacted (never echoes
+the password). The prober nil-degrades in tests / non-k8s builds — the check
+is then skipped and the runner's copy step still catches a bad credential later
+(fail-fast optimization, not the only line of defense). When the prober IS
+present and the connect fails, the op is refused.
 
-**Recovery if the flip goes bad** (ESO secret missing/mismatched): flip back
-to the source shard — provider-sql re-creates the role/DB **empty** — then
-copy back from the external target, whose data passed verify. The one path
-where the source is rebuilt rather than left untouched.
+**Recovery if the flip goes bad** (external never Ready, ESO secret
+missing/mismatched, or external-catalog verify fails): flip `type` back to
+cnpg-shard AND clear `retainCnpgOnFlip` in one patch (`SetMetadataStoreCnpgAdopt`)
+— the composition re-renders the cnpg Role/Database MRs at full lifecycle and
+provider-sql **ADOPTS** the still-present orphaned role/DB by external-name (same
+`pgIdent`, same pinned password). **No empty-recreate, no copy-back** — the
+catalog never left the source. This replaces the old recreate-then-copy-back
+recovery (which stranded the tenant with an empty catalog when the copy-back
+also failed, the prod-shaped data-loss incident this change fixes) and avoids
+the `2BP01` "role can't drop while its DB exists" wedge the coupled delete hit.
 
 ## Rollback, cancel, crash-safety
 
 - Rollback never removes `spec.metadataStore.cnpgShard` — it patches the
   source VALUE back (key-absent would fall through to the freshly-stamped
   bogus status pin). ext→cnpg rollback patches `{type: external, cnpgShard:
-  null}` (the XRD's CEL forbids the key on external).
+  null}` (the XRD's CEL forbids the key on external). cnpg→ext rollback:
+  post-flip → adopt recovery (above); pre-flip → if `retainCnpgOnFlip` was set,
+  reset it to false so the still-cnpg source keeps full-lifecycle (Delete) MRs
+  and deprovision stays clean.
 - Cancel (`POST /reshards/:id/cancel`): flag checked between steps and inside
   every wait loop; rolls back like a failure at that step → `cancelled`.
   Pending (unclaimed) ops finish immediately. On cnpg→ext, cancel is refused
@@ -204,13 +269,21 @@ where the source is rebuilt rather than left untouched.
 Unit: `configstore` (tests/configstore/reshard_postgres_test.go — claim CAS,
 takeover fencing, cancel, log pagination, the grant-path gate),
 `provisioner/reshard_runner_test.go` (all three directions, rollbacks, cancel,
-ephemeral-password loss), `admin/reshard_test.go` (validation incl. the
-ESO-name allowlist + the pre-flight connection-check pass/fail/skip, secrets
-never persisted). e2e (`tests/mw-dev/e2e/harness.sh`): validation 400s (incl. a
-non-allowlisted external secret name),
-cancel-during-drain (drain-not-kill + 57P03 visible), bogus-shard rollback
-(real flip → Synced=False → rollback, data intact), and the **ext→cnpg
-positive path** (real catalog move off the harness RDS onto shard-001).
-cnpg→cnpg positive path needs a second mw-dev shard (follow-up infra);
-cnpg→ext positive path is unit-test-only (the harness has no RDS password —
-the start API requires it ephemerally).
+ephemeral-password loss; for cnpg→ext specifically the two-step orphan flip, the
+external-catalog verify gate, the flip-back adopt recovery with NO copy-back,
+and the XRD-without-`retainCnpgOnFlip` refusal), `admin/reshard_test.go`
+(validation incl. the ESO-name allowlist + the pre-flight connection-check
+pass/fail/skip, secrets never persisted). The charts side (composition +
+`retainCnpgOnFlip` XRD field) is tested by
+`charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh` (both
+managementPolicies variants render; the XRD field defaults false). e2e
+(`tests/mw-dev/e2e/harness.sh`): validation 400s (incl. a non-allowlisted
+external secret name), cancel-during-drain (drain-not-kill + 57P03 visible),
+bogus-shard rollback (real flip → Synced=False → rollback, data intact), the
+**ext→cnpg positive path** (real catalog move off the harness RDS onto
+shard-001), and the LOAD-BEARING `lifecycle_teardown_cnpg` (a normal cnpg
+tenant deprovision still fully deletes the Duckling CR + its cnpg role/DB — the
+deprovision-unaffected regression net for `retainCnpgOnFlip`). cnpg→cnpg
+positive path needs a second mw-dev shard (follow-up infra); the cnpg→ext
+positive path is unit-test-only (the harness has no RDS password — the start
+API requires it ephemerally).

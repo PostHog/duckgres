@@ -551,9 +551,28 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   Flight sessions are destroyed locally per CP (they'd hold leases ~1h).
 - **Flip semantics differ by direction**: a `cnpgShard` change re-points
   role/DB in place (source ORPHANED — explicit cleanup after verify); a TYPE
-  flip to external makes Crossplane DELETE the cnpg role/DB → cnpg→ext runs
-  **copy-before-flip** (the flip IS the cleanup, only after verify).
-  **External stores are never modified/deleted.**
+  flip to external un-renders the cnpg MRs, and whether Crossplane then DELETES
+  or ORPHANS the role/DB depends on `spec.metadataStore.retainCnpgOnFlip`
+  (charts). **External stores are never modified/deleted.**
+- **cnpg→ext escape hatch = orphan-adopt then verified-delete** (charts
+  `retainCnpgOnFlip`): copy → verify source → set `retainCnpgOnFlip=true` AND
+  poll the cnpg Role/Database MRs until they carry the no-Delete policy (two-step
+  flip, closes the un-render-before-policy race) → flip type to external (now
+  ORPHANS, not deletes, the cnpg role/DB) → verify the external catalog row
+  counts match the copy EXACTLY → only THEN `DROP DATABASE` the retained source +
+  clear the flag. ANY failure before that drop → flip back to cnpg-shard +
+  clear flag in one patch (`SetMetadataStoreCnpgAdopt`), provider-sql re-ADOPTS
+  the still-present role/DB by external-name — NO copy-back, NO empty-recreate
+  (replaces the old recreate+copy-back recovery that caused a data-loss
+  incident). **XRD-compat**: if the read-back shows the cluster's XRD lacks
+  `retainCnpgOnFlip` (patch pruned), REFUSE the reshard ("deploy charts first")
+  — safer than the destructive delete-on-flip.
+- **DEPROVISION-UNAFFECTED (non-negotiable)**: `retainCnpgOnFlip` defaults false
+  and is true only transiently mid-reshard; a normal never-resharded cnpg tenant
+  always has it false → its cnpg Role/DB render with full lifecycle `["*"]`
+  (Delete) → deprovision (Duckling delete → finalizer) drops them exactly as
+  before. The orphan is bound to the reshard type-flip, NEVER to Duckling
+  deletion. `lifecycle_teardown_cnpg` in the e2e is the regression net.
 - **Rollback patches the source shard VALUE back — never removes the key**
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
@@ -593,8 +612,12 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
 - Touching any of this → update `tests/configstore/reshard_postgres_test.go`,
   `provisioner/reshard_runner_test.go`, `admin/reshard_test.go`, the
   migration asserts in `tests/configstore/migrations_postgres_test.go`, AND
-  the `reshard_*` assertions in `tests/e2e-mw-dev/harness.sh` (validation,
-  cancel-during-drain, bogus-shard-rollback, ext→cnpg positive path).
+  the `reshard_*` + `lifecycle_teardown_cnpg` assertions in
+  `tests/e2e-mw-dev/harness.sh` (validation, cancel-during-drain,
+  bogus-shard-rollback, ext→cnpg positive path, and the deprovision-unaffected
+  net). The cnpg→ext orphan-adopt charts side (composition managementPolicies +
+  `retainCnpgOnFlip` XRD field) lives in the `charts` repo and is covered by
+  `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh`.
   cnpg→ext positive path is unit-only (harness lacks the RDS password);
   cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
 

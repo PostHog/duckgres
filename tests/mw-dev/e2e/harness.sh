@@ -2470,6 +2470,18 @@ tenant_isolation() { # orgA pwA orgB pwB
 # Crossplane Duckling CR removed, and its finalizer cascade (which drops the
 # cnpg metadata role+db) completed.
 #
+# LOAD-BEARING for the cnpg→ext orphan-adopt change (retainCnpgOnFlip): this is
+# the deprovision-UNAFFECTED regression net. A normal never-resharded cnpg
+# tenant has spec.metadataStore.retainCnpgOnFlip=false, so its cnpg Role/Database
+# MRs render with full lifecycle ["*"] (Delete) and the finalizer cascade below
+# MUST still fully DROP them. The `kubectl wait --for=delete duckling/<org>`
+# only completes once every composed MR — including the provider-sql Role +
+# Database — finished deleting, i.e. the role/DB were dropped. If a future
+# change ever "always orphaned" the cnpg MRs, this wait would hang on the
+# retained Role/Database finalizers and this assertion would (correctly) fail.
+# The cnpg→ext orphan path itself is unit-only (harness has no RDS password —
+# see the reshard section above and provisioner/reshard_runner_test.go).
+#
 # NOTE: same-org-id *re-provision* in the SAME run is intentionally NOT done
 # here. It is the regression net for the stranded-cnpg-role bugs
 # (#649/#650/#11518/#11522), but it cannot be made reliable from inside the Job:

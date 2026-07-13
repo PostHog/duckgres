@@ -191,10 +191,11 @@ func (f *fakeReshardStore) countLog(substr string) int {
 }
 
 type ducklingCall struct {
-	kind  string // "cnpg" | "external" | "compaction"
-	shard string
-	ext   ExternalMetadataStoreSpec
-	comp  *bool
+	kind   string // "cnpg" | "external" | "compaction" | "retain" | "cnpg-adopt"
+	shard  string
+	ext    ExternalMetadataStoreSpec
+	comp   *bool
+	retain *bool
 }
 
 type fakeDuckling struct {
@@ -205,6 +206,15 @@ type fakeDuckling struct {
 
 	compEnabled, compPresent bool
 	calls                    []ducklingCall
+
+	// cnpg→ext orphan-adopt escape hatch simulation.
+	// retainFieldUnsupported=true models an XRD that predates
+	// spec.metadataStore.retainCnpgOnFlip (the API server prunes the patch, so
+	// the read-back reports present=false). retainFlag is the current spec
+	// value; CnpgSourceMRsOrphaned reports the MRs as orphaned once it is true
+	// (composition converges instantly).
+	retainFieldUnsupported bool
+	retainFlag             bool
 }
 
 func (f *fakeDuckling) Get(context.Context, string) (*DucklingStatus, error) {
@@ -254,6 +264,50 @@ func (f *fakeDuckling) SetMetadataStoreExternal(_ context.Context, _ string, ext
 	return nil
 }
 
+func (f *fakeDuckling) SetMetadataStoreRetainCnpgOnFlip(_ context.Context, _ string, retain bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := retain
+	f.calls = append(f.calls, ducklingCall{kind: "retain", retain: &r})
+	if !f.retainFieldUnsupported {
+		f.retainFlag = retain
+	}
+	return nil
+}
+
+func (f *fakeDuckling) GetMetadataStoreRetainCnpgOnFlip(context.Context, string) (bool, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.retainFieldUnsupported {
+		return false, false, nil // XRD pruned the field
+	}
+	return f.retainFlag, true, nil
+}
+
+func (f *fakeDuckling) CnpgSourceMRsOrphaned(context.Context, string) (bool, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Composition converges instantly: once retain is set, the cnpg source MRs
+	// reflect the no-Delete policy. present is always true (the source cnpg
+	// Role/Database MRs exist while type is cnpg-shard).
+	return f.retainFlag, true, nil
+}
+
+func (f *fakeDuckling) SetMetadataStoreCnpgAdopt(_ context.Context, _ string, shard string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, ducklingCall{kind: "cnpg-adopt", shard: shard})
+	// Composition re-adopts the orphaned role/DB and converges back to cnpg.
+	f.status.MetadataStore.Type = configstore.MetadataStoreKindCnpgShard
+	f.status.MetadataStore.Endpoint = shard + "-pooler.cnpg-shards.svc.cluster.local"
+	f.status.MetadataStore.User = "mdstore_org"
+	f.status.MetadataStore.Database = "mdstore_org"
+	f.status.MetadataStore.Password = "pinned-pw"
+	f.status.ReadyCondition = true
+	f.retainFlag = false
+	return nil
+}
+
 func (f *fakeDuckling) callKinds() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -277,9 +331,13 @@ type fakeCopier struct {
 
 	copyResult CatalogCopyResult
 	copyErr    error
-	// countsAfter is what SnapshotCounts returns (the stability recheck);
-	// defaults to copyResult.PerTableRows (stable source).
+	// countsAfter is what SnapshotCounts returns for the SOURCE stability
+	// recheck (sslmode!=require); defaults to copyResult.PerTableRows (stable).
 	countsAfter map[string]int64
+	// externalCounts is what SnapshotCounts returns for the EXTERNAL target
+	// verify (sslmode==require, cnpg→ext verifyExternalCatalog); defaults to
+	// copyResult.PerTableRows (complete target).
+	externalCounts map[string]int64
 }
 
 func (f *fakeCopier) record(c copierCall) {
@@ -302,8 +360,16 @@ func (f *fakeCopier) Copy(_ context.Context, source, target CatalogEndpoint, log
 	return f.copyResult, nil
 }
 
-func (f *fakeCopier) SnapshotCounts(context.Context, CatalogEndpoint) (map[string]int64, error) {
-	f.record(copierCall{kind: "counts"})
+func (f *fakeCopier) SnapshotCounts(_ context.Context, ep CatalogEndpoint) (map[string]int64, error) {
+	f.record(copierCall{kind: "counts", target: ep})
+	// The external target is reached with sslmode=require (verifyExternalCatalog);
+	// the cnpg source with sslmode=disable (verifySourceStable).
+	if ep.SSLMode == "require" {
+		if f.externalCounts != nil {
+			return f.externalCounts, nil
+		}
+		return f.copyResult.PerTableRows, nil
+	}
 	if f.countsAfter != nil {
 		return f.countsAfter, nil
 	}
@@ -496,9 +562,11 @@ func TestReshardHappyPathExtToCnpg(t *testing.T) {
 	}
 }
 
-// TestReshardHappyPathCnpgToExt pins the ESCAPE-HATCH ordering: copy and
-// verify BEFORE the flip (the flip deletes the cnpg source), and no explicit
-// source drop (the flip is the cleanup).
+// TestReshardHappyPathCnpgToExt pins the ORPHAN-ADOPT-then-VERIFIED-DELETE
+// escape-hatch ordering: copy + verify, then a TWO-STEP flip (retain flag set +
+// MRs observed no-Delete WHILE still cnpg, THEN the type flip), then external
+// catalog verify, then the explicit source drop (only after verify), then the
+// retain flag cleared.
 func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	op := cnpgOp()
 	op.TargetKind = configstore.MetadataStoreKindExternal
@@ -518,15 +586,39 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	if store.op.State != configstore.ReshardStateSucceeded {
 		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
 	}
-	// Copy + stability recheck happen BEFORE the flip; no dropdb ever.
-	if fmt.Sprint(copier.kinds()) != fmt.Sprint([]string{"probe", "probe", "copy", "counts"}) {
+	// copy + source-stability recheck BEFORE the flip, external-catalog verify
+	// AFTER the flip, then the explicit source drop.
+	if fmt.Sprint(copier.kinds()) != fmt.Sprint([]string{"probe", "probe", "copy", "counts", "counts", "dropdb"}) {
 		t.Fatalf("copier calls = %v", copier.kinds())
 	}
-	dkinds := duckling.callKinds()
-	if fmt.Sprint(dkinds) != fmt.Sprint([]string{"compaction", "external", "compaction"}) {
-		t.Fatalf("duckling calls = %v, want flip AFTER copy", dkinds)
+	// The source drop names the recorded source DB and runs against the source.
+	for _, call := range copier.calls {
+		if call.kind == "dropdb" {
+			if call.dbName != "mdstore_org" {
+				t.Fatalf("dropdb database = %q, want the recorded source database mdstore_org", call.dbName)
+			}
+			if !strings.HasPrefix(call.target.Host, "shard-001-pooler") {
+				t.Fatalf("dropdb ran against %q, want the recorded shard-001 source", call.target.Host)
+			}
+		}
 	}
-	wantSteps := []string{"blocking", "draining", "pausing_compaction", "copying", "verifying", "cutover", "finalizing"}
+	// Two-step flip: retain(true) → type flip(external) → source drop clears
+	// retain(false). Compaction pause/restore bracket it.
+	dkinds := duckling.callKinds()
+	if fmt.Sprint(dkinds) != fmt.Sprint([]string{"compaction", "retain", "external", "retain", "compaction"}) {
+		t.Fatalf("duckling calls = %v, want retain-before-flip + retain-clear-after-drop", dkinds)
+	}
+	// The retain flag is set true BEFORE the flip and cleared false after.
+	var retainVals []bool
+	for _, c := range duckling.calls {
+		if c.kind == "retain" && c.retain != nil {
+			retainVals = append(retainVals, *c.retain)
+		}
+	}
+	if len(retainVals) != 2 || retainVals[0] != true || retainVals[1] != false {
+		t.Fatalf("retain patches = %v, want [true false]", retainVals)
+	}
+	wantSteps := []string{"blocking", "draining", "pausing_compaction", "copying", "verifying", "orphaning_source", "cutover", "verifying_external", "cleaning_up", "finalizing"}
 	if fmt.Sprint(store.steps) != fmt.Sprint(wantSteps) {
 		t.Fatalf("steps = %v, want %v", store.steps, wantSteps)
 	}
@@ -760,7 +852,6 @@ func (s *stuckExternalDuckling) SetMetadataStoreExternal(_ context.Context, _ st
 	return nil
 }
 
-
 func stuckExtOp() *configstore.ReshardOperation {
 	op := cnpgOp()
 	op.TargetKind = configstore.MetadataStoreKindExternal
@@ -773,10 +864,12 @@ func stuckExtOp() *configstore.ReshardOperation {
 	return op
 }
 
-// TestReshardExtFlipTimeoutRecovers pins the escape-hatch recovery: when the
+// TestReshardExtFlipTimeoutRecovers pins the ORPHAN-ADOPT recovery: when the
 // cnpg→ext cutover never becomes ready (the target's status password never
-// syncs), the flip times out and the runner recovers — flips back to the
-// source shard and copies the catalog back — leaving the org in service.
+// syncs), the flip times out and the runner recovers by flipping back to the
+// source shard and RE-ADOPTING the still-present (orphaned) cnpg role/DB — NO
+// copy-back, NO empty-recreate — leaving the org in service. The source is
+// never dropped (external verify never reached).
 func TestReshardExtFlipTimeoutRecovers(t *testing.T) {
 	store := newFakeReshardStore(stuckExtOp())
 	duckling := &stuckExternalDuckling{fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()}}
@@ -792,10 +885,122 @@ func TestReshardExtFlipTimeoutRecovers(t *testing.T) {
 	if !store.hasLog("waiting for external target") {
 		t.Fatalf("generic waiting line missing: %v", store.logs)
 	}
-	// The op still recovers (flip-back + copy-back) and unblocks.
+	// Recovery is flip-back + adopt (SetMetadataStoreCnpgAdopt), never copy-back.
+	if !containsStr(duckling.callKinds(), "cnpg-adopt") {
+		t.Fatalf("recovery did not flip back + adopt (no cnpg-adopt call): %v", duckling.callKinds())
+	}
+	// Exactly ONE copy (the forward copy) — no copy-back to a recreated source.
+	nCopy := 0
+	for _, k := range copier.kinds() {
+		if k == "copy" {
+			nCopy++
+		}
+	}
+	if nCopy != 1 {
+		t.Fatalf("copy ran %d times, want exactly 1 (no copy-back on adopt recovery): %v", nCopy, copier.kinds())
+	}
+	// The orphaned cnpg source is NEVER dropped when the flip failed.
+	if containsStr(copier.kinds(), "dropdb") {
+		t.Fatalf("orphaned cnpg source was dropped on a failed flip — must be retained for adoption: %v", copier.kinds())
+	}
 	if store.warehouseState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("warehouse state = %s, want ready after recovery", store.warehouseState)
 	}
+}
+
+// TestReshardExtVerifyMismatchAdopts pins the step-5 gate: if the external
+// target catalog does NOT exactly match the copied row counts, the runner
+// REFUSES to drop the retained cnpg source and instead flips back + re-adopts
+// it — no data loss.
+func TestReshardExtVerifyMismatchAdopts(t *testing.T) {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{
+		copyResult: CatalogCopyResult{Tables: 1, Rows: 5, PerTableRows: map[string]int64{"ducklake_data_file": 5}},
+		// External target verify sees a DIFFERENT count than the copy snapshot.
+		externalCounts: map[string]int64{"ducklake_data_file": 4},
+	}
+
+	r := testRunner(store, duckling, copier)
+	r.StashExternalPassword(op.ID, "ext-pw")
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "catalog incomplete") {
+		t.Fatalf("state=%s err=%q, want external-verify (catalog incomplete) failure", store.op.State, store.op.Error)
+	}
+	// The retained cnpg source must NEVER be dropped on a verify mismatch.
+	if containsStr(copier.kinds(), "dropdb") {
+		t.Fatalf("verify mismatch dropped the source — must retain it for adoption: %v", copier.kinds())
+	}
+	// Recovery flips back + re-adopts.
+	if !containsStr(duckling.callKinds(), "cnpg-adopt") {
+		t.Fatalf("verify mismatch did not flip back + adopt: %v", duckling.callKinds())
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after adopt recovery", store.warehouseState)
+	}
+}
+
+// TestReshardCnpgToExtXRDUnsupportedRefuses pins the XRD-compat fallback: a
+// cluster whose Duckling XRD predates spec.metadataStore.retainCnpgOnFlip (the
+// patch is pruned) makes the runner REFUSE the cnpg→ext flip BEFORE touching
+// the source — no flip, no drop, source intact, retain flag reset, org back to
+// ready.
+func TestReshardCnpgToExtXRDUnsupportedRefuses(t *testing.T) {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), retainFieldUnsupported: true}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	r := testRunner(store, duckling, copier)
+	r.StashExternalPassword(op.ID, "ext-pw")
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "does not support") {
+		t.Fatalf("state=%s err=%q, want XRD-unsupported refusal", store.op.State, store.op.Error)
+	}
+	// Never flipped, never dropped — the source is untouched.
+	if containsStr(duckling.callKinds(), "external") {
+		t.Fatalf("flip ran despite an unsupported XRD: %v", duckling.callKinds())
+	}
+	if containsStr(copier.kinds(), "dropdb") {
+		t.Fatalf("source dropped despite refusing the flip: %v", copier.kinds())
+	}
+	// The retain flag we attempted to set is reset on rollback.
+	var retainVals []bool
+	for _, c := range duckling.calls {
+		if c.kind == "retain" && c.retain != nil {
+			retainVals = append(retainVals, *c.retain)
+		}
+	}
+	if len(retainVals) == 0 || retainVals[len(retainVals)-1] != false {
+		t.Fatalf("retain patches = %v, want the last to reset to false on rollback", retainVals)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after refusal rollback", store.warehouseState)
+	}
+}
+
+func containsStr(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestReshardVerifyMismatchRollsBack pins the concurrent-writer detection: a
