@@ -627,6 +627,22 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
 - **Runner fencing**: claim bumps `runner_epoch`; every runner write is
   CAS-fenced on (runner, epoch); stale-heartbeat (>5m) ops are takeover-able;
   the copy holds a target-DB advisory lock.
+- **Takeover rollback reconstructs progress from the persisted row.** The
+  in-process rollback flags (`blocked`, `compactionPaused`, `flipped`,
+  `retainRequested`) start false on a fresh `opRun`. A runner that CLAIMS an op a
+  prior epoch advanced (crash-takeover or replica switch) MUST call
+  `reconstructProgress()` before `run()` — otherwise a cancel/failure that
+  short-circuits before the steps re-execute (e.g. `run()`'s first
+  `cancelRequested()` check) rolls back with all-false flags and silently skips
+  unblocking the warehouse (org stuck in `resharding`) and restoring compaction.
+  Reconstruction is conservative: `blocked` ← `blocked_at` set OR step past
+  `blocking`; `compactionPaused` ← step past `pausing_compaction` (proves the
+  prior setting was recorded, else restore could wrongly re-enable compaction);
+  `flipped`/`retainRequested` ← step reached `cutover`/`orphaning_source`
+  (over-marking is safe — the flip-back/adopt patches are idempotent no-ops when
+  the store never moved). This was a real mw-dev incident: the blocking runner
+  OOM-crashed mid-backup, a sibling replica took over, saw the cancel flag, and
+  marked the op `cancelled` while leaving the warehouse blocked.
 - Touching any of this → update `tests/configstore/reshard_postgres_test.go`,
   `provisioner/reshard_runner_test.go` (incl. the `TestReshardBackup*` cases),
   `admin/reshard_test.go`, the

@@ -260,6 +260,77 @@ func (o *opRun) logf(level, format string, args ...any) {
 	}
 }
 
+// reshardStepOrderCnpg / reshardStepOrderExternal are the canonical execution
+// orders of the op's step column, one per target direction. They exist so a
+// runner that CLAIMS an op a prior epoch already advanced (takeover after a
+// crash, or a switch to another replica) can reconstruct how far the work got —
+// the in-process opRun progress flags all start false, but the persisted step
+// records the prior runner's position.
+var (
+	reshardStepOrderCnpg     = []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "cutover", "copying", "verifying", "cleaning_up", "finalizing"}
+	reshardStepOrderExternal = []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "copying", "verifying", "orphaning_source", "cutover", "verifying_external", "cleaning_up", "finalizing"}
+)
+
+// reshardStepReached reports whether the op's persisted step is at or past
+// target in the op's direction order. An unknown/empty step (fresh op) → false.
+func reshardStepReached(op *configstore.ReshardOperation, target string) bool {
+	order := reshardStepOrderCnpg
+	if op.TargetKind == configstore.MetadataStoreKindExternal {
+		order = reshardStepOrderExternal
+	}
+	cur, tgt := -1, -1
+	for i, s := range order {
+		if s == op.Step {
+			cur = i
+		}
+		if s == target {
+			tgt = i
+		}
+	}
+	return cur >= 0 && tgt >= 0 && cur >= tgt
+}
+
+// reconstructProgress re-derives the rollback progress flags from the persisted
+// op row. On a fresh op it is a no-op (BlockedAt nil, step ""); on a TAKEOVER
+// (crash of the owning runner, or a replica switch) it makes rollback behave as
+// if this runner had performed the prior steps — otherwise the flags stay false
+// and rollback silently skips unblocking the warehouse (leaving the org stuck in
+// resharding) and restoring compaction. This is what let a cancel of an op whose
+// owning replica had OOM-crashed mark the op cancelled while the warehouse
+// stayed blocked.
+//
+// Steps are stamped at the START of a step; a progress flag is set at its
+// SUCCESS. Reconstruction is deliberately conservative so a "started but not
+// completed" step can never trigger a damaging rollback:
+//   - blocked: keyed off the persisted blocked_at timestamp (written only after
+//     the ready→resharding CAS succeeds) — exact, no step guessing.
+//   - compactionPaused: requires the step to be STRICTLY PAST pausing_compaction
+//     (i.e. backup_catalog reached), which proves pauseCompaction recorded the
+//     prior setting; restoring to an unrecorded (zero) prior could wrongly
+//     re-enable compaction (key-absent enables it), so we would rather leave it
+//     paused than guess.
+//   - flipped / retainRequested: keyed off the step reaching cutover /
+//     orphaning_source. Over-marking these is safe: every post-flip rollback
+//     patch (re-point shard, flip back, adopt) is idempotent and no-ops when the
+//     store never actually moved.
+func (o *opRun) reconstructProgress() {
+	// blocked_at is written just after the ready→resharding CAS; reaching a step
+	// past "blocking" also proves the CAS succeeded (run() aborts on a block
+	// error), covering the sliver between the CAS and the blocked_at write.
+	if o.op.BlockedAt != nil || reshardStepReached(o.op, "draining") {
+		o.blocked = true
+	}
+	if reshardStepReached(o.op, "backup_catalog") {
+		o.compactionPaused = true
+	}
+	if o.op.TargetKind == configstore.MetadataStoreKindExternal && reshardStepReached(o.op, "orphaning_source") {
+		o.retainRequested = true
+	}
+	if reshardStepReached(o.op, "cutover") {
+		o.flipped = true
+	}
+}
+
 // flipTimeout is the per-op cutover bound, falling back to the runner
 // default (15m / DUCKGRES_RESHARD_FLIP_TIMEOUT).
 func (o *opRun) flipTimeout() time.Duration {
@@ -313,6 +384,10 @@ func (o *opRun) wait(ctx context.Context, d time.Duration) error {
 
 func (r *ReshardRunner) execute(ctx context.Context, op *configstore.ReshardOperation) {
 	o := &opRun{r: r, op: op}
+	// Recover progress flags from the persisted row so a takeover/replica-switch
+	// rolls back (unblocks the warehouse, restores compaction) as if this runner
+	// had done the prior steps. No-op for a fresh op.
+	o.reconstructProgress()
 	o.logf("info", "operation claimed by %s (epoch %d): %s → %s", r.cpID, op.RunnerEpoch, describeSource(op), describeTarget(op))
 
 	// Heartbeat until the op function returns. A fencing loss stops the op.

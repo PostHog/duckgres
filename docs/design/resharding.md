@@ -334,6 +334,19 @@ the `2BP01` "role can't drop while its DB exists" wedge the coupled delete hit.
   `runner_epoch=1`, owned by the creating CP — a fresh-heartbeat running row no
   sibling replica can steal, which is what keeps the ephemeral external
   password with the one runner that has it.
+- Takeover rollback reconstructs progress from the persisted row. A runner that
+  claims an op a prior epoch advanced starts with all in-process rollback flags
+  false, so it calls `reconstructProgress()` before running: `blocked` from
+  `blocked_at`/step-past-`blocking`, `compactionPaused` from step-past-
+  `pausing_compaction`, `flipped`/`retainRequested` from step reaching
+  `cutover`/`orphaning_source`. Without this, a cancel or failure that
+  short-circuits before the steps re-execute (the first `cancelRequested()`
+  check) would mark the op terminal while leaving the warehouse stuck in
+  `resharding` and compaction paused — the exact mw-dev incident where the
+  blocking runner OOM-crashed mid-backup and a sibling replica finalized the
+  cancel without unblocking. Reconstruction is conservative (only signals that
+  prove a step completed flip a flag) and every rollback action is idempotent, so
+  a takeover rolls back identically to the original runner.
 - An org is never stranded: every failure path restores `resharding→ready`
   (or logs at ERROR if it can't — that's the page-someone signal).
 
