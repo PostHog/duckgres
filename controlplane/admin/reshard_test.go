@@ -205,6 +205,11 @@ func TestReshardStartValidation(t *testing.T) {
 		{"bad target type", nil, `{"target":{"type":"nonsense"}}`, 400},
 		{"missing ext fields", nil, `{"target":{"type":"external","endpoint":"x"}}`, 400},
 		{"missing ext password", nil, `{"target":{"type":"external","endpoint":"x","password_aws_secret":"s"}}`, 400},
+		// RDS-managed master secrets are outside every env's ESO IAM policy
+		// (posthog-*/duckling-* prefixes only) — the cutover would hang on an
+		// ESO AccessDenied, so the start handler rejects them up front.
+		{"rds slash master secret", nil, `{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds/duckling-example/master","password":"p"}}`, 400},
+		{"rds bang managed secret", nil, `{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds!db-1234-abcd","password":"p"}}`, 400},
 		{"not ready", func(f *fakeReshardStore) {
 			f.warehouse.State = configstore.ManagedWarehouseStateProvisioning
 		}, `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`, 409},

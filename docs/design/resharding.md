@@ -112,6 +112,30 @@ resume (password lost); the new runner fails the op with a clear re-run
 message. After the flip, the runner checks the ESO-synced status password
 matches the provided one (catches a wrong/missing SM secret).
 
+**The SM secret name and value are constrained by the ESO wiring.** After the
+flip, the composition renders an ExternalSecret
+(`duckling-<name>-password` in the duckling namespace, store
+`aws-cluster-secret-store`) whose `remoteRef.key` is the typed secret NAME
+with no `property` — ESO copies the **whole secret value verbatim** into the
+k8s Secret key `password`, so the value must be the **raw password string**
+(JSON like `{"password": …}` breaks the equality check). The external-secrets
+IAM role can only `GetSecretValue` on a per-env name-prefix allowlist —
+`posthog-*` and `duckling-*` in every managed-warehouse env (see the
+`external-secrets-pod-identity` terraform module in posthog-cloud-infra) —
+so an RDS-managed master secret (`rds!db-…` / `rds/…/master`) is NEVER
+readable and would hang the cutover on an ESO AccessDenied. Defenses, outer
+to inner: the reshard form documents the convention
+(`duckling-<name>-<env>-<region>-rds-password`) and warns live on suspicious
+names (`classifySecretName`); the start handler 400s names matching
+`^rds[!/]` (`rdsManagedSecretNamePattern`); and during the cutover wait the
+runner reads the tenant's ExternalSecret (best-effort, via the duckling
+client's dynamic client — `ExternalSecretSyncError`) and, while the status
+password is still empty, surfaces a failing sync condition (reason+message,
+e.g. the AccessDenied) into the op log at warn, deduped by content. A
+diagnostic read error (RBAC Forbidden — the CP has no `external-secrets.io`
+grant today, CRD absent, object not rendered yet) degrades quietly to the
+generic waiting line and never fails the op.
+
 **Recovery if the flip goes bad** (ESO secret missing/mismatched): flip back
 to the source shard — provider-sql re-creates the role/DB **empty** — then
 copy back from the external target, whose data passed verify. The one path

@@ -83,6 +83,12 @@ type reshardDucklingClient interface {
 	SetCompactionEnabled(ctx context.Context, name string, enabled *bool) error
 	SetMetadataStoreCnpg(ctx context.Context, name, shard string) error
 	SetMetadataStoreExternal(ctx context.Context, name string, ext ExternalMetadataStoreSpec) error
+	// ExternalSecretSyncError is a best-effort diagnostic read of the
+	// tenant's password ExternalSecret (duckling-<name>-password): a failing
+	// sync yields its reason+message, a healthy one yields "". err means the
+	// object couldn't be read (RBAC, CRD absent, not created yet) — callers
+	// degrade quietly and never fail the operation on it.
+	ExternalSecretSyncError(ctx context.Context, name string) (string, error)
 }
 
 // NewReshardRunner builds a runner over the real config store + duckling
@@ -656,6 +662,7 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 	providedPassword := o.target.Password
 	deadline := time.Now().Add(o.flipTimeout())
 	lastLog := time.Time{}
+	lastESOWarn := ""
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -663,7 +670,7 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 		// No cancel check: past this flip the only ways out are forward or
 		// the copy-back recovery in rollback().
 		if time.Now().After(deadline) {
-			return fmt.Errorf("external target did not become ready within %s (ESO secret %q missing or wrong?)", o.flipTimeout(), o.op.TargetPasswordSecret)
+			return fmt.Errorf("external target did not become ready within %s (ESO secret %q missing, unreadable, or wrong? the ESO role can only read allowed secret NAME patterns — e.g. duckling-*/posthog-* — and the value must be the raw password string)", o.flipTimeout(), o.op.TargetPasswordSecret)
 		}
 
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -677,6 +684,20 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 			if st.ReadyCondition {
 				o.logf("info", "external target ready: ESO password synced and matches, duckling Ready")
 				return nil
+			}
+		}
+		// Diagnostic: when the status password hasn't landed, the usual
+		// culprit is the ESO sync — e.g. an SM secret name outside the ESO
+		// IAM policy's allowed patterns (an RDS-managed rds/…/master secret
+		// is never readable). Surface the ExternalSecret's own failure at
+		// warn, deduped by content so it doesn't repeat every poll. A read
+		// error (RBAC Forbidden, CRD absent, object not rendered yet)
+		// degrades quietly to the generic waiting line below.
+		if err == nil && st.MetadataStore.Password == "" {
+			if esoMsg, esoErr := o.r.duckling.ExternalSecretSyncError(ctx, o.op.DucklingName); esoErr == nil && esoMsg != "" && esoMsg != lastESOWarn {
+				o.logf("warn", "ExternalSecret %q is failing to sync secret %q: %s — the ESO role can only read allowed secret NAME patterns (e.g. duckling-*); an RDS-managed master secret (rds/…/master) will NOT work",
+					ExternalSecretName(o.op.DucklingName), o.op.TargetPasswordSecret, esoMsg)
+				lastESOWarn = esoMsg
 			}
 		}
 		if time.Since(lastLog) >= 15*time.Second {
