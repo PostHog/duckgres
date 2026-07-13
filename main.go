@@ -50,10 +50,10 @@ var (
 
 func validateRunMode(mode string) error {
 	switch mode {
-	case "standalone", "control-plane", "duckdb-service":
+	case "standalone", "control-plane", "duckdb-service", "reshard-runner":
 		return nil
 	default:
-		return fmt.Errorf("unsupported --mode %q; supported modes: standalone, control-plane, duckdb-service", mode)
+		return fmt.Errorf("unsupported --mode %q; supported modes: standalone, control-plane, duckdb-service, reshard-runner", mode)
 	}
 }
 
@@ -104,7 +104,7 @@ func main() {
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
-	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
+	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, duckdb-service, or reshard-runner")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
 	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
@@ -316,6 +316,24 @@ func main() {
 		return
 	}
 
+	// Handle reshard-runner mode: the entrypoint of a dedicated per-operation
+	// pod (duckgres-reshard-op-<id>) the control plane spawns for each reshard.
+	// Claims ONE operation (DUCKGRES_RESHARD_OP_ID), executes the step machine
+	// to a terminal state, exits. The op row is the source of truth for the
+	// OUTCOME (a failed/rolled-back op still exits 0); only infrastructure
+	// errors (config store unreachable, claim lost/fenced) exit nonzero.
+	// Requires -tags kubernetes. No PG listener, no TLS, no metrics endpoint.
+	if *mode == "reshard-runner" {
+		if err := controlplane.RunReshardRunnerMode(controlplane.ReshardRunnerModeConfig{
+			ConfigStoreConn:    resolved.ConfigStoreConn,
+			ConfigPollInterval: resolved.ConfigPollInterval,
+			AWSRegion:          resolved.AWSRegion,
+		}); err != nil {
+			fatal("Reshard runner failed: " + err.Error())
+		}
+		return
+	}
+
 	// Handle REPL mode (interactive SQL shell, no TLS/metrics/server needed)
 	if *repl {
 		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
@@ -393,6 +411,8 @@ func main() {
 				WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
 				WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
 				WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
+				ReshardPodCPU:                resolved.K8sReshardPodCPU,
+				ReshardPodMemory:             resolved.K8sReshardPodMemory,
 				AWSRegion:                    resolved.AWSRegion,
 			},
 		}

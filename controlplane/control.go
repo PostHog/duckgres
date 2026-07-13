@@ -142,6 +142,14 @@ type K8sConfig struct {
 	WorkerPriorityClassName string // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
 	AWSRegion               string // AWS region for STS client
 
+	// Reshard runner pod shape (env-only DUCKGRES_RESHARD_POD_CPU /
+	// DUCKGRES_RESHARD_POD_MEMORY; requests=limits, Guaranteed QoS). Empty =
+	// built-in defaults (2 CPU / 8Gi). Reshard ops run in dedicated per-op
+	// pods so a catalog dump/copy never competes with live traffic for CP
+	// resources.
+	ReshardPodCPU    string
+	ReshardPodMemory string
+
 	// Node-headroom controller holds preemptible low-priority placeholder pods so
 	// a worker spawn schedules immediately (preempting a placeholder) rather than
 	// waiting on a fresh Karpenter node. Slot count and size are derived

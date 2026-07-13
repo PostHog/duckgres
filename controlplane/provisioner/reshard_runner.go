@@ -16,10 +16,15 @@ import (
 )
 
 // ReshardRunner drives reshard operations (see docs/design/resharding.md and
-// configstore/reshard.go). Every CP replica runs one; a single replica wins
-// each operation via the claim CAS, heartbeats it, and is fenced by the
-// runner epoch on every write, so a zombie ex-runner can never corrupt an op
-// another replica took over.
+// configstore/reshard.go). It runs inside a DEDICATED per-operation pod
+// (`--mode reshard-runner`, pod duckgres-reshard-op-<id>), NOT inside a
+// control-plane process: a reshard pg_dumps and copies whole catalogs and must
+// never compete with live traffic for CP memory/CPU (a 20k-table catalog dump
+// OOM-killed a 512Mi CP pod). The pod claims exactly ONE operation via the
+// claim CAS (RunSingleOperation), heartbeats it, and is fenced by the runner
+// epoch on every write, so a zombie ex-runner can never corrupt an op another
+// pod took over (the leader reconciler respawns a pod for a stale-heartbeat
+// op).
 //
 // Step order for →cnpg targets: block → drain → pause compaction → backup
 // catalog (pre-flip pg_dump of the source to the org's S3 bucket — the safety
@@ -40,11 +45,12 @@ type ReshardRunner struct {
 	duckling reshardDucklingClient
 	copier   CatalogCopier
 	backuper CatalogBackuper
-	cpID     string
+	// cpID identifies THIS runner in the fencing columns (runner_cp). In the
+	// pod model it is the reshard pod's own name.
+	cpID string
 
-	// pollInterval is the claim-scan cadence; configPollInterval is the CP
-	// config-snapshot poll (the propagation wait after the block CAS).
-	pollInterval       time.Duration
+	// configPollInterval is the CP config-snapshot poll (the propagation wait
+	// after the block CAS).
 	configPollInterval time.Duration
 
 	heartbeatInterval time.Duration
@@ -55,26 +61,17 @@ type ReshardRunner struct {
 	// cancel checks). 5s in production; tests shrink it.
 	loopPoll time.Duration
 
-	// baseCtx is the runner's LIFECYCLE context (the one handed to Run). Ops
-	// adopted straight from the admin HTTP handler (claim-on-create) execute
-	// under this context, NOT the request context — a reshard runs for minutes
-	// and the request ctx is cancelled the moment the 202 response returns.
-	// Defaults to context.Background(); Run overwrites it with its own ctx.
-	baseCtx context.Context
-
 	// extPasswords holds the EPHEMERAL external passwords by op id: the
-	// cnpg→ext target password and the ext→cnpg source password (both come
-	// from the create request and are never persisted). A takeover runner
-	// does not have them and fails the affected step with a clear re-run
-	// message.
+	// cnpg→ext target password (pulled from the creating CP replica's stash
+	// over the internal-secret-authed password URL) and the ext→cnpg source
+	// password (recorded from the CR status pre-flip). Never persisted. A
+	// runner without the target password fails the affected step with a clear
+	// re-run message.
 	extPasswords sync.Map // opID int64 -> string
-
-	running sync.Map // opID int64 -> struct{}
 }
 
 // reshardStore is the config-store surface the runner needs (fakeable).
 type reshardStore interface {
-	ListClaimableReshardOperations(staleAfter time.Duration) ([]int64, error)
 	ClaimReshardOperation(id int64, runnerCP string, staleAfter time.Duration) (*configstore.ReshardOperation, error)
 	GetReshardOperation(id int64) (*configstore.ReshardOperation, error)
 	UpdateReshardStep(id int64, runnerCP string, epoch int64, step string) error
@@ -131,8 +128,6 @@ func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, 
 		copier:             PGCatalogCopier{},
 		backuper:           backuper,
 		cpID:               cpID,
-		baseCtx:            context.Background(),
-		pollInterval:       10 * time.Second,
 		configPollInterval: configPollInterval,
 		heartbeatInterval:  30 * time.Second,
 		staleAfter:         5 * time.Minute,
@@ -142,88 +137,60 @@ func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, 
 	}
 }
 
-// CPID returns this runner's control-plane id — the value the admin handler
-// passes to CreateReshardOperationClaimed so the op is created already owned by
-// THIS replica (the one holding the ephemeral password).
-func (r *ReshardRunner) CPID() string { return r.cpID }
-
-// StashExternalPassword hands the runner an ephemeral password for an op it is
-// expected to run. Used by AdoptClaimedOperation and by tests.
+// StashExternalPassword hands the runner the ephemeral external-target
+// password for the op it is about to run (pulled from the creating CP
+// replica's in-memory stash at pod startup). Never persisted.
 func (r *ReshardRunner) StashExternalPassword(opID int64, password string) {
 	if password != "" {
 		r.extPasswords.Store(opID, password)
 	}
 }
 
-// AdoptClaimedOperation takes an op that was just created ALREADY claimed by
-// this CP (CreateReshardOperationClaimed) and executes it directly, without
-// waiting for the scanOnce poll tick. This is the second half of
-// claim-on-create: the admin handler creates the op owned by this replica and
-// hands it straight here so the replica that holds the ephemeral external
-// password is the one that runs the copy. For external targets password is the
-// ephemeral credential (stashed for copyCatalog); for cnpg targets it is "".
+// RunSingleOperation is the reshard-runner pod's entire job: claim the ONE
+// operation this pod was spawned for, execute the step machine to a terminal
+// state (success, failure+rollback, or cancel+rollback), and return. The
+// operation row is the source of truth for the op OUTCOME — a failed/rolled-
+// back op still returns nil here (the pod exits 0). Only infrastructure
+// problems return an error (op unreadable, claim not winnable, fenced away
+// mid-run), signalling the pod to exit nonzero.
 //
-// Execution runs under the runner's LIFECYCLE context (r.baseCtx), never the
-// caller's (HTTP request) context — a reshard runs for minutes. The r.running
-// map dedups against a racing scanOnce pickup (which cannot happen anyway: a
-// fresh-heartbeat running op owned by this CP is neither listed nor claimable
-// elsewhere).
-func (r *ReshardRunner) AdoptClaimedOperation(op *configstore.ReshardOperation, password string) {
-	r.StashExternalPassword(op.ID, password)
-	if _, alreadyRunning := r.running.LoadOrStore(op.ID, struct{}{}); alreadyRunning {
-		return
-	}
-	ctx := r.baseCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	go func() {
-		defer r.running.Delete(op.ID)
-		defer r.extPasswords.Delete(op.ID)
-		r.execute(ctx, op)
-	}()
-}
+// The claim path is the standard CAS (pending, or running with a stale
+// heartbeat — the respawn/takeover case, which bumps the fencing epoch).
+func (r *ReshardRunner) RunSingleOperation(ctx context.Context, opID int64) error {
+	defer r.extPasswords.Delete(opID)
 
-// Run is the claim loop. Blocks until ctx is done.
-func (r *ReshardRunner) Run(ctx context.Context) {
-	r.baseCtx = ctx
-	ticker := time.NewTicker(r.pollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			r.scanOnce(ctx)
-		}
-	}
-}
-
-func (r *ReshardRunner) scanOnce(ctx context.Context) {
-	ids, err := r.store.ListClaimableReshardOperations(r.staleAfter)
+	op, err := r.store.GetReshardOperation(opID)
 	if err != nil {
-		slog.Warn("Reshard runner: listing claimable operations failed.", "error", err)
-		return
+		return fmt.Errorf("read reshard operation %d: %w", opID, err)
 	}
-	for _, id := range ids {
-		if _, alreadyRunning := r.running.Load(id); alreadyRunning {
-			continue
-		}
-		op, err := r.store.ClaimReshardOperation(id, r.cpID, r.staleAfter)
-		if err != nil {
-			slog.Warn("Reshard runner: claim failed.", "op", id, "error", err)
-			continue
-		}
-		if op == nil {
-			continue // someone else won
-		}
-		r.running.Store(id, struct{}{})
-		go func(op *configstore.ReshardOperation) {
-			defer r.running.Delete(op.ID)
-			defer r.extPasswords.Delete(op.ID)
-			r.execute(ctx, op)
-		}(op)
+	if op.State.Terminal() {
+		slog.Info("Reshard operation already terminal; nothing to do.", "op", opID, "state", op.State)
+		return nil
 	}
+
+	claimed, err := r.store.ClaimReshardOperation(opID, r.cpID, r.staleAfter)
+	if err != nil {
+		return fmt.Errorf("claim reshard operation %d: %w", opID, err)
+	}
+	if claimed == nil {
+		return fmt.Errorf("reshard operation %d is not claimable (owned by %q with a fresh heartbeat?)", opID, op.RunnerCP)
+	}
+
+	r.execute(ctx, claimed)
+
+	// The op row decides the exit: terminal (whatever the outcome) means this
+	// pod did its job; a non-terminal row here means we were fenced away by a
+	// takeover (or the store write failed) — infrastructure trouble.
+	final, err := r.store.GetReshardOperation(opID)
+	if err != nil {
+		return fmt.Errorf("re-read reshard operation %d after execution: %w", opID, err)
+	}
+	if !final.State.Terminal() {
+		return fmt.Errorf("reshard operation %d did not reach a terminal state (state %s, owner %q epoch %d — fenced away by a takeover?)",
+			opID, final.State, final.RunnerCP, final.RunnerEpoch)
+	}
+	slog.Info("Reshard operation finished.", "op", opID, "state", final.State)
+	return nil
 }
 
 // reshardAborted marks step errors that already carry operator context.
