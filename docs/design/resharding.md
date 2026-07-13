@@ -245,9 +245,13 @@ idempotent (drops each `ducklake_*` object before recreating it).
 
 Backups are **kept**, not deleted on success — a subtly corrupted catalog can be
 noticed days later, and the escape-hatch direction is exactly when you want the
-net to persist. Every object carries the tag `duckgres-reshard-catalog-backup=1`
-and lives under the `_reshard_catalog_backups/` prefix, so a single S3 lifecycle
-rule expires them without touching DuckLake data. **Suggested rule** (on the
+net to persist. Every object lives under the reserved
+`_reshard_catalog_backups/` prefix, so a single prefix-scoped S3 lifecycle rule
+expires them without touching DuckLake data. (The objects are deliberately NOT
+object-tagged: `PutObject` with an `x-amz-tagging` header requires
+`s3:PutObjectTagging`, which the per-org duckling IAM roles do not grant — a
+tagged upload 403s on the real cluster. The prefix is the sole, sufficient
+lifecycle key.) **Suggested rule** (on the
 per-org data bucket, or a bucket-wide default): expire objects under prefix
 `_reshard_catalog_backups/` after **30 days**. A catalog is tens of MB to
 ~100 MB, so even frequent reshards stay negligible against the parquet data —

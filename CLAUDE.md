@@ -615,8 +615,10 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   backup fails; non-destructive directions (source survives) log a warning and
   continue. The URI is recorded on `backup_s3_uri` (migration `000021`) + the op
   log, with the exact `pg_restore` recovery command. Retention is an S3 lifecycle
-  rule on the tagged/prefixed objects (30d suggested) — no in-app GC; backups are
-  kept on success. pg_dump/pg_restore ship in the CP image
+  rule on the reserved key prefix (30d suggested) — no in-app GC; backups are
+  kept on success. The objects carry NO object tag: PutObject with x-amz-tagging
+  needs `s3:PutObjectTagging`, which the org duckling roles do not grant (a
+  tagged upload 403s on the real cluster — mw-dev e2e regression). pg_dump/pg_restore ship in the CP image
   (`postgresql-client-18`, PGDG repo, in BOTH `Dockerfile` and
   `Dockerfile.controlplane`). Full design + restore procedure:
   `docs/design/resharding.md`.

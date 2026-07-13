@@ -19,11 +19,12 @@ import (
 // fakeBackupS3 fakes both the streaming uploader and the object deleter: it
 // drains the body (like the real multipart uploader) and records what landed.
 type fakeBackupS3 struct {
-	mu        sync.Mutex
-	uploaded  []byte
-	uploadKey string
-	uploadErr error
-	deleted   []string
+	mu            sync.Mutex
+	uploaded      []byte
+	uploadKey     string
+	uploadTagging *string
+	uploadErr     error
+	deleted       []string
 }
 
 func (f *fakeBackupS3) Upload(_ context.Context, input *s3.PutObjectInput, _ ...func(*manager.Uploader)) (*manager.UploadOutput, error) {
@@ -34,6 +35,7 @@ func (f *fakeBackupS3) Upload(_ context.Context, input *s3.PutObjectInput, _ ...
 	f.mu.Lock()
 	f.uploaded = body
 	f.uploadKey = *input.Key
+	f.uploadTagging = input.Tagging
 	f.mu.Unlock()
 	if f.uploadErr != nil {
 		return nil, f.uploadErr
@@ -114,6 +116,13 @@ while [ $i -lt 3200 ]; do printf '0123456789012345678901234567890123456789012345
 	}
 	if len(fake.deleted) != 0 {
 		t.Fatalf("unexpected DeleteObject calls: %v", fake.deleted)
+	}
+	// LOAD-BEARING: the upload must carry NO object tagging. PutObject with an
+	// x-amz-tagging header requires s3:PutObjectTagging, which the per-org
+	// duckling IAM roles do not grant — a tagged upload 403s on the real
+	// cluster (AccessDenied on s3:PutObjectTagging, mw-dev e2e).
+	if fake.uploadTagging != nil {
+		t.Fatalf("upload carried Tagging %q — requires s3:PutObjectTagging the org roles lack", *fake.uploadTagging)
 	}
 }
 

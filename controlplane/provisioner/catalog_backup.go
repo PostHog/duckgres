@@ -42,12 +42,16 @@ import (
 
 // backupPrefix is the reserved S3 key prefix under the org data bucket that
 // reshard catalog backups land under — kept distinct from DuckLake's parquet so
-// a lifecycle rule can expire it and it never collides with real data.
+// a prefix-scoped lifecycle rule can expire it and it never collides with real
+// data.
 const backupPrefix = "_reshard_catalog_backups/"
 
-// backupObjectTag is applied to every uploaded artifact so an S3 lifecycle rule
-// can target reshard catalog backups by tag (see docs/design/resharding.md).
-const backupObjectTag = "duckgres-reshard-catalog-backup=1"
+// NOTE: the artifacts are deliberately NOT object-tagged. PutObject with an
+// x-amz-tagging header requires s3:PutObjectTagging, which the per-org
+// duckling IAM roles do not grant — on the real cluster the tagged upload
+// 403s (AccessDenied on s3:PutObjectTagging; observed in the mw-dev e2e).
+// Lifecycle retention targets the reserved backupPrefix instead (see
+// docs/design/resharding.md § Retention), which needs no extra permission.
 
 // backupUploadPartSize / backupUploadConcurrency bound the streaming upload's
 // memory: at most partSize × concurrency (+1 part being filled) is buffered,
@@ -216,7 +220,8 @@ func (b *PGCatalogBackuper) Backup(ctx context.Context, source CatalogEndpoint, 
 		Key:         aws.String(dest.Key),
 		Body:        counter,
 		ContentType: aws.String("application/octet-stream"),
-		Tagging:     aws.String(backupObjectTag),
+		// No Tagging: it would require s3:PutObjectTagging, which the org
+		// duckling roles do not hold (see the package note above).
 	})
 	if uploadErr != nil {
 		// The uploader stopped consuming the pipe; kill pg_dump so Wait can't
