@@ -2301,17 +2301,25 @@ reshard_targets() { # destination discovery; ext org's RDS must appear too
 
 reshard_validation() { # cnpg-org currently on shard-001
   log "reshard validation: same-shard + bad targets are 400"
-  # The last two pin the RDS-managed-master-secret rejection: names matching
-  # rds/… or rds!… are outside the ESO IAM policy's allowed prefixes
-  # (posthog-*/duckling-*), so a cutover pointed at one would hang on an ESO
-  # AccessDenied — the start handler refuses them up front.
+  # The RDS-managed-master and generic-prefix rows pin Fix 1's positive ESO
+  # allowlist: the external-secrets IAM policy only allows GetSecretValue on
+  # posthog-*/duckling-* names, so the start handler 400s an SM secret name
+  # outside that set (rds/…/rds!… gets the more-specific RDS-managed message,
+  # anything else the general allowlist message) — otherwise the destructive
+  # cnpg→ext cutover would hang on an ESO AccessDenied. All of these are
+  # rejected at name validation, BEFORE the pre-flight connection check (Fix 2),
+  # so they need no reachable target. The connect check itself needs a real
+  # reachable RDS + a valid password, which this Job lacks (same reason the
+  # cnpg→ext positive path is unit-only), so it stays covered by
+  # controlplane/admin/reshard_test.go (TestReshardExtPreflightProbe).
   for body in \
     '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"}}' \
     '{"target":{"type":"cnpg-shard","cnpg_shard":"Bad_Shard"}}' \
     '{"target":{"type":"nonsense"}}' \
     '{"target":{"type":"external","endpoint":"x"}}' \
     '{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds/some-db/master","password":"p"}}' \
-    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds!db-0000-1111","password":"p"}}'; do
+    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds!db-0000-1111","password":"p"}}' \
+    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"my-own-secret","password":"p"}}'; do
     code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
       -d "$body" "$API/api/v1/orgs/$1/reshard")"
     [ "$code" = "400" ] || fail "reshard validation: body $body -> $code, want 400"

@@ -264,10 +264,11 @@ export function ReshardForm() {
                       </p>
                     )}
                     {secretVerdict === "unknown-prefix" && (
-                      <p className="flex items-start gap-1 text-xs text-warning">
+                      <p className="flex items-start gap-1 text-xs text-destructive">
                         <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
                         Name doesn't start with duckling- or posthog- — the ESO role can only read
-                        secrets matching its allowed name prefixes. Double-check before running.
+                        secrets matching those prefixes, so the server will reject this. Rename the
+                        secret to duckling-…-rds-password (same password) and use that.
                       </p>
                     )}
                   </div>

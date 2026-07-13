@@ -200,13 +200,35 @@ IAM role can only `GetSecretValue` on a per-env name-prefix allowlist —
 so an RDS-managed master secret (`rds!db-…` / `rds/…/master`) is NEVER
 readable and would hang the cutover on an ESO AccessDenied. Defenses: the reshard form documents the convention
 (`duckling-<name>-<env>-<region>-rds-password`) and warns live on suspicious
-names (`classifySecretName`), and the start handler 400s names matching
-`^rds[!/]` (`rdsManagedSecretNamePattern`). If a name that slips through is
+names (`classifySecretName`), and the start handler enforces a **positive
+allowlist** — the SM secret name MUST start with `posthog-` or `duckling-`
+(`esoReadableSecretPrefixes`), else 400. RDS-managed names (`^rds[!/]`,
+`rdsManagedSecretNamePattern`) are detected first and get a more specific
+message; any other non-allowlisted name gets the general allowlist message.
+The two prefixes are identical across every env, so they're hardcoded (not
+resolved per-env). If a name that slips through is
 still unreadable by ESO, the cutover simply waits for the status password
 until its per-op timeout and then recovers (below) — the op log shows the
 generic "waiting for external target" line. (Surfacing the ExternalSecret's
 own AccessDenied into the op log would need an `external-secrets.io` read
 grant on the CP SA, which it does not have; not worth the extra RBAC.)
+
+**Pre-flight connection check (fail before the destructive flip).** The
+cnpg→ext flip is destructive — Crossplane un-renders the cnpg source role/DB on
+the TYPE change, so a doomed external target that only fails *after* the flip
+forces the flip-back adopt recovery. Two submit-time gates make a doomed op
+fail fast with a 400 (nothing created): Fix 1 above (the ESO-readable name
+allowlist), and a bounded `SELECT 1` against the target Postgres
+(`ExternalTargetProber`, an adapter over `provisioner.PGCatalogCopier.Probe`
+wired in `multitenant.go`) that proves endpoint reachability + the
+user/database/password all work, before any maintenance window or flip.
+External RDS uses `sslmode=require` (matches the runner's copy). The whole
+check is bounded (~8s) so a black-holed endpoint can't hang the handler; a
+timeout counts as a connect failure. The 400 message is redacted (never echoes
+the password). The prober nil-degrades in tests / non-k8s builds — the check
+is then skipped and the runner's copy step still catches a bad credential later
+(fail-fast optimization, not the only line of defense). When the prober IS
+present and the connect fails, the op is refused.
 
 **Recovery if the flip goes bad** (external never Ready, ESO secret
 missing/mismatched, or external-catalog verify fails): flip `type` back to
@@ -250,16 +272,18 @@ takeover fencing, cancel, log pagination, the grant-path gate),
 ephemeral-password loss; for cnpg→ext specifically the two-step orphan flip, the
 external-catalog verify gate, the flip-back adopt recovery with NO copy-back,
 and the XRD-without-`retainCnpgOnFlip` refusal), `admin/reshard_test.go`
-(validation, secrets never persisted). The charts side (composition +
+(validation incl. the ESO-name allowlist + the pre-flight connection-check
+pass/fail/skip, secrets never persisted). The charts side (composition +
 `retainCnpgOnFlip` XRD field) is tested by
 `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh` (both
 managementPolicies variants render; the XRD field defaults false). e2e
-(`tests/mw-dev/e2e/harness.sh`): validation 400s, cancel-during-drain
-(drain-not-kill + 57P03 visible), bogus-shard rollback (real flip →
-Synced=False → rollback, data intact), the **ext→cnpg positive path** (real
-catalog move off the harness RDS onto shard-001), and the LOAD-BEARING
-`lifecycle_teardown_cnpg` (a normal cnpg tenant deprovision still fully deletes
-the Duckling CR + its cnpg role/DB — the deprovision-unaffected regression net
-for `retainCnpgOnFlip`). cnpg→cnpg positive path needs a second mw-dev shard
-(follow-up infra); the cnpg→ext positive path is unit-test-only (the harness has
-no RDS password — the start API requires it ephemerally).
+(`tests/mw-dev/e2e/harness.sh`): validation 400s (incl. a non-allowlisted
+external secret name), cancel-during-drain (drain-not-kill + 57P03 visible),
+bogus-shard rollback (real flip → Synced=False → rollback, data intact), the
+**ext→cnpg positive path** (real catalog move off the harness RDS onto
+shard-001), and the LOAD-BEARING `lifecycle_teardown_cnpg` (a normal cnpg
+tenant deprovision still fully deletes the Duckling CR + its cnpg role/DB — the
+deprovision-unaffected regression net for `retainCnpgOnFlip`). cnpg→cnpg
+positive path needs a second mw-dev shard (follow-up infra); the cnpg→ext
+positive path is unit-test-only (the harness has no RDS password — the start
+API requires it ephemerally).
