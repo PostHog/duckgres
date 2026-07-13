@@ -244,6 +244,14 @@ metadata:
 spec:
   backoffLimit: 0
   template:
+    metadata:
+      annotations:
+        # Same consolidation pinning as the CP/config-store: the harness runs
+        # ~15 minutes of ordered assertions with zero retry budget
+        # (backoffLimit 0), and the worker-churn lanes empty nodes mid-run —
+        # a Karpenter reclaim of the harness pod's node kills the Job at
+        # whatever lane is next (observed: rc=130 mid COPY lane, no FAIL line).
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: duckgres
       restartPolicy: Never
