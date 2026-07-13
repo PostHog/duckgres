@@ -5,11 +5,13 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -66,6 +68,48 @@ var reshardShardNamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?
 // it up front.
 var rdsManagedSecretNamePattern = regexp.MustCompile(`^rds[!/]`)
 
+// esoReadableSecretPrefixes is the positive allowlist of Secrets Manager name
+// prefixes the external-secrets IAM role can GetSecretValue on. The policy is
+// identical across every managed-warehouse environment (dev / prod-us /
+// prod-eu) — see the external-secrets-pod-identity terraform module in
+// posthog-cloud-infra — so these two prefixes are hardcoded rather than
+// resolved per-env. A cnpg→external reshard whose SM secret name is outside
+// this set would pass the catalog copy and then hang the destructive cutover on
+// an ESO AccessDenied, so the start handler rejects it up front (Fix 1).
+var esoReadableSecretPrefixes = []string{"posthog-", "duckling-"}
+
+// hasESOReadablePrefix reports whether name begins with a prefix the
+// external-secrets role is allowed to read.
+func hasESOReadablePrefix(name string) bool {
+	for _, p := range esoReadableSecretPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// externalProbeTimeout bounds the pre-flight connection check to the external
+// target so a black-holed endpoint can't hang the admin HTTP handler; a timeout
+// counts as a connect failure → 400.
+const externalProbeTimeout = 8 * time.Second
+
+// ExternalTargetProber verifies the CP can actually reach + authenticate
+// against a cnpg→external reshard target Postgres before the op is created —
+// the destructive cnpg→ext flip (Crossplane DELETEs the source role/DB) happens
+// long after submit, so a doomed credential/endpoint is far cheaper to catch
+// here than after the flip. Satisfied in production by an adapter over
+// provisioner.PGCatalogCopier (wired in controlplane/multitenant.go); nil in
+// tests / non-k8s builds, in which case the check is SKIPPED (the runner's copy
+// step still catches a bad credential later — this is a fail-fast optimization,
+// not the only line of defense).
+type ExternalTargetProber interface {
+	// Probe opens a bounded connection to endpoint (host[:port], default port
+	// 5432) as user/database with password over the given sslmode and runs a
+	// trivial liveness query. It MUST NOT echo the password in its error.
+	Probe(ctx context.Context, endpoint, user, database, password, sslMode string) error
+}
+
 type reshardTargetRequest struct {
 	Type string `json:"type"` // "cnpg-shard" | "external"
 
@@ -92,9 +136,10 @@ type startReshardRequest struct {
 // client unavailable) — starting a reshard then 503s; reads still work.
 // stash may be nil (no local runner) — external targets then 503. cluster may
 // be nil (non-k8s) — shard discovery then falls back to the shards tenants
-// already occupy.
-func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, stash ReshardPasswordStash, cluster kubernetes.Interface) {
-	h := &reshardHandler{store: store, lister: lister, stash: stash, cluster: cluster}
+// already occupy. prober may be nil (tests / non-k8s) — the external target
+// pre-flight connection check is then SKIPPED (see ExternalTargetProber).
+func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, stash ReshardPasswordStash, cluster kubernetes.Interface, prober ExternalTargetProber) {
+	h := &reshardHandler{store: store, lister: lister, stash: stash, cluster: cluster, prober: prober}
 	r.POST("/orgs/:id/reshard", h.start)
 	r.GET("/orgs/:id/reshards", h.listForOrg)
 	r.GET("/reshards", h.listAll)
@@ -109,6 +154,7 @@ type reshardHandler struct {
 	lister  DucklingMetadataLister
 	stash   ReshardPasswordStash
 	cluster kubernetes.Interface
+	prober  ExternalTargetProber
 }
 
 // cnpgShardsNamespace is where the shared CNPG metadata shards run; instance
@@ -258,12 +304,21 @@ func (h *reshardHandler) start(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "external → external is not supported"})
 			return
 		}
-		if strings.TrimSpace(req.Target.Endpoint) == "" || strings.TrimSpace(req.Target.PasswordAWSSecret) == "" {
+		targetEndpoint := strings.TrimSpace(req.Target.Endpoint)
+		targetSecret := strings.TrimSpace(req.Target.PasswordAWSSecret)
+		if targetEndpoint == "" || targetSecret == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "external target requires endpoint and password_aws_secret"})
 			return
 		}
-		if rdsManagedSecretNamePattern.MatchString(strings.TrimSpace(req.Target.PasswordAWSSecret)) {
+		// Fix 1 — the SM secret NAME must be ESO-readable. Detect the more
+		// specific RDS-managed-master shape first (its message is more helpful),
+		// then fall back to the general positive-allowlist message.
+		switch {
+		case rdsManagedSecretNamePattern.MatchString(targetSecret):
 			c.JSON(http.StatusBadRequest, gin.H{"error": "password_aws_secret looks like an RDS-managed master secret (rds!… / rds/…) — the external-secrets role cannot read those, so the cutover would hang on an ESO AccessDenied. Create a Secrets Manager secret whose name the ESO policy allows (e.g. duckling-<name>-…-rds-password) with the raw password string as its value, and use that name"})
+			return
+		case !hasESOReadablePrefix(targetSecret):
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("password_aws_secret %q is not readable by the external-secrets role: its IAM policy only allows Secrets Manager names starting with %s, so the cutover would hang on an ESO AccessDenied. Create a secret whose name starts with one of those (convention: duckling-<name>-<env>-<region>-rds-password) holding the raw password string, and use that name", targetSecret, strings.Join(esoReadableSecretPrefixes, " or "))})
 			return
 		}
 		if req.Target.Password == "" {
@@ -274,9 +329,34 @@ func (h *reshardHandler) start(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no reshard runner on this control plane — external targets unavailable"})
 			return
 		}
+		targetUser := strings.TrimSpace(req.Target.User)
+		if targetUser == "" {
+			targetUser = "postgres"
+		}
+		targetDatabase := strings.TrimSpace(req.Target.Database)
+		if targetDatabase == "" {
+			targetDatabase = "postgres"
+		}
+		// Fix 2 — pre-flight connection check. Prove the CP can reach the target
+		// Postgres AND that the endpoint/user/database/password are valid before
+		// the op is created — the destructive cnpg→ext flip happens much later,
+		// so a doomed target is far cheaper to catch here than after the flip.
+		// External RDS uses sslmode=require (matches the runner's copy of the
+		// external target). Skipped when no prober is configured (tests / non-k8s
+		// — the runner's copy still catches a bad credential later). The error is
+		// redacted: it never echoes the password.
+		if h.prober != nil {
+			probeCtx, cancel := context.WithTimeout(c.Request.Context(), externalProbeTimeout)
+			err := h.prober.Probe(probeCtx, targetEndpoint, targetUser, targetDatabase, req.Target.Password, "require")
+			cancel()
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("cannot connect to the external target %s/%s as %s with the provided password: %v", targetEndpoint, targetDatabase, targetUser, err)})
+				return
+			}
+		}
 		op.TargetKind = configstore.MetadataStoreKindExternal
-		op.TargetEndpoint = strings.TrimSpace(req.Target.Endpoint)
-		op.TargetPasswordSecret = strings.TrimSpace(req.Target.PasswordAWSSecret)
+		op.TargetEndpoint = targetEndpoint
+		op.TargetPasswordSecret = targetSecret
 		op.TargetUser = strings.TrimSpace(req.Target.User)
 		op.TargetDatabase = strings.TrimSpace(req.Target.Database)
 	default:

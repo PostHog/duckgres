@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +23,32 @@ import (
 	"github.com/posthog/duckgres/server"
 	"k8s.io/client-go/kubernetes"
 )
+
+// catalogCopierProber adapts provisioner.PGCatalogCopier's SELECT-1 probe to
+// the admin.ExternalTargetProber seam so the reshard start handler can
+// fail-fast a doomed cnpg→external target (unreachable endpoint / wrong
+// credentials / missing DB) BEFORE the destructive flip. It parses the
+// admin-supplied endpoint as host[:port] (default 5432), mirroring how the
+// reshard runner builds the external target CatalogEndpoint.
+type catalogCopierProber struct{}
+
+func (catalogCopierProber) Probe(ctx context.Context, endpoint, user, database, password, sslMode string) error {
+	host, port := endpoint, 5432
+	if h, p, err := net.SplitHostPort(endpoint); err == nil {
+		host = h
+		if n, convErr := strconv.Atoi(p); convErr == nil {
+			port = n
+		}
+	}
+	return provisioner.PGCatalogCopier{}.Probe(ctx, provisioner.CatalogEndpoint{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Database: database,
+		Password: password,
+		SSLMode:  sslMode,
+	})
+}
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
 // (for the control plane) and admin.OrgStackInfo (for the admin API).
@@ -577,7 +605,11 @@ func SetupMultiTenant(
 	if reshardRunner != nil {
 		reshardStash = reshardRunner
 	}
-	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardStash, clusterClient)
+	// Pre-flight prober for cnpg→external targets: reuses the catalog copier's
+	// SELECT-1 probe to fail-fast an unreachable/bad-credential target before
+	// the destructive flip. Always available in the k8s CP build; nil-degrades
+	// in tests / non-k8s (the runner's copy still catches a bad credential).
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardStash, clusterClient, catalogCopierProber{})
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)

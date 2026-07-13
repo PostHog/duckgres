@@ -561,13 +561,22 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   runner memory; never in the op row, log, or audit. Takeover mid-copy fails
   with a clear re-run message instead of proceeding without it.
 - **The ext SM secret must be ESO-readable and a raw string**: the ESO IAM
-  policy only allows `posthog-*`/`duckling-*` names (RDS-managed
-  `rds!…`/`rds/…/master` secrets never work → start handler 400s them,
-  `rdsManagedSecretNamePattern`), and the composition's ExternalSecret copies
-  the whole value verbatim (no JSON property). An unreadable name that slips
-  through just hangs the cutover wait until the per-op timeout, then recovers
-  (flip-back + copy-back). The form teaches the same rules
-  (`ui/src/lib/reshard.ts::classifySecretName`).
+  policy only allows `posthog-*`/`duckling-*` names, so the start handler
+  enforces a POSITIVE allowlist (`esoReadableSecretPrefixes`) — a name outside
+  it is 400'd, with RDS-managed `rds!…`/`rds/…/master` names
+  (`rdsManagedSecretNamePattern`) detected first for a more specific message.
+  The composition's ExternalSecret copies the whole value verbatim (no JSON
+  property). An unreadable name that slips through just hangs the cutover wait
+  until the per-op timeout, then recovers (flip-back + copy-back). The form
+  teaches the same rules (`ui/src/lib/reshard.ts::classifySecretName`).
+- **cnpg→ext fails fast at submit, before the destructive flip**: the flip
+  DELETEs the cnpg source, so both submit-time gates (the ESO-name allowlist
+  above + a bounded `SELECT 1` pre-flight connection check to the external
+  target, `admin.ExternalTargetProber` over `provisioner.PGCatalogCopier.Probe`,
+  `sslmode=require`, wired in `multitenant.go`) 400 a doomed op before anything
+  is created. The prober nil-degrades (tests / non-k8s → check skipped; the
+  runner's copy still catches a bad credential); when present and the connect
+  fails, the op is refused. The 400 never echoes the password.
 - **Runner fencing**: claim bumps `runner_epoch`; every runner write is
   CAS-fenced on (runner, epoch); stale-heartbeat (>5m) ops are takeover-able;
   the copy holds a target-DB advisory lock.
