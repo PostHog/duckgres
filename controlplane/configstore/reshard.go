@@ -141,6 +141,34 @@ func (cs *ConfigStore) CreateReshardOperation(op *ReshardOperation) error {
 	return nil
 }
 
+// CreateReshardOperationClaimed inserts an operation that is ALREADY claimed
+// by runnerCP — state running, runner_epoch 1, heartbeat/started stamped now —
+// in a single insert. This is the real claim-on-create: because the row lands
+// as a fresh-heartbeat running op owned by runnerCP, no other replica's
+// scanOnce loop can list or claim it (ListClaimableReshardOperations /
+// ClaimReshardOperation only touch pending or stale-heartbeat running ops). It
+// is mandatory for external-target ops, whose ephemeral password lives only in
+// the creating CP's memory: a different replica must never win the op and then
+// fail the copy for want of the password. The partial unique index on (org_id)
+// WHERE state IN (pending, running) still fails a second active op →
+// ErrReshardConflict.
+func (cs *ConfigStore) CreateReshardOperationClaimed(op *ReshardOperation, runnerCP string) error {
+	now := time.Now().UTC()
+	op.State = ReshardStateRunning
+	op.RunnerCP = runnerCP
+	op.RunnerEpoch = 1
+	op.HeartbeatAt = &now
+	op.StartedAt = &now
+	op.CreatedAt = now
+	if err := cs.db.Create(op).Error; err != nil {
+		if isUniqueViolationErr(err) {
+			return ErrReshardConflict
+		}
+		return fmt.Errorf("create claimed reshard operation: %w", err)
+	}
+	return nil
+}
+
 // GetReshardOperation loads one operation by id.
 func (cs *ConfigStore) GetReshardOperation(id int64) (*ReshardOperation, error) {
 	var op ReshardOperation

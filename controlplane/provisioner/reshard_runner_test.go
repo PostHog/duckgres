@@ -646,6 +646,69 @@ func TestReshardCancelDuringDrain(t *testing.T) {
 	}
 }
 
+// waitOpTerminal polls the fake store until the op reaches a terminal state
+// (or the deadline), for tests that drive the runner via AdoptClaimedOperation
+// (which launches execution on its own goroutine rather than via runOp).
+func waitOpTerminal(t *testing.T, store *fakeReshardStore) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		st := store.op.State
+		store.mu.Unlock()
+		if st.Terminal() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("operation did not reach a terminal state in time")
+}
+
+// TestReshardAdoptClaimedExecutesWithStashedPassword pins the claim-on-create
+// handoff: an op handed straight to the runner via AdoptClaimedOperation (as
+// the admin start handler does for a create-claimed op) executes to completion
+// using the stashed external password — no scanOnce poll tick, no password on
+// the op row.
+func TestReshardAdoptClaimedExecutesWithStashedPassword(t *testing.T) {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	// Already claimed by this CP (what CreateReshardOperationClaimed stamps).
+	op.State = configstore.ReshardStateRunning
+	op.RunnerCP = "cp-test"
+	op.RunnerEpoch = 1
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	r := testRunner(store, duckling, copier)
+	// AdoptClaimedOperation must run under the runner's lifecycle context, not
+	// a request context — leave baseCtx nil to prove it falls back safely.
+	r.AdoptClaimedOperation(op, "ext-pw")
+	waitOpTerminal(t, store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
+	}
+	// The stashed password flowed into the copy's target endpoint.
+	var sawCopy bool
+	for _, call := range copier.calls {
+		if call.kind == "copy" {
+			sawCopy = true
+			if call.target.Password != "ext-pw" {
+				t.Fatalf("copy target password = %q, want the stashed ext-pw", call.target.Password)
+			}
+		}
+	}
+	if !sawCopy {
+		t.Fatalf("copy never ran; copier calls = %v", copier.kinds())
+	}
+}
+
 // TestReshardExtTargetWithoutPasswordFails pins the takeover semantics of the
 // ephemeral password: a runner without the stash must fail with the re-run
 // message, never proceed with an empty password.
