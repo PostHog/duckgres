@@ -697,11 +697,16 @@ type ExternalMetadataStoreSpec struct {
 // SetMetadataStoreExternal patches the metadata store to external in one
 // merge patch, REMOVING cnpgShard (JSON merge patch null) — the XRD's CEL
 // forbids cnpgShard on the external type, so leaving the key would fail
-// admission. Used for the cnpg→ext escape-hatch flip and as the ext→cnpg
+// admission. It deliberately does NOT touch retainCnpgOnFlip: the reshard
+// runner sets that true BEFORE this flip so the un-render ORPHANS the cnpg
+// role/DB. Used for the cnpg→ext escape-hatch flip and as the ext→cnpg
 // rollback patch. NOTE: this flip makes the composition STOP rendering the
-// cnpg Role/Database managed resources — Crossplane then DELETES the cnpg
-// role/database. Callers sequence this only after the catalog has been
-// copied and verified elsewhere.
+// cnpg Role/Database managed resources. Whether Crossplane then DELETES the
+// cnpg role/database or ORPHANS it depends on their managementPolicies:
+// retainCnpgOnFlip=true renders them WITHOUT Delete, so the flip orphans (the
+// orphan-adopt safety net); false (a normal tenant) renders them WITH Delete,
+// so the flip deletes them. Callers sequence this only after the catalog has
+// been copied and verified elsewhere.
 func (d *DucklingClient) SetMetadataStoreExternal(ctx context.Context, name string, ext ExternalMetadataStoreSpec) error {
 	if ext.Endpoint == "" || ext.PasswordAWSSecret == "" {
 		return fmt.Errorf("patch duckling CR %q metadata store to external: endpoint and passwordAwsSecret are required", name)
@@ -735,6 +740,160 @@ func (d *DucklingClient) SetMetadataStoreExternal(ctx context.Context, name stri
 		return fmt.Errorf("patch duckling CR %q metadata store to external: %w", name, err)
 	}
 	return nil
+}
+
+// SetMetadataStoreRetainCnpgOnFlip patches spec.metadataStore.retainCnpgOnFlip
+// on the named Duckling CR (JSON merge patch, idempotent, touches only that
+// field). true makes the composition render the per-tenant cnpg Role/Database
+// MRs WITHOUT Delete (managementPolicies ["Observe","Create","Update"], the v2
+// Orphan equivalent), so a subsequent type flip cnpg-shard→external ORPHANS the
+// role/DB instead of deleting them — the cnpg→external reshard escape hatch's
+// orphan-adopt safety net. false restores full lifecycle (Delete) so a normal
+// deprovision drops them. Callers MUST read the value back with
+// GetMetadataStoreRetainCnpgOnFlip: an XRD predating the field silently prunes
+// the patch, so a successful Patch alone does not mean the flag applied.
+func (d *DucklingClient) SetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string, retain bool) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"retainCnpgOnFlip": retain,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal retainCnpgOnFlip patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadataStore retainCnpgOnFlip: %w", name, err)
+	}
+	return nil
+}
+
+// GetMetadataStoreRetainCnpgOnFlip reads spec.metadataStore.retainCnpgOnFlip.
+// present is false when the key is absent — which, right after a
+// SetMetadataStoreRetainCnpgOnFlip(true), means the cluster's Duckling XRD
+// predates the field and the API server pruned the patch. The reshard runner
+// uses a post-set read-back (retain==true) to decide whether it is safe to
+// flip: if the field did not stick it REFUSES the cnpg→external flip rather
+// than risk the destructive delete-on-flip with no orphan-adopt safety net.
+func (d *DucklingClient) GetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string) (retain, present bool, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return false, false, fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	ms, ok := spec["metadataStore"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	v, ok := ms["retainCnpgOnFlip"].(bool)
+	if !ok {
+		return false, false, nil
+	}
+	return v, true, nil
+}
+
+// SetMetadataStoreCnpgAdopt is the cnpg→external orphan-adopt RECOVERY patch: it
+// flips the metadata store back to a cnpg shard AND clears retainCnpgOnFlip in
+// ONE merge patch. The composition re-renders the per-tenant cnpg Role/Database
+// MRs at full lifecycle (Delete restored) and provider-sql ADOPTS the
+// still-present orphaned role/DB by external-name (same pgIdent, same pinned
+// password) — instant recovery, no empty-recreate, no copy-back. Clearing the
+// flag in the same patch closes any window where the tenant is back on cnpg but
+// a deprovision would orphan (leak) the role/DB. Any leftover external block is
+// ignored by the composition for the cnpg-shard type (as with SetMetadataStoreCnpg).
+func (d *DucklingClient) SetMetadataStoreCnpgAdopt(ctx context.Context, name, shard string) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":             configstore.MetadataStoreKindCnpgShard,
+				"cnpgShard":        shard,
+				"retainCnpgOnFlip": false,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cnpg-adopt patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadata store to cnpg (adopt): %w", name, err)
+	}
+	return nil
+}
+
+// cnpgTenantMRGroup is the provider-sql API group the per-tenant cnpg Role and
+// Database managed resources belong to (the composition's cnpg-tenant-role /
+// cnpg-tenant-database composed resources).
+const cnpgTenantMRGroup = "postgresql.sql.m.crossplane.io"
+
+// CnpgSourceMRsOrphaned reports whether the named Duckling's per-tenant cnpg
+// Role AND Database managed resources currently carry the retain (no-Delete)
+// managementPolicies — i.e. a type flip away from cnpg-shard will ORPHAN them
+// rather than delete them. present is true only when BOTH MRs were found (while
+// type is cnpg-shard the composite renders exactly one Role + one Database, the
+// source's). The reshard runner polls this after setting retainCnpgOnFlip=true
+// and only flips once both MRs reflect the policy — closing the race where the
+// flip un-renders the MRs before the retain policy propagated.
+func (d *DucklingClient) CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return false, false, fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	var roleFound, dbFound, roleNoDelete, dbNoDelete bool
+	for _, ref := range nestedComposedRefs(cr) {
+		gvr, kind, refName, ok := composedRefGVR(ref)
+		if !ok || gvr.Group != cnpgTenantMRGroup {
+			continue
+		}
+		if kind != "Role" && kind != "Database" {
+			continue
+		}
+		obj, gerr := d.client.Resource(gvr).Namespace(ducklingNamespace).Get(ctx, refName, metav1.GetOptions{})
+		if gerr != nil {
+			if apierrors.IsNotFound(gerr) {
+				continue
+			}
+			return false, false, fmt.Errorf("get %s %q: %w", kind, refName, gerr)
+		}
+		noDelete := !managementPoliciesHaveDelete(obj)
+		switch kind {
+		case "Role":
+			roleFound, roleNoDelete = true, noDelete
+		case "Database":
+			dbFound, dbNoDelete = true, noDelete
+		}
+	}
+	present = roleFound && dbFound
+	orphaned = present && roleNoDelete && dbNoDelete
+	return orphaned, present, nil
+}
+
+// managementPoliciesHaveDelete reports whether a managed resource's
+// spec.managementPolicies includes Delete (or the "*" wildcard). An
+// absent/empty field means the MR uses Crossplane's default ["*"] (full
+// lifecycle), so it is treated as HAVING Delete — the conservative reading:
+// only an explicit no-Delete policy counts as orphan-ready.
+func managementPoliciesHaveDelete(obj *unstructured.Unstructured) bool {
+	spec, _ := obj.Object["spec"].(map[string]interface{})
+	raw, ok := spec["managementPolicies"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return true
+	}
+	for _, p := range raw {
+		if s, _ := p.(string); s == "Delete" || s == "*" {
+			return true
+		}
+	}
+	return false
 }
 
 // readSpecDuckLakeEnabled returns spec.ducklake.enabled as *bool — nil when the
