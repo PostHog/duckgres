@@ -123,18 +123,15 @@ IAM role can only `GetSecretValue` on a per-env name-prefix allowlist —
 `posthog-*` and `duckling-*` in every managed-warehouse env (see the
 `external-secrets-pod-identity` terraform module in posthog-cloud-infra) —
 so an RDS-managed master secret (`rds!db-…` / `rds/…/master`) is NEVER
-readable and would hang the cutover on an ESO AccessDenied. Defenses, outer
-to inner: the reshard form documents the convention
+readable and would hang the cutover on an ESO AccessDenied. Defenses: the reshard form documents the convention
 (`duckling-<name>-<env>-<region>-rds-password`) and warns live on suspicious
-names (`classifySecretName`); the start handler 400s names matching
-`^rds[!/]` (`rdsManagedSecretNamePattern`); and during the cutover wait the
-runner reads the tenant's ExternalSecret (best-effort, via the duckling
-client's dynamic client — `ExternalSecretSyncError`) and, while the status
-password is still empty, surfaces a failing sync condition (reason+message,
-e.g. the AccessDenied) into the op log at warn, deduped by content. A
-diagnostic read error (RBAC Forbidden — the CP has no `external-secrets.io`
-grant today, CRD absent, object not rendered yet) degrades quietly to the
-generic waiting line and never fails the op.
+names (`classifySecretName`), and the start handler 400s names matching
+`^rds[!/]` (`rdsManagedSecretNamePattern`). If a name that slips through is
+still unreadable by ESO, the cutover simply waits for the status password
+until its per-op timeout and then recovers (below) — the op log shows the
+generic "waiting for external target" line. (Surfacing the ExternalSecret's
+own AccessDenied into the op log would need an `external-secrets.io` read
+grant on the CP SA, which it does not have; not worth the extra RBAC.)
 
 **Recovery if the flip goes bad** (ESO secret missing/mismatched): flip back
 to the source shard — provider-sql re-creates the role/DB **empty** — then
