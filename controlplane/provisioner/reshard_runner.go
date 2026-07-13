@@ -48,6 +48,13 @@ type ReshardRunner struct {
 	// cancel checks). 5s in production; tests shrink it.
 	loopPoll time.Duration
 
+	// baseCtx is the runner's LIFECYCLE context (the one handed to Run). Ops
+	// adopted straight from the admin HTTP handler (claim-on-create) execute
+	// under this context, NOT the request context — a reshard runs for minutes
+	// and the request ctx is cancelled the moment the 202 response returns.
+	// Defaults to context.Background(); Run overwrites it with its own ctx.
+	baseCtx context.Context
+
 	// extPasswords holds the EPHEMERAL external passwords by op id: the
 	// cnpg→ext target password and the ext→cnpg source password (both come
 	// from the create request and are never persisted). A takeover runner
@@ -108,6 +115,7 @@ func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, 
 		duckling:           duckling,
 		copier:             PGCatalogCopier{},
 		cpID:               cpID,
+		baseCtx:            context.Background(),
 		pollInterval:       10 * time.Second,
 		configPollInterval: configPollInterval,
 		heartbeatInterval:  30 * time.Second,
@@ -118,17 +126,51 @@ func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, 
 	}
 }
 
-// StashExternalPassword hands the runner an ephemeral password for an op it
-// is expected to claim (claim-on-create: the admin handler creates the op on
-// this CP and stashes the password here before the runner picks it up).
+// CPID returns this runner's control-plane id — the value the admin handler
+// passes to CreateReshardOperationClaimed so the op is created already owned by
+// THIS replica (the one holding the ephemeral password).
+func (r *ReshardRunner) CPID() string { return r.cpID }
+
+// StashExternalPassword hands the runner an ephemeral password for an op it is
+// expected to run. Used by AdoptClaimedOperation and by tests.
 func (r *ReshardRunner) StashExternalPassword(opID int64, password string) {
 	if password != "" {
 		r.extPasswords.Store(opID, password)
 	}
 }
 
+// AdoptClaimedOperation takes an op that was just created ALREADY claimed by
+// this CP (CreateReshardOperationClaimed) and executes it directly, without
+// waiting for the scanOnce poll tick. This is the second half of
+// claim-on-create: the admin handler creates the op owned by this replica and
+// hands it straight here so the replica that holds the ephemeral external
+// password is the one that runs the copy. For external targets password is the
+// ephemeral credential (stashed for copyCatalog); for cnpg targets it is "".
+//
+// Execution runs under the runner's LIFECYCLE context (r.baseCtx), never the
+// caller's (HTTP request) context — a reshard runs for minutes. The r.running
+// map dedups against a racing scanOnce pickup (which cannot happen anyway: a
+// fresh-heartbeat running op owned by this CP is neither listed nor claimable
+// elsewhere).
+func (r *ReshardRunner) AdoptClaimedOperation(op *configstore.ReshardOperation, password string) {
+	r.StashExternalPassword(op.ID, password)
+	if _, alreadyRunning := r.running.LoadOrStore(op.ID, struct{}{}); alreadyRunning {
+		return
+	}
+	ctx := r.baseCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		defer r.running.Delete(op.ID)
+		defer r.extPasswords.Delete(op.ID)
+		r.execute(ctx, op)
+	}()
+}
+
 // Run is the claim loop. Blocks until ctx is done.
 func (r *ReshardRunner) Run(ctx context.Context) {
+	r.baseCtx = ctx
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
 	for {

@@ -558,8 +558,18 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
 - **The ext target password is ephemeral**: request → in-process stash →
-  runner memory; never in the op row, log, or audit. Takeover mid-copy fails
-  with a clear re-run message instead of proceeding without it.
+  runner memory; never in the op row, log, or audit. Because it lives only in
+  the creating replica's memory, the op must run on THAT replica —
+  **claim-on-create**: the admin start handler creates the op via
+  `CreateReshardOperationClaimed(op, cpID)` (single insert, lands `running` +
+  owned, `runner_epoch=1`, fresh heartbeat) and hands it straight to the local
+  runner via `AdoptClaimedOperation(op, password)`, which executes it on the
+  runner's LIFECYCLE ctx (NOT the HTTP request ctx). A fresh-heartbeat running
+  op owned by the local CP is unclaimable by any sibling replica's scanOnce, so
+  a passwordless replica can never win it. (cnpg targets are create-claimed too
+  when a local runner exists; with none they fall back to `pending`, any
+  replica — no password needed.) A genuine crash-takeover mid-copy still fails
+  with a clear re-run message instead of proceeding without the password.
 - **The ext SM secret must be ESO-readable and a raw string**: the ESO IAM
   policy only allows `posthog-*`/`duckling-*` names (RDS-managed
   `rds!…`/`rds/…/master` secrets never work → start handler 400s them,

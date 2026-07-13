@@ -147,6 +147,67 @@ func TestReshardTakeoverFencingPostgres(t *testing.T) {
 	}
 }
 
+// TestReshardCreateClaimedPostgres pins claim-on-create: the op lands running
+// and owned by the creating CP in a single insert, a second active op for the
+// org still conflicts, and a sibling replica cannot steal the fresh-heartbeat
+// running op (the fix for the multi-replica ephemeral-password bug).
+func TestReshardCreateClaimedPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	op := newReshardOp("org-cc")
+	if err := store.CreateReshardOperationClaimed(op, "cp-a"); err != nil {
+		t.Fatalf("create claimed: %v", err)
+	}
+	if op.ID == 0 || op.State != cpconfigstore.ReshardStateRunning || op.RunnerCP != "cp-a" || op.RunnerEpoch != 1 {
+		t.Fatalf("create-claimed returned op %+v, want running/cp-a/epoch=1", op)
+	}
+	if op.HeartbeatAt == nil || op.StartedAt == nil {
+		t.Fatalf("create-claimed did not stamp heartbeat/started: %+v", op)
+	}
+
+	// Persisted row matches.
+	fresh, err := store.GetReshardOperation(op.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if fresh.State != cpconfigstore.ReshardStateRunning || fresh.RunnerCP != "cp-a" || fresh.RunnerEpoch != 1 {
+		t.Fatalf("persisted op = %+v, want running/cp-a/epoch=1", fresh)
+	}
+
+	// A second active op for the same org still conflicts (partial unique index).
+	if err := store.CreateReshardOperationClaimed(newReshardOp("org-cc"), "cp-b"); !errors.Is(err, cpconfigstore.ErrReshardConflict) {
+		t.Fatalf("second create-claimed error = %v, want ErrReshardConflict", err)
+	}
+
+	// A fresh-heartbeat running op is NOT claimable by another replica — the
+	// whole point: cp-b's scanOnce can never win it away from cp-a.
+	if !claimListExcludes(t, store, op.ID) {
+		t.Fatal("create-claimed op is listed as claimable — a sibling replica could steal it")
+	}
+	stolen, err := store.ClaimReshardOperation(op.ID, "cp-b", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if stolen != nil {
+		t.Fatalf("cp-b stole a fresh-heartbeat create-claimed op: %+v", stolen)
+	}
+}
+
+// claimListExcludes reports whether id is absent from the claimable set.
+func claimListExcludes(t *testing.T, store *cpconfigstore.ConfigStore, id int64) bool {
+	t.Helper()
+	ids, err := store.ListClaimableReshardOperations(5 * time.Minute)
+	if err != nil {
+		t.Fatalf("list claimable: %v", err)
+	}
+	for _, got := range ids {
+		if got == id {
+			return false
+		}
+	}
+	return true
+}
+
 // TestReshardCancelPostgres pins the cancel flag on active ops and the
 // immediate finish of unclaimed (pending) ops.
 func TestReshardCancelPostgres(t *testing.T) {

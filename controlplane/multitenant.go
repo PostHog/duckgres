@@ -573,11 +573,11 @@ func SetupMultiTenant(
 
 	// Reshard operations (metadata-store migrations). The runner may be nil
 	// (no k8s API) — reads still work, starts fail with a clear error.
-	var reshardStash admin.ReshardPasswordStash
+	var reshardRunnerHandle admin.ReshardRunnerHandle
 	if reshardRunner != nil {
-		reshardStash = reshardRunner
+		reshardRunnerHandle = reshardRunner
 	}
-	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardStash, clusterClient)
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardRunnerHandle, clusterClient)
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)
