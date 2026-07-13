@@ -1141,9 +1141,12 @@ org_default_profile() { # org password catalog
 #      bodies (mandatory now); GET /orgs/:id must round-trip exactly each value.
 #   2. Reject path: provisioning a brand-new org WITHOUT default_team_id must be
 #      400 naming the field, and must create nothing (org GET stays 404).
-#   3. Mutate path: PUT /orgs/:id can set and clear it (0=NULL) on the EXT org
-#      (admin escape hatch), round-tripping on GET; the provisioned value is
-#      restored afterwards so the org stays contract-conformant.
+#   3. Mutate path: PUT /orgs/:id can set it to a positive team id on the EXT
+#      org, round-tripping on GET; clearing (0 or null) is REJECTED with a 400
+#      and must leave the stored value untouched — the column is NOT NULL
+#      (migration 000020) and every org must keep its default team (the
+#      billing bucket key). The provisioned value is restored afterwards so
+#      the org stays contract-conformant.
 # get_org_default_team_id prints the raw JSON value ("null" when NULL) so the
 # assertions can distinguish an unset column from an empty string.
 get_org_default_team_id() { # org -> prints default_team_id (jq raw; "null" when unset)
@@ -1176,18 +1179,28 @@ default_team_id_mandatory() { # cnpg_org ext_org
     || fail "default_team_id: rejected provision must create nothing, GET /orgs/$noteam -> HTTP $code want 404"
   log "default_team_id OK: new org without it rejected with 400, nothing created"
 
-  # 3. Mutate path: PUT can set, clear ("" -> NULL), then restore on the ext org.
+  # 3. Mutate path: PUT with a positive value sets; clearing (0 or JSON null)
+  # is rejected with a 400 and must not change the stored value (the column is
+  # NOT NULL — every org must keep a default team).
   code="$(put_org "$ext_org" '{"default_team_id":424242}')"
   [ "$code" = "200" ] || fail "default_team_id: PUT set -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
   [ "$got" = "424242" ] || fail "default_team_id: after PUT set, GET = '$got' want '424242'"
   code="$(put_org "$ext_org" '{"default_team_id":0}')"
-  [ "$code" = "200" ] || fail "default_team_id: PUT clear -> HTTP $code: $(cat /tmp/put_org_out)"
+  [ "$code" = "400" ] || fail "default_team_id: PUT clear (0) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
+  grep -q "default_team_id" /tmp/put_org_out \
+    || fail "default_team_id: PUT clear rejection should name the field: $(cat /tmp/put_org_out)"
   got="$(get_org_default_team_id "$ext_org")"
-  [ "$got" = "null" ] || fail "default_team_id: after PUT clear, GET = '$got' want 'null' (0 must clear to NULL)"
+  [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT clear, GET = '$got' want '424242' (stored value must be unchanged)"
+  code="$(put_org "$ext_org" '{"default_team_id":null}')"
+  [ "$code" = "400" ] || fail "default_team_id: PUT clear (null) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
+  got="$(get_org_default_team_id "$ext_org")"
+  [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT null, GET = '$got' want '424242' (stored value must be unchanged)"
   code="$(put_org "$ext_org" "{\"default_team_id\":$EXT_DEFAULT_TEAM_ID}")"
   [ "$code" = "200" ] || fail "default_team_id: PUT restore -> HTTP $code: $(cat /tmp/put_org_out)"
-  log "default_team_id OK: PUT set/clear/restore round-trips on $ext_org"
+  got="$(get_org_default_team_id "$ext_org")"
+  [ "$got" = "$EXT_DEFAULT_TEAM_ID" ] || fail "default_team_id: after PUT restore, GET = '$got' want '$EXT_DEFAULT_TEAM_ID'"
+  log "default_team_id OK: PUT set round-trips, clear (0/null) rejected 400, value preserved on $ext_org"
 }
 
 # ---- user persistent secrets ------------------------------------------------
@@ -2228,6 +2241,11 @@ duckling_shard_backfill() { # cnpgOrg
 #     shard-001, data intact after, report in the log)
 # cnpg→ext stays unit-test-only: the harness knows the RDS SM secret NAME but
 # not the password, and the start API requires the password (ephemerally).
+# That also keeps the in-cutover ESO-sync-error surfacing (the deduped warn in
+# flipToExternal when the ExternalSecret is SecretSyncedError) unit-test-only
+# (provisioner/reshard_runner_test.go): asserting it live needs a real
+# cnpg→ext flip against an unreadable secret. The validation loop below does
+# pin the rds-master-name 400, the up-front defense for the same failure.
 
 reshard_post() { # org body
   curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
@@ -2283,11 +2301,25 @@ reshard_targets() { # destination discovery; ext org's RDS must appear too
 
 reshard_validation() { # cnpg-org currently on shard-001
   log "reshard validation: same-shard + bad targets are 400"
+  # The RDS-managed-master and generic-prefix rows pin Fix 1's positive ESO
+  # allowlist: the external-secrets IAM policy only allows GetSecretValue on
+  # posthog-*/duckling-* names, so the start handler 400s an SM secret name
+  # outside that set (rds/…/rds!… gets the more-specific RDS-managed message,
+  # anything else the general allowlist message) — otherwise the destructive
+  # cnpg→ext cutover would hang on an ESO AccessDenied. All of these are
+  # rejected at name validation, BEFORE the pre-flight connection check (Fix 2),
+  # so they need no reachable target. The connect check itself needs a real
+  # reachable RDS + a valid password, which this Job lacks (same reason the
+  # cnpg→ext positive path is unit-only), so it stays covered by
+  # controlplane/admin/reshard_test.go (TestReshardExtPreflightProbe).
   for body in \
     '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"}}' \
     '{"target":{"type":"cnpg-shard","cnpg_shard":"Bad_Shard"}}' \
     '{"target":{"type":"nonsense"}}' \
-    '{"target":{"type":"external","endpoint":"x"}}'; do
+    '{"target":{"type":"external","endpoint":"x"}}' \
+    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds/some-db/master","password":"p"}}' \
+    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds!db-0000-1111","password":"p"}}' \
+    '{"target":{"type":"external","endpoint":"x","password_aws_secret":"my-own-secret","password":"p"}}'; do
     code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
       -d "$body" "$API/api/v1/orgs/$1/reshard")"
     [ "$code" = "400" ] || fail "reshard validation: body $body -> $code, want 400"
@@ -2386,6 +2418,15 @@ reshard_ext_to_cnpg() { # ext-org password
     || fail "reshard ext→cnpg: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
 
+  # Claim-on-create regression (multi-replica CP): a password-bearing
+  # (external-source here) op must be created ALREADY claimed by the replica
+  # that holds the ephemeral password — state running + runner_cp set in the
+  # 202 response — so no sibling replica's scanOnce can win it and fail the
+  # copy for want of the password. (Before the fix the op was created pending
+  # and ~2/3 of the time a passwordless replica claimed it.)
+  echo "$out" | jq -e '.state == "running" and (.runner_cp | length > 0)' >/dev/null \
+    || fail "reshard ext→cnpg: op not create-claimed (state/runner_cp): $out"
+
   # Budget: drain (org quiet) + provider-sql role/db create on the shard (the
   # cnpg SASL propagation tail can add minutes — see READY_TIMEOUT) + copy +
   # verify.
@@ -2394,6 +2435,26 @@ reshard_ext_to_cnpg() { # ext-org password
   reshard_log_has "$opid" "reshard report (succeeded)" || fail "reshard ext→cnpg: report missing"
   reshard_log_has "$opid" "maintenance mode (connections blocked)" || fail "reshard ext→cnpg: maintenance duration missing from report"
   reshard_log_has "$opid" "external source left untouched" || fail "reshard ext→cnpg: missing ext-source-untouched line"
+
+  # Pre-flip catalog backup (safety-net layer C): the runner pg_dumps the SOURCE
+  # catalog to the org's own data bucket under _reshard_catalog_backups/ before
+  # the flip, records the artifact URI on the op row, and logs a runnable
+  # pg_restore command. The CP image now carries pg_dump (postgresql-client-18)
+  # and holds the org's STS creds, so this SHOULD succeed here — assert it did.
+  # (The Job has no aws CLI, so we cannot LIST S3 to confirm the object exists;
+  # we assert the recorded URI + restore command instead — same limitation the
+  # tenant_isolation object-store-prefix half documents. The S3 write itself is
+  # proven by the runner not warning "pre-flip catalog backup failed".)
+  reshard_log_has "$opid" "catalog backup complete" || { reshard_dump_log "$opid"; fail "reshard ext→cnpg: pre-flip catalog backup did not complete"; }
+  reshard_log_has "$opid" "pg_restore --no-owner" || fail "reshard ext→cnpg: restore command missing from op log"
+  if reshard_log_has "$opid" "pre-flip catalog backup failed"; then
+    reshard_dump_log "$opid"; fail "reshard ext→cnpg: catalog backup failed (best-effort warning present)"
+  fi
+  buri="$(curl -fsS -H "$H" "$API/api/v1/reshards/$opid" | jq -r '.backup_s3_uri // ""')"
+  case "$buri" in
+    s3://*/_reshard_catalog_backups/op-"$opid"-*.dump) log "reshard ext→cnpg: backup artifact recorded at $buri" ;;
+    *) reshard_dump_log "$opid"; fail "reshard ext→cnpg: backup_s3_uri not recorded/shaped: '$buri'" ;;
+  esac
 
   # The duckling is now a cnpg-shard tenant…
   typ="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.type}')"
@@ -2428,6 +2489,18 @@ tenant_isolation() { # orgA pwA orgB pwB
 # Proves the teardown path works end to end: warehouse marked deleted, the
 # Crossplane Duckling CR removed, and its finalizer cascade (which drops the
 # cnpg metadata role+db) completed.
+#
+# LOAD-BEARING for the cnpg→ext orphan-adopt change (retainCnpgOnFlip): this is
+# the deprovision-UNAFFECTED regression net. A normal never-resharded cnpg
+# tenant has spec.metadataStore.retainCnpgOnFlip=false, so its cnpg Role/Database
+# MRs render with full lifecycle ["*"] (Delete) and the finalizer cascade below
+# MUST still fully DROP them. The `kubectl wait --for=delete duckling/<org>`
+# only completes once every composed MR — including the provider-sql Role +
+# Database — finished deleting, i.e. the role/DB were dropped. If a future
+# change ever "always orphaned" the cnpg MRs, this wait would hang on the
+# retained Role/Database finalizers and this assertion would (correctly) fail.
+# The cnpg→ext orphan path itself is unit-only (harness has no RDS password —
+# see the reshard section above and provisioner/reshard_runner_test.go).
 #
 # NOTE: same-org-id *re-provision* in the SAME run is intentionally NOT done
 # here. It is the regression net for the stranded-cnpg-role bugs

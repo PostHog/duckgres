@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +23,32 @@ import (
 	"github.com/posthog/duckgres/server"
 	"k8s.io/client-go/kubernetes"
 )
+
+// catalogCopierProber adapts provisioner.PGCatalogCopier's SELECT-1 probe to
+// the admin.ExternalTargetProber seam so the reshard start handler can
+// fail-fast a doomed cnpg→external target (unreachable endpoint / wrong
+// credentials / missing DB) BEFORE the destructive flip. It parses the
+// admin-supplied endpoint as host[:port] (default 5432), mirroring how the
+// reshard runner builds the external target CatalogEndpoint.
+type catalogCopierProber struct{}
+
+func (catalogCopierProber) Probe(ctx context.Context, endpoint, user, database, password, sslMode string) error {
+	host, port := endpoint, 5432
+	if h, p, err := net.SplitHostPort(endpoint); err == nil {
+		host = h
+		if n, convErr := strconv.Atoi(p); convErr == nil {
+			port = n
+		}
+	}
+	return provisioner.PGCatalogCopier{}.Probe(ctx, provisioner.CatalogEndpoint{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Database: database,
+		Password: password,
+		SSLMode:  sslMode,
+	})
+}
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
 // (for the control plane) and admin.OrgStackInfo (for the admin API).
@@ -434,10 +462,27 @@ func SetupMultiTenant(
 		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
 		go provCtrl.Run(context.Background())
 
+		// Pre-flip catalog backuper: pg_dumps the source catalog to the org's
+		// own S3 data bucket before a reshard flip, uploading with credentials
+		// from the org's IAM role (the same STS AssumeRole path the worker
+		// activator uses). Nil when STS is unavailable (local/non-AWS) — the
+		// runner then skips the best-effort backup and hard-fails only the
+		// destructive cnpg→external direction.
+		var backuper provisioner.CatalogBackuper
+		if stsBroker != nil {
+			backuper = provisioner.NewPGCatalogBackuper(func(ctx context.Context, roleARN string) (string, string, string, error) {
+				creds, err := stsBroker.AssumeRole(ctx, roleARN)
+				if err != nil {
+					return "", "", "", err
+				}
+				return creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, nil
+			})
+		}
+
 		// Reshard runner: drives operator-initiated metadata-store migrations
 		// (admin console → op row → claim/execute). Every replica runs one;
 		// a single replica wins each op via the claim CAS.
-		reshardRunner = provisioner.NewReshardRunner(store, provCtrl.DucklingClient(), cpInstanceID, pollInterval)
+		reshardRunner = provisioner.NewReshardRunner(store, provCtrl.DucklingClient(), cpInstanceID, pollInterval, backuper)
 		go reshardRunner.Run(context.Background())
 	}
 
@@ -573,11 +618,15 @@ func SetupMultiTenant(
 
 	// Reshard operations (metadata-store migrations). The runner may be nil
 	// (no k8s API) — reads still work, starts fail with a clear error.
-	var reshardStash admin.ReshardPasswordStash
+	var reshardRunnerHandle admin.ReshardRunnerHandle
 	if reshardRunner != nil {
-		reshardStash = reshardRunner
+		reshardRunnerHandle = reshardRunner
 	}
-	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardStash, clusterClient)
+	// Pre-flight prober for cnpg→external targets: reuses the catalog copier's
+	// SELECT-1 probe to fail-fast an unreachable/bad-credential target before
+	// the destructive flip. Always available in the k8s CP build; nil-degrades
+	// in tests / non-k8s (the runner's copy still catches a bad credential).
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardRunnerHandle, clusterClient, catalogCopierProber{})
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)

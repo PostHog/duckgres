@@ -68,7 +68,19 @@ RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VER
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# postgresql-client-18 provides pg_dump/pg_restore, used by the control-plane
+# reshard runner's pre-flip catalog backup (docs/design/resharding.md). Pinned
+# to PG 18 to match the cnpg shard major so it can dump PG-18 catalogs. From the
+# PGDG apt repo because Debian bookworm's stock repo only carries PG 15. mw-dev
+# runs this single all-in-one image as BOTH control plane and workers, so the
+# client must live here (not only in Dockerfile.controlplane).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg wget \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && wget -qO /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends postgresql-client-18 \
+    && apt-get purge -y gnupg wget && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
 
 WORKDIR /app

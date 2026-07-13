@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -289,13 +290,13 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 				buf.Write(encoded)
 			}
 		} else {
-			// Text encoding — use JSON re-serialization for JSON columns
-			var str string
-			if typeOIDs != nil && i < len(typeOIDs) && (typeOIDs[i] == OidJSON || typeOIDs[i] == OidJSONB) {
-				str = string(encodeJSON(v))
-			} else {
-				str = formatValue(v)
+			// Text encoding must use the column OID for types whose PostgreSQL
+			// representation cannot be inferred from the scanned Go value alone.
+			var typeOID int32
+			if typeOIDs != nil && i < len(typeOIDs) {
+				typeOID = typeOIDs[i]
 			}
+			str := formatTextValue(v, typeOID)
 			_ = binary.Write(&buf, binary.BigEndian, int32(len(str)))
 			buf.WriteString(str)
 		}
@@ -306,6 +307,51 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 		return err
 	}
 	return nil
+}
+
+// formatTextValue converts a value to its PostgreSQL text representation when
+// the result column's OID is known. DuckDB scans DATE values into time.Time, so
+// the OID is required to distinguish a DATE (YYYY-MM-DD) from timestamp types.
+func formatTextValue(v interface{}, oid int32) string {
+	switch oid {
+	case OidJSON, OidJSONB:
+		return string(encodeJSON(v))
+	case OidDate:
+		if date, ok := normalizeDriverValue(v).(time.Time); ok {
+			return formatDate(date)
+		}
+	case OidDateArray:
+		if dates, ok := normalizeDriverValue(v).([]any); ok {
+			return formatArrayValueWithElementOID(dates, OidDate)
+		}
+	}
+	return formatValue(v)
+}
+
+const secondsPerDay int64 = 24 * 60 * 60
+
+var (
+	// DuckDB stores DATE as signed days since 1970-01-01 and reserves
+	// ±MaxInt32 for infinity. duckdb-go converts those values to time.Time.
+	duckDBPositiveInfinityDate = time.Unix(int64(math.MaxInt32)*secondsPerDay, 0).UTC()
+	duckDBNegativeInfinityDate = time.Unix(-int64(math.MaxInt32)*secondsPerDay, 0).UTC()
+)
+
+func formatDate(date time.Time) string {
+	if sameDate(date, duckDBPositiveInfinityDate) {
+		return "infinity"
+	}
+	if sameDate(date, duckDBNegativeInfinityDate) {
+		return "-infinity"
+	}
+	if date.Year() <= 0 {
+		return fmt.Sprintf("%04d-%02d-%02d BC", 1-date.Year(), date.Month(), date.Day())
+	}
+	return date.Format("2006-01-02")
+}
+
+func sameDate(a, b time.Time) bool {
+	return a.Year() == b.Year() && a.Month() == b.Month() && a.Day() == b.Day()
 }
 
 // formatValue converts a value to its PostgreSQL text representation
@@ -426,6 +472,10 @@ func formatInterval(iv arrowmap.IntervalValue) string {
 
 // formatArrayValue formats a []any slice as PostgreSQL text array: {1,2,3}
 func formatArrayValue(arr []any) string {
+	return formatArrayValueWithElementOID(arr, 0)
+}
+
+func formatArrayValueWithElementOID(arr []any, elementOID int32) string {
 	var buf strings.Builder
 	buf.WriteByte('{')
 	for i, elem := range arr {
@@ -435,7 +485,7 @@ func formatArrayValue(arr []any) string {
 		if elem == nil {
 			buf.WriteString("NULL")
 		} else {
-			s := formatValue(elem)
+			s := formatTextValue(elem, elementOID)
 			// Quote strings that contain special characters
 			if needsArrayQuoting(s) {
 				buf.WriteByte('"')

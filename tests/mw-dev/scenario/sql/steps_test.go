@@ -34,7 +34,7 @@ func TestExecutorRetriesTransientStartupErrors(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -97,7 +97,7 @@ func TestExecutorRetriesEOFStartupErrors(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -149,7 +149,7 @@ func TestExecutorRetriesConnectionResetStartupErrors(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -201,7 +201,7 @@ func TestExecutorRetriesIOTimeoutStartupErrors(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -250,7 +250,7 @@ func TestExecutorDoesNotRetryNonTransientSQLErrors(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -290,7 +290,7 @@ func TestExecutorFailsWhenSQLReturnsFewerThanMinRows(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -341,7 +341,7 @@ func TestExecutorRunsInlineSQLCatalog(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -405,7 +405,7 @@ queries:
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -476,7 +476,7 @@ func TestExecutorTemplatesSQLFileEnvVars(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -510,17 +510,17 @@ func TestExecutorUsesProvisionCredentialsInDSN(t *testing.T) {
 		Username: "custom-root",
 		Password: "root password",
 	})
-	var gotDSN string
+	var gotConnection PGWireConnection
 	driver := &fakeDriver{
 		executeFunc: func(_ context.Context, req QueryRequest) (QueryResult, error) {
-			gotDSN = req.DSN
+			gotConnection = req.PGWire
 			return QueryResult{Rows: 1}, nil
 		},
 	}
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",
@@ -541,16 +541,19 @@ func TestExecutorUsesProvisionCredentialsInDSN(t *testing.T) {
 		t.Fatalf("ExecuteStep returned error: %v", err)
 	}
 	for _, want := range []string{"user=custom-root", "password='root password'", "dbname=ducklake"} {
-		if !strings.Contains(gotDSN, want) {
-			t.Fatalf("DSN %q missing %q", gotDSN, want)
+		if !strings.Contains(gotConnection.DSN, want) {
+			t.Fatalf("DSN %q missing %q", gotConnection.DSN, want)
 		}
+	}
+	if gotConnection.DialAddress != "10.0.0.10:5432" {
+		t.Fatalf("direct dial address = %q, want 10.0.0.10:5432", gotConnection.DialAddress)
 	}
 }
 
 func TestExecutorFailsWithoutProvisionState(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		Connection: ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			Port:      5432,
 			SSLMode:   "require",

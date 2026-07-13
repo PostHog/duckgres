@@ -463,9 +463,11 @@ ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
 **MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
 sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
 decimals (vCPU / GiB). `team_id` is the org's `default_team_id` (an integer —
-PostHog's `Team.id`; a JSON NUMBER on every API surface, BIGINT in the config
-store, 0 = "no default team"; resolved from the config snapshot at connection
-end); `query_source` is the
+PostHog's `Team.id`; a JSON NUMBER on every API surface, a **NOT NULL** BIGINT
+in the config store — required at org creation on both the provisioning and
+admin APIs, never clearable via the admin API, so every org always has one;
+resolved from the config snapshot at connection end, where 0 can still appear
+only for an unknown org / stale snapshot); `query_source` is the
 `duckgres.query_source` session GUC (`standard` unless set; a mid-connection
 change bills the whole connection under the final value). Invariants for anyone
 touching this path:
@@ -549,23 +551,109 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   Flight sessions are destroyed locally per CP (they'd hold leases ~1h).
 - **Flip semantics differ by direction**: a `cnpgShard` change re-points
   role/DB in place (source ORPHANED — explicit cleanup after verify); a TYPE
-  flip to external makes Crossplane DELETE the cnpg role/DB → cnpg→ext runs
-  **copy-before-flip** (the flip IS the cleanup, only after verify).
-  **External stores are never modified/deleted.**
+  flip to external un-renders the cnpg MRs, and whether Crossplane then DELETES
+  or ORPHANS the role/DB depends on `spec.metadataStore.retainCnpgOnFlip`
+  (charts). **External stores are never modified/deleted.**
+- **cnpg→ext escape hatch = orphan-adopt then verified-delete** (charts
+  `retainCnpgOnFlip`): copy → verify source → set `retainCnpgOnFlip=true` AND
+  poll the cnpg Role/Database MRs until they carry the no-Delete policy (two-step
+  flip, closes the un-render-before-policy race) → flip type to external (now
+  ORPHANS, not deletes, the cnpg role/DB) → verify the external catalog row
+  counts match the copy EXACTLY → only THEN `DROP DATABASE` the retained source +
+  clear the flag. ANY failure before that drop → flip back to cnpg-shard +
+  clear flag in one patch (`SetMetadataStoreCnpgAdopt`), provider-sql re-ADOPTS
+  the still-present role/DB by external-name — NO copy-back, NO empty-recreate
+  (replaces the old recreate+copy-back recovery that caused a data-loss
+  incident). **XRD-compat**: if the read-back shows the cluster's XRD lacks
+  `retainCnpgOnFlip` (patch pruned), REFUSE the reshard ("deploy charts first")
+  — safer than the destructive delete-on-flip.
+- **DEPROVISION-UNAFFECTED (non-negotiable)**: `retainCnpgOnFlip` defaults false
+  and is true only transiently mid-reshard; a normal never-resharded cnpg tenant
+  always has it false → its cnpg Role/DB render with full lifecycle `["*"]`
+  (Delete) → deprovision (Duckling delete → finalizer) drops them exactly as
+  before. The orphan is bound to the reshard type-flip, NEVER to Duckling
+  deletion. `lifecycle_teardown_cnpg` in the e2e is the regression net.
+- **Pre-flip catalog backup (safety net, `backup_catalog` step,
+  `catalog_backup.go`)**: after drain + pause-compaction + `recordSource` and
+  BEFORE any flip (for EVERY direction), the runner `pg_dump`s the SOURCE catalog
+  to the org's OWN S3 data bucket under
+  `s3://<bucket>/_reshard_catalog_backups/op-<id>-<ts>.dump` (custom format →
+  `pg_restore`; password via `PGPASSWORD`, never argv; bucket/region/IAM-role
+  from the duckling CR status; upload creds via STS AssumeRole of the org's own
+  role, injected as an `AssumeRoleFunc` from `multitenant.go` to avoid the
+  import cycle). **Gate by direction**: the destructive cnpg→external direction
+  (its verified-delete drops the source) HARD-FAILS the op before the flip if the
+  backup fails; non-destructive directions (source survives) log a warning and
+  continue. The URI is recorded on `backup_s3_uri` (migration `000021`) + the op
+  log, with the exact `pg_restore` recovery command. Retention is an S3 lifecycle
+  rule on the tagged/prefixed objects (30d suggested) — no in-app GC; backups are
+  kept on success. pg_dump/pg_restore ship in the CP image
+  (`postgresql-client-18`, PGDG repo, in BOTH `Dockerfile` and
+  `Dockerfile.controlplane`). Full design + restore procedure:
+  `docs/design/resharding.md`.
 - **Rollback patches the source shard VALUE back — never removes the key**
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
 - **The ext target password is ephemeral**: request → in-process stash →
-  runner memory; never in the op row, log, or audit. Takeover mid-copy fails
-  with a clear re-run message instead of proceeding without it.
+  runner memory; never in the op row, log, or audit. Because it lives only in
+  the creating replica's memory, the op must run on THAT replica —
+  **claim-on-create**: the admin start handler creates the op via
+  `CreateReshardOperationClaimed(op, cpID)` (single insert, lands `running` +
+  owned, `runner_epoch=1`, fresh heartbeat) and hands it straight to the local
+  runner via `AdoptClaimedOperation(op, password)`, which executes it on the
+  runner's LIFECYCLE ctx (NOT the HTTP request ctx). A fresh-heartbeat running
+  op owned by the local CP is unclaimable by any sibling replica's scanOnce, so
+  a passwordless replica can never win it. (cnpg targets are create-claimed too
+  when a local runner exists; with none they fall back to `pending`, any
+  replica — no password needed.) A genuine crash-takeover mid-copy still fails
+  with a clear re-run message instead of proceeding without the password.
+- **The ext SM secret must be ESO-readable and a raw string**: the ESO IAM
+  policy only allows `posthog-*`/`duckling-*` names, so the start handler
+  enforces a POSITIVE allowlist (`esoReadableSecretPrefixes`) — a name outside
+  it is 400'd, with RDS-managed `rds!…`/`rds/…/master` names
+  (`rdsManagedSecretNamePattern`) detected first for a more specific message.
+  The composition's ExternalSecret copies the whole value verbatim (no JSON
+  property). An unreadable name that slips through just hangs the cutover wait
+  until the per-op timeout, then recovers (flip-back + copy-back). The form
+  teaches the same rules (`ui/src/lib/reshard.ts::classifySecretName`).
+- **cnpg→ext fails fast at submit, before the destructive flip**: the flip
+  DELETEs the cnpg source, so both submit-time gates (the ESO-name allowlist
+  above + a bounded `SELECT 1` pre-flight connection check to the external
+  target, `admin.ExternalTargetProber` over `provisioner.PGCatalogCopier.Probe`,
+  `sslmode=require`, wired in `multitenant.go`) 400 a doomed op before anything
+  is created. The prober nil-degrades (tests / non-k8s → check skipped; the
+  runner's copy still catches a bad credential); when present and the connect
+  fails, the op is refused. The 400 never echoes the password.
 - **Runner fencing**: claim bumps `runner_epoch`; every runner write is
   CAS-fenced on (runner, epoch); stale-heartbeat (>5m) ops are takeover-able;
   the copy holds a target-DB advisory lock.
+- **Takeover rollback reconstructs progress from the persisted row.** The
+  in-process rollback flags (`blocked`, `compactionPaused`, `flipped`,
+  `retainRequested`) start false on a fresh `opRun`. A runner that CLAIMS an op a
+  prior epoch advanced (crash-takeover or replica switch) MUST call
+  `reconstructProgress()` before `run()` — otherwise a cancel/failure that
+  short-circuits before the steps re-execute (e.g. `run()`'s first
+  `cancelRequested()` check) rolls back with all-false flags and silently skips
+  unblocking the warehouse (org stuck in `resharding`) and restoring compaction.
+  Reconstruction is conservative: `blocked` ← `blocked_at` set OR step past
+  `blocking`; `compactionPaused` ← step past `pausing_compaction` (proves the
+  prior setting was recorded, else restore could wrongly re-enable compaction);
+  `flipped`/`retainRequested` ← step reached `cutover`/`orphaning_source`
+  (over-marking is safe — the flip-back/adopt patches are idempotent no-ops when
+  the store never moved). This was a real mw-dev incident: the blocking runner
+  OOM-crashed mid-backup, a sibling replica took over, saw the cancel flag, and
+  marked the op `cancelled` while leaving the warehouse blocked.
 - Touching any of this → update `tests/configstore/reshard_postgres_test.go`,
-  `provisioner/reshard_runner_test.go`, `admin/reshard_test.go`, the
+  `provisioner/reshard_runner_test.go` (incl. the `TestReshardBackup*` cases),
+  `admin/reshard_test.go`, the
   migration asserts in `tests/configstore/migrations_postgres_test.go`, AND
-  the `reshard_*` assertions in `tests/e2e-mw-dev/harness.sh` (validation,
-  cancel-during-drain, bogus-shard-rollback, ext→cnpg positive path).
+  the `reshard_*` + `lifecycle_teardown_cnpg` assertions in
+  `tests/mw-dev/e2e/harness.sh` (validation, cancel-during-drain,
+  bogus-shard-rollback, ext→cnpg positive path incl. the pre-flip backup
+  assertion, and the deprovision-unaffected net). The cnpg→ext orphan-adopt
+  charts side (composition managementPolicies + `retainCnpgOnFlip` XRD field)
+  lives in the `charts` repo and is covered by
+  `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh`.
   cnpg→ext positive path is unit-only (harness lacks the RDS password);
   cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
 

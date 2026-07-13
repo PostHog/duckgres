@@ -1,5 +1,7 @@
-INSERT INTO duckgres_orgs (name, database_name, max_workers, created_at, updated_at)
-VALUES ('local', 'duckgres', 0, NOW(), NOW())
+-- default_team_id is NOT NULL (every org must carry its default PostHog team
+-- id); 1 is a placeholder for local dev.
+INSERT INTO duckgres_orgs (name, database_name, max_workers, default_team_id, created_at, updated_at)
+VALUES ('local', 'duckgres', 0, 1, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
 

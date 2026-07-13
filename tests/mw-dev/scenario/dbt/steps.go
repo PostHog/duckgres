@@ -361,8 +361,8 @@ func (e *Executor) commandEnv(spec stepSpec) []string {
 		"DUCKGRES_DBT_SSLMODE=" + spec.SSLMode,
 		"DUCKGRES_DBT_CONNECT_TIMEOUT=" + strconv.Itoa(connectTimeout),
 	}
-	if _, err := netip.ParseAddr(e.connection.HostAddr); err == nil {
-		env = append(env, "PGHOSTADDR="+e.connection.HostAddr)
+	if _, err := netip.ParseAddr(e.connection.DialHost); err == nil {
+		env = append(env, "PGHOSTADDR="+e.connection.DialHost)
 	}
 	return env
 }

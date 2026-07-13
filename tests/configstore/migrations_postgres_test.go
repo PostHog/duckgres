@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	cpconfigstore "github.com/posthog/duckgres/controlplane/configstore"
@@ -37,7 +38,9 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 17)
 	requireGooseMigrationRecorded(t, db, 18)
 	requireGooseMigrationRecorded(t, db, 19)
-	requireGooseLatestVersion(t, db, 19)
+	requireGooseMigrationRecorded(t, db, 20)
+	requireGooseMigrationRecorded(t, db, 21)
+	requireGooseLatestVersion(t, db, 21)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -49,6 +52,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "cutover_timeout_seconds")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "blocked_at")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "compaction_was_present")
+	// Migration 000021 added the pre-flip catalog backup artifact URI.
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "backup_s3_uri")
 	requireTablePresent(t, db, "duckgres_reshard_operation_log")
 	requireColumnPresent(t, db, "duckgres_reshard_operation_log", "operation_id")
 
@@ -59,11 +64,13 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnPresent(t, db, "duckgres_worker_spawn_log", "mem_bytes")
 	requireColumnPresent(t, db, "duckgres_worker_spawn_log", "spawned_at")
 
-	// Migration 000013 added the nullable per-org default_team_id column;
-	// 000017 converted it (and the usage-bucket team_id below) to BIGINT to
-	// match PostHog's integer team ids.
+	// Migration 000013 added the per-org default_team_id column (nullable at
+	// the time); 000017 converted it (and the usage-bucket team_id below) to
+	// BIGINT to match PostHog's integer team ids; 000020 made it NOT NULL —
+	// every org must keep its default team (the billing bucket key).
 	requireColumnPresent(t, db, "duckgres_orgs", "default_team_id")
 	requireColumnType(t, db, "duckgres_orgs", "default_team_id", "bigint")
+	requireColumnNotNull(t, db, "duckgres_orgs", "default_team_id")
 	requireColumnType(t, db, "duckgres_org_compute_usage", "team_id", "bigint")
 
 	// Migration 000007 added the compute-usage billing buffer; 000015 widened
@@ -157,7 +164,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -190,12 +197,15 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 17)
 	requireGooseMigrationRecorded(t, upgradedDB, 18)
 	requireGooseMigrationRecorded(t, upgradedDB, 19)
-	requireGooseLatestVersion(t, upgradedDB, 19)
+	requireGooseMigrationRecorded(t, upgradedDB, 20)
+	requireGooseMigrationRecorded(t, upgradedDB, 21)
+	requireGooseLatestVersion(t, upgradedDB, 21)
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")
 	requireColumnPresent(t, upgradedDB, "duckgres_orgs", "default_team_id")
+	requireColumnNotNull(t, upgradedDB, "duckgres_orgs", "default_team_id")
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "max_connections")
 	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "default_catalog")
@@ -211,6 +221,11 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 		_ = db.Close()
 	})
 
+	// default_team_id is seeded pre-populated: migration 000013 adds the
+	// column with IF NOT EXISTS (so this no-ops there) and 000020 makes it
+	// NOT NULL, failing loudly on any NULL row. Real envs were backfilled
+	// before 000020 shipped, so a legacy-with-rows fixture must carry a value
+	// too (the loud-fail path has its own regression test below).
 	if _, err := db.Exec(`
 		CREATE TABLE duckgres_orgs (
 			name VARCHAR(255) PRIMARY KEY,
@@ -225,13 +240,14 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 			default_worker_cpu VARCHAR(32),
 			default_worker_memory VARCHAR(32),
 			default_worker_ttl VARCHAR(32),
+			default_team_id VARCHAR(255),
 			created_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ
 		);
 		CREATE UNIQUE INDEX idx_duckgres_orgs_database_name ON duckgres_orgs(database_name);
 		CREATE UNIQUE INDEX idx_duckgres_orgs_hostname_alias ON duckgres_orgs(hostname_alias);
-		INSERT INTO duckgres_orgs (name, database_name, created_at, updated_at)
-		VALUES ('old-org', 'old-org', now(), now());
+		INSERT INTO duckgres_orgs (name, database_name, default_team_id, created_at, updated_at)
+		VALUES ('old-org', 'old-org', '1', now(), now());
 	`); err != nil {
 		t.Fatalf("create old org schema: %v", err)
 	}
@@ -263,6 +279,47 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	requireGooseMigrationRecorded(t, sqlDB, 3)
 }
 
+// TestConfigStoreMigrationFailsLoudlyOnNullDefaultTeamID pins the deploy-time
+// stance of migration 000020: a NULL default_team_id row (an org that somehow
+// escaped the backfill) makes SET NOT NULL fail loudly instead of being
+// silently papered over. The correct outcome is to fix the row, not the
+// constraint.
+func TestConfigStoreMigrationFailsLoudlyOnNullDefaultTeamID(t *testing.T) {
+	_, connStr := newIsolatedConfigStoreSchema(t)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		t.Fatalf("open schema db: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	// Minimal pre-000013 org schema with a live row and no default_team_id:
+	// 000013 adds the column as NULL for the row, 000020 must then refuse.
+	if _, err := db.Exec(`
+		CREATE TABLE duckgres_orgs (
+			name VARCHAR(255) PRIMARY KEY,
+			database_name VARCHAR(255),
+			created_at TIMESTAMPTZ,
+			updated_at TIMESTAMPTZ
+		);
+		INSERT INTO duckgres_orgs (name, database_name, created_at, updated_at)
+		VALUES ('unbackfilled-org', 'unbackfilled-org', now(), now());
+	`); err != nil {
+		t.Fatalf("create unbackfilled org schema: %v", err)
+	}
+
+	store, err := cpconfigStoreNew(connStr)
+	if err == nil {
+		sqlDB := storeDB(t, store)
+		_ = sqlDB.Close()
+		t.Fatal("config store migration succeeded, want loud failure on NULL default_team_id")
+	}
+	if !strings.Contains(err.Error(), "default_team_id") || !strings.Contains(err.Error(), "null") {
+		t.Fatalf("migration error should name the NULL default_team_id violation, got: %v", err)
+	}
+}
+
 func TestConfigStoreSQLMigrationsUpgradeLegacyOrgUsersUsernamePK(t *testing.T) {
 	_, connStr := newIsolatedConfigStoreSchema(t)
 	db, err := sql.Open("postgres", connStr)
@@ -278,10 +335,13 @@ func TestConfigStoreSQLMigrationsUpgradeLegacyOrgUsersUsernamePK(t *testing.T) {
 		t.Fatalf("hash password: %v", err)
 	}
 
+	// default_team_id pre-populated for the same reason as the old-org-schema
+	// test above: 000020 makes it NOT NULL and real envs are backfilled.
 	if _, err := db.Exec(`
 		CREATE TABLE duckgres_orgs (
 			name VARCHAR(255) PRIMARY KEY,
 			database_name VARCHAR(255),
+			default_team_id VARCHAR(255),
 			created_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ
 		);
@@ -292,8 +352,8 @@ func TestConfigStoreSQLMigrationsUpgradeLegacyOrgUsersUsernamePK(t *testing.T) {
 			created_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ
 		);
-		INSERT INTO duckgres_orgs (name, database_name, created_at, updated_at)
-		VALUES ('old-org', 'old-org', now(), now());
+		INSERT INTO duckgres_orgs (name, database_name, default_team_id, created_at, updated_at)
+		VALUES ('old-org', 'old-org', '1', now(), now());
 	`); err != nil {
 		t.Fatalf("create legacy org user schema: %v", err)
 	}
@@ -567,6 +627,28 @@ func requireColumnType(t *testing.T, db *sql.DB, tableName, columnName, wantType
 	}
 	if got != wantType {
 		t.Fatalf("%s.%s type = %q, want %q", tableName, columnName, got, wantType)
+	}
+}
+
+func requireColumnNotNull(t *testing.T, db *sql.DB, tableName, columnName string) {
+	t.Helper()
+
+	var isNullable string
+	err := db.QueryRow(`
+		SELECT is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = $1
+		  AND column_name = $2
+	`, tableName, columnName).Scan(&isNullable)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			t.Fatalf("%s.%s column missing", tableName, columnName)
+		}
+		t.Fatalf("query %s.%s nullability: %v", tableName, columnName, err)
+	}
+	if isNullable != "NO" {
+		t.Fatalf("%s.%s is_nullable = %q, want %q (column must be NOT NULL)", tableName, columnName, isNullable, "NO")
 	}
 }
 

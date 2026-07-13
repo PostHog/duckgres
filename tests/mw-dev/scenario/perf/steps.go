@@ -19,7 +19,7 @@ import (
 const StepTypePerfQueries = "perf_queries"
 
 type DriverFactory interface {
-	NewPGWire(dsn string) (perfcore.ProtocolDriver, error)
+	NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error)
 	NewFlight(addr, serverName, username, password string, insecureSkipVerify bool) (perfcore.ProtocolDriver, error)
 }
 
@@ -263,11 +263,11 @@ func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (m
 		}
 		switch target {
 		case perfcore.ProtocolPGWire:
-			dsn, err := e.pgwireDSN(spec)
+			connection, err := e.pgwireConnection(spec)
 			if err != nil {
 				return nil, err
 			}
-			driver, err := e.driverFactory.NewPGWire(dsn)
+			driver, err := e.driverFactory.NewPGWire(connection)
 			if err != nil {
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
@@ -299,17 +299,17 @@ func (e *Executor) defaultFlightServerName(orgID string) string {
 	return orgID + e.connection.SNISuffix
 }
 
-func (e *Executor) pgwireDSN(spec stepSpec) (string, error) {
+func (e *Executor) pgwireConnection(spec stepSpec) (scenariosql.PGWireConnection, error) {
 	cfg := e.connection
 	cfg.OrgID = spec.OrgID
 	cfg.Database = spec.Database
 	cfg.Username = spec.Username
 	cfg.Password = spec.Password
-	dsn, err := cfg.DSN()
+	connection, err := cfg.PGWire()
 	if err != nil {
-		return "", classified(ErrorClassConfig, err)
+		return scenariosql.PGWireConnection{}, classified(ErrorClassConfig, err)
 	}
-	return dsn, nil
+	return connection, nil
 }
 
 func closeDrivers(drivers map[perfcore.Protocol]perfcore.ProtocolDriver) {
@@ -318,8 +318,12 @@ func closeDrivers(drivers map[perfcore.Protocol]perfcore.ProtocolDriver) {
 	}
 }
 
-func (defaultDriverFactory) NewPGWire(dsn string) (perfcore.ProtocolDriver, error) {
-	return pgdriver.NewFromDSN(dsn)
+func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
+	db, err := connection.OpenDB()
+	if err != nil {
+		return nil, err
+	}
+	return pgdriver.NewWithDB(db), nil
 }
 
 func (defaultDriverFactory) NewFlight(addr, serverName, username, password string, insecureSkipVerify bool) (perfcore.ProtocolDriver, error) {
