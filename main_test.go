@@ -15,7 +15,7 @@ func envFromMap(values map[string]string) func(string) string {
 }
 
 func TestValidateRunModeRejectsUnsupportedMode(t *testing.T) {
-	for _, mode := range []string{"standalone", "control-plane", "duckdb-service"} {
+	for _, mode := range []string{"standalone", "control-plane", "duckdb-service", "reshard-runner"} {
 		if err := validateRunMode(mode); err != nil {
 			t.Fatalf("expected mode %q to be valid: %v", mode, err)
 		}
