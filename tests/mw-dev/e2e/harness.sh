@@ -2238,7 +2238,13 @@ duckling_shard_backfill() { # cnpgOrg
 #     data intact, spec.cnpgShard patched back; short per-op
 #     cutover_timeout_seconds keeps it fast)
 #   * ext→cnpg POSITIVE path (real catalog copy off the harness RDS onto
-#     shard-001, data intact after, report in the log)
+#     shard-001, data intact after, report in the log) — including the pod
+#     model: every reshard executes in a dedicated duckgres-reshard-op-<id>
+#     pod (NOT in the CP process), so this lane also asserts the runner pod
+#     appears while the op runs and is reaped by the leader reconciler after
+#     it finishes. Ops now start PENDING (the pod claims the row itself), and
+#     every wait below carries pod-schedule + image-pull latency on top of
+#     what the step itself needs.
 # cnpg→ext stays unit-test-only: the harness knows the RDS SM secret NAME but
 # not the password, and the start API requires the password (ephemerally).
 # That also keeps the in-cutover ESO-sync-error surfacing (the deduped warn in
@@ -2246,6 +2252,22 @@ duckling_shard_backfill() { # cnpgOrg
 # (provisioner/reshard_runner_test.go): asserting it live needs a real
 # cnpg→ext flip against an unreadable secret. The validation loop below does
 # pin the rds-master-name 400, the up-front defense for the same failure.
+
+reshard_pod_wait() { # opid timeout_s — wait until the runner pod exists
+  deadline=$(( $(date +%s) + $2 ))
+  until k get pod "duckgres-reshard-op-$1" >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "reshard runner pod duckgres-reshard-op-$1 never appeared"
+    sleep 3
+  done
+}
+
+reshard_pod_wait_gone() { # opid timeout_s — wait until the reconciler reaped it
+  deadline=$(( $(date +%s) + $2 ))
+  while k get pod "duckgres-reshard-op-$1" >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "reshard runner pod duckgres-reshard-op-$1 not reaped after the op finished"
+    sleep 5
+  done
+}
 
 reshard_post() { # org body
   curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
@@ -2346,7 +2368,9 @@ reshard_cancel_during_drain() { # org password
   opid="$(echo "$out" | jq -r .id)"
   [ -n "$opid" ] && [ "$opid" != "null" ] || fail "reshard cancel: no op id: $out"
 
-  reshard_wait_step "$opid" draining 120
+  # The op executes in a dedicated runner pod now: budget covers pod schedule
+  # + (first-time) image pull on an arch-pinned node before the drain step.
+  reshard_wait_step "$opid" draining 420
   deadline=$(( $(date +%s) + 90 ))
   until reshard_log_has "$opid" "waiting for connections to drain"; do
     [ "$(date +%s)" -lt "$deadline" ] || fail "reshard cancel: no drain-wait log line"
@@ -2366,7 +2390,7 @@ reshard_cancel_during_drain() { # org password
 
   curl -fsS -X POST -H "$H" "$API/api/v1/reshards/$opid/cancel" >/dev/null \
     || fail "reshard cancel: cancel POST failed"
-  st="$(reshard_wait_terminal "$opid" 180)"
+  st="$(reshard_wait_terminal "$opid" 300)"
   [ "$st" = "cancelled" ] || { reshard_dump_log "$opid"; fail "reshard cancel: final state $st, want cancelled"; }
   reshard_log_has "$opid" "reshard report (cancelled)" || fail "reshard cancel: report missing"
 
@@ -2388,9 +2412,9 @@ reshard_bogus_shard_rollback() { # org password
     || fail "reshard rollback: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
 
-  # Budget: drain + snapshot-propagation waits + the 90s per-op cutover
-  # timeout + rollback convergence.
-  st="$(reshard_wait_terminal "$opid" 600)"
+  # Budget: runner-pod schedule/pull + drain + snapshot-propagation waits +
+  # the 90s per-op cutover timeout + rollback convergence.
+  st="$(reshard_wait_terminal "$opid" 900)"
   [ "$st" = "failed" ] || { reshard_dump_log "$opid"; fail "reshard rollback: final state $st, want failed"; }
   reshard_log_has "$opid" "rolling back" || fail "reshard rollback: no rollback log"
   reshard_log_has "$opid" "reshard report (failed)" || fail "reshard rollback: report missing"
@@ -2418,14 +2442,18 @@ reshard_ext_to_cnpg() { # ext-org password
     || fail "reshard ext→cnpg: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
 
-  # Claim-on-create regression (multi-replica CP): a password-bearing
-  # (external-source here) op must be created ALREADY claimed by the replica
-  # that holds the ephemeral password — state running + runner_cp set in the
-  # 202 response — so no sibling replica's scanOnce can win it and fail the
-  # copy for want of the password. (Before the fix the op was created pending
-  # and ~2/3 of the time a passwordless replica claimed it.)
-  echo "$out" | jq -e '.state == "running" and (.runner_cp | length > 0)' >/dev/null \
-    || fail "reshard ext→cnpg: op not create-claimed (state/runner_cp): $out"
+  # Pod model: the op is created PENDING — the dedicated runner pod
+  # (duckgres-reshard-op-<id>, spawned by the CP on this POST) claims the row
+  # itself. This ext-SOURCE op needs no password URL (the source password is
+  # read from the CR status pre-flip), so password_url stays empty.
+  echo "$out" | jq -e '.state == "pending"' >/dev/null \
+    || fail "reshard ext→cnpg: op not created pending (pod model): $out"
+
+  # The dedicated runner pod appears (spawned by the start handler; the leader
+  # reconciler would backstop it) and carries the op-id label.
+  reshard_pod_wait "$opid" 120
+  lbl="$(k get pod "duckgres-reshard-op-$opid" -o jsonpath='{.metadata.labels.app}/{.metadata.labels.duckgres-op-id}')"
+  [ "$lbl" = "duckgres-reshard/$opid" ] || fail "reshard ext→cnpg: runner pod labels wrong: $lbl"
 
   # Budget: drain (org quiet) + provider-sql role/db create on the shard (the
   # cnpg SASL propagation tail can add minutes — see READY_TIMEOUT) + copy +
@@ -2464,7 +2492,11 @@ reshard_ext_to_cnpg() { # ext-org password
   got="$(pg "$org" "$pw" ducklake "SELECT COUNT(*) || ':' || SUM(v) FROM reshard_move")"
   echo "$got" | grep -q "100:4950" || fail "reshard ext→cnpg: data mismatch after move (got '$got')"
   pg "$org" "$pw" ducklake "DROP TABLE reshard_move;"
-  log "reshard ext→cnpg OK (op $opid): catalog moved, data intact"
+
+  # The runner pod exits 0 once the op is terminal and the leader reconciler
+  # reaps it (30s tick; give it a couple of ticks plus pod-exit time).
+  reshard_pod_wait_gone "$opid" 180
+  log "reshard ext→cnpg OK (op $opid): catalog moved, data intact, runner pod reaped"
 }
 
 # ---- tenant isolation -----------------------------------------------------

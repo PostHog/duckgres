@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -189,6 +190,25 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 		limits[k] = v.DeepCopy()
 	}
 
+	// Scheduling: inherit the CP's nodeSelector and (non-auto-injected)
+	// tolerations, and pin the node ARCH to this process's own — the runner
+	// runs the CP's image, which is arch-specific, and on a mixed-arch
+	// nodepool an unpinned pod can land on the wrong arch (exec format error).
+	nodeSelector := map[string]string{}
+	for k, v := range cpPod.Spec.NodeSelector {
+		nodeSelector[k] = v
+	}
+	if _, ok := nodeSelector["kubernetes.io/arch"]; !ok {
+		nodeSelector["kubernetes.io/arch"] = runtime.GOARCH
+	}
+	var tolerations []corev1.Toleration
+	for _, tol := range cpPod.Spec.Tolerations {
+		if strings.HasPrefix(tol.Key, "node.kubernetes.io/") {
+			continue // kubelet auto-injected (not-ready/unreachable grace)
+		}
+		tolerations = append(tolerations, tol)
+	}
+
 	podName := ReshardPodName(op.ID)
 	grace := reshardPodTerminationGraceSeconds
 	pod := &corev1.Pod{
@@ -209,6 +229,8 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 			// The CP's own SA: the runner patches Duckling CRs and reads the
 			// config store — grants the CP already holds. No new RBAC.
 			ServiceAccountName: cpPod.Spec.ServiceAccountName,
+			NodeSelector:       nodeSelector,
+			Tolerations:        tolerations,
 			Containers: []corev1.Container{
 				{
 					Name:            "reshard-runner",

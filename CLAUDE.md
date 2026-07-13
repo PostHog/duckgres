@@ -8,7 +8,7 @@ Duckgres is a PostgreSQL wire protocol server backed by DuckDB. It allows any Po
 
 ## Architecture
 
-Duckgres has three deployment topologies, built from three run modes (`standalone`, `control-plane`, `duckdb-service`):
+Duckgres has three deployment topologies, built from three primary run modes (`standalone`, `control-plane`, `duckdb-service`; a fourth utility mode, `reshard-runner`, is the entrypoint of the dedicated per-operation reshard pods the control plane spawns — see the Resharding section):
 
 **1. Standalone** — single process. One binary running in `standalone` mode handles the PG wire protocol, auth, TLS, transpilation, and DuckDB execution itself. Each user gets their own DuckDB database in-process.
 ```
@@ -61,9 +61,10 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - **Process backend** (default, `--worker-backend process`): local Flight SQL workers over Unix sockets.
   - **Remote backend** (`--worker-backend remote`): per-org Kubernetes worker pods over TCP+TLS. Multitenant; requires `-tags kubernetes` and a Postgres-backed config store. Adds config store, org router, runtime tracker, janitor/leader election, and a provisioning/admin HTTP API.
 - **duckdb-service**: Thin DuckDB execution engine exposed via Arrow Flight SQL. Spawned automatically by the control plane as worker processes, or run standalone for testing.
+- **reshard-runner** (`-tags kubernetes` only): entrypoint of the dedicated per-operation reshard pod (`duckgres-reshard-op-<id>`), spawned by the control plane when an operator starts a reshard. Claims ONE op (`DUCKGRES_RESHARD_OP_ID`), executes the reshard step machine to a terminal state, exits (0 unless an infrastructure error). See "Resharding" below.
 
 Key CLI flags for control-plane mode:
-- `--mode control-plane|duckdb-service|standalone`
+- `--mode control-plane|duckdb-service|standalone|reshard-runner`
 - `--worker-backend process|remote`
 - `--process-min-workers N` / `--process-max-workers N`
 - `--process-retire-on-session-end`
@@ -535,9 +536,33 @@ touching this path:
 Operator-driven moves of an org's DuckLake catalog between metadata stores
 (cnpg↔cnpg, ext→cnpg, cnpg→ext escape hatch), admin-console-driven with a
 verbose op log. Full design: `docs/design/resharding.md`. Pieces:
-`configstore/reshard.go` (+ migration `000018`),
-`provisioner/reshard_runner.go` + `catalog_copy.go`, `admin/reshard.go`, UI
+`configstore/reshard.go` (+ migrations `000018`/`000021`/`000022`),
+`provisioner/reshard_runner.go` + `catalog_copy.go` + `catalog_backup.go`
+(the step machine, executed in a DEDICATED per-op pod — see below),
+`controlplane/reshard_runner_mode.go` (`--mode reshard-runner`, the pod's
+entrypoint), `controlplane/reshard_pod.go` (spawner) +
+`reshard_reconciler.go` (leader-only pod janitor), `admin/reshard.go`, UI
 `ReshardForm.tsx`/`ReshardOperation.tsx`. Invariants:
+
+- **Reshards execute in a dedicated per-operation pod, NEVER in a CP
+  process** (`duckgres-reshard-op-<id>`, labels `app=duckgres-reshard` +
+  `duckgres-op-id`, restartPolicy Never, TGPS 600, requests=limits from the
+  env-only `DUCKGRES_RESHARD_POD_CPU`/`DUCKGRES_RESHARD_POD_MEMORY`, default
+  2/8Gi): a catalog pg_dump/copy must not compete with live traffic for CP
+  resources (a ~20k-table dump OOM-killed a 512Mi CP pod). The pod runs the
+  CP's OWN image + ServiceAccount (no new RBAC) and inherits an ALLOWLIST of
+  the CP's env spec verbatim (`reshardPodEnvAllowlist` — secretKeyRefs stay
+  refs; nothing secret lands in a pod spec). The start handler creates the op
+  PENDING and spawns the pod; the pod claims the row via the standard CAS,
+  runs the step machine to a terminal state, and exits 0 — the op row is the
+  OUTCOME's source of truth (failed/rolled-back still exits 0; only infra
+  errors — store unreachable, claim lost/fenced — exit nonzero). A leader-only
+  reconciler (attached under the janitor lease) respawns the pod of a
+  pending-past-grace or stale-heartbeat op (bounded, 3 attempts, then
+  force-fail with an operator-facing error) and reaps pods of terminal ops.
+  The e2e reshard pod netpol lives in `k8s/networkpolicy.yaml`
+  (`duckgres-reshard-runner-boundaries`, egress-only: DNS/5432/443/8080); the
+  production chart needs the equivalent (charts repo).
 
 - **The sound connection barrier is the lease-GRANT check**, not the
   connect-time 57P03 gates: the grant transaction refuses `resharding` orgs
@@ -580,8 +605,12 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   `s3://<bucket>/_reshard_catalog_backups/op-<id>-<ts>.dump` (custom format →
   `pg_restore`; password via `PGPASSWORD`, never argv; bucket/region/IAM-role
   from the duckling CR status; upload creds via STS AssumeRole of the org's own
-  role, injected as an `AssumeRoleFunc` from `multitenant.go` to avoid the
-  import cycle). **Gate by direction**: the destructive cnpg→external direction
+  role, injected as an `AssumeRoleFunc` from the reshard-runner mode
+  (`controlplane/reshard_runner_mode.go`) to avoid the import cycle). The dump
+  is STREAMED: pg_dump stdout flows straight into an S3 multipart upload
+  (16MiB parts × concurrency 2 bounds memory regardless of catalog size — no
+  temp file, no whole-dump buffering; a nonzero pg_dump exit or empty dump
+  deletes the partial object). **Gate by direction**: the destructive cnpg→external direction
   (its verified-delete drops the source) HARD-FAILS the op before the flip if the
   backup fails; non-destructive directions (source survives) log a warning and
   continue. The URI is recorded on `backup_s3_uri` (migration `000021`) + the op
@@ -594,19 +623,21 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
 - **Rollback patches the source shard VALUE back — never removes the key**
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
-- **The ext target password is ephemeral**: request → in-process stash →
-  runner memory; never in the op row, log, or audit. Because it lives only in
-  the creating replica's memory, the op must run on THAT replica —
-  **claim-on-create**: the admin start handler creates the op via
-  `CreateReshardOperationClaimed(op, cpID)` (single insert, lands `running` +
-  owned, `runner_epoch=1`, fresh heartbeat) and hands it straight to the local
-  runner via `AdoptClaimedOperation(op, password)`, which executes it on the
-  runner's LIFECYCLE ctx (NOT the HTTP request ctx). A fresh-heartbeat running
-  op owned by the local CP is unclaimable by any sibling replica's scanOnce, so
-  a passwordless replica can never win it. (cnpg targets are create-claimed too
-  when a local runner exists; with none they fall back to `pending`, any
-  replica — no password needed.) A genuine crash-takeover mid-copy still fails
-  with a clear re-run message instead of proceeding without the password.
+- **The ext target password is ephemeral**: request → creating replica's
+  in-memory stash → one-shot pull by the runner pod → runner memory; never in
+  the op row, log, audit, k8s Secret, or any pod spec. The runner pod fetches
+  it at startup from `GET /api/v1/reshards/:id/password` on the CREATING
+  replica's pod IP (the URL — never the password — is persisted on
+  `password_url`, migration `000022`, so a reconciler respawn re-wires the
+  same handoff). The endpoint is INTERNAL-SECRET identity ONLY (an SSO admin
+  is 403'd — operators must never read tenant credentials); the stash is
+  pruned once the op turns terminal. A pull that 404s (creating replica gone)
+  is not an infra error: the runner proceeds stashless and the step machine
+  fails the op with the clear "password is not available … cancel and re-run"
+  message, then rolls back. (This replaces the old claim-on-create /
+  `CreateReshardOperationClaimed`+`AdoptClaimedOperation` path — with the op
+  no longer executing in a CP process, pinning it to the creating replica is
+  neither possible nor needed.)
 - **The ext SM secret must be ESO-readable and a raw string**: the ESO IAM
   policy only allows `posthog-*`/`duckling-*` names, so the start handler
   enforces a POSITIVE allowlist (`esoReadableSecretPrefixes`) — a name outside
@@ -645,12 +676,15 @@ verbose op log. Full design: `docs/design/resharding.md`. Pieces:
   marked the op `cancelled` while leaving the warehouse blocked.
 - Touching any of this → update `tests/configstore/reshard_postgres_test.go`,
   `provisioner/reshard_runner_test.go` (incl. the `TestReshardBackup*` cases),
-  `admin/reshard_test.go`, the
-  migration asserts in `tests/configstore/migrations_postgres_test.go`, AND
+  `admin/reshard_test.go`, `controlplane/reshard_pod_test.go` +
+  `reshard_reconciler_test.go` + `reshard_runner_mode_test.go`, the
+  migration asserts in `tests/configstore/migrations_postgres_test.go`, the
+  netpol assert in `tests/manifests/manifests_test.go`, AND
   the `reshard_*` + `lifecycle_teardown_cnpg` assertions in
   `tests/mw-dev/e2e/harness.sh` (validation, cancel-during-drain,
   bogus-shard-rollback, ext→cnpg positive path incl. the pre-flip backup
-  assertion, and the deprovision-unaffected net). The cnpg→ext orphan-adopt
+  assertion + the runner-pod appear/reap assertions, and the
+  deprovision-unaffected net). The cnpg→ext orphan-adopt
   charts side (composition managementPolicies + `retainCnpgOnFlip` XRD field)
   lives in the `charts` repo and is covered by
   `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh`.

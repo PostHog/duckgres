@@ -147,6 +147,15 @@ normal `go test ./...` lane.
   request paths against real S3.
 - **Version-mismatch worker reaper** — needs a mid-run image bump, so it stays
   covered by `controlplane/` unit tests rather than in-Job.
+- **Reshard runner-pod crash respawn** — the reshard e2e lanes run in the
+  dedicated `duckgres-reshard-op-<id>` pods and assert the pod appears and is
+  reaped after the op finishes, but deliberately do NOT kill a runner pod
+  mid-operation to exercise the leader reconciler's respawn/takeover: a
+  mid-copy kill races the drain/flip waits and would add minutes of
+  deterministic-flake risk per run. Respawn, the retry bound + force-fail, and
+  the stale-heartbeat takeover claim (incl. `reconstructProgress`) are covered
+  by `controlplane/reshard_reconciler_test.go` and
+  `provisioner/reshard_runner_test.go`.
 - **Physical object-store-prefix isolation** — the Go suite listed the MinIO
   prefix to prove writes land only in a tenant's own path. Against real mw-dev
   S3 the Job holds no list creds, so isolation is asserted **logically** (the

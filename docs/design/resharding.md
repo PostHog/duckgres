@@ -17,10 +17,13 @@ those stay valid because the bucket is untouched.
 
 | Piece | Where |
 |---|---|
-| Operation row + verbose log (config store) | `controlplane/configstore/reshard.go`, migrations `000018` + `000021` (backup URI) |
-| Runner (claims + executes ops) | `controlplane/provisioner/reshard_runner.go` |
+| Operation row + verbose log (config store) | `controlplane/configstore/reshard.go`, migrations `000018` + `000021` (backup URI) + `000022` (password pull URL) |
+| Runner (the step machine, executed inside the dedicated per-op pod) | `controlplane/provisioner/reshard_runner.go` |
+| Runner pod entrypoint (`--mode reshard-runner`) | `controlplane/reshard_runner_mode.go` |
+| Runner pod spawner (CP-side) | `controlplane/reshard_pod.go` |
+| Runner pod reconciler (leader-only respawn/reap) | `controlplane/reshard_reconciler.go` |
 | Catalog copier (schema + rows + verify) | `controlplane/provisioner/catalog_copy.go` |
-| Pre-flip catalog backuper (pg_dump → S3) | `controlplane/provisioner/catalog_backup.go` |
+| Pre-flip catalog backuper (pg_dump → streamed S3 multipart upload) | `controlplane/provisioner/catalog_backup.go` |
 | Duckling CR patches (flip, compaction pause, cnpg-orphan/adopt: `SetMetadataStoreRetainCnpgOnFlip`, `CnpgSourceMRsOrphaned`, `SetMetadataStoreCnpgAdopt`) | `controlplane/provisioner/k8s_client.go` |
 | Admin REST API (start/read/cancel + `GET /reshards/targets` destination discovery: all cnpg shards incl. empty ones via the cluster-topology pod read, RBAC-degrading to occupied shards; known external stores from live warehouse rows) | `controlplane/admin/reshard.go` |
 | Console UI (form + operation page with live log) | `admin/ui/src/pages/ReshardForm.tsx`, `ReshardOperation.tsx` |
@@ -55,6 +58,56 @@ deprovisioning drop/create the cnpg role/DB exactly as before. The orphan
 behavior is bound to the reshard type-flip, never to Duckling deletion. The e2e
 `lifecycle_teardown_cnpg` asserts the finalizer cascade still fully deletes the
 CR (and its cnpg role/DB) on a normal deprovision.
+
+## Execution model: one dedicated pod per operation
+
+A reshard never executes inside a control-plane process. When an operator
+starts one, the admin handler creates the op row **pending** and spawns a
+dedicated pod `duckgres-reshard-op-<id>` (labels `app=duckgres-reshard`,
+`duckgres-op-id=<id>`; restartPolicy Never; terminationGracePeriodSeconds 600
+so a deleted pod can roll back; requests=limits from the env-only
+`DUCKGRES_RESHARD_POD_CPU` / `DUCKGRES_RESHARD_POD_MEMORY`, defaults 2 CPU /
+8Gi). Motivation: a real incident — the CP pod (512Mi limit) OOM-crashed while
+running `pg_dump` on a ~20k-table catalog during `backup_catalog`, orphaning
+the op. Resharding must never compete with live traffic for CP resources, and
+catalogs can be much larger than that one.
+
+The pod runs the CP's **own image** (it carries `pg_dump` and the duckgres
+binary) in `--mode reshard-runner`, under the CP's **own ServiceAccount** (the
+runner patches Duckling CRs — RBAC the CP already holds; no new grants), and
+inherits an **allowlist** of the CP container's env spec verbatim
+(`DUCKGRES_CONFIG_STORE`, `DUCKGRES_INTERNAL_SECRET`, `DUCKGRES_AWS_REGION`, …
+— a secretKeyRef is copied as a ref, so nothing secret ever lands in a pod
+spec). The pod pins `kubernetes.io/arch` to the CP's own arch (the image is
+arch-specific and worker nodepools can be mixed-arch) and inherits the CP's
+nodeSelector/tolerations.
+
+The pod's whole job (`RunSingleOperation`): claim the ONE op named by
+`DUCKGRES_RESHARD_OP_ID` via the standard claim CAS (pending, or running with
+a stale heartbeat — the respawn/takeover path, which bumps the fencing epoch
+and runs `reconstructProgress`), execute the step machine to a terminal state,
+exit. **The op row is the source of truth for the outcome**: a failed /
+rolled-back / cancelled op still exits 0; only infrastructure errors (config
+store unreachable, claim not winnable, fenced away mid-run) exit nonzero.
+SIGTERM (pod deletion) cancels the run context → rollback within the
+termination grace.
+
+A **leader-only reconciler** (attached under the janitor lease, 30s tick)
+keeps the fleet honest:
+
+- an op that should be executing but has no live pod — pending older than a
+  grace (2m), or running with a stale heartbeat (>5m) — gets its pod
+  (re)spawned. Bounded: after 3 failed interventions the op is force-failed
+  with a clear operator-facing error (the warehouse may still be blocked —
+  that is the page-someone signal; there is no runner to roll back).
+- pods of terminal ops are reaped (exited pods immediately; a still-running
+  pod only after the op has been terminal for a grace).
+
+Network policy: reshard pods need egress to Postgres (5432 — config store,
+cnpg shard poolers, external RDS), S3/STS (443), the CP admin API (8080, the
+password pull below) and DNS, and no ingress. The e2e manifest policy is
+`duckgres-reshard-runner-boundaries` in `k8s/networkpolicy.yaml`; the
+production chart needs the equivalent (charts repo).
 
 ## Step machine (→cnpg targets)
 
@@ -141,16 +194,27 @@ even if both live copies are damaged, and covers all directions.
   the same the copy step uses (`o.source`, recorded pre-flip: external →
   `sslmode=require` direct to RDS, cnpg → `sslmode=disable` via the pooler).
   `catalog_backup.go::PGCatalogBackuper`.
+- **How**: STREAMED. pg_dump writes the archive to stdout and the bytes flow
+  straight into an S3 **multipart upload** (`feature/s3/manager`, 16MiB parts,
+  concurrency 2) — no temp file, no whole-dump buffering, memory bounded by
+  partsize × concurrency regardless of catalog size (the previous
+  temp-file+PutObject implementation buffered the dump and OOM-killed a 512Mi
+  CP pod on a ~20k-table catalog). A nonzero pg_dump exit or an empty dump
+  deletes the just-uploaded partial object so a broken artifact never
+  masquerades as a valid backup; a failed upload aborts the multipart and
+  kills pg_dump.
 - **Where**: `s3://<org-data-bucket>/_reshard_catalog_backups/op-<opID>-<UTC
   timestamp>.dump`. Bucket + region come from the duckling CR status
   (`status.dataStore.bucketName` / `s3Region`); the reserved
   `_reshard_catalog_backups/` prefix keeps backups clear of DuckLake's parquet.
 - **Creds**: the upload assumes the org's **own** IAM role
-  (`status.iamRoleARN`) via the same STS broker the worker activator uses for
-  DuckLake S3 access — the CP writes to the org bucket with short-lived,
-  org-scoped credentials, no worker required. The broker is injected into the
-  runner from `multitenant.go` (the STS broker lives in the `controlplane`
-  package; the runner takes an `AssumeRoleFunc` to avoid the import cycle).
+  (`status.iamRoleARN`) via the same STS AssumeRole the worker activator uses
+  for DuckLake S3 access — the runner pod writes to the org bucket with
+  short-lived, org-scoped credentials, no worker required. The broker is
+  injected into the runner by the reshard-runner mode
+  (`controlplane/reshard_runner_mode.go`; the STS broker lives in the
+  `controlplane` package and the provisioner runner takes an `AssumeRoleFunc`
+  to avoid the import cycle).
 - **Gate strength by direction**:
   - **cnpg→external (destructive)**: a dump- or upload-failure **fails the op
     before the flip** — never destroy the source without a durable snapshot.
@@ -235,30 +299,29 @@ blocking → draining → pausing_compaction → backup_catalog → copying → 
    (orphaned, harmless — roles cannot drop themselves).
 
 The target password is **ephemeral**: sent once in the start request,
-validated by connecting, handed in-process to the local runner, never
-persisted to the op row/log/audit — the row stores the AWS SM secret NAME
-only. Because the password lives only in the creating replica's memory, the op
-must be run by THAT replica. This is **claim-on-create** (real, not just a
-comment): the admin start handler creates the op via
-`CreateReshardOperationClaimed(op, cpID)`, a single insert that lands the row
-already `running` and owned by the local CP (`runner_epoch=1`,
-`heartbeat_at=now`), then hands it straight to the local runner via
-`AdoptClaimedOperation(op, password)` — which stashes the password and launches
-execution on the runner's LIFECYCLE context (not the HTTP request context,
-which dies with the 202 response). A create-claimed op has a fresh-heartbeat
-`running` row owned by the local CP, so no sibling replica's scanOnce loop can
-list or claim it. (The prior code created the op `pending` and only stashed the
-password locally; on a multi-replica CP a *different* replica's scanOnce would
-win the op ~2/3 of the time and fail the copy — "external target password is
-not available to this runner". Fixed.) cnpg targets are create-claimed too when
-a local runner exists (lower latency, uniform path); with no local runner they
-fall back to a `pending` op any replica may claim (no password needed).
-Consequence for external targets: a genuine crash-takeover mid-copy still
-cannot resume (password lost with the dead replica's memory); the new runner
-fails the op with a clear re-run message, and — because cnpg→ext copies BEFORE
-the flip — a pre-flip failure leaves the cnpg source untouched. After the flip,
-the runner checks the ESO-synced status password matches the provided one
-(catches a wrong/missing SM secret).
+validated by connecting, never persisted to the op row/log/audit/pod spec —
+the row stores the AWS SM secret NAME only. With execution in a dedicated pod,
+the handoff is a **one-shot pull**: the creating CP replica keeps the password
+in an in-memory stash (per op id, pruned once the op is terminal) and the
+runner pod fetches it at startup from
+`GET /api/v1/reshards/<id>/password` on the creating replica's **pod IP**
+(the stash is process-local, so the URL must bypass the service VIP). The
+endpoint accepts the INTERNAL-SECRET identity only — an SSO admin, even with
+the admin role, is 403'd; operators must never read tenant credentials — and
+404s for unknown/terminal ops or a replica without the stash. The pull URL
+(never the password) is persisted on the op row (`password_url`, migration
+`000022`) and injected into the pod env as `DUCKGRES_RESHARD_PASSWORD_URL`, so
+a reconciler respawn re-wires the same handoff while the stashing replica
+lives. (This replaces claim-on-create —
+`CreateReshardOperationClaimed`/`AdoptClaimedOperation` — which pinned
+execution to the creating replica's own process; with no in-CP execution left,
+that pinning is neither possible nor needed.)
+If the pull 404s (the creating replica is gone), the runner proceeds without
+the stash and the step machine fails the op with the clear "external target
+password is not available … cancel and re-run" message, then rolls back —
+and because cnpg→ext copies BEFORE the flip, a pre-flip failure leaves the
+cnpg source untouched. After the flip, the runner checks the ESO-synced status
+password matches the provided one (catches a wrong/missing SM secret).
 
 **The SM secret name and value are constrained by the ESO wiring.** After the
 flip, the composition renders an ExternalSecret
@@ -329,11 +392,13 @@ the `2BP01` "role can't drop while its DB exists" wedge the coupled delete hit.
   once the flip started (forward-or-recovery only).
 - Runner fencing: claim bumps `runner_epoch`; every runner write is CAS-fenced
   on (runner, epoch); heartbeat ~30s; an op with a >5m-stale heartbeat is
-  claimable (takeover). The target-DB advisory lock fences the copy itself.
-  Claim-on-create (see the cnpg→external section) creates the op already at
-  `runner_epoch=1`, owned by the creating CP — a fresh-heartbeat running row no
-  sibling replica can steal, which is what keeps the ephemeral external
-  password with the one runner that has it.
+  claimable (takeover — in the pod model that is the leader reconciler
+  respawning `duckgres-reshard-op-<id>`, whose fresh claim fences the old
+  pod's zombie writes and reconstructs rollback progress from the row). The
+  target-DB advisory lock fences the copy itself. A pod crash therefore never
+  strands an op: the respawned pod re-claims, and for ext targets re-pulls the
+  password from the persisted `password_url` (or fails with the clear re-run
+  message if the stashing replica died too).
 - Takeover rollback reconstructs progress from the persisted row. A runner that
   claims an op a prior epoch advanced starts with all in-process rollback flags
   false, so it calls `reconstructProgress()` before running: `blocked` from
@@ -353,7 +418,13 @@ the `2BP01` "role can't drop while its DB exists" wedge the coupled delete hit.
 ## Testing
 
 Unit: `configstore` (tests/configstore/reshard_postgres_test.go — claim CAS,
-takeover fencing, cancel, log pagination, the grant-path gate),
+takeover fencing, cancel, log pagination, the grant-path gate, the password
+pull URL + active-op listing), `controlplane` (reshard_pod_test.go — pod spec:
+labels/SA/image/env-allowlist/secretKeyRef preservation/resource knobs;
+reshard_reconciler_test.go — respawn, retry bound + force-fail, terminal-pod
+reap; reshard_runner_mode_test.go — the password pull incl. the 404-is-terminal
+contract; catalog_backup_test.go — the streamed dump→S3 path, stderr
+diagnostics, partial-object cleanup, empty-dump refusal),
 `provisioner/reshard_runner_test.go` (all three directions, rollbacks, cancel,
 ephemeral-password loss, the pre-flip backup: recorded before the flip, the
 destructive-direction hard-fail-before-flip, the non-destructive
@@ -370,7 +441,10 @@ managementPolicies variants render; the XRD field defaults false). e2e
 external secret name), cancel-during-drain (drain-not-kill + 57P03 visible),
 bogus-shard rollback (real flip → Synced=False → rollback, data intact), the
 **ext→cnpg positive path** (real catalog move off the harness RDS onto
-shard-001), which also asserts the pre-flip backup completed and recorded a
+shard-001) — which, since reshards execute in dedicated pods, also asserts the
+op is created `pending`, the `duckgres-reshard-op-<id>` pod appears with the
+right labels while the op runs, and the leader reconciler reaps it after the
+op finishes — and which also asserts the pre-flip backup completed and recorded a
 `backup_s3_uri` under `_reshard_catalog_backups/` (the Job has no aws CLI, so it
 asserts the recorded URI + restore command in the op log, not an S3 list — same
 limitation as the tenant-isolation object-store half), and the LOAD-BEARING

@@ -155,6 +155,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET_FALLBACKS  Comma-separated previous internal secrets still accepted during rotation\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_OP_ID      Reshard operation to execute (reshard-runner mode; set by the control plane)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_PASSWORD_URL  One-shot ephemeral password pull URL (reshard-runner mode, ext targets; set by the control plane)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_POD_CPU    Reshard runner pod CPU requests=limits (control-plane mode, default 2)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_POD_MEMORY Reshard runner pod memory requests=limits (control-plane mode, default 8Gi)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}

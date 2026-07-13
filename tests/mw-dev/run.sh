@@ -292,7 +292,10 @@ YAML
   # The Job has no activeDeadlineSeconds, so this loop is the only cap; size it
   # generously above READY_TIMEOUT and stay under the CP's 30-min provisioning
   # hard-timeout. Env-overridable to keep it in lockstep with READY_TIMEOUT.
-  deadline=$(( $(date +%s) + ${HARNESS_WATCH_TIMEOUT:-1800} ))
+  # 2100: the reshard lanes now run in dedicated runner pods, adding pod
+  # schedule + image pull (~1-2 min worst case per lane) on top of the old
+  # in-process execution.
+  deadline=$(( $(date +%s) + ${HARNESS_WATCH_TIMEOUT:-2100} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if [ "$("${KUBECTL[@]}" -n "$NS" get job duckgres-harness -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)" = "True" ]; then
       echo "harness Job complete."; return 0
