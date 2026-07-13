@@ -23,12 +23,16 @@ func NewWithExecutor(exec Executor) *Driver {
 	return &Driver{exec: exec}
 }
 
+func NewWithDB(db *sql.DB) *Driver {
+	return NewWithExecutor(&sqlExecutor{db: db})
+}
+
 func NewFromDSN(dsn string) (*Driver, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open pgwire connection: %w", err)
 	}
-	return &Driver{exec: &sqlExecutor{db: db}}, nil
+	return NewWithDB(db), nil
 }
 
 func (d *Driver) Protocol() core.Protocol {

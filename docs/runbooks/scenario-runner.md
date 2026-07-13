@@ -13,11 +13,11 @@ Set these before running a real scenario:
 ```bash
 export DUCKGRES_SCENARIO_API_BASE="<control-plane-api-base-url>"
 export DUCKGRES_SCENARIO_INTERNAL_SECRET="<internal-secret>"
-export DUCKGRES_SCENARIO_PG_HOST="<pgwire-direct-address-for-libpq-hostaddr>"
+export DUCKGRES_SCENARIO_PG_HOST="<pgwire-direct-tcp-host>"
 export DUCKGRES_SCENARIO_SNI_SUFFIX="<managed-hostname-suffix>"
 ```
 
-`DUCKGRES_SCENARIO_PG_HOST` is used as libpq `hostaddr`; the runner separately sets `host=<org><suffix>` so TLS SNI carries the managed warehouse identity.
+`DUCKGRES_SCENARIO_PG_HOST` is the direct PGWire TCP host. The Go SQL and perf clients dial it through a connector while retaining `host=<org><suffix>` for TLS SNI and managed-warehouse routing. The dbt client exports a numeric value as `PGHOSTADDR`, which libpq supports.
 
 Optional:
 

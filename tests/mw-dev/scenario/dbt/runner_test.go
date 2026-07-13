@@ -45,7 +45,7 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:        "10.0.0.10",
+			DialHost:        "10.0.0.10",
 			SNISuffix:       ".dev.example",
 			Port:            5432,
 			SSLMode:         "require",
@@ -130,7 +130,7 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 	}
 }
 
-func TestExecutorOmitsPGHostAddrWhenConnectionHostAddrIsNotNumeric(t *testing.T) {
+func TestExecutorOmitsPGDialHostWhenConnectionDialHostIsNotNumeric(t *testing.T) {
 	projectDir := writeDBTProject(t)
 	provisionState := provision.NewState()
 	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
@@ -142,7 +142,7 @@ func TestExecutorOmitsPGHostAddrWhenConnectionHostAddrIsNotNumeric(t *testing.T)
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:  "duckgres-control-plane.test.svc",
+			DialHost:  "duckgres-control-plane.test.svc",
 			SNISuffix: ".dev.example",
 			SSLMode:   "require",
 		},
@@ -186,7 +186,7 @@ func TestExecutorStopsAfterFailedDBTCommand(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			SSLMode:   "require",
 		},
@@ -243,7 +243,7 @@ func TestExecutorRetriesFailedDBTCommandAndRecordsRecoveredFailure(t *testing.T)
 	executor := NewExecutor(ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
-			HostAddr:  "10.0.0.10",
+			DialHost:  "10.0.0.10",
 			SNISuffix: ".dev.example",
 			SSLMode:   "require",
 		},
