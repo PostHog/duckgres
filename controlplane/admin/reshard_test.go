@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -34,7 +35,10 @@ type fakeReshardStore struct {
 
 	logs      []configstore.ReshardLogEntry
 	cancelled []int64
-	stashed   map[int64]string
+	// adopted records AdoptClaimedOperation calls (opID -> password); the
+	// claimed map records CreateReshardOperationClaimed calls (opID -> runnerCP).
+	adopted map[int64]string
+	claimed map[int64]string
 }
 
 func newFakeReshardStore() *fakeReshardStore {
@@ -55,6 +59,26 @@ func (f *fakeReshardStore) CreateReshardOperation(op *configstore.ReshardOperati
 	f.nextID++
 	op.State = configstore.ReshardStatePending
 	f.ops[op.ID] = op
+	return nil
+}
+
+func (f *fakeReshardStore) CreateReshardOperationClaimed(op *configstore.ReshardOperation, runnerCP string) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	op.ID = f.nextID
+	f.nextID++
+	op.State = configstore.ReshardStateRunning
+	op.RunnerCP = runnerCP
+	op.RunnerEpoch = 1
+	now := time.Now().UTC()
+	op.HeartbeatAt = &now
+	op.StartedAt = &now
+	f.ops[op.ID] = op
+	if f.claimed == nil {
+		f.claimed = map[int64]string{}
+	}
+	f.claimed[op.ID] = runnerCP
 	return nil
 }
 
@@ -136,11 +160,15 @@ func (f *fakeReshardStore) ListExternalMetadataStores() ([]configstore.ExternalM
 	}, nil
 }
 
-func (f *fakeReshardStore) StashExternalPassword(opID int64, password string) {
-	if f.stashed == nil {
-		f.stashed = map[int64]string{}
+// The fake doubles as the local runner handle (passed as both store and runner
+// to RegisterReshardAPI).
+func (f *fakeReshardStore) CPID() string { return "cp-test" }
+
+func (f *fakeReshardStore) AdoptClaimedOperation(op *configstore.ReshardOperation, password string) {
+	if f.adopted == nil {
+		f.adopted = map[int64]string{}
 	}
-	f.stashed[opID] = password
+	f.adopted[op.ID] = password
 }
 
 type fakeShardLister struct {
@@ -206,6 +234,18 @@ func TestReshardStartCnpg(t *testing.T) {
 	}
 	if op.SourceKind != "cnpg-shard" || op.FromShard != "shard-001" || op.ToShard != "shard-002" || op.DrainTimeoutSeconds != 120 || op.CutoverTimeoutSeconds != 45 {
 		t.Fatalf("op = %+v", op)
+	}
+	// Claim-on-create: the op is created ALREADY claimed by the local CP
+	// (state running, runner_cp set) and handed to the runner to execute — no
+	// pending window a sibling replica could claim.
+	if op.State != configstore.ReshardStateRunning || op.RunnerCP != "cp-test" {
+		t.Fatalf("op not create-claimed: state=%s runner_cp=%q", op.State, op.RunnerCP)
+	}
+	if store.claimed[op.ID] != "cp-test" {
+		t.Fatalf("create-claimed not recorded: %v", store.claimed)
+	}
+	if _, ok := store.adopted[op.ID]; !ok {
+		t.Fatalf("op was not adopted by the runner: %v", store.adopted)
 	}
 }
 
@@ -351,8 +391,11 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 }
 
 // TestReshardExtPasswordStashedNotPersisted pins the ephemeral-password
-// contract: the password reaches the stash, the op row carries only the
-// secret NAME, and neither the response nor the log contains the password.
+// contract: the password reaches the runner via the claim-on-create adopt
+// handoff, the op row carries only the secret NAME, and neither the response
+// nor the log contains the password. The op is also create-claimed by the
+// local CP so no other replica can win it and fail the copy for want of the
+// password (the production multi-replica bug).
 func TestReshardExtPasswordStashedNotPersisted(t *testing.T) {
 	store := newFakeReshardStore()
 	w := doJSON(reshardRouter(store), http.MethodPost, "/api/v1/orgs/acme/reshard",
@@ -360,10 +403,16 @@ func TestReshardExtPasswordStashedNotPersisted(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body %s, want 202", w.Code, w.Body.String())
 	}
-	if store.stashed[1] != "hunter2" {
-		t.Fatalf("stash = %v, want the password handed to the runner", store.stashed)
+	if store.adopted[1] != "hunter2" {
+		t.Fatalf("adopted = %v, want the password handed to the runner", store.adopted)
+	}
+	if store.claimed[1] != "cp-test" {
+		t.Fatalf("external op not create-claimed by local CP: %v", store.claimed)
 	}
 	op := store.ops[1]
+	if op.State != configstore.ReshardStateRunning || op.RunnerCP != "cp-test" {
+		t.Fatalf("external op not create-claimed: state=%s runner_cp=%q", op.State, op.RunnerCP)
+	}
 	if op.TargetPasswordSecret != "duckling-my-secret" || op.TargetEndpoint != "rds.example.com" {
 		t.Fatalf("op = %+v", op)
 	}
@@ -424,25 +473,26 @@ func TestReshardGetListLogCancel(t *testing.T) {
 		t.Fatalf("after_id poll returned %d entries, want 0", len(resp.Entries))
 	}
 
-	// Cancel a PENDING op → finished immediately as cancelled.
+	// Op 1 is create-claimed (running), so cancel sets the flag → 202 (the
+	// runner rolls back from wherever it is).
 	w = doJSON(r, http.MethodPost, "/api/v1/reshards/1/cancel", "")
+	if w.Code != http.StatusAccepted || !store.ops[1].CancelRequested {
+		t.Fatalf("cancel running op 1: status %d, flag %t", w.Code, store.ops[1].CancelRequested)
+	}
+
+	// A PENDING op (the no-local-runner path) finishes immediately as
+	// cancelled; a re-cancel is 409 (terminal).
+	store.ops[3] = &configstore.ReshardOperation{ID: 3, OrgID: "acme", State: configstore.ReshardStatePending}
+	w = doJSON(r, http.MethodPost, "/api/v1/reshards/3/cancel", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("cancel pending status = %d body %s", w.Code, w.Body.String())
 	}
-	if store.ops[1].State != configstore.ReshardStateCancelled {
-		t.Fatalf("pending op state = %s, want cancelled", store.ops[1].State)
+	if store.ops[3].State != configstore.ReshardStateCancelled {
+		t.Fatalf("pending op state = %s, want cancelled", store.ops[3].State)
 	}
-	// Cancel again → 409 (terminal).
-	w = doJSON(r, http.MethodPost, "/api/v1/reshards/1/cancel", "")
+	w = doJSON(r, http.MethodPost, "/api/v1/reshards/3/cancel", "")
 	if w.Code != http.StatusConflict {
 		t.Fatalf("re-cancel status = %d, want 409", w.Code)
-	}
-
-	// Cancel a RUNNING op → flag set, 202.
-	store.ops[2] = &configstore.ReshardOperation{ID: 2, OrgID: "acme", State: configstore.ReshardStateRunning}
-	w = doJSON(r, http.MethodPost, "/api/v1/reshards/2/cancel", "")
-	if w.Code != http.StatusAccepted || !store.ops[2].CancelRequested {
-		t.Fatalf("cancel running: status %d, flag %t", w.Code, store.ops[2].CancelRequested)
 	}
 }
 

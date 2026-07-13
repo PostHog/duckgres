@@ -36,6 +36,7 @@ import (
 // ReshardStore is the config-store surface these handlers need.
 type ReshardStore interface {
 	CreateReshardOperation(op *configstore.ReshardOperation) error
+	CreateReshardOperationClaimed(op *configstore.ReshardOperation, runnerCP string) error
 	GetReshardOperation(id int64) (*configstore.ReshardOperation, error)
 	ListReshardOperationsForOrg(orgID string, limit int) ([]configstore.ReshardOperation, error)
 	ListReshardOperations(limit int) ([]configstore.ReshardOperation, error)
@@ -47,11 +48,15 @@ type ReshardStore interface {
 	ListExternalMetadataStores() ([]configstore.ExternalMetadataStoreInfo, error)
 }
 
-// ReshardPasswordStash hands the runner the ephemeral external password for
-// an op created on this CP (claim-on-create handoff). Satisfied by
-// *provisioner.ReshardRunner.
-type ReshardPasswordStash interface {
-	StashExternalPassword(opID int64, password string)
+// ReshardRunnerHandle is the LOCAL reshard runner surface the start handler
+// needs for claim-on-create: its CP id (so the op is created already owned by
+// this replica) and AdoptClaimedOperation (to hand the just-created op — plus
+// the ephemeral external password — straight to the runner to execute).
+// Satisfied by *provisioner.ReshardRunner. nil when this CP has no runner (no
+// k8s API); external targets are refused up front in that case.
+type ReshardRunnerHandle interface {
+	CPID() string
+	AdoptClaimedOperation(op *configstore.ReshardOperation, password string)
 }
 
 // reshardShardNamePattern mirrors the Duckling XRD's cnpgShard pattern.
@@ -134,12 +139,13 @@ type startReshardRequest struct {
 
 // RegisterReshardAPI wires the reshard endpoints. lister may be nil (duckling
 // client unavailable) — starting a reshard then 503s; reads still work.
-// stash may be nil (no local runner) — external targets then 503. cluster may
-// be nil (non-k8s) — shard discovery then falls back to the shards tenants
-// already occupy. prober may be nil (tests / non-k8s) — the external target
-// pre-flight connection check is then SKIPPED (see ExternalTargetProber).
-func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, stash ReshardPasswordStash, cluster kubernetes.Interface, prober ExternalTargetProber) {
-	h := &reshardHandler{store: store, lister: lister, stash: stash, cluster: cluster, prober: prober}
+// runner may be nil (no local runner) — external targets then 503, cnpg
+// targets fall back to a pending op any replica may claim. cluster may be nil
+// (non-k8s) — shard discovery then falls back to the shards tenants already
+// occupy. prober may be nil (tests / non-k8s) — the external target pre-flight
+// connection check is then SKIPPED (see ExternalTargetProber).
+func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, runner ReshardRunnerHandle, cluster kubernetes.Interface, prober ExternalTargetProber) {
+	h := &reshardHandler{store: store, lister: lister, runner: runner, cluster: cluster, prober: prober}
 	r.POST("/orgs/:id/reshard", h.start)
 	r.GET("/orgs/:id/reshards", h.listForOrg)
 	r.GET("/reshards", h.listAll)
@@ -152,7 +158,7 @@ func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingM
 type reshardHandler struct {
 	store   ReshardStore
 	lister  DucklingMetadataLister
-	stash   ReshardPasswordStash
+	runner  ReshardRunnerHandle
 	cluster kubernetes.Interface
 	prober  ExternalTargetProber
 }
@@ -325,7 +331,7 @@ func (h *reshardHandler) start(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "external target requires the password (sent once, never stored — the runner uses it for the copy; password_aws_secret must contain the same value)"})
 			return
 		}
-		if h.stash == nil {
+		if h.runner == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no reshard runner on this control plane — external targets unavailable"})
 			return
 		}
@@ -364,20 +370,34 @@ func (h *reshardHandler) start(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.CreateReshardOperation(op); err != nil {
-		if errors.Is(err, configstore.ErrReshardConflict) {
+	// Claim-on-create: when this CP has a local runner, create the op ALREADY
+	// claimed by it (single insert, state running + owned) so no other
+	// replica's scanOnce can pick it up. This is mandatory for external
+	// targets — the ephemeral password lives only in THIS replica's memory, so
+	// a different replica winning the op would fail the copy for want of it
+	// (the production bug this fixes). It is harmless and lower-latency for
+	// cnpg targets too. With no local runner (cnpg only — external is 503'd
+	// above) fall back to a pending op any replica may claim.
+	var createErr error
+	if h.runner != nil {
+		createErr = h.store.CreateReshardOperationClaimed(op, h.runner.CPID())
+	} else {
+		createErr = h.store.CreateReshardOperation(op)
+	}
+	if createErr != nil {
+		if errors.Is(createErr, configstore.ErrReshardConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": "org already has an active reshard operation"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": createErr.Error()})
 		return
 	}
-	if op.TargetKind == configstore.MetadataStoreKindExternal && h.stash != nil {
-		// Ephemeral handoff to the LOCAL runner — never persisted. The local
-		// runner claims pending ops within its poll tick; only a crash before
-		// the claim loses the password (the runner then fails the op with a
-		// clear re-run message).
-		h.stash.StashExternalPassword(op.ID, req.Target.Password)
+	if h.runner != nil {
+		// Hand the create-claimed op straight to the local runner to execute on
+		// its OWN lifecycle context (not this request ctx). For external
+		// targets this also carries the ephemeral password (never persisted);
+		// for cnpg targets the password arg is empty.
+		h.runner.AdoptClaimedOperation(op, req.Target.Password)
 	}
 	_ = h.store.AppendReshardLog(op.ID, "info", "operation created by "+actorForAudit(c)+": "+describeReshard(op))
 	// Audit detail carries no secrets.

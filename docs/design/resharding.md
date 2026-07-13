@@ -105,12 +105,30 @@ cutover → finalizing`. The flip IS the source cleanup and only runs after
 verify passed.
 
 The target password is **ephemeral**: sent once in the start request,
-validated by connecting, handed in-process to the local runner
-(claim-on-create), never persisted to the op row/log/audit — the row stores
-the AWS SM secret NAME only. Consequence: a crash-takeover mid-copy cannot
-resume (password lost); the new runner fails the op with a clear re-run
-message. After the flip, the runner checks the ESO-synced status password
-matches the provided one (catches a wrong/missing SM secret).
+validated by connecting, handed in-process to the local runner, never
+persisted to the op row/log/audit — the row stores the AWS SM secret NAME
+only. Because the password lives only in the creating replica's memory, the op
+must be run by THAT replica. This is **claim-on-create** (real, not just a
+comment): the admin start handler creates the op via
+`CreateReshardOperationClaimed(op, cpID)`, a single insert that lands the row
+already `running` and owned by the local CP (`runner_epoch=1`,
+`heartbeat_at=now`), then hands it straight to the local runner via
+`AdoptClaimedOperation(op, password)` — which stashes the password and launches
+execution on the runner's LIFECYCLE context (not the HTTP request context,
+which dies with the 202 response). A create-claimed op has a fresh-heartbeat
+`running` row owned by the local CP, so no sibling replica's scanOnce loop can
+list or claim it. (The prior code created the op `pending` and only stashed the
+password locally; on a multi-replica CP a *different* replica's scanOnce would
+win the op ~2/3 of the time and fail the copy — "external target password is
+not available to this runner". Fixed.) cnpg targets are create-claimed too when
+a local runner exists (lower latency, uniform path); with no local runner they
+fall back to a `pending` op any replica may claim (no password needed).
+Consequence for external targets: a genuine crash-takeover mid-copy still
+cannot resume (password lost with the dead replica's memory); the new runner
+fails the op with a clear re-run message, and — because cnpg→ext copies BEFORE
+the flip — a pre-flip failure leaves the cnpg source untouched. After the flip,
+the runner checks the ESO-synced status password matches the provided one
+(catches a wrong/missing SM secret).
 
 **The SM secret name and value are constrained by the ESO wiring.** After the
 flip, the composition renders an ExternalSecret
@@ -174,6 +192,10 @@ where the source is rebuilt rather than left untouched.
 - Runner fencing: claim bumps `runner_epoch`; every runner write is CAS-fenced
   on (runner, epoch); heartbeat ~30s; an op with a >5m-stale heartbeat is
   claimable (takeover). The target-DB advisory lock fences the copy itself.
+  Claim-on-create (see the cnpg→external section) creates the op already at
+  `runner_epoch=1`, owned by the creating CP — a fresh-heartbeat running row no
+  sibling replica can steal, which is what keeps the ephemeral external
+  password with the one runner that has it.
 - An org is never stranded: every failure path restores `resharding→ready`
   (or logs at ERROR if it can't — that's the page-someone signal).
 

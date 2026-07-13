@@ -2418,6 +2418,15 @@ reshard_ext_to_cnpg() { # ext-org password
     || fail "reshard ext→cnpg: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
 
+  # Claim-on-create regression (multi-replica CP): a password-bearing
+  # (external-source here) op must be created ALREADY claimed by the replica
+  # that holds the ephemeral password — state running + runner_cp set in the
+  # 202 response — so no sibling replica's scanOnce can win it and fail the
+  # copy for want of the password. (Before the fix the op was created pending
+  # and ~2/3 of the time a passwordless replica claimed it.)
+  echo "$out" | jq -e '.state == "running" and (.runner_cp | length > 0)' >/dev/null \
+    || fail "reshard ext→cnpg: op not create-claimed (state/runner_cp): $out"
+
   # Budget: drain (org quiet) + provider-sql role/db create on the shard (the
   # cnpg SASL propagation tail can add minutes — see READY_TIMEOUT) + copy +
   # verify.
