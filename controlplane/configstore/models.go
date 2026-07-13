@@ -28,10 +28,12 @@ type Org struct {
 	// DefaultTeamID links the org to its default PostHog team id (an integer,
 	// matching PostHog's Team.id). It is a prerequisite for pull-based compute
 	// billing — usage buckets are keyed by team_id = the org's default team.
-	// *int64 so the column is a nullable BIGINT: NULL means "unset" (required
-	// at provision time for new orgs; the admin API can still clear it).
-	// Callers must tolerate an absent value.
-	DefaultTeamID *int64            `json:"default_team_id,omitempty"`
+	// The column is a NOT NULL BIGINT (migration 000020) and 0 is never stored:
+	// every create path (provisioning + admin API) requires a positive team id
+	// and the admin API rejects clears. The field stays *int64 anyway — the
+	// admin PUT presence-merge relies on nil = "field absent, preserve", and a
+	// plain int64 would make gorm treat 0 as a zero value to skip.
+	DefaultTeamID *int64            `gorm:"not null" json:"default_team_id,omitempty"`
 	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
@@ -488,7 +490,7 @@ type OrgConfig struct {
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
 	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
 	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
-	DefaultTeamID           int64             // org's default PostHog team id (0 = unset); prereq for pull-based compute billing
+	DefaultTeamID           int64             // org's default PostHog team id (NOT NULL in the store; 0 only for a missing org / stale snapshot); prereq for pull-based compute billing
 	Users                   map[string]string // username -> password
 	Warehouse               *ManagedWarehouseConfig
 }

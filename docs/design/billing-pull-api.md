@@ -163,8 +163,10 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
   the HTTP API (aggregate-on-read into one row per key per UTC day + watermark ack)
   + safety GC.
-- **Add:** a `default_team_id` column on the org (BIGINT; used as the bucket
-  `team_id` — fixed per org, no per-team logic yet); a `duckgres.query_source` session GUC
+- **Add:** a `default_team_id` column on the org (BIGINT **NOT NULL** — required
+  at org creation on both the provisioning and admin APIs, and not clearable
+  via the admin API; used as the bucket `team_id` — fixed per org, no per-team
+  logic yet); a `duckgres.query_source` session GUC
   (`standard` | `endpoints`, default `standard`) read by the meter; a bearer secret
   for the API.
 

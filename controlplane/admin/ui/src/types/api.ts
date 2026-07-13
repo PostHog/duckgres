@@ -66,7 +66,8 @@ export interface OrgUpdate {
   default_worker_ttl?: string;
   default_worker_min_hot_idle?: number;
   hostname_alias?: string | null;
-  // Number sets, 0 clears (backend maps 0 → NULL), absent preserves.
+  // Positive number sets, absent preserves. Clearing is not possible: the
+  // column is NOT NULL and the backend rejects 0/null/negative with a 400.
   default_team_id?: number;
 }
 
