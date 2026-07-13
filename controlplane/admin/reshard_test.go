@@ -5,6 +5,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -178,17 +179,35 @@ func (f fakeShardLister) CRMetadataStores(context.Context) (map[string]DucklingM
 	return f.stores, nil
 }
 
+// fakeProber records the last probe and returns a canned error (nil = success).
+type fakeProber struct {
+	err    error
+	called bool
+	// last* capture the resolved args so a test can assert defaulting.
+	lastEndpoint, lastUser, lastDatabase, lastPassword, lastSSLMode string
+}
+
+func (p *fakeProber) Probe(_ context.Context, endpoint, user, database, password, sslMode string) error {
+	p.called = true
+	p.lastEndpoint, p.lastUser, p.lastDatabase, p.lastPassword, p.lastSSLMode = endpoint, user, database, password, sslMode
+	return p.err
+}
+
 func reshardRouter(store *fakeReshardStore) *gin.Engine {
-	return reshardRouterWithCluster(store, nil)
+	return reshardRouterFull(store, nil, nil)
 }
 
 func reshardRouterWithCluster(store *fakeReshardStore, cluster kubernetes.Interface) *gin.Engine {
+	return reshardRouterFull(store, cluster, nil)
+}
+
+func reshardRouterFull(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	lister := fakeShardLister{stores: map[string]DucklingMetadataStore{
 		"acme": {Kind: "cnpg-shard", Endpoint: "shard-001-pooler.cnpg-shards.svc.cluster.local"},
 	}}
-	RegisterReshardAPI(r.Group("/api/v1"), store, lister, store, cluster)
+	RegisterReshardAPI(r.Group("/api/v1"), store, lister, store, cluster, prober)
 	return r
 }
 
@@ -280,6 +299,97 @@ func TestReshardStartValidation(t *testing.T) {
 	}
 }
 
+// TestReshardExtSecretNameValidation pins the positive ESO-readable allowlist
+// (Fix 1): posthog-/duckling- names reach op creation; an RDS-managed master
+// name gets the specific rds message; any other prefix gets the general
+// allowlist message. No prober here (nil) so the connection check is skipped.
+func TestReshardExtSecretNameValidation(t *testing.T) {
+	cases := []struct {
+		name       string
+		secret     string
+		wantCode   int
+		wantSubstr string
+	}{
+		{"posthog prefix accepted", "posthog-x", http.StatusAccepted, ""},
+		{"duckling prefix accepted", "duckling-x", http.StatusAccepted, ""},
+		{"rds slash master rejected", "rds/some-db/master", http.StatusBadRequest, "RDS-managed master secret"},
+		{"rds bang managed rejected", "rds!db-0000-1111", http.StatusBadRequest, "RDS-managed master secret"},
+		{"other prefix rejected", "whatever-else", http.StatusBadRequest, "is not readable by the external-secrets role"},
+	}
+	for _, tc := range cases {
+		store := newFakeReshardStore()
+		body := `{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"` + tc.secret + `","password":"p"}}`
+		w := doJSON(reshardRouter(store), http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+		if w.Code != tc.wantCode {
+			t.Errorf("%s: status = %d body %s, want %d", tc.name, w.Code, w.Body.String(), tc.wantCode)
+			continue
+		}
+		if tc.wantSubstr != "" && !strings.Contains(w.Body.String(), tc.wantSubstr) {
+			t.Errorf("%s: body %s, want substring %q", tc.name, w.Body.String(), tc.wantSubstr)
+		}
+		if tc.wantCode == http.StatusAccepted {
+			if len(store.ops) != 1 {
+				t.Errorf("%s: op not created (%d ops)", tc.name, len(store.ops))
+			}
+		} else if len(store.ops) != 0 {
+			t.Errorf("%s: op created despite rejection (%d ops)", tc.name, len(store.ops))
+		}
+	}
+}
+
+// TestReshardExtPreflightProbe pins Fix 2: a passing prober lets the op be
+// created (202); a failing prober rejects with a redacted 400 and creates NO
+// op; a nil prober skips the check (op created). It also pins that the probe
+// received the defaulted user/database + sslmode=require and that neither the
+// error body nor any log leaks the password.
+func TestReshardExtPreflightProbe(t *testing.T) {
+	body := `{"target":{"type":"external","endpoint":"rds.example.com:6543","password_aws_secret":"duckling-x","password":"hunter2"}}`
+
+	// Passing prober → 202, op created, probe saw the resolved args.
+	store := newFakeReshardStore()
+	pb := &fakeProber{}
+	w := doJSON(reshardRouterFull(store, nil, pb), http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("passing prober: status = %d body %s, want 202", w.Code, w.Body.String())
+	}
+	if !pb.called {
+		t.Fatal("passing prober: probe was not called")
+	}
+	if pb.lastEndpoint != "rds.example.com:6543" || pb.lastUser != "postgres" || pb.lastDatabase != "postgres" || pb.lastSSLMode != "require" {
+		t.Fatalf("passing prober: probe args = %q/%q/%q sslmode=%q, want defaulted postgres + require", pb.lastEndpoint, pb.lastUser, pb.lastDatabase, pb.lastSSLMode)
+	}
+	if len(store.ops) != 1 {
+		t.Fatalf("passing prober: op count = %d, want 1", len(store.ops))
+	}
+
+	// Failing prober → 400, redacted message, NO op created.
+	store = newFakeReshardStore()
+	pb = &fakeProber{err: errors.New("connection refused")}
+	w = doJSON(reshardRouterFull(store, nil, pb), http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("failing prober: status = %d body %s, want 400", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "cannot connect to the external target") || !strings.Contains(w.Body.String(), "connection refused") {
+		t.Fatalf("failing prober: body %s, want the redacted connect-failure message", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "hunter2") {
+		t.Fatal("failing prober: error body leaked the password")
+	}
+	if len(store.ops) != 0 {
+		t.Fatalf("failing prober: op created despite connect failure (%d ops)", len(store.ops))
+	}
+
+	// Nil prober → check skipped, op created.
+	store = newFakeReshardStore()
+	w = doJSON(reshardRouterFull(store, nil, nil), http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("nil prober: status = %d body %s, want 202", w.Code, w.Body.String())
+	}
+	if len(store.ops) != 1 {
+		t.Fatalf("nil prober: op count = %d, want 1", len(store.ops))
+	}
+}
+
 // TestReshardExtPasswordStashedNotPersisted pins the ephemeral-password
 // contract: the password reaches the runner via the claim-on-create adopt
 // handoff, the op row carries only the secret NAME, and neither the response
@@ -289,7 +399,7 @@ func TestReshardStartValidation(t *testing.T) {
 func TestReshardExtPasswordStashedNotPersisted(t *testing.T) {
 	store := newFakeReshardStore()
 	w := doJSON(reshardRouter(store), http.MethodPost, "/api/v1/orgs/acme/reshard",
-		`{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"my-secret","user":"postgres","database":"postgres","password":"hunter2"}}`)
+		`{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"duckling-my-secret","user":"postgres","database":"postgres","password":"hunter2"}}`)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body %s, want 202", w.Code, w.Body.String())
 	}
@@ -303,7 +413,7 @@ func TestReshardExtPasswordStashedNotPersisted(t *testing.T) {
 	if op.State != configstore.ReshardStateRunning || op.RunnerCP != "cp-test" {
 		t.Fatalf("external op not create-claimed: state=%s runner_cp=%q", op.State, op.RunnerCP)
 	}
-	if op.TargetPasswordSecret != "my-secret" || op.TargetEndpoint != "rds.example.com" {
+	if op.TargetPasswordSecret != "duckling-my-secret" || op.TargetEndpoint != "rds.example.com" {
 		t.Fatalf("op = %+v", op)
 	}
 	if strings.Contains(w.Body.String(), "hunter2") {
