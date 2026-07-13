@@ -243,6 +243,35 @@ func TestControlPlaneServiceExposesFlight(t *testing.T) {
 	t.Fatal("duckgres-control-plane Service missing from manifests template")
 }
 
+func TestE2EHarnessPodIsProtectedFromKarpenterDisruption(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+
+	const jobMarker = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: duckgres-harness"
+	jobStart := strings.Index(string(raw), jobMarker)
+	if jobStart < 0 {
+		t.Fatal("duckgres-harness Job manifest missing from run.sh")
+	}
+	jobYAML := string(raw)[jobStart:]
+	if jobEnd := strings.Index(jobYAML, "\nYAML"); jobEnd >= 0 {
+		jobYAML = jobYAML[:jobEnd]
+	}
+
+	var manifest map[string]any
+	if err := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(jobYAML), 4096).Decode(&manifest); err != nil {
+		t.Fatalf("decode duckgres-harness Job manifest: %v", err)
+	}
+	spec, _ := manifest["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	metadata, _ := template["metadata"].(map[string]any)
+	annotations, _ := metadata["annotations"].(map[string]any)
+	if got := annotations["karpenter.sh/do-not-disrupt"]; got != "true" {
+		t.Fatalf("duckgres-harness Pod karpenter.sh/do-not-disrupt = %v, want true", got)
+	}
+}
+
 func manifestName(manifest map[string]any) string {
 	metadata, _ := manifest["metadata"].(map[string]any)
 	name, _ := metadata["name"].(string)

@@ -244,6 +244,11 @@ metadata:
 spec:
   backoffLimit: 0
   template:
+    metadata:
+      annotations:
+        # The suite is stateful and non-restartable (backoffLimit: 0). A
+        # voluntary Karpenter consolidation would discard the entire run.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: duckgres
       restartPolicy: Never
