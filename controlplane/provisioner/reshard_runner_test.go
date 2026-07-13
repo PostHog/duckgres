@@ -785,6 +785,62 @@ func TestReshardCancelDuringDrain(t *testing.T) {
 	}
 }
 
+// TestReshardTakeoverCancelUnblocksWarehouse is the regression for the mw-dev
+// incident: the runner that BLOCKED the warehouse crashed (OOM during the
+// pre-flip backup); a different replica later claimed the op (a fresh opRun with
+// all progress flags false) and, seeing cancel_requested, rolled back. Before
+// the fix the rollback's `if o.blocked` / `if o.compactionPaused` guards were
+// false on the takeover runner, so the op was marked cancelled while the
+// warehouse stayed stuck in `resharding` and compaction stayed paused. With
+// progress reconstructed from the persisted op row, the takeover rollback must
+// unblock the warehouse and restore compaction exactly as the original runner
+// would have.
+func TestReshardTakeoverCancelUnblocksWarehouse(t *testing.T) {
+	// A cnpg→ext op a prior epoch had already carried through backup_catalog
+	// (the incident's exact step) before its runner died.
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	blocked := time.Now().UTC().Add(-2 * time.Minute)
+	op.BlockedAt = &blocked
+	op.Step = "backup_catalog"
+	op.CompactionWasPresent = true
+	op.CompactionWasEnabled = false // pre-reshard compaction was already off
+	op.CancelRequested = true       // operator hit cancel while the owner was dead
+
+	store := newFakeReshardStore(op)
+	store.warehouseState = configstore.ManagedWarehouseStateResharding // prior runner blocked it
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: false}
+	copier := &fakeCopier{}
+
+	// A fresh runner (different replica) claims and executes the abandoned op.
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.op.State != configstore.ReshardStateCancelled {
+		t.Fatalf("state = %s (err %q), want cancelled", store.op.State, store.op.Error)
+	}
+	// The whole point: the warehouse is returned to ready, not left resharding.
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after takeover rollback", store.warehouseState)
+	}
+	if !store.hasLog("warehouse unblocked") {
+		t.Fatal("takeover rollback did not unblock the warehouse")
+	}
+	// Compaction is restored to the recorded prior setting (a takeover must not
+	// skip this): a compaction patch back to the recorded value is issued.
+	if !store.hasLog("compaction setting restored") {
+		t.Fatal("takeover rollback did not restore compaction")
+	}
+	// backup_catalog is before any flip, so nothing may be flipped.
+	for _, k := range duckling.callKinds() {
+		if k == "cnpg" || k == "external" || k == "cnpg-adopt" {
+			t.Fatalf("takeover rollback flipped the duckling (%s) — source was never flipped", k)
+		}
+	}
+}
+
 // waitOpTerminal polls the fake store until the op reaches a terminal state
 // (or the deadline), for tests that drive the runner via AdoptClaimedOperation
 // (which launches execution on its own goroutine rather than via runOp).
