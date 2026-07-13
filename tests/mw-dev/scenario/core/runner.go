@@ -97,17 +97,13 @@ func (r *Runner) Run(ctx context.Context) (RunSummary, error) {
 	}
 
 	statusByStep := make(map[string]StepStatus, len(r.cfg.Scenario.Steps))
-	normalStepsBlocked := false
 	var runErrs []error
 	for _, step := range r.cfg.Scenario.Steps {
-		result := r.runStep(ctx, runID, step, statusByStep, normalStepsBlocked)
+		result := r.runStep(ctx, runID, step, statusByStep)
 		r.results = append(r.results, result)
 		statusByStep[step.ID] = result.Status
 		if result.Err != nil {
 			runErrs = append(runErrs, result.Err)
-		}
-		if !step.AlwaysRun && !isSuccessfulStepStatus(result.Status) {
-			normalStepsBlocked = true
 		}
 		switch result.Status {
 		case StepStatusOK, StepStatusSuccessAfterRetry:
@@ -142,11 +138,8 @@ func (r *Runner) Results() []StepResult {
 	return out
 }
 
-func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByStep map[string]StepStatus, normalStepsBlocked bool) StepResult {
+func (r *Runner) runStep(ctx context.Context, runID string, step Step, statusByStep map[string]StepStatus) StepResult {
 	if !step.AlwaysRun {
-		if normalStepsBlocked {
-			return r.skippedResult(runID, step, "prior_step_failed", "a prior non-cleanup step did not complete successfully", nil)
-		}
 		if err := ctx.Err(); err != nil {
 			return r.skippedResult(runID, step, "context_canceled", "scenario context is canceled", err)
 		}

@@ -4,7 +4,7 @@
 
 The scenario runner executes end-to-end managed-warehouse flows against a configured dev environment. The first smoke scenario provisions a warehouse, waits for readiness, runs `SELECT 1` over PGWire with managed-hostname SNI, then deprovisions and verifies cleanup.
 
-The frozen metadata, perf, and dbt scenarios provision the same fresh dev warehouse shape, create read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, run their workload, then deprovision.
+The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. The standalone frozen metadata, perf, and dbt scenarios remain available for focused debugging.
 
 ## Required Environment
 
@@ -37,7 +37,7 @@ Frozen dataset scenarios additionally require:
 export DUCKGRES_SCENARIO_FROZEN_S3_URI="s3://<dev-managed-bucket>/frozen_v1/"
 ```
 
-Frozen perf scenarios additionally require the Flight SQL address because the perf catalog exercises both PGWire and Flight:
+The full suite and targeted perf scenarios additionally require the Flight SQL address because the perf catalog exercises both PGWire and Flight:
 
 ```bash
 export DUCKGRES_SCENARIO_FLIGHT_ADDR="<flight-sql-address>"
@@ -63,7 +63,13 @@ Run the dev smoke:
 just scenario-smoke
 ```
 
-Run frozen metadata exploration:
+Run the composed full suite:
+
+```bash
+just scenario scenario=tests/mw-dev/scenario/scenarios/full-suite.yaml
+```
+
+Run targeted frozen metadata exploration:
 
 ```bash
 just scenario-frozen-metadata
@@ -89,7 +95,17 @@ just scenario scenario=tests/mw-dev/scenario/scenarios/provision_smoke.yaml
 
 Artifacts are written under `artifacts/scenario/<run_id>/`.
 
-The frozen metadata scenario uses:
+The default full-suite scenario uses:
+
+- `tests/mw-dev/scenario/scenarios/full-suite.yaml`
+- `tests/mw-dev/scenario/sql/setup_frozen_views.sql`
+- `tests/mw-dev/scenario/sql/metadata_catalog.yaml`
+- `tests/perf/queries/ducklake_frozen.yaml`
+- `tests/mw-dev/scenario/dbt/posthog_frozen_project/`
+
+It runs serially in topological order: `provision` → `wait_ready` → `setup_frozen_views`, then `metadata_exploration`, `perf_queries`, and `dbt_models`. Each workload branch depends only on setup, so a failure in one branch does not suppress the others; `deprovision` always runs after the branches.
+
+The targeted frozen metadata scenario uses:
 
 - `tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml`
 - `tests/mw-dev/scenario/sql/setup_frozen_views.sql`
