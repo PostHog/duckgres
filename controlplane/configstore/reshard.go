@@ -91,6 +91,14 @@ type ReshardOperation struct {
 	RowsCopied   int64 `gorm:"not null;default:0" json:"rows_copied"`
 	BytesCopied  int64 `gorm:"not null;default:0" json:"bytes_copied"`
 
+	// BackupS3URI is the s3:// URI of the pre-flip pg_dump of the SOURCE
+	// catalog, taken (after drain + pause-compaction, before the flip) into the
+	// org's own data bucket under _reshard_catalog_backups/. Empty until the
+	// backup step records it; stays empty when a best-effort backup was skipped
+	// on a non-destructive direction. The safety net for a catalog lost at the
+	// flip — recovery is a `pg_restore` of this artifact.
+	BackupS3URI string `gorm:"size:1024;not null;default:''" json:"backup_s3_uri"`
+
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at"`

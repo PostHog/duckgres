@@ -462,10 +462,27 @@ func SetupMultiTenant(
 		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
 		go provCtrl.Run(context.Background())
 
+		// Pre-flip catalog backuper: pg_dumps the source catalog to the org's
+		// own S3 data bucket before a reshard flip, uploading with credentials
+		// from the org's IAM role (the same STS AssumeRole path the worker
+		// activator uses). Nil when STS is unavailable (local/non-AWS) — the
+		// runner then skips the best-effort backup and hard-fails only the
+		// destructive cnpg→external direction.
+		var backuper provisioner.CatalogBackuper
+		if stsBroker != nil {
+			backuper = provisioner.NewPGCatalogBackuper(func(ctx context.Context, roleARN string) (string, string, string, error) {
+				creds, err := stsBroker.AssumeRole(ctx, roleARN)
+				if err != nil {
+					return "", "", "", err
+				}
+				return creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, nil
+			})
+		}
+
 		// Reshard runner: drives operator-initiated metadata-store migrations
 		// (admin console → op row → claim/execute). Every replica runs one;
 		// a single replica wins each op via the claim CAS.
-		reshardRunner = provisioner.NewReshardRunner(store, provCtrl.DucklingClient(), cpInstanceID, pollInterval)
+		reshardRunner = provisioner.NewReshardRunner(store, provCtrl.DucklingClient(), cpInstanceID, pollInterval, backuper)
 		go reshardRunner.Run(context.Background())
 	}
 

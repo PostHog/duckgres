@@ -2436,6 +2436,26 @@ reshard_ext_to_cnpg() { # ext-org password
   reshard_log_has "$opid" "maintenance mode (connections blocked)" || fail "reshard ext→cnpg: maintenance duration missing from report"
   reshard_log_has "$opid" "external source left untouched" || fail "reshard ext→cnpg: missing ext-source-untouched line"
 
+  # Pre-flip catalog backup (safety-net layer C): the runner pg_dumps the SOURCE
+  # catalog to the org's own data bucket under _reshard_catalog_backups/ before
+  # the flip, records the artifact URI on the op row, and logs a runnable
+  # pg_restore command. The CP image now carries pg_dump (postgresql-client-18)
+  # and holds the org's STS creds, so this SHOULD succeed here — assert it did.
+  # (The Job has no aws CLI, so we cannot LIST S3 to confirm the object exists;
+  # we assert the recorded URI + restore command instead — same limitation the
+  # tenant_isolation object-store-prefix half documents. The S3 write itself is
+  # proven by the runner not warning "pre-flip catalog backup failed".)
+  reshard_log_has "$opid" "catalog backup complete" || { reshard_dump_log "$opid"; fail "reshard ext→cnpg: pre-flip catalog backup did not complete"; }
+  reshard_log_has "$opid" "pg_restore --no-owner" || fail "reshard ext→cnpg: restore command missing from op log"
+  if reshard_log_has "$opid" "pre-flip catalog backup failed"; then
+    reshard_dump_log "$opid"; fail "reshard ext→cnpg: catalog backup failed (best-effort warning present)"
+  fi
+  buri="$(curl -fsS -H "$H" "$API/api/v1/reshards/$opid" | jq -r '.backup_s3_uri // ""')"
+  case "$buri" in
+    s3://*/_reshard_catalog_backups/op-"$opid"-*.dump) log "reshard ext→cnpg: backup artifact recorded at $buri" ;;
+    *) reshard_dump_log "$opid"; fail "reshard ext→cnpg: backup_s3_uri not recorded/shaped: '$buri'" ;;
+  esac
+
   # The duckling is now a cnpg-shard tenant…
   typ="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.type}')"
   [ "$typ" = "cnpg-shard" ] || fail "reshard ext→cnpg: duckling type $typ, want cnpg-shard"

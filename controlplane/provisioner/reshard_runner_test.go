@@ -104,6 +104,9 @@ func (f *fakeReshardStore) UpdateReshardFields(_ int64, _ string, _ int64, updat
 	if v, ok := updates["source_database"].(string); ok {
 		f.op.SourceDatabase = v
 	}
+	if v, ok := updates["backup_s3_uri"].(string); ok {
+		f.op.BackupS3URI = v
+	}
 	return nil
 }
 
@@ -330,6 +333,42 @@ func (f *fakeCopier) kinds() []string {
 	return kinds
 }
 
+// fakeBackuper records Backup calls and returns a canned URI (or an injected
+// error) so tests exercise the pre-flip backup seam without pg_dump or S3.
+type fakeBackuper struct {
+	mu        sync.Mutex
+	calls     []CatalogEndpoint
+	dests     []BackupDestination
+	backupErr error
+	uri       string
+	size      int64
+}
+
+func (f *fakeBackuper) Backup(_ context.Context, source CatalogEndpoint, dest BackupDestination) (string, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, source)
+	f.dests = append(f.dests, dest)
+	if f.backupErr != nil {
+		return "", 0, f.backupErr
+	}
+	uri := f.uri
+	if uri == "" {
+		uri = "s3://" + dest.Bucket + "/" + dest.Key
+	}
+	size := f.size
+	if size == 0 {
+		size = 4096
+	}
+	return uri, size, nil
+}
+
+func (f *fakeBackuper) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
 // ---- harness ----------------------------------------------------------------
 
 func testRunner(store *fakeReshardStore, duckling reshardDucklingClient, copier *fakeCopier) *ReshardRunner {
@@ -337,6 +376,7 @@ func testRunner(store *fakeReshardStore, duckling reshardDucklingClient, copier 
 		store:              store,
 		duckling:           duckling,
 		copier:             copier,
+		backuper:           &fakeBackuper{},
 		cpID:               "cp-test",
 		pollInterval:       time.Hour, // scanOnce called manually
 		configPollInterval: time.Millisecond,
@@ -383,6 +423,10 @@ func cnpgSourceStatus() DucklingStatus {
 	st.MetadataStore.User = "mdstore_org"
 	st.MetadataStore.Database = "mdstore_org"
 	st.MetadataStore.Password = "pinned-pw"
+	// Data store (unchanged by a reshard) — the pre-flip backup target.
+	st.DataStore.BucketName = "org-a-data-bucket"
+	st.DataStore.S3Region = "us-east-1"
+	st.IAMRoleARN = "arn:aws:iam::123:role/duckling-org-a"
 	st.ReadyCondition = true
 	return st
 }
@@ -404,7 +448,7 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	if store.op.State != configstore.ReshardStateSucceeded {
 		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
 	}
-	wantSteps := []string{"blocking", "draining", "pausing_compaction", "cutover", "copying", "verifying", "cleaning_up", "finalizing"}
+	wantSteps := []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "cutover", "copying", "verifying", "cleaning_up", "finalizing"}
 	if fmt.Sprint(store.steps) != fmt.Sprint(wantSteps) {
 		t.Fatalf("steps = %v, want %v", store.steps, wantSteps)
 	}
@@ -472,6 +516,9 @@ func TestReshardHappyPathExtToCnpg(t *testing.T) {
 	st.MetadataStore.User = "postgres"
 	st.MetadataStore.Database = "postgres"
 	st.MetadataStore.Password = "rds-pw"
+	st.DataStore.BucketName = "org-a-data-bucket"
+	st.DataStore.S3Region = "us-east-1"
+	st.IAMRoleARN = "arn:aws:iam::123:role/duckling-org-a"
 	st.ReadyCondition = true
 	duckling := &fakeDuckling{status: st}
 	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
@@ -526,7 +573,7 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	if fmt.Sprint(dkinds) != fmt.Sprint([]string{"compaction", "external", "compaction"}) {
 		t.Fatalf("duckling calls = %v, want flip AFTER copy", dkinds)
 	}
-	wantSteps := []string{"blocking", "draining", "pausing_compaction", "copying", "verifying", "cutover", "finalizing"}
+	wantSteps := []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "copying", "verifying", "cutover", "finalizing"}
 	if fmt.Sprint(store.steps) != fmt.Sprint(wantSteps) {
 		t.Fatalf("steps = %v, want %v", store.steps, wantSteps)
 	}
@@ -760,7 +807,6 @@ func (s *stuckExternalDuckling) SetMetadataStoreExternal(_ context.Context, _ st
 	return nil
 }
 
-
 func stuckExtOp() *configstore.ReshardOperation {
 	op := cnpgOp()
 	op.TargetKind = configstore.MetadataStoreKindExternal
@@ -795,6 +841,123 @@ func TestReshardExtFlipTimeoutRecovers(t *testing.T) {
 	// The op still recovers (flip-back + copy-back) and unblocks.
 	if store.warehouseState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("warehouse state = %s, want ready after recovery", store.warehouseState)
+	}
+}
+
+// TestReshardBackupRecordedBeforeFlip pins the pre-flip catalog backup: it runs
+// after pause-compaction and BEFORE the cutover, dumps the RECORDED source
+// endpoint to the org's data bucket under _reshard_catalog_backups/, records
+// backup_s3_uri on the op row, and logs a runnable pg_restore command.
+func TestReshardBackupRecordedBeforeFlip(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: true}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	backuper := &fakeBackuper{}
+	r := testRunner(store, duckling, copier)
+	r.backuper = backuper
+
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
+	}
+	if backuper.count() != 1 {
+		t.Fatalf("backuper called %d times, want 1", backuper.count())
+	}
+	// Backup step is sequenced before cutover.
+	backupIdx, cutoverIdx := -1, -1
+	for i, s := range store.steps {
+		switch s {
+		case "backup_catalog":
+			backupIdx = i
+		case "cutover":
+			cutoverIdx = i
+		}
+	}
+	if backupIdx < 0 || cutoverIdx < 0 || backupIdx > cutoverIdx {
+		t.Fatalf("backup_catalog (%d) must precede cutover (%d): steps=%v", backupIdx, cutoverIdx, store.steps)
+	}
+	// The dump reads the recorded pre-flip source, not the post-flip target.
+	if !strings.HasPrefix(backuper.calls[0].Host, "shard-001-pooler") {
+		t.Fatalf("backup read from %q, want the recorded shard-001 source", backuper.calls[0].Host)
+	}
+	// Destination: org data bucket, reserved prefix, org IAM role.
+	dest := backuper.dests[0]
+	if dest.Bucket != "org-a-data-bucket" || dest.RoleARN != "arn:aws:iam::123:role/duckling-org-a" {
+		t.Fatalf("backup dest bucket/role = %q/%q", dest.Bucket, dest.RoleARN)
+	}
+	if !strings.HasPrefix(dest.Key, "_reshard_catalog_backups/op-1-") || !strings.HasSuffix(dest.Key, ".dump") {
+		t.Fatalf("backup key = %q, want _reshard_catalog_backups/op-1-<ts>.dump", dest.Key)
+	}
+	if store.op.BackupS3URI != "s3://org-a-data-bucket/"+dest.Key {
+		t.Fatalf("op.BackupS3URI = %q, want the uploaded URI", store.op.BackupS3URI)
+	}
+	if !store.hasLog("catalog backup complete") || !store.hasLog("pg_restore --no-owner") {
+		t.Fatalf("backup URI + restore command missing from log: %v", store.logs)
+	}
+	if !store.hasLog("pre-flip catalog backup: s3://org-a-data-bucket/") {
+		t.Fatalf("backup URI missing from end-of-op report: %v", store.logs)
+	}
+}
+
+// TestReshardBackupFailureCnpgToExtFailsBeforeFlip pins the HARD gate: on the
+// destructive cnpg→external direction a backup failure fails the op BEFORE the
+// flip — no cutover, source untouched, warehouse returned to ready.
+func TestReshardBackupFailureCnpgToExtFailsBeforeFlip(t *testing.T) {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	r := testRunner(store, duckling, copier)
+	r.backuper = &fakeBackuper{backupErr: fmt.Errorf("pg_dump exploded")}
+	r.StashExternalPassword(op.ID, "ext-pw")
+
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "backup is mandatory") {
+		t.Fatalf("state=%s err=%q, want mandatory-backup failure", store.op.State, store.op.Error)
+	}
+	for _, k := range duckling.callKinds() {
+		if k == "external" {
+			t.Fatal("destructive flip must NOT run when the pre-flip backup failed")
+		}
+	}
+	for _, k := range copier.kinds() {
+		if k == "copy" {
+			t.Fatal("copy must not run when the mandatory backup failed")
+		}
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after rollback", store.warehouseState)
+	}
+}
+
+// TestReshardBackupFailureNonDestructiveContinues pins best-effort semantics:
+// on a non-destructive direction (cnpg→cnpg, source survives) a backup failure
+// logs a warning and the op proceeds to succeed.
+func TestReshardBackupFailureNonDestructiveContinues(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: true}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	r := testRunner(store, duckling, copier)
+	r.backuper = &fakeBackuper{backupErr: fmt.Errorf("s3 upload timed out")}
+
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want succeeded despite best-effort backup failure", store.op.State, store.op.Error)
+	}
+	if !store.hasLog("pre-flip catalog backup failed") {
+		t.Fatalf("best-effort backup-failure warning missing: %v", store.logs)
+	}
+	if store.op.BackupS3URI != "" {
+		t.Fatalf("op.BackupS3URI = %q, want empty when backup failed", store.op.BackupS3URI)
 	}
 }
 

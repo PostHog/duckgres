@@ -17,9 +17,10 @@ those stay valid because the bucket is untouched.
 
 | Piece | Where |
 |---|---|
-| Operation row + verbose log (config store) | `controlplane/configstore/reshard.go`, migration `000018` |
+| Operation row + verbose log (config store) | `controlplane/configstore/reshard.go`, migrations `000018` + `000021` (backup URI) |
 | Runner (claims + executes ops) | `controlplane/provisioner/reshard_runner.go` |
 | Catalog copier (schema + rows + verify) | `controlplane/provisioner/catalog_copy.go` |
+| Pre-flip catalog backuper (pg_dump → S3) | `controlplane/provisioner/catalog_backup.go` |
 | Duckling CR patches (flip, compaction pause) | `controlplane/provisioner/k8s_client.go` |
 | Admin REST API (start/read/cancel + `GET /reshards/targets` destination discovery: all cnpg shards incl. empty ones via the cluster-topology pod read, RBAC-degrading to occupied shards; known external stores from live warehouse rows) | `controlplane/admin/reshard.go` |
 | Console UI (form + operation page with live log) | `admin/ui/src/pages/ReshardForm.tsx`, `ReshardOperation.tsx` |
@@ -36,8 +37,8 @@ Crossplane **deletes** the cnpg role/DB (`managementPolicies: ["*"]`).
 ## Step machine (→cnpg targets)
 
 ```
-blocking → draining → pausing_compaction → cutover → copying → verifying
-        → cleaning_up → finalizing
+blocking → draining → pausing_compaction → backup_catalog → cutover → copying
+        → verifying → cleaning_up → finalizing
 ```
 
 1. **blocking** — CAS warehouse `ready→resharding` inside a transaction
@@ -65,14 +66,19 @@ blocking → draining → pausing_compaction → cutover → copying → verifyi
    absent). Residual window: an already-running millpond Job (≤30m, source
    endpoint baked in) can outlive the pause — covered by the verify step and
    the cleanup fence.
-4. **cutover** — record the FULL source connection info from CR status first,
+4. **backup_catalog** — the safety net (§ Pre-flip catalog backup below). Dump
+   the SOURCE catalog to the org's own S3 data bucket BEFORE any flip. Runs for
+   every direction; the source is quiescent here (post-drain, compaction paused)
+   and `recordSource` (which the runner runs just before this step) has resolved
+   the source endpoint + password.
+5. **cutover** — record the FULL source connection info from CR status first,
    then patch `cnpgShard` (and `type` for ext→cnpg; the external block is
    left in spec, ignored). Wait: CR status endpoint on the target pooler,
    Ready condition, `SELECT 1` with tenant creds. Timeout → rollback. The
    wait is bounded per-op by `cutover_timeout_seconds` (0 = default 15m /
    `DUCKGRES_RESHARD_FLIP_TIMEOUT`); real cnpg cutovers need minutes —
    provider-sql role/DB creation plus cnpg SASL credential propagation.
-5. **copying** — source read via its recorded pre-flip endpoint (the orphaned
+6. **copying** — source read via its recorded pre-flip endpoint (the orphaned
    role/DB survives a shard flip; an ext source is reached direct-to-RDS with
    TLS because the flip deletes its ESO sync + pgbouncer). One
    REPEATABLE READ read-only transaction = consistent snapshot; faithful DDL
@@ -81,15 +87,15 @@ blocking → draining → pausing_compaction → cutover → copying → verifyi
    CONSTRAINT already made them). No sequences exist in the DuckLake catalog
    (next-ids are rows). A `pg_advisory_lock` in the TARGET database fences a
    zombie ex-runner for copy+verify.
-6. **verifying** — per-table counts (snapshot vs target), then re-read the
+7. **verifying** — per-table counts (snapshot vs target), then re-read the
    source OUTSIDE the transaction: any change means a concurrent writer
    (straggler compactor, stray client) → rollback.
-7. **cleaning_up** — **cnpg sources only**: `DROP DATABASE … WITH (FORCE)`
+8. **cleaning_up** — **cnpg sources only**: `DROP DATABASE … WITH (FORCE)`
    via the source pooler (`dbname=postgres`; the tenant role owns the DB).
    Also the fence that makes any straggler writer fail loudly. Failure is
    ERROR-logged but doesn't fail the op. The role stays (cannot drop itself).
    **External sources are never modified.**
-8. **finalizing** — restore compaction exactly, reconcile the warehouse
+9. **finalizing** — restore compaction exactly, reconcile the warehouse
    config-store row (kind/endpoint/secret fields), CAS `resharding→ready`,
    write the **report** (maintenance duration = blocked→unblocked, per-op
    counters: tables/rows/bytes) into the log. New sessions cold-spawn workers
@@ -97,12 +103,78 @@ blocking → draining → pausing_compaction → cutover → copying → verifyi
    (`migrationChecked` is orgID-keyed and endpoint-independent;
    `ducklake.migrations` is DSN-keyed → new endpoint = new entry).
 
+## Pre-flip catalog backup (safety net)
+
+Before a reshard mutates the catalog, the runner dumps the **source** catalog to
+the org's **own** S3 data bucket, so a catalog damaged or lost at the flip is a
+one-command restore away rather than an RDS-PITR archaeology dig. Only the
+Postgres catalog metadata is ever at risk in a reshard (the S3 parquet data is
+never touched), and this backs up exactly that. Layer C of defense-in-depth:
+independent of the live copy/verify and of orphan-adopt — the artifact survives
+even if both live copies are damaged, and covers all directions.
+
+- **What**: `pg_dump --format=custom --no-owner --schema=public` of the source
+  (the `ducklake_*` tables). Custom format → restore with stock `pg_restore`.
+  The DB password is passed via `PGPASSWORD` env, **never argv**. Source DSN is
+  the same the copy step uses (`o.source`, recorded pre-flip: external →
+  `sslmode=require` direct to RDS, cnpg → `sslmode=disable` via the pooler).
+  `catalog_backup.go::PGCatalogBackuper`.
+- **Where**: `s3://<org-data-bucket>/_reshard_catalog_backups/op-<opID>-<UTC
+  timestamp>.dump`. Bucket + region come from the duckling CR status
+  (`status.dataStore.bucketName` / `s3Region`); the reserved
+  `_reshard_catalog_backups/` prefix keeps backups clear of DuckLake's parquet.
+- **Creds**: the upload assumes the org's **own** IAM role
+  (`status.iamRoleARN`) via the same STS broker the worker activator uses for
+  DuckLake S3 access — the CP writes to the org bucket with short-lived,
+  org-scoped credentials, no worker required. The broker is injected into the
+  runner from `multitenant.go` (the STS broker lives in the `controlplane`
+  package; the runner takes an `AssumeRoleFunc` to avoid the import cycle).
+- **Gate strength by direction**:
+  - **cnpg→external (destructive)**: a dump- or upload-failure **fails the op
+    before the flip** — never destroy the source without a durable snapshot.
+  - **ext→cnpg, cnpg→cnpg (non-destructive)**: the source is left
+    intact/orphaned, so the backup is belt-and-suspenders — a failure logs a
+    warning and the op continues.
+- **Recorded + logged**: the artifact's `s3://` URI lands on the op row
+  (`backup_s3_uri`, migration `000021`) and in the op log, alongside the exact
+  `pg_restore` command an operator can run.
+
+### Restore procedure
+
+The op log carries the ready-to-run command (host/user/db name the recorded
+source; the password is a `<PASSWORD>` placeholder — supply the target catalog
+DB's password). To recover a catalog into a target DB:
+
+```
+aws s3 cp s3://<org-data-bucket>/_reshard_catalog_backups/op-<id>-<ts>.dump ./catalog.dump
+PGPASSWORD=<password> pg_restore --no-owner --clean --if-exists --format=custom \
+  --host=<catalog-host> --port=5432 --username=<user> --dbname=<db> ./catalog.dump
+```
+
+Point `--dbname` at whichever catalog DB needs the data — usually the org's
+CURRENT catalog after a bad flip. `--clean --if-exists` makes the restore
+idempotent (drops each `ducklake_*` object before recreating it).
+
+### Retention
+
+Backups are **kept**, not deleted on success — a subtly corrupted catalog can be
+noticed days later, and the escape-hatch direction is exactly when you want the
+net to persist. Every object carries the tag `duckgres-reshard-catalog-backup=1`
+and lives under the `_reshard_catalog_backups/` prefix, so a single S3 lifecycle
+rule expires them without touching DuckLake data. **Suggested rule** (on the
+per-org data bucket, or a bucket-wide default): expire objects under prefix
+`_reshard_catalog_backups/` after **30 days**. A catalog is tens of MB to
+~100 MB, so even frequent reshards stay negligible against the parquet data —
+but the lifecycle rule guarantees they never accumulate unbounded. No in-app GC
+is built; the lifecycle rule is the retention mechanism.
+
 ## cnpg→external (escape hatch): copy-before-flip
 
 The type flip DELETES the cnpg source role/DB, so this direction inverts the
-order: `blocking → draining → pausing_compaction → copying → verifying →
-cutover → finalizing`. The flip IS the source cleanup and only runs after
-verify passed.
+order: `blocking → draining → pausing_compaction → backup_catalog → copying →
+verifying → cutover → finalizing`. The flip IS the source cleanup and only runs
+after verify passed. `backup_catalog` still runs first, and for this
+destructive direction it is a **hard prerequisite** (see below).
 
 The target password is **ephemeral**: sent once in the start request,
 validated by connecting, handed in-process to the local runner, never
@@ -204,13 +276,21 @@ where the source is rebuilt rather than left untouched.
 Unit: `configstore` (tests/configstore/reshard_postgres_test.go — claim CAS,
 takeover fencing, cancel, log pagination, the grant-path gate),
 `provisioner/reshard_runner_test.go` (all three directions, rollbacks, cancel,
-ephemeral-password loss), `admin/reshard_test.go` (validation incl. the
+ephemeral-password loss, the pre-flip backup: recorded before the flip, the
+destructive-direction hard-fail-before-flip, the non-destructive
+warning-and-continue), `admin/reshard_test.go` (validation incl. the
 ESO-name allowlist + the pre-flight connection-check pass/fail/skip, secrets
-never persisted). e2e (`tests/mw-dev/e2e/harness.sh`): validation 400s (incl. a
+never persisted). The `backup_s3_uri` column is asserted in
+`tests/configstore/migrations_postgres_test.go` (migration `000021`). e2e
+(`tests/mw-dev/e2e/harness.sh`): validation 400s (incl. a
 non-allowlisted external secret name),
 cancel-during-drain (drain-not-kill + 57P03 visible), bogus-shard rollback
 (real flip → Synced=False → rollback, data intact), and the **ext→cnpg
-positive path** (real catalog move off the harness RDS onto shard-001).
+positive path** (real catalog move off the harness RDS onto shard-001), which
+also asserts the pre-flip backup completed and recorded a `backup_s3_uri` under
+`_reshard_catalog_backups/` (the Job has no aws CLI, so it asserts the recorded
+URI + restore command in the op log, not an S3 list — same limitation as the
+tenant-isolation object-store half).
 cnpg→cnpg positive path needs a second mw-dev shard (follow-up infra);
 cnpg→ext positive path is unit-test-only (the harness has no RDS password —
 the start API requires it ephemerally).

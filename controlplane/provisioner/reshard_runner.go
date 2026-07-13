@@ -21,18 +21,22 @@ import (
 // runner epoch on every write, so a zombie ex-runner can never corrupt an op
 // another replica took over.
 //
-// Step order for →cnpg targets: block → drain → pause compaction → flip →
-// wait target → copy (source survives the flip: a shard change re-points the
-// provider-sql MRs in place, orphaning the old role/DB) → verify stability →
-// cleanup source (cnpg sources only) → finalize.
+// Step order for →cnpg targets: block → drain → pause compaction → backup
+// catalog (pre-flip pg_dump of the source to the org's S3 bucket — the safety
+// net) → flip → wait target → copy (source survives the flip: a shard change
+// re-points the provider-sql MRs in place, orphaning the old role/DB) → verify
+// stability → cleanup source (cnpg sources only) → finalize.
 //
 // cnpg→external inverts copy and flip: the type flip makes the composition
 // stop rendering the cnpg Role/Database MRs and Crossplane DELETES them, so
-// the flip IS the source cleanup and only runs after the copy verified.
+// the flip IS the source cleanup and only runs after the copy verified. The
+// pre-flip backup still runs first, and for THIS destructive direction it is a
+// HARD prerequisite (a backup failure fails the op before the flip).
 type ReshardRunner struct {
 	store    reshardStore
 	duckling reshardDucklingClient
 	copier   CatalogCopier
+	backuper CatalogBackuper
 	cpID     string
 
 	// pollInterval is the claim-scan cadence; configPollInterval is the CP
@@ -101,7 +105,10 @@ type reshardDucklingClient interface {
 // converge before rolling back. Individual operations override it per-op via
 // cutover_timeout_seconds (what the e2e's bogus-shard rollback uses to stay
 // fast without shortening real cutovers).
-func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, cpID string, configPollInterval time.Duration) *ReshardRunner {
+// backuper is the pre-flip catalog backuper (nil-safe: a nil backuper skips the
+// best-effort backup on non-destructive directions and HARD-fails the
+// destructive cnpg→external direction, which must never flip without a backup).
+func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, cpID string, configPollInterval time.Duration, backuper CatalogBackuper) *ReshardRunner {
 	flipTimeout := 15 * time.Minute
 	if v := os.Getenv("DUCKGRES_RESHARD_FLIP_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -114,6 +121,7 @@ func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, 
 		store:              store,
 		duckling:           duckling,
 		copier:             PGCatalogCopier{},
+		backuper:           backuper,
 		cpID:               cpID,
 		baseCtx:            context.Background(),
 		pollInterval:       10 * time.Second,
@@ -381,6 +389,9 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 	if err := o.recordSource(ctx); err != nil {
 		return err
 	}
+	if err := o.backupCatalog(ctx); err != nil {
+		return err
+	}
 
 	toExternal := o.op.TargetKind == configstore.MetadataStoreKindExternal
 	if toExternal {
@@ -620,6 +631,93 @@ func (o *opRun) recordSource(ctx context.Context) error {
 	o.op.SourceDatabase = ms.Database
 	o.logf("info", "recorded source metadata store: %s", o.source.Redacted())
 	return nil
+}
+
+// isDestructiveDirection reports whether this op's flip is destructive at the
+// source — the cnpg→external escape hatch, where the type flip makes Crossplane
+// DELETE the cnpg source role/DB. For that direction the pre-flip backup is a
+// HARD prerequisite; every other direction leaves the source intact/orphaned,
+// so a failed backup is only belt-and-suspenders.
+func (o *opRun) isDestructiveDirection() bool {
+	return o.op.SourceKind == configstore.MetadataStoreKindCnpgShard &&
+		o.op.TargetKind == configstore.MetadataStoreKindExternal
+}
+
+// backupCatalog dumps the SOURCE catalog to the org's own S3 data bucket under
+// _reshard_catalog_backups/ BEFORE any flip, so a catalog lost at the cutover
+// is a one-command pg_restore away. Gate strength by direction: for the
+// destructive cnpg→external escape hatch a backup failure FAILS the op before
+// the flip (never destroy the source without a durable snapshot); for
+// non-destructive directions (the source survives) a failure is logged and the
+// op continues. Runs after drain + pause-compaction (source is quiescent) and
+// after recordSource (o.source is resolved, including an external source's
+// password).
+func (o *opRun) backupCatalog(ctx context.Context) error {
+	if err := o.step("backup_catalog"); err != nil {
+		return err
+	}
+	destructive := o.isDestructiveDirection()
+
+	if o.r.backuper == nil {
+		return o.backupFailed(destructive, fmt.Errorf("no catalog backuper configured (STS/S3 unavailable)"))
+	}
+
+	// The org's data bucket + region + IAM role come from the live CR status.
+	st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+	if err != nil {
+		return o.backupFailed(destructive, fmt.Errorf("read duckling status for backup: %w", err))
+	}
+	bucket := st.DataStore.BucketName
+	if bucket == "" || st.IAMRoleARN == "" {
+		return o.backupFailed(destructive, fmt.Errorf("duckling status missing data bucket (%q) or IAM role (%q) — cannot back up catalog", bucket, st.IAMRoleARN))
+	}
+
+	ts := time.Now().UTC().Format("20060102T150405Z")
+	key := fmt.Sprintf("%sop-%d-%s.dump", backupPrefix, o.op.ID, ts)
+	dest := BackupDestination{Bucket: bucket, Key: key, Region: st.DataStore.S3Region, RoleARN: st.IAMRoleARN}
+
+	o.logf("info", "backing up source catalog %s → s3://%s/%s before the flip%s",
+		o.source.Redacted(), bucket, key,
+		map[bool]string{true: " (HARD prerequisite: cnpg→external destroys the source at the flip)", false: ""}[destructive])
+	uri, size, err := o.r.backuper.Backup(ctx, o.source, dest)
+	if err != nil {
+		return o.backupFailed(destructive, fmt.Errorf("catalog backup: %w", err))
+	}
+	if err := o.fields(map[string]interface{}{"backup_s3_uri": uri}); err != nil {
+		return err
+	}
+	o.op.BackupS3URI = uri
+	o.logf("info", "catalog backup complete: %s (%d bytes)", uri, size)
+	o.logf("info", "recover this catalog with: %s", restoreCommand(uri, o.source))
+	return nil
+}
+
+// backupFailed applies the direction gate to a backup failure: a hard error for
+// the destructive cnpg→external direction (fails the op before the flip), a
+// warning-and-continue for every other direction.
+func (o *opRun) backupFailed(destructive bool, err error) error {
+	if destructive {
+		return fmt.Errorf("pre-flip catalog backup is mandatory for the destructive cnpg→external direction: %w", err)
+	}
+	o.logf("warn", "pre-flip catalog backup failed: %v — continuing (this direction leaves the source intact, so the backup is belt-and-suspenders, not a prerequisite)", err)
+	return nil
+}
+
+// restoreCommand renders the exact operator-runnable recovery command: download
+// the artifact from S3 and pg_restore it into a target catalog DB. The target
+// host/user/db name the recorded source (not secrets); the password is a
+// <PASSWORD> placeholder so this is safe to log. Point --dbname at whichever
+// catalog DB needs the data (usually the org's CURRENT catalog after a bad
+// flip).
+func restoreCommand(uri string, target CatalogEndpoint) string {
+	port := target.Port
+	if port == 0 {
+		port = 5432
+	}
+	return fmt.Sprintf(
+		"aws s3 cp %s ./catalog.dump && PGPASSWORD=<PASSWORD> pg_restore --no-owner --clean --if-exists --format=custom "+
+			"--host=%s --port=%d --username=%s --dbname=%s ./catalog.dump",
+		uri, target.Host, port, target.User, target.Database)
 }
 
 // flipToCnpg patches the duckling to the target cnpg shard and waits for the
@@ -1056,6 +1154,9 @@ func (o *opRun) report(state configstore.ReshardState) {
 	}
 	if o.op.TablesCopied > 0 || state == configstore.ReshardStateSucceeded {
 		lines = append(lines, fmt.Sprintf("copied: %d tables, %d rows, %d bytes", o.op.TablesCopied, o.op.RowsCopied, o.op.BytesCopied))
+	}
+	if o.op.BackupS3URI != "" {
+		lines = append(lines, "pre-flip catalog backup: "+o.op.BackupS3URI)
 	}
 	if o.op.SourceKind == configstore.MetadataStoreKindExternal {
 		lines = append(lines, "external source: left untouched")
