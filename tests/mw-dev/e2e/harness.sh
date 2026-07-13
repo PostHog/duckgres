@@ -2253,6 +2253,18 @@ duckling_shard_backfill() { # cnpgOrg
 # cnpg→ext flip against an unreadable secret. The validation loop below does
 # pin the rds-master-name 400, the up-front defense for the same failure.
 
+reshard_backup_debug() { # opid — focused debug for a backup-assert failure:
+  # the op log's backup-related lines (bounded, so stream truncation can't eat
+  # them) plus the runner pod's own stdout (the slog lines carry the exact
+  # error the op log only summarizes). Best effort — the reconciler may have
+  # reaped the pod already.
+  echo "---- op $1 backup-related log lines ----"
+  curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=0&limit=2000" 2>/dev/null \
+    | jq -r '.entries[] | select(.message | test("(?i)backup|sts|assume|s3")) | "\(.level): \(.message)"' || true
+  echo "---- runner pod duckgres-reshard-op-$1 logs (tail) ----"
+  k logs "duckgres-reshard-op-$1" --tail=150 2>/dev/null || echo "(runner pod already gone)"
+}
+
 reshard_pod_wait() { # opid timeout_s — wait until the runner pod exists
   deadline=$(( $(date +%s) + $2 ))
   until k get pod "duckgres-reshard-op-$1" >/dev/null 2>&1; do
@@ -2473,10 +2485,10 @@ reshard_ext_to_cnpg() { # ext-org password
   # we assert the recorded URI + restore command instead — same limitation the
   # tenant_isolation object-store-prefix half documents. The S3 write itself is
   # proven by the runner not warning "pre-flip catalog backup failed".)
-  reshard_log_has "$opid" "catalog backup complete" || { reshard_dump_log "$opid"; fail "reshard ext→cnpg: pre-flip catalog backup did not complete"; }
+  reshard_log_has "$opid" "catalog backup complete" || { reshard_backup_debug "$opid"; reshard_dump_log "$opid"; fail "reshard ext→cnpg: pre-flip catalog backup did not complete"; }
   reshard_log_has "$opid" "pg_restore --no-owner" || fail "reshard ext→cnpg: restore command missing from op log"
   if reshard_log_has "$opid" "pre-flip catalog backup failed"; then
-    reshard_dump_log "$opid"; fail "reshard ext→cnpg: catalog backup failed (best-effort warning present)"
+    reshard_backup_debug "$opid"; reshard_dump_log "$opid"; fail "reshard ext→cnpg: catalog backup failed (best-effort warning present)"
   fi
   buri="$(curl -fsS -H "$H" "$API/api/v1/reshards/$opid" | jq -r '.backup_s3_uri // ""')"
   case "$buri" in

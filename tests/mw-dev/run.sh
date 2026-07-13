@@ -435,6 +435,19 @@ cmd_diagnostics() {
   echo "::group::worker pods"
   "${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-worker -o wide || true
   echo "::endgroup::"
+  echo "::group::reshard runner pods (spec + logs)"
+  # Reshard ops execute in dedicated duckgres-reshard-op-<id> pods; their
+  # stdout carries the step machine's slog lines (incl. the exact error of a
+  # best-effort backup failure that the op log only summarizes). Describe
+  # shows whether pod-identity env/volume injection happened.
+  "${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-reshard -o wide || true
+  for p in $("${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-reshard -o name 2>/dev/null); do
+    echo "---- $p describe (tail) ----"
+    "${KUBECTL[@]}" -n "$NS" describe "$p" 2>/dev/null | tail -40 || true
+    echo "---- $p logs ----"
+    "${KUBECTL[@]}" -n "$NS" logs "$p" --tail=300 2>/dev/null || true
+  done
+  echo "::endgroup::"
   echo "::group::scenario jobs"
   "${KUBECTL[@]}" -n "$NS" get job,pod -l job-name -o wide || true
   echo "::endgroup::"

@@ -70,7 +70,15 @@ func RunReshardRunnerMode(cfg ReshardRunnerModeConfig) error {
 
 	// Pre-flip catalog backuper: same nil-degrade contract as before — without
 	// STS the runner skips the best-effort backup on non-destructive directions
-	// and hard-fails the destructive cnpg→external direction.
+	// and hard-fails the destructive cnpg→external direction. Log the AWS
+	// credential CONTEXT (presence booleans only, never values) so a
+	// backup-step credential failure is diagnosable from the pod log alone:
+	// pod-identity injection shows up as AWS_CONTAINER_CREDENTIALS_FULL_URI,
+	// IRSA as AWS_WEB_IDENTITY_TOKEN_FILE.
+	slog.Info("Reshard runner AWS context.",
+		"region", cfg.AWSRegion,
+		"container_creds_env", os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "",
+		"web_identity_env", os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "")
 	var backuper provisioner.CatalogBackuper
 	if cfg.AWSRegion != "" {
 		if stsBroker, err := NewSTSBroker(ctx, cfg.AWSRegion); err != nil {
