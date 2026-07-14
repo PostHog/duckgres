@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
@@ -61,6 +62,13 @@ type ReshardRunner struct {
 	// loopPoll is the inner-loop poll cadence (drain checks, flip waits,
 	// cancel checks). 5s in production; tests shrink it.
 	loopPoll time.Duration
+	// progressLogInterval is how often a wait loop (drain, flip converge,
+	// orphan-policy wait, recovery) writes what it currently observes to the
+	// op log. 15s in production; tests shrink it. Every wait loop MUST emit
+	// periodic observations at this cadence — a silent multi-minute poll loop
+	// is undebuggable from the op log (the mw-dev recovery that spun for ~8
+	// minutes on SASL auth failures with zero diagnostics).
+	progressLogInterval time.Duration
 
 	// extPasswords holds the EPHEMERAL external passwords by op id: the
 	// cnpg→ext target password (pulled from the creating CP replica's stash
@@ -124,18 +132,57 @@ func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, 
 		}
 	}
 	return &ReshardRunner{
-		store:              store,
-		duckling:           duckling,
-		copier:             PGCatalogCopier{},
-		backuper:           backuper,
-		cpID:               cpID,
-		configPollInterval: configPollInterval,
-		heartbeatInterval:  30 * time.Second,
-		staleAfter:         5 * time.Minute,
-		flipTimeout:        flipTimeout,
-		hotIdleGrace:       30 * time.Second,
-		loopPoll:           5 * time.Second,
+		store:               store,
+		duckling:            duckling,
+		copier:              PGCatalogCopier{},
+		backuper:            backuper,
+		cpID:                cpID,
+		configPollInterval:  configPollInterval,
+		heartbeatInterval:   30 * time.Second,
+		staleAfter:          5 * time.Minute,
+		flipTimeout:         flipTimeout,
+		hotIdleGrace:        30 * time.Second,
+		loopPoll:            5 * time.Second,
+		progressLogInterval: 15 * time.Second,
 	}
+}
+
+// isAuthProbeError reports whether a catalog-probe failure is an
+// authentication failure: SQLSTATE 28P01 (invalid_password) / 28000
+// (invalid_authorization_specification), or the "SASL authentication failed" /
+// "password authentication failed" server messages (pgbouncer/poolers vary in
+// which they emit). pgx surfaces these as a *pgconn.PgError inside the connect
+// error chain; the string match covers errors that arrive pre-flattened.
+func isAuthProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "28P01" || pgErr.Code == "28000") {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "sasl authentication failed") ||
+		strings.Contains(msg, "password authentication failed")
+}
+
+// describeProbeFailure renders a tenant-role probe failure for the op log.
+// Authentication failures are named explicitly, with the operator remedy: the
+// role's ACTUAL Postgres password differing from the freshly published status
+// password (a stranded password — e.g. a re-adopted role whose status password
+// the composition regenerated) is effectively permanent, and retrying to the
+// timeout cannot fix it by itself. We keep polling anyway (a composition fix
+// can converge the password mid-wait, and bailing early would leave the org
+// worse off), but the log must tell the operator what to do.
+//
+// Safe to log verbatim: Probe wraps the endpoint via CatalogEndpoint.Redacted()
+// (password elided) and pgx's ConnectError/PgError texts carry user/database
+// but never the password.
+func describeProbeFailure(err error, role string) string {
+	if !isAuthProbeError(err) {
+		return fmt.Sprintf("tenant-role probe failing: %v", err)
+	}
+	return fmt.Sprintf("tenant-role probe failing with an AUTHENTICATION error: %v — the role's actual Postgres password likely differs from the published status password (stranded password). If this persists, align it manually on the shard primary: ALTER ROLE %s WITH PASSWORD '<status password>' (take the password from the duckling CR status — it is never logged here)", err, role)
 }
 
 // StashExternalPassword hands the runner the ephemeral external-target
@@ -587,7 +634,7 @@ func (o *opRun) drain(ctx context.Context) error {
 			return nil
 		}
 
-		if time.Since(lastLog) >= 15*time.Second {
+		if time.Since(lastLog) >= o.r.progressLogInterval {
 			o.logf("info", "waiting for connections to drain: %d active sessions, %d queued connections, %d live workers",
 				conns.ActiveLeases, conns.QueuedConns, len(workers))
 			lastLog = time.Now()
@@ -806,8 +853,10 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 	o.flipped = true
 
 	targetPrefix := o.op.ToShard + "-pooler."
+	o.logf("info", "cutover patch applied; waiting up to %s for the composition to converge on %s* and the tenant role to answer", o.flipTimeout(), targetPrefix)
 	deadline := time.Now().Add(o.flipTimeout())
 	lastLog := time.Time{}
+	lastObserved := "no successful duckling read yet"
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -816,7 +865,7 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 			return errReshardCancelled
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("target shard %s did not become ready within %s", o.op.ToShard, o.flipTimeout())
+			return fmt.Errorf("target shard %s did not become ready within %s; last observation: %s", o.op.ToShard, o.flipTimeout(), lastObserved)
 		}
 
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -826,22 +875,24 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
 				SSLMode: "disable",
 			}
-			if probeErr := o.r.copier.Probe(ctx, o.target); probeErr == nil {
+			probeErr := o.r.copier.Probe(ctx, o.target)
+			if probeErr == nil {
 				o.logf("info", "target ready: duckling converged on %s and the tenant role answers", st.MetadataStore.Endpoint)
 				return nil
-			} else if time.Since(lastLog) >= 15*time.Second {
-				o.logf("info", "waiting for target: composition converged, probe still failing: %v", probeErr)
-				lastLog = time.Now()
 			}
-		} else if time.Since(lastLog) >= 15*time.Second {
+			lastObserved = "composition converged, " + describeProbeFailure(probeErr, st.MetadataStore.User)
+		} else {
 			switch {
 			case err != nil:
-				o.logf("info", "waiting for target: reading duckling failed: %v", err)
+				lastObserved = fmt.Sprintf("reading duckling failed: %v", err)
 			case st.SyncedFalseMessage != "":
-				o.logf("info", "waiting for target: duckling Synced=False: %s", st.SyncedFalseMessage)
+				lastObserved = "duckling Synced=False: " + st.SyncedFalseMessage
 			default:
-				o.logf("info", "waiting for target: duckling endpoint %q, ready=%t", st.MetadataStore.Endpoint, st.ReadyCondition)
+				lastObserved = fmt.Sprintf("duckling endpoint %q, ready=%t", st.MetadataStore.Endpoint, st.ReadyCondition)
 			}
+		}
+		if time.Since(lastLog) >= o.r.progressLogInterval {
+			o.logf("info", "waiting for target: %s", lastObserved)
 			lastLog = time.Now()
 		}
 		time.Sleep(o.r.loopPoll)
@@ -914,7 +965,7 @@ func (o *opRun) orphanCnpgSource(ctx context.Context) error {
 		default:
 			lastObserved = detail
 		}
-		if time.Since(lastLog) >= 15*time.Second {
+		if time.Since(lastLog) >= o.r.progressLogInterval {
 			o.logf("info", "waiting for the cnpg source MRs to reflect the retain (no-Delete) policy: %s", lastObserved)
 			lastLog = time.Now()
 		}
@@ -943,8 +994,10 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 	o.flipped = true
 
 	providedPassword := o.target.Password
+	o.logf("info", "cutover patch applied; waiting up to %s for the external target (ESO password sync + Ready condition)", o.flipTimeout())
 	deadline := time.Now().Add(o.flipTimeout())
 	lastLog := time.Time{}
+	lastObserved := "no successful duckling read yet"
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -952,13 +1005,14 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 		// No cancel check: past this flip the only ways out are forward or
 		// the orphan-adopt recovery in rollback().
 		if time.Now().After(deadline) {
-			return fmt.Errorf("external target did not become ready within %s (ESO secret %q missing, unreadable, or wrong? the ESO role can only read allowed secret NAME patterns — e.g. duckling-*/posthog-* — and the value must be the raw password string)", o.flipTimeout(), o.op.TargetPasswordSecret)
+			return fmt.Errorf("external target did not become ready within %s (ESO secret %q missing, unreadable, or wrong? the ESO role can only read allowed secret NAME patterns — e.g. duckling-*/posthog-* — and the value must be the raw password string); last observation: %s", o.flipTimeout(), o.op.TargetPasswordSecret, lastObserved)
 		}
 
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
 		switch {
 		case err != nil:
 			// transient — keep polling
+			lastObserved = fmt.Sprintf("reading duckling failed: %v", err)
 		case st.MetadataStore.Type == configstore.MetadataStoreKindExternal && st.MetadataStore.Password != "":
 			if st.MetadataStore.Password != providedPassword {
 				return fmt.Errorf("ESO-synced password from secret %q does not match the password the catalog was copied with — fix the secret and re-run", o.op.TargetPasswordSecret)
@@ -967,13 +1021,15 @@ func (o *opRun) flipToExternal(ctx context.Context) error {
 				o.logf("info", "external target ready: ESO password synced and matches, duckling Ready")
 				return nil
 			}
+			lastObserved = "ESO password synced and matches, but the duckling is not Ready yet"
+		default:
+			lastObserved = fmt.Sprintf("duckling type %q, ESO password synced=%t, ready=%t", st.MetadataStore.Type, st.MetadataStore.Password != "", st.ReadyCondition)
 		}
-		if time.Since(lastLog) >= 15*time.Second {
-			msg := "waiting for external target (ESO password sync + Ready condition)"
-			if err == nil && st.SyncedFalseMessage != "" {
-				msg += ": " + st.SyncedFalseMessage
-			}
-			o.logf("info", "%s", msg)
+		if err == nil && st.SyncedFalseMessage != "" {
+			lastObserved += "; duckling Synced=False: " + st.SyncedFalseMessage
+		}
+		if time.Since(lastLog) >= o.r.progressLogInterval {
+			o.logf("info", "waiting for external target (ESO password sync + Ready condition): %s", lastObserved)
 			lastLog = time.Now()
 		}
 		time.Sleep(o.r.loopPoll)
@@ -1319,25 +1375,51 @@ func (o *opRun) recoverFromExternal(ctx context.Context) {
 	}
 
 	// Wait for the composition to re-adopt the role/DB on the source shard and
-	// the tenant role to answer again.
+	// the tenant role to answer again. NEVER silently: this loop logs what it
+	// observes every progressLogInterval — a recovery that spins on a failing
+	// probe (e.g. SASL auth failures from a stranded re-adopted-role password,
+	// the mw-dev incident) must be diagnosable from the op log alone, and the
+	// terminal timeout line must carry the last observation (the root cause).
+	// An auth probe failure is effectively permanent, but we still poll to the
+	// deadline rather than bail: a charts/composition fix can converge the
+	// password mid-wait, and giving up early would leave the org worse off.
 	sourcePrefix := o.op.FromShard + "-pooler."
+	o.logf("info", "recovery: waiting up to %s for the composition to re-adopt the cnpg role/DB on %s* and for the tenant role to answer", o.flipTimeout(), sourcePrefix)
 	deadline := time.Now().Add(o.flipTimeout())
+	lastLog := time.Time{}
+	lastObserved := "no successful duckling read yet"
 	for {
 		if time.Now().After(deadline) {
-			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s)", o.flipTimeout(), o.op.FromShard)
+			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s); last observation: %s", o.flipTimeout(), o.op.FromShard, lastObserved)
 			return
 		}
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
-		if err == nil && strings.HasPrefix(st.MetadataStore.Endpoint, sourcePrefix) && st.ReadyCondition {
+		switch {
+		case err != nil:
+			lastObserved = fmt.Sprintf("reading duckling failed: %v", err)
+		case !strings.HasPrefix(st.MetadataStore.Endpoint, sourcePrefix) || !st.ReadyCondition:
+			lastObserved = fmt.Sprintf("duckling endpoint %q, ready=%t (waiting for %s*)", st.MetadataStore.Endpoint, st.ReadyCondition, sourcePrefix)
+			if st.SyncedFalseMessage != "" {
+				lastObserved += "; duckling Synced=False: " + st.SyncedFalseMessage
+			}
+		default:
 			restored := CatalogEndpoint{
 				Host: st.MetadataStore.Endpoint, Port: 5432,
 				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
 				SSLMode: "disable",
 			}
-			if o.r.copier.Probe(ctx, restored) == nil {
+			probeErr := o.r.copier.Probe(ctx, restored)
+			if probeErr == nil {
 				o.logf("info", "recovery complete: duckling re-adopted the orphaned cnpg role/DB on %s and the tenant role answers — no data was copied back (the catalog never left the source)", o.op.FromShard)
 				return
 			}
+			// describeProbeFailure names an auth failure explicitly (stranded
+			// re-adopted-role password) with the manual ALTER ROLE remedy.
+			lastObserved = "duckling converged on " + st.MetadataStore.Endpoint + " (Ready), " + describeProbeFailure(probeErr, st.MetadataStore.User)
+		}
+		if time.Since(lastLog) >= o.r.progressLogInterval {
+			o.logf("info", "recovery: waiting for the source shard: %s", lastObserved)
+			lastLog = time.Now()
 		}
 		time.Sleep(o.r.loopPoll)
 	}
