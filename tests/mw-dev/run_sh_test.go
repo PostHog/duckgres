@@ -1,11 +1,14 @@
 package e2emwdev_test
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
 func TestDeployFailsWhenSamePRDucklingsDoNotDelete(t *testing.T) {
@@ -198,6 +201,93 @@ func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 			t.Fatalf("run.sh still contains shared-dev/config-secret path %q", forbidden)
 		}
 	}
+}
+
+func TestControlPlaneServiceExposesFlight(t *testing.T) {
+	raw, err := os.ReadFile("manifests.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+
+	rendered := strings.NewReplacer(
+		"${NAMESPACE}", "test-namespace",
+		"${PR_NUMBER}", "123",
+		"${CONTROLPLANE_IMAGE}", "example.invalid/duckgres:test",
+		"${WORKER_IMAGE}", "example.invalid/duckgres:test",
+		"${INTERNAL_SECRET}", "test-secret",
+		"${INTERNAL_SECRET_FALLBACK}", "test-secret-fallback",
+		"${USER_SECRET_KEY}", "test-user-secret-key",
+	).Replace(string(raw))
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
+	for {
+		var manifest map[string]any
+		err := decoder.Decode(&manifest)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode manifests template: %v", err)
+		}
+		if manifest["kind"] != "Service" || manifestName(manifest) != "duckgres-control-plane" {
+			continue
+		}
+
+		for _, port := range manifestPorts(manifest) {
+			if port["name"] == "flight" && port["port"] == float64(8815) && port["targetPort"] == "flight" {
+				return
+			}
+		}
+		t.Fatalf("duckgres-control-plane Service does not expose flight port 8815 to targetPort flight")
+	}
+
+	t.Fatal("duckgres-control-plane Service missing from manifests template")
+}
+
+func TestE2EHarnessPodIsProtectedFromKarpenterDisruption(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+
+	const jobMarker = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: duckgres-harness"
+	jobStart := strings.Index(string(raw), jobMarker)
+	if jobStart < 0 {
+		t.Fatal("duckgres-harness Job manifest missing from run.sh")
+	}
+	jobYAML := string(raw)[jobStart:]
+	if jobEnd := strings.Index(jobYAML, "\nYAML"); jobEnd >= 0 {
+		jobYAML = jobYAML[:jobEnd]
+	}
+
+	var manifest map[string]any
+	if err := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(jobYAML), 4096).Decode(&manifest); err != nil {
+		t.Fatalf("decode duckgres-harness Job manifest: %v", err)
+	}
+	spec, _ := manifest["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	metadata, _ := template["metadata"].(map[string]any)
+	annotations, _ := metadata["annotations"].(map[string]any)
+	if got := annotations["karpenter.sh/do-not-disrupt"]; got != "true" {
+		t.Fatalf("duckgres-harness Pod karpenter.sh/do-not-disrupt = %v, want true", got)
+	}
+}
+
+func manifestName(manifest map[string]any) string {
+	metadata, _ := manifest["metadata"].(map[string]any)
+	name, _ := metadata["name"].(string)
+	return name
+}
+
+func manifestPorts(manifest map[string]any) []map[string]any {
+	spec, _ := manifest["spec"].(map[string]any)
+	rawPorts, _ := spec["ports"].([]any)
+	ports := make([]map[string]any, 0, len(rawPorts))
+	for _, rawPort := range rawPorts {
+		if port, ok := rawPort.(map[string]any); ok {
+			ports = append(ports, port)
+		}
+	}
+	return ports
 }
 
 type runSHFakes struct {
