@@ -1,6 +1,10 @@
 package transpiler
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
 
 // TestTranspile_QuerySourceSet asserts that `SET duckgres.query_source = '...'`
 // is intercepted as a duckgres-namespaced custom GUC (QuerySourceSet populated,
@@ -15,7 +19,11 @@ func TestTranspile_QuerySourceSet(t *testing.T) {
 		{"set standard", "SET duckgres.query_source = 'standard'", "standard"},
 		{"set local", "SET LOCAL duckgres.query_source = 'endpoints'", "endpoints"},
 		{"case-insensitive name", "SET DUCKGRES.QUERY_SOURCE = 'endpoints'", "endpoints"},
-		{"arbitrary passthrough value", "SET duckgres.query_source = 'whatever'", "whatever"},
+		{"case-insensitive value normalized", "SET duckgres.query_source = 'ENDPOINTS'", "endpoints"},
+		{"whitespace trimmed", "SET duckgres.query_source = '  standard '", "standard"},
+		{"unquoted identifier value", "SET duckgres.query_source = endpoints", "endpoints"},
+		{"empty string resets to default", "SET duckgres.query_source = ''", ""},
+		{"set to default clears to empty", "SET duckgres.query_source TO DEFAULT", ""},
 		{"reset clears to empty", "RESET duckgres.query_source", ""},
 	}
 
@@ -36,6 +44,58 @@ func TestTranspile_QuerySourceSet(t *testing.T) {
 			// Custom GUC must never be forwarded to DuckDB.
 			if result.QuerySourceShow {
 				t.Errorf("Transpile(%q): QuerySourceShow = true, want false", tt.input)
+			}
+		})
+	}
+}
+
+// TestTranspile_QuerySourceSetInvalidRejected asserts that a SET with a value
+// outside the closed {standard, endpoints} set surfaces Result.Error with
+// SQLSTATE 22023 (invalid_parameter_value) and does NOT populate
+// QuerySourceSet. The value is the billing-bucket key, so accepting arbitrary
+// strings would hand clients unbounded cardinality (and junk) in the billing
+// table and its exports. The error message must name the valid values but must
+// NOT echo the offending value (arbitrary client input flowing into logs / the
+// recent-errors ring).
+func TestTranspile_QuerySourceSetInvalidRejected(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	longJunk := strings.Repeat("x", 10*1024)
+	inputs := map[string]string{
+		"garbage":                 "SET duckgres.query_source = 'garbage'",
+		"10KB string":             "SET duckgres.query_source = '" + longJunk + "'",
+		"unicode + control chars": "SET duckgres.query_source = e'caf\\u00e9\\n\\ttab'",
+		"integer constant":        "SET duckgres.query_source = 123",
+		"boolean constant":        "SET duckgres.query_source = true",
+		"multiple values":         "SET duckgres.query_source = 'standard', 'endpoints'",
+		"set local garbage":       "SET LOCAL duckgres.query_source = 'garbage'",
+	}
+	for name, in := range inputs {
+		t.Run(name, func(t *testing.T) {
+			result, err := tr.Transpile(in)
+			if err != nil {
+				t.Fatalf("Transpile(%.80q) error: %v", in, err)
+			}
+			if result.Error == nil {
+				got := "<nil>"
+				if result.QuerySourceSet != nil {
+					got = *result.QuerySourceSet
+				}
+				t.Fatalf("Transpile(%.80q): Error = nil, want 22023 rejection (QuerySourceSet=%.80q)", in, got)
+			}
+			var coded interface{ SQLState() string }
+			if !errors.As(result.Error, &coded) || coded.SQLState() != "22023" {
+				t.Errorf("Transpile(%.80q): Error SQLSTATE = %v, want 22023", in, result.Error)
+			}
+			msg := result.Error.Error()
+			if !strings.Contains(msg, `"standard"`) || !strings.Contains(msg, `"endpoints"`) {
+				t.Errorf("error message must name the valid values, got %q", msg)
+			}
+			if strings.Contains(msg, "garbage") || strings.Contains(msg, longJunk[:64]) {
+				t.Errorf("error message must not echo the offending value, got %.120q", msg)
+			}
+			if result.QuerySourceSet != nil {
+				t.Errorf("Transpile(%.80q): QuerySourceSet = %q, want nil on rejection", in, *result.QuerySourceSet)
 			}
 		})
 	}

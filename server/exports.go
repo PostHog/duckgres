@@ -10,6 +10,7 @@ import (
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/wire"
+	"github.com/posthog/duckgres/transpiler/transform"
 )
 
 // Exported wrappers for protocol functions used by the control plane worker.
@@ -213,11 +214,25 @@ func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 // size). Call at the same teardown point as CloseConnectionMetrics. A
 // mid-connection GUC change is not split: the whole connection is metered
 // under the final value (documented in docs/design/billing-pull-api.md).
+//
+// The query source is clamped to the closed {standard, endpoints} set as
+// defense in depth: every set path already validates (22023 at SET / startup
+// time), so a non-canonical value here means a validation bypass — degrade it
+// to the default rather than writing unbounded-cardinality client input into
+// the billing bucket key (and onward into billing exports).
 func ConnectionBilling(cc *clientConn) (orgID, querySource string, millicores, mib int64, dur time.Duration) {
 	if cc == nil {
 		return "", "", 0, 0, 0
 	}
-	return cc.orgID, cc.QuerySource(), cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
+	qs := cc.QuerySource()
+	if qs != transform.QuerySourceStandard && qs != transform.QuerySourceEndpoints {
+		// Should be unreachable. Log the length, not the value — it is
+		// arbitrary client input.
+		cc.logger().Warn("Non-canonical duckgres.query_source at billing teardown; degrading to default.",
+			"value_len", len(qs))
+		qs = defaultQuerySource
+	}
+	return cc.orgID, qs, cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
 }
 
 // CancelClientConn cancels the context of a clientConn.

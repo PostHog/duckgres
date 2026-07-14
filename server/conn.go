@@ -27,6 +27,7 @@ import (
 	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/wire"
 	"github.com/posthog/duckgres/transpiler"
+	"github.com/posthog/duckgres/transpiler/transform"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -196,7 +197,9 @@ type clientConn struct {
 	// This is a prerequisite for pull-based compute billing (usage buckets are
 	// keyed by query_source). Set via `SET duckgres.query_source = '...'` (or a
 	// `-c duckgres.query_source=...` startup option) and read back via
-	// `SHOW duckgres.query_source` / current_setting.
+	// `SHOW duckgres.query_source` / current_setting. Every set path validates
+	// against the closed {standard, endpoints} set (22023 on anything else), so
+	// this only ever holds "", "standard", or "endpoints".
 	querySource string
 
 	// Provisioned worker pod size for compute-usage billing (remote/k8s backend
@@ -265,11 +268,29 @@ func (c *clientConn) QuerySource() string {
 }
 
 // setQuerySource records a client-supplied `duckgres.query_source` value on the
-// session. Pass-through: any string is accepted (only "standard"/"endpoints" are
-// meaningful downstream, but other values are stored, not rejected). An empty
-// value resets to the default.
+// session. Callers must pass an already-validated canonical value ("standard",
+// "endpoints", or "" = reset to default): the transpiler validates SET
+// statements (transform.NormalizeQuerySource, rejecting anything else with
+// 22023 before this is reached) and applyStartupQuerySource validates the
+// startup option. The setter itself stays dumb; ConnectionBilling additionally
+// clamps at the metering boundary as defense in depth.
 func (c *clientConn) setQuerySource(value string) {
 	c.querySource = value
+}
+
+// applyStartupQuerySource validates and applies a `-c duckgres.query_source=…`
+// startup-option value. The GUC is a billing dimension, so the value must be
+// in the closed {standard, endpoints} set (case-insensitive, normalized to
+// lowercase; empty = default). An invalid value returns the 22023 error for
+// the caller to reject the connection with, mirroring how the control plane
+// rejects invalid duckgres.worker_* startup options.
+func (c *clientConn) applyStartupQuerySource(raw string) error {
+	norm, err := transform.NormalizeQuerySource(raw)
+	if err != nil {
+		return err
+	}
+	c.setQuerySource(norm)
+	return nil
 }
 
 // generateSecretKey is a thin alias for wire.GenerateSecretKey kept for the
@@ -1017,9 +1038,16 @@ func (c *clientConn) handleStartup() error {
 
 		// Honor a `-c duckgres.query_source=...` startup option (libpq `options`
 		// keyword / PGOPTIONS). Other GUCs in `options` are not applied here.
+		// An invalid value rejects the connection with FATAL 22023 — the same
+		// treatment resolveWorkerProfile gives an invalid duckgres.worker_*
+		// startup option, and what PostgreSQL itself does with an invalid
+		// `options` GUC value.
 		if opts := ParseStartupOptions(params["options"]); len(opts) > 0 {
 			if v, ok := opts[querySourceGUCName]; ok {
-				c.setQuerySource(v)
+				if err := c.applyStartupQuerySource(v); err != nil {
+					c.sendError("FATAL", "22023", err.Error())
+					return fmt.Errorf("invalid %s startup option", querySourceGUCName)
+				}
 			}
 		}
 
