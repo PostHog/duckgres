@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // ReshardRunner drives reshard operations (see docs/design/resharding.md and
@@ -97,7 +98,7 @@ type reshardDucklingClient interface {
 	// cnpg→external orphan-adopt escape hatch:
 	SetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string, retain bool) error
 	GetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string) (retain, present bool, err error)
-	CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, err error)
+	CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, detail string, err error)
 	SetMetadataStoreCnpgAdopt(ctx context.Context, name, shard string) error
 }
 
@@ -882,8 +883,10 @@ func (o *opRun) orphanCnpgSource(ctx context.Context) error {
 	// Wait until the cnpg Role+Database MRs reflect the no-Delete policy, so the
 	// type flip orphans (not deletes) them. Closes the race where the flip
 	// un-renders the MRs before the retain policy propagated.
+	o.logf("info", "retainCnpgOnFlip=true confirmed on the duckling spec (the XRD carries the field); waiting up to %s for the composition to re-render the cnpg Role/Database MRs without Delete", o.flipTimeout())
 	deadline := time.Now().Add(o.flipTimeout())
 	lastLog := time.Time{}
+	lastObserved := "no successful read yet"
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -892,22 +895,27 @@ func (o *opRun) orphanCnpgSource(ctx context.Context) error {
 			return errReshardCancelled
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("cnpg source role/DB did not reflect the retain (no-Delete) policy within %s — refusing to flip (the composition may not honor retainCnpgOnFlip; charts/composition skew?)", o.flipTimeout())
+			return fmt.Errorf("cnpg source role/DB did not reflect the retain (no-Delete) policy within %s — refusing to flip (the composition may not honor retainCnpgOnFlip; charts/composition skew?); last observation: %s", o.flipTimeout(), lastObserved)
 		}
-		orphaned, mrsPresent, err := o.r.duckling.CnpgSourceMRsOrphaned(ctx, o.op.DucklingName)
-		if err == nil && mrsPresent && orphaned {
-			o.logf("info", "cnpg source role/DB now carry the retain (no-Delete) policy — safe to flip")
+		orphaned, mrsPresent, detail, err := o.r.duckling.CnpgSourceMRsOrphaned(ctx, o.op.DucklingName)
+		switch {
+		case err != nil && apierrors.IsForbidden(err):
+			// An RBAC denial is a permanent misconfiguration — polling to the
+			// timeout cannot heal it and would end in a misleading error
+			// blaming the composition (mw-dev reshard op: the runner's
+			// ServiceAccount could not read the provider-sql MRs and burned
+			// the full wait on Forbidden). Fail fast, naming the exact grant.
+			return fmt.Errorf("cannot verify the retain (no-Delete) policy on the cnpg source role/DB: reading the provider-sql managed resources is Forbidden for this runner's ServiceAccount — refusing to flip. Grant get on roles+databases in API group %s (the ducklings namespace) to the control-plane ServiceAccount (duckgres chart RBAC), then re-run the reshard: %v", cnpgTenantMRGroup, err)
+		case err != nil:
+			lastObserved = fmt.Sprintf("read failed: %v", err)
+		case mrsPresent && orphaned:
+			o.logf("info", "cnpg source role/DB now carry the retain (no-Delete) policy — safe to flip (%s)", detail)
 			return nil
+		default:
+			lastObserved = detail
 		}
 		if time.Since(lastLog) >= 15*time.Second {
-			switch {
-			case err != nil:
-				o.logf("info", "waiting for the cnpg source MRs to reflect the retain policy: read failed: %v", err)
-			case !mrsPresent:
-				o.logf("info", "waiting for the cnpg source MRs to reflect the retain policy: Role/Database MRs not both observed yet")
-			default:
-				o.logf("info", "waiting for the cnpg source MRs to reflect the retain (no-Delete) policy")
-			}
+			o.logf("info", "waiting for the cnpg source MRs to reflect the retain (no-Delete) policy: %s", lastObserved)
 			lastLog = time.Now()
 		}
 		time.Sleep(o.r.loopPoll)

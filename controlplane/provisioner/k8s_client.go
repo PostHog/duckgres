@@ -843,12 +843,23 @@ const cnpgTenantMRGroup = "postgresql.sql.m.crossplane.io"
 // source's). The reshard runner polls this after setting retainCnpgOnFlip=true
 // and only flips once both MRs reflect the policy — closing the race where the
 // flip un-renders the MRs before the retain policy propagated.
-func (d *DucklingClient) CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, err error) {
+//
+// detail is a one-line human-readable account of what was observed (per-MR
+// found/not-found + current managementPolicies), destined for the reshard op
+// log so a wait that is not converging is diagnosable from the log alone.
+//
+// NOTE this read needs RBAC the Duckling patch itself does not: get on
+// roles+databases in cnpgTenantMRGroup (the duckling-reader grant only covers
+// ducklings). A Forbidden here is a permanent misconfiguration — callers
+// should fail fast on it (apierrors.IsForbidden unwraps the %w chain), not
+// poll to a timeout.
+func (d *DucklingClient) CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, detail string, err error) {
 	cr, gerr := d.getCR(ctx, name)
 	if gerr != nil {
-		return false, false, fmt.Errorf("get duckling CR %q: %w", name, gerr)
+		return false, false, "", fmt.Errorf("get duckling CR %q: %w", name, gerr)
 	}
 	var roleFound, dbFound, roleNoDelete, dbNoDelete bool
+	observed := map[string]string{}
 	for _, ref := range nestedComposedRefs(cr) {
 		gvr, kind, refName, ok := composedRefGVR(ref)
 		if !ok || gvr.Group != cnpgTenantMRGroup {
@@ -860,11 +871,13 @@ func (d *DucklingClient) CnpgSourceMRsOrphaned(ctx context.Context, name string)
 		obj, gerr := d.client.Resource(gvr).Namespace(ducklingNamespace).Get(ctx, refName, metav1.GetOptions{})
 		if gerr != nil {
 			if apierrors.IsNotFound(gerr) {
+				observed[kind] = fmt.Sprintf("%s %q: referenced by the composite but not found", kind, refName)
 				continue
 			}
-			return false, false, fmt.Errorf("get %s %q: %w", kind, refName, gerr)
+			return false, false, "", fmt.Errorf("get %s %q: %w", kind, refName, gerr)
 		}
 		noDelete := !managementPoliciesHaveDelete(obj)
+		observed[kind] = fmt.Sprintf("%s %q: managementPolicies %s", kind, refName, describeManagementPolicies(obj))
 		switch kind {
 		case "Role":
 			roleFound, roleNoDelete = true, noDelete
@@ -872,9 +885,18 @@ func (d *DucklingClient) CnpgSourceMRsOrphaned(ctx context.Context, name string)
 			dbFound, dbNoDelete = true, noDelete
 		}
 	}
+	parts := make([]string, 0, 2)
+	for _, kind := range []string{"Role", "Database"} {
+		if s, ok := observed[kind]; ok {
+			parts = append(parts, s)
+		} else {
+			parts = append(parts, fmt.Sprintf("%s: no composed resourceRef in group %s", kind, cnpgTenantMRGroup))
+		}
+	}
+	detail = strings.Join(parts, "; ")
 	present = roleFound && dbFound
 	orphaned = present && roleNoDelete && dbNoDelete
-	return orphaned, present, nil
+	return orphaned, present, detail, nil
 }
 
 // managementPoliciesHaveDelete reports whether a managed resource's
@@ -894,6 +916,22 @@ func managementPoliciesHaveDelete(obj *unstructured.Unstructured) bool {
 		}
 	}
 	return false
+}
+
+// describeManagementPolicies renders a managed resource's
+// spec.managementPolicies for the reshard op log, making explicit that an
+// absent/empty field means Crossplane's default full lifecycle.
+func describeManagementPolicies(obj *unstructured.Unstructured) string {
+	spec, _ := obj.Object["spec"].(map[string]interface{})
+	raw, ok := spec["managementPolicies"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return `absent (defaults to ["*"], full lifecycle incl. Delete)`
+	}
+	parts := make([]string, len(raw))
+	for i, p := range raw {
+		parts[i] = fmt.Sprintf("%q", fmt.Sprint(p))
+	}
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 // readSpecDuckLakeEnabled returns spec.ducklake.enabled as *bool — nil when the

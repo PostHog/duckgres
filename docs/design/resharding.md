@@ -74,7 +74,9 @@ catalogs can be much larger than that one.
 
 The pod runs the CP's **own image** (it carries `pg_dump` and the duckgres
 binary) in `--mode reshard-runner`, under the CP's **own ServiceAccount** (the
-runner patches Duckling CRs — RBAC the CP already holds; no new grants), and
+runner patches Duckling CRs — RBAC the CP already holds; the ONE extra grant
+is the cnpg→ext orphan wait's read of the provider-sql MRs, see
+`orphaning_source` below), and
 inherits an **allowlist** of the CP container's env spec verbatim
 (`DUCKGRES_CONFIG_STORE`, `DUCKGRES_INTERNAL_SECRET`, `DUCKGRES_AWS_REGION`, …
 — a secretKeyRef is copied as a ref, so nothing secret ever lands in a pod
@@ -297,6 +299,18 @@ blocking → draining → pausing_compaction → backup_catalog → copying → 
    the reshard with a clear "deploy the charts first" error rather than risk the
    old destructive delete-on-flip. (Refuse is safer than silently falling back
    to data-loss risk.)
+   **RBAC:** this is the ONE reshard step that reads beyond the Duckling CR —
+   `CnpgSourceMRsOrphaned` gets the provider-sql `Role`/`Database` MRs
+   (`postgresql.sql.m.crossplane.io`, ducklings namespace), which the
+   duckling-reader grant does NOT cover; the runner's ServiceAccount needs an
+   explicit get grant on those resources (duckgres chart RBAC). A **Forbidden**
+   read fails the wait IMMEDIATELY with an error naming the missing grant — an
+   RBAC denial is permanent, and polling to the timeout would only produce a
+   misleading "composition skew?" error (a real mw-dev incident: the first live
+   cnpg→ext burned its full 15m orphan wait on Forbidden reads). Transient read
+   errors keep polling; every ~15s the op log records what the poll observed
+   (per-MR found/not-found + current `managementPolicies`), and the timeout
+   error carries the last observation.
 3. **cutover** — flip `type` to external (`cnpgShard: null`, external block set;
    `retainCnpgOnFlip` left true). The un-render now ORPHANS the cnpg role/DB.
    Wait for external Ready + ESO password synced + matching the typed password.
