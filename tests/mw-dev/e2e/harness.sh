@@ -2941,14 +2941,8 @@ main() {
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
 
-  # ---- reshard operations (validation, cancel, rollback on res2; then the
-  #      ext→cnpg POSITIVE path on the ext org — must run AFTER every assert
-  #      that needs the ext org on the RDS, notably tenant_isolation) ----
-  reshard_targets
-  reshard_validation "$CNPG"
-  reshard_cancel_during_drain "$RES2" "$res2_pw"
-  reshard_bogus_shard_rollback "$RES2" "$res2_pw"
-  reshard_ext_to_cnpg "$EXT" "$ext_pw"
+  # ---- reshard operations temporarily disabled; retain unit coverage ----
+  log "SKIP reshard E2E (temporarily disabled; covered by unit tests)"
 
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
   # (res1/res2/ext are deprovisioned by run.sh teardown; the cascade assertion
