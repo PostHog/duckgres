@@ -139,6 +139,25 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   minute is never in the window, so an ack can't delete buckets that were never
   served.
 
+## Changing an org's default team
+
+Buckets are stamped with the org's `default_team_id` **at record time**, so an
+update to the org (admin `PUT /orgs/:id` or a re-provision carrying a different
+`default_team_id`) would otherwise strand already-buffered usage under the old
+team — including a team that was just deleted in PostHog (duckgres treats the
+id as opaque and never validates it against PostHog). Both update paths
+therefore **re-attribute every unacked bucket** — both metric families — to the
+new team id in the **same transaction** as the org-row update
+(`configstore.ReattributeUsageTeamTx`; colliding target keys, e.g. after an
+A→B→A flip, merge additively since `team_id` is part of both primary keys).
+The next pull reports the org's whole buffered window under the new team.
+
+One bounded race: connections and storage samples record under the team id from
+the config snapshot, which trails the update by up to the poll interval
+(~30s) — a flush landing just after the flip can leave a **small residual
+old-team row** on a later pull. Billing tolerates it, and re-running the update
+folds it in.
+
 ## No infinite accumulation
 
 - Ack deletes everything `≤ watermark_high` immediately.

@@ -507,6 +507,15 @@ touching this path:
 - **Graceful shutdown does a final flush** after connections drain to their
   natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
   last interval before exit.
+- **Changing an org's `default_team_id` re-attributes its unacked buckets** to
+  the new team in the SAME transaction as the org update, on BOTH paths (admin
+  `PUT /orgs/:id` and provisioning re-provision) via
+  `configstore.ReattributeUsageTeamTx` — additive fold on PK collisions; a
+  small in-flight residual under the old team is tolerated (snapshot poll
+  lag, ~30s). Tests: `tests/configstore/reattribute_usage_postgres_test.go`,
+  `controlplane/admin/api_test.go` + `api_postgres_test.go`
+  (`TestUpdateOrg*Reattribut*`), and the re-attribution leg of
+  `compute_usage_pull_api` in the e2e harness.
 - **Storage metric** (`managed_warehouse_storage_gib_seconds`,
   `storage_meter.go`): a LEADER-ONLY sampler (double writers would
   double-bill — the UPSERT is additive) visits each Ready warehouse's DuckLake

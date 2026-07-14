@@ -568,8 +568,10 @@ connection_duration_logged() { # org password
 # the same round-trip: the leader's sampler (60s here) must serve a storage row
 # with gib_seconds > 0 for the org, and the shared ack must advance past it. A bucket closes ~90s after the
 # connection ends (60s width + 30s grace) plus ≤15s flush, so the poll allows
-# ~4 minutes. This e2e stack has its own config store, so acking here cannot
-# eat production usage.
+# ~4 minutes. Between serve and ack, an admin PUT changing the org's
+# default_team_id must re-attribute the unacked buckets to the new team (and a
+# restore PUT moves them back — the merge path). This e2e stack has its own
+# config store, so acking here cannot eat production usage.
 compute_usage_pull_api() { # org password
   org="$1"; pw="$2"
   log "compute-usage pull API round-trip on $org"
@@ -595,6 +597,38 @@ compute_usage_pull_api() { # org password
   wl="$(echo "$body" | jq -r '.watermark_low')"
   wh="$(echo "$body" | jq -r '.watermark_high')"
   log "compute-usage OK: usage served (low=$wl high=$wh)"
+
+  # ---- default_team_id re-attribution (unacked buckets follow the org) ----
+  # Changing an org's default_team_id must re-attribute ALL buffered (unacked)
+  # buckets to the NEW team in the same transaction as the org update, so the
+  # next pull reports them under the new team and none stay stranded under the
+  # old one. Only the compute (.usage) family is asserted team-exclusively:
+  # the storage sampler keeps stamping the stale snapshot's team until the
+  # config poll catches up, so a fresh old-team storage bucket may legitimately
+  # appear; compute rows for this org can only come from the two connections
+  # above, whose buckets are already closed and flushed (that's why the poll
+  # found them — anything metered after the flip lands in a not-yet-served
+  # open bucket). The provisioned team id is restored right after (the restore
+  # PUT re-attributes back — the A→B→A merge path), so the ack flow and every
+  # later assertion still see the canonical team.
+  reattr_team=515151
+  code="$(put_org "$org" "{\"default_team_id\":$reattr_team}")"
+  [ "$code" = "200" ] || fail "reattribute: PUT default_team_id=$reattr_team -> HTTP $code: $(cat /tmp/put_org_out)"
+  rbody="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" \
+    || fail "reattribute: GET /billing/usage after team change failed"
+  echo "$rbody" | jq -e --arg o "$org" --argjson new "$reattr_team" --argjson old "$CNPG_DEFAULT_TEAM_ID" '
+      (.usage | map(select(.org_id==$o and .team_id==$new)) | length >= 2)
+      and (.usage | map(select(.org_id==$o and .team_id==$old)) | length == 0)' >/dev/null \
+    || fail "reattribute: after default_team_id $CNPG_DEFAULT_TEAM_ID -> $reattr_team, unacked compute rows not re-attributed: $(echo "$rbody" | jq -c --arg o "$org" '[.usage[] | select(.org_id==$o)]' | head -c 600)"
+  code="$(put_org "$org" "{\"default_team_id\":$CNPG_DEFAULT_TEAM_ID}")"
+  [ "$code" = "200" ] || fail "reattribute: PUT restore default_team_id=$CNPG_DEFAULT_TEAM_ID -> HTTP $code: $(cat /tmp/put_org_out)"
+  rbody="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" \
+    || fail "reattribute: GET /billing/usage after team restore failed"
+  echo "$rbody" | jq -e --arg o "$org" --argjson new "$reattr_team" --argjson old "$CNPG_DEFAULT_TEAM_ID" '
+      (.usage | map(select(.org_id==$o and .team_id==$old)) | length >= 2)
+      and (.usage | map(select(.org_id==$o and .team_id==$new)) | length == 0)' >/dev/null \
+    || fail "reattribute: after restoring default_team_id=$CNPG_DEFAULT_TEAM_ID, compute rows not moved back: $(echo "$rbody" | jq -c --arg o "$org" '[.usage[] | select(.org_id==$o)]' | head -c 600)"
+  log "compute-usage OK: default_team_id change re-attributed unacked buckets ($CNPG_DEFAULT_TEAM_ID -> $reattr_team -> restored)"
 
   # Ack the served watermark; the cursor must advance and acked buckets die.
   ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \

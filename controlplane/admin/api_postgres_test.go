@@ -102,6 +102,13 @@ func resetConfigStoreTables(t *testing.T, db *gorm.DB) {
 			t.Fatalf("delete %T: %v", model, err)
 		}
 	}
+	// Billing usage buffers have no gorm model (raw goose-migrated tables) but
+	// leak across tests on the shared schema all the same.
+	for _, table := range []string{"duckgres_org_compute_usage", "duckgres_org_storage_usage"} {
+		if err := db.Exec("DELETE FROM " + table).Error; err != nil {
+			t.Fatalf("delete %s: %v", table, err)
+		}
+	}
 }
 
 func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
@@ -215,6 +222,85 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 	// The database_name is now free for reuse (no unique-index squat).
 	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
 		t.Fatalf("expected database_name to be reusable after org deletion: %v", err)
+	}
+}
+
+// TestUpdateOrgReattributesUsagePostgres drives the real gormAPIStore against
+// Postgres: an UpdateOrg carrying reattributeUsageTeam must move the org's
+// buffered billing buckets (both tables) to the new team in the same
+// transaction as the org-row update — folding a colliding target-key row
+// additively — while an UpdateOrg without it leaves the buckets alone.
+func TestUpdateOrgReattributesUsagePostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	oldTeam := int64(1)
+	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acmedb", DefaultTeamID: &oldTeam}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	seed := func(teamID, cpuSeconds, byteSeconds int64) {
+		t.Helper()
+		if err := store.FlushComputeUsage([]configstore.ComputeUsageDelta{{
+			OrgID: "acme", TeamID: teamID, QuerySource: "standard",
+			Millicores: 2000, MiB: 4096, BucketStart: bucket,
+			CPUSeconds: cpuSeconds, MemorySeconds: cpuSeconds * 2,
+		}}); err != nil {
+			t.Fatalf("seed compute usage: %v", err)
+		}
+		if err := store.UpsertStorageSample("acme", teamID, bucket, byteSeconds); err != nil {
+			t.Fatalf("seed storage usage: %v", err)
+		}
+	}
+	seed(1, 10, 1000)
+	// Pre-existing rows under the target team at the same bucket — the
+	// collision the additive fold must absorb instead of violating the PK.
+	seed(2, 5, 500)
+
+	// An update WITHOUT reattribution must not touch the buckets.
+	merged := configstore.Org{MaxWorkers: 3, DefaultTeamID: &oldTeam}
+	if _, ok, err := apiStore.UpdateOrg("acme", merged, nil); err != nil || !ok {
+		t.Fatalf("UpdateOrg without reattribution: ok=%v err=%v", ok, err)
+	}
+	var teams []int64
+	if err := store.DB().Raw(`SELECT DISTINCT team_id FROM duckgres_org_compute_usage WHERE org_id = 'acme' ORDER BY team_id`).Scan(&teams).Error; err != nil {
+		t.Fatalf("read teams: %v", err)
+	}
+	if len(teams) != 2 {
+		t.Fatalf("buckets mutated by non-team update: teams=%v", teams)
+	}
+
+	// The team change moves everything onto team 2 and folds the collision.
+	newTeam := int64(2)
+	merged.DefaultTeamID = &newTeam
+	updated, ok, err := apiStore.UpdateOrg("acme", merged, &newTeam)
+	if err != nil || !ok {
+		t.Fatalf("UpdateOrg with reattribution: ok=%v err=%v", ok, err)
+	}
+	if updated.DefaultTeamID == nil || *updated.DefaultTeamID != 2 {
+		t.Fatalf("org default_team_id = %v, want 2", updated.DefaultTeamID)
+	}
+	var compute []struct {
+		TeamID        int64
+		CPUSeconds    int64
+		MemorySeconds int64
+	}
+	if err := store.DB().Raw(`SELECT team_id, cpu_seconds, memory_seconds FROM duckgres_org_compute_usage WHERE org_id = 'acme'`).Scan(&compute).Error; err != nil {
+		t.Fatalf("read compute rows: %v", err)
+	}
+	if len(compute) != 1 || compute[0].TeamID != 2 || compute[0].CPUSeconds != 15 || compute[0].MemorySeconds != 30 {
+		t.Fatalf("compute rows not folded onto team 2: %+v", compute)
+	}
+	var storage []struct {
+		TeamID      int64
+		ByteSeconds int64
+	}
+	if err := store.DB().Raw(`SELECT team_id, byte_seconds FROM duckgres_org_storage_usage WHERE org_id = 'acme'`).Scan(&storage).Error; err != nil {
+		t.Fatalf("read storage rows: %v", err)
+	}
+	if len(storage) != 1 || storage[0].TeamID != 2 || storage[0].ByteSeconds != 1500 {
+		t.Fatalf("storage rows not folded onto team 2: %+v", storage)
 	}
 }
 
