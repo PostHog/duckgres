@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Catalog copy for reshard operations: streams every ducklake_* table of one
@@ -30,6 +32,16 @@ import (
 //     so a table copy carries counters correctly.
 //   - Indexes backing constraints (PKs) are excluded from the pg_indexes
 //     replay — ADD CONSTRAINT already created them.
+//   - The target database may be REUSED (it survives failed/rolled-back
+//     attempts and an earlier residence of the same catalog, and a dev target
+//     can even host another tenant's live catalog): the per-table
+//     DROP TABLE IF EXISTS covers same-named tables, but index NAMES are
+//     schema-global, so replay is idempotent — every CREATE INDEX (and every
+//     index-backed ADD CONSTRAINT) drops a same-named stale index first, and
+//     a create that STILL collides (a live worker's
+//     ensureDuckLakeMetadataIndexes CREATE INDEX IF NOT EXISTS racing between
+//     our drop and create) is re-dropped and retried a bounded number of
+//     times.
 
 // CatalogEndpoint describes one side of the copy.
 type CatalogEndpoint struct {
@@ -492,6 +504,16 @@ ORDER BY conname`, table)
 		if !shouldReplayConstraint(c.typ) {
 			continue
 		}
+		if constraintCreatesIndex(c.typ) {
+			// The backing index is named after the constraint and index names
+			// are schema-global: on a reused target a stale index (attached to
+			// a table outside the source's table set, so it survived the
+			// per-table drop) can squat the name and fail the ADD CONSTRAINT
+			// with 42P07.
+			if _, err := dst.Exec(ctx, "DROP INDEX IF EXISTS public."+quoteIdent(c.name)); err != nil {
+				return fmt.Errorf("drop stale index %s on target (squats the constraint name for %s): %w", c.name, table, err)
+			}
+		}
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", quoteIdent(table), quoteIdent(c.name), c.def)
 		if _, err := dst.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("apply constraint %s on %s: %w", c.name, table, err)
@@ -504,8 +526,8 @@ ORDER BY conname`, table)
 // EXCLUDING indexes backing constraints — ADD CONSTRAINT already created
 // those, and replaying them would collide on the index name.
 func applyIndexes(ctx context.Context, srcTx pgx.Tx, dst *pgx.Conn, table string) error {
-	defs, err := queryStrings(ctx, srcTx, `
-SELECT i.indexdef
+	rows, err := srcTx.Query(ctx, `
+SELECT i.indexname, i.indexdef
 FROM pg_indexes i
 WHERE i.schemaname = 'public' AND i.tablename = $1
   AND NOT EXISTS (
@@ -518,12 +540,82 @@ ORDER BY i.indexname`, table)
 	if err != nil {
 		return fmt.Errorf("introspect indexes of %s: %w", table, err)
 	}
-	for _, def := range defs {
-		if _, err := dst.Exec(ctx, def); err != nil {
-			return fmt.Errorf("apply index on %s (%s): %w", table, def, err)
+	var indexes []indexReplay
+	for rows.Next() {
+		var ix indexReplay
+		if err := rows.Scan(&ix.name, &ix.def); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan index of %s: %w", table, err)
+		}
+		indexes = append(indexes, ix)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("introspect indexes of %s: %w", table, err)
+	}
+	return replayIndexes(table, indexes, func(sql string) error {
+		_, err := dst.Exec(ctx, sql)
+		return err
+	}, isDuplicateRelationError)
+}
+
+// indexReplay is one standalone index to recreate on the target.
+type indexReplay struct {
+	name string // pg_indexes.indexname — index names are schema-global
+	def  string // pg_indexes.indexdef — a complete CREATE INDEX statement
+}
+
+// maxIndexReplayAttempts bounds the drop+create retry of one index replay when
+// the create keeps colliding with a concurrently recreated same-named index.
+const maxIndexReplayAttempts = 3
+
+// replayIndexes recreates a table's standalone indexes on the target
+// idempotently. The target may be a reused database where a same-named index
+// already exists, in two flavors (both observed on the real mw-dev target):
+//
+//   - stale: left over from a prior residence/attempt, attached to a table
+//     outside the source's table set, so the per-table DROP TABLE missed it;
+//   - concurrent: a live worker attached to the same (dev, shared) database
+//     re-created a duckgres metadata performance index via
+//     ensureDuckLakeMetadataIndexes' CREATE INDEX IF NOT EXISTS on a table
+//     this copy had just recreated — mid-copy, before this replay ran.
+//
+// So each index is dropped BY NAME first, and a create that still collides
+// (SQLSTATE 42P07 — the concurrent ensure raced between our drop and our
+// create) is re-dropped and retried, bounded by maxIndexReplayAttempts.
+// IF NOT EXISTS instead would silently keep a possibly-wrong stale index; the
+// replayed definition must win.
+func replayIndexes(table string, indexes []indexReplay, exec func(sql string) error, isDuplicate func(error) bool) error {
+	for _, ix := range indexes {
+		drop := "DROP INDEX IF EXISTS public." + quoteIdent(ix.name)
+		var lastCreateErr error
+		created := false
+		for attempt := 0; attempt < maxIndexReplayAttempts && !created; attempt++ {
+			if err := exec(drop); err != nil {
+				return fmt.Errorf("drop stale index %s on target (before replaying it for %s): %w", ix.name, table, err)
+			}
+			err := exec(ix.def)
+			switch {
+			case err == nil:
+				created = true
+			case isDuplicate(err):
+				lastCreateErr = err // concurrently recreated — drop and retry
+			default:
+				return fmt.Errorf("apply index on %s (%s): %w", table, ix.def, err)
+			}
+		}
+		if !created {
+			return fmt.Errorf("apply index on %s (%s): still colliding after %d drop+create attempts: %w", table, ix.def, maxIndexReplayAttempts, lastCreateErr)
 		}
 	}
 	return nil
+}
+
+// isDuplicateRelationError reports whether err is PostgreSQL "relation ...
+// already exists" (SQLSTATE 42P07).
+func isDuplicateRelationError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P07"
 }
 
 func quoteIdent(s string) string {
@@ -536,4 +628,12 @@ func quoteIdent(s string) string {
 // and its ADD CONSTRAINT syntax doesn't parse on older targets.
 func shouldReplayConstraint(contype string) bool {
 	return contype != "n"
+}
+
+// constraintCreatesIndex reports whether replaying a pg_constraint row of the
+// given contype creates a backing index named after the constraint (primary
+// key, unique, exclusion). Those names are schema-global on the target, so a
+// stale same-named index must be dropped before the ADD CONSTRAINT.
+func constraintCreatesIndex(contype string) bool {
+	return contype == "p" || contype == "u" || contype == "x"
 }

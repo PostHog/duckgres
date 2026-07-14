@@ -161,7 +161,17 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    constraints then non-constraint indexes (PK-backed indexes excluded — ADD
    CONSTRAINT already made them). No sequences exist in the DuckLake catalog
    (next-ids are rows). A `pg_advisory_lock` in the TARGET database fences a
-   zombie ex-runner for copy+verify.
+   zombie ex-runner for copy+verify. The target database may be REUSED
+   (failed/rolled-back attempts and prior residences leave their catalog in
+   place — external stores are never cleaned up — and a dev target can even
+   host another tenant's live catalog): each table is `DROP TABLE IF EXISTS`d
+   before CREATE, and because index names are schema-global the index replay
+   is idempotent — `DROP INDEX IF EXISTS` by name before every `CREATE INDEX`
+   and every index-backed `ADD CONSTRAINT` (never `IF NOT EXISTS`, which would
+   silently keep a wrong stale index), with a bounded re-drop+retry when the
+   create still hits 42P07 because a live worker's
+   `ensureDuckLakeMetadataIndexes` (`CREATE INDEX IF NOT EXISTS` on attach)
+   raced the replay on a shared target.
 7. **verifying** — per-table counts (snapshot vs target), then re-read the
    source OUTSIDE the transaction: any change means a concurrent writer
    (straggler compactor, stray client) → rollback.
