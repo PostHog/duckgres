@@ -2236,7 +2236,13 @@ duckling_shard_backfill() { # cnpgOrg
 #     connections are 57P03-blocked; cancel rolls back; org healthy)
 #   * bogus-shard rollback (flip → Synced=False → flip-timeout → rollback;
 #     data intact, spec.cnpgShard patched back; short per-op
-#     cutover_timeout_seconds keeps it fast)
+#     cutover_timeout_seconds keeps it fast). Also asserts the wait-loop
+#     diagnostics: deadline announce, periodic "waiting for target"
+#     observations, and the flip-timeout error carrying the last observation.
+#     (The cnpg→ext RECOVERY loop's stranded-password/SASL classification
+#     can't be provoked here — it needs a role whose actual password diverged
+#     from the status password — so that path is pinned by
+#     provisioner/reshard_runner_test.go instead.)
 #   * ext→cnpg POSITIVE path (real catalog copy off the harness RDS onto
 #     shard-001, data intact after, report in the log) — including the pod
 #     model: every reshard executes in a dedicated duckgres-reshard-op-<id>
@@ -2435,6 +2441,13 @@ reshard_bogus_shard_rollback() { # org password
   [ "$st" = "failed" ] || { reshard_dump_log "$opid"; fail "reshard rollback: final state $st, want failed"; }
   reshard_log_has "$opid" "rolling back" || fail "reshard rollback: no rollback log"
   reshard_log_has "$opid" "reshard report (failed)" || fail "reshard rollback: report missing"
+  # Wait-loop diagnostics: the converge wait announces its deadline, logs what
+  # it observes every ~15s, and the flip-timeout failure carries the LAST
+  # observation — a stuck cutover must be diagnosable from the op log alone
+  # (the mw-dev recovery that spun ~8 min on silent SASL probe failures).
+  reshard_log_has "$opid" "cutover patch applied; waiting up to" || { reshard_dump_log "$opid"; fail "reshard rollback: converge-wait deadline announce missing"; }
+  reshard_log_has "$opid" "waiting for target:" || { reshard_dump_log "$opid"; fail "reshard rollback: periodic converge observations missing"; }
+  reshard_log_has "$opid" "last observation:" || { reshard_dump_log "$opid"; fail "reshard rollback: flip-timeout error lacks the last observation"; }
 
   # The duckling spec must be back on the real shard (the rollback patches the
   # VALUE back — it never removes the key).

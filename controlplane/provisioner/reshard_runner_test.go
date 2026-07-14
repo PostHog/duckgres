@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -188,6 +190,18 @@ func (f *fakeReshardStore) hasLog(substr string) bool {
 	return f.countLog(substr) > 0
 }
 
+// findLog returns the first op-log line containing substr ("" if none).
+func (f *fakeReshardStore) findLog(substr string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, l := range f.logs {
+		if strings.Contains(l, substr) {
+			return l
+		}
+	}
+	return ""
+}
+
 func (f *fakeReshardStore) countLog(substr string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -356,6 +370,10 @@ type fakeCopier struct {
 
 	copyResult CatalogCopyResult
 	copyErr    error
+	// probeFn, when set, decides each Probe's result (nil = all probes
+	// succeed). It sees the probed endpoint so tests can fail e.g. only the
+	// post-flip-back recovery probe.
+	probeFn func(ep CatalogEndpoint) error
 	// countsAfter is what SnapshotCounts returns for the SOURCE stability
 	// recheck (sslmode!=require); defaults to copyResult.PerTableRows (stable).
 	countsAfter map[string]int64
@@ -373,6 +391,12 @@ func (f *fakeCopier) record(c copierCall) {
 
 func (f *fakeCopier) Probe(_ context.Context, ep CatalogEndpoint) error {
 	f.record(copierCall{kind: "probe", target: ep})
+	f.mu.Lock()
+	fn := f.probeFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ep)
+	}
 	return nil
 }
 
@@ -472,6 +496,9 @@ func testRunner(store *fakeReshardStore, duckling reshardDucklingClient, copier 
 		flipTimeout:        2 * time.Second,
 		hotIdleGrace:       time.Millisecond,
 		loopPoll:           5 * time.Millisecond,
+		// Shrunk so tests observe the periodic wait-loop observations (15s in
+		// production, > any test's whole runtime).
+		progressLogInterval: 15 * time.Millisecond,
 	}
 }
 
@@ -757,6 +784,10 @@ func TestReshardFlipTimeoutRollsBackShardValue(t *testing.T) {
 
 	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "did not become ready") {
 		t.Fatalf("state=%s err=%q, want flip-timeout failure", store.op.State, store.op.Error)
+	}
+	// The timeout error carries the last converge observation (root cause).
+	if !strings.Contains(store.op.Error, "last observation:") {
+		t.Fatalf("flip-timeout error lacks the last observation: %q", store.op.Error)
 	}
 	// Last cnpg patch must be the flip-back to the source shard value.
 	var shardPatches []string
@@ -1062,6 +1093,11 @@ func TestReshardExtFlipTimeoutRecovers(t *testing.T) {
 	}
 	if !store.hasLog("waiting for external target") {
 		t.Fatalf("generic waiting line missing: %v", store.logs)
+	}
+	// The timeout error carries the last observed duckling state (root cause).
+	if !strings.Contains(store.op.Error, "last observation:") ||
+		!strings.Contains(store.op.Error, "ESO password synced=false") {
+		t.Fatalf("flip-timeout error lacks the last ESO/Ready observation: %q", store.op.Error)
 	}
 	// Recovery is flip-back + adopt (SetMetadataStoreCnpgAdopt), never copy-back.
 	if !containsStr(duckling.callKinds(), "cnpg-adopt") {
@@ -1433,5 +1469,134 @@ func TestReshardVerifyMismatchRollsBack(t *testing.T) {
 	}
 	if store.warehouseState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("warehouse state = %s, want ready after rollback", store.warehouseState)
+	}
+}
+
+// TestProbeErrorAuthClassification pins isAuthProbeError/describeProbeFailure
+// against errors shaped the way catalog_copy.go::Probe actually wraps them
+// (`connect <redacted>: %w` / `probe <redacted>: %w` around pgx errors, whose
+// chain carries a *pgconn.PgError for server-side auth failures).
+func TestProbeErrorAuthClassification(t *testing.T) {
+	saslPgErr := &pgconn.PgError{Severity: "FATAL", Code: "28P01", Message: "SASL authentication failed"}
+	pwPgErr := &pgconn.PgError{Severity: "FATAL", Code: "28P01", Message: `password authentication failed for user "mdstore_org"`}
+	authSpecErr := &pgconn.PgError{Severity: "FATAL", Code: "28000", Message: `no pg_hba.conf entry for host "10.0.0.1"`}
+
+	auth := []error{
+		// Wrapped the way Probe wraps a pgx connect failure (the mw-dev
+		// incident shape: pooler answered FATAL: SASL authentication failed).
+		fmt.Errorf("connect host=shard-001-pooler user=mdstore_org: failed to connect to `user=mdstore_org database=mdstore_org`: server error: %w", saslPgErr),
+		fmt.Errorf("probe host=shard-001-pooler user=mdstore_org: %w", pwPgErr),
+		fmt.Errorf("connect host=x user=y: %w", authSpecErr),
+		// Pre-flattened text (no PgError left in the chain).
+		errors.New("connect host=x user=y: FATAL: SASL authentication failed (SQLSTATE 28P01)"),
+		errors.New("failed to connect: password authentication failed for user \"mdstore_org\""),
+	}
+	for _, err := range auth {
+		if !isAuthProbeError(err) {
+			t.Errorf("isAuthProbeError(%v) = false, want true", err)
+		}
+		got := describeProbeFailure(err, "mdstore_org")
+		if !strings.Contains(got, "AUTHENTICATION error") ||
+			!strings.Contains(got, "stranded password") ||
+			!strings.Contains(got, "ALTER ROLE mdstore_org WITH PASSWORD") {
+			t.Errorf("describeProbeFailure(%v) lacks the named condition + operator remedy: %q", err, got)
+		}
+		if strings.Contains(got, "'pinned-pw'") {
+			t.Errorf("describeProbeFailure must never embed a password: %q", got)
+		}
+	}
+
+	notAuth := []error{
+		errors.New("connect host=x user=y: dial tcp 10.0.0.1:5432: connect: connection refused"),
+		context.DeadlineExceeded,
+		fmt.Errorf("probe host=x user=y: %w", &pgconn.PgError{Severity: "FATAL", Code: "57P03", Message: "the database system is starting up"}),
+	}
+	for _, err := range notAuth {
+		if isAuthProbeError(err) {
+			t.Errorf("isAuthProbeError(%v) = true, want false", err)
+		}
+		if got := describeProbeFailure(err, "mdstore_org"); strings.Contains(got, "AUTHENTICATION") {
+			t.Errorf("describeProbeFailure(%v) misclassified as auth: %q", err, got)
+		}
+	}
+}
+
+// TestReshardExtRecoveryProbeAuthFailureDiagnosed is the regression for the
+// mw-dev incident where the cnpg→ext post-flip recovery spun silently for ~8
+// minutes on `FATAL: SASL authentication failed` (the re-adopted role's actual
+// password differed from the freshly regenerated status password) and the
+// operator had to reproduce the probe from a shell to see why. The recovery
+// wait must (a) announce its deadline, (b) periodically log the classified
+// probe failure naming the stranded-password condition + the manual ALTER ROLE
+// remedy, and (c) end with a timeout line carrying that last observation —
+// all without ever logging a password.
+func TestReshardExtRecoveryProbeAuthFailureDiagnosed(t *testing.T) {
+	store := newFakeReshardStore(stuckExtOp())
+	duckling := &stuckExternalDuckling{fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	// The forward copy pre-flight probes the cnpg source once (must succeed so
+	// the op reaches the flip); every LATER probe of the cnpg endpoint is the
+	// recovery loop re-probing the re-adopted role — those fail with the
+	// incident-shaped SASL error, persistently (stranded password).
+	saslErr := fmt.Errorf("connect host=shard-001-pooler user=mdstore_org: failed to connect to `user=mdstore_org database=mdstore_org`: server error: %w",
+		&pgconn.PgError{Severity: "FATAL", Code: "28P01", Message: "SASL authentication failed"})
+	var cnpgProbes atomic.Int32
+	copier.probeFn = func(ep CatalogEndpoint) error {
+		if ep.SSLMode != "disable" {
+			return nil // external target pre-flight
+		}
+		if cnpgProbes.Add(1) == 1 {
+			return nil // forward-copy source pre-flight
+		}
+		return saslErr
+	}
+
+	r := testRunner(store, duckling, copier)
+	r.StashExternalPassword(store.op.ID, "ext-pw")
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state=%s err=%q, want failed", store.op.State, store.op.Error)
+	}
+	// (a) The recovery wait announces itself with its deadline.
+	if !store.hasLog("recovery: waiting up to") {
+		t.Fatalf("recovery deadline announce missing: %v", store.logs)
+	}
+	// (b) Periodic observations name the auth failure + operator remedy.
+	if n := store.countLog("AUTHENTICATION error"); n < 2 {
+		t.Fatalf("want >=2 periodic auth-failure observations, got %d: %v", n, store.logs)
+	}
+	if !store.hasLog("stranded password") || !store.hasLog("ALTER ROLE mdstore_org WITH PASSWORD") {
+		t.Fatalf("stranded-password condition/remedy missing from the periodic observations: %v", store.logs)
+	}
+	// (c) The terminal recovery-timeout line carries the last observation.
+	terminal := store.findLog("recovery: source shard did not become ready within")
+	if terminal == "" {
+		t.Fatalf("recovery timeout line missing: %v", store.logs)
+	}
+	if !strings.Contains(terminal, "last observation:") ||
+		!strings.Contains(terminal, "SASL authentication failed") ||
+		!strings.Contains(terminal, "AUTHENTICATION error") {
+		t.Fatalf("recovery timeout line lacks the classified root cause: %q", terminal)
+	}
+	// Never a password in the op log — neither the pinned cnpg password nor
+	// the ephemeral external one.
+	store.mu.Lock()
+	logs := append([]string(nil), store.logs...)
+	store.mu.Unlock()
+	for _, l := range logs {
+		if strings.Contains(l, "pinned-pw") || strings.Contains(l, "ext-pw") {
+			t.Fatalf("op log leaked a password: %q", l)
+		}
+	}
+	// The recovery still ran to its normal conclusion: flip-back + adopt,
+	// warehouse unblocked (auth failures do NOT abort the wait early — a
+	// composition fix may still converge the password mid-wait).
+	if !containsStr(duckling.callKinds(), "cnpg-adopt") {
+		t.Fatalf("recovery did not flip back + adopt: %v", duckling.callKinds())
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after recovery", store.warehouseState)
 	}
 }
