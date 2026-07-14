@@ -2247,6 +2247,11 @@ duckling_shard_backfill() { # cnpgOrg
 #     what the step itself needs.
 # cnpg→ext stays unit-test-only: the harness knows the RDS SM secret NAME but
 # not the password, and the start API requires the password (ephemerally).
+# That includes the reused-/shared-target index-replay idempotency (a stale or
+# concurrently ensured idx_ducklake_* on the shared ext RDS 42P07'd a real
+# cnpg→ext copy): the collision only arises on the cnpg→ext COPY onto that
+# reused RDS, so it is pinned by the replayIndexes unit tests
+# (provisioner/catalog_copy_test.go) instead.
 # That also keeps the in-cutover ESO-sync-error surfacing (the deduped warn in
 # flipToExternal when the ExternalSecret is SecretSyncedError) unit-test-only
 # (provisioner/reshard_runner_test.go): asserting it live needs a real
