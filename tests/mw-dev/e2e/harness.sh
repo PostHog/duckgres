@@ -2270,8 +2270,7 @@ reshard_backup_debug() { # opid — focused debug for a backup-assert failure:
   # error the op log only summarizes). Best effort — the reconciler may have
   # reaped the pod already.
   echo "---- op $1 backup-related log lines ----"
-  curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=0&limit=2000" 2>/dev/null \
-    | jq -r '.entries[] | select(.message | test("(?i)backup|sts|assume|s3")) | "\(.level): \(.message)"' || true
+  reshard_log_fetch "$1" 2>/dev/null | grep -iE 'backup|sts|assume|s3' || true
   echo "---- runner pod duckgres-reshard-op-$1 logs (tail) ----"
   k logs "duckgres-reshard-op-$1" --tail=150 2>/dev/null || echo "(runner pod already gone)"
 }
@@ -2318,14 +2317,30 @@ reshard_wait_step() { # opid step timeout_s
   fail "reshard op $1 never reached step $2 (last=$cur)"
 }
 
-reshard_log_has() { # opid substr
-  curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=0&limit=2000" \
-    | jq -r '.entries[].message' | grep -qF "$2"
+reshard_log_fetch() { # opid -> the FULL op log, one "level: message" line per entry
+  # Pages with after_id until exhausted. A single first-page fetch is NOT
+  # enough: the catalog copy logs one op-log line per table, and the shared
+  # ext-RDS catalog has accumulated 20k+ ducklake_* tables across e2e runs —
+  # far past the server's 2000-per-page cap — so a one-shot fetch saw only the
+  # first page and the asserts on END-of-log lines (the terminal "reshard
+  # report" block) failed on an op that actually succeeded.
+  _after=0
+  while :; do
+    _page="$(curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=${_after}&limit=2000")" || break
+    _n="$(echo "$_page" | jq '.entries | length')" || break
+    [ "${_n:-0}" -gt 0 ] || break
+    echo "$_page" | jq -r '.entries[] | "\(.level): \(.message)"'
+    _after="$(echo "$_page" | jq '.entries[-1].id')" || break
+    if [ "$_n" -lt 2000 ]; then break; fi
+  done
 }
 
-reshard_dump_log() { # opid
-  curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=0&limit=2000" \
-    | jq -r '.entries[] | "\(.level): \(.message)"' | tail -30 || true
+reshard_log_has() { # opid substr
+  reshard_log_fetch "$1" | grep -qF "$2"
+}
+
+reshard_dump_log() { # opid — the log TAIL (where the failure/report lands)
+  reshard_log_fetch "$1" | tail -30 || true
 }
 
 reshard_targets() { # destination discovery; ext org's RDS must appear too
