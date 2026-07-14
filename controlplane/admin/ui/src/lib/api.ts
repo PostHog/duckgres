@@ -231,11 +231,14 @@ export const api = {
       (r) => r.operations ?? [],
     ),
   getReshard: (opId: number) => get<ReshardOperation>(`/reshards/${opId}`),
-  // Incremental log poll: pass the last seen entry id.
-  getReshardLog: (opId: number, afterId: number) =>
-    get<{ entries: ReshardLogEntry[] }>(`/reshards/${opId}/log`, { after_id: afterId }).then(
-      (r) => r.entries ?? [],
-    ),
+  // Incremental log poll: pass the last seen entry id. `limit` caps the page
+  // size (server default 500, hard cap 2000 in ListReshardLog) — the catch-up
+  // loop asks for big pages to drain a long backlog in few round-trips.
+  getReshardLog: (opId: number, afterId: number, limit?: number) =>
+    get<{ entries: ReshardLogEntry[] }>(`/reshards/${opId}/log`, {
+      after_id: afterId,
+      limit,
+    }).then((r) => r.entries ?? []),
   cancelReshard: (opId: number) =>
     post<{ cancel_requested?: boolean; state?: string }>(`/reshards/${opId}/cancel`, {}),
   // Global operation list (all orgs, newest first) for the Reshards nav page.

@@ -63,4 +63,48 @@ describe("useRevealedCount", () => {
     for (let i = 0; i < 20; i++) tick();
     expect(result.current).toBe(5);
   });
+
+  it("reveals the instant floor immediately, with no replay", () => {
+    const { result } = renderHook(
+      ({ total, instant }) => useRevealedCount(total, instant),
+      { initialProps: { total: 5000, instant: 5000 } },
+    );
+    // The whole backlog is visible on first render — no ticks needed.
+    expect(result.current).toBe(5000);
+  });
+
+  it("replays only lines beyond the instant floor", () => {
+    const { result, rerender } = renderHook(
+      ({ total, instant }) => useRevealedCount(total, instant),
+      { initialProps: { total: 100, instant: 100 } },
+    );
+    expect(result.current).toBe(100);
+
+    // Live appends after the backlog still surface tick-by-tick.
+    rerender({ total: 102, instant: 100 });
+    expect(result.current).toBe(100);
+    tick();
+    expect(result.current).toBeGreaterThan(100);
+    tick();
+    expect(result.current).toBe(102);
+  });
+
+  it("a raised instant floor mid-flight surfaces at once", () => {
+    const { result, rerender } = renderHook(
+      ({ total, instant }) => useRevealedCount(total, instant),
+      { initialProps: { total: 0, instant: 0 } },
+    );
+    expect(result.current).toBe(0);
+    // Catch-up completes: entries and the floor land together.
+    rerender({ total: 3000, instant: 3000 });
+    expect(result.current).toBe(3000);
+  });
+
+  it("clamps the instant floor to the total", () => {
+    const { result } = renderHook(
+      ({ total, instant }) => useRevealedCount(total, instant),
+      { initialProps: { total: 3, instant: 10 } },
+    );
+    expect(result.current).toBe(3);
+  });
 });
