@@ -582,7 +582,11 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
 - **cnpg→ext escape hatch = orphan-adopt then verified-delete** (charts
   `retainCnpgOnFlip`): copy → verify source → set `retainCnpgOnFlip=true` AND
   poll the cnpg Role/Database MRs until they carry the no-Delete policy (two-step
-  flip, closes the un-render-before-policy race) → flip type to external (now
+  flip, closes the un-render-before-policy race; this MR read needs an explicit
+  get grant on roles+databases in `postgresql.sql.m.crossplane.io` — NOT covered
+  by duckling-reader; a Forbidden fails the wait immediately with the missing
+  grant named, and the periodic wait log + timeout error carry the observed
+  `managementPolicies`) → flip type to external (now
   ORPHANS, not deletes, the cnpg role/DB) → verify the external catalog row
   counts match the copy EXACTLY → only THEN `DROP DATABASE` the retained source +
   clear the flag. ANY failure before that drop → flip back to cnpg-shard +

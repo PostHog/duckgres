@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // ---- fakes -----------------------------------------------------------------
@@ -222,6 +225,12 @@ type fakeDuckling struct {
 	// (composition converges instantly).
 	retainFieldUnsupported bool
 	retainFlag             bool
+	// mrsReadErr scripts a CnpgSourceMRsOrphaned read failure (e.g. an RBAC
+	// Forbidden, wrapped the way the real client wraps it).
+	mrsReadErr error
+	// mrsStuckWithDelete models a composition that never honors the retain
+	// flag: the MRs stay at full lifecycle ["*"] no matter what.
+	mrsStuckWithDelete bool
 }
 
 func (f *fakeDuckling) Get(context.Context, string) (*DucklingStatus, error) {
@@ -291,13 +300,22 @@ func (f *fakeDuckling) GetMetadataStoreRetainCnpgOnFlip(context.Context, string)
 	return f.retainFlag, true, nil
 }
 
-func (f *fakeDuckling) CnpgSourceMRsOrphaned(context.Context, string) (bool, bool, error) {
+func (f *fakeDuckling) CnpgSourceMRsOrphaned(context.Context, string) (bool, bool, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.mrsReadErr != nil {
+		return false, false, "", f.mrsReadErr
+	}
+	if f.mrsStuckWithDelete {
+		return false, true, `Role "org-a-role": managementPolicies ["*"]; Database "org-a-db": managementPolicies ["*"]`, nil
+	}
 	// Composition converges instantly: once retain is set, the cnpg source MRs
 	// reflect the no-Delete policy. present is always true (the source cnpg
 	// Role/Database MRs exist while type is cnpg-shard).
-	return f.retainFlag, true, nil
+	if f.retainFlag {
+		return true, true, `Role "org-a-role": managementPolicies ["Observe","Create","Update"]; Database "org-a-db": managementPolicies ["Observe","Create","Update"]`, nil
+	}
+	return false, true, `Role "org-a-role": managementPolicies ["*"]; Database "org-a-db": managementPolicies ["*"]`, nil
 }
 
 func (f *fakeDuckling) SetMetadataStoreCnpgAdopt(_ context.Context, _ string, shard string) error {
@@ -1273,6 +1291,103 @@ func TestReshardCnpgToExtXRDUnsupportedRefuses(t *testing.T) {
 	}
 	if store.warehouseState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("warehouse state = %s, want ready after refusal rollback", store.warehouseState)
+	}
+}
+
+// TestReshardCnpgToExtOrphanWaitForbiddenFailsFast pins the RBAC fail-fast:
+// when the runner's ServiceAccount cannot read the provider-sql Role/Database
+// MRs (Forbidden), the orphan wait must NOT poll to its timeout and then blame
+// the composition — it fails immediately with an error naming the missing
+// grant, before any flip, and rolls back cleanly. Regression for the mw-dev
+// reshard op that burned the full 15m wait on a Forbidden read.
+func TestReshardCnpgToExtOrphanWaitForbiddenFailsFast(t *testing.T) {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	store := newFakeReshardStore(op)
+	// Wrapped exactly the way the real client wraps a Get failure — the
+	// runner's IsForbidden must see through the %w chain.
+	forbidden := fmt.Errorf("get Database %q: %w", "org-a-db",
+		apierrors.NewForbidden(
+			schema.GroupResource{Group: "postgresql.sql.m.crossplane.io", Resource: "databases"},
+			"org-a-db", errors.New("no RBAC grant")))
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), mrsReadErr: forbidden}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	r := testRunner(store, duckling, copier)
+	// An hour-long flip timeout proves the failure is the fail-fast, not the
+	// deadline (runOp's 30s guard would trip if the wait polled to timeout).
+	r.flipTimeout = time.Hour
+	r.StashExternalPassword(op.ID, "ext-pw")
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed ||
+		!strings.Contains(store.op.Error, "Forbidden") ||
+		!strings.Contains(store.op.Error, "postgresql.sql.m.crossplane.io") {
+		t.Fatalf("state=%s err=%q, want fast Forbidden failure naming the missing RBAC grant", store.op.State, store.op.Error)
+	}
+	// Never flipped, never dropped — the source is untouched.
+	if containsStr(duckling.callKinds(), "external") {
+		t.Fatalf("flip ran despite the Forbidden orphan check: %v", duckling.callKinds())
+	}
+	if containsStr(copier.kinds(), "dropdb") {
+		t.Fatalf("source dropped despite refusing the flip: %v", copier.kinds())
+	}
+	// The retain flag we set is reset on rollback.
+	var retainVals []bool
+	for _, c := range duckling.calls {
+		if c.kind == "retain" && c.retain != nil {
+			retainVals = append(retainVals, *c.retain)
+		}
+	}
+	if len(retainVals) == 0 || retainVals[len(retainVals)-1] != false {
+		t.Fatalf("retain patches = %v, want the last to reset to false on rollback", retainVals)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after fail-fast rollback", store.warehouseState)
+	}
+}
+
+// TestReshardCnpgToExtOrphanWaitTimeoutReportsObservation pins the wait-loop
+// diagnostics: when the composition never re-renders the MRs without Delete,
+// the periodic op-log lines and the final timeout error must carry the last
+// observed managementPolicies, so a stuck wait is diagnosable from the op log
+// alone.
+func TestReshardCnpgToExtOrphanWaitTimeoutReportsObservation(t *testing.T) {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), mrsStuckWithDelete: true}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	r := testRunner(store, duckling, copier)
+	r.flipTimeout = 150 * time.Millisecond
+	r.StashExternalPassword(op.ID, "ext-pw")
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed ||
+		!strings.Contains(store.op.Error, "charts/composition skew") ||
+		!strings.Contains(store.op.Error, `managementPolicies ["*"]`) {
+		t.Fatalf("state=%s err=%q, want composition-skew timeout carrying the last observed managementPolicies", store.op.State, store.op.Error)
+	}
+	// No flip, no drop — the source is untouched, and rollback recovers.
+	if containsStr(duckling.callKinds(), "external") {
+		t.Fatalf("flip ran despite the MRs never reflecting the retain policy: %v", duckling.callKinds())
+	}
+	if containsStr(copier.kinds(), "dropdb") {
+		t.Fatalf("source dropped despite refusing the flip: %v", copier.kinds())
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after timeout rollback", store.warehouseState)
 	}
 }
 
