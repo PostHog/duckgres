@@ -120,6 +120,20 @@ EXPECT_HTTPFS_SHA="0dac6fc"
 # manual validation used). Endpoint is stable in mw-dev.
 EXT_RDS_ENDPOINT="duckling-example-managed-warehouse-dev-us-east-1.c8jy2c68kipq.us-east-1.rds.amazonaws.com"
 EXT_RDS_SECRET="duckling-example-managed-warehouse-dev-us-east-1-rds-password"
+EXT_RDS_USER="ducklingexample"
+# Per-run metadata DATABASE on that shared RDS. Every run used to point its
+# ext org at the one shared database, whose DuckLake catalog therefore grew
+# monotonically across runs (20k+ ducklake_* tables observed) — inflating
+# every catalog copy (the reshard ext→cnpg lane went to ~6 min / ~95MB) and
+# exposing runs to each other's writers. Instead each run CREATEs its own
+# database (ext_rds_setup, once the run's own duckling status carries the
+# ESO-synced RDS password) and DROPs it at the end (ext_rds_teardown); the
+# name embeds a UTC timestamp so ext_rds_setup can also GC databases leaked
+# by aborted runs (>24h old). The RDS user/password/secret are unchanged —
+# only the database is per-run. run.sh teardown cannot do this drop itself
+# (the GitHub runner has neither psql nor any path to the RDS password), so
+# crash-leaked databases are reaped by the NEXT run's GC instead.
+EXT_RDS_DB="mdstore_e2e_$(date -u +%Y%m%d%H%M%S)_pr$(printf %s "${PR_NUMBER:-0}" | tr -cd 'a-z0-9')"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -180,6 +194,86 @@ provision() { # org metadata_json
   log "provision $1"
   curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
     "$API/api/v1/orgs/$1/provision"
+}
+
+# ---- per-run external metadata database (see EXT_RDS_DB above) --------------
+# rds_psql runs one statement against the shared RDS as the shared tenant user.
+# It anchors the session on the long-lived legacy database (connect only —
+# never written) because CREATE/DROP DATABASE cannot run against the database
+# being created/dropped. EXT_RDS_PW must be set (ext_rds_setup below).
+rds_psql() { # sql
+  PGPASSWORD="$EXT_RDS_PW" psql \
+    "host=$EXT_RDS_ENDPOINT port=5432 user=$EXT_RDS_USER dbname=$EXT_RDS_USER sslmode=require connect_timeout=10" \
+    -v ON_ERROR_STOP=1 -qtA -c "$1"
+}
+
+# ext_rds_setup creates this run's metadata database and GCs databases leaked
+# by aborted runs. It needs the RDS password, which the harness obtains
+# in-cluster from its OWN ext duckling's CR status (status.metadataStore
+# .password, the ESO-synced value — the same shared-user password every run
+# uses; the harness SA already has cross-namespace duckling read RBAC). That
+# status field only exists once the composition has synced the secret, so this
+# runs as a lane CONCURRENT with the readiness waits: the CP's end-to-end
+# provisioning probe (controller.go reconcileProvisioning) targets the per-run
+# database and simply retries until we create it — never terminal before the
+# CP's 30-minute provisioning timeout — so ready_ext flips shortly after the
+# CREATE DATABASE lands. Requires bootstrap_kubectl to have completed in the
+# MAIN shell first (the lane subshell must not race the background download).
+ext_rds_setup() {
+  d="$(echo "$EXT" | tr 'A-Z' 'a-z')"
+  log "ext metadata db: waiting for the ESO-synced RDS password on duckling/${d}…"
+  deadline=$(( $(date +%s) + 300 ))
+  EXT_RDS_PW=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    EXT_RDS_PW="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.password}' 2>/dev/null || true)"
+    [ -n "$EXT_RDS_PW" ] && break
+    sleep 5
+  done
+  [ -n "$EXT_RDS_PW" ] || fail "ext metadata db: duckling/$d never published status.metadataStore.password (ESO sync stuck?)"
+  # Stash for ext_rds_teardown: this runs in a lane subshell, so a shell var
+  # would not survive back to main() (same pattern as the prov_*.json files).
+  printf %s "$EXT_RDS_PW" > "$LANE_DIR/ext_rds_pw"
+
+  # GC databases leaked by aborted runs: strictly name-gated (full per-run
+  # pattern with a parseable 14-digit UTC timestamp) and >24h old, so a
+  # concurrent run on another PR can never lose its live database and nothing
+  # outside the mdstore_e2e_* namespace is ever touched.
+  cutoff="$(python3 -c 'from datetime import datetime,timedelta,timezone;print((datetime.now(timezone.utc)-timedelta(hours=24)).strftime("%Y%m%d%H%M%S"))')"
+  for db in $(rds_psql "SELECT datname FROM pg_database WHERE datname LIKE 'mdstore\_e2e\_%'" || true); do
+    case "$db" in
+      *[!a-z0-9_]*) log "ext metadata db: GC skipping odd name '$db'"; continue ;;
+    esac
+    ts="${db#mdstore_e2e_}"; ts="${ts%%_*}"
+    case "$ts" in
+      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+      *) log "ext metadata db: GC skipping unparseable name '$db'"; continue ;;
+    esac
+    if [ "$ts" -lt "$cutoff" ]; then
+      log "ext metadata db: GC dropping stale $db (leaked by an aborted run >24h ago)"
+      rds_psql "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null \
+        || log "ext metadata db: GC drop of $db failed (the next run retries)"
+    fi
+  done
+
+  log "ext metadata db: creating per-run database $EXT_RDS_DB"
+  rds_psql "CREATE DATABASE \"$EXT_RDS_DB\"" >/dev/null \
+    || fail "ext metadata db: CREATE DATABASE $EXT_RDS_DB failed (does $EXT_RDS_USER still have CREATEDB?)"
+  log "ext metadata db: $EXT_RDS_DB ready"
+}
+
+# ext_rds_teardown drops this run's database and asserts it is gone. By this
+# point the ext org has been resharded onto cnpg (reshard_ext_to_cnpg leaves
+# the external source untouched but unused), so the drop can never yank a
+# live catalog. On any failure the >24h GC in the next run reaps it.
+ext_rds_teardown() {
+  EXT_RDS_PW="$(cat "$LANE_DIR/ext_rds_pw" 2>/dev/null || true)"
+  [ -n "$EXT_RDS_PW" ] || { log "ext metadata db: no stashed password — skipping drop (GC will reap)"; return 0; }
+  log "ext metadata db: dropping per-run database $EXT_RDS_DB"
+  rds_psql "DROP DATABASE IF EXISTS \"$EXT_RDS_DB\" WITH (FORCE)" >/dev/null \
+    || fail "ext metadata db: DROP DATABASE $EXT_RDS_DB failed"
+  left="$(rds_psql "SELECT 1 FROM pg_database WHERE datname = '$EXT_RDS_DB'")" || left=""
+  [ -z "$left" ] || fail "ext metadata db: $EXT_RDS_DB still exists after DROP"
+  log "ext metadata db: per-run database dropped"
 }
 
 wait_state() { # org target timeout_s
@@ -2648,7 +2742,7 @@ EXT_BODY='{"database_name":"'"$EXT"'",
   "default_team_id":'"$EXT_DEFAULT_TEAM_ID"',
   "metadata_store":{"type":"external","external":{
     "endpoint":"'"$EXT_RDS_ENDPOINT"'","password_aws_secret":"'"$EXT_RDS_SECRET"'",
-    "user":"ducklingexample","database":"ducklingexample"}},
+    "user":"'"$EXT_RDS_USER"'","database":"'"$EXT_RDS_DB"'"}},
   "data_store":{"type":"external","bucket_name":"posthog-duckling-example-managed-warehouse-dev","region":"us-east-1"},
   "ducklake":{"enabled":true}}'
 
@@ -2936,11 +3030,22 @@ main() {
   for v in "$cnpg_pw" "$ext_pw" "$res1_pw" "$res2_pw"; do
     case "$v" in ""|null) fail "a provision call returned no password" ;; esac
   done
+  # kubectl must be usable BEFORE the extdb lane below (the lane subshell
+  # reads the ext duckling's CR status and must not race the background
+  # download). This trades away only the readiness-phase overlap; the fetch
+  # already overlapped the whole provisioning phase above.
+  bootstrap_kubectl
+
+  # The extdb lane creates the run's external metadata database (and GCs
+  # leaked ones) CONCURRENTLY with the readiness waits: ready_ext cannot flip
+  # before the database exists (the CP's end-to-end probe targets it and
+  # retries), so this lane completing is a hard prerequisite it races ahead of.
   run_lane ready_cnpg wait_state "$CNPG" ready "$READY_TIMEOUT"
   run_lane ready_ext  wait_state "$EXT"  ready "$READY_TIMEOUT"
   run_lane ready_res1 wait_state "$RES1" ready "$READY_TIMEOUT"
   run_lane ready_res2 wait_state "$RES2" ready "$READY_TIMEOUT"
-  join_lanes ready_cnpg ready_ext ready_res1 ready_res2
+  run_lane extdb ext_rds_setup
+  join_lanes ready_cnpg ready_ext ready_res1 ready_res2 extdb
 
   # Settle: let the CP's config-store poll pick up the provisioned orgs/users
   # before the first connection, so we don't burn failed-auth attempts against
@@ -2960,11 +3065,8 @@ main() {
   admin_console_api
   admin_rbac_viewer "$CNPG"
 
-  # Join the kubectl background download started at script load — first k use
-  # is inside the lanes, so the fetch overlapped the whole provisioning phase.
-  bootstrap_kubectl
-
   # ---- the four parallel assertion lanes (see lane_* above) ----
+  # (kubectl was bootstrapped before the readiness lanes above.)
   run_lane cnpg lane_cnpg
   run_lane res1 lane_res1
   run_lane res2 lane_res2
@@ -3032,11 +3134,17 @@ main() {
   # only needs one cnpg-shard org.)
   lifecycle_teardown_cnpg "$CNPG"
 
+  # ---- per-run external metadata database: drop + assert gone ----------------
+  # (Safe now: reshard_ext_to_cnpg moved the ext org off the RDS, so the
+  # per-run database is an orphaned source. A crashed run skips this and the
+  # next run's >24h GC in ext_rds_setup reaps the leftover.)
+  ext_rds_teardown
+
   # NOTE: the version-mismatch worker reaper is not exercised in-Job (it needs a
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release) + per-run-ext-metadata-db(create/stale-GC/drop), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
