@@ -7,8 +7,9 @@
 //
 //	go list -deps ./cmd/duckgres-controlplane | grep duckdb-go   # empty
 //
-// At runtime, this binary only supports control-plane mode; standalone /
-// duckdb-service modes belong in the all-in-one duckgres binary or
+// At runtime, this binary supports control-plane mode and reshard-runner mode
+// (the dedicated per-operation reshard pod, which runs the CP's own image);
+// standalone / duckdb-service modes belong in the all-in-one duckgres binary or
 // cmd/duckgres-worker respectively.
 package main
 
@@ -75,7 +76,7 @@ func main() {
 	// cmd/duckgres-worker, which accepts --mode duckdb-service for
 	// compatibility with hardcoded pod-spec args. This binary is
 	// control-plane by definition; any other value is loud misuse.
-	mode := flag.String("mode", "control-plane", "Run mode (must be 'control-plane'; accepted for symmetry with the all-in-one binary's CLI shape)")
+	mode := flag.String("mode", "control-plane", "Run mode: control-plane (default) or reshard-runner (dedicated per-operation reshard pod)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Duckgres control plane %s — PostgreSQL wire protocol + Flight ingress\n\n", version)
@@ -112,8 +113,8 @@ func main() {
 		flag.Usage()
 		os.Exit(0)
 	}
-	if *mode != "control-plane" {
-		fmt.Fprintf(os.Stderr, "duckgres-controlplane only supports --mode control-plane (got %q). Use the all-in-one duckgres binary for standalone or duckdb-service modes, or cmd/duckgres-worker for worker pods.\n", *mode)
+	if *mode != "control-plane" && *mode != "reshard-runner" {
+		fmt.Fprintf(os.Stderr, "duckgres-controlplane only supports --mode control-plane or --mode reshard-runner (got %q). Use the all-in-one duckgres binary for standalone or duckdb-service modes, or cmd/duckgres-worker for worker pods.\n", *mode)
 		os.Exit(2)
 	}
 
@@ -148,7 +149,7 @@ func main() {
 	tracingShutdown := cliboot.InitTracing()
 	defer tracingShutdown()
 
-	buildInfo().Log("control-plane")
+	buildInfo().Log(*mode)
 	server.SetProcessVersion(version)
 
 	if fileCfg != nil {
@@ -165,6 +166,24 @@ func main() {
 		slog.Warn(msg)
 	})
 	cfg := resolved.Server
+
+	// Reshard-runner mode: the entrypoint of a dedicated per-operation pod
+	// (duckgres-reshard-op-<id>) the control plane spawns for each reshard.
+	// Claims ONE operation (DUCKGRES_RESHARD_OP_ID), executes the step machine
+	// to a terminal state, exits. The op row is the source of truth for the
+	// OUTCOME (a failed/rolled-back op still exits 0); only infrastructure
+	// errors (config store unreachable, claim lost/fenced) exit nonzero. No PG
+	// listener, no TLS, no metrics endpoint, no data dir.
+	if *mode == "reshard-runner" {
+		if err := controlplane.RunReshardRunnerMode(controlplane.ReshardRunnerModeConfig{
+			ConfigStoreConn:    resolved.ConfigStoreConn,
+			ConfigPollInterval: resolved.ConfigPollInterval,
+			AWSRegion:          resolved.AWSRegion,
+		}); err != nil {
+			fatal("Reshard runner failed: " + err.Error())
+		}
+		return
+	}
 
 	// Process isolation is incompatible with control-plane mode — that mode
 	// already provides process-level isolation via the worker pool.
@@ -251,6 +270,8 @@ func main() {
 			WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
 			WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
 			WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
+			ReshardPodCPU:                resolved.K8sReshardPodCPU,
+			ReshardPodMemory:             resolved.K8sReshardPodMemory,
 			AWSRegion:                    resolved.AWSRegion,
 		},
 	}

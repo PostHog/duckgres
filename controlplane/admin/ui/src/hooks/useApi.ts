@@ -499,37 +499,82 @@ export function useReshard(opId: number | null) {
   });
 }
 
-// Incremental log accumulation: polls /log?after_id=<last seen> and appends.
-// Keeps polling (slower) even after the op is terminal so the final report
-// lines always land; the page unmount stops it. Returned entries are revealed
-// PROGRESSIVELY (useRevealedCount): opening the page of a running or finished
-// op replays the accumulated backlog line-by-line over a few seconds like a
-// live terminal, then live-appends new lines as they arrive.
+// Catch-up page size: the server's hard cap (ListReshardLog clamps >2000 back
+// to the 500 default), so a many-thousand-line backlog drains in a handful of
+// round-trips.
+export const RESHARD_LOG_CATCHUP_PAGE = 2000;
+
+// Reshard op log accumulation, in two phases:
+//
+// 1. Catch-up (mount / opId change): drain the ENTIRE existing backlog in an
+//    immediate tight loop of full pages — no poll-interval sleep between
+//    pages — and land it in ONE state update, revealed instantly. Opening the
+//    page of an op that already logged thousands of lines (a 20k-table copy
+//    logs one line per table) jumps straight to the newest lines instead of
+//    pumping batches at poll cadence.
+// 2. Live tail: poll /log?after_id=<last seen> and append; new lines are
+//    revealed progressively (useRevealedCount) like a live terminal. Keeps
+//    polling (slower) even after the op is terminal so the final report lines
+//    always land; the page unmount stops it.
 export function useReshardLog(opId: number | null, opState: string | undefined) {
   const [entries, setEntries] = useState<ReshardLogEntry[]>([]);
+  // Size of the instantly-revealed backlog; null until catch-up completes.
+  const [backlog, setBacklog] = useState<number | null>(null);
   const lastID = entries.length > 0 ? entries[entries.length - 1].id : 0;
   const terminal = opState != null && RESHARD_TERMINAL.has(opState);
 
+  useEffect(() => {
+    if (opId == null) return;
+    let cancelled = false;
+    setEntries([]);
+    setBacklog(null);
+    (async () => {
+      const acc: ReshardLogEntry[] = [];
+      let after = 0;
+      try {
+        for (;;) {
+          const page = await api.getReshardLog(opId, after, RESHARD_LOG_CATCHUP_PAGE);
+          if (cancelled) return;
+          acc.push(...page);
+          if (page.length < RESHARD_LOG_CATCHUP_PAGE) break;
+          after = page[page.length - 1].id;
+        }
+      } catch {
+        // Partial backlog is fine — the incremental poll resumes from its tail.
+      }
+      if (!cancelled) {
+        setEntries(acc);
+        setBacklog(acc.length);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [opId]);
+
+  const caughtUp = backlog != null;
   const poll = useQuery<ReshardLogEntry[]>({
     queryKey: ["reshardLog", opId, lastID],
     queryFn: () => api.getReshardLog(opId as number, lastID),
-    enabled: opId != null,
+    enabled: opId != null && caughtUp,
     retry: false,
+    // A full poll page changes lastID → new query key → immediate refetch, so
+    // an over-500-line gap between polls also drains without interval sleeps.
     refetchInterval: terminal ? POLL.slow : POLL.fast,
   });
 
   useEffect(() => {
     const fresh = poll.data;
-    if (fresh && fresh.length > 0) {
+    if (caughtUp && fresh && fresh.length > 0) {
       setEntries((prev) => {
         const seen = prev.length > 0 ? prev[prev.length - 1].id : 0;
         const append = fresh.filter((e) => e.id > seen);
         return append.length > 0 ? [...prev, ...append] : prev;
       });
     }
-  }, [poll.data]);
+  }, [poll.data, caughtUp]);
 
-  const revealed = useRevealedCount(entries.length);
+  const revealed = useRevealedCount(entries.length, backlog ?? 0);
   return useMemo(() => entries.slice(0, revealed), [entries, revealed]);
 }
 

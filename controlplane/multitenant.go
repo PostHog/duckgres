@@ -451,7 +451,6 @@ func SetupMultiTenant(
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
-	var reshardRunner *provisioner.ReshardRunner
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		slog.Warn("Provisioning controller unavailable.", "error", err)
@@ -461,29 +460,26 @@ func SetupMultiTenant(
 		// it disabled (composition keeps deriving).
 		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
 		go provCtrl.Run(context.Background())
+	}
 
-		// Pre-flip catalog backuper: pg_dumps the source catalog to the org's
-		// own S3 data bucket before a reshard flip, uploading with credentials
-		// from the org's IAM role (the same STS AssumeRole path the worker
-		// activator uses). Nil when STS is unavailable (local/non-AWS) — the
-		// runner then skips the best-effort backup and hard-fails only the
-		// destructive cnpg→external direction.
-		var backuper provisioner.CatalogBackuper
-		if stsBroker != nil {
-			backuper = provisioner.NewPGCatalogBackuper(func(ctx context.Context, roleARN string) (string, string, string, error) {
-				creds, err := stsBroker.AssumeRole(ctx, roleARN)
-				if err != nil {
-					return "", "", "", err
-				}
-				return creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, nil
-			})
+	// Reshard operations execute in DEDICATED per-op pods, never inside a CP
+	// process (a catalog pg_dump must not compete with live traffic for CP
+	// memory — a 20k-table dump OOM-killed a 512Mi CP pod). The CP's part is
+	// (a) the spawner (admin start handler creates the op + pod) and (b) the
+	// leader-only reconciler (respawn dead runner pods, reap finished ones).
+	var reshardSpawner *ReshardPodSpawner
+	if router.sharedPool != nil && router.sharedPool.clientset != nil {
+		selfPod := os.Getenv("POD_NAME")
+		if selfPod == "" {
+			selfPod = cpID
 		}
-
-		// Reshard runner: drives operator-initiated metadata-store migrations
-		// (admin console → op row → claim/execute). Every replica runs one;
-		// a single replica wins each op via the claim CAS.
-		reshardRunner = provisioner.NewReshardRunner(store, provCtrl.DucklingClient(), cpInstanceID, pollInterval, backuper)
-		go reshardRunner.Run(context.Background())
+		reshardSpawner = NewReshardPodSpawner(
+			router.sharedPool.clientset, namespace, selfPod,
+			cfg.K8s.ReshardPodCPU, cfg.K8s.ReshardPodMemory,
+		)
+		if janitorLeader != nil {
+			janitorLeader.AttachLeaderLoop(newReshardReconciler(store, reshardSpawner).Run)
+		}
 	}
 
 	// Register config change handler
@@ -616,17 +612,17 @@ func SetupMultiTenant(
 	}
 	admin.RegisterDucklingsMetadata(api, ducklingMetadata)
 
-	// Reshard operations (metadata-store migrations). The runner may be nil
+	// Reshard operations (metadata-store migrations). The spawner may be nil
 	// (no k8s API) — reads still work, starts fail with a clear error.
-	var reshardRunnerHandle admin.ReshardRunnerHandle
-	if reshardRunner != nil {
-		reshardRunnerHandle = reshardRunner
+	var reshardSpawnerHandle admin.ReshardPodSpawner
+	if reshardSpawner != nil {
+		reshardSpawnerHandle = reshardSpawner
 	}
 	// Pre-flight prober for cnpg→external targets: reuses the catalog copier's
 	// SELECT-1 probe to fail-fast an unreachable/bad-credential target before
 	// the destructive flip. Always available in the k8s CP build; nil-degrades
 	// in tests / non-k8s (the runner's copy still catches a bad credential).
-	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardRunnerHandle, clusterClient, catalogCopierProber{})
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardSpawnerHandle, clusterClient, catalogCopierProber{})
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)

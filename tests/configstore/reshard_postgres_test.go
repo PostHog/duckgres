@@ -4,6 +4,7 @@ package configstore_test
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -147,65 +148,60 @@ func TestReshardTakeoverFencingPostgres(t *testing.T) {
 	}
 }
 
-// TestReshardCreateClaimedPostgres pins claim-on-create: the op lands running
-// and owned by the creating CP in a single insert, a second active op for the
-// org still conflicts, and a sibling replica cannot steal the fresh-heartbeat
-// running op (the fix for the multi-replica ephemeral-password bug).
-func TestReshardCreateClaimedPostgres(t *testing.T) {
+// TestReshardPasswordURLAndActiveListPostgres pins the pod-model plumbing:
+// the password pull URL is recordable only while the op is PENDING (the
+// runner pod's claim freezes the wiring), it round-trips, it is absent from
+// terminal updates, and ListActiveReshardOperations returns exactly the
+// pending/running set the leader reconciler works on.
+func TestReshardPasswordURLAndActiveListPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	op := newReshardOp("org-cc")
-	if err := store.CreateReshardOperationClaimed(op, "cp-a"); err != nil {
-		t.Fatalf("create claimed: %v", err)
+	op := newReshardOp("org-purl")
+	if err := store.CreateReshardOperation(op); err != nil {
+		t.Fatalf("create: %v", err)
 	}
-	if op.ID == 0 || op.State != cpconfigstore.ReshardStateRunning || op.RunnerCP != "cp-a" || op.RunnerEpoch != 1 {
-		t.Fatalf("create-claimed returned op %+v, want running/cp-a/epoch=1", op)
+	url := "http://192.0.2.7:8080/api/v1/reshards/" + strconv.FormatInt(op.ID, 10) + "/password"
+	if err := store.SetReshardOperationPasswordURL(op.ID, url); err != nil {
+		t.Fatalf("set password url: %v", err)
 	}
-	if op.HeartbeatAt == nil || op.StartedAt == nil {
-		t.Fatalf("create-claimed did not stamp heartbeat/started: %+v", op)
-	}
-
-	// Persisted row matches.
 	fresh, err := store.GetReshardOperation(op.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if fresh.State != cpconfigstore.ReshardStateRunning || fresh.RunnerCP != "cp-a" || fresh.RunnerEpoch != 1 {
-		t.Fatalf("persisted op = %+v, want running/cp-a/epoch=1", fresh)
+	if fresh.PasswordURL != url {
+		t.Fatalf("password url = %q, want %q", fresh.PasswordURL, url)
 	}
 
-	// A second active op for the same org still conflicts (partial unique index).
-	if err := store.CreateReshardOperationClaimed(newReshardOp("org-cc"), "cp-b"); !errors.Is(err, cpconfigstore.ErrReshardConflict) {
-		t.Fatalf("second create-claimed error = %v, want ErrReshardConflict", err)
-	}
-
-	// A fresh-heartbeat running op is NOT claimable by another replica — the
-	// whole point: cp-b's scanOnce can never win it away from cp-a.
-	if !claimListExcludes(t, store, op.ID) {
-		t.Fatal("create-claimed op is listed as claimable — a sibling replica could steal it")
-	}
-	stolen, err := store.ClaimReshardOperation(op.ID, "cp-b", 5*time.Minute)
+	// Reconciler working set: the pending op is listed…
+	active, err := store.ListActiveReshardOperations()
 	if err != nil {
-		t.Fatalf("claim: %v", err)
+		t.Fatalf("list active: %v", err)
 	}
-	if stolen != nil {
-		t.Fatalf("cp-b stole a fresh-heartbeat create-claimed op: %+v", stolen)
+	if len(active) != 1 || active[0].ID != op.ID || active[0].PasswordURL != url {
+		t.Fatalf("active ops = %+v, want just op %d with its password url", active, op.ID)
 	}
-}
 
-// claimListExcludes reports whether id is absent from the claimable set.
-func claimListExcludes(t *testing.T, store *cpconfigstore.ConfigStore, id int64) bool {
-	t.Helper()
-	ids, err := store.ListClaimableReshardOperations(5 * time.Minute)
-	if err != nil {
-		t.Fatalf("list claimable: %v", err)
+	// …a claimed (running) op still is…
+	claimed, err := store.ClaimReshardOperation(op.ID, "pod-a", 5*time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v / %+v", err, claimed)
 	}
-	for _, got := range ids {
-		if got == id {
-			return false
-		}
+	if active, _ = store.ListActiveReshardOperations(); len(active) != 1 {
+		t.Fatalf("running op missing from active list: %+v", active)
 	}
-	return true
+
+	// …and once running the URL is frozen (CAS on pending fails).
+	if err := store.SetReshardOperationPasswordURL(op.ID, "http://192.0.2.8:8080/x"); err == nil {
+		t.Fatal("set password url on a running op must fail")
+	}
+
+	// Terminal ops leave the active set.
+	if err := store.FinishReshardOperation(op.ID, "pod-a", claimed.RunnerEpoch, cpconfigstore.ReshardStateFailed, "x"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if active, _ = store.ListActiveReshardOperations(); len(active) != 0 {
+		t.Fatalf("terminal op still in active list: %+v", active)
+	}
 }
 
 // TestReshardCancelPostgres pins the cancel flag on active ops and the

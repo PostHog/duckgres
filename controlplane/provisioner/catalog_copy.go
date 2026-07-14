@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Catalog copy for reshard operations: streams every ducklake_* table of one
@@ -30,6 +32,16 @@ import (
 //     so a table copy carries counters correctly.
 //   - Indexes backing constraints (PKs) are excluded from the pg_indexes
 //     replay — ADD CONSTRAINT already created them.
+//   - The target database may be REUSED (it survives failed/rolled-back
+//     attempts and an earlier residence of the same catalog, and a dev target
+//     can even host another tenant's live catalog): the per-table
+//     DROP TABLE IF EXISTS covers same-named tables, but index NAMES are
+//     schema-global, so replay is idempotent — every CREATE INDEX (and every
+//     index-backed ADD CONSTRAINT) drops a same-named stale index first, and
+//     a create that STILL collides (a live worker's
+//     ensureDuckLakeMetadataIndexes CREATE INDEX IF NOT EXISTS racing between
+//     our drop and create) is re-dropped and retried a bounded number of
+//     times.
 
 // CatalogEndpoint describes one side of the copy.
 type CatalogEndpoint struct {
@@ -98,8 +110,10 @@ type CatalogCopier interface {
 	// verbose operator-facing progress lines.
 	Copy(ctx context.Context, source, target CatalogEndpoint, log func(level, msg string)) (CatalogCopyResult, error)
 	// SnapshotCounts re-reads the current per-table row counts (no snapshot
-	// tx) — the post-copy source-stability recheck.
-	SnapshotCounts(ctx context.Context, ep CatalogEndpoint) (map[string]int64, error)
+	// tx) — the post-copy source-stability recheck and the external-catalog
+	// verify. log receives periodic progress lines (a ~20k-table catalog
+	// takes minutes to count).
+	SnapshotCounts(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]int64, error)
 	// DropCatalogTables drops all ducklake_* tables (rollback cleanup of a
 	// partially copied target).
 	DropCatalogTables(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) error
@@ -152,6 +166,8 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 		return result, fmt.Errorf("target catalog is locked by another copier — refusing to interleave")
 	}
 
+	log("info", "opening a consistent source snapshot and discovering catalog tables…")
+
 	// One consistent snapshot across every table.
 	tx, err := src.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -193,31 +209,34 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 
 	// Constraints after data (bulk-load fast path), then non-constraint
 	// indexes (constraint-backed PK indexes already exist via ADD CONSTRAINT).
-	for _, table := range tables {
+	if err := applyConstraintsAndIndexes(tables, func(table string) error {
 		if err := applyConstraints(ctx, tx, dst, table); err != nil {
-			return result, err
+			return err
 		}
-		if err := applyIndexes(ctx, tx, dst, table); err != nil {
-			return result, err
-		}
+		return applyIndexes(ctx, tx, dst, table)
+	}, log); err != nil {
+		return result, err
 	}
-	log("info", "constraints and indexes applied on target")
 
 	// Verify inside the same snapshot: source snapshot counts vs live target.
-	for _, table := range tables {
-		var srcCount, dstCount int64
-		if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&srcCount); err != nil {
-			return result, fmt.Errorf("count source %s: %w", table, err)
-		}
-		if err := dst.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&dstCount); err != nil {
-			return result, fmt.Errorf("count target %s: %w", table, err)
-		}
-		if srcCount != dstCount {
-			return result, fmt.Errorf("row count mismatch on %s: source %d, target %d", table, srcCount, dstCount)
-		}
-		result.PerTableRows[table] = srcCount
+	verified, err := verifyCopiedRowCounts(tables,
+		func(table string) (int64, error) {
+			var c int64
+			err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c)
+			return c, err
+		},
+		func(table string) (int64, error) {
+			var c int64
+			err := dst.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c)
+			return c, err
+		},
+		log)
+	if err != nil {
+		return result, err
 	}
-	log("info", fmt.Sprintf("verified %d tables: target row counts match the source snapshot", len(tables)))
+	for table, c := range verified {
+		result.PerTableRows[table] = c
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return result, fmt.Errorf("close source snapshot tx: %w", err)
@@ -225,7 +244,7 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 	return result, nil
 }
 
-func (PGCatalogCopier) SnapshotCounts(ctx context.Context, ep CatalogEndpoint) (map[string]int64, error) {
+func (PGCatalogCopier) SnapshotCounts(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]int64, error) {
 	conn, err := pgx.Connect(ctx, ep.DSN())
 	if err != nil {
 		return nil, fmt.Errorf("connect %s: %w", ep.Redacted(), err)
@@ -237,13 +256,69 @@ func (PGCatalogCopier) SnapshotCounts(ctx context.Context, ep CatalogEndpoint) (
 		return nil, fmt.Errorf("discover catalog tables: %w", err)
 	}
 	counts := make(map[string]int64, len(tables))
-	for _, table := range tables {
+	for i, table := range tables {
 		var c int64
 		if err := conn.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c); err != nil {
 			return nil, fmt.Errorf("count %s: %w", table, err)
 		}
 		counts[table] = c
+		maybeLogProgress(log, "counted", i+1, len(tables))
 	}
+	return counts, nil
+}
+
+// verifyProgressEvery is the periodic-progress cadence of the loops that visit
+// every catalog table (row-count verification and recounts): one
+// "<verb> N/M tables…" line per this many tables — ~8 lines on a ~20k-table
+// catalog, never per-table — so the op log does not go silent for minutes
+// while the loop is healthy.
+const verifyProgressEvery = 2500
+
+// maybeLogProgress emits the periodic progress line every verifyProgressEvery
+// items. The final item is skipped — the caller logs its own completion line.
+func maybeLogProgress(log func(level, msg string), verb string, done, total int) {
+	if done > 0 && done < total && done%verifyProgressEvery == 0 {
+		log("info", fmt.Sprintf("%s %d/%d tables…", verb, done, total))
+	}
+}
+
+// applyConstraintsAndIndexes drives the constraint/index replay across all
+// tables. On a large catalog (~20k tables) this runs tens of seconds, so the
+// phase announces itself before the first ALTER instead of logging only on
+// completion.
+func applyConstraintsAndIndexes(tables []string, apply func(table string) error, log func(level, msg string)) error {
+	log("info", fmt.Sprintf("applying constraints and indexes on the target (%d tables)…", len(tables)))
+	for _, table := range tables {
+		if err := apply(table); err != nil {
+			return err
+		}
+	}
+	log("info", "constraints and indexes applied on target")
+	return nil
+}
+
+// verifyCopiedRowCounts compares the source-snapshot row count of every table
+// against the live target, announcing the phase up front and emitting periodic
+// progress. Returns the per-table source counts on success.
+func verifyCopiedRowCounts(tables []string, srcCount, dstCount func(table string) (int64, error), log func(level, msg string)) (map[string]int64, error) {
+	log("info", fmt.Sprintf("verifying row counts across %d tables… (may take a few minutes)", len(tables)))
+	counts := make(map[string]int64, len(tables))
+	for i, table := range tables {
+		src, err := srcCount(table)
+		if err != nil {
+			return nil, fmt.Errorf("count source %s: %w", table, err)
+		}
+		dst, err := dstCount(table)
+		if err != nil {
+			return nil, fmt.Errorf("count target %s: %w", table, err)
+		}
+		if src != dst {
+			return nil, fmt.Errorf("row count mismatch on %s: source %d, target %d", table, src, dst)
+		}
+		counts[table] = src
+		maybeLogProgress(log, "verified", i+1, len(tables))
+	}
+	log("info", fmt.Sprintf("verified %d tables: target row counts match the source snapshot", len(tables)))
 	return counts, nil
 }
 
@@ -429,6 +504,16 @@ ORDER BY conname`, table)
 		if !shouldReplayConstraint(c.typ) {
 			continue
 		}
+		if constraintCreatesIndex(c.typ) {
+			// The backing index is named after the constraint and index names
+			// are schema-global: on a reused target a stale index (attached to
+			// a table outside the source's table set, so it survived the
+			// per-table drop) can squat the name and fail the ADD CONSTRAINT
+			// with 42P07.
+			if _, err := dst.Exec(ctx, "DROP INDEX IF EXISTS public."+quoteIdent(c.name)); err != nil {
+				return fmt.Errorf("drop stale index %s on target (squats the constraint name for %s): %w", c.name, table, err)
+			}
+		}
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s %s", quoteIdent(table), quoteIdent(c.name), c.def)
 		if _, err := dst.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("apply constraint %s on %s: %w", c.name, table, err)
@@ -441,8 +526,8 @@ ORDER BY conname`, table)
 // EXCLUDING indexes backing constraints — ADD CONSTRAINT already created
 // those, and replaying them would collide on the index name.
 func applyIndexes(ctx context.Context, srcTx pgx.Tx, dst *pgx.Conn, table string) error {
-	defs, err := queryStrings(ctx, srcTx, `
-SELECT i.indexdef
+	rows, err := srcTx.Query(ctx, `
+SELECT i.indexname, i.indexdef
 FROM pg_indexes i
 WHERE i.schemaname = 'public' AND i.tablename = $1
   AND NOT EXISTS (
@@ -455,12 +540,82 @@ ORDER BY i.indexname`, table)
 	if err != nil {
 		return fmt.Errorf("introspect indexes of %s: %w", table, err)
 	}
-	for _, def := range defs {
-		if _, err := dst.Exec(ctx, def); err != nil {
-			return fmt.Errorf("apply index on %s (%s): %w", table, def, err)
+	var indexes []indexReplay
+	for rows.Next() {
+		var ix indexReplay
+		if err := rows.Scan(&ix.name, &ix.def); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan index of %s: %w", table, err)
+		}
+		indexes = append(indexes, ix)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("introspect indexes of %s: %w", table, err)
+	}
+	return replayIndexes(table, indexes, func(sql string) error {
+		_, err := dst.Exec(ctx, sql)
+		return err
+	}, isDuplicateRelationError)
+}
+
+// indexReplay is one standalone index to recreate on the target.
+type indexReplay struct {
+	name string // pg_indexes.indexname — index names are schema-global
+	def  string // pg_indexes.indexdef — a complete CREATE INDEX statement
+}
+
+// maxIndexReplayAttempts bounds the drop+create retry of one index replay when
+// the create keeps colliding with a concurrently recreated same-named index.
+const maxIndexReplayAttempts = 3
+
+// replayIndexes recreates a table's standalone indexes on the target
+// idempotently. The target may be a reused database where a same-named index
+// already exists, in two flavors (both observed on the real mw-dev target):
+//
+//   - stale: left over from a prior residence/attempt, attached to a table
+//     outside the source's table set, so the per-table DROP TABLE missed it;
+//   - concurrent: a live worker attached to the same (dev, shared) database
+//     re-created a duckgres metadata performance index via
+//     ensureDuckLakeMetadataIndexes' CREATE INDEX IF NOT EXISTS on a table
+//     this copy had just recreated — mid-copy, before this replay ran.
+//
+// So each index is dropped BY NAME first, and a create that still collides
+// (SQLSTATE 42P07 — the concurrent ensure raced between our drop and our
+// create) is re-dropped and retried, bounded by maxIndexReplayAttempts.
+// IF NOT EXISTS instead would silently keep a possibly-wrong stale index; the
+// replayed definition must win.
+func replayIndexes(table string, indexes []indexReplay, exec func(sql string) error, isDuplicate func(error) bool) error {
+	for _, ix := range indexes {
+		drop := "DROP INDEX IF EXISTS public." + quoteIdent(ix.name)
+		var lastCreateErr error
+		created := false
+		for attempt := 0; attempt < maxIndexReplayAttempts && !created; attempt++ {
+			if err := exec(drop); err != nil {
+				return fmt.Errorf("drop stale index %s on target (before replaying it for %s): %w", ix.name, table, err)
+			}
+			err := exec(ix.def)
+			switch {
+			case err == nil:
+				created = true
+			case isDuplicate(err):
+				lastCreateErr = err // concurrently recreated — drop and retry
+			default:
+				return fmt.Errorf("apply index on %s (%s): %w", table, ix.def, err)
+			}
+		}
+		if !created {
+			return fmt.Errorf("apply index on %s (%s): still colliding after %d drop+create attempts: %w", table, ix.def, maxIndexReplayAttempts, lastCreateErr)
 		}
 	}
 	return nil
+}
+
+// isDuplicateRelationError reports whether err is PostgreSQL "relation ...
+// already exists" (SQLSTATE 42P07).
+func isDuplicateRelationError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P07"
 }
 
 func quoteIdent(s string) string {
@@ -473,4 +628,12 @@ func quoteIdent(s string) string {
 // and its ADD CONSTRAINT syntax doesn't parse on older targets.
 func shouldReplayConstraint(contype string) bool {
 	return contype != "n"
+}
+
+// constraintCreatesIndex reports whether replaying a pg_constraint row of the
+// given contype creates a backing index named after the constraint (primary
+// key, unique, exclusion). Those names are schema-global on the target, so a
+// stale same-named index must be dropped before the ADD CONSTRAINT.
+func constraintCreatesIndex(contype string) bool {
+	return contype == "p" || contype == "u" || contype == "x"
 }

@@ -40,7 +40,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 19)
 	requireGooseMigrationRecorded(t, db, 20)
 	requireGooseMigrationRecorded(t, db, 21)
-	requireGooseLatestVersion(t, db, 21)
+	requireGooseMigrationRecorded(t, db, 22)
+	requireGooseLatestVersion(t, db, 22)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -54,6 +55,9 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "compaction_was_present")
 	// Migration 000021 added the pre-flip catalog backup artifact URI.
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "backup_s3_uri")
+	// Migration 000022 added the runner pod's ephemeral-password pull URL
+	// (URL only — the password itself is never persisted).
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, db, "duckgres_reshard_operation_log")
 	requireColumnPresent(t, db, "duckgres_reshard_operation_log", "operation_id")
 
@@ -164,7 +168,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -199,7 +203,9 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 19)
 	requireGooseMigrationRecorded(t, upgradedDB, 20)
 	requireGooseMigrationRecorded(t, upgradedDB, 21)
-	requireGooseLatestVersion(t, upgradedDB, 21)
+	requireGooseMigrationRecorded(t, upgradedDB, 22)
+	requireGooseLatestVersion(t, upgradedDB, 22)
+	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")

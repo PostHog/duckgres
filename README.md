@@ -348,7 +348,7 @@ Options:
   -threads int             DuckDB threads per session
   -process-isolation       Enable process isolation (spawn child process per connection)
   -idle-timeout string     Connection idle timeout (e.g., '30m', '1h', '-1' to disable)
-  -mode string             Run mode: standalone (default), control-plane, or duckdb-service
+  -mode string             Run mode: standalone (default), control-plane, duckdb-service, or reshard-runner
   -process-min-workers int Pre-warm process worker count at startup (control-plane mode, default 0)
   -process-max-workers int Max process workers, 0=auto-derived (control-plane mode)
   -process-retire-on-session-end
@@ -629,7 +629,7 @@ GROUP BY name;
 
 ## Architecture
 
-Duckgres supports three run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), and **duckdb-service** (worker process mode used by the control plane).
+Duckgres supports three primary run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), and **duckdb-service** (worker process mode used by the control plane). A fourth utility mode, **reshard-runner**, is the entrypoint of the dedicated per-operation pods the multitenant control plane spawns to execute metadata-store reshards (see `docs/design/resharding.md`).
 
 ### Standalone Mode
 
