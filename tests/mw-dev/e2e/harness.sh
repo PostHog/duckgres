@@ -2990,12 +2990,14 @@ main() {
   # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
 
-  # ---- reshard operations (validation, cancel, and rollback on res2) ----
+  # ---- reshard operations (validation, cancel, rollback on res2; then the
+  #      ext→cnpg POSITIVE path on the ext org — must run AFTER every assert
+  #      that needs the ext org on the RDS, notably tenant_isolation) ----
   reshard_targets
   reshard_validation "$CNPG"
   reshard_cancel_during_drain "$RES2" "$res2_pw"
   reshard_bogus_shard_rollback "$RES2" "$res2_pw"
-  log "SKIP ext-to-cnpg positive path (temporarily excluded from per-PR e2e)"
+  reshard_ext_to_cnpg "$EXT" "$ext_pw"
 
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
   # (res1/res2/ext are deprovisioned by run.sh teardown; the cascade assertion
@@ -3006,7 +3008,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"
