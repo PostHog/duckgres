@@ -2768,6 +2768,32 @@ user_kill_switch() { # org rootpw
   # New-user auth is config-snapshot-driven; wait one poll before first login.
   sleep "${CONFIG_POLL_SETTLE:-12}"
 
+  # The kill can RACE query completion: on a fully warm worker (no cpu limit —
+  # a worker gets the node's cores) HEAVY_Q can finish in single-digit seconds,
+  # so between "victim visible in /queries + psql still alive" and the kill RPC
+  # actually landing on the worker, the query may deliver its FULL result. The
+  # session is then still counted (killed>=1) but the client already has its
+  # data — the test measured nothing. That inconclusive outcome (victim
+  # finished rc=0 with EXACTLY the full result) retries with a fresh query; a
+  # genuinely broken kill survives every attempt and still fails here. Any
+  # other outcome fails immediately.
+  ksa=1
+  while :; do
+    ksrc=0
+    user_kill_switch_attempt "$org" "$pw" "$vic" "$vicpw" || ksrc=$?
+    [ "$ksrc" = 0 ] && break
+    [ "$ksrc" = 2 ] || fail "user_kill_switch: attempt failed unexpectedly (rc=$ksrc)"
+    [ "$ksa" -lt 3 ] || fail "user_kill_switch: kill raced query completion in 3/3 attempts — victim query too fast to overlap the kill (raise HEAVY_Q), or the kill is not interrupting in-flight queries"
+    ksa=$((ksa + 1))
+    log "user kill switch on $org: attempt $ksa (previous kill raced query completion)"
+  done
+  log "user kill switch OK on $org (victim torn down, root untouched)"
+}
+
+# One kill-switch attempt: 0 = pass, 2 = kill raced query completion
+# (inconclusive — caller retries), any real violation fail()s the harness.
+user_kill_switch_attempt() { # org rootpw vic vicpw
+  org="$1"; pw="$2"; vic="$3"; vicpw="$4"
   vout="$(mktemp)"; vrc="$(mktemp)"; rout="$(mktemp)"; rrc="$(mktemp)"
   # Victim's long query AND a root long query run concurrently (distinct users,
   # distinct workers — MaxSessions=1). Only the victim's must die.
@@ -2785,17 +2811,29 @@ user_kill_switch() { # org rootpw
     sleep 2; a=$((a + 1))
   done
   [ "$seen" = 1 ] || { kill "$vpid" "$rpid" 2>/dev/null || true; fail "user_kill_switch: victim query never appeared in /queries"; }
-  # Overlap proof: both queries must still be running at kill time, else the test
-  # measures nothing (false pass on a query that already finished).
-  kill -0 "$vpid" 2>/dev/null || fail "user_kill_switch: victim query finished before kill (raise HEAVY_Q row count)"
+  if ! kill -0 "$vpid" 2>/dev/null; then
+    # Victim already finished before we could even send the kill — same
+    # inconclusive-overlap class as the raced outcome below.
+    log "user_kill_switch: victim finished before the kill was sent — inconclusive overlap"
+    wait "$vpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+    rm -f "$vout" "$vrc" "$rout" "$rrc"
+    return 2
+  fi
 
   killed="$(api_post "$org" "users/$vic/kill" | jq -r '.killed')"
   [ "${killed:-0}" -ge 1 ] || fail "user_kill_switch: kill reported killed=$killed (want >=1)"
 
   wait "$vpid" 2>/dev/null || true
   wait "$rpid" 2>/dev/null || true
-  [ "$(cat "$vrc")" = 1 ] \
-    || fail "user_kill_switch: victim query survived the kill: $(tr -d '\n' <"$vout" | tail -c 200)"
+  if [ "$(cat "$vrc")" = 0 ]; then
+    if [ "$(tr -dc '0-9' <"$vout")" = "$HEAVY_EXPECT" ]; then
+      log "user_kill_switch: victim delivered its full result before the kill landed — inconclusive overlap"
+      rm -f "$vout" "$vrc" "$rout" "$rrc"
+      return 2
+    fi
+    fail "user_kill_switch: victim query survived the kill: $(tr -d '\n' <"$vout" | tail -c 200)"
+  fi
   [ "$(cat "$rrc")" = 0 ] \
     || fail "user_kill_switch: root (other user) query was wrongly killed: $(tr -d '\n' <"$rout" | tail -c 200)"
   rn="$(tr -dc '0-9' <"$rout")"
@@ -2804,7 +2842,7 @@ user_kill_switch() { # org rootpw
   n="$(curl -fsS -H "$H" "$API/api/v1/queries?org=$org&user=$vic" | jq -r '.queries | length')"
   [ "${n:-0}" = 0 ] || fail "user_kill_switch: victim still has $n live queries after kill"
   rm -f "$vout" "$vrc" "$rout" "$rrc"
-  log "user kill switch OK on $org (victim torn down, root untouched)"
+  return 0
 }
 
 # ---- per-user disable/enable block ------------------------------------------
