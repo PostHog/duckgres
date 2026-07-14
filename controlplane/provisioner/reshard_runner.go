@@ -748,7 +748,7 @@ func (o *opRun) backupCatalog(ctx context.Context) error {
 	key := fmt.Sprintf("%sop-%d-%s.dump", backupPrefix, o.op.ID, ts)
 	dest := BackupDestination{Bucket: bucket, Key: key, Region: st.DataStore.S3Region, RoleARN: st.IAMRoleARN}
 
-	o.logf("info", "backing up source catalog %s → s3://%s/%s before the flip%s",
+	o.logf("info", "backing up source catalog %s → s3://%s/%s before the flip (pg_dump streamed to S3; may take several minutes — size unknown until complete)%s",
 		o.source.Redacted(), bucket, key,
 		map[bool]string{true: " (HARD prerequisite: cnpg→external destroys the source at the flip)", false: ""}[destructive])
 	uri, size, err := o.r.backuper.Backup(ctx, o.source, dest)
@@ -982,7 +982,8 @@ func (o *opRun) verifyExternalCatalog(ctx context.Context) error {
 	if err := o.step("verifying_external"); err != nil {
 		return err
 	}
-	current, err := o.r.copier.SnapshotCounts(ctx, o.target)
+	o.logf("info", "verifying the external target catalog: counting rows across %d tables… (may take a few minutes)", len(o.copied.PerTableRows))
+	current, err := o.r.copier.SnapshotCounts(ctx, o.target, func(level, msg string) { o.logf(level, "%s", msg) })
 	if err != nil {
 		return fmt.Errorf("re-reading external target counts: %w", err)
 	}
@@ -1092,7 +1093,8 @@ func (o *opRun) verifySourceStable(ctx context.Context) error {
 	if err := o.step("verifying"); err != nil {
 		return err
 	}
-	current, err := o.r.copier.SnapshotCounts(ctx, o.source)
+	o.logf("info", "verifying source stability: re-counting rows across %d tables outside the snapshot… (may take a few minutes)", len(o.copied.PerTableRows))
+	current, err := o.r.copier.SnapshotCounts(ctx, o.source, func(level, msg string) { o.logf(level, "%s", msg) })
 	if err != nil {
 		return fmt.Errorf("re-reading source counts: %w", err)
 	}

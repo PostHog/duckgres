@@ -98,8 +98,10 @@ type CatalogCopier interface {
 	// verbose operator-facing progress lines.
 	Copy(ctx context.Context, source, target CatalogEndpoint, log func(level, msg string)) (CatalogCopyResult, error)
 	// SnapshotCounts re-reads the current per-table row counts (no snapshot
-	// tx) — the post-copy source-stability recheck.
-	SnapshotCounts(ctx context.Context, ep CatalogEndpoint) (map[string]int64, error)
+	// tx) — the post-copy source-stability recheck and the external-catalog
+	// verify. log receives periodic progress lines (a ~20k-table catalog
+	// takes minutes to count).
+	SnapshotCounts(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]int64, error)
 	// DropCatalogTables drops all ducklake_* tables (rollback cleanup of a
 	// partially copied target).
 	DropCatalogTables(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) error
@@ -152,6 +154,8 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 		return result, fmt.Errorf("target catalog is locked by another copier — refusing to interleave")
 	}
 
+	log("info", "opening a consistent source snapshot and discovering catalog tables…")
+
 	// One consistent snapshot across every table.
 	tx, err := src.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -193,31 +197,34 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 
 	// Constraints after data (bulk-load fast path), then non-constraint
 	// indexes (constraint-backed PK indexes already exist via ADD CONSTRAINT).
-	for _, table := range tables {
+	if err := applyConstraintsAndIndexes(tables, func(table string) error {
 		if err := applyConstraints(ctx, tx, dst, table); err != nil {
-			return result, err
+			return err
 		}
-		if err := applyIndexes(ctx, tx, dst, table); err != nil {
-			return result, err
-		}
+		return applyIndexes(ctx, tx, dst, table)
+	}, log); err != nil {
+		return result, err
 	}
-	log("info", "constraints and indexes applied on target")
 
 	// Verify inside the same snapshot: source snapshot counts vs live target.
-	for _, table := range tables {
-		var srcCount, dstCount int64
-		if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&srcCount); err != nil {
-			return result, fmt.Errorf("count source %s: %w", table, err)
-		}
-		if err := dst.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&dstCount); err != nil {
-			return result, fmt.Errorf("count target %s: %w", table, err)
-		}
-		if srcCount != dstCount {
-			return result, fmt.Errorf("row count mismatch on %s: source %d, target %d", table, srcCount, dstCount)
-		}
-		result.PerTableRows[table] = srcCount
+	verified, err := verifyCopiedRowCounts(tables,
+		func(table string) (int64, error) {
+			var c int64
+			err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c)
+			return c, err
+		},
+		func(table string) (int64, error) {
+			var c int64
+			err := dst.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c)
+			return c, err
+		},
+		log)
+	if err != nil {
+		return result, err
 	}
-	log("info", fmt.Sprintf("verified %d tables: target row counts match the source snapshot", len(tables)))
+	for table, c := range verified {
+		result.PerTableRows[table] = c
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return result, fmt.Errorf("close source snapshot tx: %w", err)
@@ -225,7 +232,7 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 	return result, nil
 }
 
-func (PGCatalogCopier) SnapshotCounts(ctx context.Context, ep CatalogEndpoint) (map[string]int64, error) {
+func (PGCatalogCopier) SnapshotCounts(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]int64, error) {
 	conn, err := pgx.Connect(ctx, ep.DSN())
 	if err != nil {
 		return nil, fmt.Errorf("connect %s: %w", ep.Redacted(), err)
@@ -237,13 +244,69 @@ func (PGCatalogCopier) SnapshotCounts(ctx context.Context, ep CatalogEndpoint) (
 		return nil, fmt.Errorf("discover catalog tables: %w", err)
 	}
 	counts := make(map[string]int64, len(tables))
-	for _, table := range tables {
+	for i, table := range tables {
 		var c int64
 		if err := conn.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c); err != nil {
 			return nil, fmt.Errorf("count %s: %w", table, err)
 		}
 		counts[table] = c
+		maybeLogProgress(log, "counted", i+1, len(tables))
 	}
+	return counts, nil
+}
+
+// verifyProgressEvery is the periodic-progress cadence of the loops that visit
+// every catalog table (row-count verification and recounts): one
+// "<verb> N/M tables…" line per this many tables — ~8 lines on a ~20k-table
+// catalog, never per-table — so the op log does not go silent for minutes
+// while the loop is healthy.
+const verifyProgressEvery = 2500
+
+// maybeLogProgress emits the periodic progress line every verifyProgressEvery
+// items. The final item is skipped — the caller logs its own completion line.
+func maybeLogProgress(log func(level, msg string), verb string, done, total int) {
+	if done > 0 && done < total && done%verifyProgressEvery == 0 {
+		log("info", fmt.Sprintf("%s %d/%d tables…", verb, done, total))
+	}
+}
+
+// applyConstraintsAndIndexes drives the constraint/index replay across all
+// tables. On a large catalog (~20k tables) this runs tens of seconds, so the
+// phase announces itself before the first ALTER instead of logging only on
+// completion.
+func applyConstraintsAndIndexes(tables []string, apply func(table string) error, log func(level, msg string)) error {
+	log("info", fmt.Sprintf("applying constraints and indexes on the target (%d tables)…", len(tables)))
+	for _, table := range tables {
+		if err := apply(table); err != nil {
+			return err
+		}
+	}
+	log("info", "constraints and indexes applied on target")
+	return nil
+}
+
+// verifyCopiedRowCounts compares the source-snapshot row count of every table
+// against the live target, announcing the phase up front and emitting periodic
+// progress. Returns the per-table source counts on success.
+func verifyCopiedRowCounts(tables []string, srcCount, dstCount func(table string) (int64, error), log func(level, msg string)) (map[string]int64, error) {
+	log("info", fmt.Sprintf("verifying row counts across %d tables… (may take a few minutes)", len(tables)))
+	counts := make(map[string]int64, len(tables))
+	for i, table := range tables {
+		src, err := srcCount(table)
+		if err != nil {
+			return nil, fmt.Errorf("count source %s: %w", table, err)
+		}
+		dst, err := dstCount(table)
+		if err != nil {
+			return nil, fmt.Errorf("count target %s: %w", table, err)
+		}
+		if src != dst {
+			return nil, fmt.Errorf("row count mismatch on %s: source %d, target %d", table, src, dst)
+		}
+		counts[table] = src
+		maybeLogProgress(log, "verified", i+1, len(tables))
+	}
+	log("info", fmt.Sprintf("verified %d tables: target row counts match the source snapshot", len(tables)))
 	return counts, nil
 }
 

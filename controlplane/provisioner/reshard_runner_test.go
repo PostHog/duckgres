@@ -367,7 +367,7 @@ func (f *fakeCopier) Copy(_ context.Context, source, target CatalogEndpoint, log
 	return f.copyResult, nil
 }
 
-func (f *fakeCopier) SnapshotCounts(_ context.Context, ep CatalogEndpoint) (map[string]int64, error) {
+func (f *fakeCopier) SnapshotCounts(_ context.Context, ep CatalogEndpoint, _ func(string, string)) (map[string]int64, error) {
 	f.record(copierCall{kind: "counts", target: ep})
 	// The external target is reached with sslmode=require (verifyExternalCatalog);
 	// the cnpg source with sslmode=disable (verifySourceStable).
@@ -568,6 +568,12 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	if !store.hasLog("reshard report (succeeded)") || !store.hasLog("maintenance mode (connections blocked)") {
 		t.Fatalf("report missing from log: %v", store.logs)
 	}
+	// Long-running phases announce themselves when they START (an operator
+	// watching the live op log must never wonder whether a silent op is stuck):
+	// the source-stability recheck re-counts every table outside the snapshot.
+	if !store.hasLog("verifying source stability: re-counting rows across 3 tables") {
+		t.Fatalf("stability-recheck announce missing from log: %v", store.logs)
+	}
 }
 
 // TestReshardHappyPathExtToCnpg pins that an external source is NEVER
@@ -675,6 +681,14 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	last := store.warehouseUpds[len(store.warehouseUpds)-1]
 	if last["metadata_store_kind"] != configstore.MetadataStoreKindExternal || last["metadata_store_endpoint"] != "escape.rds.amazonaws.com" {
 		t.Fatalf("warehouse row not reconciled to external: %v", last)
+	}
+	// Both count-verification phases announce themselves with the table total
+	// before the (potentially multi-minute) recount starts.
+	if !store.hasLog("verifying source stability: re-counting rows across 1 tables") {
+		t.Fatalf("stability-recheck announce missing from log: %v", store.logs)
+	}
+	if !store.hasLog("verifying the external target catalog: counting rows across 1 tables") {
+		t.Fatalf("external-verify announce missing from log: %v", store.logs)
 	}
 }
 
@@ -1104,6 +1118,11 @@ func TestReshardBackupRecordedBeforeFlip(t *testing.T) {
 	}
 	if !store.hasLog("catalog backup complete") || !store.hasLog("pg_restore --no-owner") {
 		t.Fatalf("backup URI + restore command missing from log: %v", store.logs)
+	}
+	// The backup announces itself before pg_dump starts (streamed, duration and
+	// size unknown up front — the log must not go silent while it runs).
+	if !store.hasLog("backing up source catalog") || !store.hasLog("may take several minutes") {
+		t.Fatalf("backup start announce missing from log: %v", store.logs)
 	}
 	if !store.hasLog("pre-flip catalog backup: s3://org-a-data-bucket/") {
 		t.Fatalf("backup URI missing from end-of-op report: %v", store.logs)
