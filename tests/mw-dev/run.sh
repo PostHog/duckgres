@@ -244,6 +244,14 @@ metadata:
 spec:
   backoffLimit: 0
   template:
+    metadata:
+      annotations:
+        # Same consolidation pinning as the CP/config-store: the harness runs
+        # ~15 minutes of ordered assertions with zero retry budget
+        # (backoffLimit 0), and the worker-churn lanes empty nodes mid-run —
+        # a Karpenter reclaim of the harness pod's node kills the Job at
+        # whatever lane is next (observed: rc=130 mid COPY lane, no FAIL line).
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: duckgres
       restartPolicy: Never
@@ -292,7 +300,10 @@ YAML
   # The Job has no activeDeadlineSeconds, so this loop is the only cap; size it
   # generously above READY_TIMEOUT and stay under the CP's 30-min provisioning
   # hard-timeout. Env-overridable to keep it in lockstep with READY_TIMEOUT.
-  deadline=$(( $(date +%s) + ${HARNESS_WATCH_TIMEOUT:-1800} ))
+  # 2100: the reshard lanes now run in dedicated runner pods, adding pod
+  # schedule + image pull (~1-2 min worst case per lane) on top of the old
+  # in-process execution.
+  deadline=$(( $(date +%s) + ${HARNESS_WATCH_TIMEOUT:-2100} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if [ "$("${KUBECTL[@]}" -n "$NS" get job duckgres-harness -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)" = "True" ]; then
       echo "harness Job complete."; return 0
@@ -431,6 +442,19 @@ cmd_diagnostics() {
   echo "::endgroup::"
   echo "::group::worker pods"
   "${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-worker -o wide || true
+  echo "::endgroup::"
+  echo "::group::reshard runner pods (spec + logs)"
+  # Reshard ops execute in dedicated duckgres-reshard-op-<id> pods; their
+  # stdout carries the step machine's slog lines (incl. the exact error of a
+  # best-effort backup failure that the op log only summarizes). Describe
+  # shows whether pod-identity env/volume injection happened.
+  "${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-reshard -o wide || true
+  for p in $("${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-reshard -o name 2>/dev/null); do
+    echo "---- $p describe (tail) ----"
+    "${KUBECTL[@]}" -n "$NS" describe "$p" 2>/dev/null | tail -40 || true
+    echo "---- $p logs ----"
+    "${KUBECTL[@]}" -n "$NS" logs "$p" --tail=300 2>/dev/null || true
+  done
   echo "::endgroup::"
   echo "::group::scenario jobs"
   "${KUBECTL[@]}" -n "$NS" get job,pod -l job-name -o wide || true

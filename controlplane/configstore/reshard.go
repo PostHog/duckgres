@@ -99,6 +99,17 @@ type ReshardOperation struct {
 	// flip — recovery is a `pg_restore` of this artifact.
 	BackupS3URI string `gorm:"size:1024;not null;default:''" json:"backup_s3_uri"`
 
+	// PasswordURL is where the reshard-runner pod pulls the EPHEMERAL external
+	// target password from: the internal-secret-authed admin endpoint on the
+	// control-plane replica that took the start request and holds the password
+	// in memory (http://<cp-pod-ip>:8080/api/v1/reshards/<id>/password). Only
+	// the URL is persisted — the password itself is never at rest anywhere.
+	// Empty for cnpg targets. Recorded so the leader reconciler can respawn a
+	// crashed runner pod with the same handoff wiring (the pull still 404s if
+	// the stashing replica is gone, which fails the op with a clear re-run
+	// message).
+	PasswordURL string `gorm:"size:1024;not null;default:''" json:"password_url"`
+
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at"`
@@ -149,32 +160,35 @@ func (cs *ConfigStore) CreateReshardOperation(op *ReshardOperation) error {
 	return nil
 }
 
-// CreateReshardOperationClaimed inserts an operation that is ALREADY claimed
-// by runnerCP — state running, runner_epoch 1, heartbeat/started stamped now —
-// in a single insert. This is the real claim-on-create: because the row lands
-// as a fresh-heartbeat running op owned by runnerCP, no other replica's
-// scanOnce loop can list or claim it (ListClaimableReshardOperations /
-// ClaimReshardOperation only touch pending or stale-heartbeat running ops). It
-// is mandatory for external-target ops, whose ephemeral password lives only in
-// the creating CP's memory: a different replica must never win the op and then
-// fail the copy for want of the password. The partial unique index on (org_id)
-// WHERE state IN (pending, running) still fails a second active op →
-// ErrReshardConflict.
-func (cs *ConfigStore) CreateReshardOperationClaimed(op *ReshardOperation, runnerCP string) error {
-	now := time.Now().UTC()
-	op.State = ReshardStateRunning
-	op.RunnerCP = runnerCP
-	op.RunnerEpoch = 1
-	op.HeartbeatAt = &now
-	op.StartedAt = &now
-	op.CreatedAt = now
-	if err := cs.db.Create(op).Error; err != nil {
-		if isUniqueViolationErr(err) {
-			return ErrReshardConflict
-		}
-		return fmt.Errorf("create claimed reshard operation: %w", err)
+// SetReshardOperationPasswordURL records the password pull URL on a still-
+// PENDING operation (the start handler sets it right after the insert, before
+// the runner pod spawns; the URL embeds the op id so it cannot be set on the
+// struct before Create assigns one). CAS on state=pending — once a runner
+// claimed the op the wiring is frozen.
+func (cs *ConfigStore) SetReshardOperationPasswordURL(id int64, url string) error {
+	res := cs.db.Model(&ReshardOperation{}).
+		Where("id = ? AND state = ?", id, ReshardStatePending).
+		Update("password_url", url)
+	if res.Error != nil {
+		return fmt.Errorf("set reshard password url: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("set reshard password url: operation %d is not pending", id)
 	}
 	return nil
+}
+
+// ListActiveReshardOperations returns every pending/running operation, oldest
+// first — the leader reconciler's working set (respawn dead runner pods, fail
+// ops whose pod can't be kept alive).
+func (cs *ConfigStore) ListActiveReshardOperations() ([]ReshardOperation, error) {
+	var ops []ReshardOperation
+	err := cs.db.Where("state IN ?", []ReshardState{ReshardStatePending, ReshardStateRunning}).
+		Order("id").Find(&ops).Error
+	if err != nil {
+		return nil, fmt.Errorf("list active reshard operations: %w", err)
+	}
+	return ops, nil
 }
 
 // GetReshardOperation loads one operation by id.
@@ -236,22 +250,6 @@ func (cs *ConfigStore) ClaimReshardOperation(id int64, runnerCP string, staleAft
 		return nil, nil
 	}
 	return cs.GetReshardOperation(id)
-}
-
-// ListClaimableReshardOperations returns ids of operations a runner may try
-// to claim: pending, or running with a stale heartbeat.
-func (cs *ConfigStore) ListClaimableReshardOperations(staleAfter time.Duration) ([]int64, error) {
-	staleBefore := time.Now().UTC().Add(-staleAfter)
-	var ids []int64
-	err := cs.db.Model(&ReshardOperation{}).
-		Where("state = ? OR (state = ? AND (heartbeat_at IS NULL OR heartbeat_at < ?))",
-			ReshardStatePending, ReshardStateRunning, staleBefore).
-		Order("id").
-		Pluck("id", &ids).Error
-	if err != nil {
-		return nil, fmt.Errorf("list claimable reshard operations: %w", err)
-	}
-	return ids, nil
 }
 
 // reshardFencedUpdate applies updates to a running op iff (runner, epoch)

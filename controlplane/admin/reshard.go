@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -23,20 +24,21 @@ import (
 )
 
 // Reshard admin API: start/inspect/cancel metadata-store migrations (see
-// docs/design/resharding.md). The operation itself is executed by the
-// provisioner-side ReshardRunner; these handlers only create/read op rows and
-// the verbose log the console polls.
+// docs/design/resharding.md). The operation itself is executed by a DEDICATED
+// per-operation runner pod (duckgres-reshard-op-<id>, spawned here on start);
+// these handlers only create/read op rows, spawn the pod, and serve the
+// verbose log the console polls.
 //
 // Registered inside the audited /api/v1 group: RoleGate makes the POSTs
 // admin-only, AuditMiddleware records them. The external target password is
-// EPHEMERAL: validated, handed to the local runner in-process
-// (claim-on-create), and never persisted to the op row, the log, or the audit
-// detail.
+// EPHEMERAL: validated, held in THIS replica's in-memory stash, pulled once by
+// the runner pod over the internal-secret-only password endpoint, and never
+// persisted to the op row, the log, the audit detail, or any pod spec.
 
 // ReshardStore is the config-store surface these handlers need.
 type ReshardStore interface {
 	CreateReshardOperation(op *configstore.ReshardOperation) error
-	CreateReshardOperationClaimed(op *configstore.ReshardOperation, runnerCP string) error
+	SetReshardOperationPasswordURL(id int64, url string) error
 	GetReshardOperation(id int64) (*configstore.ReshardOperation, error)
 	ListReshardOperationsForOrg(orgID string, limit int) ([]configstore.ReshardOperation, error)
 	ListReshardOperations(limit int) ([]configstore.ReshardOperation, error)
@@ -48,15 +50,70 @@ type ReshardStore interface {
 	ListExternalMetadataStores() ([]configstore.ExternalMetadataStoreInfo, error)
 }
 
-// ReshardRunnerHandle is the LOCAL reshard runner surface the start handler
-// needs for claim-on-create: its CP id (so the op is created already owned by
-// this replica) and AdoptClaimedOperation (to hand the just-created op — plus
-// the ephemeral external password — straight to the runner to execute).
-// Satisfied by *provisioner.ReshardRunner. nil when this CP has no runner (no
-// k8s API); external targets are refused up front in that case.
-type ReshardRunnerHandle interface {
-	CPID() string
-	AdoptClaimedOperation(op *configstore.ReshardOperation, password string)
+// ReshardPodSpawner spawns the dedicated runner pod for a just-created
+// operation. Satisfied by *controlplane.ReshardPodSpawner. nil when this CP
+// has no kubernetes API — starting a reshard is then refused (nothing would
+// ever execute it).
+type ReshardPodSpawner interface {
+	// SpawnReshardPod creates the duckgres-reshard-op-<id> pod (no wait for
+	// readiness; the pod claims the op row itself).
+	SpawnReshardPod(ctx context.Context, op *configstore.ReshardOperation) error
+	// PasswordURLForOp renders the URL (pointing at THIS replica) the runner
+	// pod pulls the ephemeral external target password from. Empty when the
+	// replica cannot determine its own pod IP.
+	PasswordURLForOp(opID int64) string
+}
+
+// reshardPasswordStash holds the ephemeral external-target passwords by op id,
+// in THIS replica's memory only, until the runner pod pulls them or the op
+// turns terminal. Never persisted anywhere.
+type reshardPasswordStash struct {
+	mu   sync.Mutex
+	byOp map[int64]string
+}
+
+func newReshardPasswordStash() *reshardPasswordStash {
+	return &reshardPasswordStash{byOp: map[int64]string{}}
+}
+
+func (s *reshardPasswordStash) put(opID int64, password string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.byOp[opID] = password
+}
+
+func (s *reshardPasswordStash) get(opID int64) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pw, ok := s.byOp[opID]
+	return pw, ok
+}
+
+func (s *reshardPasswordStash) delete(opID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.byOp, opID)
+}
+
+// pruneTerminal lazily drops stashed passwords whose operation reached a
+// terminal state (called from the start + password handlers; reshards are rare
+// so the stash stays tiny).
+func (s *reshardPasswordStash) pruneTerminal(store ReshardStore) {
+	s.mu.Lock()
+	ids := make([]int64, 0, len(s.byOp))
+	for id := range s.byOp {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		op, err := store.GetReshardOperation(id)
+		if err != nil {
+			continue
+		}
+		if op.State.Terminal() {
+			s.delete(id)
+		}
+	}
 }
 
 // reshardShardNamePattern mirrors the Duckling XRD's cnpgShard pattern.
@@ -138,14 +195,14 @@ type startReshardRequest struct {
 }
 
 // RegisterReshardAPI wires the reshard endpoints. lister may be nil (duckling
-// client unavailable) — starting a reshard then 503s; reads still work.
-// runner may be nil (no local runner) — external targets then 503, cnpg
-// targets fall back to a pending op any replica may claim. cluster may be nil
-// (non-k8s) — shard discovery then falls back to the shards tenants already
-// occupy. prober may be nil (tests / non-k8s) — the external target pre-flight
-// connection check is then SKIPPED (see ExternalTargetProber).
-func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, runner ReshardRunnerHandle, cluster kubernetes.Interface, prober ExternalTargetProber) {
-	h := &reshardHandler{store: store, lister: lister, runner: runner, cluster: cluster, prober: prober}
+// client unavailable) — shard discovery degrades; reads still work. spawner
+// may be nil (no kubernetes API) — starting a reshard then 503s (nothing would
+// execute the op). cluster may be nil (non-k8s) — shard discovery then falls
+// back to the shards tenants already occupy. prober may be nil (tests /
+// non-k8s) — the external target pre-flight connection check is then SKIPPED
+// (see ExternalTargetProber).
+func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, spawner ReshardPodSpawner, cluster kubernetes.Interface, prober ExternalTargetProber) {
+	h := &reshardHandler{store: store, lister: lister, spawner: spawner, cluster: cluster, prober: prober, stash: newReshardPasswordStash()}
 	r.POST("/orgs/:id/reshard", h.start)
 	r.GET("/orgs/:id/reshards", h.listForOrg)
 	r.GET("/reshards", h.listAll)
@@ -153,14 +210,17 @@ func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingM
 	r.GET("/reshards/:opid/log", h.log)
 	r.GET("/reshards/targets", h.targets)
 	r.POST("/reshards/:opid/cancel", h.cancel)
+	// Internal-secret-only: the runner pod's one-shot ephemeral password pull.
+	r.GET("/reshards/:opid/password", h.password)
 }
 
 type reshardHandler struct {
 	store   ReshardStore
 	lister  DucklingMetadataLister
-	runner  ReshardRunnerHandle
+	spawner ReshardPodSpawner
 	cluster kubernetes.Interface
 	prober  ExternalTargetProber
+	stash   *reshardPasswordStash
 }
 
 // cnpgShardsNamespace is where the shared CNPG metadata shards run; instance
@@ -243,6 +303,13 @@ func (h *reshardHandler) start(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
+	// The op executes in a dedicated runner pod; without a spawner nothing
+	// would ever run it, so refuse up front (any target kind).
+	if h.spawner == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no reshard pod spawner on this control plane (kubernetes API unavailable)"})
+		return
+	}
+	h.stash.pruneTerminal(h.store)
 
 	wh, err := h.store.GetManagedWarehouse(orgID)
 	if err != nil {
@@ -331,10 +398,6 @@ func (h *reshardHandler) start(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "external target requires the password (sent once, never stored — the runner uses it for the copy; password_aws_secret must contain the same value)"})
 			return
 		}
-		if h.runner == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no reshard runner on this control plane — external targets unavailable"})
-			return
-		}
 		targetUser := strings.TrimSpace(req.Target.User)
 		if targetUser == "" {
 			targetUser = "postgres"
@@ -370,21 +433,10 @@ func (h *reshardHandler) start(c *gin.Context) {
 		return
 	}
 
-	// Claim-on-create: when this CP has a local runner, create the op ALREADY
-	// claimed by it (single insert, state running + owned) so no other
-	// replica's scanOnce can pick it up. This is mandatory for external
-	// targets — the ephemeral password lives only in THIS replica's memory, so
-	// a different replica winning the op would fail the copy for want of it
-	// (the production bug this fixes). It is harmless and lower-latency for
-	// cnpg targets too. With no local runner (cnpg only — external is 503'd
-	// above) fall back to a pending op any replica may claim.
-	var createErr error
-	if h.runner != nil {
-		createErr = h.store.CreateReshardOperationClaimed(op, h.runner.CPID())
-	} else {
-		createErr = h.store.CreateReshardOperation(op)
-	}
-	if createErr != nil {
+	// Create the op PENDING, then spawn its dedicated runner pod. The pod
+	// claims the row itself (pending → running via the standard claim CAS);
+	// the leader reconciler backstops a pod that dies or never starts.
+	if createErr := h.store.CreateReshardOperation(op); createErr != nil {
 		if errors.Is(createErr, configstore.ErrReshardConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": "org already has an active reshard operation"})
 			return
@@ -392,18 +444,86 @@ func (h *reshardHandler) start(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": createErr.Error()})
 		return
 	}
-	if h.runner != nil {
-		// Hand the create-claimed op straight to the local runner to execute on
-		// its OWN lifecycle context (not this request ctx). For external
-		// targets this also carries the ephemeral password (never persisted);
-		// for cnpg targets the password arg is empty.
-		h.runner.AdoptClaimedOperation(op, req.Target.Password)
+
+	// Ephemeral external-target password handoff: stash it in THIS replica's
+	// memory and record the pull URL (which points at this replica's pod IP)
+	// on the op row so the runner pod — and a reconciler respawn of it — can
+	// fetch it over the internal-secret-only password endpoint. The URL is
+	// persisted; the password never is.
+	if op.TargetKind == configstore.MetadataStoreKindExternal {
+		url := h.spawner.PasswordURLForOp(op.ID)
+		if url == "" {
+			_, _ = h.store.FinishPendingReshardOperation(op.ID, configstore.ReshardStateFailed, "control plane could not determine its own pod IP for the password handoff")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "control plane could not determine its own pod IP for the ephemeral password handoff"})
+			return
+		}
+		if err := h.store.SetReshardOperationPasswordURL(op.ID, url); err != nil {
+			_, _ = h.store.FinishPendingReshardOperation(op.ID, configstore.ReshardStateFailed, "recording the password handoff URL failed: "+err.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "recording the password handoff URL failed: " + err.Error()})
+			return
+		}
+		op.PasswordURL = url
+		h.stash.put(op.ID, req.Target.Password)
 	}
-	_ = h.store.AppendReshardLog(op.ID, "info", "operation created by "+actorForAudit(c)+": "+describeReshard(op))
+
+	if err := h.spawner.SpawnReshardPod(c.Request.Context(), op); err != nil {
+		h.stash.delete(op.ID)
+		_, _ = h.store.FinishPendingReshardOperation(op.ID, configstore.ReshardStateFailed, "spawning the reshard runner pod failed: "+err.Error())
+		_ = h.store.AppendReshardLog(op.ID, "error", "spawning the reshard runner pod failed: "+err.Error())
+		c.JSON(http.StatusBadGateway, gin.H{"error": "spawning the reshard runner pod failed: " + err.Error()})
+		return
+	}
+
+	_ = h.store.AppendReshardLog(op.ID, "info", "operation created by "+actorForAudit(c)+": "+describeReshard(op)+
+		"; runner pod "+reshardPodNameForLog(op.ID)+" spawned")
 	// Audit detail carries no secrets.
 	setAuditDetail(c, "reshard "+describeReshard(op))
 
 	c.JSON(http.StatusAccepted, op)
+}
+
+// reshardPodNameForLog mirrors controlplane.ReshardPodName without the import
+// (admin must not depend on the controlplane package).
+func reshardPodNameForLog(opID int64) string {
+	return "duckgres-reshard-op-" + strconv.FormatInt(opID, 10)
+}
+
+// password serves the runner pod's ONE-SHOT pull of the ephemeral external
+// target password. Internal-secret callers ONLY (the runner pod authenticates
+// with the same internal secret the CP holds) — an SSO admin must never read a
+// tenant credential, so Source is checked, not just the admin role. 404 for
+// anything unavailable (unknown op, terminal op, stash on another replica or
+// already gone). The password value is never logged or audited; the ACCESS is
+// recorded in the op log.
+func (h *reshardHandler) password(c *gin.Context) {
+	id := IdentityFromContext(c)
+	if id == nil || id.Source != "internal-secret" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "internal secret required"})
+		return
+	}
+	opID, err := strconv.ParseInt(c.Param("opid"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid operation id"})
+		return
+	}
+	h.stash.pruneTerminal(h.store)
+	op, err := h.store.GetReshardOperation(opID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "password not available"})
+		return
+	}
+	if op.State.Terminal() {
+		h.stash.delete(opID)
+		c.JSON(http.StatusNotFound, gin.H{"error": "password not available"})
+		return
+	}
+	pw, ok := h.stash.get(opID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "password not available"})
+		return
+	}
+	_ = h.store.AppendReshardLog(opID, "info", "runner pod fetched the ephemeral external target password")
+	c.JSON(http.StatusOK, gin.H{"password": pw})
 }
 
 func describeReshard(op *configstore.ReshardOperation) string {

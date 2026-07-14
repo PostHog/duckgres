@@ -117,6 +117,8 @@ type Resolved struct {
 	K8sWorkerProfileMaxMemory       string
 	K8sWorkerMaxTTL                 time.Duration
 	K8sWorkerDefaultTTL             time.Duration
+	K8sReshardPodCPU                string
+	K8sReshardPodMemory             string
 	AWSRegion                       string
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
@@ -198,6 +200,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
+	var k8sReshardPodCPU, k8sReshardPodMemory string
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -797,6 +800,15 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_TOLERATION_VALUE"); v != "" {
 		k8sWorkerTolerationValue = v
 	}
+	// Reshard runner pod shape (env-only, like the other pod-scheduling knobs):
+	// the dedicated duckgres-reshard-op-<id> pods' requests=limits. Empty →
+	// built-in defaults (2 CPU / 8Gi).
+	if v := getenv("DUCKGRES_RESHARD_POD_CPU"); v != "" {
+		k8sReshardPodCPU = v
+	}
+	if v := getenv("DUCKGRES_RESHARD_POD_MEMORY"); v != "" {
+		k8sReshardPodMemory = v
+	}
 
 	// Connection-string worker-profile config.
 	if v := getenv("DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE"); v != "" {
@@ -1154,6 +1166,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
 		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
 		K8sWorkerDefaultTTL:             k8sWorkerDefaultTTL,
+		K8sReshardPodCPU:                k8sReshardPodCPU,
+		K8sReshardPodMemory:             k8sReshardPodMemory,
 		AWSRegion:                       awsRegion,
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,

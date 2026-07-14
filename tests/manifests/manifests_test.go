@@ -93,6 +93,40 @@ func TestNetworkPolicyAllowsControlPlaneToReachWorkerGRPC(t *testing.T) {
 	}
 }
 
+// TestNetworkPolicyCoversReshardRunnerPods pins the dedicated reshard runner
+// pod policy: selected by app=duckgres-reshard, egress to Postgres (5432,
+// config store + cnpg poolers + external RDS), S3/STS (443), the CP admin API
+// (8080, the ephemeral-password pull) and DNS — and NO ingress rules (the
+// runner only dials out).
+func TestNetworkPolicyCoversReshardRunnerPods(t *testing.T) {
+	manifest := readManifest(t, "k8s", "networkpolicy.yaml")
+
+	var reshardDoc string
+	for _, doc := range strings.Split(manifest, "---") {
+		if strings.Contains(doc, "name: duckgres-reshard-runner-boundaries") {
+			reshardDoc = doc
+			break
+		}
+	}
+	if reshardDoc == "" {
+		t.Fatal("could not find reshard runner network policy in k8s/networkpolicy.yaml")
+	}
+	for _, want := range []string{
+		"app: duckgres-reshard",
+		"- port: 5432",
+		"- port: 443",
+		"- port: 8080",
+		"- port: 53",
+	} {
+		if !strings.Contains(reshardDoc, want) {
+			t.Fatalf("expected %q in reshard runner network policy in k8s/networkpolicy.yaml", want)
+		}
+	}
+	if strings.Contains(reshardDoc, "ingress:") {
+		t.Fatal("reshard runner policy must define no ingress rules (deny-all ingress)")
+	}
+}
+
 func TestManifestTestsRunInUnitRecipe(t *testing.T) {
 	content := readManifest(t, "justfile")
 	if !strings.Contains(content, "./tests/manifests/...") {

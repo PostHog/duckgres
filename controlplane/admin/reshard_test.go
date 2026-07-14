@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -35,10 +34,6 @@ type fakeReshardStore struct {
 
 	logs      []configstore.ReshardLogEntry
 	cancelled []int64
-	// adopted records AdoptClaimedOperation calls (opID -> password); the
-	// claimed map records CreateReshardOperationClaimed calls (opID -> runnerCP).
-	adopted map[int64]string
-	claimed map[int64]string
 }
 
 func newFakeReshardStore() *fakeReshardStore {
@@ -62,23 +57,12 @@ func (f *fakeReshardStore) CreateReshardOperation(op *configstore.ReshardOperati
 	return nil
 }
 
-func (f *fakeReshardStore) CreateReshardOperationClaimed(op *configstore.ReshardOperation, runnerCP string) error {
-	if f.createErr != nil {
-		return f.createErr
+func (f *fakeReshardStore) SetReshardOperationPasswordURL(id int64, url string) error {
+	op, ok := f.ops[id]
+	if !ok || op.State != configstore.ReshardStatePending {
+		return errors.New("operation is not pending")
 	}
-	op.ID = f.nextID
-	f.nextID++
-	op.State = configstore.ReshardStateRunning
-	op.RunnerCP = runnerCP
-	op.RunnerEpoch = 1
-	now := time.Now().UTC()
-	op.HeartbeatAt = &now
-	op.StartedAt = &now
-	f.ops[op.ID] = op
-	if f.claimed == nil {
-		f.claimed = map[int64]string{}
-	}
-	f.claimed[op.ID] = runnerCP
+	op.PasswordURL = url
 	return nil
 }
 
@@ -160,15 +144,28 @@ func (f *fakeReshardStore) ListExternalMetadataStores() ([]configstore.ExternalM
 	}, nil
 }
 
-// The fake doubles as the local runner handle (passed as both store and runner
-// to RegisterReshardAPI).
-func (f *fakeReshardStore) CPID() string { return "cp-test" }
+// fakeSpawner implements ReshardPodSpawner: records spawned ops (a snapshot of
+// the op as handed over, incl. PasswordURL), configurable failure, and a
+// deterministic password URL.
+type fakeSpawner struct {
+	spawned  []configstore.ReshardOperation
+	spawnErr error
+	noURL    bool // PasswordURLForOp returns "" (pod IP undeterminable)
+}
 
-func (f *fakeReshardStore) AdoptClaimedOperation(op *configstore.ReshardOperation, password string) {
-	if f.adopted == nil {
-		f.adopted = map[int64]string{}
+func (f *fakeSpawner) SpawnReshardPod(_ context.Context, op *configstore.ReshardOperation) error {
+	if f.spawnErr != nil {
+		return f.spawnErr
 	}
-	f.adopted[op.ID] = password
+	f.spawned = append(f.spawned, *op)
+	return nil
+}
+
+func (f *fakeSpawner) PasswordURLForOp(opID int64) string {
+	if f.noURL {
+		return ""
+	}
+	return "http://192.0.2.1:8080/api/v1/reshards/" + strconv.FormatInt(opID, 10) + "/password"
 }
 
 type fakeShardLister struct {
@@ -194,21 +191,41 @@ func (p *fakeProber) Probe(_ context.Context, endpoint, user, database, password
 }
 
 func reshardRouter(store *fakeReshardStore) *gin.Engine {
-	return reshardRouterFull(store, nil, nil)
+	r, _ := reshardRouterFull(store, nil, nil)
+	return r
 }
 
 func reshardRouterWithCluster(store *fakeReshardStore, cluster kubernetes.Interface) *gin.Engine {
-	return reshardRouterFull(store, cluster, nil)
+	r, _ := reshardRouterFull(store, cluster, nil)
+	return r
 }
 
-func reshardRouterFull(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber) *gin.Engine {
+// reshardRouterFull registers the API with a fakeSpawner and an
+// internal-secret identity on every request (the password endpoint gates on
+// it; production wiring runs AuthMiddleware in front).
+func reshardRouterFull(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber) (*gin.Engine, *fakeSpawner) {
+	return reshardRouterSpawner(store, cluster, prober, &fakeSpawner{}, "internal-secret")
+}
+
+func reshardRouterSpawner(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber, spawner ReshardPodSpawner, identitySource string) (*gin.Engine, *fakeSpawner) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		if identitySource != "" {
+			role := RoleAdmin
+			if identitySource == "sso" {
+				role = RoleAdmin // an SSO ADMIN must still be refused the password
+			}
+			c.Set(ctxIdentityKey, &Identity{Email: identitySource, Role: role, Source: identitySource})
+		}
+		c.Next()
+	})
 	lister := fakeShardLister{stores: map[string]DucklingMetadataStore{
 		"acme": {Kind: "cnpg-shard", Endpoint: "shard-001-pooler.cnpg-shards.svc.cluster.local"},
 	}}
-	RegisterReshardAPI(r.Group("/api/v1"), store, lister, store, cluster, prober)
-	return r
+	RegisterReshardAPI(r.Group("/api/v1"), store, lister, spawner, cluster, prober)
+	fs, _ := spawner.(*fakeSpawner)
+	return r, fs
 }
 
 func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder {
@@ -223,7 +240,8 @@ func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder
 // target on the op row.
 func TestReshardStartCnpg(t *testing.T) {
 	store := newFakeReshardStore()
-	w := doJSON(reshardRouter(store), http.MethodPost, "/api/v1/orgs/acme/reshard",
+	r, spawner := reshardRouterFull(store, nil, nil)
+	w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"},"drain_timeout_seconds":120,"cutover_timeout_seconds":45}`)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body %s, want 202", w.Code, w.Body.String())
@@ -235,17 +253,17 @@ func TestReshardStartCnpg(t *testing.T) {
 	if op.SourceKind != "cnpg-shard" || op.FromShard != "shard-001" || op.ToShard != "shard-002" || op.DrainTimeoutSeconds != 120 || op.CutoverTimeoutSeconds != 45 {
 		t.Fatalf("op = %+v", op)
 	}
-	// Claim-on-create: the op is created ALREADY claimed by the local CP
-	// (state running, runner_cp set) and handed to the runner to execute — no
-	// pending window a sibling replica could claim.
-	if op.State != configstore.ReshardStateRunning || op.RunnerCP != "cp-test" {
-		t.Fatalf("op not create-claimed: state=%s runner_cp=%q", op.State, op.RunnerCP)
+	// Pod model: the op is created PENDING (the dedicated runner pod claims it
+	// itself) and the runner pod was spawned for it. cnpg targets carry no
+	// password URL.
+	if op.State != configstore.ReshardStatePending {
+		t.Fatalf("op state = %s, want pending (the runner pod claims it)", op.State)
 	}
-	if store.claimed[op.ID] != "cp-test" {
-		t.Fatalf("create-claimed not recorded: %v", store.claimed)
+	if len(spawner.spawned) != 1 || spawner.spawned[0].ID != op.ID {
+		t.Fatalf("runner pod not spawned for the op: %+v", spawner.spawned)
 	}
-	if _, ok := store.adopted[op.ID]; !ok {
-		t.Fatalf("op was not adopted by the runner: %v", store.adopted)
+	if spawner.spawned[0].PasswordURL != "" || op.PasswordURL != "" {
+		t.Fatalf("cnpg target must carry no password URL (got %q)", spawner.spawned[0].PasswordURL)
 	}
 }
 
@@ -348,7 +366,8 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 	// Passing prober → 202, op created, probe saw the resolved args.
 	store := newFakeReshardStore()
 	pb := &fakeProber{}
-	w := doJSON(reshardRouterFull(store, nil, pb), http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+	rp, _ := reshardRouterFull(store, nil, pb)
+	w := doJSON(rp, http.MethodPost, "/api/v1/orgs/acme/reshard", body)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("passing prober: status = %d body %s, want 202", w.Code, w.Body.String())
 	}
@@ -365,7 +384,8 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 	// Failing prober → 400, redacted message, NO op created.
 	store = newFakeReshardStore()
 	pb = &fakeProber{err: errors.New("connection refused")}
-	w = doJSON(reshardRouterFull(store, nil, pb), http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+	rp, _ = reshardRouterFull(store, nil, pb)
+	w = doJSON(rp, http.MethodPost, "/api/v1/orgs/acme/reshard", body)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("failing prober: status = %d body %s, want 400", w.Code, w.Body.String())
 	}
@@ -381,7 +401,8 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 
 	// Nil prober → check skipped, op created.
 	store = newFakeReshardStore()
-	w = doJSON(reshardRouterFull(store, nil, nil), http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+	rp, _ = reshardRouterFull(store, nil, nil)
+	w = doJSON(rp, http.MethodPost, "/api/v1/orgs/acme/reshard", body)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("nil prober: status = %d body %s, want 202", w.Code, w.Body.String())
 	}
@@ -391,30 +412,33 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 }
 
 // TestReshardExtPasswordStashedNotPersisted pins the ephemeral-password
-// contract: the password reaches the runner via the claim-on-create adopt
-// handoff, the op row carries only the secret NAME, and neither the response
-// nor the log contains the password. The op is also create-claimed by the
-// local CP so no other replica can win it and fail the copy for want of the
-// password (the production multi-replica bug).
+// contract in the pod model: the op row carries only the secret NAME plus the
+// password PULL URL (never the password); the runner pod spawned with that URL
+// wired; and neither the response nor the log contains the password. The
+// password itself is served exactly once-per-request by the internal-secret-
+// only endpoint (covered by TestReshardPasswordEndpoint).
 func TestReshardExtPasswordStashedNotPersisted(t *testing.T) {
 	store := newFakeReshardStore()
-	w := doJSON(reshardRouter(store), http.MethodPost, "/api/v1/orgs/acme/reshard",
+	r, spawner := reshardRouterFull(store, nil, nil)
+	w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"duckling-my-secret","user":"postgres","database":"postgres","password":"hunter2"}}`)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body %s, want 202", w.Code, w.Body.String())
 	}
-	if store.adopted[1] != "hunter2" {
-		t.Fatalf("adopted = %v, want the password handed to the runner", store.adopted)
-	}
-	if store.claimed[1] != "cp-test" {
-		t.Fatalf("external op not create-claimed by local CP: %v", store.claimed)
-	}
 	op := store.ops[1]
-	if op.State != configstore.ReshardStateRunning || op.RunnerCP != "cp-test" {
-		t.Fatalf("external op not create-claimed: state=%s runner_cp=%q", op.State, op.RunnerCP)
+	if op.State != configstore.ReshardStatePending {
+		t.Fatalf("op state = %s, want pending", op.State)
 	}
 	if op.TargetPasswordSecret != "duckling-my-secret" || op.TargetEndpoint != "rds.example.com" {
 		t.Fatalf("op = %+v", op)
+	}
+	// The pull URL is recorded on the row and wired into the spawned pod.
+	wantURL := "http://192.0.2.1:8080/api/v1/reshards/1/password"
+	if op.PasswordURL != wantURL {
+		t.Fatalf("op.PasswordURL = %q, want %q", op.PasswordURL, wantURL)
+	}
+	if len(spawner.spawned) != 1 || spawner.spawned[0].PasswordURL != wantURL {
+		t.Fatalf("spawned op missing the password URL: %+v", spawner.spawned)
 	}
 	if strings.Contains(w.Body.String(), "hunter2") {
 		t.Fatal("response leaked the ephemeral password")
@@ -423,6 +447,112 @@ func TestReshardExtPasswordStashedNotPersisted(t *testing.T) {
 		if strings.Contains(e.Message, "hunter2") {
 			t.Fatal("log leaked the ephemeral password")
 		}
+	}
+}
+
+// TestReshardPasswordEndpoint pins the runner pod's one-shot password pull:
+// internal-secret identity gets the stashed password; an SSO ADMIN is refused
+// (403 — an operator must never read a tenant credential); a terminal op or a
+// replica without the stash 404s; the access is logged WITHOUT the value.
+func TestReshardPasswordEndpoint(t *testing.T) {
+	start := `{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"duckling-my-secret","password":"hunter2"}}`
+
+	// Same handler instance must serve start + pull (the stash is in-memory).
+	store := newFakeReshardStore()
+	r, _ := reshardRouterFull(store, nil, nil)
+	if w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard", start); w.Code != http.StatusAccepted {
+		t.Fatalf("start: %d %s", w.Code, w.Body.String())
+	}
+	w := doJSON(r, http.MethodGet, "/api/v1/reshards/1/password", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("password pull status = %d body %s, want 200", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp.Password != "hunter2" {
+		t.Fatalf("password pull body = %s (err %v)", w.Body.String(), err)
+	}
+	for _, e := range store.logs {
+		if strings.Contains(e.Message, "hunter2") {
+			t.Fatal("op log leaked the password on the pull")
+		}
+	}
+
+	// Terminal op → 404 and the stash entry is dropped.
+	store.ops[1].State = configstore.ReshardStateFailed
+	if w := doJSON(r, http.MethodGet, "/api/v1/reshards/1/password", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("terminal op password pull = %d, want 404", w.Code)
+	}
+	store.ops[1].State = configstore.ReshardStateRunning
+	if w := doJSON(r, http.MethodGet, "/api/v1/reshards/1/password", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("post-terminal (pruned stash) pull = %d, want 404", w.Code)
+	}
+
+	// An SSO admin identity is refused — internal secret ONLY.
+	ssoStore := newFakeReshardStore()
+	ssoR, _ := reshardRouterSpawner(ssoStore, nil, nil, &fakeSpawner{}, "sso")
+	if w := doJSON(ssoR, http.MethodPost, "/api/v1/orgs/acme/reshard", start); w.Code != http.StatusAccepted {
+		t.Fatalf("sso start: %d", w.Code)
+	}
+	w = doJSON(ssoR, http.MethodGet, "/api/v1/reshards/1/password", "")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("SSO password pull = %d body %s, want 403", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "hunter2") {
+		t.Fatal("SSO refusal leaked the password")
+	}
+
+	// A replica that never saw the start request has no stash → 404.
+	otherStore := newFakeReshardStore()
+	otherStore.ops[1] = &configstore.ReshardOperation{ID: 1, OrgID: "acme", State: configstore.ReshardStateRunning}
+	otherR, _ := reshardRouterFull(otherStore, nil, nil)
+	if w := doJSON(otherR, http.MethodGet, "/api/v1/reshards/1/password", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("stashless replica pull = %d, want 404", w.Code)
+	}
+}
+
+// TestReshardStartSpawnFailure pins the pod model's start-failure contract: a
+// spawner error finishes the just-created pending op as FAILED (nothing would
+// ever execute it) and surfaces a 502; a spawner that cannot determine its own
+// pod IP fails an ext-target start the same way; a nil spawner refuses every
+// start with 503 and creates nothing.
+func TestReshardStartSpawnFailure(t *testing.T) {
+	// Spawn error → 502, op failed.
+	store := newFakeReshardStore()
+	r, _ := reshardRouterSpawner(store, nil, nil, &fakeSpawner{spawnErr: errors.New("pods is forbidden")}, "internal-secret")
+	w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
+		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("spawn failure status = %d body %s, want 502", w.Code, w.Body.String())
+	}
+	if store.ops[1].State != configstore.ReshardStateFailed {
+		t.Fatalf("op state = %s, want failed after spawn failure", store.ops[1].State)
+	}
+
+	// Ext target + no self pod IP → 500, op failed, no spawn attempted.
+	store = newFakeReshardStore()
+	sp := &fakeSpawner{noURL: true}
+	r, _ = reshardRouterSpawner(store, nil, nil, sp, "internal-secret")
+	w = doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
+		`{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"duckling-x","password":"p"}}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("no-pod-ip status = %d body %s, want 500", w.Code, w.Body.String())
+	}
+	if store.ops[1].State != configstore.ReshardStateFailed || len(sp.spawned) != 0 {
+		t.Fatalf("no-pod-ip: op state %s, spawned %d", store.ops[1].State, len(sp.spawned))
+	}
+
+	// Nil spawner → 503, nothing created.
+	store = newFakeReshardStore()
+	r, _ = reshardRouterSpawner(store, nil, nil, nil, "internal-secret")
+	w = doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
+		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil spawner status = %d, want 503", w.Code)
+	}
+	if len(store.ops) != 0 {
+		t.Fatalf("nil spawner created %d ops, want 0", len(store.ops))
 	}
 }
 
@@ -473,24 +603,24 @@ func TestReshardGetListLogCancel(t *testing.T) {
 		t.Fatalf("after_id poll returned %d entries, want 0", len(resp.Entries))
 	}
 
-	// Op 1 is create-claimed (running), so cancel sets the flag → 202 (the
+	// A RUNNING op (the pod claimed it) gets the cancel flag → 202 (the
 	// runner rolls back from wherever it is).
-	w = doJSON(r, http.MethodPost, "/api/v1/reshards/1/cancel", "")
-	if w.Code != http.StatusAccepted || !store.ops[1].CancelRequested {
-		t.Fatalf("cancel running op 1: status %d, flag %t", w.Code, store.ops[1].CancelRequested)
+	store.ops[2] = &configstore.ReshardOperation{ID: 2, OrgID: "acme", State: configstore.ReshardStateRunning}
+	w = doJSON(r, http.MethodPost, "/api/v1/reshards/2/cancel", "")
+	if w.Code != http.StatusAccepted || !store.ops[2].CancelRequested {
+		t.Fatalf("cancel running op 2: status %d, flag %t", w.Code, store.ops[2].CancelRequested)
 	}
 
-	// A PENDING op (the no-local-runner path) finishes immediately as
-	// cancelled; a re-cancel is 409 (terminal).
-	store.ops[3] = &configstore.ReshardOperation{ID: 3, OrgID: "acme", State: configstore.ReshardStatePending}
-	w = doJSON(r, http.MethodPost, "/api/v1/reshards/3/cancel", "")
+	// A PENDING op (pod not started / never claimed) finishes immediately as
+	// cancelled; a re-cancel is 409 (terminal). Op 1 is pending (pod model).
+	w = doJSON(r, http.MethodPost, "/api/v1/reshards/1/cancel", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("cancel pending status = %d body %s", w.Code, w.Body.String())
 	}
-	if store.ops[3].State != configstore.ReshardStateCancelled {
-		t.Fatalf("pending op state = %s, want cancelled", store.ops[3].State)
+	if store.ops[1].State != configstore.ReshardStateCancelled {
+		t.Fatalf("pending op state = %s, want cancelled", store.ops[1].State)
 	}
-	w = doJSON(r, http.MethodPost, "/api/v1/reshards/3/cancel", "")
+	w = doJSON(r, http.MethodPost, "/api/v1/reshards/1/cancel", "")
 	if w.Code != http.StatusConflict {
 		t.Fatalf("re-cancel status = %d, want 409", w.Code)
 	}
