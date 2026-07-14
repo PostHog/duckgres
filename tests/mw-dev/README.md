@@ -257,6 +257,20 @@ erase provisioned org rows. Everything PR-specific lives in the namespace and
 is deleted; the shared-infra footprint is removed by deprovisioning the
 ducklings first.
 
+The ext org's metadata store is a **per-run database** on the shared RDS
+(`mdstore_e2e_<utc-ts>_pr<pr>`), not a shared one: a shared database's
+DuckLake catalog grows monotonically across runs (20k+ `ducklake_*` tables
+observed), inflating every catalog copy and exposing runs to each other's
+writers. The harness creates it once its own duckling status carries the
+ESO-synced RDS password (`ext_rds_setup`, concurrent with the readiness
+waits — the CP's provisioning probe retries until the database exists), drops
+it at the end of a passing run (`ext_rds_teardown`), and GCs databases leaked
+by aborted runs (name-gated, >24h old) at the start of every run. The runner
+side (`run.sh` teardown / `e2e-cleanup`) cannot drop them — no psql and no
+path to the RDS password — so the next run's GC is the backstop. The RDS
+user/secret are unchanged; only the database is per-run, and nothing outside
+`mdstore_e2e_*` is ever touched.
+
 Each deploy first reaps any existing resources for the same PR number (namespace,
 Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role).
 It fails before applying manifests if the same-PR Duckling CRs do not fully

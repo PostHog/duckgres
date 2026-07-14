@@ -520,6 +520,15 @@ cmd_teardown() {
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
   for org in $(ci_cnpg_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
 
+  # The ext org's PER-RUN metadata database on the shared RDS
+  # (mdstore_e2e_<utc-ts>_pr<pr>, see harness.sh EXT_RDS_DB) is NOT dropped
+  # here: this runner has neither psql nor any path to the RDS password (it
+  # lives in AWS SM, synced in-cluster by ESO into the duckling's status). The
+  # harness drops its own database at the end of a passing run
+  # (ext_rds_teardown); databases leaked by crashed/cancelled runs are reaped
+  # by the NEXT run's >24h name-gated GC (ext_rds_setup). Same story for
+  # cmd_e2e_cleanup below.
+
   # Drop the Pod Identity association (it's an EKS resource, not in the ns).
   delete_pod_identity
 

@@ -405,6 +405,21 @@ recovery (which stranded the tenant with an empty catalog when the copy-back
 also failed, the prod-shaped data-loss incident this change fixes) and avoids
 the `2BP01` "role can't drop while its DB exists" wedge the coupled delete hit.
 
+Every wait loop in the runner (drain, flip converge, orphan-policy wait, this
+recovery) announces its deadline on entry and logs what it observes every ~15s
+(duckling endpoint/Ready state, classified probe errors), and its timeout
+error/log line carries the LAST observation — a stuck reshard is diagnosable
+from the op log alone. One recovery failure mode deserves naming: the
+re-adopted role's ACTUAL Postgres password can differ from the freshly
+regenerated status password (a **stranded password** — the probe fails with
+`FATAL: SASL authentication failed` / SQLSTATE 28P01 until the composition
+converges the password). The runner classifies auth probe failures
+(`isAuthProbeError`) and the observation names the condition and the manual
+remedy — `ALTER ROLE <role> WITH PASSWORD '<status password>'` on the source
+shard primary — but it still polls to the deadline rather than bailing early,
+since a charts/composition fix can converge the password mid-wait. Passwords
+never appear in the op log.
+
 ## Rollback, cancel, crash-safety
 
 - Rollback never removes `spec.metadataStore.cnpgShard` — it patches the
