@@ -23,6 +23,7 @@ SA_NAME="duckgres"
 FROZEN_S3_URI="${DUCKGRES_SCENARIO_FROZEN_S3_URI:-s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/}"
 SCENARIO_JOB_WATCH_TIMEOUT_SECONDS="${SCENARIO_JOB_WATCH_TIMEOUT_SECONDS:-16200}"
 SCENARIO_NAME="${SCENARIO_NAME:-full-suite}"
+SCENARIO_ARTIFACTS_DIR="${SCENARIO_ARTIFACTS_DIR:-$HERE/../../artifacts/scenario-dev}"
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -350,7 +351,7 @@ cmd_test_scenario() {
 }
 
 run_scenario() {
-  local scenario_name="$1" scenario_file="$2" job api_base pg flight suffix internal_secret rc=0
+  local scenario_name="$1" scenario_file="$2" job pod api_base pg flight suffix internal_secret artifact_rc=0 container_rc=0 container_exit_code scenario_rc=0
   api_base="http://duckgres-control-plane.$NS.svc:8080"
   pg="$("${KUBECTL[@]}" -n "$NS" get svc duckgres-control-plane -o jsonpath='{.spec.clusterIP}')"
   flight="duckgres-control-plane.$NS.svc:8815"
@@ -396,16 +397,77 @@ spec:
             limits: { memory: "6Gi" }
           volumeMounts:
             - { name: artifacts, mountPath: /artifacts }
+        # Keep the shared artifact volume attached to a running container after
+        # the scenario exits. kubectl cp uses exec/tar and cannot copy from a
+        # terminated scenario container.
+        - name: artifact-keeper
+          image: $SCENARIO_RUNNER_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "-c"]
+          args:
+            - |
+              until [ -f /artifacts/artifacts-collected ]; do sleep 1; done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits: { memory: "64Mi" }
+          volumeMounts:
+            - { name: artifacts, mountPath: /artifacts }
       volumes:
         - { name: artifacts, emptyDir: {} }
 YAML
 
   echo "Streaming scenario logs for $job..."
   "${KUBECTL[@]}" -n "$NS" wait --for=condition=ready pod -l "job-name=$job" --timeout=180s || true
-  "${KUBECTL[@]}" -n "$NS" logs -f "job/$job" || true
-  wait_for_scenario_job "$job" || rc=$?
-  copy_scenario_artifacts "$scenario_name" "$job"
-  return "$rc"
+  if ! pod="$(discover_scenario_pod "$job")"; then
+    echo "Scenario pod for $job could not be discovered." >&2
+    "${KUBECTL[@]}" -n "$NS" delete job "$job" --ignore-not-found --wait=false || true
+    return 1
+  fi
+  "${KUBECTL[@]}" -n "$NS" logs -f "job/$job" -c scenario || true
+  wait_for_scenario_container "$pod" || container_rc=$?
+  copy_scenario_artifacts "$scenario_name" "$pod" || artifact_rc=$?
+  if [ "$artifact_rc" -eq 2 ]; then
+    container_exit_code="$(scenario_container_exit_code "$pod" || true)"
+    echo "Scenario container exit code before forced Job cleanup: ${container_exit_code:-unknown}." >&2
+    "${KUBECTL[@]}" -n "$NS" delete job "$job" --ignore-not-found --wait=false || true
+    case "$container_exit_code" in
+      ""|*[!0-9]*|0) return "$artifact_rc" ;;
+      *) return "$container_exit_code" ;;
+    esac
+  fi
+  if [ "$container_rc" -ne 0 ]; then
+    echo "Scenario container for $job did not reach a terminated state before artifact collection." >&2
+    return "$container_rc"
+  fi
+  wait_for_scenario_job "$job" || scenario_rc=$?
+  [ "$scenario_rc" -eq 0 ] || return "$scenario_rc"
+  return "$artifact_rc"
+}
+
+discover_scenario_pod() {
+  local job="$1" attempt pod
+  for attempt in 1 2 3 4 5 6; do
+    pod="$("${KUBECTL[@]}" -n "$NS" get pod -l "job-name=$job" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [ -n "$pod" ]; then
+      printf '%s\n' "$pod"
+      return 0
+    fi
+    [ "$attempt" -eq 6 ] || sleep 5
+  done
+  return 1
+}
+
+wait_for_scenario_container() {
+  local pod="$1"
+  "${KUBECTL[@]}" -n "$NS" wait \
+    --for='jsonpath={.status.containerStatuses[?(@.name=="scenario")].state.terminated.reason}' \
+    "pod/$pod" --timeout="${SCENARIO_JOB_WATCH_TIMEOUT_SECONDS}s"
+}
+
+scenario_container_exit_code() {
+  local pod="$1"
+  "${KUBECTL[@]}" -n "$NS" get "pod/$pod" \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="scenario")].state.terminated.exitCode}' 2>/dev/null
 }
 
 wait_for_scenario_job() {
@@ -427,12 +489,53 @@ wait_for_scenario_job() {
 }
 
 copy_scenario_artifacts() {
-  local scenario_name="$1" job="$2" pod dest
-  pod="$("${KUBECTL[@]}" -n "$NS" get pod -l "job-name=$job" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [ -n "$pod" ] || return 0
-  dest="$HERE/../../artifacts/scenario-dev/${scenario_name}"
-  mkdir -p "$dest"
-  "${KUBECTL[@]}" -n "$NS" cp "$pod:/artifacts/scenario-dev" "$dest" >/dev/null 2>&1 || true
+  local scenario_name="$1" pod="$2" artifact dest staging copy_failed=0
+  mkdir -p "$SCENARIO_ARTIFACTS_DIR"
+  staging="$(mktemp -d "$SCENARIO_ARTIFACTS_DIR/.${scenario_name}.XXXXXX")"
+  dest="$SCENARIO_ARTIFACTS_DIR/${scenario_name}"
+  if "${KUBECTL[@]}" -n "$NS" cp -c artifact-keeper "$pod:/artifacts/scenario-dev/." "$staging"; then
+    for artifact in scenario_summary.json step_results.csv events.jsonl; do
+      if [ -z "$(find "$staging" -type f -name "$artifact" -print -quit)" ]; then
+        echo "Failed to copy scenario artifacts: missing required scenario artifact $artifact." >&2
+        copy_failed=1
+      fi
+    done
+    if [ "$copy_failed" -eq 0 ] && [ -e "$dest" ]; then
+      echo "Failed to promote scenario artifacts: destination $dest already exists." >&2
+      copy_failed=1
+    fi
+    if [ "$copy_failed" -eq 0 ]; then
+      if mv "$staging" "$dest"; then
+        echo "Copied scenario artifacts to $dest."
+      else
+        echo "Failed to promote scenario artifacts to $dest." >&2
+        copy_failed=1
+      fi
+    fi
+  else
+    echo "Failed to copy scenario artifacts from $pod." >&2
+    copy_failed=1
+  fi
+
+  # Release the keeper even when copying fails so the Job can reach a terminal
+  # state and preserve the scenario container's real exit status.
+  if ! release_artifact_keeper "$pod"; then
+    echo "Failed to release scenario artifact keeper for $pod." >&2
+    return 2
+  fi
+  return "$copy_failed"
+}
+
+release_artifact_keeper() {
+  local pod="$1" attempt
+  for attempt in 1 2 3; do
+    if "${KUBECTL[@]}" -n "$NS" exec -c artifact-keeper "$pod" -- touch /artifacts/artifacts-collected; then
+      return 0
+    fi
+    echo "Artifact keeper release attempt $attempt failed for $pod." >&2
+    [ "$attempt" -eq 3 ] || sleep 2
+  done
+  return 1
 }
 
 cmd_diagnostics() {

@@ -137,7 +137,12 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	for _, want := range []string{
 		"kubectl --context test-context -n duckgres-ci-pr-123 get svc duckgres-control-plane -o jsonpath={.spec.clusterIP}",
 		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
+		"name: artifact-keeper",
 		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-fast-suite-",
+		"-c scenario",
+		"kubectl --context test-context -n duckgres-ci-pr-123 wait --for=jsonpath={.status.containerStatuses[?(@.name==\"scenario\")].state.terminated.reason} pod/duckgres-scenario-pod",
+		"kubectl --context test-context -n duckgres-ci-pr-123 cp -c artifact-keeper duckgres-scenario-pod:/artifacts/scenario-dev/.",
+		"kubectl --context test-context -n duckgres-ci-pr-123 exec -c artifact-keeper duckgres-scenario-pod -- touch /artifacts/artifacts-collected",
 	} {
 		if !strings.Contains(calls, want) {
 			t.Fatalf("selected scenario missing expected call %q; calls:\n%s", want, calls)
@@ -153,6 +158,103 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	}
 	if strings.Contains(calls, "get secret duckgres-scenario-config") {
 		t.Fatalf("selected scenario still reads a scenario config secret; calls:\n%s", calls)
+	}
+	copyAt := strings.Index(calls, " cp -c artifact-keeper ")
+	terminatedAt := strings.Index(calls, " wait --for=jsonpath={.status.containerStatuses")
+	waitAt := strings.Index(calls, " get job duckgres-scenario-fast-suite-")
+	if terminatedAt < 0 || copyAt < 0 || waitAt < 0 || terminatedAt > copyAt || copyAt > waitAt {
+		t.Fatalf("scenario must terminate, copy from the live keeper, then wait for Job completion; calls:\n%s", calls)
+	}
+}
+
+func TestScenarioCleansUpWhenPodCannotBeDiscovered(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
+		"SCENARIO_DEV_NO_POD=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario succeeded without a discoverable pod; output:\n%s", out)
+	}
+
+	calls := fakes.calls(t)
+	if !strings.Contains(calls, "delete job duckgres-scenario-fast-suite-") || !strings.Contains(calls, "--wait=false") {
+		t.Fatalf("scenario did not clean up a Job whose pod could not be discovered; calls:\n%s", calls)
+	}
+}
+
+func TestScenarioDoesNotAcceptStaleArtifactsAfterEmptyCopy(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	staleDir := filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts", "fast-suite", "old-run")
+	if err := os.MkdirAll(staleDir, 0o755); err != nil {
+		t.Fatalf("create stale artifact dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staleDir, "scenario_summary.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write stale artifact: %v", err)
+	}
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
+		"SCENARIO_DEV_EMPTY_COPY=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario accepted stale artifacts after an empty copy; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "missing required scenario artifact") {
+		t.Fatalf("scenario did not report missing required artifacts; output:\n%s", out)
+	}
+}
+
+func TestScenarioPreservesContainerExitWhenKeeperReleaseFails(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
+		"SCENARIO_DEV_FAIL_RELEASE=1",
+		"SCENARIO_DEV_EXIT_CODE=7",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario succeeded despite failed scenario and keeper release; output:\n%s", out)
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 7 {
+		t.Fatalf("scenario exit = %v, want preserved container exit 7; output:\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	exitAt := strings.Index(calls, "state.terminated.exitCode")
+	deleteAt := strings.LastIndex(calls, "delete job duckgres-scenario-fast-suite-")
+	if exitAt < 0 || deleteAt < 0 || exitAt > deleteAt {
+		t.Fatalf("scenario did not capture container exit before deleting stuck Job; calls:\n%s", calls)
+	}
+}
+
+func TestScenarioFailsWhenArtifactCopyFails(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
+		"SCENARIO_DEV_FAIL_COPY=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario succeeded despite artifact copy failure; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "Failed to copy scenario artifacts") {
+		t.Fatalf("scenario did not report artifact copy failure; output:\n%s", out)
+	}
+
+	calls := fakes.calls(t)
+	if !strings.Contains(calls, "exec -c artifact-keeper duckgres-scenario-pod -- touch /artifacts/artifacts-collected") {
+		t.Fatalf("scenario did not release artifact keeper after copy failure; calls:\n%s", calls)
 	}
 }
 
@@ -322,6 +424,20 @@ if [[ "$*" == *" apply -f -"* ]]; then
   tee -a "$RUN_SH_TEST_CALLS" >/dev/null
   exit 0
 fi
+if [[ -n "${SCENARIO_DEV_FAIL_COPY:-}" && "$*" == *" cp "* ]]; then
+  exit 1
+fi
+if [[ -n "${SCENARIO_DEV_EMPTY_COPY:-}" && "$*" == *" cp "* ]]; then
+  exit 0
+fi
+if [[ "$*" == *" cp "* ]]; then
+  dest="${@: -1}"
+  mkdir -p "$dest"
+  printf '{}\n' > "$dest/scenario_summary.json"
+  printf 'header\n' > "$dest/step_results.csv"
+  printf '{}\n' > "$dest/events.jsonl"
+  exit 0
+fi
 if [[ "$*" == *" get svc duckgres-control-plane "* ]]; then
   printf '10.96.0.20'
   exit 0
@@ -339,9 +455,19 @@ if [[ "$*" == *" get job duckgres-scenario-"* ]]; then
   printf 'True'
   exit 0
 fi
+if [[ -n "${SCENARIO_DEV_NO_POD:-}" && "$*" == *" get pod -l job-name=duckgres-scenario-"* ]]; then
+  exit 0
+fi
+if [[ "$*" == *"state.terminated.exitCode"* ]]; then
+  printf '%s' "${SCENARIO_DEV_EXIT_CODE:-0}"
+  exit 0
+fi
 if [[ "$*" == *" get pod -l job-name=duckgres-scenario-"* ]]; then
   printf 'duckgres-scenario-pod'
   exit 0
+fi
+if [[ -n "${SCENARIO_DEV_FAIL_RELEASE:-}" && "$*" == *" exec -c artifact-keeper "* ]]; then
+  exit 1
 fi
 if [[ "$*" == *" wait --for=delete duckling/ci-pr-123-"* ]]; then
   exit 1
@@ -459,6 +585,7 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"CP_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/duckgres-control-plane-dev",
 		"EKS_CLUSTER_NAME=test-cluster",
 		"AWS_REGION=us-east-1",
+		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),
 	)
 	env = append(env, extraEnv...)
 	cmd.Env = env

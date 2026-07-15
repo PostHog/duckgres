@@ -17,7 +17,9 @@ cnpg-shard metadata stores, and external metadata fixtures.
    in the same namespace.
 4. **Test** via an in-cluster payload Job hitting the CP ClusterIP service.
    `test-e2e` runs `e2e/harness.sh`; `test-scenario` runs the scenario named by
-   `SCENARIO_NAME`, which defaults to `full-suite`.
+   `SCENARIO_NAME`, which defaults to `full-suite`. Scenario artifacts are
+   copied to `SCENARIO_ARTIFACTS_DIR`, which defaults to
+   `artifacts/scenario-dev/` at the repository root.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
 
