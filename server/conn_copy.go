@@ -275,7 +275,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	rows, err := c.executor.Query(selectQuery)
 	if err != nil {
 		copyFinalErr = err
-		c.logger().Error("COPY TO query failed.", boundedQueryErrorLogAttrs(selectQuery, err)...)
+		c.logger().Error("COPY TO query failed.", "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
@@ -287,7 +287,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("COPY TO failed to get columns.", boundedQueryErrorLogAttrs(selectQuery, err)...)
+		c.logger().Error("COPY TO failed to get columns.", "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
@@ -560,8 +560,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	}
 	testRows, err := c.executor.Query(colQuery)
 	if err != nil {
-		attrs := append(boundedQueryErrorLogAttrs(colQuery, err), "table", boundQueryLogText(tableName))
-		c.logger().Error("COPY FROM table check failed.", attrs...)
+		c.logger().Error("COPY FROM table check failed.", "table", tableName, "error", err)
 		errMsg := fmt.Sprintf("relation \"%s\" does not exist", tableName)
 		c.sendError("ERROR", "42P01", errMsg)
 		c.setTxError()
@@ -689,7 +688,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			}
 			c.logQueryFinished(copySQL, loadStart, copyRowsAffected, err)
 			if err != nil {
-				c.logger().Error("COPY FROM STDIN DuckDB COPY failed.", boundedQueryErrorLogAttrs(copySQL, err)...)
+				c.logger().Error("COPY FROM STDIN DuckDB COPY failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -785,7 +784,7 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 		return nil
 	}
 	if err != nil {
-		c.logger().Error("COPY FROM STDIN remote streaming failed.", boundedQueryErrorLogAttrs(copySQL, err)...)
+		c.logger().Error("COPY FROM STDIN remote streaming failed.", "error", err)
 		errMsg := fmt.Sprintf("COPY failed: %v", err)
 		c.sendError("ERROR", "22P02", errMsg)
 		c.setTxError()
@@ -975,7 +974,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			loadStart := time.Now()
 			rowCount, err := c.batchInsertRows(opts.TableName, opts.ColumnList, cols, rows)
 			if err != nil {
-				c.logger().Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", boundedQueryErrorLogAttrs(query, err)...)
+				c.logger().Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -1054,7 +1053,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			data := buf.Bytes()
 			rowCount, err := c.parseBinaryCopyAndInsert(data, opts.TableName, opts.ColumnList, cols, typeOIDs)
 			if err != nil {
-				c.logger().Error("COPY FROM STDIN binary: parse/insert failed.", boundedQueryErrorLogAttrs(query, err)...)
+				c.logger().Error("COPY FROM STDIN binary: parse/insert failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -1258,8 +1257,7 @@ func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList
 		if err == nil {
 			return count, nil
 		}
-		attrs := append(boundedQueryErrorLogAttrs(tableName, err), "table", boundQueryLogText(tableName))
-		c.logger().Warn("Appender failed, falling back to batched INSERT.", attrs...)
+		c.logger().Warn("Appender failed, falling back to batched INSERT.", "table", tableName, "error", err)
 	}
 
 	// Fallback: batched multi-row INSERT

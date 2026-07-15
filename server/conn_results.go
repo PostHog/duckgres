@@ -20,7 +20,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("Failed to get column info.", boundedQueryErrorLogAttrs(query, err)...)
+		c.logger().Error("Failed to get column info.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -28,7 +28,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.logger().Error("Failed to get column types.", boundedQueryErrorLogAttrs(query, err)...)
+		c.logger().Error("Failed to get column types.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -57,7 +57,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.logger().Error("Failed to scan row.", boundedQueryErrorLogAttrs(query, err)...)
+			c.logger().Error("Failed to scan row.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			return
@@ -73,7 +73,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			c.logger().Error("Row iteration error.", boundedQueryErrorLogAttrs(query, err)...)
+			c.logger().Error("Row iteration error.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 		}
 		c.setTxError()
@@ -91,7 +91,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("Failed to get column info.", boundedQueryErrorLogAttrs(query, err)...)
+		c.logger().Error("Failed to get column info.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
@@ -101,7 +101,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.logger().Error("Failed to get column types.", boundedQueryErrorLogAttrs(query, err)...)
+		c.logger().Error("Failed to get column types.", "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
@@ -130,7 +130,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.logger().Error("Failed to scan row.", boundedQueryErrorLogAttrs(query, err)...)
+			c.logger().Error("Failed to scan row.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			_ = c.writeReadyForQuery(c.txStatus)
@@ -148,7 +148,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			c.logger().Error("Row iteration error.", boundedQueryErrorLogAttrs(query, err)...)
+			c.logger().Error("Row iteration error.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 		}
 		c.setTxError()

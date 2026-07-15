@@ -805,7 +805,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		}
 		c.logQueryFinished(stmt, setupStart, setupRows, err)
 		if err != nil {
-			c.logger().Error("Multi-stmt setup error.", boundedQueryErrorLogAttrs(stmt, err)...)
+			c.logger().Error("Multi-stmt setup error.", "query", stmt, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -835,7 +835,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt final query error.", boundedQueryErrorLogAttrs(finalStmt, err)...)
+			c.logger().Error("Multi-stmt final query error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -865,7 +865,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt final exec error.", boundedQueryErrorLogAttrs(finalStmt, err)...)
+			c.logger().Error("Multi-stmt final exec error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -896,7 +896,7 @@ func (c *clientConn) executeCleanup(cleanup []string) {
 		_, err := c.executor.Exec(stmt)
 		if err != nil {
 			// Log but don't fail - cleanup is best effort
-			c.logger().Warn("Multi-stmt cleanup error (ignored).", boundedQueryErrorLogAttrs(stmt, err)...)
+			c.logger().Warn("Multi-stmt cleanup error (ignored).", "error", err)
 		}
 	}
 }
@@ -937,7 +937,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		}
 		c.logQueryFinished(stmt, setupStart, setupRows, err)
 		if err != nil {
-			c.logger().Error("Multi-stmt-ext setup error.", boundedQueryErrorLogAttrs(stmt, err)...)
+			c.logger().Error("Multi-stmt-ext setup error.", "query", stmt, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -965,7 +965,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt-ext final query error.", boundedQueryErrorLogAttrs(finalStmt, err)...)
+			c.logger().Error("Multi-stmt-ext final query error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -987,7 +987,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
 			finalErr = err
-			c.logger().Error("Multi-stmt-ext final exec error.", boundedQueryErrorLogAttrs(finalStmt, err)...)
+			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())

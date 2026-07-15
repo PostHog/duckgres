@@ -101,39 +101,24 @@ func TestNormalizeQueryHash(t *testing.T) {
 
 func TestIsQueryLogSelfReferential(t *testing.T) {
 	tests := []struct {
-		name  string
 		query string
 		want  bool
 	}{
-		{"direct", "SELECT * FROM system.query_log", true},
-		{"qualified", "SELECT * FROM ducklake.system.query_log ORDER BY event_time DESC", true},
-		{"uppercase", "SELECT * FROM SYSTEM.QUERY_LOG", true},
-		{"unrelated table", "SELECT * FROM users", false},
-		{"unrelated insert", "INSERT INTO logs VALUES (1, 'test')", false},
-		{"column only", "SELECT query_log FROM metadata", false},
-		{"mixed case beyond bound", strings.Repeat("SELECT 1; ", maxQueryLength) + "SELECT * FROM SyStEm.QuErY_lOg", true},
+		{"SELECT * FROM system.query_log", true},
+		{"SELECT * FROM ducklake.system.query_log ORDER BY event_time DESC", true},
+		{"SELECT * FROM SYSTEM.QUERY_LOG", true},
+		{"SELECT * FROM users", false},
+		{"INSERT INTO logs VALUES (1, 'test')", false},
+		{"SELECT query_log FROM metadata", false}, // "query_log" without "system." prefix is not self-referential
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.query, func(t *testing.T) {
 			got := isQueryLogSelfReferential(tt.query)
 			if got != tt.want {
-				t.Errorf("isQueryLogSelfReferential result = %v, want %v (query length %d)", got, tt.want, len(tt.query))
+				t.Errorf("isQueryLogSelfReferential(%q) = %v, want %v", tt.query, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestIsQueryLogSelfReferentialDoesNotAllocateForOversizedQuery(t *testing.T) {
-	query := strings.Repeat("select value from events; ", maxQueryLength)
-	var got bool
-	if allocs := testing.AllocsPerRun(100, func() {
-		got = isQueryLogSelfReferential(query)
-	}); allocs != 0 {
-		t.Fatalf("isQueryLogSelfReferential allocated %.1f times per oversized query, want 0", allocs)
-	}
-	if got {
-		t.Fatal("non-self-referential query was classified as self-referential")
 	}
 }
 

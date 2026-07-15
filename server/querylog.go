@@ -385,27 +385,8 @@ func normalizeQueryHash(query string) int64 {
 // isQueryLogSelfReferential returns true if the query targets system.query_log,
 // to prevent infinite recursion.
 func isQueryLogSelfReferential(query string) bool {
-	const target = "system.query_log"
-	for start := 0; start+len(target) <= len(query); start++ {
-		if query[start] != 's' && query[start] != 'S' {
-			continue
-		}
-		matched := true
-		for i := 1; i < len(target); i++ {
-			b := query[start+i]
-			if b >= 'A' && b <= 'Z' {
-				b += 'a' - 'A'
-			}
-			if b != target[i] {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			return true
-		}
-	}
-	return false
+	upper := strings.ToUpper(query)
+	return strings.Contains(upper, "SYSTEM.QUERY_LOG")
 }
 
 // logQuery builds a QueryLogEntry from the connection context and sends it to the logger.

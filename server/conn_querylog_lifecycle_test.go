@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -47,20 +46,16 @@ func newLifecycleClientConn(t *testing.T) (*clientConn, func()) {
 // lifecycle tests to drive each entrypoint without needing real DuckDB.
 type lifecycleExecutor struct {
 	noopProfiling
-	queryRows        RowSet
-	queryErr         error
-	execResult       ExecResult
-	execErr          error
-	queryEntered     chan struct{}
-	queryRelease     chan struct{}
-	queryEnteredOnce sync.Once
-	queryCalls       atomic.Int32
-	execCalls        atomic.Int32
+	queryRows  RowSet
+	queryErr   error
+	execResult ExecResult
+	execErr    error
+	queryCalls atomic.Int32
+	execCalls  atomic.Int32
 }
 
 func (e *lifecycleExecutor) QueryContext(_ context.Context, _ string, _ ...any) (RowSet, error) {
 	e.queryCalls.Add(1)
-	e.blockQuery()
 	return e.queryRows, e.queryErr
 }
 func (e *lifecycleExecutor) ExecContext(_ context.Context, _ string, _ ...any) (ExecResult, error) {
@@ -69,7 +64,6 @@ func (e *lifecycleExecutor) ExecContext(_ context.Context, _ string, _ ...any) (
 }
 func (e *lifecycleExecutor) Query(_ string, _ ...any) (RowSet, error) {
 	e.queryCalls.Add(1)
-	e.blockQuery()
 	return e.queryRows, e.queryErr
 }
 func (e *lifecycleExecutor) Exec(_ string, _ ...any) (ExecResult, error) {
@@ -81,15 +75,6 @@ func (e *lifecycleExecutor) ConnContext(_ context.Context) (RawConn, error) {
 }
 func (e *lifecycleExecutor) PingContext(_ context.Context) error { return nil }
 func (e *lifecycleExecutor) Close() error                        { return nil }
-
-func (e *lifecycleExecutor) blockQuery() {
-	if e.queryEntered != nil {
-		e.queryEnteredOnce.Do(func() { close(e.queryEntered) })
-	}
-	if e.queryRelease != nil {
-		<-e.queryRelease
-	}
-}
 
 // emptyExecResult is an ExecResult that reports 0 rows affected — sufficient
 // for these tests, which assert lifecycle log presence not row-count math.
@@ -124,17 +109,6 @@ func assertLifecyclePair(t *testing.T, buf *bytes.Buffer, label string) {
 	}
 }
 
-func capturedLogLine(t *testing.T, output, message string) string {
-	t.Helper()
-	for _, line := range strings.Split(output, "\n") {
-		if strings.Contains(line, message) {
-			return line
-		}
-	}
-	t.Fatalf("missing captured log line containing %q in:\n%s", message, output)
-	return ""
-}
-
 func TestLifecycleLogsBoundOversizedQueryText(t *testing.T) {
 	buf, restore := captureSlog(t)
 	defer restore()
@@ -150,194 +124,6 @@ func TestLifecycleLogsBoundOversizedQueryText(t *testing.T) {
 	assertLifecyclePair(t, buf, "oversized-query")
 	if strings.Contains(out, "query-tail-marker") {
 		t.Fatal("lifecycle logs retained query text beyond the control-plane bound")
-	}
-}
-
-type columnErrorRowSet struct {
-	err error
-}
-
-func (r *columnErrorRowSet) Columns() ([]string, error)          { return nil, r.err }
-func (r *columnErrorRowSet) ColumnTypes() ([]ColumnTyper, error) { return nil, nil }
-func (r *columnErrorRowSet) Next() bool                          { return false }
-func (r *columnErrorRowSet) Scan(...any) error                   { return nil }
-func (r *columnErrorRowSet) Close() error                        { return nil }
-func (r *columnErrorRowSet) Err() error                          { return nil }
-
-func TestRowStreamErrorLogBoundsAndRedactsQueryText(t *testing.T) {
-	tests := []struct {
-		name       string
-		query      string
-		errMessage string
-		forbidden  string
-	}{
-		{
-			name:       "oversized",
-			query:      "SELECT " + strings.Repeat("q", maxQueryLength) + " row-query-tail-marker",
-			errMessage: "engine error: " + strings.Repeat("e", maxQueryLength) + " row-error-tail-marker",
-			forbidden:  "tail-marker",
-		},
-		{
-			name:       "secret",
-			query:      "CREATE SECRET s (TYPE S3, SECRET 'row-log-secret-marker')",
-			errMessage: "engine error: CREATE SECRET s (TYPE S3, SECRET 'row-log-secret-marker')",
-			forbidden:  "row-log-secret-marker",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf, restore := captureSlog(t)
-			defer restore()
-
-			c, cleanup := newLifecycleClientConn(t)
-			defer cleanup()
-
-			_ = c.streamRowsToClient(&columnErrorRowSet{err: errors.New(tt.errMessage)}, "SELECT", tt.query)
-			line := capturedLogLine(t, buf.String(), `msg="Failed to get column info."`)
-			if strings.Contains(line, tt.forbidden) {
-				t.Fatalf("row-stream error log retained unsafe query text %q:\n%s", tt.forbidden, line)
-			}
-		})
-	}
-}
-
-func TestCopyOutErrorLogBoundsQueryText(t *testing.T) {
-	buf, restore := captureSlog(t)
-	defer restore()
-
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-	c.passthrough = true
-	c.executor = &lifecycleExecutor{
-		queryErr: errors.New("engine error: " + strings.Repeat("e", maxQueryLength) + " copy-error-tail-marker"),
-	}
-
-	query := "COPY (SELECT '" + strings.Repeat("q", maxQueryLength) + " copy-query-tail-marker') TO STDOUT"
-	if err := c.handleCopyOut(query, strings.ToUpper(query)); err != nil {
-		t.Fatalf("handleCopyOut returned error: %v", err)
-	}
-	line := capturedLogLine(t, buf.String(), `msg="COPY TO query failed."`)
-	if strings.Contains(line, "tail-marker") {
-		t.Fatalf("COPY error log retained query text beyond the control-plane bound:\n%s", line)
-	}
-}
-
-func TestCopyInTableCheckErrorLogBoundsQueryText(t *testing.T) {
-	buf, restore := captureSlog(t)
-	defer restore()
-
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-	c.executor = &lifecycleExecutor{
-		queryErr: errors.New("engine error: " + strings.Repeat("e", maxQueryLength) + " copy-check-error-tail-marker"),
-	}
-
-	query := "COPY " + strings.Repeat("q", maxQueryLength) + "_copy-table-tail-marker FROM STDIN"
-	if err := c.handleCopyIn(query, strings.ToUpper(query)); err != nil {
-		t.Fatalf("handleCopyIn returned error: %v", err)
-	}
-	line := capturedLogLine(t, buf.String(), `msg="COPY FROM table check failed."`)
-	if strings.Contains(line, "tail-marker") {
-		t.Fatalf("COPY table-check error log retained text beyond the control-plane bound:\n%s", line)
-	}
-}
-
-func assertCurrentQueryBoundWhileRunning(t *testing.T, c *clientConn, exec *lifecycleExecutor, want string, run func()) {
-	t.Helper()
-	done := make(chan struct{})
-	released := false
-	waited := false
-	finish := func() {
-		if !released {
-			close(exec.queryRelease)
-			released = true
-		}
-		if waited {
-			return
-		}
-		waited = true
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("query did not finish after executor release")
-		}
-	}
-	go func() {
-		defer close(done)
-		run()
-	}()
-	defer finish()
-
-	select {
-	case <-exec.queryEntered:
-	case <-time.After(time.Second):
-		t.Fatal("query did not reach executor")
-	}
-
-	query, _ := c.currentQuery.Load().(string)
-	if query != want {
-		t.Fatalf("active-query snapshot length = %d, want exact prefix length %d", len(query), len(want))
-	}
-
-	finish()
-}
-
-func TestCurrentQuerySnapshotsBoundOversizedSQL(t *testing.T) {
-	query := "SELECT '" + strings.Repeat("q", maxQueryLength) + " active-query-tail-marker'"
-
-	t.Run("simple", func(t *testing.T) {
-		c, cleanup := newLifecycleClientConn(t)
-		defer cleanup()
-		release := make(chan struct{})
-		exec := &lifecycleExecutor{
-			queryRows:    &streamingRowSet{},
-			queryEntered: make(chan struct{}),
-			queryRelease: release,
-		}
-		c.executor = exec
-		assertCurrentQueryBoundWhileRunning(t, c, exec, query[:maxQueryLength], func() {
-			_ = c.handleQuery([]byte(query))
-		})
-	})
-
-	t.Run("extended", func(t *testing.T) {
-		c, cleanup := newLifecycleClientConn(t)
-		defer cleanup()
-		release := make(chan struct{})
-		exec := &lifecycleExecutor{
-			queryRows:    &streamingRowSet{},
-			queryEntered: make(chan struct{}),
-			queryRelease: release,
-		}
-		c.executor = exec
-		c.portals["p1"] = &portal{stmt: &preparedStmt{query: query, convertedQuery: "SELECT 1"}}
-		body := append([]byte("p1"), 0, 0, 0, 0, 0)
-		assertCurrentQueryBoundWhileRunning(t, c, exec, query[:maxQueryLength], func() {
-			c.handleExecute(body)
-		})
-	})
-}
-
-func TestExtendedQueryColumnErrorLogBoundsQueryText(t *testing.T) {
-	buf, restore := captureSlog(t)
-	defer restore()
-
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-	query := "SELECT '" + strings.Repeat("q", maxQueryLength) + " extended-query-tail-marker'"
-	c.executor = &lifecycleExecutor{
-		queryRows: &columnErrorRowSet{
-			err: errors.New("engine error: " + strings.Repeat("e", maxQueryLength) + " extended-error-tail-marker"),
-		},
-	}
-	c.portals["p1"] = &portal{stmt: &preparedStmt{query: query, convertedQuery: query}}
-	body := append([]byte("p1"), 0, 0, 0, 0, 0)
-	c.handleExecute(body)
-
-	line := capturedLogLine(t, buf.String(), `msg="Columns error."`)
-	if strings.Contains(line, "tail-marker") {
-		t.Fatalf("extended-query column error log retained text beyond the control-plane bound:\n%s", line)
 	}
 }
 

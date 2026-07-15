@@ -94,24 +94,3 @@ func TestLogQueryErrorCapturesPlainQuery(t *testing.T) {
 		t.Errorf("category = %q, want user (Catalog Error)", got[0].Category)
 	}
 }
-
-func TestLogQueryErrorBoundsRetainedText(t *testing.T) {
-	installFakeQueryTracker(t)
-	s := &Server{recentErrors: newRecentErrorRing(0)}
-	c := &clientConn{server: s, orgID: "acme", username: "root", ctx: context.Background()}
-
-	query := "SELECT " + strings.Repeat("q", maxQueryLength) + " query-tail-marker"
-	message := "engine error: " + strings.Repeat("e", maxQueryLength) + " error-tail-marker"
-	c.logQueryError(query, errors.New(message))
-
-	got := s.RecentErrors(10)
-	if len(got) != 1 {
-		t.Fatalf("ring len = %d, want 1", len(got))
-	}
-	if len(got[0].Query) > maxQueryLength || strings.Contains(got[0].Query, "tail-marker") {
-		t.Errorf("retained query was not bounded: length=%d", len(got[0].Query))
-	}
-	if len(got[0].Message) > maxQueryLength || strings.Contains(got[0].Message, "tail-marker") {
-		t.Errorf("retained error was not bounded: length=%d", len(got[0].Message))
-	}
-}

@@ -5,10 +5,10 @@ import (
 	"time"
 )
 
-// RecentError is a redacted, bounded snapshot of one failed query, for the
-// admin Errors page. Message and Query are sanitized at the capture site — this
-// struct must never carry raw SQL or a CREATE SECRET credential, since the
-// Errors page surfaces both fields.
+// RecentError is a redacted snapshot of one failed query, for the admin Errors
+// page. Message and Query are ALREADY redacted (usersecrets.RedactErrorForLog /
+// RedactForLog) at the capture site — this struct must never carry raw SQL or a
+// CREATE SECRET credential, since the Errors page surfaces both fields.
 type RecentError struct {
 	Time       time.Time `json:"time"`
 	OrgID      string    `json:"org"`
