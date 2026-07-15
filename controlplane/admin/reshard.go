@@ -197,7 +197,9 @@ type startReshardRequest struct {
 }
 
 // RegisterReshardAPI wires the reshard endpoints. lister may be nil (duckling
-// client unavailable) — shard discovery degrades; reads still work. spawner
+// client unavailable) — shard discovery degrades, reads still work, and
+// starting a reshard whose source identity needs the duckling status (any
+// cnpg-shard source) is then refused. spawner
 // may be nil (no kubernetes API) — starting a reshard then 503s (nothing would
 // execute the op). cluster may be nil (non-k8s) — shard discovery then falls
 // back to the shards tenants already occupy. prober may be nil (tests /
@@ -326,40 +328,93 @@ func (h *reshardHandler) start(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "warehouse must be in ready state to reshard (currently " + string(wh.State) + ")"})
 		return
 	}
-	sourceKind := wh.MetadataStore.Kind
-	if sourceKind == "" {
-		sourceKind = configstore.MetadataStoreKindCnpgShard
+
+	ducklingName := wh.DucklingName
+	if ducklingName == "" {
+		ducklingName = orgID
+	}
+
+	// ---- source identity (submit-time guard) --------------------------------
+	// The duckling STATUS is authoritative for where the org's catalog actually
+	// lives: the composition writes it after convergence, while the config-store
+	// row and the duckling SPEC are operator-editable inputs that can drift. An
+	// op recorded from a drifted row (empty metadata block defaulted to
+	// cnpg-shard while the org actually lived on an external RDS) once flipped
+	// an org onto a freshly created EMPTY catalog with no copy performed
+	// (cnpg→cnpg flips BEFORE copying) and then could not roll back — the empty
+	// recorded from_shard produced a patch the XRD rejects. Refuse to create an
+	// op whose source identity is incomplete or contradicted by the live status.
+	rowKind := wh.MetadataStore.Kind
+	statusStore, statusKnown := h.ducklingStatusStore(c, ducklingName)
+	var sourceKind string
+	switch {
+	case statusKnown:
+		sourceKind = statusStore.Kind
+		if rowKind != "" && rowKind != sourceKind {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf(
+				"metadata-store identity drift between config store and duckling status — refusing to reshard until reconciled: the config-store warehouse row says kind %q but duckling %s's status says %q (endpoint %q). Fix the warehouse row (metadata_store_* columns) and/or the duckling spec so they agree with where the catalog actually lives, then retry",
+				rowKind, ducklingName, statusStore.Kind, statusStore.Endpoint)})
+			return
+		}
+	case rowKind != "":
+		// No live status to cross-check against (lister unavailable or the CR
+		// status is not populated) — fall back to the row, still subject to the
+		// completeness checks below.
+		sourceKind = rowKind
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "the org's metadata-store identity is incomplete: the config-store warehouse row has no metadata-store kind and duckling " + ducklingName + "'s status is unavailable — reconcile the warehouse row (metadata_store_* columns) and the duckling spec/status before resharding"})
+		return
 	}
 	if sourceKind != configstore.MetadataStoreKindCnpgShard && sourceKind != configstore.MetadataStoreKindExternal {
 		c.JSON(http.StatusConflict, gin.H{"error": "unsupported source metadata-store kind " + sourceKind})
 		return
 	}
 
+	currentShard := ""
+	if statusKnown && statusStore.Kind == configstore.MetadataStoreKindCnpgShard {
+		currentShard = cnpgShardFromEndpoint(statusStore.Endpoint)
+	}
+	if sourceKind == configstore.MetadataStoreKindCnpgShard {
+		// An op with an empty (or malformed) from_shard cannot roll back: the
+		// rollback patches the shard VALUE back and the XRD rejects anything
+		// outside its shard-name pattern — including the empty string.
+		if currentShard == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "the org's metadata-store identity is incomplete: the source resolves to cnpg-shard but the current shard could not be determined from duckling " + ducklingName + "'s status — an operation recorded with an empty from_shard cannot roll back (the XRD rejects an empty cnpgShard patch). Reconcile the config-store warehouse row (metadata_store_* columns) and the duckling spec/status, then retry"})
+			return
+		}
+		if len(currentShard) > 63 || !reshardShardNamePattern.MatchString(currentShard) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("the org's current shard %q (from duckling status endpoint %q) is not a valid cnpg shard name (%s) — refusing to record it as the rollback target", currentShard, statusStore.Endpoint, reshardShardNamePattern.String())})
+			return
+		}
+	}
+
 	op := &configstore.ReshardOperation{
 		OrgID:                 orgID,
-		DucklingName:          wh.DucklingName,
+		DucklingName:          ducklingName,
 		SourceKind:            sourceKind,
+		FromShard:             currentShard,
 		DrainTimeoutSeconds:   req.DrainTimeoutSeconds,
 		CutoverTimeoutSeconds: req.CutoverTimeoutSeconds,
 	}
 	if op.CutoverTimeoutSeconds < 0 {
 		op.CutoverTimeoutSeconds = 0
 	}
-	if op.DucklingName == "" {
-		op.DucklingName = orgID
-	}
 	if op.DrainTimeoutSeconds <= 0 {
 		op.DrainTimeoutSeconds = 1800
 	}
 	if sourceKind == configstore.MetadataStoreKindExternal {
+		// The rollback of an ext→cnpg op re-renders the external spec from
+		// these fields; an incomplete block would emit an invalid patch, so
+		// refuse up front rather than record a source we cannot restore.
+		if wh.MetadataStore.Endpoint == "" || wh.MetadataStore.PasswordAWSSecret == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("the org's metadata-store identity is incomplete: the source is external but the config-store warehouse row's external block is missing its endpoint (%q) or password secret (%q) — a rollback could not re-render the external metadata-store spec. Reconcile the warehouse row (metadata_store_* columns), then retry", wh.MetadataStore.Endpoint, wh.MetadataStore.PasswordAWSSecret)})
+			return
+		}
 		op.SourceEndpoint = wh.MetadataStore.Endpoint
 		op.SourceUser = wh.MetadataStore.Username
 		op.SourceDatabase = wh.MetadataStore.DatabaseName
 		op.SourcePasswordSecret = wh.MetadataStore.PasswordAWSSecret
 	}
-
-	currentShard := h.currentShard(c, op.DucklingName)
-	op.FromShard = currentShard
 
 	switch req.Target.Type {
 	case configstore.MetadataStoreKindCnpgShard:
@@ -556,26 +611,29 @@ func describeReshard(op *configstore.ReshardOperation) string {
 	return "org " + op.OrgID + ": " + src + " → " + dst
 }
 
-// currentShard resolves the org's live shard from the duckling CR status
-// (best-effort — empty when the lister is unavailable).
-func (h *reshardHandler) currentShard(c *gin.Context, ducklingName string) string {
+// ducklingStatusStore resolves the org's live metadata store from the duckling
+// CR STATUS — the authoritative record of where the catalog actually lives.
+// ok=false when the lister is unavailable, the CR list fails, or the CR's
+// status is not populated (still provisioning); the start handler then falls
+// back to the config-store row and its completeness checks.
+func (h *reshardHandler) ducklingStatusStore(c *gin.Context, ducklingName string) (DucklingMetadataStore, bool) {
 	if h.lister == nil {
-		return ""
+		return DucklingMetadataStore{}, false
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), ducklingMetadataTimeout)
 	defer cancel()
 	stores, err := h.lister.CRMetadataStores(ctx)
 	if err != nil {
-		return ""
+		return DucklingMetadataStore{}, false
 	}
 	ms, ok := stores[strings.ToLower(ducklingName)]
 	if !ok {
 		ms, ok = stores[ducklingName]
 	}
-	if !ok || ms.Kind != "cnpg-shard" {
-		return ""
+	if !ok || ms.Kind == "" {
+		return DucklingMetadataStore{}, false
 	}
-	return cnpgShardFromEndpoint(ms.Endpoint)
+	return ms, true
 }
 
 // listAll returns operations across every org, newest first — the console's
