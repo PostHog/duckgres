@@ -205,7 +205,9 @@ func (c *clientConn) handlePgCursorsQueryExtended(p *portal) {
 	if !c.validPortalResultFormats(p, 1) {
 		return
 	}
-	p.rowDescription = pgCursorsRowDescriptionBody(p.resultFormats)
+	if !c.replacePortalRowDescription(p, pgCursorsRowDescriptionBody(p.resultFormats)) {
+		return
+	}
 
 	if !p.stmt.described {
 		_ = c.writeCachedPortalRowDescription(p)

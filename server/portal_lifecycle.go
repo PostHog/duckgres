@@ -5,9 +5,10 @@ import (
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
-// DefaultMaxRetainedBindBytes limits the bytes a single connection can retain
-// in unexecuted named portals. It comfortably admits a normal 27,000-parameter
-// bulk Bind while bounding abandoned portal memory.
+// DefaultMaxRetainedBindBytes limits the portal-owned bytes a single connection
+// can retain: compact Bind storage, cached RowDescriptions, and retained
+// protocol names. It comfortably admits a normal 27,000-parameter bulk Bind
+// while bounding abandoned portal memory.
 const DefaultMaxRetainedBindBytes int64 = 64 << 20
 
 // DefaultMaxOpenPortals bounds lightweight named portal shells per connection.
@@ -28,6 +29,13 @@ func retainedBindStorageBytes(bodyBytes, params, paramFormats, resultFormats int
 	return bodyBytes +
 		params*bindParamRetainedBytes +
 		(paramFormats+resultFormats)*bindFormatCodeRetainedBytes
+}
+
+// retainedPortalNameBytes covers the Go string backing storage retained after
+// Bind validation: the portal map key and the statement name kept for a later
+// Close(S), including after that statement name has been re-Parsed.
+func retainedPortalNameBytes(portalName, stmtName string) int {
+	return len(portalName) + len(stmtName)
 }
 
 func (c *clientConn) maxRetainedBindBytes() int64 {
@@ -52,10 +60,72 @@ func (c *clientConn) installPortal(name string, p *portal) {
 		c.portals = make(map[string]*portal)
 	}
 	c.portals[name] = p
-	retained := p.retainedPayloadBytes()
+	retained := p.retainedStorageBytes()
 	c.retainedBindBytes += int64(retained)
 	observe.AddRetainedBindBytes(retained)
 	observe.AddOpenPortals(1)
+}
+
+// canReplacePortalRowDescription preflights a metadata replacement before the
+// caller allocates the encoded RowDescription body.
+func (c *clientConn) canReplacePortalRowDescription(p *portal, bodyBytes int) bool {
+	if p == nil {
+		return false
+	}
+	delta := bodyBytes - len(p.rowDescription)
+	if delta > 0 && c.retainedBindBytes+int64(delta) > c.maxRetainedBindBytes() {
+		observe.IncPortalBudgetRejection("retained_bytes")
+		c.sendError("ERROR", "54000", "retained Bind portal byte budget exceeded")
+		return false
+	}
+	return true
+}
+
+// replacePortalRowDescription accounts for the encoded metadata kept by a
+// portal shell. Unlike the Bind body it survives terminal Execute so a later
+// Describe(P) can replay metadata without probing with released parameters.
+// It therefore shares the per-connection retention budget with Bind storage.
+func (c *clientConn) replacePortalRowDescription(p *portal, body []byte) bool {
+	if !c.canReplacePortalRowDescription(p, len(body)) {
+		return false
+	}
+	delta := len(body) - len(p.rowDescription)
+	p.rowDescription = body
+	if delta != 0 {
+		c.retainedBindBytes += int64(delta)
+		observe.AddRetainedBindBytes(delta)
+	}
+	return true
+}
+
+func (c *clientConn) releasePortalRowDescription(p *portal) {
+	if p == nil || len(p.rowDescription) == 0 {
+		return
+	}
+	retained := len(p.rowDescription)
+	p.rowDescription = nil
+	c.retainedBindBytes -= int64(retained)
+	if c.retainedBindBytes < 0 {
+		c.retainedBindBytes = 0
+	}
+	observe.AddRetainedBindBytes(-retained)
+}
+
+// releasePortalNameStorage drops the protocol strings kept by a portal shell.
+// It runs only after the portal map entry is deleted: terminal portals still
+// need both the map key and stmtName for Describe(P) and Close(S).
+func (c *clientConn) releasePortalNameStorage(p *portal) {
+	if p == nil || p.retainedNameBytes == 0 {
+		return
+	}
+	retained := p.retainedNameBytes
+	p.stmtName = ""
+	p.retainedNameBytes = 0
+	c.retainedBindBytes -= int64(retained)
+	if c.retainedBindBytes < 0 {
+		c.retainedBindBytes = 0
+	}
+	observe.AddRetainedBindBytes(-retained)
 }
 
 // releasePortalPayload is idempotent. It releases the Bind backing body and
@@ -102,6 +172,8 @@ func (c *clientConn) dropPortal(name, reason string) {
 	}
 	delete(c.portals, name)
 	c.releasePortalPayload(p, reason)
+	c.releasePortalRowDescription(p)
+	c.releasePortalNameStorage(p)
 	observe.AddOpenPortals(-1)
 }
 

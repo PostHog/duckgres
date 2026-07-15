@@ -14,13 +14,13 @@ var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently open client connections",
 })
 
-// retainedBindBytesGauge tracks Bind storage currently retained by open portals
-// across the process: the wire body plus compact parameter/format metadata. It
-// deliberately has no connection, portal, user, or org label so it remains
-// safe to scrape at high connection cardinality.
+// retainedBindBytesGauge tracks portal-owned storage retained by open portals
+// across the process: Bind storage, cached RowDescriptions, and retained
+// protocol names. It deliberately has no connection, portal, user, or org
+// label, so it remains safe to scrape at high connection cardinality.
 var retainedBindBytesGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "duckgres_retained_bind_bytes",
-	Help: "Aggregate Bind storage bytes retained by open portals.",
+	Help: "Aggregate portal-owned bytes retained by open portals.",
 })
 
 // openPortalsGauge tracks installed portal shells across the process. It has no
@@ -67,7 +67,7 @@ func IncrementOpenConnections() { connectionsGauge.Inc() }
 // DecrementOpenConnections decrements the open connections gauge.
 func DecrementOpenConnections() { connectionsGauge.Dec() }
 
-// AddRetainedBindBytes applies a per-connection retained-payload delta to the
+// AddRetainedBindBytes applies a per-connection portal-retention delta to the
 // process-wide gauge. A delta, rather than a Set operation, keeps concurrent
 // client connections from overwriting each other's contribution.
 func AddRetainedBindBytes(delta int) { retainedBindBytesGauge.Add(float64(delta)) }

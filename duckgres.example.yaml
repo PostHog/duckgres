@@ -108,9 +108,9 @@ ducklake:
 # memory_budget: "24GB"
 
 # Retained Bind portal limits (per client connection).
-# These cap aggregate Bind storage (wire body plus compact metadata) and
-# installed portal shells, not
-# parameter count. Positive values are required; defaults are 64 MiB and 1024.
+# These cap aggregate portal-owned storage (Bind body/metadata, cached
+# RowDescriptions, and retained protocol names) and installed portal shells,
+# not parameter count. Positive values are required; defaults are 64 MiB and 1024.
 # max_retained_bind_bytes: 67108864
 # max_open_portals: 1024
 

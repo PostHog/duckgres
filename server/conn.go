@@ -117,8 +117,9 @@ type bindParam struct {
 func (p bindParam) isNull() bool { return p.length < 0 }
 
 type portal struct {
-	stmt     *preparedStmt
-	stmtName string // retained lightweight metadata for Close(S) after re-Parse
+	stmt              *preparedStmt
+	stmtName          string // retained lightweight metadata for Close(S) after re-Parse
+	retainedNameBytes int    // portal map key plus stmtName string backing storage
 
 	// bindBody is the immutable Bind frame body allocated by wire.ReadMessage.
 	// Parameter data is never copied out of it: params stores offsets into this
@@ -132,9 +133,9 @@ type portal struct {
 	resultFormats []int16 // retained only until the portal reaches a terminal state
 
 	// rowDescription is an already-encoded RowDescription body with this
-	// portal's result formats applied. It is intentionally the only
-	// result-metadata retained after terminal cleanup: it avoids a re-probe
-	// using released Bind values when a client later sends Describe(P).
+	// portal's result formats applied. It remains through terminal cleanup so a
+	// later Describe(P) avoids re-probing with released Bind values. Its bytes
+	// are admitted against the same per-connection portal-retention budget.
 	rowDescription []byte
 
 	described       bool // true if Describe was called on this portal
@@ -142,15 +143,22 @@ type portal struct {
 	payloadReleased bool
 }
 
-// retainedPayloadBytes reports all temporary Bind storage owned by a portal:
-// the immutable wire body plus compact descriptor/format backing slices. The
-// serialized row description is intentionally excluded because it is the
-// lightweight metadata retained after terminal cleanup.
+// retainedPayloadBytes reports temporary Bind storage owned by a portal: the
+// immutable wire body plus compact descriptor/format backing slices. Terminal
+// RowDescription metadata is tracked separately because it outlives payload
+// release.
 func (p *portal) retainedPayloadBytes() int {
 	if p == nil {
 		return 0
 	}
 	return retainedBindStorageBytes(len(p.bindBody), len(p.params), len(p.paramFormats), len(p.resultFormats))
+}
+
+func (p *portal) retainedStorageBytes() int {
+	if p == nil {
+		return 0
+	}
+	return p.retainedPayloadBytes() + len(p.rowDescription) + p.retainedNameBytes
 }
 
 func (p *portal) paramValue(index int) []byte {
@@ -279,7 +287,7 @@ type clientConn struct {
 	secretKey          int32                    // unique key for cancel requests
 	stmts              map[string]*preparedStmt // prepared statements by name
 	portals            map[string]*portal       // portals by name
-	retainedBindBytes  int64                    // bytes held by non-terminal portal Bind bodies
+	retainedBindBytes  int64                    // all portal-owned retained bytes: Bind payloads, cached RowDescriptions, and protocol names
 	txStatus           byte                     // current transaction status ('I', 'T', or 'E')
 	ignoreTillSync     bool                     // discard extended-query messages until Sync after an error; see runExtendedQueryMessage
 	errorResponsesSent uint64                   // ErrorResponses sent via sendError; observed by runExtendedQueryMessage
@@ -1276,9 +1284,18 @@ func (c *clientConn) messageLoop() error {
 			c.idleRead.Store(false)
 			return nil
 		}
-		msgType, body, err := wire.ReadMessage(c.reader)
+		msgType, body, err := wire.ReadMessageWithTypeBodyLimit(c.reader, wire.MsgBind, c.maxRetainedBindBytes())
 		c.idleRead.Store(false)
 		if err != nil {
+			var bodyLimitErr *wire.MessageBodyLimitError
+			if errors.As(err, &bodyLimitErr) {
+				observe.IncPortalBudgetRejection("retained_bytes")
+				c.sendError("ERROR", "54000", "retained Bind portal byte budget exceeded")
+				// The frame body was intentionally not read, so it cannot safely be
+				// skipped until Sync. The ErrorResponse is flushed by sendError;
+				// close this connection without attempting to parse stale bytes.
+				return nil
+			}
 			if c.drainRequested.Load() {
 				return nil
 			}

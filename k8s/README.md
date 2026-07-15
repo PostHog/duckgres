@@ -64,7 +64,7 @@ Key flags for Kubernetes multitenant mode:
 | `--worker-backend remote` | - | Use K8s remote workers in config-store-backed multitenant mode |
 | `--config-store` | `DUCKGRES_CONFIG_STORE` | PostgreSQL config-store connection string required for remote mode |
 | `--session-init-timeout` | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout (`10s` default) |
-| `--max-retained-bind-bytes` | `DUCKGRES_MAX_RETAINED_BIND_BYTES` | Per-client-connection cap for aggregate Bind storage retained by open portals (integer bytes; `67108864` / 64 MiB default) |
+| `--max-retained-bind-bytes` | `DUCKGRES_MAX_RETAINED_BIND_BYTES` | Per-client-connection cap for aggregate portal-owned storage retained by open portals (integer bytes; `67108864` / 64 MiB default) |
 | `--max-open-portals` | `DUCKGRES_MAX_OPEN_PORTALS` | Per-client-connection cap for installed portal shells (`1024` default) |
 | `--handover-drain-timeout` | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns/upgrades before forced exit (`15m` default in remote mode) |
 | `--sni-routing-mode` | `DUCKGRES_SNI_ROUTING_MODE` | Managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty |

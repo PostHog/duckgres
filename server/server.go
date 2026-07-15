@@ -194,9 +194,10 @@ type Config struct {
 	// a fresh bootstrap request.
 	FlightSessionTokenTTL time.Duration
 
-	// MaxRetainedBindBytes limits aggregate Bind storage retained by portals on
-	// one client connection, including the wire body and compact metadata. It
-	// must be positive; zero-value configs are normalized to
+	// MaxRetainedBindBytes limits aggregate portal-owned storage retained on one
+	// client connection, including Bind storage, cached RowDescriptions, and
+	// retained protocol names. It must be positive; zero-value configs are
+	// normalized to
 	// DefaultMaxRetainedBindBytes during server setup.
 	MaxRetainedBindBytes int64
 

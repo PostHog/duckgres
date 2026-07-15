@@ -29,7 +29,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	flightSessionReapInterval := fs.String("flight-session-reap-interval", "", "Flight auth session reap interval (e.g., '1m') (env: DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL)")
 	flightHandleIdleTTL := fs.String("flight-handle-idle-ttl", "", "Flight prepared/query handle idle TTL (e.g., '15m') (env: DUCKGRES_FLIGHT_HANDLE_IDLE_TTL)")
 	flightSessionTokenTTL := fs.String("flight-session-token-ttl", "", "Flight issued session token absolute TTL (e.g., '1h') (env: DUCKGRES_FLIGHT_SESSION_TOKEN_TTL)")
-	maxRetainedBindBytes := fs.Int64("max-retained-bind-bytes", 0, "Maximum Bind storage retained by open portals per client connection (default 67108864; env: DUCKGRES_MAX_RETAINED_BIND_BYTES)")
+	maxRetainedBindBytes := fs.Int64("max-retained-bind-bytes", 0, "Maximum portal-owned storage retained by open portals per client connection (default 67108864; env: DUCKGRES_MAX_RETAINED_BIND_BYTES)")
 	maxOpenPortals := fs.Int("max-open-portals", 0, "Maximum portal shells per client connection (default 1024; env: DUCKGRES_MAX_OPEN_PORTALS)")
 	dataDir := fs.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := fs.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")

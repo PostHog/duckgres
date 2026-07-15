@@ -101,7 +101,9 @@ func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 	if !c.validPortalResultFormats(p, len(pgStatActivityColumns)) {
 		return
 	}
-	p.rowDescription = pgStatActivityRowDescriptionBody(p.resultFormats)
+	if !c.replacePortalRowDescription(p, pgStatActivityRowDescriptionBody(p.resultFormats)) {
+		return
+	}
 	if !p.stmt.described && !p.described {
 		_ = c.writeCachedPortalRowDescription(p)
 	}

@@ -416,7 +416,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 				c.finishPortal(p, portalStateFailed, "terminal_failure")
 				return
 			}
-			p.rowDescription = pgCursorsRowDescriptionBody(p.resultFormats)
+			if !c.replacePortalRowDescription(p, pgCursorsRowDescriptionBody(p.resultFormats)) {
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				return
+			}
 			_ = c.writeCachedPortalRowDescription(p)
 			p.described = true
 			return
@@ -425,7 +428,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 				c.finishPortal(p, portalStateFailed, "terminal_failure")
 				return
 			}
-			p.rowDescription = pgStatActivityRowDescriptionBody(p.resultFormats)
+			if !c.replacePortalRowDescription(p, pgStatActivityRowDescriptionBody(p.resultFormats)) {
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				return
+			}
 			_ = c.writeCachedPortalRowDescription(p)
 			p.described = true
 			return
@@ -1176,10 +1182,10 @@ func (c *clientConn) handleBind(body []byte) {
 		return
 	}
 
-	incomingRetainedBytes := retainedBindStorageBytes(len(body), len(params), len(paramFormats), len(resultFormats))
+	incomingRetainedBytes := retainedBindStorageBytes(len(body), len(params), len(paramFormats), len(resultFormats)) + retainedPortalNameBytes(portalName, stmtName)
 	projectedBytes := c.retainedBindBytes + int64(incomingRetainedBytes)
 	if portalName == "" && existing != nil {
-		projectedBytes -= int64(existing.retainedPayloadBytes())
+		projectedBytes -= int64(existing.retainedStorageBytes())
 	}
 	if projectedBytes > c.maxRetainedBindBytes() {
 		observe.IncPortalBudgetRejection("retained_bytes")
@@ -1200,14 +1206,15 @@ func (c *clientConn) handleBind(body []byte) {
 		c.dropPortal(portalName, "unnamed_rebind")
 	}
 	c.installPortal(portalName, &portal{
-		stmt:          ps,
-		stmtName:      stmtName,
-		bindBody:      body,
-		params:        params,
-		paramFormats:  paramFormats,
-		resultFormats: resultFormats,
-		described:     ps.described, // Inherit from statement Describe state.
-		state:         portalStateReady,
+		stmt:              ps,
+		stmtName:          stmtName,
+		retainedNameBytes: retainedPortalNameBytes(portalName, stmtName),
+		bindBody:          body,
+		params:            params,
+		paramFormats:      paramFormats,
+		resultFormats:     resultFormats,
+		described:         ps.described, // Inherit from statement Describe state.
+		state:             portalStateReady,
 	})
 
 	_ = wire.WriteBindComplete(c.writer)

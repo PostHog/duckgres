@@ -64,6 +64,22 @@ const (
 	maxMessageLength = 1 << 30
 )
 
+// MessageBodyLimitError reports a per-message-type limit that was checked
+// after framing but before allocating or reading the declared body.
+//
+// The caller must close or otherwise discard the connection after this error:
+// the oversized body intentionally remains unread, so treating it as a new
+// protocol frame would desynchronize the stream.
+type MessageBodyLimitError struct {
+	MessageType byte
+	BodyLength  int64
+	Limit       int64
+}
+
+func (e *MessageBodyLimitError) Error() string {
+	return fmt.Sprintf("message %q body length %d exceeds limit %d", e.MessageType, e.BodyLength, e.Limit)
+}
+
 // readStartupMessage reads the initial startup message from the client
 func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 	// Read message length (4 bytes)
@@ -152,8 +168,16 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 	return params, nil
 }
 
-// readMessage reads a single message from the client
+// ReadMessage reads a single message from the client.
 func ReadMessage(r io.Reader) (byte, []byte, error) {
+	return ReadMessageWithTypeBodyLimit(r, 0, -1)
+}
+
+// ReadMessageWithTypeBodyLimit is ReadMessage with an optional body-length
+// limit for one message type. A negative maxBodyLength disables the additional
+// limit. It is intended for messages such as Bind whose configured ownership
+// budget must be enforced before a client-controlled allocation.
+func ReadMessageWithTypeBodyLimit(r io.Reader, limitedType byte, maxBodyLength int64) (byte, []byte, error) {
 	// Read message type (1 byte)
 	typeBuf := make([]byte, 1)
 	if _, err := io.ReadFull(r, typeBuf); err != nil {
@@ -171,9 +195,17 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 	if length < 4 || length > maxMessageLength {
 		return 0, nil, fmt.Errorf("invalid message length: %d", length)
 	}
+	bodyLength := int64(length) - 4
+	if msgType == limitedType && maxBodyLength >= 0 && bodyLength > maxBodyLength {
+		return msgType, nil, &MessageBodyLimitError{
+			MessageType: msgType,
+			BodyLength:  bodyLength,
+			Limit:       maxBodyLength,
+		}
+	}
 
 	// Read message body
-	body := make([]byte, length-4)
+	body := make([]byte, int(bodyLength))
 	if length > 4 {
 		if _, err := io.ReadFull(r, body); err != nil {
 			return 0, nil, fmt.Errorf("failed to read message body: %w", err)

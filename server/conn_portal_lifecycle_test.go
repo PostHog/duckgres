@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -372,8 +373,8 @@ func TestPortalLifecycleCursorFetchRejectsMismatchedFormatsBeforeRows(t *testing
 	}
 	requirePortalState(t, p, portalStateFailed)
 	requireReleasedPortalPayload(t, p)
-	if got := c.retainedBindBytes; got != 0 {
-		t.Fatalf("retained Bind bytes = %d after terminal cursor FETCH error, want 0", got)
+	if got, want := c.retainedBindBytes, int64(p.retainedNameBytes); got != want {
+		t.Fatalf("retained portal bytes = %d after terminal cursor FETCH error, want retained name bytes %d", got, want)
 	}
 }
 
@@ -635,7 +636,7 @@ func TestPortalLifecycleBindBudgetRejectionLeavesExistingPortalsUntouched(t *tes
 		defer cleanup()
 		c.stmts["insert"] = &preparedStmt{query: "INSERT INTO t VALUES ($1)", convertedQuery: "INSERT INTO t VALUES (?)", numParams: 1}
 		firstBody := portalLifecycleBindBody("p1", "insert", nil, []portalLifecycleBindValue{{data: []byte("value")}}, nil)
-		c.server.cfg.MaxRetainedBindBytes = int64(len(firstBody) + bindParamRetainedBytes)
+		c.server.cfg.MaxRetainedBindBytes = int64(retainedBindStorageBytes(len(firstBody), 1, 0, 0) + retainedPortalNameBytes("p1", "insert"))
 
 		first := bindPortalForLifecycle(t, c, "p1", "insert", nil, []portalLifecycleBindValue{{data: []byte("value")}})
 		retained := first.retainedPayloadBytes()
@@ -665,7 +666,7 @@ func TestPortalLifecycleBindBudgetRejectionLeavesExistingPortalsUntouched(t *tes
 		body := portalLifecycleBindBody("p1", "insert", nil, []portalLifecycleBindValue{{null: true}}, nil)
 		// The raw frame alone fits, but the descriptor backing storage must be
 		// admitted too or a large NULL/empty Bind can bypass the byte budget.
-		c.server.cfg.MaxRetainedBindBytes = int64(len(body))
+		c.server.cfg.MaxRetainedBindBytes = int64(len(body) + retainedPortalNameBytes("p1", "insert"))
 
 		c.handleBind(body)
 		if err := c.writer.Flush(); err != nil {
@@ -742,6 +743,9 @@ func TestPortalLifecycleCloseReleasesPortalPayloads(t *testing.T) {
 		requireReleasedPortalPayload(t, p1)
 		requireReleasedPortalPayload(t, p2)
 		requirePortalPayload(t, other)
+		if got, want := c.retainedBindBytes, int64(other.retainedStorageBytes()); got != want {
+			t.Fatalf("Close(S) retained portal bytes = %d, want unrelated portal bytes %d", got, want)
+		}
 	})
 }
 
@@ -829,6 +833,167 @@ func stopPortalLifecycleLoop(t *testing.T, client net.Conn, done <-chan error) {
 	}
 }
 
+// The retained-Bind budget must be enforced while only the frame header is in
+// hand. Otherwise wire.ReadMessage allocates the complete client-declared
+// Bind body before handleBind can reject it, defeating the control-plane memory
+// bound. The header-only input also proves this path never waits for the
+// rejected body.
+func TestPortalLifecycleMessageLoopRejectsOversizedBindBeforeBodyRead(t *testing.T) {
+	c, out := newPipelineConn(t, nil)
+	c.server.cfg.MaxRetainedBindBytes = 64
+
+	var frame bytes.Buffer
+	frame.WriteByte(wire.MsgBind)
+	_ = binary.Write(&frame, binary.BigEndian, int32(4+65))
+	c.reader = bufio.NewReader(bytes.NewReader(frame.Bytes()))
+
+	if err := c.messageLoop(); err != nil {
+		t.Fatalf("messageLoop() = %v, want clean resource-limit close", err)
+	}
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush resource-limit response: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("54000")) {
+		t.Fatalf("oversized Bind response = %q, want SQLSTATE 54000", out.Bytes())
+	}
+	if len(c.portals) != 0 || c.retainedBindBytes != 0 {
+		t.Fatalf("oversized Bind changed portal/accounting state: portals=%d retained=%d", len(c.portals), c.retainedBindBytes)
+	}
+}
+
+func TestPortalLifecycleAllowsLongExtendedProtocolNames(t *testing.T) {
+	// Extended-protocol names are protocol Strings, not SQL identifiers. Keep
+	// accepting names beyond PostgreSQL's NAMEDATALEN so the Bind-memory work
+	// does not introduce a new frontend compatibility limit.
+	longName := strings.Repeat("n", 64)
+
+	t.Run("Parse statement name", func(t *testing.T) {
+		c, out, cleanup := newPortalLifecycleConn(t, nil)
+		defer cleanup()
+		c.passthrough = true
+
+		var body bytes.Buffer
+		body.WriteString(longName)
+		body.WriteByte(0)
+		body.WriteString("SELECT 1")
+		body.WriteByte(0)
+		_ = binary.Write(&body, binary.BigEndian, int16(0))
+		c.handleParse(body.Bytes())
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Parse: %v", err)
+		}
+		if bytes.Contains(out.Bytes(), []byte("42622")) || c.stmts[longName] == nil {
+			t.Fatalf("long statement name was not installed: response=%q", out.Bytes())
+		}
+	})
+
+	t.Run("Bind portal and statement names", func(t *testing.T) {
+		c, out, cleanup := newPortalLifecycleConn(t, nil)
+		defer cleanup()
+		c.stmts[longName] = &preparedStmt{query: "SELECT 1", convertedQuery: "SELECT 1"}
+
+		c.handleBind(portalLifecycleBindBody(longName, longName, nil, nil, nil))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Bind: %v", err)
+		}
+		if bytes.Contains(out.Bytes(), []byte("42622")) || c.portals[longName] == nil {
+			t.Fatalf("long portal/statement names were not installed: response=%q", out.Bytes())
+		}
+	})
+}
+
+func TestPortalLifecycleBudgetsTerminalPortalNames(t *testing.T) {
+	c, out, cleanup := newPortalLifecycleConn(t, &lifecycleExecutor{execResult: emptyExecResult{}})
+	defer cleanup()
+
+	stmtName := strings.Repeat("s", 1024)
+	firstName := strings.Repeat("p", 1024)
+	secondName := strings.Repeat("q", 1024)
+	c.stmts[stmtName] = &preparedStmt{query: "INSERT INTO t VALUES (1)", convertedQuery: "INSERT INTO t VALUES (1)"}
+
+	firstBody := portalLifecycleBindBody(firstName, stmtName, nil, nil, nil)
+	payloadBytes := retainedBindStorageBytes(len(firstBody), 0, 0, 0)
+	nameBytes := len(firstName) + len(stmtName)
+	c.server.cfg.MaxRetainedBindBytes = int64(payloadBytes + nameBytes)
+
+	first := bindPortalForLifecycle(t, c, firstName, stmtName, nil, nil)
+	c.handleExecute(portalLifecycleExecuteBody(firstName))
+	requirePortalState(t, first, portalStateDone)
+	requireReleasedPortalPayload(t, first)
+	if got := c.retainedBindBytes; got != int64(nameBytes) {
+		t.Fatalf("retained terminal portal names = %d, want %d", got, nameBytes)
+	}
+
+	out.Reset()
+	c.handleBind(portalLifecycleBindBody(secondName, stmtName, nil, nil, nil))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush budget-rejected Bind: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("54000")) {
+		t.Fatalf("second long-name Bind response = %q, want SQLSTATE 54000", out.Bytes())
+	}
+	if c.portals[secondName] != nil {
+		t.Fatal("budget-rejected Bind installed a second terminal-name portal")
+	}
+
+	c.dropPortal(firstName, "close_portal")
+	if got := c.retainedBindBytes; got != 0 {
+		t.Fatalf("retained portal names after Close(P) = %d, want 0", got)
+	}
+
+	out.Reset()
+	c.handleBind(portalLifecycleBindBody(secondName, stmtName, nil, nil, nil))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush Bind after Close(P): %v", err)
+	}
+	if bytes.Contains(out.Bytes(), []byte("54000")) || c.portals[secondName] == nil {
+		t.Fatalf("long-name Bind after Close(P) was not installed: response=%q", out.Bytes())
+	}
+}
+
+func TestPortalLifecycleBudgetsCachedRowDescriptions(t *testing.T) {
+	c, out, cleanup := newPortalLifecycleConn(t, nil)
+	defer cleanup()
+	c.stmts["select"] = &preparedStmt{query: "SELECT 1", convertedQuery: "SELECT 1"}
+	p1 := bindPortalForLifecycle(t, c, "wide-1", "select", nil, nil)
+	p2 := bindPortalForLifecycle(t, c, "wide-2", "select", nil, nil)
+
+	// Terminal portal shells survive until Close/Sync. The cached wire metadata
+	// must therefore share the same per-connection budget as their Bind bodies;
+	// otherwise many tiny named Binds can retain arbitrary column metadata.
+	columnName := strings.Repeat("c", 1024)
+	descriptionBytes := 2 + len(columnName) + 19 // field count + name/NUL + fixed fields
+	portalBytes := p1.retainedStorageBytes()
+	c.server.cfg.MaxRetainedBindBytes = int64(2*portalBytes + descriptionBytes)
+
+	if !c.cachePortalRowDescription(p1, []string{columnName}, []ColumnTyper{staticColumnType("VARCHAR")}) {
+		t.Fatal("first cached RowDescription rejected within budget")
+	}
+	if got, want := c.retainedBindBytes, int64(2*portalBytes+descriptionBytes); got != want {
+		t.Fatalf("retained portal bytes after first description = %d, want %d", got, want)
+	}
+
+	out.Reset()
+	if c.cachePortalRowDescription(p2, []string{columnName}, []ColumnTyper{staticColumnType("VARCHAR")}) {
+		t.Fatal("second cached RowDescription bypassed the per-connection budget")
+	}
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush RowDescription budget error: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("54000")) {
+		t.Fatalf("RowDescription budget response = %q, want SQLSTATE 54000", out.Bytes())
+	}
+	if len(p2.rowDescription) != 0 {
+		t.Fatalf("rejected RowDescription retained %d bytes", len(p2.rowDescription))
+	}
+
+	c.dropPortal("wide-1", "close_portal")
+	c.dropPortal("wide-2", "close_portal")
+	if got := c.retainedBindBytes; got != 0 {
+		t.Fatalf("retained portal bytes after Close(P) = %d, want 0", got)
+	}
+}
+
 func TestPortalLifecycleSyncDropsIdlePortalsButPreservesTransactionPortals(t *testing.T) {
 	t.Run("idle", func(t *testing.T) {
 		c, client, out, done, cleanup := newPortalLifecycleLoopConn(t, txStatusIdle)
@@ -874,14 +1039,16 @@ func TestPortalLifecycleManyNamedBindExecuteBeforeSyncReleasePayloads(t *testing
 	c.stmts["insert"] = &preparedStmt{query: "INSERT INTO t VALUES ($1)", convertedQuery: "INSERT INTO t VALUES (?)", numParams: 1}
 
 	const portals = 12
+	var expectedShellBytes int64
 	for i := 0; i < portals; i++ {
 		name := "bulk-" + string(rune('a'+i))
 		p := bindPortalForLifecycle(t, c, name, "insert", nil, []portalLifecycleBindValue{{data: bytes.Repeat([]byte("v"), 1024)}})
 		c.handleExecute(portalLifecycleExecuteBody(name))
 		requirePortalState(t, p, portalStateDone)
 		requireReleasedPortalPayload(t, p)
-		if got := c.retainedBindBytes; got != 0 {
-			t.Fatalf("retained Bind bytes after terminal Execute %q = %d, want 0", name, got)
+		expectedShellBytes += int64(p.retainedNameBytes)
+		if got := c.retainedBindBytes; got != expectedShellBytes {
+			t.Fatalf("retained portal shell bytes after terminal Execute %q = %d, want %d", name, got, expectedShellBytes)
 		}
 	}
 	if got := len(c.portals); got != portals {
@@ -894,6 +1061,9 @@ func TestPortalLifecycleManyNamedBindExecuteBeforeSyncReleasePayloads(t *testing
 	_ = runPipeline(t, c, out, pgFrame(wire.MsgSync, nil))
 	if got := len(c.portals); got != 0 {
 		t.Fatalf("idle Sync left %d portal shells, want 0", got)
+	}
+	if got := c.retainedBindBytes; got != 0 {
+		t.Fatalf("idle Sync left %d retained portal shell bytes, want 0", got)
 	}
 }
 

@@ -67,7 +67,7 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | Metric | Type | Description |
 |--------|------|-------------|
 | `duckgres_connections_open` | Gauge | Number of currently open client connections |
-| `duckgres_retained_bind_bytes` | Gauge | Aggregate Bind storage bytes (wire body plus compact metadata) retained by open portals in this process |
+| `duckgres_retained_bind_bytes` | Gauge | Aggregate portal-owned bytes retained by open portals in this process (Bind storage, cached RowDescriptions, and retained protocol names) |
 | `duckgres_open_portals` | Gauge | Aggregate installed portal shells in this process |
 | `duckgres_portal_payload_releases_total{reason}` | Counter | Portal payload releases. `reason` is one of `terminal_success`, `terminal_failure`, `close_portal`, `close_statement`, `unnamed_rebind`, `idle_sync`, `tx_end`, `simple_query`, or `connection_close` |
 | `duckgres_portal_budget_rejections_total{reason}` | Counter | Bind admissions rejected by the per-connection portal budget. `reason` is `retained_bytes` or `open_portals` |
@@ -234,8 +234,9 @@ Run with config file:
 ```
 
 Portal-retention limits are enforced per client connection.
-`max_retained_bind_bytes` caps the aggregate Bind storage retained by open
-portals, while `max_open_portals` caps installed portal shells. They do not
+`max_retained_bind_bytes` caps aggregate portal-owned storage retained by open
+portals (Bind storage, cached RowDescriptions, and retained protocol names),
+while `max_open_portals` caps installed portal shells. They do not
 limit Bind parameter count, so a valid 27,000-parameter Bind remains allowed
 when its retained bytes fit the budget. A rejected Bind installs no portal and
 does not change retained-byte or portal accounting.
@@ -252,7 +253,7 @@ does not change retained-byte or portal accounting.
 | `DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL` | Flight auth session reap interval | `1m` |
 | `DUCKGRES_FLIGHT_HANDLE_IDLE_TTL` | Flight prepared/query handle idle TTL | `15m` |
 | `DUCKGRES_FLIGHT_SESSION_TOKEN_TTL` | Flight issued session token absolute TTL | `1h` |
-| `DUCKGRES_MAX_RETAINED_BIND_BYTES` | Maximum aggregate Bind storage retained by open portals per client connection (integer bytes; no parameter-count cap) | `67108864` (64 MiB) |
+| `DUCKGRES_MAX_RETAINED_BIND_BYTES` | Maximum aggregate portal-owned storage retained by open portals per client connection (integer bytes; no parameter-count cap) | `67108864` (64 MiB) |
 | `DUCKGRES_MAX_OPEN_PORTALS` | Maximum installed portal shells per client connection | `1024` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
@@ -361,7 +362,7 @@ Options:
   -flight-session-reap-interval string Flight auth session reap interval (e.g., '1m')
   -flight-handle-idle-ttl string       Flight prepared/query handle idle TTL (e.g., '15m')
   -flight-session-token-ttl string     Flight issued session token absolute TTL (e.g., '1h')
-  -max-retained-bind-bytes int          Maximum Bind storage retained by open portals per client connection (default 67108864)
+  -max-retained-bind-bytes int          Maximum portal-owned storage retained by open portals per client connection (default 67108864)
   -max-open-portals int                 Maximum portal shells per client connection (default 1024)
   -data-dir string         Directory for DuckDB files
   -cert string             TLS certificate file

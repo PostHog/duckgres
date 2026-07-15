@@ -195,11 +195,15 @@ func (c *clientConn) cachePortalRowDescription(p *portal, cols []string, colType
 		return false
 	}
 	if len(cols) == 0 {
-		p.rowDescription = nil
-		return true
+		return c.replacePortalRowDescription(p, nil)
 	}
-	p.rowDescription = c.rowDescriptionBody(cols, colTypes, p.resultFormats)
-	return true
+	// Preflight exact wire-body storage before serializing it. Column names
+	// originate in SQL and can be client-controlled, so allocating first would
+	// allow Describe(P) to bypass the portal retention budget.
+	if !c.canReplacePortalRowDescription(p, c.rowDescriptionBodySize(cols)) {
+		return false
+	}
+	return c.replacePortalRowDescription(p, c.rowDescriptionBody(cols, colTypes, p.resultFormats))
 }
 
 func (c *clientConn) validPortalResultFormats(p *portal, columns int) bool {
@@ -227,6 +231,7 @@ func (c *clientConn) writeRowDescriptionBody(body []byte) error {
 
 func (c *clientConn) rowDescriptionBody(cols []string, colTypes []ColumnTyper, formatCodes []int16) []byte {
 	var buf bytes.Buffer
+	buf.Grow(c.rowDescriptionBodySize(cols))
 
 	// Number of fields
 	_ = binary.Write(&buf, binary.BigEndian, int16(len(cols)))
@@ -271,6 +276,18 @@ func (c *clientConn) rowDescriptionBody(cols []string, colTypes []ColumnTyper, f
 	}
 
 	return buf.Bytes()
+}
+
+// rowDescriptionBodySize returns the exact bytes written by
+// rowDescriptionBody: two bytes for the field count, then each display name,
+// its NUL terminator, and 18 fixed metadata bytes.
+func (c *clientConn) rowDescriptionBodySize(cols []string) int {
+	size := 2
+	for _, col := range cols {
+		displayCol := strings.TrimPrefix(col, "memory.main.")
+		size += len(displayCol) + 19
+	}
+	return size
 }
 
 func (c *clientConn) mapTypeOIDWithColumnName(colName string, colType ColumnTyper) int32 {

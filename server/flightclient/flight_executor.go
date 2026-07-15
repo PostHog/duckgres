@@ -309,7 +309,15 @@ func (e *FlightExecutor) Exec(query string, args ...any) (sqlcore.ExecResult, er
 // values are appended straight into the final Flight SQL request buffer by the
 // portal-owned appender, avoiding an intermediate string/interface for every
 // value in a large extended-protocol Bind.
-func (e *FlightExecutor) QueryWithBoundParams(query string, params sqlcore.SQLLiteralAppender) (sqlcore.RowSet, error) {
+func (e *FlightExecutor) QueryWithBoundParams(query string, params sqlcore.SQLLiteralAppender) (rs sqlcore.RowSet, err error) {
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	if sqlcore.IsEmptyQuery(query) {
+		return &emptyRowSet{}, nil
+	}
+	defer recoverClientPanic(&err)
+
 	interpolated, err := interpolateBoundArgs(query, params)
 	if err != nil {
 		return nil, err
@@ -318,7 +326,15 @@ func (e *FlightExecutor) QueryWithBoundParams(query string, params sqlcore.SQLLi
 }
 
 // ExecWithBoundParams is the Exec counterpart of QueryWithBoundParams.
-func (e *FlightExecutor) ExecWithBoundParams(query string, params sqlcore.SQLLiteralAppender) (sqlcore.ExecResult, error) {
+func (e *FlightExecutor) ExecWithBoundParams(query string, params sqlcore.SQLLiteralAppender) (result sqlcore.ExecResult, err error) {
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	if sqlcore.IsEmptyQuery(query) {
+		return &flightExecResult{rowsAffected: 0}, nil
+	}
+	defer recoverClientPanic(&err)
+
 	interpolated, err := interpolateBoundArgs(query, params)
 	if err != nil {
 		return nil, err
