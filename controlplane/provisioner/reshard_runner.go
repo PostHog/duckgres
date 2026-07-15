@@ -252,7 +252,10 @@ type opRun struct {
 	// progress flags for the rollback decision
 	blocked          bool
 	compactionPaused bool
-	flipped          bool
+	// compactionSnapshotRecorded prevents a takeover from replacing the
+	// persisted pre-reshard setting with the already-paused live value.
+	compactionSnapshotRecorded bool
+	flipped                    bool
 	// retainRequested: we set retainCnpgOnFlip=true on the source (cnpg→ext
 	// orphan step). If we roll back BEFORE the flip, reset it to false so the
 	// still-cnpg source keeps full-lifecycle (Delete) MRs and deprovision stays
@@ -338,6 +341,7 @@ func (o *opRun) reconstructProgress() {
 	if reshardStepReached(o.op, "backup_catalog") {
 		o.compactionPaused = true
 	}
+	o.compactionSnapshotRecorded = reshardStepReached(o.op, "pausing_compaction")
 	if o.op.TargetKind == configstore.MetadataStoreKindExternal && reshardStepReached(o.op, "orphaning_source") {
 		o.retainRequested = true
 	}
@@ -678,15 +682,20 @@ func (o *opRun) pauseCompaction(ctx context.Context) error {
 	if err := o.step("pausing_compaction"); err != nil {
 		return err
 	}
-	enabled, present, err := o.r.duckling.GetCompactionSetting(ctx, o.op.DucklingName)
-	if err != nil {
-		return fmt.Errorf("read compaction setting: %w", err)
-	}
-	if err := o.fields(map[string]interface{}{
-		"compaction_was_present": present,
-		"compaction_was_enabled": enabled,
-	}); err != nil {
-		return err
+	enabled, present := o.op.CompactionWasEnabled, o.op.CompactionWasPresent
+	if !o.compactionSnapshotRecorded {
+		var err error
+		enabled, present, err = o.r.duckling.GetCompactionSetting(ctx, o.op.DucklingName)
+		if err != nil {
+			return fmt.Errorf("read compaction setting: %w", err)
+		}
+		if err := o.fields(map[string]interface{}{
+			"compaction_was_present": present,
+			"compaction_was_enabled": enabled,
+		}); err != nil {
+			return err
+		}
+		o.compactionSnapshotRecorded = true
 	}
 	off := false
 	if err := o.r.duckling.SetCompactionEnabled(ctx, o.op.DucklingName, &off); err != nil {
@@ -1279,6 +1288,7 @@ func (o *opRun) restoreCompaction(ctx context.Context) {
 // the op is marked failed/cancelled regardless.
 func (o *opRun) rollback(ctx context.Context) {
 	ctx = context.WithoutCancel(ctx)
+	recovered := true
 
 	if o.flipped {
 		switch {
@@ -1289,6 +1299,7 @@ func (o *opRun) rollback(ctx context.Context) {
 			o.logf("warn", "rolling back: re-pointing duckling at source shard %s", o.op.FromShard)
 			if err := o.r.duckling.SetMetadataStoreCnpg(ctx, o.op.DucklingName, o.op.FromShard); err != nil {
 				o.logf("error", "rollback flip failed: %v — duckling still points at %s; fix manually", err, o.op.ToShard)
+				recovered = false
 			}
 			o.dropPartialTarget(ctx)
 		case o.op.TargetKind == configstore.MetadataStoreKindCnpgShard && o.op.SourceKind == configstore.MetadataStoreKindExternal:
@@ -1302,12 +1313,13 @@ func (o *opRun) rollback(ctx context.Context) {
 				Database:          o.op.SourceDatabase,
 			}); err != nil {
 				o.logf("error", "rollback flip failed: %v — duckling still points at cnpg %s; fix manually", err, o.op.ToShard)
+				recovered = false
 			}
 			o.dropPartialTarget(ctx)
 		case o.op.TargetKind == configstore.MetadataStoreKindExternal:
 			// cnpg→ext flipped: the cnpg source was ORPHANED (retained), not
 			// deleted, so recovery flips back and re-ADOPTS it — no copy-back.
-			o.recoverFromExternal(ctx)
+			recovered = o.recoverFromExternal(ctx)
 		}
 	} else if o.op.TargetKind == configstore.MetadataStoreKindExternal {
 		// cnpg→ext failed BEFORE the flip: source untouched.
@@ -1331,7 +1343,7 @@ func (o *opRun) rollback(ctx context.Context) {
 
 	o.restoreCompaction(ctx)
 
-	if o.blocked {
+	if o.blocked && recovered {
 		if err := o.r.store.UpdateWarehouseState(o.op.OrgID, configstore.ManagedWarehouseStateResharding, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateReady,
 			"status_message": "metadata-store reshard rolled back",
@@ -1343,6 +1355,8 @@ func (o *opRun) rollback(ctx context.Context) {
 			o.op.UnblockedAt = &now
 			o.logf("info", "warehouse unblocked: resharding → ready (rolled back)")
 		}
+	} else if o.blocked {
+		o.logf("error", "warehouse remains blocked because catalog recovery did not complete successfully; repair the metadata-store target, then explicitly restore warehouse readiness")
 	}
 }
 
@@ -1366,12 +1380,12 @@ func (o *opRun) dropPartialTarget(ctx context.Context) {
 // re-ADOPTS the role/DB by external-name (same pgIdent, same pinned password).
 // No empty-recreate, no copy-back — the catalog never left the source. This is
 // the whole point of the orphan-adopt escape hatch.
-func (o *opRun) recoverFromExternal(ctx context.Context) {
+func (o *opRun) recoverFromExternal(ctx context.Context) bool {
 	o.logf("warn", "cnpg→external cutover failed AFTER the flip — the cnpg source role/DB were RETAINED (orphaned), not deleted; recovering by flipping back to shard %s and re-adopting them (no data copy)", o.op.FromShard)
 
 	if err := o.r.duckling.SetMetadataStoreCnpgAdopt(ctx, o.op.DucklingName, o.op.FromShard); err != nil {
 		o.logf("error", "recovery flip-back failed: %v — duckling still points at the external target; the orphaned cnpg role/DB survive on %s and can be re-adopted manually (patch spec.metadataStore to {type: cnpg-shard, cnpgShard: %s, retainCnpgOnFlip: false}); fix manually", err, o.op.FromShard, o.op.FromShard)
-		return
+		return false
 	}
 
 	// Wait for the composition to re-adopt the role/DB on the source shard and
@@ -1391,7 +1405,7 @@ func (o *opRun) recoverFromExternal(ctx context.Context) {
 	for {
 		if time.Now().After(deadline) {
 			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s); last observation: %s", o.flipTimeout(), o.op.FromShard, lastObserved)
-			return
+			return false
 		}
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
 		switch {
@@ -1411,7 +1425,7 @@ func (o *opRun) recoverFromExternal(ctx context.Context) {
 			probeErr := o.r.copier.Probe(ctx, restored)
 			if probeErr == nil {
 				o.logf("info", "recovery complete: duckling re-adopted the orphaned cnpg role/DB on %s and the tenant role answers — no data was copied back (the catalog never left the source)", o.op.FromShard)
-				return
+				return true
 			}
 			// describeProbeFailure names an auth failure explicitly (stranded
 			// re-adopted-role password) with the manual ALTER ROLE remedy.

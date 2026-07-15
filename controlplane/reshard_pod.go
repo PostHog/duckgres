@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
@@ -33,8 +34,9 @@ import (
 
 // reshardPodAppLabel / reshardPodOpIDLabel identify reshard runner pods.
 const (
-	reshardPodAppLabel  = "duckgres-reshard"
-	reshardPodOpIDLabel = "duckgres-op-id"
+	reshardPodAppLabel            = "duckgres-reshard"
+	reshardPodOpIDLabel           = "duckgres-op-id"
+	reshardPodSpawnedAtAnnotation = "duckgres.posthog.com/runner-spawned-at"
 )
 
 // reshardPodDefaultCPU / reshardPodDefaultMemory are the runner pod's resource
@@ -221,7 +223,10 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 			},
 			// A reshard is a long single-shot maintenance operation; don't let
 			// node consolidation kill it mid-copy.
-			Annotations: map[string]string{doNotDisruptAnnotation: "true"},
+			Annotations: map[string]string{
+				doNotDisruptAnnotation:        "true",
+				reshardPodSpawnedAtAnnotation: time.Now().UTC().Format(time.RFC3339Nano),
+			},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                 corev1.RestartPolicyNever,

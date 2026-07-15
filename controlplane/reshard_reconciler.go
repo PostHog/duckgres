@@ -129,12 +129,17 @@ func (r *reshardReconciler) reconcileActiveOp(ctx context.Context, op *configsto
 		return
 	}
 	if pod != nil && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-		// A live (or still-starting) pod exists; give it time to claim and
-		// heartbeat. A wedged-but-Running pod keeps the op heartbeat stale and
-		// we land here again — but replacing a Running pod on every tick would
-		// thrash, so only exited pods are replaced.
-		return
+		if spawnedAt, err := time.Parse(time.RFC3339Nano, pod.Annotations[reshardPodSpawnedAtAnnotation]); err == nil && time.Since(spawnedAt) <= r.pendingGrace {
+			// A replacement was created recently and needs time to schedule, start,
+			// and claim the stale row. Do not replace it again on every tick.
+			return
+		}
 	}
+	// Reaching this point means the operation itself is stale. Pod phase is not
+	// a liveness signal: a wedged process remains Running forever. Replace even
+	// a non-terminal pod; SpawnReshardPod deletes the deterministic old pod
+	// before creating its successor. Fresh-heartbeat operations never reach
+	// this branch, so healthy runners are left alone.
 
 	attempts := r.respawnAttempts[op.ID]
 	if attempts >= r.maxRespawnAttempts {

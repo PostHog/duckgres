@@ -809,6 +809,58 @@ type stuckCnpgDuckling struct {
 	*fakeDuckling
 }
 
+// failSourceRecoveryDuckling allows the initial cutover but rejects the
+// rollback patch to the source shard, modeling an API or admission failure.
+type failSourceRecoveryDuckling struct {
+	*fakeDuckling
+}
+
+func (s *failSourceRecoveryDuckling) SetMetadataStoreCnpg(ctx context.Context, name, shard string) error {
+	if shard == "shard-001" {
+		return errors.New("source recovery rejected")
+	}
+	return s.fakeDuckling.SetMetadataStoreCnpg(ctx, name, shard)
+}
+
+// TestReshardRollbackKeepsWarehouseBlockedWhenSourceRecoveryFails asserts the
+// safety invariant: traffic cannot be admitted unless rollback has positively
+// restored a usable catalog. Logging and swallowing this error is unsafe.
+func TestReshardRollbackKeepsWarehouseBlockedWhenSourceRecoveryFails(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &failSourceRecoveryDuckling{fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()}}
+	copier := &fakeCopier{copyErr: errors.New("copy failed after cutover")}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s, want failed", store.op.State)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want resharding after failed source recovery", store.warehouseState)
+	}
+	if store.op.UnblockedAt != nil {
+		t.Fatalf("unblocked_at = %v after failed source recovery", store.op.UnblockedAt)
+	}
+}
+
+// TestReshardTakeoverPreservesOriginalCompactionSnapshot ensures replay cannot
+// replace the persisted pre-reshard setting with the already-paused live value.
+func TestReshardTakeoverPreservesOriginalCompactionSnapshot(t *testing.T) {
+	op := cnpgOp()
+	op.Step = "pausing_compaction"
+	op.CompactionWasPresent = true
+	op.CompactionWasEnabled = true
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: false}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if !store.op.CompactionWasEnabled {
+		t.Fatal("takeover overwrote original compaction=true snapshot with paused live value")
+	}
+}
+
 func (s *stuckCnpgDuckling) SetMetadataStoreCnpg(_ context.Context, _ string, shard string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

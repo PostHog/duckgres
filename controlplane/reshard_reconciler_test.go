@@ -114,6 +114,37 @@ func TestReconcilerRespawnsDeadRunner(t *testing.T) {
 	}
 }
 
+// TestReconcilerReplacesWedgedRunningPod covers the failure mode where the
+// process remains Running but has stopped heartbeating. Pod phase is not proof
+// of liveness: the stale lease must cause a replacement so takeover can occur.
+func TestReconcilerReplacesWedgedRunningPod(t *testing.T) {
+	op := staleRunningOp(9)
+	wedged := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "duckgres-reshard-op-9", Namespace: "duckgres",
+			Labels: map[string]string{"app": "duckgres-reshard", "duckgres-op-id": "9"},
+			UID:    "wedged-runner",
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	store := &fakeReconcilerStore{ops: map[int64]*configstore.ReshardOperation{9: op}}
+	cs := k8sfake.NewSimpleClientset(fakeCPPod(), wedged)
+	r := testReconciler(store, cs)
+
+	r.reconcileOnce(context.Background())
+
+	pod, err := cs.CoreV1().Pods("duckgres").Get(context.Background(), wedged.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("replacement runner missing: %v", err)
+	}
+	if pod.UID == wedged.UID {
+		t.Fatal("stale-heartbeat Running pod was left in place")
+	}
+	if got := r.respawnAttempts[9]; got != 1 {
+		t.Fatalf("respawn attempts = %d, want 1", got)
+	}
+}
+
 // TestReconcilerLeavesHealthyOpsAlone pins: fresh-heartbeat running ops and
 // young pending ops are untouched.
 func TestReconcilerLeavesHealthyOpsAlone(t *testing.T) {
