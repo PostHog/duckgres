@@ -157,6 +157,7 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 }
 
 func TestScenarioDefaultsToFullSuite(t *testing.T) {
+	t.Setenv("SCENARIO_NAME", "")
 	fakes := newRunSHFakes(t)
 
 	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
