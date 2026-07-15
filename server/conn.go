@@ -177,6 +177,8 @@ type clientConn struct {
 	catalogUseRewrite  bool                     // true when bare `USE ducklake` should expand to the reliable two-part target
 	ctx                context.Context          // connection context, cancelled when connection is closed
 	cancel             context.CancelFunc       // cancels the connection context
+	drainRequested     atomic.Bool              // close at the next idle protocol boundary
+	idleRead           atomic.Bool              // blocked reading the next top-level client message
 
 	// sharedDB is true when this connection uses a shared file-persistence DB pool.
 	// Cleanup differs: we return the pinned conn to the pool instead of closing the DB.
@@ -1144,11 +1146,26 @@ func (c *clientConn) armIdleReadDeadline() {
 }
 
 func (c *clientConn) messageLoop() error {
+	atReadyBoundary := true
 	for {
+		if atReadyBoundary && c.drainRequested.Load() {
+			return nil
+		}
 		c.armIdleReadDeadline()
 
+		c.idleRead.Store(atReadyBoundary)
+		// Close the race where a drain was requested after the check above but
+		// before this connection advertised that its top-level read is idle.
+		if atReadyBoundary && c.drainRequested.Load() {
+			c.idleRead.Store(false)
+			return nil
+		}
 		msgType, body, err := wire.ReadMessage(c.reader)
+		c.idleRead.Store(false)
 		if err != nil {
+			if c.drainRequested.Load() {
+				return nil
+			}
 			if err == io.EOF {
 				return nil
 			}
@@ -1159,6 +1176,13 @@ func (c *clientConn) messageLoop() error {
 			}
 			return err
 		}
+		// A drain may race with the client sending its next message while the
+		// loop is blocked in ReadMessage. The previous ReadyForQuery is still a
+		// safe idle boundary, so do not start new work after the drain request.
+		if atReadyBoundary && c.drainRequested.Load() {
+			return nil
+		}
+		atReadyBoundary = false
 
 		switch msgType {
 		case wire.MsgQuery:
@@ -1173,6 +1197,10 @@ func (c *clientConn) messageLoop() error {
 				}
 				c.logger().Error("Query error.", "error", err)
 			}
+			if c.drainRequested.Load() {
+				return nil
+			}
+			atReadyBoundary = true
 
 		case wire.MsgParse:
 			// Extended query protocol - Parse
@@ -1198,6 +1226,10 @@ func (c *clientConn) messageLoop() error {
 				return err
 			}
 			_ = c.flushWriter()
+			if c.drainRequested.Load() {
+				return nil
+			}
+			atReadyBoundary = true
 
 		case wire.MsgClose:
 			// Extended query protocol - Close

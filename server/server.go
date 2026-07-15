@@ -742,6 +742,32 @@ func (s *Server) unregisterConn(pid int32) {
 	s.connsMu.Unlock()
 }
 
+// DrainOrgConnections requests a clean close of every PostgreSQL connection
+// for orgID at its next idle protocol boundary. Connections already blocked
+// waiting for client input are woken immediately; executing queries are not
+// cancelled and close after their next ReadyForQuery.
+func (s *Server) DrainOrgConnections(orgID string) int {
+	s.connsMu.RLock()
+	conns := make([]*clientConn, 0)
+	for _, c := range s.conns {
+		if c != nil && c.orgID == orgID {
+			conns = append(conns, c)
+		}
+	}
+	s.connsMu.RUnlock()
+
+	for _, c := range conns {
+		c.drainRequested.Store(true)
+		if c.conn != nil && c.idleRead.Load() {
+			// Wake a message loop already blocked at an idle boundary. An active
+			// query (including COPY reading client data) is not marked idle and is
+			// therefore unaffected.
+			_ = c.conn.SetReadDeadline(time.Now())
+		}
+	}
+	return len(conns)
+}
+
 // listConns returns a snapshot of all registered client connections.
 func (s *Server) listConns() []*clientConn {
 	s.connsMu.RLock()
