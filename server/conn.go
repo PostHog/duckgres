@@ -513,6 +513,16 @@ func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64,
 	c.logger().Info("Query finished.", attrs...)
 }
 
+// boundedQueryErrorLogAttrs returns safe structured-log attributes for a
+// failed query. Classify secrets against the full original SQL before bounding
+// both fields, since engine errors can echo the offending statement.
+func boundedQueryErrorLogAttrs(query string, err error) []any {
+	return []any{
+		"query", boundQueryLogText(usersecrets.RedactForLog(query)),
+		"error", boundQueryLogText(usersecrets.RedactErrorForLog(query, err.Error())),
+	}
+}
+
 // logQueryError logs a query execution failure. DuckLake-specific
 // retryable conditions and user-attributable errors get Warn / Info so
 // the Error level stays meaningful as an alerting signal — "Query
@@ -1266,7 +1276,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	// Redacted form for everything observable (pg_stat_activity, spans,
 	// logs): CREATE SECRET option lists carry credential material.
-	loggableQuery := usersecrets.RedactForLog(query)
+	loggableQuery := boundQueryLogText(usersecrets.RedactForLog(query))
 
 	c.currentQuery.Store(loggableQuery)
 	c.queryStart.Store(time.Now())

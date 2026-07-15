@@ -193,8 +193,8 @@ func (c *clientConn) handleParse(body []byte) {
 		isIgnoredSet:      result.IsIgnoredSet,
 		isNoOp:            result.IsNoOp,
 		noOpTag:           result.NoOpTag,
-		querySourceSet:    result.QuerySourceSet,  // SET duckgres.query_source (custom GUC)
-		querySourceShow:   result.QuerySourceShow, // SHOW duckgres.query_source
+		querySourceSet:    result.QuerySourceSet,    // SET duckgres.query_source (custom GUC)
+		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
@@ -515,7 +515,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Redacted form for everything observable (pg_stat_activity, spans,
 	// logs): CREATE SECRET option lists carry credential material.
-	loggableQuery := usersecrets.RedactForLog(p.stmt.query)
+	loggableQuery := boundQueryLogText(usersecrets.RedactForLog(p.stmt.query))
 
 	c.currentQuery.Store(loggableQuery)
 	c.queryStart.Store(time.Now())
@@ -764,7 +764,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	cols, err := rows.Columns()
 	if err != nil {
 		queryFinalErr = err
-		c.logger().Error("Columns error.", "error", err)
+		c.logger().Error("Columns error.", boundedQueryErrorLogAttrs(convertedQuery, err)...)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -828,7 +828,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			c.logger().Error("Row iteration error.", "error", err)
+			c.logger().Error("Row iteration error.", boundedQueryErrorLogAttrs(convertedQuery, err)...)
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()

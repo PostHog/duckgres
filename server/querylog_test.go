@@ -101,24 +101,39 @@ func TestNormalizeQueryHash(t *testing.T) {
 
 func TestIsQueryLogSelfReferential(t *testing.T) {
 	tests := []struct {
+		name  string
 		query string
 		want  bool
 	}{
-		{"SELECT * FROM system.query_log", true},
-		{"SELECT * FROM ducklake.system.query_log ORDER BY event_time DESC", true},
-		{"SELECT * FROM SYSTEM.QUERY_LOG", true},
-		{"SELECT * FROM users", false},
-		{"INSERT INTO logs VALUES (1, 'test')", false},
-		{"SELECT query_log FROM metadata", false}, // "query_log" without "system." prefix is not self-referential
+		{"direct", "SELECT * FROM system.query_log", true},
+		{"qualified", "SELECT * FROM ducklake.system.query_log ORDER BY event_time DESC", true},
+		{"uppercase", "SELECT * FROM SYSTEM.QUERY_LOG", true},
+		{"unrelated table", "SELECT * FROM users", false},
+		{"unrelated insert", "INSERT INTO logs VALUES (1, 'test')", false},
+		{"column only", "SELECT query_log FROM metadata", false},
+		{"mixed case beyond bound", strings.Repeat("SELECT 1; ", maxQueryLength) + "SELECT * FROM SyStEm.QuErY_lOg", true},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.query, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			got := isQueryLogSelfReferential(tt.query)
 			if got != tt.want {
-				t.Errorf("isQueryLogSelfReferential(%q) = %v, want %v", tt.query, got, tt.want)
+				t.Errorf("isQueryLogSelfReferential result = %v, want %v (query length %d)", got, tt.want, len(tt.query))
 			}
 		})
+	}
+}
+
+func TestIsQueryLogSelfReferentialDoesNotAllocateForOversizedQuery(t *testing.T) {
+	query := strings.Repeat("select value from events; ", maxQueryLength)
+	var got bool
+	if allocs := testing.AllocsPerRun(100, func() {
+		got = isQueryLogSelfReferential(query)
+	}); allocs != 0 {
+		t.Fatalf("isQueryLogSelfReferential allocated %.1f times per oversized query, want 0", allocs)
+	}
+	if got {
+		t.Fatal("non-self-referential query was classified as self-referential")
 	}
 }
 
@@ -141,6 +156,10 @@ func TestTruncateQuery(t *testing.T) {
 func TestBoundQueryLogTextClonesAtValidUTF8Boundary(t *testing.T) {
 	long := strings.Repeat("x", maxQueryLength-1) + "é-tail"
 	result := boundQueryLogText(long)
+	expected := strings.Repeat("x", maxQueryLength-1)
+	if result != expected {
+		t.Fatalf("bounded query log text = %q, want maximal valid prefix of length %d", result, len(expected))
+	}
 	if len(result) > maxQueryLength {
 		t.Fatalf("bounded length = %d, want <= %d", len(result), maxQueryLength)
 	}
@@ -525,22 +544,17 @@ func TestLogQueryBoundsTextBeforeExecutorQueryLogSink(t *testing.T) {
 		t.Fatalf("expected executor query-log sink to receive one entry, got %d", len(exec.entries))
 	}
 	entry := exec.entries[0]
-	for name, text := range map[string]string{
-		"query":     entry.Query,
-		"exception": entry.Exception,
-	} {
-		if len(text) > maxQueryLength {
-			t.Errorf("%s length = %d, want <= %d", name, len(text), maxQueryLength)
-		}
-		if strings.Contains(text, "tail-marker") {
-			t.Errorf("%s retained text beyond the control-plane bound", name)
-		}
+	if want := query[:maxQueryLength]; entry.Query != want {
+		t.Errorf("bounded query length = %d, want exact prefix length %d", len(entry.Query), len(want))
+	}
+	if want := exception[:maxQueryLength]; entry.Exception != want {
+		t.Errorf("bounded exception length = %d, want exact prefix length %d", len(entry.Exception), len(want))
 	}
 	if entry.TranspiledQuery == nil {
 		t.Fatal("expected transpiled query")
 	}
-	if got := *entry.TranspiledQuery; len(got) > maxQueryLength || strings.Contains(got, "tail-marker") {
-		t.Errorf("transpiled query was not bounded before forwarding: length=%d", len(got))
+	if got, want := *entry.TranspiledQuery, transpiled[:maxQueryLength]; got != want {
+		t.Errorf("bounded transpiled query length = %d, want exact prefix length %d", len(got), len(want))
 	}
 	if want := normalizeQueryHash(entry.Query); entry.NormalizedHash != want {
 		t.Errorf("normalized hash = %d, want hash of bounded query %d", entry.NormalizedHash, want)
@@ -566,6 +580,9 @@ func TestLogQueryRedactsBeforeBounding(t *testing.T) {
 	entry := exec.entries[0]
 	if want := usersecrets.RedactForLog(query); entry.Query != want {
 		t.Errorf("query was not redacted before bounding: got %q, want %q", entry.Query, want)
+	}
+	if want := usersecrets.RedactErrorForLog(query, exception); entry.Exception != want {
+		t.Errorf("exception was not redacted before bounding: got %q, want %q", entry.Exception, want)
 	}
 	if strings.Contains(entry.Query, credential) || strings.Contains(entry.Exception, credential) {
 		t.Fatal("bounded query-log entry leaked a credential")
