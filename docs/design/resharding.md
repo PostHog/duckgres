@@ -158,7 +158,13 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
 6. **copying** — source read via its recorded pre-flip endpoint (the orphaned
    role/DB survives a shard flip; an ext source is reached direct-to-RDS with
    TLS because the flip deletes its ESO sync + pgbouncer). One
-   REPEATABLE READ read-only transaction = consistent snapshot; faithful DDL
+   REPEATABLE READ transaction = consistent snapshot. The transaction takes
+   `SHARE` locks on every discovered `ducklake_*` table, re-discovers the table
+   set after locking, and remains open through verification and source cleanup;
+   this blocks DML and conflicting DDL without killing an already-running
+   writer. Source and target also receive streaming, order-independent SHA-256
+   multiset fingerprints of canonical `jsonb` rows, so same-count UPDATEs and
+   balanced DELETE+INSERT changes cannot pass verification. Faithful DDL
    from `pg_catalog` introspection; rows via raw binary COPY passthrough;
    constraints then non-constraint indexes (PK-backed indexes excluded — ADD
    CONSTRAINT already made them). No sequences exist in the DuckLake catalog

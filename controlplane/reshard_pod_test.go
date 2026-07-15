@@ -157,6 +157,20 @@ func TestSpawnReshardPodKnobsAndNoPasswordURL(t *testing.T) {
 	}
 }
 
+func TestSpawnReshardPodRejectsInvalidResourceKnobsWithoutPanicking(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset(fakeCPPod())
+	s := NewReshardPodSpawner(cs, "duckgres", "duckgres-control-plane-abc-xyz", "not-a-cpu", "also-bad")
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("SpawnReshardPod panicked on invalid operator config: %v", recovered)
+		}
+	}()
+	err := s.SpawnReshardPod(context.Background(), &configstore.ReshardOperation{ID: 8})
+	if err == nil || !strings.Contains(err.Error(), "invalid reshard pod") {
+		t.Fatalf("error = %v, want invalid reshard pod resource error", err)
+	}
+}
+
 // TestSpawnReshardPodMissingCPPod pins the failure mode when the CP cannot
 // read its own pod (the template): a clear error, no pod created.
 func TestSpawnReshardPodMissingCPPod(t *testing.T) {

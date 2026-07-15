@@ -77,9 +77,10 @@ type ReshardOperation struct {
 	// Runner fencing: claiming CP instance + monotonically bumped epoch. Every
 	// runner-side write is CAS-fenced on (runner_cp, runner_epoch) so a zombie
 	// ex-runner's writes fail after a takeover.
-	RunnerCP    string     `gorm:"size:255;not null;default:''" json:"runner_cp"`
-	RunnerEpoch int64      `gorm:"not null;default:0" json:"runner_epoch"`
-	HeartbeatAt *time.Time `json:"heartbeat_at"`
+	RunnerCP        string     `gorm:"size:255;not null;default:''" json:"runner_cp"`
+	RunnerEpoch     int64      `gorm:"not null;default:0" json:"runner_epoch"`
+	RespawnAttempts int64      `gorm:"not null;default:0" json:"respawn_attempts"`
+	HeartbeatAt     *time.Time `json:"heartbeat_at"`
 
 	// Maintenance-mode window: warehouse state resharding from block to
 	// unblock. UnblockedAt-BlockedAt is the org's client-visible downtime.
@@ -191,6 +192,25 @@ func (cs *ConfigStore) ListActiveReshardOperations() ([]ReshardOperation, error)
 	return ops, nil
 }
 
+// IncrementReshardRespawnAttempts durably records one reconciler intervention
+// and returns the new count. The count survives leader and process changes.
+func (cs *ConfigStore) IncrementReshardRespawnAttempts(id int64) (int64, error) {
+	var attempts int64
+	err := cs.db.Raw(`
+		UPDATE duckgres_reshard_operations
+		SET respawn_attempts = respawn_attempts + 1
+		WHERE id = ? AND state IN (?, ?)
+		RETURNING respawn_attempts`, id, ReshardStatePending, ReshardStateRunning).
+		Scan(&attempts).Error
+	if err != nil {
+		return 0, fmt.Errorf("increment reshard respawn attempts: %w", err)
+	}
+	if attempts == 0 {
+		return 0, fmt.Errorf("increment reshard respawn attempts: operation %d is not active", id)
+	}
+	return attempts, nil
+}
+
 // GetReshardOperation loads one operation by id.
 func (cs *ConfigStore) GetReshardOperation(id int64) (*ReshardOperation, error) {
 	var op ReshardOperation
@@ -299,6 +319,40 @@ func (cs *ConfigStore) FinishReshardOperation(id int64, runnerCP string, epoch i
 		"state":       state,
 		"error":       errMsg,
 		"finished_at": time.Now().UTC(),
+	})
+}
+
+// FinalizeReshardOperation atomically admits traffic and marks the operation
+// succeeded. Neither state may become visible without the other: a crash after
+// only one write would otherwise leave an unsafe takeover or a stranded org.
+func (cs *ConfigStore) FinalizeReshardOperation(id int64, runnerCP string, epoch int64, orgID string, warehouseUpdates map[string]interface{}, unblockedAt time.Time) error {
+	return cs.db.Transaction(func(tx *gorm.DB) error {
+		warehouse := tx.Model(&ManagedWarehouse{}).
+			Where("org_id = ? AND state = ?", orgID, ManagedWarehouseStateResharding).
+			Updates(warehouseUpdates)
+		if warehouse.Error != nil {
+			return fmt.Errorf("finalize reshard warehouse: %w", warehouse.Error)
+		}
+		if warehouse.RowsAffected == 0 {
+			return fmt.Errorf("warehouse %q expected state %q: %w", orgID, ManagedWarehouseStateResharding, ErrWarehouseStateMismatch)
+		}
+
+		finished := tx.Model(&ReshardOperation{}).
+			Where("id = ? AND state = ? AND runner_cp = ? AND runner_epoch = ?", id, ReshardStateRunning, runnerCP, epoch).
+			Updates(map[string]interface{}{
+				"state":        ReshardStateSucceeded,
+				"error":        "",
+				"unblocked_at": unblockedAt,
+				"finished_at":  unblockedAt,
+				"heartbeat_at": unblockedAt,
+			})
+		if finished.Error != nil {
+			return fmt.Errorf("finalize reshard operation: %w", finished.Error)
+		}
+		if finished.RowsAffected == 0 {
+			return ErrReshardFenced
+		}
+		return nil
 	})
 }
 

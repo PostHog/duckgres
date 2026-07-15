@@ -69,6 +69,12 @@ func (f *fakeReconcilerStore) AppendReshardLog(_ int64, level, message string) e
 	return nil
 }
 
+func (f *fakeReconcilerStore) IncrementReshardRespawnAttempts(id int64) (int64, error) {
+	op := f.ops[id]
+	op.RespawnAttempts++
+	return op.RespawnAttempts, nil
+}
+
 func staleRunningOp(id int64) *configstore.ReshardOperation {
 	hb := time.Now().UTC().Add(-time.Hour)
 	return &configstore.ReshardOperation{
@@ -109,7 +115,7 @@ func TestReconcilerRespawnsDeadRunner(t *testing.T) {
 
 	// A live pod now exists: the next tick must NOT replace it.
 	r.reconcileOnce(context.Background())
-	if got := r.respawnAttempts[1]; got != 1 {
+	if got := store.ops[1].RespawnAttempts; got != 1 {
 		t.Fatalf("respawn attempts = %d after a successful spawn + live pod, want 1", got)
 	}
 }
@@ -140,7 +146,7 @@ func TestReconcilerReplacesWedgedRunningPod(t *testing.T) {
 	if pod.UID == wedged.UID {
 		t.Fatal("stale-heartbeat Running pod was left in place")
 	}
-	if got := r.respawnAttempts[9]; got != 1 {
+	if got := store.ops[9].RespawnAttempts; got != 1 {
 		t.Fatalf("respawn attempts = %d, want 1", got)
 	}
 }
@@ -180,10 +186,9 @@ func TestReconcilerRespawnsStalePending(t *testing.T) {
 	}
 }
 
-// TestReconcilerRetryBoundForceFails pins the bound: after maxRespawnAttempts
-// interventions the op is force-failed (claimed + finished) with the clear
-// operator-facing error, and the counter is dropped.
-func TestReconcilerRetryBoundForceFails(t *testing.T) {
+// TestReconcilerRetryBoundLeavesOperationRecoverable pins the bound without
+// terminal-stranding the blocked warehouse.
+func TestReconcilerRetryBoundLeavesOperationRecoverable(t *testing.T) {
 	store := &fakeReconcilerStore{ops: map[int64]*configstore.ReshardOperation{1: staleRunningOp(1)}}
 	// No CP pod in the fake cluster → every spawn fails (own-pod read error).
 	cs := k8sfake.NewSimpleClientset()
@@ -196,14 +201,26 @@ func TestReconcilerRetryBoundForceFails(t *testing.T) {
 		}
 	}
 	r.reconcileOnce(context.Background())
-	if store.ops[1].State != configstore.ReshardStateFailed {
-		t.Fatalf("op state = %s after exhausted respawns, want failed", store.ops[1].State)
+	if store.ops[1].State != configstore.ReshardStateRunning {
+		t.Fatalf("op state = %s after exhausted respawns, want active running", store.ops[1].State)
 	}
-	if !strings.Contains(store.ops[1].Error, "giving up") {
-		t.Fatalf("force-fail error = %q", store.ops[1].Error)
+	if !strings.Contains(strings.Join(store.logs, "\n"), "automatic respawn paused") {
+		t.Fatalf("recovery-required log missing: %v", store.logs)
 	}
-	if _, tracked := r.respawnAttempts[1]; tracked {
-		t.Fatal("respawn counter not dropped after force-fail")
+	if store.ops[1].RespawnAttempts != int64(r.maxRespawnAttempts+1) {
+		t.Fatalf("durable respawn attempts = %d", store.ops[1].RespawnAttempts)
+	}
+}
+
+func TestReconcilerRetryBoundSurvivesLeaderChurn(t *testing.T) {
+	store := &fakeReconcilerStore{ops: map[int64]*configstore.ReshardOperation{1: staleRunningOp(1)}}
+	cs := k8sfake.NewSimpleClientset()
+	for i := 0; i <= 3; i++ {
+		// A new reconciler models a process restart or janitor lease handoff.
+		testReconciler(store, cs).reconcileOnce(context.Background())
+	}
+	if store.ops[1].State != configstore.ReshardStateRunning {
+		t.Fatalf("op state after leader churn = %s, want active recovery state", store.ops[1].State)
 	}
 }
 

@@ -183,9 +183,17 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 		env = append(env, corev1.EnvVar{Name: "DUCKGRES_RESHARD_PASSWORD_URL", Value: op.PasswordURL})
 	}
 
+	cpu, err := resource.ParseQuantity(s.cpuRequest)
+	if err != nil {
+		return fmt.Errorf("invalid reshard pod CPU %q: %w", s.cpuRequest, err)
+	}
+	memory, err := resource.ParseQuantity(s.memoryRequest)
+	if err != nil {
+		return fmt.Errorf("invalid reshard pod memory %q: %w", s.memoryRequest, err)
+	}
 	requests := corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse(s.cpuRequest),
-		corev1.ResourceMemory: resource.MustParse(s.memoryRequest),
+		corev1.ResourceCPU:    cpu,
+		corev1.ResourceMemory: memory,
 	}
 	limits := make(corev1.ResourceList, len(requests))
 	for k, v := range requests {

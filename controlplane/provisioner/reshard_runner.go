@@ -87,6 +87,7 @@ type reshardStore interface {
 	UpdateReshardFields(id int64, runnerCP string, epoch int64, updates map[string]interface{}) error
 	TouchReshardHeartbeat(id int64, runnerCP string, epoch int64) error
 	FinishReshardOperation(id int64, runnerCP string, epoch int64, state configstore.ReshardState, errMsg string) error
+	FinalizeReshardOperation(id int64, runnerCP string, epoch int64, orgID string, warehouseUpdates map[string]interface{}, unblockedAt time.Time) error
 	AppendReshardLog(opID int64, level, message string) error
 
 	SetWarehouseResharding(orgID string) error
@@ -267,7 +268,8 @@ type opRun struct {
 	target CatalogEndpoint
 
 	// snapshot row counts from the copy (source-stability recheck reference)
-	copied CatalogCopyResult
+	copied      CatalogCopyResult
+	sourceFence func()
 }
 
 func (o *opRun) logf(level, format string, args ...any) {
@@ -409,7 +411,11 @@ func (r *ReshardRunner) execute(ctx context.Context, op *configstore.ReshardOper
 	o.reconstructProgress()
 	o.logf("info", "operation claimed by %s (epoch %d): %s → %s", r.cpID, op.RunnerEpoch, describeSource(op), describeTarget(op))
 
-	// Heartbeat until the op function returns. A fencing loss stops the op.
+	// Heartbeat until the op function returns. A confirmed fencing loss cancels
+	// the context used by every external side effect. Transient store errors are
+	// retried: they do not prove that ownership changed.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 	fenced := make(chan struct{})
@@ -422,15 +428,25 @@ func (r *ReshardRunner) execute(ctx context.Context, op *configstore.ReshardOper
 				return
 			case <-ticker.C:
 				if err := r.store.TouchReshardHeartbeat(op.ID, r.cpID, op.RunnerEpoch); err != nil {
-					slog.Error("Reshard: heartbeat fenced — another runner took over; abandoning.", "op", op.ID, "error", err)
-					close(fenced)
-					return
+					if errors.Is(err, configstore.ErrReshardFenced) {
+						slog.Error("Reshard: heartbeat fenced — another runner took over; abandoning.", "op", op.ID, "error", err)
+						close(fenced)
+						runCancel()
+						return
+					}
+					slog.Warn("Reshard: heartbeat update failed; retaining ownership and retrying.", "op", op.ID, "error", err)
 				}
 			}
 		}
 	}()
 
-	runErr := o.run(ctx, fenced)
+	runErr := o.run(runCtx, fenced)
+	select {
+	case <-fenced:
+		o.logf("error", "operation fenced: another runner took over; this runner abandons it")
+		return
+	default:
+	}
 	if runErr == nil {
 		return
 	}
@@ -482,6 +498,9 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 	}
 	if o.cancelRequested() {
 		return errReshardCancelled
+	}
+	if o.op.Step != "" {
+		return o.resumeTakeover(ctx)
 	}
 
 	if err := o.block(ctx); err != nil {
@@ -546,6 +565,53 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 	}
 
 	return o.finalize(ctx)
+}
+
+// resumeTakeover continues only phases whose durable inputs are sufficient to
+// make replay safe. In particular, it never re-runs recordSource after cutover:
+// the live Duckling status names the target at that point. Earlier and external
+// target phases fail into the conservative rollback path.
+func (o *opRun) resumeTakeover(ctx context.Context) error {
+	if o.op.TargetKind != configstore.MetadataStoreKindCnpgShard ||
+		o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
+		return fmt.Errorf("takeover at step %q cannot be resumed safely; rolling back from durable progress", o.op.Step)
+	}
+
+	switch o.op.Step {
+	case "copying", "verifying":
+		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+		if err != nil {
+			return fmt.Errorf("read target status during takeover: %w", err)
+		}
+		if o.op.SourceEndpoint == "" || o.op.SourceUser == "" || o.op.SourceDatabase == "" {
+			return fmt.Errorf("takeover at step %q has incomplete durable source identity", o.op.Step)
+		}
+		o.source = CatalogEndpoint{
+			Host: o.op.SourceEndpoint, Port: 5432, User: o.op.SourceUser,
+			Password: st.MetadataStore.Password, Database: o.op.SourceDatabase, SSLMode: "disable",
+		}
+		o.target = CatalogEndpoint{
+			Host: st.MetadataStore.Endpoint, Port: 5432, User: st.MetadataStore.User,
+			Password: st.MetadataStore.Password, Database: st.MetadataStore.Database, SSLMode: "disable",
+		}
+		if err := o.copyCatalog(ctx); err != nil {
+			return err
+		}
+		if err := o.verifySourceStable(ctx); err != nil {
+			return err
+		}
+		if err := o.cleanupSource(ctx); err != nil {
+			return err
+		}
+		return o.finalize(ctx)
+	case "cleaning_up", "finalizing":
+		// Copy+verification already completed. Source cleanup is explicitly
+		// best-effort, so it is safer to leave possible cruft than to reconstruct
+		// credentials and risk dropping the live target.
+		return o.finalize(ctx)
+	default:
+		return fmt.Errorf("takeover at step %q cannot be resumed safely; rolling back from durable progress", o.op.Step)
+	}
 }
 
 // ---- steps ----------------------------------------------------------------
@@ -1072,6 +1138,17 @@ func (o *opRun) verifyExternalCatalog(ctx context.Context) error {
 			return fmt.Errorf("external target table %s row count %d != copied %d — catalog incomplete; NOT dropping the retained cnpg source", table, got, want)
 		}
 	}
+	if len(o.copied.PerTableFingerprints) > 0 {
+		fingerprints, err := o.r.copier.SnapshotFingerprints(ctx, o.target, func(level, msg string) { o.logf(level, "%s", msg) })
+		if err != nil {
+			return fmt.Errorf("fingerprinting external target: %w", err)
+		}
+		for table, want := range o.copied.PerTableFingerprints {
+			if got, ok := fingerprints[table]; !ok || got != want {
+				return fmt.Errorf("external target table %s content fingerprint differs from the copy — NOT dropping the retained cnpg source", table)
+			}
+		}
+	}
 	o.logf("info", "verified external target catalog: %d tables match the copied row counts exactly — safe to drop the retained cnpg source", len(current))
 	return nil
 }
@@ -1101,6 +1178,7 @@ func (o *opRun) dropOrphanedCnpgSource(ctx context.Context) error {
 	if err := o.r.duckling.SetMetadataStoreRetainCnpgOnFlip(ctx, o.op.DucklingName, false); err != nil {
 		o.logf("warn", "clearing retainCnpgOnFlip after cnpg→ext completion failed: %v — harmless while on external; a later ext→cnpg reshard should ensure it is false", err)
 	}
+	o.releaseSourceFence()
 	return nil
 }
 
@@ -1147,6 +1225,7 @@ func (o *opRun) copyCatalog(ctx context.Context) error {
 		return fmt.Errorf("catalog copy: %w", err)
 	}
 	o.copied = result
+	o.sourceFence = result.ReleaseSourceFence
 	if err := o.fields(map[string]interface{}{
 		"tables_copied": result.Tables,
 		"rows_copied":   result.Rows,
@@ -1183,6 +1262,21 @@ func (o *opRun) verifySourceStable(ctx context.Context) error {
 			return fmt.Errorf("source table %s changed during the copy (%d rows now, %d in snapshot) — a concurrent writer is active", table, nowCount, snapCount)
 		}
 	}
+	if len(o.copied.PerTableFingerprints) > 0 {
+		fingerprints, err := o.r.copier.SnapshotFingerprints(ctx, o.source, func(level, msg string) { o.logf(level, "%s", msg) })
+		if err != nil {
+			return fmt.Errorf("re-fingerprinting source contents: %w", err)
+		}
+		if len(fingerprints) != len(o.copied.PerTableFingerprints) {
+			return fmt.Errorf("source fingerprint table set changed during the copy")
+		}
+		for table, snapshot := range o.copied.PerTableFingerprints {
+			current, ok := fingerprints[table]
+			if !ok || current != snapshot {
+				return fmt.Errorf("source table %s content changed during the copy despite stable row count — a concurrent writer is active", table)
+			}
+		}
+	}
 	o.logf("info", "verified: source is unchanged since the snapshot (%d tables) — no concurrent writer", len(current))
 	return nil
 }
@@ -1196,6 +1290,7 @@ func (o *opRun) cleanupSource(ctx context.Context) error {
 	}
 	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
 		o.logf("info", "external source left untouched (never deleted)")
+		o.releaseSourceFence()
 		return nil
 	}
 	// o.source is the copy-path source of truth (recorded from the duckling
@@ -1210,10 +1305,19 @@ func (o *opRun) cleanupSource(ctx context.Context) error {
 		// Loud but non-fatal: the copy is verified and live; a leftover
 		// source DB is cruft plus a weaker fence, not data loss.
 		o.logf("error", "DROP DATABASE on the source failed — old catalog database still exists on %s and must be dropped manually: %v", o.op.FromShard, err)
+		o.releaseSourceFence()
 		return nil
 	}
+	o.releaseSourceFence()
 	o.logf("info", "source database dropped (the source role remains; roles cannot drop themselves)")
 	return nil
+}
+
+func (o *opRun) releaseSourceFence() {
+	if o.sourceFence != nil {
+		o.sourceFence()
+		o.sourceFence = nil
+	}
 }
 
 func (o *opRun) finalize(ctx context.Context) error {
@@ -1247,20 +1351,14 @@ func (o *opRun) finalize(ctx context.Context) error {
 		// The XRD defaults stand up a per-duckling pgbouncer for external.
 		updates["pgbouncer_enabled"] = true
 	}
-	if err := o.r.store.UpdateWarehouseState(o.op.OrgID, configstore.ManagedWarehouseStateResharding, updates); err != nil {
-		return fmt.Errorf("unblock warehouse: %w", err)
-	}
 	now := time.Now().UTC()
-	if err := o.fields(map[string]interface{}{"unblocked_at": now}); err != nil {
-		return err
+	if err := o.r.store.FinalizeReshardOperation(o.op.ID, o.r.cpID, o.op.RunnerEpoch, o.op.OrgID, updates, now); err != nil {
+		return fmt.Errorf("atomically finalize reshard and unblock warehouse: %w", err)
 	}
 	o.op.UnblockedAt = &now
 	o.logf("info", "warehouse unblocked: resharding → ready; new sessions cold-spawn against the new metadata store")
 
 	o.report(configstore.ReshardStateSucceeded)
-	if err := o.r.store.FinishReshardOperation(o.op.ID, o.r.cpID, o.op.RunnerEpoch, configstore.ReshardStateSucceeded, ""); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -1288,6 +1386,7 @@ func (o *opRun) restoreCompaction(ctx context.Context) {
 // the op is marked failed/cancelled regardless.
 func (o *opRun) rollback(ctx context.Context) {
 	ctx = context.WithoutCancel(ctx)
+	defer o.releaseSourceFence()
 	recovered := true
 
 	if o.flipped {

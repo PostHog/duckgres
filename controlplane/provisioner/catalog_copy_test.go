@@ -3,12 +3,32 @@
 package provisioner
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestContentFingerprintDetectsSameCountMutationAndIgnoresRowOrder(t *testing.T) {
+	fingerprint := func(rows ...string) [sha256.Size]byte {
+		var sum [sha256.Size]byte
+		for _, row := range rows {
+			addRowFingerprint(&sum, row)
+		}
+		return sum
+	}
+	original := fingerprint(`{"id":1,"value":"a"}`, `{"id":2,"value":"b"}`)
+	reordered := fingerprint(`{"id":2,"value":"b"}`, `{"id":1,"value":"a"}`)
+	mutated := fingerprint(`{"id":1,"value":"changed"}`, `{"id":2,"value":"b"}`)
+	if original != reordered {
+		t.Fatal("multiset fingerprint changed with row order")
+	}
+	if original == mutated {
+		t.Fatal("same-row-count UPDATE was not detected by content fingerprint")
+	}
+}
 
 // TestShouldReplayConstraint pins the PG-18 NOT NULL skip: catalogued
 // not-null constraints (contype 'n') must never be replayed — the CREATE

@@ -39,15 +39,13 @@ type reshardReconciler struct {
 	terminalPodGrace time.Duration // how long a terminal op's still-running pod is left to exit on its own
 
 	maxRespawnAttempts int
-	respawnAttempts    map[int64]int // opID → consecutive failed respawns (leader-local)
 }
 
 // reshardReconcilerStore is the config-store surface the reconciler needs.
 type reshardReconcilerStore interface {
 	ListActiveReshardOperations() ([]configstore.ReshardOperation, error)
 	GetReshardOperation(id int64) (*configstore.ReshardOperation, error)
-	ClaimReshardOperation(id int64, runnerCP string, staleAfter time.Duration) (*configstore.ReshardOperation, error)
-	FinishReshardOperation(id int64, runnerCP string, epoch int64, state configstore.ReshardState, errMsg string) error
+	IncrementReshardRespawnAttempts(id int64) (int64, error)
 	AppendReshardLog(opID int64, level, message string) error
 }
 
@@ -60,7 +58,6 @@ func newReshardReconciler(store reshardReconcilerStore, spawner *ReshardPodSpawn
 		staleAfter:         5 * time.Minute,
 		terminalPodGrace:   5 * time.Minute,
 		maxRespawnAttempts: 3,
-		respawnAttempts:    map[int64]int{},
 	}
 }
 
@@ -89,17 +86,22 @@ func (r *reshardReconciler) reconcileOnce(ctx context.Context) {
 		return
 	}
 	active := make(map[int64]struct{}, len(ops))
+	stale := 0
+	recoveryRequired := 0
 	for i := range ops {
 		op := &ops[i]
 		active[op.ID] = struct{}{}
+		if r.opNeedsPod(op) {
+			stale++
+		}
+		if op.RespawnAttempts > int64(r.maxRespawnAttempts) {
+			recoveryRequired++
+		}
 		r.reconcileActiveOp(ctx, op)
 	}
-	// Attempt counters for ops no longer active are done.
-	for id := range r.respawnAttempts {
-		if _, ok := active[id]; !ok {
-			delete(r.respawnAttempts, id)
-		}
-	}
+	reshardActiveOperationsGauge.Set(float64(len(ops)))
+	reshardStaleOperationsGauge.Set(float64(stale))
+	reshardRecoveryRequiredGauge.Set(float64(recoveryRequired))
 	r.reapTerminalPods(ctx, active)
 }
 
@@ -140,50 +142,47 @@ func (r *reshardReconciler) reconcileActiveOp(ctx context.Context, op *configsto
 	// a non-terminal pod; SpawnReshardPod deletes the deterministic old pod
 	// before creating its successor. Fresh-heartbeat operations never reach
 	// this branch, so healthy runners are left alone.
-
-	attempts := r.respawnAttempts[op.ID]
-	if attempts >= r.maxRespawnAttempts {
-		r.failOpAfterRespawnsExhausted(op)
+	if op.RespawnAttempts > int64(r.maxRespawnAttempts) {
 		return
 	}
-	r.respawnAttempts[op.ID] = attempts + 1
+
+	attempt, err := r.store.IncrementReshardRespawnAttempts(op.ID)
+	if err != nil {
+		slog.Warn("Reshard reconciler: recording durable respawn attempt failed.", "op", op.ID, "error", err)
+		return
+	}
+	if attempt > int64(r.maxRespawnAttempts) {
+		if attempt == int64(r.maxRespawnAttempts+1) {
+			r.markOpRecoveryRequired(op)
+		}
+		return
+	}
 	slog.Info("Reshard reconciler: (re)spawning runner pod.",
-		"op", op.ID, "state", op.State, "attempt", attempts+1, "pod_was", podPhaseOrAbsent(pod))
+		"op", op.ID, "state", op.State, "attempt", attempt, "pod_was", podPhaseOrAbsent(pod))
 	_ = r.store.AppendReshardLog(op.ID, "warn",
 		fmt.Sprintf("runner pod missing or dead (%s) — respawning %s (attempt %d/%d)",
-			podPhaseOrAbsent(pod), ReshardPodName(op.ID), attempts+1, r.maxRespawnAttempts))
+			podPhaseOrAbsent(pod), ReshardPodName(op.ID), attempt, r.maxRespawnAttempts))
 	if err := r.spawner.SpawnReshardPod(ctx, op); err != nil {
+		reshardRespawnCounter.WithLabelValues("failed").Inc()
 		slog.Warn("Reshard reconciler: respawn failed.", "op", op.ID, "error", err)
 		_ = r.store.AppendReshardLog(op.ID, "error", "respawning runner pod failed: "+err.Error())
 		return
 	}
+	reshardRespawnCounter.WithLabelValues("spawned").Inc()
 	// A successful spawn resets nothing: the counter counts consecutive
 	// reconciler interventions for this op, so a pod that keeps dying still
 	// converges to the failure below instead of respawning forever. The
 	// counter is dropped once the op leaves the active set.
 }
 
-// failOpAfterRespawnsExhausted terminates an op whose runner pod cannot be
-// kept alive. The claim CAS (epoch bump) fences any zombie runner first, then
-// the op is finished failed. The warehouse may still be blocked in
-// `resharding` — there is no runner to roll back — so the error says exactly
-// that; this is the page-someone signal.
-func (r *reshardReconciler) failOpAfterRespawnsExhausted(op *configstore.ReshardOperation) {
-	msg := fmt.Sprintf("reshard runner pod died/failed to start %d times — giving up. "+
-		"The warehouse may still be blocked (state resharding) and partial state may need manual rollback; "+
-		"investigate the %s pod events, then cancel/re-run.", r.maxRespawnAttempts, ReshardPodName(op.ID))
-	claimed, err := r.store.ClaimReshardOperation(op.ID, "reshard-reconciler", r.staleAfter)
-	if err != nil || claimed == nil {
-		slog.Warn("Reshard reconciler: claiming op to force-fail it did not succeed.", "op", op.ID, "error", err)
-		return
-	}
-	if err := r.store.FinishReshardOperation(op.ID, "reshard-reconciler", claimed.RunnerEpoch, configstore.ReshardStateFailed, msg); err != nil {
-		slog.Warn("Reshard reconciler: force-failing op failed.", "op", op.ID, "error", err)
-		return
-	}
-	slog.Error("Reshard reconciler: operation force-failed after exhausted respawns.", "op", op.ID)
+// markOpRecoveryRequired leaves the operation active and therefore keeps the
+// connection barrier intact. Terminal-failing without rollback creates an
+// unrecoverable state: cancel/re-run cannot operate on a blocked warehouse.
+func (r *reshardReconciler) markOpRecoveryRequired(op *configstore.ReshardOperation) {
+	msg := fmt.Sprintf("reshard runner pod died/failed to start %d times — automatic respawn paused with the operation ACTIVE and the warehouse safely blocked. "+
+		"Repair the %s scheduling/startup failure, reset respawn_attempts to 0, and let the reconciler resume; see docs/runbooks/resharding.md.", r.maxRespawnAttempts, ReshardPodName(op.ID))
+	slog.Error("Reshard reconciler: operation requires manual recovery after exhausted respawns.", "op", op.ID)
 	_ = r.store.AppendReshardLog(op.ID, "error", msg)
-	delete(r.respawnAttempts, op.ID)
 }
 
 // reapTerminalPods deletes runner pods whose operation is no longer active:
