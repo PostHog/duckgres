@@ -60,6 +60,7 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	// (URL only — the password itself is never persisted).
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "password_url")
 	requireColumnPresent(t, db, "duckgres_reshard_operations", "respawn_attempts")
+	requireColumnPresent(t, db, "duckgres_reshard_operations", "runner_image")
 	requireTablePresent(t, db, "duckgres_reshard_operation_log")
 	requireColumnPresent(t, db, "duckgres_reshard_operation_log", "operation_id")
 

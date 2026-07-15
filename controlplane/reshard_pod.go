@@ -83,6 +83,20 @@ type ReshardPodSpawner struct {
 	memoryRequest string // env-only DUCKGRES_RESHARD_POD_MEMORY (default 8Gi)
 }
 
+func (s *ReshardPodSpawner) RunnerImage(ctx context.Context) (string, error) {
+	if s == nil || s.clientset == nil {
+		return "", fmt.Errorf("no reshard pod spawner (kubernetes API unavailable)")
+	}
+	cpPod, err := s.clientset.CoreV1().Pods(s.namespace).Get(ctx, s.selfPodName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("read own control-plane pod %s/%s: %w", s.namespace, s.selfPodName, err)
+	}
+	if len(cpPod.Spec.Containers) == 0 || cpPod.Spec.Containers[0].Image == "" {
+		return "", fmt.Errorf("control-plane pod %s has no runner image", s.selfPodName)
+	}
+	return cpPod.Spec.Containers[0].Image, nil
+}
+
 // NewReshardPodSpawner builds a spawner over the shared in-cluster clientset.
 // cpu/memory come from the resolved env-only knobs ("" → defaults).
 func NewReshardPodSpawner(clientset kubernetes.Interface, namespace, selfPodName, cpu, memory string) *ReshardPodSpawner {
@@ -150,6 +164,11 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 		return fmt.Errorf("control-plane pod %s has no containers", s.selfPodName)
 	}
 	cpContainer := cpPod.Spec.Containers[0]
+	runnerImage := op.RunnerImage
+	if runnerImage == "" {
+		// Legacy operations created before runner_image was persisted.
+		runnerImage = cpContainer.Image
+	}
 
 	// Inherit the allowlisted env VERBATIM — a secretKeyRef stays a
 	// secretKeyRef; nothing secret is copied by value into the pod spec.
@@ -247,7 +266,7 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 			Containers: []corev1.Container{
 				{
 					Name:            "reshard-runner",
-					Image:           cpContainer.Image,
+					Image:           runnerImage,
 					ImagePullPolicy: cpContainer.ImagePullPolicy,
 					Args:            []string{"--mode", "reshard-runner"},
 					Env:             env,

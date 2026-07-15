@@ -66,6 +66,11 @@ func (f *fakeReshardStore) SetReshardOperationPasswordURL(id int64, url string) 
 	return nil
 }
 
+func (f *fakeReshardStore) SetReshardOperationRunnerImage(id int64, image string) error {
+	f.ops[id].RunnerImage = image
+	return nil
+}
+
 func (f *fakeReshardStore) GetReshardOperation(id int64) (*configstore.ReshardOperation, error) {
 	op, ok := f.ops[id]
 	if !ok {
@@ -151,6 +156,10 @@ type fakeSpawner struct {
 	spawned  []configstore.ReshardOperation
 	spawnErr error
 	noURL    bool // PasswordURLForOp returns "" (pod IP undeterminable)
+}
+
+func (f *fakeSpawner) RunnerImage(context.Context) (string, error) {
+	return "example/duckgres:pinned", nil
 }
 
 func (f *fakeSpawner) SpawnReshardPod(_ context.Context, op *configstore.ReshardOperation) error {

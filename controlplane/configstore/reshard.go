@@ -80,6 +80,7 @@ type ReshardOperation struct {
 	RunnerCP        string     `gorm:"size:255;not null;default:''" json:"runner_cp"`
 	RunnerEpoch     int64      `gorm:"not null;default:0" json:"runner_epoch"`
 	RespawnAttempts int64      `gorm:"not null;default:0" json:"respawn_attempts"`
+	RunnerImage     string     `gorm:"size:1024;not null;default:''" json:"runner_image"`
 	HeartbeatAt     *time.Time `json:"heartbeat_at"`
 
 	// Maintenance-mode window: warehouse state resharding from block to
@@ -175,6 +176,19 @@ func (cs *ConfigStore) SetReshardOperationPasswordURL(id int64, url string) erro
 	}
 	if res.RowsAffected == 0 {
 		return fmt.Errorf("set reshard password url: operation %d is not pending", id)
+	}
+	return nil
+}
+
+func (cs *ConfigStore) SetReshardOperationRunnerImage(id int64, image string) error {
+	res := cs.db.Model(&ReshardOperation{}).
+		Where("id = ? AND state = ?", id, ReshardStatePending).
+		Update("runner_image", image)
+	if res.Error != nil {
+		return fmt.Errorf("set reshard runner image: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("set reshard runner image: operation %d is not pending", id)
 	}
 	return nil
 }

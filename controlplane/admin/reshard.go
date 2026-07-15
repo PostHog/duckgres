@@ -39,6 +39,7 @@ import (
 type ReshardStore interface {
 	CreateReshardOperation(op *configstore.ReshardOperation) error
 	SetReshardOperationPasswordURL(id int64, url string) error
+	SetReshardOperationRunnerImage(id int64, image string) error
 	GetReshardOperation(id int64) (*configstore.ReshardOperation, error)
 	ListReshardOperationsForOrg(orgID string, limit int) ([]configstore.ReshardOperation, error)
 	ListReshardOperations(limit int) ([]configstore.ReshardOperation, error)
@@ -55,6 +56,7 @@ type ReshardStore interface {
 // has no kubernetes API — starting a reshard is then refused (nothing would
 // ever execute it).
 type ReshardPodSpawner interface {
+	RunnerImage(ctx context.Context) (string, error)
 	// SpawnReshardPod creates the duckgres-reshard-op-<id> pod (no wait for
 	// readiness; the pod claims the op row itself).
 	SpawnReshardPod(ctx context.Context, op *configstore.ReshardOperation) error
@@ -465,6 +467,18 @@ func (h *reshardHandler) start(c *gin.Context) {
 		op.PasswordURL = url
 		h.stash.put(op.ID, req.Target.Password)
 	}
+	image, err := h.spawner.RunnerImage(c.Request.Context())
+	if err != nil || image == "" {
+		_, _ = h.store.FinishPendingReshardOperation(op.ID, configstore.ReshardStateFailed, "resolving the reshard runner image failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "resolving the reshard runner image failed"})
+		return
+	}
+	if err := h.store.SetReshardOperationRunnerImage(op.ID, image); err != nil {
+		_, _ = h.store.FinishPendingReshardOperation(op.ID, configstore.ReshardStateFailed, "recording the reshard runner image failed: "+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "recording the reshard runner image failed: " + err.Error()})
+		return
+	}
+	op.RunnerImage = image
 
 	if err := h.spawner.SpawnReshardPod(c.Request.Context(), op); err != nil {
 		h.stash.delete(op.ID)
