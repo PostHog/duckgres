@@ -199,6 +199,22 @@ func (p *fakeProber) Probe(_ context.Context, endpoint, user, database, password
 	return p.err
 }
 
+// defaultShardLister matches the default fake warehouse: a cnpg-shard org
+// living on shard-001 per its duckling STATUS.
+func defaultShardLister() DucklingMetadataLister {
+	return fakeShardLister{stores: map[string]DucklingMetadataStore{
+		"acme": {Kind: "cnpg-shard", Endpoint: "shard-001-pooler.cnpg-shards.svc.cluster.local"},
+	}}
+}
+
+// externalShardLister models an org whose duckling STATUS says the catalog
+// lives on an external RDS.
+func externalShardLister(endpoint string) DucklingMetadataLister {
+	return fakeShardLister{stores: map[string]DucklingMetadataStore{
+		"acme": {Kind: "external", Endpoint: endpoint},
+	}}
+}
+
 func reshardRouter(store *fakeReshardStore) *gin.Engine {
 	r, _ := reshardRouterFull(store, nil, nil)
 	return r
@@ -209,14 +225,21 @@ func reshardRouterWithCluster(store *fakeReshardStore, cluster kubernetes.Interf
 	return r
 }
 
+// reshardRouterLister registers the API with a specific duckling lister (nil
+// allowed — the degraded no-duckling-client path).
+func reshardRouterLister(store *fakeReshardStore, lister DucklingMetadataLister) *gin.Engine {
+	r, _ := reshardRouterSpawner(store, nil, nil, &fakeSpawner{}, "internal-secret", lister)
+	return r
+}
+
 // reshardRouterFull registers the API with a fakeSpawner and an
 // internal-secret identity on every request (the password endpoint gates on
 // it; production wiring runs AuthMiddleware in front).
 func reshardRouterFull(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber) (*gin.Engine, *fakeSpawner) {
-	return reshardRouterSpawner(store, cluster, prober, &fakeSpawner{}, "internal-secret")
+	return reshardRouterSpawner(store, cluster, prober, &fakeSpawner{}, "internal-secret", defaultShardLister())
 }
 
-func reshardRouterSpawner(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber, spawner ReshardPodSpawner, identitySource string) (*gin.Engine, *fakeSpawner) {
+func reshardRouterSpawner(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber, spawner ReshardPodSpawner, identitySource string, lister DucklingMetadataLister) (*gin.Engine, *fakeSpawner) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(func(c *gin.Context) {
@@ -229,9 +252,6 @@ func reshardRouterSpawner(store *fakeReshardStore, cluster kubernetes.Interface,
 		}
 		c.Next()
 	})
-	lister := fakeShardLister{stores: map[string]DucklingMetadataStore{
-		"acme": {Kind: "cnpg-shard", Endpoint: "shard-001-pooler.cnpg-shards.svc.cluster.local"},
-	}}
 	RegisterReshardAPI(r.Group("/api/v1"), store, lister, spawner, cluster, prober)
 	fs, _ := spawner.(*fakeSpawner)
 	return r, fs
@@ -281,37 +301,47 @@ func TestReshardStartCnpg(t *testing.T) {
 // active-op conflict.
 func TestReshardStartValidation(t *testing.T) {
 	cases := []struct {
-		name string
-		prep func(*fakeReshardStore)
-		body string
-		want int
+		name   string
+		prep   func(*fakeReshardStore)
+		lister DucklingMetadataLister // nil = defaultShardLister()
+		body   string
+		want   int
 	}{
-		{"same shard", nil, `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"}}`, 400},
-		{"bad shard name", nil, `{"target":{"type":"cnpg-shard","cnpg_shard":"Shard_002"}}`, 400},
-		{"bad target type", nil, `{"target":{"type":"nonsense"}}`, 400},
-		{"missing ext fields", nil, `{"target":{"type":"external","endpoint":"x"}}`, 400},
-		{"missing ext password", nil, `{"target":{"type":"external","endpoint":"x","password_aws_secret":"s"}}`, 400},
+		{name: "same shard", body: `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"}}`, want: 400},
+		{name: "bad shard name", body: `{"target":{"type":"cnpg-shard","cnpg_shard":"Shard_002"}}`, want: 400},
+		{name: "bad target type", body: `{"target":{"type":"nonsense"}}`, want: 400},
+		{name: "missing ext fields", body: `{"target":{"type":"external","endpoint":"x"}}`, want: 400},
+		{name: "missing ext password", body: `{"target":{"type":"external","endpoint":"x","password_aws_secret":"s"}}`, want: 400},
 		// RDS-managed master secrets are outside every env's ESO IAM policy
 		// (posthog-*/duckling-* prefixes only) — the cutover would hang on an
 		// ESO AccessDenied, so the start handler rejects them up front.
-		{"rds slash master secret", nil, `{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds/duckling-example/master","password":"p"}}`, 400},
-		{"rds bang managed secret", nil, `{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds!db-1234-abcd","password":"p"}}`, 400},
-		{"not ready", func(f *fakeReshardStore) {
+		{name: "rds slash master secret", body: `{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds/duckling-example/master","password":"p"}}`, want: 400},
+		{name: "rds bang managed secret", body: `{"target":{"type":"external","endpoint":"x","password_aws_secret":"rds!db-1234-abcd","password":"p"}}`, want: 400},
+		{name: "not ready", prep: func(f *fakeReshardStore) {
 			f.warehouse.State = configstore.ManagedWarehouseStateProvisioning
-		}, `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`, 409},
-		{"active op conflict", func(f *fakeReshardStore) {
+		}, body: `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`, want: 409},
+		{name: "active op conflict", prep: func(f *fakeReshardStore) {
 			f.createErr = configstore.ErrReshardConflict
-		}, `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`, 409},
-		{"ext to ext", func(f *fakeReshardStore) {
+		}, body: `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`, want: 409},
+		// A genuinely-external org (row + duckling status agree) may not
+		// reshard to another external store.
+		{name: "ext to ext", prep: func(f *fakeReshardStore) {
 			f.warehouse.MetadataStore.Kind = configstore.MetadataStoreKindExternal
-		}, `{"target":{"type":"external","endpoint":"x","password_aws_secret":"s","password":"p"}}`, 400},
+			f.warehouse.MetadataStore.Endpoint = "src.rds.example.com"
+			f.warehouse.MetadataStore.PasswordAWSSecret = "duckling-src-secret"
+		}, lister: externalShardLister("src.rds.example.com"),
+			body: `{"target":{"type":"external","endpoint":"x","password_aws_secret":"s","password":"p"}}`, want: 400},
 	}
 	for _, tc := range cases {
 		store := newFakeReshardStore()
 		if tc.prep != nil {
 			tc.prep(store)
 		}
-		w := doJSON(reshardRouter(store), http.MethodPost, "/api/v1/orgs/acme/reshard", tc.body)
+		lister := tc.lister
+		if lister == nil {
+			lister = defaultShardLister()
+		}
+		w := doJSON(reshardRouterLister(store, lister), http.MethodPost, "/api/v1/orgs/acme/reshard", tc.body)
 		if w.Code != tc.want {
 			t.Errorf("%s: status = %d body %s, want %d", tc.name, w.Code, w.Body.String(), tc.want)
 		}
@@ -323,6 +353,104 @@ func TestReshardStartValidation(t *testing.T) {
 		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("unknown org status = %d, want 404", w.Code)
+	}
+}
+
+// TestReshardStartSourceIdentityValidation pins the submit-time source-identity
+// guard: the duckling STATUS is authoritative for where the catalog actually
+// lives, and the start handler refuses (400, no op created) when that identity
+// is incomplete or contradicted by the config-store row. Regression for a prod
+// incident: an org whose config-store metadata block was EMPTY (defaulted to
+// cnpg-shard) while its duckling status pointed at an external RDS got a
+// cnpg→cnpg op with an empty from_shard — the flip-before-copy re-pointed the
+// org at a fresh empty catalog and the rollback patch (empty shard) was
+// rejected by the XRD.
+func TestReshardStartSourceIdentityValidation(t *testing.T) {
+	cnpgTarget := `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`
+	emptyLister := fakeShardLister{stores: map[string]DucklingMetadataStore{}}
+
+	cases := []struct {
+		name       string
+		prep       func(*fakeReshardStore)
+		lister     DucklingMetadataLister
+		body       string
+		wantCode   int
+		wantSubstr string
+	}{
+		// cnpg source whose current shard cannot be resolved → the op would
+		// record an empty from_shard, which cannot roll back. Refused.
+		{name: "cnpg source, shard unresolvable (no CR status)", lister: emptyLister,
+			body: cnpgTarget, wantCode: 400, wantSubstr: "identity is incomplete"},
+		{name: "cnpg source, no duckling lister", lister: nil,
+			body: cnpgTarget, wantCode: 400, wantSubstr: "identity is incomplete"},
+		// Row has no kind at all AND no status to fall back on.
+		{name: "empty row kind and no status", prep: func(f *fakeReshardStore) {
+			f.warehouse.MetadataStore.Kind = ""
+		}, lister: emptyLister, body: cnpgTarget, wantCode: 400, wantSubstr: "identity is incomplete"},
+		// Type drift between row and status — both directions.
+		{name: "row cnpg, status external (drift)", lister: externalShardLister("real.rds.example.com"),
+			body: cnpgTarget, wantCode: 400, wantSubstr: "identity drift"},
+		{name: "row external, status cnpg (drift)", prep: func(f *fakeReshardStore) {
+			f.warehouse.MetadataStore.Kind = configstore.MetadataStoreKindExternal
+			f.warehouse.MetadataStore.Endpoint = "real.rds.example.com"
+			f.warehouse.MetadataStore.PasswordAWSSecret = "duckling-src-secret"
+		}, lister: defaultShardLister(), body: cnpgTarget, wantCode: 400, wantSubstr: "identity drift"},
+		// The incident shape: EMPTY row metadata block, status says external.
+		// The source is external per the status, but the row block a rollback
+		// would need (endpoint + password secret) is missing. Refused.
+		{name: "incident: empty row block, external status", prep: func(f *fakeReshardStore) {
+			f.warehouse.MetadataStore.Kind = ""
+		}, lister: externalShardLister("real.rds.example.com"),
+			body: cnpgTarget, wantCode: 400, wantSubstr: "external block is missing"},
+		// Happy: legacy empty row kind on a cnpg org — status resolves it.
+		{name: "empty row kind, cnpg status resolves", prep: func(f *fakeReshardStore) {
+			f.warehouse.MetadataStore.Kind = ""
+		}, lister: defaultShardLister(), body: cnpgTarget, wantCode: 202},
+		// Happy: external source with row + status in agreement.
+		{name: "external source consistent", prep: func(f *fakeReshardStore) {
+			f.warehouse.MetadataStore.Kind = configstore.MetadataStoreKindExternal
+			f.warehouse.MetadataStore.Endpoint = "real.rds.example.com"
+			f.warehouse.MetadataStore.PasswordAWSSecret = "duckling-src-secret"
+		}, lister: externalShardLister("real.rds.example.com"), body: cnpgTarget, wantCode: 202},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeReshardStore()
+			if tc.prep != nil {
+				tc.prep(store)
+			}
+			w := doJSON(reshardRouterLister(store, tc.lister), http.MethodPost, "/api/v1/orgs/acme/reshard", tc.body)
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d body %s, want %d", w.Code, w.Body.String(), tc.wantCode)
+			}
+			if tc.wantSubstr != "" && !strings.Contains(w.Body.String(), tc.wantSubstr) {
+				t.Fatalf("body %s, want substring %q", w.Body.String(), tc.wantSubstr)
+			}
+			if tc.wantCode != http.StatusAccepted && len(store.ops) != 0 {
+				t.Fatalf("op created despite rejection (%d ops)", len(store.ops))
+			}
+		})
+	}
+
+	// The source side of a created op is recorded from the duckling STATUS:
+	// an external source keeps from_shard empty and carries the row's external
+	// block; a cnpg source records the status-derived shard (pinned by
+	// TestReshardStartCnpg).
+	store := newFakeReshardStore()
+	store.warehouse.MetadataStore.Kind = configstore.MetadataStoreKindExternal
+	store.warehouse.MetadataStore.Endpoint = "real.rds.example.com"
+	store.warehouse.MetadataStore.Username = "postgres"
+	store.warehouse.MetadataStore.DatabaseName = "postgres"
+	store.warehouse.MetadataStore.PasswordAWSSecret = "duckling-src-secret"
+	w := doJSON(reshardRouterLister(store, externalShardLister("real.rds.example.com")),
+		http.MethodPost, "/api/v1/orgs/acme/reshard", cnpgTarget)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("ext→cnpg start: status = %d body %s, want 202", w.Code, w.Body.String())
+	}
+	op := store.ops[1]
+	if op.SourceKind != configstore.MetadataStoreKindExternal || op.FromShard != "" ||
+		op.SourceEndpoint != "real.rds.example.com" || op.SourcePasswordSecret != "duckling-src-secret" {
+		t.Fatalf("op source identity = %+v", op)
 	}
 }
 
@@ -500,7 +628,7 @@ func TestReshardPasswordEndpoint(t *testing.T) {
 
 	// An SSO admin identity is refused — internal secret ONLY.
 	ssoStore := newFakeReshardStore()
-	ssoR, _ := reshardRouterSpawner(ssoStore, nil, nil, &fakeSpawner{}, "sso")
+	ssoR, _ := reshardRouterSpawner(ssoStore, nil, nil, &fakeSpawner{}, "sso", defaultShardLister())
 	if w := doJSON(ssoR, http.MethodPost, "/api/v1/orgs/acme/reshard", start); w.Code != http.StatusAccepted {
 		t.Fatalf("sso start: %d", w.Code)
 	}
@@ -529,7 +657,7 @@ func TestReshardPasswordEndpoint(t *testing.T) {
 func TestReshardStartSpawnFailure(t *testing.T) {
 	// Spawn error → 502, op failed.
 	store := newFakeReshardStore()
-	r, _ := reshardRouterSpawner(store, nil, nil, &fakeSpawner{spawnErr: errors.New("pods is forbidden")}, "internal-secret")
+	r, _ := reshardRouterSpawner(store, nil, nil, &fakeSpawner{spawnErr: errors.New("pods is forbidden")}, "internal-secret", defaultShardLister())
 	w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`)
 	if w.Code != http.StatusBadGateway {
@@ -542,7 +670,7 @@ func TestReshardStartSpawnFailure(t *testing.T) {
 	// Ext target + no self pod IP → 500, op failed, no spawn attempted.
 	store = newFakeReshardStore()
 	sp := &fakeSpawner{noURL: true}
-	r, _ = reshardRouterSpawner(store, nil, nil, sp, "internal-secret")
+	r, _ = reshardRouterSpawner(store, nil, nil, sp, "internal-secret", defaultShardLister())
 	w = doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"duckling-x","password":"p"}}`)
 	if w.Code != http.StatusInternalServerError {
@@ -554,7 +682,7 @@ func TestReshardStartSpawnFailure(t *testing.T) {
 
 	// Nil spawner → 503, nothing created.
 	store = newFakeReshardStore()
-	r, _ = reshardRouterSpawner(store, nil, nil, nil, "internal-secret")
+	r, _ = reshardRouterSpawner(store, nil, nil, nil, "internal-secret", defaultShardLister())
 	w = doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`)
 	if w.Code != http.StatusServiceUnavailable {

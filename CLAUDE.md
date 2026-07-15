@@ -634,9 +634,36 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   (`postgresql-client-18`, PGDG repo, in BOTH `Dockerfile` and
   `Dockerfile.controlplane`). Full design + restore procedure:
   `docs/design/resharding.md`.
+- **Source identity: the duckling STATUS is authoritative, validated at
+  submit.** The start handler derives source_kind/from_shard/the external
+  source block from the duckling STATUS (where the catalog actually lives) and
+  400s an op whose identity is incomplete or contradicts the config-store row
+  (kind drift, cnpg source with unresolvable shard, external source with an
+  incomplete row block). The runner re-checks at recordSource (pre-flip).
+  Never re-introduce the old "empty row kind defaults to cnpg-shard" fallback
+  — it pointed a flip-before-copy reshard at a phantom cnpg source while the
+  org lived on an external RDS (prod incident: org re-pointed onto an empty
+  catalog, rollback patch rejected).
 - **Rollback patches the source shard VALUE back — never removes the key**
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
+  **Never emit a patch the XRD would reject**: an empty/invalid recorded
+  from_shard (`isValidCnpgShardName`, mirrors the XRD pattern) or an
+  incomplete external source block skips the flip-back/adopt patch, logs
+  ERROR operator instructions, and **intentionally leaves the warehouse
+  blocked in `resharding`** — unblocking onto the wrong store is worse than a
+  blocked org (see docs/design/resharding.md's never-stranded carve-out).
+  Takeover/endpoint reconstructions derive sslmode from the metadata-store
+  KIND via `sslModeFor` (cnpg → disable, external → require) — never
+  hardcode an sslmode.
+- **The compaction pause must never let XRD defaulting disable DuckLake**:
+  `SetCompactionEnabled` pins the org's effective `spec.ducklake.enabled`
+  (legacy type coupling, as the activator derives it) into the patch when the
+  CR has no `spec.ducklake` object — otherwise materializing the object gets
+  `enabled: false` stamped by the XRD default and every later activation
+  fails ("tenant activation requires a ducklake metadata_store"). The pinned
+  value is never removed afterwards (deliberate — see
+  `TestSetCompactionEnabledPinsDuckLakeEnablement`).
 - **The ext target password is ephemeral**: request → creating replica's
   in-memory stash → one-shot pull by the runner pod → runner memory; never in
   the op row, log, audit, k8s Secret, or any pod spec. The runner pod fetches
@@ -690,6 +717,7 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   marked the op `cancelled` while leaving the warehouse blocked.
 - Touching any of this → update `tests/configstore/reshard_postgres_test.go`,
   `provisioner/reshard_runner_test.go` (incl. the `TestReshardBackup*` cases),
+  `provisioner/k8s_client_test.go` (the compaction/ducklake-pin cases),
   `admin/reshard_test.go`, `controlplane/reshard_pod_test.go` +
   `reshard_reconciler_test.go` + `reshard_runner_mode_test.go`, the
   migration asserts in `tests/configstore/migrations_postgres_test.go`, the

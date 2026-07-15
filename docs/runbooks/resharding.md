@@ -40,5 +40,16 @@ the catalog fingerprint/table set is complete. Only then restore warehouse
 readiness. For a damaged catalog, use the `pg_restore` command recorded beside
 `backup_s3_uri` in the operation log.
 
+One blocked shape is deliberate: when the op's recorded source identity was
+unusable (empty/invalid `from_shard`, or an external source block without
+endpoint/password secret), rollback refuses to emit the flip-back patch — the
+XRD would reject it — and leaves the warehouse blocked with an ERROR carrying
+the manual steps. The duckling then still points at the WRONG (target) store.
+Determine where the catalog actually lives (duckling status history, the
+pre-flip `backup_s3_uri`), patch `spec.metadataStore` to it, verify a client
+can activate against the real catalog, and only then set the warehouse state
+back to `ready`. Never unblock first — clients would activate against the
+wrong (likely empty) catalog.
+
 Never delete or recreate a retained cnpg database until the operation log shows
 that the external target passed content fingerprint verification.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,36 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
+
+// cnpgShardNamePattern mirrors the Duckling XRD's spec.metadataStore.cnpgShard
+// validation (charts repo: pattern ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, max 63
+// chars). The API server REJECTS a patch whose shard value violates it —
+// including the empty string — so a rollback must never emit such a patch: the
+// refused patch would leave the duckling pointing at the WRONG (target) store.
+// A prod incident did exactly that: an op created with an empty from_shard
+// rolled back into a rejected patch and the org was left activated against a
+// freshly created empty catalog.
+var cnpgShardNamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// isValidCnpgShardName reports whether s would pass the XRD's cnpgShard
+// admission validation.
+func isValidCnpgShardName(s string) bool {
+	return s != "" && len(s) <= 63 && cnpgShardNamePattern.MatchString(s)
+}
+
+// sslModeFor derives the sslmode a metadata store of the given kind requires,
+// exactly like recordSource: cnpg poolers are in-cluster plaintext
+// ("disable"); external stores are RDS, which requires TLS ("require" — a
+// plaintext attempt fails pg_hba with "no encryption"). Every CatalogEndpoint
+// (re)construction MUST derive its sslmode through this helper instead of
+// hardcoding one: a takeover-resume path that hardcoded "disable" broke
+// against an external source in production.
+func sslModeFor(kind string) string {
+	if kind == configstore.MetadataStoreKindExternal {
+		return "require"
+	}
+	return "disable"
+}
 
 // ReshardRunner drives reshard operations (see docs/design/resharding.md and
 // configstore/reshard.go). It runs inside a DEDICATED per-operation pod
@@ -586,14 +617,7 @@ func (o *opRun) resumeTakeover(ctx context.Context) error {
 		if o.op.SourceEndpoint == "" || o.op.SourceUser == "" || o.op.SourceDatabase == "" {
 			return fmt.Errorf("takeover at step %q has incomplete durable source identity", o.op.Step)
 		}
-		o.source = CatalogEndpoint{
-			Host: o.op.SourceEndpoint, Port: 5432, User: o.op.SourceUser,
-			Password: st.MetadataStore.Password, Database: o.op.SourceDatabase, SSLMode: "disable",
-		}
-		o.target = CatalogEndpoint{
-			Host: st.MetadataStore.Endpoint, Port: 5432, User: st.MetadataStore.User,
-			Password: st.MetadataStore.Password, Database: st.MetadataStore.Database, SSLMode: "disable",
-		}
+		o.source, o.target = takeoverEndpoints(o.op, st)
 		if err := o.copyCatalog(ctx); err != nil {
 			return err
 		}
@@ -612,6 +636,30 @@ func (o *opRun) resumeTakeover(ctx context.Context) error {
 	default:
 		return fmt.Errorf("takeover at step %q cannot be resumed safely; rolling back from durable progress", o.op.Step)
 	}
+}
+
+// takeoverEndpoints reconstructs the copy endpoints for a takeover resume from
+// the durable op row (source identity) plus the live duckling status (target +
+// the pinned tenant password, which a cnpg shard change preserves). Each
+// side's sslmode is derived from its metadata-store KIND via sslModeFor —
+// NEVER hardcoded: a reconstruction that hardcoded "disable" was probed
+// against an external RDS source in production and failed pg_hba with
+// "no encryption". Today resumeTakeover only reaches this for cnpg→cnpg ops
+// (other directions fail into the conservative rollback), but the derivation
+// must stay kind-correct so relaxing that guard — or a drifted op row — can
+// never reintroduce the wrong sslmode.
+func takeoverEndpoints(op *configstore.ReshardOperation, st *DucklingStatus) (source, target CatalogEndpoint) {
+	source = CatalogEndpoint{
+		Host: op.SourceEndpoint, Port: 5432, User: op.SourceUser,
+		Password: st.MetadataStore.Password, Database: op.SourceDatabase,
+		SSLMode: sslModeFor(op.SourceKind),
+	}
+	target = CatalogEndpoint{
+		Host: st.MetadataStore.Endpoint, Port: 5432, User: st.MetadataStore.User,
+		Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
+		SSLMode: sslModeFor(op.TargetKind),
+	}
+	return source, target
 }
 
 // ---- steps ----------------------------------------------------------------
@@ -786,6 +834,15 @@ func (o *opRun) recordSource(ctx context.Context) error {
 	if ms.Endpoint == "" || ms.User == "" || ms.Database == "" {
 		return fmt.Errorf("duckling status has incomplete metadata-store info (endpoint %q user %q database %q)", ms.Endpoint, ms.User, ms.Database)
 	}
+	// Defense in depth behind the admin start handler's submit-time check: the
+	// duckling STATUS is authoritative for where the catalog actually lives.
+	// An op whose recorded source kind contradicts it (a drifted config-store
+	// row, an op created by an older CP, or a hand-inserted row) would treat
+	// e.g. an external RDS as a cnpg source — the incident that flipped an org
+	// onto an empty catalog. Refuse pre-flip: rollback from here is clean.
+	if ms.Type != "" && ms.Type != o.op.SourceKind {
+		return fmt.Errorf("metadata-store identity drift: the duckling status says the catalog lives on %q (endpoint %q) but the operation recorded source kind %q — refusing to proceed; reconcile the config-store warehouse row and the duckling spec/status, then re-run the reshard", ms.Type, ms.Endpoint, o.op.SourceKind)
+	}
 
 	switch o.op.SourceKind {
 	case configstore.MetadataStoreKindCnpgShard:
@@ -794,7 +851,7 @@ func (o *opRun) recordSource(ctx context.Context) error {
 		o.source = CatalogEndpoint{
 			Host: ms.Endpoint, Port: 5432,
 			User: ms.User, Password: ms.Password, Database: ms.Database,
-			SSLMode: "disable",
+			SSLMode: sslModeFor(o.op.SourceKind),
 		}
 	case configstore.MetadataStoreKindExternal:
 		// Post-flip the composition deletes the ESO sync + pgbouncer, so the
@@ -804,7 +861,7 @@ func (o *opRun) recordSource(ctx context.Context) error {
 		o.source = CatalogEndpoint{
 			Host: ms.Endpoint, Port: 5432,
 			User: ms.User, Password: ms.Password, Database: ms.Database,
-			SSLMode: "require",
+			SSLMode: sslModeFor(o.op.SourceKind),
 		}
 		o.r.extPasswords.Store(o.op.ID, ms.Password)
 	default:
@@ -948,7 +1005,7 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 			o.target = CatalogEndpoint{
 				Host: st.MetadataStore.Endpoint, Port: 5432,
 				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
-				SSLMode: "disable",
+				SSLMode: sslModeFor(o.op.TargetKind),
 			}
 			probeErr := o.r.copier.Probe(ctx, o.target)
 			if probeErr == nil {
@@ -1169,7 +1226,7 @@ func (o *opRun) copyCatalog(ctx context.Context) error {
 			User:     orDefault(o.op.TargetUser, "postgres"),
 			Password: pw.(string),
 			Database: orDefault(o.op.TargetDatabase, "postgres"),
-			SSLMode:  "require",
+			SSLMode:  sslModeFor(o.op.TargetKind),
 		}
 	}
 	if o.op.SourceKind == configstore.MetadataStoreKindExternal && o.source.Password == "" {
@@ -1331,6 +1388,18 @@ func (o *opRun) rollback(ctx context.Context) {
 			// Patch the source shard VALUE back — never remove the key: the
 			// precedence chain would fall through to the freshly-stamped
 			// (bogus) status pin.
+			if !isValidCnpgShardName(o.op.FromShard) {
+				// NEVER emit a patch the XRD would reject (empty/malformed
+				// shard): the refused patch would burn the one rollback
+				// attempt and mislead the log. The duckling stays pointing at
+				// the WRONG (target) store, so the org must stay blocked —
+				// recovered=false below intentionally leaves the warehouse in
+				// resharding. Leave the half-copied target untouched too, for
+				// forensics.
+				o.logf("error", "rollback CANNOT re-point the duckling at the source shard: recorded from_shard %q is empty or not a valid cnpg shard name (XRD pattern %s) — the org's source identity was incomplete when this operation was created. Duckling %s still points at %s, which does NOT hold the org's catalog. Operator action: determine where the catalog actually lives (check the duckling STATUS history / the pre-flip backup URI on this op), patch spec.metadataStore on the duckling to point at it, verify a client can activate against the real catalog, and only then set the warehouse state back to ready. The warehouse is intentionally left in the resharding state so clients cannot activate against the wrong (likely empty) catalog", o.op.FromShard, cnpgShardNamePattern, o.op.DucklingName, o.op.ToShard)
+				recovered = false
+				break
+			}
 			o.logf("warn", "rolling back: re-pointing duckling at source shard %s", o.op.FromShard)
 			if err := o.r.duckling.SetMetadataStoreCnpg(ctx, o.op.DucklingName, o.op.FromShard); err != nil {
 				o.logf("error", "rollback flip failed: %v — duckling still points at %s; fix manually", err, o.op.ToShard)
@@ -1340,6 +1409,14 @@ func (o *opRun) rollback(ctx context.Context) {
 		case o.op.TargetKind == configstore.MetadataStoreKindCnpgShard && o.op.SourceKind == configstore.MetadataStoreKindExternal:
 			// ext→cnpg rollback: back to external; cnpgShard must be removed
 			// (CEL forbids it on the external type).
+			if o.op.SourceEndpoint == "" || o.op.SourcePasswordSecret == "" {
+				// Same never-emit-an-invalid-patch guard as the cnpg case: an
+				// external spec without endpoint/password secret would be
+				// rejected (or worse, rendered broken). Leave the org blocked.
+				o.logf("error", "rollback CANNOT re-point the duckling at the external source: recorded source endpoint %q / password secret %q are incomplete — refusing to emit an invalid external metadata-store patch. Duckling %s still points at cnpg %s, which does NOT hold the org's catalog. Operator action: determine the org's real external metadata store (endpoint, user, database, SM password secret), patch spec.metadataStore on the duckling to it, verify a client can activate against the real catalog, and only then set the warehouse state back to ready. The warehouse is intentionally left in the resharding state so clients cannot activate against the wrong catalog", o.op.SourceEndpoint, o.op.SourcePasswordSecret, o.op.DucklingName, o.op.ToShard)
+				recovered = false
+				break
+			}
 			o.logf("warn", "rolling back: re-pointing duckling at external source %s", o.op.SourceEndpoint)
 			if err := o.r.duckling.SetMetadataStoreExternal(ctx, o.op.DucklingName, ExternalMetadataStoreSpec{
 				Endpoint:          o.op.SourceEndpoint,
@@ -1416,6 +1493,12 @@ func (o *opRun) dropPartialTarget(ctx context.Context) {
 // No empty-recreate, no copy-back — the catalog never left the source. This is
 // the whole point of the orphan-adopt escape hatch.
 func (o *opRun) recoverFromExternal(ctx context.Context) bool {
+	if !isValidCnpgShardName(o.op.FromShard) {
+		// Same guard as the rollback flip-backs: never emit an adopt patch the
+		// XRD would reject (empty/malformed shard).
+		o.logf("error", "recovery CANNOT flip back and re-adopt the cnpg source: recorded from_shard %q is empty or not a valid cnpg shard name (XRD pattern %s) — the org's source identity was incomplete when this operation was created. Duckling %s still points at external %s. The orphaned cnpg role/DB survive on the source shard and can be re-adopted manually (patch spec.metadataStore to {type: cnpg-shard, cnpgShard: <real shard>, retainCnpgOnFlip: false}); verify a client can activate against the real catalog, then set the warehouse state back to ready. The warehouse is intentionally left in the resharding state so clients cannot activate against the wrong catalog", o.op.FromShard, cnpgShardNamePattern, o.op.DucklingName, o.op.TargetEndpoint)
+		return false
+	}
 	o.logf("warn", "cnpg→external cutover failed AFTER the flip — the cnpg source role/DB were RETAINED (orphaned), not deleted; recovering by flipping back to shard %s and re-adopting them (no data copy)", o.op.FromShard)
 
 	if err := o.r.duckling.SetMetadataStoreCnpgAdopt(ctx, o.op.DucklingName, o.op.FromShard); err != nil {
@@ -1455,7 +1538,9 @@ func (o *opRun) recoverFromExternal(ctx context.Context) bool {
 			restored := CatalogEndpoint{
 				Host: st.MetadataStore.Endpoint, Port: 5432,
 				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
-				SSLMode: "disable",
+				// The flip-back re-adopts the cnpg source (this recovery only
+				// runs for cnpg→ext ops), so the probe goes via the pooler.
+				SSLMode: sslModeFor(o.op.SourceKind),
 			}
 			probeErr := o.r.copier.Probe(ctx, restored)
 			if probeErr == nil {
