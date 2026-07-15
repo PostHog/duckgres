@@ -37,6 +37,11 @@ type fakeReshardStore struct {
 
 	logs  []string
 	steps []string
+
+	heartbeatErrs      []error
+	heartbeatIdx       int
+	heartbeatCalls     int
+	failUnblockedWrite bool
 }
 
 func newFakeReshardStore(op *configstore.ReshardOperation) *fakeReshardStore {
@@ -86,6 +91,9 @@ func (f *fakeReshardStore) UpdateReshardStep(_ int64, _ string, _ int64, step st
 func (f *fakeReshardStore) UpdateReshardFields(_ int64, _ string, _ int64, updates map[string]interface{}) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, ok := updates["unblocked_at"]; ok && f.failUnblockedWrite {
+		return errors.New("persist unblocked_at failed")
+	}
 	if v, ok := updates["blocked_at"].(time.Time); ok {
 		f.op.BlockedAt = &v
 	}
@@ -119,13 +127,41 @@ func (f *fakeReshardStore) UpdateReshardFields(_ int64, _ string, _ int64, updat
 	return nil
 }
 
-func (f *fakeReshardStore) TouchReshardHeartbeat(int64, string, int64) error { return nil }
+func (f *fakeReshardStore) TouchReshardHeartbeat(int64, string, int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heartbeatCalls++
+	if f.heartbeatIdx >= len(f.heartbeatErrs) {
+		return nil
+	}
+	err := f.heartbeatErrs[f.heartbeatIdx]
+	f.heartbeatIdx++
+	return err
+}
 
 func (f *fakeReshardStore) FinishReshardOperation(_ int64, _ string, _ int64, state configstore.ReshardState, errMsg string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.op.State = state
 	f.op.Error = errMsg
+	return nil
+}
+
+func (f *fakeReshardStore) FinalizeReshardOperation(_ int64, _ string, _ int64, _ string, updates map[string]interface{}, unblockedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failUnblockedWrite {
+		return errors.New("persist finalization failed")
+	}
+	if f.warehouseState != configstore.ManagedWarehouseStateResharding {
+		return configstore.ErrWarehouseStateMismatch
+	}
+	if state, ok := updates["state"].(configstore.ManagedWarehouseProvisioningState); ok {
+		f.warehouseState = state
+	}
+	f.warehouseUpds = append(f.warehouseUpds, updates)
+	f.op.State = configstore.ReshardStateSucceeded
+	f.op.UnblockedAt = &unblockedAt
 	return nil
 }
 
@@ -380,7 +416,37 @@ type fakeCopier struct {
 	// externalCounts is what SnapshotCounts returns for the EXTERNAL target
 	// verify (sslmode==require, cnpg→ext verifyExternalCatalog); defaults to
 	// copyResult.PerTableRows (complete target).
-	externalCounts map[string]int64
+	externalCounts       map[string]int64
+	fingerprintsAfter    map[string]CatalogTableFingerprint
+	externalFingerprints map[string]CatalogTableFingerprint
+}
+
+type blockingCopier struct {
+	*fakeCopier
+	started  chan struct{}
+	released chan struct{}
+	canceled chan struct{}
+}
+
+func newBlockingCopier() *blockingCopier {
+	return &blockingCopier{
+		fakeCopier: &fakeCopier{},
+		started:    make(chan struct{}),
+		released:   make(chan struct{}),
+		canceled:   make(chan struct{}),
+	}
+}
+
+func (f *blockingCopier) Copy(ctx context.Context, source, target CatalogEndpoint, log func(string, string)) (CatalogCopyResult, error) {
+	f.record(copierCall{kind: "copy", source: source, target: target})
+	close(f.started)
+	select {
+	case <-ctx.Done():
+		close(f.canceled)
+		return CatalogCopyResult{}, ctx.Err()
+	case <-f.released:
+		return CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}, nil
+	}
 }
 
 func (f *fakeCopier) record(c copierCall) {
@@ -423,6 +489,16 @@ func (f *fakeCopier) SnapshotCounts(_ context.Context, ep CatalogEndpoint, _ fun
 		return f.countsAfter, nil
 	}
 	return f.copyResult.PerTableRows, nil
+}
+
+func (f *fakeCopier) SnapshotFingerprints(_ context.Context, ep CatalogEndpoint, _ func(string, string)) (map[string]CatalogTableFingerprint, error) {
+	if ep.SSLMode == "require" && f.externalFingerprints != nil {
+		return f.externalFingerprints, nil
+	}
+	if ep.SSLMode != "require" && f.fingerprintsAfter != nil {
+		return f.fingerprintsAfter, nil
+	}
+	return f.copyResult.PerTableFingerprints, nil
 }
 
 func (f *fakeCopier) DropCatalogTables(_ context.Context, ep CatalogEndpoint, _ func(string, string)) error {
@@ -807,6 +883,185 @@ func TestReshardFlipTimeoutRollsBackShardValue(t *testing.T) {
 // stuckCnpgDuckling records patches but never converges the status.
 type stuckCnpgDuckling struct {
 	*fakeDuckling
+}
+
+// failSourceRecoveryDuckling allows the initial cutover but rejects the
+// rollback patch to the source shard, modeling an API or admission failure.
+type failSourceRecoveryDuckling struct {
+	*fakeDuckling
+}
+
+func (s *failSourceRecoveryDuckling) SetMetadataStoreCnpg(ctx context.Context, name, shard string) error {
+	if shard == "shard-001" {
+		return errors.New("source recovery rejected")
+	}
+	return s.fakeDuckling.SetMetadataStoreCnpg(ctx, name, shard)
+}
+
+// TestReshardRollbackKeepsWarehouseBlockedWhenSourceRecoveryFails asserts the
+// safety invariant: traffic cannot be admitted unless rollback has positively
+// restored a usable catalog. Logging and swallowing this error is unsafe.
+func TestReshardRollbackKeepsWarehouseBlockedWhenSourceRecoveryFails(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &failSourceRecoveryDuckling{fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()}}
+	copier := &fakeCopier{copyErr: errors.New("copy failed after cutover")}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s, want failed", store.op.State)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want resharding after failed source recovery", store.warehouseState)
+	}
+	if store.op.UnblockedAt != nil {
+		t.Fatalf("unblocked_at = %v after failed source recovery", store.op.UnblockedAt)
+	}
+}
+
+// TestReshardTakeoverPreservesOriginalCompactionSnapshot ensures replay cannot
+// replace the persisted pre-reshard setting with the already-paused live value.
+func TestReshardTakeoverPreservesOriginalCompactionSnapshot(t *testing.T) {
+	op := cnpgOp()
+	op.Step = "pausing_compaction"
+	op.CompactionWasPresent = true
+	op.CompactionWasEnabled = true
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: false}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if !store.op.CompactionWasEnabled {
+		t.Fatal("takeover overwrote original compaction=true snapshot with paused live value")
+	}
+}
+
+// TestReshardTakeoverAfterCutoverDoesNotReplaySourceDiscovery models a runner
+// crash after the CR already points at the target. A takeover must use the
+// durable source identity and resume/reconcile from the persisted phase; it
+// must never treat the live target status as the source.
+func TestReshardTakeoverAfterCutoverDoesNotReplaySourceDiscovery(t *testing.T) {
+	op := cnpgOp()
+	op.Step = "copying"
+	op.SourceEndpoint = "shard-001-pooler.cnpg-shards.svc.cluster.local"
+	op.SourceUser = "mdstore_org"
+	op.SourceDatabase = "mdstore_org"
+	blocked := time.Now().UTC().Add(-time.Minute)
+	op.BlockedAt = &blocked
+
+	store := newFakeReshardStore(op)
+	store.warehouseState = configstore.ManagedWarehouseStateResharding
+	targetStatus := cnpgSourceStatus()
+	targetStatus.MetadataStore.Endpoint = "shard-002-pooler.cnpg-shards.svc.cluster.local"
+	duckling := &fakeDuckling{status: targetStatus, compPresent: true, compEnabled: false}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.op.SourceEndpoint != "shard-001-pooler.cnpg-shards.svc.cluster.local" {
+		t.Fatalf("durable source overwritten with live target: %q", store.op.SourceEndpoint)
+	}
+	for _, call := range copier.calls {
+		if call.kind == "copy" && call.source.Host != "shard-001-pooler.cnpg-shards.svc.cluster.local" {
+			t.Fatalf("takeover copied from %q, want durable source shard-001", call.source.Host)
+		}
+		if call.kind == "dropdb" && call.target.Host == "shard-002-pooler.cnpg-shards.svc.cluster.local" {
+			t.Fatal("takeover attempted destructive cleanup against the live target")
+		}
+	}
+}
+
+func executeWithBlockingCopy(t *testing.T, store *fakeReshardStore, heartbeatErr error) (*blockingCopier, <-chan struct{}) {
+	t.Helper()
+	store.heartbeatErrs = []error{heartbeatErr}
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := newBlockingCopier()
+	r := testRunner(store, duckling, copier.fakeCopier)
+	r.copier = copier
+	r.heartbeatInterval = 5 * time.Millisecond
+	op, err := store.ClaimReshardOperation(store.op.ID, r.cpID, r.staleAfter)
+	if err != nil || op == nil {
+		t.Fatalf("claim = %v, %v", op, err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.execute(context.Background(), op)
+	}()
+	select {
+	case <-copier.started:
+	case <-time.After(time.Second):
+		t.Fatal("copy did not start")
+	}
+	return copier, done
+}
+
+// TestReshardHeartbeatFenceCancelsInFlightCopy asserts that epoch fencing is
+// propagated through the operation context, including long-running external
+// side effects. Merely closing a channel checked before the first step leaves a
+// zombie copier alive after ownership has moved.
+func TestReshardHeartbeatFenceCancelsInFlightCopy(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	copier, done := executeWithBlockingCopy(t, store, configstore.ErrReshardFenced)
+	defer close(copier.released)
+
+	select {
+	case <-copier.canceled:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("in-flight copy context was not cancelled after heartbeat fencing")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fenced runner did not stop")
+	}
+}
+
+// TestReshardTransientHeartbeatErrorDoesNotFenceRunner distinguishes a store
+// outage from a lost epoch. A transient error must be retried while ownership
+// is retained; it must not silently turn the active operation into a zombie.
+func TestReshardTransientHeartbeatErrorDoesNotFenceRunner(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	copier, done := executeWithBlockingCopy(t, store, errors.New("temporary config-store outage"))
+
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-copier.canceled:
+		t.Fatal("transient heartbeat error was treated as fencing")
+	default:
+	}
+	store.mu.Lock()
+	heartbeats := store.heartbeatCalls
+	store.mu.Unlock()
+	if heartbeats < 2 {
+		t.Fatalf("heartbeat attempts = %d, want retry after transient error", heartbeats)
+	}
+	close(copier.released)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not finish after copy release")
+	}
+}
+
+// TestReshardFinalizeFailureRollsBackBeforeReadmittingTraffic pins the final
+// commit invariant: a failed atomic finalization enters the ordinary rollback
+// path, and only that verified recovery may return the warehouse to ready.
+func TestReshardFinalizeFailureRollsBackBeforeReadmittingTraffic(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	store.failUnblockedWrite = true
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.warehouseState != configstore.ManagedWarehouseStateReady || store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state after failed atomic finalization = warehouse %s/op %s, want verified rollback ready/failed", store.warehouseState, store.op.State)
+	}
+	if len(store.warehouseUpds) == 0 || store.warehouseUpds[len(store.warehouseUpds)-1]["status_message"] != "metadata-store reshard rolled back" {
+		t.Fatalf("warehouse was not readmitted through rollback: %v", store.warehouseUpds)
+	}
 }
 
 func (s *stuckCnpgDuckling) SetMetadataStoreCnpg(_ context.Context, _ string, shard string) error {
@@ -1472,6 +1727,31 @@ func TestReshardVerifyMismatchRollsBack(t *testing.T) {
 	}
 }
 
+func TestReshardVerifyDetectsSameCountContentMutation(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{
+		copyResult: CatalogCopyResult{
+			Tables: 1, Rows: 1,
+			PerTableRows: map[string]int64{"ducklake_metadata": 1},
+			PerTableFingerprints: map[string]CatalogTableFingerprint{
+				"ducklake_metadata": {Rows: 1, Digest: "before"},
+			},
+		},
+		countsAfter: map[string]int64{"ducklake_metadata": 1},
+		fingerprintsAfter: map[string]CatalogTableFingerprint{
+			"ducklake_metadata": {Rows: 1, Digest: "after"},
+		},
+	}
+	runOp(t, testRunner(store, duckling, copier), store)
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s, want failed for same-count content mutation", store.op.State)
+	}
+	if !strings.Contains(store.op.Error, "content changed") {
+		t.Fatalf("error = %q, want content-change diagnosis", store.op.Error)
+	}
+}
+
 // TestProbeErrorAuthClassification pins isAuthProbeError/describeProbeFailure
 // against errors shaped the way catalog_copy.go::Probe actually wraps them
 // (`connect <redacted>: %w` / `probe <redacted>: %w` around pgx errors, whose
@@ -1590,13 +1870,12 @@ func TestReshardExtRecoveryProbeAuthFailureDiagnosed(t *testing.T) {
 			t.Fatalf("op log leaked a password: %q", l)
 		}
 	}
-	// The recovery still ran to its normal conclusion: flip-back + adopt,
-	// warehouse unblocked (auth failures do NOT abort the wait early — a
-	// composition fix may still converge the password mid-wait).
+	// The recovery attempted flip-back + adopt, but traffic must remain blocked
+	// because the tenant role never answered successfully.
 	if !containsStr(duckling.callKinds(), "cnpg-adopt") {
 		t.Fatalf("recovery did not flip back + adopt: %v", duckling.callKinds())
 	}
-	if store.warehouseState != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("warehouse state = %s, want ready after recovery", store.warehouseState)
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want resharding after unverified recovery", store.warehouseState)
 	}
 }

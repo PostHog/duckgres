@@ -138,7 +138,7 @@ func TestSpawnReshardPodKnobsAndNoPasswordURL(t *testing.T) {
 	cs := k8sfake.NewSimpleClientset(fakeCPPod())
 	s := NewReshardPodSpawner(cs, "duckgres", "duckgres-control-plane-abc-xyz", "4", "16Gi")
 
-	op := &configstore.ReshardOperation{ID: 7, OrgID: "acme", TargetKind: configstore.MetadataStoreKindCnpgShard}
+	op := &configstore.ReshardOperation{ID: 7, OrgID: "acme", TargetKind: configstore.MetadataStoreKindCnpgShard, RunnerImage: "example/duckgres:pinned-at-submit"}
 	if err := s.SpawnReshardPod(context.Background(), op); err != nil {
 		t.Fatalf("SpawnReshardPod: %v", err)
 	}
@@ -147,6 +147,9 @@ func TestSpawnReshardPodKnobsAndNoPasswordURL(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 	c := pod.Spec.Containers[0]
+	if c.Image != op.RunnerImage {
+		t.Fatalf("runner image = %q, want operation-pinned %q", c.Image, op.RunnerImage)
+	}
 	cpu := c.Resources.Requests[corev1.ResourceCPU]
 	mem := c.Resources.Requests[corev1.ResourceMemory]
 	if cpu.String() != "4" || mem.String() != "16Gi" {
@@ -154,6 +157,20 @@ func TestSpawnReshardPodKnobsAndNoPasswordURL(t *testing.T) {
 	}
 	if _, has := envByName(c.Env)["DUCKGRES_RESHARD_PASSWORD_URL"]; has {
 		t.Fatal("cnpg-target runner pod must carry no password URL env")
+	}
+}
+
+func TestSpawnReshardPodRejectsInvalidResourceKnobsWithoutPanicking(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset(fakeCPPod())
+	s := NewReshardPodSpawner(cs, "duckgres", "duckgres-control-plane-abc-xyz", "not-a-cpu", "also-bad")
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("SpawnReshardPod panicked on invalid operator config: %v", recovered)
+		}
+	}()
+	err := s.SpawnReshardPod(context.Background(), &configstore.ReshardOperation{ID: 8})
+	if err == nil || !strings.Contains(err.Error(), "invalid reshard pod") {
+		t.Fatalf("error = %v, want invalid reshard pod resource error", err)
 	}
 }
 

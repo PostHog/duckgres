@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
@@ -33,8 +34,9 @@ import (
 
 // reshardPodAppLabel / reshardPodOpIDLabel identify reshard runner pods.
 const (
-	reshardPodAppLabel  = "duckgres-reshard"
-	reshardPodOpIDLabel = "duckgres-op-id"
+	reshardPodAppLabel            = "duckgres-reshard"
+	reshardPodOpIDLabel           = "duckgres-op-id"
+	reshardPodSpawnedAtAnnotation = "duckgres.posthog.com/runner-spawned-at"
 )
 
 // reshardPodDefaultCPU / reshardPodDefaultMemory are the runner pod's resource
@@ -79,6 +81,20 @@ type ReshardPodSpawner struct {
 
 	cpuRequest    string // env-only DUCKGRES_RESHARD_POD_CPU (default 2)
 	memoryRequest string // env-only DUCKGRES_RESHARD_POD_MEMORY (default 8Gi)
+}
+
+func (s *ReshardPodSpawner) RunnerImage(ctx context.Context) (string, error) {
+	if s == nil || s.clientset == nil {
+		return "", fmt.Errorf("no reshard pod spawner (kubernetes API unavailable)")
+	}
+	cpPod, err := s.clientset.CoreV1().Pods(s.namespace).Get(ctx, s.selfPodName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("read own control-plane pod %s/%s: %w", s.namespace, s.selfPodName, err)
+	}
+	if len(cpPod.Spec.Containers) == 0 || cpPod.Spec.Containers[0].Image == "" {
+		return "", fmt.Errorf("control-plane pod %s has no runner image", s.selfPodName)
+	}
+	return cpPod.Spec.Containers[0].Image, nil
 }
 
 // NewReshardPodSpawner builds a spawner over the shared in-cluster clientset.
@@ -148,6 +164,11 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 		return fmt.Errorf("control-plane pod %s has no containers", s.selfPodName)
 	}
 	cpContainer := cpPod.Spec.Containers[0]
+	runnerImage := op.RunnerImage
+	if runnerImage == "" {
+		// Legacy operations created before runner_image was persisted.
+		runnerImage = cpContainer.Image
+	}
 
 	// Inherit the allowlisted env VERBATIM — a secretKeyRef stays a
 	// secretKeyRef; nothing secret is copied by value into the pod spec.
@@ -181,9 +202,17 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 		env = append(env, corev1.EnvVar{Name: "DUCKGRES_RESHARD_PASSWORD_URL", Value: op.PasswordURL})
 	}
 
+	cpu, err := resource.ParseQuantity(s.cpuRequest)
+	if err != nil {
+		return fmt.Errorf("invalid reshard pod CPU %q: %w", s.cpuRequest, err)
+	}
+	memory, err := resource.ParseQuantity(s.memoryRequest)
+	if err != nil {
+		return fmt.Errorf("invalid reshard pod memory %q: %w", s.memoryRequest, err)
+	}
 	requests := corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse(s.cpuRequest),
-		corev1.ResourceMemory: resource.MustParse(s.memoryRequest),
+		corev1.ResourceCPU:    cpu,
+		corev1.ResourceMemory: memory,
 	}
 	limits := make(corev1.ResourceList, len(requests))
 	for k, v := range requests {
@@ -221,7 +250,10 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 			},
 			// A reshard is a long single-shot maintenance operation; don't let
 			// node consolidation kill it mid-copy.
-			Annotations: map[string]string{doNotDisruptAnnotation: "true"},
+			Annotations: map[string]string{
+				doNotDisruptAnnotation:        "true",
+				reshardPodSpawnedAtAnnotation: time.Now().UTC().Format(time.RFC3339Nano),
+			},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                 corev1.RestartPolicyNever,
@@ -234,7 +266,7 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 			Containers: []corev1.Container{
 				{
 					Name:            "reshard-runner",
-					Image:           cpContainer.Image,
+					Image:           runnerImage,
 					ImagePullPolicy: cpContainer.ImagePullPolicy,
 					Args:            []string{"--mode", "reshard-runner"},
 					Env:             env,
