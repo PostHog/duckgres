@@ -23,6 +23,20 @@ func AppendTextLiteralBytes(dst *strings.Builder, data []byte) {
 	dst.WriteByte('\'')
 }
 
+// AppendTextLiteralString is the string counterpart to
+// AppendTextLiteralBytes. Keeping this separate avoids a string-to-byte
+// conversion when a caller has already formatted a binary protocol value.
+func AppendTextLiteralString(dst *strings.Builder, data string) {
+	dst.WriteByte('\'')
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\'' {
+			dst.WriteByte('\'')
+		}
+		dst.WriteByte(data[i])
+	}
+	dst.WriteByte('\'')
+}
+
 // AppendSQLLiteral appends the same literal representation historically used
 // by Flight interpolation. It is shared with compact Bind interpolation so
 // local and remote paths retain matching NULL, binary, numeric, and time

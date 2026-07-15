@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +33,7 @@ type portalLifecycleBindValue struct {
 type compactFlightRecordingExecutor struct {
 	lifecycleExecutor
 	interpolated string
+	boundQueries int
 	boundExecs   int
 }
 
@@ -58,7 +61,7 @@ func (*cursorFormatCountingRowSet) Close() error      { return nil }
 func (*cursorFormatCountingRowSet) Err() error        { return nil }
 
 func (e *compactFlightRecordingExecutor) QueryWithBoundParams(query string, params sqlcore.SQLLiteralAppender) (RowSet, error) {
-	e.boundExecs++
+	e.boundQueries++
 	interpolated, err := flightclient.InterpolateBoundArgs(query, params)
 	if err != nil {
 		return nil, err
@@ -111,7 +114,7 @@ func portalLifecycleExecuteBody(portalName string) []byte {
 	return body.Bytes()
 }
 
-func newPortalLifecycleConn(t *testing.T, executor QueryExecutor) (*clientConn, *bytes.Buffer, func()) {
+func newPortalLifecycleConn(t testing.TB, executor QueryExecutor) (*clientConn, *bytes.Buffer, func()) {
 	t.Helper()
 	serverSide, clientSide := net.Pipe()
 	out := &bytes.Buffer{}
@@ -136,7 +139,7 @@ func newPortalLifecycleConn(t *testing.T, executor QueryExecutor) (*clientConn, 
 	}
 }
 
-func bindPortalForLifecycle(t *testing.T, c *clientConn, portalName, stmtName string, paramFormats []int16, values []portalLifecycleBindValue) *portal {
+func bindPortalForLifecycle(t testing.TB, c *clientConn, portalName, stmtName string, paramFormats []int16, values []portalLifecycleBindValue) *portal {
 	t.Helper()
 	c.handleBind(portalLifecycleBindBody(portalName, stmtName, paramFormats, values, nil))
 	if err := c.writer.Flush(); err != nil {
@@ -527,6 +530,344 @@ func TestPortalLifecycleFlightUsesCompactLiteralAppender(t *testing.T) {
 		t.Fatalf("compact Flight SQL = %q, want %q", got, want)
 	}
 	requireReleasedPortalPayload(t, p)
+}
+
+const (
+	flightBinaryInt4AllocationParamCount      = 27_000
+	flightBinaryInt4AllocationSmallParamCount = 2
+)
+
+type flightBoundOperation string
+
+const (
+	flightBoundExecute  flightBoundOperation = "execute"
+	flightBoundDescribe flightBoundOperation = "describe"
+)
+
+type flightBinaryInt4AllocationFixture struct {
+	body       []byte
+	stmt       *preparedStmt
+	paramCount int
+}
+
+// newFlightBinaryInt4AllocationFixture creates a statement with exactly one
+// placeholder per Bind value. Execute uses a DML shape to exercise Flight's
+// bound Exec path; Describe(P) uses a one-column SELECT to exercise its bound
+// Query/LIMIT 0 path without constructing a 27,000-column RowDescription.
+func newFlightBinaryInt4AllocationFixture(binaryFormat bool, operation flightBoundOperation, paramCount int) flightBinaryInt4AllocationFixture {
+	values := make([]portalLifecycleBindValue, paramCount)
+	paramTypes := make([]int32, paramCount)
+
+	for i := range values {
+		value := int32(1000 + i)
+		paramTypes[i] = OidInt4
+		if binaryFormat {
+			data := make([]byte, 4)
+			binary.BigEndian.PutUint32(data, uint32(value))
+			values[i] = portalLifecycleBindValue{data: data}
+		} else {
+			values[i] = portalLifecycleBindValue{data: []byte(strconv.Itoa(int(value)))}
+		}
+	}
+
+	query, convertedQuery := flightBinaryInt4AllocationQueries(operation, paramCount)
+	format := int16(0)
+	if binaryFormat {
+		format = 1
+	}
+	return flightBinaryInt4AllocationFixture{
+		body: portalLifecycleBindBody("", "bulk", []int16{format}, values, nil),
+		stmt: &preparedStmt{
+			query:          query,
+			convertedQuery: convertedQuery,
+			paramTypes:     paramTypes,
+			numParams:      paramCount,
+		},
+		paramCount: paramCount,
+	}
+}
+
+func flightBinaryInt4AllocationQueries(operation flightBoundOperation, paramCount int) (query string, convertedQuery string) {
+	switch operation {
+	case flightBoundExecute:
+		var original, converted strings.Builder
+		original.Grow(paramCount * len("$27000, "))
+		converted.Grow(paramCount * len("?, "))
+		original.WriteString("INSERT INTO t VALUES ")
+		converted.WriteString("INSERT INTO t VALUES ")
+		for i := 0; i < paramCount; i++ {
+			switch {
+			case i == 0:
+				original.WriteByte('(')
+				converted.WriteByte('(')
+			case i%27 == 0:
+				original.WriteString("), (")
+				converted.WriteString("), (")
+			default:
+				original.WriteString(", ")
+				converted.WriteString(", ")
+			}
+			original.WriteByte('$')
+			original.WriteString(strconv.Itoa(i + 1))
+			converted.WriteByte('?')
+			if i%27 == 26 || i == paramCount-1 {
+				original.WriteByte(')')
+				converted.WriteByte(')')
+			}
+		}
+		return original.String(), converted.String()
+	case flightBoundDescribe:
+		if paramCount%2 != 0 {
+			panic("Describe allocation fixture requires an even parameter count")
+		}
+		var original, converted strings.Builder
+		original.Grow(paramCount * len("$27000 = $27000 AND "))
+		converted.Grow(paramCount * len("? = ? AND "))
+		original.WriteString("SELECT 1 WHERE ")
+		converted.WriteString("SELECT 1 WHERE ")
+		for i := 0; i < paramCount; i += 2 {
+			if i != 0 {
+				original.WriteString(" AND ")
+				converted.WriteString(" AND ")
+			}
+			original.WriteByte('$')
+			original.WriteString(strconv.Itoa(i + 1))
+			original.WriteString(" = $")
+			original.WriteString(strconv.Itoa(i + 2))
+			converted.WriteString("? = ?")
+		}
+		return original.String(), converted.String()
+	default:
+		panic("unknown Flight allocation operation")
+	}
+}
+
+func runFlightBinaryInt4AllocationOperation(tb testing.TB, c *clientConn, out *bytes.Buffer, fixture flightBinaryInt4AllocationFixture, operation flightBoundOperation) {
+	tb.Helper()
+	c.handleBind(fixture.body)
+	if c.portals[""] == nil {
+		tb.Fatal("Bind did not install an unnamed portal")
+	}
+
+	switch operation {
+	case flightBoundExecute:
+		c.handleExecute(portalLifecycleExecuteBody(""))
+	case flightBoundDescribe:
+		c.handleDescribe([]byte{'P', 0})
+	default:
+		tb.Fatalf("unknown Flight operation %q", operation)
+	}
+	if err := c.writer.Flush(); err != nil {
+		tb.Fatalf("flush %s response: %v", operation, err)
+	}
+	out.Reset()
+}
+
+func flightBinaryInt4AllocationCount(t *testing.T, fixture flightBinaryInt4AllocationFixture, operation flightBoundOperation) float64 {
+	t.Helper()
+	executor := &compactFlightRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+		queryRows: &describeStaticRowSet{
+			cols:     []string{"value"},
+			colTypes: []ColumnTyper{describeColumnType("INTEGER")},
+		},
+		execResult: emptyExecResult{},
+	}}
+	c, out, cleanup := newPortalLifecycleConn(t, executor)
+	defer cleanup()
+	c.stmts["bulk"] = fixture.stmt
+
+	allocs := testing.AllocsPerRun(3, func() {
+		runFlightBinaryInt4AllocationOperation(t, c, out, fixture, operation)
+	})
+	if got := strings.Count(fixture.stmt.convertedQuery, "?"); got != fixture.paramCount {
+		t.Fatalf("%s fixture placeholders = %d, want %d", operation, got, fixture.paramCount)
+	}
+	if strings.Contains(executor.interpolated, "?") {
+		t.Fatalf("%s left unresolved placeholders in Flight SQL", operation)
+	}
+	switch operation {
+	case flightBoundExecute:
+		if executor.boundExecs == 0 || executor.boundQueries != 0 {
+			t.Fatalf("Execute Flight routing: Exec calls = %d, Query calls = %d; want Exec only", executor.boundExecs, executor.boundQueries)
+		}
+	case flightBoundDescribe:
+		if executor.boundQueries == 0 || executor.boundExecs != 0 {
+			t.Fatalf("Describe Flight routing: Query calls = %d, Exec calls = %d; want Query only", executor.boundQueries, executor.boundExecs)
+		}
+		if !strings.HasSuffix(executor.interpolated, " LIMIT 0") {
+			t.Fatalf("Describe Flight SQL = %q, want LIMIT 0", executor.interpolated)
+		}
+	default:
+		t.Fatalf("unknown Flight operation %q", operation)
+	}
+	c.dropAllPortals("test_cleanup")
+	return allocs
+}
+
+func muteDefaultSlog(tb testing.TB) {
+	tb.Helper()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	tb.Cleanup(func() { slog.SetDefault(previous) })
+}
+
+// Regression test for large binary Bind values on Flight. decodeBinary used to
+// box every int4 once during protocol validation and again during SQL literal
+// interpolation, so allocations grew with the parameter count. The text path
+// is the control: both paths retain the same body, descriptors, and one final
+// SQL buffer, but neither should allocate per parameter.
+func TestFlightBinaryInt4Bind27000ParamsAllocationsStayTextComparable(t *testing.T) {
+	muteDefaultSlog(t)
+
+	for _, operation := range []flightBoundOperation{flightBoundExecute, flightBoundDescribe} {
+		t.Run(string(operation), func(t *testing.T) {
+			textFixture := newFlightBinaryInt4AllocationFixture(false, operation, flightBinaryInt4AllocationParamCount)
+			binaryFixture := newFlightBinaryInt4AllocationFixture(true, operation, flightBinaryInt4AllocationParamCount)
+			smallBinaryFixture := newFlightBinaryInt4AllocationFixture(true, operation, flightBinaryInt4AllocationSmallParamCount)
+			textAllocs := flightBinaryInt4AllocationCount(t, textFixture, operation)
+			binaryAllocs := flightBinaryInt4AllocationCount(t, binaryFixture, operation)
+			smallBinaryAllocs := flightBinaryInt4AllocationCount(t, smallBinaryFixture, operation)
+			if binaryAllocs > textAllocs+32 {
+				t.Fatalf("binary int4 Bind allocations = %.0f, text allocations = %.0f; want binary within a constant of text", binaryAllocs, textAllocs)
+			}
+			if binaryAllocs > smallBinaryAllocs+32 {
+				t.Fatalf("27,000-parameter binary int4 Bind allocations = %.0f, two-parameter binary allocations = %.0f; want O(1) allocation growth", binaryAllocs, smallBinaryAllocs)
+			}
+		})
+	}
+}
+
+func TestPortalLifecycleFlightMalformedBinaryParametersReturnProtocolViolation(t *testing.T) {
+	for _, operation := range []flightBoundOperation{flightBoundExecute, flightBoundDescribe} {
+		t.Run(string(operation), func(t *testing.T) {
+			executor := &compactFlightRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+				queryRows: &describeStaticRowSet{
+					cols:     []string{"value"},
+					colTypes: []ColumnTyper{describeColumnType("INTEGER")},
+				},
+				execResult: emptyExecResult{},
+			}}
+			c, out, cleanup := newPortalLifecycleConn(t, executor)
+			defer cleanup()
+			c.stmts["binary"] = &preparedStmt{
+				query:          "SELECT $1",
+				convertedQuery: "SELECT ?",
+				paramTypes:     []int32{OidInt4},
+				numParams:      1,
+			}
+
+			p := bindPortalForLifecycle(t, c, "bad-binary", "binary", []int16{1}, []portalLifecycleBindValue{{data: []byte{1}}})
+			switch operation {
+			case flightBoundExecute:
+				c.handleExecute(portalLifecycleExecuteBody("bad-binary"))
+			case flightBoundDescribe:
+				c.handleDescribe([]byte{'P', 'b', 'a', 'd', '-', 'b', 'i', 'n', 'a', 'r', 'y', 0})
+			}
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush %s error: %v", operation, err)
+			}
+			if !bytes.Contains(out.Bytes(), []byte("08P01")) {
+				t.Fatalf("%s malformed Flight binary response = %q, want 08P01", operation, out.Bytes())
+			}
+			if executor.boundExecs != 0 || executor.boundQueries != 0 {
+				t.Fatalf("%s called the Flight executor for malformed binary data: Exec calls = %d, Query calls = %d; want 0", operation, executor.boundExecs, executor.boundQueries)
+			}
+			requirePortalState(t, p, portalStateFailed)
+			requireReleasedPortalPayload(t, p)
+		})
+	}
+}
+
+func TestPortalBinaryLiteralAppenderPreservesDecodeBinarySemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		oid    int32
+		format int16
+		data   []byte
+	}{
+		{name: "bool", oid: OidBool, format: 1, data: []byte{2}},
+		{name: "int2", oid: OidInt2, format: 1, data: []byte{0xff, 0xfe}},
+		{name: "int4", oid: OidInt4, format: 1, data: []byte{0xff, 0xff, 0xff, 0xfe}},
+		{name: "int8", oid: OidInt8, format: 1, data: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe}},
+		{name: "float4", oid: OidFloat4, format: 1, data: []byte{0x40, 0x60, 0x00, 0x00}},
+		{name: "float8", oid: OidFloat8, format: 1, data: []byte{0xc0, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+		{name: "numeric", oid: OidNumeric, format: 1, data: []byte{0, 1, 0, 0, 0, 0, 0, 2, 0, 42}},
+		{name: "date", oid: OidDate, format: 1, data: []byte{0, 0, 0, 0}},
+		{name: "timestamp", oid: OidTimestamp, format: 1, data: []byte{0, 0, 0, 0, 0, 0, 0, 0}},
+		{name: "time", oid: OidTime, format: 1, data: []byte{0, 0, 0, 0, 0, 15, 66, 64}},
+		{name: "interval", oid: OidInterval, format: 1, data: []byte{0, 0, 0, 0, 0, 15, 66, 64, 0, 0, 0, 1, 0, 0, 0, 14}},
+		{name: "uuid", oid: OidUUID, format: 1, data: []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}},
+		{name: "bytea", oid: OidBytea, format: 1, data: []byte{0, 0xff, 1}},
+		{name: "unknown binary OID remains text", oid: OidJSONB, format: 1, data: []byte("a'b")},
+		{name: "unknown OID is text despite binary format", oid: 0, format: 1, data: []byte("a'b")},
+		{name: "text format remains text", oid: OidInt4, format: 0, data: []byte("a'b")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &portal{
+				stmt:         &preparedStmt{paramTypes: []int32{tc.oid}},
+				bindBody:     tc.data,
+				params:       []bindParam{{offset: 0, length: int32(len(tc.data))}},
+				paramFormats: []int16{tc.format},
+			}
+			if err := p.validateBinaryParameters(); err != nil {
+				t.Fatalf("validate binary parameter: %v", err)
+			}
+
+			var got, want strings.Builder
+			if err := p.AppendBindParameterLiteral(&got, 0); err != nil {
+				t.Fatalf("append binary literal: %v", err)
+			}
+			if tc.oid == 0 || tc.format == 0 {
+				sqlcore.AppendTextLiteralBytes(&want, tc.data)
+			} else {
+				decoded, err := decodeBinary(tc.data, tc.oid)
+				if err != nil {
+					t.Fatalf("decode binary expected literal: %v", err)
+				}
+				sqlcore.AppendSQLLiteral(&want, decoded)
+			}
+			if got.String() != want.String() {
+				t.Fatalf("literal = %q, want historical decode literal %q", got.String(), want.String())
+			}
+		})
+	}
+}
+
+func BenchmarkFlightBinaryInt4Bind27000Params(b *testing.B) {
+	muteDefaultSlog(b)
+	for _, tc := range []struct {
+		name         string
+		binaryFormat bool
+		operation    flightBoundOperation
+	}{
+		{name: "text/Execute", operation: flightBoundExecute},
+		{name: "binary/Execute", binaryFormat: true, operation: flightBoundExecute},
+		{name: "text/Describe", operation: flightBoundDescribe},
+		{name: "binary/Describe", binaryFormat: true, operation: flightBoundDescribe},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			fixture := newFlightBinaryInt4AllocationFixture(tc.binaryFormat, tc.operation, flightBinaryInt4AllocationParamCount)
+			executor := &compactFlightRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+				queryRows: &describeStaticRowSet{
+					cols:     []string{"value"},
+					colTypes: []ColumnTyper{describeColumnType("INTEGER")},
+				},
+				execResult: emptyExecResult{},
+			}}
+			c, out, cleanup := newPortalLifecycleConn(b, executor)
+			defer cleanup()
+			c.stmts["bulk"] = fixture.stmt
+
+			b.ReportAllocs()
+			b.SetBytes(int64(len(fixture.body)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				runFlightBinaryInt4AllocationOperation(b, c, out, fixture, tc.operation)
+			}
+			b.StopTimer()
+			c.dropAllPortals("benchmark_cleanup")
+		})
+	}
 }
 
 func TestPortalLifecycleEmptyExecuteReleasesPayload(t *testing.T) {

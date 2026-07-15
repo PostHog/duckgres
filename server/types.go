@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 // PostgreSQL type OIDs
@@ -908,6 +910,180 @@ func decodeBinary(data []byte, oid int32) (interface{}, error) {
 		// For text, varchar, and unknown types, return as string
 		return string(data), nil
 	}
+}
+
+// validateBinaryBindValue checks the wire shape of one binary Bind value
+// without converting it to an interface{} value. Flight uses this before it
+// starts interpolation so malformed data remains a PostgreSQL protocol error
+// (08P01), rather than becoming a generic Flight execution error.
+//
+// Keep these checks aligned with decodeBinary. In particular, the fixed-width
+// types accept trailing bytes, UUID requires exactly 16 bytes, and numeric only
+// validates the header and declared digit payload that decodeNumeric needs.
+func validateBinaryBindValue(data []byte, oid int32) error {
+	// decodeBinary historically treats nil as NULL for manually constructed
+	// portals. A parsed non-NULL Bind value is never nil, but preserve that
+	// behavior for direct SQLLiteralAppender callers.
+	if data == nil {
+		return nil
+	}
+
+	switch oid {
+	case OidBool:
+		return validateBinaryBindLength(data, 1, "bool")
+	case OidInt2:
+		return validateBinaryBindLength(data, 2, "int2")
+	case OidInt4:
+		return validateBinaryBindLength(data, 4, "int4")
+	case OidInt8:
+		return validateBinaryBindLength(data, 8, "int8")
+	case OidFloat4:
+		return validateBinaryBindLength(data, 4, "float4")
+	case OidFloat8:
+		return validateBinaryBindLength(data, 8, "float8")
+	case OidNumeric:
+		if len(data) < 8 {
+			return fmt.Errorf("insufficient data for numeric: got %d bytes, need at least 8", len(data))
+		}
+		ndigits := int(binary.BigEndian.Uint16(data))
+		need := 8 + 2*ndigits
+		if len(data) < need {
+			return fmt.Errorf("insufficient data for numeric digits: got %d bytes, need %d", len(data), need)
+		}
+		return nil
+	case OidDate:
+		return validateBinaryBindLength(data, 4, "date")
+	case OidTimestamp, OidTimestamptz:
+		return validateBinaryBindLength(data, 8, "timestamp")
+	case OidTime:
+		return validateBinaryBindLength(data, 8, "time")
+	case OidInterval:
+		return validateBinaryBindLength(data, 16, "interval")
+	case OidUUID:
+		if len(data) != 16 {
+			return fmt.Errorf("invalid UUID binary data: got %d bytes, need 16", len(data))
+		}
+	}
+	return nil
+}
+
+func validateBinaryBindLength(data []byte, need int, typeName string) error {
+	if len(data) < need {
+		return fmt.Errorf("insufficient data for %s: got %d bytes, need %d", typeName, len(data), need)
+	}
+	return nil
+}
+
+// appendValidatedBinaryBindLiteral writes the same SQL literal that
+// decodeBinary followed by sqlcore.AppendSQLLiteral historically produced,
+// but reads directly from the retained Bind bytes. Callers must validate first
+// with validateBinaryBindValue; the error return is retained for defensive
+// direct SQLLiteralAppender use.
+func appendValidatedBinaryBindLiteral(dst *strings.Builder, data []byte, oid int32) error {
+	if data == nil {
+		dst.WriteString("NULL")
+		return nil
+	}
+
+	switch oid {
+	case OidBool:
+		if data[0] == 0 {
+			dst.WriteString("FALSE")
+		} else {
+			dst.WriteString("TRUE")
+		}
+	case OidInt2:
+		appendBinaryBindInt(dst, int64(int16(binary.BigEndian.Uint16(data))))
+	case OidInt4:
+		appendBinaryBindInt(dst, int64(int32(binary.BigEndian.Uint32(data))))
+	case OidInt8:
+		appendBinaryBindInt(dst, int64(binary.BigEndian.Uint64(data)))
+	case OidFloat4:
+		appendBinaryBindFloat(dst, float64(math.Float32frombits(binary.BigEndian.Uint32(data))), 32)
+	case OidFloat8:
+		appendBinaryBindFloat(dst, math.Float64frombits(binary.BigEndian.Uint64(data)), 64)
+	case OidNumeric:
+		value, err := decodeNumeric(data)
+		if err != nil {
+			return err
+		}
+		// decodeNumeric returns a string, so the historical generic literal
+		// path quoted it (including NaN). Preserve that representation.
+		sqlcore.AppendTextLiteralString(dst, value)
+	case OidDate:
+		days := int32(binary.BigEndian.Uint32(data))
+		appendBinaryBindTime(dst, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, int(days)))
+	case OidTimestamp, OidTimestamptz:
+		micros := int64(binary.BigEndian.Uint64(data))
+		secs := micros / 1_000_000
+		remainMicros := micros % 1_000_000
+		if remainMicros < 0 {
+			secs--
+			remainMicros += 1_000_000
+		}
+		appendBinaryBindTime(dst, time.Unix(946684800+secs, remainMicros*1000).UTC())
+	case OidTime:
+		value, err := decodeTime(data)
+		if err != nil {
+			return err
+		}
+		sqlcore.AppendTextLiteralString(dst, value)
+	case OidInterval:
+		value, err := decodeInterval(data)
+		if err != nil {
+			return err
+		}
+		sqlcore.AppendTextLiteralString(dst, value)
+	case OidUUID:
+		appendBinaryBindUUID(dst, data)
+	case OidBytea:
+		appendBinaryBindBytea(dst, data)
+	default:
+		// decodeBinary's default is string(data), which AppendSQLLiteral then
+		// escapes as a text literal. Avoid the intermediate string.
+		sqlcore.AppendTextLiteralBytes(dst, data)
+	}
+	return nil
+}
+
+func appendBinaryBindInt(dst *strings.Builder, value int64) {
+	var scratch [20]byte
+	dst.Write(strconv.AppendInt(scratch[:0], value, 10))
+}
+
+func appendBinaryBindFloat(dst *strings.Builder, value float64, bitSize int) {
+	var scratch [32]byte
+	dst.Write(strconv.AppendFloat(scratch[:0], value, 'g', -1, bitSize))
+}
+
+func appendBinaryBindTime(dst *strings.Builder, value time.Time) {
+	var scratch [32]byte
+	dst.WriteByte('\'')
+	dst.Write(value.AppendFormat(scratch[:0], "2006-01-02 15:04:05.999999"))
+	dst.WriteByte('\'')
+}
+
+func appendBinaryBindUUID(dst *strings.Builder, data []byte) {
+	const hexDigits = "0123456789abcdef"
+	dst.WriteByte('\'')
+	for i, value := range data {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			dst.WriteByte('-')
+		}
+		dst.WriteByte(hexDigits[value>>4])
+		dst.WriteByte(hexDigits[value&0x0f])
+	}
+	dst.WriteByte('\'')
+}
+
+func appendBinaryBindBytea(dst *strings.Builder, data []byte) {
+	const hexDigits = "0123456789abcdef"
+	dst.WriteString(`'\x`)
+	for _, value := range data {
+		dst.WriteByte(hexDigits[value>>4])
+		dst.WriteByte(hexDigits[value&0x0f])
+	}
+	dst.WriteString(`'::BLOB`)
 }
 
 func decodeBool(data []byte) (bool, error) {

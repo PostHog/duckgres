@@ -141,6 +141,12 @@ type portal struct {
 	described       bool // true if Describe was called on this portal
 	state           portalState
 	payloadReleased bool
+
+	// binaryParamsValidated is set only after every non-null binary Bind value
+	// has passed the direct wire-shape validation used by Flight. The Bind body
+	// is immutable while a portal is ready, so interpolation can then write
+	// literals without decoding or boxing each value a second time.
+	binaryParamsValidated bool
 }
 
 // retainedPayloadBytes reports temporary Bind storage owned by a portal: the
@@ -241,29 +247,37 @@ func (p *portal) AppendBindParameterLiteral(dst *strings.Builder, index int) err
 		return nil
 	}
 	value := p.paramValue(index)
-	if typeOID, format := p.paramTypeOID(index), p.paramFormat(index); typeOID == 0 || format == 0 {
+	typeOID, format := p.paramTypeOID(index), p.paramFormat(index)
+	if typeOID == 0 || format == 0 {
 		sqlcore.AppendTextLiteralBytes(dst, value)
 		return nil
 	}
-	decoded, err := decodeBinary(value, p.paramTypeOID(index))
-	if err != nil {
+	if !p.binaryParamsValidated {
+		if err := validateBinaryBindValue(value, typeOID); err != nil {
+			return fmt.Errorf("parameter %d: %w", index+1, err)
+		}
+	}
+	if err := appendValidatedBinaryBindLiteral(dst, value, typeOID); err != nil {
 		return fmt.Errorf("parameter %d: %w", index+1, err)
 	}
-	sqlcore.AppendSQLLiteral(dst, decoded)
 	return nil
 }
 
 // validateBinaryParameters preserves the protocol-level 08P01 classification
 // before a Flight interpolation error reaches generic executor handling.
 func (p *portal) validateBinaryParameters() error {
+	if p == nil || p.binaryParamsValidated {
+		return nil
+	}
 	for i, param := range p.params {
 		if param.isNull() || p.paramTypeOID(i) == 0 || p.paramFormat(i) == 0 {
 			continue
 		}
-		if _, err := decodeBinary(p.paramValue(i), p.paramTypeOID(i)); err != nil {
+		if err := validateBinaryBindValue(p.paramValue(i), p.paramTypeOID(i)); err != nil {
 			return fmt.Errorf("parameter %d: %w", i+1, err)
 		}
 	}
+	p.binaryParamsValidated = true
 	return nil
 }
 
