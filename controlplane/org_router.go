@@ -234,6 +234,12 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 	// Detect new orgs or orgs whose warehouse just became ready
 	for name, tc := range new.Orgs {
 		oldTC, existed := old.Orgs[name]
+		if tr.srv != nil && tc.Warehouse != nil && tc.Warehouse.State == configstore.ManagedWarehouseStateResharding &&
+			(!existed || oldTC.Warehouse == nil || oldTC.Warehouse.State != configstore.ManagedWarehouseStateResharding) {
+			drained := tr.srv.DrainOrgConnections(name)
+			slog.Info("Warehouse resharding, draining PostgreSQL connections at their next idle boundary.",
+				"org", name, "connections", drained)
+		}
 
 		// Skip orgs with warehouses that aren't ready
 		if tc.Warehouse != nil && tc.Warehouse.State != configstore.ManagedWarehouseStateReady {
