@@ -62,9 +62,8 @@ type closeWaitFlightServer struct {
 	releaseActionCalled   chan struct{}
 	releaseActionOnce     sync.Once
 	releaseTicket         []byte
-	logQueryCalled        chan struct{}
-	logQueryOnce          sync.Once
-	logQueryPayload       wire.WorkerQueryLogPayload
+	logQueryPayloads      chan wire.WorkerQueryLogPayload
+	blockLogQuery         <-chan struct{}
 	waitBeforeDoGetCancel chan struct{}
 	waitBeforeOnce        sync.Once
 	closeAfterFirstBatch  bool
@@ -82,7 +81,7 @@ func newCloseWaitFlightServer() *closeWaitFlightServer {
 		doGetDone:            make(chan struct{}),
 		doActionCalled:       make(chan struct{}),
 		releaseActionCalled:  make(chan struct{}),
-		logQueryCalled:       make(chan struct{}),
+		logQueryPayloads:     make(chan wire.WorkerQueryLogPayload, 100),
 	}
 }
 
@@ -148,11 +147,21 @@ func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.Flight
 		s.releaseTicket = payload.Ticket
 		return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
 	case logQueryAction:
-		s.logQueryOnce.Do(func() {
-			close(s.logQueryCalled)
-		})
-		if err := json.Unmarshal(action.Body, &s.logQueryPayload); err != nil {
+		var payload wire.WorkerQueryLogPayload
+		if err := json.Unmarshal(action.Body, &payload); err != nil {
 			return err
+		}
+		select {
+		case s.logQueryPayloads <- payload:
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+		if s.blockLogQuery != nil {
+			select {
+			case <-s.blockLogQuery:
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			}
 		}
 		return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
 	case waitSessionIdleAction:
@@ -210,45 +219,182 @@ func newCloseWaitExecutor(t *testing.T, srv *closeWaitFlightServer) (*FlightExec
 	return exec, ctx
 }
 
-func TestFlightExecutorLogForwardsQueryLogBatch(t *testing.T) {
+func TestFlightExecutorLogForwardsEachEntryAsSingletonAction(t *testing.T) {
 	srv := newCloseWaitFlightServer()
 	exec, _ := newCloseWaitExecutor(t, srv)
 	exec.SetControlMetadata(17, "cp-live:boot-a", 7)
 
-	exec.Log(wire.QueryLogEntry{
+	entries := []wire.QueryLogEntry{{
 		Query:                 "SELECT 1",
 		UserName:              "alice",
 		OrgID:                 "analytics",
 		CPUTimeSeconds:        1.5,
 		PeakBufferMemoryBytes: 2048,
-	})
+	}, {
+		Query:                 "SELECT 2",
+		UserName:              "bob",
+		OrgID:                 "analytics",
+		CPUTimeSeconds:        2.5,
+		PeakBufferMemoryBytes: 4096,
+	}}
+	for _, entry := range entries {
+		exec.Log(entry)
+	}
 	if err := exec.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
+	gotEntries := make(map[string]wire.QueryLogEntry, len(entries))
+	for range entries {
+		select {
+		case payload := <-srv.logQueryPayloads:
+			if got := payload.WorkerID; got != 17 {
+				t.Fatalf("worker_id = %d, want 17", got)
+			}
+			if got := payload.OwnerEpoch; got != 7 {
+				t.Fatalf("owner_epoch = %d, want 7", got)
+			}
+			if got := payload.CPInstanceID; got != "cp-live:boot-a" {
+				t.Fatalf("cp_instance_id = %q, want cp-live:boot-a", got)
+			}
+			if len(payload.Entries) != 1 {
+				t.Fatalf("entries = %d, want 1", len(payload.Entries))
+			}
+			entry := payload.Entries[0]
+			gotEntries[entry.Query] = entry
+		case <-time.After(time.Second):
+			t.Fatal("LogQuery action was not sent")
+		}
+	}
+	for _, want := range entries {
+		got, ok := gotEntries[want.Query]
+		if !ok {
+			t.Fatalf("query %q was not forwarded", want.Query)
+		}
+		if got.UserName != want.UserName || got.OrgID != want.OrgID ||
+			got.CPUTimeSeconds != want.CPUTimeSeconds || got.PeakBufferMemoryBytes != want.PeakBufferMemoryBytes {
+			t.Fatalf("forwarded entry = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestFlightExecutorLogAllowsConcurrentInFlightActions(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseLogs := func() { releaseOnce.Do(func() { close(release) }) }
+
+	srv := newCloseWaitFlightServer()
+	srv.blockLogQuery = release
+	exec, _ := newCloseWaitExecutor(t, srv)
+	// Registered after the executor cleanup so blocked handlers are released
+	// before Close waits for the query-log calls to finish.
+	t.Cleanup(releaseLogs)
+
+	logQueryWithoutBlocking(t, exec, wire.QueryLogEntry{Query: "SELECT 1"})
+	first := receiveQueryLogPayload(t, srv.logQueryPayloads, 2*time.Second)
+	if len(first.Entries) != 1 || first.Entries[0].Query != "SELECT 1" {
+		t.Fatalf("first payload = %#v, want singleton SELECT 1", first)
+	}
+
+	logQueryWithoutBlocking(t, exec, wire.QueryLogEntry{Query: "SELECT 2"})
+	second := receiveQueryLogPayload(t, srv.logQueryPayloads, 250*time.Millisecond)
+	if len(second.Entries) != 1 || second.Entries[0].Query != "SELECT 2" {
+		t.Fatalf("second payload = %#v, want singleton SELECT 2", second)
+	}
+
+	releaseLogs()
+}
+
+func TestFlightExecutorLogLimitsStalledActionsAcrossWorkerSessions(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseLogs := func() { releaseOnce.Do(func() { close(release) }) }
+
+	srv := newCloseWaitFlightServer()
+	srv.blockLogQuery = release
+	exec1, _ := newCloseWaitExecutor(t, srv)
+	exec2 := NewFlightExecutorFromClient(exec1.client, "session-2")
+	t.Cleanup(func() { _ = exec2.Close() })
+	t.Cleanup(releaseLogs)
+
+	limiter := newQueryLogLimiter(2)
+	exec1.queryLogLimiter = limiter
+	exec2.queryLogLimiter = limiter
+
+	logQueryWithoutBlocking(t, exec1, wire.QueryLogEntry{Query: "SELECT 1"})
+	receiveQueryLogPayload(t, srv.logQueryPayloads, time.Second)
+	logQueryWithoutBlocking(t, exec2, wire.QueryLogEntry{Query: "SELECT 2"})
+	receiveQueryLogPayload(t, srv.logQueryPayloads, time.Second)
+
+	logQueryWithoutBlocking(t, exec1, wire.QueryLogEntry{Query: "SELECT 3"})
 	select {
-	case <-srv.logQueryCalled:
+	case payload := <-srv.logQueryPayloads:
+		t.Fatalf("LogQuery action started after the shared worker limit was reached: %#v", payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseLogs()
+}
+
+func TestFlightExecutorCloseWaitsForInFlightQueryLogAction(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseLog := func() { releaseOnce.Do(func() { close(release) }) }
+
+	srv := newCloseWaitFlightServer()
+	srv.blockLogQuery = release
+	exec, _ := newCloseWaitExecutor(t, srv)
+	// Registered after the executor cleanup so a failed assertion cannot leave
+	// Close blocked behind the test server.
+	t.Cleanup(releaseLog)
+
+	exec.Log(wire.QueryLogEntry{Query: "SELECT 1"})
+	receiveQueryLogPayload(t, srv.logQueryPayloads, time.Second)
+
+	closeReturned := make(chan error, 1)
+	go func() {
+		closeReturned <- exec.Close()
+	}()
+
+	select {
+	case err := <-closeReturned:
+		t.Fatalf("Close returned before the in-flight LogQuery action: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseLog()
+	select {
+	case err := <-closeReturned:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("LogQuery action was not sent")
+		t.Fatal("Close did not return after the LogQuery action completed")
 	}
-	if got := srv.logQueryPayload.WorkerID; got != 17 {
-		t.Fatalf("worker_id = %d, want 17", got)
+}
+
+func receiveQueryLogPayload(t *testing.T, payloads <-chan wire.WorkerQueryLogPayload, timeout time.Duration) wire.WorkerQueryLogPayload {
+	t.Helper()
+	select {
+	case payload := <-payloads:
+		return payload
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for LogQuery action")
+		return wire.WorkerQueryLogPayload{}
 	}
-	if got := srv.logQueryPayload.OwnerEpoch; got != 7 {
-		t.Fatalf("owner_epoch = %d, want 7", got)
-	}
-	if got := srv.logQueryPayload.CPInstanceID; got != "cp-live:boot-a" {
-		t.Fatalf("cp_instance_id = %q, want cp-live:boot-a", got)
-	}
-	if len(srv.logQueryPayload.Entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(srv.logQueryPayload.Entries))
-	}
-	entry := srv.logQueryPayload.Entries[0]
-	if entry.Query != "SELECT 1" || entry.UserName != "alice" || entry.OrgID != "analytics" {
-		t.Fatalf("unexpected forwarded entry: %#v", entry)
-	}
-	if entry.CPUTimeSeconds != 1.5 || entry.PeakBufferMemoryBytes != 2048 {
-		t.Fatalf("resource fields not forwarded: %#v", entry)
+}
+
+func logQueryWithoutBlocking(t *testing.T, exec *FlightExecutor, entry wire.QueryLogEntry) {
+	t.Helper()
+	returned := make(chan struct{})
+	go func() {
+		exec.Log(entry)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Log blocked on the worker LogQuery action")
 	}
 }
 
