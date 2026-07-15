@@ -138,10 +138,11 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"kubectl --context test-context -n duckgres-ci-pr-123 get svc duckgres-control-plane -o jsonpath={.spec.clusterIP}",
 		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
 		"name: artifact-keeper",
-		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-fast-suite-",
+		"value: \"isolated-test-secret\"",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f pod/duckgres-scenario-pod",
 		"-c scenario",
 		"kubectl --context test-context -n duckgres-ci-pr-123 wait --for=jsonpath={.status.containerStatuses[?(@.name==\"scenario\")].state.terminated.reason} pod/duckgres-scenario-pod",
-		"kubectl --context test-context -n duckgres-ci-pr-123 cp -c artifact-keeper duckgres-scenario-pod:/artifacts/scenario-dev/.",
+		"kubectl --context test-context -n duckgres-ci-pr-123 cp -c artifact-keeper duckgres-scenario-pod:/artifacts/scenario-dev/scenario-dev-fast-suite-123/.",
 		"kubectl --context test-context -n duckgres-ci-pr-123 exec -c artifact-keeper duckgres-scenario-pod -- touch /artifacts/artifacts-collected",
 	} {
 		if !strings.Contains(calls, want) {
@@ -159,11 +160,43 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	if strings.Contains(calls, "get secret duckgres-scenario-config") {
 		t.Fatalf("selected scenario still reads a scenario config secret; calls:\n%s", calls)
 	}
+	if strings.Contains(calls, "wait --for=condition=ready pod") {
+		t.Fatalf("selected scenario waited for whole-Pod readiness instead of following the selected container; calls:\n%s", calls)
+	}
 	copyAt := strings.Index(calls, " cp -c artifact-keeper ")
 	terminatedAt := strings.Index(calls, " wait --for=jsonpath={.status.containerStatuses")
 	waitAt := strings.Index(calls, " get job duckgres-scenario-fast-suite-")
 	if terminatedAt < 0 || copyAt < 0 || waitAt < 0 || terminatedAt > copyAt || copyAt > waitAt {
 		t.Fatalf("scenario must terminate, copy from the live keeper, then wait for Job completion; calls:\n%s", calls)
+	}
+}
+
+func TestScenarioStopsJobWithoutCollectingArtifactsWhenContainerTerminationCannotBeConfirmed(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
+		"SCENARIO_DEV_FAIL_CONTAINER_WAIT=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario succeeded without confirmed container termination; output:\n%s", out)
+	}
+
+	calls := fakes.calls(t)
+	waitAt := strings.Index(calls, " wait --for=jsonpath={.status.containerStatuses")
+	deleteAt := strings.LastIndex(calls, " delete job duckgres-scenario-fast-suite-")
+	if waitAt < 0 || deleteAt < 0 || waitAt > deleteAt {
+		t.Fatalf("scenario did not stop the Job after termination wait failed; calls:\n%s", calls)
+	}
+	if !strings.Contains(calls[deleteAt:], "--cascade=foreground --wait=true --timeout=180s") {
+		t.Fatalf("scenario did not wait for foreground Job cleanup; calls:\n%s", calls)
+	}
+	for _, unwanted := range []string{" cp -c artifact-keeper ", " exec -c artifact-keeper "} {
+		if strings.Contains(calls, unwanted) {
+			t.Fatalf("scenario collected or released artifacts after unconfirmed termination (%q); calls:\n%s", unwanted, calls)
+		}
 	}
 }
 
@@ -181,7 +214,7 @@ func TestScenarioCleansUpWhenPodCannotBeDiscovered(t *testing.T) {
 	}
 
 	calls := fakes.calls(t)
-	if !strings.Contains(calls, "delete job duckgres-scenario-fast-suite-") || !strings.Contains(calls, "--wait=false") {
+	if !strings.Contains(calls, "delete job duckgres-scenario-fast-suite-") || !strings.Contains(calls, "--cascade=foreground --wait=true --timeout=180s") {
 		t.Fatalf("scenario did not clean up a Job whose pod could not be discovered; calls:\n%s", calls)
 	}
 }
@@ -208,6 +241,7 @@ func TestScenarioDoesNotAcceptStaleArtifactsAfterEmptyCopy(t *testing.T) {
 	if !strings.Contains(string(out), "missing required scenario artifact") {
 		t.Fatalf("scenario did not report missing required artifacts; output:\n%s", out)
 	}
+	assertVisiblePartialArtifact(t, filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts"), "fast-suite")
 }
 
 func TestScenarioPreservesContainerExitWhenKeeperReleaseFails(t *testing.T) {
@@ -256,6 +290,90 @@ func TestScenarioFailsWhenArtifactCopyFails(t *testing.T) {
 	if !strings.Contains(calls, "exec -c artifact-keeper duckgres-scenario-pod -- touch /artifacts/artifacts-collected") {
 		t.Fatalf("scenario did not release artifact keeper after copy failure; calls:\n%s", calls)
 	}
+	assertVisiblePartialArtifact(t, filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts"), "fast-suite")
+}
+
+func TestScenarioSuccessfulRerunsPreserveEachArtifactSet(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	artifactRoot := filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts")
+
+	for run := 1; run <= 2; run++ {
+		cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+			"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+			"SCENARIO_NAME=fast-suite",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("scenario rerun %d failed: %v\n%s", run, err, out)
+		}
+	}
+
+	entries, err := os.ReadDir(artifactRoot)
+	if err != nil {
+		t.Fatalf("read artifact root: %v", err)
+	}
+	var successful []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			t.Fatalf("artifact staging directory remained hidden after success: %s", entry.Name())
+		}
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "fast-suite-") && !strings.HasSuffix(entry.Name(), ".partial") {
+			successful = append(successful, filepath.Join(artifactRoot, entry.Name()))
+		}
+	}
+	if len(successful) != 2 {
+		t.Fatalf("successful artifact directories = %v, want two run-specific directories", successful)
+	}
+	for _, dir := range successful {
+		for _, artifact := range []string{"scenario_summary.json", "step_results.csv", "events.jsonl"} {
+			if _, err := os.Stat(filepath.Join(dir, artifact)); err != nil {
+				t.Fatalf("successful artifact directory %s missing %s: %v", dir, artifact, err)
+			}
+		}
+	}
+}
+
+func TestScenarioArtifactTokenCollisionCreatesANewResultDirectory(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	artifactRoot := filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts")
+	priorDir := filepath.Join(artifactRoot, "fast-suite-COLLIDE")
+	if err := os.MkdirAll(priorDir, 0o755); err != nil {
+		t.Fatalf("create prior artifact directory: %v", err)
+	}
+	priorMarker := filepath.Join(priorDir, "prior-run.txt")
+	if err := os.WriteFile(priorMarker, []byte("prior\n"), 0o600); err != nil {
+		t.Fatalf("write prior artifact marker: %v", err)
+	}
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
+		"SCENARIO_DEV_MKTEMP_COLLISION_ONCE=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("scenario failed after artifact token collision: %v\n%s", err, out)
+	}
+
+	if contents, err := os.ReadFile(priorMarker); err != nil || string(contents) != "prior\n" {
+		t.Fatalf("prior artifact directory was modified: contents=%q err=%v", contents, err)
+	}
+	if _, err := os.Stat(filepath.Join(priorDir, ".fast-suite.COLLIDE")); !os.IsNotExist(err) {
+		t.Fatalf("new artifact staging directory was nested into the prior result: %v", err)
+	}
+	entries, err := os.ReadDir(artifactRoot)
+	if err != nil {
+		t.Fatalf("read artifact root: %v", err)
+	}
+	var successful int
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "fast-suite-") && !strings.HasSuffix(entry.Name(), ".partial") {
+			successful++
+		}
+	}
+	if successful != 2 {
+		t.Fatalf("successful artifact directory count = %d, want prior and new results; entries=%v", successful, entries)
+	}
 }
 
 func TestScenarioDefaultsToFullSuite(t *testing.T) {
@@ -271,7 +389,7 @@ func TestScenarioDefaultsToFullSuite(t *testing.T) {
 	}
 
 	calls := fakes.calls(t)
-	if !strings.Contains(calls, "kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-full-suite-") {
+	if !strings.Contains(calls, "kubectl --context test-context -n duckgres-ci-pr-123 logs -f pod/duckgres-scenario-pod -c scenario") {
 		t.Fatalf("default did not run full-suite; calls:\n%s", calls)
 	}
 	for _, unwanted := range []string{"scenario-provision-rejection", "scenario-provision-smoke"} {
@@ -300,6 +418,9 @@ func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 	for _, forbidden := range []string{
 		"test-scenario-full",
 		"SCENARIO_FULL_FILES",
+		"internal_secret_file=\"/tmp/duckgres-ci-internal-secret\"",
+		"internal_secret_fallback_file=\"/tmp/duckgres-ci-internal-secret-fallback\"",
+		"user_secret_key_file=\"/tmp/duckgres-ci-user-secret-key\"",
 		"USE_SHARED_DEV",
 		"SCENARIO_SHARED_",
 		"SCENARIO_CONFIG_SECRET",
@@ -307,6 +428,69 @@ func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("run.sh still contains shared-dev/config-secret path %q", forbidden)
 		}
+	}
+}
+
+func TestDeployCreatesConfiguredSecretDirectoryPrivately(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "generated", "secrets")
+
+	cmd := runSHCommand(t, fakes.binDir, "deploy",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"DUCKGRES_CI_SECRET_DIR="+secretDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("deploy did not create configured secret directory: %v\n%s", err, out)
+	}
+	for _, name := range []string{
+		"duckgres-ci-internal-secret",
+		"duckgres-ci-internal-secret-fallback",
+		"duckgres-ci-user-secret-key",
+	} {
+		info, statErr := os.Stat(filepath.Join(secretDir, name))
+		if statErr != nil {
+			t.Fatalf("generated secret %s missing: %v", name, statErr)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("generated secret %s mode = %o, want 600", name, got)
+		}
+	}
+	info, statErr := os.Stat(secretDir)
+	if statErr != nil {
+		t.Fatalf("configured secret directory missing: %v", statErr)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("configured secret directory mode = %o, want 700", got)
+	}
+}
+
+func TestScenarioPodIsProtectedFromKarpenterDisruption(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+
+	const jobMarker = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: $job"
+	jobStart := strings.Index(string(raw), jobMarker)
+	if jobStart < 0 {
+		t.Fatal("scenario Job manifest missing from run.sh")
+	}
+	jobYAML := string(raw)[jobStart:]
+	if jobEnd := strings.Index(jobYAML, "\nYAML"); jobEnd >= 0 {
+		jobYAML = jobYAML[:jobEnd]
+	}
+
+	var manifest map[string]any
+	if err := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(jobYAML), 4096).Decode(&manifest); err != nil {
+		t.Fatalf("decode scenario Job manifest: %v", err)
+	}
+	spec, _ := manifest["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	metadata, _ := template["metadata"].(map[string]any)
+	annotations, _ := metadata["annotations"].(map[string]any)
+	if got := annotations["karpenter.sh/do-not-disrupt"]; got != "true" {
+		t.Fatalf("scenario Pod karpenter.sh/do-not-disrupt = %v, want true", got)
 	}
 }
 
@@ -411,11 +595,14 @@ func newRunSHFakes(t *testing.T) runSHFakes {
 		t.Fatalf("mkdir fake bin: %v", err)
 	}
 	logPath := filepath.Join(dir, "calls.log")
-	const internalSecretPath = "/tmp/duckgres-ci-internal-secret"
-	if err := os.WriteFile(internalSecretPath, []byte("test-secret\n"), 0o600); err != nil {
+	secretDir := filepath.Join(dir, "secrets")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatalf("mkdir fake secret dir: %v", err)
+	}
+	internalSecretPath := filepath.Join(secretDir, "duckgres-ci-internal-secret")
+	if err := os.WriteFile(internalSecretPath, []byte("isolated-test-secret\n"), 0o600); err != nil {
 		t.Fatalf("write fake internal secret: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Remove(internalSecretPath) })
 
 	writeFake(t, binDir, "kubectl", `#!/usr/bin/env bash
 printf 'kubectl %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
@@ -458,6 +645,9 @@ fi
 if [[ -n "${SCENARIO_DEV_NO_POD:-}" && "$*" == *" get pod -l job-name=duckgres-scenario-"* ]]; then
   exit 0
 fi
+if [[ -n "${SCENARIO_DEV_FAIL_CONTAINER_WAIT:-}" && "$*" == *" wait --for=jsonpath="* && "$*" == *'@.name=="scenario"'* ]]; then
+  exit 1
+fi
 if [[ "$*" == *"state.terminated.exitCode"* ]]; then
   printf '%s' "${SCENARIO_DEV_EXIT_CODE:-0}"
   exit 0
@@ -468,6 +658,9 @@ if [[ "$*" == *" get pod -l job-name=duckgres-scenario-"* ]]; then
 fi
 if [[ -n "${SCENARIO_DEV_FAIL_RELEASE:-}" && "$*" == *" exec -c artifact-keeper "* ]]; then
   exit 1
+fi
+if [[ -n "${SCENARIO_DEV_ALLOW_DUCKLING_DELETE:-}" && "$*" == *" wait --for=delete duckling/ci-pr-123-"* ]]; then
+  exit 0
 fi
 if [[ "$*" == *" wait --for=delete duckling/ci-pr-123-"* ]]; then
   exit 1
@@ -513,6 +706,18 @@ if [[ "$*" == *" exec duckgres-control-plane-test -- sh -c "* ]]; then
 fi
 
 exit 0
+`)
+
+	writeFake(t, binDir, "mktemp", `#!/usr/bin/env bash
+if [[ -n "${SCENARIO_DEV_MKTEMP_COLLISION_ONCE:-}" && ! -e "$RUN_SH_TEST_MKTEMP_STATE" ]]; then
+  touch "$RUN_SH_TEST_MKTEMP_STATE"
+  template="${@: -1}"
+  path="${template%XXXXXX}COLLIDE"
+  mkdir -p "$path"
+  printf '%s\n' "$path"
+  exit 0
+fi
+exec /usr/bin/mktemp "$@"
 `)
 
 	writeFake(t, binDir, "aws", `#!/usr/bin/env bash
@@ -577,6 +782,7 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 	env := append(os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"RUN_SH_TEST_CALLS="+filepath.Join(filepath.Dir(binDir), "calls.log"),
+		"RUN_SH_TEST_MKTEMP_STATE="+filepath.Join(filepath.Dir(binDir), "mktemp-state"),
 		"KUBE_CONTEXT=test-context",
 		"NAMESPACE=duckgres-ci-pr-123",
 		"PR_NUMBER=123",
@@ -586,10 +792,39 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"EKS_CLUSTER_NAME=test-cluster",
 		"AWS_REGION=us-east-1",
 		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),
+		"DUCKGRES_CI_SECRET_DIR="+filepath.Join(filepath.Dir(binDir), "secrets"),
 	)
 	env = append(env, extraEnv...)
 	cmd.Env = env
 	return cmd
+}
+
+func assertVisiblePartialArtifact(t *testing.T, artifactRoot, scenarioName string) {
+	t.Helper()
+	entries, err := os.ReadDir(artifactRoot)
+	if err != nil {
+		t.Fatalf("read artifact root: %v", err)
+	}
+	var partials []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			t.Fatalf("artifact staging directory remained hidden after failure: %s", entry.Name())
+		}
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), scenarioName+"-") && strings.HasSuffix(entry.Name(), ".partial") {
+			partials = append(partials, filepath.Join(artifactRoot, entry.Name()))
+		}
+	}
+	if len(partials) != 1 {
+		t.Fatalf("partial artifact directories = %v, want exactly one", partials)
+	}
+	marker := filepath.Join(partials[0], "artifact_collection_error.txt")
+	contents, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read partial artifact marker: %v", err)
+	}
+	if len(strings.TrimSpace(string(contents))) == 0 {
+		t.Fatalf("partial artifact marker %s is empty", marker)
+	}
 }
 
 func (f runSHFakes) calls(t *testing.T) string {
