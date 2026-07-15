@@ -585,7 +585,11 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 			"pid", pid, "worker", worker.ID, "user", username, "warning", w)
 	}
 
-	executor := flightclient.NewFlightExecutorFromClient(worker.client, sessionToken)
+	executor := flightclient.NewFlightExecutorFromClientWithQueryLogLimiter(
+		worker.client,
+		sessionToken,
+		worker.workerQueryLogLimiter(),
+	)
 	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
 
 	if pid == 0 {

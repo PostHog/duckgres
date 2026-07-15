@@ -42,13 +42,47 @@ const (
 	logQueryAction           = "LogQuery"
 	queryCloseWaitTimeout    = 30 * time.Second
 	queryLogForwardTimeout   = 5 * time.Second
-	queryLogForwardBatchSize = 100
-	queryLogForwardInterval  = 1 * time.Second
-	queryLogForwardQueueSize = 10000
+	queryLogMaxInFlight      = 64
 )
 
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
+
+// QueryLogLimiter bounds concurrent control-plane query-log RPCs for one
+// worker. It holds no entries itself; sessions sharing a worker share the
+// same limiter so a stalled endpoint cannot accumulate unbounded goroutines.
+type QueryLogLimiter struct {
+	limit    int64
+	inFlight atomic.Int64
+}
+
+// NewQueryLogLimiter creates a limiter with the production per-worker limit.
+func NewQueryLogLimiter() *QueryLogLimiter {
+	return newQueryLogLimiter(queryLogMaxInFlight)
+}
+
+func newQueryLogLimiter(limit int64) *QueryLogLimiter {
+	if limit <= 0 {
+		limit = 1
+	}
+	return &QueryLogLimiter{limit: limit}
+}
+
+func (l *QueryLogLimiter) tryAcquire() bool {
+	for {
+		current := l.inFlight.Load()
+		if current >= l.limit {
+			return false
+		}
+		if l.inFlight.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (l *QueryLogLimiter) release() {
+	l.inFlight.Add(-1)
+}
 
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
@@ -72,9 +106,11 @@ type FlightExecutor struct {
 	// from the worker via gRPC trailing metadata.
 	lastProfiling atomic.Value // stores string
 
-	queryLogCh       chan wire.QueryLogEntry
-	queryLogDone     chan struct{}
+	queryLogMu       sync.Mutex
+	queryLogClosed   bool
+	queryLogWG       sync.WaitGroup
 	queryLogStopOnce sync.Once
+	queryLogLimiter  *QueryLogLimiter
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -104,15 +140,15 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &FlightExecutor{
-		client:       client,
-		sessionToken: sessionToken,
-		ownerEpoch:   0,
-		alloc:        memory.DefaultAllocator,
-		ownsClient:   true,
-		ctx:          ctx,
-		cancel:       cancel,
+		client:          client,
+		sessionToken:    sessionToken,
+		ownerEpoch:      0,
+		alloc:           memory.DefaultAllocator,
+		ownsClient:      true,
+		ctx:             ctx,
+		cancel:          cancel,
+		queryLogLimiter: NewQueryLogLimiter(),
 	}
-	e.startQueryLogForwarder()
 	return e, nil
 }
 
@@ -120,17 +156,26 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 // Flight SQL client. The client is NOT closed when this executor is closed.
 // This avoids creating a new gRPC connection per session.
 func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) *FlightExecutor {
+	return NewFlightExecutorFromClientWithQueryLogLimiter(client, sessionToken, nil)
+}
+
+// NewFlightExecutorFromClientWithQueryLogLimiter creates a per-session
+// executor whose asynchronous query-log calls share a worker-wide limiter.
+func NewFlightExecutorFromClientWithQueryLogLimiter(client *flightsql.Client, sessionToken string, limiter *QueryLogLimiter) *FlightExecutor {
+	if limiter == nil {
+		limiter = NewQueryLogLimiter()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &FlightExecutor{
-		client:       client,
-		sessionToken: sessionToken,
-		ownerEpoch:   0,
-		alloc:        memory.DefaultAllocator,
-		ownsClient:   false,
-		ctx:          ctx,
-		cancel:       cancel,
+		client:          client,
+		sessionToken:    sessionToken,
+		ownerEpoch:      0,
+		alloc:           memory.DefaultAllocator,
+		ownsClient:      false,
+		ctx:             ctx,
+		cancel:          cancel,
+		queryLogLimiter: limiter,
 	}
-	e.startQueryLogForwarder()
 	return e
 }
 
@@ -339,9 +384,10 @@ func (e *FlightExecutor) mergedContext(ctx context.Context) (context.Context, co
 }
 
 func (e *FlightExecutor) Close() error {
-	if !e.stopQueryLogForwarder() && e.cancel != nil {
+	e.stopQueryLogForwarding()
+	if !e.waitQueryLogForwarding() && e.cancel != nil {
 		e.cancel()
-		e.waitQueryLogForwarder()
+		e.queryLogWG.Wait()
 	}
 	if e.cancel != nil {
 		e.cancel()
@@ -362,102 +408,84 @@ func (e *FlightExecutor) Log(entry wire.QueryLogEntry) {
 		observe.AddQueryLogDroppedEntries("forward_worker_dead", 1)
 		return
 	}
-	if e.queryLogCh == nil {
+
+	e.queryLogMu.Lock()
+	if e.queryLogClosed {
+		e.queryLogMu.Unlock()
+		observe.AddQueryLogDroppedEntries("forward_closed", 1)
+		return
+	}
+	if e.dead.Load() {
+		e.queryLogMu.Unlock()
+		observe.AddQueryLogDroppedEntries("forward_worker_dead", 1)
+		return
+	}
+	if e.client == nil || e.client.Client == nil {
+		e.queryLogMu.Unlock()
 		observe.AddQueryLogDroppedEntries("forward_unavailable", 1)
 		return
 	}
-	defer func() {
-		if recover() != nil {
-			observe.AddQueryLogDroppedEntries("forward_closed", 1)
-		}
+	limiter := e.queryLogLimiter
+	if limiter == nil {
+		limiter = NewQueryLogLimiter()
+		e.queryLogLimiter = limiter
+	}
+	if !limiter.tryAcquire() {
+		e.queryLogMu.Unlock()
+		observe.AddQueryLogDroppedEntries("forward_in_flight_limit", 1)
+		return
+	}
+	baseCtx := context.Background()
+	if e.ctx != nil {
+		baseCtx = e.ctx
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, queryLogForwardTimeout)
+	e.queryLogWG.Add(1)
+	e.queryLogMu.Unlock()
+
+	go func() {
+		defer e.queryLogWG.Done()
+		defer limiter.release()
+		defer cancel()
+		_ = e.forwardQueryLogEntry(ctx, entry)
+	}()
+}
+
+func (e *FlightExecutor) stopQueryLogForwarding() {
+	e.queryLogStopOnce.Do(func() {
+		e.queryLogMu.Lock()
+		e.queryLogClosed = true
+		e.queryLogMu.Unlock()
+	})
+}
+
+func (e *FlightExecutor) waitQueryLogForwarding() bool {
+	done := make(chan struct{})
+	go func() {
+		e.queryLogWG.Wait()
+		close(done)
 	}()
 	select {
-	case e.queryLogCh <- entry:
-	default:
-		observe.AddQueryLogDroppedEntries("forward_buffer_full", 1)
-	}
-}
-
-func (e *FlightExecutor) startQueryLogForwarder() {
-	e.queryLogCh = make(chan wire.QueryLogEntry, queryLogForwardQueueSize)
-	e.queryLogDone = make(chan struct{})
-	go e.queryLogForwardLoop()
-}
-
-func (e *FlightExecutor) stopQueryLogForwarder() bool {
-	stopped := true
-	e.queryLogStopOnce.Do(func() {
-		if e.queryLogCh != nil {
-			close(e.queryLogCh)
-		}
-		stopped = e.waitQueryLogForwarder()
-	})
-	return stopped
-}
-
-func (e *FlightExecutor) waitQueryLogForwarder() bool {
-	if e.queryLogDone == nil {
-		return true
-	}
-	select {
-	case <-e.queryLogDone:
+	case <-done:
 		return true
 	case <-time.After(queryLogForwardTimeout):
 		return false
 	}
 }
 
-func (e *FlightExecutor) queryLogForwardLoop() {
-	defer close(e.queryLogDone)
-	ticker := time.NewTicker(queryLogForwardInterval)
-	defer ticker.Stop()
-
-	batch := make([]wire.QueryLogEntry, 0, queryLogForwardBatchSize)
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		// forwardQueryLogBatch records dropped-entry metrics for failed batches.
-		_ = e.forwardQueryLogBatch(batch)
-		batch = batch[:0]
-	}
-
-	for {
-		select {
-		case entry, ok := <-e.queryLogCh:
-			if !ok {
-				flush()
-				return
-			}
-			batch = append(batch, entry)
-			if len(batch) >= queryLogForwardBatchSize {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
-		case <-e.ctx.Done():
-			observe.AddQueryLogDroppedEntries("forward_context_done", len(batch)+len(e.queryLogCh))
-			return
-		}
-	}
-}
-
-func (e *FlightExecutor) forwardQueryLogBatch(entries []wire.QueryLogEntry) (err error) {
-	if len(entries) == 0 {
-		return nil
-	}
+func (e *FlightExecutor) forwardQueryLogEntry(ctx context.Context, entry wire.QueryLogEntry) (err error) {
 	if e.dead.Load() {
-		observe.AddQueryLogDroppedEntries("forward_worker_dead", len(entries))
+		observe.AddQueryLogDroppedEntries("forward_worker_dead", 1)
 		return nil
 	}
 	if e.client == nil || e.client.Client == nil {
-		observe.AddQueryLogDroppedEntries("forward_unavailable", len(entries))
+		observe.AddQueryLogDroppedEntries("forward_unavailable", 1)
 		return nil
 	}
 	defer func() {
 		recoverClientPanic(&err)
 		if err != nil {
-			observe.AddQueryLogDroppedEntries("forward_error", len(entries))
+			observe.AddQueryLogDroppedEntries("forward_error", 1)
 		}
 	}()
 
@@ -467,18 +495,12 @@ func (e *FlightExecutor) forwardQueryLogBatch(entries []wire.QueryLogEntry) (err
 			OwnerEpoch:   e.ownerEpoch,
 			CPInstanceID: e.cpInstanceID,
 		},
-		Entries: entries,
+		Entries: []wire.QueryLogEntry{entry},
 	})
 	if err != nil {
 		return err
 	}
 
-	baseCtx := context.Background()
-	if e.ctx != nil {
-		baseCtx = e.ctx
-	}
-	ctx, cancel := context.WithTimeout(baseCtx, queryLogForwardTimeout)
-	defer cancel()
 	stream, err := e.client.Client.DoAction(
 		e.withSession(ctx),
 		&flight.Action{Type: logQueryAction, Body: payload},

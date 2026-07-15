@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -718,7 +717,6 @@ func TestDestroyAllSessions_ReleasesAllLeasesAndClearsSessions(t *testing.T) {
 }
 
 func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T) {
-	queryLogForwardersBefore := countFlightExecutorQueryLogForwarders()
 	flightClient := &blockingCreateSessionFlightClient{
 		createStarted:   make(chan struct{}),
 		allowCreate:     make(chan struct{}),
@@ -792,7 +790,6 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	if got := flightClient.destroyCalls.Load(); got != 1 {
 		t.Fatalf("expected worker session to be destroyed once, got %d", got)
 	}
-	waitForFlightExecutorQueryLogForwardersAtMost(t, queryLogForwardersBefore)
 }
 
 func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
@@ -977,24 +974,6 @@ func waitForSessionManagerDraining(t *testing.T, sm *SessionManager) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for session manager to start draining")
-}
-
-func waitForFlightExecutorQueryLogForwardersAtMost(t *testing.T, want int) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if got := countFlightExecutorQueryLogForwarders(); got <= want {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("flight executor query-log forwarder count = %d, want <= %d", countFlightExecutorQueryLogForwarders(), want)
-}
-
-func countFlightExecutorQueryLogForwarders() int {
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	return strings.Count(string(buf[:n]), "(*FlightExecutor).queryLogForwardLoop")
 }
 
 func countEvents(events []string, want string) int {
