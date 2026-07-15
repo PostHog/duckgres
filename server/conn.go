@@ -476,7 +476,7 @@ func (c *clientConn) logger() *slog.Logger {
 }
 
 func (c *clientConn) logQueryStarted(query string) {
-	query = usersecrets.RedactForLog(query)
+	query = boundQueryLogText(usersecrets.RedactForLog(query))
 	c.logger().Info("Query started.",
 		"query", query,
 		"trace_id", observe.TraceIDFromContext(c.ctx))
@@ -500,7 +500,7 @@ func (c *clientConn) logQueryStarted(query string) {
 // line for severity context.
 func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64, err error) {
 	attrs := []any{
-		"query", usersecrets.RedactForLog(query),
+		"query", boundQueryLogText(usersecrets.RedactForLog(query)),
 		"duration_ms", time.Since(start).Milliseconds(),
 		"rows", rows,
 		"trace_id", observe.TraceIDFromContext(c.ctx),
@@ -508,7 +508,7 @@ func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64,
 	if err != nil {
 		// Engine errors echo the offending SQL, so a failed CREATE SECRET
 		// leaks the credential here unless the error is redacted too.
-		attrs = append(attrs, "error", usersecrets.RedactErrorForLog(query, err.Error()))
+		attrs = append(attrs, "error", boundQueryLogText(usersecrets.RedactErrorForLog(query, err.Error())))
 	}
 	c.logger().Info("Query finished.", attrs...)
 }

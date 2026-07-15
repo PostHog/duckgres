@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/usersecrets"
@@ -299,6 +300,23 @@ func truncateQuery(q string) string {
 	return q
 }
 
+// boundQueryLogText caps control-plane query-log text before it reaches logs,
+// in-memory queues, normalization, or RPC serialization. Clone the retained
+// text so a bounded entry cannot keep a much larger query allocation alive.
+func boundQueryLogText(text string) string {
+	if text == "" {
+		return ""
+	}
+	if len(text) > maxQueryLength {
+		end := maxQueryLength
+		for end > 0 && !utf8.RuneStart(text[end]) {
+			end--
+		}
+		text = text[:end]
+	}
+	return strings.Clone(text)
+}
+
 func truncateNullableQuery(q *string) *string {
 	if q == nil {
 		return nil
@@ -400,7 +418,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	// them to the query log. The engine's error text echoes the offending SQL,
 	// so a failed CREATE SECRET leaks the credential via Exception unless the
 	// error is redacted too — classify against the original query first.
-	errMsg = usersecrets.RedactErrorForLog(query, errMsg)
+	errMsg = boundQueryLogText(usersecrets.RedactErrorForLog(query, errMsg))
 	query = usersecrets.RedactForLog(query)
 	transpiledQuery = usersecrets.RedactForLog(transpiledQuery)
 
@@ -409,9 +427,12 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		entryType = "ExceptionWhileProcessing"
 	}
 
+	isTranspiled := transpiledQuery != "" && transpiledQuery != query
+	query = boundQueryLogText(query)
 	var transpiled *string
-	if transpiledQuery != "" && transpiledQuery != query {
-		transpiled = &transpiledQuery
+	if isTranspiled {
+		boundedTranspiledQuery := boundQueryLogText(transpiledQuery)
+		transpiled = &boundedTranspiledQuery
 	}
 
 	// Extract client address and port from the connection
@@ -455,7 +476,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		ApplicationName:       c.applicationName,
 		PID:                   c.pid,
 		WorkerID:              c.workerID,
-		IsTranspiled:          transpiled != nil,
+		IsTranspiled:          isTranspiled,
 		Protocol:              protocol,
 		TraceID:               observe.TraceIDFromContext(c.ctx),
 		SpanID:                observe.SpanIDFromContext(c.ctx),

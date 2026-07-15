@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newLifecycleClientConn builds a clientConn with both reader and writer
@@ -105,6 +106,24 @@ func assertLifecyclePair(t *testing.T, buf *bytes.Buffer, label string) {
 	}
 	if !strings.Contains(out, `msg="Query finished."`) {
 		t.Errorf("[%s] missing 'Query finished.' in:\n%s", label, out)
+	}
+}
+
+func TestLifecycleLogsBoundOversizedQueryText(t *testing.T) {
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	query := "SELECT " + strings.Repeat("q", maxQueryLength) + " query-tail-marker"
+	c.logQueryStarted(query)
+	c.logQueryFinished(query, time.Now(), 0, errors.New("engine error: "+query))
+
+	out := buf.String()
+	assertLifecyclePair(t, buf, "oversized-query")
+	if strings.Contains(out, "query-tail-marker") {
+		t.Fatal("lifecycle logs retained query text beyond the control-plane bound")
 	}
 }
 
