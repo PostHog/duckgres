@@ -470,7 +470,15 @@ admin APIs, never clearable via the admin API, so every org always has one;
 resolved from the config snapshot at connection end, where 0 can still appear
 only for an unknown org / stale snapshot); `query_source` is the
 `duckgres.query_source` session GUC (`standard` unless set; a mid-connection
-change bills the whole connection under the final value). Invariants for anyone
+change bills the whole connection under the final value). The GUC is a **closed
+enum validated at SET time** (`transform.NormalizeQuerySource`): only
+`standard` | `endpoints` (case-insensitive, normalized to lowercase; empty =
+reset to default) — anything else is rejected with `22023` on every set path
+(simple/batched SET, extended Parse, and the `-c` startup option, which rejects
+the connection like invalid `duckgres.worker_*` options), and
+`server.ConnectionBilling` clamps a non-canonical value to `standard` as
+defense in depth so client junk can never become a billing bucket key.
+Invariants for anyone
 touching this path:
 
 - **Metering is strictly best-effort and off the hot path.** A metering error

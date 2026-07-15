@@ -94,6 +94,9 @@ type Result struct {
 	// '<value>'` on the duckgres-namespaced custom GUC. The connection layer
 	// stores the pointed-to value on the session and acknowledges it as "SET"
 	// (it is NOT forwarded to DuckDB, which would reject the unknown setting).
+	// The value is pre-validated and canonical: "standard", "endpoints", or ""
+	// (reset to default) — an invalid value never reaches here (it surfaces as
+	// Error with SQLSTATE 22023 instead).
 	QuerySourceSet *string
 
 	// QuerySourceShow indicates a `SHOW duckgres.query_source`; the connection

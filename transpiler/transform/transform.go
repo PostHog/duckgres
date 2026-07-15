@@ -27,7 +27,9 @@ type Result struct {
 	// `SET duckgres.query_source = '<value>'` (a duckgres-namespaced custom GUC
 	// that must NOT be forwarded to DuckDB). The pointed-to string is the value
 	// to store on the session; the connection layer intercepts and acknowledges
-	// it as "SET" without executing anything against DuckDB.
+	// it as "SET" without executing anything against DuckDB. The value has been
+	// validated + normalized by NormalizeQuerySource ("standard", "endpoints",
+	// or "" = reset); an invalid value sets Error (22023) instead.
 	QuerySourceSet *string
 
 	// QuerySourceShow indicates the statement is `SHOW duckgres.query_source`.

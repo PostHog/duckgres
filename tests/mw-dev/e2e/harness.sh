@@ -463,14 +463,20 @@ pg_compat_functions() { # org password
 # unknown settings). Assertions, each in a single simple-query session:
 #   1. unset SHOW → default "standard" (never errors on a missing value)
 #   2. SET then SHOW in the same session → the value round-trips
-#   3. an arbitrary (non-standard/endpoints) value is accepted pass-through,
-#      not rejected — only "standard"/"endpoints" are meaningful downstream.
-#   4. a batch mixing the GUC SET with a normal statement runs the normal
+#   3. the value is a billing dimension (bucket key in
+#      duckgres_org_compute_usage + the billing pull API), so it is a closed
+#      enum: a non-{standard,endpoints} value MUST be rejected at SET time
+#      (22023 invalid_parameter_value) with an error naming the valid values,
+#      and a subsequent SHOW still reports the default — client junk must
+#      never reach the billing key (unbounded cardinality + junk in exports).
+#   4. matching is case-insensitive, normalized to lowercase (SHOW reports the
+#      canonical form).
+#   5. a batch mixing the GUC SET with a normal statement runs the normal
 #      statement too — the intercepted GUC must NOT swallow the rest of the
 #      batch (regression for the multi-statement-swallow bug).
-# Assertions 2-4 are multi-statement simple queries: the CP splits the batch and
-# runs each statement in order, so the SET applies session-side before the
-# trailing SHOW/SELECT. If any statement forwarded to DuckDB, the query would
+# The batched assertions are multi-statement simple queries: the CP splits the
+# batch and runs each statement in order, so the SET applies session-side before
+# the trailing SHOW/SELECT. If any statement forwarded to DuckDB, the query would
 # error ("unrecognized configuration parameter"), failing the assert; if the GUC
 # swallowed the batch, the trailing statement's value would be missing.
 query_source_guc() { # org password
@@ -479,7 +485,19 @@ query_source_guc() { # org password
   # psql's `SET` command tag on its own line first, so assert only the last line.
   assert_compat  "$1" "$2" ducklake "SHOW duckgres.query_source" "standard" "query_source_default"
   assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SHOW duckgres.query_source" "endpoints" "query_source_set"
-  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'anything'; SHOW duckgres.query_source" "anything" "query_source_passthrough"
+  # Invalid value → rejected at SET time with an error naming the valid values.
+  # The trailing SHOW never runs (ON_ERROR_STOP), and the session value is
+  # untouched: a fresh session's SHOW below still reports the default.
+  if out="$(pg_try "$1" "$2" ducklake "SET duckgres.query_source = 'garbage'; SHOW duckgres.query_source")"; then
+    fail "query_source: invalid value 'garbage' was accepted (junk would reach the billing bucket key): $out"
+  fi
+  case "$out" in
+    *'must be "standard" or "endpoints"'*) ;;
+    *) fail "query_source: invalid-value rejection did not name the valid values: '$out'" ;;
+  esac
+  assert_compat "$1" "$2" ducklake "SHOW duckgres.query_source" "standard" "query_source_after_rejected_set"
+  # Case-insensitive, normalized to lowercase.
+  assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'ENDPOINTS'; SHOW duckgres.query_source" "endpoints" "query_source_case_insensitive"
   assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" "1" "query_source_set_then_query"
 }
 

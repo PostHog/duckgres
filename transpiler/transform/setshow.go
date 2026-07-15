@@ -18,6 +18,45 @@ var configParamPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 // (DuckDB rejects unknown settings). See clientConn.QuerySource in server/.
 const querySourceParam = "duckgres.query_source"
 
+// Valid values for the duckgres.query_source GUC. The value is a billing
+// dimension — it lands verbatim in the compute-usage bucket key
+// (duckgres_org_compute_usage.query_source) and in the billing pull API — so
+// it is a closed enum: accepting arbitrary strings would hand clients
+// unbounded cardinality (and arbitrary junk) in the billing table and its
+// exports.
+const (
+	QuerySourceStandard  = "standard"
+	QuerySourceEndpoints = "endpoints"
+)
+
+// NormalizeQuerySource validates a client-supplied duckgres.query_source value
+// against the closed set above. Matching is case-insensitive (and ignores
+// surrounding whitespace); the returned value is canonical lowercase. Empty is
+// valid and means "reset to default" (the session then reports "standard").
+// An invalid value returns a 22023 (invalid_parameter_value) CodedError. The
+// message deliberately does NOT echo the offending value: it is arbitrary
+// client input (possibly huge) and error messages flow into logs, the query
+// log, and the admin recent-errors ring.
+func NormalizeQuerySource(raw string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", QuerySourceStandard, QuerySourceEndpoints:
+		return v, nil
+	default:
+		return "", errInvalidQuerySource()
+	}
+}
+
+// errInvalidQuerySource is the SET-time rejection for a bad
+// duckgres.query_source value: 22023 invalid_parameter_value, matching how the
+// control plane rejects invalid duckgres.worker_* startup options.
+func errInvalidQuerySource() *CodedError {
+	return &CodedError{
+		Code: "22023", // invalid_parameter_value
+		Message: fmt.Sprintf("invalid value for %q: must be %q or %q",
+			querySourceParam, QuerySourceStandard, QuerySourceEndpoints),
+	}
+}
+
 // duckdbShowCommands are DuckDB-specific SHOW commands that should be passed
 // through to DuckDB rather than treated as PostgreSQL config parameters.
 var duckdbShowCommands = map[string]bool{
@@ -251,19 +290,38 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				// duckgres.query_source: a duckgres-namespaced custom GUC. Intercept
 				// and hand the value to the connection layer to store on the session;
 				// do NOT forward to DuckDB (it would reject the unknown setting).
-				// RESET restores the default (empty value). SET LOCAL is treated the
-				// same as SET here (there is no transaction-scoped restore for this
-				// billing GUC).
+				// RESET / SET ... TO DEFAULT restore the default (empty value).
+				// SET LOCAL is treated the same as SET here (there is no
+				// transaction-scoped restore for this billing GUC). The value is a
+				// billing dimension, so it is validated against the closed
+				// {standard, endpoints} set (case-insensitively, normalized to
+				// lowercase); anything else — including a value that is not a
+				// single simple constant/identifier — is rejected with 22023 via
+				// result.Error, which every protocol path (simple, split-batch,
+				// extended Parse) surfaces before storing anything on the session.
 				if paramName == querySourceParam && !multiStatement {
 					value := ""
 					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
+						extracted := false
 						if len(n.VariableSetStmt.Args) == 1 {
 							if v, ok := searchPathValue(n.VariableSetStmt.Args[0]); ok {
-								value = v
+								value, extracted = v, true
 							}
 						}
+						if !extracted {
+							// Multiple values / a non-string constant can never
+							// name a valid query source; reject rather than
+							// silently resetting to the default.
+							result.Error = errInvalidQuerySource()
+							return true, nil
+						}
 					}
-					result.QuerySourceSet = &value
+					norm, err := NormalizeQuerySource(value)
+					if err != nil {
+						result.Error = err
+						return true, nil
+					}
+					result.QuerySourceSet = &norm
 					return true, nil
 				}
 
