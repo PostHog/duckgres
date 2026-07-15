@@ -35,6 +35,19 @@ func counterVecValue(t *testing.T, counterVec *prometheus.CounterVec, labels ...
 	return counterValue(t, counter)
 }
 
+func collectorMetricCount(collector prometheus.Collector) int {
+	metrics := make(chan prometheus.Metric)
+	go func() {
+		collector.Collect(metrics)
+		close(metrics)
+	}()
+	count := 0
+	for range metrics {
+		count++
+	}
+	return count
+}
+
 func histogramSampleCount(t *testing.T, histogram prometheus.Histogram) uint64 {
 	t.Helper()
 	m := &dto.Metric{}
@@ -119,5 +132,49 @@ func TestQueryLogMetricsHelpersRecordBufferFlushAndDrops(t *testing.T) {
 	}
 	if got := histogramSampleCount(t, queryLogFlushDurationHistogram) - flushSamplesBefore; got != 1 {
 		t.Fatalf("flush duration sample delta = %d, want 1", got)
+	}
+}
+
+func TestPortalRetentionMetricsHelpersRecordDeltas(t *testing.T) {
+	retainedBefore := gaugeValue(t, retainedBindBytesGauge)
+	portalsBefore := gaugeValue(t, openPortalsGauge)
+	releasedBefore := counterVecValue(t, portalPayloadReleasesTotal, "terminal_success")
+	rejectedBefore := counterVecValue(t, portalBudgetRejectionsTotal, "retained_bytes")
+
+	AddRetainedBindBytes(1024)
+	AddOpenPortals(1)
+	IncPortalPayloadRelease("terminal_success")
+	IncPortalBudgetRejection("retained_bytes")
+
+	if got := gaugeValue(t, retainedBindBytesGauge) - retainedBefore; got != 1024 {
+		t.Fatalf("retained Bind bytes delta = %v, want 1024", got)
+	}
+	if got := gaugeValue(t, openPortalsGauge) - portalsBefore; got != 1 {
+		t.Fatalf("open portals delta = %v, want 1", got)
+	}
+	if got := counterVecValue(t, portalPayloadReleasesTotal, "terminal_success") - releasedBefore; got != 1 {
+		t.Fatalf("terminal_success releases delta = %v, want 1", got)
+	}
+	if got := counterVecValue(t, portalBudgetRejectionsTotal, "retained_bytes") - rejectedBefore; got != 1 {
+		t.Fatalf("retained_bytes rejections delta = %v, want 1", got)
+	}
+
+	// Gauges are process-wide aggregates, so restore them after this focused test.
+	AddRetainedBindBytes(-1024)
+	AddOpenPortals(-1)
+}
+
+func TestPortalRetentionCountersIgnoreUnknownReasons(t *testing.T) {
+	releasesBefore := collectorMetricCount(portalPayloadReleasesTotal)
+	rejectionsBefore := collectorMetricCount(portalBudgetRejectionsTotal)
+
+	IncPortalPayloadRelease("unexpected_reason")
+	IncPortalBudgetRejection("unexpected_reason")
+
+	if got := collectorMetricCount(portalPayloadReleasesTotal); got != releasesBefore {
+		t.Fatalf("release counter series = %d, want %d after unknown reason", got, releasesBefore)
+	}
+	if got := collectorMetricCount(portalBudgetRejectionsTotal); got != rejectionsBefore {
+		t.Fatalf("rejection counter series = %d, want %d after unknown reason", got, rejectionsBefore)
 	}
 }

@@ -81,6 +81,8 @@ func main() {
 	filePersistence := flag.Bool("file-persistence", false, "Persist DuckDB to <data-dir>/<username>.duckdb instead of in-memory (env: DUCKGRES_FILE_PERSISTENCE)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	sessionInitTimeout := flag.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
+	maxRetainedBindBytes := flag.Int64("max-retained-bind-bytes", 0, "Maximum Bind storage retained by open portals per client connection (default 67108864; env: DUCKGRES_MAX_RETAINED_BIND_BYTES)")
+	maxOpenPortals := flag.Int("max-open-portals", 0, "Maximum portal shells per client connection (default 1024; env: DUCKGRES_MAX_OPEN_PORTALS)")
 
 	// DuckLake (workers attach DuckLake)
 	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
@@ -207,6 +209,8 @@ func main() {
 		MemoryLimit:                 *memoryLimit,
 		Threads:                     *threads,
 		MemoryBudget:                *memoryBudget,
+		MaxRetainedBindBytes:        *maxRetainedBindBytes,
+		MaxOpenPortals:              *maxOpenPortals,
 		DuckLakeDeltaCatalogEnabled: *duckLakeDeltaCatalogEnabled,
 		DuckLakeDeltaCatalogPath:    *duckLakeDeltaCatalogPath,
 		DuckLakeDefaultSpecVersion:  *duckLakeDefaultSpecVersion,

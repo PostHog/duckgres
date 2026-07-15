@@ -20,6 +20,8 @@ type FileConfig struct {
 	FlightSessionReapInterval string              `yaml:"flight_session_reap_interval"` // e.g., "1m"
 	FlightHandleIdleTTL       string              `yaml:"flight_handle_idle_ttl"`       // e.g., "15m"
 	FlightSessionTokenTTL     string              `yaml:"flight_session_token_ttl"`     // e.g., "1h"
+	MaxRetainedBindBytes      *int64              `yaml:"max_retained_bind_bytes"`      // positive integer bytes
+	MaxOpenPortals            *int                `yaml:"max_open_portals"`             // positive count
 	DataDir                   string              `yaml:"data_dir"`
 	TLS                       TLSConfig           `yaml:"tls"`
 	Users                     map[string]string   `yaml:"users"`

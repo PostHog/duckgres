@@ -107,6 +107,13 @@ ducklake:
 # Default: 75% of system RAM.
 # memory_budget: "24GB"
 
+# Retained Bind portal limits (per client connection).
+# These cap aggregate Bind storage (wire body plus compact metadata) and
+# installed portal shells, not
+# parameter count. Positive values are required; defaults are 64 MiB and 1024.
+# max_retained_bind_bytes: 67108864
+# max_open_portals: 1024
+
 # Worker process limits (control-plane mode only)
 # process:
 #   # min_workers: pre-warm process workers at startup for instant connection handling.

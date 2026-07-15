@@ -12,6 +12,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Metrics](#metrics)
 - [Runbooks](#runbooks)
   - [Perf Runbook](docs/perf-harness-runbook.md)
+  - [Retained Bind Portals](docs/runbooks/retained-bind-portals.md)
   - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md)
   - [Dev Scenario Runner](docs/runbooks/scenario-dev.md)
 - [Quick Start](#quick-start)
@@ -66,6 +67,10 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | Metric | Type | Description |
 |--------|------|-------------|
 | `duckgres_connections_open` | Gauge | Number of currently open client connections |
+| `duckgres_retained_bind_bytes` | Gauge | Aggregate Bind storage bytes (wire body plus compact metadata) retained by open portals in this process |
+| `duckgres_open_portals` | Gauge | Aggregate installed portal shells in this process |
+| `duckgres_portal_payload_releases_total{reason}` | Counter | Portal payload releases. `reason` is one of `terminal_success`, `terminal_failure`, `close_portal`, `close_statement`, `unnamed_rebind`, `idle_sync`, `tx_end`, `simple_query`, or `connection_close` |
+| `duckgres_portal_budget_rejections_total{reason}` | Counter | Bind admissions rejected by the per-connection portal budget. `reason` is `retained_bytes` or `open_portals` |
 | `duckgres_connection_duration_seconds{org}` | Histogram | Client connection lifetime, accept→disconnect (includes `_count`, `_sum`, `_bucket`); `_sum` is exact total connection-seconds (per org) with no scrape-integral bias. The disconnect log also carries `duration_ms` |
 | `duckgres_query_total{org,outcome}` | Counter | Total number of non-empty query attempts by terminal outcome (`success`, `error`, `canceled`) |
 | `duckgres_query_duration_seconds{org}` | Histogram | Simple/extended query execution latency (includes `_count`, `_sum`, `_bucket`); use `duckgres_query_total` for attempt totals |
@@ -112,6 +117,7 @@ DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
+- [Retained Bind Portals](docs/runbooks/retained-bind-portals.md): Monitor and recover from per-connection retained Bind payload and portal-budget rejections.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
@@ -173,6 +179,10 @@ flight_session_idle_ttl: "10m"
 flight_session_reap_interval: "1m"
 flight_handle_idle_ttl: "15m"
 flight_session_token_ttl: "1h"
+# Per client connection; integer bytes, not a parameter-count cap.
+# Defaults: 67108864 (64 MiB) and 1024. Values must be positive.
+max_retained_bind_bytes: 67108864
+max_open_portals: 1024
 data_dir: "./data"
 session_init_timeout: "10s"
 
@@ -223,6 +233,13 @@ Run with config file:
 ./duckgres --config duckgres.yaml
 ```
 
+Portal-retention limits are enforced per client connection.
+`max_retained_bind_bytes` caps the aggregate Bind storage retained by open
+portals, while `max_open_portals` caps installed portal shells. They do not
+limit Bind parameter count, so a valid 27,000-parameter Bind remains allowed
+when its retained bytes fit the budget. A rejected Bind installs no portal and
+does not change retained-byte or portal accounting.
+
 ### Environment Variables
 
 | Variable | Description | Default |
@@ -235,6 +252,8 @@ Run with config file:
 | `DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL` | Flight auth session reap interval | `1m` |
 | `DUCKGRES_FLIGHT_HANDLE_IDLE_TTL` | Flight prepared/query handle idle TTL | `15m` |
 | `DUCKGRES_FLIGHT_SESSION_TOKEN_TTL` | Flight issued session token absolute TTL | `1h` |
+| `DUCKGRES_MAX_RETAINED_BIND_BYTES` | Maximum aggregate Bind storage retained by open portals per client connection (integer bytes; no parameter-count cap) | `67108864` (64 MiB) |
+| `DUCKGRES_MAX_OPEN_PORTALS` | Maximum installed portal shells per client connection | `1024` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
@@ -342,6 +361,8 @@ Options:
   -flight-session-reap-interval string Flight auth session reap interval (e.g., '1m')
   -flight-handle-idle-ttl string       Flight prepared/query handle idle TTL (e.g., '15m')
   -flight-session-token-ttl string     Flight issued session token absolute TTL (e.g., '1h')
+  -max-retained-bind-bytes int          Maximum Bind storage retained by open portals per client connection (default 67108864)
+  -max-open-portals int                 Maximum portal shells per client connection (default 1024)
   -data-dir string         Directory for DuckDB files
   -cert string             TLS certificate file
   -key string              TLS private key file

@@ -135,8 +135,8 @@ func TestHandleBindAcceptsValidParam(t *testing.T) {
 	if !ok {
 		t.Fatal("expected portal to be created")
 	}
-	if len(p.paramValues) != 1 || string(p.paramValues[0]) != "abc" {
-		t.Fatalf("unexpected param values: %v", p.paramValues)
+	if p.retainedPayloadBytes() == 0 || len(p.params) != 1 || string(p.paramValue(0)) != "abc" {
+		t.Fatalf("unexpected compact parameter view: payload=%d params=%v value=%q", p.retainedPayloadBytes(), p.params, p.paramValue(0))
 	}
 }
 
@@ -155,7 +155,33 @@ func TestHandleBindValidMessageStillBinds(t *testing.T) {
 	if !ok {
 		t.Fatal("expected portal to be created")
 	}
-	if len(p.paramValues) != 1 || p.paramValues[0] != nil {
-		t.Fatalf("expected one NULL param value, got %v", p.paramValues)
+	if len(p.params) != 1 || !p.params[0].isNull() || p.paramValue(0) != nil {
+		t.Fatalf("expected one NULL compact parameter, got %#v", p.params)
+	}
+}
+
+// FETCH exposes the columns of an already-declared cursor, so its output
+// cardinality is only known once the cursor schema is available during
+// Describe or Execute. A client may nevertheless provide one result-format
+// code per output column in Bind.
+func TestHandleBindDefersCursorFetchResultFormatValidation(t *testing.T) {
+	var out bytes.Buffer
+	c := newBindTestConn(&out)
+	c.stmts["fetch"] = &preparedStmt{
+		query:      "FETCH 4 FROM cursor_name",
+		cursorOp:   cursorOpFetch,
+		cursorName: "cursor_name",
+	}
+
+	// No parameters, then two result format codes for the cursor's two
+	// columns. Their exact cardinality is validated once the schema is known.
+	c.handleBind(bindMessageBody("fetch-portal", "fetch", int16(0), int16(0), int16(2), int16(0), int16(1)))
+	_ = c.writer.Flush()
+
+	if bytes.Contains(out.Bytes(), []byte("08P01")) {
+		t.Fatalf("cursor FETCH Bind must defer result format validation, got: %q", out.Bytes())
+	}
+	if _, ok := c.portals["fetch-portal"]; !ok {
+		t.Fatal("expected cursor FETCH portal to be created")
 	}
 }

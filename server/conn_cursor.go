@@ -197,14 +197,18 @@ func (c *clientConn) handlePgCursorsQuery(cursorName string) error {
 func (c *clientConn) handlePgCursorsQueryExtended(p *portal) {
 	// Resolve cursor name: either from literal in query or from bind parameter
 	cursorName := p.stmt.cursorName
-	if cursorName == "" && len(p.paramValues) > 0 && p.paramValues[0] != nil {
-		cursorName = string(p.paramValues[0])
+	if cursorName == "" && p.BindParameterCount() > 0 && !p.params[0].isNull() {
+		cursorName = string(p.paramValue(0))
 	}
 
 	_, exists := c.cursors[cursorName]
+	if !c.validPortalResultFormats(p, 1) {
+		return
+	}
+	p.rowDescription = pgCursorsRowDescriptionBody(p.resultFormats)
 
 	if !p.stmt.described {
-		_ = c.sendPgCursorsRowDescriptionWithFormats(p.resultFormats)
+		_ = c.writeCachedPortalRowDescription(p)
 	}
 
 	rowCount := 0
@@ -218,6 +222,10 @@ func (c *clientConn) handlePgCursorsQueryExtended(p *portal) {
 
 // sendPgCursorsRowDescription sends a RowDescription for a pg_cursors query result (single int4 column).
 func (c *clientConn) sendPgCursorsRowDescriptionWithFormats(formatCodes []int16) error {
+	return wire.WriteMessage(c.writer, wire.MsgRowDescription, pgCursorsRowDescriptionBody(formatCodes))
+}
+
+func pgCursorsRowDescriptionBody(formatCodes []int16) []byte {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.BigEndian, int16(1)) // 1 column
 	buf.WriteString("?column?")
@@ -234,7 +242,7 @@ func (c *clientConn) sendPgCursorsRowDescriptionWithFormats(formatCodes []int16)
 		format = formatCodes[0]
 	}
 	_ = binary.Write(&buf, binary.BigEndian, format)
-	return wire.WriteMessage(c.writer, wire.MsgRowDescription, buf.Bytes())
+	return buf.Bytes()
 }
 
 // handleDeclareCursor handles DECLARE cursor in the Simple Query protocol.
@@ -481,8 +489,11 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 	}
 
 	// Send RowDescription if Describe wasn't already called
+	if !c.cachePortalRowDescription(p, cursor.cols, cursor.colTypes) {
+		return
+	}
 	if !p.described && len(cursor.cols) > 0 {
-		if err := c.sendRowDescriptionWithFormats(cursor.cols, cursor.colTypes, p.resultFormats); err != nil {
+		if err := c.writeCachedPortalRowDescription(p); err != nil {
 			return
 		}
 	}

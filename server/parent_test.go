@@ -9,14 +9,16 @@ import (
 
 func TestChildConfigSerialization(t *testing.T) {
 	cfg := ChildConfig{
-		RemoteAddr:       "192.168.1.1:12345",
-		DataDir:          "/data",
-		Extensions:       []string{"ducklake", "json"},
-		IdleTimeout:      int64(10 * time.Minute),
-		TLSCertFile:      "/certs/server.crt",
-		TLSKeyFile:       "/certs/server.key",
-		Users:            map[string]string{"postgres": "secret123"},
-		BackendSecretKey: 12345678,
+		RemoteAddr:           "192.168.1.1:12345",
+		DataDir:              "/data",
+		Extensions:           []string{"ducklake", "json"},
+		IdleTimeout:          int64(10 * time.Minute),
+		MaxRetainedBindBytes: 1 << 20,
+		MaxOpenPortals:       32,
+		TLSCertFile:          "/certs/server.crt",
+		TLSKeyFile:           "/certs/server.key",
+		Users:                map[string]string{"postgres": "secret123"},
+		BackendSecretKey:     12345678,
 		DuckLake: DuckLakeConfig{
 			MetadataStore: "postgres:host=localhost",
 			S3Region:      "us-east-1",
@@ -47,6 +49,12 @@ func TestChildConfigSerialization(t *testing.T) {
 	}
 	if cfg2.IdleTimeout != cfg.IdleTimeout {
 		t.Errorf("IdleTimeout mismatch: got %d, want %d", cfg2.IdleTimeout, cfg.IdleTimeout)
+	}
+	if cfg2.MaxRetainedBindBytes != cfg.MaxRetainedBindBytes {
+		t.Errorf("MaxRetainedBindBytes mismatch: got %d, want %d", cfg2.MaxRetainedBindBytes, cfg.MaxRetainedBindBytes)
+	}
+	if cfg2.MaxOpenPortals != cfg.MaxOpenPortals {
+		t.Errorf("MaxOpenPortals mismatch: got %d, want %d", cfg2.MaxOpenPortals, cfg.MaxOpenPortals)
 	}
 	if cfg2.TLSCertFile != cfg.TLSCertFile {
 		t.Errorf("TLSCertFile mismatch: got %q, want %q", cfg2.TLSCertFile, cfg.TLSCertFile)

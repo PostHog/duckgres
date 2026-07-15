@@ -16,7 +16,7 @@ import (
 // streamRowsToClientExtended sends result rows for the extended query protocol.
 // Unlike streamRowsToClient, this does NOT send ReadyForQuery, and supports
 // binary result formats and the described flag.
-func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, resultFormats []int16, described bool, query string) {
+func (c *clientConn) streamRowsToClientExtended(p *portal, rows RowSet, cmdType string, resultFormats []int16, described bool, query string) {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
@@ -33,6 +33,9 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		c.setTxError()
 		return
 	}
+	if !c.cachePortalRowDescription(p, cols, colTypes) {
+		return
+	}
 
 	// Get type OIDs for binary encoding
 	typeOIDs := make([]int32, len(cols))
@@ -42,7 +45,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 	// Send RowDescription if Describe wasn't called before Execute
 	if !described && len(cols) > 0 {
-		if err := c.sendRowDescriptionWithFormats(cols, colTypes, resultFormats); err != nil {
+		if err := c.writeCachedPortalRowDescription(p); err != nil {
 			return
 		}
 	}
@@ -174,6 +177,55 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) e
 //   - single element: applies to all columns
 //   - one per column: per-column format
 func (c *clientConn) sendRowDescriptionWithFormats(cols []string, colTypes []ColumnTyper, formatCodes []int16) error {
+	return c.writeRowDescriptionBody(c.rowDescriptionBody(cols, colTypes, formatCodes))
+}
+
+// cachePortalRowDescription stores exactly the wire metadata a terminal
+// portal needs for a later Describe(P). It intentionally serializes the
+// description instead of retaining RowSet/driver objects or the full Bind
+// result-format slice. PostgreSQL allows zero formats, one format for every
+// output column, or one format per actual output column; the count is first
+// knowable here for arbitrary SQL.
+func (c *clientConn) cachePortalRowDescription(p *portal, cols []string, colTypes []ColumnTyper) bool {
+	if p == nil {
+		return false
+	}
+	if len(p.resultFormats) != 0 && len(p.resultFormats) != 1 && len(p.resultFormats) != len(cols) {
+		c.sendError("ERROR", "08P01", "invalid result format count in Bind message")
+		return false
+	}
+	if len(cols) == 0 {
+		p.rowDescription = nil
+		return true
+	}
+	p.rowDescription = c.rowDescriptionBody(cols, colTypes, p.resultFormats)
+	return true
+}
+
+func (c *clientConn) validPortalResultFormats(p *portal, columns int) bool {
+	if p == nil || len(p.resultFormats) == 0 || len(p.resultFormats) == 1 || len(p.resultFormats) == columns {
+		return true
+	}
+	c.sendError("ERROR", "08P01", "invalid result format count in Bind message")
+	return false
+}
+
+func (c *clientConn) writeCachedPortalRowDescription(p *portal) error {
+	if p == nil || len(p.rowDescription) == 0 {
+		return wire.WriteNoData(c.writer)
+	}
+	return c.writeRowDescriptionBody(p.rowDescription)
+}
+
+func (c *clientConn) writeRowDescriptionBody(body []byte) error {
+	if err := wire.WriteMessage(c.writer, wire.MsgRowDescription, body); err != nil {
+		c.markActiveQueryMetricsError(err)
+		return err
+	}
+	return nil
+}
+
+func (c *clientConn) rowDescriptionBody(cols []string, colTypes []ColumnTyper, formatCodes []int16) []byte {
 	var buf bytes.Buffer
 
 	// Number of fields
@@ -218,11 +270,7 @@ func (c *clientConn) sendRowDescriptionWithFormats(cols []string, colTypes []Col
 		_ = binary.Write(&buf, binary.BigEndian, format)
 	}
 
-	if err := wire.WriteMessage(c.writer, wire.MsgRowDescription, buf.Bytes()); err != nil {
-		c.markActiveQueryMetricsError(err)
-		return err
-	}
-	return nil
+	return buf.Bytes()
 }
 
 func (c *clientConn) mapTypeOIDWithColumnName(colName string, colType ColumnTyper) int32 {

@@ -193,8 +193,19 @@ type Config struct {
 	// x-duckgres-session tokens. Expired tokens are rejected and require
 	// a fresh bootstrap request.
 	FlightSessionTokenTTL time.Duration
-	DataDir               string
-	Users                 map[string]string // username -> password
+
+	// MaxRetainedBindBytes limits aggregate Bind storage retained by portals on
+	// one client connection, including the wire body and compact metadata. It
+	// must be positive; zero-value configs are normalized to
+	// DefaultMaxRetainedBindBytes during server setup.
+	MaxRetainedBindBytes int64
+
+	// MaxOpenPortals limits the portal shells installed on one client
+	// connection. It must be positive; zero-value configs are normalized to
+	// DefaultMaxOpenPortals during server setup.
+	MaxOpenPortals int
+	DataDir        string
+	Users          map[string]string // username -> password
 
 	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file
@@ -299,6 +310,18 @@ type Config struct {
 	QueryLog QueryLogConfig
 }
 
+// normalizeBindPortalBudgets makes direct server construction as safe as the
+// configuration resolver. It is intentionally applied by both New and
+// InitMinimalServer because control-plane workers use the latter path.
+func normalizeBindPortalBudgets(cfg *Config) {
+	if cfg.MaxRetainedBindBytes <= 0 {
+		cfg.MaxRetainedBindBytes = DefaultMaxRetainedBindBytes
+	}
+	if cfg.MaxOpenPortals <= 0 {
+		cfg.MaxOpenPortals = DefaultMaxOpenPortals
+	}
+}
+
 // QueryLogConfig configures the query log feature.
 type QueryLogConfig struct {
 	Enabled       bool
@@ -374,6 +397,8 @@ type Server struct {
 }
 
 func New(cfg Config) (*Server, error) {
+	normalizeBindPortalBudgets(&cfg)
+
 	// Apply default rate limit config for any unset fields
 	defaults := DefaultRateLimitConfig()
 	if cfg.RateLimit.MaxFailedAttempts == 0 {

@@ -311,6 +311,7 @@ func CloseConnectionMetrics(cc *clientConn) time.Duration {
 // InitMinimalServer initializes a Server struct with minimal fields for use
 // in control plane worker sessions.
 func InitMinimalServer(s *Server, cfg Config, queryCancelCh <-chan struct{}) {
+	normalizeBindPortalBudgets(&cfg)
 	s.cfg = cfg
 	s.activeQueries = make(map[BackendKey]context.CancelFunc)
 	s.duckLakeSem = make(chan struct{}, 1)

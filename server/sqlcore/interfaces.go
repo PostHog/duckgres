@@ -12,6 +12,7 @@ package sqlcore
 import (
 	"context"
 	"io"
+	"strings"
 )
 
 // ColumnTyper provides type name information for a database column.
@@ -57,6 +58,29 @@ type QueryExecutor interface {
 	// executed query, or "" if profiling is not enabled or not available
 	// (e.g. Flight SQL mode where the query ran on a remote worker).
 	LastProfilingOutput() string
+}
+
+// SQLLiteralAppender exposes compact, already-validated bound parameters to an
+// executor that must inline them into SQL. AppendBindParameterLiteral writes a
+// single SQL literal directly into dst. Implementations must keep the backing
+// parameter bytes alive until the executor returns.
+//
+// This deliberately avoids []any/string conversion for each text Bind value:
+// remote Flight SQL execution needs one final SQL request buffer, but does not
+// need thousands of intermediate Go strings. Local executors continue to use
+// QueryExecutor's database/sql-compatible argument methods.
+type SQLLiteralAppender interface {
+	BindParameterCount() int
+	AppendBindParameterLiteral(dst *strings.Builder, index int) error
+}
+
+// BoundQueryExecutor is an optional QueryExecutor capability for backends
+// (currently Flight SQL) that need a final interpolated SQL string. It accepts
+// a compact literal appender so text Bind values can be written straight into
+// that final buffer rather than first becoming one string/interface per value.
+type BoundQueryExecutor interface {
+	QueryWithBoundParams(query string, params SQLLiteralAppender) (RowSet, error)
+	ExecWithBoundParams(query string, params SQLLiteralAppender) (ExecResult, error)
 }
 
 // CopyFromStdinExecutor is an optional capability implemented by executors

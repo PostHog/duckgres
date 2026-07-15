@@ -40,6 +40,10 @@ type ChildConfig struct {
 	DataDir     string   `json:"data_dir"`
 	Extensions  []string `json:"extensions"`
 	IdleTimeout int64    `json:"idle_timeout"` // nanoseconds
+	// Bind portal budgets are carried explicitly because process-isolation
+	// children construct a minimal Server rather than re-running resolution.
+	MaxRetainedBindBytes int64 `json:"max_retained_bind_bytes"`
+	MaxOpenPortals       int   `json:"max_open_portals"`
 
 	// TLS config
 	TLSCertFile string `json:"tls_cert_file"`
@@ -291,14 +295,17 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 
 	// Create a minimal server config for the worker
 	serverCfg := Config{
-		DataDir:     cfg.DataDir,
-		Extensions:  cfg.Extensions,
-		DuckLake:    cfg.DuckLake,
-		IdleTimeout: time.Duration(cfg.IdleTimeout),
-		TLSCertFile: cfg.TLSCertFile,
-		TLSKeyFile:  cfg.TLSKeyFile,
-		Users:       cfg.Users,
+		DataDir:              cfg.DataDir,
+		Extensions:           cfg.Extensions,
+		DuckLake:             cfg.DuckLake,
+		IdleTimeout:          time.Duration(cfg.IdleTimeout),
+		MaxRetainedBindBytes: cfg.MaxRetainedBindBytes,
+		MaxOpenPortals:       cfg.MaxOpenPortals,
+		TLSCertFile:          cfg.TLSCertFile,
+		TLSKeyFile:           cfg.TLSKeyFile,
+		Users:                cfg.Users,
 	}
+	normalizeBindPortalBudgets(&serverCfg)
 
 	// Reconstruct parent server start time for uptime() macro.
 	// Fall back to this process's start time if the field is missing (e.g.,

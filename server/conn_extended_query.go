@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/wire"
 	"go.opentelemetry.io/otel/attribute"
@@ -193,8 +193,8 @@ func (c *clientConn) handleParse(body []byte) {
 		isIgnoredSet:      result.IsIgnoredSet,
 		isNoOp:            result.IsNoOp,
 		noOpTag:           result.NoOpTag,
-		querySourceSet:    result.QuerySourceSet,  // SET duckgres.query_source (custom GUC)
-		querySourceShow:   result.QuerySourceShow, // SHOW duckgres.query_source
+		querySourceSet:    result.QuerySourceSet,    // SET duckgres.query_source (custom GUC)
+		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
@@ -380,6 +380,13 @@ func (c *clientConn) handleDescribe(body []byte) {
 			c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", name))
 			return
 		}
+		// Terminal portals have released their Bind frame. Describe(P) must use
+		// the compact wire metadata captured while the portal was executable,
+		// never re-probe with an empty argument list.
+		if p.state != portalStateReady {
+			_ = c.writeCachedPortalRowDescription(p)
+			return
+		}
 
 		// Handle cursor operations in portal Describe
 		switch p.stmt.cursorOp {
@@ -397,15 +404,29 @@ func (c *clientConn) handleDescribe(body []byte) {
 				_ = wire.WriteNoData(c.writer)
 				return
 			}
+			if !c.cachePortalRowDescription(p, cols, colTypes) {
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				return
+			}
 			p.described = true
-			_ = c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats)
+			_ = c.writeCachedPortalRowDescription(p)
 			return
 		case cursorOpPgCursorsQuery:
-			_ = c.sendPgCursorsRowDescriptionWithFormats(p.resultFormats)
+			if !c.validPortalResultFormats(p, 1) {
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				return
+			}
+			p.rowDescription = pgCursorsRowDescriptionBody(p.resultFormats)
+			_ = c.writeCachedPortalRowDescription(p)
 			p.described = true
 			return
 		case cursorOpPgStatActivity:
-			_ = c.sendPgStatActivityRowDescriptionWithFormats(p.resultFormats)
+			if !c.validPortalResultFormats(p, len(pgStatActivityColumns)) {
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				return
+			}
+			p.rowDescription = pgStatActivityRowDescriptionBody(p.resultFormats)
+			_ = c.writeCachedPortalRowDescription(p)
 			p.described = true
 			return
 		}
@@ -434,19 +455,36 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// EXPLAIN [ANALYZE]: synthesize the single plan column without executing
 		// (see the statement-Describe branch above).
 		if isExplainStmt(p.stmt.query) {
-			_ = c.sendRowDescriptionWithFormats([]string{explainPlanColumn(p.stmt.query)}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
+			if !c.cachePortalRowDescription(p, []string{explainPlanColumn(p.stmt.query)}, []ColumnTyper{staticColumnType("VARCHAR")}) {
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				return
+			}
+			_ = c.writeCachedPortalRowDescription(p)
 			p.described = true
 			p.stmt.described = true
 			return
 		}
 
-		// For SELECT, we need to describe the result columns
-		// We'll do a trial query with LIMIT 0 to get column info
-		args, err := p.decodeParams()
-		if err != nil {
-			// PostgreSQL returns 08P01 (protocol violation) for malformed binary data
-			c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
-			return
+		// For SELECT, we need to describe the result columns. Local executors
+		// decode to database/sql arguments, while Flight receives the same
+		// compact literal appender used by Execute.
+		boundExecutor, usesBoundExecutor := c.executor.(sqlcore.BoundQueryExecutor)
+		var args []interface{}
+		if usesBoundExecutor {
+			if err := p.validateBinaryParameters(); err != nil {
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
+				return
+			}
+		} else {
+			var err error
+			args, err = p.decodeParams()
+			if err != nil {
+				// PostgreSQL returns 08P01 (protocol violation) for malformed binary data
+				c.finishPortal(p, portalStateFailed, "terminal_failure")
+				c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
+				return
+			}
 		}
 
 		// Try to get column info without fully executing expensive queries.
@@ -456,7 +494,15 @@ func (c *clientConn) handleDescribe(body []byte) {
 			describeQuery = describeQuery + " LIMIT 0"
 		}
 
-		rows, err := c.executor.Query(describeQuery, args...)
+		var (
+			rows RowSet
+			err  error
+		)
+		if usesBoundExecutor {
+			rows, err = boundExecutor.QueryWithBoundParams(describeQuery, p)
+		} else {
+			rows, err = c.executor.Query(describeQuery, args...)
+		}
 		if err != nil {
 			// Can't describe - send NoData
 			_ = wire.WriteNoData(c.writer)
@@ -479,9 +525,13 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// RowDescription. Without this, JDBC drivers that reuse named statements
 		// (Bind/Execute without re-Describing) get an unexpected RowDescription
 		// and desync their message queue.
+		if !c.cachePortalRowDescription(p, cols, colTypes) {
+			c.finishPortal(p, portalStateFailed, "terminal_failure")
+			return
+		}
 		p.described = true
 		p.stmt.described = true
-		_ = c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats)
+		_ = c.writeCachedPortalRowDescription(p)
 
 	default:
 		c.sendError("ERROR", "08P01", "invalid Describe type")
@@ -501,17 +551,38 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	// Resolve the portal before parsing maxRows so a malformed Execute that
+	// still identifies a ready portal releases its retained Bind payload rather
+	// than leaving it until Sync or connection close.
+	p, ok := c.portals[portalName]
 	var maxRows int32
 	if err := binary.Read(reader, binary.BigEndian, &maxRows); err != nil {
 		c.sendError("ERROR", "08P01", "invalid Execute message")
+		if ok && p.state == portalStateReady {
+			c.finishPortal(p, portalStateFailed, "terminal_failure")
+		}
 		return
 	}
 
-	p, ok := c.portals[portalName]
 	if !ok {
 		c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", portalName))
 		return
 	}
+	if p.state != portalStateReady {
+		c.sendError("ERROR", "55000", fmt.Sprintf("portal %q is not executable", portalName))
+		return
+	}
+	// Duckgres has no PortalSuspended implementation, so every return below is
+	// terminal. Centralizing state/release here prevents an early Execute path
+	// from retaining its Bind body until a distant Sync or connection close.
+	errorsBeforeExecute := c.errorResponsesSent
+	defer func() {
+		if c.errorResponsesSent != errorsBeforeExecute {
+			c.finishPortal(p, portalStateFailed, "terminal_failure")
+			return
+		}
+		c.finishPortal(p, portalStateDone, "terminal_success")
+	}()
 
 	// Redacted form for everything observable (pg_stat_activity, spans,
 	// logs): CREATE SECRET option lists carry credential material.
@@ -564,12 +635,23 @@ func (c *clientConn) handleExecute(body []byte) {
 	)
 	defer span.End()
 
-	// Convert parameter values to interface{}, handling binary format
-	args, err := p.decodeParams()
-	if err != nil {
-		// PostgreSQL returns 08P01 (protocol violation) for malformed binary data
-		c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
-		return
+	// Local database/sql executors need []any. Flight can instead append the
+	// compact portal views directly into its final SQL request buffer, avoiding
+	// string(value) and interface boxing for every text parameter.
+	boundExecutor, usesBoundExecutor := c.executor.(sqlcore.BoundQueryExecutor)
+	var args []interface{}
+	if usesBoundExecutor {
+		if err := p.validateBinaryParameters(); err != nil {
+			c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
+			return
+		}
+	} else {
+		args, err = p.decodeParams()
+		if err != nil {
+			// PostgreSQL returns 08P01 (protocol violation) for malformed binary data
+			c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
+			return
+		}
 	}
 
 	upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
@@ -584,7 +666,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	c.logger().Debug("Execute portal.", "portal", portalName, "params", len(args), "query", loggableQuery)
+	c.logger().Debug("Execute portal.", "portal", portalName, "params", p.BindParameterCount(), "query", loggableQuery)
 
 	// duckgres.query_source custom GUC (SET / SHOW): intercepted session-side,
 	// never forwarded to DuckDB. Determined by the transpiler during Parse.
@@ -595,8 +677,11 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 	if p.stmt.querySourceShow {
+		if !c.cachePortalRowDescription(p, []string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}) {
+			return
+		}
 		if !p.described {
-			_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+			_ = c.writeCachedPortalRowDescription(p)
 		}
 		_ = c.sendDataRowWithFormats([]interface{}{c.QuerySource()}, p.resultFormats, nil)
 		_ = c.writeCommandComplete("SHOW")
@@ -622,7 +707,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Handle multi-statement results (e.g., writable CTE rewrites)
 	if len(p.stmt.statements) > 0 {
 		c.logger().Debug("Execute multi-statement.", "statements", len(p.stmt.statements), "cleanup", len(p.stmt.cleanupStatements))
-		c.executeMultiStatementExtended(p.stmt.statements, p.stmt.cleanupStatements, args, p.resultFormats, p.described)
+		c.executeMultiStatementExtended(p, p.stmt.statements, p.stmt.cleanupStatements, args, p.resultFormats, p.described)
 		return
 	}
 
@@ -661,9 +746,18 @@ func (c *clientConn) handleExecute(body []byte) {
 
 		// Non-result-returning query: use Exec with converted query
 		runExec := func() (ExecResult, error) {
-			result, err := c.executor.Exec(convertedQuery, args...)
+			var result ExecResult
+			var err error
+			if usesBoundExecutor {
+				result, err = boundExecutor.ExecWithBoundParams(convertedQuery, p)
+			} else {
+				result, err = c.executor.Exec(convertedQuery, args...)
+			}
 			if err != nil {
 				if fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(convertedQuery, err, func(fallbackQuery string) (ExecResult, error) {
+					if usesBoundExecutor {
+						return boundExecutor.ExecWithBoundParams(fallbackQuery, p)
+					}
 					return c.executor.Exec(fallbackQuery, args...)
 				}); handled {
 					return fallbackResult, fallbackErr
@@ -722,6 +816,9 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Result-returning query: use Query with converted query
 	runQuery := func() (RowSet, error) {
+		if usesBoundExecutor {
+			return boundExecutor.QueryWithBoundParams(convertedQuery, p)
+		}
 		return c.executor.Query(convertedQuery, args...)
 	}
 
@@ -773,6 +870,11 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Get column types for binary encoding
 	colTypes, _ := rows.ColumnTypes()
+	// Cache serialized portal metadata even when Describe(S) made
+	// p.described true and Execute therefore suppresses RowDescription.
+	if !c.cachePortalRowDescription(p, cols, colTypes) {
+		return
+	}
 	typeOIDs := make([]int32, len(cols))
 	for i, ct := range colTypes {
 		typeOIDs[i] = getTypeInfo(ct).OID
@@ -784,7 +886,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Skip if there are no columns - queries that return 0 columns (like
 	// DDL accidentally routed here) don't need RowDescription.
 	if !p.described && len(cols) > 0 {
-		if err := c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats); err != nil {
+		if err := c.writeCachedPortalRowDescription(p); err != nil {
 			return
 		}
 	}
@@ -857,9 +959,19 @@ func (c *clientConn) handleClose(body []byte) {
 
 	switch closeType {
 	case 'S':
-		delete(c.stmts, name)
+		stmt := c.stmts[name]
+		// Closing a statement also closes all portals derived from that
+		// statement, including portals whose statement was subsequently
+		// re-Parsed under the same name.
+		c.dropPortalsForStatement(stmt, name, "close_statement")
+		if stmt != nil {
+			delete(c.stmts, name)
+		}
 	case 'P':
-		delete(c.portals, name)
+		c.dropPortal(name, "close_portal")
+	default:
+		c.sendError("ERROR", "08P01", "invalid Close type")
+		return
 	}
 
 	_ = wire.WriteCloseComplete(c.writer)
@@ -929,32 +1041,26 @@ func (c *clientConn) handleBind(body []byte) {
 	// - Number of result format codes (int16)
 	// - Result format codes (int16 each)
 
-	reader := bytes.NewReader(body)
-
-	// Read portal name
-	portalName, err := readCString(reader)
+	reader := bindFrameReader{body: body}
+	portalName, err := reader.readCString()
+	if err != nil {
+		c.sendError("ERROR", "08P01", "invalid Bind message")
+		return
+	}
+	stmtName, err := reader.readCString()
 	if err != nil {
 		c.sendError("ERROR", "08P01", "invalid Bind message")
 		return
 	}
 
-	// Read statement name
-	stmtName, err := readCString(reader)
-	if err != nil {
-		c.sendError("ERROR", "08P01", "invalid Bind message")
-		return
-	}
-
-	// Look up prepared statement
 	ps, ok := c.stmts[stmtName]
 	if !ok {
 		c.sendError("ERROR", "26000", fmt.Sprintf("prepared statement %q does not exist", stmtName))
 		return
 	}
 
-	// Read parameter format codes
-	var numParamFormats int16
-	if err := binary.Read(reader, binary.BigEndian, &numParamFormats); err != nil {
+	numParamFormats, err := reader.readInt16()
+	if err != nil {
 		c.sendError("ERROR", "08P01", "invalid Bind message")
 		return
 	}
@@ -962,17 +1068,25 @@ func (c *clientConn) handleBind(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid parameter format count in Bind message")
 		return
 	}
-	paramFormats := make([]int16, numParamFormats)
-	for i := int16(0); i < numParamFormats; i++ {
-		if err := binary.Read(reader, binary.BigEndian, &paramFormats[i]); err != nil {
-			c.sendError("ERROR", "08P01", "invalid Bind message")
-			return
+	var paramFormats []int16
+	if numParamFormats > 0 {
+		paramFormats = make([]int16, int(numParamFormats))
+		for i := range paramFormats {
+			format, err := reader.readInt16()
+			if err != nil {
+				c.sendError("ERROR", "08P01", "invalid Bind message")
+				return
+			}
+			if format != 0 && format != 1 {
+				c.sendError("ERROR", "08P01", "invalid parameter format code in Bind message")
+				return
+			}
+			paramFormats[i] = format
 		}
 	}
 
-	// Read parameter values
-	var numParams int16
-	if err := binary.Read(reader, binary.BigEndian, &numParams); err != nil {
+	numParams, err := reader.readInt16()
+	if err != nil {
 		c.sendError("ERROR", "08P01", "invalid Bind message")
 		return
 	}
@@ -980,39 +1094,42 @@ func (c *clientConn) handleBind(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid parameter count in Bind message")
 		return
 	}
-	paramValues := make([][]byte, numParams)
-	for i := int16(0); i < numParams; i++ {
-		var length int32
-		if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+	if int(numParams) != ps.numParams {
+		c.sendError("ERROR", "08P01", fmt.Sprintf("bind message supplies %d parameters, but prepared statement %q requires %d", numParams, stmtName, ps.numParams))
+		return
+	}
+	if len(paramFormats) != 0 && len(paramFormats) != 1 && len(paramFormats) != int(numParams) {
+		c.sendError("ERROR", "08P01", "invalid parameter format count in Bind message")
+		return
+	}
+
+	params := make([]bindParam, int(numParams))
+	for i := range params {
+		length, err := reader.readInt32()
+		if err != nil {
 			c.sendError("ERROR", "08P01", "invalid Bind message")
 			return
 		}
 		if length == -1 {
-			paramValues[i] = nil // NULL
-		} else if length < 0 {
-			// Only -1 (NULL) is a valid negative length.
+			params[i].length = -1
+			continue
+		}
+		if length < 0 {
+			// Only -1 (NULL) is a valid negative length. This preserves the
+			// #717/#720 malformed-length behavior without allocating per value.
 			c.sendError("ERROR", "08P01", "invalid parameter length in Bind message")
 			return
-		} else {
-			// The length field is client-controlled; bound the allocation by
-			// the remaining bytes of the already-framed Bind message body — a
-			// parameter value can never legitimately exceed it. Without this
-			// check a client could reserve multi-GiB per parameter (#717).
-			if int64(length) > int64(reader.Len()) {
-				c.sendError("ERROR", "08P01", fmt.Sprintf("invalid Bind message: parameter %d length %d exceeds remaining message size %d", i+1, length, reader.Len()))
-				return
-			}
-			paramValues[i] = make([]byte, length)
-			if _, err := io.ReadFull(reader, paramValues[i]); err != nil {
-				c.sendError("ERROR", "08P01", "invalid Bind message")
-				return
-			}
 		}
+		if int64(length) > int64(reader.remaining()) {
+			c.sendError("ERROR", "08P01", fmt.Sprintf("invalid Bind message: parameter %d length %d exceeds remaining message size %d", i+1, length, reader.remaining()))
+			return
+		}
+		params[i] = bindParam{offset: int32(reader.pos), length: length}
+		reader.pos += int(length)
 	}
 
-	// Read result format codes
-	var numResultFormats int16
-	if err := binary.Read(reader, binary.BigEndian, &numResultFormats); err != nil {
+	numResultFormats, err := reader.readInt16()
+	if err != nil {
 		c.sendError("ERROR", "08P01", "invalid Bind message")
 		return
 	}
@@ -1020,24 +1137,239 @@ func (c *clientConn) handleBind(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid result format count in Bind message")
 		return
 	}
-	resultFormats := make([]int16, numResultFormats)
-	for i := int16(0); i < numResultFormats; i++ {
-		if err := binary.Read(reader, binary.BigEndian, &resultFormats[i]); err != nil {
-			c.sendError("ERROR", "08P01", "invalid Bind message")
-			return
+	var resultFormats []int16
+	if numResultFormats > 0 {
+		resultFormats = make([]int16, int(numResultFormats))
+		for i := range resultFormats {
+			format, err := reader.readInt16()
+			if err != nil {
+				c.sendError("ERROR", "08P01", "invalid Bind message")
+				return
+			}
+			if format != 0 && format != 1 {
+				c.sendError("ERROR", "08P01", "invalid result format code in Bind message")
+				return
+			}
+			resultFormats[i] = format
 		}
 	}
-
-	// Close existing portal with same name
-	delete(c.portals, portalName)
-
-	c.portals[portalName] = &portal{
-		stmt:          ps,
-		paramValues:   paramValues,
-		paramFormats:  paramFormats,
-		resultFormats: resultFormats,
-		described:     ps.described, // Inherit from statement if Describe(S) was called
+	if reader.remaining() != 0 {
+		c.sendError("ERROR", "08P01", "invalid Bind message: trailing data")
+		return
+	}
+	// For ordinary read-only queries, a multi-code result-format vector is
+	// validated once their row metadata is available during Describe or Execute.
+	// DML RETURNING and transpiled multi-statement writes cannot safely be
+	// probed first: executing to discover their output cardinality could mutate
+	// data before a malformed Bind is rejected. Validate every known cardinality
+	// here and conservatively reject an ambiguous multi-code vector instead.
+	if !bindResultFormatCountSafeBeforeExecute(ps, len(resultFormats)) {
+		c.sendError("ERROR", "08P01", "invalid result format count in Bind message")
+		return
 	}
 
+	// PostgreSQL replaces only the unnamed portal. A duplicate named portal is
+	// an error and must leave the original portal/accounting untouched.
+	existing := c.portals[portalName]
+	if portalName != "" && existing != nil {
+		c.sendError("ERROR", "42P03", fmt.Sprintf("portal %q already exists", portalName))
+		return
+	}
+
+	incomingRetainedBytes := retainedBindStorageBytes(len(body), len(params), len(paramFormats), len(resultFormats))
+	projectedBytes := c.retainedBindBytes + int64(incomingRetainedBytes)
+	if portalName == "" && existing != nil {
+		projectedBytes -= int64(existing.retainedPayloadBytes())
+	}
+	if projectedBytes > c.maxRetainedBindBytes() {
+		observe.IncPortalBudgetRejection("retained_bytes")
+		c.sendError("ERROR", "54000", "retained Bind portal byte budget exceeded")
+		return
+	}
+	projectedPortals := len(c.portals)
+	if existing == nil {
+		projectedPortals++
+	}
+	if projectedPortals > c.maxOpenPortals() {
+		observe.IncPortalBudgetRejection("open_portals")
+		c.sendError("ERROR", "54000", "open portal budget exceeded")
+		return
+	}
+
+	if portalName == "" && existing != nil {
+		c.dropPortal(portalName, "unnamed_rebind")
+	}
+	c.installPortal(portalName, &portal{
+		stmt:          ps,
+		stmtName:      stmtName,
+		bindBody:      body,
+		params:        params,
+		paramFormats:  paramFormats,
+		resultFormats: resultFormats,
+		described:     ps.described, // Inherit from statement Describe state.
+		state:         portalStateReady,
+	})
+
 	_ = wire.WriteBindComplete(c.writer)
+}
+
+// bindResultFormatCountSafeBeforeExecute reports whether a Bind result-format
+// vector can be accepted without risking execution of a mutation merely to
+// learn its result-column count. PostgreSQL allows zero formats, one format,
+// or exactly one per result column.
+func bindResultFormatCountSafeBeforeExecute(ps *preparedStmt, formats int) bool {
+	if formats <= 1 {
+		return true
+	}
+	if ps == nil {
+		return false
+	}
+	// A non-MOVE FETCH returns the columns of a previously declared cursor.
+	// Its schema is not stored on the FETCH prepared statement, but becomes
+	// available during Describe or Execute before any cursor row is advanced.
+	// Defer an exact multi-code count check to that point. MOVE has no result
+	// columns and therefore cannot accept a multi-code vector.
+	if ps.cursorOp == cursorOpFetch {
+		return !ps.cursorIsMove
+	}
+	if !queryReturnsResults(ps.query) {
+		return false
+	}
+	// EXPLAIN always returns one plan column. In particular, EXPLAIN ANALYZE
+	// may execute a wrapped write, so its cardinality must be rejected here.
+	if isExplainStmt(ps.query) {
+		return false
+	}
+	// Writable-CTE rewrites run setup writes before their final result query.
+	// Their output cardinality is not safely knowable at Bind time, so reject a
+	// multi-code vector rather than run the setup and discover it too late.
+	if len(ps.statements) > 0 {
+		return false
+	}
+	if isDMLReturning(ps.query) {
+		columns, known := explicitDMLReturningColumnCount(ps.query)
+		return known && formats == columns
+	}
+	return true
+}
+
+// explicitDMLReturningColumnCount returns a cardinality only when the original
+// DML RETURNING list is a set of explicit targets. A wildcard depends on the
+// table schema, so callers must not execute a mutation merely to resolve it.
+func explicitDMLReturningColumnCount(query string) (int, bool) {
+	tree, err := pg_query.Parse(query)
+	if err != nil || len(tree.Stmts) != 1 || tree.Stmts[0] == nil || tree.Stmts[0].Stmt == nil {
+		return 0, false
+	}
+
+	var targets []*pg_query.Node
+	switch stmt := tree.Stmts[0].Stmt.Node.(type) {
+	case *pg_query.Node_InsertStmt:
+		if stmt.InsertStmt != nil {
+			targets = stmt.InsertStmt.ReturningList
+		}
+	case *pg_query.Node_UpdateStmt:
+		if stmt.UpdateStmt != nil {
+			targets = stmt.UpdateStmt.ReturningList
+		}
+	case *pg_query.Node_DeleteStmt:
+		if stmt.DeleteStmt != nil {
+			targets = stmt.DeleteStmt.ReturningList
+		}
+	default:
+		return 0, false
+	}
+	if len(targets) == 0 {
+		return 0, false
+	}
+	for _, targetNode := range targets {
+		target := targetNode.GetResTarget()
+		if target == nil || resultTargetHasWildcard(target) {
+			return 0, false
+		}
+	}
+	return len(targets), true
+}
+
+func resultTargetHasWildcard(target *pg_query.ResTarget) bool {
+	if resultTargetNodeHasWildcard(target.Val) {
+		return true
+	}
+	for _, indirection := range target.Indirection {
+		if resultTargetNodeHasWildcard(indirection) {
+			return true
+		}
+	}
+	return false
+}
+
+// resultTargetNodeHasWildcard follows the AST shapes that expand one target
+// into several output columns: `*`, `table.*`, and `(composite_expr).*`.
+// Function calls such as count(*) remain a single explicit output target.
+func resultTargetNodeHasWildcard(node *pg_query.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.GetAStar() != nil {
+		return true
+	}
+	if column := node.GetColumnRef(); column != nil {
+		for _, field := range column.Fields {
+			if field.GetAStar() != nil {
+				return true
+			}
+		}
+	}
+	if indirection := node.GetAIndirection(); indirection != nil {
+		if resultTargetNodeHasWildcard(indirection.Arg) {
+			return true
+		}
+		for _, part := range indirection.Indirection {
+			if resultTargetNodeHasWildcard(part) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// bindFrameReader parses an already framed Bind body without allocating a
+// separate []byte for every parameter value. Its offsets are retained by the
+// portal as compact descriptors into the immutable body.
+type bindFrameReader struct {
+	body []byte
+	pos  int
+}
+
+func (r *bindFrameReader) remaining() int { return len(r.body) - r.pos }
+
+func (r *bindFrameReader) readCString() (string, error) {
+	start := r.pos
+	for r.pos < len(r.body) {
+		if r.body[r.pos] == 0 {
+			value := string(r.body[start:r.pos])
+			r.pos++
+			return value, nil
+		}
+		r.pos++
+	}
+	return "", fmt.Errorf("unterminated cstring")
+}
+
+func (r *bindFrameReader) readInt16() (int16, error) {
+	if r.remaining() < 2 {
+		return 0, fmt.Errorf("short int16")
+	}
+	value := int16(binary.BigEndian.Uint16(r.body[r.pos:]))
+	r.pos += 2
+	return value, nil
+}
+
+func (r *bindFrameReader) readInt32() (int32, error) {
+	if r.remaining() < 4 {
+		return 0, fmt.Errorf("short int32")
+	}
+	value := int32(binary.BigEndian.Uint32(r.body[r.pos:]))
+	r.pos += 4
+	return value, nil
 }

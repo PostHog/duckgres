@@ -151,17 +151,19 @@ func (s *Server) spawnChildForTLS(conn net.Conn) (*ChildProcess, error) {
 	// Prepare child configuration
 	// Note: Username is not known yet - child will read it from the startup message after TLS
 	childCfg := ChildConfig{
-		RemoteAddr:       remoteAddr,
-		DataDir:          s.cfg.DataDir,
-		Extensions:       s.cfg.Extensions,
-		IdleTimeout:      int64(s.cfg.IdleTimeout),
-		TLSCertFile:      s.cfg.TLSCertFile,
-		TLSKeyFile:       s.cfg.TLSKeyFile,
-		DuckLake:         s.cfg.DuckLake,
-		Users:            s.cfg.Users, // Pass all users - child will look up after getting username
-		BackendSecretKey: backendSecretKey,
-		ServerStartTime:  processStartTime.UnixNano(),
-		ServerVersion:    processVersion,
+		RemoteAddr:           remoteAddr,
+		DataDir:              s.cfg.DataDir,
+		Extensions:           s.cfg.Extensions,
+		IdleTimeout:          int64(s.cfg.IdleTimeout),
+		MaxRetainedBindBytes: s.cfg.MaxRetainedBindBytes,
+		MaxOpenPortals:       s.cfg.MaxOpenPortals,
+		TLSCertFile:          s.cfg.TLSCertFile,
+		TLSKeyFile:           s.cfg.TLSKeyFile,
+		DuckLake:             s.cfg.DuckLake,
+		Users:                s.cfg.Users, // Pass all users - child will look up after getting username
+		BackendSecretKey:     backendSecretKey,
+		ServerStartTime:      processStartTime.UnixNano(),
+		ServerVersion:        processVersion,
 	}
 
 	configJSON, err := json.Marshal(childCfg)

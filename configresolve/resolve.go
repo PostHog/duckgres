@@ -34,6 +34,8 @@ type CLIInputs struct {
 	FlightSessionReapInterval   string
 	FlightHandleIdleTTL         string
 	FlightSessionTokenTTL       string
+	MaxRetainedBindBytes        int64
+	MaxOpenPortals              int
 	DataDir                     string
 	CertFile                    string
 	KeyFile                     string
@@ -143,6 +145,8 @@ func DefaultServerConfig() server.Config {
 		FlightSessionReapInterval: 1 * time.Minute,
 		FlightHandleIdleTTL:       15 * time.Minute,
 		FlightSessionTokenTTL:     1 * time.Hour,
+		MaxRetainedBindBytes:      server.DefaultMaxRetainedBindBytes,
+		MaxOpenPortals:            server.DefaultMaxOpenPortals,
 		DataDir:                   "./data",
 		SessionInitTimeout:        server.DefaultSessionInitTimeout,
 		TLSCertFile:               "./certs/server.crt",
@@ -247,6 +251,20 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 				cfg.FlightSessionTokenTTL = d
 			} else {
 				warn("Invalid flight_session_token_ttl duration: " + err.Error())
+			}
+		}
+		if fileCfg.MaxRetainedBindBytes != nil {
+			if *fileCfg.MaxRetainedBindBytes > 0 {
+				cfg.MaxRetainedBindBytes = *fileCfg.MaxRetainedBindBytes
+			} else {
+				warn("max_retained_bind_bytes must be > 0")
+			}
+		}
+		if fileCfg.MaxOpenPortals != nil {
+			if *fileCfg.MaxOpenPortals > 0 {
+				cfg.MaxOpenPortals = *fileCfg.MaxOpenPortals
+			} else {
+				warn("max_open_portals must be > 0")
 			}
 		}
 		if fileCfg.DataDir != "" {
@@ -517,6 +535,28 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			cfg.FlightSessionTokenTTL = d
 		} else {
 			warn("Invalid DUCKGRES_FLIGHT_SESSION_TOKEN_TTL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_MAX_RETAINED_BIND_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			if n > 0 {
+				cfg.MaxRetainedBindBytes = n
+			} else {
+				warn("DUCKGRES_MAX_RETAINED_BIND_BYTES must be > 0")
+			}
+		} else {
+			warn("Invalid DUCKGRES_MAX_RETAINED_BIND_BYTES: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_MAX_OPEN_PORTALS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n > 0 {
+				cfg.MaxOpenPortals = n
+			} else {
+				warn("DUCKGRES_MAX_OPEN_PORTALS must be > 0")
+			}
+		} else {
+			warn("Invalid DUCKGRES_MAX_OPEN_PORTALS: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_DATA_DIR"); v != "" {
@@ -916,6 +956,20 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			cfg.FlightSessionTokenTTL = d
 		} else {
 			warn("Invalid --flight-session-token-ttl duration: " + err.Error())
+		}
+	}
+	if cli.Set["max-retained-bind-bytes"] {
+		if cli.MaxRetainedBindBytes > 0 {
+			cfg.MaxRetainedBindBytes = cli.MaxRetainedBindBytes
+		} else {
+			warn("--max-retained-bind-bytes must be > 0")
+		}
+	}
+	if cli.Set["max-open-portals"] {
+		if cli.MaxOpenPortals > 0 {
+			cfg.MaxOpenPortals = cli.MaxOpenPortals
+		} else {
+			warn("--max-open-portals must be > 0")
 		}
 	}
 	if cli.Set["data-dir"] {

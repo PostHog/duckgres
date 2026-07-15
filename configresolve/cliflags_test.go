@@ -69,6 +69,8 @@ func fieldNameToFlagName(name string) string {
 		{"MemoryLimit", "memory-limit"},
 		{"MemoryBudget", "memory-budget"},
 		{"MemoryRebalance", "memory-rebalance"},
+		{"MaxRetainedBindBytes", "max-retained-bind-bytes"},
+		{"MaxOpenPortals", "max-open-portals"},
 		{"MaxConnections", "max-connections"},
 		{"DataDir", "data-dir"},
 		{"CertFile", "cert"},
@@ -154,6 +156,8 @@ func TestRegisterCLIInputsFlagsHarvestPropagatesValuesAndSet(t *testing.T) {
 		"--port", "5433",
 		"--data-dir", "/tmp/duckgres-test",
 		"--memory-limit", "2GB",
+		"--max-retained-bind-bytes", "2097152",
+		"--max-open-portals", "64",
 		"--query-log=false",
 	}); err != nil {
 		t.Fatalf("parse: %v", err)
@@ -168,10 +172,16 @@ func TestRegisterCLIInputsFlagsHarvestPropagatesValuesAndSet(t *testing.T) {
 	if cli.MemoryLimit != "2GB" {
 		t.Errorf("MemoryLimit: want 2GB, got %q", cli.MemoryLimit)
 	}
+	if cli.MaxRetainedBindBytes != 2097152 {
+		t.Errorf("MaxRetainedBindBytes: want 2097152, got %d", cli.MaxRetainedBindBytes)
+	}
+	if cli.MaxOpenPortals != 64 {
+		t.Errorf("MaxOpenPortals: want 64, got %d", cli.MaxOpenPortals)
+	}
 	if cli.QueryLog != false {
 		t.Errorf("QueryLog: want false, got %v", cli.QueryLog)
 	}
-	for _, name := range []string{"port", "data-dir", "memory-limit", "query-log"} {
+	for _, name := range []string{"port", "data-dir", "memory-limit", "max-retained-bind-bytes", "max-open-portals", "query-log"} {
 		if !cli.Set[name] {
 			t.Errorf("Set[%q] should be true after explicit --%s", name, name)
 		}

@@ -14,11 +14,86 @@ var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently open client connections",
 })
 
+// retainedBindBytesGauge tracks Bind storage currently retained by open portals
+// across the process: the wire body plus compact parameter/format metadata. It
+// deliberately has no connection, portal, user, or org label so it remains
+// safe to scrape at high connection cardinality.
+var retainedBindBytesGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_retained_bind_bytes",
+	Help: "Aggregate Bind storage bytes retained by open portals.",
+})
+
+// openPortalsGauge tracks installed portal shells across the process. It has no
+// labels because portal-level labels would have unbounded cardinality.
+var openPortalsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_open_portals",
+	Help: "Aggregate number of installed portal shells.",
+})
+
+// portalPayloadReleasesTotal counts portal payload releases by a fixed
+// lifecycle reason. Callers must use only bounded protocol-lifecycle reasons.
+var portalPayloadReleasesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_portal_payload_releases_total",
+	Help: "Total portal payload releases by lifecycle reason.",
+}, []string{"reason"})
+
+// portalBudgetRejectionsTotal counts Bind admissions rejected by one of the
+// fixed portal-budget reasons. It intentionally has no tenant/user labels.
+var portalBudgetRejectionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_portal_budget_rejections_total",
+	Help: "Total Bind admissions rejected by portal budget reason.",
+}, []string{"reason"})
+
+var portalPayloadReleaseReasons = map[string]struct{}{
+	"terminal_success": {},
+	"terminal_failure": {},
+	"close_portal":     {},
+	"close_statement":  {},
+	"unnamed_rebind":   {},
+	"idle_sync":        {},
+	"tx_end":           {},
+	"simple_query":     {},
+	"connection_close": {},
+}
+
+var portalBudgetRejectionReasons = map[string]struct{}{
+	"retained_bytes": {},
+	"open_portals":   {},
+}
+
 // IncrementOpenConnections increments the open connections gauge.
 func IncrementOpenConnections() { connectionsGauge.Inc() }
 
 // DecrementOpenConnections decrements the open connections gauge.
 func DecrementOpenConnections() { connectionsGauge.Dec() }
+
+// AddRetainedBindBytes applies a per-connection retained-payload delta to the
+// process-wide gauge. A delta, rather than a Set operation, keeps concurrent
+// client connections from overwriting each other's contribution.
+func AddRetainedBindBytes(delta int) { retainedBindBytesGauge.Add(float64(delta)) }
+
+// AddOpenPortals applies a per-connection portal-count delta to the
+// process-wide gauge. Callers pair every successful installation with exactly
+// one matching negative delta when the shell is removed.
+func AddOpenPortals(delta int) { openPortalsGauge.Add(float64(delta)) }
+
+// IncPortalPayloadRelease records one payload release using a fixed lifecycle
+// reason (for example terminal_success or close_portal).
+func IncPortalPayloadRelease(reason string) {
+	if _, ok := portalPayloadReleaseReasons[reason]; !ok {
+		return
+	}
+	portalPayloadReleasesTotal.WithLabelValues(reason).Inc()
+}
+
+// IncPortalBudgetRejection records one rejected Bind using a fixed budget
+// reason (retained_bytes or open_portals).
+func IncPortalBudgetRejection(reason string) {
+	if _, ok := portalBudgetRejectionReasons[reason]; !ok {
+		return
+	}
+	portalBudgetRejectionsTotal.WithLabelValues(reason).Inc()
+}
 
 // connectionDurationHistogram observes the full lifetime of a client
 // connection (accept → disconnect) in seconds, labelled by org. It complements
