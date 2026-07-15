@@ -3,7 +3,6 @@
 package provisioner
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,22 +10,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func TestContentFingerprintDetectsSameCountMutationAndIgnoresRowOrder(t *testing.T) {
-	fingerprint := func(rows ...string) [sha256.Size]byte {
-		var sum [sha256.Size]byte
-		for _, row := range rows {
-			addRowFingerprint(&sum, row)
-		}
-		return sum
+func TestValidateCopyRowCounts(t *testing.T) {
+	if err := validateCopyRowCounts("ducklake_metadata", 2, 2); err != nil {
+		t.Fatalf("matching COPY command tags: %v", err)
 	}
-	original := fingerprint(`{"id":1,"value":"a"}`, `{"id":2,"value":"b"}`)
-	reordered := fingerprint(`{"id":2,"value":"b"}`, `{"id":1,"value":"a"}`)
-	mutated := fingerprint(`{"id":1,"value":"changed"}`, `{"id":2,"value":"b"}`)
-	if original != reordered {
-		t.Fatal("multiset fingerprint changed with row order")
-	}
-	if original == mutated {
-		t.Fatal("same-row-count UPDATE was not detected by content fingerprint")
+	err := validateCopyRowCounts("ducklake_metadata", 2, 1)
+	if err == nil || !strings.Contains(err.Error(), "source COPY TO reported 2 rows, target COPY FROM reported 1") {
+		t.Fatalf("err = %v, want COPY command-tag mismatch", err)
 	}
 }
 
@@ -60,71 +50,6 @@ func (l *logRecorder) count(substr string) int {
 		}
 	}
 	return n
-}
-
-func fakeTables(n int) []string {
-	tables := make([]string, n)
-	for i := range tables {
-		tables[i] = fmt.Sprintf("ducklake_t%05d", i)
-	}
-	return tables
-}
-
-// TestVerifyCopiedRowCountsAnnouncesAndEmitsProgress pins the op-log
-// liveness contract of the copy-verify loop: it announces itself with the
-// table total BEFORE the first count, emits a periodic progress line every
-// verifyProgressEvery tables (never per-table — a 20k-table catalog must
-// produce ~8 lines, not 20k), and closes with the completion line.
-func TestVerifyCopiedRowCountsAnnouncesAndEmitsProgress(t *testing.T) {
-	tables := fakeTables(2*verifyProgressEvery + 1000) // 6000: progress at 2500 and 5000
-	rec := &logRecorder{}
-	one := func(string) (int64, error) { return 1, nil }
-
-	counts, err := verifyCopiedRowCounts(tables, one, one, rec.log)
-	if err != nil {
-		t.Fatalf("verifyCopiedRowCounts: %v", err)
-	}
-	if len(counts) != len(tables) {
-		t.Fatalf("returned %d counts, want %d", len(counts), len(tables))
-	}
-	if len(rec.lines) == 0 || !strings.Contains(rec.lines[0], "verifying row counts across 6000 tables") {
-		t.Fatalf("first line must be the announce with the table total, got %v", rec.lines)
-	}
-	if rec.count("verified 2500/6000 tables…") != 1 || rec.count("verified 5000/6000 tables…") != 1 {
-		t.Fatalf("periodic progress lines missing: %v", rec.lines)
-	}
-	if !strings.Contains(rec.lines[len(rec.lines)-1], "verified 6000 tables: target row counts match the source snapshot") {
-		t.Fatalf("last line must be the completion line, got %v", rec.lines)
-	}
-	// Log volume is bounded: announce + 2 progress + completion. Never per-table.
-	if len(rec.lines) != 4 {
-		t.Fatalf("emitted %d lines, want exactly 4 (announce, 2 progress, completion): %v", len(rec.lines), rec.lines)
-	}
-}
-
-// TestVerifyCopiedRowCountsSmallCatalogNoProgress pins the no-spam rule: a
-// small catalog gets the announce and the completion line only.
-func TestVerifyCopiedRowCountsSmallCatalogNoProgress(t *testing.T) {
-	rec := &logRecorder{}
-	one := func(string) (int64, error) { return 1, nil }
-	if _, err := verifyCopiedRowCounts(fakeTables(3), one, one, rec.log); err != nil {
-		t.Fatalf("verifyCopiedRowCounts: %v", err)
-	}
-	if len(rec.lines) != 2 {
-		t.Fatalf("emitted %d lines, want exactly 2 (announce + completion): %v", len(rec.lines), rec.lines)
-	}
-}
-
-// TestVerifyCopiedRowCountsMismatch pins the mismatch error text (asserted by
-// operators reading the op log).
-func TestVerifyCopiedRowCountsMismatch(t *testing.T) {
-	rec := &logRecorder{}
-	src := func(string) (int64, error) { return 2, nil }
-	dst := func(string) (int64, error) { return 1, nil }
-	_, err := verifyCopiedRowCounts([]string{"ducklake_metadata"}, src, dst, rec.log)
-	if err == nil || !strings.Contains(err.Error(), "row count mismatch on ducklake_metadata: source 2, target 1") {
-		t.Fatalf("err = %v, want the row-count-mismatch error", err)
-	}
 }
 
 // TestApplyConstraintsAndIndexesAnnounces pins that the constraint/index
@@ -326,19 +251,5 @@ func TestConstraintCreatesIndex(t *testing.T) {
 		if got := constraintCreatesIndex(contype); got != want {
 			t.Errorf("constraintCreatesIndex(%q) = %t, want %t", contype, got, want)
 		}
-	}
-}
-
-// TestMaybeLogProgressSkipsFinalItem pins that the final item never emits a
-// progress line even when it lands exactly on the cadence — the caller's
-// completion line covers it.
-func TestMaybeLogProgressSkipsFinalItem(t *testing.T) {
-	rec := &logRecorder{}
-	total := 2 * verifyProgressEvery
-	for i := 1; i <= total; i++ {
-		maybeLogProgress(rec.log, "counted", i, total)
-	}
-	if len(rec.lines) != 1 || !strings.Contains(rec.lines[0], fmt.Sprintf("counted %d/%d tables…", verifyProgressEvery, total)) {
-		t.Fatalf("lines = %v, want exactly one mid-loop progress line (the final on-cadence item is skipped)", rec.lines)
 	}
 }

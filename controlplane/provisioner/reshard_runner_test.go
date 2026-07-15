@@ -394,7 +394,7 @@ func (f *fakeDuckling) callKinds() []string {
 }
 
 type copierCall struct {
-	kind   string // "probe" | "copy" | "counts" | "droptables" | "dropdb"
+	kind   string // "probe" | "copy" | "droptables" | "dropdb"
 	source CatalogEndpoint
 	target CatalogEndpoint
 	dbName string
@@ -410,15 +410,6 @@ type fakeCopier struct {
 	// succeed). It sees the probed endpoint so tests can fail e.g. only the
 	// post-flip-back recovery probe.
 	probeFn func(ep CatalogEndpoint) error
-	// countsAfter is what SnapshotCounts returns for the SOURCE stability
-	// recheck (sslmode!=require); defaults to copyResult.PerTableRows (stable).
-	countsAfter map[string]int64
-	// externalCounts is what SnapshotCounts returns for the EXTERNAL target
-	// verify (sslmode==require, cnpg→ext verifyExternalCatalog); defaults to
-	// copyResult.PerTableRows (complete target).
-	externalCounts       map[string]int64
-	fingerprintsAfter    map[string]CatalogTableFingerprint
-	externalFingerprints map[string]CatalogTableFingerprint
 }
 
 type blockingCopier struct {
@@ -445,7 +436,7 @@ func (f *blockingCopier) Copy(ctx context.Context, source, target CatalogEndpoin
 		close(f.canceled)
 		return CatalogCopyResult{}, ctx.Err()
 	case <-f.released:
-		return CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}, nil
+		return CatalogCopyResult{}, nil
 	}
 }
 
@@ -473,32 +464,6 @@ func (f *fakeCopier) Copy(_ context.Context, source, target CatalogEndpoint, log
 	}
 	log("info", "fake copy done")
 	return f.copyResult, nil
-}
-
-func (f *fakeCopier) SnapshotCounts(_ context.Context, ep CatalogEndpoint, _ func(string, string)) (map[string]int64, error) {
-	f.record(copierCall{kind: "counts", target: ep})
-	// The external target is reached with sslmode=require (verifyExternalCatalog);
-	// the cnpg source with sslmode=disable (verifySourceStable).
-	if ep.SSLMode == "require" {
-		if f.externalCounts != nil {
-			return f.externalCounts, nil
-		}
-		return f.copyResult.PerTableRows, nil
-	}
-	if f.countsAfter != nil {
-		return f.countsAfter, nil
-	}
-	return f.copyResult.PerTableRows, nil
-}
-
-func (f *fakeCopier) SnapshotFingerprints(_ context.Context, ep CatalogEndpoint, _ func(string, string)) (map[string]CatalogTableFingerprint, error) {
-	if ep.SSLMode == "require" && f.externalFingerprints != nil {
-		return f.externalFingerprints, nil
-	}
-	if ep.SSLMode != "require" && f.fingerprintsAfter != nil {
-		return f.fingerprintsAfter, nil
-	}
-	return f.copyResult.PerTableFingerprints, nil
 }
 
 func (f *fakeCopier) DropCatalogTables(_ context.Context, ep CatalogEndpoint, _ func(string, string)) error {
@@ -631,7 +596,6 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: true}
 	copier := &fakeCopier{copyResult: CatalogCopyResult{
 		Tables: 3, Rows: 42, Bytes: 1000,
-		PerTableRows: map[string]int64{"ducklake_metadata": 1, "ducklake_snapshot": 40, "ducklake_table": 1},
 	}}
 	runOp(t, testRunner(store, duckling, copier), store)
 
@@ -646,7 +610,7 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	kinds := copier.kinds()
 	// probe(target, flip wait) → probe(source) → probe(target) → copy →
 	// stability recheck → source drop.
-	if fmt.Sprint(kinds) != fmt.Sprint([]string{"probe", "probe", "probe", "copy", "counts", "dropdb"}) {
+	if fmt.Sprint(kinds) != fmt.Sprint([]string{"probe", "probe", "probe", "copy", "dropdb"}) {
 		t.Fatalf("copier calls = %v", kinds)
 	}
 	// The copy's SOURCE is the recorded pre-flip endpoint, not the new one.
@@ -689,11 +653,8 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	if !store.hasLog("reshard report (succeeded)") || !store.hasLog("maintenance mode (connections blocked)") {
 		t.Fatalf("report missing from log: %v", store.logs)
 	}
-	// Long-running phases announce themselves when they START (an operator
-	// watching the live op log must never wonder whether a silent op is stuck):
-	// the source-stability recheck re-counts every table outside the snapshot.
-	if !store.hasLog("verifying source stability: re-counting rows across 3 tables") {
-		t.Fatalf("stability-recheck announce missing from log: %v", store.logs)
+	if !store.hasLog("COPY command tags matched for 3 tables") {
+		t.Fatalf("COPY verification log missing: %v", store.logs)
 	}
 }
 
@@ -717,7 +678,7 @@ func TestReshardHappyPathExtToCnpg(t *testing.T) {
 	st.IAMRoleARN = "arn:aws:iam::123:role/duckling-org-a"
 	st.ReadyCondition = true
 	duckling := &fakeDuckling{status: st}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	runOp(t, testRunner(store, duckling, copier), store)
 
@@ -754,7 +715,7 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	op.TargetDatabase = "postgres"
 	store := newFakeReshardStore(op)
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	r := testRunner(store, duckling, copier)
 	r.StashExternalPassword(op.ID, "ext-pw")
@@ -765,7 +726,7 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	}
 	// copy + source-stability recheck BEFORE the flip, external-catalog verify
 	// AFTER the flip, then the explicit source drop.
-	if fmt.Sprint(copier.kinds()) != fmt.Sprint([]string{"probe", "probe", "copy", "counts", "counts", "dropdb"}) {
+	if fmt.Sprint(copier.kinds()) != fmt.Sprint([]string{"probe", "probe", "copy", "dropdb"}) {
 		t.Fatalf("copier calls = %v", copier.kinds())
 	}
 	// The source drop names the recorded source DB and runs against the source.
@@ -803,12 +764,10 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	if last["metadata_store_kind"] != configstore.MetadataStoreKindExternal || last["metadata_store_endpoint"] != "escape.rds.amazonaws.com" {
 		t.Fatalf("warehouse row not reconciled to external: %v", last)
 	}
-	// Both count-verification phases announce themselves with the table total
-	// before the (potentially multi-minute) recount starts.
-	if !store.hasLog("verifying source stability: re-counting rows across 1 tables") {
-		t.Fatalf("stability-recheck announce missing from log: %v", store.logs)
+	if !store.hasLog("COPY command tags matched for 1 tables") {
+		t.Fatalf("COPY verification log missing: %v", store.logs)
 	}
-	if !store.hasLog("verifying the external target catalog: counting rows across 1 tables") {
+	if !store.hasLog("external target catalog copy completed") {
 		t.Fatalf("external-verify announce missing from log: %v", store.logs)
 	}
 }
@@ -928,7 +887,7 @@ func TestReshardTakeoverPreservesOriginalCompactionSnapshot(t *testing.T) {
 	op.CompactionWasEnabled = true
 	store := newFakeReshardStore(op)
 	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: false}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{}}
 
 	runOp(t, testRunner(store, duckling, copier), store)
 
@@ -955,7 +914,7 @@ func TestReshardTakeoverAfterCutoverDoesNotReplaySourceDiscovery(t *testing.T) {
 	targetStatus := cnpgSourceStatus()
 	targetStatus.MetadataStore.Endpoint = "shard-002-pooler.cnpg-shards.svc.cluster.local"
 	duckling := &fakeDuckling{status: targetStatus, compPresent: true, compEnabled: false}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{}}
 
 	runOp(t, testRunner(store, duckling, copier), store)
 
@@ -1052,7 +1011,7 @@ func TestReshardFinalizeFailureRollsBackBeforeReadmittingTraffic(t *testing.T) {
 	store := newFakeReshardStore(cnpgOp())
 	store.failUnblockedWrite = true
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{}}
 
 	runOp(t, testRunner(store, duckling, copier), store)
 
@@ -1195,7 +1154,7 @@ func TestReshardRunSingleOperationWithStashedPassword(t *testing.T) {
 	op.TargetDatabase = "postgres"
 	store := newFakeReshardStore(op)
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	r := testRunner(store, duckling, copier)
 	r.StashExternalPassword(op.ID, "ext-pw")
@@ -1337,7 +1296,7 @@ func stuckExtOp() *configstore.ReshardOperation {
 func TestReshardExtFlipTimeoutRecovers(t *testing.T) {
 	store := newFakeReshardStore(stuckExtOp())
 	duckling := &stuckExternalDuckling{fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()}}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	r := testRunner(store, duckling, copier)
 	r.StashExternalPassword(store.op.ID, "ext-pw")
@@ -1384,7 +1343,7 @@ func TestReshardExtFlipTimeoutRecovers(t *testing.T) {
 func TestReshardBackupRecordedBeforeFlip(t *testing.T) {
 	store := newFakeReshardStore(cnpgOp())
 	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: true}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 	backuper := &fakeBackuper{}
 	r := testRunner(store, duckling, copier)
 	r.backuper = backuper
@@ -1451,7 +1410,7 @@ func TestReshardBackupFailureCnpgToExtFailsBeforeFlip(t *testing.T) {
 	op.TargetDatabase = "postgres"
 	store := newFakeReshardStore(op)
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 	r := testRunner(store, duckling, copier)
 	r.backuper = &fakeBackuper{backupErr: fmt.Errorf("pg_dump exploded")}
 	r.StashExternalPassword(op.ID, "ext-pw")
@@ -1482,7 +1441,7 @@ func TestReshardBackupFailureCnpgToExtFailsBeforeFlip(t *testing.T) {
 func TestReshardBackupFailureNonDestructiveContinues(t *testing.T) {
 	store := newFakeReshardStore(cnpgOp())
 	duckling := &fakeDuckling{status: cnpgSourceStatus(), compPresent: true, compEnabled: true}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 	r := testRunner(store, duckling, copier)
 	r.backuper = &fakeBackuper{backupErr: fmt.Errorf("s3 upload timed out")}
 
@@ -1496,46 +1455,6 @@ func TestReshardBackupFailureNonDestructiveContinues(t *testing.T) {
 	}
 	if store.op.BackupS3URI != "" {
 		t.Fatalf("op.BackupS3URI = %q, want empty when backup failed", store.op.BackupS3URI)
-	}
-}
-
-// TestReshardExtVerifyMismatchAdopts pins the step-5 gate: if the external
-// target catalog does NOT exactly match the copied row counts, the runner
-// REFUSES to drop the retained cnpg source and instead flips back + re-adopts
-// it — no data loss.
-func TestReshardExtVerifyMismatchAdopts(t *testing.T) {
-	op := cnpgOp()
-	op.TargetKind = configstore.MetadataStoreKindExternal
-	op.ToShard = ""
-	op.TargetEndpoint = "escape.rds.amazonaws.com"
-	op.TargetPasswordSecret = "escape-secret"
-	op.TargetUser = "postgres"
-	op.TargetDatabase = "postgres"
-	store := newFakeReshardStore(op)
-	duckling := &fakeDuckling{status: cnpgSourceStatus()}
-	copier := &fakeCopier{
-		copyResult: CatalogCopyResult{Tables: 1, Rows: 5, PerTableRows: map[string]int64{"ducklake_data_file": 5}},
-		// External target verify sees a DIFFERENT count than the copy snapshot.
-		externalCounts: map[string]int64{"ducklake_data_file": 4},
-	}
-
-	r := testRunner(store, duckling, copier)
-	r.StashExternalPassword(op.ID, "ext-pw")
-	runOp(t, r, store)
-
-	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "catalog incomplete") {
-		t.Fatalf("state=%s err=%q, want external-verify (catalog incomplete) failure", store.op.State, store.op.Error)
-	}
-	// The retained cnpg source must NEVER be dropped on a verify mismatch.
-	if containsStr(copier.kinds(), "dropdb") {
-		t.Fatalf("verify mismatch dropped the source — must retain it for adoption: %v", copier.kinds())
-	}
-	// Recovery flips back + re-adopts.
-	if !containsStr(duckling.callKinds(), "cnpg-adopt") {
-		t.Fatalf("verify mismatch did not flip back + adopt: %v", duckling.callKinds())
-	}
-	if store.warehouseState != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("warehouse state = %s, want ready after adopt recovery", store.warehouseState)
 	}
 }
 
@@ -1554,7 +1473,7 @@ func TestReshardCnpgToExtXRDUnsupportedRefuses(t *testing.T) {
 	op.TargetDatabase = "postgres"
 	store := newFakeReshardStore(op)
 	duckling := &fakeDuckling{status: cnpgSourceStatus(), retainFieldUnsupported: true}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	r := testRunner(store, duckling, copier)
 	r.StashExternalPassword(op.ID, "ext-pw")
@@ -1607,7 +1526,7 @@ func TestReshardCnpgToExtOrphanWaitForbiddenFailsFast(t *testing.T) {
 			schema.GroupResource{Group: "postgresql.sql.m.crossplane.io", Resource: "databases"},
 			"org-a-db", errors.New("no RBAC grant")))
 	duckling := &fakeDuckling{status: cnpgSourceStatus(), mrsReadErr: forbidden}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	r := testRunner(store, duckling, copier)
 	// An hour-long flip timeout proves the failure is the fail-fast, not the
@@ -1658,7 +1577,7 @@ func TestReshardCnpgToExtOrphanWaitTimeoutReportsObservation(t *testing.T) {
 	op.TargetDatabase = "postgres"
 	store := newFakeReshardStore(op)
 	duckling := &fakeDuckling{status: cnpgSourceStatus(), mrsStuckWithDelete: true}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	r := testRunner(store, duckling, copier)
 	r.flipTimeout = 150 * time.Millisecond
@@ -1689,67 +1608,6 @@ func containsStr(ss []string, want string) bool {
 		}
 	}
 	return false
-}
-
-// TestReshardVerifyMismatchRollsBack pins the concurrent-writer detection: a
-// source that changed after the snapshot fails verify and rolls back.
-func TestReshardVerifyMismatchRollsBack(t *testing.T) {
-	store := newFakeReshardStore(cnpgOp())
-	duckling := &fakeDuckling{status: cnpgSourceStatus()}
-	copier := &fakeCopier{
-		copyResult:  CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_snapshot": 1}},
-		countsAfter: map[string]int64{"ducklake_snapshot": 2}, // writer snuck in
-	}
-
-	runOp(t, testRunner(store, duckling, copier), store)
-
-	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "concurrent writer") {
-		t.Fatalf("state=%s err=%q, want concurrent-writer failure", store.op.State, store.op.Error)
-	}
-	// Rollback of a flipped cnpg→cnpg: shard value patched back + partial
-	// target dropped; source NEVER dropped.
-	for _, k := range copier.kinds() {
-		if k == "dropdb" {
-			t.Fatal("verify failure must never drop the source database")
-		}
-	}
-	foundDropTables := false
-	for _, k := range copier.kinds() {
-		if k == "droptables" {
-			foundDropTables = true
-		}
-	}
-	if !foundDropTables {
-		t.Fatal("partial target tables were not dropped on rollback")
-	}
-	if store.warehouseState != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("warehouse state = %s, want ready after rollback", store.warehouseState)
-	}
-}
-
-func TestReshardVerifyDetectsSameCountContentMutation(t *testing.T) {
-	store := newFakeReshardStore(cnpgOp())
-	duckling := &fakeDuckling{status: cnpgSourceStatus()}
-	copier := &fakeCopier{
-		copyResult: CatalogCopyResult{
-			Tables: 1, Rows: 1,
-			PerTableRows: map[string]int64{"ducklake_metadata": 1},
-			PerTableFingerprints: map[string]CatalogTableFingerprint{
-				"ducklake_metadata": {Rows: 1, Digest: "before"},
-			},
-		},
-		countsAfter: map[string]int64{"ducklake_metadata": 1},
-		fingerprintsAfter: map[string]CatalogTableFingerprint{
-			"ducklake_metadata": {Rows: 1, Digest: "after"},
-		},
-	}
-	runOp(t, testRunner(store, duckling, copier), store)
-	if store.op.State != configstore.ReshardStateFailed {
-		t.Fatalf("state = %s, want failed for same-count content mutation", store.op.State)
-	}
-	if !strings.Contains(store.op.Error, "content changed") {
-		t.Fatalf("error = %q, want content-change diagnosis", store.op.Error)
-	}
 }
 
 // TestProbeErrorAuthClassification pins isAuthProbeError/describeProbeFailure
@@ -1813,7 +1671,7 @@ func TestProbeErrorAuthClassification(t *testing.T) {
 func TestReshardExtRecoveryProbeAuthFailureDiagnosed(t *testing.T) {
 	store := newFakeReshardStore(stuckExtOp())
 	duckling := &stuckExternalDuckling{fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()}}
-	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1, PerTableRows: map[string]int64{"ducklake_metadata": 1}}}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
 
 	// The forward copy pre-flight probes the cnpg source once (must succeed so
 	// the op reaches the flip); every LATER probe of the cnpg endpoint is the
