@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -631,20 +632,66 @@ func (d *DucklingClient) GetCompactionSetting(ctx context.Context, name string) 
 // SetCompactionEnabled patches spec.ducklake.maintenance.compaction.enabled
 // to an explicit value. enabled=nil REMOVES the key (JSON merge patch null),
 // restoring the pre-reshard "absent" state.
+//
+// XRD-defaulting guard (prod incident): a legacy CR can have NO spec.ducklake
+// object at all — its DuckLake enablement then comes from the legacy
+// metadata-store type coupling (see shared_worker_activator.go::
+// buildDuckLakeConfigFromDuckling). This merge patch MATERIALIZES the
+// spec.ducklake object, and the XRD's `ducklake.enabled: {default: false}`
+// stamps `enabled: false` onto the freshly created object — silently DISABLING
+// DuckLake for the org (the CP then builds an S3-only activation payload and
+// every activation fails with "tenant activation requires a ducklake
+// metadata_store"). When the object is absent, pin the org's EFFECTIVE
+// enablement into the same patch so defaulting cannot flip it; when it already
+// exists, patch exactly the compaction key and nothing else. The pinned
+// explicit value is deliberately NEVER removed afterwards (not by
+// restoreCompaction, not on takeover): it equals the effective value, so it is
+// a harmless no-op — whereas removing it after a successful flip would hand
+// enablement back to the type coupling, whose answer may have CHANGED with the
+// new metadata-store type (ext→cnpg would re-derive false — the same outage
+// through another door).
 func (d *DucklingClient) SetCompactionEnabled(ctx context.Context, name string, enabled *bool) error {
 	var value interface{}
 	if enabled != nil {
 		value = *enabled
 	}
+	ducklakeBlock := map[string]interface{}{
+		"maintenance": map[string]interface{}{
+			"compaction": map[string]interface{}{
+				"enabled": value,
+			},
+		},
+	}
+
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return fmt.Errorf("get duckling CR %q before compaction patch: %w", name, gerr)
+	}
+	hasDucklakeObject := false
+	if spec, ok := cr.Object["spec"].(map[string]interface{}); ok {
+		_, hasDucklakeObject = spec["ducklake"].(map[string]interface{})
+	}
+	if !hasDucklakeObject {
+		st, perr := parseDucklingStatus(cr)
+		if perr != nil {
+			return fmt.Errorf("parse duckling CR %q status before compaction patch: %w", name, perr)
+		}
+		// Mirror buildDuckLakeConfigFromDuckling's effective enablement: an
+		// explicit spec.ducklake.enabled wins (impossible here — the object is
+		// absent — but kept for symmetry), else the legacy coupling
+		// status.metadataStore.type != cnpg-shard.
+		effective := st.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
+		if st.DuckLakeEnabled != nil {
+			effective = *st.DuckLakeEnabled
+		}
+		ducklakeBlock["enabled"] = effective
+		slog.Info("Duckling has no spec.ducklake object; pinning effective ducklake enablement into the compaction patch so XRD defaulting cannot disable it.",
+			"duckling", name, "effective_enabled", effective, "status_metadata_store_type", st.MetadataStore.Type)
+	}
+
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
-			"ducklake": map[string]interface{}{
-				"maintenance": map[string]interface{}{
-					"compaction": map[string]interface{}{
-						"enabled": value,
-					},
-				},
-			},
+			"ducklake": ducklakeBlock,
 		},
 	})
 	if err != nil {

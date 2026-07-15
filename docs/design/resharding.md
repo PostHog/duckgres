@@ -59,6 +59,42 @@ behavior is bound to the reshard type-flip, never to Duckling deletion. The e2e
 `lifecycle_teardown_cnpg` asserts the finalizer cascade still fully deletes the
 CR (and its cnpg role/DB) on a normal deprovision.
 
+## Source identity: the duckling STATUS is authoritative
+
+The start handler (`admin/reshard.go`) derives the op's **source side**
+(`source_kind`, `from_shard`, the external source block) with the live
+Duckling **status** as the source of truth: the composition writes the status
+after convergence, so it records where the catalog *actually* lives, while
+the config-store warehouse row and the duckling *spec* are operator-editable
+inputs that can drift. The op is **refused (400, nothing created)** when the
+identity is incomplete or contradicted:
+
+- **kind drift** — the row's `metadata_store_kind` (when set) disagrees with
+  the status type → 400 naming both values ("refusing to reshard until
+  reconciled").
+- **cnpg source with an unresolvable current shard** (no lister / no CR
+  status / empty endpoint) → 400: an op recorded with an empty `from_shard`
+  cannot roll back — the XRD rejects an empty `cnpgShard` patch. The resolved
+  shard is also shape-checked against the XRD pattern.
+- **external source with an incomplete row block** (no endpoint or SM
+  password secret) → 400: an ext→cnpg rollback re-renders the external spec
+  from those fields.
+- **empty row kind AND no status** → 400 (nothing to derive from).
+
+The runner re-checks at `recordSource` (pre-flip, defense in depth for ops
+created by older CPs or hand-inserted rows): a status type that contradicts
+the op's recorded `source_kind` fails the op before anything is flipped.
+
+This guards against a real prod incident: an org whose config-store metadata
+block was EMPTY (previously silently defaulted to cnpg-shard) and whose
+duckling *spec* type had drifted from its *status* (the org actually lived on
+an external RDS) got a cnpg→cnpg op with `from_shard=""`. cnpg→cnpg flips
+BEFORE copying, so the org was re-pointed at a freshly created EMPTY catalog
+with no copy performed; the copy then failed (the external source was probed
+with the cnpg branch's `sslmode=disable`), and the rollback patch
+(`cnpgShard: ""`) was rejected by the XRD — leaving the duckling on the empty
+target while the warehouse was unblocked to ready.
+
 ## Execution model: one dedicated pod per operation
 
 A reshard never executes inside a control-plane process. When an operator
@@ -143,6 +179,22 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    absent). Residual window: an already-running millpond Job (≤30m, source
    endpoint baked in) can outlive the pause — covered by the verify step and
    the cleanup fence.
+   **XRD-defaulting guard (prod incident)**: a legacy CR can have NO
+   `spec.ducklake` object at all — its DuckLake enablement then comes from the
+   legacy metadata-store type coupling (`status.metadataStore.type !=
+   cnpg-shard`, the same derivation the worker activator uses). The compaction
+   merge patch MATERIALIZES `spec.ducklake`, and the XRD's
+   `ducklake.enabled: {default: false}` stamps `enabled: false` onto the fresh
+   object — silently disabling DuckLake for the org (activation then builds an
+   S3-only payload and the worker fails with "tenant activation requires a
+   ducklake metadata_store"). `SetCompactionEnabled` therefore reads the CR
+   first and, when the object is absent, pins the org's EFFECTIVE enablement
+   into the same patch; an existing `spec.ducklake` is patched exactly as
+   before (compaction key only). The pinned explicit value is deliberately
+   never removed afterwards: it equals the effective value (a no-op), whereas
+   removing it after a successful flip would hand enablement back to the type
+   coupling, whose answer may have CHANGED with the new store type (ext→cnpg
+   would re-derive false — the same outage through another door).
 4. **backup_catalog** — the safety net (§ Pre-flip catalog backup below). Dump
    the SOURCE catalog to the org's own S3 data bucket BEFORE any flip. Runs for
    every direction; the source is quiescent here (post-drain, compaction paused)
@@ -433,6 +485,22 @@ never appear in the op log.
   post-flip → adopt recovery (above); pre-flip → if `retainCnpgOnFlip` was set,
   reset it to false so the still-cnpg source keeps full-lifecycle (Delete) MRs
   and deprovision stays clean.
+- **Rollback never emits a patch the XRD would reject.** If the recorded
+  source identity is unusable — `from_shard` empty or outside the XRD's
+  shard-name pattern (`isValidCnpgShardName` mirrors it), or an external
+  source block missing endpoint/password secret — the rollback flip-back (and
+  the cnpg→ext adopt recovery) is SKIPPED with an ERROR carrying explicit
+  operator instructions, and the warehouse is **intentionally left blocked in
+  `resharding`** (see the never-stranded caveat below). Emitting the invalid
+  patch would just be refused by the API server and mislead the log — the
+  prod incident's rollback failed exactly that way. The submit-time
+  source-identity validation makes such ops unrepresentable going forward;
+  this guard covers pre-guard rows and drift after creation.
+- Takeover-resume reconstructs `o.source`/`o.target` from the durable op row +
+  live duckling status with each side's **sslmode derived from its
+  metadata-store kind** (`sslModeFor`: cnpg pooler → `disable`, external RDS →
+  `require`) — never hardcoded; a hardcoded `disable` fails RDS pg_hba with
+  "no encryption".
 - Cancel (`POST /reshards/:id/cancel`): flag checked between steps and inside
   every wait loop; rolls back like a failure at that step → `cancelled`.
   Pending (unclaimed) ops finish immediately. On cnpg→ext, cancel is refused
@@ -460,7 +528,16 @@ never appear in the op log.
   prove a step completed flip a flag) and every rollback action is idempotent, so
   a takeover rolls back identically to the original runner.
 - An org is never stranded: every failure path restores `resharding→ready`
-  (or logs at ERROR if it can't — that's the page-someone signal).
+  (or logs at ERROR if it can't — that's the page-someone signal) — with ONE
+  deliberate carve-out: when the duckling is known to point at the WRONG
+  store and rollback cannot repair it (an invalid/incomplete recorded source
+  identity, or a flip-back that failed), the warehouse stays BLOCKED in
+  `resharding`. Unblocking would let clients activate against the wrong
+  (likely empty) catalog — worse than a blocked org: the prod incident
+  unblocked after a failed rollback and clients landed on an empty catalog.
+  The ERROR log carries the manual repair steps (verify where the catalog
+  actually lives, patch `spec.metadataStore`, verify activation, then set the
+  warehouse ready).
 
 ## Testing
 
@@ -477,9 +554,15 @@ ephemeral-password loss, the pre-flip backup: recorded before the flip, the
 destructive-direction hard-fail-before-flip, the non-destructive
 warning-and-continue; for cnpg→ext specifically the two-step orphan flip, the
 external-catalog verify gate, the flip-back adopt recovery with NO copy-back,
-and the XRD-without-`retainCnpgOnFlip` refusal), `admin/reshard_test.go`
+and the XRD-without-`retainCnpgOnFlip` refusal; plus the source-identity
+guards: the recordSource status-drift refusal, the invalid-from_shard /
+incomplete-external-source rollback refusals with the warehouse left blocked,
+and the kind-derived takeover sslmode reconstruction), `admin/reshard_test.go`
 (validation incl. the ESO-name allowlist + the pre-flight connection-check
-pass/fail/skip, secrets never persisted). The `backup_s3_uri` column is asserted
+pass/fail/skip, the submit-time source-identity validation
+(`TestReshardStartSourceIdentityValidation`), secrets never persisted).
+`provisioner/k8s_client_test.go` pins the compaction patch's XRD-defaulting
+guard (`TestSetCompactionEnabledPinsDuckLakeEnablement`). The `backup_s3_uri` column is asserted
 in `tests/configstore/migrations_postgres_test.go` (migration `000021`). The
 charts side (composition + `retainCnpgOnFlip` XRD field) is tested by
 `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh` (both

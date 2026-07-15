@@ -878,6 +878,183 @@ func TestReshardRollbackKeepsWarehouseBlockedWhenSourceRecoveryFails(t *testing.
 	}
 }
 
+// TestReshardRollbackRefusesInvalidFromShardPatch pins the never-emit-an-
+// invalid-patch guard (prod incident): a cnpg→cnpg op recorded with an EMPTY
+// from_shard (incomplete source identity — pre-guard CPs could create these)
+// must NOT attempt the rollback re-point (the XRD rejects an empty cnpgShard,
+// so the patch would just fail and mislead), must log explicit operator
+// instructions, and must leave the warehouse BLOCKED in resharding — unblocking
+// would let clients activate against the wrong (likely empty) target catalog.
+func TestReshardRollbackRefusesInvalidFromShardPatch(t *testing.T) {
+	op := cnpgOp()
+	op.FromShard = "" // the incident shape: source identity was incomplete
+	op.CutoverTimeoutSeconds = 1
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	stuck := &stuckCnpgDuckling{fakeDuckling: duckling} // flip never converges
+	copier := &fakeCopier{}
+
+	runOp(t, testRunner(store, stuck, copier), store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s (err %q), want failed", store.op.State, store.op.Error)
+	}
+	// Exactly ONE cnpg patch: the forward flip. No rollback patch was emitted.
+	var shardPatches []string
+	for _, call := range duckling.calls {
+		if call.kind == "cnpg" {
+			shardPatches = append(shardPatches, call.shard)
+		}
+	}
+	if fmt.Sprint(shardPatches) != fmt.Sprint([]string{"shard-002"}) {
+		t.Fatalf("shard patches = %v, want only the forward flip (no invalid rollback patch)", shardPatches)
+	}
+	// Loud operator instructions, and the deliberate left-blocked decision.
+	if !store.hasLog("rollback CANNOT re-point the duckling at the source shard") {
+		t.Fatalf("invalid-from_shard refusal missing from log: %v", store.logs)
+	}
+	if !store.hasLog("intentionally left in the resharding state") {
+		t.Fatalf("left-blocked decision missing from log: %v", store.logs)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want resharding (left blocked — never unblock onto the wrong store)", store.warehouseState)
+	}
+	if store.op.UnblockedAt != nil {
+		t.Fatalf("unblocked_at = %v, want nil (org left blocked)", store.op.UnblockedAt)
+	}
+	if !store.hasLog("reshard report (failed)") {
+		t.Fatal("failure report missing")
+	}
+}
+
+// TestReshardRollbackRefusesIncompleteExternalSourcePatch is the ext→cnpg
+// sibling of the invalid-from_shard guard: a post-flip rollback whose recorded
+// external source identity is incomplete (no password secret — the admin
+// handler records it; recordSource cannot) must not emit an invalid external
+// spec patch, and must leave the warehouse blocked with operator instructions.
+func TestReshardRollbackRefusesIncompleteExternalSourcePatch(t *testing.T) {
+	op := cnpgOp()
+	op.SourceKind = configstore.MetadataStoreKindExternal
+	op.FromShard = ""
+	op.SourcePasswordSecret = "" // incomplete: rollback could not re-render the spec
+	op.CutoverTimeoutSeconds = 1
+	store := newFakeReshardStore(op)
+
+	var st DucklingStatus
+	st.MetadataStore.Type = configstore.MetadataStoreKindExternal
+	st.MetadataStore.Endpoint = "db.example.rds.amazonaws.com"
+	st.MetadataStore.User = "postgres"
+	st.MetadataStore.Database = "postgres"
+	st.MetadataStore.Password = "rds-pw"
+	st.DataStore.BucketName = "org-a-data-bucket"
+	st.DataStore.S3Region = "us-east-1"
+	st.IAMRoleARN = "arn:aws:iam::123:role/duckling-org-a"
+	st.ReadyCondition = true
+	duckling := &fakeDuckling{status: st}
+	stuck := &stuckCnpgDuckling{fakeDuckling: duckling} // flip never converges
+	copier := &fakeCopier{}
+
+	runOp(t, testRunner(store, stuck, copier), store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s (err %q), want failed", store.op.State, store.op.Error)
+	}
+	// No rollback flip to external was emitted.
+	if containsStr(duckling.callKinds(), "external") {
+		t.Fatalf("rollback emitted an external patch despite the incomplete source identity: %v", duckling.callKinds())
+	}
+	if !store.hasLog("rollback CANNOT re-point the duckling at the external source") {
+		t.Fatalf("incomplete-external-source refusal missing from log: %v", store.logs)
+	}
+	if !store.hasLog("intentionally left in the resharding state") {
+		t.Fatalf("left-blocked decision missing from log: %v", store.logs)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want resharding (left blocked)", store.warehouseState)
+	}
+}
+
+// TestReshardRecordSourceRefusesStatusKindDrift pins the runner-side defense
+// in depth behind the admin submit-time guard: an op whose recorded source
+// kind contradicts the duckling STATUS (where the catalog actually lives)
+// fails PRE-flip — nothing is flipped, and the rollback unblocks the
+// warehouse cleanly. This is the incident shape: an empty config-store
+// metadata block defaulted to cnpg-shard while the org lived on an external
+// RDS.
+func TestReshardRecordSourceRefusesStatusKindDrift(t *testing.T) {
+	op := cnpgOp() // recorded as cnpg→cnpg…
+	store := newFakeReshardStore(op)
+	// …but the duckling status says the catalog lives on an external RDS.
+	var st DucklingStatus
+	st.MetadataStore.Type = configstore.MetadataStoreKindExternal
+	st.MetadataStore.Endpoint = "db.example.rds.amazonaws.com"
+	st.MetadataStore.User = "postgres"
+	st.MetadataStore.Database = "postgres"
+	st.MetadataStore.Password = "rds-pw"
+	st.ReadyCondition = true
+	duckling := &fakeDuckling{status: st}
+	copier := &fakeCopier{}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.op.State != configstore.ReshardStateFailed || !strings.Contains(store.op.Error, "identity drift") {
+		t.Fatalf("state=%s err=%q, want identity-drift failure", store.op.State, store.op.Error)
+	}
+	// Refused BEFORE any flip: the duckling was never patched to a store.
+	for _, k := range duckling.callKinds() {
+		if k == "cnpg" || k == "external" || k == "cnpg-adopt" {
+			t.Fatalf("duckling flipped (%s) despite the identity drift — must refuse pre-flip", k)
+		}
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready (pre-flip failure rolls back cleanly)", store.warehouseState)
+	}
+}
+
+// TestReshardTakeoverEndpointsDeriveSSLModeFromKind pins that a takeover
+// resume reconstructs each endpoint's sslmode from its metadata-store KIND —
+// never hardcoded. Regression for the takeover path that hardcoded "disable"
+// and hit RDS pg_hba "no encryption" against an external source in prod.
+func TestReshardTakeoverEndpointsDeriveSSLModeFromKind(t *testing.T) {
+	st := &DucklingStatus{}
+	st.MetadataStore.Endpoint = "shard-002-pooler.cnpg-shards.svc.cluster.local"
+	st.MetadataStore.User = "mdstore_org"
+	st.MetadataStore.Database = "mdstore_org"
+	st.MetadataStore.Password = "pinned-pw"
+
+	cases := []struct {
+		name                string
+		sourceKind, tgtKind string
+		wantSrcSSL, wantTgt string
+	}{
+		{"cnpg→cnpg", configstore.MetadataStoreKindCnpgShard, configstore.MetadataStoreKindCnpgShard, "disable", "disable"},
+		{"ext→cnpg (external source needs TLS)", configstore.MetadataStoreKindExternal, configstore.MetadataStoreKindCnpgShard, "require", "disable"},
+		{"cnpg→ext (external target needs TLS)", configstore.MetadataStoreKindCnpgShard, configstore.MetadataStoreKindExternal, "disable", "require"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			op := &configstore.ReshardOperation{
+				SourceKind:     tc.sourceKind,
+				TargetKind:     tc.tgtKind,
+				SourceEndpoint: "src.example.internal",
+				SourceUser:     "u",
+				SourceDatabase: "d",
+			}
+			source, target := takeoverEndpoints(op, st)
+			if source.SSLMode != tc.wantSrcSSL || target.SSLMode != tc.wantTgt {
+				t.Fatalf("sslmodes = source %q / target %q, want %q / %q", source.SSLMode, target.SSLMode, tc.wantSrcSSL, tc.wantTgt)
+			}
+		})
+	}
+
+	if got := sslModeFor(configstore.MetadataStoreKindExternal); got != "require" {
+		t.Fatalf("sslModeFor(external) = %q, want require", got)
+	}
+	if got := sslModeFor(configstore.MetadataStoreKindCnpgShard); got != "disable" {
+		t.Fatalf("sslModeFor(cnpg-shard) = %q, want disable", got)
+	}
+}
+
 // TestReshardTakeoverPreservesOriginalCompactionSnapshot ensures replay cannot
 // replace the persisted pre-reshard setting with the already-paused live value.
 func TestReshardTakeoverPreservesOriginalCompactionSnapshot(t *testing.T) {
@@ -924,6 +1101,13 @@ func TestReshardTakeoverAfterCutoverDoesNotReplaySourceDiscovery(t *testing.T) {
 	for _, call := range copier.calls {
 		if call.kind == "copy" && call.source.Host != "shard-001-pooler.cnpg-shards.svc.cluster.local" {
 			t.Fatalf("takeover copied from %q, want durable source shard-001", call.source.Host)
+		}
+		if call.kind == "copy" && (call.source.SSLMode != "disable" || call.target.SSLMode != "disable") {
+			// cnpg endpoints are in-cluster plaintext; the sslmode must be
+			// KIND-derived (sslModeFor), never hardcoded — see
+			// TestReshardTakeoverEndpointsDeriveSSLModeFromKind for the
+			// external cases.
+			t.Fatalf("takeover copy sslmodes = source %q / target %q, want disable/disable for cnpg→cnpg", call.source.SSLMode, call.target.SSLMode)
 		}
 		if call.kind == "dropdb" && call.target.Host == "shard-002-pooler.cnpg-shards.svc.cluster.local" {
 			t.Fatal("takeover attempted destructive cleanup against the live target")

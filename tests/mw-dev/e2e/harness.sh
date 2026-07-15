@@ -2473,6 +2473,18 @@ reshard_targets() { # destination discovery; ext org's RDS must appear too
 
 reshard_validation() { # cnpg-org currently on shard-001
   log "reshard validation: same-shard + bad targets are 400"
+  # NOT asserted here: the submit-time source-identity 400s (empty/unresolvable
+  # from_shard, config-store-row vs duckling-status kind drift, incomplete
+  # external source block — controlplane/admin/reshard.go). Those trigger on a
+  # BROKEN org state (empty metadata block / drifted duckling), which cannot be
+  # provoked in-Job without corrupting a live org's duckling spec (a
+  # spec.metadataStore patch is exactly the destructive flip the guard exists
+  # to prevent). Covered by admin/reshard_test.go
+  # (TestReshardStartSourceIdentityValidation) and
+  # provisioner/reshard_runner_test.go (the recordSource drift + rollback
+  # guards). The positive side — from_shard/source_kind being derived from the
+  # duckling STATUS — IS asserted on the live ops below (cancel + ext→cnpg
+  # lanes).
   # The RDS-managed-master and generic-prefix rows pin Fix 1's positive ESO
   # allowlist: the external-secrets IAM policy only allows GetSecretValue on
   # posthog-*/duckling-* names, so the start handler 400s an SM secret name
@@ -2517,6 +2529,12 @@ reshard_cancel_during_drain() { # org password
     || fail "reshard cancel: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
   [ -n "$opid" ] && [ "$opid" != "null" ] || fail "reshard cancel: no op id: $out"
+  # Source identity is derived from the duckling STATUS (authoritative) and
+  # must be complete on the created op: a cnpg-shard source always carries the
+  # real current shard (an op with an empty from_shard cannot roll back and is
+  # refused at submit — the source-identity guard).
+  echo "$out" | jq -e '.source_kind == "cnpg-shard" and .from_shard == "shard-001"' >/dev/null \
+    || fail "reshard cancel: op source identity not derived from duckling status: $out"
 
   # The op executes in a dedicated runner pod now: budget covers pod schedule
   # + (first-time) image pull on an arch-pinned node before the drain step.
@@ -2605,6 +2623,12 @@ reshard_ext_to_cnpg() { # ext-org password
   # read from the CR status pre-flip), so password_url stays empty.
   echo "$out" | jq -e '.state == "pending"' >/dev/null \
     || fail "reshard ext→cnpg: op not created pending (pod model): $out"
+  # Source identity: derived from the duckling STATUS (external) and complete
+  # (endpoint + SM secret name recorded from the warehouse row — the rollback
+  # needs them to re-render the external spec; incomplete would have been a
+  # submit-time 400).
+  echo "$out" | jq -e '.source_kind == "external" and (.source_endpoint | length > 0) and (.source_password_secret | length > 0)' >/dev/null \
+    || fail "reshard ext→cnpg: op source identity incomplete or not status-derived: $out"
 
   # The dedicated runner pod appears (spawned by the start handler; the leader
   # reconciler would backstop it) and carries the op-id label.
