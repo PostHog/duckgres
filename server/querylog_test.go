@@ -3,10 +3,14 @@ package server
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/usersecrets"
 )
 
 func TestClassifyQuery(t *testing.T) {
@@ -131,6 +135,20 @@ func TestTruncateQuery(t *testing.T) {
 	result := truncateQuery(string(long))
 	if len(result) != maxQueryLength {
 		t.Errorf("Expected truncated length %d, got %d", maxQueryLength, len(result))
+	}
+}
+
+func TestBoundQueryLogTextClonesAtValidUTF8Boundary(t *testing.T) {
+	long := strings.Repeat("x", maxQueryLength-1) + "é-tail"
+	result := boundQueryLogText(long)
+	if len(result) > maxQueryLength {
+		t.Fatalf("bounded length = %d, want <= %d", len(result), maxQueryLength)
+	}
+	if !utf8.ValidString(result) {
+		t.Fatalf("bounded query log text is not valid UTF-8: %q", result[len(result)-4:])
+	}
+	if unsafe.StringData(result) == unsafe.StringData(long) {
+		t.Fatal("bounded query log text still aliases the oversized backing string")
 	}
 }
 
@@ -478,5 +496,100 @@ func TestLogQueryPrefersExecutorQueryLogSink(t *testing.T) {
 	case entry := <-ql.ch:
 		t.Fatalf("server query logger should not receive entry when executor sink is available: %#v", entry)
 	default:
+	}
+}
+
+func TestLogQueryBoundsTextBeforeExecutorQueryLogSink(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	query := "SELECT " + strings.Repeat("q", maxQueryLength) + " query-tail-marker"
+	transpiled := "SELECT " + strings.Repeat("t", maxQueryLength) + " transpiled-tail-marker"
+	exception := "engine error: " + strings.Repeat("e", maxQueryLength) + " exception-tail-marker"
+	c.logQuery(
+		time.Unix(1700000000, 0).UTC(),
+		query,
+		transpiled,
+		"SELECT",
+		0,
+		0,
+		"XX000",
+		exception,
+		"simple",
+	)
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected executor query-log sink to receive one entry, got %d", len(exec.entries))
+	}
+	entry := exec.entries[0]
+	for name, text := range map[string]string{
+		"query":     entry.Query,
+		"exception": entry.Exception,
+	} {
+		if len(text) > maxQueryLength {
+			t.Errorf("%s length = %d, want <= %d", name, len(text), maxQueryLength)
+		}
+		if strings.Contains(text, "tail-marker") {
+			t.Errorf("%s retained text beyond the control-plane bound", name)
+		}
+	}
+	if entry.TranspiledQuery == nil {
+		t.Fatal("expected transpiled query")
+	}
+	if got := *entry.TranspiledQuery; len(got) > maxQueryLength || strings.Contains(got, "tail-marker") {
+		t.Errorf("transpiled query was not bounded before forwarding: length=%d", len(got))
+	}
+	if want := normalizeQueryHash(entry.Query); entry.NormalizedHash != want {
+		t.Errorf("normalized hash = %d, want hash of bounded query %d", entry.NormalizedHash, want)
+	}
+}
+
+func TestLogQueryRedactsBeforeBounding(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	const credential = "query-log-secret-marker"
+	query := strings.Repeat("SELECT 1; ", maxQueryLength/4) +
+		"CREATE SECRET s (TYPE S3, SECRET '" + credential + "')"
+	exception := "Parser Error: " + query
+	c.logQuery(time.Unix(1700000000, 0).UTC(), query, "", "SELECT", 0, 0, "42601", exception, "simple")
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected one query-log entry, got %d", len(exec.entries))
+	}
+	entry := exec.entries[0]
+	if want := usersecrets.RedactForLog(query); entry.Query != want {
+		t.Errorf("query was not redacted before bounding: got %q, want %q", entry.Query, want)
+	}
+	if strings.Contains(entry.Query, credential) || strings.Contains(entry.Exception, credential) {
+		t.Fatal("bounded query-log entry leaked a credential")
+	}
+}
+
+func TestLogQueryPreservesTranspiledFlagWhenOnlyBoundedSuffixDiffers(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	prefix := strings.Repeat("q", maxQueryLength)
+	c.logQuery(time.Unix(1700000000, 0).UTC(), prefix+" original", prefix+" transpiled", "SELECT", 0, 0, "", "", "simple")
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected one query-log entry, got %d", len(exec.entries))
+	}
+	entry := exec.entries[0]
+	if !entry.IsTranspiled || entry.TranspiledQuery == nil {
+		t.Fatal("expected transpiled identity to be preserved after bounding")
+	}
+	if entry.Query != *entry.TranspiledQuery {
+		t.Fatalf("test requires bounded texts to match, got lengths %d and %d", len(entry.Query), len(*entry.TranspiledQuery))
 	}
 }
