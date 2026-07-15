@@ -162,11 +162,11 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    `SHARE` locks on every discovered `ducklake_*` table, re-discovers the table
    set after locking, and remains open through verification and source cleanup;
    this blocks DML and conflicting DDL without killing an already-running
-   writer. Source and target also receive streaming, order-independent SHA-256
-   multiset fingerprints of canonical `jsonb` rows, so same-count UPDATEs and
-   balanced DELETE+INSERT changes cannot pass verification. Faithful DDL
-   from `pg_catalog` introspection; rows via raw binary COPY passthrough;
-   constraints then non-constraint indexes (PK-backed indexes excluded — ADD
+   writer. Faithful DDL from `pg_catalog` introspection; rows via raw binary
+   COPY passthrough. The source `COPY TO` and target `COPY FROM` command-tag row
+   counts must match for every table; no additional full-table count or
+   fingerprint scans are performed. Constraints then non-constraint indexes
+   (PK-backed indexes excluded — ADD
    CONSTRAINT already made them). No sequences exist in the DuckLake catalog
    (next-ids are rows). A `pg_advisory_lock` in the TARGET database fences a
    zombie ex-runner for copy+verify. The target database may be REUSED
@@ -320,11 +320,9 @@ blocking → draining → pausing_compaction → backup_catalog → copying → 
 3. **cutover** — flip `type` to external (`cnpgShard: null`, external block set;
    `retainCnpgOnFlip` left true). The un-render now ORPHANS the cnpg role/DB.
    Wait for external Ready + ESO password synced + matching the typed password.
-4. **verifying_external** — connect to the now-live external target and require
-   its per-table `ducklake_*` row counts to match the copy snapshot
-   (`CatalogCopyResult.PerTableRows`) EXACTLY. A missing table / count mismatch
-   fails here — the cnpg source is still present (orphaned), so recovery adopts
-   it back with no data loss.
+4. **verifying_external** — record that the copy completed with matching source
+   `COPY TO` and target `COPY FROM` command-tag row counts for every table while
+   the source SHARE fence remained held.
 5. **cleaning_up** — only after external verify passes: `DROP DATABASE … WITH
    (FORCE)` the retained cnpg source database via the source pooler (best-effort;
    a leftover DB is cruft, not data loss — the external target is verified live),

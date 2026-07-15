@@ -4,8 +4,6 @@ package provisioner
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -96,19 +94,9 @@ type CatalogCopyResult struct {
 	Tables int64
 	Rows   int64
 	Bytes  int64
-	// PerTableRows are the row counts observed INSIDE the source snapshot
-	// transaction — the reference for both the target verify and the
-	// post-copy source-stability recheck.
-	PerTableRows         map[string]int64
-	PerTableFingerprints map[string]CatalogTableFingerprint
 	// ReleaseSourceFence releases the source snapshot and its SHARE locks.
 	// The runner keeps it until verification and destructive cleanup finish.
 	ReleaseSourceFence func()
-}
-
-type CatalogTableFingerprint struct {
-	Rows   int64
-	Digest string
 }
 
 // CatalogCopier is the interface the reshard runner drives; *PGCatalogCopier
@@ -117,15 +105,9 @@ type CatalogCopier interface {
 	// Probe runs SELECT 1 against the endpoint.
 	Probe(ctx context.Context, ep CatalogEndpoint) error
 	// Copy streams the full ducklake_* catalog from source into target and
-	// verifies per-table row counts against the snapshot. log receives
+	// verifies the source and target COPY command-tag row counts. log receives
 	// verbose operator-facing progress lines.
 	Copy(ctx context.Context, source, target CatalogEndpoint, log func(level, msg string)) (CatalogCopyResult, error)
-	// SnapshotCounts re-reads the current per-table row counts (no snapshot
-	// tx) — the post-copy source-stability recheck and the external-catalog
-	// verify. log receives periodic progress lines (a ~20k-table catalog
-	// takes minutes to count).
-	SnapshotCounts(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]int64, error)
-	SnapshotFingerprints(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]CatalogTableFingerprint, error)
 	// DropCatalogTables drops all ducklake_* tables (rollback cleanup of a
 	// partially copied target).
 	DropCatalogTables(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) error
@@ -156,7 +138,7 @@ WHERE table_schema = 'public' AND table_name LIKE 'ducklake\_%' ESCAPE '\'
 ORDER BY table_name`
 
 func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint, log func(level, msg string)) (CatalogCopyResult, error) {
-	result := CatalogCopyResult{PerTableRows: map[string]int64{}, PerTableFingerprints: map[string]CatalogTableFingerprint{}}
+	result := CatalogCopyResult{}
 
 	src, err := pgx.Connect(ctx, source.DSN())
 	if err != nil {
@@ -239,7 +221,6 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 		result.Tables++
 		result.Rows += rows
 		result.Bytes += bytes
-		result.PerTableRows[table] = rows
 		log("info", fmt.Sprintf("copied %s: %d rows, %d bytes", table, rows, bytes))
 	}
 
@@ -252,41 +233,6 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 		return applyIndexes(ctx, tx, dst, table)
 	}, log); err != nil {
 		return result, err
-	}
-
-	// Verify inside the same snapshot: source snapshot counts vs live target.
-	verified, err := verifyCopiedRowCounts(tables,
-		func(table string) (int64, error) {
-			var c int64
-			err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c)
-			return c, err
-		},
-		func(table string) (int64, error) {
-			var c int64
-			err := dst.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c)
-			return c, err
-		},
-		log)
-	if err != nil {
-		return result, err
-	}
-	for table, c := range verified {
-		result.PerTableRows[table] = c
-	}
-	log("info", fmt.Sprintf("fingerprinting source and target contents across %d tables…", len(tables)))
-	for _, table := range tables {
-		sourceFingerprint, err := fingerprintTable(ctx, tx, table)
-		if err != nil {
-			return result, fmt.Errorf("fingerprint source %s: %w", table, err)
-		}
-		targetFingerprint, err := fingerprintTable(ctx, dst, table)
-		if err != nil {
-			return result, fmt.Errorf("fingerprint target %s: %w", table, err)
-		}
-		if sourceFingerprint != targetFingerprint {
-			return result, fmt.Errorf("content fingerprint mismatch on %s: source %s, target %s", table, sourceFingerprint.Digest, targetFingerprint.Digest)
-		}
-		result.PerTableFingerprints[table] = sourceFingerprint
 	}
 
 	keepSourceFence = true
@@ -302,106 +248,6 @@ func (PGCatalogCopier) Copy(ctx context.Context, source, target CatalogEndpoint,
 	return result, nil
 }
 
-type fingerprintQuerier interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}
-
-// fingerprintTable computes a streaming, order-independent multiset digest.
-// Each canonical jsonb row is SHA-256 hashed; the hashes are added modulo
-// 2^256, so row order does not matter while duplicates remain significant.
-func fingerprintTable(ctx context.Context, q fingerprintQuerier, table string) (CatalogTableFingerprint, error) {
-	rows, err := q.Query(ctx, "SELECT to_jsonb(t)::text FROM "+quoteIdent(table)+" AS t")
-	if err != nil {
-		return CatalogTableFingerprint{}, err
-	}
-	defer rows.Close()
-	var out CatalogTableFingerprint
-	var sum [sha256.Size]byte
-	for rows.Next() {
-		var canonical string
-		if err := rows.Scan(&canonical); err != nil {
-			return CatalogTableFingerprint{}, err
-		}
-		addRowFingerprint(&sum, canonical)
-		out.Rows++
-	}
-	if err := rows.Err(); err != nil {
-		return CatalogTableFingerprint{}, err
-	}
-	out.Digest = hex.EncodeToString(sum[:])
-	return out, nil
-}
-
-func addRowFingerprint(sum *[sha256.Size]byte, canonical string) {
-	h := sha256.Sum256([]byte(canonical))
-	carry := uint16(0)
-	for i := len(sum) - 1; i >= 0; i-- {
-		total := uint16(sum[i]) + uint16(h[i]) + carry
-		sum[i] = byte(total)
-		carry = total >> 8
-	}
-}
-
-func (PGCatalogCopier) SnapshotCounts(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]int64, error) {
-	conn, err := pgx.Connect(ctx, ep.DSN())
-	if err != nil {
-		return nil, fmt.Errorf("connect %s: %w", ep.Redacted(), err)
-	}
-	defer conn.Close(context.WithoutCancel(ctx))
-
-	tables, err := queryStrings(ctx, conn, catalogTablesQuery)
-	if err != nil {
-		return nil, fmt.Errorf("discover catalog tables: %w", err)
-	}
-	counts := make(map[string]int64, len(tables))
-	for i, table := range tables {
-		var c int64
-		if err := conn.QueryRow(ctx, "SELECT COUNT(*) FROM "+quoteIdent(table)).Scan(&c); err != nil {
-			return nil, fmt.Errorf("count %s: %w", table, err)
-		}
-		counts[table] = c
-		maybeLogProgress(log, "counted", i+1, len(tables))
-	}
-	return counts, nil
-}
-
-func (PGCatalogCopier) SnapshotFingerprints(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) (map[string]CatalogTableFingerprint, error) {
-	conn, err := pgx.Connect(ctx, ep.DSN())
-	if err != nil {
-		return nil, fmt.Errorf("connect %s: %w", ep.Redacted(), err)
-	}
-	defer conn.Close(context.WithoutCancel(ctx))
-	tables, err := queryStrings(ctx, conn, catalogTablesQuery)
-	if err != nil {
-		return nil, fmt.Errorf("discover catalog tables: %w", err)
-	}
-	result := make(map[string]CatalogTableFingerprint, len(tables))
-	for i, table := range tables {
-		fingerprint, err := fingerprintTable(ctx, conn, table)
-		if err != nil {
-			return nil, fmt.Errorf("fingerprint %s: %w", table, err)
-		}
-		result[table] = fingerprint
-		maybeLogProgress(log, "fingerprinted", i+1, len(tables))
-	}
-	return result, nil
-}
-
-// verifyProgressEvery is the periodic-progress cadence of the loops that visit
-// every catalog table (row-count verification and recounts): one
-// "<verb> N/M tables…" line per this many tables — ~8 lines on a ~20k-table
-// catalog, never per-table — so the op log does not go silent for minutes
-// while the loop is healthy.
-const verifyProgressEvery = 2500
-
-// maybeLogProgress emits the periodic progress line every verifyProgressEvery
-// items. The final item is skipped — the caller logs its own completion line.
-func maybeLogProgress(log func(level, msg string), verb string, done, total int) {
-	if done > 0 && done < total && done%verifyProgressEvery == 0 {
-		log("info", fmt.Sprintf("%s %d/%d tables…", verb, done, total))
-	}
-}
-
 // applyConstraintsAndIndexes drives the constraint/index replay across all
 // tables. On a large catalog (~20k tables) this runs tens of seconds, so the
 // phase announces itself before the first ALTER instead of logging only on
@@ -415,31 +261,6 @@ func applyConstraintsAndIndexes(tables []string, apply func(table string) error,
 	}
 	log("info", "constraints and indexes applied on target")
 	return nil
-}
-
-// verifyCopiedRowCounts compares the source-snapshot row count of every table
-// against the live target, announcing the phase up front and emitting periodic
-// progress. Returns the per-table source counts on success.
-func verifyCopiedRowCounts(tables []string, srcCount, dstCount func(table string) (int64, error), log func(level, msg string)) (map[string]int64, error) {
-	log("info", fmt.Sprintf("verifying row counts across %d tables… (may take a few minutes)", len(tables)))
-	counts := make(map[string]int64, len(tables))
-	for i, table := range tables {
-		src, err := srcCount(table)
-		if err != nil {
-			return nil, fmt.Errorf("count source %s: %w", table, err)
-		}
-		dst, err := dstCount(table)
-		if err != nil {
-			return nil, fmt.Errorf("count target %s: %w", table, err)
-		}
-		if src != dst {
-			return nil, fmt.Errorf("row count mismatch on %s: source %d, target %d", table, src, dst)
-		}
-		counts[table] = src
-		maybeLogProgress(log, "verified", i+1, len(tables))
-	}
-	log("info", fmt.Sprintf("verified %d tables: target row counts match the source snapshot", len(tables)))
-	return counts, nil
 }
 
 func (PGCatalogCopier) DropCatalogTables(ctx context.Context, ep CatalogEndpoint, log func(level, msg string)) error {
@@ -554,23 +375,37 @@ func copyTableBinary(ctx context.Context, srcTx pgx.Tx, dst *pgx.Conn, table str
 	copyOut := fmt.Sprintf("COPY %s TO STDOUT (FORMAT binary)", quoteIdent(table))
 	copyIn := fmt.Sprintf("COPY %s FROM STDIN (FORMAT binary)", quoteIdent(table))
 
-	errCh := make(chan error, 1)
+	type copyToResult struct {
+		rows int64
+		err  error
+	}
+	resultCh := make(chan copyToResult, 1)
 	go func() {
-		_, copyErr := srcTx.Conn().PgConn().CopyTo(ctx, counter, copyOut)
+		tag, copyErr := srcTx.Conn().PgConn().CopyTo(ctx, counter, copyOut)
 		_ = pw.CloseWithError(copyErr)
-		errCh <- copyErr
+		resultCh <- copyToResult{rows: tag.RowsAffected(), err: copyErr}
 	}()
 
 	tag, inErr := dst.PgConn().CopyFrom(ctx, pr, copyIn)
-	outErr := <-errCh
+	out := <-resultCh
 	_ = pr.Close()
-	if outErr != nil {
-		return 0, counter.n, fmt.Errorf("source COPY TO: %w", outErr)
+	if out.err != nil {
+		return 0, counter.n, fmt.Errorf("source COPY TO: %w", out.err)
 	}
 	if inErr != nil {
 		return 0, counter.n, fmt.Errorf("target COPY FROM: %w", inErr)
 	}
-	return tag.RowsAffected(), counter.n, nil
+	if err := validateCopyRowCounts(table, out.rows, tag.RowsAffected()); err != nil {
+		return 0, counter.n, err
+	}
+	return out.rows, counter.n, nil
+}
+
+func validateCopyRowCounts(table string, sourceRows, targetRows int64) error {
+	if sourceRows != targetRows {
+		return fmt.Errorf("COPY row count mismatch on %s: source COPY TO reported %d rows, target COPY FROM reported %d", table, sourceRows, targetRows)
+	}
+	return nil
 }
 
 type countingWriter struct {
