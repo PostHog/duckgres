@@ -121,57 +121,59 @@ func TestDeployRejectsMissingPRNumberBeforeCleanup(t *testing.T) {
 	}
 }
 
-func TestScenarioFullRunsScenarioJobsAgainstIsolatedStack(t *testing.T) {
+func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	fakes := newRunSHFakes(t)
 
-	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("scenario full failed: %v\n%s", err, out)
+		t.Fatalf("selected scenario failed: %v\n%s", err, out)
 	}
 
 	calls := fakes.calls(t)
 	for _, want := range []string{
 		"kubectl --context test-context -n duckgres-ci-pr-123 get svc duckgres-control-plane -o jsonpath={.spec.clusterIP}",
 		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
-		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-provision-rejection-",
-		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-provision-smoke-",
-		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-full-suite-",
+		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-fast-suite-",
 	} {
 		if !strings.Contains(calls, want) {
-			t.Fatalf("scenario full missing expected call %q; calls:\n%s", want, calls)
+			t.Fatalf("selected scenario missing expected call %q; calls:\n%s", want, calls)
+		}
+	}
+	for _, unwanted := range []string{"scenario-provision-rejection", "scenario-provision-smoke", "scenario-full-suite"} {
+		if strings.Contains(calls, unwanted) {
+			t.Fatalf("selected scenario unexpectedly ran %q; calls:\n%s", unwanted, calls)
 		}
 	}
 	if !strings.Contains(calls, "s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/") {
-		t.Fatalf("scenario full did not pass the frozen dataset URI in the Job manifest; calls:\n%s", calls)
+		t.Fatalf("selected scenario did not pass the frozen dataset URI in the Job manifest; calls:\n%s", calls)
 	}
 	if strings.Contains(calls, "get secret duckgres-scenario-config") {
-		t.Fatalf("scenario full still reads a scenario config secret; calls:\n%s", calls)
+		t.Fatalf("selected scenario still reads a scenario config secret; calls:\n%s", calls)
 	}
 }
 
-func TestScenarioFullContinuesAfterScenarioFailure(t *testing.T) {
+func TestScenarioDefaultsToFullSuite(t *testing.T) {
 	fakes := newRunSHFakes(t)
 
-	cmd := runSHCommand(t, fakes.binDir, "test-scenario-full",
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
-		"SCENARIO_FULL_FILES=tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml",
-		"SCENARIO_DEV_FAIL_JOB=posthog-frozen-metadata",
 	)
 	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("scenario full succeeded despite a failed subscenario; output:\n%s", out)
+	if err != nil {
+		t.Fatalf("default scenario failed: %v\n%s", err, out)
 	}
 
 	calls := fakes.calls(t)
-	for _, want := range []string{
-		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-metadata-",
-		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-posthog-frozen-perf-",
-	} {
-		if !strings.Contains(calls, want) {
-			t.Fatalf("scenario full did not continue through expected call %q; calls:\n%s", want, calls)
+	if !strings.Contains(calls, "kubectl --context test-context -n duckgres-ci-pr-123 logs -f job/duckgres-scenario-full-suite-") {
+		t.Fatalf("default did not run full-suite; calls:\n%s", calls)
+	}
+	for _, unwanted := range []string{"scenario-provision-rejection", "scenario-provision-smoke"} {
+		if strings.Contains(calls, unwanted) {
+			t.Fatalf("default unexpectedly ran %q; calls:\n%s", unwanted, calls)
 		}
 	}
 }
@@ -184,8 +186,8 @@ func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 	script := string(raw)
 	for _, want := range []string{
 		"$HERE/e2e/harness.sh",
-		"test-scenario-full",
-		"SCENARIO_FULL_FILES",
+		"test-scenario",
+		"SCENARIO_NAME",
 		".ci.duckgres.local",
 	} {
 		if !strings.Contains(script, want) {
@@ -193,6 +195,8 @@ func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
+		"test-scenario-full",
+		"SCENARIO_FULL_FILES",
 		"USE_SHARED_DEV",
 		"SCENARIO_SHARED_",
 		"SCENARIO_CONFIG_SECRET",
@@ -304,6 +308,11 @@ func newRunSHFakes(t *testing.T) runSHFakes {
 		t.Fatalf("mkdir fake bin: %v", err)
 	}
 	logPath := filepath.Join(dir, "calls.log")
+	const internalSecretPath = "/tmp/duckgres-ci-internal-secret"
+	if err := os.WriteFile(internalSecretPath, []byte("test-secret\n"), 0o600); err != nil {
+		t.Fatalf("write fake internal secret: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(internalSecretPath) })
 
 	writeFake(t, binDir, "kubectl", `#!/usr/bin/env bash
 printf 'kubectl %s\n' "$*" >> "$RUN_SH_TEST_CALLS"

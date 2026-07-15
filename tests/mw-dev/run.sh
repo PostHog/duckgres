@@ -22,7 +22,7 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 SA_NAME="duckgres"
 FROZEN_S3_URI="${DUCKGRES_SCENARIO_FROZEN_S3_URI:-s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/}"
 SCENARIO_JOB_WATCH_TIMEOUT_SECONDS="${SCENARIO_JOB_WATCH_TIMEOUT_SECONDS:-16200}"
-SCENARIO_FULL_FILES="${SCENARIO_FULL_FILES:-tests/mw-dev/scenario/scenarios/provision_rejection.yaml tests/mw-dev/scenario/scenarios/provision_smoke.yaml tests/mw-dev/scenario/scenarios/full-suite.yaml}"
+SCENARIO_NAME="${SCENARIO_NAME:-full-suite}"
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -327,19 +327,26 @@ scenario_job_name() {
   printf 'duckgres-scenario-%s-%s\n' "$name" "$run_hash" | tr '_' '-'
 }
 
-cmd_test_scenario_full() {
-  local scenario_file scenario_name scenario_rc rc=0
+cmd_test_scenario() {
+  local scenario_file scenario_name
   : "${SCENARIO_RUNNER_IMAGE:?SCENARIO_RUNNER_IMAGE is required}"
 
-  for scenario_file in $SCENARIO_FULL_FILES; do
-    scenario_name="$(scenario_name_for_file "$scenario_file")"
-    DUCKGRES_SCENARIO_RUN_ID="scenario-dev-${scenario_name}-${PR_NUMBER}" \
-      run_scenario "$scenario_name" "$scenario_file" || {
-        scenario_rc=$?
-        [ "$rc" -ne 0 ] || rc="$scenario_rc"
-      }
-  done
-  return "$rc"
+  case "$SCENARIO_NAME" in
+    ""|*[!a-z0-9_-]*)
+      echo "SCENARIO_NAME must contain only lowercase letters, numbers, hyphens, and underscores, got '$SCENARIO_NAME'." >&2
+      return 2
+      ;;
+  esac
+
+  scenario_file="tests/mw-dev/scenario/scenarios/${SCENARIO_NAME}.yaml"
+  if [ ! -f "$HERE/scenario/scenarios/${SCENARIO_NAME}.yaml" ]; then
+    echo "Scenario '$SCENARIO_NAME' does not exist at $scenario_file." >&2
+    return 2
+  fi
+
+  scenario_name="$(scenario_name_for_file "$scenario_file")"
+  DUCKGRES_SCENARIO_RUN_ID="scenario-dev-${scenario_name}-${PR_NUMBER}" \
+    run_scenario "$scenario_name" "$scenario_file"
 }
 
 run_scenario() {
@@ -571,10 +578,10 @@ cmd_e2e_cleanup() {
     done
 }
 
-case "${1:?usage: run.sh deploy|test-e2e|test-scenario-full|diagnostics|teardown|e2e-cleanup}" in
+case "${1:?usage: run.sh deploy|test-e2e|test-scenario|diagnostics|teardown|e2e-cleanup}" in
   deploy) : "${NAMESPACE:?}"; require_pr_identity; cmd_deploy ;;
   test-e2e|test) : "${NAMESPACE:?}"; require_pr_identity; cmd_test_e2e ;;
-  test-scenario-full) : "${NAMESPACE:?}"; require_pr_identity; cmd_test_scenario_full ;;
+  test-scenario) : "${NAMESPACE:?}"; require_pr_identity; cmd_test_scenario ;;
   diagnostics) : "${NAMESPACE:?}"; require_pr_identity; cmd_diagnostics ;;
   teardown) : "${NAMESPACE:?}"; require_pr_identity; cmd_teardown ;;
   e2e-cleanup) cmd_e2e_cleanup ;;

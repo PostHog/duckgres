@@ -67,8 +67,9 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	for _, required := range []string{
 		"name: scenario-dev",
 		"workflow_dispatch:",
-		"skip_slow:",
-		"default: false",
+		"scenario:",
+		"default: full-suite",
+		"SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}",
 		"schedule:",
 		"id-token: write",
 		"uses: ./.github/workflows/_image-build.yml",
@@ -81,7 +82,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
 		"tests/mw-dev/run.sh deploy",
-		"tests/mw-dev/run.sh test-scenario-full",
+		"tests/mw-dev/run.sh test-scenario",
 		"tests/mw-dev/run.sh diagnostics",
 		"tests/mw-dev/run.sh teardown",
 		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev",
@@ -92,6 +93,10 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	}
 
 	for _, forbidden := range []string{
+		"skip_slow:",
+		"inputs.skip_slow",
+		"scenario-skipped:",
+		"test-scenario-full",
 		"use_shared_dev:",
 		"USE_SHARED_DEV",
 		"SCENARIO_SHARED_",

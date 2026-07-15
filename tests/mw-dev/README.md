@@ -16,8 +16,8 @@ cnpg-shard metadata stores, and external metadata fixtures.
    Postgres + a control-plane Deployment on the test image, spawning worker pods
    in the same namespace.
 4. **Test** via an in-cluster payload Job hitting the CP ClusterIP service.
-   `test-e2e` runs `e2e/harness.sh`; `test-scenario-full` runs the scenario
-   runner over the full dev workload group.
+   `test-e2e` runs `e2e/harness.sh`; `test-scenario` runs the scenario named by
+   `SCENARIO_NAME`, which defaults to `full-suite`.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
 

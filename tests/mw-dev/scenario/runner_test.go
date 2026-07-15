@@ -161,6 +161,7 @@ func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
 		"posthog_frozen_metadata.yaml",
 		"posthog_frozen_perf.yaml",
 		"posthog_frozen_dbt.yaml",
+		"fast-suite.yaml",
 		"full-suite.yaml",
 	} {
 		t.Run(scenarioFile, func(t *testing.T) {
@@ -199,6 +200,68 @@ func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFastSuiteScenarioComposesWorkloadsWithoutDBT(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "fast-suite.yaml"))
+	if err != nil {
+		t.Fatalf("load fast suite scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-fast-suite-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	steps := make(map[string]core.Step, len(resolved.Steps))
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+		if step.Type == scenariodbt.StepTypeDBTRun {
+			t.Fatalf("fast suite contains dbt step %s", step.ID)
+		}
+		steps[step.ID] = step
+	}
+
+	if _, ok := steps["dbt_models"]; ok {
+		t.Fatal("fast suite should not contain dbt_models")
+	}
+	for _, stepID := range []string{"setup_frozen_views", "metadata_exploration", "perf_queries"} {
+		step, ok := steps[stepID]
+		if !ok {
+			t.Fatalf("missing %s step", stepID)
+		}
+		for _, key := range []string{"file", "catalog_file"} {
+			path, ok := step.With[key].(string)
+			if !ok {
+				continue
+			}
+			if !filepath.IsAbs(path) {
+				t.Fatalf("step %s %s = %q, want absolute path", step.ID, key, path)
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("step %s %s %q should exist: %v", step.ID, key, path, err)
+			}
+		}
+	}
+	for _, stepID := range []string{"metadata_exploration", "perf_queries"} {
+		if got := steps[stepID].DependsOn; len(got) != 1 || got[0] != "setup_frozen_views" {
+			t.Fatalf("step %s dependencies = %#v, want [setup_frozen_views]", stepID, got)
+		}
+	}
+	deprovision := steps["deprovision"]
+	if !deprovision.AlwaysRun {
+		t.Fatal("deprovision should always run")
+	}
+	if got := deprovision.DependsOn; len(got) != 2 || got[0] != "metadata_exploration" || got[1] != "perf_queries" {
+		t.Fatalf("deprovision dependencies = %#v, want metadata and perf branches", got)
 	}
 }
 

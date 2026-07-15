@@ -3,11 +3,11 @@ name: scenario-dev
 on:
   workflow_dispatch:
     inputs:
-      skip_slow:
-        description: Skip slow scenarios
+      scenario:
+        description: Scenario YAML name under tests/mw-dev/scenario/scenarios, without .yaml
         required: true
-        default: false
-        type: boolean
+        default: full-suite
+        type: string
       duckgres_image:
         description: Existing Duckgres image to deploy instead of building this SHA
         required: false
@@ -26,7 +26,6 @@ concurrency:
 
 jobs:
   scenario-runner-image:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow }}
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: tests/mw-dev/scenario/Dockerfile
@@ -38,7 +37,7 @@ jobs:
       ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
   duckgres-image:
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.skip_slow && inputs.duckgres_image == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.duckgres_image == '' }}
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
@@ -55,9 +54,9 @@ jobs:
     secrets:
       ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
-  scenario-full:
+  scenario:
     needs: [scenario-runner-image, duckgres-image]
-    if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow) && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
+    if: ${{ always() && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
     env:
@@ -73,11 +72,12 @@ jobs:
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
+      SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Scenario dev target selected
-        run: echo "Deploying an isolated Duckgres stack for scenario.full."
+        run: echo "Deploying an isolated Duckgres stack for $SCENARIO_NAME."
 
       - name: Set up Go
         uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
@@ -109,8 +109,8 @@ jobs:
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
 
-      - name: Run scenario.full
-        run: tests/mw-dev/run.sh test-scenario-full
+      - name: Run selected scenario
+        run: tests/mw-dev/run.sh test-scenario
 
       - name: Collect diagnostics
         if: failure()
@@ -124,13 +124,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: scenario-dev-full-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scenario-dev-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/scenario-dev/
           if-no-files-found: warn
           retention-days: 14
-
-  scenario-skipped:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_slow }}
-    runs-on: ubuntu-24.04
-    steps:
-      - run: echo "Skipping scenario.full because skip_slow is true."
