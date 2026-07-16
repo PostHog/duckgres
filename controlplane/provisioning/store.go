@@ -3,6 +3,7 @@ package provisioning
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"gorm.io/gorm"
@@ -133,8 +134,28 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 	// existed (the create branch above only runs on insert). Only ever set,
 	// never cleared here, so an omitted value is a no-op rather than a wipe.
 	if defaultTeamID != 0 {
+		oldTeamID := int64(0)
+		if org.DefaultTeamID != nil {
+			oldTeamID = *org.DefaultTeamID
+		}
 		if err := tx.Model(&org).Update("default_team_id", defaultTeamID).Error; err != nil {
 			return err
+		}
+		// The org's default team changed: re-attribute its buffered (unacked)
+		// billing buckets to the new team in this same transaction, so the next
+		// billing pull reports them under the new team instead of stranding
+		// them under the stale one. A freshly-created org lands here with
+		// oldTeamID == defaultTeamID (set on insert above), so this only fires
+		// on a real re-provision change. In-flight metering under the old team
+		// (config-snapshot poll lag, ~30s) can still land a small residual
+		// old-team bucket — tolerated, see configstore.ReattributeUsageTeamTx.
+		if oldTeamID != defaultTeamID {
+			moved, err := configstore.ReattributeUsageTeamTx(tx, orgID, defaultTeamID)
+			if err != nil {
+				return err
+			}
+			slog.Info("Re-attributed org usage buckets to new default team.",
+				"org", orgID, "old_team", oldTeamID, "new_team", defaultTeamID, "rows", moved)
 		}
 	}
 

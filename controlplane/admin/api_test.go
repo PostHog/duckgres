@@ -22,6 +22,15 @@ type fakeAPIStore struct {
 	orgs       map[string]*configstore.Org
 	users      map[string]*configstore.OrgUser
 	warehouses map[string]*configstore.ManagedWarehouse
+	// reattributeCalls records every non-nil reattributeUsageTeam passed to
+	// UpdateOrg (org → new team ids, in order), so tests can assert the handler
+	// requests bucket re-attribution exactly when default_team_id changes.
+	reattributeCalls []fakeReattributeCall
+}
+
+type fakeReattributeCall struct {
+	org    string
+	teamID int64
 }
 
 func newFakeAPIStore() *fakeAPIStore {
@@ -58,10 +67,13 @@ func (s *fakeAPIStore) GetOrg(name string) (*configstore.Org, error) {
 	return copyOrg(org), nil
 }
 
-func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
+func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error) {
 	org, ok := s.orgs[name]
 	if !ok {
 		return nil, false, nil
+	}
+	if reattributeUsageTeam != nil {
+		s.reattributeCalls = append(s.reattributeCalls, fakeReattributeCall{org: name, teamID: *reattributeUsageTeam})
 	}
 	org.MaxWorkers = updates.MaxWorkers
 	org.MaxVCPUs = updates.MaxVCPUs
@@ -1723,6 +1735,46 @@ func TestUpdateOrgSetsDefaultTeamID(t *testing.T) {
 	stored := store.orgs["acme"]
 	if stored.DefaultTeamID == nil || *stored.DefaultTeamID != 67890 {
 		t.Fatalf("DefaultTeamID = %v, want 67890", stored.DefaultTeamID)
+	}
+}
+
+// TestUpdateOrgDefaultTeamIDChangeReattributesUsage pins the billing contract:
+// a PUT that CHANGES default_team_id must ask the store to re-attribute the
+// org's buffered usage buckets to the new team (in the same transaction as the
+// org update), while a PUT carrying the SAME value — or not carrying the field
+// at all — must not.
+func TestUpdateOrgDefaultTeamIDChangeReattributesUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []fakeReattributeCall
+	}{
+		{"changed value triggers reattribution", `{"default_team_id":67890}`, []fakeReattributeCall{{org: "acme", teamID: 67890}}},
+		{"same value does not", `{"default_team_id":12345}`, nil},
+		{"omitted field does not", `{"max_workers":8}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			teamID := int64(12345)
+			store.orgs["acme"] = &configstore.Org{
+				Name:          "acme",
+				DatabaseName:  "acme",
+				DefaultTeamID: &teamID,
+			}
+			router := newTestAPIRouter(store)
+
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if !slices.Equal(store.reattributeCalls, tc.want) {
+				t.Fatalf("reattribute calls = %+v, want %+v", store.reattributeCalls, tc.want)
+			}
+		})
 	}
 }
 

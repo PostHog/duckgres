@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -127,7 +128,12 @@ type apiStore interface {
 	ListOrgs() ([]configstore.Org, error)
 	CreateOrg(org *configstore.Org) error
 	GetOrg(name string) (*configstore.Org, error)
-	UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error)
+	// UpdateOrg persists the merged org row. reattributeUsageTeam is non-nil
+	// when the update changes default_team_id: the store must then re-attribute
+	// the org's buffered (unacked) billing buckets to that new team id in the
+	// SAME transaction as the org-row update, so a committed team change never
+	// leaves usage stranded under the old team.
+	UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error)
 	DeleteOrg(name string) (bool, error)
 
 	ListUsers() ([]configstore.OrgUser, error)
@@ -180,7 +186,7 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 	return &org, nil
 }
 
-func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
+func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error) {
 	fields := map[string]interface{}{
 		"max_workers": updates.MaxWorkers,
 		"max_vcpus":   updates.MaxVCPUs,
@@ -208,11 +214,48 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	if updates.DefaultTeamID != nil {
 		fields["default_team_id"] = *updates.DefaultTeamID
 	}
-	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
-	if result.Error != nil {
-		return nil, false, result.Error
+	found := false
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		// Read the pre-update team id before writing, purely for the log line —
+		// the handler already decided reattribution is needed.
+		var oldTeams []int64
+		if reattributeUsageTeam != nil {
+			if err := tx.Model(&configstore.Org{}).Where("name = ?", name).
+				Pluck("default_team_id", &oldTeams).Error; err != nil {
+				return err
+			}
+		}
+		result := tx.Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		found = true
+		if reattributeUsageTeam != nil {
+			// Same transaction as the org-row update: a committed team change
+			// always carries its buffered buckets along. In-flight metering under
+			// the old team can still land a small residual row right after this
+			// (config-snapshot poll lag, ~30s) — tolerated, see
+			// configstore.ReattributeUsageTeamTx.
+			moved, err := configstore.ReattributeUsageTeamTx(tx, name, *reattributeUsageTeam)
+			if err != nil {
+				return err
+			}
+			old := int64(0)
+			if len(oldTeams) > 0 {
+				old = oldTeams[0]
+			}
+			slog.Info("Re-attributed org usage buckets to new default team.",
+				"org", name, "old_team", old, "new_team", *reattributeUsageTeam, "rows", moved)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
 	}
-	if result.RowsAffected == 0 {
+	if !found {
 		return nil, false, nil
 	}
 	org, err := s.GetOrg(name)
@@ -626,6 +669,12 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
+	// Set when the PUT actually changes default_team_id: the store then
+	// re-attributes the org's buffered (unacked) billing buckets to the new
+	// team in the same transaction as the org update, so the next billing pull
+	// reports them under the new team (docs/design/billing-pull-api.md,
+	// "Changing an org's default team").
+	var reattributeUsageTeam *int64
 	if _, ok := fields["default_team_id"]; ok {
 		// Key present: a positive number sets. Clearing is rejected — the
 		// column is NOT NULL (the org's default team is the billing bucket
@@ -636,6 +685,9 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 			return
 		}
 		merged.DefaultTeamID = updates.DefaultTeamID
+		if existing.DefaultTeamID == nil || *existing.DefaultTeamID != *updates.DefaultTeamID {
+			reattributeUsageTeam = updates.DefaultTeamID
+		}
 	}
 
 	// Audit detail: which fields changed and their old → new values, so the
@@ -659,7 +711,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}
 
-	org, ok, err := h.store.UpdateOrg(name, merged)
+	org, ok, err := h.store.UpdateOrg(name, merged, reattributeUsageTeam)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
