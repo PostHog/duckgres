@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fmtCompact, fmtMetricAxis, fmtMetricValue } from "./format";
+import { fmtCompact, fmtMetricAxis, fmtMetricValue, orgLabel } from "./format";
 
 describe("fmtCompact", () => {
   it("renders compact SI so large numbers don't overflow an axis", () => {
@@ -42,5 +42,20 @@ describe("fmtMetricValue", () => {
   });
   it("nullish renders a dash", () => {
     expect(fmtMetricValue(null, "B/s")).toBe("—");
+  });
+});
+
+describe("orgLabel", () => {
+  const uuid = "019740a8-ac01-0000-cad1-26dbbe0cde55";
+
+  it("prefers the database name", () => {
+    expect(orgLabel({ name: uuid, database_name: "product_analytics", hostname_alias: "alias" })).toBe(
+      "product_analytics",
+    );
+  });
+  it("falls back to the hostname alias, then the UUID", () => {
+    expect(orgLabel({ name: uuid, database_name: "", hostname_alias: "eu-prod" })).toBe("eu-prod");
+    expect(orgLabel({ name: uuid, database_name: "", hostname_alias: null })).toBe(uuid);
+    expect(orgLabel({ name: uuid })).toBe(uuid);
   });
 });
