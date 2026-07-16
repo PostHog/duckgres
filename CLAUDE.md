@@ -239,7 +239,7 @@ Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
 `duckdbservice` session counting → update the unit tests
 (`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
 `duckdbservice/service_test.go`) AND the `one_session_per_worker` +
-`cold_burst_parallel_spawns` assertions in `tests/e2e-mw-dev/harness.sh`.
+`cold_burst_parallel_spawns` assertions in `tests/mw-dev/e2e/harness.sh`.
 
 ## Worker Drain Protocol (graceful shutdown, #690)
 
@@ -302,7 +302,7 @@ Invariants for anyone touching this path:
 - Touching the interception, wipe/replay, or payload shape → update
   `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
   and the `persistent_user_secret`(+`_isolation`) assertions in
-  `tests/e2e-mw-dev/harness.sh`.
+  `tests/mw-dev/e2e/harness.sh`.
 
 ## Admin Console (VPC-private web UI, `kubernetes` tag)
 
@@ -435,7 +435,7 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   `cluster_test.go`. Touching
   the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
   and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
-  (`tests/e2e-mw-dev/harness.sh`).
+  (`tests/mw-dev/e2e/harness.sh`).
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
   `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`),
   `controlplane/session_mgr_test.go`
@@ -554,7 +554,7 @@ touching this path:
   `configstore/storage_usage_test.go`, the migration assertion in
   `tests/configstore/migrations_postgres_test.go`, and the
   `compute_usage_pull_api` assertion (compute + storage) in
-  `tests/e2e-mw-dev/harness.sh`.
+  `tests/mw-dev/e2e/harness.sh`.
 
 ## Resharding (metadata-store migrations) — LOAD-BEARING CONTRACT
 

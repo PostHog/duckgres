@@ -348,14 +348,14 @@ function DeleteOperatorDialog({ operator, isSelf, onClose }: { operator: Operato
             Revoke access for <span className="font-mono">{operator.email}</span>?
           </DialogTitle>
           <DialogDescription>
-            Removes <span className="font-mono">{operator.email}</span> from the console access list. They can
-            no longer sign in (a fresh SSO login would re-provision them as a viewer). This does not affect any
-            org database account.
+            Removes <span className="font-mono">{operator.email}</span> from the console access list. This does
+            not block sign-in — a fresh @posthog.com SSO login re-provisions them as a read-only viewer — so its
+            effect is dropping an admin back to viewer. It does not affect any org database account.
           </DialogDescription>
         </DialogHeader>
         {isSelf && (
           <p className="text-xs text-warning">
-            This is your own account — you will lose access to this console.
+            This is your own account — you will lose your admin role and drop to a read-only viewer.
           </p>
         )}
         {err && <p className="text-xs text-destructive">{err}</p>}

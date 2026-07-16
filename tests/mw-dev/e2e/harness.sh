@@ -1838,16 +1838,23 @@ admin_console_api() {
 # The Operators page (ui/src/pages/Operators.tsx) manages who can sign in to the
 # admin console — distinct from Org Users (per-org DB logins). The SPA can't be
 # driven from this in-cluster Job (no browser), so we assert the admin-only API
-# it drives: a grant → list → role-change → validation → revoke round-trip on a
-# throwaway @posthog.com probe (self-cleaning, isolated from real operators). The
-# last-admin lockout guard (409) is unit-tested (operators_api_test.go's
-# TestOperatorLastAdminGuard) — it hinges on the ambient admin count, which we
-# must not perturb on the shared stack.
+# it drives: a grant → list → idempotent re-grant → validation → revoke
+# round-trip on a throwaway @posthog.com probe (self-cleaning).
+#
+# The probe is kept a VIEWER on purpose. The last-admin guard (unit-tested in
+# operators_api_test.go::TestOperatorLastAdminGuard) makes admin operators
+# effectively permanent — the final admin can be neither demoted nor deleted —
+# and this shared stack has no ambient admin operators (the internal secret is
+# admin without a table row). Promoting the probe to admin would make it the
+# sole admin and the guard would (correctly) refuse to delete it, leaving an
+# unremovable row behind. Viewers are always deletable, so a viewer probe stays
+# fully self-cleaning. The admin/role-change/guard paths are the unit test's job.
 admin_operators() {
   log "admin console: operators CRUD (console access list)"
-  probe="e2e-operator-probe@posthog.com"
+  probe="e2e-operator-crud-probe@posthog.com"
 
-  # Clear any leftover from a prior aborted run so the grant is deterministic.
+  # Clear any leftover from a prior aborted run so the grant is deterministic
+  # (safe: a viewer probe is always deletable).
   curl -s -o /dev/null -X DELETE -H "$H" "$API/api/v1/operators/$probe" || true
 
   # List returns the documented envelope.
@@ -1863,18 +1870,15 @@ admin_operators() {
     | jq -e --arg e "$probe" 'any(.operators[]?; .email==$e and .role=="viewer")' >/dev/null \
     || fail "operator $probe not listed as viewer after grant"
 
-  # Upsert the same email to admin (role change), then confirm.
+  # Re-grant the same email (idempotent upsert of an existing row) still 200s.
   curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
-    -d "{\"email\":\"$probe\",\"role\":\"admin\"}" "$API/api/v1/operators" \
-    | jq -e '.role == "admin"' >/dev/null \
-    || fail "POST /operators (upsert to admin) did not return role=admin"
-  curl -fsS -H "$H" "$API/api/v1/operators" \
-    | jq -e --arg e "$probe" 'any(.operators[]?; .email==$e and .role=="admin")' >/dev/null \
-    || fail "operator $probe not listed as admin after role change"
+    -d "{\"email\":\"$probe\",\"role\":\"viewer\"}" "$API/api/v1/operators" \
+    | jq -e '.role == "viewer"' >/dev/null \
+    || fail "POST /operators (idempotent re-grant) did not return role=viewer"
 
   # Validation: a non-@posthog.com domain and an invalid role are both 400.
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
-    -d '{"email":"outsider@example.com","role":"admin"}' "$API/api/v1/operators")"
+    -d '{"email":"outsider@example.com","role":"viewer"}' "$API/api/v1/operators")"
   [ "$code" = "400" ] || fail "POST /operators bad domain returned $code, want 400"
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
     -d "{\"email\":\"$probe\",\"role\":\"superuser\"}" "$API/api/v1/operators")"
@@ -1888,7 +1892,7 @@ admin_operators() {
     | jq -e --arg e "$probe" 'all(.operators[]?; .email != $e)' >/dev/null \
     || fail "operator $probe still listed after revoke"
 
-  log "admin console: operators CRUD OK (grant/list/role-change/validation/revoke)"
+  log "admin console: operators CRUD OK (grant/list/idempotent upsert/validation/revoke)"
 }
 
 # ---- admin: /status reports per-org worker counts --------------------------

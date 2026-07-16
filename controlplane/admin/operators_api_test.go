@@ -277,3 +277,16 @@ func TestOperatorMutationForbiddenForViewer(t *testing.T) {
 		t.Fatalf("viewer POST /operators = %d, want 403 (%s)", rec.Code, rec.Body.String())
 	}
 }
+
+// The operator list is admin-only (RequireAdmin on GET too), so even a viewer
+// cannot see who has console access — the SPA gates the page on this.
+func TestOperatorListForbiddenForViewer(t *testing.T) {
+	store := newFakeOperatorStore(
+		configstore.Operator{Email: "alice@posthog.com", Role: "admin", AddedBy: "bootstrap"},
+	)
+	r := newOperatorsRouter(store, RoleViewer)
+	rec := doOperatorReq(t, r, http.MethodGet, "/api/v1/operators", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("viewer GET /operators = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+}
