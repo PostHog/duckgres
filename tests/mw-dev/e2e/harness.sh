@@ -1834,6 +1834,67 @@ admin_console_api() {
   done
 }
 
+# ---- admin: operators CRUD (console access list) ---------------------------
+# The Operators page (ui/src/pages/Operators.tsx) manages who can sign in to the
+# admin console — distinct from Org Users (per-org DB logins). The SPA can't be
+# driven from this in-cluster Job (no browser), so we assert the admin-only API
+# it drives: a grant → list → idempotent re-grant → validation → revoke
+# round-trip on a throwaway @posthog.com probe (self-cleaning).
+#
+# The probe is kept a VIEWER on purpose. The last-admin guard (unit-tested in
+# operators_api_test.go::TestOperatorLastAdminGuard) makes admin operators
+# effectively permanent — the final admin can be neither demoted nor deleted —
+# and this shared stack has no ambient admin operators (the internal secret is
+# admin without a table row). Promoting the probe to admin would make it the
+# sole admin and the guard would (correctly) refuse to delete it, leaving an
+# unremovable row behind. Viewers are always deletable, so a viewer probe stays
+# fully self-cleaning. The admin/role-change/guard paths are the unit test's job.
+admin_operators() {
+  log "admin console: operators CRUD (console access list)"
+  probe="e2e-operator-crud-probe@posthog.com"
+
+  # Clear any leftover from a prior aborted run so the grant is deterministic
+  # (safe: a viewer probe is always deletable).
+  curl -s -o /dev/null -X DELETE -H "$H" "$API/api/v1/operators/$probe" || true
+
+  # List returns the documented envelope.
+  curl -fsS -H "$H" "$API/api/v1/operators" | jq -e 'has("operators")' >/dev/null \
+    || fail "GET /operators missing 'operators' key"
+
+  # Grant the probe as viewer, then confirm it lists as viewer.
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$probe\",\"role\":\"viewer\"}" "$API/api/v1/operators" \
+    | jq -e '.role == "viewer"' >/dev/null \
+    || fail "POST /operators (grant viewer) did not return role=viewer"
+  curl -fsS -H "$H" "$API/api/v1/operators" \
+    | jq -e --arg e "$probe" 'any(.operators[]?; .email==$e and .role=="viewer")' >/dev/null \
+    || fail "operator $probe not listed as viewer after grant"
+
+  # Re-grant the same email (idempotent upsert of an existing row) still 200s.
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$probe\",\"role\":\"viewer\"}" "$API/api/v1/operators" \
+    | jq -e '.role == "viewer"' >/dev/null \
+    || fail "POST /operators (idempotent re-grant) did not return role=viewer"
+
+  # Validation: a non-@posthog.com domain and an invalid role are both 400.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d '{"email":"outsider@example.com","role":"viewer"}' "$API/api/v1/operators")"
+  [ "$code" = "400" ] || fail "POST /operators bad domain returned $code, want 400"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$probe\",\"role\":\"superuser\"}" "$API/api/v1/operators")"
+  [ "$code" = "400" ] || fail "POST /operators bad role returned $code, want 400"
+
+  # Revoke and confirm the probe is gone (leaves the stack as we found it).
+  curl -fsS -X DELETE -H "$H" "$API/api/v1/operators/$probe" \
+    | jq -e '.deleted == true' >/dev/null \
+    || fail "DELETE /operators/$probe did not return deleted=true"
+  curl -fsS -H "$H" "$API/api/v1/operators" \
+    | jq -e --arg e "$probe" 'all(.operators[]?; .email != $e)' >/dev/null \
+    || fail "operator $probe still listed after revoke"
+
+  log "admin console: operators CRUD OK (grant/list/idempotent upsert/validation/revoke)"
+}
+
 # ---- admin: /status reports per-org worker counts --------------------------
 # OrgStatus.Workers (the Overview per-org load bars + total_workers) was an
 # always-0 dead field; it's now populated from each CP's OrgReservedPool
@@ -3177,6 +3238,7 @@ main() {
   # Admin console read surfaces: identity/role, live state, metrics proxy, auth
   # gate. Independent of the per-org lanes, so run it here once orgs exist.
   admin_console_api
+  admin_operators
   admin_rbac_viewer "$CNPG"
 
   # ---- the four parallel assertion lanes (see lane_* above) ----

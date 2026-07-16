@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
 import { useClusterStatus, useFleet, useMetricRange, useModel, useOrgs } from "@/hooks/useApi";
-import { fmtInt, fmtPercent, promToSeries } from "@/lib/format";
+import { fmtInt, fmtPercent, orgLabel, promToSeries } from "@/lib/format";
 import { isIdleLeak, orgLoadPercent, summarizeFleet, topOrgsByLoad } from "@/lib/fleet";
 import type { WorkerLifecycleState } from "@/types/api";
 
@@ -66,7 +66,7 @@ export function Overview() {
   const orgLabels = useMemo(() => {
     const labels = new Map<string, string>();
     for (const org of orgs.data ?? []) {
-      labels.set(org.name, org.database_name || org.hostname_alias || org.name);
+      labels.set(org.name, orgLabel(org));
     }
     return labels;
   }, [orgs.data]);

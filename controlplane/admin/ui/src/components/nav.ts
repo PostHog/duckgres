@@ -9,6 +9,7 @@ import {
   Network,
   ScrollText,
   Server,
+  ShieldCheck,
   TerminalSquare,
   Users,
   type LucideIcon,
@@ -25,7 +26,8 @@ export interface NavItem {
 export const NAV: NavItem[] = [
   { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
   { to: "/orgs", label: "Organizations", icon: Building2 },
-  { to: "/users", label: "Users", icon: Users },
+  { to: "/users", label: "Org Users", icon: Users },
+  { to: "/operators", label: "Operators", icon: ShieldCheck, adminOnly: true },
   { to: "/live", label: "Live", icon: Activity },
   { to: "/errors", label: "Errors", icon: AlertTriangle },
   { to: "/nodes", label: "Nodes", icon: Network },

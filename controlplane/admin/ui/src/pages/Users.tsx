@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { Ban, KeyRound, Pencil, Plus, Power, Search, Trash2, Users as UsersIcon, Zap } from "lucide-react";
+import { Ban, Info, KeyRound, Pencil, Plus, Power, Search, Trash2, Users as UsersIcon, Zap } from "lucide-react";
+import { Link } from "react-router-dom";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { DataTable } from "@/components/DataTable";
 import { Card } from "@/components/ui/card";
@@ -159,8 +160,8 @@ export function UsersPage() {
   return (
     <>
       <PageHeader
-        title="Users"
-        description="Per-org login accounts. Manage credentials, passthrough mode, and persistent secrets."
+        title="Org Users"
+        description="Per-org database login accounts your customers use to connect to their warehouse (PG wire / Flight SQL) — not console operators."
         actions={
           <div className="flex items-center gap-2">
             <div className="relative">
@@ -176,6 +177,19 @@ export function UsersPage() {
         }
       />
       <PageBody>
+        <div className="mb-3 flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            <span className="font-medium text-foreground">Org Users</span> are customer-facing database
+            accounts scoped to an organization — the credentials apps and people use to run SQL against a
+            warehouse. To manage who can sign in to <span className="font-medium text-foreground">this admin
+            console</span>, see{" "}
+            <Link to="/operators" className="text-primary hover:underline">
+              Operators
+            </Link>
+            .
+          </span>
+        </div>
         <Card className="overflow-hidden">
           {users.isLoading ? (
             <TableSkeleton cols={8} />

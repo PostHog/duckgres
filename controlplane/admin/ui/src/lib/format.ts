@@ -145,6 +145,18 @@ export function isZeroTime(ts: string | null | undefined): boolean {
   return !ts || ts.startsWith(ZERO_TIME);
 }
 
+// A human-readable label for an org: its database name, then hostname alias,
+// then the raw UUID as a last resort. Use this anywhere an org UUID would
+// otherwise be shown on its own — the UUIDs are impossible to tell apart at a
+// glance. Returns the UUID unchanged when no readable name is available.
+export function orgLabel(org: {
+  name: string;
+  database_name?: string | null;
+  hostname_alias?: string | null;
+}): string {
+  return org.database_name || org.hostname_alias || org.name;
+}
+
 // Resolve an org's entry in a Duckling-CR-name-keyed map by exact match only:
 // the warehouse's stored duckling_name (authoritative, NOT NULL in the DB)
 // wins, then the org name itself. No client-side derivation of CR names.

@@ -10,6 +10,7 @@ import { ReshardForm } from "@/pages/ReshardForm";
 import { Reshards } from "@/pages/Reshards";
 import { ReshardOperation } from "@/pages/ReshardOperation";
 import { UsersPage } from "@/pages/Users";
+import { Operators } from "@/pages/Operators";
 import { Live } from "@/pages/Live";
 import { Errors } from "@/pages/Errors";
 import { Nodes } from "@/pages/Nodes";
@@ -37,6 +38,7 @@ export default function App() {
         <Route path="/reshards" element={<Reshards />} />
         <Route path="/reshards/:opId" element={<ReshardOperation />} />
         <Route path="/users" element={<UsersPage />} />
+        <Route path="/operators" element={<Operators />} />
         <Route path="/live" element={<Live />} />
         <Route path="/errors" element={<Errors />} />
         <Route path="/nodes" element={<Nodes />} />

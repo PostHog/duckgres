@@ -239,7 +239,7 @@ Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
 `duckdbservice` session counting → update the unit tests
 (`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
 `duckdbservice/service_test.go`) AND the `one_session_per_worker` +
-`cold_burst_parallel_spawns` assertions in `tests/e2e-mw-dev/harness.sh`.
+`cold_burst_parallel_spawns` assertions in `tests/mw-dev/e2e/harness.sh`.
 
 ## Worker Drain Protocol (graceful shutdown, #690)
 
@@ -302,7 +302,7 @@ Invariants for anyone touching this path:
 - Touching the interception, wipe/replay, or payload shape → update
   `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
   and the `persistent_user_secret`(+`_isolation`) assertions in
-  `tests/e2e-mw-dev/harness.sh`.
+  `tests/mw-dev/e2e/harness.sh`.
 
 ## Admin Console (VPC-private web UI, `kubernetes` tag)
 
@@ -327,14 +327,20 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   (`@posthog.com` + `email_verified != false`, else 401) is mapped to a role
   **per-request** by a `RoleResolver` backed by the `duckgres_operators` config-schema
   table (goose migration `000006_create_operators.sql`) — `admin` row → admin, else
-  viewer. Admins manage operators
-  under **Admin → Operators** (`/api/v1/operators`); the first SSO login
-  auto-provisions a create-only **viewer** row, and the first admin is minted by
-  logging in over the break-glass internal token and patching that row to `admin`
-  under **Admin → Operators**. `RoleGate` requires admin for
-  all mutating verbs + the audit GET. `AuditMiddleware` records every mutation.
-  Keep new mutating routes under this gate; never add a write path that bypasses
-  RoleGate/audit.
+  viewer. Admins manage operators in the admin-only **Operators** page
+  (`ui/src/pages/Operators.tsx` → `/api/v1/operators`, `operators_api.go`) — a
+  deliberately distinct surface from the **Org Users** page (`ui/src/pages/Users.tsx`,
+  `/users`, per-org *database* logins). The two are labelled + cross-linked in the
+  UI so "users" is never ambiguous: Operators = who can sign in to this console;
+  Org Users = customer DB accounts. The operators GET is `RequireAdmin`, so
+  `useOperators` only fires for admins (viewers see an "admin only" notice). The
+  first SSO login auto-provisions a create-only **viewer** row, and the first
+  admin is minted by logging in over the break-glass internal token and patching
+  that row to `admin`. The **last-admin guard** (`operators_api.go`) refuses to
+  demote/delete the final admin (409) so the console can't be locked out.
+  `RoleGate` requires admin for all mutating verbs + the audit GET.
+  `AuditMiddleware` records every mutation. Keep new mutating routes under this
+  gate; never add a write path that bypasses RoleGate/audit.
 - **Impersonation is a real session** (`impersonate.go` + `admin_providers.go`):
   it reuses `SessionManager.CreateSessionWithProtocol` (workers trust the CP — no
   password) and **always** `DestroySession` in a defer. Admin-only, every
@@ -429,13 +435,15 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   `cluster_test.go`. Touching
   the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
   and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
-  (`tests/e2e-mw-dev/harness.sh`).
+  (`tests/mw-dev/e2e/harness.sh`).
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
-  `authz_test.go`, `kill_switch_test.go`), `controlplane/session_mgr_test.go`
+  `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`),
+  `controlplane/session_mgr_test.go`
   (`TestDestroySessionsForUser`), `controlplane/configstore/store_test.go`
-  (`TestDisabledUserEnforcement`) AND the `admin_*` / `impersonation_*` /
-  `user_kill_switch` / `user_disable_block` assertions in
-  `tests/e2e-mw-dev/harness.sh`.
+  (`TestDisabledUserEnforcement`), the `Operators`/`Org Users` UI pages +
+  `ui/src/pages/Operators.test.tsx`, AND the `admin_*` / `admin_operators` /
+  `impersonation_*` / `user_kill_switch` / `user_disable_block` assertions in
+  `tests/mw-dev/e2e/harness.sh`.
 
 ## Compute-Usage Billing (managed-warehouse, remote backend only)
 
@@ -546,7 +554,7 @@ touching this path:
   `configstore/storage_usage_test.go`, the migration assertion in
   `tests/configstore/migrations_postgres_test.go`, and the
   `compute_usage_pull_api` assertion (compute + storage) in
-  `tests/e2e-mw-dev/harness.sh`.
+  `tests/mw-dev/e2e/harness.sh`.
 
 ## Resharding (metadata-store migrations) — LOAD-BEARING CONTRACT
 

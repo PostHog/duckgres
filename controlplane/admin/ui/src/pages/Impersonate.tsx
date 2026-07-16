@@ -19,7 +19,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useImpersonateQuery, useOrgs, useUsers } from "@/hooks/useApi";
-import { sqlLooksLikeRead } from "@/lib/format";
+import { orgLabel, sqlLooksLikeRead } from "@/lib/format";
 import type { QueryResult } from "@/types/api";
 
 export function Impersonate() {
@@ -39,6 +39,18 @@ export function Impersonate() {
     () => (users.data ?? []).filter((u) => u.org_id === org),
     [users.data, org],
   );
+
+  // Orgs are identified by UUID, which is unreadable at a glance — sort the
+  // picker by the human-readable label (database name) and resolve the selected
+  // org's label for the banner + confirm dialog.
+  const sortedOrgs = useMemo(
+    () => [...(orgs.data ?? [])].sort((a, b) => orgLabel(a).localeCompare(orgLabel(b))),
+    [orgs.data],
+  );
+  const selectedOrgLabel = useMemo(() => {
+    const found = (orgs.data ?? []).find((o) => o.name === org);
+    return found ? orgLabel(found) : org;
+  }, [orgs.data, org]);
 
   if (!isAdmin) {
     return (
@@ -89,8 +101,12 @@ export function Impersonate() {
           <div className="mb-4 flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-4 py-2.5 text-sm">
             <UserCog className="h-4 w-4 text-warning" />
             <span>
-              You are impersonating <span className="font-mono font-semibold">{username}</span> on org{" "}
-              <span className="font-mono font-semibold">{org}</span>. Actions run with that user's privileges.
+              You are impersonating <span className="font-mono font-semibold">{username}</span> on{" "}
+              <span className="font-semibold">{selectedOrgLabel}</span>
+              {selectedOrgLabel !== org && (
+                <span className="ml-1 font-mono text-xs text-muted-foreground">({org})</span>
+              )}
+              . Actions run with that user's privileges.
             </span>
           </div>
         )}
@@ -111,11 +127,17 @@ export function Impersonate() {
                     <SelectValue placeholder="Select org…" />
                   </SelectTrigger>
                   <SelectContent>
-                    {(orgs.data ?? []).map((o) => (
-                      <SelectItem key={o.name} value={o.name}>
-                        {o.name}
-                      </SelectItem>
-                    ))}
+                    {sortedOrgs.map((o) => {
+                      const label = orgLabel(o);
+                      return (
+                        <SelectItem key={o.name} value={o.name}>
+                          <span className="font-medium">{label}</span>
+                          {label !== o.name && (
+                            <span className="ml-2 font-mono text-xs text-muted-foreground">{o.name}</span>
+                          )}
+                        </SelectItem>
+                      );
+                    })}
                   </SelectContent>
                 </Select>
               </div>
@@ -169,8 +191,8 @@ export function Impersonate() {
             </DialogTitle>
             <DialogDescription>
               This statement does not look like a read. It will run as{" "}
-              <span className="font-mono">{username}</span> on <span className="font-mono">{org}</span> with{" "}
-              <span className="font-mono">allow_write=true</span> and may modify tenant data.
+              <span className="font-mono">{username}</span> on <span className="font-semibold">{selectedOrgLabel}</span>{" "}
+              with <span className="font-mono">allow_write=true</span> and may modify tenant data.
             </DialogDescription>
           </DialogHeader>
           <pre className="max-h-40 overflow-auto rounded-md bg-muted/40 p-3 font-mono text-xs">{sql}</pre>
