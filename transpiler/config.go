@@ -71,6 +71,12 @@ type Result struct {
 	// final query. When populated, SQL should be ignored.
 	Statements []string
 
+	// SchemaQuery can be PREPAREd to discover an output schema without executing
+	// user DML. For writable-CTE rewrites, its CTE bodies are replaced with the
+	// generated read-only SELECTs; an outer DML statement may remain because
+	// PREPARE is non-executing.
+	SchemaQuery string
+
 	// CleanupStatements contains statements to execute after obtaining the cursor
 	// for the final query but before streaming results. Typically DROP TEMP TABLE
 	// and COMMIT statements. Execute these with best-effort (ignore errors).

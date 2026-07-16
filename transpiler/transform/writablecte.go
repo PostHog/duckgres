@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"google.golang.org/protobuf/proto"
 )
 
 const maxIdentifierLength = 63 // PostgreSQL/DuckDB identifier limit
@@ -72,6 +73,7 @@ func (t *WritableCTETransform) Transform(tree *pg_query.ParseResult, result *Res
 
 		// Populate Result with separated statements and cleanup
 		result.Statements = rewrite.statements
+		result.SchemaQuery = rewrite.schemaQuery
 		result.CleanupStatements = rewrite.cleanup
 		return true, nil
 	}
@@ -284,8 +286,9 @@ func (t *WritableCTETransform) walkForDependencies(node *pg_query.Node, knownCTE
 
 // rewriteResult holds separated main and cleanup statements
 type rewriteResult struct {
-	statements []string // Setup + final query
-	cleanup    []string // DROP tables + COMMIT
+	statements  []string // Setup + final query
+	schemaQuery string   // Non-mutating equivalent used for output-schema discovery
+	cleanup     []string // DROP tables + COMMIT
 }
 
 func (t *WritableCTETransform) rewriteWritableCTE(
@@ -293,6 +296,17 @@ func (t *WritableCTETransform) rewriteWritableCTE(
 	ctes []*cteInfo, // Already in declaration order
 ) (*rewriteResult, error) {
 	result := &rewriteResult{}
+
+	// Build this before the execution rewrite mutates the original AST. It keeps
+	// the final statement and replaces each writable CTE with the same SELECT
+	// used to populate its temporary table, so PREPARE can obtain the result
+	// shape without running the setup or DML statements.
+	schemaQuery, err := t.buildSchemaQuery(stmt, ctes)
+	if err != nil {
+		return nil, err
+	}
+	result.schemaQuery = schemaQuery
+
 	tempTableNames := make(map[string]string)
 
 	// 1. Start transaction (if not already in one - handled by caller)
@@ -370,6 +384,57 @@ func (t *WritableCTETransform) rewriteWritableCTE(
 	result.cleanup = append(result.cleanup, "COMMIT")
 
 	return result, nil
+}
+
+// buildSchemaQuery returns a single statement that is safe to PREPARE for
+// output-schema discovery. It mirrors the execution rewrite's temporary-table
+// inputs with CTEs: writable CTE bodies become their generated read-only
+// SELECTs, while read-only CTE bodies and the outer final statement are kept.
+// The outer statement can itself be DML with RETURNING; PREPARE is
+// non-executing and therefore does not cause that mutation.
+func (t *WritableCTETransform) buildSchemaQuery(stmt *pg_query.RawStmt, ctes []*cteInfo) (string, error) {
+	if stmt == nil || stmt.Stmt == nil {
+		return "", fmt.Errorf("empty statement")
+	}
+
+	// The execution rewrite below intentionally modifies the parsed AST while
+	// replacing CTE references with temp table names. Clone it so the schema
+	// query preserves the original CTE names and final-query structure.
+	schemaStmt := proto.Clone(stmt).(*pg_query.RawStmt)
+	withClause := t.getWithClause(schemaStmt.Stmt)
+	if withClause == nil {
+		return "", fmt.Errorf("writable CTE statement has no WITH clause")
+	}
+
+	for _, cteInfo := range ctes {
+		if !cteInfo.isWrite {
+			continue
+		}
+		if cteInfo.order < 0 || cteInfo.order >= len(withClause.Ctes) {
+			return "", fmt.Errorf("writable CTE %q has invalid declaration order", cteInfo.name)
+		}
+
+		cte := withClause.Ctes[cteInfo.order].GetCommonTableExpr()
+		if cte == nil {
+			return "", fmt.Errorf("writable CTE %q is missing", cteInfo.name)
+		}
+
+		selectSQL, err := t.generateReturningSelect(cte, nil)
+		if err != nil {
+			return "", fmt.Errorf("generate schema query for CTE %s: %w", cteInfo.name, err)
+		}
+		selectTree, err := pg_query.Parse(selectSQL)
+		if err != nil {
+			return "", fmt.Errorf("parse generated schema SELECT for CTE %s: %w", cteInfo.name, err)
+		}
+		if len(selectTree.Stmts) != 1 || selectTree.Stmts[0].Stmt == nil || selectTree.Stmts[0].Stmt.GetSelectStmt() == nil {
+			return "", fmt.Errorf("generated schema query for CTE %s is not a SELECT", cteInfo.name)
+		}
+
+		cte.Ctequery = selectTree.Stmts[0].Stmt
+	}
+
+	return pg_query.Deparse(&pg_query.ParseResult{Stmts: []*pg_query.RawStmt{schemaStmt}})
 }
 
 // generateReturningSelect converts a writable CTE into a SELECT that captures

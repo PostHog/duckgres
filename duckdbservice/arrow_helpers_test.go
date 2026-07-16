@@ -1069,6 +1069,56 @@ func TestGetQuerySchemaExplainDoesNotExecute(t *testing.T) {
 	}
 }
 
+func TestGetQuerySchemaDMLReturningDoesNotExecute(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("open connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE schema_returning_once (id INTEGER, name VARCHAR)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	for _, tt := range []struct {
+		name  string
+		query string
+	}{
+		{name: "direct", query: "INSERT INTO schema_returning_once VALUES (1, 'first') RETURNING *"},
+		{name: "WITH prefix", query: "WITH source AS (SELECT 2 AS id) INSERT INTO schema_returning_once SELECT id, 'second' FROM source RETURNING *"},
+		{name: "leading comment", query: "/* schema metadata */ INSERT INTO schema_returning_once VALUES (3, 'third') RETURNING *"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			schema, err := GetQuerySchema(ctx, conn, tt.query, nil)
+			if err != nil {
+				t.Fatalf("GetQuerySchema: %v", err)
+			}
+			if got := schema.NumFields(); got != 2 {
+				t.Fatalf("schema fields = %d, want 2", got)
+			}
+			if got := schema.Field(0).Name; got != "id" {
+				t.Fatalf("first schema field = %q, want id", got)
+			}
+			if got := schema.Field(1).Name; got != "name" {
+				t.Fatalf("second schema field = %q, want name", got)
+			}
+
+			var count int
+			if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM schema_returning_once").Scan(&count); err != nil {
+				t.Fatalf("count rows: %v", err)
+			}
+			if count != 0 {
+				t.Fatalf("schema discovery executed INSERT: rows = %d, want 0", count)
+			}
+		})
+	}
+}
+
 func TestRowsToRecordExplainUsesPlanValueColumn(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {

@@ -305,6 +305,16 @@ func (e *FlightExecutor) Exec(query string, args ...any) (sqlcore.ExecResult, er
 	return e.ExecContext(context.Background(), query, args...)
 }
 
+// ResultColumnCount prepares a statement in the worker session and reads its
+// DuckDB metadata without executing the statement itself.
+func (e *FlightExecutor) ResultColumnCount(ctx context.Context, query string) (count int, err error) {
+	if e.dead.Load() {
+		return 0, ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+	return sqlcore.PreparedStatementResultColumnCount(ctx, e, query)
+}
+
 // QueryWithBoundParams executes a query using compact Bind parameters. Text
 // values are appended straight into the final Flight SQL request buffer by the
 // portal-owned appender, avoiding an intermediate string/interface for every

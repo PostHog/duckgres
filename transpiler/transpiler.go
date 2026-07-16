@@ -274,6 +274,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 			return &Result{
 				SQL:               sql, // Keep original for logging
 				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
+				SchemaQuery:       restoreLongIdentifiers(transformResult.SchemaQuery, longIdents),
 				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
 				ParamCount:        transformResult.ParamCount,
 			}, nil

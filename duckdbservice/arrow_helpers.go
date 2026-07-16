@@ -3,13 +3,16 @@ package duckdbservice
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"reflect"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server"
 )
 
 // DuckDBTypeToArrow re-exports arrowmap.DuckDBTypeToArrow for backward
@@ -148,6 +151,11 @@ func isNil(i contextQueryer) bool {
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.
 func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx contextQueryer) (*arrow.Schema, error) {
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
+	if tx == nil && isDMLReturningSchemaQuery(q) {
+		if conn, ok := db.(*sql.Conn); ok {
+			return preparedDMLReturningSchema(ctx, conn, q)
+		}
+	}
 	queryWithLimit := q
 	upper := strings.ToUpper(q)
 	// EXPLAIN [ANALYZE] returns a fixed single-column textual plan. We must NOT
@@ -193,4 +201,139 @@ func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx con
 		fields[i] = arrow.Field{Name: ct.Name(), Type: DuckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
 	}
 	return arrow.NewSchema(fields, nil), nil
+}
+
+// isDMLReturningSchemaQuery identifies the worker query shapes that need
+// prepared-statement metadata. They are executed later by DoGet, so running
+// them here merely to learn their schema would apply the mutation twice.
+func isDMLReturningSchemaQuery(query string) bool {
+	return server.IsDMLReturning(query)
+}
+
+// preparedDMLReturningSchema uses duckdb-go's native prepared-statement
+// metadata on the session's already-pinned connection. Preparing binds and
+// plans the DML RETURNING statement but does not run it, unlike QueryContext.
+func preparedDMLReturningSchema(ctx context.Context, conn *sql.Conn, query string) (schema *arrow.Schema, err error) {
+	if conn == nil {
+		return nil, fmt.Errorf("prepare DML RETURNING schema: nil connection")
+	}
+	err = conn.Raw(func(driverConn any) (callbackErr error) {
+		duckConn, ok := driverConn.(*duckdb.Conn)
+		if !ok {
+			return fmt.Errorf("prepare DML RETURNING schema: unexpected driver connection %T", driverConn)
+		}
+		prepared, prepareErr := duckConn.PrepareContext(ctx, query)
+		if prepareErr != nil {
+			return fmt.Errorf("prepare DML RETURNING schema: %w", prepareErr)
+		}
+		stmt, ok := prepared.(*duckdb.Stmt)
+		if !ok {
+			_ = prepared.Close()
+			return fmt.Errorf("prepare DML RETURNING schema: unexpected prepared statement %T", prepared)
+		}
+		defer func() {
+			if closeErr := stmt.Close(); closeErr != nil && callbackErr == nil {
+				callbackErr = fmt.Errorf("close prepared DML RETURNING schema: %w", closeErr)
+			}
+		}()
+
+		count, countErr := stmt.ColumnCount()
+		if countErr != nil {
+			return fmt.Errorf("prepared DML RETURNING column count: %w", countErr)
+		}
+		fields := make([]arrow.Field, count)
+		for i := range fields {
+			name, nameErr := stmt.ColumnName(i)
+			if nameErr != nil {
+				return fmt.Errorf("prepared DML RETURNING column %d name: %w", i, nameErr)
+			}
+			typeInfo, typeErr := stmt.ColumnTypeInfo(i)
+			if typeErr != nil {
+				return fmt.Errorf("prepared DML RETURNING column %d type: %w", i, typeErr)
+			}
+			fields[i] = arrow.Field{Name: name, Type: arrowTypeFromPreparedDuckDB(typeInfo), Nullable: true}
+		}
+		schema = arrow.NewSchema(fields, nil)
+		return nil
+	})
+	return schema, err
+}
+
+func arrowTypeFromPreparedDuckDB(info duckdb.TypeInfo) arrow.DataType {
+	if info == nil {
+		return arrow.BinaryTypes.String
+	}
+	switch info.InternalType() {
+	case duckdb.TYPE_BOOLEAN:
+		return arrow.FixedWidthTypes.Boolean
+	case duckdb.TYPE_TINYINT:
+		return arrow.PrimitiveTypes.Int8
+	case duckdb.TYPE_SMALLINT:
+		return arrow.PrimitiveTypes.Int16
+	case duckdb.TYPE_INTEGER:
+		return arrow.PrimitiveTypes.Int32
+	case duckdb.TYPE_BIGINT:
+		return arrow.PrimitiveTypes.Int64
+	case duckdb.TYPE_UTINYINT:
+		return arrow.PrimitiveTypes.Uint8
+	case duckdb.TYPE_USMALLINT:
+		return arrow.PrimitiveTypes.Uint16
+	case duckdb.TYPE_UINTEGER:
+		return arrow.PrimitiveTypes.Uint32
+	case duckdb.TYPE_UBIGINT:
+		return arrow.PrimitiveTypes.Uint64
+	case duckdb.TYPE_HUGEINT, duckdb.TYPE_UHUGEINT:
+		return &arrow.Decimal128Type{Precision: 38, Scale: 0}
+	case duckdb.TYPE_FLOAT:
+		return arrow.PrimitiveTypes.Float32
+	case duckdb.TYPE_DOUBLE:
+		return arrow.PrimitiveTypes.Float64
+	case duckdb.TYPE_VARCHAR, duckdb.TYPE_ENUM, duckdb.TYPE_BIT:
+		return arrow.BinaryTypes.String
+	case duckdb.TYPE_BLOB:
+		return arrow.BinaryTypes.Binary
+	case duckdb.TYPE_DATE:
+		return arrow.FixedWidthTypes.Date32
+	case duckdb.TYPE_TIME, duckdb.TYPE_TIME_TZ:
+		return arrow.FixedWidthTypes.Time64us
+	case duckdb.TYPE_TIMESTAMP:
+		return &arrow.TimestampType{Unit: arrow.Microsecond}
+	case duckdb.TYPE_TIMESTAMP_S:
+		return &arrow.TimestampType{Unit: arrow.Second}
+	case duckdb.TYPE_TIMESTAMP_MS:
+		return &arrow.TimestampType{Unit: arrow.Millisecond}
+	case duckdb.TYPE_TIMESTAMP_NS:
+		return &arrow.TimestampType{Unit: arrow.Nanosecond}
+	case duckdb.TYPE_TIMESTAMP_TZ:
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+	case duckdb.TYPE_INTERVAL:
+		return arrow.FixedWidthTypes.MonthDayNanoInterval
+	case duckdb.TYPE_UUID:
+		return arrow.BinaryTypes.String
+	case duckdb.TYPE_DECIMAL:
+		if details, ok := info.Details().(*duckdb.DecimalDetails); ok {
+			return &arrow.Decimal128Type{Precision: int32(details.Width), Scale: int32(details.Scale)}
+		}
+		return &arrow.Decimal128Type{Precision: 18, Scale: 3}
+	case duckdb.TYPE_LIST, duckdb.TYPE_ARRAY:
+		if details, ok := info.Details().(*duckdb.ListDetails); ok {
+			return arrow.ListOf(arrowTypeFromPreparedDuckDB(details.Child))
+		}
+		if details, ok := info.Details().(*duckdb.ArrayDetails); ok {
+			return arrow.ListOf(arrowTypeFromPreparedDuckDB(details.Child))
+		}
+	case duckdb.TYPE_MAP:
+		if details, ok := info.Details().(*duckdb.MapDetails); ok {
+			return arrow.MapOf(arrowTypeFromPreparedDuckDB(details.Key), arrowTypeFromPreparedDuckDB(details.Value))
+		}
+	case duckdb.TYPE_STRUCT:
+		if details, ok := info.Details().(*duckdb.StructDetails); ok {
+			fields := make([]arrow.Field, 0, len(details.Entries))
+			for _, entry := range details.Entries {
+				fields = append(fields, arrow.Field{Name: entry.Name(), Type: arrowTypeFromPreparedDuckDB(entry.Info()), Nullable: true})
+			}
+			return arrow.StructOf(fields...)
+		}
+	}
+	return arrow.BinaryTypes.String
 }

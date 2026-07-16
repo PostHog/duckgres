@@ -37,6 +37,99 @@ type compactFlightRecordingExecutor struct {
 	boundExecs   int
 }
 
+// resultFormatRecordingExecutor records each execution statement so result
+// format validation tests can distinguish a non-mutating metadata lookup from
+// the DML and setup work performed by Execute.
+type resultFormatRecordingExecutor struct {
+	lifecycleExecutor
+	queries              []string
+	execs                []string
+	metadataQueries      []string
+	resultColumnCount    int
+	resultColumnCountErr error
+}
+
+func (e *resultFormatRecordingExecutor) query(query string) (RowSet, error) {
+	e.queries = append(e.queries, query)
+	e.queryCalls.Add(1)
+	return e.queryRows, e.queryErr
+}
+
+func (e *resultFormatRecordingExecutor) exec(query string) (ExecResult, error) {
+	e.execs = append(e.execs, query)
+	e.execCalls.Add(1)
+	return e.execResult, e.execErr
+}
+
+func (e *resultFormatRecordingExecutor) QueryContext(_ context.Context, query string, _ ...any) (RowSet, error) {
+	return e.query(query)
+}
+
+func (e *resultFormatRecordingExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	return e.exec(query)
+}
+
+func (e *resultFormatRecordingExecutor) Query(query string, _ ...any) (RowSet, error) {
+	return e.query(query)
+}
+
+func (e *resultFormatRecordingExecutor) Exec(query string, _ ...any) (ExecResult, error) {
+	return e.exec(query)
+}
+
+// ResultColumnCount models the executor's non-mutating prepared-statement
+// metadata capability. It deliberately does not route through Query/Exec: the
+// lifecycle assertions below distinguish it from running setup or DML SQL.
+func (e *resultFormatRecordingExecutor) ResultColumnCount(_ context.Context, query string) (int, error) {
+	e.metadataQueries = append(e.metadataQueries, query)
+	return e.resultColumnCount, e.resultColumnCountErr
+}
+
+func (e *resultFormatRecordingExecutor) resetRecordedCalls() {
+	e.queryCalls.Store(0)
+	e.execCalls.Store(0)
+	e.queries = nil
+	e.execs = nil
+}
+
+func (e *resultFormatRecordingExecutor) execCountWithPrefix(prefix string) int {
+	count := 0
+	for _, query := range e.execs {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+// requireNoResultFormatMetadata makes sure zero- and one-code Binds retain
+// their existing fast path: they never need output-cardinality metadata.
+func requireNoResultFormatMetadata(t testing.TB, executor *resultFormatRecordingExecutor) {
+	t.Helper()
+	if got := len(executor.metadataQueries); got != 0 {
+		t.Fatalf("metadata lookup count = %d, want 0; queries=%v", got, executor.metadataQueries)
+	}
+}
+
+// requireNonMutatingResultFormatMetadata confirms that a per-column Bind used
+// harmless metadata rather than running DML or writable-CTE setup to learn its
+// output shape.
+func requireNonMutatingResultFormatMetadata(t testing.TB, executor *resultFormatRecordingExecutor) {
+	t.Helper()
+	if got := len(executor.metadataQueries); got != 1 {
+		t.Fatalf("metadata lookup count = %d, want 1; queries=%v", got, executor.metadataQueries)
+	}
+	if got := executor.execCalls.Load(); got != 0 {
+		t.Fatalf("metadata discovery invoked Exec %d times, want 0; statements=%v", got, executor.execs)
+	}
+	for _, query := range executor.queries {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		if strings.HasPrefix(upper, "INSERT ") || strings.HasPrefix(upper, "UPDATE ") || strings.HasPrefix(upper, "DELETE ") || strings.HasPrefix(upper, "MERGE ") || strings.HasPrefix(upper, "COPY ") || strings.HasPrefix(upper, "WITH ") {
+			t.Fatalf("metadata discovery ran mutating query %q", query)
+		}
+	}
+}
+
 // cursorFormatCountingRowSet exposes a fixed two-column cursor schema while
 // recording whether extended FETCH tried to advance it.
 type cursorFormatCountingRowSet struct {
@@ -125,6 +218,22 @@ func portalLifecycleParseBody(stmtName, query string, paramTypes []int32) []byte
 		_ = binary.Write(&body, binary.BigEndian, oid)
 	}
 	return body.Bytes()
+}
+
+// parsePortalLifecycleStatement deliberately goes through Parse so an
+// implementation can cache output cardinality using a non-mutating operation
+// before Bind. Tests reset their executor after this helper to make the Bind
+// assertions strict.
+func parsePortalLifecycleStatement(t testing.TB, c *clientConn, out *bytes.Buffer, stmtName, query string, paramTypes []int32) {
+	t.Helper()
+	c.handleParse(portalLifecycleParseBody(stmtName, query, paramTypes))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush Parse: %v", err)
+	}
+	if _, ok := c.stmts[stmtName]; !ok {
+		t.Fatalf("Parse did not install statement %q: response=%q", stmtName, out.Bytes())
+	}
+	out.Reset()
 }
 
 func newPortalLifecycleConn(t testing.TB, executor QueryExecutor) (*clientConn, *bytes.Buffer, func()) {
@@ -696,54 +805,534 @@ func TestPortalLifecycleRejectsMultiCodeFormatsForExplainAnalyzeWriteBeforeExecu
 	}
 }
 
-func TestPortalLifecycleRejectsMultiCodeFormatsForWildcardDMLReturning(t *testing.T) {
-	c, out, cleanup := newPortalLifecycleConn(t, nil)
-	defer cleanup()
-	c.stmts["returning-star"] = &preparedStmt{
-		query:          "INSERT INTO t VALUES ($1) RETURNING *",
-		convertedQuery: "INSERT INTO t VALUES (?) RETURNING *",
-		numParams:      1,
+func TestPortalLifecyclePerColumnFormatsForWildcardDMLReturning(t *testing.T) {
+	const outputColumns = 2
+	const query = "INSERT INTO result_format_target (id, name) VALUES ($1, 'name') RETURNING *"
+
+	newExecutor := func() *resultFormatRecordingExecutor {
+		return &resultFormatRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+			queryRows: &describeStaticRowSet{
+				cols:     []string{"id", "name"},
+				colTypes: []ColumnTyper{describeColumnType("INTEGER"), describeColumnType("VARCHAR")},
+			},
+			execResult: emptyExecResult{},
+		}, resultColumnCount: outputColumns}
 	}
 
-	// The table schema determines the cardinality of RETURNING *. A multi-code
-	// vector must be rejected rather than execute a write to discover it.
-	c.handleBind(portalLifecycleBindBody("invalid-returning-star", "returning-star", nil, []portalLifecycleBindValue{{data: []byte("value")}}, []int16{0, 1}))
-	if err := c.writer.Flush(); err != nil {
-		t.Fatalf("flush Bind error: %v", err)
+	t.Run("matching vector is accepted without a Bind execution", func(t *testing.T) {
+		executor := newExecutor()
+		c, out, cleanup := newPortalLifecycleConn(t, executor)
+		defer cleanup()
+		parsePortalLifecycleStatement(t, c, out, "returning-star", query, []int32{OidText})
+		requireNoResultFormatMetadata(t, executor)
+		executor.resetRecordedCalls()
+
+		formats := []int16{1, 0}
+		c.handleBind(portalLifecycleBindBody("returning-star-portal", "returning-star", nil, []portalLifecycleBindValue{{data: []byte("1")}}, formats))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Bind: %v", err)
+		}
+		requireNonMutatingResultFormatMetadata(t, executor)
+		if bytes.Contains(out.Bytes(), []byte("08P01")) {
+			t.Fatalf("matching wildcard RETURNING Bind response = %q, want acceptance", out.Bytes())
+		}
+		p := c.portals["returning-star-portal"]
+		if p == nil {
+			t.Fatal("matching wildcard RETURNING formats did not install a portal")
+		}
+		if len(p.resultFormats) != outputColumns || p.resultFormats[0] != formats[0] || p.resultFormats[1] != formats[1] {
+			t.Fatalf("portal result formats = %v, want %v", p.resultFormats, formats)
+		}
+		if got := executor.queryCalls.Load(); got != 0 {
+			t.Fatalf("Bind invoked Query %d times, want 0", got)
+		}
+		if got := executor.execCalls.Load(); got != 0 {
+			t.Fatalf("Bind invoked Exec %d times, want 0", got)
+		}
+
+		out.Reset()
+		c.handleExecute(portalLifecycleExecuteBody("returning-star-portal"))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Execute: %v", err)
+		}
+		if bytes.Contains(out.Bytes(), []byte("ERROR")) {
+			t.Fatalf("matching wildcard RETURNING Execute response = %q, want success", out.Bytes())
+		}
+		if got := executor.queryCalls.Load(); got != 1 {
+			t.Fatalf("RETURNING mutation Query calls = %d, want 1", got)
+		}
+		if got := executor.execCalls.Load(); got != 0 {
+			t.Fatalf("RETURNING mutation Exec calls = %d, want 0", got)
+		}
+		requirePortalState(t, p, portalStateDone)
+		if len(p.rowDescription) == 0 {
+			t.Fatal("terminal wildcard RETURNING portal did not retain RowDescription")
+		}
+	})
+
+	t.Run("mismatched vector is rejected before the mutation", func(t *testing.T) {
+		executor := newExecutor()
+		c, out, cleanup := newPortalLifecycleConn(t, executor)
+		defer cleanup()
+		parsePortalLifecycleStatement(t, c, out, "returning-star", query, []int32{OidText})
+		requireNoResultFormatMetadata(t, executor)
+		executor.resetRecordedCalls()
+
+		c.handleBind(portalLifecycleBindBody("invalid-returning-star", "returning-star", nil, []portalLifecycleBindValue{{data: []byte("1")}}, []int16{0, 1, 0}))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Bind error: %v", err)
+		}
+		requireNonMutatingResultFormatMetadata(t, executor)
+		if _, ok := c.portals["invalid-returning-star"]; ok {
+			t.Fatal("mismatched wildcard RETURNING formats installed a portal")
+		}
+		if !bytes.Contains(out.Bytes(), []byte("08P01")) {
+			t.Fatalf("mismatched wildcard RETURNING Bind response = %q, want 08P01", out.Bytes())
+		}
+		if got := executor.queryCalls.Load(); got != 0 {
+			t.Fatalf("mismatched Bind invoked Query %d times, want 0", got)
+		}
+		if got := executor.execCalls.Load(); got != 0 {
+			t.Fatalf("mismatched Bind invoked Exec %d times, want 0", got)
+		}
+	})
+}
+
+func TestPortalLifecycleMutationZeroAndSingleResultFormatsNeedNoMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		paramTypes []int32
+		values     []portalLifecycleBindValue
+	}{
+		{
+			name:       "wildcard RETURNING",
+			query:      "INSERT INTO result_format_target (id, name) VALUES ($1, 'name') RETURNING *",
+			paramTypes: []int32{OidText},
+			values:     []portalLifecycleBindValue{{data: []byte("1")}},
+		},
+		{
+			name:       "explicit RETURNING list",
+			query:      "INSERT INTO result_format_target (id, name) VALUES ($1, 'name') RETURNING id, name",
+			paramTypes: []int32{OidText},
+			values:     []portalLifecycleBindValue{{data: []byte("1")}},
+		},
+		{
+			name:  "writable CTE",
+			query: "WITH changed AS (UPDATE result_format_target SET value = 'updated' RETURNING id, name) SELECT id, name FROM changed",
+		},
 	}
-	if _, ok := c.portals["invalid-returning-star"]; ok {
-		t.Fatal("wildcard DML RETURNING formats must not install a portal")
+	formats := []struct {
+		name    string
+		formats []int16
+	}{
+		{name: "zero codes"},
+		{name: "one text code", formats: []int16{0}},
+		{name: "one binary code", formats: []int16{1}},
 	}
-	if !bytes.Contains(out.Bytes(), []byte("08P01")) {
-		t.Fatalf("wildcard DML RETURNING result format response = %q, want 08P01", out.Bytes())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &resultFormatRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+				queryRows: &describeStaticRowSet{
+					cols:     []string{"id", "name"},
+					colTypes: []ColumnTyper{describeColumnType("INTEGER"), describeColumnType("VARCHAR")},
+				},
+			}}
+			c, out, cleanup := newPortalLifecycleConn(t, executor)
+			defer cleanup()
+			parsePortalLifecycleStatement(t, c, out, "zero-one", tt.query, tt.paramTypes)
+
+			for i, formatCase := range formats {
+				t.Run(formatCase.name, func(t *testing.T) {
+					out.Reset()
+					portalName := "zero-one-" + strconv.Itoa(i)
+					c.handleBind(portalLifecycleBindBody(portalName, "zero-one", nil, tt.values, formatCase.formats))
+					if err := c.writer.Flush(); err != nil {
+						t.Fatalf("flush Bind: %v", err)
+					}
+					if bytes.Contains(out.Bytes(), []byte("08P01")) {
+						t.Fatalf("%s Bind response = %q, want acceptance", formatCase.name, out.Bytes())
+					}
+					if _, ok := c.portals[portalName]; !ok {
+						t.Fatalf("%s did not install portal", formatCase.name)
+					}
+					requireNoResultFormatMetadata(t, executor)
+					if got := executor.queryCalls.Load(); got != 0 {
+						t.Fatalf("%s Bind invoked Query %d times, want 0", formatCase.name, got)
+					}
+					if got := executor.execCalls.Load(); got != 0 {
+						t.Fatalf("%s Bind invoked Exec %d times, want 0", formatCase.name, got)
+					}
+				})
+			}
+		})
 	}
 }
 
-func TestPortalLifecycleRejectsMultiCodeFormatsForWritableCTERewrite(t *testing.T) {
-	c, out, cleanup := newPortalLifecycleConn(t, nil)
-	defer cleanup()
-	c.stmts["writable-cte"] = &preparedStmt{
-		query:          "WITH changed AS (UPDATE t SET value = $1 RETURNING id) SELECT id FROM changed",
-		convertedQuery: "SELECT id FROM changed",
-		numParams:      1,
-		statements: []string{
-			"UPDATE t SET value = ?",
-			"SELECT id FROM changed",
+func TestPortalLifecyclePerColumnFormatsForExplicitDMLReturning(t *testing.T) {
+	const query = "INSERT INTO result_format_target (id, name) VALUES ($1, 'name') RETURNING id, name"
+
+	newExecutor := func() *resultFormatRecordingExecutor {
+		return &resultFormatRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+			queryRows: &describeStaticRowSet{
+				cols:     []string{"id", "name"},
+				colTypes: []ColumnTyper{describeColumnType("INTEGER"), describeColumnType("VARCHAR")},
+			},
+		}}
+	}
+
+	t.Run("matching vector executes once", func(t *testing.T) {
+		executor := newExecutor()
+		c, out, cleanup := newPortalLifecycleConn(t, executor)
+		defer cleanup()
+		parsePortalLifecycleStatement(t, c, out, "explicit-returning", query, []int32{OidText})
+		requireNoResultFormatMetadata(t, executor)
+
+		c.handleBind(portalLifecycleBindBody("explicit-returning-portal", "explicit-returning", nil, []portalLifecycleBindValue{{data: []byte("1")}}, []int16{1, 0}))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Bind: %v", err)
+		}
+		if _, ok := c.portals["explicit-returning-portal"]; !ok {
+			t.Fatal("matching explicit RETURNING formats did not install a portal")
+		}
+		requireNoResultFormatMetadata(t, executor)
+
+		out.Reset()
+		c.handleExecute(portalLifecycleExecuteBody("explicit-returning-portal"))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Execute: %v", err)
+		}
+		if got := executor.queryCalls.Load(); got != 1 {
+			t.Fatalf("explicit RETURNING mutation Query calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("mismatched vector does not execute", func(t *testing.T) {
+		executor := newExecutor()
+		c, out, cleanup := newPortalLifecycleConn(t, executor)
+		defer cleanup()
+		parsePortalLifecycleStatement(t, c, out, "explicit-returning", query, []int32{OidText})
+
+		c.handleBind(portalLifecycleBindBody("invalid-explicit-returning", "explicit-returning", nil, []portalLifecycleBindValue{{data: []byte("1")}}, []int16{0, 1, 0}))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Bind error: %v", err)
+		}
+		if _, ok := c.portals["invalid-explicit-returning"]; ok {
+			t.Fatal("mismatched explicit RETURNING formats installed a portal")
+		}
+		if !bytes.Contains(out.Bytes(), []byte("08P01")) {
+			t.Fatalf("mismatched explicit RETURNING Bind response = %q, want 08P01", out.Bytes())
+		}
+		requireNoResultFormatMetadata(t, executor)
+		if got := executor.queryCalls.Load(); got != 0 {
+			t.Fatalf("mismatched explicit Bind invoked Query %d times, want 0", got)
+		}
+		if got := executor.execCalls.Load(); got != 0 {
+			t.Fatalf("mismatched explicit Bind invoked Exec %d times, want 0", got)
+		}
+	})
+}
+
+func TestPortalLifecycleDescribeMutationOutputsNeverExecutes(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		paramTypes []int32
+		values     []portalLifecycleBindValue
+	}{
+		{
+			name:       "DML RETURNING",
+			query:      "INSERT INTO result_format_target (id) VALUES ($1) RETURNING id",
+			paramTypes: []int32{OidText},
+			values:     []portalLifecycleBindValue{{data: []byte("1")}},
+		},
+		{
+			name:  "writable CTE",
+			query: "WITH changed AS (UPDATE result_format_target SET value = 'updated' RETURNING id) SELECT id FROM changed",
 		},
 	}
 
-	// Rewritten writable CTEs perform setup writes before their final SELECT, so
-	// a multi-code vector cannot wait for runtime output metadata.
-	c.handleBind(portalLifecycleBindBody("invalid-writable-cte", "writable-cte", nil, []portalLifecycleBindValue{{data: []byte("value")}}, []int16{0, 1}))
-	if err := c.writer.Flush(); err != nil {
-		t.Fatalf("flush Bind error: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &resultFormatRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+				queryRows: &describeStaticRowSet{
+					cols:     []string{"id"},
+					colTypes: []ColumnTyper{describeColumnType("INTEGER")},
+				},
+			}}
+			c, out, cleanup := newPortalLifecycleConn(t, executor)
+			defer cleanup()
+			parsePortalLifecycleStatement(t, c, out, "describe-mutation", tt.query, tt.paramTypes)
+
+			// Statement Describe must not probe by executing the mutation.
+			c.handleDescribe([]byte{'S', 'd', 'e', 's', 'c', 'r', 'i', 'b', 'e', '-', 'm', 'u', 't', 'a', 't', 'i', 'o', 'n', 0})
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush statement Describe: %v", err)
+			}
+			if got := executor.queryCalls.Load(); got != 0 {
+				t.Fatalf("statement Describe invoked Query %d times, want 0", got)
+			}
+			if got := executor.execCalls.Load(); got != 0 {
+				t.Fatalf("statement Describe invoked Exec %d times, want 0", got)
+			}
+
+			out.Reset()
+			c.handleBind(portalLifecycleBindBody("describe-mutation-portal", "describe-mutation", nil, tt.values, nil))
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush Bind: %v", err)
+			}
+			out.Reset()
+			c.handleDescribe([]byte{'P', 'd', 'e', 's', 'c', 'r', 'i', 'b', 'e', '-', 'm', 'u', 't', 'a', 't', 'i', 'o', 'n', '-', 'p', 'o', 'r', 't', 'a', 'l', 0})
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush portal Describe: %v", err)
+			}
+			if got := executor.queryCalls.Load(); got != 0 {
+				t.Fatalf("portal Describe invoked Query %d times, want 0", got)
+			}
+			if got := executor.execCalls.Load(); got != 0 {
+				t.Fatalf("portal Describe invoked Exec %d times, want 0", got)
+			}
+		})
 	}
-	if _, ok := c.portals["invalid-writable-cte"]; ok {
-		t.Fatal("writable CTE result formats must not install a portal")
+}
+
+func TestPortalLifecycleRefreshesSchemaDependentResultFormatsAtBind(t *testing.T) {
+	tests := []struct {
+		name   string
+		query  string
+		values []portalLifecycleBindValue
+	}{
+		{
+			name:   "RETURNING star",
+			query:  "INSERT INTO result_format_target (id, name) VALUES ($1, 'name') RETURNING *",
+			values: []portalLifecycleBindValue{{data: []byte("1")}},
+		},
+		{
+			name:  "writable CTE star output",
+			query: "WITH changed AS (UPDATE result_format_target SET value = 'updated' RETURNING *) SELECT * FROM changed",
+		},
 	}
-	if !bytes.Contains(out.Bytes(), []byte("08P01")) {
-		t.Fatalf("writable CTE result format response = %q, want 08P01", out.Bytes())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &resultFormatRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+				queryRows: &describeStaticRowSet{
+					cols:     []string{"id", "name"},
+					colTypes: []ColumnTyper{describeColumnType("INTEGER"), describeColumnType("VARCHAR")},
+				},
+			}, resultColumnCount: 2}
+			c, out, cleanup := newPortalLifecycleConn(t, executor)
+			defer cleanup()
+			parsePortalLifecycleStatement(t, c, out, "schema-dependent", tt.query, []int32{OidText})
+			requireNoResultFormatMetadata(t, executor)
+
+			// The initial two-column shape accepts the vector without executing
+			// anything. This records a cache that must not be reused after the
+			// schema changes below.
+			executor.resetRecordedCalls()
+			c.handleBind(portalLifecycleBindBody("initial-schema", "schema-dependent", nil, tt.values, []int16{1, 0}))
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush initial Bind: %v", err)
+			}
+			if _, ok := c.portals["initial-schema"]; !ok {
+				t.Fatal("initial two-column result-format vector did not install a portal")
+			}
+			requireNonMutatingResultFormatMetadata(t, executor)
+
+			// Simulate ALTER TABLE between Binds. The two-code vector was valid
+			// for the old shape, but is now malformed for the three-column output
+			// and must be rejected before any DML or writable-CTE setup runs.
+			executor.resultColumnCount = 3
+			executor.resetRecordedCalls()
+			out.Reset()
+			c.handleBind(portalLifecycleBindBody("stale-schema", "schema-dependent", nil, tt.values, []int16{1, 0}))
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush Bind error: %v", err)
+			}
+			if _, ok := c.portals["stale-schema"]; ok {
+				t.Fatal("stale result-format vector installed a portal")
+			}
+			if !bytes.Contains(out.Bytes(), []byte("08P01")) {
+				t.Fatalf("stale result-format Bind response = %q, want 08P01", out.Bytes())
+			}
+			if got := len(executor.metadataQueries); got != 2 {
+				t.Fatalf("result metadata lookups = %d, want one lookup per per-column Bind", got)
+			}
+			if got := executor.queryCalls.Load(); got != 0 {
+				t.Fatalf("stale Bind invoked Query %d times, want 0", got)
+			}
+			if got := executor.execCalls.Load(); got != 0 {
+				t.Fatalf("stale Bind invoked Exec %d times, want 0", got)
+			}
+		})
 	}
+}
+
+func TestPortalLifecycleRevalidatesSchemaDependentFormatsBeforeExecute(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		paramTypes []int32
+		values     []portalLifecycleBindValue
+	}{
+		{
+			name:       "RETURNING star",
+			query:      "INSERT INTO result_format_target (id, name) VALUES ($1, 'name') RETURNING *",
+			paramTypes: []int32{OidText},
+			values:     []portalLifecycleBindValue{{data: []byte("1")}},
+		},
+		{
+			name:  "writable CTE star output",
+			query: "WITH changed AS (UPDATE result_format_target SET value = 'updated' RETURNING *) SELECT * FROM changed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &resultFormatRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+				queryRows: &describeStaticRowSet{
+					cols:     []string{"id", "name"},
+					colTypes: []ColumnTyper{describeColumnType("INTEGER"), describeColumnType("VARCHAR")},
+				},
+				execResult: emptyExecResult{},
+			}, resultColumnCount: 2}
+			c, out, cleanup := newPortalLifecycleConn(t, executor)
+			defer cleanup()
+			parsePortalLifecycleStatement(t, c, out, "execute-schema", tt.query, tt.paramTypes)
+			c.handleBind(portalLifecycleBindBody("execute-schema-portal", "execute-schema", nil, tt.values, []int16{1, 0}))
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush Bind: %v", err)
+			}
+			p := c.portals["execute-schema-portal"]
+			if p == nil {
+				t.Fatal("initial two-column result-format vector did not install a portal")
+			}
+
+			// The output expands after Bind but before Execute. Revalidation must
+			// reject the now-mismatched vector before the direct DML or writable
+			// CTE setup can run.
+			executor.resultColumnCount = 3
+			executor.resetRecordedCalls()
+			out.Reset()
+			c.handleExecute(portalLifecycleExecuteBody("execute-schema-portal"))
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush Execute: %v", err)
+			}
+			if !bytes.Contains(out.Bytes(), []byte("08P01")) {
+				t.Fatalf("stale result-format Execute response = %q, want 08P01", out.Bytes())
+			}
+			requirePortalState(t, p, portalStateFailed)
+			if got := len(executor.metadataQueries); got != 2 {
+				t.Fatalf("result metadata lookups = %d, want Bind and Execute revalidation", got)
+			}
+			if got := executor.queryCalls.Load(); got != 0 {
+				t.Fatalf("stale Execute invoked Query %d times, want 0", got)
+			}
+			if got := executor.execCalls.Load(); got != 0 {
+				t.Fatalf("stale Execute invoked Exec %d times, want 0", got)
+			}
+		})
+	}
+}
+
+func TestPortalLifecyclePerColumnFormatsForWritableCTERewrite(t *testing.T) {
+	const outputColumns = 2
+	const query = "WITH changed AS (UPDATE result_format_target SET value = 'updated' RETURNING id, name) SELECT id, name FROM changed"
+
+	newExecutor := func() *resultFormatRecordingExecutor {
+		return &resultFormatRecordingExecutor{lifecycleExecutor: lifecycleExecutor{
+			queryRows: &describeStaticRowSet{
+				cols:     []string{"id", "name"},
+				colTypes: []ColumnTyper{describeColumnType("INTEGER"), describeColumnType("VARCHAR")},
+			},
+			execResult: emptyExecResult{},
+		}, resultColumnCount: outputColumns}
+	}
+
+	t.Run("matching vector executes each setup mutation once", func(t *testing.T) {
+		executor := newExecutor()
+		c, out, cleanup := newPortalLifecycleConn(t, executor)
+		defer cleanup()
+		parsePortalLifecycleStatement(t, c, out, "writable-cte", query, nil)
+		if len(c.stmts["writable-cte"].statements) == 0 {
+			t.Fatal("writable CTE Parse did not create a multi-statement rewrite")
+		}
+		requireNoResultFormatMetadata(t, executor)
+		executor.resetRecordedCalls()
+
+		formats := []int16{1, 0}
+		c.handleBind(portalLifecycleBindBody("writable-cte-portal", "writable-cte", nil, nil, formats))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Bind: %v", err)
+		}
+		requireNonMutatingResultFormatMetadata(t, executor)
+		if bytes.Contains(out.Bytes(), []byte("08P01")) {
+			t.Fatalf("matching writable CTE Bind response = %q, want acceptance", out.Bytes())
+		}
+		p := c.portals["writable-cte-portal"]
+		if p == nil {
+			t.Fatal("matching writable CTE formats did not install a portal")
+		}
+		if len(p.resultFormats) != outputColumns || p.resultFormats[0] != formats[0] || p.resultFormats[1] != formats[1] {
+			t.Fatalf("portal result formats = %v, want %v", p.resultFormats, formats)
+		}
+		if got := executor.queryCalls.Load(); got != 0 {
+			t.Fatalf("Bind invoked Query %d times, want 0", got)
+		}
+		if got := executor.execCalls.Load(); got != 0 {
+			t.Fatalf("Bind invoked Exec %d times, want 0", got)
+		}
+
+		out.Reset()
+		c.handleExecute(portalLifecycleExecuteBody("writable-cte-portal"))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Execute: %v", err)
+		}
+		if bytes.Contains(out.Bytes(), []byte("ERROR")) {
+			t.Fatalf("matching writable CTE Execute response = %q, want success", out.Bytes())
+		}
+		if got := executor.execCountWithPrefix("UPDATE "); got != 1 {
+			t.Fatalf("writable CTE UPDATE executions = %d, want 1; statements=%v", got, executor.execs)
+		}
+		if got := executor.queryCalls.Load(); got != 1 {
+			t.Fatalf("writable CTE final Query calls = %d, want 1", got)
+		}
+		requirePortalState(t, p, portalStateDone)
+		if len(p.rowDescription) == 0 {
+			t.Fatal("terminal writable CTE portal did not retain RowDescription")
+		}
+	})
+
+	t.Run("mismatched vector is rejected before setup and DML", func(t *testing.T) {
+		executor := newExecutor()
+		c, out, cleanup := newPortalLifecycleConn(t, executor)
+		defer cleanup()
+		parsePortalLifecycleStatement(t, c, out, "writable-cte", query, nil)
+		requireNoResultFormatMetadata(t, executor)
+		executor.resetRecordedCalls()
+
+		c.handleBind(portalLifecycleBindBody("invalid-writable-cte", "writable-cte", nil, nil, []int16{0, 1, 0}))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Bind error: %v", err)
+		}
+		requireNonMutatingResultFormatMetadata(t, executor)
+		if _, ok := c.portals["invalid-writable-cte"]; ok {
+			t.Fatal("mismatched writable CTE formats installed a portal")
+		}
+		if !bytes.Contains(out.Bytes(), []byte("08P01")) {
+			t.Fatalf("mismatched writable CTE Bind response = %q, want 08P01", out.Bytes())
+		}
+		if got := executor.queryCalls.Load(); got != 0 {
+			t.Fatalf("mismatched Bind invoked Query %d times, want 0", got)
+		}
+		if got := executor.execCalls.Load(); got != 0 {
+			t.Fatalf("mismatched Bind invoked Exec %d times, want 0", got)
+		}
+		if got := executor.execCountWithPrefix("UPDATE "); got != 0 {
+			t.Fatalf("mismatched Bind ran %d writable CTE UPDATE statements, want 0", got)
+		}
+	})
 }
 
 func TestPortalLifecycleFlightUsesCompactLiteralAppender(t *testing.T) {

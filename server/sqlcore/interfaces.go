@@ -60,6 +60,14 @@ type QueryExecutor interface {
 	LastProfilingOutput() string
 }
 
+// ResultColumnCounter is an optional QueryExecutor capability that determines
+// a statement's result-column count without executing that statement. It is
+// used by protocol layers that must validate per-column result formats before
+// allowing a data-modifying statement to run.
+type ResultColumnCounter interface {
+	ResultColumnCount(ctx context.Context, query string) (int, error)
+}
+
 // SQLLiteralAppender exposes compact, already-validated bound parameters to an
 // executor that must inline them into SQL. AppendBindParameterLiteral writes a
 // single SQL literal directly into dst. Implementations must keep the backing

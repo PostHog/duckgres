@@ -351,6 +351,115 @@ func TestStatementFlightInfoNonEmptyHoldsSessionOperationUntilDoGet(t *testing.T
 	}
 }
 
+func TestStatementDMLReturningExecutesOnceAcrossFlightInfoAndDoGet(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		inTransaction bool
+	}{
+		{name: "autocommit"},
+		{name: "Flight SQL transaction", inTransaction: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := sql.Open("duckdb", "")
+			if err != nil {
+				t.Fatalf("open db: %v", err)
+			}
+			defer func() { _ = db.Close() }()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatalf("open connection: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+			if _, err := conn.ExecContext(ctx, "CREATE TABLE flight_returning_once (id INTEGER, name VARCHAR)"); err != nil {
+				t.Fatalf("create table: %v", err)
+			}
+
+			pool := &SessionPool{sessions: make(map[string]*Session), stopRefresh: make(map[string]func())}
+			session := &Session{
+				ID:       "session-1",
+				Conn:     conn,
+				queries:  make(map[string]*QueryHandle),
+				txns:     make(map[string]*trackedTx),
+				txnOwner: make(map[string]string),
+			}
+			pool.sessions[session.ID] = session
+			handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+			flightCtx := metadata.NewIncomingContext(ctx, metadata.Pairs("x-duckgres-session", session.ID))
+
+			var txnID []byte
+			if tt.inTransaction {
+				txnID, err = handler.BeginTransaction(flightCtx, nil)
+				if err != nil {
+					t.Fatalf("begin transaction: %v", err)
+				}
+			}
+
+			info, err := handler.GetFlightInfoStatement(flightCtx, testStatementQuery{
+				query:         "INSERT INTO flight_returning_once VALUES (1, 'first') RETURNING *",
+				transactionID: txnID,
+			}, &flight.FlightDescriptor{})
+			if err != nil {
+				t.Fatalf("GetFlightInfoStatement: %v", err)
+			}
+			if len(info.Endpoint) != 1 {
+				t.Fatalf("FlightInfo endpoints = %d, want 1", len(info.Endpoint))
+			}
+
+			countRows := func() int {
+				t.Helper()
+				var count int
+				if tt.inTransaction {
+					session.mu.RLock()
+					ttx := session.txns[string(txnID)]
+					session.mu.RUnlock()
+					if ttx == nil || ttx.tx == nil {
+						t.Fatal("transaction disappeared")
+					}
+					if err := ttx.tx.QueryRowContext(ctx, "SELECT count(*) FROM flight_returning_once").Scan(&count); err != nil {
+						t.Fatalf("count transaction rows: %v", err)
+					}
+				} else if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM flight_returning_once").Scan(&count); err != nil {
+					t.Fatalf("count rows: %v", err)
+				}
+				return count
+			}
+			if got := countRows(); got != 0 {
+				t.Fatalf("GetFlightInfo executed DML RETURNING %d times, want 0", got)
+			}
+
+			ticket, err := flightsql.GetStatementQueryTicket(info.Endpoint[0].Ticket)
+			if err != nil {
+				t.Fatalf("decode statement ticket: %v", err)
+			}
+			_, chunks, err := handler.DoGetStatement(flightCtx, testStatementQueryTicket{handle: ticket.GetStatementHandle()})
+			if err != nil {
+				t.Fatalf("DoGetStatement: %v", err)
+			}
+			for chunk := range chunks {
+				if chunk.Err != nil {
+					t.Fatalf("DoGetStatement stream error: %v", chunk.Err)
+				}
+				if chunk.Data != nil {
+					chunk.Data.Release()
+				}
+			}
+			if got := countRows(); got != 1 {
+				t.Fatalf("DML RETURNING executions = %d, want 1", got)
+			}
+
+			if tt.inTransaction {
+				if err := handler.EndTransaction(flightCtx, testEndTransactionRequest{
+					transactionID: txnID,
+					action:        flightsql.EndTransactionCommit,
+				}); err != nil {
+					t.Fatalf("commit transaction: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestHealthCheckBlocksUntilWarmup(t *testing.T) {
 	pool := &SessionPool{
 		sessions:    make(map[string]*Session),

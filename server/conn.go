@@ -85,9 +85,12 @@ type transactionControl struct {
 type preparedStmt struct {
 	query             string
 	convertedQuery    string
+	schemaQuery       string // non-mutating writable-CTE equivalent used only for output metadata
 	transaction       transactionControl
 	paramTypes        []int32
 	numParams         int
+	resultColumnCount int      // exact output cardinality cached without executing a mutation
+	resultCountKnown  bool     // false when output cardinality could not be safely determined
 	isIgnoredSet      bool     // True if this is an ignored SET parameter
 	isNoOp            bool     // True if this is a no-op command (CREATE INDEX, etc.)
 	noOpTag           string   // Command tag for no-op commands
@@ -2029,6 +2032,13 @@ func isDMLReturning(query string) bool {
 	default:
 		return false
 	}
+}
+
+// IsDMLReturning reports whether a query can return rows from DML without
+// executing it. Worker-side schema discovery uses the same classification to
+// select native prepared metadata instead of running the mutation twice.
+func IsDMLReturning(query string) bool {
+	return isDMLReturning(query)
 }
 
 // isWithDML reports whether a query is a WITH (CTE) whose outer statement is

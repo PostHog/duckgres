@@ -59,6 +59,18 @@ func (e *LocalExecutor) Exec(query string, args ...any) (ExecResult, error) {
 	return e.db.Exec(query, args...)
 }
 
+// ResultColumnCount prepares the statement on one pinned connection, so the
+// temporary SQL PREPARE and its metadata lookup share the same DuckDB session.
+func (e *LocalExecutor) ResultColumnCount(ctx context.Context, query string) (int, error) {
+	conn, err := e.db.Conn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	pinned := NewPinnedExecutor(conn, e.db)
+	defer func() { _ = pinned.Close() }()
+	return pinned.ResultColumnCount(ctx, query)
+}
+
 func (e *LocalExecutor) ConnContext(ctx context.Context) (RawConn, error) {
 	return e.db.Conn(ctx)
 }
@@ -117,6 +129,13 @@ func (e *PinnedExecutor) Query(query string, args ...any) (RowSet, error) {
 
 func (e *PinnedExecutor) Exec(query string, args ...any) (ExecResult, error) {
 	return e.conn.ExecContext(context.Background(), query, args...)
+}
+
+// ResultColumnCount determines result metadata through SQL PREPARE without
+// executing the statement. The PinnedExecutor keeps PREPARE, metadata lookup,
+// and DEALLOCATE on the same DuckDB connection.
+func (e *PinnedExecutor) ResultColumnCount(ctx context.Context, query string) (int, error) {
+	return sqlcore.PreparedStatementResultColumnCount(ctx, e, query)
 }
 
 func (e *PinnedExecutor) ConnContext(ctx context.Context) (RawConn, error) {

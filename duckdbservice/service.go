@@ -437,6 +437,19 @@ func (s *Session) queryConnRows(ctx context.Context, query string, args ...any) 
 }
 
 func (s *Session) getQuerySchema(ctx context.Context, query string, tx *sql.Tx) (*arrow.Schema, error) {
+	// A DML RETURNING query is executed by DoGet. Its schema must therefore
+	// come from native prepared-statement metadata, not a QueryContext probe
+	// that would execute the mutation before DoGet. Use the owning connection
+	// even for a Flight SQL transaction so temp objects and transaction-local
+	// state remain visible.
+	if isDMLReturningSchemaQuery(query) {
+		s.connMu.Lock()
+		defer s.connMu.Unlock()
+		if s.Conn == nil {
+			return nil, errSessionClosed
+		}
+		return preparedDMLReturningSchema(ctx, s.Conn, query)
+	}
 	if tx != nil {
 		s.connMu.Lock()
 		defer s.connMu.Unlock()

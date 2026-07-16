@@ -149,13 +149,14 @@ func (c *clientConn) handleParse(body []byte) {
 		// Count $N parameters with a simple regex (pg_query.Parse may fail on DuckDB-native SQL)
 		paramCount := countDollarParams(query)
 		delete(c.stmts, stmtName)
-		c.stmts[stmtName] = &preparedStmt{
+		ps := &preparedStmt{
 			query:          query,
 			convertedQuery: query, // No transpilation
 			transaction:    transaction,
 			paramTypes:     paramTypes,
 			numParams:      paramCount,
 		}
+		c.stmts[stmtName] = ps
 		_ = wire.WriteParseComplete(c.writer)
 		return
 	}
@@ -187,9 +188,10 @@ func (c *clientConn) handleParse(body []byte) {
 	// Close existing statement with same name
 	delete(c.stmts, stmtName)
 
-	c.stmts[stmtName] = &preparedStmt{
+	ps := &preparedStmt{
 		query:             query,                            // Keep original for logging and Describe
 		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
+		schemaQuery:       c.rewriteDirectQuery(result.SchemaQuery),
 		transaction:       transaction,
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
@@ -201,6 +203,7 @@ func (c *clientConn) handleParse(body []byte) {
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
+	c.stmts[stmtName] = ps
 
 	c.logger().Debug("Prepared statement.", "name", stmtName, "query", usersecrets.RedactForLog(query))
 	if len(result.Statements) > 0 {
@@ -592,6 +595,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 		c.finishPortal(p, portalStateDone, "terminal_success")
 	}()
+	if !c.revalidatePortalResultFormatsBeforeExecute(p) {
+		return
+	}
 
 	// Redacted form for everything observable (pg_stat_activity, spans,
 	// logs): CREATE SECRET option lists carry credential material.
@@ -1167,6 +1173,13 @@ func (c *clientConn) handleBind(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid Bind message: trailing data")
 		return
 	}
+	// A wildcard RETURNING list and a rewritten writable CTE can change shape
+	// after Parse (for example, after ALTER TABLE). Refresh their metadata
+	// before accepting a per-column format vector so a stale cache cannot let a
+	// malformed Bind reach a mutation.
+	if len(resultFormats) > 1 {
+		c.refreshSchemaDependentResultColumnCount(ps)
+	}
 	// For ordinary read-only queries, a multi-code result-format vector is
 	// validated once their row metadata is available during Describe or Execute.
 	// DML RETURNING and transpiled multi-statement writes cannot safely be
@@ -1224,6 +1237,116 @@ func (c *clientConn) handleBind(body []byte) {
 	_ = wire.WriteBindComplete(c.writer)
 }
 
+// cachePreparedStmtResultColumnCount records the exact output arity for the
+// mutation shapes whose row metadata cannot safely be discovered at Execute.
+// DuckDB SQL PREPARE binds and plans the supplied query but does not run it;
+// the optional executor capability exposes that prepared-statement metadata.
+//
+// Ordinary SELECTs intentionally keep their existing deferred validation at
+// Describe/Execute. A client may use zero or one result-format code for every
+// statement, so only multi-code Bind vectors rely on this cache.
+func (c *clientConn) cachePreparedStmtResultColumnCount(ps *preparedStmt) {
+	if ps == nil || (!isDMLReturning(ps.query) && len(ps.statements) == 0) {
+		return
+	}
+
+	// A rewritten writable CTE that ends in a command rather than a row-returning
+	// statement has zero output columns. Record that directly rather than asking
+	// DuckDB to prepare a schema query that would report command metadata.
+	if len(ps.statements) > 0 {
+		finalStatement := ps.statements[len(ps.statements)-1]
+		if !queryReturnsResults(finalStatement) {
+			ps.resultColumnCount = 0
+			ps.resultCountKnown = true
+			return
+		}
+	}
+
+	// An explicit top-level RETURNING list is exact without contacting the
+	// backend. Retaining this fast path also preserves callers that construct a
+	// preparedStmt directly in unit tests.
+	if len(ps.statements) == 0 {
+		if columns, known := explicitDMLReturningColumnCount(ps.query); known {
+			ps.resultColumnCount = columns
+			ps.resultCountKnown = true
+			return
+		}
+	}
+
+	// Never turn a multi-statement Parse input into a PREPARE command by string
+	// concatenation. The cached schema query for writable CTEs is generated from
+	// one parsed AST; direct DML uses its already-transpiled single statement.
+	if !isSingleParsedStatement(ps.query) {
+		return
+	}
+	schemaQuery := ps.schemaQuery
+	if schemaQuery == "" {
+		schemaQuery = ps.convertedQuery
+	}
+	if strings.TrimSpace(schemaQuery) == "" {
+		return
+	}
+
+	counter, ok := c.executor.(sqlcore.ResultColumnCounter)
+	if !ok {
+		return
+	}
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	columns, err := counter.ResultColumnCount(ctx, schemaQuery)
+	if err != nil || columns < 0 {
+		return
+	}
+	ps.resultColumnCount = columns
+	ps.resultCountKnown = true
+}
+
+// refreshSchemaDependentResultColumnCount discards Parse-time metadata whose
+// cardinality can change with the schema, then safely re-derives it at Bind.
+// An explicit top-level RETURNING list has a fixed cardinality and does not
+// need a backend round trip. This is called only for multi-code result-format
+// vectors; zero and one format code are valid regardless of output arity.
+func (c *clientConn) refreshSchemaDependentResultColumnCount(ps *preparedStmt) {
+	if ps == nil {
+		return
+	}
+	if len(ps.statements) == 0 {
+		if !isDMLReturning(ps.query) {
+			return
+		}
+		if _, explicit := explicitDMLReturningColumnCount(ps.query); explicit {
+			return
+		}
+	}
+
+	ps.resultColumnCount = 0
+	ps.resultCountKnown = false
+	c.cachePreparedStmtResultColumnCount(ps)
+}
+
+// revalidatePortalResultFormatsBeforeExecute closes the small schema-change
+// window between Bind and Execute. A per-column vector that was valid at Bind
+// can become invalid after ALTER TABLE; refresh only the mutation shapes whose
+// cardinality depends on schema, then reject before any setup or DML runs.
+func (c *clientConn) revalidatePortalResultFormatsBeforeExecute(p *portal) bool {
+	if p == nil || p.stmt == nil || len(p.resultFormats) <= 1 {
+		return true
+	}
+	c.refreshSchemaDependentResultColumnCount(p.stmt)
+	if bindResultFormatCountSafeBeforeExecute(p.stmt, len(p.resultFormats)) {
+		return true
+	}
+	c.sendError("ERROR", "08P01", "invalid result format count in Bind message")
+	return false
+}
+
+func isSingleParsedStatement(query string) bool {
+	tree, err := pg_query.Parse(query)
+	return err == nil && len(tree.Stmts) == 1 && tree.Stmts[0] != nil && tree.Stmts[0].Stmt != nil
+}
+
 // bindResultFormatCountSafeBeforeExecute reports whether a Bind result-format
 // vector can be accepted without risking execution of a mutation merely to
 // learn its result-column count. PostgreSQL allows zero formats, one format,
@@ -1251,13 +1374,15 @@ func bindResultFormatCountSafeBeforeExecute(ps *preparedStmt, formats int) bool 
 	if isExplainStmt(ps.query) {
 		return false
 	}
-	// Writable-CTE rewrites run setup writes before their final result query.
-	// Their output cardinality is not safely knowable at Bind time, so reject a
-	// multi-code vector rather than run the setup and discover it too late.
 	if len(ps.statements) > 0 {
-		return false
+		return ps.resultCountKnown && formats == ps.resultColumnCount
 	}
 	if isDMLReturning(ps.query) {
+		if ps.resultCountKnown {
+			return formats == ps.resultColumnCount
+		}
+		// Keep the explicit-list fallback for manually assembled preparedStmt
+		// fixtures and executors that do not expose prepared metadata.
 		columns, known := explicitDMLReturningColumnCount(ps.query)
 		return known && formats == columns
 	}
