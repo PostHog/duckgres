@@ -566,20 +566,18 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.sendError("ERROR", "55000", fmt.Sprintf("portal %q is not executable", portalName))
 		return
 	}
-	// A normal Execute is terminal. Preserve the existing maxRows behavior
-	// until PortalSuspended gets a dedicated implementation: limited executions
-	// keep their portal executable and retain its Bind payload.
-	terminalExecute := maxRows == 0
+	// Failed Execute calls are terminal. Preserve the existing successful
+	// maxRows behavior until PortalSuspended gets a dedicated implementation:
+	// only successful limited executions keep their portal and Bind payload.
 	errorsBeforeExecute := c.errorResponsesSent
 	defer func() {
-		if !terminalExecute {
-			return
-		}
 		if c.errorResponsesSent != errorsBeforeExecute {
 			c.finishPortal(p, portalStateFailed, "terminal_failure")
 			return
 		}
-		c.finishPortal(p, portalStateDone, "terminal_success")
+		if maxRows <= 0 {
+			c.finishPortal(p, portalStateDone, "terminal_success")
+		}
 	}()
 
 	// Redacted form for everything observable (pg_stat_activity, spans,

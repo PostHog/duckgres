@@ -516,6 +516,96 @@ func TestPortalLifecycleMaxRowsKeepsLegacyReadyPortal(t *testing.T) {
 	}
 }
 
+func TestPortalLifecycleFailedLimitedExecuteReleasesPortal(t *testing.T) {
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+	var out bytes.Buffer
+	c.writer = bufio.NewWriter(&out)
+	executor := &lifecycleExecutor{execErr: errors.New("worker is unavailable")}
+	c.executor = executor
+	c.stmts["insert"] = &preparedStmt{
+		query:          "INSERT INTO t VALUES ($1)",
+		convertedQuery: "INSERT INTO t VALUES (?)",
+		numParams:      1,
+	}
+	p := bindPortalForTest(t, c, "failed-limited", "insert", []int16{0}, []bindTestValue{{data: []byte("value")}}, []int16{0})
+	if p.params == nil || p.paramFormats == nil || p.resultFormats == nil {
+		t.Fatal("test setup did not retain every Bind-owned descriptor")
+	}
+
+	out.Reset()
+	c.handleExecute(executeTestBodyWithMaxRows("failed-limited", 1))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush limited Execute: %v", err)
+	}
+	if got := frameTypes(scanWireFrames(t, out.Bytes())); !strings.Contains(got, string(wire.MsgErrorResponse)) {
+		t.Fatalf("limited Execute response frames = %q, want ErrorResponse", got)
+	}
+	if p.state != portalStateFailed {
+		t.Errorf("limited failed Execute state = %v, want failed", p.state)
+	}
+	if p.stmt != nil {
+		t.Errorf("limited failed Execute retained prepared statement %p", p.stmt)
+	}
+
+	out.Reset()
+	c.handleExecute(executeTestBodyWithMaxRows("failed-limited", 1))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush repeated limited Execute: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("55000")) {
+		t.Errorf("repeated failed limited Execute response = %q, want 55000", out.Bytes())
+	}
+	if got := executor.execCalls.Load(); got != 1 {
+		t.Errorf("failed limited Execute calls = %d, want 1", got)
+	}
+	requireReleasedBindPayload(t, p)
+}
+
+func TestPortalLifecycleNegativeMaxRowsIsUnlimitedAndTerminal(t *testing.T) {
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+	var out bytes.Buffer
+	c.writer = bufio.NewWriter(&out)
+	executor := &lifecycleExecutor{
+		queryRows: &streamingRowSet{
+			cols:      []string{"value"},
+			colTypers: []ColumnTyper{stringColumnTyper{}},
+			rows:      [][]any{{"one"}, {"two"}},
+		},
+	}
+	c.executor = executor
+	c.stmts["select"] = &preparedStmt{
+		query:          "SELECT $1",
+		convertedQuery: "SELECT ?",
+		numParams:      1,
+	}
+	p := bindPortalForTest(t, c, "negative", "select", []int16{0}, []bindTestValue{{data: []byte("value")}}, []int16{0})
+	if p.params == nil || p.paramFormats == nil || p.resultFormats == nil {
+		t.Fatal("test setup did not retain every Bind-owned descriptor")
+	}
+
+	out.Reset()
+	c.handleExecute(executeTestBodyWithMaxRows("negative", -1))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush negative maxRows Execute: %v", err)
+	}
+	frames := scanWireFrames(t, out.Bytes())
+	if got := strings.Count(frameTypes(frames), string(wire.MsgDataRow)); got != 2 {
+		t.Errorf("negative maxRows DataRow count = %d, want 2", got)
+	}
+	if got := frameTypes(frames); !strings.Contains(got, string(wire.MsgCommandComplete)) {
+		t.Errorf("negative maxRows response frames = %q, want CommandComplete", got)
+	}
+	if p.state != portalStateDone {
+		t.Errorf("negative maxRows Execute state = %v, want done", p.state)
+	}
+	if p.stmt != nil {
+		t.Errorf("negative maxRows Execute retained prepared statement %p", p.stmt)
+	}
+	requireReleasedBindPayload(t, p)
+}
+
 func TestPortalLifecycleSimpleQueryDropsUnnamedPortal(t *testing.T) {
 	c, cleanup := newLifecycleClientConn(t)
 	defer cleanup()
