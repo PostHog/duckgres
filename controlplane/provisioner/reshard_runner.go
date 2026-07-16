@@ -1404,6 +1404,8 @@ func (o *opRun) rollback(ctx context.Context) {
 			if err := o.r.duckling.SetMetadataStoreCnpg(ctx, o.op.DucklingName, o.op.FromShard); err != nil {
 				o.logf("error", "rollback flip failed: %v — duckling still points at %s; fix manually", err, o.op.ToShard)
 				recovered = false
+			} else if !o.waitForRollbackSourceConvergence(ctx) {
+				recovered = false
 			}
 			o.dropPartialTarget(ctx)
 		case o.op.TargetKind == configstore.MetadataStoreKindCnpgShard && o.op.SourceKind == configstore.MetadataStoreKindExternal:
@@ -1425,6 +1427,8 @@ func (o *opRun) rollback(ctx context.Context) {
 				Database:          o.op.SourceDatabase,
 			}); err != nil {
 				o.logf("error", "rollback flip failed: %v — duckling still points at cnpg %s; fix manually", err, o.op.ToShard)
+				recovered = false
+			} else if !o.waitForRollbackSourceConvergence(ctx) {
 				recovered = false
 			}
 			o.dropPartialTarget(ctx)
@@ -1453,7 +1457,14 @@ func (o *opRun) rollback(ctx context.Context) {
 		}
 	}
 
-	o.restoreCompaction(ctx)
+	if recovered {
+		o.restoreCompaction(ctx)
+	} else if o.compactionPaused {
+		// The Duckling may still route independent compaction work to the
+		// failed target. Keep the source quiescent until an operator repairs
+		// the composition/catalog and has separately verified recovery.
+		o.logf("error", "leaving compaction paused because rollback source recovery did not converge; do not re-enable it until Duckling identifies the source and a tenant probe succeeds")
+	}
 
 	if o.blocked && recovered {
 		if err := o.r.store.UpdateWarehouseState(o.op.OrgID, configstore.ManagedWarehouseStateResharding, map[string]interface{}{
@@ -1484,6 +1495,130 @@ func (o *opRun) dropPartialTarget(ctx context.Context) {
 	}
 }
 
+// waitForRollbackSourceConvergence is the common safety gate after every
+// successful rollback metadata-store patch. A Kubernetes PATCH acknowledgement
+// only proves that the desired spec was accepted; it does not prove that the
+// Duckling composition/status or the worker activation configuration have
+// stopped referring to the failed target. Do not readmit traffic until the
+// live status identifies the recorded source, reports Ready=True, and its
+// tenant role answers a fresh probe.
+//
+// rollback deliberately passes a context.WithoutCancel context here: once a
+// cutover needs recovery, a user cancellation must not bypass recovery and
+// expose the failed target. The per-operation cutover timeout remains the hard
+// bound, including each Get/Probe attempt, so an unavailable source cannot
+// leave a runner waiting forever.
+func (o *opRun) waitForRollbackSourceConvergence(ctx context.Context) bool {
+	want := describeSource(o.op)
+	o.logf("info", "recovery: waiting up to %s for Duckling status to identify the recorded source metadata store (%s), become Ready, and for the tenant role to answer", o.flipTimeout(), want)
+
+	deadline := time.Now().Add(o.flipTimeout())
+	lastLog := time.Time{}
+	lastObserved := "no successful Duckling status read yet"
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			o.logf("error", "recovery: source metadata store did not converge within %s — org stays blocked; investigate the Duckling spec/status and source catalog; last observation: %s", o.flipTimeout(), lastObserved)
+			return false
+		}
+
+		// Bound reads and probes by the remaining recovery window. The parent
+		// context is intentionally cancellation-free (see above), not
+		// unbounded.
+		attemptCtx, cancel := context.WithTimeout(ctx, remaining)
+		st, err := o.r.duckling.Get(attemptCtx, o.op.DucklingName)
+		switch {
+		case err != nil:
+			lastObserved = fmt.Sprintf("reading Duckling failed: %v", err)
+		case st == nil:
+			lastObserved = "Duckling returned an empty status"
+		default:
+			if observation, matches := o.rollbackSourceStatusMatches(st); !matches {
+				lastObserved = observation
+			} else {
+				restored := CatalogEndpoint{
+					Host: st.MetadataStore.Endpoint, Port: 5432,
+					User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
+					SSLMode: sslModeFor(o.op.SourceKind),
+				}
+				if probeErr := o.r.copier.Probe(attemptCtx, restored); probeErr != nil {
+					lastObserved = "Duckling identifies the recorded source " + st.MetadataStore.Endpoint + " (Ready), " + describeProbeFailure(probeErr, st.MetadataStore.User)
+				} else {
+					cancel()
+					o.source = restored
+					o.logf("info", "recovery complete: Duckling status identifies the recorded source %s (Ready) and the tenant role answers", st.MetadataStore.Endpoint)
+					return true
+				}
+			}
+		}
+		cancel()
+
+		if time.Since(lastLog) >= o.r.progressLogInterval {
+			o.logf("info", "recovery: waiting for recorded source metadata store: %s", lastObserved)
+			lastLog = time.Now()
+		}
+		if sleep := minDuration(o.r.loopPoll, time.Until(deadline)); sleep > 0 {
+			time.Sleep(sleep)
+		}
+	}
+}
+
+// rollbackSourceStatusMatches reports whether Duckling's live status names
+// the source recorded before the cutover, and is ready to supply tenant
+// credentials for a probe. The exact endpoint is durable for all new ops. The
+// cnpg shard-prefix fallback only supports legacy rows that predate durable
+// source_endpoint recording; an external source without an endpoint can never
+// be proven safe and remains blocked.
+func (o *opRun) rollbackSourceStatusMatches(st *DucklingStatus) (string, bool) {
+	ms := st.MetadataStore
+	if ms.Type != o.op.SourceKind {
+		return fmt.Sprintf("duckling type %q, endpoint %q, ready=%t (waiting for recorded source type %q)", ms.Type, ms.Endpoint, st.ReadyCondition, o.op.SourceKind), false
+	}
+
+	expectedEndpoint := o.op.SourceEndpoint
+	if expectedEndpoint == "" {
+		expectedEndpoint = o.source.Host
+	}
+	switch {
+	case expectedEndpoint != "" && ms.Endpoint != expectedEndpoint:
+		return fmt.Sprintf("duckling endpoint %q, ready=%t (waiting for recorded source endpoint %q)", ms.Endpoint, st.ReadyCondition, expectedEndpoint), false
+	case expectedEndpoint == "" && o.op.SourceKind == configstore.MetadataStoreKindCnpgShard && isValidCnpgShardName(o.op.FromShard):
+		prefix := o.op.FromShard + "-pooler."
+		if !strings.HasPrefix(ms.Endpoint, prefix) {
+			return fmt.Sprintf("duckling endpoint %q, ready=%t (waiting for recorded source shard %s*)", ms.Endpoint, st.ReadyCondition, prefix), false
+		}
+	case expectedEndpoint == "":
+		return fmt.Sprintf("recorded source endpoint is empty for source type %q; cannot prove Duckling status endpoint %q is the source", o.op.SourceKind, ms.Endpoint), false
+	}
+	if o.op.SourceUser != "" && ms.User != o.op.SourceUser {
+		return fmt.Sprintf("Duckling source user %q, ready=%t (waiting for recorded source user %q)", ms.User, st.ReadyCondition, o.op.SourceUser), false
+	}
+	if o.op.SourceDatabase != "" && ms.Database != o.op.SourceDatabase {
+		return fmt.Sprintf("Duckling source database %q, ready=%t (waiting for recorded source database %q)", ms.Database, st.ReadyCondition, o.op.SourceDatabase), false
+	}
+	if !st.ReadyCondition {
+		observation := fmt.Sprintf("Duckling identifies recorded source %q but Ready=False", ms.Endpoint)
+		if st.SyncedFalseMessage != "" {
+			observation += "; Duckling Synced=False: " + st.SyncedFalseMessage
+		}
+		if st.ReadyFalseMessage != "" {
+			observation += "; Duckling Ready=False: " + st.ReadyFalseMessage
+		}
+		return observation, false
+	}
+	if ms.User == "" || ms.Database == "" || ms.Password == "" {
+		return fmt.Sprintf("Duckling identifies recorded source %q (Ready) but tenant credentials are incomplete (user set=%t database set=%t password set=%t)", ms.Endpoint, ms.User != "", ms.Database != "", ms.Password != ""), false
+	}
+	return "", true
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // recoverFromExternal handles the cnpg→ext post-flip rollback: the external
 // target never became Ready, or the external-catalog verify failed. Because the
 // orphan step retained the cnpg source, the role/DB are STILL PRESENT on the
@@ -1506,57 +1641,7 @@ func (o *opRun) recoverFromExternal(ctx context.Context) bool {
 		return false
 	}
 
-	// Wait for the composition to re-adopt the role/DB on the source shard and
-	// the tenant role to answer again. NEVER silently: this loop logs what it
-	// observes every progressLogInterval — a recovery that spins on a failing
-	// probe (e.g. SASL auth failures from a stranded re-adopted-role password,
-	// the mw-dev incident) must be diagnosable from the op log alone, and the
-	// terminal timeout line must carry the last observation (the root cause).
-	// An auth probe failure is effectively permanent, but we still poll to the
-	// deadline rather than bail: a charts/composition fix can converge the
-	// password mid-wait, and giving up early would leave the org worse off.
-	sourcePrefix := o.op.FromShard + "-pooler."
-	o.logf("info", "recovery: waiting up to %s for the composition to re-adopt the cnpg role/DB on %s* and for the tenant role to answer", o.flipTimeout(), sourcePrefix)
-	deadline := time.Now().Add(o.flipTimeout())
-	lastLog := time.Time{}
-	lastObserved := "no successful duckling read yet"
-	for {
-		if time.Now().After(deadline) {
-			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s); last observation: %s", o.flipTimeout(), o.op.FromShard, lastObserved)
-			return false
-		}
-		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
-		switch {
-		case err != nil:
-			lastObserved = fmt.Sprintf("reading duckling failed: %v", err)
-		case !strings.HasPrefix(st.MetadataStore.Endpoint, sourcePrefix) || !st.ReadyCondition:
-			lastObserved = fmt.Sprintf("duckling endpoint %q, ready=%t (waiting for %s*)", st.MetadataStore.Endpoint, st.ReadyCondition, sourcePrefix)
-			if st.SyncedFalseMessage != "" {
-				lastObserved += "; duckling Synced=False: " + st.SyncedFalseMessage
-			}
-		default:
-			restored := CatalogEndpoint{
-				Host: st.MetadataStore.Endpoint, Port: 5432,
-				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
-				// The flip-back re-adopts the cnpg source (this recovery only
-				// runs for cnpg→ext ops), so the probe goes via the pooler.
-				SSLMode: sslModeFor(o.op.SourceKind),
-			}
-			probeErr := o.r.copier.Probe(ctx, restored)
-			if probeErr == nil {
-				o.logf("info", "recovery complete: duckling re-adopted the orphaned cnpg role/DB on %s and the tenant role answers — no data was copied back (the catalog never left the source)", o.op.FromShard)
-				return true
-			}
-			// describeProbeFailure names an auth failure explicitly (stranded
-			// re-adopted-role password) with the manual ALTER ROLE remedy.
-			lastObserved = "duckling converged on " + st.MetadataStore.Endpoint + " (Ready), " + describeProbeFailure(probeErr, st.MetadataStore.User)
-		}
-		if time.Since(lastLog) >= o.r.progressLogInterval {
-			o.logf("info", "recovery: waiting for the source shard: %s", lastObserved)
-			lastLog = time.Now()
-		}
-		time.Sleep(o.r.loopPoll)
-	}
+	return o.waitForRollbackSourceConvergence(ctx)
 }
 
 // report writes the end-of-op report to the log — also on failure/cancel.

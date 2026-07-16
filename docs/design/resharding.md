@@ -461,11 +461,11 @@ recovery (which stranded the tenant with an empty catalog when the copy-back
 also failed, the prod-shaped data-loss incident this change fixes) and avoids
 the `2BP01` "role can't drop while its DB exists" wedge the coupled delete hit.
 
-Every wait loop in the runner (drain, flip converge, orphan-policy wait, this
-recovery) announces its deadline on entry and logs what it observes every ~15s
-(duckling endpoint/Ready state, classified probe errors), and its timeout
-error/log line carries the LAST observation — a stuck reshard is diagnosable
-from the op log alone. One recovery failure mode deserves naming: the
+Every wait loop in the runner (drain, flip converge, orphan-policy wait, and
+rollback recovery) announces its deadline on entry and logs what it observes
+every ~15s (duckling type/endpoint/Ready state, classified probe errors), and
+its timeout error/log line carries the LAST observation — a stuck reshard is
+diagnosable from the op log alone. One recovery failure mode deserves naming: the
 re-adopted role's ACTUAL Postgres password can differ from the freshly
 regenerated status password (a **stranded password** — the probe fails with
 `FATAL: SASL authentication failed` / SQLSTATE 28P01 until the composition
@@ -496,6 +496,19 @@ never appear in the op log.
   prod incident's rollback failed exactly that way. The submit-time
   source-identity validation makes such ops unrepresentable going forward;
   this guard covers pre-guard rows and drift after creation.
+- **A successful rollback PATCH is not recovery.** After every reverse
+  metadata-store patch (cnpg→cnpg, ext→cnpg, and cnpg→ext's re-adopt patch),
+  the warehouse stays in `resharding` until Duckling status reports the
+  recorded source kind/endpoint/user/database, `Ready=True`, and a fresh
+  tenant-credential `SELECT 1` probe succeeds against that source. This closes
+  the asynchronous spec/status window where the PATCH succeeded but worker
+  activation still saw the failed target. A timeout, missing credentials, or
+  failed probe logs periodic and terminal observations and deliberately leaves
+  the warehouse blocked with compaction still paused, so independent catalog
+  writers cannot use an unverified source/target. The recovery wait
+  intentionally does not re-honor the cancellation that triggered rollback;
+  its per-operation cutover timeout is the bound that prevents an unsafe
+  immediate unblock.
 - Takeover-resume reconstructs `o.source`/`o.target` from the durable op row +
   live duckling status with each side's **sslmode derived from its
   metadata-store kind** (`sslModeFor`: cnpg pooler → `disable`, external RDS →
@@ -528,16 +541,16 @@ never appear in the op log.
   prove a step completed flip a flag) and every rollback action is idempotent, so
   a takeover rolls back identically to the original runner.
 - An org is never stranded: every failure path restores `resharding→ready`
-  (or logs at ERROR if it can't — that's the page-someone signal) — with ONE
-  deliberate carve-out: when the duckling is known to point at the WRONG
-  store and rollback cannot repair it (an invalid/incomplete recorded source
-  identity, or a flip-back that failed), the warehouse stays BLOCKED in
-  `resharding`. Unblocking would let clients activate against the wrong
-  (likely empty) catalog — worse than a blocked org: the prod incident
-  unblocked after a failed rollback and clients landed on an empty catalog.
-  The ERROR log carries the manual repair steps (verify where the catalog
-  actually lives, patch `spec.metadataStore`, verify activation, then set the
-  warehouse ready).
+  (or logs at ERROR if it can't — that's the page-someone signal) — with
+  deliberate safety carve-outs: when the duckling is known to point at the
+  WRONG store and rollback cannot repair it (an invalid/incomplete recorded
+  source identity, a flip-back that failed, or a successful flip-back whose
+  status/probe never converges), the warehouse stays BLOCKED in `resharding`.
+  Unblocking would let clients activate against the wrong (likely empty)
+  catalog — worse than a blocked org: the prod incident unblocked after a
+  failed rollback and clients landed on an empty catalog. The ERROR log
+  carries the manual repair steps (verify where the catalog actually lives,
+  patch `spec.metadataStore`, verify activation, then set the warehouse ready).
 
 ## Testing
 

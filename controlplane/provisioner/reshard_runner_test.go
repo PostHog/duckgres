@@ -839,6 +839,176 @@ func TestReshardFlipTimeoutRollsBackShardValue(t *testing.T) {
 	}
 }
 
+// rollbackPatchPendingDuckling accepts the forward and rollback spec patches,
+// but holds status at the target after the rollback patch. This models the
+// asynchronous Duckling composition window that can otherwise admit a worker
+// against the failed target immediately after rollback.
+type rollbackPatchPendingDuckling struct {
+	*fakeDuckling
+}
+
+func (s *rollbackPatchPendingDuckling) SetMetadataStoreCnpg(ctx context.Context, name, shard string) error {
+	if shard != "shard-001" {
+		return s.fakeDuckling.SetMetadataStoreCnpg(ctx, name, shard)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, ducklingCall{kind: "cnpg", shard: shard})
+	return nil // Spec patch accepted, but status still identifies shard-002.
+}
+
+// TestReshardRollbackWaitsForDucklingStatusBeforeUnblocking pins the safety
+// boundary exposed by the bogus-shard e2e: a successful rollback PATCH alone
+// is not recovery. Until Duckling status reports the recorded source as Ready
+// (and its tenant catalog can be probed), traffic must remain blocked.
+func TestReshardRollbackWaitsForDucklingStatusBeforeUnblocking(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &rollbackPatchPendingDuckling{fakeDuckling: &fakeDuckling{status: cnpgSourceStatus()}}
+	copier := &fakeCopier{copyErr: errors.New("copy failed after cutover")}
+	r := testRunner(store, duckling, copier)
+	r.flipTimeout = 50 * time.Millisecond
+
+	runOp(t, r, store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s, want failed", store.op.State)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want resharding while rollback status remains on the target", store.warehouseState)
+	}
+	if store.op.UnblockedAt != nil {
+		t.Fatalf("unblocked_at = %v, want nil before Duckling reports the source ready", store.op.UnblockedAt)
+	}
+	if !store.hasLog("recovery: waiting up to") {
+		t.Fatalf("recovery wait announcement missing: %v", store.logs)
+	}
+	terminal := store.findLog("recovery: source metadata store did not converge within")
+	if terminal == "" || !strings.Contains(terminal, "shard-002-pooler") {
+		t.Fatalf("recovery terminal diagnostic = %q, want target-status observation", terminal)
+	}
+	var compactionPatches int
+	for _, call := range duckling.calls {
+		if call.kind == "compaction" {
+			compactionPatches++
+		}
+	}
+	if compactionPatches != 1 {
+		t.Fatalf("compaction patches = %d, want only the initial pause while source recovery remains unverified", compactionPatches)
+	}
+}
+
+// rollbackExternalPatchWrongSourceDuckling accepts the rollback patch but
+// reports a different Ready external catalog. Type+Ready alone must never be
+// treated as recovery: the status must identify the recorded source endpoint.
+type rollbackExternalPatchWrongSourceDuckling struct {
+	*fakeDuckling
+}
+
+func (s *rollbackExternalPatchWrongSourceDuckling) SetMetadataStoreExternal(_ context.Context, _ string, ext ExternalMetadataStoreSpec) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, ducklingCall{kind: "external", ext: ext})
+	s.status.MetadataStore.Type = configstore.MetadataStoreKindExternal
+	s.status.MetadataStore.Endpoint = "wrong-source.example.rds.amazonaws.com"
+	s.status.MetadataStore.User = ext.User
+	s.status.MetadataStore.Database = ext.Database
+	s.status.MetadataStore.Password = "wrong-source-password"
+	s.status.ReadyCondition = true
+	return nil
+}
+
+// TestReshardExternalRollbackWaitsForRecordedSource confirms the same gate is
+// used for external→cnpg rollback. A Ready external status for a different
+// endpoint is not the catalog this operation recorded before the cutover.
+func TestReshardExternalRollbackWaitsForRecordedSource(t *testing.T) {
+	op := cnpgOp()
+	op.SourceKind = configstore.MetadataStoreKindExternal
+	op.FromShard = ""
+	op.SourceEndpoint = "source.example.rds.amazonaws.com"
+	op.SourceUser = "postgres"
+	op.SourceDatabase = "postgres"
+	op.SourcePasswordSecret = "source-secret"
+	store := newFakeReshardStore(op)
+
+	var source DucklingStatus
+	source.MetadataStore.Type = configstore.MetadataStoreKindExternal
+	source.MetadataStore.Endpoint = op.SourceEndpoint
+	source.MetadataStore.User = op.SourceUser
+	source.MetadataStore.Database = op.SourceDatabase
+	source.MetadataStore.Password = "source-password"
+	source.DataStore.BucketName = "org-a-data-bucket"
+	source.DataStore.S3Region = "us-east-1"
+	source.IAMRoleARN = "arn:aws:iam::123:role/duckling-org-a"
+	source.ReadyCondition = true
+	duckling := &rollbackExternalPatchWrongSourceDuckling{fakeDuckling: &fakeDuckling{status: source}}
+	copier := &fakeCopier{copyErr: errors.New("copy failed after cutover")}
+	r := testRunner(store, duckling, copier)
+	r.flipTimeout = 50 * time.Millisecond
+
+	runOp(t, r, store)
+
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want resharding while external rollback reports the wrong source", store.warehouseState)
+	}
+	if store.op.UnblockedAt != nil {
+		t.Fatalf("unblocked_at = %v, want nil before the recorded external source converges", store.op.UnblockedAt)
+	}
+	terminal := store.findLog("recovery: source metadata store did not converge within")
+	if terminal == "" || !strings.Contains(terminal, "wrong-source.example.rds.amazonaws.com") {
+		t.Fatalf("recovery terminal diagnostic = %q, want wrong-source observation", terminal)
+	}
+}
+
+// TestReshardExternalRollbackConvergesBeforeUnblocking covers the successful
+// external→cnpg reverse patch. The common recovery gate must accept the
+// recorded external source only after it is Ready and its live status
+// credentials answer a TLS probe.
+func TestReshardExternalRollbackConvergesBeforeUnblocking(t *testing.T) {
+	op := cnpgOp()
+	op.SourceKind = configstore.MetadataStoreKindExternal
+	op.FromShard = ""
+	op.SourceEndpoint = "source.example.rds.amazonaws.com"
+	op.SourceUser = "postgres"
+	op.SourceDatabase = "postgres"
+	op.SourcePasswordSecret = "source-secret"
+	store := newFakeReshardStore(op)
+
+	var source DucklingStatus
+	source.MetadataStore.Type = configstore.MetadataStoreKindExternal
+	source.MetadataStore.Endpoint = op.SourceEndpoint
+	source.MetadataStore.User = op.SourceUser
+	source.MetadataStore.Database = op.SourceDatabase
+	source.MetadataStore.Password = "source-password"
+	source.DataStore.BucketName = "org-a-data-bucket"
+	source.DataStore.S3Region = "us-east-1"
+	source.IAMRoleARN = "arn:aws:iam::123:role/duckling-org-a"
+	source.ReadyCondition = true
+	duckling := &fakeDuckling{status: source}
+	copier := &fakeCopier{copyErr: errors.New("copy failed after cutover")}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after external source recovery", store.warehouseState)
+	}
+	if !containsStr(duckling.callKinds(), "external") {
+		t.Fatalf("external rollback patch missing: %v", duckling.callKinds())
+	}
+	var lastProbe *copierCall
+	for i := range copier.calls {
+		if copier.calls[i].kind == "probe" {
+			lastProbe = &copier.calls[i]
+		}
+	}
+	if lastProbe == nil {
+		t.Fatalf("rollback source probe missing: %v", copier.kinds())
+	}
+	if lastProbe.target.Host != op.SourceEndpoint || lastProbe.target.SSLMode != "require" || lastProbe.target.Password != "ext-pw" {
+		t.Fatalf("rollback source probe = %+v, want live external source credentials over TLS", lastProbe.target)
+	}
+}
+
 // stuckCnpgDuckling records patches but never converges the status.
 type stuckCnpgDuckling struct {
 	*fakeDuckling
@@ -1893,7 +2063,7 @@ func TestReshardExtRecoveryProbeAuthFailureDiagnosed(t *testing.T) {
 		t.Fatalf("stranded-password condition/remedy missing from the periodic observations: %v", store.logs)
 	}
 	// (c) The terminal recovery-timeout line carries the last observation.
-	terminal := store.findLog("recovery: source shard did not become ready within")
+	terminal := store.findLog("recovery: source metadata store did not converge within")
 	if terminal == "" {
 		t.Fatalf("recovery timeout line missing: %v", store.logs)
 	}

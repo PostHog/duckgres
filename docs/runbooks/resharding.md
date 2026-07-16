@@ -51,5 +51,14 @@ can activate against the real catalog, and only then set the warehouse state
 back to `ready`. Never unblock first — clients would activate against the
 wrong (likely empty) catalog.
 
+The same blocked state is deliberate after an accepted rollback patch when
+Duckling status still names the failed target, is not Ready, does not identify
+the recorded source, or the source tenant-role probe does not answer. The
+runner logs periodic observations and a terminal one with the last status or
+probe error. Repair the Duckling composition/source catalog, then confirm the
+status and a tenant activation both use the intended source before setting the
+warehouse back to `ready`. Compaction intentionally remains paused in this
+state; do not re-enable it until that recovery check succeeds.
+
 Never delete or recreate a retained cnpg database until the operation log shows
 that the external target passed content fingerprint verification.
