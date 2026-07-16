@@ -74,9 +74,18 @@ type cursorState struct {
 	cleanup  func()        // Query context cleanup
 }
 
+// transactionControl retains only the parsed transaction statement details
+// that affect connection lifecycle. It deliberately distinguishes ROLLBACK TO
+// from a top-level ROLLBACK.
+type transactionControl struct {
+	kind  pg_query.TransactionStmtKind
+	chain bool
+}
+
 type preparedStmt struct {
 	query             string
 	convertedQuery    string
+	transaction       transactionControl
 	paramTypes        []int32
 	numParams         int
 	isIgnoredSet      bool     // True if this is an ignored SET parameter
@@ -1459,20 +1468,19 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	c.logger().Debug("Query received.", "query", loggableQuery)
 
-	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
-	// or transpilation. DuckDB doesn't support these natively, so cursor
-	// emulation is needed for all users including passthrough.
-	{
-		tree, parseErr := pg_query.Parse(query)
-		if parseErr == nil && len(tree.Stmts) == 1 {
-			switch s := tree.Stmts[0].Stmt.Node.(type) {
-			case *pg_query.Node_DeclareCursorStmt:
-				return c.handleDeclareCursor(query, s.DeclareCursorStmt)
-			case *pg_query.Node_FetchStmt:
-				return c.handleFetchCursor(query, s.FetchStmt)
-			case *pg_query.Node_ClosePortalStmt:
-				return c.handleCloseCursor(query, s.ClosePortalStmt)
-			}
+	// Parse once for cursor handling, transaction lifecycle classification, and
+	// multi-statement detection. DuckDB doesn't support DECLARE/FETCH/CLOSE
+	// natively, so cursor emulation is needed for all users including passthrough.
+	tree, parseErr := pg_query.Parse(query)
+	transaction := transactionControlFromParseResult(tree)
+	if parseErr == nil && len(tree.Stmts) == 1 {
+		switch s := tree.Stmts[0].Stmt.Node.(type) {
+		case *pg_query.Node_DeclareCursorStmt:
+			return c.handleDeclareCursor(query, s.DeclareCursorStmt)
+		case *pg_query.Node_FetchStmt:
+			return c.handleFetchCursor(query, s.FetchStmt)
+		case *pg_query.Node_ClosePortalStmt:
+			return c.handleCloseCursor(query, s.ClosePortalStmt)
 		}
 	}
 
@@ -1499,11 +1507,11 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
 	if c.passthrough {
 		upperQuery := strings.ToUpper(query)
-		cmdType := c.getCommandType(upperQuery)
+		cmdType := commandTypeForTransaction(c.getCommandType(upperQuery), transaction)
 		if cmdType == "COPY" {
 			return c.handleCopy(query, upperQuery)
 		}
-		return c.executeQueryDirect(query, cmdType)
+		return c.executeQueryDirect(query, cmdType, transaction)
 	}
 
 	// Route COPY directly to handleCopy()
@@ -1525,7 +1533,6 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Check for multi-statement query (PostgreSQL simple query protocol supports
 	// multiple semicolon-separated statements in a single Q message).
 	// Each statement gets its own results, with a single ReadyForQuery at the end.
-	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) > 1 {
 		return c.handleMultiStatementQuery(query)
 	}
@@ -1625,7 +1632,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	// Determine command type for proper response
 	upperQuery := strings.ToUpper(query)
-	cmdType := c.getCommandType(upperQuery)
+	cmdType := commandTypeForTransaction(c.getCommandType(upperQuery), transaction)
 
 	// Handle COPY commands specially
 	if cmdType == "COPY" {
@@ -1636,7 +1643,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	if !queryReturnsResults(query) {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
 		// while DuckDB throws an error. Match PostgreSQL behavior.
-		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+		if transaction.begins() && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
 			_ = c.writeCommandComplete("BEGIN")
 			_ = c.writeReadyForQuery(c.txStatus)
@@ -1646,7 +1653,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
-		c.closeCursorsAtTxEnd(cmdType)
+		c.closeCursorsAtTxEnd(transaction)
 
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
@@ -1706,7 +1713,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		if execResult != nil {
 			writtenRows, _ = execResult.RowsAffected()
 		}
-		c.updateTxStatus(cmdType)
+		c.updateTxStatus(transaction)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = c.writeCommandComplete(tag)
 		c.logQuery(start, originalQuery, query, cmdType, 0, writtenRows, "", "", "simple")
@@ -2357,21 +2364,84 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 	}
 }
 
-// updateTxStatus updates the transaction status based on the executed command.
-// This is called after a successful command execution.
-func (c *clientConn) updateTxStatus(cmdType string) {
-	switch cmdType {
-	case "BEGIN":
-		c.txStatus = txStatusTransaction
-	case "COMMIT", "ROLLBACK":
-		c.txStatus = txStatusIdle
-		c.closeAllCursors()
-		// A successful transaction end invalidates all portal shells and any
-		// remaining Bind ownership, independent of whether it came through the
-		// simple or extended protocol.
-		c.dropAllPortals("tx_end")
+func transactionControlFromParseResult(tree *pg_query.ParseResult) transactionControl {
+	if tree == nil || len(tree.Stmts) != 1 || tree.Stmts[0] == nil || tree.Stmts[0].Stmt == nil {
+		return transactionControl{}
 	}
-	// For other commands, keep the current status
+	stmt := tree.Stmts[0].Stmt.GetTransactionStmt()
+	if stmt == nil {
+		return transactionControl{}
+	}
+	return transactionControl{kind: stmt.Kind, chain: stmt.Chain}
+}
+
+func transactionControlForQuery(query string) transactionControl {
+	tree, err := pg_query.Parse(query)
+	if err != nil {
+		return transactionControl{}
+	}
+	return transactionControlFromParseResult(tree)
+}
+
+func (t transactionControl) begins() bool {
+	return t.kind == pg_query.TransactionStmtKind_TRANS_STMT_BEGIN ||
+		t.kind == pg_query.TransactionStmtKind_TRANS_STMT_START
+}
+
+// ends returns true only for statements that finish the current local
+// transaction. In particular, it intentionally excludes ROLLBACK TO and
+// prepared-transaction commands.
+func (t transactionControl) ends() bool {
+	return t.kind == pg_query.TransactionStmtKind_TRANS_STMT_COMMIT ||
+		t.kind == pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK
+}
+
+func (t transactionControl) rollsBackToSavepoint() bool {
+	return t.kind == pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO
+}
+
+func (t transactionControl) commandType() string {
+	switch {
+	case t.begins():
+		return "BEGIN"
+	case t.kind == pg_query.TransactionStmtKind_TRANS_STMT_COMMIT:
+		return "COMMIT"
+	case t.kind == pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK,
+		t.kind == pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+		return "ROLLBACK"
+	default:
+		return ""
+	}
+}
+
+func commandTypeForTransaction(commandType string, transaction transactionControl) string {
+	if parsed := transaction.commandType(); parsed != "" {
+		return parsed
+	}
+	return commandType
+}
+
+// updateTxStatus applies parsed transaction control only after successful
+// execution. Top-level COMMIT/ROLLBACK release transaction-scoped state;
+// ROLLBACK TO remains within its transaction and never does.
+func (c *clientConn) updateTxStatus(transaction transactionControl) {
+	switch {
+	case transaction.begins():
+		c.txStatus = txStatusTransaction
+	case transaction.ends():
+		c.closeAllCursors()
+		// A successful transaction completion invalidates all portal shells and
+		// remaining Bind ownership, independent of simple or extended protocol.
+		c.dropAllPortals("tx_end")
+		if transaction.chain {
+			c.txStatus = txStatusTransaction
+		} else {
+			c.txStatus = txStatusIdle
+		}
+	case transaction.rollsBackToSavepoint() && c.txStatus == txStatusError:
+		// A successful rollback to a savepoint recovers the outer transaction.
+		c.txStatus = txStatusTransaction
+	}
 }
 
 // setTxError marks the transaction as failed if we're in a transaction.

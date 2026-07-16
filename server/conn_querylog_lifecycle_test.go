@@ -141,7 +141,7 @@ func TestLifecyclePairFiresOnExecuteQueryDirect(t *testing.T) {
 	c.username = "alice"
 	c.workerID = 7777
 
-	if err := c.executeQueryDirect("UPDATE foo SET x = 1", "UPDATE"); err != nil {
+	if err := c.executeQueryDirect("UPDATE foo SET x = 1", "UPDATE", transactionControl{}); err != nil {
 		t.Fatalf("executeQueryDirect: %v", err)
 	}
 	assertLifecyclePair(t, buf, "executeQueryDirect")
@@ -165,7 +165,7 @@ func TestLifecyclePairFiresOnExecuteQueryDirectOnError(t *testing.T) {
 	c.username = "alice"
 	c.workerID = 7777
 
-	if err := c.executeQueryDirect("UPDATE missing SET x = 1", "UPDATE"); err != nil {
+	if err := c.executeQueryDirect("UPDATE missing SET x = 1", "UPDATE", transactionControl{}); err != nil {
 		t.Fatalf("executeQueryDirect returned non-nil err: %v", err)
 	}
 	assertLifecyclePair(t, buf, "executeQueryDirect-error")

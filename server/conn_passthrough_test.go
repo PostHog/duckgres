@@ -80,7 +80,7 @@ func TestExecuteQueryDirectPassthroughPreservesUse(t *testing.T) {
 		database:   "test",
 	}
 
-	if err := c.executeQueryDirect("USE test", "USE"); err != nil {
+	if err := c.executeQueryDirect("USE test", "USE", transactionControl{}); err != nil {
 		t.Fatalf("executeQueryDirect returned error: %v", err)
 	}
 

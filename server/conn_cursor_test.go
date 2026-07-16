@@ -10,11 +10,12 @@ import "testing"
 // (cursorBackwardFlow rolls back with a partially-read cursor open).
 func TestCloseCursorsAtTxEnd(t *testing.T) {
 	for _, tc := range []struct {
-		cmdType string
+		command string
 		closed  bool
 	}{
 		{"COMMIT", true},
 		{"ROLLBACK", true},
+		{"ROLLBACK TO savepoint_name", false},
 		{"BEGIN", false},
 		{"SELECT", false},
 		{"FETCH", false},
@@ -26,13 +27,13 @@ func TestCloseCursorsAtTxEnd(t *testing.T) {
 			"cur_open":    {query: "SELECT 2", cleanup: func() { released = true }},
 		}}
 
-		c.closeCursorsAtTxEnd(tc.cmdType)
+		c.closeCursorsAtTxEnd(transactionControlForQuery(tc.command))
 
 		if gotClosed := len(c.cursors) == 0; gotClosed != tc.closed {
-			t.Errorf("closeCursorsAtTxEnd(%q): cursors closed = %v, want %v", tc.cmdType, gotClosed, tc.closed)
+			t.Errorf("closeCursorsAtTxEnd(%q): cursors closed = %v, want %v", tc.command, gotClosed, tc.closed)
 		}
 		if released != tc.closed {
-			t.Errorf("closeCursorsAtTxEnd(%q): cursor query context released = %v, want %v", tc.cmdType, released, tc.closed)
+			t.Errorf("closeCursorsAtTxEnd(%q): cursor query context released = %v, want %v", tc.command, released, tc.closed)
 		}
 	}
 }

@@ -103,16 +103,16 @@ func (c *clientConn) closeAllCursors() {
 	}
 }
 
-// closeCursorsAtTxEnd closes all open cursors before a COMMIT/ROLLBACK
-// statement executes. PostgreSQL destroys non-holdable cursors at transaction
-// end; doing it BEFORE the statement runs (rather than after, in
+// closeCursorsAtTxEnd closes all open cursors before a parsed top-level
+// COMMIT/ROLLBACK statement executes. PostgreSQL destroys non-holdable cursors
+// at transaction end; doing it BEFORE the statement runs (rather than after, in
 // updateTxStatus) is required for liveness, not just compatibility: the
 // session's DuckDB pool is capped at one connection (openBaseDB), so a
 // partially-read cursor's open rowset holds the only connection and the
 // COMMIT/ROLLBACK would block on it forever. updateTxStatus keeps its
 // post-exec close as a backstop for paths that don't call this hook.
-func (c *clientConn) closeCursorsAtTxEnd(cmdType string) {
-	if cmdType != "COMMIT" && cmdType != "ROLLBACK" {
+func (c *clientConn) closeCursorsAtTxEnd(transaction transactionControl) {
+	if !transaction.ends() {
 		return
 	}
 	c.closeAllCursors()

@@ -15,10 +15,10 @@ import (
 
 // executeQueryDirect executes a query directly against DuckDB without any transpilation.
 // Used for passthrough users who send DuckDB-native SQL.
-func (c *clientConn) executeQueryDirect(query, cmdType string) error {
+func (c *clientConn) executeQueryDirect(query, cmdType string, transaction transactionControl) error {
 	if !queryReturnsResults(query) {
 		// Handle nested BEGIN
-		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+		if transaction.begins() && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
 			_ = c.writeCommandComplete("BEGIN")
 			_ = c.writeReadyForQuery(c.txStatus)
@@ -28,7 +28,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
-		c.closeCursorsAtTxEnd(cmdType)
+		c.closeCursorsAtTxEnd(transaction)
 
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
@@ -85,7 +85,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		if result != nil {
 			queryRowsAff, _ = result.RowsAffected()
 		}
-		c.updateTxStatus(cmdType)
+		c.updateTxStatus(transaction)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = c.writeCommandComplete(tag)
 		_ = c.writeReadyForQuery(c.txStatus)
@@ -310,7 +310,6 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		return 0, errCode, errMsg, nil
 	}
 
-	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = c.writeCommandComplete(tag)
 	_ = c.writeReadyForQuery(c.txStatus)
@@ -374,6 +373,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	// Check for cursor operations before transpilation
 	tree, parseErr := pg_query.Parse(query)
+	transaction := transactionControlFromParseResult(tree)
 	if parseErr == nil && len(tree.Stmts) == 1 {
 		switch s := tree.Stmts[0].Stmt.Node.(type) {
 		case *pg_query.Node_DeclareCursorStmt:
@@ -573,7 +573,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	}
 
 	upperQuery := strings.ToUpper(executedQuery)
-	cmdType := c.getCommandType(upperQuery)
+	cmdType := commandTypeForTransaction(c.getCommandType(upperQuery), transaction)
 
 	// COPY not supported inside batches
 	if cmdType == "COPY" {
@@ -594,7 +594,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	}()
 
 	if !queryReturnsResults(executedQuery) {
-		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+		if transaction.begins() && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
 			_ = c.writeCommandComplete("BEGIN")
 			return false, nil
@@ -602,7 +602,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
-		c.closeCursorsAtTxEnd(cmdType)
+		c.closeCursorsAtTxEnd(transaction)
 
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
@@ -658,7 +658,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			writtenRows, _ = execResult.RowsAffected()
 		}
 		queryRowsAff = writtenRows
-		c.updateTxStatus(cmdType)
+		c.updateTxStatus(transaction)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = c.writeCommandComplete(tag)
 		c.logQuery(start, query, executedQuery, cmdType, 0, writtenRows, "", "", "simple-batch")
@@ -754,7 +754,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	}
 	queryRowsAff = int64(rowCount)
 
-	c.updateTxStatus(cmdType)
+	c.updateTxStatus(transaction)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = c.writeCommandComplete(tag)
 	c.logQuery(start, query, executedQuery, cmdType, int64(rowCount), 0, "", "", "simple-batch")

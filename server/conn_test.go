@@ -501,29 +501,29 @@ func TestTransactionStatusTracking(t *testing.T) {
 	}
 
 	// BEGIN should set to transaction
-	c.updateTxStatus("BEGIN")
+	c.updateTxStatus(transactionControlForQuery("BEGIN"))
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("after BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
 	}
 
 	// SELECT should not change status
-	c.updateTxStatus("SELECT")
+	c.updateTxStatus(transactionControlForQuery("SELECT"))
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("after SELECT txStatus = %c, want %c", c.txStatus, txStatusTransaction)
 	}
 
 	// COMMIT should set back to idle
-	c.updateTxStatus("COMMIT")
+	c.updateTxStatus(transactionControlForQuery("COMMIT"))
 	if c.txStatus != txStatusIdle {
 		t.Errorf("after COMMIT txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
 
 	// Test ROLLBACK path
-	c.updateTxStatus("BEGIN")
+	c.updateTxStatus(transactionControlForQuery("BEGIN"))
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("after second BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
 	}
-	c.updateTxStatus("ROLLBACK")
+	c.updateTxStatus(transactionControlForQuery("ROLLBACK"))
 	if c.txStatus != txStatusIdle {
 		t.Errorf("after ROLLBACK txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
@@ -539,14 +539,14 @@ func TestTransactionErrorStatus(t *testing.T) {
 	}
 
 	// Error inside transaction should set to error
-	c.updateTxStatus("BEGIN")
+	c.updateTxStatus(transactionControlForQuery("BEGIN"))
 	c.setTxError()
 	if c.txStatus != txStatusError {
 		t.Errorf("error inside transaction txStatus = %c, want %c", c.txStatus, txStatusError)
 	}
 
 	// ROLLBACK should recover from error state
-	c.updateTxStatus("ROLLBACK")
+	c.updateTxStatus(transactionControlForQuery("ROLLBACK"))
 	if c.txStatus != txStatusIdle {
 		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
@@ -558,13 +558,14 @@ func TestNestedBeginDetection(t *testing.T) {
 	c := &clientConn{txStatus: txStatusIdle}
 
 	// First BEGIN should work normally
-	c.updateTxStatus("BEGIN")
+	c.updateTxStatus(transactionControlForQuery("BEGIN"))
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("after first BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
 	}
 
 	// At this point, a second BEGIN should trigger warning behavior
-	// In handleQuery, when cmdType == "BEGIN" && c.txStatus == txStatusTransaction,
+	// In handleQuery, when the parsed statement begins a transaction and
+	// c.txStatus == txStatusTransaction,
 	// we send a warning and return success without calling DuckDB
 	isNestedBegin := c.txStatus == txStatusTransaction
 	if !isNestedBegin {
@@ -3638,31 +3639,31 @@ func TestTransactionStatusWithCopyCommands(t *testing.T) {
 	c := &clientConn{txStatus: txStatusIdle}
 
 	// BEGIN starts a transaction
-	c.updateTxStatus("BEGIN")
+	c.updateTxStatus(transactionControlForQuery("BEGIN"))
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("after BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
 	}
 
 	// COPY (to file/S3) should not change transaction status — it's a normal
 	// statement inside the transaction, not a transaction control command.
-	c.updateTxStatus("COPY")
+	c.updateTxStatus(transactionControlForQuery("COPY"))
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("after COPY txStatus = %c, want %c (should remain in transaction)", c.txStatus, txStatusTransaction)
 	}
 
 	// COMMIT should end the transaction
-	c.updateTxStatus("COMMIT")
+	c.updateTxStatus(transactionControlForQuery("COMMIT"))
 	if c.txStatus != txStatusIdle {
 		t.Errorf("after COMMIT txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
 
 	// Same flow with COPY FROM STDIN (the COPY command type is the same)
-	c.updateTxStatus("BEGIN")
-	c.updateTxStatus("COPY")
+	c.updateTxStatus(transactionControlForQuery("BEGIN"))
+	c.updateTxStatus(transactionControlForQuery("COPY"))
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("after COPY FROM txStatus = %c, want %c", c.txStatus, txStatusTransaction)
 	}
-	c.updateTxStatus("ROLLBACK")
+	c.updateTxStatus(transactionControlForQuery("ROLLBACK"))
 	if c.txStatus != txStatusIdle {
 		t.Errorf("after ROLLBACK txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
@@ -3672,7 +3673,7 @@ func TestTransactionErrorOnCopyFailure(t *testing.T) {
 	c := &clientConn{txStatus: txStatusIdle}
 
 	// BEGIN a transaction
-	c.updateTxStatus("BEGIN")
+	c.updateTxStatus(transactionControlForQuery("BEGIN"))
 	if c.txStatus != txStatusTransaction {
 		t.Fatalf("expected txStatusTransaction after BEGIN")
 	}
@@ -3684,7 +3685,7 @@ func TestTransactionErrorOnCopyFailure(t *testing.T) {
 	}
 
 	// Any subsequent command should fail (error state), ROLLBACK recovers
-	c.updateTxStatus("ROLLBACK")
+	c.updateTxStatus(transactionControlForQuery("ROLLBACK"))
 	if c.txStatus != txStatusIdle {
 		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
@@ -3699,7 +3700,7 @@ func TestTransactionCommitClosesAllCursors(t *testing.T) {
 		},
 	}
 
-	c.updateTxStatus("COMMIT")
+	c.updateTxStatus(transactionControlForQuery("COMMIT"))
 
 	if c.txStatus != txStatusIdle {
 		t.Errorf("txStatus = %c, want %c", c.txStatus, txStatusIdle)
@@ -3717,7 +3718,7 @@ func TestTransactionRollbackClosesAllCursors(t *testing.T) {
 		},
 	}
 
-	c.updateTxStatus("ROLLBACK")
+	c.updateTxStatus(transactionControlForQuery("ROLLBACK"))
 
 	if c.txStatus != txStatusIdle {
 		t.Errorf("txStatus = %c, want %c", c.txStatus, txStatusIdle)

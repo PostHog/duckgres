@@ -128,6 +128,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 
 	upperQuery := strings.ToUpper(query)
 	cmdType := c.getCommandType(upperQuery)
+	transaction := transactionControlForQuery(query)
 
 	_, execErr := c.executor.ExecContext(ctx, query)
 	if execErr != nil {
@@ -145,7 +146,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 			// confirmation — fatal for a credential revocation.
 			if existed, delErr := mgr.DeleteSecret(ctx, c.orgID, c.username, st.Name); delErr == nil && existed {
 				queryFinalErr = nil
-				c.updateTxStatus(cmdType)
+				c.updateTxStatus(transaction)
 				return true, c.buildCommandTag(cmdType, nil), nil
 			}
 		}
@@ -179,7 +180,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 		}
 	}
 
-	c.updateTxStatus(cmdType)
+	c.updateTxStatus(transaction)
 	return true, c.buildCommandTag(cmdType, nil), nil
 }
 

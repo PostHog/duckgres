@@ -59,6 +59,7 @@ func (c *clientConn) handleParse(body []byte) {
 	// DuckDB doesn't support DECLARE/FETCH/CLOSE natively, so cursor
 	// emulation is needed for all users including passthrough.
 	cursorTree, cursorParseErr := pg_query.Parse(query)
+	transaction := transactionControlFromParseResult(cursorTree)
 	if cursorParseErr == nil && len(cursorTree.Stmts) == 1 {
 		switch s := cursorTree.Stmts[0].Stmt.Node.(type) {
 		case *pg_query.Node_DeclareCursorStmt:
@@ -151,6 +152,7 @@ func (c *clientConn) handleParse(body []byte) {
 		c.stmts[stmtName] = &preparedStmt{
 			query:          query,
 			convertedQuery: query, // No transpilation
+			transaction:    transaction,
 			paramTypes:     paramTypes,
 			numParams:      paramCount,
 		}
@@ -188,6 +190,7 @@ func (c *clientConn) handleParse(body []byte) {
 	c.stmts[stmtName] = &preparedStmt{
 		query:             query,                            // Keep original for logging and Describe
 		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
+		transaction:       transaction,
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
 		isIgnoredSet:      result.IsIgnoredSet,
@@ -660,8 +663,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 	}
 
+	transaction := p.stmt.transaction
 	upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
-	cmdType := c.getCommandType(upperQuery)
+	cmdType := commandTypeForTransaction(c.getCommandType(upperQuery), transaction)
 	returnsResults := queryReturnsResults(p.stmt.query)
 
 	// Intercept persistent-secret DDL (multitenant remote backend): persist /
@@ -740,7 +744,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	if !returnsResults {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
 		// while DuckDB throws an error. Match PostgreSQL behavior.
-		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+		if transaction.begins() && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
 			_ = c.writeCommandComplete("BEGIN")
 			return
@@ -748,7 +752,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
-		c.closeCursorsAtTxEnd(cmdType)
+		c.closeCursorsAtTxEnd(transaction)
 
 		// Non-result-returning query: use Exec with converted query
 		runExec := func() (ExecResult, error) {
@@ -813,7 +817,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			writtenRows, _ = result.RowsAffected()
 		}
 		queryRowsAff = writtenRows
-		c.updateTxStatus(cmdType)
+		c.updateTxStatus(transaction)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = c.writeCommandComplete(tag)
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, writtenRows, "", "", "extended")
@@ -944,7 +948,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	c.updateTxStatus(cmdType)
+	c.updateTxStatus(transaction)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = c.writeCommandComplete(tag)
 	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")

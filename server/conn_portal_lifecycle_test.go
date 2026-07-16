@@ -189,6 +189,56 @@ func requirePortalState(t *testing.T, p *portal, want portalState) {
 	}
 }
 
+func requireReadyForQueryStatus(t *testing.T, payload []byte, want byte) {
+	t.Helper()
+	frames := scanWireFrames(t, payload)
+	if len(frames) == 0 || frames[len(frames)-1].msgType != wire.MsgReadyForQuery {
+		t.Fatalf("response frames = %q, want final ReadyForQuery", frameTypes(frames))
+	}
+	if got := frames[len(frames)-1].body; len(got) != 1 || got[0] != want {
+		t.Fatalf("ReadyForQuery status = %q, want %q", got, []byte{want})
+	}
+}
+
+func installTransactionLifecycleMarker(t *testing.T, c *clientConn) (*portal, func() bool) {
+	t.Helper()
+	c.stmts["marker"] = &preparedStmt{query: "INSERT INTO t VALUES (1)", convertedQuery: "INSERT INTO t VALUES (1)"}
+	p := bindPortalForLifecycle(t, c, "marker-portal", "marker", nil, nil)
+	closed := false
+	c.cursors["marker-cursor"] = &cursorState{cleanup: func() { closed = true }}
+	return p, func() bool { return closed }
+}
+
+func executeExtendedTransactionStatement(t *testing.T, client net.Conn, out *portalLifecycleOutput, stmtName, portalName, query string) {
+	t.Helper()
+	if err := wire.WriteMessage(client, wire.MsgParse, portalLifecycleParseBody(stmtName, query, nil)); err != nil {
+		t.Fatalf("write Parse %q: %v", query, err)
+	}
+	if err := wire.WriteMessage(client, wire.MsgBind, portalLifecycleBindBody(portalName, stmtName, nil, nil, nil)); err != nil {
+		t.Fatalf("write Bind %q: %v", query, err)
+	}
+	if err := wire.WriteMessage(client, wire.MsgExecute, portalLifecycleExecuteBody(portalName)); err != nil {
+		t.Fatalf("write Execute %q: %v", query, err)
+	}
+	syncPortalLifecycleConn(t, client, out)
+}
+
+func bindExtendedTransactionMarker(t *testing.T, c *clientConn, client net.Conn, out *portalLifecycleOutput) *portal {
+	t.Helper()
+	if err := wire.WriteMessage(client, wire.MsgParse, portalLifecycleParseBody("marker", "INSERT INTO t VALUES (1)", nil)); err != nil {
+		t.Fatalf("write marker Parse: %v", err)
+	}
+	if err := wire.WriteMessage(client, wire.MsgBind, portalLifecycleBindBody("marker-portal", "marker", nil, nil, nil)); err != nil {
+		t.Fatalf("write marker Bind: %v", err)
+	}
+	syncPortalLifecycleConn(t, client, out)
+	p := c.portals["marker-portal"]
+	if p == nil {
+		t.Fatal("extended marker Bind did not install a portal")
+	}
+	return p
+}
+
 func TestPortalLifecycleTerminalExecuteReleasesPayloadAndRejectsReuse(t *testing.T) {
 	c, out, cleanup := newPortalLifecycleConn(t, &lifecycleExecutor{execResult: emptyExecResult{}})
 	defer cleanup()
@@ -1326,17 +1376,27 @@ func newPortalLifecycleLoopConn(t *testing.T, status byte) (*clientConn, net.Con
 
 func syncPortalLifecycleConn(t *testing.T, client net.Conn, out *portalLifecycleOutput) {
 	t.Helper()
+	before := len(out.snapshot())
 	if err := wire.WriteMessage(client, wire.MsgSync, nil); err != nil {
 		t.Fatalf("write Sync: %v", err)
 	}
-	select {
-	case <-out.writes:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for Sync response")
-	}
-	frames := scanWireFrames(t, out.snapshot())
-	if len(frames) == 0 || frames[len(frames)-1].msgType != wire.MsgReadyForQuery {
-		t.Fatalf("Sync response frames = %q, want final ReadyForQuery", frameTypes(frames))
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-out.writes:
+			payload := out.snapshot()
+			if len(payload) <= before {
+				continue
+			}
+			frames := scanWireFrames(t, payload[before:])
+			if len(frames) > 0 && frames[len(frames)-1].msgType == wire.MsgReadyForQuery {
+				return
+			}
+		case <-timeout.C:
+			frames := scanWireFrames(t, out.snapshot()[before:])
+			t.Fatalf("Sync response frames = %q, want final ReadyForQuery", frameTypes(frames))
+		}
 	}
 }
 
@@ -1599,7 +1659,7 @@ func TestPortalLifecycleTransactionEndAndSimpleQueryDropPortals(t *testing.T) {
 			c.stmts["insert"] = &preparedStmt{query: "INSERT INTO t VALUES ($1)", convertedQuery: "INSERT INTO t VALUES (?)", numParams: 1}
 			p := bindPortalForLifecycle(t, c, "p", "insert", nil, []portalLifecycleBindValue{{data: []byte("value")}})
 
-			c.updateTxStatus(command)
+			c.updateTxStatus(transactionControlForQuery(command))
 			if len(c.portals) != 0 {
 				t.Fatalf("successful %s must drop all portals, got %d", command, len(c.portals))
 			}
@@ -1620,6 +1680,202 @@ func TestPortalLifecycleTransactionEndAndSimpleQueryDropPortals(t *testing.T) {
 			t.Fatal("simple Query must destroy the unnamed portal")
 		}
 		requireReleasedPortalPayload(t, p)
+	})
+}
+
+func TestPortalLifecycleTransactionBoundariesSimpleProtocol(t *testing.T) {
+	for _, command := range []string{"BEGIN", "START TRANSACTION"} {
+		command := command
+		t.Run("start_"+command, func(t *testing.T) {
+			c, out, cleanup := newPortalLifecycleConn(t, &lifecycleExecutor{execResult: emptyExecResult{}})
+			defer cleanup()
+
+			if err := c.handleQuery([]byte(command + "\x00")); err != nil {
+				t.Fatalf("handle %s: %v", command, err)
+			}
+			if got := c.txStatus; got != txStatusTransaction {
+				t.Fatalf("%s tx status = %c, want %c", command, got, txStatusTransaction)
+			}
+			requireReadyForQueryStatus(t, out.Bytes(), txStatusTransaction)
+		})
+	}
+
+	for _, command := range []string{"COMMIT", "END", "ROLLBACK", "ABORT"} {
+		command := command
+		t.Run("end_"+command, func(t *testing.T) {
+			c, out, cleanup := newPortalLifecycleConn(t, &lifecycleExecutor{execResult: emptyExecResult{}})
+			defer cleanup()
+			c.txStatus = txStatusTransaction
+			p, cursorClosed := installTransactionLifecycleMarker(t, c)
+			out.Reset()
+
+			if err := c.handleQuery([]byte(command + "\x00")); err != nil {
+				t.Fatalf("handle %s: %v", command, err)
+			}
+			if got := c.txStatus; got != txStatusIdle {
+				t.Fatalf("%s tx status = %c, want %c", command, got, txStatusIdle)
+			}
+			if len(c.portals) != 0 {
+				t.Fatalf("%s left %d portals, want none", command, len(c.portals))
+			}
+			requireReleasedPortalPayload(t, p)
+			if len(c.cursors) != 0 || !cursorClosed() {
+				t.Fatalf("%s did not close transaction-scoped cursor", command)
+			}
+			requireReadyForQueryStatus(t, out.Bytes(), txStatusIdle)
+		})
+	}
+
+	for _, command := range []string{"ROLLBACK TO marker", "ROLLBACK TO SAVEPOINT marker"} {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			c, out, cleanup := newPortalLifecycleConn(t, &lifecycleExecutor{execResult: emptyExecResult{}})
+			defer cleanup()
+			c.txStatus = txStatusTransaction
+			p, cursorClosed := installTransactionLifecycleMarker(t, c)
+			payloadBytes := requirePortalPayload(t, p)
+			out.Reset()
+
+			if err := c.handleQuery([]byte(command + "\x00")); err != nil {
+				t.Fatalf("handle %s: %v", command, err)
+			}
+			if got := c.txStatus; got != txStatusTransaction {
+				t.Fatalf("%s tx status = %c, want %c", command, got, txStatusTransaction)
+			}
+			if got := c.portals["marker-portal"]; got != p {
+				t.Fatalf("%s portal = %p, want retained ready portal %p", command, got, p)
+			}
+			if got := p.retainedPayloadBytes(); got != payloadBytes {
+				t.Fatalf("%s portal payload = %d, want %d", command, got, payloadBytes)
+			}
+			if _, ok := c.cursors["marker-cursor"]; !ok || cursorClosed() {
+				t.Fatalf("%s closed transaction-scoped cursor", command)
+			}
+			requireReadyForQueryStatus(t, out.Bytes(), txStatusTransaction)
+		})
+	}
+}
+
+func TestPortalLifecycleTransactionBoundariesExtendedProtocol(t *testing.T) {
+	for _, command := range []string{"BEGIN", "START TRANSACTION"} {
+		command := command
+		t.Run("start_"+command, func(t *testing.T) {
+			c, client, out, done, cleanup := newPortalLifecycleLoopConn(t, txStatusIdle)
+			defer cleanup()
+			c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+
+			executeExtendedTransactionStatement(t, client, out, "start", "start-portal", command)
+			if got := c.txStatus; got != txStatusTransaction {
+				t.Fatalf("%s tx status = %c, want %c", command, got, txStatusTransaction)
+			}
+			requireReadyForQueryStatus(t, out.snapshot(), txStatusTransaction)
+
+			p := bindExtendedTransactionMarker(t, c, client, out)
+			if got := c.portals["marker-portal"]; got != p {
+				t.Fatalf("Sync after %s dropped marker portal: got %p, want %p", command, got, p)
+			}
+			requirePortalState(t, p, portalStateReady)
+			requireReadyForQueryStatus(t, out.snapshot(), txStatusTransaction)
+			stopPortalLifecycleLoop(t, client, done)
+		})
+	}
+
+	for _, command := range []string{"COMMIT", "END", "ROLLBACK", "ABORT"} {
+		command := command
+		t.Run("end_"+command, func(t *testing.T) {
+			c, client, out, done, cleanup := newPortalLifecycleLoopConn(t, txStatusTransaction)
+			defer cleanup()
+			c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+			p := bindExtendedTransactionMarker(t, c, client, out)
+			cursorClosed := false
+			c.cursors["marker-cursor"] = &cursorState{cleanup: func() { cursorClosed = true }}
+
+			executeExtendedTransactionStatement(t, client, out, "end", "end-portal", command)
+			if got := c.txStatus; got != txStatusIdle {
+				t.Fatalf("%s tx status = %c, want %c", command, got, txStatusIdle)
+			}
+			if len(c.portals) != 0 {
+				t.Fatalf("%s left %d portals, want none", command, len(c.portals))
+			}
+			requireReleasedPortalPayload(t, p)
+			if len(c.cursors) != 0 || !cursorClosed {
+				t.Fatalf("%s did not close transaction-scoped cursor", command)
+			}
+			requireReadyForQueryStatus(t, out.snapshot(), txStatusIdle)
+			stopPortalLifecycleLoop(t, client, done)
+		})
+	}
+
+	for _, command := range []string{"ROLLBACK TO marker", "ROLLBACK TO SAVEPOINT marker"} {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			c, client, out, done, cleanup := newPortalLifecycleLoopConn(t, txStatusTransaction)
+			defer cleanup()
+			c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+			p := bindExtendedTransactionMarker(t, c, client, out)
+			payloadBytes := requirePortalPayload(t, p)
+			cursorClosed := false
+			c.cursors["marker-cursor"] = &cursorState{cleanup: func() { cursorClosed = true }}
+
+			executeExtendedTransactionStatement(t, client, out, "rollback-to", "rollback-to-portal", command)
+			if got := c.txStatus; got != txStatusTransaction {
+				t.Fatalf("%s tx status = %c, want %c", command, got, txStatusTransaction)
+			}
+			if got := c.portals["marker-portal"]; got != p {
+				t.Fatalf("%s portal = %p, want retained ready portal %p", command, got, p)
+			}
+			if got := p.retainedPayloadBytes(); got != payloadBytes {
+				t.Fatalf("%s portal payload = %d, want %d", command, got, payloadBytes)
+			}
+			if _, ok := c.cursors["marker-cursor"]; !ok || cursorClosed {
+				t.Fatalf("%s closed transaction-scoped cursor", command)
+			}
+			requireReadyForQueryStatus(t, out.snapshot(), txStatusTransaction)
+			stopPortalLifecycleLoop(t, client, done)
+		})
+	}
+}
+
+func TestPortalLifecycleParsedTransactionBoundaryEdgeCases(t *testing.T) {
+	t.Run("commit and chain starts a clean transaction", func(t *testing.T) {
+		c, _, cleanup := newPortalLifecycleConn(t, nil)
+		defer cleanup()
+		c.txStatus = txStatusTransaction
+		p, cursorClosed := installTransactionLifecycleMarker(t, c)
+
+		c.updateTxStatus(transactionControlForQuery("COMMIT AND CHAIN"))
+		if got := c.txStatus; got != txStatusTransaction {
+			t.Fatalf("COMMIT AND CHAIN tx status = %c, want %c", got, txStatusTransaction)
+		}
+		if len(c.portals) != 0 {
+			t.Fatalf("COMMIT AND CHAIN left %d portals, want none", len(c.portals))
+		}
+		requireReleasedPortalPayload(t, p)
+		if len(c.cursors) != 0 || !cursorClosed() {
+			t.Fatal("COMMIT AND CHAIN did not close the completed transaction's cursor")
+		}
+	})
+
+	t.Run("rollback to savepoint recovers the outer transaction", func(t *testing.T) {
+		c, _, cleanup := newPortalLifecycleConn(t, nil)
+		defer cleanup()
+		c.txStatus = txStatusError
+		p, cursorClosed := installTransactionLifecycleMarker(t, c)
+		payloadBytes := requirePortalPayload(t, p)
+
+		c.updateTxStatus(transactionControlForQuery("ROLLBACK TO SAVEPOINT marker"))
+		if got := c.txStatus; got != txStatusTransaction {
+			t.Fatalf("ROLLBACK TO SAVEPOINT tx status = %c, want %c", got, txStatusTransaction)
+		}
+		if got := c.portals["marker-portal"]; got != p {
+			t.Fatalf("ROLLBACK TO SAVEPOINT portal = %p, want %p", got, p)
+		}
+		if got := p.retainedPayloadBytes(); got != payloadBytes {
+			t.Fatalf("ROLLBACK TO SAVEPOINT portal payload = %d, want %d", got, payloadBytes)
+		}
+		if _, ok := c.cursors["marker-cursor"]; !ok || cursorClosed() {
+			t.Fatal("ROLLBACK TO SAVEPOINT closed the outer transaction's cursor")
+		}
 	})
 }
 
