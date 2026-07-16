@@ -111,9 +111,9 @@ READY_TIMEOUT="${READY_TIMEOUT:-1200}"
 
 # The bundled extensions MUST be the PostHog forks. These are the short commit
 # SHAs duckdb_extensions() reports for the tags the image pins
-# (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.5, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry).
+# (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.6, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry).
 # If the image accidentally ships upstream, the version differs and we fail.
-EXPECT_DUCKLAKE_SHA="40174368"
+EXPECT_DUCKLAKE_SHA="49ec0dc8"
 EXPECT_HTTPFS_SHA="0dac6fc"
 
 # duckling-example RDS — the shared external metadata store (same one the

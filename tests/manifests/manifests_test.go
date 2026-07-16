@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestControlPlaneRBACIncludesLeaseAccess(t *testing.T) {
@@ -131,6 +133,69 @@ func TestManifestTestsRunInUnitRecipe(t *testing.T) {
 	content := readManifest(t, "justfile")
 	if !strings.Contains(content, "./tests/manifests/...") {
 		t.Fatal("expected just test-unit to include ./tests/manifests/...")
+	}
+}
+
+func TestCurrentDuckLakeReleasePins(t *testing.T) {
+	const (
+		tag     = "v1.0-posthog.6"
+		version = "49ec0dc8"
+	)
+
+	tests := []struct {
+		path []string
+		want []string
+	}{
+		{path: []string{"Dockerfile"}, want: []string{"ARG DUCKLAKE_EXTENSION_TAG=" + tag}},
+		{path: []string{"Dockerfile.worker"}, want: []string{"ARG DUCKLAKE_EXTENSION_TAG=" + tag}},
+		{path: []string{".github", "workflows", "scenario-dev.yml"}, want: []string{"DUCKLAKE_EXTENSION_TAG=" + tag}},
+		{path: []string{".github", "workflows", "e2e-mw-dev.yml"}, want: []string{"DUCKLAKE_EXTENSION_TAG=" + tag}},
+		{
+			path: []string{"tests", "mw-dev", "e2e", "harness.sh"},
+			want: []string{"DUCKLAKE_EXTENSION_TAG=" + tag, `EXPECT_DUCKLAKE_SHA="` + version + `"`},
+		},
+	}
+
+	for _, tt := range tests {
+		content := readManifest(t, tt.path...)
+		for _, want := range tt.want {
+			if !strings.Contains(content, want) {
+				t.Errorf("expected %q in %s", want, filepath.Join(tt.path...))
+			}
+		}
+	}
+
+	var workflow struct {
+		Jobs map[string]struct {
+			Strategy struct {
+				Matrix struct {
+					DuckDB []struct {
+						DuckLake string `yaml:"ducklake"`
+						Default  bool   `yaml:"default"`
+					} `yaml:"duckdb"`
+				} `yaml:"matrix"`
+			} `yaml:"strategy"`
+		} `yaml:"jobs"`
+	}
+	workerWorkflow := readManifest(t, ".github", "workflows", "container-image-worker-cd.yml")
+	if err := yaml.Unmarshal([]byte(workerWorkflow), &workflow); err != nil {
+		t.Fatalf("parse worker image workflow: %v", err)
+	}
+	buildJob, ok := workflow.Jobs["build"]
+	if !ok {
+		t.Fatal("worker image workflow has no build job")
+	}
+	var defaults []string
+	for _, row := range buildJob.Strategy.Matrix.DuckDB {
+		if row.Default {
+			defaults = append(defaults, row.DuckLake)
+		}
+	}
+	if len(defaults) != 1 {
+		t.Fatalf("expected exactly one default DuckDB worker matrix row, got %d", len(defaults))
+	}
+	if defaults[0] != tag {
+		t.Errorf("default DuckDB worker matrix row pins DuckLake %q, want %q", defaults[0], tag)
 	}
 }
 
