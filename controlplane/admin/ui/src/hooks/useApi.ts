@@ -412,10 +412,15 @@ export function useModel(model: string | undefined) {
 
 // ---- operators (admin allow-list) ----
 
+// GET /operators is RequireAdmin, so it 403s for viewers — only fire it for
+// admins (like useDucklingDrift) and tolerate 403/404 so a viewer who lands on
+// the page sees the "admin only" notice rather than an error toast.
 export function useOperators() {
+  const { isAdmin } = useIdentity();
   return useQuery<Operator[]>({
     queryKey: ["operators"],
-    queryFn: () => tolerate404<Operator[]>([])(api.listOperators()),
+    queryFn: () => tolerateStatus<Operator[]>([], 403, 404)(api.listOperators()),
+    enabled: isAdmin,
   });
 }
 

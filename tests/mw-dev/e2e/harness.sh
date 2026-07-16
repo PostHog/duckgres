@@ -1834,6 +1834,63 @@ admin_console_api() {
   done
 }
 
+# ---- admin: operators CRUD (console access list) ---------------------------
+# The Operators page (ui/src/pages/Operators.tsx) manages who can sign in to the
+# admin console — distinct from Org Users (per-org DB logins). The SPA can't be
+# driven from this in-cluster Job (no browser), so we assert the admin-only API
+# it drives: a grant → list → role-change → validation → revoke round-trip on a
+# throwaway @posthog.com probe (self-cleaning, isolated from real operators). The
+# last-admin lockout guard (409) is unit-tested (operators_api_test.go's
+# TestOperatorLastAdminGuard) — it hinges on the ambient admin count, which we
+# must not perturb on the shared stack.
+admin_operators() {
+  log "admin console: operators CRUD (console access list)"
+  probe="e2e-operator-probe@posthog.com"
+
+  # Clear any leftover from a prior aborted run so the grant is deterministic.
+  curl -s -o /dev/null -X DELETE -H "$H" "$API/api/v1/operators/$probe" || true
+
+  # List returns the documented envelope.
+  curl -fsS -H "$H" "$API/api/v1/operators" | jq -e 'has("operators")' >/dev/null \
+    || fail "GET /operators missing 'operators' key"
+
+  # Grant the probe as viewer, then confirm it lists as viewer.
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$probe\",\"role\":\"viewer\"}" "$API/api/v1/operators" \
+    | jq -e '.role == "viewer"' >/dev/null \
+    || fail "POST /operators (grant viewer) did not return role=viewer"
+  curl -fsS -H "$H" "$API/api/v1/operators" \
+    | jq -e --arg e "$probe" 'any(.operators[]?; .email==$e and .role=="viewer")' >/dev/null \
+    || fail "operator $probe not listed as viewer after grant"
+
+  # Upsert the same email to admin (role change), then confirm.
+  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$probe\",\"role\":\"admin\"}" "$API/api/v1/operators" \
+    | jq -e '.role == "admin"' >/dev/null \
+    || fail "POST /operators (upsert to admin) did not return role=admin"
+  curl -fsS -H "$H" "$API/api/v1/operators" \
+    | jq -e --arg e "$probe" 'any(.operators[]?; .email==$e and .role=="admin")' >/dev/null \
+    || fail "operator $probe not listed as admin after role change"
+
+  # Validation: a non-@posthog.com domain and an invalid role are both 400.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d '{"email":"outsider@example.com","role":"admin"}' "$API/api/v1/operators")"
+  [ "$code" = "400" ] || fail "POST /operators bad domain returned $code, want 400"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$probe\",\"role\":\"superuser\"}" "$API/api/v1/operators")"
+  [ "$code" = "400" ] || fail "POST /operators bad role returned $code, want 400"
+
+  # Revoke and confirm the probe is gone (leaves the stack as we found it).
+  curl -fsS -X DELETE -H "$H" "$API/api/v1/operators/$probe" \
+    | jq -e '.deleted == true' >/dev/null \
+    || fail "DELETE /operators/$probe did not return deleted=true"
+  curl -fsS -H "$H" "$API/api/v1/operators" \
+    | jq -e --arg e "$probe" 'all(.operators[]?; .email != $e)' >/dev/null \
+    || fail "operator $probe still listed after revoke"
+
+  log "admin console: operators CRUD OK (grant/list/role-change/validation/revoke)"
+}
+
 # ---- admin: /status reports per-org worker counts --------------------------
 # OrgStatus.Workers (the Overview per-org load bars + total_workers) was an
 # always-0 dead field; it's now populated from each CP's OrgReservedPool
@@ -3177,6 +3234,7 @@ main() {
   # Admin console read surfaces: identity/role, live state, metrics proxy, auth
   # gate. Independent of the per-org lanes, so run it here once orgs exist.
   admin_console_api
+  admin_operators
   admin_rbac_viewer "$CNPG"
 
   # ---- the four parallel assertion lanes (see lane_* above) ----

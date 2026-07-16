@@ -11,18 +11,30 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
+// operatorStore is the slice of the config store the operators handler needs.
+// Narrowing to an interface (satisfied by *configstore.ConfigStore) lets the
+// handler — including the last-admin guard — be unit-tested with a fake, the
+// same way apiStore backs the rest of the admin API.
+type operatorStore interface {
+	ListOperators() ([]configstore.Operator, error)
+	OperatorRole(email string) (string, error)
+	CountAdmins() (int64, error)
+	UpsertOperator(email, role, addedBy string) error
+	DeleteOperator(email string) (bool, error)
+}
+
 // operatorsHandler serves the admin-only Operators management API. Operators
 // are the admin-console access list: each row maps an @posthog.com SSO email to
 // a role (admin|viewer), which AuthMiddleware resolves per-request.
 type operatorsHandler struct {
-	store *configstore.ConfigStore
+	store operatorStore
 }
 
 // registerOperatorsAPI wires the Operators management endpoints. Every route is
 // admin-only (RequireAdmin per-route, so the gate travels with the route and a
 // rename can't silently downgrade it). Mutations also flow through the audited
 // /api/v1 group, so operator changes are recorded automatically.
-func registerOperatorsAPI(r *gin.RouterGroup, store *configstore.ConfigStore) {
+func registerOperatorsAPI(r *gin.RouterGroup, store operatorStore) {
 	h := &operatorsHandler{store: store}
 	r.GET("/operators", RequireAdmin(), h.listOperators)
 	r.POST("/operators", RequireAdmin(), h.upsertOperator)
