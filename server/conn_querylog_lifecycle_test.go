@@ -11,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/posthog/duckgres/server/sqlcore"
+	"github.com/posthog/duckgres/server/wire"
 )
 
 // newLifecycleClientConn builds a clientConn with both reader and writer
@@ -75,6 +78,21 @@ func (e *lifecycleExecutor) ConnContext(_ context.Context) (RawConn, error) {
 }
 func (e *lifecycleExecutor) PingContext(_ context.Context) error { return nil }
 func (e *lifecycleExecutor) Close() error                        { return nil }
+
+type boundLifecycleExecutor struct {
+	lifecycleExecutor
+	boundCalls atomic.Int32
+}
+
+func (e *boundLifecycleExecutor) QueryWithBoundParams(_ string, _ sqlcore.SQLLiteralAppender) (RowSet, error) {
+	e.boundCalls.Add(1)
+	return e.queryRows, e.queryErr
+}
+
+func (e *boundLifecycleExecutor) ExecWithBoundParams(_ string, _ sqlcore.SQLLiteralAppender) (ExecResult, error) {
+	e.boundCalls.Add(1)
+	return e.execResult, e.execErr
+}
 
 // emptyExecResult is an ExecResult that reports 0 rows affected — sufficient
 // for these tests, which assert lifecycle log presence not row-count math.
@@ -342,4 +360,176 @@ func TestLifecyclePairFiresOnHandleExecuteQuery(t *testing.T) {
 
 	c.handleExecute(body)
 	assertLifecyclePair(t, buf, "handleExecute-Query")
+}
+
+func TestPortalLifecycleTerminalPortalsReleaseLargeStatementsAfterReparse(t *testing.T) {
+	const (
+		largeQuerySize = 256 << 10
+		largeParamOIDs = 27_000
+	)
+	for _, tc := range []struct {
+		name   string
+		binary bool
+	}{
+		{name: "success"},
+		{name: "binary failure", binary: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, cleanup := newLifecycleClientConn(t)
+			defer cleanup()
+			var out bytes.Buffer
+			c.writer = bufio.NewWriter(&out)
+			c.passthrough = true
+
+			var (
+				executor QueryExecutor
+				bound    *boundLifecycleExecutor
+			)
+			if tc.binary {
+				bound = &boundLifecycleExecutor{}
+				executor = bound
+			} else {
+				executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+			}
+			c.executor = executor
+
+			paramTypes := make([]int32, largeParamOIDs)
+			paramFormats := []int16(nil)
+			value := bindTestValue{data: []byte("value")}
+			wantState := portalStateDone
+			if tc.binary {
+				paramTypes[0] = OidInt4
+				paramFormats = []int16{1}
+				value = bindTestValue{data: []byte{0, 0}}
+				wantState = portalStateFailed
+			}
+			largeQuery := "INSERT INTO t VALUES ($1) /* " + strings.Repeat("x", largeQuerySize) + " */"
+			c.stmts["large"] = &preparedStmt{
+				query:          largeQuery,
+				convertedQuery: "INSERT INTO t VALUES (?) /* " + strings.Repeat("x", largeQuerySize) + " */",
+				paramTypes:     paramTypes,
+				numParams:      1,
+			}
+
+			p := bindPortalForTest(t, c, "terminal", "large", paramFormats, []bindTestValue{value}, nil)
+			out.Reset()
+			c.handleExecute(executeTestBody("terminal"))
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush Execute: %v", err)
+			}
+			if p.state != wantState {
+				t.Fatalf("terminal state = %v, want %v", p.state, wantState)
+			}
+			requireReleasedBindPayload(t, p)
+			if p.stmt != nil {
+				t.Fatalf("terminal portal retained prepared statement %p", p.stmt)
+			}
+			if tc.binary {
+				if !bytes.Contains(out.Bytes(), []byte("08P01")) {
+					t.Fatalf("malformed binary Execute response = %q, want 08P01", out.Bytes())
+				}
+				if got := bound.boundCalls.Load(); got != 0 {
+					t.Fatalf("malformed binary Bind reached Flight executor %d times", got)
+				}
+			}
+
+			out.Reset()
+			c.handleExecute(executeTestBody("terminal"))
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush repeated Execute: %v", err)
+			}
+			if !bytes.Contains(out.Bytes(), []byte("55000")) {
+				t.Fatalf("repeated terminal Execute response = %q, want 55000", out.Bytes())
+			}
+
+			c.handleClose([]byte{'S', 'm', 'i', 's', 's', 'i', 'n', 'g', 0})
+			if c.portals["terminal"] != p {
+				t.Fatal("Close(S) for a missing statement dropped terminal portal")
+			}
+			if err := c.writer.Flush(); err != nil {
+				t.Fatalf("flush missing Close(S): %v", err)
+			}
+			out.Reset()
+
+			replacementQuery := "SELECT 1 /* " + strings.Repeat("r", largeQuerySize) + " */"
+			for i := 0; i < 3; i++ {
+				previous := c.stmts["large"]
+				c.handleParse(parseTestBody("large", replacementQuery, nil))
+				if err := c.writer.Flush(); err != nil {
+					t.Fatalf("flush re-Parse %d: %v", i, err)
+				}
+				frames := scanWireFrames(t, out.Bytes())
+				if len(frames) != 1 || frames[0].msgType != wire.MsgParseComplete {
+					t.Fatalf("re-Parse %d frames = %q, want ParseComplete", i, frameTypes(frames))
+				}
+				replacement := c.stmts["large"]
+				if replacement == nil || replacement == previous || replacement.query != replacementQuery {
+					t.Fatalf("re-Parse %d did not replace large statement: got %p, previous %p", i, replacement, previous)
+				}
+				out.Reset()
+			}
+
+			c.handleClose([]byte{'S', 'l', 'a', 'r', 'g', 'e', 0})
+			if _, ok := c.portals["terminal"]; ok {
+				t.Fatal("Close(S) did not remove terminal portal after re-Parse")
+			}
+		})
+	}
+}
+
+func TestPortalLifecycleMaxRowsKeepsLegacyReadyPortal(t *testing.T) {
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+	var out bytes.Buffer
+	c.writer = bufio.NewWriter(&out)
+	executor := &lifecycleExecutor{
+		queryRows: &streamingRowSet{
+			cols:      []string{"value"},
+			colTypers: []ColumnTyper{stringColumnTyper{}},
+			rows:      [][]any{{"one"}, {"two"}, {"three"}, {"four"}},
+		},
+	}
+	c.executor = executor
+	c.stmts["select"] = &preparedStmt{
+		query:          "SELECT $1",
+		convertedQuery: "SELECT ?",
+		numParams:      1,
+	}
+	p := bindPortalForTest(t, c, "limited", "select", nil, []bindTestValue{{data: []byte("value")}}, nil)
+
+	for i := 0; i < 2; i++ {
+		out.Reset()
+		c.handleExecute(executeTestBodyWithMaxRows("limited", 1))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush limited Execute %d: %v", i, err)
+		}
+		if p.state != portalStateReady {
+			t.Fatalf("limited Execute %d state = %v, want ready", i, p.state)
+		}
+		if p.stmt == nil {
+			t.Fatalf("limited Execute %d released the statement", i)
+		}
+		requireBindPayload(t, p)
+	}
+	if got := executor.queryCalls.Load(); got != 2 {
+		t.Fatalf("limited Execute query calls = %d, want 2", got)
+	}
+}
+
+func TestPortalLifecycleSimpleQueryDropsUnnamedPortal(t *testing.T) {
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+	var out bytes.Buffer
+	c.writer = bufio.NewWriter(&out)
+	c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+	c.stmts["insert"] = &preparedStmt{query: "INSERT INTO t VALUES ($1)", convertedQuery: "INSERT INTO t VALUES (?)", numParams: 1}
+	p := bindPortalForTest(t, c, "", "insert", nil, []bindTestValue{{data: []byte("value")}}, nil)
+
+	if err := c.handleQuery([]byte("UPDATE t SET value = 1\x00")); err != nil {
+		t.Fatalf("handle simple query: %v", err)
+	}
+	if _, ok := c.portals[""]; ok {
+		t.Fatal("simple Query did not remove unnamed portal")
+	}
+	requireReleasedBindPayload(t, p)
 }

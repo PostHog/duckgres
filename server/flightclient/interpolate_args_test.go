@@ -1,6 +1,42 @@
 package flightclient
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/posthog/duckgres/server/sqlcore"
+)
+
+type testLiteralAppender struct {
+	literals []string
+	errAt    int
+}
+
+func (a testLiteralAppender) BindParameterCount() int { return len(a.literals) }
+
+func (a testLiteralAppender) AppendBindParameterLiteral(dst *strings.Builder, index int) error {
+	if index == a.errAt {
+		return errors.New("malformed binary value")
+	}
+	dst.WriteString(a.literals[index])
+	return nil
+}
+
+var _ sqlcore.SQLLiteralAppender = testLiteralAppender{}
+
+type countingLiteralAppender struct {
+	calls int
+}
+
+func (a *countingLiteralAppender) BindParameterCount() int { return 1 }
+
+func (a *countingLiteralAppender) AppendBindParameterLiteral(*strings.Builder, int) error {
+	a.calls++
+	return errors.New("literal appender should not be called")
+}
+
+var _ sqlcore.SQLLiteralAppender = (*countingLiteralAppender)(nil)
 
 func TestInterpolateArgs(t *testing.T) {
 	tests := []struct {
@@ -96,4 +132,58 @@ func TestInterpolateArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInterpolateBoundArgs(t *testing.T) {
+	source := testLiteralAppender{literals: []string{"'o''brien'", "NULL", "42"}, errAt: -1}
+	got, err := interpolateBoundArgs("SELECT ?, $3, $1, '?' /* $2 */", source)
+	if err != nil {
+		t.Fatalf("interpolateBoundArgs() error = %v", err)
+	}
+	const want = "SELECT 'o''brien', 42, 'o''brien', '?' /* $2 */"
+	if got != want {
+		t.Fatalf("interpolateBoundArgs() = %q, want %q", got, want)
+	}
+
+	_, err = interpolateBoundArgs("SELECT ?", testLiteralAppender{literals: []string{"ignored"}, errAt: 0})
+	if err == nil || !strings.Contains(err.Error(), "malformed binary value") {
+		t.Fatalf("interpolateBoundArgs() error = %v, want literal decode error", err)
+	}
+}
+
+func TestBoundParamsPreflightSkipsInterpolation(t *testing.T) {
+	t.Run("dead worker", func(t *testing.T) {
+		exec := &FlightExecutor{}
+		exec.MarkDead()
+		params := &countingLiteralAppender{}
+
+		if _, err := exec.QueryWithBoundParams("SELECT ?", params); !errors.Is(err, ErrWorkerDead) {
+			t.Fatalf("QueryWithBoundParams() error = %v, want ErrWorkerDead", err)
+		}
+		if _, err := exec.ExecWithBoundParams("SELECT ?", params); !errors.Is(err, ErrWorkerDead) {
+			t.Fatalf("ExecWithBoundParams() error = %v, want ErrWorkerDead", err)
+		}
+		if params.calls != 0 {
+			t.Fatalf("literal appender calls = %d, want 0", params.calls)
+		}
+	})
+
+	t.Run("empty query", func(t *testing.T) {
+		exec := &FlightExecutor{}
+		params := &countingLiteralAppender{}
+
+		rows, err := exec.QueryWithBoundParams("-- ping", params)
+		if err != nil {
+			t.Fatalf("QueryWithBoundParams() error = %v", err)
+		}
+		if rows.Next() {
+			t.Fatal("empty query returned a row")
+		}
+		if _, err := exec.ExecWithBoundParams("-- ping", params); err != nil {
+			t.Fatalf("ExecWithBoundParams() error = %v", err)
+		}
+		if params.calls != 0 {
+			t.Fatalf("literal appender calls = %d, want 0", params.calls)
+		}
+	})
 }

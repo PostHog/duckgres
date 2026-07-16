@@ -352,6 +352,42 @@ func (e *FlightExecutor) Exec(query string, args ...any) (sqlcore.ExecResult, er
 	return e.ExecContext(context.Background(), query, args...)
 }
 
+// QueryWithBoundParams executes a query using compact Bind parameters. Text
+// values are appended straight into the final Flight SQL request buffer by the
+// portal-owned appender, avoiding an intermediate string/interface per value.
+func (e *FlightExecutor) QueryWithBoundParams(query string, params sqlcore.SQLLiteralAppender) (sqlcore.RowSet, error) {
+	// Match QueryContext's cheap terminal checks before building potentially
+	// large SQL from a compact Bind frame.
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	if sqlcore.IsEmptyQuery(query) {
+		return &emptyRowSet{}, nil
+	}
+	interpolated, err := interpolateBoundArgs(query, params)
+	if err != nil {
+		return nil, err
+	}
+	return e.Query(interpolated)
+}
+
+// ExecWithBoundParams is the Exec counterpart of QueryWithBoundParams.
+func (e *FlightExecutor) ExecWithBoundParams(query string, params sqlcore.SQLLiteralAppender) (sqlcore.ExecResult, error) {
+	// Match ExecContext's cheap terminal checks before building potentially
+	// large SQL from a compact Bind frame.
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	if sqlcore.IsEmptyQuery(query) {
+		return &flightExecResult{rowsAffected: 0}, nil
+	}
+	interpolated, err := interpolateBoundArgs(query, params)
+	if err != nil {
+		return nil, err
+	}
+	return e.Exec(interpolated)
+}
+
 func (e *FlightExecutor) ConnContext(ctx context.Context) (sqlcore.RawConn, error) {
 	return nil, fmt.Errorf("ConnContext not supported in Flight mode (use batched INSERT for COPY FROM)")
 }
@@ -1130,6 +1166,70 @@ func interpolateArgs(query string, args []any) string {
 		}
 	}
 	return b.String()
+}
+
+// InterpolateBoundArgs is interpolateArgs for a compact portal parameter
+// source. It preserves the same placeholder and quoted/comment scanning rules
+// while asking the source to append each literal directly to the one final SQL
+// builder. That keeps a large text Bind from creating one transient string per
+// parameter before the Flight RPC is made.
+func InterpolateBoundArgs(query string, params sqlcore.SQLLiteralAppender) (string, error) {
+	if params == nil || params.BindParameterCount() == 0 {
+		return query, nil
+	}
+
+	var b strings.Builder
+	b.Grow(len(query) + 16*params.BindParameterCount())
+	nextPositional := 0
+
+	for i := 0; i < len(query); {
+		ch := query[i]
+		switch {
+		case ch == '\'' || ch == '"':
+			end := scanQuoted(query, i, ch)
+			b.WriteString(query[i:end])
+			i = end
+		case ch == '-' && i+1 < len(query) && query[i+1] == '-':
+			end := indexOrEnd(query, i+2, "\n")
+			b.WriteString(query[i:end])
+			i = end
+		case ch == '/' && i+1 < len(query) && query[i+1] == '*':
+			end := blockCommentEnd(query, i+2)
+			b.WriteString(query[i:end])
+			i = end
+		case ch == '?':
+			if nextPositional < params.BindParameterCount() {
+				if err := params.AppendBindParameterLiteral(&b, nextPositional); err != nil {
+					return "", err
+				}
+				nextPositional++
+			} else {
+				b.WriteByte(ch)
+			}
+			i++
+		case ch == '$' && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9':
+			j := i + 1
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+			}
+			if n, err := strconv.Atoi(query[i+1 : j]); err == nil && n >= 1 && n <= params.BindParameterCount() {
+				if err := params.AppendBindParameterLiteral(&b, n-1); err != nil {
+					return "", err
+				}
+			} else {
+				b.WriteString(query[i:j])
+			}
+			i = j
+		default:
+			b.WriteByte(ch)
+			i++
+		}
+	}
+	return b.String(), nil
+}
+
+func interpolateBoundArgs(query string, params sqlcore.SQLLiteralAppender) (string, error) {
+	return InterpolateBoundArgs(query, params)
 }
 
 // scanQuoted returns the index just past a quoted region starting at start

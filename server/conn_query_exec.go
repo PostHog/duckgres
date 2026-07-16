@@ -904,7 +904,7 @@ func (c *clientConn) executeCleanup(cleanup []string) {
 // executeMultiStatementExtended handles execution of multi-statement query rewrites
 // for the extended query protocol (Parse/Bind/Execute).
 // Unlike executeMultiStatement, this does NOT send ReadyForQuery (that's done by Sync).
-func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup []string, args []interface{}, resultFormats []int16, described bool) {
+func (c *clientConn) executeMultiStatementExtended(p *portal, statements []string, cleanup []string, args []interface{}, resultFormats []int16, described bool) {
 	if len(statements) == 0 {
 		_ = wire.WriteEmptyQueryResponse(c.writer)
 		return
@@ -930,7 +930,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		setupStart := time.Now()
 		c.logQueryStarted(stmt)
-		result, err := c.executor.Exec(stmt, args...)
+		result, err := c.execPortal(p, stmt, args)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
@@ -962,7 +962,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		rows, err := c.executor.Query(finalStmt, args...)
+		rows, err := c.queryPortal(p, finalStmt, args)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt-ext final query error.", "query", finalStmt, "error", err)
@@ -980,11 +980,11 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// is tracked by streamRowsToClientExtended; the deferred Finished
 		// log uses 0 as an approximation (logQuery still records the
 		// precise count via the structured channel).
-		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
+		c.streamRowsToClientExtended(p, rows, cmdType, resultFormats, described, finalStmt)
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
-		result, err := c.executor.Exec(finalStmt, args...)
+		result, err := c.execPortal(p, finalStmt, args)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalStmt, "error", err)

@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/posthog/duckgres/server/wire"
 )
 
 type describeRecordingExecutor struct {
@@ -162,5 +164,45 @@ func TestHandleDescribePortalPreservesExistingLimit(t *testing.T) {
 	}
 	if got := exec.queries[0]; got != "SELECT version() LIMIT 1" {
 		t.Fatalf("unexpected describe probe query: %q", got)
+	}
+}
+
+func TestPortalLifecycleTerminalDescribeUsesCachedRowDescription(t *testing.T) {
+	exec := &describeRecordingExecutor{}
+	var out bytes.Buffer
+	c := &clientConn{
+		executor: exec,
+		writer:   bufio.NewWriter(&out),
+		portals:  make(map[string]*portal),
+		cursors:  make(map[string]*cursorState),
+	}
+	p := &portal{
+		stmt:          &preparedStmt{query: "SELECT $1", convertedQuery: "SELECT ?"},
+		stmtName:      "select",
+		bindBody:      []byte("retained-bind-frame"),
+		params:        []bindParam{{offset: 0, length: 1}},
+		resultFormats: []int16{1},
+		state:         portalStateReady,
+	}
+	if !c.cachePortalRowDescription(p, []string{"value"}, []ColumnTyper{describeColumnType("VARCHAR")}) {
+		t.Fatal("cachePortalRowDescription failed")
+	}
+	c.finishPortal(p, portalStateDone, "terminal_success")
+	c.portals["p"] = p
+	requireReleasedBindPayload(t, p)
+	if p.stmt != nil {
+		t.Fatalf("terminal portal retained prepared statement %p", p.stmt)
+	}
+
+	c.handleDescribe([]byte{'P', 'p', 0})
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush terminal Describe: %v", err)
+	}
+	if got := len(exec.queries); got != 0 {
+		t.Fatalf("terminal Describe queried %d times, want cached metadata only", got)
+	}
+	frames := scanWireFrames(t, out.Bytes())
+	if len(frames) != 1 || frames[0].msgType != wire.MsgRowDescription {
+		t.Fatalf("terminal Describe frames = %q, want RowDescription", frameTypes(frames))
 	}
 }

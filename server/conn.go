@@ -94,57 +94,160 @@ type preparedStmt struct {
 	cursorIsMove      bool     // FETCH is a MOVE: advance position without returning rows
 }
 
-type portal struct {
-	stmt          *preparedStmt
-	paramValues   [][]byte
-	paramFormats  []int16 // 0=text, 1=binary for each parameter
-	resultFormats []int16
-	described     bool // true if Describe was called on this portal
+// portalState describes whether a portal can still be executed. A normal
+// Execute (maxRows == 0) reaches a terminal state; existing maxRows behavior
+// remains reusable until a future PortalSuspended implementation gives it
+// lifecycle semantics. Keeping terminal shells matches PostgreSQL's error
+// behavior for a repeated Execute while allowing the large Bind payload to be
+// released now.
+type portalState uint8
+
+const (
+	portalStateReady portalState = iota
+	portalStateDone
+	portalStateFailed
+)
+
+// bindParam is a compact view into portal.bindBody. The PostgreSQL wire frame
+// is capped below 2 GiB, so int32 offsets and lengths are sufficient. A
+// negative length represents NULL; zero remains a distinct empty value.
+type bindParam struct {
+	offset int32
+	length int32
 }
 
-// decodeParams converts raw parameter bytes to Go values based on format codes.
-// Returns (args, nil) on success, or (nil, error) for malformed binary data.
-// On error, caller should send ErrorResponse with SQLSTATE 08P01.
+func (p bindParam) isNull() bool { return p.length < 0 }
+
+type portal struct {
+	stmt     *preparedStmt
+	stmtName string // retained lightweight metadata for Close(S) after re-Parse
+
+	// bindBody is the immutable Bind frame body allocated by wire.ReadMessage.
+	// Parameter data is never copied out of it: params stores offsets into this
+	// one backing allocation. Ownership transfers to this portal only after the
+	// entire Bind frame has been validated; releasePortalPayload drops it at a
+	// terminal lifecycle boundary.
+	bindBody []byte
+	params   []bindParam
+
+	paramFormats  []int16 // 0=text, 1=binary; either one code or one per parameter
+	resultFormats []int16 // retained only until the portal reaches a terminal state
+
+	// rowDescription is an already-encoded RowDescription body with this
+	// portal's result formats applied. It is intentionally the only
+	// result-metadata retained after terminal cleanup: it avoids a re-probe
+	// using released Bind values when a client later sends Describe(P).
+	rowDescription []byte
+
+	described       bool // true if Describe was called on this portal
+	state           portalState
+	payloadReleased bool
+}
+
+func (p *portal) paramValue(index int) []byte {
+	if p == nil || index < 0 || index >= len(p.params) {
+		return nil
+	}
+	param := p.params[index]
+	if param.isNull() || param.offset < 0 || param.length < 0 {
+		return nil
+	}
+	start := int(param.offset)
+	end := start + int(param.length)
+	if start < 0 || end < start || end > len(p.bindBody) {
+		return nil
+	}
+	return p.bindBody[start:end]
+}
+
+func (p *portal) paramTypeOID(index int) int32 {
+	if p != nil && p.stmt != nil && index >= 0 && index < len(p.stmt.paramTypes) {
+		return p.stmt.paramTypes[index]
+	}
+	return 0
+}
+
+func (p *portal) paramFormat(index int) int16 {
+	if p == nil {
+		return 0
+	}
+	if len(p.paramFormats) == 1 {
+		return p.paramFormats[0]
+	}
+	if index >= 0 && index < len(p.paramFormats) {
+		return p.paramFormats[index]
+	}
+	return 0
+}
+
+// decodeParams converts compact raw parameter views to database/sql values.
+// LocalExecutor and PinnedExecutor require this []any representation. Flight
+// instead uses the SQLLiteralAppender methods below so its text path does not
+// allocate a string/interface per value.
 func (p *portal) decodeParams() ([]interface{}, error) {
-	args := make([]interface{}, len(p.paramValues))
-	for i, v := range p.paramValues {
-		if v == nil {
+	args := make([]interface{}, len(p.params))
+	for i, param := range p.params {
+		if param.isNull() {
 			args[i] = nil
 			continue
 		}
+		value := p.paramValue(i)
+		typeOID := p.paramTypeOID(i)
+		format := p.paramFormat(i)
 
-		// Get type OID for this parameter
-		typeOID := int32(0) // Unknown
-		if i < len(p.stmt.paramTypes) {
-			typeOID = p.stmt.paramTypes[i]
-		}
-
-		// Get format code for this parameter
-		format := int16(0) // Default to text
-		if len(p.paramFormats) == 1 {
-			// Single format code applies to all parameters
-			format = p.paramFormats[0]
-		} else if i < len(p.paramFormats) {
-			// Per-parameter format codes
-			format = p.paramFormats[i]
-		}
-
-		// CRITICAL: Per PostgreSQL spec, when type is unknown (OID 0),
-		// IGNORE binary format code and always treat as text.
-		// "Anything you have down as UNKNOWN, send as text."
+		// Per PostgreSQL spec, UNKNOWN parameters are text even when a client
+		// supplied a binary format code.
 		if typeOID == 0 || format == 0 {
-			// Unknown type OR text format: treat as string
-			args[i] = string(v)
-		} else {
-			// Known type AND binary format: decode per type
-			val, err := decodeBinary(v, typeOID)
-			if err != nil {
-				return nil, fmt.Errorf("parameter %d: %w", i+1, err)
-			}
-			args[i] = val
+			args[i] = string(value)
+			continue
 		}
+		decoded, err := decodeBinary(value, typeOID)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %d: %w", i+1, err)
+		}
+		args[i] = decoded
 	}
 	return args, nil
+}
+
+// BindParameterCount and AppendBindParameterLiteral implement sqlcore's
+// compact Flight interpolation capability. Raw text bytes are escaped directly
+// into the final SQL builder, avoiding string(value) for every Bind parameter.
+func (p *portal) BindParameterCount() int { return len(p.params) }
+
+func (p *portal) AppendBindParameterLiteral(dst *strings.Builder, index int) error {
+	if p == nil || index < 0 || index >= len(p.params) {
+		return fmt.Errorf("parameter %d is out of range", index+1)
+	}
+	if p.params[index].isNull() {
+		dst.WriteString("NULL")
+		return nil
+	}
+	value := p.paramValue(index)
+	if typeOID, format := p.paramTypeOID(index), p.paramFormat(index); typeOID == 0 || format == 0 {
+		sqlcore.AppendTextLiteralBytes(dst, value)
+		return nil
+	}
+	decoded, err := decodeBinary(value, p.paramTypeOID(index))
+	if err != nil {
+		return fmt.Errorf("parameter %d: %w", index+1, err)
+	}
+	sqlcore.AppendSQLLiteral(dst, decoded)
+	return nil
+}
+
+// validateBinaryParameters preserves the protocol-level 08P01 classification
+// before a Flight interpolation error reaches generic executor handling.
+func (p *portal) validateBinaryParameters() error {
+	for i, param := range p.params {
+		if param.isNull() || p.paramTypeOID(i) == 0 || p.paramFormat(i) == 0 {
+			continue
+		}
+		if _, err := decodeBinary(p.paramValue(i), p.paramTypeOID(i)); err != nil {
+			return fmt.Errorf("parameter %d: %w", i+1, err)
+		}
+	}
+	return nil
 }
 
 // Transaction status constants for PostgreSQL wire protocol
@@ -1146,6 +1249,9 @@ func (c *clientConn) armIdleReadDeadline() {
 }
 
 func (c *clientConn) messageLoop() error {
+	// Every caller (standalone, control plane, and isolated worker) reaches
+	// this loop, so it is the single connection-close ownership boundary.
+	defer c.dropAllPortals("connection_close")
 	atReadyBoundary := true
 	for {
 		if atReadyBoundary && c.drainRequested.Load() {
@@ -1219,8 +1325,8 @@ func (c *clientConn) messageLoop() error {
 			c.runExtendedQueryMessage(c.handleExecute, body)
 
 		case wire.MsgSync:
-			// Extended query protocol - Sync: ends any skip-until-Sync error
-			// recovery, then reports readiness.
+			// Extended query protocol - Sync ends skip-until-Sync error recovery
+			// and reports readiness. It does not own portal cleanup.
 			c.ignoreTillSync = false
 			if err := c.writeReadyForQuery(c.txStatus); err != nil {
 				return err
@@ -1252,6 +1358,9 @@ func (c *clientConn) messageLoop() error {
 }
 
 func (c *clientConn) handleQuery(body []byte) (retErr error) {
+	// A simple Query destroys the unnamed extended-protocol portal before it
+	// executes, including an empty or failing query.
+	c.dropPortal("", "simple_query")
 	query := string(bytes.TrimRight(body, "\x00"))
 	query = strings.TrimSpace(query)
 

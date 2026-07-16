@@ -98,8 +98,12 @@ func (c *clientConn) handlePgStatActivity() error {
 
 // handlePgStatActivityExtended handles SELECT FROM pg_stat_activity in the Extended Query protocol.
 func (c *clientConn) handlePgStatActivityExtended(p *portal) {
+	if !c.validPortalResultFormats(p, len(pgStatActivityColumns)) {
+		return
+	}
+	p.rowDescription = pgStatActivityRowDescriptionBody(p.resultFormats)
 	if !p.stmt.described && !p.described {
-		_ = c.sendPgStatActivityRowDescriptionWithFormats(p.resultFormats)
+		_ = c.writeCachedPortalRowDescription(p)
 	}
 
 	conns := c.server.listConns()
@@ -114,6 +118,10 @@ func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 
 // sendPgStatActivityRowDescription sends a RowDescription for pg_stat_activity.
 func (c *clientConn) sendPgStatActivityRowDescriptionWithFormats(formatCodes []int16) error {
+	return wire.WriteMessage(c.writer, wire.MsgRowDescription, pgStatActivityRowDescriptionBody(formatCodes))
+}
+
+func pgStatActivityRowDescriptionBody(formatCodes []int16) []byte {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.BigEndian, int16(len(pgStatActivityColumns)))
 	for i, col := range pgStatActivityColumns {
@@ -132,7 +140,7 @@ func (c *clientConn) sendPgStatActivityRowDescriptionWithFormats(formatCodes []i
 		}
 		_ = binary.Write(&buf, binary.BigEndian, format)
 	}
-	return wire.WriteMessage(c.writer, wire.MsgRowDescription, buf.Bytes())
+	return buf.Bytes()
 }
 
 // sendPgStatActivityDataRow sends a DataRow for a single connection in pg_stat_activity.

@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/server/wire"
 )
@@ -233,6 +234,68 @@ func TestExtendedQueryErrorDiscardsPipelineUntilSync(t *testing.T) {
 	if len(deletes) != 1 {
 		t.Fatalf("DELETE executed %d times (%v), want exactly once (the post-Sync Execute)", len(deletes), executor.execCalls)
 	}
+}
+
+func TestPortalLifecycleSyncKeepsPortalUntilConnectionClose(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer func() { _ = serverSide.Close() }()
+	defer func() { _ = clientSide.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stmt := &preparedStmt{query: "SELECT 1", convertedQuery: "SELECT 1"}
+	p := &portal{
+		stmt:     stmt,
+		stmtName: "s",
+		bindBody: []byte("x"),
+		params:   []bindParam{{offset: 0, length: 1}},
+		state:    portalStateReady,
+	}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     serverSide,
+		reader:   bufio.NewReader(serverSide),
+		writer:   bufio.NewWriter(serverSide),
+		ctx:      ctx,
+		cancel:   cancel,
+		txStatus: txStatusIdle,
+		stmts:    map[string]*preparedStmt{"s": stmt},
+		portals:  map[string]*portal{"p": p},
+		cursors:  make(map[string]*cursorState),
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.messageLoop() }()
+
+	if err := wire.WriteMessage(clientSide, wire.MsgSync, nil); err != nil {
+		t.Fatalf("write Sync: %v", err)
+	}
+	msgType, body, err := wire.ReadMessage(clientSide)
+	if err != nil {
+		t.Fatalf("read Sync response: %v", err)
+	}
+	if msgType != wire.MsgReadyForQuery || len(body) != 1 || body[0] != txStatusIdle {
+		t.Fatalf("Sync response = type %q body %q, want ReadyForQuery(I)", msgType, body)
+	}
+	if got := c.portals["p"]; got != p {
+		t.Fatalf("Sync dropped portal: got %p, want %p", got, p)
+	}
+	requireBindPayload(t, p)
+
+	if err := clientSide.Close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("messageLoop returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("messageLoop did not stop after connection close")
+	}
+	if _, ok := c.portals["p"]; ok {
+		t.Fatal("connection close did not remove portal")
+	}
+	requireReleasedBindPayload(t, p)
 }
 
 // TestAbortedTransactionStillAllowsExtendedRollback pins the recovery
