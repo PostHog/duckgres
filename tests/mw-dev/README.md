@@ -16,10 +16,24 @@ cnpg-shard metadata stores, and external metadata fixtures.
    Postgres + a control-plane Deployment on the test image, spawning worker pods
    in the same namespace.
 4. **Test** via an in-cluster payload Job hitting the CP ClusterIP service.
-   `test-e2e` runs `e2e/harness.sh`; `test-scenario-full` runs the scenario
-   runner over the full dev workload group.
+   `test-e2e` runs `e2e/harness.sh`; `test-scenario` runs the scenario named by
+   `SCENARIO_NAME`, which defaults to `full-suite`. Scenario artifacts are
+   copied to `SCENARIO_ARTIFACTS_DIR`, which defaults to
+   `artifacts/scenario-dev/` at the repository root. Each invocation gets a
+   unique `<scenario>-<token>/` directory; failed or incomplete copies are
+   preserved as visible `<scenario>-<token>.partial/` directories with an
+   `artifact_collection_error.txt` marker.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
+
+The harness stores its generated internal secret, rotation fallback, and user
+secret key under `DUCKGRES_CI_SECRET_DIR` (default `/tmp`). Tests override this
+with a private temporary directory so they cannot alter credentials belonging
+to a concurrent local run. A missing configured directory is created with mode
+`0700`, and newly generated secret files use mode `0600`.
+`SCENARIO_JOB_CLEANUP_TIMEOUT_SECONDS` and
+`SCENARIO_POD_START_TIMEOUT_SECONDS` both default to `180` seconds and can be
+raised for unusually slow local clusters.
 
 A scheduled (`cron`) **e2e-cleanup** job (`run.sh e2e-cleanup`) runs every 6h and
 reaps any `duckgres-ci-pr-*` namespace older than 6h — a backstop for runs that

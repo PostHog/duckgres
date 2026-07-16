@@ -4,7 +4,7 @@
 
 The scenario runner executes end-to-end managed-warehouse flows against a configured dev environment. The first smoke scenario provisions a warehouse, waits for readiness, runs `SELECT 1` over PGWire with managed-hostname SNI, then deprovisions and verifies cleanup.
 
-The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. The standalone frozen metadata, perf, and dbt scenarios remain available for focused debugging.
+The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. `fast-suite.yaml` follows the same flow without dbt. The standalone provisioning, frozen metadata, perf, and dbt scenarios remain available for focused debugging.
 
 ## Required Environment
 
@@ -37,7 +37,7 @@ Frozen dataset scenarios additionally require:
 export DUCKGRES_SCENARIO_FROZEN_S3_URI="s3://<dev-managed-bucket>/frozen_v1/"
 ```
 
-The full suite and targeted perf scenarios additionally require the Flight SQL address because the perf catalog exercises both PGWire and Flight:
+The full suite, fast suite, and targeted perf scenarios additionally require the Flight SQL address because the perf catalog exercises both PGWire and Flight:
 
 ```bash
 export DUCKGRES_SCENARIO_FLIGHT_ADDR="<flight-sql-address>"
@@ -67,6 +67,12 @@ Run the composed full suite:
 
 ```bash
 just scenario scenario=tests/mw-dev/scenario/scenarios/full-suite.yaml
+```
+
+Run the fast suite without dbt:
+
+```bash
+just scenario scenario=tests/mw-dev/scenario/scenarios/fast-suite.yaml
 ```
 
 Run targeted frozen metadata exploration:

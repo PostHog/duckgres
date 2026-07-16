@@ -3,11 +3,11 @@ name: scenario-dev
 on:
   workflow_dispatch:
     inputs:
-      skip_slow:
-        description: Skip slow scenarios
+      scenario:
+        description: Scenario YAML name under tests/mw-dev/scenario/scenarios, without .yaml
         required: true
-        default: false
-        type: boolean
+        default: full-suite
+        type: string
       duckgres_image:
         description: Existing Duckgres image to deploy instead of building this SHA
         required: false
@@ -26,7 +26,6 @@ concurrency:
 
 jobs:
   scenario-runner-image:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_slow }}
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: tests/mw-dev/scenario/Dockerfile
@@ -38,7 +37,7 @@ jobs:
       ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
   duckgres-image:
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.skip_slow && inputs.duckgres_image == '') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.duckgres_image == '' }}
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
@@ -55,9 +54,9 @@ jobs:
     secrets:
       ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
-  scenario-full:
+  scenario:
     needs: [scenario-runner-image, duckgres-image]
-    if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_slow) && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
+    if: ${{ always() && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
     env:
@@ -74,13 +73,15 @@ jobs:
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Scenario dev target selected
-        run: echo "Deploying an isolated Duckgres stack for scenario.full."
+        env:
+          SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}
+        run: echo "Deploying an isolated Duckgres stack for $SCENARIO_NAME."
 
       - name: Set up Go
-        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -88,7 +89,7 @@ jobs:
         run: go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
         with:
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
@@ -101,7 +102,7 @@ jobs:
           tags: tag:github-runner
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
@@ -109,8 +110,10 @@ jobs:
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
 
-      - name: Run scenario.full
-        run: tests/mw-dev/run.sh test-scenario-full
+      - name: Run selected scenario
+        env:
+          SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}
+        run: tests/mw-dev/run.sh test-scenario
 
       - name: Collect diagnostics
         if: failure()
@@ -122,15 +125,9 @@ jobs:
 
       - name: Upload scenario artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scenario-dev-full-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scenario-dev-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/scenario-dev/
           if-no-files-found: warn
           retention-days: 14
-
-  scenario-skipped:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_slow }}
-    runs-on: ubuntu-24.04
-    steps:
-      - run: echo "Skipping scenario.full because skip_slow is true."
