@@ -129,8 +129,9 @@ func (c *clientConn) releasePortalNameStorage(p *portal) {
 }
 
 // releasePortalPayload is idempotent. It releases the Bind backing body and
-// every Bind-derived compact slice, while retaining only statement identity and
-// an already-encoded RowDescription body needed by Describe and Close.
+// every Bind-derived compact slice. finishPortal then clears the prepared
+// statement reference, leaving a terminal shell with only its lightweight
+// stmtName identity and cached RowDescription body for Describe and Close.
 func (c *clientConn) releasePortalPayload(p *portal, reason string) {
 	if p == nil || p.payloadReleased {
 		return
@@ -160,6 +161,10 @@ func (c *clientConn) finishPortal(p *portal, state portalState, reason string) {
 	}
 	p.state = state
 	c.releasePortalPayload(p, reason)
+	// Terminal Describe(P) replays rowDescription and Close(S) matches
+	// stmtName, so a completed shell must not pin the potentially large
+	// preparedStmt after a re-Parse replaces it in c.stmts.
+	p.stmt = nil
 }
 
 func (c *clientConn) dropPortal(name, reason string) {
@@ -185,7 +190,7 @@ func (c *clientConn) dropAllPortals(reason string) {
 
 func (c *clientConn) dropPortalsForStatement(stmt *preparedStmt, stmtName, reason string) {
 	for name, p := range c.portals {
-		if p.stmt == stmt || p.stmtName == stmtName {
+		if (stmt != nil && p.stmt == stmt) || p.stmtName == stmtName {
 			c.dropPortal(name, reason)
 		}
 	}

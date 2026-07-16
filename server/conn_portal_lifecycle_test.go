@@ -114,6 +114,19 @@ func portalLifecycleExecuteBody(portalName string) []byte {
 	return body.Bytes()
 }
 
+func portalLifecycleParseBody(stmtName, query string, paramTypes []int32) []byte {
+	var body bytes.Buffer
+	body.WriteString(stmtName)
+	body.WriteByte(0)
+	body.WriteString(query)
+	body.WriteByte(0)
+	_ = binary.Write(&body, binary.BigEndian, int16(len(paramTypes)))
+	for _, oid := range paramTypes {
+		_ = binary.Write(&body, binary.BigEndian, oid)
+	}
+	return body.Bytes()
+}
+
 func newPortalLifecycleConn(t testing.TB, executor QueryExecutor) (*clientConn, *bytes.Buffer, func()) {
 	t.Helper()
 	serverSide, clientSide := net.Pipe()
@@ -256,6 +269,174 @@ func TestPortalLifecycleTerminalDescribeUsesCachedRowDescription(t *testing.T) {
 	frames := scanWireFrames(t, out.Bytes())
 	if len(frames) != 1 || frames[0].msgType != wire.MsgRowDescription {
 		t.Fatalf("terminal Describe frames = %q, want RowDescription", frameTypes(frames))
+	}
+}
+
+func TestPortalLifecycleTerminalShellsReleasePreparedStatementsAfterReparse(t *testing.T) {
+	muteDefaultSlog(t)
+	const (
+		reparses       = 4
+		largeQuerySize = 256 << 10
+		largeParamOIDs = 27_000
+	)
+	executor := &lifecycleExecutor{queryRows: &describeStaticRowSet{
+		cols:     []string{"value"},
+		colTypes: []ColumnTyper{describeColumnType("VARCHAR")},
+	}, execResult: emptyExecResult{}}
+	c, out, cleanup := newPortalLifecycleConn(t, executor)
+	defer cleanup()
+	c.passthrough = true
+
+	paramTypes := make([]int32, largeParamOIDs)
+	paramTypes[0] = OidText
+	portals := make([]*portal, 0, reparses)
+	var wantRetained int64
+	for i := 0; i < reparses; i++ {
+		query := "SELECT $1 /* terminal-shell-reparse-" + strconv.Itoa(i) + " " + strings.Repeat("x", largeQuerySize) + " */"
+		c.handleParse(portalLifecycleParseBody("large", query, paramTypes))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush Parse %d: %v", i, err)
+		}
+		out.Reset()
+
+		stmt := c.stmts["large"]
+		if stmt == nil {
+			t.Fatalf("Parse %d did not install a statement", i)
+		}
+		p := bindPortalForLifecycle(t, c, "terminal-"+strconv.Itoa(i), "large", nil, []portalLifecycleBindValue{{data: []byte("value")}})
+		if p.stmt != stmt {
+			t.Fatalf("ready portal %d statement = %p, want parsed statement %p", i, p.stmt, stmt)
+		}
+		// A re-Parse replaces c.stmts["large"], but the ready portal must
+		// still execute against the statement it was bound to.
+		c.handleParse(portalLifecycleParseBody("large", "INSERT INTO t VALUES ($1) /* replacement */", []int32{OidText}))
+		if err := c.writer.Flush(); err != nil {
+			t.Fatalf("flush replacement Parse %d: %v", i, err)
+		}
+		out.Reset()
+		if got := c.stmts["large"]; got == stmt {
+			t.Fatalf("re-Parse %d did not replace the prepared statement", i)
+		}
+		if p.stmt != stmt {
+			t.Fatalf("ready portal %d lost its bound statement after re-Parse", i)
+		}
+
+		queryCalls, execCalls := executor.queryCalls.Load(), executor.execCalls.Load()
+		c.handleExecute(portalLifecycleExecuteBody("terminal-" + strconv.Itoa(i)))
+		if got := executor.queryCalls.Load(); got != queryCalls+1 {
+			t.Fatalf("ready portal %d Query calls = %d, want %d", i, got, queryCalls+1)
+		}
+		if got := executor.execCalls.Load(); got != execCalls {
+			t.Fatalf("ready portal %d Exec calls = %d, want %d", i, got, execCalls)
+		}
+		requirePortalState(t, p, portalStateDone)
+		requireReleasedPortalPayload(t, p)
+		if p.stmt != nil {
+			t.Fatalf("terminal portal %d retained prepared statement %p", i, p.stmt)
+		}
+		if got, want := p.stmtName, "large"; got != want {
+			t.Fatalf("terminal portal %d statement name = %q, want %q", i, got, want)
+		}
+		wantRetained += int64(p.retainedStorageBytes())
+		if got := c.retainedBindBytes; got != wantRetained {
+			t.Fatalf("terminal portal accounting after reparse %d = %d, want %d", i, got, wantRetained)
+		}
+		portals = append(portals, p)
+	}
+
+	// The oldest terminal portal must replay the cached description without
+	// retaining its old, large statement or probing through the current Parse.
+	oldest := portals[0]
+	if got := c.portals["terminal-0"]; got != oldest {
+		t.Fatalf("oldest terminal portal = %p, want %p", got, oldest)
+	}
+	queryCalls := executor.queryCalls.Load()
+	out.Reset()
+	c.handleDescribe([]byte{'P', 't', 'e', 'r', 'm', 'i', 'n', 'a', 'l', '-', '0', 0})
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush terminal Describe: %v", err)
+	}
+	if got := executor.queryCalls.Load(); got != queryCalls {
+		t.Fatalf("terminal Describe queried %d times, want %d", got, queryCalls)
+	}
+	frames := scanWireFrames(t, out.Bytes())
+	if len(frames) != 1 || frames[0].msgType != wire.MsgRowDescription {
+		t.Fatalf("terminal Describe frames = %q, want RowDescription", frameTypes(frames))
+	}
+
+	// The retained shell must reject reuse before dereferencing a released
+	// statement, and Close(S) for an unrelated name must not match nil stmt
+	// pointers on every terminal portal.
+	out.Reset()
+	c.handleExecute(portalLifecycleExecuteBody("terminal-0"))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush repeated Execute: %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("55000")) {
+		t.Fatalf("repeated Execute response = %q, want SQLSTATE 55000", out.Bytes())
+	}
+
+	retainedBeforeUnknownClose := c.retainedBindBytes
+	c.handleClose([]byte{'S', 'm', 'i', 's', 's', 'i', 'n', 'g', 0})
+	if got := len(c.portals); got != reparses {
+		t.Fatalf("Close(S) for missing statement removed %d portals, want %d retained shells", reparses-got, reparses)
+	}
+	if got := c.retainedBindBytes; got != retainedBeforeUnknownClose {
+		t.Fatalf("Close(S) for missing statement retained bytes = %d, want %d", got, retainedBeforeUnknownClose)
+	}
+
+	// Close(S) must still find every terminal portal by stmtName after the
+	// last Parse replaced the statement object.
+	c.handleClose([]byte{'S', 'l', 'a', 'r', 'g', 'e', 0})
+	if len(c.portals) != 0 {
+		t.Fatalf("Close(S) left %d terminal portals after re-Parse", len(c.portals))
+	}
+	if got := c.retainedBindBytes; got != 0 {
+		t.Fatalf("Close(S) retained bytes = %d, want 0", got)
+	}
+}
+
+func TestPortalLifecycleFailedTerminalShellReleasesPreparedStatement(t *testing.T) {
+	muteDefaultSlog(t)
+	const largeQuerySize = 256 << 10
+	executor := &lifecycleExecutor{execErr: errors.New("executor failed")}
+	c, out, cleanup := newPortalLifecycleConn(t, executor)
+	defer cleanup()
+	c.passthrough = true
+
+	query := "INSERT INTO t VALUES ($1) /* terminal-shell-failure " + strings.Repeat("x", largeQuerySize) + " */"
+	paramTypes := make([]int32, 27_000)
+	paramTypes[0] = OidText
+	c.handleParse(portalLifecycleParseBody("large-failure", query, paramTypes))
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush Parse: %v", err)
+	}
+	out.Reset()
+
+	p := bindPortalForLifecycle(t, c, "failed", "large-failure", nil, []portalLifecycleBindValue{{data: []byte("value")}})
+	c.handleExecute(portalLifecycleExecuteBody("failed"))
+	requirePortalState(t, p, portalStateFailed)
+	requireReleasedPortalPayload(t, p)
+	if p.stmt != nil {
+		t.Fatalf("failed terminal portal retained prepared statement %p", p.stmt)
+	}
+	if got, want := c.retainedBindBytes, int64(p.retainedStorageBytes()); got != want {
+		t.Fatalf("failed terminal portal accounting = %d, want %d", got, want)
+	}
+
+	out.Reset()
+	c.handleDescribe([]byte{'P', 'f', 'a', 'i', 'l', 'e', 'd', 0})
+	if err := c.writer.Flush(); err != nil {
+		t.Fatalf("flush failed terminal Describe: %v", err)
+	}
+	frames := scanWireFrames(t, out.Bytes())
+	if len(frames) != 1 || frames[0].msgType != wire.MsgNoData {
+		t.Fatalf("failed terminal Describe frames = %q, want NoData", frameTypes(frames))
+	}
+
+	c.handleClose([]byte{'S', 'l', 'a', 'r', 'g', 'e', '-', 'f', 'a', 'i', 'l', 'u', 'r', 'e', 0})
+	if len(c.portals) != 0 || c.retainedBindBytes != 0 {
+		t.Fatalf("Close(S) left failed terminal state: portals=%d retained=%d", len(c.portals), c.retainedBindBytes)
 	}
 }
 

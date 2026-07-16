@@ -164,6 +164,9 @@ func (p *portal) retainedStorageBytes() int {
 	if p == nil {
 		return 0
 	}
+	// This is the explicit Bind/shell budget. Ready portals need stmt to
+	// execute; finishPortal clears that reference before a terminal shell is
+	// retained, so the terminal shell's retained storage is fully counted here.
 	return p.retainedPayloadBytes() + len(p.rowDescription) + p.retainedNameBytes
 }
 
@@ -301,7 +304,7 @@ type clientConn struct {
 	secretKey          int32                    // unique key for cancel requests
 	stmts              map[string]*preparedStmt // prepared statements by name
 	portals            map[string]*portal       // portals by name
-	retainedBindBytes  int64                    // all portal-owned retained bytes: Bind payloads, cached RowDescriptions, and protocol names
+	retainedBindBytes  int64                    // budgeted portal Bind payloads, cached RowDescriptions, and protocol names
 	txStatus           byte                     // current transaction status ('I', 'T', or 'E')
 	ignoreTillSync     bool                     // discard extended-query messages until Sync after an error; see runExtendedQueryMessage
 	errorResponsesSent uint64                   // ErrorResponses sent via sendError; observed by runExtendedQueryMessage
