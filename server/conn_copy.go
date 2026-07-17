@@ -23,6 +23,15 @@ func shouldHandleCopyBeforeTranspile(query string) bool {
 	return strings.HasPrefix(strings.ToUpper(trimmed), "COPY")
 }
 
+// sendGeneratedCopyWorkerError preserves the engine error on the wire while
+// keeping generated SQL and worker-local paths out of lifecycle and durable
+// query telemetry.
+func (c *clientConn) sendGeneratedCopyWorkerError(code, clientMessage string) string {
+	telemetryMessage := generatedWorkerTelemetryErrorMessage(code)
+	c.sendErrorWithTelemetryMessage("ERROR", code, clientMessage, telemetryMessage)
+	return telemetryMessage
+}
+
 // Regular expressions for parsing COPY commands
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
@@ -204,14 +213,17 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	}
 
 	// For other COPY commands (e.g., COPY TO file), pass through to DuckDB
-	c.logQueryStarted(query)
+	workerStatement := workerStatementWithQuery(workerOriginClient, workerOperationCopyDirect, query)
 	queryStart := time.Now()
+	var workerRows int64
+	c.logWorkerStatementStarted(workerStatement)
 	result, err := c.executor.Exec(query)
 	var rowsAffected int64
 	if result != nil {
 		rowsAffected, _ = result.RowsAffected()
 	}
-	c.logQueryFinished(query, queryStart, rowsAffected, err)
+	workerRows = rowsAffected
+	c.logWorkerStatementFinished(workerStatement, queryStart, workerRows, err)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
@@ -261,24 +273,27 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		}
 	}
 
-	// Execute the query. Lifecycle log pair (PR #519): every COPY-OUT
-	// driven SELECT gets a logQueryStarted and a logQueryFinished — the
-	// row count comes from the iteration loop further down, so the
-	// deferred close in the outer function path captures it.
+	// The inner SELECT is generated to implement the client COPY operation.
+	// Record a worker event without exposing its generated SQL text.
 	queryStart := time.Now()
 	var copyRowsRead int64
 	var copyFinalErr error
-	c.logQueryStarted(selectQuery)
+	workerStatement := generatedWorkerStatement(
+		workerOriginCopy,
+		workerOperationCopyOutSelect,
+		"source_kind", map[bool]string{true: "query", false: "table"}[strings.HasPrefix(source, "(")],
+	)
+	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
-		c.logQueryFinished(selectQuery, queryStart, copyRowsRead, copyFinalErr)
+		c.logWorkerStatementFinished(workerStatement, queryStart, copyRowsRead, copyFinalErr)
 	}()
 	rows, err := c.executor.Query(selectQuery)
 	if err != nil {
 		copyFinalErr = err
-		c.logger().Error("COPY TO query failed.", "query", selectQuery, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		c.logger().Error("COPY TO query failed.", "error_code", classifyErrorCode(err))
+		errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -287,10 +302,11 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("COPY TO failed to get columns.", "query", selectQuery, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		copyFinalErr = err
+		c.logger().Error("COPY TO failed to get columns.", "error_code", classifyErrorCode(err))
+		errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -299,16 +315,16 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	isBinary := copyBinaryRegex.MatchString(query)
 
 	if isBinary {
-		return c.handleCopyOutBinary(query, rows, cols)
+		return c.handleCopyOutBinary(query, rows, cols, &copyFinalErr, &copyRowsRead)
 	}
 
 	// Get column types for JSON-aware formatting
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
 		copyFinalErr = err
-		c.sendError("ERROR", "42000", err.Error())
+		errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -328,6 +344,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	// Send CopyOutResponse (text format)
 	if err := wire.WriteCopyOutResponse(c.writer, int16(len(cols)), true); err != nil {
+		copyFinalErr = err
 		return err
 	}
 	_ = c.flushWriter()
@@ -336,6 +353,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery) {
 		header := strings.Join(cols, delimiter) + "\n"
 		if err := wire.WriteCopyData(c.writer, []byte(header)); err != nil {
+			copyFinalErr = err
 			return err
 		}
 	}
@@ -351,9 +369,12 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 		if err := rows.Scan(valuePtrs...); err != nil {
 			copyFinalErr = err
-			c.sendError("ERROR", "42000", err.Error())
-			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
-			break
+			errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
+			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", errMsg, "simple")
+			c.setTxError()
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
+			return nil
 		}
 
 		// Format row as tab/comma separated values
@@ -376,9 +397,9 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	if err := rows.Err(); err != nil {
 		copyFinalErr = err
-		c.sendError("ERROR", "42000", err.Error())
+		errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -402,13 +423,25 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 // Sends one CopyData message per tuple, with header prepended to the first tuple
 // and trailer appended to the last, matching how clients like DuckDB's postgres
 // extension consume binary COPY streams via PQgetCopyData.
-func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []string) error {
+func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []string, workerErr *error, workerRows *int64) (retErr error) {
+	rowCount := 0
+	defer func() {
+		if workerRows != nil {
+			*workerRows = int64(rowCount)
+		}
+		if retErr != nil && workerErr != nil && *workerErr == nil {
+			*workerErr = retErr
+		}
+	}()
 	start := time.Now()
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.sendError("ERROR", "42000", err.Error())
+		if workerErr != nil {
+			*workerErr = err
+		}
+		errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -455,7 +488,6 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 
 	// Send each tuple as its own CopyData message.
 	// The header is prepended to the first tuple's message.
-	rowCount := 0
 	firstRow := true
 	for rows.Next() {
 		values := make([]interface{}, len(cols))
@@ -465,9 +497,12 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.sendError("ERROR", "42000", err.Error())
+			if workerErr != nil {
+				*workerErr = err
+			}
+			errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
 			c.setTxError()
-			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", errMsg, "simple")
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
@@ -493,9 +528,12 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 	}
 
 	if err := rows.Err(); err != nil {
-		c.sendError("ERROR", "42000", err.Error())
+		if workerErr != nil {
+			*workerErr = err
+		}
+		errMsg := c.sendGeneratedCopyWorkerError("42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -547,7 +585,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 	tableName := opts.TableName
 	columnList := opts.ColumnList
-	c.logger().Debug("COPY FROM STDIN parsed.", "table", tableName, "columns", columnList, "binary", opts.IsBinary)
+	c.logger().Debug("COPY FROM STDIN parsed.", "table", tableName, "column_list_specified", columnList != "", "binary", opts.IsBinary)
 
 	// Get column info. If a column list is specified, query only those columns
 	// in the specified order to match the binary data field order.
@@ -558,9 +596,18 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	} else {
 		colQuery = fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
 	}
+	probeStatement := generatedWorkerStatement(
+		workerOriginCopy,
+		workerOperationCopySchemaProbe,
+		"target_table", tableName,
+		"column_list_specified", columnList != "",
+	)
+	probeStart := time.Now()
+	c.logWorkerStatementStarted(probeStatement)
 	testRows, err := c.executor.Query(colQuery)
 	if err != nil {
-		c.logger().Error("COPY FROM table check failed.", "table", tableName, "error", err)
+		c.logWorkerStatementFinished(probeStatement, probeStart, 0, err)
+		c.logger().Error("COPY FROM table check failed.", "table", tableName, "error_code", classifyErrorCode(err))
 		errMsg := fmt.Sprintf("relation \"%s\" does not exist", tableName)
 		c.sendError("ERROR", "42P01", errMsg)
 		c.setTxError()
@@ -572,6 +619,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	cols, _ := testRows.Columns()
 	colTypes, _ := testRows.ColumnTypes()
 	_ = testRows.Close()
+	c.logWorkerStatementFinished(probeStatement, probeStart, 0, nil)
 
 	// Branch to binary handler if binary format
 	if opts.IsBinary {
@@ -674,25 +722,30 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			// Build DuckDB COPY FROM statement using the helper function
 			copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, tmpPath, opts)
 
-			c.logger().Debug("COPY FROM STDIN executing native DuckDB COPY.", "sql", copySQL)
+			c.logger().Debug("COPY FROM STDIN executing native DuckDB COPY.", "target_table", tableName, "column_list_specified", columnList != "")
 			loadStart := time.Now()
 
-			// Lifecycle log pair (PR #519): the native DuckDB COPY FROM is
-			// the actual query the worker runs; everything before this is
-			// CSV byte-pumping into a tempfile, not worker work.
-			c.logQueryStarted(copySQL)
+			// The generated local-file COPY must not be presented as client SQL.
+			workerStatement := generatedWorkerStatement(
+				workerOriginCopy,
+				workerOperationCopyFromStdinNative,
+				"target_table", tableName,
+				"column_list_specified", columnList != "",
+			)
+			c.logWorkerStatementStarted(workerStatement)
 			result, err := c.executor.Exec(copySQL)
 			var copyRowsAffected int64
 			if result != nil {
 				copyRowsAffected, _ = result.RowsAffected()
 			}
-			c.logQueryFinished(copySQL, loadStart, copyRowsAffected, err)
+			c.logWorkerStatementFinished(workerStatement, loadStart, copyRowsAffected, err)
 			if err != nil {
-				c.logger().Error("COPY FROM STDIN DuckDB COPY failed.", "error", err)
-				errMsg := fmt.Sprintf("COPY failed: %v", err)
-				c.sendError("ERROR", "22P02", errMsg)
+				c.logger().Error("COPY FROM STDIN DuckDB COPY failed.", "error_code", classifyErrorCode(err))
+				clientErrMsg := fmt.Sprintf("COPY failed: %v", err)
+				telemetryErrMsg := generatedWorkerTelemetryErrorMessage("22P02")
+				c.sendErrorWithTelemetryMessage("ERROR", "22P02", clientErrMsg, telemetryErrMsg)
 				c.setTxError()
-				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", telemetryErrMsg, "simple")
 				_ = c.writeReadyForQuery(c.txStatus)
 				_ = c.flushWriter()
 				return nil
@@ -750,16 +803,23 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 	columnList := opts.ColumnList
 
 	// Build the COPY SQL with the path placeholder; the worker substitutes
-	// in its own tempfile path before executing.
+	// in its own tempfile path before executing. It is generated work, so
+	// neither this text nor the local path belongs in structured logs.
 	copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
-	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "sql", copySQL)
+	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "target_table", tableName, "column_list_specified", columnList != "")
 
 	r := &copyDataWireReader{c: c}
 
 	loadStart := time.Now()
-	c.logQueryStarted(copySQL)
+	workerStatement := generatedWorkerStatement(
+		workerOriginCopy,
+		workerOperationCopyFromStdinStream,
+		"target_table", tableName,
+		"column_list_specified", columnList != "",
+	)
+	c.logWorkerStatementStarted(workerStatement)
 	rowCount, err := streamer.CopyFromStdin(c.ctx, copySQL, r)
-	c.logQueryFinished(copySQL, loadStart, rowCount, err)
+	c.logWorkerStatementFinished(workerStatement, loadStart, rowCount, err)
 
 	// On wire-level CopyFail / unexpected message, the reader returns a
 	// non-EOF error so the streamer aborts the gRPC stream (its deferred
@@ -784,11 +844,12 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 		return nil
 	}
 	if err != nil {
-		c.logger().Error("COPY FROM STDIN remote streaming failed.", "error", err)
-		errMsg := fmt.Sprintf("COPY failed: %v", err)
-		c.sendError("ERROR", "22P02", errMsg)
+		c.logger().Error("COPY FROM STDIN remote streaming failed.", "error_code", classifyErrorCode(err))
+		clientErrMsg := fmt.Sprintf("COPY failed: %v", err)
+		telemetryErrMsg := generatedWorkerTelemetryErrorMessage("22P02")
+		c.sendErrorWithTelemetryMessage("ERROR", "22P02", clientErrMsg, telemetryErrMsg)
 		c.setTxError()
-		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", telemetryErrMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -1156,18 +1217,31 @@ func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string
 		insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES %s",
 			tableName, colNames, strings.Join(valueClauses, ", "))
 
-		// Lifecycle log pair (PR #519) per batched INSERT — one query
-		// the worker actually runs.
+		// Each generated fallback batch is a physical worker statement. Never
+		// attach the generated INSERT, placeholders, identifiers, or arguments
+		// to logs that can be confused with the client-authored COPY.
+		workerStatement := generatedWorkerStatement(
+			workerOriginCopyFallback,
+			workerOperationCopyFallbackBatch,
+			"target_table", tableName,
+			"row_start", start+1,
+			"row_end", end,
+			"batch_size", len(batch),
+			"column_count", numCols,
+			"parameter_count", len(args),
+		)
 		batchStart := time.Now()
-		c.logQueryStarted(insertSQL)
+		c.logWorkerStatementStarted(workerStatement)
 		result, err := c.executor.Exec(insertSQL, args...)
 		var rowsAff int64
 		if result != nil {
 			rowsAff, _ = result.RowsAffected()
 		}
-		c.logQueryFinished(insertSQL, batchStart, rowsAff, err)
+		c.logWorkerStatementFinished(workerStatement, batchStart, rowsAff, err)
 		if err != nil {
-			return rowCount, fmt.Errorf("batch INSERT failed at rows %d-%d: %v", start+1, start+len(batch), err)
+			// Engine errors can echo the generated INSERT. Preserve the compact
+			// range and SQLSTATE for the outer COPY error without leaking it.
+			return rowCount, fmt.Errorf("COPY fallback batch failed at rows %d-%d (SQLSTATE %s)", start+1, end, classifyErrorCode(err))
 		}
 		rowCount += len(batch)
 	}

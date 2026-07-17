@@ -16,20 +16,20 @@ import (
 // streamRowsToClientExtended sends result rows for the extended query protocol.
 // Unlike streamRowsToClient, this does NOT send ReadyForQuery, and supports
 // binary result formats and the described flag.
-func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, resultFormats []int16, described bool, query string) {
+func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, resultFormats []int16, described bool) {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("Failed to get column info.", "query", query, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		c.logger().Error("Failed to get column info.", "error_code", classifyErrorCode(err))
+		c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 		c.setTxError()
 		return
 	}
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.logger().Error("Failed to get column types.", "query", query, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		c.logger().Error("Failed to get column types.", "error_code", classifyErrorCode(err))
+		c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 		c.setTxError()
 		return
 	}
@@ -57,8 +57,8 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.logger().Error("Failed to scan row.", "query", query, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			c.logger().Error("Failed to scan row.", "error_code", classifyErrorCode(err))
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			c.setTxError()
 			return
 		}
@@ -73,8 +73,8 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			c.logger().Error("Row iteration error.", "query", query, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			c.logger().Error("Row iteration error.", "error_code", classifyErrorCode(err))
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 		}
 		c.setTxError()
 		return
@@ -87,12 +87,12 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 // streamRowsToClient sends result rows over the wire protocol.
 // The rows cursor must already be obtained before calling this function.
-func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query string) error {
+func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string) error {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("Failed to get column info.", "query", query, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		c.logger().Error("Failed to get column info.", "error_code", classifyErrorCode(err))
+		c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
@@ -101,8 +101,8 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.logger().Error("Failed to get column types.", "query", query, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		c.logger().Error("Failed to get column types.", "error_code", classifyErrorCode(err))
+		c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
@@ -130,8 +130,8 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.logger().Error("Failed to scan row.", "query", query, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			c.logger().Error("Failed to scan row.", "error_code", classifyErrorCode(err))
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			c.setTxError()
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
@@ -148,8 +148,8 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			c.logger().Error("Row iteration error.", "query", query, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			c.logger().Error("Row iteration error.", "error_code", classifyErrorCode(err))
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 		}
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
@@ -583,6 +583,13 @@ func (c *clientConn) flushWriter() error {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
+	c.sendErrorWithTelemetryMessage(severity, code, message, message)
+}
+
+// sendErrorWithTelemetryMessage keeps a client-facing wire error intact while
+// allowing generated worker paths to keep implementation SQL and temporary
+// paths out of lifecycle telemetry. Most callers should use sendError.
+func (c *clientConn) sendErrorWithTelemetryMessage(severity, code, message, telemetryMessage string) {
 	// Class 28 = "Invalid Authorization Specification" (auth failures).
 	// All current FATAL errors use class 28, so this covers both auth
 	// failures and connection rejections (no SSL, no user, wrong password).
@@ -594,7 +601,8 @@ func (c *clientConn) sendError(severity, code, message string) {
 	if severity != "" {
 		c.lastErrorCode = code
 	}
-	c.logger().Debug("Sending error to client.", "severity", severity, "code", code, "message", message)
+	c.recordActiveClientQueryErrorResponse(code, telemetryMessage)
+	c.logger().Debug("Sending error to client.", "severity", severity, "code", code, "message", telemetryMessage)
 	c.errorResponsesSent++
 	_ = wire.WriteErrorResponse(c.writer, severity, code, message)
 	_ = c.flushWriter()

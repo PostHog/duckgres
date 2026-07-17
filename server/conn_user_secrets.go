@@ -116,14 +116,14 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	// Lifecycle log pair, like the normal exec paths. logQueryStarted/
-	// Finished/Error redact secret DDL internally (see usersecrets.
-	// RedactForLog) — they own redaction, callers pass raw text.
+	// Persistent-secret DDL is a physical worker statement. The worker helper
+	// applies the secret-aware redaction policy before recording client text.
+	statement := workerStatementWithQuery(workerOriginClient, workerOperationPersistentSecretDDL, query)
 	queryStart := time.Now()
-	var queryFinalErr error
-	c.logQueryStarted(query)
+	var workerErr error
+	c.logWorkerStatementStarted(statement)
 	defer func() {
-		c.logQueryFinished(query, queryStart, 0, queryFinalErr)
+		c.logWorkerStatementFinished(statement, queryStart, 0, workerErr)
 	}()
 
 	upperQuery := strings.ToUpper(query)
@@ -131,7 +131,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 
 	_, execErr := c.executor.ExecContext(ctx, query)
 	if execErr != nil {
-		queryFinalErr = execErr
+		workerErr = execErr
 		if st.Kind == usersecrets.KindDrop && isSecretNotFoundError(execErr) {
 			// The stored secret may exist even though the session-side one
 			// doesn't (its replay failed, e.g. a missing extension). Deleting
@@ -144,7 +144,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 			// deleting only the stored copy would hand the user a false
 			// confirmation — fatal for a credential revocation.
 			if existed, delErr := mgr.DeleteSecret(ctx, c.orgID, c.username, st.Name); delErr == nil && existed {
-				queryFinalErr = nil
+				workerErr = nil
 				c.updateTxStatus(cmdType)
 				return true, c.buildCommandTag(cmdType, nil), nil
 			}

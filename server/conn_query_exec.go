@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -33,15 +34,13 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		// Lifecycle log pair (PR #519): every DML simple-query gets a
-		// matched logQueryStarted / logQueryFinished. Captured via
-		// closures so the deferred call sees the eventual rows + err.
-		queryStart := time.Now()
-		var queryRowsAff int64
-		var queryFinalErr error
-		c.logQueryStarted(query)
+		workerStatement := workerStatementWithQuery(workerOriginClient, workerOperationDirectExec, query)
+		workerStart := time.Now()
+		var workerRows int64
+		var workerErr error
+		c.logWorkerStatementStarted(workerStatement)
 		defer func() {
-			c.logQueryFinished(query, queryStart, queryRowsAff, queryFinalErr)
+			c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
 		}()
 
 		runExec := func() (ExecResult, error) {
@@ -67,7 +66,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			)
 		}
 		if err != nil {
-			queryFinalErr = err
+			workerErr = err
 			errCode := classifyErrorCode(err)
 			errMsg := err.Error()
 			if c.isCallerCancellation(err) {
@@ -83,7 +82,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		}
 
 		if result != nil {
-			queryRowsAff, _ = result.RowsAffected()
+			workerRows, _ = result.RowsAffected()
 		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
@@ -93,7 +92,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		return nil
 	}
 
-	_, _, _, err := c.executeSelectQuery(query, cmdType)
+	_, _, _, err := c.executeSelectQuery(query, cmdType, workerStatementWithQuery(workerOriginClient, workerOperationSelect, query))
 	return err
 }
 
@@ -150,21 +149,19 @@ const physicalDuckLakeCatalog = "ducklake"
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
 // Returns the number of rows sent, any SQLSTATE+message sent to the client,
 // and any connection-level error.
-func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, string, string, error) {
+func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStatement workerStatement) (int64, string, string, error) {
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
 	execStart := time.Now()
 	execCtx, execSpan := observe.Tracer().Start(ctx, "duckgres.execute")
-	// Lifecycle log pair: deferred logQueryFinished captures the eventual
-	// rowCount and any error from any return path — including Scan,
-	// ColumnTypes, sendRowDescription, and rows.Err() — so the pair is
-	// always balanced.
-	var queryRowsAff int64
-	var queryFinalErr error
-	c.logQueryStarted(query)
+	// The physical worker pair captures row streaming failures as well as the
+	// initial dispatch, while the outer client scope owns logical analytics.
+	var workerRows int64
+	var workerErr error
+	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
-		c.logQueryFinished(query, execStart, queryRowsAff, queryFinalErr)
+		c.logWorkerStatementFinished(workerStatement, execStart, workerRows, workerErr)
 	}()
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, query)
@@ -191,7 +188,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
@@ -209,7 +206,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 	cols, err := rows.Columns()
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		if !c.isCallerCancellation(err) {
@@ -224,7 +221,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		if !c.isCallerCancellation(err) {
@@ -245,10 +242,10 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	// connection, or the kernel collapsing the socket after TCP_USER_TIMEOUT.
 	// They must route through logQueryError so the SQLSTATE-class severity
 	// router fires Error-level "Query execution errored." for alerts.
-	// Pre-fix the only signal was Info-level "Query finished." from the
+	// Pre-fix the only signal was Info-level "Client query finished." from the
 	// deferred lifecycle log, which silently disappears below alerting.
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
-		queryFinalErr = err
+		workerErr = err
 		if !c.isCallerCancellation(err) {
 			c.logQueryError(query, fmt.Errorf("pgwire client write failed sending row description: %w", err))
 		}
@@ -269,7 +266,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			queryFinalErr = err
+			workerErr = err
 			errCode := "42000"
 			errMsg := err.Error()
 			if !c.isCallerCancellation(err) {
@@ -283,7 +280,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
-			queryFinalErr = err
+			workerErr = err
 			if !c.isCallerCancellation(err) {
 				c.logQueryError(query, fmt.Errorf("pgwire client write failed during result streaming: %w", err))
 			}
@@ -291,10 +288,10 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 		rowCount++
 	}
-	queryRowsAff = int64(rowCount)
+	workerRows = int64(rowCount)
 
 	if err := rows.Err(); err != nil {
-		queryFinalErr = err
+		workerErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
@@ -581,25 +578,26 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return true, nil
 	}
 
-	// Lifecycle log pair: every per-statement run in a multi-statement
-	// simple-query batch gets a logQueryStarted / logQueryFinished bracket
-	// (PR #519). The deferred close captures whichever code path the
-	// statement took — DML, SELECT, retry, transaction-conflict recovery.
-	queryStart := time.Now()
-	var queryRowsAff int64
-	var queryFinalErr error
-	c.logQueryStarted(executedQuery)
+	if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+		c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+		_ = c.writeCommandComplete("BEGIN")
+		return false, nil
+	}
+
+	workerStatement := workerStatementForQuery(
+		workerOriginForQueries(query, result.SQL, executedQuery),
+		workerOperationSimpleBatchStatement,
+		executedQuery,
+	)
+	workerStart := time.Now()
+	var workerRows int64
+	var workerErr error
+	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
-		c.logQueryFinished(executedQuery, queryStart, queryRowsAff, queryFinalErr)
+		c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
 	}()
 
 	if !queryReturnsResults(executedQuery) {
-		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
-			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			_ = c.writeCommandComplete("BEGIN")
-			return false, nil
-		}
-
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
 		c.closeCursorsAtTxEnd(cmdType)
@@ -638,7 +636,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				)
 			}
 			if err != nil {
-				queryFinalErr = err
+				workerErr = err
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
@@ -657,7 +655,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		if execResult != nil {
 			writtenRows, _ = execResult.RowsAffected()
 		}
-		queryRowsAff = writtenRows
+		workerRows = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = c.writeCommandComplete(tag)
@@ -690,7 +688,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		)
 	}
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
@@ -707,7 +705,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	cols, err := rows.Columns()
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return true, nil
@@ -715,14 +713,14 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return true, nil
 	}
 
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
-		queryFinalErr = err
+		workerErr = err
 		return false, err
 	}
 
@@ -741,18 +739,18 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			queryFinalErr = err
+			workerErr = err
 			c.sendError("ERROR", "42000", err.Error())
 			return true, nil
 		}
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
-			queryFinalErr = err
+			workerErr = err
 			return false, err
 		}
 		rowCount++
 	}
-	queryRowsAff = int64(rowCount)
+	workerRows = int64(rowCount)
 
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
@@ -790,26 +788,32 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
-	// Execute setup statements (all but last). Each step is its own
-	// logical query on the worker, so each gets its own logQueryStarted /
-	// logQueryFinished pair (PR #519).
+	// Execute setup statements (all but last). These statements are generated
+	// by the rewrite, so expose only their stable operation and position rather
+	// than presenting generated SQL as client text.
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		c.logger().Debug("Multi-stmt setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
+		workerStatement := generatedWorkerStatement(
+			workerOriginRewrite,
+			workerOperationRewriteSetup,
+			"step", i+1,
+			"total", len(statements)-1,
+		)
+		c.logger().Debug("Multi-stmt setup.", "step", i+1, "total", len(statements)-1)
 		setupStart := time.Now()
-		c.logQueryStarted(stmt)
+		c.logWorkerStatementStarted(workerStatement)
 		result, err := c.executor.Exec(stmt)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
 		}
-		c.logQueryFinished(stmt, setupStart, setupRows, err)
+		c.logWorkerStatementFinished(workerStatement, setupStart, setupRows, err)
 		if err != nil {
-			c.logger().Error("Multi-stmt setup error.", "query", stmt, "error", err)
+			c.logger().Error("Multi-stmt setup error.", "step", i+1, "error_code", classifyErrorCode(err))
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
@@ -820,25 +824,26 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	finalStmt := statements[len(statements)-1]
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	c.logger().Debug("Multi-stmt final.", "stmt", finalStmt, "cmd_type", cmdType)
+	c.logger().Debug("Multi-stmt final.", "cmd_type", cmdType)
 
 	finalStart := time.Now()
-	var finalRowsAff int64
-	var finalErr error
-	c.logQueryStarted(finalStmt)
+	var workerRows int64
+	var workerErr error
+	workerStatement := generatedWorkerStatement(workerOriginRewrite, workerOperationRewriteFinal)
+	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
-		c.logQueryFinished(finalStmt, finalStart, finalRowsAff, finalErr)
+		c.logWorkerStatementFinished(workerStatement, finalStart, workerRows, workerErr)
 	}()
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
-			finalErr = err
-			c.logger().Error("Multi-stmt final query error.", "query", finalStmt, "error", err)
+			workerErr = err
+			c.logger().Error("Multi-stmt final query error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
@@ -854,9 +859,14 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		// (logQuery's own structured channel still records the precise
 		// count). A future refactor can plumb the count out of
 		// streamRowsToClient.
-		err = c.streamRowsToClient(rows, cmdType, finalStmt)
+		errorResponsesBeforeStream := c.errorResponsesSent
+		err = c.streamRowsToClient(rows, cmdType)
 		if err != nil {
-			finalErr = err
+			workerErr = err
+		} else if c.errorResponsesSent > errorResponsesBeforeStream {
+			// streamRowsToClient handles protocol errors itself and returns nil;
+			// preserve the terminal worker outcome without exposing rewrite SQL.
+			workerErr = errors.New("generated rewrite result streaming failed")
 		}
 		return err
 
@@ -864,17 +874,17 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
-			finalErr = err
-			c.logger().Error("Multi-stmt final exec error.", "query", finalStmt, "error", err)
+			workerErr = err
+			c.logger().Error("Multi-stmt final exec error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
 		}
 		if result != nil {
-			finalRowsAff, _ = result.RowsAffected()
+			workerRows, _ = result.RowsAffected()
 		}
 
 		// Execute cleanup
@@ -891,12 +901,25 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 // executeCleanup runs cleanup statements, ignoring errors (best effort).
 // This is used to clean up temp tables after a multi-statement query.
 func (c *clientConn) executeCleanup(cleanup []string) {
-	for _, stmt := range cleanup {
-		c.logger().Debug("Multi-stmt cleanup.", "stmt", stmt)
-		_, err := c.executor.Exec(stmt)
+	for i, stmt := range cleanup {
+		workerStatement := generatedWorkerStatement(
+			workerOriginRewrite,
+			workerOperationRewriteCleanup,
+			"step", i+1,
+			"total", len(cleanup),
+		)
+		c.logger().Debug("Multi-stmt cleanup.", "step", i+1, "total", len(cleanup))
+		cleanupStart := time.Now()
+		c.logWorkerStatementStarted(workerStatement)
+		result, err := c.executor.Exec(stmt)
+		var cleanupRows int64
+		if result != nil {
+			cleanupRows, _ = result.RowsAffected()
+		}
+		c.logWorkerStatementFinished(workerStatement, cleanupStart, cleanupRows, err)
 		if err != nil {
 			// Log but don't fail - cleanup is best effort
-			c.logger().Warn("Multi-stmt cleanup error (ignored).", "error", err)
+			c.logger().Warn("Multi-stmt cleanup error (ignored).", "step", i+1, "error_code", classifyErrorCode(err))
 		}
 	}
 }
@@ -922,26 +945,31 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
-	// Execute setup statements (all but last). Each step gets its own
-	// logQueryStarted / logQueryFinished pair (PR #519) so multi-stmt
-	// setup work is observable per statement, not just per outer query.
+	// Execute setup statements (all but last). Rewrite-generated SQL is never
+	// logged as client text; worker events carry only stable operation metadata.
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1, "stmt", stmt)
+		workerStatement := generatedWorkerStatement(
+			workerOriginRewrite,
+			workerOperationRewriteSetup,
+			"step", i+1,
+			"total", len(statements)-1,
+		)
+		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1)
 		setupStart := time.Now()
-		c.logQueryStarted(stmt)
+		c.logWorkerStatementStarted(workerStatement)
 		result, err := c.executor.Exec(stmt, args...)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
 		}
-		c.logQueryFinished(stmt, setupStart, setupRows, err)
+		c.logWorkerStatementFinished(workerStatement, setupStart, setupRows, err)
 		if err != nil {
-			c.logger().Error("Multi-stmt-ext setup error.", "query", stmt, "error", err)
+			c.logger().Error("Multi-stmt-ext setup error.", "step", i+1, "error_code", classifyErrorCode(err))
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			return
 		}
 	}
@@ -950,25 +978,26 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	finalStmt := statements[len(statements)-1]
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	c.logger().Debug("Multi-stmt-ext final.", "stmt", finalStmt, "cmd_type", cmdType)
+	c.logger().Debug("Multi-stmt-ext final.", "cmd_type", cmdType)
 
 	finalStart := time.Now()
-	var finalRowsAff int64
-	var finalErr error
-	c.logQueryStarted(finalStmt)
+	var workerRows int64
+	var workerErr error
+	workerStatement := generatedWorkerStatement(workerOriginRewrite, workerOperationRewriteFinal)
+	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
-		c.logQueryFinished(finalStmt, finalStart, finalRowsAff, finalErr)
+		c.logWorkerStatementFinished(workerStatement, finalStart, workerRows, workerErr)
 	}()
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
-			finalErr = err
-			c.logger().Error("Multi-stmt-ext final query error.", "query", finalStmt, "error", err)
+			workerErr = err
+			c.logger().Error("Multi-stmt-ext final query error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			return
 		}
 		defer func() { _ = rows.Close() }()
@@ -980,21 +1009,27 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// is tracked by streamRowsToClientExtended; the deferred Finished
 		// log uses 0 as an approximation (logQuery still records the
 		// precise count via the structured channel).
-		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
+		errorResponsesBeforeStream := c.errorResponsesSent
+		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described)
+		if c.errorResponsesSent > errorResponsesBeforeStream {
+			// Extended streaming reports handled errors through sendError rather
+			// than a return value; retain an error terminal worker event.
+			workerErr = errors.New("generated rewrite result streaming failed")
+		}
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
-			finalErr = err
-			c.logger().Error("Multi-stmt-ext final exec error.", "query", finalStmt, "error", err)
+			workerErr = err
+			c.logger().Error("Multi-stmt-ext final exec error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendErrorWithTelemetryMessage("ERROR", "42000", err.Error(), generatedWorkerTelemetryErrorMessage("42000"))
 			return
 		}
 		if result != nil {
-			finalRowsAff, _ = result.RowsAffected()
+			workerRows, _ = result.RowsAffected()
 		}
 
 		// Execute cleanup

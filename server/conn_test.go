@@ -1595,7 +1595,11 @@ func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
 		},
 	}
 
-	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT * FROM missing_table", "SELECT")
+	rowCount, errCode, errMsg, err := c.executeSelectQuery(
+		"SELECT * FROM missing_table",
+		"SELECT",
+		workerStatementWithQuery(workerOriginClient, workerOperationSelect, "SELECT * FROM missing_table"),
+	)
 	if err != nil {
 		t.Fatalf("expected nil connection error, got %v", err)
 	}
@@ -1764,7 +1768,11 @@ func TestExecuteSelectQueryRecoversAbortedAutocommitConnection(t *testing.T) {
 		executor: exec,
 	}
 
-	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT 1", "SELECT")
+	rowCount, errCode, errMsg, err := c.executeSelectQuery(
+		"SELECT 1",
+		"SELECT",
+		workerStatementWithQuery(workerOriginClient, workerOperationSelect, "SELECT 1"),
+	)
 	if err != nil {
 		t.Fatalf("expected nil connection error, got %v", err)
 	}
@@ -1973,7 +1981,11 @@ func TestExecuteSelectQueryDoesNotRollbackInsideUserTransaction(t *testing.T) {
 		executor: exec,
 	}
 
-	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT 1", "SELECT")
+	rowCount, errCode, errMsg, err := c.executeSelectQuery(
+		"SELECT 1",
+		"SELECT",
+		workerStatementWithQuery(workerOriginClient, workerOperationSelect, "SELECT 1"),
+	)
 	if err != nil {
 		t.Fatalf("expected nil connection error, got %v", err)
 	}

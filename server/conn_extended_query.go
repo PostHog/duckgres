@@ -184,17 +184,19 @@ func (c *clientConn) handleParse(body []byte) {
 
 	// Close existing statement with same name
 	delete(c.stmts, stmtName)
+	convertedQuery := c.rewriteDirectQuery(result.SQL)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:             query,                            // Keep original for logging and Describe
-		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
+		query:             query,          // Keep original for logging and Describe
+		convertedQuery:    convertedQuery, // Transpiled SQL for execution
+		workerOrigin:      workerOriginForQueries(query, result.SQL, convertedQuery),
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
 		isIgnoredSet:      result.IsIgnoredSet,
 		isNoOp:            result.IsNoOp,
 		noOpTag:           result.NoOpTag,
-		querySourceSet:    result.QuerySourceSet,  // SET duckgres.query_source (custom GUC)
-		querySourceShow:   result.QuerySourceShow, // SHOW duckgres.query_source
+		querySourceSet:    result.QuerySourceSet,    // SET duckgres.query_source (custom GUC)
+		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
@@ -533,9 +535,27 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	start := time.Now()
 	queryMetrics := c.beginQueryMetrics(start)
+
+	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
+		trace.WithAttributes(
+			attribute.String("duckgres.protocol", "extended"),
+			attribute.String("duckgres.org_id", c.orgID),
+			attribute.String("db.user", c.username),
+			attribute.String("db.statement", observe.TruncateForSpan(loggableQuery)),
+		),
+	)
+	// Extended Execute needs the same temporary connection context as simple
+	// Query. Without this, nested logs and durable query records accidentally
+	// read a stale connection trace rather than this Execute's trace.
+	prevCtx := c.ctx
+	c.ctx = queryCtx
+	defer func() { c.ctx = prevCtx }()
+	defer span.End()
+	c.beginClientQuery(queryMetrics, "extended", p.stmt.query, queryCtx)
 	defer c.finishQueryMetrics(queryMetrics)
 
-	// Handle cursor operations before normal execution
+	// Handle cursor operations after the logical boundary, before parameter
+	// decoding or any worker dispatch.
 	switch p.stmt.cursorOp {
 	case cursorOpDeclare:
 		c.handleDeclareCursorExtended(p)
@@ -553,16 +573,6 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.handlePgStatActivityExtended(p)
 		return
 	}
-
-	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
-		trace.WithAttributes(
-			attribute.String("duckgres.protocol", "extended"),
-			attribute.String("duckgres.org_id", c.orgID),
-			attribute.String("db.user", c.username),
-			attribute.String("db.statement", observe.TruncateForSpan(loggableQuery)),
-		),
-	)
-	defer span.End()
 
 	// Convert parameter values to interface{}, handling binary format
 	args, err := p.decodeParams()
@@ -628,23 +638,12 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	originalQuery := p.stmt.query
 	convertedQuery := p.stmt.convertedQuery
-
-	// Lifecycle log pair for the extended-query path. logQueryStarted /
-	// logQueryFinished are the canonical "did a query run on a worker?"
-	// signal for Loki / Grafana (PR #519). Without these, the only log a
-	// successful extended-query produces is the structured logQuery() to
-	// the queryLogger channel, which doesn't carry worker_id and isn't
-	// scrape-friendly. queryFinalErr is captured by the deferred call so
-	// every termination path — success, ALTER-TABLE-as-VIEW retry,
-	// transaction-conflict retry, recovery rollback, fatal error — emits
-	// exactly one Finished log per Started.
-	queryStart := time.Now()
-	var queryRowsAff int64
-	var queryFinalErr error
-	c.logQueryStarted(convertedQuery)
-	defer func() {
-		c.logQueryFinished(convertedQuery, queryStart, queryRowsAff, queryFinalErr)
-	}()
+	workerOrigin := p.stmt.workerOrigin
+	if workerOrigin == "" {
+		// Hand-built prepared statements in tests and legacy callers do not
+		// carry Parse-time provenance; treat their execution SQL as direct.
+		workerOrigin = workerOriginForQueries(originalQuery, convertedQuery, convertedQuery)
+	}
 
 	if !returnsResults {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
@@ -658,6 +657,14 @@ func (c *clientConn) handleExecute(body []byte) {
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
 		c.closeCursorsAtTxEnd(cmdType)
+		workerStatement := workerStatementForQuery(workerOrigin, workerOperationExecute, convertedQuery)
+		workerStart := time.Now()
+		var workerRows int64
+		var workerErr error
+		c.logWorkerStatementStarted(workerStatement)
+		defer func() {
+			c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
+		}()
 
 		// Non-result-returning query: use Exec with converted query
 		runExec := func() (ExecResult, error) {
@@ -694,7 +701,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				)
 			}
 			if err != nil {
-				queryFinalErr = err
+				workerErr = err
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
@@ -712,7 +719,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		if result != nil {
 			writtenRows, _ = result.RowsAffected()
 		}
-		queryRowsAff = writtenRows
+		workerRows = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = c.writeCommandComplete(tag)
@@ -721,6 +728,14 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	// Result-returning query: use Query with converted query
+	workerStatement := workerStatementForQuery(workerOrigin, workerOperationSelect, convertedQuery)
+	workerStart := time.Now()
+	var workerRows int64
+	var workerErr error
+	c.logWorkerStatementStarted(workerStatement)
+	defer func() {
+		c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
+	}()
 	runQuery := func() (RowSet, error) {
 		return c.executor.Query(convertedQuery, args...)
 	}
@@ -746,7 +761,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
@@ -763,7 +778,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		queryFinalErr = err
+		workerErr = err
 		c.logger().Error("Columns error.", "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
@@ -785,6 +800,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// DDL accidentally routed here) don't need RowDescription.
 	if !p.described && len(cols) > 0 {
 		if err := c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats); err != nil {
+			workerErr = err
 			return
 		}
 	}
@@ -804,7 +820,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			queryFinalErr = err
+			workerErr = err
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -812,15 +828,15 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		if err := c.sendDataRowWithFormats(values, p.resultFormats, typeOIDs); err != nil {
-			queryFinalErr = err
+			workerErr = err
 			return
 		}
 		rowCount++
 	}
-	queryRowsAff = int64(rowCount)
+	workerRows = int64(rowCount)
 
 	if err := rows.Err(); err != nil {
-		queryFinalErr = err
+		workerErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {

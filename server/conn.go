@@ -77,6 +77,7 @@ type cursorState struct {
 type preparedStmt struct {
 	query             string
 	convertedQuery    string
+	workerOrigin      workerStatementOrigin // execution SQL provenance decided during Parse
 	paramTypes        []int32
 	numParams         int
 	isIgnoredSet      bool     // True if this is an ignored SET parameter
@@ -444,15 +445,6 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 	}
 }
 
-// logQueryStarted records a query handing off to a worker. Pairs with
-// logQueryFinished at every termination point so logs and traces can
-// be cross-referenced — the trace_id attribute matches the OTEL span
-// ID exported by the same query, so a search like trace_id=abc123 in
-// Loki/Grafana lines up directly with the trace view.
-//
-// Includes worker_id and worker_pod so an operator chasing a specific
-// worker incident (e.g. the one in the worker-40761 postmortem) can
-// filter to just that worker's queries without joining across logs.
 // logger returns the connection-scoped logger: every line carries the session
 // identity (user, org, worker, worker_pod) so the full request/query lifecycle
 // is filterable by org or worker without joining log streams. Built per call —
@@ -475,42 +467,109 @@ func (c *clientConn) logger() *slog.Logger {
 	return slog.With(attrs...)
 }
 
-func (c *clientConn) logQueryStarted(query string) {
-	query = boundQueryLogText(usersecrets.RedactForLog(query))
-	c.logger().Info("Query started.",
-		"query", query,
-		"trace_id", observe.TraceIDFromContext(c.ctx))
+// beginClientQuery records the logical pgwire operation once the outer query
+// trace exists but before routing, rewriting, parameter decoding, COPY payload
+// ingestion, or worker dispatch.
+func (c *clientConn) beginClientQuery(scope *queryMetricsScope, protocol, query string, ctx context.Context) {
+	if scope == nil || scope.client != nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lifecycle := &clientQueryLifecycle{
+		query:       query,
+		protocol:    protocol,
+		querySource: c.QuerySource(),
+		traceID:     observe.TraceIDFromContext(ctx),
+	}
+	scope.client = lifecycle
+
+	c.logger().Info("Client query started.",
+		"scope", "client",
+		"protocol", lifecycle.protocol,
+		"query", boundQueryLogText(usersecrets.RedactForLog(lifecycle.query)),
+		"query_source", lifecycle.querySource,
+		"trace_id", lifecycle.traceID,
+	)
 	// Per-org product analytics. No SQL text or secrets are sent — only
 	// metadata — so this is unaffected by the secret-redaction concerns above.
 	analytics.Default().Capture("query_initiated", c.orgID, map[string]any{
 		"user":     c.username,
-		"trace_id": observe.TraceIDFromContext(c.ctx),
+		"trace_id": lifecycle.traceID,
 	})
 }
 
-// logQueryFinished records a query terminating on the worker. Counter-
-// part to logQueryStarted; emit once per query regardless of outcome
-// so the start/finish pair is always balanced.
-//
-// On error paths logQueryError still fires for severity routing
-// (Info vs Error based on SQLSTATE class). logQueryFinished
-// deliberately stays at Info even on error so the lifecycle pair stays
-// readable as a stream — operators following one trace see both a
-// "started" and a "finished" line, and can look at the separate error
-// line for severity context.
-func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64, err error) {
+// finishClientQuery emits the one terminal logical lifecycle event. It is
+// called from finishQueryMetrics after the final writer flush has been
+// accounted for, so handled sendError paths and returned wire errors share the
+// same outcome accounting.
+func (c *clientConn) finishClientQuery(scope *queryMetricsScope, outcome queryOutcome) {
+	if scope == nil || scope.client == nil || scope.client.finished {
+		return
+	}
+	lifecycle := scope.client
+	lifecycle.finished = true
+
 	attrs := []any{
-		"query", boundQueryLogText(usersecrets.RedactForLog(query)),
-		"duration_ms", time.Since(start).Milliseconds(),
-		"rows", rows,
-		"trace_id", observe.TraceIDFromContext(c.ctx),
+		"scope", "client",
+		"protocol", lifecycle.protocol,
+		"query", boundQueryLogText(usersecrets.RedactForLog(lifecycle.query)),
+		"query_source", lifecycle.querySource,
+		"duration_ms", time.Since(scope.start).Milliseconds(),
+		"outcome", string(outcome),
+		"trace_id", lifecycle.traceID,
 	}
-	if err != nil {
-		// Engine errors echo the offending SQL, so a failed CREATE SECRET
-		// leaks the credential here unless the error is redacted too.
-		attrs = append(attrs, "error", boundQueryLogText(usersecrets.RedactErrorForLog(query, err.Error())))
+
+	errorCode := lifecycle.errorCode
+	if errorCode == "" && lifecycle.error != nil {
+		errorCode = classifyErrorCode(lifecycle.error)
 	}
-	c.logger().Info("Query finished.", attrs...)
+	if errorCode == "" && outcome == queryOutcomeCanceled {
+		errorCode = "57014"
+	}
+	if errorCode != "" && outcome != queryOutcomeSuccess {
+		attrs = append(attrs, "sqlstate", errorCode)
+	}
+
+	if outcome != queryOutcomeSuccess {
+		errorText := lifecycle.errorMessage
+		if lifecycle.error != nil {
+			errorText = lifecycle.error.Error()
+		}
+		if errorText != "" {
+			// Engine errors can echo SQL, including CREATE SECRET values.
+			attrs = append(attrs, "error", boundQueryLogText(usersecrets.RedactErrorForLog(lifecycle.query, errorText)))
+		}
+	}
+
+	if outcome == queryOutcomeError {
+		category := queryErrorCategory(lifecycle.error, errorCode)
+		attrs = append(attrs, "error_category", category)
+		analytics.Default().Capture("query_failed", c.orgID, map[string]any{
+			"user":           c.username,
+			"trace_id":       lifecycle.traceID,
+			"error_code":     errorCode,
+			"error_category": category,
+		})
+	}
+	c.logger().Info("Client query finished.", attrs...)
+}
+
+func queryErrorCategory(err error, sqlState string) string {
+	switch {
+	case isDuckLakeTransactionConflict(err) || sqlState == "40001":
+		return "conflict"
+	case isDuckLakeMetadataConnectionLost(err):
+		return "metadata_connection_lost"
+	case isUserQueryError(err):
+		return "user"
+	case len(sqlState) >= 2:
+		if _, ok := userErrorSQLSTATEClasses[sqlState[:2]]; ok {
+			return "user"
+		}
+	}
+	return "system"
 }
 
 // logQueryError logs a query execution failure. DuckLake-specific
@@ -520,6 +579,7 @@ func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64,
 // (worker crash, IO failure, internal panic, infra unreachable), not
 // "user typo'd a column name."
 func (c *clientConn) logQueryError(query string, err error) {
+	c.recordActiveClientQueryError(err)
 	// Engine errors echo the offending SQL, so a failed CREATE SECRET leaks the
 	// credential via the error attribute unless it is redacted too. Classify
 	// against the original query before it is replaced with the redacted form.
@@ -529,29 +589,9 @@ func (c *clientConn) logQueryError(query string, err error) {
 		"query", redactedQuery,
 		"error", redactedErr,
 	}
-	// category mirrors the severity routing below so the dashboard can split
-	// user-attributable failures from genuine system errors per org.
-	var category string
-	switch {
-	case isDuckLakeTransactionConflict(err):
-		category = "conflict"
-	case isDuckLakeMetadataConnectionLost(err):
-		category = "metadata_connection_lost"
-	case isUserQueryError(err):
-		category = "user"
-	default:
-		category = "system"
-	}
 	sqlState := classifyErrorCode(err)
+	category := queryErrorCategory(err, sqlState)
 	traceID := observe.TraceIDFromContext(c.ctx)
-	// Per-org product analytics. No SQL text or secrets are sent — only the
-	// SQLSTATE and category — so this is unaffected by the redaction above.
-	analytics.Default().Capture("query_failed", c.orgID, map[string]any{
-		"user":           c.username,
-		"trace_id":       traceID,
-		"error_code":     sqlState,
-		"error_category": category,
-	})
 
 	// Retain a redacted snapshot for the admin Errors page. Both Query and
 	// Message are already redacted above — never store the raw forms here.
@@ -1277,12 +1317,6 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	start := time.Now()
 	queryMetrics := c.beginQueryMetrics(start)
-	defer func() {
-		if retErr != nil {
-			queryMetrics.markError(retErr)
-		}
-		c.finishQueryMetrics(queryMetrics)
-	}()
 
 	ctx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
@@ -1292,12 +1326,19 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 			attribute.String("db.statement", observe.TruncateForSpan(loggableQuery)),
 		),
 	)
-	defer span.End()
 	// Replace connection context for the duration of this query so child
 	// operations (queryContext, etc.) inherit the span.
 	prevCtx := c.ctx
 	c.ctx = ctx
 	defer func() { c.ctx = prevCtx }()
+	defer span.End()
+	c.beginClientQuery(queryMetrics, "simple", query, ctx)
+	defer func() {
+		if retErr != nil {
+			queryMetrics.markError(retErr)
+		}
+		c.finishQueryMetrics(queryMetrics)
+	}()
 
 	c.logger().Debug("Query received.", "query", loggableQuery)
 
@@ -1459,6 +1500,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Use the transpiled SQL
 	originalQuery := query
 	query = c.rewriteDirectQuery(result.SQL)
+	workerOrigin := workerOriginForQueries(originalQuery, result.SQL, query)
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
@@ -1489,6 +1531,14 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
 		c.closeCursorsAtTxEnd(cmdType)
+		workerStatement := workerStatementForQuery(workerOrigin, workerOperationExecute, query)
+		workerStart := time.Now()
+		var workerRows int64
+		var workerErr error
+		c.logWorkerStatementStarted(workerStatement)
+		defer func() {
+			c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
+		}()
 
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
@@ -1528,6 +1578,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 				)
 			}
 			if err != nil {
+				workerErr = err
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
@@ -1548,6 +1599,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		if execResult != nil {
 			writtenRows, _ = execResult.RowsAffected()
 		}
+		workerRows = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = c.writeCommandComplete(tag)
@@ -1558,7 +1610,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	}
 
 	// Execute query that returns results (SELECT, DML RETURNING, etc.)
-	rowCount, errCode, errMsg, err := c.executeSelectQuery(query, cmdType)
+	rowCount, errCode, errMsg, err := c.executeSelectQuery(query, cmdType, workerStatementForQuery(workerOrigin, workerOperationSelect, query))
 	if err == nil {
 		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, errCode, errMsg, "simple")
 	}

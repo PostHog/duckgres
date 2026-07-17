@@ -310,8 +310,8 @@ teardown), so you can build a provisioning funnel and alert on failures.
 | `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
 | `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
-| `query_initiated` | A client query begins execution | `user`, `trace_id` |
-| `query_failed` | A query errors | `user`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
+| `query_initiated` | A non-empty client query begins execution | `user`, `trace_id` |
+| `query_failed` | A client query reaches a terminal error | `user`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
 
 > Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
 > are terminal and fire exactly once per warehouse (guarded on the state
@@ -324,9 +324,35 @@ teardown), so you can build a provisioning funnel and alert on failures.
 > `-tags kubernetes`). The `_begin` events fire wherever the admin provisioning
 > API runs.
 
-> Note: `query_initiated` fires once per query with no sampling, so its volume
-> scales 1:1 with query throughput. Capture is asynchronous and batched, so it
-> stays off the query latency path.
+> Note: `query_initiated` fires exactly once per non-empty simple-protocol
+> Query or extended-protocol Execute, with no sampling. It and
+> `query_failed` describe the terminal logical client-query attempt; retries,
+> rewrites, cursor helpers, and generated COPY batches do not emit additional
+> client-query analytics. Capture is asynchronous and batched, so it stays off
+> the query latency path.
+
+### Query Lifecycle Logs
+
+Structured query logs distinguish the client-visible operation from the worker
+statements used to carry it out:
+
+| Event | Scope | Meaning |
+| --- | --- | --- |
+| `Client query started.` | `client` | Exactly once at the logical boundary of a non-empty simple Query or extended Execute, before routing, rewriting, payload ingestion, or worker dispatch. Carries the bounded/redacted client SQL and `protocol=simple` or `protocol=extended`. |
+| `Client query finished.` | `client` | Exactly once at the logical terminal outcome. Carries duration and `outcome=success`, `error`, or `canceled`; error outcomes also carry SQLSTATE/error information where available. |
+| `Worker statement started.` | `worker` | A physical statement is about to run on behalf of the client operation. |
+| `Worker statement finished.` | `worker` | The matching physical statement completed, with duration, affected rows, and a bounded/redacted error where applicable. |
+
+Worker logs include a typed `origin` rather than treating every physical
+statement as a new client query. The origin taxonomy is `client`,
+`transpiled`, `rewrite`, `copy`, `copy_fallback`, `cursor`, and `internal`.
+Generated work uses a stable `operation` and compact metadata instead of SQL
+text. For example, binary-COPY fallback batches use
+`origin=copy_fallback` and identify the target table, row range, batch size,
+column count, and parameter count without logging generated INSERT text,
+placeholders, arguments, or values.
+The durable query log remains the terminal history channel for logical client
+operations; worker statements do not create durable query-log records.
 
 ### CLI Flags
 

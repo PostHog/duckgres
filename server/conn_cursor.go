@@ -31,16 +31,20 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	ctx, cleanup := c.queryContextForCursor()
 	cursor.cleanup = cleanup
 
-	// Lifecycle log pair (PR #519): the cursor's underlying SELECT is the
-	// query the worker runs at OPEN time. The eventual row count comes
-	// from later FETCH iterations against the same rowset, which the
-	// outer cursor lifecycle (closeCursor) doesn't currently bubble up to
-	// us — log the cursor metadata phase as rows=0 / err=initial failure.
+	// The cursor's underlying SELECT is a physical worker statement at OPEN
+	// time. Rows stream through later FETCH calls, so this records only the
+	// metadata phase (rows=0) and its initial failure, if any.
+	statement := workerStatementWithQuery(workerOriginCursor, workerOperationCursorOpen, cursor.query)
 	cursorStart := time.Now()
-	c.logQueryStarted(cursor.query)
+	var workerErr error
+	c.logWorkerStatementStarted(statement)
+	defer func() {
+		c.logWorkerStatementFinished(statement, cursorStart, 0, workerErr)
+	}()
+
 	rows, err := c.executor.QueryContext(ctx, cursor.query)
 	if err != nil {
-		c.logQueryFinished(cursor.query, cursorStart, 0, err)
+		workerErr = err
 		cleanup()
 		cursor.cleanup = nil
 		return err
@@ -49,7 +53,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logQueryFinished(cursor.query, cursorStart, 0, err)
+		workerErr = err
 		_ = rows.Close()
 		cursor.rows = nil
 		cleanup()
@@ -60,7 +64,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.logQueryFinished(cursor.query, cursorStart, 0, err)
+		workerErr = err
 		_ = rows.Close()
 		cursor.rows = nil
 		cleanup()
@@ -68,10 +72,6 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 		return err
 	}
 	cursor.colTypes = colTypes
-	// Cursor opened successfully — emit the matching Finished now (rows=0,
-	// since rows are streamed via FETCH later and we'd otherwise log
-	// nothing on the success path).
-	c.logQueryFinished(cursor.query, cursorStart, 0, nil)
 
 	typeOIDs := make([]int32, len(colTypes))
 	for i, ct := range colTypes {
