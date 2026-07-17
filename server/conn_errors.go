@@ -15,7 +15,7 @@ import (
 // since infra cancels are real failures we want surfaced. Use
 // (*clientConn).isCallerCancellation for that.
 func isQueryCancelled(err error) bool {
-	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
+	return errors.Is(err, context.Canceled) || (err != nil && strings.Contains(err.Error(), "context canceled"))
 }
 
 // isCallerCancellation reports whether err is a cancellation that the caller
@@ -34,6 +34,30 @@ func (c *clientConn) isCallerCancellation(err error) bool {
 		return false
 	}
 	return c.ctx.Err() != nil
+}
+
+// clientErrorResponse returns the SQLSTATE and message for a terminal client
+// response. Keep SQLSTATE classification independent of who canceled the
+// context: both caller- and infrastructure-originated cancellation errors
+// arrive as 57014, while only caller cancellation gets the friendlier text.
+func (c *clientConn) clientErrorResponse(err error) (code, message string) {
+	code = classifyErrorCode(err)
+	message = err.Error()
+	if c.isCallerCancellation(err) {
+		message = "canceling statement due to user request"
+	}
+	return code, message
+}
+
+// clientResultStreamErrorResponse preserves pgwire's established 42000
+// response for non-cancellation failures that occur after a result cursor has
+// opened. Cancellations remain 57014 so logical lifecycle telemetry can retain
+// the correct terminal outcome.
+func (c *clientConn) clientResultStreamErrorResponse(err error) (code, message string) {
+	if isQueryCancelled(err) {
+		return c.clientErrorResponse(err)
+	}
+	return "42000", err.Error()
 }
 
 // isDuckLakeTransactionConflict returns true if the error is a DuckLake

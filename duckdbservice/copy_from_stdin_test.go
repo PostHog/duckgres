@@ -1,10 +1,12 @@
 package duckdbservice
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -131,6 +133,11 @@ func newSessionWithInMemoryDuckDB(t *testing.T) (*Session, func()) {
 }
 
 func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
+	previousLogger := slog.Default()
+	var logs bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
 	session, cleanup := newSessionWithInMemoryDuckDB(t)
 	defer cleanup()
 
@@ -183,6 +190,9 @@ func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("table row count = %d, want 3", n)
+	}
+	if strings.Contains(logs.String(), "tmp=") {
+		t.Errorf("COPY worker telemetry leaked generated tempfile metadata:\n%s", logs.String())
 	}
 }
 

@@ -29,21 +29,22 @@ const (
 type workerStatementOperation string
 
 const (
-	workerOperationExecute              workerStatementOperation = "execute"
-	workerOperationDirectExec           workerStatementOperation = "direct_exec"
-	workerOperationSelect               workerStatementOperation = "select"
-	workerOperationSimpleBatchStatement workerStatementOperation = "simple_batch_statement"
-	workerOperationRewriteSetup         workerStatementOperation = "rewrite_setup"
-	workerOperationRewriteFinal         workerStatementOperation = "rewrite_final"
-	workerOperationRewriteCleanup       workerStatementOperation = "rewrite_cleanup"
-	workerOperationCursorOpen           workerStatementOperation = "cursor_open"
-	workerOperationPersistentSecretDDL  workerStatementOperation = "persistent_secret_ddl"
-	workerOperationCopyDirect           workerStatementOperation = "copy_direct"
-	workerOperationCopyOutSelect        workerStatementOperation = "copy_out_select"
-	workerOperationCopySchemaProbe      workerStatementOperation = "copy_schema_probe"
-	workerOperationCopyFromStdinNative  workerStatementOperation = "copy_from_stdin_native"
-	workerOperationCopyFromStdinStream  workerStatementOperation = "copy_from_stdin_stream"
-	workerOperationCopyFallbackBatch    workerStatementOperation = "copy_fallback_batch"
+	workerOperationExecute               workerStatementOperation = "execute"
+	workerOperationDirectExec            workerStatementOperation = "direct_exec"
+	workerOperationSelect                workerStatementOperation = "select"
+	workerOperationSimpleBatchStatement  workerStatementOperation = "simple_batch_statement"
+	workerOperationRewriteSetup          workerStatementOperation = "rewrite_setup"
+	workerOperationRewriteFinal          workerStatementOperation = "rewrite_final"
+	workerOperationRewriteCleanup        workerStatementOperation = "rewrite_cleanup"
+	workerOperationCompatibilityFallback workerStatementOperation = "compatibility_fallback"
+	workerOperationCursorOpen            workerStatementOperation = "cursor_open"
+	workerOperationPersistentSecretDDL   workerStatementOperation = "persistent_secret_ddl"
+	workerOperationCopyDirect            workerStatementOperation = "copy_direct"
+	workerOperationCopyOutSelect         workerStatementOperation = "copy_out_select"
+	workerOperationCopySchemaProbe       workerStatementOperation = "copy_schema_probe"
+	workerOperationCopyFromStdinNative   workerStatementOperation = "copy_from_stdin_native"
+	workerOperationCopyFromStdinStream   workerStatementOperation = "copy_from_stdin_stream"
+	workerOperationCopyFallbackBatch     workerStatementOperation = "copy_fallback_batch"
 )
 
 // workerStatement describes one physical statement. query is set only for
@@ -88,6 +89,77 @@ func generatedWorkerStatement(origin workerStatementOrigin, operation workerStat
 
 func generatedWorkerTelemetryErrorMessage(sqlState string) string {
 	return fmt.Sprintf("generated worker statement failed (SQLSTATE %s)", sqlState)
+}
+
+// generatedWorkerErrorTelemetry returns the logical telemetry-safe form of a
+// generated worker failure without writing a second ErrorResponse. Callers
+// that already surfaced the wire error (for example result streaming) use it
+// to retain the real SQLSTATE in durable history.
+func (c *clientConn) generatedWorkerErrorTelemetry(err error) (code, telemetryMessage string) {
+	code, clientMessage := c.clientErrorResponse(err)
+	if c.isCallerCancellation(err) {
+		return code, clientMessage
+	}
+	return code, generatedWorkerTelemetryErrorMessage(code)
+}
+
+// sendGeneratedWorkerError writes an error without allowing generated SQL or
+// worker-local paths to reach logical lifecycle telemetry. The wire keeps the
+// original message except for a caller-requested cancellation, where pgwire's
+// standard cancellation text is more useful.
+func (c *clientConn) sendGeneratedWorkerError(err error) (code, telemetryMessage string) {
+	code, clientMessage := c.clientErrorResponse(err)
+	if c.isCallerCancellation(err) {
+		c.sendError("ERROR", code, clientMessage)
+		return code, clientMessage
+	}
+	_, telemetryMessage = c.generatedWorkerErrorTelemetry(err)
+	c.sendErrorWithTelemetryMessage("ERROR", code, clientMessage, telemetryMessage)
+	return code, telemetryMessage
+}
+
+// logicalWorkerTranspiledQuery returns the execution text that is safe to
+// retain on the enclosing logical client operation. Generated rewrites have
+// their own worker lifecycle records, but their implementation SQL must not
+// become a transpiled form of client input in durable history.
+func logicalWorkerTranspiledQuery(origin workerStatementOrigin, executedQuery string) string {
+	if origin == workerOriginRewrite {
+		return ""
+	}
+	return executedQuery
+}
+
+// sendLogicalWorkerError keeps generated worker failures out of the enclosing
+// client telemetry. Non-generated statements preserve the caller's existing
+// query-error logging behavior while sending their client-facing response.
+func (c *clientConn) sendLogicalWorkerError(origin workerStatementOrigin, query string, err error, recordQueryError bool) (code, telemetryMessage string) {
+	if origin == workerOriginRewrite {
+		return c.sendGeneratedWorkerError(err)
+	}
+
+	code, telemetryMessage = c.clientErrorResponse(err)
+	if recordQueryError && !c.isCallerCancellation(err) {
+		c.logQueryError(query, err)
+	}
+	c.sendError("ERROR", code, telemetryMessage)
+	return code, telemetryMessage
+}
+
+// sendLogicalResultWorkerError is the result-streaming counterpart to
+// sendLogicalWorkerError. It retains pgwire's legacy 42000 classification for
+// normal cursor errors while still keeping generated-rewrite details out of
+// the enclosing client lifecycle and durable telemetry.
+func (c *clientConn) sendLogicalResultWorkerError(origin workerStatementOrigin, query string, err error, recordQueryError bool) (code, telemetryMessage string) {
+	if origin == workerOriginRewrite {
+		return c.sendGeneratedWorkerError(err)
+	}
+
+	code, telemetryMessage = c.clientResultStreamErrorResponse(err)
+	if recordQueryError && !c.isCallerCancellation(err) {
+		c.logQueryError(query, err)
+	}
+	c.sendError("ERROR", code, telemetryMessage)
+	return code, telemetryMessage
 }
 
 func workerOriginForQueries(original, transpiled, executed string) workerStatementOrigin {

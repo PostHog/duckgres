@@ -1410,7 +1410,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Each statement gets its own results, with a single ReadyForQuery at the end.
 	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) > 1 {
-		return c.handleMultiStatementQuery(query)
+		return c.handleMultiStatementQuery(start, query)
 	}
 
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
@@ -1494,17 +1494,22 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Handle multi-statement results (writable CTE rewrites)
 	if len(result.Statements) > 0 {
 		c.logger().Debug("Multi-statement query.", "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
-		return c.executeMultiStatement(result.Statements, result.CleanupStatements)
+		return c.executeMultiStatement(start, query, result.Statements, result.CleanupStatements)
 	}
 
 	// Use the transpiled SQL
 	originalQuery := query
 	query = c.rewriteDirectQuery(result.SQL)
 	workerOrigin := workerOriginForQueries(originalQuery, result.SQL, query)
+	logicalTranspiledQuery := logicalWorkerTranspiledQuery(workerOrigin, query)
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
-		c.logger().Debug("Query transpiled.", "executed", query)
+		if workerOrigin == workerOriginRewrite {
+			c.logger().Debug("Generated query rewrite.", "operation", workerOperationExecute)
+		} else {
+			c.logger().Debug("Query transpiled.", "executed", query)
+		}
 	}
 
 	// Determine command type for proper response
@@ -1535,21 +1540,32 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		workerStart := time.Now()
 		var workerRows int64
 		var workerErr error
-		c.logWorkerStatementStarted(workerStatement)
-		defer func() {
+		workerFinished := false
+		finishWorker := func() {
+			if workerFinished {
+				return
+			}
+			workerFinished = true
 			c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
-		}()
+		}
+		c.logWorkerStatementStarted(workerStatement)
+		defer finishWorker()
 
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
 		execStart := time.Now()
 		execCtx, execSpan := observe.Tracer().Start(ctx, "duckgres.execute")
+		compatibilityFallbackUsed := false
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
 				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(query, err, func(fallbackQuery string) (ExecResult, error) {
 					return c.executor.ExecContext(ctx, fallbackQuery)
+				}, func() {
+					compatibilityFallbackUsed = true
+					workerErr = err
+					finishWorker()
 				})
 				if handled {
 					return fallbackResult, fallbackErr
@@ -1562,33 +1578,33 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 		execSpan.End()
 		if err != nil {
-			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
-				ducklakeConflictTotal.Inc()
-				execResult, err = retryOnConflict(runExec)
-			}
-			if err != nil {
-				execResult, err, _ = recoverAbortedTransaction(
-					err,
-					c.txStatus == txStatusIdle,
-					func() error {
-						_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
-						return rollbackErr
-					},
-					runExec,
-				)
-			}
-			if err != nil {
-				workerErr = err
-				errCode := classifyErrorCode(err)
-				errMsg := err.Error()
-				if c.isCallerCancellation(err) {
-					errMsg = "canceling statement due to user request"
-				} else {
-					c.logQueryError(query, err)
+			if !compatibilityFallbackUsed {
+				if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+					ducklakeConflictTotal.Inc()
+					execResult, err = retryOnConflict(runExec)
 				}
-				c.sendError("ERROR", errCode, errMsg)
+				if err != nil {
+					execResult, err, _ = recoverAbortedTransaction(
+						err,
+						c.txStatus == txStatusIdle,
+						func() error {
+							_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+							return rollbackErr
+						},
+						runExec,
+					)
+				}
+			}
+			if err != nil {
+				var errCode, errMsg string
+				if compatibilityFallbackUsed {
+					errCode, errMsg = c.sendGeneratedWorkerError(err)
+				} else {
+					workerErr = err
+					errCode, errMsg = c.sendLogicalWorkerError(workerOrigin, query, err, true)
+				}
 				c.setTxError()
-				c.logQuery(start, originalQuery, query, cmdType, 0, 0, errCode, errMsg, "simple")
+				c.logQuery(start, originalQuery, logicalTranspiledQuery, cmdType, 0, 0, errCode, errMsg, "simple")
 				_ = c.writeReadyForQuery(c.txStatus)
 				_ = c.flushWriter()
 				return nil
@@ -1599,11 +1615,13 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		if execResult != nil {
 			writtenRows, _ = execResult.RowsAffected()
 		}
-		workerRows = writtenRows
+		if !compatibilityFallbackUsed {
+			workerRows = writtenRows
+		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = c.writeCommandComplete(tag)
-		c.logQuery(start, originalQuery, query, cmdType, 0, writtenRows, "", "", "simple")
+		c.logQuery(start, originalQuery, logicalTranspiledQuery, cmdType, 0, writtenRows, "", "", "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -1612,7 +1630,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Execute query that returns results (SELECT, DML RETURNING, etc.)
 	rowCount, errCode, errMsg, err := c.executeSelectQuery(query, cmdType, workerStatementForQuery(workerOrigin, workerOperationSelect, query))
 	if err == nil {
-		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, errCode, errMsg, "simple")
+		c.logQuery(start, originalQuery, logicalTranspiledQuery, cmdType, rowCount, 0, errCode, errMsg, "simple")
 	}
 	return err
 }

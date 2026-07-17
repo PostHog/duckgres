@@ -131,8 +131,7 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	closeOnce()
 
 	finalSQL := strings.ReplaceAll(copySQL, flightclient.CopyFromStdinPathPlaceholder, tmpPath)
-	slog.Debug("copy-from-stdin: executing COPY",
-		"frames", frames, "bytes", bytesWritten, "tmp", tmpPath)
+	slog.Debug("copy-from-stdin: executing COPY", "frames", frames, "bytes", bytesWritten)
 
 	res, execErr := session.execConn(ctx, finalSQL)
 	if execErr != nil {

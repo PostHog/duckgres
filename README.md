@@ -346,6 +346,9 @@ statements used to carry it out:
 Worker logs include a typed `origin` rather than treating every physical
 statement as a new client query. The origin taxonomy is `client`,
 `transpiled`, `rewrite`, `copy`, `copy_fallback`, `cursor`, and `internal`.
+Generated rewrite operations are identified by a stable `operation`, including
+`rewrite_setup`, `rewrite_final`, `rewrite_cleanup`, and
+`compatibility_fallback`; their implementation SQL is not logged.
 Generated work uses a stable `operation` and compact metadata instead of SQL
 text. For example, binary-COPY fallback batches use
 `origin=copy_fallback` and identify the target table, row range, batch size,

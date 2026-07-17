@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -444,5 +447,325 @@ func TestBinaryCopyFallbackTelemetrySeparatesClientAndBatchWorkerLifecycles(t *t
 		t.Errorf("durable query-log entries = %d, want 1", got)
 	} else if entry := queryLogSink.entries[0]; entry.Query != query || entry.Protocol != "simple" {
 		t.Errorf("durable query-log entry = %#v, want one outer simple COPY", entry)
+	}
+}
+
+type copySchemaProbeFailureRowSet struct {
+	stage  string
+	closed bool
+}
+
+func (r *copySchemaProbeFailureRowSet) Columns() ([]string, error) {
+	if r.stage == "columns" {
+		return nil, errors.New("schema probe columns failed")
+	}
+	return []string{"value"}, nil
+}
+
+func (r *copySchemaProbeFailureRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	if r.stage == "column types" {
+		return nil, errors.New("schema probe column types failed")
+	}
+	return []ColumnTyper{copyFallbackTelemetryColumnType("VARCHAR")}, nil
+}
+
+func (*copySchemaProbeFailureRowSet) Next() bool        { return false }
+func (*copySchemaProbeFailureRowSet) Scan(...any) error { return nil }
+func (r *copySchemaProbeFailureRowSet) Close() error {
+	r.closed = true
+	if r.stage == "close" {
+		return errors.New("schema probe close failed")
+	}
+	return nil
+}
+func (*copySchemaProbeFailureRowSet) Err() error { return nil }
+
+func TestCopySchemaProbeMetadataFailureStopsCopyAndFailsWorkerTelemetry(t *testing.T) {
+	for _, stage := range []string{"columns", "column types", "close"} {
+		t.Run(stage, func(t *testing.T) {
+			logs := captureCopyFallbackTelemetryLogs(t)
+			c, cleanup := newLifecycleClientConn(t)
+			defer cleanup()
+
+			// A failed probe must terminate before the handler reads COPY data.
+			c.reader = bufio.NewReader(bytes.NewReader(nil))
+			c.writer = bufio.NewWriter(&bytes.Buffer{})
+			probeRows := &copySchemaProbeFailureRowSet{stage: stage}
+			executor := &lifecycleExecutor{queryRows: probeRows}
+			c.executor = executor
+			sink := &copyFallbackTelemetryQueryLogSink{}
+			c.server.queryLogSink = sink
+
+			const query = "COPY telemetry_target FROM STDIN"
+			if err := c.handleCopyIn(query, strings.ToUpper(query)); err != nil {
+				t.Fatalf("handleCopyIn: %v", err)
+			}
+			if !probeRows.closed {
+				t.Fatal("schema probe rows were not closed")
+			}
+			if got := executor.execCalls.Load(); got != 0 {
+				t.Fatalf("COPY load exec calls = %d, want 0 after schema probe failure", got)
+			}
+			if got := len(sink.entries); got != 1 {
+				t.Fatalf("durable query-log entries = %d, want 1", got)
+			}
+
+			probeFinishes := copyFallbackTelemetryLogLinesWithAttr(logs.String(), "Worker statement finished.", "operation=copy_schema_probe")
+			if got := len(probeFinishes); got != 1 {
+				t.Fatalf("schema-probe worker finishes = %d, want 1; logs:\n%s", got, logs.String())
+			}
+			assertCopyFallbackTelemetryAttrs(t, probeFinishes[0], "scope=worker", "origin=copy", "error_code=", "error=")
+			if strings.Contains(logs.String(), "operation=copy_from_stdin_") {
+				t.Errorf("COPY continued to a load worker after failed schema probe:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+func TestCopySchemaProbeInfrastructureCancellationHidesGeneratedDetails(t *testing.T) {
+	logs := captureCopyFallbackTelemetryLogs(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	const query = "COPY telemetry_target FROM STDIN"
+	const generatedMarker = "copy-schema-probe-generated-marker"
+	c.reader = bufio.NewReader(bytes.NewReader(nil))
+	c.executor = &lifecycleExecutor{
+		queryErr: fmt.Errorf("worker failed running SELECT * FROM telemetry_target LIMIT 0: %s: %w", generatedMarker, context.Canceled),
+	}
+	sink := &copyFallbackTelemetryQueryLogSink{}
+	c.server.queryLogSink = sink
+
+	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+	if got := len(sink.entries); got != 1 {
+		t.Fatalf("durable query-log entries = %d, want 1", got)
+	}
+	entry := sink.entries[0]
+	if entry.ExceptionCode != "57014" {
+		t.Errorf("durable query log SQLSTATE = %q, want 57014", entry.ExceptionCode)
+	}
+	if strings.Contains(entry.Exception, generatedMarker) {
+		t.Errorf("durable query log leaked generated schema-probe details: %#v", entry)
+	}
+	if strings.Contains(logs.String(), generatedMarker) {
+		t.Errorf("logical telemetry leaked generated schema-probe details:\n%s", logs.String())
+	}
+}
+
+func TestCopyLocalSpoolFailureDoesNotLeakTempPathToTelemetryOrDurableHistory(t *testing.T) {
+	tempPath := filepath.Join(t.TempDir(), "missing-copy-temp-directory")
+	t.Setenv("TMPDIR", tempPath)
+	if got := os.TempDir(); got != tempPath {
+		t.Fatalf("os.TempDir() = %q, want %q", got, tempPath)
+	}
+
+	logs := captureCopyFallbackTelemetryLogs(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+	c.executor = &lifecycleExecutor{queryRows: &copyFallbackTelemetryRowSet{
+		columns: []string{"value"},
+		types:   []ColumnTyper{copyFallbackTelemetryColumnType("VARCHAR")},
+	}}
+	sink := &copyFallbackTelemetryQueryLogSink{}
+	c.server.queryLogSink = sink
+
+	const query = "COPY telemetry_target FROM STDIN"
+	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	output := logs.String()
+	if strings.Contains(output, tempPath) {
+		t.Errorf("telemetry leaked local COPY spool path %q:\n%s", tempPath, output)
+	}
+	if got := len(sink.entries); got != 1 {
+		t.Fatalf("durable query-log entries = %d, want 1", got)
+	}
+	if strings.Contains(sink.entries[0].Exception, tempPath) {
+		t.Errorf("durable query log leaked local COPY spool path %q: %#v", tempPath, sink.entries[0])
+	}
+}
+
+type copyOutPartialScanErrorRowSet struct {
+	next    int
+	scanErr error
+}
+
+func (*copyOutPartialScanErrorRowSet) Columns() ([]string, error) {
+	return []string{"value"}, nil
+}
+func (*copyOutPartialScanErrorRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	return []ColumnTyper{copyFallbackTelemetryColumnType("VARCHAR")}, nil
+}
+func (r *copyOutPartialScanErrorRowSet) Next() bool {
+	r.next++
+	return r.next <= 2
+}
+func (r *copyOutPartialScanErrorRowSet) Scan(dest ...any) error {
+	if r.next == 2 {
+		if r.scanErr != nil {
+			return r.scanErr
+		}
+		return errors.New("copy out scan failed")
+	}
+	if len(dest) > 0 {
+		if value, ok := dest[0].(*interface{}); ok {
+			*value = "first row"
+		}
+	}
+	return nil
+}
+func (*copyOutPartialScanErrorRowSet) Close() error { return nil }
+func (*copyOutPartialScanErrorRowSet) Err() error   { return nil }
+
+func TestCopyOutWorkerTelemetryKeepsPartialRowsOnScanFailure(t *testing.T) {
+	logs := captureCopyFallbackTelemetryLogs(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+	c.executor = &lifecycleExecutor{queryRows: &copyOutPartialScanErrorRowSet{}}
+
+	const query = "COPY telemetry_target TO STDOUT"
+	if err := c.handleCopyOut(query, strings.ToUpper(query)); err != nil {
+		t.Fatalf("handleCopyOut: %v", err)
+	}
+
+	workerFinishes := copyFallbackTelemetryLogLinesWithAttr(logs.String(), "Worker statement finished.", "operation=copy_out_select")
+	if got := len(workerFinishes); got != 1 {
+		t.Fatalf("copy-out worker finishes = %d, want 1; logs:\n%s", got, logs.String())
+	}
+	assertCopyFallbackTelemetryAttrs(t, workerFinishes[0], "scope=worker", "origin=copy", "rows=1", "error_code=", "error=")
+}
+
+func TestCopyOutCancellationRemainsCanceledAtTheLogicalBoundary(t *testing.T) {
+	logs := captureCopyFallbackTelemetryLogs(t)
+	tracker := installCopyFallbackTelemetryTracker(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.cancel()
+	c.executor = &lifecycleExecutor{queryRows: &copyOutPartialScanErrorRowSet{scanErr: context.Canceled}}
+	sink := &copyFallbackTelemetryQueryLogSink{}
+	c.server.queryLogSink = sink
+
+	const query = "COPY telemetry_target TO STDOUT"
+	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	clientFinishes := assertCopyFallbackTelemetryLogCount(t, logs.String(), "Client query finished.", 1)
+	assertCopyFallbackTelemetryAttrs(t, clientFinishes[0], "scope=client", "outcome=canceled", "sqlstate=57014")
+	workerFinishes := copyFallbackTelemetryLogLinesWithAttr(logs.String(), "Worker statement finished.", "operation=copy_out_select")
+	if got := len(workerFinishes); got != 1 {
+		t.Fatalf("copy-out worker finishes = %d, want 1; logs:\n%s", got, logs.String())
+	}
+	assertCopyFallbackTelemetryAttrs(t, workerFinishes[0], "error_code=57014")
+	if got := len(sink.entries); got != 1 {
+		t.Fatalf("durable query-log entries = %d, want 1", got)
+	} else if entry := sink.entries[0]; entry.ExceptionCode != "57014" {
+		t.Errorf("durable query log SQLSTATE = %q, want 57014", entry.ExceptionCode)
+	}
+	if got := copyFallbackTelemetryEventCount(tracker, "query_initiated"); got != 1 {
+		t.Errorf("query_initiated analytics events = %d, want 1", got)
+	}
+	if got := copyFallbackTelemetryEventCount(tracker, "query_failed"); got != 0 {
+		t.Errorf("query_failed analytics events = %d, want 0", got)
+	}
+}
+
+type copyOutCloseCancellationRowSet struct{}
+
+func (*copyOutCloseCancellationRowSet) Columns() ([]string, error) {
+	return []string{"value"}, nil
+}
+func (*copyOutCloseCancellationRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	return []ColumnTyper{copyFallbackTelemetryColumnType("VARCHAR")}, nil
+}
+func (*copyOutCloseCancellationRowSet) Next() bool        { return false }
+func (*copyOutCloseCancellationRowSet) Scan(...any) error { return nil }
+func (*copyOutCloseCancellationRowSet) Close() error      { return context.Canceled }
+func (*copyOutCloseCancellationRowSet) Err() error        { return nil }
+
+func TestCopyOutCloseCancellationRemainsCanceledAtTheLogicalBoundary(t *testing.T) {
+	logs := captureCopyFallbackTelemetryLogs(t)
+	tracker := installCopyFallbackTelemetryTracker(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.cancel()
+	c.executor = &lifecycleExecutor{queryRows: &copyOutCloseCancellationRowSet{}}
+	sink := &copyFallbackTelemetryQueryLogSink{}
+	c.server.queryLogSink = sink
+
+	const query = "COPY telemetry_target TO STDOUT"
+	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	clientFinishes := assertCopyFallbackTelemetryLogCount(t, logs.String(), "Client query finished.", 1)
+	assertCopyFallbackTelemetryAttrs(t, clientFinishes[0], "scope=client", "outcome=canceled", "sqlstate=57014")
+	workerFinishes := copyFallbackTelemetryLogLinesWithAttr(logs.String(), "Worker statement finished.", "operation=copy_out_select")
+	if got := len(workerFinishes); got != 1 {
+		t.Fatalf("copy-out worker finishes = %d, want 1; logs:\n%s", got, logs.String())
+	}
+	assertCopyFallbackTelemetryAttrs(t, workerFinishes[0], "error_code=57014")
+	if got := len(sink.entries); got != 1 {
+		t.Fatalf("durable query-log entries = %d, want 1", got)
+	} else if entry := sink.entries[0]; entry.ExceptionCode != "57014" {
+		t.Errorf("durable query log SQLSTATE = %q, want 57014", entry.ExceptionCode)
+	}
+	if got := copyFallbackTelemetryEventCount(tracker, "query_failed"); got != 0 {
+		t.Errorf("query_failed analytics events = %d, want 0", got)
+	}
+}
+
+func TestBinaryCopyFallbackCancellationRemainsCanceledAtTheLogicalBoundary(t *testing.T) {
+	tracker := installCopyFallbackTelemetryTracker(t)
+	logs := captureCopyFallbackTelemetryLogs(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	var inbound bytes.Buffer
+	payload := copyFallbackTelemetryBinaryPayload(1, 1, "x")
+	if err := wire.WriteMessage(&inbound, wire.MsgCopyData, payload); err != nil {
+		t.Fatalf("write CopyData: %v", err)
+	}
+	if err := wire.WriteMessage(&inbound, wire.MsgCopyDone, nil); err != nil {
+		t.Fatalf("write CopyDone: %v", err)
+	}
+	c.reader = bufio.NewReader(bytes.NewReader(inbound.Bytes()))
+	c.writer = bufio.NewWriter(&bytes.Buffer{})
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.cancel()
+	c.executor = &lifecycleExecutor{
+		queryRows: &copyFallbackTelemetryRowSet{
+			columns: []string{"value"},
+			types:   []ColumnTyper{copyFallbackTelemetryColumnType("VARCHAR")},
+		},
+		execErr: context.Canceled,
+	}
+	sink := &copyFallbackTelemetryQueryLogSink{}
+	c.server.queryLogSink = sink
+
+	const query = "COPY telemetry_target (value) FROM STDIN WITH (FORMAT binary)"
+	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	clientFinishes := assertCopyFallbackTelemetryLogCount(t, logs.String(), "Client query finished.", 1)
+	assertCopyFallbackTelemetryAttrs(t, clientFinishes[0], "scope=client", "outcome=canceled", "sqlstate=57014")
+	if got := len(sink.entries); got != 1 {
+		t.Fatalf("durable query-log entries = %d, want 1", got)
+	} else if entry := sink.entries[0]; entry.ExceptionCode != "57014" {
+		t.Errorf("durable query log SQLSTATE = %q, want 57014", entry.ExceptionCode)
+	}
+	if got := copyFallbackTelemetryEventCount(tracker, "query_initiated"); got != 1 {
+		t.Errorf("query_initiated analytics events = %d, want 1", got)
+	}
+	if got := copyFallbackTelemetryEventCount(tracker, "query_failed"); got != 0 {
+		t.Errorf("query_failed analytics events = %d, want 0", got)
 	}
 }
