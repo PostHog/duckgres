@@ -93,13 +93,13 @@ func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // handler treats partial failure as a complete rollback.
 func (s *fakeStore) setProvisionUserFailHook(err error) { s.provisionUserFailHook = err }
 
-func (s *fakeStore) Provision(req ProvisionRequest) error {
+func (s *fakeStore) Provision(req ProvisionRequest) (ProvisionResult, error) {
 	// Pre-check: warehouse already exists in non-terminal state? Mirrors
 	// createPendingWarehouseTx so the handler's 409 branch is exercised.
 	if existing, ok := s.warehouses[req.OrgID]; ok &&
 		existing.State != configstore.ManagedWarehouseStateFailed &&
 		existing.State != configstore.ManagedWarehouseStateDeleted {
-		return ErrWarehouseNonTerminal
+		return ProvisionResult{}, ErrWarehouseNonTerminal
 	}
 
 	// Stage the writes into shadow maps so a mid-step failure can roll
@@ -111,11 +111,13 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	// 1. Warehouse + Org. Mirrors createPendingWarehouseTx: a NEW org
 	// requires default_team_id (rejected before any write); an existing org
 	// keeps its stored value when the field is omitted (set-only, never wipe).
+	orgCreated := false
 	if _, ok := s.orgs[req.OrgID]; !ok {
 		if req.DefaultTeamID == 0 {
-			return ErrDefaultTeamIDRequired
+			return ProvisionResult{}, ErrDefaultTeamIDRequired
 		}
 		s.orgs[req.OrgID] = &configstore.Org{Name: req.OrgID, DatabaseName: req.DatabaseName}
+		orgCreated = true
 	}
 	if req.DefaultTeamID != 0 {
 		teamID := req.DefaultTeamID
@@ -143,14 +145,14 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 		} else {
 			s.warehouses[req.OrgID] = shadowWarehouse
 		}
-		return s.provisionUserFailHook
+		return ProvisionResult{}, s.provisionUserFailHook
 	}
 	s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}] = req.RootUserHash
 
 	// Reference the shadow vars so the linter doesn't complain about
 	// declared-and-unused on the success path.
 	_, _ = shadowUserHash, hadUser
-	return nil
+	return ProvisionResult{OrgCreated: orgCreated}, nil
 }
 
 func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {

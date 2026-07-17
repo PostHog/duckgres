@@ -17,6 +17,11 @@ port: 5432
 # Default: 60s
 # worker_queue_timeout: "60s"
 
+# Slack operational notifications are env-only because the incoming webhook URL
+# is secret-bearing. Use DUCKGRES_SLACK_WEBHOOK_URL plus optional
+# DUCKGRES_NOTIFICATION_HASH_KEY, DUCKGRES_NOTIFICATION_QUEUE_SIZE, and
+# DUCKGRES_NOTIFICATION_TIMEOUT.
+
 # Directory for DuckDB database files (one per user)
 data_dir: "./data"
 

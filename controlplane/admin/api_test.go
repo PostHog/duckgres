@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/internal/notifications"
 	"gorm.io/gorm"
 )
 
@@ -31,6 +32,39 @@ type fakeAPIStore struct {
 type fakeReattributeCall struct {
 	org    string
 	teamID int64
+}
+
+type adminCapturedNotification struct {
+	name  string
+	orgID string
+	props map[string]any
+}
+
+type adminFakeNotifier struct {
+	events []adminCapturedNotification
+}
+
+func (f *adminFakeNotifier) Notify(event notifications.Event) {
+	f.events = append(f.events, adminCapturedNotification{name: event.Name, orgID: event.OrgID, props: event.Props})
+}
+func (f *adminFakeNotifier) Close() {}
+
+func installAdminFakeNotifier(t *testing.T) *adminFakeNotifier {
+	t.Helper()
+	fake := &adminFakeNotifier{}
+	notifications.SetDefault(fake)
+	t.Cleanup(func() { notifications.SetDefault(nil) })
+	return fake
+}
+
+func (f *adminFakeNotifier) count(name string) int {
+	n := 0
+	for _, event := range f.events {
+		if event.name == name {
+			n++
+		}
+	}
+	return n
 }
 
 func newFakeAPIStore() *fakeAPIStore {
@@ -1157,6 +1191,7 @@ func TestDeleteOrgRejectsWhenWarehouseStillExists(t *testing.T) {
 }
 
 func TestDeleteOrgSucceedsAfterWarehouseRemoved(t *testing.T) {
+	notifier := installAdminFakeNotifier(t)
 	store := newFakeAPIStore()
 	seedOrgWithWarehouse(store, "analytics")
 	delete(store.warehouses, "analytics")
@@ -1172,9 +1207,13 @@ func TestDeleteOrgSucceedsAfterWarehouseRemoved(t *testing.T) {
 	if _, ok := store.orgs["analytics"]; ok {
 		t.Fatal("expected org to be deleted once the warehouse is gone")
 	}
+	if got := notifier.count("org_deleted"); got != 1 {
+		t.Fatalf("org_deleted notifications = %d, want 1 (all: %+v)", got, notifier.events)
+	}
 }
 
 func TestDeleteOrgCascadesDeletedWarehouse(t *testing.T) {
+	notifier := installAdminFakeNotifier(t)
 	store := newFakeAPIStore()
 	seedOrgWithWarehouse(store, "analytics")
 	// Simulate a completed deprovision: the provisioner leaves the warehouse
@@ -1194,6 +1233,9 @@ func TestDeleteOrgCascadesDeletedWarehouse(t *testing.T) {
 	}
 	if _, ok := store.warehouses["analytics"]; ok {
 		t.Fatal("expected the deleted warehouse row to be cascaded away")
+	}
+	if got := notifier.count("org_deleted"); got != 1 {
+		t.Fatalf("org_deleted notifications = %d, want 1 (all: %+v)", got, notifier.events)
 	}
 }
 

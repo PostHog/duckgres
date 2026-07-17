@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/internal/analytics"
+	"github.com/posthog/duckgres/internal/notifications"
 	"gorm.io/gorm"
 )
 
@@ -76,7 +77,7 @@ type Store interface {
 	// transaction so partial failure rolls back cleanly. Use this for the
 	// public provision endpoint; the older per-step methods below are kept
 	// for the standalone surfaces (reset-password).
-	Provision(req ProvisionRequest) error
+	Provision(req ProvisionRequest) (ProvisionResult, error)
 	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
 	CreateOrgUser(orgID, username, passwordHash string) error
 	UpdateOrgUserPassword(orgID, username, passwordHash string) error
@@ -311,13 +312,14 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	// One transaction wraps warehouse + root user. Failure of any
 	// sub-step rolls the others back so the caller's retry sees the same
 	// starting state (no half-provisioned row blocking re-creation).
-	if err := h.store.Provision(ProvisionRequest{
+	provisionResult, err := h.store.Provision(ProvisionRequest{
 		OrgID:         orgID,
 		DatabaseName:  req.DatabaseName,
 		DefaultTeamID: req.DefaultTeamID,
 		Warehouse:     warehouse,
 		RootUserHash:  hash,
-	}); err != nil {
+	})
+	if err != nil {
 		// The warehouse-already-exists conflict is the only error
 		// shape that maps to 409. Everything else (DB write failure,
 		// OnConflict surprise) is internal. The sentinel here
@@ -355,6 +357,25 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		"metadata_store":   string(req.MetadataStore.Type),
 		"ducklake_enabled": ducklakeEnabled,
 	})
+	if provisionResult.OrgCreated {
+		notifications.Default().Notify(notifications.Event{
+			Name:  "org_created",
+			OrgID: orgID,
+			Props: map[string]any{
+				"source":           "provisioning",
+				"metadata_store":   string(req.MetadataStore.Type),
+				"ducklake_enabled": ducklakeEnabled,
+			},
+		})
+	}
+	notifications.Default().Notify(notifications.Event{
+		Name:  "warehouse_provision_begin",
+		OrgID: orgID,
+		Props: map[string]any{
+			"metadata_store":   string(req.MetadataStore.Type),
+			"ducklake_enabled": ducklakeEnabled,
+		},
+	})
 
 	resp := gin.H{
 		"status":   "provisioning started",
@@ -390,6 +411,7 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 			// are emitted by the async provisioner controller as it deletes the
 			// underlying resources.
 			analytics.Default().Capture("warehouse_deprovision_begin", orgID, nil)
+			notifications.Default().Notify(notifications.Event{Name: "warehouse_deprovision_begin", OrgID: orgID})
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}

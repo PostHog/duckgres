@@ -11,6 +11,7 @@ import (
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/internal/analytics"
+	"github.com/posthog/duckgres/internal/notifications"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
@@ -36,6 +37,7 @@ func captureProvisionFailed(w *configstore.ManagedWarehouse, reason string, upda
 	props := provisionEventProps(w)
 	props["reason"] = reason
 	analytics.Default().Capture("warehouse_provision_failed", w.OrgID, props)
+	notifications.Default().Notify(notifications.Event{Name: "warehouse_provision_failed", OrgID: w.OrgID, Props: props})
 }
 
 // ducklingCRName returns the Duckling CR name for a warehouse row: the stored
@@ -369,7 +371,9 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 			// usable. Guarded on a successful CAS from Provisioning, so this
 			// fires exactly once — the next tick routes a Ready warehouse to
 			// reconcileReady, not here.
-			analytics.Default().Capture("warehouse_provision_success", w.OrgID, provisionEventProps(w))
+			props := provisionEventProps(w)
+			analytics.Default().Capture("warehouse_provision_success", w.OrgID, props)
+			notifications.Default().Notify(notifications.Event{Name: "warehouse_provision_success", OrgID: w.OrgID, Props: props})
 		}
 	}
 
@@ -579,6 +583,11 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 			analytics.Default().Capture("warehouse_deprovision_failed", w.OrgID, map[string]any{
 				"reason": "duckling_delete_failed",
 			})
+			notifications.Default().Notify(notifications.Event{
+				Name:  "warehouse_deprovision_failed",
+				OrgID: w.OrgID,
+				Props: map[string]any{"reason": "duckling_delete_failed"},
+			})
 			return
 		}
 	}
@@ -592,5 +601,6 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 		// Terminal success: all underlying resources are gone. Guarded on a
 		// successful CAS from Deleting, so this fires exactly once.
 		analytics.Default().Capture("warehouse_deprovision_success", w.OrgID, nil)
+		notifications.Default().Notify(notifications.Event{Name: "warehouse_deprovision_success", OrgID: w.OrgID})
 	}
 }

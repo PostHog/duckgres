@@ -154,6 +154,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET_FALLBACKS  Comma-separated previous internal secrets still accepted during rotation\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_SLACK_WEBHOOK_URL  Slack incoming webhook URL for operational notifications (disabled when unset)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_NOTIFICATION_HASH_KEY  Optional secret key for HMAC org references in Slack notifications\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_NOTIFICATION_QUEUE_SIZE  Notification queue size (default: 100)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_NOTIFICATION_TIMEOUT  Per-notification delivery timeout (default: 2s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_OP_ID      Reshard operation to execute (reshard-runner mode; set by the control plane)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_PASSWORD_URL  One-shot ephemeral password pull URL (reshard-runner mode, ext targets; set by the control plane)\n")
@@ -209,6 +213,9 @@ func main() {
 
 	analyticsShutdown := cliboot.InitAnalytics()
 	defer analyticsShutdown()
+
+	notificationsShutdown := cliboot.InitNotifications()
+	defer notificationsShutdown()
 
 	tracingShutdown := cliboot.InitTracing()
 	defer tracingShutdown()

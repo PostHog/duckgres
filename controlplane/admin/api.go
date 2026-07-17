@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/internal/notifications"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -602,6 +603,11 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
+	notifications.Default().Notify(notifications.Event{
+		Name:  "org_created",
+		OrgID: org.Name,
+		Props: map[string]any{"source": "admin_api"},
+	})
 	c.JSON(http.StatusCreated, org)
 }
 
@@ -738,6 +744,11 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
 	}
+	notifications.Default().Notify(notifications.Event{
+		Name:  "org_deleted",
+		OrgID: name,
+		Props: map[string]any{"source": "admin_api"},
+	})
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
 }
 
