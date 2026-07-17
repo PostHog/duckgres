@@ -38,7 +38,11 @@ type Org struct {
 	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	// UpdatedAt doubles as an input to the discovery change marker
+	// (ConfigStore.LatestConfigChange): DeleteOrgTeamTx touches it so a
+	// team-row DELETE — which leaves no updated_at of its own behind —
+	// still advances the marker external pollers gate on.
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -76,11 +80,16 @@ type OrgTeam struct {
 	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_billing_org,unique,where:is_billing_team IS TRUE;index:idx_duckgres_org_teams_org_schema,unique,priority:1" json:"org_id"`
 	// autoIncrement:false — int fields in a composite primary key default to
 	// auto-increment in gorm, which would make this a bigserial.
-	TeamID                int64     `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
-	SchemaName            string    `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
-	Enabled               bool      `gorm:"not null;default:true" json:"enabled"`
-	IsBillingTeam         *bool     `json:"is_billing_team,omitempty"`
-	BackfillEnabled       *bool     `json:"backfill_enabled,omitempty"`
+	TeamID          int64  `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
+	SchemaName      string `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
+	Enabled         bool   `gorm:"not null;default:true" json:"enabled"`
+	IsBillingTeam   *bool  `json:"is_billing_team,omitempty"`
+	BackfillEnabled *bool  `json:"backfill_enabled,omitempty"`
+	// The legacy overrides are BARE identifiers (never schema-qualified):
+	// events/persons are table names within SchemaName's schema, the
+	// data-imports override is a schema name. Enforced by
+	// ValidateOrgTeamTableName on every write surface; resolved for
+	// consumers in provisioning/discovery.go resolveTeamTables.
 	EventsTableName       *string   `gorm:"size:255" json:"events_table_name,omitempty"`
 	PersonsTableName      *string   `gorm:"size:255" json:"persons_table_name,omitempty"`
 	SchemaDataImportsName *string   `gorm:"size:255" json:"schema_data_imports_name,omitempty"`

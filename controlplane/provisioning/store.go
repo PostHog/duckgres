@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"gorm.io/gorm"
@@ -357,4 +358,20 @@ func (s *gormStore) DeleteOrgTeam(orgID string, teamID int64) (*configstore.OrgT
 		return nil, err
 	}
 	return res, nil
+}
+
+// ListWarehousesByStates delegates to the config store (discovery endpoints).
+func (s *gormStore) ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error) {
+	return s.cs.ListWarehousesByStates(states)
+}
+
+// ListOrgTeamsByOrgIDs delegates to the config store (discovery endpoints).
+func (s *gormStore) ListOrgTeamsByOrgIDs(orgIDs []string) ([]configstore.OrgTeam, error) {
+	return s.cs.ListOrgTeamsByOrgIDs(orgIDs)
+}
+
+// LatestConfigChange delegates to the config store (discovery endpoints).
+func (s *gormStore) LatestConfigChange() (time.Time, error) {
+	return s.cs.LatestConfigChange()
+
 }

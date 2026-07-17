@@ -417,7 +417,27 @@ func (s *gormAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) er
 			return configstore.ErrOrgTeamSchemaConflict
 		}
 		team.OrgID = orgID
-		return tx.Create(team).Error
+		// Capture intent BEFORE Create: gorm's RETURNING write-back stamps
+		// the DB row (enabled defaulted TRUE) back onto the struct, so the
+		// post-Create value lies about what the caller asked for.
+		wantDisabled := !team.Enabled
+		if err := tx.Create(team).Error; err != nil {
+			return err
+		}
+		// Enabled carries gorm's `default:true` tag: a zero-valued (false)
+		// field is omitted from the INSERT and the DB default TRUE wins —
+		// the same pitfall fixed in configstore.UpsertOrgTeamTx, on this
+		// surface reachable via POST /teams {"enabled":false}. Force the
+		// column explicitly. Pinned by TestAdminCreateOrgTeamDisabledPostgres.
+		if wantDisabled {
+			if err := tx.Model(&configstore.OrgTeam{}).
+				Where("org_id = ? AND team_id = ?", orgID, team.TeamID).
+				Update("enabled", false).Error; err != nil {
+				return err
+			}
+			team.Enabled = false // undo the RETURNING write-back for the caller
+		}
+		return nil
 	})
 }
 
@@ -1027,10 +1047,6 @@ type updateOrgTeamRequest struct {
 	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
 }
 
-// maxOrgTeamTableNameLength caps the legacy table-name overrides at the
-// column width (varchar(255)) so a typo'd blob is a 400, not a DB error.
-const maxOrgTeamTableNameLength = 255
-
 // legacyTableNameUpdate folds one presence-aware legacy table-name field of
 // the PUT body into (set, value): absent = (false, nil); explicit null or ""
 // = (true, nil) — clear back to NULL / derive from schema_name; anything else
@@ -1089,8 +1105,14 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 		"persons_table_name":       req.PersonsTableName,
 		"schema_data_imports_name": req.SchemaDataImportsName,
 	} {
-		if v != nil && len(*v) > maxOrgTeamTableNameLength {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%s must be at most %d characters", name, maxOrgTeamTableNameLength)})
+		if v == nil {
+			continue
+		}
+		// Shared bare-identifier contract (see configstore.ValidateOrgTeamTableName):
+		// overrides are never schema-qualified; a dot stored here would be
+		// silently ambiguous to every discovery consumer. "" passes (clear).
+		if err := configstore.ValidateOrgTeamTableName(name, *v); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 	}
