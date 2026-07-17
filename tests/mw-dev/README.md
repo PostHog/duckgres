@@ -302,6 +302,11 @@ finalizers are still running.
 | (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP role + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
 | repo setting | "Require approval for all outside collaborators" | the access gate (see below) |
 
+The `scenario-dev` workflow requests a 16,200-second session from
+`github-duckgres-e2e`, matching its 270-minute job timeout. The role's
+`max_session_duration` in posthog-cloud-infra must be at least 16,200 seconds
+before this workflow setting is deployed.
+
 The Tailscale tailnet ACL must allow `tag:github-runner` to reach the mw-dev
 VPC subnet router (same pattern hogland set up for its dev cluster).
 
