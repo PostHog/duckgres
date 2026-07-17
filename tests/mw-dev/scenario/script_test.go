@@ -82,6 +82,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"CLUSTER_NAME: posthog-mw-dev",
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
+		"role-duration-seconds: 16200",
 		"tests/mw-dev/run.sh deploy",
 		"tests/mw-dev/run.sh test-scenario",
 		"tests/mw-dev/run.sh diagnostics",
