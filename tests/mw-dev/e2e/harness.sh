@@ -17,6 +17,13 @@
 # Anything that kills/drains/counts worker pods MUST stay inside its org's lane
 # and select pods via the org label (newest_org_worker), never globally.
 #
+# UNIT-ONLY (not assertable in this Job): the cache-proxy S3 transport override
+# (duckdbservice/cache_proxy.go + the hot-idle credential-refresh path in
+# activation.go, mw-prod-us 2026-07-17 regression) — mw-dev does not deploy the
+# duckgres-cache-proxy DaemonSet, and enabling DUCKGRES_CACHE_ENABLED without it
+# would hang worker startup on the proxy health wait. Covered by
+# TestSessionPoolCredentialRefreshKeepsCacheProxyTransport in
+# duckdbservice/activation_test.go.
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
 #                  a malformed startup-message length is rejected cleanly (no CP
