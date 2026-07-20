@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,26 @@ type OrgUserKey struct {
 	Username string
 }
 
+const (
+	OrgUserAccessModeUnrestricted  = "unrestricted"
+	OrgUserAccessModeProjectReader = "project_reader"
+)
+
+// OrgUserAccessConfig is the persisted identity binding loaded into a config
+// snapshot. Namespace permissions are derived from the matching OrgTeam row.
+type OrgUserAccessConfig struct {
+	Mode   string
+	TeamID *int64
+}
+
+// OrgUserQueryAccess is the protocol-neutral project policy returned to the
+// PostgreSQL and Flight SQL ingress layers.
+type OrgUserQueryAccess struct {
+	ReadOnly         bool
+	AllowedSchemas   []string
+	AllowedRelations []string
+}
+
 var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 
 // ErrWorkerRecordUpsertFenceMiss indicates an UpsertWorkerRecord conflict was
@@ -37,6 +58,10 @@ var ErrWorkerRecordUpsertFenceMiss = errors.New("worker record upsert fence miss
 // no row matches (orgID, username). Callers map it to a 404.
 var ErrOrgUserNotFound = errors.New("org user not found")
 
+// ErrProjectReaderTeamUnavailable is returned when a project-reader user is
+// requested for a team that does not exist or is disabled.
+var ErrProjectReaderTeamUnavailable = errors.New("project reader requires an enabled org team")
+
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
 	Orgs               map[string]*OrgConfig
@@ -46,6 +71,7 @@ type Snapshot struct {
 	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
 	OrgUserDisabled    map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
 	OrgUserMaxVCPUs    map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
+	OrgUserAccess      map[OrgUserKey]OrgUserAccessConfig
 }
 
 // Selectable catalog names. The startup `database` param now names the catalog
@@ -86,6 +112,8 @@ type PostgresConnectionResolution struct {
 	// set together with Valid=true — a wrong password / unknown user returns
 	// Valid=false and never leaks the disabled state.
 	Disabled bool
+	// QueryAccess is non-nil for a project-scoped read-only user.
+	QueryAccess *OrgUserQueryAccess
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -191,6 +219,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		OrgUserPassthrough: make(map[OrgUserKey]bool),
 		OrgUserDisabled:    make(map[OrgUserKey]bool),
 		OrgUserMaxVCPUs:    make(map[OrgUserKey]int),
+		OrgUserAccess:      make(map[OrgUserKey]OrgUserAccessConfig),
 	}
 
 	for _, o := range orgs {
@@ -201,10 +230,13 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		teams := make([]OrgTeamConfig, 0, len(o.Teams))
 		for _, team := range o.Teams {
 			teams = append(teams, OrgTeamConfig{
-				TeamID:        team.TeamID,
-				SchemaName:    team.SchemaName,
-				Enabled:       team.Enabled,
-				IsBillingTeam: team.IsBillingTeam != nil && *team.IsBillingTeam,
+				TeamID:                team.TeamID,
+				SchemaName:            team.SchemaName,
+				Enabled:               team.Enabled,
+				IsBillingTeam:         team.IsBillingTeam != nil && *team.IsBillingTeam,
+				EventsTableName:       team.EventsTableName,
+				PersonsTableName:      team.PersonsTableName,
+				SchemaDataImportsName: team.SchemaDataImportsName,
 			})
 		}
 		oc := &OrgConfig{
@@ -231,6 +263,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			oc.Users[u.Username] = u.Password
 			key := OrgUserKey{OrgID: o.Name, Username: u.Username}
 			snap.OrgUserPassword[key] = u.Password
+			snap.OrgUserAccess[key] = OrgUserAccessConfig{Mode: u.AccessMode, TeamID: u.TeamID}
 			if u.Passthrough {
 				snap.OrgUserPassthrough[key] = true
 			}
@@ -268,6 +301,58 @@ func (cs *ConfigStore) ReloadSnapshot() error {
 		fn(oldSnap, newSnap)
 	}
 	return nil
+}
+
+// OrgUserQueryAccess returns the project-scoped read policy for a user. A
+// false result means the user is unrestricted. A project reader whose team is
+// absent or disabled returns an empty, read-only policy and therefore fails
+// closed for every persistent project relation.
+func (cs *ConfigStore) OrgUserQueryAccess(orgID, username string) (OrgUserQueryAccess, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return OrgUserQueryAccess{}, false
+	}
+	return orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username)
+}
+
+func orgUserQueryAccessFromSnapshot(snapshot *Snapshot, orgID, username string) (OrgUserQueryAccess, bool) {
+	access, ok := snapshot.OrgUserAccess[OrgUserKey{OrgID: orgID, Username: username}]
+	if !ok || access.Mode != OrgUserAccessModeProjectReader {
+		return OrgUserQueryAccess{}, false
+	}
+	policy := OrgUserQueryAccess{ReadOnly: true}
+	if access.TeamID == nil {
+		return policy, true
+	}
+	org := snapshot.Orgs[orgID]
+	if org == nil {
+		return policy, true
+	}
+	for _, team := range org.Teams {
+		if team.TeamID != *access.TeamID || !team.Enabled {
+			continue
+		}
+		importsSchema := team.SchemaName + "_data_imports"
+		if team.SchemaDataImportsName != nil && *team.SchemaDataImportsName != "" {
+			importsSchema = *team.SchemaDataImportsName
+		}
+		policy.AllowedSchemas = []string{
+			importsSchema,
+			fmt.Sprintf("shadow_%d_models", team.TeamID),
+			team.SchemaName,
+		}
+		if team.EventsTableName != nil && *team.EventsTableName != "" && *team.EventsTableName != "events" {
+			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.EventsTableName)
+		}
+		if team.PersonsTableName != nil && *team.PersonsTableName != "" && *team.PersonsTableName != "persons" {
+			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.PersonsTableName)
+		}
+		sort.Strings(policy.AllowedSchemas)
+		sort.Strings(policy.AllowedRelations)
+		return policy, true
+	}
+	return policy, true
 }
 
 // Snapshot returns the current config snapshot.
@@ -424,6 +509,9 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	// so a disabled user gets a distinct "account disabled" error while a wrong
 	// password still looks identical to an unknown user.
 	result.Disabled = cs.snapshot.OrgUserDisabled[key]
+	if access, ok := orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username); ok {
+		result.QueryAccess = &access
+	}
 	return result
 }
 

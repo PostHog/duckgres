@@ -242,6 +242,7 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 | GRANT / REVOKE, column/default privileges | ❌ | — | `has_*_privilege()` return permissive stubs; privilege DDL untested |
 | CREATE / ALTER / DROP ROLE / USER | ❌ | — | |
 | Row-level security (RLS) | ⛔ | — | `pg_policy` empty stub |
+| Managed project readers | ✅ | `server/query_access_test.go`, `tests/mw-dev/e2e/harness.sh::project_reader_isolation` | Control-plane users with `access_mode=project_reader` are read-only and restricted to their project's schemas and legacy event/person relations. This is enforced by the query gateway, not PostgreSQL `GRANT` statements. |
 
 ---
 

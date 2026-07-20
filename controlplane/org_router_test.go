@@ -99,6 +99,38 @@ func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSess
 	}
 }
 
+func TestChangedProjectReaderUsersDetectsNamespaceAndCredentialChanges(t *testing.T) {
+	teamID := int64(2)
+	key := configstore.OrgUserKey{OrgID: "org-a", Username: "posthog_team_2"}
+	old := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "team_2"}}},
+		},
+		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+			key: {Mode: configstore.OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "old-hash"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+	}
+	updatedNamespace := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "renamed"}}},
+		},
+		OrgUserAccess:   old.OrgUserAccess,
+		OrgUserPassword: old.OrgUserPassword,
+		OrgUserDisabled: old.OrgUserDisabled,
+	}
+	if _, ok := changedProjectReaderUsers(old, updatedNamespace)[key]; !ok {
+		t.Fatal("namespace change did not invalidate project reader")
+	}
+
+	updatedPassword := *old
+	updatedPassword.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new-hash"}
+	if _, ok := changedProjectReaderUsers(old, &updatedPassword)[key]; !ok {
+		t.Fatal("credential change did not invalidate project reader")
+	}
+}
+
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
 	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil)

@@ -82,6 +82,30 @@ type orgRoutedSessionProvider struct {
 	pidSession map[int32]flightOwnedSession // pid → owning session manager
 }
 
+func (p *orgRoutedSessionProvider) QueryAccessPolicy(ctx context.Context, username string) *server.QueryAccessPolicy {
+	orgID, ok := p.resolveOrg(ctx)
+	if !ok || orgID == "" {
+		// Session creation will reject the same unresolved SNI. Returning an
+		// empty policy here keeps this helper independently fail-closed.
+		return &server.QueryAccessPolicy{ReadOnly: true}
+	}
+	store, ok := p.configStore.(interface {
+		OrgUserQueryAccess(orgID, username string) (configstore.OrgUserQueryAccess, bool)
+	})
+	if !ok {
+		return nil
+	}
+	access, scoped := store.OrgUserQueryAccess(orgID, username)
+	if !scoped {
+		return nil
+	}
+	return &server.QueryAccessPolicy{
+		ReadOnly:         access.ReadOnly,
+		AllowedSchemas:   access.AllowedSchemas,
+		AllowedRelations: access.AllowedRelations,
+	}
+}
+
 func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	// Bind the session to the org of THIS connection's managed hostname, not a
 	// shared username lookup. Fail closed if the SNI no longer resolves an org.

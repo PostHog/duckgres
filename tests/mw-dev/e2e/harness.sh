@@ -54,6 +54,8 @@
 #                  parallel cold-burst ramp (3 cold connections spawn 3 pods
 #                  concurrently — the acquire gate covers only the claim decision).
 #   isolation    : two tenants see distinct catalogs (cross-tenant read denied).
+#                  A generated project reader can read every table in its team
+#                  schema, cannot read another team schema, and cannot write.
 #   admin auth   : the dashboard rejects ?token= query-param auth (#721); only
 #                  the internal-secret header / POST login form authenticate.
 #   models api   : the dashboard models explorer lists every config-store model
@@ -1500,6 +1502,52 @@ discovery_endpoints() { # cnpg_org ext_org
   done
   jq -e '. == sort' /tmp/discovery_ids >/dev/null     || fail "discovery: /warehouse-team-ids must be sorted: $(cat /tmp/discovery_ids)"
   log "discovery OK: both orgs listed writable with their billing team rows + resolved table names; team-ids array carries both teams"
+}
+
+# ---- project-scoped read-only users ----------------------------------------
+# The PostHog SQL editor uses one generated login per project. The control
+# plane derives its allowed namespaces from the project's team row, so future
+# tables in those schemas are readable without per-table grants while SQL
+# writes and cross-project reads are rejected at the database boundary.
+project_reader_isolation() { # org root_password team_id
+  org="$1"; rootpw="$2"; team="$3"
+  schema="team_$team"
+  other_schema="team_$((team + 999))"
+  log "project reader isolation on $org/team $team"
+
+  pg "$org" "$rootpw" ducklake "
+    CREATE SCHEMA IF NOT EXISTS $schema;
+    CREATE TABLE IF NOT EXISTS $schema.reader_probe(value INTEGER);
+    DELETE FROM $schema.reader_probe;
+    INSERT INTO $schema.reader_probe VALUES (42);
+    CREATE SCHEMA IF NOT EXISTS $other_schema;
+    CREATE TABLE IF NOT EXISTS $other_schema.reader_probe(value INTEGER);
+    DELETE FROM $other_schema.reader_probe;
+    INSERT INTO $other_schema.reader_probe VALUES (7);
+  " >/dev/null
+
+  creds="$(curl -fsS -X PUT -H "$H" "$API/api/v1/orgs/$org/teams/$team/project-reader")"
+  reader="$(echo "$creds" | jq -r .username)"
+  readerpw="$(echo "$creds" | jq -r .password)"
+  [ "$reader" = "posthog_team_$team" ] || fail "project reader: unexpected username '$reader'"
+  case "$readerpw" in ""|null) fail "project reader: endpoint returned no password" ;; esac
+
+  got="$(pg "$org" "$readerpw" ducklake "SELECT value FROM $schema.reader_probe" "$reader")"
+  [ "$got" = "42" ] || fail "project reader: allowed schema returned '$got', want 42"
+
+  if out="$(pg_try "$org" "$readerpw" ducklake "SELECT value FROM $other_schema.reader_probe" "$reader")"; then
+    fail "project reader: cross-project read unexpectedly succeeded: $out"
+  fi
+  echo "$out" | grep -qi "permission denied" \
+    || fail "project reader: cross-project read failed without permission error: $out"
+
+  if out="$(pg_try "$org" "$readerpw" ducklake "INSERT INTO $schema.reader_probe VALUES (99)" "$reader")"; then
+    fail "project reader: write unexpectedly succeeded: $out"
+  fi
+  echo "$out" | grep -qi "read-only\|permission denied" \
+    || fail "project reader: write failed without read-only permission error: $out"
+
+  log "project reader OK: whole-schema read, cross-project denial, read-only enforcement"
 }
 
 # ---- user persistent secrets ------------------------------------------------
@@ -3409,6 +3457,9 @@ main() {
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
 
+  # ---- generated project reader: team-wide reads, no writes/cross-project ----
+  project_reader_isolation "$CNPG" "$cnpg_pw" "$CNPG_DEFAULT_TEAM_ID"
+
   # ---- admin ducklings metadata: live cnpg shard assignment ----------------
   admin_ducklings_metadata "$CNPG" "$EXT"
 
@@ -3477,7 +3528,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release) + per-run-ext-metadata-db(create/stale-GC/drop), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release) + per-run-ext-metadata-db(create/stale-GC/drop), on cnpg & ext (4 parallel lanes)"
 }
 
 main "$@"

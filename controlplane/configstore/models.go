@@ -107,10 +107,12 @@ func (OrgTeam) TableName() string { return "duckgres_org_teams" }
 // (org_id, username) so the same login name can be passthrough in one tenant
 // and not in another.
 type OrgUser struct {
-	OrgID       string `gorm:"primaryKey;size:255" json:"org_id"`
+	OrgID       string `gorm:"primaryKey;size:255;index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:1" json:"org_id"`
 	Username    string `gorm:"primaryKey;size:255" json:"username"`
 	Password    string `gorm:"size:255;not null" json:"-"`
 	Passthrough bool   `gorm:"not null;default:false" json:"passthrough"`
+	AccessMode  string `gorm:"size:32;not null;default:unrestricted" json:"access_mode"`
+	TeamID      *int64 `gorm:"index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:2" json:"team_id,omitempty"`
 	// Disabled is the per-user kill switch: when true the user is refused at
 	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
 	// user's live sessions (see admin disable endpoint).
@@ -556,10 +558,13 @@ type OrgConfig struct {
 // IsBillingTeam folds the tri-state column to a plain bool (NULL == false) —
 // snapshot consumers only care whether a row IS the billing team.
 type OrgTeamConfig struct {
-	TeamID        int64
-	SchemaName    string
-	Enabled       bool
-	IsBillingTeam bool
+	TeamID                int64
+	SchemaName            string
+	Enabled               bool
+	IsBillingTeam         bool
+	EventsTableName       *string
+	PersonsTableName      *string
+	SchemaDataImportsName *string
 }
 
 // BillingTeamID returns the org's billing PostHog team id (the team with

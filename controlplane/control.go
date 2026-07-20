@@ -988,9 +988,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// param no longer identifies the org — it selects which attached catalog
 	// (ducklake) the session defaults to.
 	var (
-		orgID            string
-		passthroughUser  bool
-		requestedCatalog string // "" | "ducklake" (validated below)
+		orgID             string
+		passthroughUser   bool
+		requestedCatalog  string // "" | "ducklake" (validated below)
+		queryAccessPolicy *server.QueryAccessPolicy
 	)
 	if cp.configStore != nil {
 		sni := tlsConn.ConnectionState().ServerName
@@ -1058,6 +1059,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog = clog.With("org", orgID)
 		passthroughUser = resolution.Passthrough
 		requestedCatalog = resolution.EffectiveCatalog
+		if resolution.QueryAccess != nil {
+			queryAccessPolicy = &server.QueryAccessPolicy{
+				ReadOnly:         resolution.QueryAccess.ReadOnly,
+				AllowedSchemas:   resolution.QueryAccess.AllowedSchemas,
+				AllowedRelations: resolution.QueryAccess.AllowedRelations,
+			}
+		}
 		// `database` is finalized post-session to the real catalog the session
 		// defaults to (once worker attachment is known), so logs and the
 		// current_database() macro surface the actual catalog.
@@ -1388,6 +1396,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// catalog is attached.
 	server.SetCatalogUseRewrite(cc, duckLakeAttached && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
+	server.SetQueryAccessPolicy(cc, queryAccessPolicy)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)
 	}

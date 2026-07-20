@@ -263,6 +263,14 @@ func SetPassthrough(cc *clientConn, enabled bool) {
 	}
 }
 
+// SetQueryAccessPolicy binds a fail-closed project policy before the message
+// loop starts. nil keeps root and internal users unrestricted.
+func SetQueryAccessPolicy(cc *clientConn, policy *QueryAccessPolicy) {
+	if cc != nil {
+		cc.queryAccessPolicy = policy
+	}
+}
+
 // SetConnectionPhysicalCatalog records the resolved DuckDB catalog for
 // control-plane proxy connections. The PostgreSQL-visible database remains on
 // clientConn.database; this value is used only for execution/transpiler policy.

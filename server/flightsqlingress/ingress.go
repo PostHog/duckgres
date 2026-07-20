@@ -90,6 +90,12 @@ type SessionProvider interface {
 	DestroySession(int32)
 }
 
+// QueryAccessPolicyProvider optionally binds a project-scoped policy to a
+// Flight session. Providers that do not implement it remain unrestricted.
+type QueryAccessPolicyProvider interface {
+	QueryAccessPolicy(ctx context.Context, username string) *server.QueryAccessPolicy
+}
+
 type DurableSessionState string
 
 const (
@@ -1170,12 +1176,13 @@ type flightQueryHandle struct {
 }
 
 type flightClientSession struct {
-	pid      int32
-	token    string
-	username string
-	executor *flightclient.FlightExecutor
-	queryFn  func(context.Context, string, ...any) (server.RowSet, error)
-	execFn   func(context.Context, string, ...any) (server.ExecResult, error)
+	pid               int32
+	token             string
+	username          string
+	executor          *flightclient.FlightExecutor
+	queryAccessPolicy *server.QueryAccessPolicy
+	queryFn           func(context.Context, string, ...any) (server.RowSet, error)
+	execFn            func(context.Context, string, ...any) (server.ExecResult, error)
 
 	lastUsed atomic.Int64
 	// tokenIssuedAt stores when this token was issued; used for absolute token TTL.
@@ -1218,6 +1225,9 @@ func (s *flightClientSession) touch() {
 
 func (s *flightClientSession) query(ctx context.Context, query string, args ...any) (server.RowSet, error) {
 	s.touch()
+	if err := s.queryAccessPolicy.Authorize(query); err != nil {
+		return nil, err
+	}
 	s.opMu.Lock()
 	rows, err := s.queryWithRecoveryLocked(ctx, query, args...)
 	if err != nil {
@@ -1229,6 +1239,9 @@ func (s *flightClientSession) query(ctx context.Context, query string, args ...a
 
 func (s *flightClientSession) exec(ctx context.Context, query string, args ...any) (server.ExecResult, error) {
 	s.touch()
+	if err := s.queryAccessPolicy.Authorize(query); err != nil {
+		return nil, err
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	result, err := s.execWithRecoveryLocked(ctx, query, args...)
@@ -1469,6 +1482,7 @@ type flightAuthSessionStore struct {
 	reconnector       sessionReconnector
 	durableStore      DurableSessionStore
 	forceDrainSession func(pid int32) bool
+	queryAccessPolicy func(context.Context, string) *server.QueryAccessPolicy
 
 	mu       sync.RWMutex
 	sessions map[string]*flightClientSession // session token -> session
@@ -1514,6 +1528,10 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 	if p, ok := provider.(durableSessionStoreProvider); ok {
 		durableStore = p.DurableSessionStore()
 	}
+	var queryAccessPolicy func(context.Context, string) *server.QueryAccessPolicy
+	if p, ok := provider.(QueryAccessPolicyProvider); ok {
+		queryAccessPolicy = p.QueryAccessPolicy
+	}
 
 	s := &flightAuthSessionStore{
 		provider:           provider,
@@ -1528,6 +1546,7 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 		metadataProvider:   metadataProvider,
 		reconnector:        reconnector,
 		durableStore:       durableStore,
+		queryAccessPolicy:  queryAccessPolicy,
 		sessions:           make(map[string]*flightClientSession),
 		byKey:              make(map[string]string),
 		stopCh:             make(chan struct{}),
@@ -1607,6 +1626,9 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 		return nil, fmt.Errorf("generate session identity token: %w", tokenErr)
 	}
 	created := newFlightClientSession(pid, username, executor)
+	if s.queryAccessPolicy != nil {
+		created.queryAccessPolicy = s.queryAccessPolicy(ctx, username)
+	}
 	created.token = token
 
 	s.mu.Lock()
@@ -1987,6 +2009,9 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	}
 
 	session := newFlightClientSession(pid, record.Username, executor)
+	if s.queryAccessPolicy != nil {
+		session.queryAccessPolicy = s.queryAccessPolicy(ctx, record.Username)
+	}
 	session.token = token
 	session.tokenIssuedAt.Store(time.Now().UnixNano())
 	if !record.ExpiresAt.IsZero() {
