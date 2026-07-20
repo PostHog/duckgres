@@ -58,13 +58,27 @@ var dangerousReadFunctions = map[string]struct{}{
 }
 
 var unqualifiedMetadataRelations = map[string]struct{}{
-	"pg_attribute": {},
-	"pg_class":     {},
-	"pg_database":  {},
-	"pg_namespace": {},
-	"pg_roles":     {},
-	"pg_tables":    {},
-	"pg_views":     {},
+	"pg_attribute":  {},
+	"pg_class":      {},
+	"pg_constraint": {},
+	"pg_database":   {},
+	"pg_index":      {},
+	"pg_namespace":  {},
+	"pg_roles":      {},
+	"pg_tables":     {},
+	"pg_type":       {},
+	"pg_views":      {},
+}
+
+var allowedSetVariables = map[string]struct{}{
+	"application_name":                    {},
+	"client_encoding":                     {},
+	"datestyle":                           {},
+	"extra_float_digits":                  {},
+	"idle_in_transaction_session_timeout": {},
+	"lock_timeout":                        {},
+	"statement_timeout":                   {},
+	"timezone":                            {},
 }
 
 var allowedShowVariables = map[string]struct{}{
@@ -89,18 +103,13 @@ func (p *QueryAccessPolicy) Authorize(query string) error {
 	if p == nil {
 		return nil
 	}
+	if handled, err := authorizeProjectUse(query); handled {
+		return err
+	}
 	tree, err := pg_query.Parse(query)
 	if err != nil {
 		return &QueryAccessError{Reason: "project connections only accept PostgreSQL-compatible read queries"}
 	}
-
-	cteNames := make(map[string]struct{})
-	transform.WalkFunc(tree, func(node *pg_query.Node) bool {
-		if cte := node.GetCommonTableExpr(); cte != nil {
-			cteNames[strings.ToLower(cte.Ctename)] = struct{}{}
-		}
-		return true
-	})
 
 	allowedSchemas := normalizedSet(p.AllowedSchemas)
 	allowedRelations := normalizedSet(p.AllowedRelations)
@@ -111,30 +120,62 @@ func (p *QueryAccessPolicy) Authorize(query string) error {
 		if err := authorizeStatementNode(raw.Stmt); err != nil {
 			return err
 		}
-	}
 
-	var denied error
-	transform.WalkFunc(tree, func(node *pg_query.Node) bool {
-		if err := authorizeReadNode(node); err != nil {
-			denied = err
-			return false
-		}
-		if rv := node.GetRangeVar(); rv != nil {
-			if err := authorizeRangeVar(rv, allowedSchemas, allowedRelations, cteNames); err != nil {
+		statementTree := &pg_query.ParseResult{Stmts: []*pg_query.RawStmt{raw}}
+		cteNames := make(map[string]struct{})
+		transform.WalkFunc(statementTree, func(node *pg_query.Node) bool {
+			if cte := node.GetCommonTableExpr(); cte != nil {
+				cteNames[strings.ToLower(cte.Ctename)] = struct{}{}
+			}
+			return true
+		})
+
+		var denied error
+		transform.WalkFunc(statementTree, func(node *pg_query.Node) bool {
+			if err := authorizeReadNode(node); err != nil {
 				denied = err
 				return false
 			}
-		}
-		if fc := node.GetFuncCall(); fc != nil {
-			name := functionName(fc)
-			if dangerousFunction(name) {
-				denied = &QueryAccessError{Reason: fmt.Sprintf("function %q is unavailable to project connections", name)}
-				return false
+			if rv := node.GetRangeVar(); rv != nil {
+				if err := authorizeRangeVar(rv, allowedSchemas, allowedRelations, cteNames); err != nil {
+					denied = err
+					return false
+				}
 			}
+			if fc := node.GetFuncCall(); fc != nil {
+				name := functionName(fc)
+				if dangerousFunction(name) {
+					denied = &QueryAccessError{Reason: fmt.Sprintf("function %q is unavailable to project connections", name)}
+					return false
+				}
+			}
+			return true
+		})
+		if denied != nil {
+			return denied
 		}
-		return true
-	})
-	return denied
+	}
+	return nil
+}
+
+func authorizeProjectUse(query string) (bool, error) {
+	trimmed := strings.TrimSpace(stripLeadingComments(query))
+	parts := strings.Fields(trimmed)
+	if len(parts) == 0 || !strings.EqualFold(parts[0], "USE") {
+		return false, nil
+	}
+	if len(parts) != 2 {
+		return true, &QueryAccessError{Reason: "project connections may only select the ducklake catalog"}
+	}
+
+	catalog := strings.TrimSpace(strings.TrimSuffix(parts[1], ";"))
+	if len(catalog) >= 2 && catalog[0] == '"' && catalog[len(catalog)-1] == '"' {
+		catalog = strings.ReplaceAll(catalog[1:len(catalog)-1], `""`, `"`)
+	}
+	if !strings.EqualFold(catalog, "ducklake") {
+		return true, &QueryAccessError{Reason: fmt.Sprintf("catalog %q is not available to this project", catalog)}
+	}
+	return true, nil
 }
 
 func dangerousFunction(name string) bool {
@@ -168,11 +209,15 @@ func authorizeStatementNode(node *pg_query.Node) error {
 		}
 		return &QueryAccessError{Reason: fmt.Sprintf("setting %q is unavailable to project connections", show.Name)}
 	}
+	if set := node.GetVariableSetStmt(); set != nil {
+		if _, allowed := allowedSetVariables[strings.ToLower(set.Name)]; allowed {
+			return nil
+		}
+		return &QueryAccessError{Reason: fmt.Sprintf("setting %q is unavailable to project connections", set.Name)}
+	}
 	switch node.Node.(type) {
 	case *pg_query.Node_SelectStmt,
-		*pg_query.Node_TransactionStmt,
-		*pg_query.Node_FetchStmt,
-		*pg_query.Node_ClosePortalStmt:
+		*pg_query.Node_TransactionStmt:
 		return nil
 	default:
 		return &QueryAccessError{Reason: "project connections are read-only"}

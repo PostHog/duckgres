@@ -1532,7 +1532,28 @@ project_reader_isolation() { # org root_password team_id
   [ "$reader" = "posthog_team_$team" ] || fail "project reader: unexpected username '$reader'"
   case "$readerpw" in ""|null) fail "project reader: endpoint returned no password" ;; esac
 
-  got="$(pg "$org" "$readerpw" ducklake "SELECT value FROM $schema.reader_probe" "$reader")"
+  # PostHog's direct adapter sends USE and the compiled SELECT as separate
+  # simple-query messages on one psycopg connection. Exercise that exact session
+  # setup boundary: project-reader authorization runs before utility routing.
+  a=0
+  while :; do
+    if got="$(PGPASSWORD="$readerpw" psql \
+        "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=$reader dbname=ducklake" \
+        -v ON_ERROR_STOP=1 -qAt \
+        -c 'USE ducklake' \
+        -c "SELECT value FROM $schema.reader_probe" 2>&1)"; then
+      break
+    fi
+    case "$got" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
+        [ "$a" -lt 12 ] || fail "project reader: session setup backpressure never cleared: $got"
+        sleep 10; a=$((a + 1)); continue ;;
+      *) fail "project reader: USE session setup failed: $got" ;;
+    esac
+  done
   [ "$got" = "42" ] || fail "project reader: allowed schema returned '$got', want 42"
 
   if out="$(pg_try "$org" "$readerpw" ducklake "SELECT value FROM $other_schema.reader_probe" "$reader")"; then

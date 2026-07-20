@@ -18,7 +18,12 @@ func TestQueryAccessPolicyAllowsProjectReads(t *testing.T) {
 		"SELECT * FROM posthog.events_prod",
 		"WITH recent AS (SELECT * FROM team_42.events) SELECT * FROM recent",
 		"SELECT count(*) FROM information_schema.tables",
+		"SELECT * FROM pg_index",
 		"SHOW search_path",
+		"SET statement_timeout = '30s'",
+		"SET application_name = 'posthog-sql-editor'",
+		"USE ducklake",
+		`USE "ducklake";`,
 		"BEGIN; SELECT * FROM team_42.events; COMMIT",
 	}
 	for _, query := range queries {
@@ -59,6 +64,14 @@ func TestQueryAccessPolicyRejectsCrossProjectAndWrites(t *testing.T) {
 		"SELECT * FROM postgres_query('host=other', 'SELECT secret FROM private')",
 		"SHOW s3_access_key_id",
 		"SHOW ALL",
+		"SET search_path = team_7",
+		"SET ROLE root",
+		"USE memory",
+		"USE ducklake; SELECT * FROM team_42.events",
+		"DECLARE project_rows CURSOR FOR SELECT * FROM team_42.events",
+		"FETCH 10 FROM project_rows",
+		"CLOSE project_rows",
+		"SELECT * FROM hidden; WITH hidden AS (SELECT * FROM team_42.events) SELECT * FROM hidden",
 	}
 	for _, query := range queries {
 		if err := policy.Authorize(query); err == nil {
