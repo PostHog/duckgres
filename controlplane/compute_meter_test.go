@@ -176,7 +176,7 @@ func TestComputeMeterFlush(t *testing.T) {
 }
 
 func TestComputeMeterUnknownTeamTolerated(t *testing.T) {
-	// An org with no default_team_id (or a nil resolver) still meters — the
+	// An org with no billing team (or a nil resolver) still meters — the
 	// bucket carries team_id 0 rather than dropping usage.
 	store := &fakeFlushStore{}
 	m := newComputeMeter(store, teamResolverA)

@@ -1281,10 +1281,11 @@ org_default_profile() { # org password catalog
 }
 
 # ---- org default_team_id (mandatory on new orgs) ----------------------------
-# default_team_id links an org to its default PostHog team id (a BIGINT
-# config-store column — a JSON NUMBER on the wire, matching PostHog's integer
-# Team.id; prereq for pull-based compute billing where usage buckets are keyed
-# by team_id). Contract: MANDATORY when a provision creates a NEW org (400, nothing
+# default_team_id is the org's billing PostHog team id (a JSON NUMBER on the
+# wire, matching PostHog's integer Team.id; stored as the org's
+# duckgres_org_teams row with is_billing_team = TRUE; prereq for pull-based
+# compute billing where usage buckets are keyed by team_id). Contract:
+# MANDATORY when a provision creates a NEW org (400, nothing
 # created); optional on re-provision of an existing org, where omission keeps
 # the stored value (set-only, never a wipe — the keep path is covered by
 # TestReprovisionExistingOrgKeepsDefaultTeamID, since same-id re-provision
@@ -1296,10 +1297,9 @@ org_default_profile() { # org password catalog
 #      400 naming the field, and must create nothing (org GET stays 404).
 #   3. Mutate path: PUT /orgs/:id can set it to a positive team id on the EXT
 #      org, round-tripping on GET; clearing (0 or null) is REJECTED with a 400
-#      and must leave the stored value untouched — the column is NOT NULL
-#      (migration 000020) and every org must keep its default team (the
-#      billing bucket key). The provisioned value is restored afterwards so
-#      the org stays contract-conformant.
+#      and must leave the stored value untouched — every org must keep its
+#      billing team (the billing bucket key). The provisioned value is
+#      restored afterwards so the org stays contract-conformant.
 # get_org_default_team_id prints the raw JSON value ("null" when NULL) so the
 # assertions can distinguish an unset column from an empty string.
 get_org_default_team_id() { # org -> prints default_team_id (jq raw; "null" when unset)

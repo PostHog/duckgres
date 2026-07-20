@@ -1,9 +1,17 @@
-INSERT INTO duckgres_orgs (name, database_name, max_workers, default_team_id, created_at, updated_at)
+INSERT INTO duckgres_orgs (name, database_name, max_workers, created_at, updated_at)
 VALUES
-    ('analytics', 'analytics', 0, 1, NOW(), NOW()),
-    ('billing', 'billing', 0, 2, NOW(), NOW())
+    ('analytics', 'analytics', 0, NOW(), NOW()),
+    ('billing', 'billing', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET database_name = EXCLUDED.database_name,
+    updated_at = NOW();
+
+INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
+VALUES
+    ('analytics', 1, 'team_1', TRUE, TRUE, NOW(), NOW()),
+    ('billing', 2, 'team_2', TRUE, TRUE, NOW(), NOW())
+ON CONFLICT (org_id, team_id) DO UPDATE
+SET is_billing_team = TRUE,
     updated_at = NOW();
 
 INSERT INTO duckgres_managed_warehouses (

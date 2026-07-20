@@ -178,7 +178,7 @@ func (cs *ConfigStore) Start(ctx context.Context) {
 // load fetches all config from the database and builds a Snapshot.
 func (cs *ConfigStore) load() (*Snapshot, error) {
 	var orgs []Org
-	if err := cs.db.Preload("Users").Preload("Warehouse").Find(&orgs).Error; err != nil {
+	if err := cs.db.Preload("Users").Preload("Warehouse").Preload("Teams").Find(&orgs).Error; err != nil {
 		return nil, fmt.Errorf("load orgs: %w", err)
 	}
 
@@ -197,9 +197,14 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		if o.HostnameAlias != nil {
 			alias = *o.HostnameAlias
 		}
-		defaultTeamID := int64(0)
-		if o.DefaultTeamID != nil {
-			defaultTeamID = *o.DefaultTeamID
+		teams := make([]OrgTeamConfig, 0, len(o.Teams))
+		for _, team := range o.Teams {
+			teams = append(teams, OrgTeamConfig{
+				TeamID:        team.TeamID,
+				SchemaName:    team.SchemaName,
+				Enabled:       team.Enabled,
+				IsBillingTeam: team.IsBillingTeam != nil && *team.IsBillingTeam,
+			})
 		}
 		oc := &OrgConfig{
 			Name:                    o.Name,
@@ -211,7 +216,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			DefaultWorkerMemory:     o.DefaultWorkerMemory,
 			DefaultWorkerTTL:        o.DefaultWorkerTTL,
 			DefaultWorkerMinHotIdle: o.DefaultWorkerMinHotIdle,
-			DefaultTeamID:           defaultTeamID,
+			Teams:                   teams,
 			Users:                   make(map[string]string),
 			Warehouse:               copyManagedWarehouseConfig(o.Warehouse),
 		}
@@ -484,12 +489,13 @@ func (cs *ConfigStore) OrgDefaultWorkerMinHotIdle(orgID string) int {
 	return oc.DefaultWorkerMinHotIdle
 }
 
-// OrgDefaultTeamID returns the org's default PostHog team id from the current
-// snapshot, or 0 when unset (including unknown orgs and a not-yet-loaded
-// snapshot). A zero return is a valid, non-error state — callers must
-// tolerate it and MUST NOT fail a connection or activation on it.
-// Prerequisite for pull-based compute billing (usage keyed by team id).
-func (cs *ConfigStore) OrgDefaultTeamID(orgID string) int64 {
+// OrgBillingTeamID returns the org's billing PostHog team id (the org team
+// with is_billing_team = TRUE) from the current snapshot, or 0 when unset
+// (including unknown orgs and a not-yet-loaded snapshot). A zero return is a
+// valid, non-error state — callers must tolerate it and MUST NOT fail a
+// connection or activation on it. Prerequisite for pull-based compute billing
+// (usage keyed by team id).
+func (cs *ConfigStore) OrgBillingTeamID(orgID string) int64 {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if cs.snapshot == nil {
@@ -499,7 +505,7 @@ func (cs *ConfigStore) OrgDefaultTeamID(orgID string) int64 {
 	if !ok {
 		return 0
 	}
-	return oc.DefaultTeamID
+	return oc.BillingTeamID()
 }
 
 // ValidateOrgUser checks username/password scoped to a specific org.

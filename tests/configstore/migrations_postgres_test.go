@@ -42,7 +42,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 21)
 	requireGooseMigrationRecorded(t, db, 22)
 	requireGooseMigrationRecorded(t, db, 23)
-	requireGooseLatestVersion(t, db, 23)
+	requireGooseMigrationRecorded(t, db, 24)
+	requireGooseLatestVersion(t, db, 24)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -73,11 +74,14 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 
 	// Migration 000013 added the per-org default_team_id column (nullable at
 	// the time); 000017 converted it (and the usage-bucket team_id below) to
-	// BIGINT to match PostHog's integer team ids; 000020 made it NOT NULL —
-	// every org must keep its default team (the billing bucket key).
-	requireColumnPresent(t, db, "duckgres_orgs", "default_team_id")
-	requireColumnType(t, db, "duckgres_orgs", "default_team_id", "bigint")
-	requireColumnNotNull(t, db, "duckgres_orgs", "default_team_id")
+	// BIGINT; 000024 replaced it with the per-org teams table — many PostHog
+	// teams per org, exactly one marked as the billing team (the billing
+	// bucket key) — and dropped the column.
+	requireColumnAbsent(t, db, "duckgres_orgs", "default_team_id")
+	requireTablePresent(t, db, "duckgres_org_teams")
+	requireColumnType(t, db, "duckgres_org_teams", "team_id", "bigint")
+	requireColumnNotNull(t, db, "duckgres_org_teams", "schema_name")
+	requireColumnDefault(t, db, "duckgres_org_teams", "enabled", "true")
 	requireColumnType(t, db, "duckgres_org_compute_usage", "team_id", "bigint")
 
 	// Migration 000007 added the compute-usage billing buffer; 000015 widened
@@ -150,7 +154,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
 			ALTER TABLE duckgres_orgs ADD COLUMN IF NOT EXISTS max_connections BIGINT DEFAULT 0;
 			ALTER TABLE duckgres_managed_warehouses ALTER COLUMN duckling_name DROP NOT NULL;
-			ALTER TABLE duckgres_orgs DROP COLUMN default_team_id;
+			DROP TABLE IF EXISTS duckgres_org_teams;
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_enabled BOOLEAN DEFAULT false;
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
 			ALTER TABLE duckgres_org_users ADD COLUMN IF NOT EXISTS default_catalog VARCHAR(255);
@@ -171,7 +175,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -208,14 +212,15 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 21)
 	requireGooseMigrationRecorded(t, upgradedDB, 22)
 	requireGooseMigrationRecorded(t, upgradedDB, 23)
-	requireGooseLatestVersion(t, upgradedDB, 23)
+	requireGooseMigrationRecorded(t, upgradedDB, 24)
+	requireGooseLatestVersion(t, upgradedDB, 24)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")
-	requireColumnPresent(t, upgradedDB, "duckgres_orgs", "default_team_id")
-	requireColumnNotNull(t, upgradedDB, "duckgres_orgs", "default_team_id")
+	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "default_team_id")
+	requireTablePresent(t, upgradedDB, "duckgres_org_teams")
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "max_connections")
 	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "default_catalog")
@@ -287,6 +292,23 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	}
 	requireColumnAbsent(t, sqlDB, "duckgres_orgs", "max_connections")
 	requireGooseMigrationRecorded(t, sqlDB, 3)
+
+	// Migration 000024 backfilled the legacy default_team_id value into the
+	// org's (billing) team row and dropped the column.
+	requireColumnAbsent(t, sqlDB, "duckgres_orgs", "default_team_id")
+	var team cpconfigstore.OrgTeam
+	if err := store.DB().First(&team, "org_id = ?", "old-org").Error; err != nil {
+		t.Fatalf("read backfilled org team row: %v", err)
+	}
+	if team.TeamID != 1 || team.SchemaName != "team_1" || !team.Enabled {
+		t.Fatalf("backfilled team row = %+v, want team 1, schema team_1, enabled", team)
+	}
+	if team.IsBillingTeam == nil || !*team.IsBillingTeam {
+		t.Fatalf("backfilled team row must be the billing team, got %+v", team)
+	}
+	if team.BackfillEnabled != nil {
+		t.Fatalf("backfilled team row backfill_enabled = %v, want NULL", *team.BackfillEnabled)
+	}
 }
 
 // TestConfigStoreMigrationFailsLoudlyOnNullDefaultTeamID pins the deploy-time
@@ -430,6 +452,7 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 		&cpconfigstore.Org{},
 		&cpconfigstore.ManagedWarehouse{},
 		&cpconfigstore.OrgUser{},
+		&cpconfigstore.OrgTeam{},
 		&cpconfigstore.OrgUserSecret{},
 		&cpconfigstore.Operator{},
 	); err != nil {
@@ -694,6 +717,7 @@ func loadConfigStoreColumnMetadata(t *testing.T, db *sql.DB) map[string]columnMe
 		  AND table_name IN (
 			'duckgres_orgs',
 			'duckgres_org_users',
+			'duckgres_org_teams',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
@@ -751,6 +775,7 @@ func loadConfigStorePrimaryKeys(t *testing.T, db *sql.DB) map[string]primaryKeyM
 		  AND src.relname IN (
 			'duckgres_orgs',
 			'duckgres_org_users',
+			'duckgres_org_teams',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
@@ -803,6 +828,7 @@ func loadConfigStoreIndexes(t *testing.T, db *sql.DB) map[string]indexMetadata {
 		  AND src.relname IN (
 			'duckgres_orgs',
 			'duckgres_org_users',
+			'duckgres_org_teams',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
@@ -867,6 +893,7 @@ func loadConfigStoreForeignKeys(t *testing.T, db *sql.DB) map[string]foreignKeyM
 		  AND src.relname IN (
 			'duckgres_orgs',
 			'duckgres_org_users',
+			'duckgres_org_teams',
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',

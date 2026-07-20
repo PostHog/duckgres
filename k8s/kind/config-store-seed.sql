@@ -1,9 +1,15 @@
--- default_team_id is NOT NULL (every org must carry its default PostHog team
--- id); 1 is a placeholder for local dev.
-INSERT INTO duckgres_orgs (name, database_name, max_workers, default_team_id, created_at, updated_at)
-VALUES ('local', 'duckgres', 0, 1, NOW(), NOW())
+INSERT INTO duckgres_orgs (name, database_name, max_workers, created_at, updated_at)
+VALUES ('local', 'duckgres', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
+
+-- Every org must carry its billing PostHog team (duckgres_org_teams row with
+-- is_billing_team = TRUE); team 1 is a placeholder for local dev.
+INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
+VALUES ('local', 1, 'team_1', TRUE, TRUE, NOW(), NOW())
+ON CONFLICT (org_id, team_id) DO UPDATE
+SET is_billing_team = TRUE,
+    updated_at = NOW();
 
 INSERT INTO duckgres_managed_warehouses (
     org_id,

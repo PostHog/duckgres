@@ -44,7 +44,11 @@ export interface Org {
   name: string;
   database_name: string;
   hostname_alias: string | null;
-  default_team_id: number | null;
+  // The org's billing PostHog team (stored server-side as the
+  // duckgres_org_teams row with is_billing_team = TRUE; the wire field keeps
+  // its historical name). Absent only for legacy orgs with no billing team.
+  default_team_id?: number | null;
+  teams?: OrgTeam[];
   max_workers: number;
   max_vcpus: number;
   default_worker_cpu: string;
@@ -66,9 +70,24 @@ export interface OrgUpdate {
   default_worker_ttl?: string;
   default_worker_min_hot_idle?: number;
   hostname_alias?: string | null;
-  // Positive number sets, absent preserves. Clearing is not possible: the
-  // column is NOT NULL and the backend rejects 0/null/negative with a 400.
+  // Positive number sets (repointing the org's billing team), absent
+  // preserves. Clearing is not possible: every org must keep a billing team
+  // and the backend rejects 0/null/negative with a 400.
   default_team_id?: number;
+}
+
+// One duckgres_org_teams row: a PostHog team mapped to this org and the
+// warehouse schema its data lives in. At most one row per org is the billing
+// team.
+export interface OrgTeam {
+  org_id: string;
+  team_id: number;
+  schema_name: string;
+  enabled: boolean;
+  is_billing_team?: boolean | null;
+  backfill_enabled?: boolean | null;
+  created_at: string;
+  updated_at: string;
 }
 
 // ---- Users (confirmed) ----

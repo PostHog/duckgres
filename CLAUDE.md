@@ -471,12 +471,14 @@ worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
 ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
 **MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
 sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
-decimals (vCPU / GiB). `team_id` is the org's `default_team_id` (an integer —
-PostHog's `Team.id`; a JSON NUMBER on every API surface, a **NOT NULL** BIGINT
-in the config store — required at org creation on both the provisioning and
-admin APIs, never clearable via the admin API, so every org always has one;
-resolved from the config snapshot at connection end, where 0 can still appear
-only for an unknown org / stale snapshot); `query_source` is the
+decimals (vCPU / GiB). `team_id` is the org's **billing team** (an integer —
+PostHog's `Team.id`; a JSON NUMBER on every API surface, kept under the
+historical `default_team_id` field name; stored as the org's
+`duckgres_org_teams` row with `is_billing_team = TRUE` — required at org
+creation on both the provisioning and admin APIs, never clearable via the
+admin API, so every org always has one; resolved from the config snapshot at
+connection end, where 0 can still appear only for an unknown org / stale
+snapshot); `query_source` is the
 `duckgres.query_source` session GUC (`standard` unless set; a mid-connection
 change bills the whole connection under the final value). The GUC is a **closed
 enum validated at SET time** (`transform.NormalizeQuerySource`): only
@@ -523,8 +525,9 @@ touching this path:
 - **Graceful shutdown does a final flush** after connections drain to their
   natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
   last interval before exit.
-- **Changing an org's `default_team_id` re-attributes its unacked buckets** to
-  the new team in the SAME transaction as the org update, on BOTH paths (admin
+- **Changing an org's billing team (`default_team_id` on the wire)
+  re-attributes its unacked buckets** to
+  the new team in the SAME transaction as the billing-team repoint, on BOTH paths (admin
   `PUT /orgs/:id` and provisioning re-provision) via
   `configstore.ReattributeUsageTeamTx` — additive fold on PK collisions; a
   small in-flight residual under the old team is tolerated (snapshot poll

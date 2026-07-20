@@ -54,7 +54,7 @@ function orgToForm(o: {
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
   hostname_alias: string | null;
-  default_team_id: number | null;
+  default_team_id?: number | null;
 }): FormState {
   return {
     max_workers: String(o.max_workers),

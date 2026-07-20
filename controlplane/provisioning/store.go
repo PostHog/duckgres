@@ -19,11 +19,12 @@ import (
 var ErrWarehouseNonTerminal = errors.New("warehouse already exists in non-terminal state")
 
 // ErrDefaultTeamIDRequired is returned by Provision when the request would
-// create a NEW org without a default_team_id. Every org must carry its default
-// PostHog team id from birth (pull-based compute billing keys usage buckets by
-// it); all pre-existing orgs have been backfilled. Re-provisioning an EXISTING
-// org without the field stays valid — the stored value is kept, never wiped.
-// HTTP handlers map this to 400.
+// create a NEW org without a default_team_id. Every org must carry its billing
+// PostHog team from birth — the request's team id becomes the org's first
+// duckgres_org_teams row, marked is_billing_team (pull-based compute billing
+// keys usage buckets by it); all pre-existing orgs have been backfilled.
+// Re-provisioning an EXISTING org without the field stays valid — the stored
+// billing team is kept, never wiped. HTTP handlers map this to 400.
 var ErrDefaultTeamIDRequired = errors.New("default_team_id is required when creating a new org")
 
 // ProvisionRequest is the all-or-nothing input the Provision endpoint
@@ -38,12 +39,12 @@ var ErrDefaultTeamIDRequired = errors.New("default_team_id is required when crea
 type ProvisionRequest struct {
 	OrgID        string
 	DatabaseName string
-	// DefaultTeamID links the org to its default PostHog team id (an
-	// integer, matching PostHog's Team.id). REQUIRED when the org does not
-	// exist yet (Provision returns ErrDefaultTeamIDRequired otherwise);
-	// optional (0) on re-provision of an existing org, where it keeps the
-	// stored value (never a wipe). Prerequisite for pull-based compute
-	// billing.
+	// DefaultTeamID is the org's billing PostHog team id (an integer,
+	// matching PostHog's Team.id), stored as the org's duckgres_org_teams
+	// billing row. REQUIRED when the org does not exist yet (Provision
+	// returns ErrDefaultTeamIDRequired otherwise); optional (0) on
+	// re-provision of an existing org, where it keeps the stored billing
+	// team (never a wipe). Prerequisite for pull-based compute billing.
 	DefaultTeamID int64
 	Warehouse     *configstore.ManagedWarehouse
 	// RootUserHash is the bcrypt hash of the freshly-generated root
@@ -64,9 +65,10 @@ func NewGormStore(cs *configstore.ConfigStore) Store {
 
 func (s *gormStore) GetOrg(orgID string) (*configstore.Org, error) {
 	var org configstore.Org
-	if err := s.cs.DB().First(&org, "name = ?", orgID).Error; err != nil {
+	if err := s.cs.DB().Preload("Teams").First(&org, "name = ?", orgID).Error; err != nil {
 		return nil, err
 	}
+	org.DefaultTeamID = org.BillingTeamID()
 	return &org, nil
 }
 
@@ -89,8 +91,8 @@ func (s *gormStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
 		// No default_team_id on this standalone path — an existing org keeps
-		// its column as-is; creating a NEW org through here now fails with
-		// ErrDefaultTeamIDRequired (same invariant as Provision).
+		// its billing team as-is; creating a NEW org through here now fails
+		// with ErrDefaultTeamIDRequired (same invariant as Provision).
 		return createPendingWarehouseTx(tx, orgID, databaseName, 0, warehouse)
 	})
 }
@@ -106,21 +108,25 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // without an extra error type.
 func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTeamID int64, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
-	// creates everything). A NEW org MUST carry default_team_id (pull-based
-	// compute billing keys usage buckets by it; all pre-existing orgs are
-	// backfilled) — creating one without it is rejected. Re-provisioning an
-	// existing org without it keeps the stored value (never a wipe).
+	// creates everything). A NEW org MUST carry default_team_id — it becomes
+	// the org's first duckgres_org_teams row, marked as the billing team
+	// (pull-based compute billing keys usage buckets by it; all pre-existing
+	// orgs are backfilled) — creating one without it is rejected.
+	// Re-provisioning an existing org without it keeps the stored billing
+	// team (never a wipe).
 	var org configstore.Org
+	orgCreated := false
 	err := tx.Where("name = ?", orgID).First(&org).Error
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		if defaultTeamID == 0 {
 			return ErrDefaultTeamIDRequired
 		}
-		org = configstore.Org{Name: orgID, DatabaseName: databaseName, DefaultTeamID: &defaultTeamID}
+		org = configstore.Org{Name: orgID, DatabaseName: databaseName}
 		if err := tx.Create(&org).Error; err != nil {
 			return err
 		}
+		orgCreated = true
 	case err != nil:
 		return err
 	}
@@ -130,31 +136,35 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 			return err
 		}
 	}
-	// If a default_team_id was supplied, persist it even when the org already
-	// existed (the create branch above only runs on insert). Only ever set,
-	// never cleared here, so an omitted value is a no-op rather than a wipe.
+	// If a default_team_id was supplied, persist it as the org's billing team
+	// row. Only ever set, never cleared here, so an omitted value is a no-op
+	// rather than a wipe.
 	if defaultTeamID != 0 {
 		oldTeamID := int64(0)
-		if org.DefaultTeamID != nil {
-			oldTeamID = *org.DefaultTeamID
+		if !orgCreated {
+			var err error
+			oldTeamID, err = configstore.OrgBillingTeamIDTx(tx, orgID)
+			if err != nil {
+				return err
+			}
 		}
-		if err := tx.Model(&org).Update("default_team_id", defaultTeamID).Error; err != nil {
+		if err := configstore.SetOrgBillingTeamTx(tx, orgID, defaultTeamID); err != nil {
 			return err
 		}
-		// The org's default team changed: re-attribute its buffered (unacked)
-		// billing buckets to the new team in this same transaction, so the next
-		// billing pull reports them under the new team instead of stranding
-		// them under the stale one. A freshly-created org lands here with
-		// oldTeamID == defaultTeamID (set on insert above), so this only fires
-		// on a real re-provision change. In-flight metering under the old team
-		// (config-snapshot poll lag, ~30s) can still land a small residual
-		// old-team bucket — tolerated, see configstore.ReattributeUsageTeamTx.
-		if oldTeamID != defaultTeamID {
+		// The org's billing team changed on a re-provision: re-attribute its
+		// buffered (unacked) billing buckets to the new team in this same
+		// transaction, so the next billing pull reports them under the new
+		// team instead of stranding them under the stale one. A
+		// freshly-created org has no buckets, so it skips this. In-flight
+		// metering under the old team (config-snapshot poll lag, ~30s) can
+		// still land a small residual old-team bucket — tolerated, see
+		// configstore.ReattributeUsageTeamTx.
+		if !orgCreated && oldTeamID != defaultTeamID {
 			moved, err := configstore.ReattributeUsageTeamTx(tx, orgID, defaultTeamID)
 			if err != nil {
 				return err
 			}
-			slog.Info("Re-attributed org usage buckets to new default team.",
+			slog.Info("Re-attributed org usage buckets to new billing team.",
 				"org", orgID, "old_team", oldTeamID, "new_team", defaultTeamID, "rows", moved)
 		}
 	}

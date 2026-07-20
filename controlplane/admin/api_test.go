@@ -91,8 +91,8 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org, reattribu
 			org.HostnameAlias = &alias
 		}
 	}
-	// Mirrors gormAPIStore: nil = preserve, n = set. No clear path — the
-	// column is NOT NULL and the handler rejects 0/null/negative.
+	// Mirrors gormAPIStore: nil = preserve, n = set (repointing the billing
+	// team). No clear path — the handler rejects 0/null/negative.
 	if updates.DefaultTeamID != nil {
 		teamID := *updates.DefaultTeamID
 		org.DefaultTeamID = &teamID
