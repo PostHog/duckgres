@@ -23,6 +23,11 @@ import (
 
 var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
 
+// The teams association is read-only through the org endpoints: the billing
+// team is managed via the default_team_id field, and there is no direct
+// team-list mutation surface yet.
+var errOrgTeamsPayloadNotAllowed = errors.New("teams cannot be set directly; set the billing team via default_team_id")
+
 var errWarehouseStillExists = errors.New("managed warehouse still exists for org")
 
 // maxWarehousePutBodyBytes caps the admin PUT body. Warehouse payloads are
@@ -129,10 +134,12 @@ type apiStore interface {
 	CreateOrg(org *configstore.Org) error
 	GetOrg(name string) (*configstore.Org, error)
 	// UpdateOrg persists the merged org row. reattributeUsageTeam is non-nil
-	// when the update changes default_team_id: the store must then re-attribute
-	// the org's buffered (unacked) billing buckets to that new team id in the
-	// SAME transaction as the org-row update, so a committed team change never
-	// leaves usage stranded under the old team.
+	// when the update changes the org's billing team (the wire field
+	// default_team_id): the store must then repoint the org's billing team row
+	// (duckgres_org_teams) AND re-attribute the org's buffered (unacked)
+	// billing buckets to that new team id in the SAME transaction as the
+	// org-row update, so a committed team change never leaves usage stranded
+	// under the old team.
 	UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error)
 	DeleteOrg(name string) (bool, error)
 
@@ -167,22 +174,37 @@ func (s *gormAPIStore) db() *gorm.DB {
 
 func (s *gormAPIStore) ListOrgs() ([]configstore.Org, error) {
 	var orgs []configstore.Org
-	if err := s.db().Preload("Users").Preload("Warehouse").Find(&orgs).Error; err != nil {
+	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").Find(&orgs).Error; err != nil {
 		return nil, err
+	}
+	for i := range orgs {
+		orgs[i].DefaultTeamID = orgs[i].BillingTeamID()
 	}
 	return orgs, nil
 }
 
 func (s *gormAPIStore) CreateOrg(org *configstore.Org) error {
 	org.Warehouse = nil
-	return s.db().Omit("Warehouse").Create(org).Error
+	// One transaction: org row + its billing team row (duckgres_org_teams).
+	// The handler already required a positive DefaultTeamID, so a created org
+	// is always born with its billing team.
+	return s.db().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Omit("Warehouse", "Teams").Create(org).Error; err != nil {
+			return err
+		}
+		if org.DefaultTeamID == nil {
+			return nil
+		}
+		return configstore.SetOrgBillingTeamTx(tx, org.Name, *org.DefaultTeamID)
+	})
 }
 
 func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 	var org configstore.Org
-	if err := s.db().Preload("Users").Preload("Warehouse").First(&org, "name = ?", name).Error; err != nil {
+	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").First(&org, "name = ?", name).Error; err != nil {
 		return nil, err
 	}
+	org.DefaultTeamID = org.BillingTeamID()
 	return &org, nil
 }
 
@@ -207,24 +229,12 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org, reattribu
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
-	// DefaultTeamID is *int64: nil = preserve, n = set. There is no clear
-	// path — the column is NOT NULL (every org must keep a default team; it
-	// is the billing bucket key) and the handler rejects 0/null/negative
-	// before this runs.
-	if updates.DefaultTeamID != nil {
-		fields["default_team_id"] = *updates.DefaultTeamID
-	}
+	// The billing team (wire field default_team_id) is not an org column: a
+	// change repoints the org's duckgres_org_teams billing row inside the same
+	// transaction below. The handler rejects 0/null/negative before this runs
+	// and only passes reattributeUsageTeam when the value actually changes.
 	found := false
 	err := s.db().Transaction(func(tx *gorm.DB) error {
-		// Read the pre-update team id before writing, purely for the log line —
-		// the handler already decided reattribution is needed.
-		var oldTeams []int64
-		if reattributeUsageTeam != nil {
-			if err := tx.Model(&configstore.Org{}).Where("name = ?", name).
-				Pluck("default_team_id", &oldTeams).Error; err != nil {
-				return err
-			}
-		}
 		result := tx.Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 		if result.Error != nil {
 			return result.Error
@@ -234,21 +244,26 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org, reattribu
 		}
 		found = true
 		if reattributeUsageTeam != nil {
-			// Same transaction as the org-row update: a committed team change
-			// always carries its buffered buckets along. In-flight metering under
-			// the old team can still land a small residual row right after this
-			// (config-snapshot poll lag, ~30s) — tolerated, see
-			// configstore.ReattributeUsageTeamTx.
+			// Read the pre-update team id purely for the log line — the
+			// handler already decided the billing team changes.
+			oldTeam, err := configstore.OrgBillingTeamIDTx(tx, name)
+			if err != nil {
+				return err
+			}
+			if err := configstore.SetOrgBillingTeamTx(tx, name, *reattributeUsageTeam); err != nil {
+				return err
+			}
+			// Same transaction as the billing-team repoint: a committed team
+			// change always carries its buffered buckets along. In-flight
+			// metering under the old team can still land a small residual row
+			// right after this (config-snapshot poll lag, ~30s) — tolerated,
+			// see configstore.ReattributeUsageTeamTx.
 			moved, err := configstore.ReattributeUsageTeamTx(tx, name, *reattributeUsageTeam)
 			if err != nil {
 				return err
 			}
-			old := int64(0)
-			if len(oldTeams) > 0 {
-				old = oldTeams[0]
-			}
-			slog.Info("Re-attributed org usage buckets to new default team.",
-				"org", name, "old_team", old, "new_team", *reattributeUsageTeam, "rows", moved)
+			slog.Info("Re-attributed org usage buckets to new billing team.",
+				"org", name, "old_team", oldTeam, "new_team", *reattributeUsageTeam, "rows", moved)
 		}
 		return nil
 	})
@@ -580,12 +595,14 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	// Every org must be born with its default PostHog team id — it is the
-	// billing bucket key and the column is NOT NULL (same invariant as the
-	// provisioning API's ErrDefaultTeamIDRequired). Positivity of a present
-	// value is enforced by validateOrgMutationPayload above.
+	// Every org must be born with its billing PostHog team — it is the
+	// billing bucket key, stored as the org's duckgres_org_teams row with
+	// is_billing_team = TRUE (same invariant as the provisioning API's
+	// ErrDefaultTeamIDRequired). The wire field keeps its historical
+	// default_team_id name. Positivity of a present value is enforced by
+	// validateOrgMutationPayload above.
 	if org.DefaultTeamID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id is required (the org's default PostHog team id)"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id is required (the org's billing PostHog team id)"})
 		return
 	}
 	// Normalize empty hostname_alias to NULL on insert so the unique index
@@ -669,19 +686,20 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
-	// Set when the PUT actually changes default_team_id: the store then
-	// re-attributes the org's buffered (unacked) billing buckets to the new
+	// Set when the PUT actually changes default_team_id (the org's billing
+	// team): the store then repoints the org's duckgres_org_teams billing row
+	// and re-attributes the buffered (unacked) billing buckets to the new
 	// team in the same transaction as the org update, so the next billing pull
 	// reports them under the new team (docs/design/billing-pull-api.md,
 	// "Changing an org's default team").
 	var reattributeUsageTeam *int64
 	if _, ok := fields["default_team_id"]; ok {
-		// Key present: a positive number sets. Clearing is rejected — the
-		// column is NOT NULL (the org's default team is the billing bucket
-		// key). An explicit JSON null unmarshals to a nil pointer here; 0 and
-		// negatives are already rejected by validateOrgMutationPayload above.
+		// Key present: a positive number sets. Clearing is rejected — every
+		// org must keep a billing team (the billing bucket key). An explicit
+		// JSON null unmarshals to a nil pointer here; 0 and negatives are
+		// already rejected by validateOrgMutationPayload above.
 		if updates.DefaultTeamID == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id cannot be cleared (every org must keep a default team); pass a valid team id"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id cannot be cleared (every org must keep a billing team); pass a valid team id"})
 			return
 		}
 		merged.DefaultTeamID = updates.DefaultTeamID
@@ -776,8 +794,8 @@ func orgStrPtr(s *string) string {
 }
 
 // orgInt64Ptr renders an optional org config integer (nil or 0 == unset) for
-// audit detail. default_team_id is NOT NULL and never 0 nowadays, so
-// "(unset)" only ever renders for legacy display of rows predating that.
+// audit detail. Every org keeps a billing team nowadays, so "(unset)" only
+// ever renders for legacy display of orgs predating that.
 func orgInt64Ptr(v *int64) string {
 	if v == nil || *v == 0 {
 		return "(unset)"
@@ -791,6 +809,9 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	if org.Warehouse != nil {
 		return errWarehousePayloadNotAllowed
+	}
+	if len(org.Teams) > 0 {
+		return errOrgTeamsPayloadNotAllowed
 	}
 	if org.HostnameAlias != nil {
 		if err := validateHostnameAlias(*org.HostnameAlias); err != nil {
@@ -808,10 +829,10 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	// Shared by create and update: nil stays allowed here (create requires
 	// the field itself; update treats an absent field as "preserve"), but a
-	// present value must be a positive PostHog team id — the column is NOT
-	// NULL and 0 is never stored, so there is no clear sentinel.
+	// present value must be a positive PostHog team id — a billing team row
+	// is never stored with team 0, so there is no clear sentinel.
 	if org.DefaultTeamID != nil && *org.DefaultTeamID <= 0 {
-		return fmt.Errorf("default_team_id: value %d must be a positive PostHog team id (it cannot be cleared — every org must keep a default team)", *org.DefaultTeamID)
+		return fmt.Errorf("default_team_id: value %d must be a positive PostHog team id (it cannot be cleared — every org must keep a billing team)", *org.DefaultTeamID)
 	}
 	return nil
 }

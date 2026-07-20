@@ -25,15 +25,16 @@ type Org struct {
 	DefaultWorkerMemory     string `gorm:"size:32" json:"default_worker_memory"`
 	DefaultWorkerTTL        string `gorm:"size:32" json:"default_worker_ttl"`
 	DefaultWorkerMinHotIdle int    `gorm:"default:0" json:"default_worker_min_hot_idle"`
-	// DefaultTeamID links the org to its default PostHog team id (an integer,
-	// matching PostHog's Team.id). It is a prerequisite for pull-based compute
-	// billing — usage buckets are keyed by team_id = the org's default team.
-	// The column is a NOT NULL BIGINT (migration 000020) and 0 is never stored:
-	// every create path (provisioning + admin API) requires a positive team id
-	// and the admin API rejects clears. The field stays *int64 anyway — the
-	// admin PUT presence-merge relies on nil = "field absent, preserve", and a
-	// plain int64 would make gorm treat 0 as a zero value to skip.
-	DefaultTeamID *int64            `gorm:"not null" json:"default_team_id,omitempty"`
+	// DefaultTeamID is NOT a column — it is the admin/provisioning API view of
+	// the org's billing team (the duckgres_org_teams row with is_billing_team
+	// = TRUE, see OrgTeam). The JSON field name is kept for wire compat with
+	// existing callers and the admin UI. Read paths populate it from the
+	// preloaded Teams association; write paths (admin create/update org,
+	// provisioning) translate it into a billing-team upsert via
+	// SetOrgBillingTeamTx. *int64 because the admin PUT presence-merge relies
+	// on nil = "field absent, preserve".
+	DefaultTeamID *int64            `gorm:"-" json:"default_team_id,omitempty"`
+	Teams         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
 	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
@@ -41,6 +42,40 @@ type Org struct {
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
+
+// BillingTeamID returns the org's billing PostHog team id from the loaded
+// Teams association (the row with is_billing_team = TRUE), or nil when the
+// org has none — including when Teams was not preloaded.
+func (o *Org) BillingTeamID() *int64 {
+	for i := range o.Teams {
+		t := &o.Teams[i]
+		if t.IsBillingTeam != nil && *t.IsBillingTeam {
+			return &t.TeamID
+		}
+	}
+	return nil
+}
+
+// OrgTeam maps one PostHog team to an org and the warehouse schema its data
+// lives in (conventionally "team_<id>"). An org can carry many teams; exactly
+// one may be the billing team — the team pull-based billing keys the org's
+// usage buckets by (enforced by a partial unique index, migration 000024).
+// IsBillingTeam and BackfillEnabled are tri-state (*bool): NULL means "not the
+// billing team" / "backfill preference unset".
+type OrgTeam struct {
+	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_billing_org,unique,where:is_billing_team IS TRUE" json:"org_id"`
+	// autoIncrement:false — int fields in a composite primary key default to
+	// auto-increment in gorm, which would make this a bigserial.
+	TeamID          int64     `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
+	SchemaName      string    `gorm:"size:255;not null" json:"schema_name"`
+	Enabled         bool      `gorm:"not null;default:true" json:"enabled"`
+	IsBillingTeam   *bool     `json:"is_billing_team,omitempty"`
+	BackfillEnabled *bool     `json:"backfill_enabled,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+func (OrgTeam) TableName() string { return "duckgres_org_teams" }
 
 // OrgUser maps a username to an org with credentials.
 //
@@ -490,9 +525,31 @@ type OrgConfig struct {
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
 	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
 	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
-	DefaultTeamID           int64             // org's default PostHog team id (NOT NULL in the store; 0 only for a missing org / stale snapshot); prereq for pull-based compute billing
+	Teams                   []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams); at most one is the billing team
 	Users                   map[string]string // username -> password
 	Warehouse               *ManagedWarehouseConfig
+}
+
+// OrgTeamConfig is the in-memory snapshot view of one duckgres_org_teams row.
+// IsBillingTeam folds the tri-state column to a plain bool (NULL == false) —
+// snapshot consumers only care whether a row IS the billing team.
+type OrgTeamConfig struct {
+	TeamID        int64
+	SchemaName    string
+	Enabled       bool
+	IsBillingTeam bool
+}
+
+// BillingTeamID returns the org's billing PostHog team id (the team with
+// is_billing_team = TRUE), or 0 when the org has none. Prereq for pull-based
+// compute billing — usage buckets are keyed by it.
+func (oc *OrgConfig) BillingTeamID() int64 {
+	for _, t := range oc.Teams {
+		if t.IsBillingTeam {
+			return t.TeamID
+		}
+	}
+	return 0
 }
 
 // ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.

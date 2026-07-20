@@ -17,14 +17,6 @@ import (
 
 const testConfigStoreConnString = "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable"
 
-// testDefaultTeamID returns a pointer to a placeholder PostHog team id for
-// seeded org rows — default_team_id is NOT NULL (migration 000020), so every
-// test fixture that inserts an org must carry one.
-func testDefaultTeamID() *int64 {
-	teamID := int64(1)
-	return &teamID
-}
-
 func newPostgresConfigStore(t *testing.T) *configstore.ConfigStore {
 	t.Helper()
 
@@ -115,7 +107,7 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 
@@ -180,8 +172,11 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics_db"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
+	}
+	if err := configstore.SetOrgBillingTeamTx(store.DB(), "analytics", 1); err != nil {
+		t.Fatalf("seed billing team: %v", err)
 	}
 	wh := &configstore.ManagedWarehouse{OrgID: "analytics", State: configstore.ManagedWarehouseStateReady}
 	if err := store.DB().Create(wh).Error; err != nil {
@@ -209,18 +204,22 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 		t.Fatal("expected org row to be deleted")
 	}
 
-	var orgs, warehouses int64
+	var orgs, warehouses, teams int64
 	store.DB().Model(&configstore.Org{}).Where("name = ?", "analytics").Count(&orgs)
 	store.DB().Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", "analytics").Count(&warehouses)
+	store.DB().Model(&configstore.OrgTeam{}).Where("org_id = ?", "analytics").Count(&teams)
 	if orgs != 0 {
 		t.Fatalf("expected org row gone, found %d", orgs)
 	}
 	if warehouses != 0 {
 		t.Fatalf("expected deleted warehouse row cascaded away, found %d", warehouses)
 	}
+	if teams != 0 {
+		t.Fatalf("expected org team rows cascaded away (FK ON DELETE CASCADE), found %d", teams)
+	}
 
 	// The database_name is now free for reuse (no unique-index squat).
-	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db"}).Error; err != nil {
 		t.Fatalf("expected database_name to be reusable after org deletion: %v", err)
 	}
 }
@@ -235,8 +234,11 @@ func TestUpdateOrgReattributesUsagePostgres(t *testing.T) {
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
 	oldTeam := int64(1)
-	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acmedb", DefaultTeamID: &oldTeam}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acmedb"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
+	}
+	if err := configstore.SetOrgBillingTeamTx(store.DB(), "acme", oldTeam); err != nil {
+		t.Fatalf("seed billing team: %v", err)
 	}
 
 	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
@@ -281,6 +283,14 @@ func TestUpdateOrgReattributesUsagePostgres(t *testing.T) {
 	if updated.DefaultTeamID == nil || *updated.DefaultTeamID != 2 {
 		t.Fatalf("org default_team_id = %v, want 2", updated.DefaultTeamID)
 	}
+	// The billing mark moved to team 2; the old team row stays, demoted.
+	var billingTeams []int64
+	if err := store.DB().Raw(`SELECT team_id FROM duckgres_org_teams WHERE org_id = 'acme' AND is_billing_team IS TRUE`).Scan(&billingTeams).Error; err != nil {
+		t.Fatalf("read billing teams: %v", err)
+	}
+	if len(billingTeams) != 1 || billingTeams[0] != 2 {
+		t.Fatalf("billing team rows = %v, want [2]", billingTeams)
+	}
 	var compute []struct {
 		TeamID        int64
 		CPUSeconds    int64
@@ -308,7 +318,7 @@ func TestMutateManagedWarehouseSerializesConcurrentWriters(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{

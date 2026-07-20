@@ -148,14 +148,18 @@ func TestReattributeUsageTeamPostgres(t *testing.T) {
 }
 
 // TestProvisionReattributesUsageOnTeamChangePostgres: re-provisioning an
-// EXISTING org with a different default_team_id must update the org row AND
-// re-attribute its buffered usage buckets to the new team, atomically.
+// EXISTING org with a different default_team_id must repoint the org's
+// billing team row (duckgres_org_teams) AND re-attribute its buffered usage
+// buckets to the new team, atomically.
 func TestProvisionReattributesUsageOnTeamChangePostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
 	oldTeam := int64(1)
-	if err := store.DB().Create(&configstore.Org{Name: "reprov", DatabaseName: "reprovdb", DefaultTeamID: &oldTeam}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "reprov", DatabaseName: "reprovdb"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
+	}
+	if err := configstore.SetOrgBillingTeamTx(store.DB(), "reprov", oldTeam); err != nil {
+		t.Fatalf("seed billing team: %v", err)
 	}
 	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
 	seedUsage(t, store, "reprov", oldTeam, bucket, 10, 20, 1000)
@@ -171,12 +175,30 @@ func TestProvisionReattributesUsageOnTeamChangePostgres(t *testing.T) {
 		t.Fatalf("re-provision with new team: %v", err)
 	}
 
-	var org configstore.Org
-	if err := store.DB().First(&org, "name = ?", "reprov").Error; err != nil {
+	org, err := pstore.GetOrg("reprov")
+	if err != nil {
 		t.Fatalf("read org: %v", err)
 	}
 	if org.DefaultTeamID == nil || *org.DefaultTeamID != 2 {
-		t.Fatalf("org default_team_id = %v, want 2", org.DefaultTeamID)
+		t.Fatalf("org billing team = %v, want 2", org.DefaultTeamID)
+	}
+	// The old team row survives the flip, demoted; team 2 carries the
+	// (single) billing mark and the conventional schema name.
+	var teamRows []configstore.OrgTeam
+	if err := store.DB().Where("org_id = ?", "reprov").Order("team_id").Find(&teamRows).Error; err != nil {
+		t.Fatalf("read org team rows: %v", err)
+	}
+	if len(teamRows) != 2 || teamRows[0].TeamID != 1 || teamRows[1].TeamID != 2 {
+		t.Fatalf("org team rows = %+v, want teams [1 2]", teamRows)
+	}
+	if teamRows[0].IsBillingTeam != nil && *teamRows[0].IsBillingTeam {
+		t.Fatal("old team 1 must be demoted from billing")
+	}
+	if teamRows[1].IsBillingTeam == nil || !*teamRows[1].IsBillingTeam {
+		t.Fatal("team 2 must carry the billing mark")
+	}
+	if teamRows[1].SchemaName != "team_2" {
+		t.Fatalf("team 2 schema_name = %q, want team_2", teamRows[1].SchemaName)
 	}
 
 	compute := computeRowsForOrg(t, store, "reprov")

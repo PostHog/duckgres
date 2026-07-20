@@ -81,7 +81,7 @@ func TestModelsAPIPostgres(t *testing.T) {
 	store := newPostgresConfigStore(t)
 
 	const secretHash = "$2a$10$DEADBEEFdeadbeefDEADBEEFdeadbeefDEADBEEFdeadbeefDEADBE"
-	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acme_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acme_db"}).Error; err != nil {
 		t.Fatalf("seed org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.OrgUser{OrgID: "acme", Username: "reader", Password: secretHash}).Error; err != nil {
