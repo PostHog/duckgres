@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -358,5 +359,78 @@ func TestMutateManagedWarehouseSerializesConcurrentWriters(t *testing.T) {
 	want := fmt.Sprintf("n=%d", writers)
 	if final.StatusMessage != want {
 		t.Fatalf("status_message = %q, want %q (lost updates under concurrency)", final.StatusMessage, want)
+	}
+}
+
+// TestAdminOrgTeamStorePostgres exercises the real gormAPIStore team methods:
+// billing repoint carries the buffered usage buckets, and create enforces
+// per-org schema uniqueness. (Delete rules live in configstore.DeleteOrgTeamTx
+// and are covered by tests/configstore/org_teams_postgres_test.go — the admin
+// UI deletes through the provisioning-registered route.)
+func TestAdminOrgTeamStorePostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	if err := store.DB().Create(&configstore.Org{Name: "teamsorg", DatabaseName: "teamsorgdb"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
+		VALUES ('teamsorg', 1, 'team_1', TRUE, TRUE, ?, ?), ('teamsorg', 2, 'team_2', TRUE, NULL, ?, ?)`,
+		base, base, base.Add(time.Hour), base.Add(time.Hour)).Error; err != nil {
+		t.Fatalf("seed teams: %v", err)
+	}
+	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	if err := store.FlushComputeUsage([]configstore.ComputeUsageDelta{{
+		OrgID: "teamsorg", TeamID: 1, QuerySource: "standard",
+		Millicores: 2000, MiB: 4096, BucketStart: bucket,
+		CPUSeconds: 10, MemorySeconds: 20,
+	}}); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	// Repoint billing to team 2: the buffered bucket must follow atomically.
+	updated, err := apiStore.UpdateOrgTeam("teamsorg", 2, orgTeamUpdate{MakeBilling: true})
+	if err != nil {
+		t.Fatalf("repoint billing: %v", err)
+	}
+	if updated.IsBillingTeam == nil || !*updated.IsBillingTeam {
+		t.Fatalf("team 2 must be billing, got %+v", updated)
+	}
+	var usageTeams []int64
+	if err := store.DB().Raw(`SELECT team_id FROM duckgres_org_compute_usage WHERE org_id = 'teamsorg'`).Scan(&usageTeams).Error; err != nil {
+		t.Fatalf("read usage teams: %v", err)
+	}
+	if len(usageTeams) != 1 || usageTeams[0] != 2 {
+		t.Fatalf("usage teams after repoint = %v, want [2]", usageTeams)
+	}
+
+	// Create with a schema another team already holds: refused.
+	err = apiStore.CreateOrgTeam("teamsorg", &configstore.OrgTeam{TeamID: 3, SchemaName: "team_1", Enabled: true})
+	if !errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+		t.Fatalf("duplicate schema create err = %v, want ErrOrgTeamSchemaConflict", err)
+	}
+	// A duplicate (org, team) is the other conflict shape.
+	err = apiStore.CreateOrgTeam("teamsorg", &configstore.OrgTeam{TeamID: 1, SchemaName: "fresh", Enabled: true})
+	if !errors.Is(err, errOrgTeamExists) {
+		t.Fatalf("duplicate team create err = %v, want errOrgTeamExists", err)
+	}
+	// A fresh schema works and appears in the cross-org list.
+	if err := apiStore.CreateOrgTeam("teamsorg", &configstore.OrgTeam{TeamID: 3, SchemaName: "team_3", Enabled: true}); err != nil {
+		t.Fatalf("create team 3: %v", err)
+	}
+	teams, err := apiStore.ListAllOrgTeams()
+	if err != nil {
+		t.Fatalf("list all teams: %v", err)
+	}
+	var got []int64
+	for _, tm := range teams {
+		if tm.OrgID == "teamsorg" {
+			got = append(got, tm.TeamID)
+		}
+	}
+	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("teamsorg teams = %v, want [1 2 3]", got)
 	}
 }

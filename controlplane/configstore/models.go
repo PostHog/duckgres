@@ -60,19 +60,32 @@ func (o *Org) BillingTeamID() *int64 {
 // lives in (conventionally "team_<id>"). An org can carry many teams; exactly
 // one may be the billing team — the team pull-based billing keys the org's
 // usage buckets by (enforced by a partial unique index, migration 000024).
-// IsBillingTeam and BackfillEnabled are tri-state (*bool): NULL means "not the
-// billing team" / "backfill preference unset".
+// Two teams in one org must never share a schema name (unique index on
+// (org_id, schema_name), migration 000025). IsBillingTeam and BackfillEnabled
+// are tri-state (*bool): NULL means "not the billing team" / "backfill
+// preference unset".
+//
+// The *TableName fields are legacy overrides. NULL — the value for every team
+// created going forward — means "derive from schema_name": events live at
+// <schema_name>.events, persons at <schema_name>.persons, and data imports
+// under the <schema_name>_data_imports schema. Non-NULL values are
+// grandfathered explicit names for pre-existing teams whose warehouse tables
+// predate the schema-per-team convention; the PostHog-side backfill sets them
+// via the provisioning team upsert.
 type OrgTeam struct {
-	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_billing_org,unique,where:is_billing_team IS TRUE" json:"org_id"`
+	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_billing_org,unique,where:is_billing_team IS TRUE;index:idx_duckgres_org_teams_org_schema,unique,priority:1" json:"org_id"`
 	// autoIncrement:false — int fields in a composite primary key default to
 	// auto-increment in gorm, which would make this a bigserial.
-	TeamID          int64     `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
-	SchemaName      string    `gorm:"size:255;not null" json:"schema_name"`
-	Enabled         bool      `gorm:"not null;default:true" json:"enabled"`
-	IsBillingTeam   *bool     `json:"is_billing_team,omitempty"`
-	BackfillEnabled *bool     `json:"backfill_enabled,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	TeamID                int64     `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
+	SchemaName            string    `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
+	Enabled               bool      `gorm:"not null;default:true" json:"enabled"`
+	IsBillingTeam         *bool     `json:"is_billing_team,omitempty"`
+	BackfillEnabled       *bool     `json:"backfill_enabled,omitempty"`
+	EventsTableName       *string   `gorm:"size:255" json:"events_table_name,omitempty"`
+	PersonsTableName      *string   `gorm:"size:255" json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string   `gorm:"size:255" json:"schema_data_imports_name,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 func (OrgTeam) TableName() string { return "duckgres_org_teams" }

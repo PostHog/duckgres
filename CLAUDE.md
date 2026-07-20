@@ -535,6 +535,26 @@ touching this path:
   `controlplane/admin/api_test.go` + `api_postgres_test.go`
   (`TestUpdateOrg*Reattribut*`), and the re-attribution leg of
   `compute_usage_pull_api` in the e2e harness.
+- **Org team CRUD (`duckgres_org_teams`)**: the PostHog backend manages an
+  org's team rows via `GET/POST /api/v1/orgs/:id/teams` +
+  `DELETE /api/v1/orgs/:id/teams/:team_id` (internal secret,
+  `controlplane/provisioning`). The POST is the **grandfather upsert**: it MAY
+  overwrite an existing row's `schema_name` and the legacy
+  `events_table_name`/`persons_table_name`/`schema_data_imports_name`
+  overrides (NULL = derive from `schema_name`: `<schema>.events`,
+  `<schema>.persons`, `<schema>_data_imports`), because the PostHog backfill
+  replaces migration 000024's `team_<id>` placeholder through it. Two teams in
+  one org can never share a schema (unique `(org_id, schema_name)`, migration
+  000025 → 409). DELETE removes CONFIG only (never warehouse data); deleting
+  the billing team promotes the remaining team with the OLDEST `created_at`
+  and re-attributes unacked usage in the same TXN; the org's LAST team is
+  undeletable (409 — delete the org). The admin console mirrors this on a
+  user-facing surface (`GET /teams`, `POST /teams`,
+  `PUT /orgs/:id/teams/:team_id`) where `schema_name` is immutable and
+  billing can only be repointed, never cleared. Shared rules live in
+  `configstore.UpsertOrgTeamTx` / `DeleteOrgTeamTx`; tests:
+  `tests/configstore/org_teams_postgres_test.go`, the provisioning/admin API
+  tests, and `org_teams_crud` in the e2e harness.
 - **Storage metric** (`managed_warehouse_storage_gib_seconds`,
   `storage_meter.go`): a LEADER-ONLY sampler (double writers would
   double-bill — the UPSERT is additive) visits each Ready warehouse's DuckLake

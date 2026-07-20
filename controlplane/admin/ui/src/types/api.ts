@@ -78,7 +78,10 @@ export interface OrgUpdate {
 
 // One duckgres_org_teams row: a PostHog team mapped to this org and the
 // warehouse schema its data lives in. At most one row per org is the billing
-// team.
+// team. The *_name fields are legacy overrides for grandfathered pre-existing
+// teams; null means "derive from schema_name" (events at
+// <schema_name>.events, persons at <schema_name>.persons, data imports under
+// <schema_name>_data_imports).
 export interface OrgTeam {
   org_id: string;
   team_id: number;
@@ -86,8 +89,41 @@ export interface OrgTeam {
   enabled: boolean;
   is_billing_team?: boolean | null;
   backfill_enabled?: boolean | null;
+  events_table_name?: string | null;
+  persons_table_name?: string | null;
+  schema_data_imports_name?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// POST /api/v1/teams — admin create (org_id in the body, mirroring
+// POST /users). schema_name is set once here and immutable afterwards on the
+// admin surface.
+export interface OrgTeamCreateBody {
+  org_id: string;
+  team_id: number;
+  schema_name: string;
+  enabled?: boolean;
+  backfill_enabled?: boolean;
+}
+
+// PUT /api/v1/orgs/:id/teams/:team_id — enabled / backfill / billing repoint
+// only (never schema_name). is_billing_team may only be true: billing is
+// repointed by marking another team, never cleared. An explicit
+// `backfill_enabled: null` clears the tri-state back to unset.
+export interface OrgTeamUpdateBody {
+  enabled?: boolean;
+  backfill_enabled?: boolean | null;
+  is_billing_team?: true;
+}
+
+// DELETE /api/v1/orgs/:id/teams/:team_id response. new_billing_team_id is set
+// when the deleted row was the billing team — the remaining team with the
+// oldest created_at took over (usage buckets re-attributed server-side).
+export interface OrgTeamDeleteResult {
+  deleted: number;
+  org: string;
+  new_billing_team_id?: number;
 }
 
 // ---- Users (confirmed) ----
