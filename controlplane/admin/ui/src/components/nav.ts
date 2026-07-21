@@ -4,6 +4,7 @@ import {
   ArrowLeftRight,
   Building2,
   Database,
+  Layers,
   LayoutDashboard,
   LineChart,
   Network,
@@ -26,6 +27,7 @@ export interface NavItem {
 export const NAV: NavItem[] = [
   { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
   { to: "/orgs", label: "Organizations", icon: Building2 },
+  { to: "/org-teams", label: "Org teams", icon: Layers },
   { to: "/users", label: "Org Users", icon: Users },
   { to: "/operators", label: "Operators", icon: ShieldCheck, adminOnly: true },
   { to: "/live", label: "Live", icon: Activity },

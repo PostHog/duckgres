@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,6 +113,18 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	// run without ever touching the config-store DB directly.
 	r.PATCH("/orgs/:id/warehouse/pinning", h.patchTenantPinning)
 
+	// Org teams (duckgres_org_teams). The per-org list/upsert/delete routes
+	// (GET/POST /orgs/:id/teams, DELETE /orgs/:id/teams/:team_id) are
+	// registered by the provisioning API on this same group — gin refuses
+	// duplicate routes, so the admin surface adds only what provisioning
+	// doesn't have: the cross-org list, a CREATE-ONLY POST (org_id in the
+	// body, mirroring POST /users), and the update. Unlike the internal
+	// provisioning upsert, this is a user-facing surface: schema_name is set
+	// once at create time and immutable afterwards (the PUT rejects it).
+	r.GET("/teams", h.listAllOrgTeams)
+	r.POST("/teams", h.createOrgTeam)
+	r.PUT("/orgs/:id/teams/:team_id", h.updateOrgTeam)
+
 	// Users CRUD
 	r.GET("/users", h.listUsers)
 	r.POST("/users", h.createUser)
@@ -142,6 +155,18 @@ type apiStore interface {
 	// under the old team.
 	UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error)
 	DeleteOrg(name string) (bool, error)
+
+	// Org teams. CreateOrgTeam is create-only (the admin surface never
+	// overwrites an existing row — schema_name is immutable here); it returns
+	// errOrgTeamExists / configstore.ErrOrgTeamSchemaConflict for the two
+	// conflict shapes, gorm.ErrRecordNotFound for an unknown org.
+	// UpdateOrgTeam mutates enabled / backfill_enabled and can repoint the
+	// billing team (usage buckets re-attributed in the same transaction).
+	// Per-org list and delete are served by the provisioning API's routes on
+	// the same router group (identical rules — configstore.DeleteOrgTeamTx).
+	ListAllOrgTeams() ([]configstore.OrgTeam, error)
+	CreateOrgTeam(orgID string, team *configstore.OrgTeam) error
+	UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, error)
 
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
@@ -318,6 +343,119 @@ func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 		return false, err
 	}
 	return returnRows > 0, nil
+}
+
+// errOrgTeamExists distinguishes the (org, team) primary-key conflict from
+// the schema-name conflict on the admin create endpoint — the admin surface
+// never overwrites an existing row (that's the internal provisioning
+// grandfather path), so an existing row is a 409, not an upsert.
+var errOrgTeamExists = errors.New("team already exists in this org")
+
+// orgTeamUpdate carries the admin-editable fields of one org team. Pointer
+// fields are presence-aware (nil = preserve). schema_name is deliberately NOT
+// here: it is immutable on the admin surface. BackfillSet distinguishes an
+// explicit `"backfill_enabled": null` (clear to unset) from an absent key.
+type orgTeamUpdate struct {
+	Enabled     *bool
+	BackfillSet bool
+	Backfill    *bool
+	// MakeBilling repoints the org's billing team to this row (the buffered
+	// usage buckets follow atomically). There is no "unset billing" — every
+	// org must keep a billing team; repoint by marking another team.
+	MakeBilling bool
+}
+
+func (s *gormAPIStore) ListAllOrgTeams() ([]configstore.OrgTeam, error) {
+	var teams []configstore.OrgTeam
+	if err := s.db().Order("org_id, team_id").Find(&teams).Error; err != nil {
+		return nil, err
+	}
+	return teams, nil
+}
+
+func (s *gormAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) error {
+	return s.db().Transaction(func(tx *gorm.DB) error {
+		var orgCount int64
+		if err := tx.Model(&configstore.Org{}).Where("name = ?", orgID).Count(&orgCount).Error; err != nil {
+			return err
+		}
+		if orgCount == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		var dup int64
+		if err := tx.Model(&configstore.OrgTeam{}).
+			Where("org_id = ? AND team_id = ?", orgID, team.TeamID).Count(&dup).Error; err != nil {
+			return err
+		}
+		if dup > 0 {
+			return errOrgTeamExists
+		}
+		var schemaClash int64
+		if err := tx.Model(&configstore.OrgTeam{}).
+			Where("org_id = ? AND schema_name = ?", orgID, team.SchemaName).Count(&schemaClash).Error; err != nil {
+			return err
+		}
+		if schemaClash > 0 {
+			return configstore.ErrOrgTeamSchemaConflict
+		}
+		team.OrgID = orgID
+		return tx.Create(team).Error
+	})
+}
+
+func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, error) {
+	var stored configstore.OrgTeam
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		var team configstore.OrgTeam
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&team, "org_id = ? AND team_id = ?", orgID, teamID).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return configstore.ErrOrgTeamNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		fields := map[string]interface{}{"updated_at": gorm.Expr("now()")}
+		if upd.Enabled != nil {
+			fields["enabled"] = *upd.Enabled
+		}
+		if upd.BackfillSet {
+			fields["backfill_enabled"] = upd.Backfill
+		}
+		if len(fields) > 1 {
+			if err := tx.Model(&configstore.OrgTeam{}).
+				Where("org_id = ? AND team_id = ?", orgID, teamID).
+				Updates(fields).Error; err != nil {
+				return err
+			}
+		}
+
+		if upd.MakeBilling && (team.IsBillingTeam == nil || !*team.IsBillingTeam) {
+			// Repointing billing carries the org's buffered usage buckets
+			// along in the SAME transaction — identical to the
+			// default_team_id repoint on the org endpoints.
+			oldTeam, err := configstore.OrgBillingTeamIDTx(tx, orgID)
+			if err != nil {
+				return err
+			}
+			if err := configstore.SetOrgBillingTeamTx(tx, orgID, teamID); err != nil {
+				return err
+			}
+			moved, err := configstore.ReattributeUsageTeamTx(tx, orgID, teamID)
+			if err != nil {
+				return err
+			}
+			slog.Info("Re-attributed org usage buckets to new billing team.",
+				"org", orgID, "old_team", oldTeam, "new_team", teamID, "rows", moved)
+		}
+
+		return tx.First(&stored, "org_id = ? AND team_id = ?", orgID, teamID).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &stored, nil
 }
 
 func (s *gormAPIStore) ListUsers() ([]configstore.OrgUser, error) {
@@ -757,6 +895,150 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
+}
+
+// --- Org teams ---
+
+func (h *apiHandler) listAllOrgTeams(c *gin.Context) {
+	teams, err := h.store.ListAllOrgTeams()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"teams": teams})
+}
+
+// createOrgTeamRequest is the admin create body (POST /teams — the org rides
+// in the body like POST /users, because the /orgs/:id/teams POST route
+// belongs to the provisioning grandfather upsert). schema_name is set here
+// ONCE and immutable afterwards on this surface (the update endpoint rejects
+// it) — only the internal provisioning grandfather path may overwrite it.
+type createOrgTeamRequest struct {
+	OrgID           string `json:"org_id"`
+	TeamID          int64  `json:"team_id"`
+	SchemaName      string `json:"schema_name"`
+	Enabled         *bool  `json:"enabled,omitempty"`
+	BackfillEnabled *bool  `json:"backfill_enabled,omitempty"`
+}
+
+func (h *apiHandler) createOrgTeam(c *gin.Context) {
+	var req createOrgTeamRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	orgID := req.OrgID
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org_id is required"})
+		return
+	}
+	if req.TeamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id)"})
+		return
+	}
+	if err := configstore.ValidateOrgTeamSchemaName(req.SchemaName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	team := configstore.OrgTeam{
+		OrgID:           orgID,
+		TeamID:          req.TeamID,
+		SchemaName:      req.SchemaName,
+		Enabled:         req.Enabled == nil || *req.Enabled,
+		BackfillEnabled: req.BackfillEnabled,
+	}
+	// POST /teams has no :id param, so the audit org column is blank — record
+	// the target org here (mirrors POST /users).
+	setAuditDetail(c, fmt.Sprintf("created team %d (schema %s) in org %s", req.TeamID, req.SchemaName, orgID))
+	if err := h.store.CreateOrgTeam(orgID, &team); err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		case errors.Is(err, errOrgTeamExists), errors.Is(err, configstore.ErrOrgTeamSchemaConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusCreated, team)
+}
+
+// updateOrgTeamRequest is the admin PUT body: enabled / backfill_enabled /
+// is_billing_team only. schema_name is immutable on this surface, and billing
+// can only be pointed AT a team (is_billing_team: true) — never cleared.
+type updateOrgTeamRequest struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	BackfillEnabled *bool `json:"backfill_enabled,omitempty"`
+	IsBillingTeam   *bool `json:"is_billing_team,omitempty"`
+}
+
+func (h *apiHandler) updateOrgTeam(c *gin.Context) {
+	orgID := c.Param("id")
+	teamID, perr := strconv.ParseInt(c.Param("team_id"), 10, 64)
+	if perr != nil || teamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
+		return
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req updateOrgTeamRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if _, ok := fields["schema_name"]; ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "schema_name is immutable — it is set once when the team is created"})
+		return
+	}
+	if _, ok := fields["is_billing_team"]; ok && (req.IsBillingTeam == nil || !*req.IsBillingTeam) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "is_billing_team can only be set to true (repoint billing by marking another team); every org must keep a billing team"})
+		return
+	}
+	_, backfillSet := fields["backfill_enabled"]
+	upd := orgTeamUpdate{
+		Enabled:     req.Enabled,
+		BackfillSet: backfillSet,
+		Backfill:    req.BackfillEnabled,
+		MakeBilling: req.IsBillingTeam != nil && *req.IsBillingTeam,
+	}
+
+	var changes []string
+	if req.Enabled != nil {
+		changes = append(changes, fmt.Sprintf("enabled=%v", *req.Enabled))
+	}
+	if backfillSet {
+		if req.BackfillEnabled == nil {
+			changes = append(changes, "backfill_enabled=(unset)")
+		} else {
+			changes = append(changes, fmt.Sprintf("backfill_enabled=%v", *req.BackfillEnabled))
+		}
+	}
+	if upd.MakeBilling {
+		changes = append(changes, "billing team")
+	}
+	if len(changes) > 0 {
+		setAuditDetail(c, fmt.Sprintf("team %d: %s", teamID, strings.Join(changes, ", ")))
+	}
+
+	team, err := h.store.UpdateOrgTeam(orgID, teamID, upd)
+	if err != nil {
+		if errors.Is(err, configstore.ErrOrgTeamNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org team not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, team)
 }
 
 // topLevelJSONKeys returns the sorted top-level object keys of a JSON body, or

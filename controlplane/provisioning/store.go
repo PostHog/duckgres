@@ -46,7 +46,13 @@ type ProvisionRequest struct {
 	// re-provision of an existing org, where it keeps the stored billing
 	// team (never a wipe). Prerequisite for pull-based compute billing.
 	DefaultTeamID int64
-	Warehouse     *configstore.ManagedWarehouse
+	// SchemaName optionally overrides the conventional "team_<id>" warehouse
+	// schema for the billing team row created/updated by this provision. Only
+	// meaningful when DefaultTeamID is set (the handler resolves the new
+	// team_id/schema_name request fields into this pair). Empty = keep the
+	// conventional name.
+	SchemaName string
+	Warehouse  *configstore.ManagedWarehouse
 	// RootUserHash is the bcrypt hash of the freshly-generated root
 	// password. Plaintext stays in the handler (returned to the
 	// caller); only the hash is persisted, same as before.
@@ -93,7 +99,7 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 		// No default_team_id on this standalone path — an existing org keeps
 		// its billing team as-is; creating a NEW org through here now fails
 		// with ErrDefaultTeamIDRequired (same invariant as Provision).
-		return createPendingWarehouseTx(tx, orgID, databaseName, 0, warehouse)
+		return createPendingWarehouseTx(tx, orgID, databaseName, 0, "", warehouse)
 	})
 }
 
@@ -106,7 +112,7 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // Returns a sentinel-comparable error string ("warehouse already
 // exists in non-terminal state") so HTTP handlers can map to 409
 // without an extra error type.
-func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTeamID int64, warehouse *configstore.ManagedWarehouse) error {
+func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTeamID int64, schemaName string, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
 	// creates everything). A NEW org MUST carry default_team_id — it becomes
 	// the org's first duckgres_org_teams row, marked as the billing team
@@ -150,6 +156,18 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, defaultTe
 		}
 		if err := configstore.SetOrgBillingTeamTx(tx, orgID, defaultTeamID); err != nil {
 			return err
+		}
+		// An explicit schema_name (the new provision fields) replaces the
+		// conventional "team_<id>" on the billing row. The unique
+		// (org_id, schema_name) index rejects a name another team already
+		// holds (23505 → 409 at the handler).
+		if schemaName != "" {
+			if err := tx.Exec(`
+				UPDATE duckgres_org_teams SET schema_name = ?, updated_at = now()
+				WHERE org_id = ? AND team_id = ?`,
+				schemaName, orgID, defaultTeamID).Error; err != nil {
+				return fmt.Errorf("set billing team schema (org=%s team=%d): %w", orgID, defaultTeamID, err)
+			}
 		}
 		// The org's billing team changed on a re-provision: re-attribute its
 		// buffered (unacked) billing buckets to the new team in this same
@@ -225,7 +243,7 @@ func (s *gormStore) Provision(req ProvisionRequest) error {
 	}
 	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
 		// 1. Warehouse + Org (extracted helper).
-		if err := createPendingWarehouseTx(tx, req.OrgID, req.DatabaseName, req.DefaultTeamID, req.Warehouse); err != nil {
+		if err := createPendingWarehouseTx(tx, req.OrgID, req.DatabaseName, req.DefaultTeamID, req.SchemaName, req.Warehouse); err != nil {
 			return err
 		}
 
@@ -284,4 +302,59 @@ func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore
 		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
 	}
 	return nil
+}
+
+// ListOrgTeams returns every duckgres_org_teams row for the org, or
+// gorm.ErrRecordNotFound when the org doesn't exist.
+func (s *gormStore) ListOrgTeams(orgID string) ([]configstore.OrgTeam, error) {
+	var count int64
+	if err := s.cs.DB().Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var teams []configstore.OrgTeam
+	if err := s.cs.DB().Where("org_id = ?", orgID).Order("team_id").Find(&teams).Error; err != nil {
+		return nil, err
+	}
+	return teams, nil
+}
+
+// UpsertOrgTeam creates or overwrites one (org, team) row in its own
+// transaction. See configstore.UpsertOrgTeamTx for the grandfather semantics
+// (schema_name IS overwritable here, by design).
+func (s *gormStore) UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*configstore.OrgTeam, error) {
+	var stored *configstore.OrgTeam
+	err := s.cs.DB().Transaction(func(tx *gorm.DB) error {
+		var err error
+		stored, err = configstore.UpsertOrgTeamTx(tx, orgID, up)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stored, nil
+}
+
+// DeleteOrgTeam deletes one (org, team) CONFIG row in its own transaction,
+// with the billing handover / last-team rules of configstore.DeleteOrgTeamTx.
+func (s *gormStore) DeleteOrgTeam(orgID string, teamID int64) (*configstore.OrgTeamDeleteResult, error) {
+	var res *configstore.OrgTeamDeleteResult
+	err := s.cs.DB().Transaction(func(tx *gorm.DB) error {
+		var err error
+		res, err = configstore.DeleteOrgTeamTx(tx, orgID, teamID)
+		if err != nil {
+			return err
+		}
+		if res.WasBilling {
+			slog.Info("Deleted billing team; promoted oldest remaining team and re-attributed usage.",
+				"org", orgID, "deleted_team", teamID, "new_billing_team", res.NewBillingTeamID, "rows", res.UsageRowsMoved)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }

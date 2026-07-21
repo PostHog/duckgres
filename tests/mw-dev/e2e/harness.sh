@@ -1356,6 +1356,69 @@ default_team_id_mandatory() { # cnpg_org ext_org
   log "default_team_id OK: PUT set round-trips, clear (0/null) rejected 400, value preserved on $ext_org"
 }
 
+# ---- org teams CRUD (duckgres_org_teams via the provisioning API) -----------
+# The PostHog backend manages an org's team rows through
+# GET/POST /orgs/:id/teams + DELETE /orgs/:id/teams/:team_id. Contract asserted
+# on a real org against the real config store, additively and self-cleaning
+# (the org ends the function with exactly its provisioned billing team):
+#   1. List: the provisioned billing team row exists with the conventional
+#      "team_<id>" schema and is_billing_team=true.
+#   2. Upsert: a second team is created (enabled defaults true); re-POSTing it
+#      is the GRANDFATHER path — schema_name and the legacy table-name
+#      overrides are overwritten (the PostHog backfill replaces the
+#      migration's placeholder through this route).
+#   3. Conflict: a third team claiming an existing schema_name is a 409.
+#   4. Delete: removing the second team is 200 with no billing handover;
+#      deleting the org's LAST team (the billing one) is refused with a 409
+#      naming org deletion as the only way.
+org_teams_crud() { # org billing_team_id
+  org="$1"; team="$2"; extra=$((team + 1)); clash=$((team + 2))
+  log "org teams CRUD on $org (billing team $team)"
+
+  # Earlier default_team_id repoints (set → restore) leave DEMOTED team rows
+  # behind (SetOrgBillingTeamTx demotes, never deletes). Delete every
+  # non-billing row first so the last-team refusal below is deterministic.
+  for tid in $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" | jq -r '.teams[] | select(.is_billing_team != true) | .team_id'); do
+    code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X DELETE -H "$H" "$API/api/v1/orgs/$org/teams/$tid")"
+    [ "$code" = "200" ] || fail "org teams: cleanup delete of leftover team $tid -> HTTP $code: $(cat /tmp/team_out)"
+  done
+
+  # 1. Provisioned billing row present.
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" \
+    | jq -e --argjson t "$team" '.teams | map(select(.team_id==$t and .schema_name=="team_\($t)" and .is_billing_team==true and .enabled==true)) | length == 1' >/dev/null \
+    || fail "org teams: provisioned billing row for team $team missing/wrong: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" | head -c 400)"
+
+  # 2. Create a second team, then grandfather-overwrite its schema + legacy names.
+  code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"team_id\":$extra,\"schema_name\":\"team_$extra\"}" "$API/api/v1/orgs/$org/teams")"
+  [ "$code" = "200" ] || fail "org teams: create team $extra -> HTTP $code: $(cat /tmp/team_out)"
+  code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"team_id\":$extra,\"schema_name\":\"e2e_legacy_wh\",\"events_table_name\":\"legacy_events\"}" "$API/api/v1/orgs/$org/teams")"
+  [ "$code" = "200" ] || fail "org teams: grandfather upsert of team $extra -> HTTP $code: $(cat /tmp/team_out)"
+  jq -e '.schema_name=="e2e_legacy_wh" and .events_table_name=="legacy_events" and .is_billing_team==null' /tmp/team_out >/dev/null \
+    || fail "org teams: grandfather upsert did not overwrite schema/legacy names: $(cat /tmp/team_out)"
+
+  # 3. Duplicate schema within the org -> 409.
+  code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "{\"team_id\":$clash,\"schema_name\":\"e2e_legacy_wh\"}" "$API/api/v1/orgs/$org/teams")"
+  [ "$code" = "409" ] || fail "org teams: duplicate schema -> HTTP $code want 409: $(cat /tmp/team_out)"
+
+  # 4. Delete the extra team (non-billing: no handover), then assert the LAST
+  # (billing) team refuses deletion — a refused delete leaves state untouched.
+  code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X DELETE -H "$H" "$API/api/v1/orgs/$org/teams/$extra")"
+  [ "$code" = "200" ] || fail "org teams: delete team $extra -> HTTP $code: $(cat /tmp/team_out)"
+  jq -e 'has("new_billing_team_id") | not' /tmp/team_out >/dev/null \
+    || fail "org teams: non-billing delete must not hand billing over: $(cat /tmp/team_out)"
+  code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X DELETE -H "$H" "$API/api/v1/orgs/$org/teams/$team")"
+  [ "$code" = "409" ] || fail "org teams: last-team delete -> HTTP $code want 409: $(cat /tmp/team_out)"
+  grep -q "deleting the org" /tmp/team_out \
+    || fail "org teams: last-team refusal should name org deletion as the only way: $(cat /tmp/team_out)"
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" \
+    | jq -e --argjson t "$team" '.teams | length == 1 and (.[0].team_id==$t) and (.[0].is_billing_team==true)' >/dev/null \
+    || fail "org teams: org must end with exactly its billing team $team"
+  log "org teams OK: list/upsert/grandfather/409/delete rules on $org"
+}
+
 # ---- user persistent secrets ------------------------------------------------
 # CREATE PERSISTENT SECRET must survive across sessions: worker pods are
 # ephemeral, so the CP intercepts the statement, stores it encrypted in the
@@ -3175,6 +3238,9 @@ lane_ext() { # external-RDS metadata backend + org default profile
   # restore on EXT. Runs here because both orgs are provisioned by now; it only
   # touches the provisioning + admin APIs, no worker/DB.
   default_team_id_mandatory "$CNPG" "$EXT"
+  # Team CRUD on the ext org (no other test mutates its team rows); ends with
+  # the org back at exactly its provisioned billing team.
+  org_teams_crud "$EXT" "$EXT_DEFAULT_TEAM_ID"
 }
 
 main() {

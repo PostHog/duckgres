@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -22,10 +23,14 @@ type fakeAPIStore struct {
 	orgs       map[string]*configstore.Org
 	users      map[string]*configstore.OrgUser
 	warehouses map[string]*configstore.ManagedWarehouse
+	teams      map[string]map[int64]*configstore.OrgTeam
 	// reattributeCalls records every non-nil reattributeUsageTeam passed to
 	// UpdateOrg (org → new team ids, in order), so tests can assert the handler
 	// requests bucket re-attribution exactly when default_team_id changes.
 	reattributeCalls []fakeReattributeCall
+	// teamBillingRepoints records every billing repoint requested through
+	// UpdateOrgTeam (usage re-attribution rides along in the real store).
+	teamBillingRepoints []fakeReattributeCall
 }
 
 type fakeReattributeCall struct {
@@ -38,6 +43,7 @@ func newFakeAPIStore() *fakeAPIStore {
 		orgs:       make(map[string]*configstore.Org),
 		users:      make(map[string]*configstore.OrgUser),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
+		teams:      make(map[string]map[int64]*configstore.OrgTeam),
 	}
 }
 
@@ -112,6 +118,70 @@ func (s *fakeAPIStore) DeleteOrg(name string) (bool, error) {
 	delete(s.warehouses, name)
 	delete(s.orgs, name)
 	return true, nil
+}
+
+func (s *fakeAPIStore) seedTeam(team configstore.OrgTeam) {
+	if s.teams[team.OrgID] == nil {
+		s.teams[team.OrgID] = make(map[int64]*configstore.OrgTeam)
+	}
+	clone := team
+	s.teams[team.OrgID][team.TeamID] = &clone
+}
+
+func (s *fakeAPIStore) ListAllOrgTeams() ([]configstore.OrgTeam, error) {
+	var out []configstore.OrgTeam
+	for _, orgTeams := range s.teams {
+		for _, t := range orgTeams {
+			out = append(out, *t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OrgID != out[j].OrgID {
+			return out[i].OrgID < out[j].OrgID
+		}
+		return out[i].TeamID < out[j].TeamID
+	})
+	return out, nil
+}
+
+func (s *fakeAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) error {
+	if _, ok := s.orgs[orgID]; !ok {
+		return gorm.ErrRecordNotFound
+	}
+	if _, ok := s.teams[orgID][team.TeamID]; ok {
+		return errOrgTeamExists
+	}
+	for _, t := range s.teams[orgID] {
+		if t.SchemaName == team.SchemaName {
+			return configstore.ErrOrgTeamSchemaConflict
+		}
+	}
+	team.OrgID = orgID
+	s.seedTeam(*team)
+	return nil
+}
+
+func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, error) {
+	team, ok := s.teams[orgID][teamID]
+	if !ok {
+		return nil, configstore.ErrOrgTeamNotFound
+	}
+	if upd.Enabled != nil {
+		team.Enabled = *upd.Enabled
+	}
+	if upd.BackfillSet {
+		team.BackfillEnabled = upd.Backfill
+	}
+	if upd.MakeBilling && (team.IsBillingTeam == nil || !*team.IsBillingTeam) {
+		for _, t := range s.teams[orgID] {
+			t.IsBillingTeam = nil
+		}
+		billing := true
+		team.IsBillingTeam = &billing
+		s.teamBillingRepoints = append(s.teamBillingRepoints, fakeReattributeCall{org: orgID, teamID: teamID})
+	}
+	clone := *team
+	return &clone, nil
 }
 
 func (s *fakeAPIStore) ListUsers() ([]configstore.OrgUser, error) {
@@ -2161,5 +2231,183 @@ func TestCreateOrgRejectsInvalidDefaultWorkerTTL(t *testing.T) {
 	}
 	if _, ok := store.orgs["acme"]; ok {
 		t.Fatal("org should NOT have been created")
+	}
+}
+
+// --- Org teams (admin surface) ---
+
+func adminJSON(t *testing.T, router *gin.Engine, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestAdminCreateOrgTeam(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"acme","team_id":5,"schema_name":"team_5","backfill_enabled":false}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.teams["acme"][5]
+	if stored == nil || stored.SchemaName != "team_5" || !stored.Enabled {
+		t.Fatalf("stored team = %+v, want schema team_5, enabled default", stored)
+	}
+	if stored.BackfillEnabled == nil || *stored.BackfillEnabled {
+		t.Fatalf("backfill_enabled = %v, want false", stored.BackfillEnabled)
+	}
+}
+
+func TestAdminCreateOrgTeamConflicts(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Existing (org, team) is a 409 — the admin surface never overwrites
+	// (that's the internal provisioning grandfather path).
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"acme","team_id":1,"schema_name":"other"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("existing team: status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if store.teams["acme"][1].SchemaName != "team_1" {
+		t.Fatal("admin create must never overwrite an existing row")
+	}
+
+	// Duplicate schema within the org is a 409 too.
+	rec = adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"acme","team_id":2,"schema_name":"team_1"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate schema: status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
+	// Unknown org is a 404.
+	rec = adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"nope","team_id":2,"schema_name":"team_2"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown org: status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+
+	// Missing org_id is a 400.
+	rec = adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"team_id":2,"schema_name":"team_2"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing org_id: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminUpdateOrgTeamRejectsSchemaChange(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"renamed"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "immutable") {
+		t.Fatalf("error should say schema_name is immutable: %s", rec.Body.String())
+	}
+	if store.teams["acme"][1].SchemaName != "team_1" {
+		t.Fatal("schema_name must not change through the admin update")
+	}
+}
+
+func TestAdminUpdateOrgTeamFields(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	backfill := true
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, BackfillEnabled: &backfill})
+	router := newTestAPIRouter(store)
+
+	// enabled=false + explicit backfill null clears the tri-state.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":false,"backfill_enabled":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.teams["acme"][1]
+	if stored.Enabled {
+		t.Fatal("enabled must be cleared")
+	}
+	if stored.BackfillEnabled != nil {
+		t.Fatalf("backfill_enabled = %v, want NULL after explicit null", *stored.BackfillEnabled)
+	}
+}
+
+func TestAdminUpdateOrgTeamBillingRepoint(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	billing := true
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &billing})
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Clearing billing is rejected — repoint only.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"is_billing_team":false}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("clear billing: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/2",
+		`{"is_billing_team":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("repoint: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][2]; got.IsBillingTeam == nil || !*got.IsBillingTeam {
+		t.Fatalf("team 2 must be billing after repoint, got %+v", got)
+	}
+	if len(store.teamBillingRepoints) != 1 || store.teamBillingRepoints[0] != (fakeReattributeCall{org: "acme", teamID: 2}) {
+		t.Fatalf("billing repoint (with usage re-attribution) not requested: %+v", store.teamBillingRepoints)
+	}
+
+	// Marking the current billing team again is a no-op, not a re-attribution.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/2",
+		`{"is_billing_team":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("idempotent repoint: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.teamBillingRepoints) != 1 {
+		t.Fatalf("idempotent repoint must not re-attribute again: %+v", store.teamBillingRepoints)
+	}
+}
+
+func TestAdminListOrgTeams(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.orgs["zeta"] = &configstore.Org{Name: "zeta"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "zeta", TeamID: 9, SchemaName: "team_9", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodGet, "/api/v1/teams", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("global list: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var global struct {
+		Teams []configstore.OrgTeam `json:"teams"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &global); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(global.Teams) != 3 {
+		t.Fatalf("global teams = %d rows, want 3", len(global.Teams))
+	}
+
+	if global.Teams[0].OrgID != "acme" || global.Teams[0].TeamID != 1 || global.Teams[2].OrgID != "zeta" {
+		t.Fatalf("global teams order = %+v, want acme[1,2] then zeta[9]", global.Teams)
 	}
 }

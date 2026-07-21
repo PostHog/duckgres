@@ -32,6 +32,9 @@ import type {
   ModelSummary,
   Operator,
   Org,
+  OrgTeam,
+  OrgTeamCreateBody,
+  OrgTeamUpdateBody,
   OrgUpdate,
   OrgUser,
   OrgUserSecret,
@@ -168,6 +171,59 @@ export function useDeprovisionWarehouse(id: string) {
       qc.invalidateQueries({ queryKey: ["orgs", id, "warehouse"] });
       qc.invalidateQueries({ queryKey: ["orgs"] });
     },
+  });
+}
+
+// ---- org teams ----
+
+// All teams across every org (the Org teams nav page). 404-tolerant so a
+// pre-rollout backend renders an empty state instead of an error.
+export function useAllOrgTeams() {
+  return useQuery<OrgTeam[]>({
+    queryKey: ["org-teams"],
+    queryFn: () => tolerate404<OrgTeam[]>([])(api.listAllOrgTeams()),
+  });
+}
+
+export function useOrgTeams(org: string | undefined) {
+  return useQuery<OrgTeam[]>({
+    queryKey: ["org-teams", org],
+    queryFn: () => tolerate404<OrgTeam[]>([])(api.listOrgTeams(org!)),
+    enabled: !!org,
+  });
+}
+
+// Team mutations invalidate the global + per-org team lists, the org queries
+// (the billing team surfaces there as default_team_id) and the models sidebar
+// counts.
+function invalidateOrgTeams(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: ["org-teams"] });
+  qc.invalidateQueries({ queryKey: ["orgs"] });
+  qc.invalidateQueries({ queryKey: ["models"] });
+}
+
+export function useCreateOrgTeam() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: OrgTeamCreateBody) => api.createOrgTeam(body),
+    onSuccess: () => invalidateOrgTeams(qc),
+  });
+}
+
+export function useUpdateOrgTeam() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { org: string; teamId: number; body: OrgTeamUpdateBody }) =>
+      api.updateOrgTeam(v.org, v.teamId, v.body),
+    onSuccess: () => invalidateOrgTeams(qc),
+  });
+}
+
+export function useDeleteOrgTeam() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { org: string; teamId: number }) => api.deleteOrgTeam(v.org, v.teamId),
+    onSuccess: () => invalidateOrgTeams(qc),
   });
 }
 
