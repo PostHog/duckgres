@@ -621,20 +621,26 @@ func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash strin
 }
 
 // SetOrgUserDisabled flips the per-user kill switch for an existing user. The
-// change is persisted immediately; it becomes effective for new connections on
-// the next snapshot poll (or sooner on the writing replica, which can read its
-// own write). Returns an error if the user does not exist.
+// write serializes with admission decisions, which read it directly;
+// snapshot-backed authentication observes it on the next poll. Returns an
+// error if the user does not exist.
 func (cs *ConfigStore) SetOrgUserDisabled(orgID, username string, disabled bool) error {
-	result := cs.db.Model(&OrgUser{}).
-		Where("org_id = ? AND username = ?", orgID, username).
-		Updates(map[string]any{"disabled": disabled, "updated_at": time.Now()})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("user %q in org %q: %w", username, orgID, ErrOrgUserNotFound)
-	}
-	return nil
+	return cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+
+		result := tx.Model(&OrgUser{}).
+			Where("org_id = ? AND username = ?", orgID, username).
+			Updates(map[string]any{"disabled": disabled, "updated_at": time.Now()})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("user %q in org %q: %w", username, orgID, ErrOrgUserNotFound)
+		}
+		return nil
+	})
 }
 
 // OnChange registers a callback that fires when the config snapshot changes.
@@ -727,6 +733,7 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 		model any
 	}{
 		{table: runtimeSchema + ".cp_instances", model: &ControlPlaneInstance{}},
+		{table: runtimeSchema + ".org_connection_admission_protocol", model: &OrgConnectionAdmissionProtocol{}},
 		{table: runtimeSchema + ".worker_records", model: &WorkerRecord{}},
 		{table: runtimeSchema + ".flight_session_records", model: &FlightSessionRecord{}},
 		{table: runtimeSchema + ".org_connection_queue", model: &OrgConnectionQueueEntry{}},
@@ -738,8 +745,74 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 	}
 
 	qs := `"` + quoteIdentifier(runtimeSchema) + `"`
+	if err := db.Exec(
+		`INSERT INTO ` + qs + `.org_connection_admission_protocol ` +
+			`(id, offers_enabled, created_at, updated_at) VALUES (1, FALSE, clock_timestamp(), clock_timestamp()) ` +
+			`ON CONFLICT (id) DO NOTHING`,
+	).Error; err != nil {
+		return err
+	}
+	// The protocol transition is monotonic. Once offers are enabled, database
+	// write fences reject unsupported or inactive owners even when the writer is
+	// a binary that predates the Go-side capability field. While the protocol is
+	// still disabled, queue and lease inserts hold a shared lock on the singleton
+	// until commit so activation cannot overtake an already-started legacy write.
+	for _, stmt := range []string{
+		`CREATE OR REPLACE FUNCTION ` + qs + `.reject_unsupported_admission_offer_cp() RETURNS trigger AS $fn$ ` +
+			`BEGIN ` +
+			`IF NOT NEW.supports_admission_offers AND EXISTS (` +
+			`SELECT 1 FROM ` + qs + `.org_connection_admission_protocol WHERE id = 1 AND offers_enabled` +
+			`) THEN RAISE EXCEPTION 'control-plane binary does not support the active admission offer protocol'; END IF; ` +
+			`RETURN NEW; END; $fn$ LANGUAGE plpgsql`,
+		`CREATE OR REPLACE TRIGGER reject_unsupported_admission_offer_cp ` +
+			`BEFORE INSERT OR UPDATE ON ` + qs + `.cp_instances ` +
+			`FOR EACH ROW EXECUTE FUNCTION ` + qs + `.reject_unsupported_admission_offer_cp()`,
+		`CREATE OR REPLACE FUNCTION ` + qs + `.reject_ineligible_admission_offer_owner() RETURNS trigger AS $fn$ ` +
+			`BEGIN ` +
+			`IF NOT EXISTS (` +
+			`SELECT 1 FROM ` + qs + `.org_connection_admission_protocol WHERE id = 1 AND offers_enabled` +
+			`) THEN PERFORM 1 FROM ` + qs + `.org_connection_admission_protocol ` +
+			`WHERE id = 1 AND NOT offers_enabled FOR SHARE; END IF; ` +
+			`IF EXISTS (` +
+			`SELECT 1 FROM ` + qs + `.org_connection_admission_protocol WHERE id = 1 AND offers_enabled` +
+			`) THEN ` +
+			`PERFORM 1 FROM ` + qs + `.cp_instances WHERE id = NEW.cp_instance_id ` +
+			`AND state = 'active' AND supports_admission_offers FOR SHARE; ` +
+			`IF NOT FOUND THEN RAISE EXCEPTION ` +
+			`'control-plane owner is not eligible for the active admission offer protocol' ` +
+			`USING ERRCODE = 'check_violation'; END IF; END IF; ` +
+			`RETURN NEW; END; $fn$ LANGUAGE plpgsql`,
+		`CREATE OR REPLACE TRIGGER reject_ineligible_admission_offer_queue_owner ` +
+			`BEFORE INSERT ON ` + qs + `.org_connection_queue ` +
+			`FOR EACH ROW EXECUTE FUNCTION ` + qs + `.reject_ineligible_admission_offer_owner()`,
+		`CREATE OR REPLACE TRIGGER reject_ineligible_admission_offer_lease_owner ` +
+			`BEFORE INSERT ON ` + qs + `.org_connection_leases ` +
+			`FOR EACH ROW EXECUTE FUNCTION ` + qs + `.reject_ineligible_admission_offer_owner()`,
+	} {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+
+	// AutoMigrate adds state with the pending default to legacy rows. Preserve
+	// their actual lifecycle before the offer scheduler is enabled: rows with a
+	// committed lease/granted_at were already active, while every other legacy
+	// row was pending. The predicates make this safe and idempotent on every CP
+	// startup without disturbing genuine offered rows.
+	for _, stmt := range []string{
+		`UPDATE ` + qs + `.org_connection_queue SET state = 'active', offer_expires_at = NULL ` +
+			`WHERE granted_at IS NOT NULL AND (state <> 'active' OR offer_expires_at IS NOT NULL)`,
+		`UPDATE ` + qs + `.org_connection_queue SET state = 'pending' WHERE state IS NULL OR state = ''`,
+	} {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_org_connection_queue_user_heads ON ` + qs + `.org_connection_queue (org_id, username, enqueued_at, request_id) WHERE granted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_org_connection_queue_pending_heads ON ` + qs + `.org_connection_queue (org_id, username, enqueued_at, request_id) WHERE state = 'pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_org_connection_queue_offer_expiry ON ` + qs + `.org_connection_queue (offer_expires_at) WHERE state = 'offered'`,
 		`CREATE INDEX IF NOT EXISTS idx_org_connection_leases_org_user ON ` + qs + `.org_connection_leases (org_id, username)`,
 	} {
 		if err := db.Exec(stmt).Error; err != nil {
@@ -911,7 +984,7 @@ func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error
 func (cs *ConfigStore) UpsertControlPlaneInstance(instance *ControlPlaneInstance) error {
 	if err := cs.db.Table(cs.runtimeTable(instance.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "state", "started_at", "last_heartbeat_at", "draining_at", "expired_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "supports_admission_offers", "state", "started_at", "last_heartbeat_at", "draining_at", "expired_at", "updated_at"}),
 	}).Create(instance).Error; err != nil {
 		return fmt.Errorf("upsert control plane instance: %w", err)
 	}

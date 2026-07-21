@@ -50,6 +50,10 @@ Unplanned control-plane failure is different:
    - `sum(duckgres_worker_lifecycle_count{state="hot"})` does not drop unexpectedly
    - client reconnect errors do not spike
 
+If the release introduces the durable org-connection offer protocol, complete
+the separate two-phase activation only after the rolling rollout is healthy.
+See [Org Connection Admission](./org-connection-admission.md).
+
 ## If a rollout stalls
 
 - Check whether the old pod is still draining active sessions:

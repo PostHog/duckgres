@@ -40,6 +40,14 @@ type runtimeOrgConnectionLimitLookupStore interface {
 	TryAcquireOrgConnectionLeaseWithLimitLookup(requestID string, limits func(string) configstore.OrgResourceLimits, now time.Time) (*configstore.OrgConnectionLease, error)
 }
 
+// runtimeOrgConnectionScheduleAndClaimStore is the optional authoritative
+// scheduler handshake. Concrete stores that implement it own both global
+// admission evaluation and claiming the caller's request; older stores and
+// test fakes continue through the legacy TryAcquire paths below.
+type runtimeOrgConnectionScheduleAndClaimStore interface {
+	ScheduleAndClaimOrgConnectionLease(requestID, cpInstanceID string) (*configstore.OrgConnectionLease, error)
+}
+
 type runtimeOrgConnectionLimiter struct {
 	store        runtimeOrgConnectionStore
 	orgID        string
@@ -100,7 +108,9 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, request conne
 
 		var lease *configstore.OrgConnectionLease
 		var err error
-		if lookupStore, ok := l.store.(runtimeOrgConnectionLimitLookupStore); ok {
+		if schedulerStore, ok := l.store.(runtimeOrgConnectionScheduleAndClaimStore); ok {
+			lease, err = schedulerStore.ScheduleAndClaimOrgConnectionLease(requestID, l.cpInstanceID)
+		} else if lookupStore, ok := l.store.(runtimeOrgConnectionLimitLookupStore); ok {
 			lease, err = lookupStore.TryAcquireOrgConnectionLeaseWithLimitLookup(requestID, limits, now)
 		} else {
 			lease, err = l.store.TryAcquireOrgConnectionLease(requestID, limits(request.Username), now)

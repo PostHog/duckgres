@@ -486,22 +486,40 @@ func (d OrgConnectionDrainStatus) Drained() bool {
 	return d.ActiveLeases == 0 && d.QueuedConns == 0
 }
 
-// OrgConnectionDrainState reads, in one transaction, the org's active lease
-// count AND its pending queue rows. Both must be zero for a sound drain
-// barrier: a queued request could still be granted a lease after a
-// lease-only count returned zero.
+// OrgConnectionDrainState reads, in one statement, the org's active lease
+// count AND its pending or offered queue rows. The org admission lock keeps the
+// offer-to-lease transition stable while both categories are classified. Both
+// counts must be zero for a sound drain barrier: an unclaimed offer still
+// reserves a waiting connection, while the queue mirror for an active lease
+// must not be counted a second time.
 func (cs *ConfigStore) OrgConnectionDrainState(orgID string) (OrgConnectionDrainStatus, error) {
 	tables := cs.orgConnectionRuntimeTables()
 	var status OrgConnectionDrainStatus
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Table(tables.lease).
-			Where("org_id = ?", orgID).
-			Count(&status.ActiveLeases).Error; err != nil {
+		// The drain loop may be the only remaining actor after a request owner
+		// dies. Run the same serialized cleanup as admission so expired owners
+		// cannot wedge resharding indefinitely.
+		if err := lockOrgConnectionAdmission(tx, orgID); err != nil {
 			return err
 		}
-		return tx.Table(tables.queue).
-			Where("org_id = ? AND granted_at IS NULL", orgID).
-			Count(&status.QueuedConns).Error
+		now, err := cs.orgConnectionDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
+		if err := cs.cleanupOrgConnectionRowsLocked(tx, orgID, now); err != nil {
+			return err
+		}
+		return tx.Raw(
+			"SELECT "+
+				"(SELECT COUNT(*) FROM "+tables.lease+" WHERE org_id = ?) AS active_leases, "+
+				"(SELECT COUNT(*) FROM "+tables.queue+" WHERE org_id = ? AND state IN ? AND granted_at IS NULL) AS queued_conns",
+			orgID,
+			orgID,
+			[]OrgConnectionRequestState{
+				OrgConnectionRequestStatePending,
+				OrgConnectionRequestStateOffered,
+			},
+		).Scan(&status).Error
 	})
 	if err != nil {
 		return OrgConnectionDrainStatus{}, fmt.Errorf("org connection drain state: %w", err)

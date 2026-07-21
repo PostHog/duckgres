@@ -344,8 +344,9 @@ const (
 // ControlPlaneInstance is a runtime coordination record for one control-plane process.
 // These rows live in the runtime schema, not the snapshot-backed config tables.
 type ControlPlaneInstance struct {
-	ID      string `gorm:"primaryKey;size:255" json:"id"`
-	PodName string `gorm:"size:255;not null" json:"pod_name"`
+	ID                      string `gorm:"primaryKey;size:255" json:"id"`
+	PodName                 string `gorm:"size:255;not null" json:"pod_name"`
+	SupportsAdmissionOffers bool   `gorm:"not null;default:false" json:"supports_admission_offers"`
 	// pod_uid + boot_id were dropped: both are already encoded into the
 	// primary-key ID (<pod_uid>-<bootIDHex>) and were never read back.
 	State           ControlPlaneInstanceState `gorm:"size:32;not null" json:"state"`
@@ -358,6 +359,22 @@ type ControlPlaneInstance struct {
 }
 
 func (ControlPlaneInstance) TableName() string { return "cp_instances" }
+
+// OrgConnectionAdmissionProtocol is the monotonic rollout fence for durable
+// admission offers. Once enabled, database triggers reject unsupported control
+// planes and queue or lease writes from ineligible owners, so a rolled-back
+// binary cannot silently reinterpret offered rows using the legacy protocol.
+type OrgConnectionAdmissionProtocol struct {
+	ID            int        `gorm:"primaryKey;autoIncrement:false" json:"id"`
+	OffersEnabled bool       `gorm:"not null;default:false" json:"offers_enabled"`
+	EnabledAt     *time.Time `json:"enabled_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+func (OrgConnectionAdmissionProtocol) TableName() string {
+	return "org_connection_admission_protocol"
+}
 
 // WorkerState is the durable lifecycle state for a worker pod.
 type WorkerState string
@@ -482,19 +499,34 @@ type OrgResourceLimits struct {
 	UserMaxVCPUs int
 }
 
+// OrgConnectionRequestState describes the durable scheduler handshake for a
+// queued connection request. Legacy pending/granted rows are backfilled to
+// pending/active; offered is used only after the protocol is explicitly
+// activated.
+type OrgConnectionRequestState string
+
+const (
+	OrgConnectionRequestStatePending OrgConnectionRequestState = "pending"
+	OrgConnectionRequestStateOffered OrgConnectionRequestState = "offered"
+	OrgConnectionRequestStateActive  OrgConnectionRequestState = "active"
+)
+
 // OrgConnectionQueueEntry is a cluster-wide FIFO admission request for one org
 // connection. Rows expire quickly; they coordinate fairness across CP replicas.
 type OrgConnectionQueueEntry struct {
-	RequestID      string     `gorm:"primaryKey;size:64" json:"request_id"`
-	OrgID          string     `gorm:"size:255;not null;index:idx_org_connection_queue_pending,priority:1" json:"org_id"`
-	Username       string     `gorm:"size:255;index" json:"username"`
-	CPInstanceID   string     `gorm:"size:255;not null;index" json:"cp_instance_id"`
-	PID            int32      `gorm:"not null" json:"pid"`
-	Protocol       string     `gorm:"size:32;not null" json:"protocol"`
-	RequestedVCPUs int        `gorm:"column:requested_vcpus;not null;default:1" json:"requested_vcpus"`
-	EnqueuedAt     time.Time  `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
-	ExpiresAt      time.Time  `gorm:"not null;index" json:"expires_at"`
-	GrantedAt      *time.Time `gorm:"index" json:"granted_at,omitempty"`
+	RequestID      string                    `gorm:"primaryKey;size:64" json:"request_id"`
+	OrgID          string                    `gorm:"size:255;not null;index:idx_org_connection_queue_pending,priority:1" json:"org_id"`
+	Username       string                    `gorm:"size:255;index" json:"username"`
+	CPInstanceID   string                    `gorm:"size:255;not null;index" json:"cp_instance_id"`
+	PID            int32                     `gorm:"not null" json:"pid"`
+	Protocol       string                    `gorm:"size:32;not null" json:"protocol"`
+	RequestedVCPUs int                       `gorm:"column:requested_vcpus;not null;default:1" json:"requested_vcpus"`
+	EnqueuedAt     time.Time                 `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
+	ExpiresAt      time.Time                 `gorm:"not null;index" json:"expires_at"`
+	State          OrgConnectionRequestState `gorm:"size:16;not null;default:pending" json:"state"`
+	OfferedAt      *time.Time                `json:"offered_at,omitempty"`
+	OfferExpiresAt *time.Time                `json:"offer_expires_at,omitempty"`
+	GrantedAt      *time.Time                `gorm:"index" json:"granted_at,omitempty"`
 	// canceled_at was dropped: cancellation is a hard DELETE of the row, so the
 	// column was never set to a non-NULL value.
 	CreatedAt time.Time `json:"created_at"`

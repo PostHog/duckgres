@@ -80,8 +80,9 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_org_connection_admission_duration_seconds{outcome}` | Histogram | DB-backed org connection admission scheduler evaluation latency by outcome |
 | `duckgres_org_connection_admission_queue_depth` | Histogram | Pending org connection queue depth observed during admission evaluation |
 | `duckgres_org_connection_admission_user_queues` | Histogram | Number of per-user queue heads considered during admission evaluation |
-| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome |
+| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome, including `ineligible_user` for a missing or disabled configured user |
 | `duckgres_org_connection_admission_user_limit_skips_total` | Counter | Per-user queue heads skipped because that user was at its vCPU limit |
+| `duckgres_org_connection_admission_ineligible_user_skips_total` | Counter | Per-user queue heads skipped because that configured user was missing or disabled |
 | `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
 | `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |

@@ -23,7 +23,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatal("expected runtime schema to be configured")
 	}
 
-	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records", "org_connection_queue", "org_connection_leases"} {
+	for _, table := range []string{"cp_instances", "org_connection_admission_protocol", "worker_records", "flight_session_records", "org_connection_queue", "org_connection_leases"} {
 		var count int64
 		if err := store.DB().Raw(
 			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
@@ -139,6 +139,417 @@ func requireRuntimeIndexDefinition(t *testing.T, store *configstore.ConfigStore,
 		if !strings.Contains(indexDef, want) {
 			t.Fatalf("runtime index %s.%s definition = %q, want substring %q", tableName, indexName, indexDef, want)
 		}
+	}
+}
+
+func TestUpsertControlPlaneInstancePersistsAdmissionOfferCapabilityPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+	instance := &configstore.ControlPlaneInstance{
+		ID:                      "cp-capability:boot-a",
+		PodName:                 "duckgres-capability",
+		State:                   configstore.ControlPlaneInstanceStateActive,
+		StartedAt:               now,
+		LastHeartbeatAt:         now,
+		SupportsAdmissionOffers: false,
+	}
+	if err := store.UpsertControlPlaneInstance(instance); err != nil {
+		t.Fatalf("insert control-plane capability: %v", err)
+	}
+
+	instance.SupportsAdmissionOffers = true
+	instance.LastHeartbeatAt = now.Add(time.Second)
+	if err := store.UpsertControlPlaneInstance(instance); err != nil {
+		t.Fatalf("upgrade control-plane capability: %v", err)
+	}
+
+	persisted, err := store.GetControlPlaneInstance(instance.ID)
+	if err != nil {
+		t.Fatalf("get upgraded control-plane capability: %v", err)
+	}
+	if !persisted.SupportsAdmissionOffers {
+		t.Fatal("supports_admission_offers was not updated on heartbeat upsert")
+	}
+}
+
+func TestRuntimeAdmissionOfferProtocolMigrationBackfillsLegacyRows(t *testing.T) {
+	adminDB, connStr := newIsolatedConfigStoreSchema(t)
+	legacy, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("create legacy config store: %v", err)
+	}
+	runtimeSchema := legacy.RuntimeSchema()
+	t.Cleanup(func() {
+		_, _ = adminDB.Exec("DROP SCHEMA IF EXISTS " + runtimeSchema + " CASCADE")
+	})
+
+	now := time.Now()
+	if err := legacy.DB().Exec(
+		"INSERT INTO "+runtimeSchema+".org_connection_queue "+
+			"(request_id, org_id, username, cp_instance_id, p_id, protocol, requested_vcpus, enqueued_at, expires_at, granted_at, created_at, updated_at) VALUES "+
+			"(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?), "+
+			"(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"legacy-pending", "org-legacy", "alice", "cp-legacy", 1001, "postgres", 1, now, now.Add(time.Minute), now, now,
+		"legacy-active", "org-legacy", "bob", "cp-legacy", 1002, "postgres", 1, now.Add(time.Millisecond), now.Add(time.Minute), now, now, now,
+	).Error; err != nil {
+		t.Fatalf("insert legacy admission rows: %v", err)
+	}
+	if err := legacy.DB().Exec(
+		"INSERT INTO "+runtimeSchema+".cp_instances "+
+			"(id, pod_name, state, started_at, last_heartbeat_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		"cp-legacy", "duckgres-legacy", configstore.ControlPlaneInstanceStateActive, now, now, now, now,
+	).Error; err != nil {
+		t.Fatalf("insert legacy control-plane row: %v", err)
+	}
+	if err := legacy.DB().Exec(
+		"ALTER TABLE " + runtimeSchema + ".org_connection_queue " +
+			"DROP COLUMN state, DROP COLUMN offered_at, DROP COLUMN offer_expires_at",
+	).Error; err != nil {
+		t.Fatalf("remove admission protocol columns to simulate legacy schema: %v", err)
+	}
+	if err := legacy.DB().Exec(
+		"ALTER TABLE " + runtimeSchema + ".cp_instances DROP COLUMN supports_admission_offers",
+	).Error; err != nil {
+		t.Fatalf("remove capability column to simulate legacy schema: %v", err)
+	}
+	legacySQLDB, err := legacy.DB().DB()
+	if err != nil {
+		t.Fatalf("legacy sql db: %v", err)
+	}
+	if err := legacySQLDB.Close(); err != nil {
+		t.Fatalf("close legacy config store: %v", err)
+	}
+
+	upgraded, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("upgrade legacy config store: %v", err)
+	}
+	upgradedSQLDB, err := upgraded.DB().DB()
+	if err != nil {
+		t.Fatalf("upgraded sql db: %v", err)
+	}
+	t.Cleanup(func() { _ = upgradedSQLDB.Close() })
+
+	wantStates := map[string]configstore.OrgConnectionRequestState{
+		"legacy-pending": configstore.OrgConnectionRequestStatePending,
+		"legacy-active":  configstore.OrgConnectionRequestStateActive,
+	}
+	for requestID, want := range wantStates {
+		var request configstore.OrgConnectionQueueEntry
+		if err := upgraded.DB().Table(runtimeSchema+".org_connection_queue").Where("request_id = ?", requestID).Take(&request).Error; err != nil {
+			t.Fatalf("load upgraded request %q: %v", requestID, err)
+		}
+		if request.State != want {
+			t.Fatalf("upgraded request %q state = %q, want %q", requestID, request.State, want)
+		}
+		if request.OfferedAt != nil || request.OfferExpiresAt != nil {
+			t.Fatalf("legacy request %q unexpectedly gained offer timestamps: offered=%v expires=%v", requestID, request.OfferedAt, request.OfferExpiresAt)
+		}
+	}
+
+	cp, err := upgraded.GetControlPlaneInstance("cp-legacy")
+	if err != nil {
+		t.Fatalf("load upgraded legacy control plane: %v", err)
+	}
+	if cp.SupportsAdmissionOffers {
+		t.Fatal("legacy control plane must default to supports_admission_offers=false")
+	}
+	requireRuntimeIndexDefinition(t, upgraded, "org_connection_queue", "idx_org_connection_queue_pending_heads",
+		"(org_id, username, enqueued_at, request_id)", "state", "pending")
+	requireRuntimeIndexDefinition(t, upgraded, "org_connection_queue", "idx_org_connection_queue_offer_expiry",
+		"(offer_expires_at)", "state", "offered")
+
+	// A rolled-back old CP does not understand state, so it can grant an offer
+	// by setting granted_at while leaving state=offered. The next new-CP startup
+	// must repair that mirror to active before offer-expiry reconciliation can
+	// reset it to pending underneath the real lease.
+	if err := upgraded.DB().Table(runtimeSchema+".org_connection_queue").
+		Where("request_id = ?", "legacy-active").
+		Updates(map[string]any{
+			"state":            configstore.OrgConnectionRequestStateOffered,
+			"offered_at":       now,
+			"offer_expires_at": now.Add(5 * time.Second),
+		}).Error; err != nil {
+		t.Fatalf("simulate legacy grant of offered row: %v", err)
+	}
+	repaired, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("restart after legacy grant of offered row: %v", err)
+	}
+	repairedSQLDB, err := repaired.DB().DB()
+	if err != nil {
+		t.Fatalf("repaired sql db: %v", err)
+	}
+	t.Cleanup(func() { _ = repairedSQLDB.Close() })
+	var repairedRequest configstore.OrgConnectionQueueEntry
+	if err := repaired.DB().Table(runtimeSchema+".org_connection_queue").
+		Where("request_id = ?", "legacy-active").Take(&repairedRequest).Error; err != nil {
+		t.Fatalf("load repaired legacy grant: %v", err)
+	}
+	if repairedRequest.State != configstore.OrgConnectionRequestStateActive {
+		t.Fatalf("legacy-granted offer state = %q, want active", repairedRequest.State)
+	}
+	if repairedRequest.OfferExpiresAt != nil {
+		t.Fatalf("legacy-granted offer retained expiry %v after active repair", repairedRequest.OfferExpiresAt)
+	}
+}
+
+func TestAdmissionOfferProtocolActivationRejectsLegacyControlPlane(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID: "cp-new", PodName: "cp-new", SupportsAdmissionOffers: true,
+		State: configstore.ControlPlaneInstanceStateActive, StartedAt: now, LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("register offer-capable CP: %v", err)
+	}
+	if err := store.DB().Create(&configstore.Org{Name: "org-protocol-activation", DatabaseName: "org-protocol-activation"}).Error; err != nil {
+		t.Fatalf("seed org: %v", err)
+	}
+
+	// Merely observing an all-capable fleet must not cross the irreversible
+	// protocol boundary. Activation is an explicit operator action.
+	if offered, err := store.DispatchOrgConnectionAdmissions("org-protocol-activation"); err != nil || offered != 0 {
+		t.Fatalf("pre-activation dispatch = %d, err = %v; want legacy mode", offered, err)
+	}
+	var enabled bool
+	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_admission_protocol").
+		Select("offers_enabled").
+		Where("id = 1").
+		Scan(&enabled).Error; err != nil {
+		t.Fatalf("read offer protocol state: %v", err)
+	}
+	if enabled {
+		t.Fatal("all-capable fleet activated offer protocol without an explicit request")
+	}
+	if err := store.ActivateOrgConnectionAdmissionOffers(); err != nil {
+		t.Fatalf("explicitly activate offer protocol: %v", err)
+	}
+	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_admission_protocol").
+		Select("offers_enabled").
+		Where("id = 1").
+		Scan(&enabled).Error; err != nil {
+		t.Fatalf("read explicitly activated offer protocol state: %v", err)
+	}
+	if !enabled {
+		t.Fatal("explicit activation did not enable offer protocol")
+	}
+
+	// An old binary inserts the old column set, so the new capability column
+	// takes its database default false. Once activated, the database must fence
+	// that process before it can serve traffic against offered rows.
+	err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID: "cp-legacy", PodName: "cp-legacy",
+		State: configstore.ControlPlaneInstanceStateActive, StartedAt: now, LastHeartbeatAt: now,
+	})
+	if err == nil {
+		t.Fatal("legacy CP registration succeeded after offer protocol activation")
+	}
+}
+
+func TestAdmissionOfferProtocolWaitsForLegacyControlPlaneExpiry(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+	for _, instance := range []*configstore.ControlPlaneInstance{
+		{
+			ID: "cp-new", PodName: "cp-new", SupportsAdmissionOffers: true,
+			State: configstore.ControlPlaneInstanceStateActive, StartedAt: now, LastHeartbeatAt: now,
+		},
+		{
+			ID: "cp-legacy", PodName: "cp-legacy",
+			State: configstore.ControlPlaneInstanceStateActive, StartedAt: now, LastHeartbeatAt: now,
+		},
+	} {
+		if err := store.UpsertControlPlaneInstance(instance); err != nil {
+			t.Fatalf("register %s: %v", instance.ID, err)
+		}
+	}
+	seedAuthoritativeOrgConnectionLimits(t, store, "org-protocol-wait", 1, map[string]int{"alice": 0})
+	request := &configstore.OrgConnectionQueueEntry{
+		RequestID: "request-protocol-wait", OrgID: "org-protocol-wait", Username: "alice", CPInstanceID: "cp-new",
+		PID: 1001, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := store.ActivateOrgConnectionAdmissionOffers(); !errors.Is(err, configstore.ErrAdmissionOfferProtocolActivationBlocked) {
+		t.Fatalf("activation with live legacy CP error = %v, want activation-blocked sentinel", err)
+	}
+	if offered, err := store.DispatchOrgConnectionAdmissions(request.OrgID); err != nil || offered != 0 {
+		t.Fatalf("dispatch with live legacy CP = %d, err = %v; want disabled", offered, err)
+	}
+	assertOrgConnectionRequestState(t, store, request.RequestID, configstore.OrgConnectionRequestStatePending)
+
+	expiredAt := time.Now()
+	if err := store.DB().Table(store.RuntimeSchema()+".cp_instances").
+		Where("id = ?", "cp-legacy").
+		Updates(map[string]any{
+			"state":      configstore.ControlPlaneInstanceStateExpired,
+			"expired_at": expiredAt,
+		}).Error; err != nil {
+		t.Fatalf("expire legacy CP: %v", err)
+	}
+	if err := store.ActivateOrgConnectionAdmissionOffers(); err != nil {
+		t.Fatalf("activate offers after legacy expiry: %v", err)
+	}
+	if offered, err := store.DispatchOrgConnectionAdmissions(request.OrgID); err != nil || offered != 1 {
+		t.Fatalf("dispatch after explicit activation = %d, err = %v; want one offer", offered, err)
+	}
+	assertOrgConnectionOffer(t, store, request.RequestID)
+}
+
+func TestAdmissionOfferProtocolActivationRejectsIneligibleRuntimeOwners(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(*testing.T, *configstore.ConfigStore, time.Time)
+	}{
+		{
+			name: "expired unsupported queue owner",
+			seed: func(t *testing.T, store *configstore.ConfigStore, now time.Time) {
+				t.Helper()
+				if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+					ID: "cp-legacy", PodName: "cp-legacy", State: configstore.ControlPlaneInstanceStateExpired,
+					StartedAt: now, LastHeartbeatAt: now, ExpiredAt: &now,
+				}); err != nil {
+					t.Fatalf("register expired legacy owner: %v", err)
+				}
+				if err := store.EnqueueOrgConnectionRequest(&configstore.OrgConnectionQueueEntry{
+					RequestID: "request-ineligible-activation", OrgID: "org-ineligible-activation", Username: "alice",
+					CPInstanceID: "cp-legacy", PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
+					EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+				}); err != nil {
+					t.Fatalf("seed queue row with expired legacy owner: %v", err)
+				}
+			},
+		},
+		{
+			name: "missing lease owner",
+			seed: func(t *testing.T, store *configstore.ConfigStore, now time.Time) {
+				t.Helper()
+				if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_leases").Create(&configstore.OrgConnectionLease{
+					LeaseID: "lease-ineligible-activation", RequestID: "request-ineligible-activation",
+					OrgID: "org-ineligible-activation", Username: "alice", CPInstanceID: "cp-missing",
+					PID: 1001, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now,
+				}).Error; err != nil {
+					t.Fatalf("seed lease row with missing owner: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			now := time.Now()
+			if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+				ID: "cp-new", PodName: "cp-new", SupportsAdmissionOffers: true,
+				State: configstore.ControlPlaneInstanceStateActive, StartedAt: now, LastHeartbeatAt: now,
+			}); err != nil {
+				t.Fatalf("register offer-capable CP: %v", err)
+			}
+			tt.seed(t, store, now)
+
+			err := store.ActivateOrgConnectionAdmissionOffers()
+			if !errors.Is(err, configstore.ErrAdmissionOfferProtocolActivationBlocked) {
+				t.Fatalf("activation error = %v, want activation-blocked sentinel", err)
+			}
+		})
+	}
+}
+
+func TestAdmissionOfferProtocolRejectsQueueInsertFromExpiredLegacyOwner(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+	registerAdmissionOfferRolloutFleet(t, store, now)
+	activateAdmissionOffersAfterLegacyExpiry(t, store, now)
+
+	err := store.EnqueueOrgConnectionRequest(&configstore.OrgConnectionQueueEntry{
+		RequestID: "request-expired-legacy-queue", OrgID: "org-expired-legacy-queue", Username: "alice",
+		CPInstanceID: "cp-legacy", PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
+		EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	})
+	if err == nil {
+		t.Fatal("expired legacy control plane inserted a queue row after offer protocol activation")
+	}
+}
+
+func TestAdmissionOfferProtocolRejectsLeaseInsertFromExpiredOwner(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+	registerAdmissionOfferRolloutFleet(t, store, now)
+
+	// The lease fence must cover a pre-existing row too, rather than relying only
+	// on the post-activation queue-insert fence. Its owner is eligible at cutover
+	// and then expires before attempting the lease insert.
+	request := &configstore.OrgConnectionQueueEntry{
+		RequestID: "request-expired-legacy-lease", OrgID: "org-expired-legacy-lease", Username: "alice",
+		CPInstanceID: "cp-new", PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
+		EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue pre-activation request: %v", err)
+	}
+	activateAdmissionOffersAfterLegacyExpiry(t, store, now)
+	if err := store.DB().Table(store.RuntimeSchema()+".cp_instances").
+		Where("id = ?", request.CPInstanceID).
+		Updates(map[string]any{
+			"state":      configstore.ControlPlaneInstanceStateExpired,
+			"expired_at": time.Now(),
+		}).Error; err != nil {
+		t.Fatalf("expire pre-existing request owner: %v", err)
+	}
+
+	err := store.DB().Table(store.RuntimeSchema() + ".org_connection_leases").Create(&configstore.OrgConnectionLease{
+		LeaseID: request.RequestID, RequestID: request.RequestID, OrgID: request.OrgID, Username: request.Username,
+		CPInstanceID: request.CPInstanceID, PID: request.PID, Protocol: request.Protocol,
+		RequestedVCPUs: request.RequestedVCPUs, AcquiredAt: time.Now(),
+	}).Error
+	if err == nil {
+		t.Fatal("expired control plane inserted a lease for a pre-activation queue row")
+	}
+}
+
+func registerAdmissionOfferRolloutFleet(t *testing.T, store *configstore.ConfigStore, now time.Time) {
+	t.Helper()
+	for _, instance := range []*configstore.ControlPlaneInstance{
+		{
+			ID: "cp-new", PodName: "cp-new", SupportsAdmissionOffers: true,
+			State: configstore.ControlPlaneInstanceStateActive, StartedAt: now, LastHeartbeatAt: now,
+		},
+		{
+			ID: "cp-legacy", PodName: "cp-legacy",
+			State: configstore.ControlPlaneInstanceStateActive, StartedAt: now, LastHeartbeatAt: now,
+		},
+	} {
+		if err := store.UpsertControlPlaneInstance(instance); err != nil {
+			t.Fatalf("register %s: %v", instance.ID, err)
+		}
+	}
+}
+
+func activateAdmissionOffersAfterLegacyExpiry(t *testing.T, store *configstore.ConfigStore, now time.Time) {
+	t.Helper()
+	if err := store.DB().Table(store.RuntimeSchema()+".cp_instances").
+		Where("id = ?", "cp-legacy").
+		Updates(map[string]any{
+			"state":      configstore.ControlPlaneInstanceStateExpired,
+			"expired_at": now,
+		}).Error; err != nil {
+		t.Fatalf("expire legacy control plane: %v", err)
+	}
+	if err := store.ActivateOrgConnectionAdmissionOffers(); err != nil {
+		t.Fatalf("activate admission offer protocol: %v", err)
+	}
+
+	var enabled bool
+	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_admission_protocol").
+		Select("offers_enabled").
+		Where("id = 1").
+		Scan(&enabled).Error; err != nil {
+		t.Fatalf("read admission offer protocol: %v", err)
+	}
+	if !enabled {
+		t.Fatal("admission offer protocol did not activate after legacy control plane expiry")
 	}
 }
 
