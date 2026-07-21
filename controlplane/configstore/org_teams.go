@@ -109,13 +109,22 @@ type OrgTeamUpsert struct {
 	SchemaName string
 	// Enabled: nil = TRUE on insert / preserve on update.
 	Enabled *bool
-	// BackfillEnabled: nil = NULL on insert / preserve on update.
+	// BackfillEnabled: nil = TRUE on insert (the column default, migration
+	// 000027) / preserve on update. The column is NOT NULL — there is no
+	// clear path.
 	BackfillEnabled *bool
 	// Legacy explicit table names for grandfathered pre-existing teams
 	// (NULL = derive from schema_name). nil = preserve; "" = clear to NULL.
 	EventsTableName       *string
 	PersonsTableName      *string
 	SchemaDataImportsName *string
+	// EarliestEventDate is PostHog's cached backfill floor (see the model
+	// field). A date has no "" sentinel, so presence rides on the Set flag:
+	// Set=false preserves the stored value (NULL on insert); Set=true stores
+	// the value, clearing back to NULL when nil (the PostHog sensor then
+	// re-resolves it).
+	EarliestEventDateSet bool
+	EarliestEventDate    *EventDate
 }
 
 // UpsertOrgTeamTx creates or overwrites the (org, team) row inside the
@@ -163,14 +172,18 @@ func UpsertOrgTeamTx(tx *gorm.DB, orgID string, up OrgTeamUpsert) (*OrgTeam, err
 		First(&existing, "org_id = ? AND team_id = ?", orgID, up.TeamID).Error
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):
+		backfill := up.BackfillEnabled == nil || *up.BackfillEnabled
 		row := OrgTeam{
 			OrgID:           orgID,
 			TeamID:          up.TeamID,
 			SchemaName:      up.SchemaName,
 			Enabled:         up.Enabled == nil || *up.Enabled,
-			BackfillEnabled: up.BackfillEnabled,
+			BackfillEnabled: &backfill,
 		}
 		applyOrgTeamTableNames(&row, up)
+		if up.EarliestEventDateSet {
+			row.EarliestEventDate = up.EarliestEventDate
+		}
 		if err := tx.Create(&row).Error; err != nil {
 			return nil, fmt.Errorf("create org team (org=%s team=%d): %w", orgID, up.TeamID, err)
 		}
@@ -187,12 +200,16 @@ func UpsertOrgTeamTx(tx *gorm.DB, orgID string, up OrgTeamUpsert) (*OrgTeam, err
 		existing.BackfillEnabled = up.BackfillEnabled
 	}
 	applyOrgTeamTableNames(&existing, up)
+	if up.EarliestEventDateSet {
+		existing.EarliestEventDate = up.EarliestEventDate
+	}
 	// Save with explicit column selection: gorm's Save would skip NULLing the
 	// pointer fields via zero-value pruning on composite-PK updates.
 	if err := tx.Model(&OrgTeam{}).
 		Where("org_id = ? AND team_id = ?", orgID, up.TeamID).
 		Select("schema_name", "enabled", "backfill_enabled",
-			"events_table_name", "persons_table_name", "schema_data_imports_name", "updated_at").
+			"events_table_name", "persons_table_name", "schema_data_imports_name",
+			"earliest_event_date", "updated_at").
 		Updates(map[string]interface{}{
 			"schema_name":              existing.SchemaName,
 			"enabled":                  existing.Enabled,
@@ -200,6 +217,7 @@ func UpsertOrgTeamTx(tx *gorm.DB, orgID string, up OrgTeamUpsert) (*OrgTeam, err
 			"events_table_name":        existing.EventsTableName,
 			"persons_table_name":       existing.PersonsTableName,
 			"schema_data_imports_name": existing.SchemaDataImportsName,
+			"earliest_event_date":      existing.EarliestEventDate,
 			"updated_at":               gorm.Expr("now()"),
 		}).Error; err != nil {
 		return nil, fmt.Errorf("update org team (org=%s team=%d): %w", orgID, up.TeamID, err)

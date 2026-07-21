@@ -88,10 +88,17 @@ export interface OrgTeam {
   schema_name: string;
   enabled: boolean;
   is_billing_team?: boolean | null;
-  backfill_enabled?: boolean | null;
+  // Always set: the column is NOT NULL DEFAULT TRUE, mirroring the
+  // PostHog-side Django BooleanField(default=True).
+  backfill_enabled: boolean;
   events_table_name?: string | null;
   persons_table_name?: string | null;
   schema_data_imports_name?: string | null;
+  // PostHog's cached earliest-event date ("YYYY-MM-DD"): the historical
+  // backfill floor its sensor computes from ClickHouse. null = not yet
+  // resolved; 1970-01-01 is the "no event history" sentinel. Owned and
+  // written by PostHog — duckgres only stores and serves it.
+  earliest_event_date?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -110,19 +117,22 @@ export interface OrgTeamCreateBody {
 // PUT /api/v1/orgs/:id/teams/:team_id — the operator break-glass: every team
 // setting is editable. All fields are presence-aware (omit = preserve).
 // schema_name may be changed (409 when another team in the org holds it) but
-// never cleared; changing it does NOT move any warehouse data. An explicit
-// `backfill_enabled: null` clears the tri-state back to unset; an explicit
+// never cleared; changing it does NOT move any warehouse data. backfill_enabled
+// always has a value (NOT NULL DEFAULT TRUE) — null is rejected. An explicit
 // null (or "") on a legacy table-name field clears it back to NULL ("derive
 // from schema_name"). is_billing_team may only be true: billing is repointed
 // by marking another team, never cleared.
 export interface OrgTeamUpdateBody {
   schema_name?: string;
   enabled?: boolean;
-  backfill_enabled?: boolean | null;
+  backfill_enabled?: boolean;
   is_billing_team?: true;
   events_table_name?: string | null;
   persons_table_name?: string | null;
   schema_data_imports_name?: string | null;
+  // "YYYY-MM-DD"; explicit null clears the cached date so PostHog's sensor
+  // re-discovers the team's backfill range.
+  earliest_event_date?: string | null;
 }
 
 // DELETE /api/v1/orgs/:id/teams/:team_id response. new_billing_team_id is set

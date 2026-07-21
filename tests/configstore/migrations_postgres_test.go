@@ -44,7 +44,9 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 23)
 	requireGooseMigrationRecorded(t, db, 24)
 	requireGooseMigrationRecorded(t, db, 25)
-	requireGooseLatestVersion(t, db, 25)
+	requireGooseMigrationRecorded(t, db, 26)
+	requireGooseMigrationRecorded(t, db, 27)
+	requireGooseLatestVersion(t, db, 27)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -91,6 +93,16 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnNullable(t, db, "duckgres_org_teams", "persons_table_name")
 	requireColumnNullable(t, db, "duckgres_org_teams", "schema_data_imports_name")
 	requireUniqueIndex(t, db, "duckgres_org_teams", "org_id,schema_name")
+
+	// Migration 000026 added PostHog's cached earliest-event date (nullable
+	// DATE — NULL until the PostHog sensor resolves it).
+	requireColumnNullable(t, db, "duckgres_org_teams", "earliest_event_date")
+	requireColumnType(t, db, "duckgres_org_teams", "earliest_event_date", "date")
+
+	// Migration 000027 pinned backfill_enabled to NOT NULL DEFAULT TRUE,
+	// mirroring the PostHog-side Django BooleanField(default=True).
+	requireColumnNotNull(t, db, "duckgres_org_teams", "backfill_enabled")
+	requireColumnDefault(t, db, "duckgres_org_teams", "backfill_enabled", "true")
 
 	// Migration 000007 added the compute-usage billing buffer; 000015 widened
 	// its key for pull-based billing (team_id, query_source, worker size),
@@ -183,7 +195,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -222,7 +234,9 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 23)
 	requireGooseMigrationRecorded(t, upgradedDB, 24)
 	requireGooseMigrationRecorded(t, upgradedDB, 25)
-	requireGooseLatestVersion(t, upgradedDB, 25)
+	requireGooseMigrationRecorded(t, upgradedDB, 26)
+	requireGooseMigrationRecorded(t, upgradedDB, 27)
+	requireGooseLatestVersion(t, upgradedDB, 27)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -231,6 +245,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "default_team_id")
 	requireTablePresent(t, upgradedDB, "duckgres_org_teams")
 	requireColumnNullable(t, upgradedDB, "duckgres_org_teams", "events_table_name")
+	requireColumnNullable(t, upgradedDB, "duckgres_org_teams", "earliest_event_date")
+	requireColumnNotNull(t, upgradedDB, "duckgres_org_teams", "backfill_enabled")
 	requireUniqueIndex(t, upgradedDB, "duckgres_org_teams", "org_id,schema_name")
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "max_connections")
 	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
@@ -317,8 +333,9 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	if team.IsBillingTeam == nil || !*team.IsBillingTeam {
 		t.Fatalf("backfilled team row must be the billing team, got %+v", team)
 	}
-	if team.BackfillEnabled != nil {
-		t.Fatalf("backfilled team row backfill_enabled = %v, want NULL", *team.BackfillEnabled)
+	// 000024 seeded the row with backfill_enabled NULL; 000027 pins it TRUE.
+	if team.BackfillEnabled == nil || !*team.BackfillEnabled {
+		t.Fatalf("backfilled team row backfill_enabled = %v, want TRUE after migration 000027", team.BackfillEnabled)
 	}
 }
 

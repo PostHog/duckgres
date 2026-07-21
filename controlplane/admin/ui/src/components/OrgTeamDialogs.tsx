@@ -31,17 +31,25 @@ import {
 import { useCreateOrgTeam, useDeleteOrgTeam, useUpdateOrgTeam } from "@/hooks/useApi";
 import type { OrgTeam, OrgTeamUpdateBody } from "@/types/api";
 
-// Tri-state backfill select value ↔ wire value.
-type BackfillChoice = "unset" | "on" | "off";
-
-function backfillChoice(v: boolean | null | undefined): BackfillChoice {
-  if (v == null) return "unset";
-  return v ? "on" : "off";
+// backfill_enabled always has a value (NOT NULL DEFAULT TRUE, mirroring the
+// PostHog-side Django default) — a plain on/off badge.
+export function BackfillBadge({ value }: { value: boolean }) {
+  return value ? <Badge variant="success">on</Badge> : <Badge variant="muted">off</Badge>;
 }
 
-export function BackfillBadge({ value }: { value: boolean | null | undefined }) {
-  if (value == null) return <span className="text-muted-foreground">—</span>;
-  return value ? <Badge variant="success">on</Badge> : <Badge variant="muted">off</Badge>;
+// EarliestEventDateCell renders PostHog's cached earliest-event date: em dash
+// while the PostHog sensor hasn't resolved it yet, "none" for the 1970-01-01
+// "no event history" sentinel, the plain date otherwise.
+export function EarliestEventDateCell({ value }: { value: string | null | undefined }) {
+  if (!value) return <span className="text-muted-foreground">—</span>;
+  if (value === "1970-01-01") {
+    return (
+      <span className="text-muted-foreground" title="1970-01-01 sentinel: the team has no event history">
+        none
+      </span>
+    );
+  }
+  return <span className="font-mono text-xs tabular-nums">{value}</span>;
 }
 
 // LegacyNamesBadge: compact indicator that a row carries explicit legacy
@@ -92,7 +100,7 @@ export function CreateTeamDialog({
   const [teamId, setTeamId] = useState("");
   const [schemaName, setSchemaName] = useState("");
   const [enabled, setEnabled] = useState(true);
-  const [backfill, setBackfill] = useState<BackfillChoice>("unset");
+  const [backfill, setBackfill] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const targetOrg = org ?? orgChoice;
@@ -103,7 +111,7 @@ export function CreateTeamDialog({
     setTeamId("");
     setSchemaName("");
     setEnabled(true);
-    setBackfill("unset");
+    setBackfill(true);
     setError(null);
     onClose();
   };
@@ -116,7 +124,7 @@ export function CreateTeamDialog({
         team_id: Number(teamId.trim()),
         schema_name: schemaName.trim(),
         enabled,
-        ...(backfill === "unset" ? {} : { backfill_enabled: backfill === "on" }),
+        backfill_enabled: backfill,
       });
       close();
     } catch (e) {
@@ -178,18 +186,10 @@ export function CreateTeamDialog({
             <Label>Enabled</Label>
             <Switch checked={enabled} onCheckedChange={setEnabled} />
           </div>
-          <FieldRow label="Backfill">
-            <Select value={backfill} onValueChange={(v) => setBackfill(v as BackfillChoice)}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="unset">unset</SelectItem>
-                <SelectItem value="on">enabled</SelectItem>
-                <SelectItem value="off">disabled</SelectItem>
-              </SelectContent>
-            </Select>
-          </FieldRow>
+          <div className="flex items-center justify-between">
+            <Label>Backfill</Label>
+            <Switch checked={backfill} onCheckedChange={setBackfill} />
+          </div>
           {error && <p className="text-xs text-destructive">{error}</p>}
         </div>
         <DialogFooter>
@@ -226,11 +226,12 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
   const isBilling = Boolean(team.is_billing_team);
   const [schemaName, setSchemaName] = useState(team.schema_name);
   const [enabled, setEnabled] = useState(team.enabled);
-  const [backfill, setBackfill] = useState<BackfillChoice>(backfillChoice(team.backfill_enabled));
+  const [backfill, setBackfill] = useState(team.backfill_enabled);
   const [makeBilling, setMakeBilling] = useState(false);
   const [eventsName, setEventsName] = useState(team.events_table_name ?? "");
   const [personsName, setPersonsName] = useState(team.persons_table_name ?? "");
   const [importsName, setImportsName] = useState(team.schema_data_imports_name ?? "");
+  const [earliestEventDate, setEarliestEventDate] = useState(team.earliest_event_date ?? "");
   const [error, setError] = useState<string | null>(null);
 
   const schemaChanged = schemaName.trim() !== team.schema_name;
@@ -240,9 +241,7 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
     const body: OrgTeamUpdateBody = {};
     if (schemaChanged) body.schema_name = schemaName.trim();
     if (enabled !== team.enabled) body.enabled = enabled;
-    if (backfill !== backfillChoice(team.backfill_enabled)) {
-      body.backfill_enabled = backfill === "unset" ? null : backfill === "on";
-    }
+    if (backfill !== team.backfill_enabled) body.backfill_enabled = backfill;
     if (makeBilling && !isBilling) body.is_billing_team = true;
     const events = legacyNameBody(eventsName, team.events_table_name);
     if (events !== undefined) body.events_table_name = events;
@@ -250,6 +249,12 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
     if (persons !== undefined) body.persons_table_name = persons;
     const imports = legacyNameBody(importsName, team.schema_data_imports_name);
     if (imports !== undefined) body.schema_data_imports_name = imports;
+    const trimmedDate = earliestEventDate.trim();
+    if (trimmedDate !== (team.earliest_event_date ?? "")) {
+      // Empty input clears the cached date (wire value null): the PostHog
+      // sensor then re-discovers the team's backfill range.
+      body.earliest_event_date = trimmedDate === "" ? null : trimmedDate;
+    }
     if (Object.keys(body).length === 0) {
       onClose();
       return;
@@ -295,18 +300,10 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
             <Label>Enabled</Label>
             <Switch checked={enabled} onCheckedChange={setEnabled} />
           </div>
-          <FieldRow label="Backfill">
-            <Select value={backfill} onValueChange={(v) => setBackfill(v as BackfillChoice)}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="unset">unset</SelectItem>
-                <SelectItem value="on">enabled</SelectItem>
-                <SelectItem value="off">disabled</SelectItem>
-              </SelectContent>
-            </Select>
-          </FieldRow>
+          <div className="flex items-center justify-between">
+            <Label>Backfill</Label>
+            <Switch checked={backfill} onCheckedChange={setBackfill} />
+          </div>
           <FieldRow label="Legacy events table">
             <Input
               value={eventsName}
@@ -334,6 +331,18 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
           <p className="text-xs text-muted-foreground">
             Legacy overrides for grandfathered teams. Leave a field empty to derive the name from
             the schema name.
+          </p>
+          <FieldRow label="Earliest event date">
+            <Input
+              type="date"
+              value={earliestEventDate}
+              onChange={(e) => setEarliestEventDate(e.target.value)}
+              className="font-mono text-xs"
+            />
+          </FieldRow>
+          <p className="text-xs text-muted-foreground">
+            Cached by PostHog's backfill sensor; 1970-01-01 means the team has no event history.
+            Clearing it makes the sensor re-discover the team's backfill range.
           </p>
           {isBilling ? (
             <p className="text-xs text-muted-foreground">

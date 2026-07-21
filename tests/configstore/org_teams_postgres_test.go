@@ -48,8 +48,13 @@ func TestUpsertOrgTeamGrandfatherPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create upsert: %v", err)
 	}
-	if !created.Enabled || created.BackfillEnabled != nil || created.EventsTableName != nil {
-		t.Fatalf("created row = %+v, want enabled default true, backfill/legacy NULL", created)
+	if !created.Enabled || created.EventsTableName != nil {
+		t.Fatalf("created row = %+v, want enabled default true, legacy names NULL", created)
+	}
+	// backfill_enabled is NOT NULL DEFAULT TRUE (migration 000027): a create
+	// that omits the field gets TRUE.
+	if created.BackfillEnabled == nil || !*created.BackfillEnabled {
+		t.Fatalf("created row backfill_enabled = %v, want default TRUE", created.BackfillEnabled)
 	}
 
 	// Grandfather: replace the placeholder schema and set explicit names;
@@ -94,6 +99,52 @@ func TestUpsertOrgTeamGrandfatherPostgres(t *testing.T) {
 	}
 	if cleared.PersonsTableName == nil || *cleared.PersonsTableName != "legacy_persons" {
 		t.Fatalf("omitted persons_table_name must be preserved, got %+v", cleared)
+	}
+	if cleared.EarliestEventDate != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL before ever being set", cleared.EarliestEventDate)
+	}
+
+	// earliest_event_date round-trip through the real DATE column: set...
+	date, err := configstore.ParseEventDate("2023-04-17")
+	if err != nil {
+		t.Fatalf("parse date: %v", err)
+	}
+	withDate, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{
+		TeamID:               7,
+		SchemaName:           "legacy_wh",
+		EarliestEventDateSet: true,
+		EarliestEventDate:    &date,
+	})
+	if err != nil {
+		t.Fatalf("set earliest_event_date: %v", err)
+	}
+	if withDate.EarliestEventDate == nil || withDate.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("earliest_event_date = %v, want 2023-04-17", withDate.EarliestEventDate)
+	}
+	if got := readTeam(t, store, "acme", 7); got.EarliestEventDate == nil || got.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("re-read earliest_event_date = %v, want 2023-04-17", got.EarliestEventDate)
+	}
+
+	// ...preserve when the Set flag is off...
+	preserved, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 7, SchemaName: "legacy_wh"})
+	if err != nil {
+		t.Fatalf("preserving upsert: %v", err)
+	}
+	if preserved.EarliestEventDate == nil || preserved.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("unset earliest_event_date must be preserved, got %v", preserved.EarliestEventDate)
+	}
+
+	// ...and clear back to NULL with Set + nil.
+	dateCleared, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{
+		TeamID:               7,
+		SchemaName:           "legacy_wh",
+		EarliestEventDateSet: true,
+	})
+	if err != nil {
+		t.Fatalf("clearing earliest_event_date: %v", err)
+	}
+	if dateCleared.EarliestEventDate != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL after explicit clear", dateCleared.EarliestEventDate)
 	}
 }
 

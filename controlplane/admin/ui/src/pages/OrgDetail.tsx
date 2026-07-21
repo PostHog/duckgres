@@ -38,6 +38,7 @@ import {
   BackfillBadge,
   CreateTeamDialog,
   DeleteTeamDialog,
+  EarliestEventDateCell,
   EditTeamDialog,
   LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
@@ -717,6 +718,7 @@ function OrgTeamsCard({ orgId }: { orgId: string }) {
                 <TableHead>Enabled</TableHead>
                 <TableHead>Billing</TableHead>
                 <TableHead>Backfill</TableHead>
+                <TableHead>Earliest event</TableHead>
                 <TableHead>Created</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
@@ -747,6 +749,9 @@ function OrgTeamsCard({ orgId }: { orgId: string }) {
                   </TableCell>
                   <TableCell>
                     <BackfillBadge value={t.backfill_enabled} />
+                  </TableCell>
+                  <TableCell>
+                    <EarliestEventDateCell value={t.earliest_event_date} />
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">{fmtTime(t.created_at)}</TableCell>
                   <TableCell>

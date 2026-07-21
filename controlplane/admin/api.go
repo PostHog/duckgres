@@ -365,10 +365,11 @@ type orgTeamUpdate struct {
 	// validated by the handler, refused with ErrOrgTeamSchemaConflict when
 	// another team in the org already uses it. Changing it does NOT move any
 	// warehouse data; tables under the old schema are not renamed.
-	SchemaName  *string
-	Enabled     *bool
-	BackfillSet bool
-	Backfill    *bool
+	SchemaName *string
+	Enabled    *bool
+	// Backfill: nil = preserve. The column is NOT NULL (migration 000027), so
+	// there is no clear path — the handler rejects an explicit null.
+	Backfill *bool
 	// Legacy explicit table names for grandfathered teams (NULL = derive from
 	// schema_name). XSet + nil value clears the column back to NULL.
 	EventsTableNameSet       bool
@@ -377,6 +378,11 @@ type orgTeamUpdate struct {
 	PersonsTableName         *string
 	SchemaDataImportsNameSet bool
 	SchemaDataImportsName    *string
+	// EarliestEventDate: PostHog's cached backfill floor (a cache owned by
+	// PostHog's sensor — see configstore.OrgTeam.EarliestEventDate). Set + nil
+	// clears the column back to NULL, making the sensor re-resolve it.
+	EarliestEventDateSet bool
+	EarliestEventDate    *configstore.EventDate
 	// MakeBilling repoints the org's billing team to this row (the buffered
 	// usage buckets follow atomically). There is no "unset billing" — every
 	// org must keep a billing team; repoint by marking another team.
@@ -455,8 +461,8 @@ func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 		if upd.Enabled != nil {
 			fields["enabled"] = *upd.Enabled
 		}
-		if upd.BackfillSet {
-			fields["backfill_enabled"] = upd.Backfill
+		if upd.Backfill != nil {
+			fields["backfill_enabled"] = *upd.Backfill
 		}
 		if upd.EventsTableNameSet {
 			fields["events_table_name"] = upd.EventsTableName
@@ -466,6 +472,9 @@ func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 		}
 		if upd.SchemaDataImportsNameSet {
 			fields["schema_data_imports_name"] = upd.SchemaDataImportsName
+		}
+		if upd.EarliestEventDateSet {
+			fields["earliest_event_date"] = upd.EarliestEventDate
 		}
 		if len(fields) > 1 {
 			if err := tx.Model(&configstore.OrgTeam{}).
@@ -985,12 +994,13 @@ func (h *apiHandler) createOrgTeam(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	backfill := req.BackfillEnabled == nil || *req.BackfillEnabled
 	team := configstore.OrgTeam{
 		OrgID:           orgID,
 		TeamID:          req.TeamID,
 		SchemaName:      req.SchemaName,
 		Enabled:         req.Enabled == nil || *req.Enabled,
-		BackfillEnabled: req.BackfillEnabled,
+		BackfillEnabled: &backfill,
 	}
 	// POST /teams has no :id param, so the audit org column is blank — record
 	// the target org here (mirrors POST /users).
@@ -1012,11 +1022,12 @@ func (h *apiHandler) createOrgTeam(c *gin.Context) {
 // updateOrgTeamRequest is the admin PUT body — the operator break-glass that
 // can edit every team setting. All fields are presence-aware (absent =
 // preserve). schema_name may be CHANGED here (immutability is a user-facing
-// flow rule, not an operator one) but never cleared — it stays NOT NULL. The
-// nullable columns (backfill_enabled and the three legacy table-name
-// overrides) treat an explicit JSON null — and, for the table names, "" — as
-// "clear back to NULL". Billing can only be pointed AT a team
-// (is_billing_team: true), never cleared.
+// flow rule, not an operator one) but never cleared — it stays NOT NULL, and
+// backfill_enabled likewise rejects an explicit null (NOT NULL DEFAULT TRUE,
+// migration 000027). The nullable columns (earliest_event_date and the three
+// legacy table-name overrides) treat an explicit JSON null — and, for the
+// table names, "" — as "clear back to NULL". Billing can only be pointed AT a
+// team (is_billing_team: true), never cleared.
 type updateOrgTeamRequest struct {
 	SchemaName            *string `json:"schema_name,omitempty"`
 	Enabled               *bool   `json:"enabled,omitempty"`
@@ -1025,6 +1036,10 @@ type updateOrgTeamRequest struct {
 	EventsTableName       *string `json:"events_table_name,omitempty"`
 	PersonsTableName      *string `json:"persons_table_name,omitempty"`
 	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate ("YYYY-MM-DD"): PostHog's cached backfill floor.
+	// Explicit null (or "") clears it to NULL so the PostHog sensor
+	// re-discovers the team's backfill range.
+	EarliestEventDate *string `json:"earliest_event_date,omitempty"`
 }
 
 // maxOrgTeamTableNameLength caps the legacy table-name overrides at the
@@ -1094,16 +1109,30 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 			return
 		}
 	}
-	_, backfillSet := fields["backfill_enabled"]
+	_, earliestSet := fields["earliest_event_date"]
+	var earliest *configstore.EventDate
+	if earliestSet && req.EarliestEventDate != nil && *req.EarliestEventDate != "" {
+		d, err := configstore.ParseEventDate(*req.EarliestEventDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "earliest_event_date " + err.Error()})
+			return
+		}
+		earliest = &d
+	}
+	if _, ok := fields["backfill_enabled"]; ok && req.BackfillEnabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "backfill_enabled cannot be null (the column always has a value); pass true or false, or omit the field to preserve it"})
+		return
+	}
 	_, eventsPresent := fields["events_table_name"]
 	_, personsPresent := fields["persons_table_name"]
 	_, importsPresent := fields["schema_data_imports_name"]
 	upd := orgTeamUpdate{
-		SchemaName:  req.SchemaName,
-		Enabled:     req.Enabled,
-		BackfillSet: backfillSet,
-		Backfill:    req.BackfillEnabled,
-		MakeBilling: req.IsBillingTeam != nil && *req.IsBillingTeam,
+		SchemaName:           req.SchemaName,
+		Enabled:              req.Enabled,
+		Backfill:             req.BackfillEnabled,
+		MakeBilling:          req.IsBillingTeam != nil && *req.IsBillingTeam,
+		EarliestEventDateSet: earliestSet,
+		EarliestEventDate:    earliest,
 	}
 	upd.EventsTableNameSet, upd.EventsTableName = legacyTableNameUpdate(eventsPresent, req.EventsTableName)
 	upd.PersonsTableNameSet, upd.PersonsTableName = legacyTableNameUpdate(personsPresent, req.PersonsTableName)
@@ -1139,6 +1168,7 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 	addChange("events_table_name", orgStrPtr(prev.EventsTableName), orgStrPtr(team.EventsTableName))
 	addChange("persons_table_name", orgStrPtr(prev.PersonsTableName), orgStrPtr(team.PersonsTableName))
 	addChange("schema_data_imports_name", orgStrPtr(prev.SchemaDataImportsName), orgStrPtr(team.SchemaDataImportsName))
+	addChange("earliest_event_date", orgDatePtr(prev.EarliestEventDate), orgDatePtr(team.EarliestEventDate))
 	if len(changes) > 0 {
 		setAuditDetail(c, fmt.Sprintf("team %d: %s", teamID, strings.Join(changes, ", ")))
 	}
@@ -1178,6 +1208,15 @@ func orgStrPtr(s *string) string {
 		return "(unset)"
 	}
 	return orgStr(*s)
+}
+
+// orgDatePtr renders an optional calendar date (nil == unset) for audit
+// detail.
+func orgDatePtr(d *configstore.EventDate) string {
+	if d == nil {
+		return "(unset)"
+	}
+	return d.String()
 }
 
 // orgBoolPtr renders an optional tri-state boolean (nil == unset) for audit

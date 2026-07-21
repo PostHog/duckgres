@@ -1,8 +1,10 @@
 package provisioning
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -558,13 +560,21 @@ func (h *handler) checkDatabaseName(c *gin.Context) {
 // for grandfathering pre-existing teams whose warehouse tables predate the
 // schema-per-team convention; NULL means "derive from schema_name".
 type orgTeamUpsertRequest struct {
-	TeamID                int64   `json:"team_id"`
-	SchemaName            string  `json:"schema_name"`
-	Enabled               *bool   `json:"enabled,omitempty"`
+	TeamID     int64  `json:"team_id"`
+	SchemaName string `json:"schema_name"`
+	Enabled    *bool  `json:"enabled,omitempty"`
+	// BackfillEnabled: absent = TRUE on insert / preserve on update. The
+	// column is NOT NULL DEFAULT TRUE (migration 000027), so an explicit null
+	// is a 400 — there is no "unset" to clear back to.
 	BackfillEnabled       *bool   `json:"backfill_enabled,omitempty"`
 	EventsTableName       *string `json:"events_table_name,omitempty"`
 	PersonsTableName      *string `json:"persons_table_name,omitempty"`
 	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate is PostHog's cached backfill floor as a "YYYY-MM-DD"
+	// string (see configstore.OrgTeam.EarliestEventDate). Tri-state: an absent
+	// key preserves the stored value; an explicit null (or "") clears it back
+	// to NULL so the PostHog sensor re-resolves it; a value must parse.
+	EarliestEventDate *string `json:"earliest_event_date,omitempty"`
 }
 
 func (h *handler) listOrgTeams(c *gin.Context) {
@@ -591,8 +601,22 @@ func (h *handler) listOrgTeams(c *gin.Context) {
 func (h *handler) upsertOrgTeam(c *gin.Context) {
 	orgID := c.Param("id")
 
+	// Read the body once: the typed struct gives values, the raw key set gives
+	// presence, so an explicit `"earliest_event_date": null` (clear) is
+	// distinguishable from an absent key (preserve) — same idiom as the admin
+	// team PUT.
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	var req orgTeamUpsertRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawFields); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -604,6 +628,20 @@ func (h *handler) upsertOrgTeam(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if _, ok := rawFields["backfill_enabled"]; ok && req.BackfillEnabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "backfill_enabled cannot be null (the column always has a value); pass true or false, or omit the field to preserve it"})
+		return
+	}
+	_, earliestSet := rawFields["earliest_event_date"]
+	var earliest *configstore.EventDate
+	if earliestSet && req.EarliestEventDate != nil && *req.EarliestEventDate != "" {
+		d, err := configstore.ParseEventDate(*req.EarliestEventDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "earliest_event_date " + err.Error()})
+			return
+		}
+		earliest = &d
+	}
 
 	team, err := h.store.UpsertOrgTeam(orgID, configstore.OrgTeamUpsert{
 		TeamID:                req.TeamID,
@@ -613,6 +651,8 @@ func (h *handler) upsertOrgTeam(c *gin.Context) {
 		EventsTableName:       req.EventsTableName,
 		PersonsTableName:      req.PersonsTableName,
 		SchemaDataImportsName: req.SchemaDataImportsName,
+		EarliestEventDateSet:  earliestSet,
+		EarliestEventDate:     earliest,
 	})
 	if err != nil {
 		switch {
