@@ -431,6 +431,36 @@ func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 	}
 }
 
+func TestE2EHarnessUsesOnlyCnpgMetadataStores(t *testing.T) {
+	harnessRaw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	runRaw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+
+	harness := string(harnessRaw)
+	for _, legacy := range []string{
+		`EXT="ci-pr-${PR_NUMBER}-ext"`,
+		"EXT_BODY=",
+		"EXT_RDS_",
+		"ext_rds_",
+		"mdstore_e2e_",
+		"lane_ext",
+		"reshard_ext_to_cnpg",
+		`"metadata_store":{"type":"external"`,
+	} {
+		if strings.Contains(harness, legacy) {
+			t.Errorf("e2e harness still contains external-metadata lane or RDS lifecycle marker %q", legacy)
+		}
+	}
+	if strings.Contains(string(runRaw), "ci-pr-${pr}-ext") {
+		t.Error("run.sh still includes the external-metadata org in e2e lifecycle cleanup")
+	}
+}
+
 func TestDeployCreatesConfiguredSecretDirectoryPrivately(t *testing.T) {
 	fakes := newRunSHFakes(t)
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "generated", "secrets")
