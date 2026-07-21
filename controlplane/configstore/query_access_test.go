@@ -46,6 +46,72 @@ func TestOrgUserQueryAccessDerivesProjectNamespaces(t *testing.T) {
 	}
 }
 
+// A backfilled legacy team can carry overrides that EQUAL the derived default
+// names (posthog org team 2: events_table_name="events" → posthog.events). A
+// non-NULL override always means "this team's table lives in the shared
+// legacy posthog schema", so the grant must not depend on the override's
+// spelling.
+func TestOrgUserQueryAccessGrantsDefaultNamedLegacyTables(t *testing.T) {
+	events := "events"
+	persons := "persons"
+	teamID := int64(2)
+	key := OrgUserKey{OrgID: "acme", Username: "posthog_team_2"}
+	cs := &ConfigStore{snapshot: &Snapshot{
+		Orgs: map[string]*OrgConfig{
+			"acme": {
+				Teams: []OrgTeamConfig{{
+					TeamID:           teamID,
+					SchemaName:       "team_2",
+					Enabled:          true,
+					EventsTableName:  &events,
+					PersonsTableName: &persons,
+				}},
+			},
+		},
+		OrgUserAccess: map[OrgUserKey]OrgUserAccessConfig{
+			key: {Mode: OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+	}}
+
+	got, ok := cs.OrgUserQueryAccess("acme", "posthog_team_2")
+	if !ok {
+		t.Fatal("expected a project reader policy")
+	}
+	wantRelations := []string{"posthog.events", "posthog.persons"}
+	if !reflect.DeepEqual(got.AllowedRelations, wantRelations) {
+		t.Fatalf("AllowedRelations = %v, want %v", got.AllowedRelations, wantRelations)
+	}
+}
+
+// NULL overrides mean "derive from schema_name" — the team is on the
+// per-team-schema model and gets no legacy posthog-schema relations.
+func TestOrgUserQueryAccessGrantsNoLegacyTablesWithoutOverrides(t *testing.T) {
+	teamID := int64(7)
+	key := OrgUserKey{OrgID: "acme", Username: "posthog_team_7"}
+	cs := &ConfigStore{snapshot: &Snapshot{
+		Orgs: map[string]*OrgConfig{
+			"acme": {
+				Teams: []OrgTeamConfig{{
+					TeamID:     teamID,
+					SchemaName: "team_7",
+					Enabled:    true,
+				}},
+			},
+		},
+		OrgUserAccess: map[OrgUserKey]OrgUserAccessConfig{
+			key: {Mode: OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+	}}
+
+	got, ok := cs.OrgUserQueryAccess("acme", "posthog_team_7")
+	if !ok {
+		t.Fatal("expected a project reader policy")
+	}
+	if len(got.AllowedRelations) != 0 {
+		t.Fatalf("AllowedRelations = %v, want none", got.AllowedRelations)
+	}
+}
+
 func TestOrgUserQueryAccessFailsClosedForMissingOrDisabledTeam(t *testing.T) {
 	teamID := int64(42)
 	key := OrgUserKey{OrgID: "acme", Username: "posthog_team_42"}

@@ -367,10 +367,15 @@ func orgUserQueryAccessFromSnapshot(snapshot *Snapshot, orgID, username string) 
 			fmt.Sprintf("shadow_%d_models", team.TeamID),
 			team.SchemaName,
 		}
-		if team.EventsTableName != nil && *team.EventsTableName != "" && *team.EventsTableName != "events" {
+		// A non-NULL override means the team's table lives in the shared
+		// legacy posthog schema — even when the override spells the derived
+		// default name (posthog org team 2 is events_table_name="events" →
+		// posthog.events). NULL means derive from schema_name, which the
+		// AllowedSchemas grant above already covers.
+		if team.EventsTableName != nil && *team.EventsTableName != "" {
 			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.EventsTableName)
 		}
-		if team.PersonsTableName != nil && *team.PersonsTableName != "" && *team.PersonsTableName != "persons" {
+		if team.PersonsTableName != nil && *team.PersonsTableName != "" {
 			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.PersonsTableName)
 		}
 		sort.Strings(policy.AllowedSchemas)
