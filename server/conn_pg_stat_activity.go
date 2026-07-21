@@ -81,7 +81,7 @@ func (c *clientConn) handlePgStatActivity() error {
 		return err
 	}
 
-	conns := c.server.listConns()
+	conns := c.visiblePgStatActivityConns()
 	sort.Slice(conns, func(i, j int) bool { return conns[i].pid < conns[j].pid })
 
 	for _, conn := range conns {
@@ -102,7 +102,7 @@ func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 		_ = c.sendPgStatActivityRowDescriptionWithFormats(p.resultFormats)
 	}
 
-	conns := c.server.listConns()
+	conns := c.visiblePgStatActivityConns()
 	sort.Slice(conns, func(i, j int) bool { return conns[i].pid < conns[j].pid })
 
 	for _, conn := range conns {
@@ -110,6 +110,22 @@ func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 	}
 
 	_ = c.writeCommandComplete(fmt.Sprintf("SELECT %d", len(conns)))
+}
+
+func (c *clientConn) visiblePgStatActivityConns() []*clientConn {
+	conns := c.server.listConns()
+	if c.queryAccessPolicy == nil {
+		return conns
+	}
+
+	visible := make([]*clientConn, 0, len(conns))
+	for _, conn := range conns {
+		// Cluster project readers have one distinct username per project.
+		if conn.orgID == c.orgID && conn.username == c.username {
+			visible = append(visible, conn)
+		}
+	}
+	return visible
 }
 
 // sendPgStatActivityRowDescription sends a RowDescription for pg_stat_activity.

@@ -1707,6 +1707,21 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
 		return
 	}
+	if raw.Passthrough != nil && *raw.Passthrough {
+		user, err := h.store.GetUser(orgID, username)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if user.AccessMode == configstore.OrgUserAccessModeProjectReader {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "project readers cannot enable passthrough"})
+			return
+		}
+	}
 	// Audit detail: which fields the update touched. The password is NEVER
 	// logged — only that it was reset.
 	var changes []string

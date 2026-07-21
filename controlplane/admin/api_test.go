@@ -612,6 +612,32 @@ func TestUpdateUserRejectsNegativeMaxVCPUs(t *testing.T) {
 	}
 }
 
+func TestUpdateUserRejectsPassthroughForProjectReader(t *testing.T) {
+	teamID := int64(42)
+	store := newFakeAPIStore()
+	store.users["analytics/project-reader"] = &configstore.OrgUser{
+		OrgID:       "analytics",
+		Username:    "project-reader",
+		Password:    "hash",
+		AccessMode:  configstore.OrgUserAccessModeProjectReader,
+		TeamID:      &teamID,
+		Passthrough: false,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/project-reader", bytes.NewReader([]byte(`{"passthrough":true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if store.users["analytics/project-reader"].Passthrough {
+		t.Fatal("project reader must remain non-passthrough")
+	}
+}
+
 func TestUpdateUserIgnoresRemovedDefaultCatalogField(t *testing.T) {
 	// default_catalog was removed with Iceberg support: a legacy update body
 	// carrying it still succeeds (unknown fields are ignored on the users

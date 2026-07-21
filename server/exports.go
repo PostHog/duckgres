@@ -264,10 +264,14 @@ func SetPassthrough(cc *clientConn, enabled bool) {
 }
 
 // SetQueryAccessPolicy binds a fail-closed project policy before the message
-// loop starts. nil keeps root and internal users unrestricted.
+// loop starts and prevents scoped sessions from bypassing the SQL layer.
+// nil keeps root and internal users unrestricted.
 func SetQueryAccessPolicy(cc *clientConn, policy *QueryAccessPolicy) {
 	if cc != nil {
 		cc.queryAccessPolicy = policy
+		if policy != nil {
+			cc.passthrough = false
+		}
 	}
 }
 
