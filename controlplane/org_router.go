@@ -38,6 +38,7 @@ type OrgRouter struct {
 	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
 	nextWorkerID          atomic.Int32
 	sharedCancel          context.CancelFunc
+	projectReaderChange   func(orgID, username string)
 
 	// migrating tracks which orgs have a DuckLake migration in progress.
 	// During migration, new connections for the org are rejected with a
@@ -231,6 +232,24 @@ func (tr *OrgRouter) IsMigrating(orgID string) bool {
 
 // HandleConfigChange reconciles org stacks when the config snapshot changes.
 func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
+	for key := range changedProjectReaderUsers(old, new) {
+		if tr.srv != nil {
+			tr.srv.DrainUserConnections(key.OrgID, key.Username)
+		}
+		tr.mu.RLock()
+		onProjectReaderChange := tr.projectReaderChange
+		tr.mu.RUnlock()
+		if onProjectReaderChange != nil {
+			onProjectReaderChange(key.OrgID, key.Username)
+		}
+		tr.mu.RLock()
+		stack := tr.orgs[key.OrgID]
+		tr.mu.RUnlock()
+		if stack != nil && stack.Sessions != nil {
+			stack.Sessions.DestroySessionsForUser(key.Username)
+		}
+	}
+
 	// Detect new orgs or orgs whose warehouse just became ready
 	for name, tc := range new.Orgs {
 		oldTC, existed := old.Orgs[name]
@@ -331,6 +350,84 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		}
 		tr.mu.Unlock()
 	}
+}
+
+func (tr *OrgRouter) setProjectReaderChangeHandler(handler func(orgID, username string)) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.projectReaderChange = handler
+}
+
+func changedProjectReaderUsers(old, new *configstore.Snapshot) map[configstore.OrgUserKey]struct{} {
+	changed := make(map[configstore.OrgUserKey]struct{})
+	keys := make(map[configstore.OrgUserKey]struct{}, len(old.OrgUserAccess)+len(new.OrgUserAccess))
+	for key := range old.OrgUserAccess {
+		keys[key] = struct{}{}
+	}
+	for key := range new.OrgUserAccess {
+		keys[key] = struct{}{}
+	}
+
+	for key := range keys {
+		oldAccess := old.OrgUserAccess[key]
+		newAccess := new.OrgUserAccess[key]
+		if oldAccess.Mode != configstore.OrgUserAccessModeProjectReader && newAccess.Mode != configstore.OrgUserAccessModeProjectReader {
+			continue
+		}
+		if !sameProjectReaderAccess(oldAccess, newAccess) ||
+			old.OrgUserPassword[key] != new.OrgUserPassword[key] ||
+			old.OrgUserDisabled[key] != new.OrgUserDisabled[key] ||
+			!sameProjectReaderTeam(old, new, key.OrgID, oldAccess.TeamID, newAccess.TeamID) {
+			changed[key] = struct{}{}
+		}
+	}
+	return changed
+}
+
+func sameProjectReaderAccess(a, b configstore.OrgUserAccessConfig) bool {
+	if a.Mode != b.Mode || (a.TeamID == nil) != (b.TeamID == nil) {
+		return false
+	}
+	return a.TeamID == nil || *a.TeamID == *b.TeamID
+}
+
+func sameProjectReaderTeam(old, new *configstore.Snapshot, orgID string, oldTeamID, newTeamID *int64) bool {
+	if oldTeamID == nil || newTeamID == nil || *oldTeamID != *newTeamID {
+		return oldTeamID == nil && newTeamID == nil
+	}
+	oldTeam, oldFound := projectReaderTeam(old, orgID, *oldTeamID)
+	newTeam, newFound := projectReaderTeam(new, orgID, *newTeamID)
+	return oldFound == newFound && (!oldFound || sameOrgTeam(oldTeam, newTeam))
+}
+
+func sameOrgTeam(a, b configstore.OrgTeamConfig) bool {
+	return a.TeamID == b.TeamID &&
+		a.SchemaName == b.SchemaName &&
+		a.Enabled == b.Enabled &&
+		a.IsBillingTeam == b.IsBillingTeam &&
+		sameOptionalString(a.EventsTableName, b.EventsTableName) &&
+		sameOptionalString(a.PersonsTableName, b.PersonsTableName) &&
+		sameOptionalString(a.SchemaDataImportsName, b.SchemaDataImportsName)
+}
+
+func sameOptionalString(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func projectReaderTeam(snapshot *configstore.Snapshot, orgID string, teamID int64) (configstore.OrgTeamConfig, bool) {
+	org := snapshot.Orgs[orgID]
+	if org == nil {
+		return configstore.OrgTeamConfig{}, false
+	}
+	for _, team := range org.Teams {
+		if team.TeamID == teamID {
+			return team, true
+		}
+	}
+	return configstore.OrgTeamConfig{}, false
 }
 
 func workerImageForOrg(tc *configstore.OrgConfig, fallback string) string {

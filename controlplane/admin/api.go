@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -125,6 +126,7 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	r.GET("/teams", h.listAllOrgTeams)
 	r.POST("/teams", h.createOrgTeam)
 	r.PUT("/orgs/:id/teams/:team_id", h.updateOrgTeam)
+	r.PUT("/orgs/:id/teams/:team_id/project-reader", h.upsertProjectReader)
 
 	// Users CRUD
 	r.GET("/users", h.listUsers)
@@ -180,6 +182,7 @@ type apiStore interface {
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
 	UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
+	UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
@@ -593,6 +596,65 @@ func (s *gormAPIStore) DeleteUser(orgID, username string) (bool, error) {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+func (s *gormAPIStore) UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error) {
+	var stored configstore.OrgUser
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		var team configstore.OrgTeam
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&team, "org_id = ? AND team_id = ? AND enabled IS TRUE", orgID, teamID,
+		).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return configstore.ErrProjectReaderTeamUnavailable
+			}
+			return err
+		}
+		passwordHash := ""
+		var existing configstore.OrgUser
+		existingResult := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&existing, "org_id = ? AND username = ?", orgID, username,
+		)
+		if existingResult.Error == nil && bcrypt.CompareHashAndPassword([]byte(existing.Password), []byte(password)) == nil {
+			passwordHash = existing.Password
+		} else if existingResult.Error != nil && !errors.Is(existingResult.Error, gorm.ErrRecordNotFound) {
+			return existingResult.Error
+		} else {
+			var err error
+			passwordHash, err = configstore.HashPassword(password)
+			if err != nil {
+				return err
+			}
+		}
+		boundTeamID := teamID
+		user := configstore.OrgUser{
+			OrgID:       orgID,
+			Username:    username,
+			Password:    passwordHash,
+			Passthrough: false,
+			AccessMode:  configstore.OrgUserAccessModeProjectReader,
+			TeamID:      &boundTeamID,
+			Disabled:    false,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "org_id"}, {Name: "username"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"password":    passwordHash,
+				"passthrough": false,
+				"access_mode": configstore.OrgUserAccessModeProjectReader,
+				"team_id":     teamID,
+				"disabled":    false,
+				"updated_at":  time.Now().UTC(),
+			}),
+		}).Create(&user).Error; err != nil {
+			return err
+		}
+		return tx.First(&stored, "org_id = ? AND username = ?", orgID, username).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &stored, nil
 }
 
 func (s *gormAPIStore) ReloadSnapshot() error {
@@ -1645,6 +1707,21 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
 		return
 	}
+	if raw.Passthrough != nil && *raw.Passthrough {
+		user, err := h.store.GetUser(orgID, username)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if user.AccessMode == configstore.OrgUserAccessModeProjectReader {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "project readers cannot enable passthrough"})
+			return
+		}
+	}
 	// Audit detail: which fields the update touched. The password is NEVER
 	// logged — only that it was reset.
 	var changes []string
@@ -1694,6 +1771,59 @@ func (h *apiHandler) deleteUser(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": username})
+}
+
+// upsertProjectReader creates or rotates the single read-only credential for
+// one PostHog project. The plaintext password is returned only in this
+// response; the config store persists only its bcrypt hash.
+func (h *apiHandler) upsertProjectReader(c *gin.Context) {
+	orgID := c.Param("id")
+	teamID, err := strconv.ParseInt(c.Param("team_id"), 10, 64)
+	if err != nil || teamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
+		return
+	}
+	var request struct {
+		Password string `json:"password"`
+	}
+	if c.Request.ContentLength > 0 {
+		decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	password := request.Password
+	if password == "" {
+		password, err = configstore.GeneratePassword()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate password"})
+			return
+		}
+	} else if len(password) < 32 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password must be at least 32 characters"})
+		return
+	}
+	username := fmt.Sprintf("posthog_team_%d", teamID)
+	user, err := h.store.UpsertProjectReader(orgID, teamID, username, password)
+	if err != nil {
+		if errors.Is(err, configstore.ErrProjectReaderTeamUnavailable) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	setAuditDetail(c, fmt.Sprintf("created or rotated project reader for team %d", teamID))
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"username": user.Username,
+		"password": password,
+	})
 }
 
 // notifyPeersOfChange reloads THIS replica's config snapshot immediately

@@ -747,10 +747,25 @@ func (s *Server) unregisterConn(pid int32) {
 // waiting for client input are woken immediately; executing queries are not
 // cancelled and close after their next ReadyForQuery.
 func (s *Server) DrainOrgConnections(orgID string) int {
+	return s.drainConnections(func(c *clientConn) bool {
+		return c.orgID == orgID
+	})
+}
+
+// DrainUserConnections requests a clean close of every PostgreSQL connection
+// for one org user. It is used when a project reader's credentials or access
+// policy changes so an established connection cannot retain stale access.
+func (s *Server) DrainUserConnections(orgID, username string) int {
+	return s.drainConnections(func(c *clientConn) bool {
+		return c.orgID == orgID && c.username == username
+	})
+}
+
+func (s *Server) drainConnections(matches func(*clientConn) bool) int {
 	s.connsMu.RLock()
 	conns := make([]*clientConn, 0)
 	for _, c := range s.conns {
-		if c != nil && c.orgID == orgID {
+		if c != nil && matches(c) {
 			conns = append(conns, c)
 		}
 	}

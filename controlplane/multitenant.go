@@ -86,6 +86,10 @@ func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }
 
+func (a *orgRouterAdapter) SetProjectReaderChangeHandler(handler func(orgID, username string)) {
+	a.router.setProjectReaderChangeHandler(handler)
+}
+
 func (a *orgRouterAdapter) ReleaseIdleHotWorkers() int {
 	return a.router.ReleaseIdleHotWorkers()
 }

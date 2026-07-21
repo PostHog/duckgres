@@ -14,10 +14,18 @@ package sessionmeta
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/posthog/duckgres/server/sqlcore"
 )
+
+// MetadataAccessPolicy limits session-local catalog views to one project's
+// schemas and legacy exact relations. A nil policy keeps unrestricted metadata.
+type MetadataAccessPolicy struct {
+	AllowedSchemas   []string
+	AllowedRelations []string
+}
 
 // InitSessionDatabaseMetadata installs session-local overrides for metadata
 // surfaces (current_database, pg_database, information_schema views) so they
@@ -25,6 +33,12 @@ import (
 // caller resolves `catalog` to "ducklake" (the name the catalog is actually
 // attached as); there is no logical→physical masking.
 func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) error {
+	return InitSessionDatabaseMetadataWithAccess(ctx, executor, catalog, nil)
+}
+
+// InitSessionDatabaseMetadataWithAccess installs metadata views filtered to
+// the relations the current principal can query.
+func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore.QueryExecutor, catalog string, access *MetadataAccessPolicy) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
 	}
@@ -60,7 +74,7 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 		}
 	}()
 
-	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog)); err != nil {
+	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(catalog, access)); err != nil {
 		return fmt.Errorf("apply session metadata override: %w", err)
 	}
 
@@ -129,22 +143,88 @@ func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, cat
 // All statements are independent: each is CREATE OR REPLACE VIEW or
 // CREATE TABLE IF NOT EXISTS, with no cross-statement dependencies that would
 // require ordering beyond the order they appear in the script.
-func buildSessionMetadataSQL(database string) string {
+func buildSessionMetadataSQL(database string, accessPolicies ...*MetadataAccessPolicy) string {
+	var access *MetadataAccessPolicy
+	if len(accessPolicies) > 0 {
+		access = accessPolicies[0]
+	}
 	parts := []string{
 		sessionColumnMetadataTableSQL(),
 		buildSessionPgDatabaseViewSQL(database),
-		buildSessionPgClassViewSQL(),
-		buildSessionPgNamespaceViewSQL(),
+		buildSessionPgClassViewSQL(access),
+		buildSessionPgNamespaceViewSQL(access),
 		buildSessionPgAttributeViewSQL(),
-		buildSessionPgTablesViewSQL(),
-		buildSessionPgViewsViewSQL(),
-		buildSessionPgSequencesViewSQL(),
-		buildSessionInformationSchemaColumnsViewSQL(),
-		buildSessionInformationSchemaTablesViewSQL(),
-		buildSessionInformationSchemaSchemataViewSQL(),
-		buildSessionInformationSchemaViewsViewSQL(),
+		buildSessionPgIndexViewSQL(),
+		buildSessionPgTablesViewSQL(access),
+		buildSessionPgViewsViewSQL(access),
+		buildSessionPgSequencesViewSQL(access),
+		buildSessionInformationSchemaColumnsViewSQL(access),
+		buildSessionInformationSchemaTablesViewSQL(access),
+		buildSessionInformationSchemaSchemataViewSQL(access),
+		buildSessionInformationSchemaViewsViewSQL(access),
+		buildSessionInformationSchemaSequencesViewSQL(access),
 	}
 	return strings.Join(parts, ";\n") + ";"
+}
+
+func (p *MetadataAccessPolicy) relationPredicate(schemaExpression, relationExpression string) string {
+	if p == nil {
+		return "TRUE"
+	}
+	schemas := normalizedSQLValues(p.AllowedSchemas)
+	relations := normalizedSQLValues(p.AllowedRelations)
+	parts := make([]string, 0, 2)
+	if len(schemas) > 0 {
+		parts = append(parts, fmt.Sprintf("lower(%s) IN (%s)", schemaExpression, quotedSQLValues(schemas)))
+	}
+	if len(relations) > 0 {
+		parts = append(parts, fmt.Sprintf("lower(%s || '.' || %s) IN (%s)", schemaExpression, relationExpression, quotedSQLValues(relations)))
+	}
+	if len(parts) == 0 {
+		return "FALSE"
+	}
+	return "(" + strings.Join(parts, " OR ") + ")"
+}
+
+func (p *MetadataAccessPolicy) schemaPredicate(schemaExpression string) string {
+	if p == nil {
+		return "TRUE"
+	}
+	values := append([]string(nil), p.AllowedSchemas...)
+	for _, relation := range p.AllowedRelations {
+		if schema, _, ok := strings.Cut(relation, "."); ok {
+			values = append(values, schema)
+		}
+	}
+	values = normalizedSQLValues(values)
+	if len(values) == 0 {
+		return "FALSE"
+	}
+	return fmt.Sprintf("lower(%s) IN (%s)", schemaExpression, quotedSQLValues(values))
+}
+
+func normalizedSQLValues(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for value := range seen {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func quotedSQLValues(values []string) string {
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, quoteSQLStringLiteral(value))
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func sessionColumnMetadataTableSQL() string {
@@ -237,7 +317,7 @@ func internalCompatRelationNamesSQL() string {
 	`
 }
 
-func buildSessionPgClassViewSQL() string {
+func buildSessionPgClassViewSQL(access *MetadataAccessPolicy) string {
 	internalNames := internalCompatRelationNamesSQL()
 	return fmt.Sprintf(`
 		CREATE OR REPLACE VIEW main.pg_class_full AS
@@ -285,6 +365,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_tables()
 			WHERE table_name NOT IN (%s)
+				AND %s
 			UNION ALL
 			SELECT
 				view_oid AS oid,
@@ -326,6 +407,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_views()
 			WHERE view_name NOT IN (%s)
+				AND %s
 			UNION ALL
 			SELECT
 				sequence_oid AS oid,
@@ -367,6 +449,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_sequences()
 			WHERE sequence_name NOT IN (%s)
+				AND %s
 			UNION ALL
 			SELECT
 				index_oid AS oid,
@@ -408,6 +491,7 @@ func buildSessionPgClassViewSQL() string {
 				database_name
 			FROM duckdb_indexes()
 			WHERE index_name NOT IN (%s)
+				AND %s
 		)
 		SELECT
 			oid, relname, relnamespace, reltype, reloftype, relowner, relam,
@@ -421,11 +505,16 @@ func buildSessionPgClassViewSQL() string {
 		FROM relations r
 		CROSS JOIN active_catalog ac
 		WHERE r.database_name = ac.catalog
-	`, internalNames, internalNames, internalNames, internalNames)
+	`,
+		internalNames, access.relationPredicate("schema_name", "table_name"),
+		internalNames, access.relationPredicate("schema_name", "view_name"),
+		internalNames, access.relationPredicate("schema_name", "sequence_name"),
+		internalNames, access.relationPredicate("schema_name", "table_name"),
+	)
 }
 
-func buildSessionPgNamespaceViewSQL() string {
-	return `
+func buildSessionPgNamespaceViewSQL(access *MetadataAccessPolicy) string {
+	sql := `
 		CREATE OR REPLACE VIEW main.pg_namespace AS
 		WITH active_catalog AS (
 			SELECT current_database() AS catalog
@@ -448,6 +537,7 @@ func buildSessionPgNamespaceViewSQL() string {
 		CROSS JOIN active_catalog ac
 		WHERE n.database_name = ac.catalog
 			AND n.schema_name NOT LIKE '__ducklake_metadata_%'
+			AND {{ACCESS}}
 		UNION ALL
 		SELECT 11::BIGINT AS oid, 'pg_catalog' AS nspname, 10::BIGINT AS nspowner, NULL AS nspacl
 		UNION ALL
@@ -455,6 +545,7 @@ func buildSessionPgNamespaceViewSQL() string {
 		UNION ALL
 		SELECT 99::BIGINT AS oid, 'pg_toast' AS nspname, 10::BIGINT AS nspowner, NULL AS nspacl
 	`
+	return strings.Replace(sql, "{{ACCESS}}", access.schemaPredicate("n.schema_name"), 1)
 }
 
 func pgTypeOIDCaseSQL(dataTypeExpr, fallbackExpr string) string {
@@ -547,6 +638,15 @@ func buildSessionPgAttributeViewSQL() string {
 	`, nativeTypeOID)
 }
 
+func buildSessionPgIndexViewSQL() string {
+	return `
+		CREATE OR REPLACE VIEW main.pg_index AS
+		SELECT i.*
+		FROM pg_catalog.pg_index i
+		JOIN main.pg_class_full c ON c.oid = i.indrelid
+	`
+}
+
 // buildSessionPgTablesViewSQL builds the catalog-scoped pg_catalog.pg_tables
 // compat view. DuckDB's native pg_tables spans EVERY attached catalog and
 // ignores current_database(), so on a multi-catalog worker a bare pg_tables
@@ -555,7 +655,7 @@ func buildSessionPgAttributeViewSQL() string {
 // own catalog's tables. Column shape mirrors DuckDB's
 // native pg_tables (schemaname, tablename, tableowner, tablespace, hasindexes,
 // hasrules, hastriggers) so clients see no change beyond the scoping.
-func buildSessionPgTablesViewSQL() string {
+func buildSessionPgTablesViewSQL(access *MetadataAccessPolicy) string {
 	internalNames := internalCompatRelationNamesSQL()
 	return fmt.Sprintf(`
 		CREATE OR REPLACE VIEW main.pg_tables AS
@@ -575,7 +675,8 @@ func buildSessionPgTablesViewSQL() string {
 		WHERE t.database_name = ac.catalog
 			AND t.schema_name NOT LIKE '__ducklake_metadata_%%'
 			AND t.table_name NOT IN (%s)
-	`, internalNames)
+			AND %s
+	`, internalNames, access.relationPredicate("t.schema_name", "t.table_name"))
 }
 
 // buildSessionPgViewsViewSQL builds the catalog-scoped pg_catalog.pg_views
@@ -583,7 +684,7 @@ func buildSessionPgTablesViewSQL() string {
 // Sources duckdb_views() filtered to current_database(); the compat views
 // themselves live in memory.main and are excluded by name so a memory-catalog
 // session does not surface them as user views.
-func buildSessionPgViewsViewSQL() string {
+func buildSessionPgViewsViewSQL(access *MetadataAccessPolicy) string {
 	internalNames := internalCompatRelationNamesSQL()
 	return fmt.Sprintf(`
 		CREATE OR REPLACE VIEW main.pg_views AS
@@ -600,7 +701,8 @@ func buildSessionPgViewsViewSQL() string {
 		WHERE v.database_name = ac.catalog
 			AND v.schema_name NOT LIKE '__ducklake_metadata_%%'
 			AND v.view_name NOT IN (%s)
-	`, internalNames)
+			AND %s
+	`, internalNames, access.relationPredicate("v.schema_name", "v.view_name"))
 }
 
 // buildSessionPgSequencesViewSQL builds the catalog-scoped pg_catalog.pg_sequences
@@ -610,8 +712,8 @@ func buildSessionPgViewsViewSQL() string {
 // before scoping) so the only behavior change is the catalog filter: data_type
 // and cache_size are INTEGER (DuckDB does not expose real values, so NULL), and
 // the value columns are BIGINT.
-func buildSessionPgSequencesViewSQL() string {
-	return `
+func buildSessionPgSequencesViewSQL(access *MetadataAccessPolicy) string {
+	sql := `
 		CREATE OR REPLACE VIEW main.pg_sequences AS
 		WITH active_catalog AS (
 			SELECT current_database() AS catalog
@@ -632,11 +734,13 @@ func buildSessionPgSequencesViewSQL() string {
 		CROSS JOIN active_catalog ac
 		WHERE s.database_name = ac.catalog
 			AND s.schema_name NOT LIKE '__ducklake_metadata_%'
+			AND {{ACCESS}}
 	`
+	return strings.Replace(sql, "{{ACCESS}}", access.relationPredicate("s.schema_name", "s.sequence_name"), 1)
 }
 
-func buildSessionInformationSchemaColumnsViewSQL() string {
-	return `
+func buildSessionInformationSchemaColumnsViewSQL(access *MetadataAccessPolicy) string {
+	sql := `
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 		WITH all_columns AS (
 			SELECT
@@ -668,8 +772,9 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			SELECT c.*
 			FROM all_columns c
 			CROSS JOIN active_catalog ac
-			WHERE c.source_catalog = ac.catalog
-			OR c.source_catalog IN ('ducklake', 'memory')
+			WHERE (c.source_catalog = ac.catalog
+				OR c.source_catalog IN ('ducklake', 'memory'))
+				AND {{ACCESS}}
 		),
 		active_search_path AS (
 			SELECT
@@ -797,10 +902,11 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 		FROM ranked_columns c
 		WHERE c.search_path_rank = 1
 	`
+	return strings.Replace(sql, "{{ACCESS}}", access.relationPredicate("c.table_schema", "c.table_name"), 1)
 }
 
-func buildSessionInformationSchemaTablesViewSQL() string {
-	return `
+func buildSessionInformationSchemaTablesViewSQL(access *MetadataAccessPolicy) string {
+	sql := `
 		CREATE OR REPLACE VIEW main.information_schema_tables_compat AS
 		SELECT
 			CASE WHEN t.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE t.table_catalog END AS table_catalog,
@@ -835,11 +941,13 @@ func buildSessionInformationSchemaTablesViewSQL() string {
 		AND t.table_name NOT LIKE 'duckdb_%'
 		AND t.table_name NOT LIKE 'sqlite_%'
 		AND t.table_name NOT LIKE 'pragma_%'
+		AND {{ACCESS}}
 	`
+	return strings.Replace(sql, "{{ACCESS}}", access.relationPredicate("t.table_schema", "t.table_name"), 1)
 }
 
-func buildSessionInformationSchemaSchemataViewSQL() string {
-	return `
+func buildSessionInformationSchemaSchemataViewSQL(access *MetadataAccessPolicy) string {
+	sql := `
 		CREATE OR REPLACE VIEW main.information_schema_schemata_compat AS
 		SELECT
 			CASE WHEN s.catalog_name IN ('ducklake', 'memory') THEN current_database() ELSE s.catalog_name END AS catalog_name,
@@ -856,6 +964,7 @@ func buildSessionInformationSchemaSchemataViewSQL() string {
 			s.catalog_name = current_database()
 			OR s.catalog_name IN ('ducklake', 'memory')
 		)
+		AND {{ACCESS}}
 		UNION ALL
 		SELECT current_database() AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
@@ -869,10 +978,11 @@ func buildSessionInformationSchemaSchemataViewSQL() string {
 		SELECT current_database() AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 	`
+	return strings.Replace(sql, "{{ACCESS}}", access.schemaPredicate("s.schema_name"), 1)
 }
 
-func buildSessionInformationSchemaViewsViewSQL() string {
-	return `
+func buildSessionInformationSchemaViewsViewSQL(access *MetadataAccessPolicy) string {
+	sql := `
 		CREATE OR REPLACE VIEW main.information_schema_views_compat AS
 		SELECT
 			CASE WHEN v.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE v.table_catalog END AS table_catalog,
@@ -904,7 +1014,32 @@ func buildSessionInformationSchemaViewsViewSQL() string {
 		AND v.table_name NOT LIKE 'duckdb_%'
 		AND v.table_name NOT LIKE 'sqlite_%'
 		AND v.table_name NOT LIKE 'pragma_%'
+		AND {{ACCESS}}
 	`
+	return strings.Replace(sql, "{{ACCESS}}", access.relationPredicate("v.table_schema", "v.table_name"), 1)
+}
+
+func buildSessionInformationSchemaSequencesViewSQL(access *MetadataAccessPolicy) string {
+	sql := `
+		CREATE OR REPLACE VIEW main.information_schema_sequences_compat AS
+		SELECT
+			CASE WHEN s.database_name IN ('ducklake', 'memory') THEN current_database() ELSE s.database_name END AS sequence_catalog,
+			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS sequence_schema,
+			s.sequence_name,
+			'bigint' AS data_type,
+			64 AS numeric_precision,
+			2 AS numeric_precision_radix,
+			0 AS numeric_scale,
+			CAST(s.start_value AS VARCHAR) AS start_value,
+			CAST(s.min_value AS VARCHAR) AS minimum_value,
+			CAST(s.max_value AS VARCHAR) AS maximum_value,
+			CAST(s.increment_by AS VARCHAR) AS increment,
+			CASE WHEN s.cycle THEN 'YES' ELSE 'NO' END AS cycle_option
+		FROM duckdb_sequences() s
+		WHERE s.database_name = current_database()
+			AND {{ACCESS}}
+	`
+	return strings.Replace(sql, "{{ACCESS}}", access.relationPredicate("s.schema_name", "s.sequence_name"), 1)
 }
 
 func quoteSQLStringLiteral(value string) string {
