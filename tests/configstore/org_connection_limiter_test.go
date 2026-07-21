@@ -29,6 +29,30 @@ func upsertActiveCP(t *testing.T, store *cpconfigstore.ConfigStore, id string) {
 	}
 }
 
+func assertOrgConnectionRequestPending(t *testing.T, store *cpconfigstore.ConfigStore, requestID string) {
+	t.Helper()
+
+	var leaseCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_leases").
+		Where("request_id = ?", requestID).
+		Count(&leaseCount).Error; err != nil {
+		t.Fatalf("count leases for request %q: %v", requestID, err)
+	}
+	if leaseCount != 0 {
+		t.Fatalf("expected request %q to have no lease, got %d", requestID, leaseCount)
+	}
+
+	var pendingCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_queue").
+		Where("request_id = ? AND granted_at IS NULL", requestID).
+		Count(&pendingCount).Error; err != nil {
+		t.Fatalf("count pending queue rows for request %q: %v", requestID, err)
+	}
+	if pendingCount != 1 {
+		t.Fatalf("expected request %q to remain pending, got %d pending rows", requestID, pendingCount)
+	}
+}
+
 func TestOrgConnectionLeasesEnforceOrgVCPUBudget(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
@@ -300,7 +324,7 @@ func TestOrgConnectionLeasesQueueUsesEachUsersOwnLimit(t *testing.T) {
 	}
 }
 
-func TestOrgConnectionLeasesOutOfOrderPollGrantsOldestEligibleUserHead(t *testing.T) {
+func TestOrgConnectionLeasesOutOfOrderPollDoesNotGrantForeignRequest(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
 	upsertActiveCP(t, store, "cp-b")
@@ -340,22 +364,37 @@ func TestOrgConnectionLeasesOutOfOrderPollGrantsOldestEligibleUserHead(t *testin
 		t.Fatalf("out-of-order acquire: %v", err)
 	}
 	if outOfOrder != nil {
-		t.Fatalf("expected bob to keep waiting while alice is granted first, got lease %q", outOfOrder.LeaseID)
+		t.Fatalf("expected bob to keep waiting behind alice, got lease %q", outOfOrder.LeaseID)
 	}
+	count, err := store.ActiveOrgConnectionLeaseCount(alice.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after bob poll: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected bob's poll not to reserve capacity for alice, got %d active leases", count)
+	}
+	assertOrgConnectionRequestPending(t, store, alice.RequestID)
 
 	aliceLease, err := store.TryAcquireOrgConnectionLease(alice.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
 	if err != nil {
-		t.Fatalf("acquire alice after scheduler grant: %v", err)
+		t.Fatalf("acquire alice: %v", err)
 	}
 	if aliceLease == nil || aliceLease.RequestID != alice.RequestID {
-		t.Fatalf("expected alice lease to have been granted by bob's poll, got %#v", aliceLease)
+		t.Fatalf("expected alice to grant only her own request, got %#v", aliceLease)
+	}
+
+	bobLease, err := store.TryAcquireOrgConnectionLease(bob.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
+	if err != nil {
+		t.Fatalf("acquire bob: %v", err)
+	}
+	if bobLease == nil || bobLease.RequestID != bob.RequestID {
+		t.Fatalf("expected bob to grant only his own request, got %#v", bobLease)
 	}
 }
 
-func TestCancelOrgConnectionRequestReleasesForeignGrantedLease(t *testing.T) {
+func TestCancelOrgConnectionRequestReleasesUnclaimedOwnLease(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
-	upsertActiveCP(t, store, "cp-b")
 
 	now := time.Now()
 	alice := &cpconfigstore.OrgConnectionQueueEntry{
@@ -369,36 +408,23 @@ func TestCancelOrgConnectionRequestReleasesForeignGrantedLease(t *testing.T) {
 		EnqueuedAt:     now,
 		ExpiresAt:      now.Add(time.Minute),
 	}
-	bob := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:      "request-bob",
-		OrgID:          "org-1",
-		Username:       "bob",
-		CPInstanceID:   "cp-b",
-		PID:            1002,
-		Protocol:       "postgres",
-		RequestedVCPUs: 1,
-		EnqueuedAt:     now.Add(time.Millisecond),
-		ExpiresAt:      now.Add(time.Minute),
-	}
-	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{alice, bob} {
-		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
-			t.Fatalf("enqueue %s: %v", entry.RequestID, err)
-		}
+	if err := store.EnqueueOrgConnectionRequest(alice); err != nil {
+		t.Fatalf("enqueue alice: %v", err)
 	}
 
-	outOfOrder, err := store.TryAcquireOrgConnectionLease(bob.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+	lease, err := store.TryAcquireOrgConnectionLease(alice.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
-		t.Fatalf("out-of-order acquire: %v", err)
+		t.Fatalf("acquire alice: %v", err)
 	}
-	if outOfOrder != nil {
-		t.Fatalf("expected bob to keep waiting while alice is granted first, got lease %q", outOfOrder.LeaseID)
+	if lease == nil || lease.RequestID != alice.RequestID {
+		t.Fatalf("expected alice lease, got %#v", lease)
 	}
 	count, err := store.ActiveOrgConnectionLeaseCount(alice.OrgID)
 	if err != nil {
 		t.Fatalf("count active leases before cancel: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("expected alice foreign-granted lease to reserve capacity, got %d active leases", count)
+		t.Fatalf("expected alice lease to reserve capacity, got %d active leases", count)
 	}
 
 	if err := store.CancelOrgConnectionRequest(alice.RequestID, now.Add(time.Second)); err != nil {
@@ -409,7 +435,7 @@ func TestCancelOrgConnectionRequestReleasesForeignGrantedLease(t *testing.T) {
 		t.Fatalf("count active leases after cancel: %v", err)
 	}
 	if count != 0 {
-		t.Fatalf("expected cancel to release unclaimed foreign-granted lease, got %d active leases", count)
+		t.Fatalf("expected cancel to release unclaimed own lease, got %d active leases", count)
 	}
 }
 
@@ -494,6 +520,14 @@ func TestOrgConnectionLeasesUserCapSkipDoesNotBypassSameUserFIFO(t *testing.T) {
 	}
 	if aliceSmallLease != nil {
 		t.Fatalf("expected alice small request to wait behind alice big FIFO head, got lease %q", aliceSmallLease.LeaseID)
+	}
+	assertOrgConnectionRequestPending(t, store, bob.RequestID)
+	count, err := store.ActiveOrgConnectionLeaseCount(activeAlice.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after alice small poll: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected alice small poll not to grant bob, got %d active leases", count)
 	}
 
 	bobLease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(bob.RequestID, limitLookup, now)
@@ -674,6 +708,14 @@ func TestOrgConnectionLeasesReordersUserQueueAfterHeadGranted(t *testing.T) {
 	}
 	if aliceSecondLease != nil {
 		t.Fatalf("expected alice second to wait behind bob after alice first is granted, got lease %q", aliceSecondLease.LeaseID)
+	}
+	assertOrgConnectionRequestPending(t, store, bob.RequestID)
+	count, err := store.ActiveOrgConnectionLeaseCount(aliceFirst.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after alice second poll: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected alice second poll not to grant bob, got %d active leases", count)
 	}
 
 	bobLease, err := store.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
@@ -926,6 +968,14 @@ func TestOrgConnectionLeasesPreserveFIFOAcrossControlPlanes(t *testing.T) {
 	if outOfOrder != nil {
 		t.Fatalf("expected FIFO to block request-b while request-a is pending, got lease %q", outOfOrder.LeaseID)
 	}
+	assertOrgConnectionRequestPending(t, store, "request-a")
+	count, err := store.ActiveOrgConnectionLeaseCount("org-1")
+	if err != nil {
+		t.Fatalf("count active leases after request-b poll: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected request-b poll not to grant request-a, got %d active leases", count)
+	}
 
 	first, err := store.TryAcquireOrgConnectionLease("request-a", cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
@@ -977,6 +1027,14 @@ func TestOrgConnectionQueueUsesDatabaseInsertionTimeForFIFO(t *testing.T) {
 	}
 	if outOfOrder != nil {
 		t.Fatalf("expected database insertion order to block request-second-inserted, got lease %q", outOfOrder.LeaseID)
+	}
+	assertOrgConnectionRequestPending(t, store, first.RequestID)
+	count, err := store.ActiveOrgConnectionLeaseCount(first.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after second request poll: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected second request poll not to grant first request, got %d active leases", count)
 	}
 
 	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)

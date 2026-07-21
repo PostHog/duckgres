@@ -178,20 +178,24 @@ func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, limitL
 			return nil
 		}
 
-		created, grantStats, grantOutcome, err := cs.grantNextEligibleOrgConnectionRequestLocked(tx, tables, orgID, limitLookup, now)
-		stats = grantStats
+		next, selectionStats, selectionOutcome, err := cs.nextEligibleOrgConnectionRequestLocked(tx, tables, orgID, limitLookup, now)
+		stats = selectionStats
 		if err != nil {
 			return err
 		}
-		if created != nil && created.RequestID == requestID {
-			lease = created
-			outcome = orgConnectionAdmissionOutcomeGranted
+		if next == nil {
+			outcome = selectionOutcome
 			return nil
 		}
-		outcome = grantOutcome
-		if created != nil {
-			outcome = orgConnectionAdmissionOutcomeGrantedOther
+		if next.RequestID != requestID {
+			outcome = orgConnectionAdmissionOutcomeWaiting
+			return nil
 		}
+		lease, err = cs.createOrgConnectionLease(tx, request, now)
+		if err != nil {
+			return err
+		}
+		outcome = orgConnectionAdmissionOutcomeGranted
 		return nil
 	})
 	return lease, retryWithFreshOrg, stats, outcome, err
@@ -262,7 +266,7 @@ func (cs *ConfigStore) existingOrgConnectionLease(tx *gorm.DB, leaseTable, reque
 	return &existing, true, nil
 }
 
-func (cs *ConfigStore) grantNextEligibleOrgConnectionRequestLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, orgID string, limitLookup func(string) OrgResourceLimits, now time.Time) (*OrgConnectionLease, orgConnectionAdmissionStats, string, error) {
+func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, orgID string, limitLookup func(string) OrgResourceLimits, now time.Time) (*OrgConnectionQueueEntry, orgConnectionAdmissionStats, string, error) {
 	heads, stats, err := cs.pendingOrgConnectionUserQueueHeads(tx, tables.queue, orgID, now)
 	if err != nil {
 		return nil, stats, orgConnectionAdmissionOutcomeError, err
@@ -291,18 +295,7 @@ func (cs *ConfigStore) grantNextEligibleOrgConnectionRequestLocked(tx *gorm.DB, 
 			return nil, stats, orgConnectionAdmissionOutcomeBlockedOrgVCPU, nil
 		}
 
-		request, found, err := cs.lockOrgConnectionRequest(tx, tables.queue, head.RequestID)
-		if err != nil {
-			return nil, stats, orgConnectionAdmissionOutcomeError, err
-		}
-		if !found || request.OrgID != orgID || request.GrantedAt != nil || !request.ExpiresAt.After(now) {
-			continue
-		}
-		created, err := cs.createOrgConnectionLease(tx, request, now)
-		if err != nil {
-			return nil, stats, orgConnectionAdmissionOutcomeError, err
-		}
-		return created, stats, orgConnectionAdmissionOutcomeGranted, nil
+		return head, stats, orgConnectionAdmissionOutcomeGranted, nil
 	}
 
 	if stats.userLimitSkips > 0 {
@@ -418,7 +411,7 @@ func (cs *ConfigStore) ReleaseOrgConnectionLease(leaseID string) error {
 }
 
 // CancelOrgConnectionRequest removes a request whose owner gave up before
-// Acquire returned. If another request's poll already granted this request, the
+// Acquire returned. If acquisition committed but its response was lost, the
 // owner still has no lease handle, so cancellation must also reclaim that
 // unclaimed lease.
 func (cs *ConfigStore) CancelOrgConnectionRequest(requestID string, _ time.Time) error {
