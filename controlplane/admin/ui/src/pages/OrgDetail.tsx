@@ -39,6 +39,7 @@ import {
   CreateTeamDialog,
   DeleteTeamDialog,
   EditTeamDialog,
+  LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { ManagedWarehouse, OrgTeam, OrgUpdate } from "@/types/api";
@@ -724,7 +725,12 @@ function OrgTeamsCard({ orgId }: { orgId: string }) {
               {rows.map((t) => (
                 <TableRow key={t.team_id} className="[&>td]:py-1.5">
                   <TableCell className="font-mono text-xs font-medium tabular-nums">{t.team_id}</TableCell>
-                  <TableCell className="font-mono text-xs">{t.schema_name}</TableCell>
+                  <TableCell>
+                    <span className="flex items-center gap-1.5">
+                      <span className="font-mono text-xs">{t.schema_name}</span>
+                      <LegacyNamesBadge team={t} />
+                    </span>
+                  </TableCell>
                   <TableCell>
                     {t.enabled ? (
                       <Badge variant="secondary">enabled</Badge>

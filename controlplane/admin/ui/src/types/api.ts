@@ -107,14 +107,22 @@ export interface OrgTeamCreateBody {
   backfill_enabled?: boolean;
 }
 
-// PUT /api/v1/orgs/:id/teams/:team_id — enabled / backfill / billing repoint
-// only (never schema_name). is_billing_team may only be true: billing is
-// repointed by marking another team, never cleared. An explicit
-// `backfill_enabled: null` clears the tri-state back to unset.
+// PUT /api/v1/orgs/:id/teams/:team_id — the operator break-glass: every team
+// setting is editable. All fields are presence-aware (omit = preserve).
+// schema_name may be changed (409 when another team in the org holds it) but
+// never cleared; changing it does NOT move any warehouse data. An explicit
+// `backfill_enabled: null` clears the tri-state back to unset; an explicit
+// null (or "") on a legacy table-name field clears it back to NULL ("derive
+// from schema_name"). is_billing_team may only be true: billing is repointed
+// by marking another team, never cleared.
 export interface OrgTeamUpdateBody {
+  schema_name?: string;
   enabled?: boolean;
   backfill_enabled?: boolean | null;
   is_billing_team?: true;
+  events_table_name?: string | null;
+  persons_table_name?: string | null;
+  schema_data_imports_name?: string | null;
 }
 
 // DELETE /api/v1/orgs/:id/teams/:team_id response. new_billing_team_id is set

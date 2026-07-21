@@ -1,8 +1,11 @@
 // Create / edit / delete dialogs for org teams (duckgres_org_teams rows),
 // shared by the Org teams page and the org detail page. The dialogs encode the
-// surface rules: schema_name is set once at create time and immutable
-// afterwards; billing is repointed (never cleared) and carries the org's
-// buffered usage with it; the org's last team cannot be deleted.
+// surface rules: billing is repointed (never cleared) and carries the org's
+// buffered usage with it; the org's last team cannot be deleted. The edit
+// dialog is the operator break-glass — it can change EVERY setting, including
+// the schema name (a config-only rename that moves no warehouse data) and the
+// legacy table-name overrides; schema immutability remains a user-facing-flow
+// rule, not an admin one.
 import { useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -39,6 +42,23 @@ function backfillChoice(v: boolean | null | undefined): BackfillChoice {
 export function BackfillBadge({ value }: { value: boolean | null | undefined }) {
   if (value == null) return <span className="text-muted-foreground">—</span>;
   return value ? <Badge variant="success">on</Badge> : <Badge variant="muted">off</Badge>;
+}
+
+// LegacyNamesBadge: compact indicator that a row carries explicit legacy
+// table-name overrides (grandfathered pre-existing teams). The actual names
+// live in the hover tooltip so the tables stay narrow.
+export function LegacyNamesBadge({ team }: { team: OrgTeam }) {
+  const parts = [
+    team.events_table_name && `events: ${team.events_table_name}`,
+    team.persons_table_name && `persons: ${team.persons_table_name}`,
+    team.schema_data_imports_name && `data imports: ${team.schema_data_imports_name}`,
+  ].filter((p): p is string => Boolean(p));
+  if (parts.length === 0) return null;
+  return (
+    <Badge variant="outline" className="whitespace-nowrap" title={parts.join("\n")}>
+      legacy names
+    </Badge>
+  );
 }
 
 function errMsg(e: unknown): string {
@@ -189,24 +209,47 @@ export function CreateTeamDialog({
   );
 }
 
-// EditTeamDialog: enabled / backfill / billing repoint. The schema name is
-// shown read-only; billing can only be pointed at this team, never cleared.
+// legacyNameBody maps an edited legacy table-name input to its wire value:
+// unchanged = undefined (omit, preserve), empty = null (clear back to
+// "derive from schema name"), otherwise the trimmed value.
+function legacyNameBody(edited: string, current: string | null | undefined): string | null | undefined {
+  const trimmed = edited.trim();
+  if (trimmed === (current ?? "")) return undefined;
+  return trimmed === "" ? null : trimmed;
+}
+
+// EditTeamDialog: the operator break-glass — every setting is editable,
+// including the schema name and the legacy table-name overrides. Billing can
+// only be pointed at this team, never cleared.
 export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () => void }) {
   const update = useUpdateOrgTeam();
   const isBilling = Boolean(team.is_billing_team);
+  const [schemaName, setSchemaName] = useState(team.schema_name);
   const [enabled, setEnabled] = useState(team.enabled);
   const [backfill, setBackfill] = useState<BackfillChoice>(backfillChoice(team.backfill_enabled));
   const [makeBilling, setMakeBilling] = useState(false);
+  const [eventsName, setEventsName] = useState(team.events_table_name ?? "");
+  const [personsName, setPersonsName] = useState(team.persons_table_name ?? "");
+  const [importsName, setImportsName] = useState(team.schema_data_imports_name ?? "");
   const [error, setError] = useState<string | null>(null);
+
+  const schemaChanged = schemaName.trim() !== team.schema_name;
 
   const submit = async () => {
     setError(null);
     const body: OrgTeamUpdateBody = {};
+    if (schemaChanged) body.schema_name = schemaName.trim();
     if (enabled !== team.enabled) body.enabled = enabled;
     if (backfill !== backfillChoice(team.backfill_enabled)) {
       body.backfill_enabled = backfill === "unset" ? null : backfill === "on";
     }
     if (makeBilling && !isBilling) body.is_billing_team = true;
+    const events = legacyNameBody(eventsName, team.events_table_name);
+    if (events !== undefined) body.events_table_name = events;
+    const persons = legacyNameBody(personsName, team.persons_table_name);
+    if (persons !== undefined) body.persons_table_name = persons;
+    const imports = legacyNameBody(importsName, team.schema_data_imports_name);
+    if (imports !== undefined) body.schema_data_imports_name = imports;
     if (Object.keys(body).length === 0) {
       onClose();
       return;
@@ -227,10 +270,27 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
             Edit team {team.team_id} in "{team.org_id}"
           </DialogTitle>
           <DialogDescription>
-            Schema <span className="font-mono">{team.schema_name}</span> (immutable).
+            Operator repair tool: every setting is editable here, including the schema name.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
+          <FieldRow label="Schema name">
+            <Input
+              value={schemaName}
+              onChange={(e) => setSchemaName(e.target.value)}
+              className="font-mono text-xs"
+            />
+          </FieldRow>
+          {schemaChanged && (
+            <p className="flex items-start gap-2 text-xs text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                Changing the schema name does not move any data. Tables under the old schema are
+                not renamed — this only repoints where duckgres looks for the team's data. Use it
+                to repair a broken row, not to relocate a team.
+              </span>
+            </p>
+          )}
           <div className="flex items-center justify-between">
             <Label>Enabled</Label>
             <Switch checked={enabled} onCheckedChange={setEnabled} />
@@ -247,6 +307,34 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
               </SelectContent>
             </Select>
           </FieldRow>
+          <FieldRow label="Legacy events table">
+            <Input
+              value={eventsName}
+              onChange={(e) => setEventsName(e.target.value)}
+              placeholder={`${team.schema_name}.events (derived)`}
+              className="font-mono text-xs"
+            />
+          </FieldRow>
+          <FieldRow label="Legacy persons table">
+            <Input
+              value={personsName}
+              onChange={(e) => setPersonsName(e.target.value)}
+              placeholder={`${team.schema_name}.persons (derived)`}
+              className="font-mono text-xs"
+            />
+          </FieldRow>
+          <FieldRow label="Legacy data-imports schema">
+            <Input
+              value={importsName}
+              onChange={(e) => setImportsName(e.target.value)}
+              placeholder={`${team.schema_name}_data_imports (derived)`}
+              className="font-mono text-xs"
+            />
+          </FieldRow>
+          <p className="text-xs text-muted-foreground">
+            Legacy overrides for grandfathered teams. Leave a field empty to derive the name from
+            the schema name.
+          </p>
           {isBilling ? (
             <p className="text-xs text-muted-foreground">
               This is the org's billing team. To change it, mark another team as billing.
@@ -274,7 +362,7 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
           <Button variant="outline" size="sm" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="sm" onClick={submit} disabled={update.isPending}>
+          <Button size="sm" onClick={submit} disabled={update.isPending || schemaName.trim() === ""}>
             {update.isPending ? "Saving…" : "Save"}
           </Button>
         </DialogFooter>

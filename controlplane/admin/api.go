@@ -118,9 +118,10 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	// registered by the provisioning API on this same group — gin refuses
 	// duplicate routes, so the admin surface adds only what provisioning
 	// doesn't have: the cross-org list, a CREATE-ONLY POST (org_id in the
-	// body, mirroring POST /users), and the update. Unlike the internal
-	// provisioning upsert, this is a user-facing surface: schema_name is set
-	// once at create time and immutable afterwards (the PUT rejects it).
+	// body, mirroring POST /users), and the update. The PUT is the operator
+	// break-glass: it can edit EVERY team setting, including schema_name and
+	// the legacy table-name overrides — schema immutability is a rule for the
+	// user-facing product flows, not for operators repairing rows here.
 	r.GET("/teams", h.listAllOrgTeams)
 	r.POST("/teams", h.createOrgTeam)
 	r.PUT("/orgs/:id/teams/:team_id", h.updateOrgTeam)
@@ -157,16 +158,20 @@ type apiStore interface {
 	DeleteOrg(name string) (bool, error)
 
 	// Org teams. CreateOrgTeam is create-only (the admin surface never
-	// overwrites an existing row — schema_name is immutable here); it returns
-	// errOrgTeamExists / configstore.ErrOrgTeamSchemaConflict for the two
-	// conflict shapes, gorm.ErrRecordNotFound for an unknown org.
-	// UpdateOrgTeam mutates enabled / backfill_enabled and can repoint the
-	// billing team (usage buckets re-attributed in the same transaction).
+	// overwrites an existing row); it returns errOrgTeamExists /
+	// configstore.ErrOrgTeamSchemaConflict for the two conflict shapes,
+	// gorm.ErrRecordNotFound for an unknown org. UpdateOrgTeam applies the
+	// presence-aware orgTeamUpdate (every column is editable — operator
+	// break-glass) and can repoint the billing team (usage buckets
+	// re-attributed in the same transaction); it returns the row as it was
+	// BEFORE the update alongside the stored result so the handler can audit
+	// old → new per field. A schema_name change that collides with another
+	// team in the org returns configstore.ErrOrgTeamSchemaConflict.
 	// Per-org list and delete are served by the provisioning API's routes on
 	// the same router group (identical rules — configstore.DeleteOrgTeamTx).
 	ListAllOrgTeams() ([]configstore.OrgTeam, error)
 	CreateOrgTeam(orgID string, team *configstore.OrgTeam) error
-	UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, error)
+	UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (prev, stored *configstore.OrgTeam, err error)
 
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
@@ -351,14 +356,27 @@ func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 // grandfather path), so an existing row is a 409, not an upsert.
 var errOrgTeamExists = errors.New("team already exists in this org")
 
-// orgTeamUpdate carries the admin-editable fields of one org team. Pointer
-// fields are presence-aware (nil = preserve). schema_name is deliberately NOT
-// here: it is immutable on the admin surface. BackfillSet distinguishes an
-// explicit `"backfill_enabled": null` (clear to unset) from an absent key.
+// orgTeamUpdate carries the admin-editable fields of one org team — every
+// column, this is the operator break-glass surface. Pointer fields are
+// presence-aware (nil = preserve). The *Set booleans distinguish an explicit
+// JSON null (clear to unset/NULL) from an absent key for the nullable columns.
 type orgTeamUpdate struct {
+	// SchemaName: nil = preserve. A non-nil value is the operator override —
+	// validated by the handler, refused with ErrOrgTeamSchemaConflict when
+	// another team in the org already uses it. Changing it does NOT move any
+	// warehouse data; tables under the old schema are not renamed.
+	SchemaName  *string
 	Enabled     *bool
 	BackfillSet bool
 	Backfill    *bool
+	// Legacy explicit table names for grandfathered teams (NULL = derive from
+	// schema_name). XSet + nil value clears the column back to NULL.
+	EventsTableNameSet       bool
+	EventsTableName          *string
+	PersonsTableNameSet      bool
+	PersonsTableName         *string
+	SchemaDataImportsNameSet bool
+	SchemaDataImportsName    *string
 	// MakeBilling repoints the org's billing team to this row (the buffered
 	// usage buckets follow atomically). There is no "unset billing" — every
 	// org must keep a billing team; repoint by marking another team.
@@ -403,8 +421,8 @@ func (s *gormAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) er
 	})
 }
 
-func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, error) {
-	var stored configstore.OrgTeam
+func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, *configstore.OrgTeam, error) {
+	var prev, stored configstore.OrgTeam
 	err := s.db().Transaction(func(tx *gorm.DB) error {
 		var team configstore.OrgTeam
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -415,13 +433,39 @@ func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 		if err != nil {
 			return err
 		}
+		prev = team
 
 		fields := map[string]interface{}{"updated_at": gorm.Expr("now()")}
+		if upd.SchemaName != nil && *upd.SchemaName != team.SchemaName {
+			// Pre-check the per-org schema uniqueness for a clean error; the
+			// unique (org_id, schema_name) index still backs it — a concurrent
+			// writer that slips past the check fails with a 23505 (same
+			// contract as configstore.UpsertOrgTeamTx).
+			var clash int64
+			if err := tx.Model(&configstore.OrgTeam{}).
+				Where("org_id = ? AND schema_name = ? AND team_id <> ?", orgID, *upd.SchemaName, teamID).
+				Count(&clash).Error; err != nil {
+				return err
+			}
+			if clash > 0 {
+				return configstore.ErrOrgTeamSchemaConflict
+			}
+			fields["schema_name"] = *upd.SchemaName
+		}
 		if upd.Enabled != nil {
 			fields["enabled"] = *upd.Enabled
 		}
 		if upd.BackfillSet {
 			fields["backfill_enabled"] = upd.Backfill
+		}
+		if upd.EventsTableNameSet {
+			fields["events_table_name"] = upd.EventsTableName
+		}
+		if upd.PersonsTableNameSet {
+			fields["persons_table_name"] = upd.PersonsTableName
+		}
+		if upd.SchemaDataImportsNameSet {
+			fields["schema_data_imports_name"] = upd.SchemaDataImportsName
 		}
 		if len(fields) > 1 {
 			if err := tx.Model(&configstore.OrgTeam{}).
@@ -453,9 +497,9 @@ func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 		return tx.First(&stored, "org_id = ? AND team_id = ?", orgID, teamID).Error
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &stored, nil
+	return &prev, &stored, nil
 }
 
 func (s *gormAPIStore) ListUsers() ([]configstore.OrgUser, error) {
@@ -910,9 +954,10 @@ func (h *apiHandler) listAllOrgTeams(c *gin.Context) {
 
 // createOrgTeamRequest is the admin create body (POST /teams — the org rides
 // in the body like POST /users, because the /orgs/:id/teams POST route
-// belongs to the provisioning grandfather upsert). schema_name is set here
-// ONCE and immutable afterwards on this surface (the update endpoint rejects
-// it) — only the internal provisioning grandfather path may overwrite it.
+// belongs to the provisioning grandfather upsert). schema_name set here is
+// immutable through user-facing flows; operators can later change it via the
+// break-glass PUT, and the internal provisioning grandfather path may
+// overwrite it.
 type createOrgTeamRequest struct {
 	OrgID           string `json:"org_id"`
 	TeamID          int64  `json:"team_id"`
@@ -964,13 +1009,40 @@ func (h *apiHandler) createOrgTeam(c *gin.Context) {
 	c.JSON(http.StatusCreated, team)
 }
 
-// updateOrgTeamRequest is the admin PUT body: enabled / backfill_enabled /
-// is_billing_team only. schema_name is immutable on this surface, and billing
-// can only be pointed AT a team (is_billing_team: true) — never cleared.
+// updateOrgTeamRequest is the admin PUT body — the operator break-glass that
+// can edit every team setting. All fields are presence-aware (absent =
+// preserve). schema_name may be CHANGED here (immutability is a user-facing
+// flow rule, not an operator one) but never cleared — it stays NOT NULL. The
+// nullable columns (backfill_enabled and the three legacy table-name
+// overrides) treat an explicit JSON null — and, for the table names, "" — as
+// "clear back to NULL". Billing can only be pointed AT a team
+// (is_billing_team: true), never cleared.
 type updateOrgTeamRequest struct {
-	Enabled         *bool `json:"enabled,omitempty"`
-	BackfillEnabled *bool `json:"backfill_enabled,omitempty"`
-	IsBillingTeam   *bool `json:"is_billing_team,omitempty"`
+	SchemaName            *string `json:"schema_name,omitempty"`
+	Enabled               *bool   `json:"enabled,omitempty"`
+	BackfillEnabled       *bool   `json:"backfill_enabled,omitempty"`
+	IsBillingTeam         *bool   `json:"is_billing_team,omitempty"`
+	EventsTableName       *string `json:"events_table_name,omitempty"`
+	PersonsTableName      *string `json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
+}
+
+// maxOrgTeamTableNameLength caps the legacy table-name overrides at the
+// column width (varchar(255)) so a typo'd blob is a 400, not a DB error.
+const maxOrgTeamTableNameLength = 255
+
+// legacyTableNameUpdate folds one presence-aware legacy table-name field of
+// the PUT body into (set, value): absent = (false, nil); explicit null or ""
+// = (true, nil) — clear back to NULL / derive from schema_name; anything else
+// = (true, &value).
+func legacyTableNameUpdate(present bool, v *string) (bool, *string) {
+	if !present {
+		return false, nil
+	}
+	if v == nil || *v == "" {
+		return true, nil
+	}
+	return true, v
 }
 
 func (h *apiHandler) updateOrgTeam(c *gin.Context) {
@@ -996,48 +1068,81 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 		return
 	}
 	if _, ok := fields["schema_name"]; ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "schema_name is immutable — it is set once when the team is created"})
-		return
+		// The operator override: changing the schema is allowed HERE (and only
+		// here — user-facing flows keep it immutable), but it must stay a
+		// valid, non-null identifier. It renames NOTHING in the warehouse.
+		if req.SchemaName == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "schema_name cannot be cleared; pass a valid schema name"})
+			return
+		}
+		if err := configstore.ValidateOrgTeamSchemaName(*req.SchemaName); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	if _, ok := fields["is_billing_team"]; ok && (req.IsBillingTeam == nil || !*req.IsBillingTeam) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "is_billing_team can only be set to true (repoint billing by marking another team); every org must keep a billing team"})
 		return
 	}
+	for name, v := range map[string]*string{
+		"events_table_name":        req.EventsTableName,
+		"persons_table_name":       req.PersonsTableName,
+		"schema_data_imports_name": req.SchemaDataImportsName,
+	} {
+		if v != nil && len(*v) > maxOrgTeamTableNameLength {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%s must be at most %d characters", name, maxOrgTeamTableNameLength)})
+			return
+		}
+	}
 	_, backfillSet := fields["backfill_enabled"]
+	_, eventsPresent := fields["events_table_name"]
+	_, personsPresent := fields["persons_table_name"]
+	_, importsPresent := fields["schema_data_imports_name"]
 	upd := orgTeamUpdate{
+		SchemaName:  req.SchemaName,
 		Enabled:     req.Enabled,
 		BackfillSet: backfillSet,
 		Backfill:    req.BackfillEnabled,
 		MakeBilling: req.IsBillingTeam != nil && *req.IsBillingTeam,
 	}
+	upd.EventsTableNameSet, upd.EventsTableName = legacyTableNameUpdate(eventsPresent, req.EventsTableName)
+	upd.PersonsTableNameSet, upd.PersonsTableName = legacyTableNameUpdate(personsPresent, req.PersonsTableName)
+	upd.SchemaDataImportsNameSet, upd.SchemaDataImportsName = legacyTableNameUpdate(importsPresent, req.SchemaDataImportsName)
 
-	var changes []string
-	if req.Enabled != nil {
-		changes = append(changes, fmt.Sprintf("enabled=%v", *req.Enabled))
+	prev, team, err := h.store.UpdateOrgTeam(orgID, teamID, upd)
+	if err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrOrgTeamNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org team not found"})
+		case errors.Is(err, configstore.ErrOrgTeamSchemaConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
 	}
-	if backfillSet {
-		if req.BackfillEnabled == nil {
-			changes = append(changes, "backfill_enabled=(unset)")
-		} else {
-			changes = append(changes, fmt.Sprintf("backfill_enabled=%v", *req.BackfillEnabled))
+
+	// Audit detail: which fields actually changed and their old → new values
+	// (same idiom as the org update). Computed AFTER the store call so the
+	// "old" side is the row the update really replaced; AuditMiddleware reads
+	// the detail once the handler returns.
+	var changes []string
+	addChange := func(key, old, next string) {
+		if old != next {
+			changes = append(changes, fmt.Sprintf("%s %s → %s", key, old, next))
 		}
 	}
-	if upd.MakeBilling {
-		changes = append(changes, "billing team")
-	}
+	addChange("schema_name", prev.SchemaName, team.SchemaName)
+	addChange("enabled", fmt.Sprintf("%v", prev.Enabled), fmt.Sprintf("%v", team.Enabled))
+	addChange("backfill_enabled", orgBoolPtr(prev.BackfillEnabled), orgBoolPtr(team.BackfillEnabled))
+	addChange("is_billing_team", orgBoolPtr(prev.IsBillingTeam), orgBoolPtr(team.IsBillingTeam))
+	addChange("events_table_name", orgStrPtr(prev.EventsTableName), orgStrPtr(team.EventsTableName))
+	addChange("persons_table_name", orgStrPtr(prev.PersonsTableName), orgStrPtr(team.PersonsTableName))
+	addChange("schema_data_imports_name", orgStrPtr(prev.SchemaDataImportsName), orgStrPtr(team.SchemaDataImportsName))
 	if len(changes) > 0 {
 		setAuditDetail(c, fmt.Sprintf("team %d: %s", teamID, strings.Join(changes, ", ")))
 	}
 
-	team, err := h.store.UpdateOrgTeam(orgID, teamID, upd)
-	if err != nil {
-		if errors.Is(err, configstore.ErrOrgTeamNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "org team not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
 	c.JSON(http.StatusOK, team)
 }
 
@@ -1073,6 +1178,15 @@ func orgStrPtr(s *string) string {
 		return "(unset)"
 	}
 	return orgStr(*s)
+}
+
+// orgBoolPtr renders an optional tri-state boolean (nil == unset) for audit
+// detail.
+func orgBoolPtr(b *bool) string {
+	if b == nil {
+		return "(unset)"
+	}
+	return fmt.Sprintf("%v", *b)
 }
 
 // orgInt64Ptr renders an optional org config integer (nil or 0 == unset) for
