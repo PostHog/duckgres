@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
-	"github.com/posthog/duckgres/transpiler/transform"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // QueryAccessPolicy is a fail-closed SQL policy for a project-scoped user.
@@ -70,6 +70,15 @@ var unqualifiedMetadataRelations = map[string]struct{}{
 	"pg_views":      {},
 }
 
+var informationSchemaRelations = map[string]struct{}{
+	"columns":   {},
+	"routines":  {},
+	"schemata":  {},
+	"sequences": {},
+	"tables":    {},
+	"views":     {},
+}
+
 var allowedSetVariables = map[string]struct{}{
 	"application_name":                    {},
 	"client_encoding":                     {},
@@ -121,41 +130,102 @@ func (p *QueryAccessPolicy) Authorize(query string) error {
 			return err
 		}
 
-		statementTree := &pg_query.ParseResult{Stmts: []*pg_query.RawStmt{raw}}
-		cteNames := make(map[string]struct{})
-		transform.WalkFunc(statementTree, func(node *pg_query.Node) bool {
-			if cte := node.GetCommonTableExpr(); cte != nil {
-				cteNames[strings.ToLower(cte.Ctename)] = struct{}{}
-			}
-			return true
-		})
+		if err := authorizeSQLNode(raw.Stmt, allowedSchemas, allowedRelations, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-		var denied error
-		transform.WalkFunc(statementTree, func(node *pg_query.Node) bool {
-			if err := authorizeReadNode(node); err != nil {
-				denied = err
-				return false
+func authorizeSQLNode(node *pg_query.Node, allowedSchemas, allowedRelations, visibleCTEs map[string]struct{}) error {
+	if node == nil {
+		return nil
+	}
+	if err := authorizeReadNode(node); err != nil {
+		return err
+	}
+	if rv := node.GetRangeVar(); rv != nil {
+		if err := authorizeRangeVar(rv, allowedSchemas, allowedRelations, visibleCTEs); err != nil {
+			return err
+		}
+	}
+	if fc := node.GetFuncCall(); fc != nil {
+		name := functionName(fc)
+		if dangerousFunction(name) {
+			return &QueryAccessError{Reason: fmt.Sprintf("function %q is unavailable to project connections", name)}
+		}
+	}
+	if selectStmt := node.GetSelectStmt(); selectStmt != nil {
+		return authorizeSelectStatement(selectStmt, allowedSchemas, allowedRelations, visibleCTEs)
+	}
+	return authorizeMessageChildren(node.ProtoReflect(), "", allowedSchemas, allowedRelations, visibleCTEs)
+}
+
+func authorizeSelectStatement(selectStmt *pg_query.SelectStmt, allowedSchemas, allowedRelations, outerCTEs map[string]struct{}) error {
+	visibleCTEs := copyStringSet(outerCTEs)
+	withClause := selectStmt.WithClause
+	if withClause != nil {
+		if withClause.Recursive {
+			for _, cteNode := range withClause.Ctes {
+				if cte := cteNode.GetCommonTableExpr(); cte != nil {
+					visibleCTEs[strings.ToLower(cte.Ctename)] = struct{}{}
+				}
 			}
-			if rv := node.GetRangeVar(); rv != nil {
-				if err := authorizeRangeVar(rv, allowedSchemas, allowedRelations, cteNames); err != nil {
+		}
+		for _, cteNode := range withClause.Ctes {
+			cte := cteNode.GetCommonTableExpr()
+			if cte == nil {
+				continue
+			}
+			if err := authorizeSQLNode(cte.Ctequery, allowedSchemas, allowedRelations, visibleCTEs); err != nil {
+				return err
+			}
+			if !withClause.Recursive {
+				visibleCTEs[strings.ToLower(cte.Ctename)] = struct{}{}
+			}
+		}
+	}
+	return authorizeMessageChildren(selectStmt.ProtoReflect(), "with_clause", allowedSchemas, allowedRelations, visibleCTEs)
+}
+
+func authorizeMessageChildren(message protoreflect.Message, skippedField protoreflect.Name, allowedSchemas, allowedRelations, visibleCTEs map[string]struct{}) error {
+	var denied error
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		if field.Name() == skippedField {
+			return true
+		}
+		if field.IsList() && field.Kind() == protoreflect.MessageKind {
+			list := value.List()
+			for index := 0; index < list.Len(); index++ {
+				if err := authorizeProtoMessage(list.Get(index).Message(), allowedSchemas, allowedRelations, visibleCTEs); err != nil {
 					denied = err
 					return false
 				}
 			}
-			if fc := node.GetFuncCall(); fc != nil {
-				name := functionName(fc)
-				if dangerousFunction(name) {
-					denied = &QueryAccessError{Reason: fmt.Sprintf("function %q is unavailable to project connections", name)}
-					return false
-				}
-			}
 			return true
-		})
-		if denied != nil {
-			return denied
 		}
+		if field.Kind() == protoreflect.MessageKind {
+			denied = authorizeProtoMessage(value.Message(), allowedSchemas, allowedRelations, visibleCTEs)
+			return denied == nil
+		}
+		return true
+	})
+	return denied
+}
+
+func authorizeProtoMessage(message protoreflect.Message, allowedSchemas, allowedRelations, visibleCTEs map[string]struct{}) error {
+	if node, ok := message.Interface().(*pg_query.Node); ok {
+		return authorizeSQLNode(node, allowedSchemas, allowedRelations, visibleCTEs)
 	}
-	return nil
+	return authorizeMessageChildren(message, "", allowedSchemas, allowedRelations, visibleCTEs)
+}
+
+func copyStringSet(values map[string]struct{}) map[string]struct{} {
+	copy := make(map[string]struct{}, len(values))
+	for value := range values {
+		copy[value] = struct{}{}
+	}
+	return copy
 }
 
 func authorizeProjectUse(query string) (bool, error) {
@@ -183,9 +253,11 @@ func dangerousFunction(name string) bool {
 		return true
 	}
 	return strings.HasPrefix(name, "read_") ||
+		strings.HasPrefix(name, "duckdb_") ||
 		strings.HasPrefix(name, "http_") ||
 		strings.HasPrefix(name, "mysql_") ||
 		strings.HasPrefix(name, "postgres_") ||
+		strings.HasPrefix(name, "pragma_") ||
 		strings.HasPrefix(name, "sqlite_") ||
 		strings.HasSuffix(name, "_scan")
 }
@@ -231,8 +303,17 @@ func authorizeRangeVar(rv *pg_query.RangeVar, allowedSchemas, allowedRelations, 
 	if catalog != "" && catalog != "ducklake" {
 		return &QueryAccessError{Reason: fmt.Sprintf("catalog %q is not available to this project", rv.Catalogname)}
 	}
-	if schema == "information_schema" || schema == "pg_catalog" {
-		return nil
+	if schema == "information_schema" {
+		if _, ok := informationSchemaRelations[relation]; ok {
+			return nil
+		}
+		return &QueryAccessError{Reason: fmt.Sprintf("catalog relation %q is unavailable to project connections", relation)}
+	}
+	if schema == "pg_catalog" {
+		if _, ok := unqualifiedMetadataRelations[relation]; ok {
+			return nil
+		}
+		return &QueryAccessError{Reason: fmt.Sprintf("catalog relation %q is unavailable to project connections", relation)}
 	}
 	if schema == "" {
 		if _, ok := cteNames[relation]; ok {

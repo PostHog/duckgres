@@ -470,18 +470,23 @@ const (
 
 // FlightSessionRecord is the durable reconnect record for Flight sessions.
 type FlightSessionRecord struct {
-	SessionToken string             `gorm:"primaryKey;size:255" json:"session_token"`
-	Username     string             `gorm:"size:255;not null" json:"username"`
-	OrgID        string             `gorm:"size:255;not null" json:"org_id"`
-	WorkerID     int                `gorm:"not null;index" json:"worker_id"`
-	PID          int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
-	OwnerEpoch   int64              `gorm:"not null" json:"owner_epoch"`
-	CPInstanceID string             `gorm:"size:255" json:"cp_instance_id"`
-	State        FlightSessionState `gorm:"size:32;not null" json:"state"`
-	ExpiresAt    time.Time          `gorm:"index" json:"expires_at"`
-	LastSeenAt   time.Time          `json:"last_seen_at"`
-	CreatedAt    time.Time          `json:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at"`
+	SessionToken         string             `gorm:"primaryKey;size:255" json:"session_token"`
+	Username             string             `gorm:"size:255;not null" json:"username"`
+	OrgID                string             `gorm:"size:255;not null" json:"org_id"`
+	WorkerID             int                `gorm:"not null;index" json:"worker_id"`
+	PID                  int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
+	OwnerEpoch           int64              `gorm:"not null" json:"owner_epoch"`
+	CPInstanceID         string             `gorm:"size:255" json:"cp_instance_id"`
+	State                FlightSessionState `gorm:"size:32;not null" json:"state"`
+	ExpiresAt            time.Time          `gorm:"index" json:"expires_at"`
+	LastSeenAt           time.Time          `json:"last_seen_at"`
+	AccessPolicyRecorded bool               `gorm:"not null;default:false" json:"access_policy_recorded"`
+	AccessRevision       string             `gorm:"size:64" json:"access_revision,omitempty"`
+	AccessReadOnly       bool               `gorm:"not null;default:false" json:"access_read_only"`
+	AllowedSchemas       []string           `gorm:"serializer:json;type:text" json:"allowed_schemas,omitempty"`
+	AllowedRelations     []string           `gorm:"serializer:json;type:text" json:"allowed_relations,omitempty"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
 }
 
 func (FlightSessionRecord) TableName() string { return "flight_session_records" }

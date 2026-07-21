@@ -17,6 +17,7 @@ func TestQueryAccessPolicyAllowsProjectReads(t *testing.T) {
 		"SELECT * FROM shadow_42_models.revenue",
 		"SELECT * FROM posthog.events_prod",
 		"WITH recent AS (SELECT * FROM team_42.events) SELECT * FROM recent",
+		"SELECT * FROM team_42.events WHERE EXISTS (WITH recent AS (SELECT * FROM team_42.events) SELECT * FROM recent)",
 		"SELECT count(*) FROM information_schema.tables",
 		"SELECT * FROM pg_index",
 		"SHOW search_path",
@@ -61,7 +62,11 @@ func TestQueryAccessPolicyRejectsCrossProjectAndWrites(t *testing.T) {
 		"SELECT * INTO team_42.copied_events FROM team_42.events",
 		"WITH removed AS (DELETE FROM team_42.events RETURNING *) SELECT * FROM removed",
 		"SELECT set_config('search_path', 'team_7', false)",
+		"SELECT * FROM duckdb_tables()",
+		"SELECT * FROM pragma_table_info('team_7.events')",
 		"SELECT * FROM postgres_query('host=other', 'SELECT secret FROM private')",
+		"SELECT * FROM information_schema.table_constraints",
+		"SELECT * FROM pg_catalog.pg_stat_activity",
 		"SHOW s3_access_key_id",
 		"SHOW ALL",
 		"SET search_path = team_7",
@@ -72,6 +77,8 @@ func TestQueryAccessPolicyRejectsCrossProjectAndWrites(t *testing.T) {
 		"FETCH 10 FROM project_rows",
 		"CLOSE project_rows",
 		"SELECT * FROM hidden; WITH hidden AS (SELECT * FROM team_42.events) SELECT * FROM hidden",
+		"WITH hidden AS (SELECT * FROM team_42.events) SELECT * FROM hidden; SELECT * FROM hidden",
+		"SELECT * FROM hidden WHERE EXISTS (WITH hidden AS (SELECT * FROM team_42.events) SELECT 1)",
 	}
 	for _, query := range queries {
 		if err := policy.Authorize(query); err == nil {

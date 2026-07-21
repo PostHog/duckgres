@@ -131,6 +131,32 @@ func TestChangedProjectReaderUsersDetectsNamespaceAndCredentialChanges(t *testin
 	}
 }
 
+func TestOrgRouterHandleConfigChangeNotifiesFlightSessionRevocation(t *testing.T) {
+	teamID := int64(42)
+	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
+	old := &configstore.Snapshot{
+		Orgs:            map[string]*configstore.OrgConfig{"analytics": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, Enabled: true}}}},
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "old"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+			key: {Mode: configstore.OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+	}
+	updated := *old
+	updated.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new"}
+
+	var revokedOrg, revokedUser string
+	router := &OrgRouter{orgs: make(map[string]*OrgStack)}
+	router.setProjectReaderChangeHandler(func(orgID, username string) {
+		revokedOrg, revokedUser = orgID, username
+	})
+	router.HandleConfigChange(old, &updated)
+
+	if revokedOrg != "analytics" || revokedUser != "reader" {
+		t.Fatalf("revoked user = %s/%s, want analytics/reader", revokedOrg, revokedUser)
+	}
+}
+
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
 	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil)

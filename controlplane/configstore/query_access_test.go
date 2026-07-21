@@ -61,3 +61,28 @@ func TestOrgUserQueryAccessFailsClosedForMissingOrDisabledTeam(t *testing.T) {
 		t.Fatalf("disabled team policy must deny all project relations: %#v, ok=%v", got, ok)
 	}
 }
+
+func TestOrgUserSessionQueryAccessDistinguishesUnrestrictedFromRevoked(t *testing.T) {
+	unrestricted := OrgUserKey{OrgID: "acme", Username: "root"}
+	disabled := OrgUserKey{OrgID: "acme", Username: "disabled"}
+	cs := &ConfigStore{snapshot: &Snapshot{
+		OrgUserPassword: map[OrgUserKey]string{unrestricted: "hash", disabled: "hash"},
+		OrgUserDisabled: map[OrgUserKey]bool{disabled: true},
+		OrgUserAccess:   map[OrgUserKey]OrgUserAccessConfig{},
+	}}
+
+	policy, revision, ok := cs.OrgUserSessionQueryAccess("acme", "root")
+	if !ok || policy != nil || revision == "" {
+		t.Fatalf("unrestricted user = (%#v, %q, %v), want (nil, non-empty, true)", policy, revision, ok)
+	}
+	cs.snapshot.OrgUserPassword[unrestricted] = "rotated-hash"
+	_, rotatedRevision, ok := cs.OrgUserSessionQueryAccess("acme", "root")
+	if !ok || rotatedRevision == "" || rotatedRevision == revision {
+		t.Fatalf("password rotation did not change credential revision: before=%q after=%q", revision, rotatedRevision)
+	}
+	for _, username := range []string{"disabled", "missing"} {
+		if policy, revision, ok := cs.OrgUserSessionQueryAccess("acme", username); ok || policy != nil || revision != "" {
+			t.Fatalf("revoked user %q = (%#v, %q, %v), want (nil, empty, false)", username, policy, revision, ok)
+		}
+	}
+}

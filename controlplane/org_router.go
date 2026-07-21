@@ -38,6 +38,7 @@ type OrgRouter struct {
 	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
 	nextWorkerID          atomic.Int32
 	sharedCancel          context.CancelFunc
+	projectReaderChange   func(orgID, username string)
 
 	// migrating tracks which orgs have a DuckLake migration in progress.
 	// During migration, new connections for the org are rejected with a
@@ -236,6 +237,12 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			tr.srv.DrainUserConnections(key.OrgID, key.Username)
 		}
 		tr.mu.RLock()
+		onProjectReaderChange := tr.projectReaderChange
+		tr.mu.RUnlock()
+		if onProjectReaderChange != nil {
+			onProjectReaderChange(key.OrgID, key.Username)
+		}
+		tr.mu.RLock()
 		stack := tr.orgs[key.OrgID]
 		tr.mu.RUnlock()
 		if stack != nil && stack.Sessions != nil {
@@ -343,6 +350,12 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		}
 		tr.mu.Unlock()
 	}
+}
+
+func (tr *OrgRouter) setProjectReaderChangeHandler(handler func(orgID, username string)) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.projectReaderChange = handler
 }
 
 func changedProjectReaderUsers(old, new *configstore.Snapshot) map[configstore.OrgUserKey]struct{} {

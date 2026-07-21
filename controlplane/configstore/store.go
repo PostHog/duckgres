@@ -3,6 +3,7 @@ package configstore
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -314,6 +315,28 @@ func (cs *ConfigStore) OrgUserQueryAccess(orgID, username string) (OrgUserQueryA
 		return OrgUserQueryAccess{}, false
 	}
 	return orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username)
+}
+
+// OrgUserSessionQueryAccess resolves the current enabled user, its optional
+// project policy, and a non-secret credential revision in one snapshot read.
+// A nil policy with ok=true is unrestricted; ok=false is missing or disabled.
+func (cs *ConfigStore) OrgUserSessionQueryAccess(orgID, username string) (*OrgUserQueryAccess, string, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return nil, "", false
+	}
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	passwordHash, exists := cs.snapshot.OrgUserPassword[key]
+	if !exists || cs.snapshot.OrgUserDisabled[key] {
+		return nil, "", false
+	}
+	revision := fmt.Sprintf("%x", sha256.Sum256([]byte(passwordHash)))
+	access, scoped := orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username)
+	if !scoped {
+		return nil, revision, true
+	}
+	return &access, revision, true
 }
 
 func orgUserQueryAccessFromSnapshot(snapshot *Snapshot, orgID, username string) (OrgUserQueryAccess, bool) {
@@ -1925,7 +1948,7 @@ func advisoryLockKey(s string) int64 {
 func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "session_token"}},
-		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "p_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "p_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "access_policy_recorded", "access_revision", "access_read_only", "allowed_schemas", "allowed_relations", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert flight session record: %w", err)
 	}
@@ -1982,6 +2005,7 @@ func (cs *ConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(stale 
 		Where("p_id = ?", stale.PID).
 		Where("owner_epoch = ?", stale.OwnerEpoch).
 		Where("cp_instance_id = ?", stale.CPInstanceID).
+		Where("access_revision = ?", stale.AccessRevision).
 		Updates(map[string]any{
 			"state":        FlightSessionStateClosed,
 			"last_seen_at": closedAt,
