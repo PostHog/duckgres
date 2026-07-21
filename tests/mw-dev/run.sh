@@ -163,16 +163,9 @@ drop_cnpg_role() { # org-id
     psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
 }
 
-# Every duckling org a harness run provisions for a PR (harness.sh main()):
-# cnpg + ext (full coverage) and res1 + res2 (cnpg-shard/ducklake-only orgs
-# hosting the parallel resilience lanes). Keep in sync with harness.sh.
+# Every CNPG-backed duckling org a harness run provisions for a PR
+# (harness.sh main()). Keep in sync with harness.sh.
 ci_orgs() { # pr-number
-  local pr="$1"
-  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-ext ci-pr-${pr}-res1 ci-pr-${pr}-res2"
-}
-# The cnpg-shard-backed orgs (everything except ext) own a metadata role+db on
-# the shard that drop_cnpg_role must clean.
-ci_cnpg_orgs() { # pr-number
   local pr="$1"
   echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2"
 }
@@ -221,7 +214,7 @@ reset_pr_stack() {
   # so apply never reuses stale network policies, services, or tenant state.
   delete_ci_ducklings "$PR_NUMBER"
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
-  for org in $(ci_cnpg_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
+  for org in $(ci_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
   delete_pod_identity
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=300s
@@ -704,16 +697,7 @@ cmd_teardown() {
 
   # Deterministically drop the cnpg role+db in case the composition's async
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
-  for org in $(ci_cnpg_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
-
-  # The ext org's PER-RUN metadata database on the shared RDS
-  # (mdstore_e2e_<utc-ts>_pr<pr>, see harness.sh EXT_RDS_DB) is NOT dropped
-  # here: this runner has neither psql nor any path to the RDS password (it
-  # lives in AWS SM, synced in-cluster by ESO into the duckling's status). The
-  # harness drops its own database at the end of a passing run
-  # (ext_rds_teardown); databases leaked by crashed/cancelled runs are reaped
-  # by the NEXT run's >24h name-gated GC (ext_rds_setup). Same story for
-  # cmd_e2e_cleanup below.
+  for org in $(ci_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
 
   # Drop the Pod Identity association (it's an EKS resource, not in the ns).
   delete_pod_identity
@@ -750,7 +734,7 @@ cmd_e2e_cleanup() {
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
       delete_ci_ducklings "$pr"
       wait_ci_ducklings_deleted "$pr" 300s || true
-      for org in $(ci_cnpg_orgs "$pr"); do drop_cnpg_role "$org"; done
+      for org in $(ci_orgs "$pr"); do drop_cnpg_role "$org"; done
       NS="$ns" delete_pod_identity
       delete_ci_bindings "$pr"
       "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false
