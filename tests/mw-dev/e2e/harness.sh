@@ -216,10 +216,12 @@ rds_psql() { # sql
 
 # ext_rds_setup creates this run's metadata database and GCs databases leaked
 # by aborted runs. It needs the RDS password, which the harness obtains
-# in-cluster from its OWN ext duckling's CR status (status.metadataStore
-# .password, the ESO-synced value — the same shared-user password every run
-# uses; the harness SA already has cross-namespace duckling read RBAC). That
-# status field only exists once the composition has synced the secret, so this
+# in-cluster from its OWN ext duckling's referenced Kubernetes Secret. During
+# the deploy-ordered migration, an older composition may not publish
+# credentialSecretRef yet, so the harness accepts the legacy plaintext status
+# field only when the reference is absent. Once the reference exists, failure
+# to read it is a hard failure rather than silently masking broken Secret RBAC.
+# The credential only becomes readable once ESO has synced the secret, so this
 # runs as a lane CONCURRENT with the readiness waits: the CP's end-to-end
 # provisioning probe (controller.go reconcileProvisioning) targets the per-run
 # database and simply retries until we create it — never terminal before the
@@ -232,11 +234,19 @@ ext_rds_setup() {
   deadline=$(( $(date +%s) + 300 ))
   EXT_RDS_PW=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    EXT_RDS_PW="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.password}' 2>/dev/null || true)"
+    secret_name="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.credentialSecretRef.name}' 2>/dev/null || true)"
+    secret_key="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.credentialSecretRef.key}' 2>/dev/null || true)"
+    if [ -n "$secret_name" ]; then
+      [ -n "$secret_key" ] || secret_key=password
+      encoded="$("$KUBECTL" -n ducklings get secret "$secret_name" -o "jsonpath={.data.${secret_key}}" 2>/dev/null || true)"
+      [ -z "$encoded" ] || EXT_RDS_PW="$(printf %s "$encoded" | base64 -d)"
+    else
+      EXT_RDS_PW="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.password}' 2>/dev/null || true)"
+    fi
     [ -n "$EXT_RDS_PW" ] && break
     sleep 5
   done
-  [ -n "$EXT_RDS_PW" ] || fail "ext metadata db: duckling/$d never published status.metadataStore.password (ESO sync stuck?)"
+  [ -n "$EXT_RDS_PW" ] || fail "ext metadata db: duckling/$d credential Secret never became readable (ESO sync or RBAC stuck?)"
   # Stash for ext_rds_teardown: this runs in a lane subshell, so a shell var
   # would not survive back to main() (same pattern as the prov_*.json files).
   printf %s "$EXT_RDS_PW" > "$LANE_DIR/ext_rds_pw"

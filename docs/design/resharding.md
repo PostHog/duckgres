@@ -69,6 +69,12 @@ the config-store warehouse row and the duckling *spec* are operator-editable
 inputs that can drift. The op is **refused (400, nothing created)** when the
 identity is incomplete or contradicted:
 
+The status contains only a non-sensitive `credentialSecretRef`; Duckgres reads
+the referenced key from the Secret in the `ducklings` namespace before any
+catalog copy, verification, or rollback. During the ordered rollout it still
+accepts the legacy plaintext status password as a fallback, but the reference
+is authoritative whenever it can be resolved.
+
 - **kind drift** — the row's `metadata_store_kind` (when set) disagrees with
   the status type → 400 naming both values ("refusing to reshard until
   reconciled").

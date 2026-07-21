@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -26,6 +27,8 @@ var ducklingGVR = schema.GroupVersionResource{
 	Resource: "ducklings",
 }
 
+var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+
 const ducklingNamespace = "ducklings"
 
 // DucklingStatus holds the parsed status from a Duckling CR.
@@ -41,7 +44,8 @@ type DucklingStatus struct {
 		User              string
 		Database          string
 	}
-	DataStore struct {
+	MetadataCredentialSecretRef SecretReference
+	DataStore                   struct {
 		Type       string
 		BucketName string
 		S3Region   string
@@ -61,6 +65,15 @@ type DucklingStatus struct {
 	// falls back to the legacy type-based default — DuckLake on for
 	// external, off for cnpg-shard). Non-nil for decoupled ducklings.
 	DuckLakeEnabled *bool
+}
+
+// SecretReference identifies one key in a namespaced Kubernetes Secret. The
+// Duckling composition publishes this non-sensitive reference instead of
+// copying the metadata database password into the CR status.
+type SecretReference struct {
+	Name      string
+	Namespace string
+	Key       string
 }
 
 // DucklingClient wraps a Kubernetes dynamic client for Duckling CR operations.
@@ -313,7 +326,59 @@ func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus,
 	if err != nil {
 		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
-	return parseDucklingStatus(cr)
+	status, err := parseDucklingStatus(cr)
+	if err != nil {
+		return nil, err
+	}
+	ref := status.MetadataCredentialSecretRef
+	if ref.Name == "" {
+		return status, nil // Legacy composition: plaintext status fallback.
+	}
+	password, err := d.readSecretKey(ctx, ref)
+	if err != nil {
+		// During the staged rollout an older/temporarily unavailable Secret must
+		// not strand tenants whose legacy status password is still populated.
+		if status.MetadataStore.Password != "" {
+			slog.Warn("Failed to resolve Duckling metadata credential Secret; using legacy status password.", "duckling", name, "secret", ref.Name, "error", err)
+			return status, nil
+		}
+		return nil, fmt.Errorf("resolve metadata credential Secret for duckling %q: %w", name, err)
+	}
+	status.MetadataStore.Password = password
+	return status, nil
+}
+
+func (d *DucklingClient) readSecretKey(ctx context.Context, ref SecretReference) (string, error) {
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = ducklingNamespace
+	}
+	if namespace != ducklingNamespace {
+		return "", fmt.Errorf("namespace %q is not allowed", namespace)
+	}
+	key := ref.Key
+	if key == "" {
+		key = "password"
+	}
+	secret, err := d.client.Resource(secretGVR).Namespace(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get Secret %s/%s: %w", namespace, ref.Name, err)
+	}
+	encoded, found, err := unstructured.NestedString(secret.Object, "data", key)
+	if err != nil {
+		return "", fmt.Errorf("read Secret %s/%s key %q: %w", namespace, ref.Name, key, err)
+	}
+	if !found || encoded == "" {
+		return "", fmt.Errorf("Secret %s/%s has no non-empty %q key", namespace, ref.Name, key)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode Secret %s/%s key %q: %w", namespace, ref.Name, key, err)
+	}
+	if len(decoded) == 0 {
+		return "", fmt.Errorf("Secret %s/%s key %q is empty", namespace, ref.Name, key)
+	}
+	return string(decoded), nil
 }
 
 // ComposedResourceError describes one composed managed resource that is not
@@ -1024,6 +1089,13 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		ds.MetadataStore.Password = getNestedString(md, "password")
 		ds.MetadataStore.User = getNestedString(md, "user")
 		ds.MetadataStore.Database = getNestedString(md, "database")
+		if ref, ok := md["credentialSecretRef"].(map[string]interface{}); ok {
+			ds.MetadataCredentialSecretRef = SecretReference{
+				Name:      getNestedString(ref, "name"),
+				Namespace: getNestedString(ref, "namespace"),
+				Key:       getNestedString(ref, "key"),
+			}
+		}
 	}
 
 	// Parse status.dataStore
