@@ -41,6 +41,8 @@ const TEAMS: OrgTeam[] = [
     enabled: false,
     is_billing_team: null,
     backfill_enabled: true,
+    events_table_name: "legacy_events",
+    persons_table_name: "legacy_persons",
     created_at: "2026-07-02T00:00:00Z",
     updated_at: "2026-07-02T00:00:00Z",
   },
@@ -99,6 +101,29 @@ describe("Org teams page", () => {
 
     expect(screen.getByText(/last team and cannot be deleted/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /delete team/i })).toBeDisabled();
+  });
+
+  it("flags rows carrying explicit legacy table names with a compact badge", () => {
+    renderPage();
+
+    // Only acme team 2 has legacy overrides; the names live in the tooltip.
+    const badges = screen.getAllByText("legacy names");
+    expect(badges).toHaveLength(1);
+    expect(badges[0].getAttribute("title")).toContain("legacy_events");
+  });
+
+  it("edit dialog lets an operator change the schema, warning that no data moves", async () => {
+    renderPage();
+
+    await userEvent.click(screen.getAllByTitle("Edit")[0]);
+    const schemaInput = screen.getByDisplayValue("team_1");
+    // The destructive warning only appears once the schema actually differs.
+    expect(screen.queryByText(/does not move any data/i)).not.toBeInTheDocument();
+    await userEvent.clear(schemaInput);
+    await userEvent.type(schemaInput, "repaired_wh");
+    expect(screen.getByText(/does not move any data/i)).toBeInTheDocument();
+    // Legacy table-name fields render with the derived-name hint.
+    expect(screen.getByText(/leave a field empty to derive/i)).toBeInTheDocument();
   });
 
   it("warns that deleting a billing team hands billing to the oldest remaining team", async () => {

@@ -161,16 +161,34 @@ func (s *fakeAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) er
 	return nil
 }
 
-func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, error) {
+func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, *configstore.OrgTeam, error) {
 	team, ok := s.teams[orgID][teamID]
 	if !ok {
-		return nil, configstore.ErrOrgTeamNotFound
+		return nil, nil, configstore.ErrOrgTeamNotFound
+	}
+	prev := *team
+	if upd.SchemaName != nil && *upd.SchemaName != team.SchemaName {
+		for _, t := range s.teams[orgID] {
+			if t.TeamID != teamID && t.SchemaName == *upd.SchemaName {
+				return nil, nil, configstore.ErrOrgTeamSchemaConflict
+			}
+		}
+		team.SchemaName = *upd.SchemaName
 	}
 	if upd.Enabled != nil {
 		team.Enabled = *upd.Enabled
 	}
 	if upd.BackfillSet {
 		team.BackfillEnabled = upd.Backfill
+	}
+	if upd.EventsTableNameSet {
+		team.EventsTableName = upd.EventsTableName
+	}
+	if upd.PersonsTableNameSet {
+		team.PersonsTableName = upd.PersonsTableName
+	}
+	if upd.SchemaDataImportsNameSet {
+		team.SchemaDataImportsName = upd.SchemaDataImportsName
 	}
 	if upd.MakeBilling && (team.IsBillingTeam == nil || !*team.IsBillingTeam) {
 		for _, t := range s.teams[orgID] {
@@ -181,7 +199,7 @@ func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 		s.teamBillingRepoints = append(s.teamBillingRepoints, fakeReattributeCall{org: orgID, teamID: teamID})
 	}
 	clone := *team
-	return &clone, nil
+	return &prev, &clone, nil
 }
 
 func (s *fakeAPIStore) ListUsers() ([]configstore.OrgUser, error) {
@@ -2305,22 +2323,143 @@ func TestAdminCreateOrgTeamConflicts(t *testing.T) {
 	}
 }
 
-func TestAdminUpdateOrgTeamRejectsSchemaChange(t *testing.T) {
+// TestAdminUpdateOrgTeamSchemaChange pins the operator break-glass: the admin
+// PUT may change schema_name (unlike user-facing flows), but only to a valid
+// identifier that no other team in the org holds.
+func TestAdminUpdateOrgTeamSchemaChange(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.orgs["other"] = &configstore.Org{Name: "other"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "other", TeamID: 9, SchemaName: "shared", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Happy path: the operator override renames the config row.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"repaired_wh"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("schema change: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if store.teams["acme"][1].SchemaName != "repaired_wh" {
+		t.Fatalf("schema_name = %q, want repaired_wh", store.teams["acme"][1].SchemaName)
+	}
+
+	// Conflict with another team in the SAME org is a 409.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"team_2"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("schema conflict: status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if store.teams["acme"][1].SchemaName != "repaired_wh" {
+		t.Fatal("schema_name must not change on a refused conflict")
+	}
+
+	// The same schema in a DIFFERENT org is fine (uniqueness is per org).
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"shared"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cross-org schema reuse: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	// Clearing (explicit null) and invalid identifiers stay 400s.
+	for _, body := range []string{`{"schema_name":null}`, `{"schema_name":"Bad-Name"}`, `{"schema_name":""}`} {
+		rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400: %s", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestAdminUpdateOrgTeamLegacyNames pins the tri-state legacy table-name
+// semantics on the PUT: omitted = preserve, explicit null or "" = clear back
+// to NULL, a value sets.
+func TestAdminUpdateOrgTeamLegacyNames(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
 	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
 	router := newTestAPIRouter(store)
 
+	// Set all three.
 	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
-		`{"schema_name":"renamed"}`)
+		`{"events_table_name":"legacy_events","persons_table_name":"legacy_persons","schema_data_imports_name":"legacy_imports"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set legacy names: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.teams["acme"][1]
+	if stored.EventsTableName == nil || *stored.EventsTableName != "legacy_events" ||
+		stored.PersonsTableName == nil || *stored.PersonsTableName != "legacy_persons" ||
+		stored.SchemaDataImportsName == nil || *stored.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("legacy names not stored: %+v", stored)
+	}
+
+	// Omitted fields preserve; explicit null and "" both clear to NULL.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"events_table_name":null,"persons_table_name":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear legacy names: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored = store.teams["acme"][1]
+	if stored.EventsTableName != nil {
+		t.Fatalf("events_table_name = %v, want NULL after explicit null", *stored.EventsTableName)
+	}
+	if stored.PersonsTableName != nil {
+		t.Fatalf("persons_table_name = %v, want NULL after explicit empty", *stored.PersonsTableName)
+	}
+	if stored.SchemaDataImportsName == nil || *stored.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("omitted schema_data_imports_name must be preserved, got %+v", stored)
+	}
+
+	// Oversized value is a 400, not a DB error.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		fmt.Sprintf(`{"events_table_name":%q}`, strings.Repeat("x", 256)))
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		t.Fatalf("oversized legacy name: status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "immutable") {
-		t.Fatalf("error should say schema_name is immutable: %s", rec.Body.String())
+}
+
+// TestAdminUpdateOrgTeamAuditDetail asserts the team.update audit detail
+// captures which fields changed with their old → new values (the org-update
+// idiom), including the break-glass schema change.
+func TestAdminUpdateOrgTeamAuditDetail(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	var detail string
+	// Capture what AuditMiddleware would read after the handler returns.
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		detail = c.GetString(ctxAuditDetailKey)
+	})
+	registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"repaired_wh","enabled":false,"events_table_name":"legacy_events"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if store.teams["acme"][1].SchemaName != "team_1" {
-		t.Fatal("schema_name must not change through the admin update")
+	for _, want := range []string{
+		"team 1:",
+		"schema_name team_1 → repaired_wh",
+		"enabled true → false",
+		"events_table_name (unset) → legacy_events",
+	} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("audit detail %q missing %q", detail, want)
+		}
+	}
+	// A no-op PUT records no detail.
+	detail = ""
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no-op status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if detail != "" {
+		t.Fatalf("no-op update must not record changes, got %q", detail)
 	}
 }
 

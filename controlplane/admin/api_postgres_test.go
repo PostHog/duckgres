@@ -391,9 +391,12 @@ func TestAdminOrgTeamStorePostgres(t *testing.T) {
 	}
 
 	// Repoint billing to team 2: the buffered bucket must follow atomically.
-	updated, err := apiStore.UpdateOrgTeam("teamsorg", 2, orgTeamUpdate{MakeBilling: true})
+	prev, updated, err := apiStore.UpdateOrgTeam("teamsorg", 2, orgTeamUpdate{MakeBilling: true})
 	if err != nil {
 		t.Fatalf("repoint billing: %v", err)
+	}
+	if prev.IsBillingTeam != nil {
+		t.Fatalf("prev must be the pre-update row (not billing), got %+v", prev)
 	}
 	if updated.IsBillingTeam == nil || !*updated.IsBillingTeam {
 		t.Fatalf("team 2 must be billing, got %+v", updated)
@@ -432,5 +435,81 @@ func TestAdminOrgTeamStorePostgres(t *testing.T) {
 	}
 	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
 		t.Fatalf("teamsorg teams = %v, want [1 2 3]", got)
+	}
+}
+
+// TestAdminUpdateOrgTeamBreakGlassPostgres exercises the operator break-glass
+// fields of gormAPIStore.UpdateOrgTeam against real Postgres: schema_name
+// change (happy path, per-org 409, cross-org reuse) and the tri-state legacy
+// table-name set / clear / preserve-on-omit semantics, including that the
+// pre-update row comes back for audit.
+func TestAdminUpdateOrgTeamBreakGlassPostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	for _, org := range []string{"repairorg", "otherorg"} {
+		if err := store.DB().Create(&configstore.Org{Name: org, DatabaseName: org + "db"}).Error; err != nil {
+			t.Fatalf("create org %s: %v", org, err)
+		}
+	}
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
+		VALUES ('repairorg', 1, 'team_1', TRUE, TRUE, now(), now()),
+		       ('repairorg', 2, 'team_2', TRUE, NULL, now(), now()),
+		       ('otherorg', 9, 'shared', TRUE, TRUE, now(), now())`).Error; err != nil {
+		t.Fatalf("seed teams: %v", err)
+	}
+
+	str := func(s string) *string { return &s }
+
+	// Schema change happy path; prev carries the replaced value.
+	prev, updated, err := apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{SchemaName: str("repaired_wh")})
+	if err != nil {
+		t.Fatalf("schema change: %v", err)
+	}
+	if prev.SchemaName != "team_1" || updated.SchemaName != "repaired_wh" {
+		t.Fatalf("schema change prev/updated = %q/%q, want team_1/repaired_wh", prev.SchemaName, updated.SchemaName)
+	}
+
+	// Conflict with another team in the same org.
+	if _, _, err := apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{SchemaName: str("team_2")}); !errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+		t.Fatalf("same-org conflict err = %v, want ErrOrgTeamSchemaConflict", err)
+	}
+
+	// The same schema in a different org is allowed (uniqueness is per org).
+	if _, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{SchemaName: str("shared")}); err != nil || updated.SchemaName != "shared" {
+		t.Fatalf("cross-org schema reuse: updated = %+v, err = %v", updated, err)
+	}
+
+	// Legacy names: set all three...
+	_, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{
+		EventsTableNameSet: true, EventsTableName: str("legacy_events"),
+		PersonsTableNameSet: true, PersonsTableName: str("legacy_persons"),
+		SchemaDataImportsNameSet: true, SchemaDataImportsName: str("legacy_imports"),
+	})
+	if err != nil {
+		t.Fatalf("set legacy names: %v", err)
+	}
+	if updated.EventsTableName == nil || *updated.EventsTableName != "legacy_events" ||
+		updated.PersonsTableName == nil || *updated.PersonsTableName != "legacy_persons" ||
+		updated.SchemaDataImportsName == nil || *updated.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("legacy names not stored: %+v", updated)
+	}
+
+	// ...then clear one; the omitted others must be preserved.
+	_, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{EventsTableNameSet: true})
+	if err != nil {
+		t.Fatalf("clear events_table_name: %v", err)
+	}
+	if updated.EventsTableName != nil {
+		t.Fatalf("events_table_name = %v, want NULL after clear", *updated.EventsTableName)
+	}
+	if updated.PersonsTableName == nil || *updated.PersonsTableName != "legacy_persons" ||
+		updated.SchemaDataImportsName == nil || *updated.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("omitted legacy names must be preserved, got %+v", updated)
+	}
+	// The schema change earlier must have survived unrelated updates.
+	if updated.SchemaName != "shared" {
+		t.Fatalf("schema_name = %q, want shared preserved on omit", updated.SchemaName)
 	}
 }

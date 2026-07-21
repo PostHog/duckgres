@@ -14,6 +14,7 @@ import {
   CreateTeamDialog,
   DeleteTeamDialog,
   EditTeamDialog,
+  LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useAllOrgTeams, useOrgs } from "@/hooks/useApi";
@@ -63,7 +64,12 @@ export function OrgTeams() {
       {
         accessorKey: "schema_name",
         header: "Schema",
-        cell: ({ getValue }) => <span className="font-mono text-xs">{String(getValue())}</span>,
+        cell: ({ row, getValue }) => (
+          <span className="flex items-center gap-1.5">
+            <span className="font-mono text-xs">{String(getValue())}</span>
+            <LegacyNamesBadge team={row.original} />
+          </span>
+        ),
       },
       {
         accessorKey: "enabled",
