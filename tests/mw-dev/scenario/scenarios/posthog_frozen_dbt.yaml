@@ -40,6 +40,8 @@ steps:
       catalog: ducklake
       schema: dbt_frozen
       project_dir: ../dbt/posthog_frozen_project
+      worker_cpu: "2"
+      worker_memory: 4Gi
       commands: [debug, run, test, docs_generate]
       retry:
         enabled: true

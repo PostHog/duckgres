@@ -313,6 +313,7 @@ func TestFullSuiteScenarioComposesWorkloadsAsDAG(t *testing.T) {
 			t.Fatalf("step %s dependencies = %#v, want [setup_frozen_views]", stepID, got)
 		}
 	}
+	assertDBTWorkerSize(t, steps["dbt_models"])
 	deprovision := steps["deprovision"]
 	if !deprovision.AlwaysRun {
 		t.Fatal("deprovision should always run")
@@ -523,9 +524,20 @@ func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {
 		if maxAttempts := fmt.Sprint(retry["max_attempts"]); maxAttempts != "2" {
 			t.Fatalf("frozen dbt retry max_attempts = %#v, want 2", retry["max_attempts"])
 		}
+		assertDBTWorkerSize(t, step)
 	}
 	if !foundDBT {
 		t.Fatal("expected frozen dbt scenario to include a dbt_run step")
+	}
+}
+
+func assertDBTWorkerSize(t *testing.T, step core.Step) {
+	t.Helper()
+	if got, _ := step.With["worker_cpu"].(string); got != "2" {
+		t.Fatalf("dbt worker_cpu = %q, want 2", got)
+	}
+	if got, _ := step.With["worker_memory"].(string); got != "4Gi" {
+		t.Fatalf("dbt worker_memory = %q, want 4Gi", got)
 	}
 }
 
