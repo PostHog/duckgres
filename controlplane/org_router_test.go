@@ -130,6 +130,66 @@ func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSess
 	}
 }
 
+func TestChangedProjectReaderUsersDetectsNamespaceAndCredentialChanges(t *testing.T) {
+	teamID := int64(2)
+	key := configstore.OrgUserKey{OrgID: "org-a", Username: "posthog_team_2"}
+	old := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "team_2"}}},
+		},
+		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+			key: {Mode: configstore.OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "old-hash"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+	}
+	updatedNamespace := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "renamed"}}},
+		},
+		OrgUserAccess:   old.OrgUserAccess,
+		OrgUserPassword: old.OrgUserPassword,
+		OrgUserDisabled: old.OrgUserDisabled,
+	}
+	if _, ok := changedProjectReaderUsers(old, updatedNamespace)[key]; !ok {
+		t.Fatal("namespace change did not invalidate project reader")
+	}
+
+	updatedPassword := *old
+	updatedPassword.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new-hash"}
+	if _, ok := changedProjectReaderUsers(old, &updatedPassword)[key]; !ok {
+		t.Fatal("credential change did not invalidate project reader")
+	}
+}
+
+func TestOrgRouterHandleConfigChangeNotifiesFlightSessionRevocation(t *testing.T) {
+	teamID := int64(42)
+	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
+	old := &configstore.Snapshot{
+		Orgs:            map[string]*configstore.OrgConfig{"analytics": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, Enabled: true}}}},
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "old"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+			key: {Mode: configstore.OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+	}
+	updated := *old
+	updated.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new"}
+
+	var revokedOrg, revokedUser string
+	router := &OrgRouter{orgs: map[string]*OrgStack{
+		"analytics": {Config: old.Orgs["analytics"]},
+	}}
+	router.setProjectReaderChangeHandler(func(orgID, username string) {
+		revokedOrg, revokedUser = orgID, username
+	})
+	router.HandleConfigChange(old, &updated)
+
+	if revokedOrg != "analytics" || revokedUser != "reader" {
+		t.Fatalf("revoked user = %s/%s, want analytics/reader", revokedOrg, revokedUser)
+	}
+}
+
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
 	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil)

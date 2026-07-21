@@ -23,10 +23,13 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/usersecrets"
+	"github.com/posthog/duckgres/transpiler/transform"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -90,6 +93,12 @@ type SessionProvider interface {
 	DestroySession(int32)
 }
 
+// QueryAccessPolicyProvider optionally binds a project-scoped policy to a
+// Flight session. Providers that do not implement it remain unrestricted.
+type QueryAccessPolicyProvider interface {
+	QueryAccessPolicy(ctx context.Context, username string) *server.QueryAccessPolicy
+}
+
 type DurableSessionState string
 
 const (
@@ -99,11 +108,12 @@ const (
 )
 
 type DurableSessionMetadata struct {
-	Username     string
-	OrgID        string
-	WorkerID     int
-	OwnerEpoch   int64
-	CPInstanceID string
+	Username       string
+	OrgID          string
+	WorkerID       int
+	OwnerEpoch     int64
+	CPInstanceID   string
+	AccessRevision string
 }
 
 type DurableSessionRecord struct {
@@ -117,6 +127,11 @@ type DurableSessionRecord struct {
 	State        DurableSessionState
 	ExpiresAt    time.Time
 	LastSeenAt   time.Time
+	// AccessPolicyRecorded distinguishes an unrestricted session (recorded nil
+	// policy) from a legacy record that predates durable scope persistence.
+	AccessPolicyRecorded bool
+	AccessRevision       string
+	QueryAccessPolicy    *server.QueryAccessPolicy
 }
 
 type DurableSessionStore interface {
@@ -137,6 +152,10 @@ type sessionReconnector interface {
 
 type durableSessionStoreProvider interface {
 	DurableSessionStore() DurableSessionStore
+}
+
+type sessionOrgProvider interface {
+	SessionOrgID(pid int32) (string, bool)
 }
 
 // CredentialValidator abstracts username/password authentication.
@@ -190,6 +209,15 @@ type FlightIngress struct {
 	shutdownState atomic.Bool
 	servingState  atomic.Bool
 	wg            sync.WaitGroup
+}
+
+// DrainUserSessions revokes this control plane's active Flight bearer tokens
+// for one org user and closes their durable reconnect records.
+func (f *FlightIngress) DrainUserSessions(orgID, username string) int {
+	if f == nil || f.sessionStore == nil {
+		return 0
+	}
+	return f.sessionStore.closeUserSessions(orgID, username)
 }
 
 func NewFlightIngress(host string, port int, tlsConfig *tls.Config, validator CredentialValidator, provider SessionProvider, cfg Config, opts Options) (*FlightIngress, error) {
@@ -1170,12 +1198,13 @@ type flightQueryHandle struct {
 }
 
 type flightClientSession struct {
-	pid      int32
-	token    string
-	username string
-	executor *flightclient.FlightExecutor
-	queryFn  func(context.Context, string, ...any) (server.RowSet, error)
-	execFn   func(context.Context, string, ...any) (server.ExecResult, error)
+	pid               int32
+	token             string
+	username          string
+	executor          *flightclient.FlightExecutor
+	queryAccessPolicy *server.QueryAccessPolicy
+	queryFn           func(context.Context, string, ...any) (server.RowSet, error)
+	execFn            func(context.Context, string, ...any) (server.ExecResult, error)
 
 	lastUsed atomic.Int64
 	// tokenIssuedAt stores when this token was issued; used for absolute token TTL.
@@ -1218,6 +1247,13 @@ func (s *flightClientSession) touch() {
 
 func (s *flightClientSession) query(ctx context.Context, query string, args ...any) (server.RowSet, error) {
 	s.touch()
+	if err := s.queryAccessPolicy.Authorize(query); err != nil {
+		return nil, err
+	}
+	query, err := rewriteScopedMetadataQuery(query, s.queryAccessPolicy)
+	if err != nil {
+		return nil, err
+	}
 	s.opMu.Lock()
 	rows, err := s.queryWithRecoveryLocked(ctx, query, args...)
 	if err != nil {
@@ -1229,10 +1265,44 @@ func (s *flightClientSession) query(ctx context.Context, query string, args ...a
 
 func (s *flightClientSession) exec(ctx context.Context, query string, args ...any) (server.ExecResult, error) {
 	s.touch()
+	if err := s.queryAccessPolicy.Authorize(query); err != nil {
+		return nil, err
+	}
+	query, err := rewriteScopedMetadataQuery(query, s.queryAccessPolicy)
+	if err != nil {
+		return nil, err
+	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	result, err := s.execWithRecoveryLocked(ctx, query, args...)
 	return result, err
+}
+
+func rewriteScopedMetadataQuery(query string, policy *server.QueryAccessPolicy) (string, error) {
+	if policy == nil {
+		return query, nil
+	}
+	tree, err := pg_query.Parse(query)
+	if err != nil {
+		return "", fmt.Errorf("parse scoped metadata query: %w", err)
+	}
+	result := &transform.Result{}
+	informationSchemaChanged, err := transform.NewInformationSchemaTransformWithConfig(true).Transform(tree, result)
+	if err != nil {
+		return "", fmt.Errorf("rewrite information_schema query: %w", err)
+	}
+	pgCatalogChanged, err := transform.NewPgCatalogTransformWithConfig(true).Transform(tree, result)
+	if err != nil {
+		return "", fmt.Errorf("rewrite pg_catalog query: %w", err)
+	}
+	if !informationSchemaChanged && !pgCatalogChanged {
+		return query, nil
+	}
+	rewritten, err := pg_query.Deparse(tree)
+	if err != nil {
+		return "", fmt.Errorf("deparse scoped metadata query: %w", err)
+	}
+	return rewritten, nil
 }
 
 func (s *flightClientSession) queryLocked(ctx context.Context, query string, args ...any) (server.RowSet, error) {
@@ -1469,6 +1539,8 @@ type flightAuthSessionStore struct {
 	reconnector       sessionReconnector
 	durableStore      DurableSessionStore
 	forceDrainSession func(pid int32) bool
+	queryAccessPolicy func(context.Context, string) *server.QueryAccessPolicy
+	sessionOrgID      func(int32) (string, bool)
 
 	mu       sync.RWMutex
 	sessions map[string]*flightClientSession // session token -> session
@@ -1514,6 +1586,14 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 	if p, ok := provider.(durableSessionStoreProvider); ok {
 		durableStore = p.DurableSessionStore()
 	}
+	var queryAccessPolicy func(context.Context, string) *server.QueryAccessPolicy
+	if p, ok := provider.(QueryAccessPolicyProvider); ok {
+		queryAccessPolicy = p.QueryAccessPolicy
+	}
+	var sessionOrgID func(int32) (string, bool)
+	if p, ok := provider.(sessionOrgProvider); ok {
+		sessionOrgID = p.SessionOrgID
+	}
 
 	s := &flightAuthSessionStore{
 		provider:           provider,
@@ -1528,6 +1608,8 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 		metadataProvider:   metadataProvider,
 		reconnector:        reconnector,
 		durableStore:       durableStore,
+		queryAccessPolicy:  queryAccessPolicy,
+		sessionOrgID:       sessionOrgID,
 		sessions:           make(map[string]*flightClientSession),
 		byKey:              make(map[string]string),
 		stopCh:             make(chan struct{}),
@@ -1607,6 +1689,13 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 		return nil, fmt.Errorf("generate session identity token: %w", tokenErr)
 	}
 	created := newFlightClientSession(pid, username, executor)
+	if s.queryAccessPolicy != nil {
+		created.queryAccessPolicy = s.queryAccessPolicy(ctx, username)
+	}
+	if err := initializeScopedMetadata(ctx, created); err != nil {
+		s.destroySessionFn(pid)
+		return nil, err
+	}
 	created.token = token
 
 	s.mu.Lock()
@@ -1751,6 +1840,44 @@ func (s *flightAuthSessionStore) CloseByToken(token string) bool {
 	}
 	s.notifySessionCountChanged(sessionCount)
 	return true
+}
+
+func (s *flightAuthSessionStore) closeUserSessions(orgID, username string) int {
+	if s == nil || s.sessionOrgID == nil {
+		return 0
+	}
+	type matchedSession struct {
+		token   string
+		session *flightClientSession
+	}
+	matched := make([]matchedSession, 0)
+	s.mu.Lock()
+	s.ensureMapsLocked()
+	for token, session := range s.sessions {
+		if session == nil || session.username != username {
+			continue
+		}
+		sessionOrgID, ok := s.sessionOrgID(session.pid)
+		if !ok || sessionOrgID != orgID {
+			continue
+		}
+		delete(s.sessions, token)
+		s.removeByKeyForTokenLocked(token)
+		matched = append(matched, matchedSession{token: token, session: session})
+	}
+	sessionCount := len(s.sessions)
+	s.mu.Unlock()
+
+	for _, item := range matched {
+		s.destroySessionFn(item.session.pid)
+		if s.durableStore != nil {
+			_ = s.durableStore.CloseSession(item.token, time.Now())
+		}
+	}
+	if len(matched) > 0 {
+		s.notifySessionCountChanged(sessionCount)
+	}
+	return len(matched)
 }
 
 func (s *flightAuthSessionStore) getExistingByKey(key string) (*flightClientSession, bool) {
@@ -1928,20 +2055,33 @@ func (s *flightAuthSessionStore) persistSession(session *flightClientSession, us
 		return
 	}
 	record := DurableSessionRecord{
-		SessionToken: session.token,
-		Username:     username,
-		OrgID:        meta.OrgID,
-		WorkerID:     meta.WorkerID,
-		PID:          session.pid,
-		OwnerEpoch:   meta.OwnerEpoch,
-		CPInstanceID: meta.CPInstanceID,
-		State:        DurableSessionStateActive,
-		ExpiresAt:    time.Unix(0, session.expiresAt.Load()),
-		LastSeenAt:   time.Now(),
+		SessionToken:         session.token,
+		Username:             username,
+		OrgID:                meta.OrgID,
+		WorkerID:             meta.WorkerID,
+		PID:                  session.pid,
+		OwnerEpoch:           meta.OwnerEpoch,
+		CPInstanceID:         meta.CPInstanceID,
+		State:                DurableSessionStateActive,
+		ExpiresAt:            time.Unix(0, session.expiresAt.Load()),
+		LastSeenAt:           time.Now(),
+		AccessPolicyRecorded: true,
+		AccessRevision:       meta.AccessRevision,
+		QueryAccessPolicy:    cloneQueryAccessPolicy(session.queryAccessPolicy),
 	}
 	if err := s.durableStore.UpsertSession(record); err != nil {
 		slog.Warn("Persisting durable Flight session record failed.", "pid", session.pid, "error", err)
 	}
+}
+
+func cloneQueryAccessPolicy(policy *server.QueryAccessPolicy) *server.QueryAccessPolicy {
+	if policy == nil {
+		return nil
+	}
+	copy := *policy
+	copy.AllowedSchemas = append([]string(nil), policy.AllowedSchemas...)
+	copy.AllowedRelations = append([]string(nil), policy.AllowedRelations...)
+	return &copy
 }
 
 // tokenFingerprint returns a short, non-reversible fingerprint of a session
@@ -1987,6 +2127,15 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	}
 
 	session := newFlightClientSession(pid, record.Username, executor)
+	if record.AccessPolicyRecorded {
+		session.queryAccessPolicy = cloneQueryAccessPolicy(record.QueryAccessPolicy)
+	} else if s.queryAccessPolicy != nil {
+		session.queryAccessPolicy = s.queryAccessPolicy(ctx, record.Username)
+	}
+	if err := initializeScopedMetadata(ctx, session); err != nil {
+		s.destroySessionFn(pid)
+		return nil, false
+	}
 	session.token = token
 	session.tokenIssuedAt.Store(time.Now().UnixNano())
 	if !record.ExpiresAt.IsZero() {
@@ -2001,6 +2150,21 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	s.notifySessionCountChanged(sessionCount)
 	s.persistSession(session, record.Username)
 	return session, true
+}
+
+func initializeScopedMetadata(ctx context.Context, session *flightClientSession) error {
+	if session == nil || session.executor == nil || session.queryAccessPolicy == nil {
+		return nil
+	}
+	policy := session.queryAccessPolicy
+	err := sessionmeta.InitSessionDatabaseMetadataWithAccess(ctx, session.executor, "ducklake", &sessionmeta.MetadataAccessPolicy{
+		AllowedSchemas:   policy.AllowedSchemas,
+		AllowedRelations: policy.AllowedRelations,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize project-scoped Flight metadata: %w", err)
+	}
+	return nil
 }
 
 func (s *flightAuthSessionStore) closeDurableSessionIfReconnectTargetUnchanged(token string, stale DurableSessionRecord, closedAt time.Time) {
@@ -2019,7 +2183,8 @@ func sameDurableReconnectTarget(a, b DurableSessionRecord) bool {
 		a.WorkerID == b.WorkerID &&
 		a.PID == b.PID &&
 		a.OwnerEpoch == b.OwnerEpoch &&
-		a.CPInstanceID == b.CPInstanceID
+		a.CPInstanceID == b.CPInstanceID &&
+		a.AccessRevision == b.AccessRevision
 }
 
 func (s *flightAuthSessionStore) removeByKeyForTokenLocked(token string) {

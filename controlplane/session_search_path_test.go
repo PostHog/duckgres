@@ -1,6 +1,19 @@
 package controlplane
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/posthog/duckgres/server"
+)
+
+func TestAuthorizedClientSearchPath(t *testing.T) {
+	if got := authorizedClientSearchPath("team_7", &server.QueryAccessPolicy{ReadOnly: true}); got != "" {
+		t.Fatalf("scoped search path = %q, want empty", got)
+	}
+	if got := authorizedClientSearchPath("analytics", nil); got != "analytics" {
+		t.Fatalf("unscoped search path = %q, want analytics", got)
+	}
+}
 
 func TestEffectiveSessionDefaultCommandDuckLakeClientSearchPathOnly(t *testing.T) {
 	// DuckLake's catalog switch is owned by InitSessionDatabaseMetadata's defer,
