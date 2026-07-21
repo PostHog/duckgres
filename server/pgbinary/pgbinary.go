@@ -31,7 +31,7 @@ const (
 // field's wire dscale already matches it, so we apply that coercion explicitly.
 type Numeric struct {
 	Precision int
-	Scale     int
+	Scale     uint16
 }
 
 // Column describes scanner-sensitive properties of one binary COPY column.
@@ -87,11 +87,11 @@ func SchemaFromDatabaseTypes(databaseTypeNames []string) (Schema, error) {
 			return Schema{}, fmt.Errorf("column %d NUMERIC type %q must include precision and scale", i+1, databaseTypeName)
 		}
 		precision, precisionErr := strconv.Atoi(matches[1])
-		scale, scaleErr := strconv.Atoi(matches[2])
-		if precisionErr != nil || scaleErr != nil {
+		scale, scaleErr := strconv.ParseUint(matches[2], 10, 16)
+		if precisionErr != nil || scaleErr != nil || scale > uint64(^uint16(0)) {
 			return Schema{}, fmt.Errorf("column %d has invalid NUMERIC type %q", i+1, databaseTypeName)
 		}
-		schema.Columns[i].Numeric = &Numeric{Precision: precision, Scale: scale}
+		schema.Columns[i].Numeric = &Numeric{Precision: precision, Scale: uint16(scale)}
 	}
 	if err := validateSchema(schema); err != nil {
 		return Schema{}, err
@@ -281,7 +281,7 @@ func validateSchema(schema Schema) error {
 			continue
 		}
 		if column.Numeric.Precision < 1 || column.Numeric.Precision > 38 ||
-			column.Numeric.Scale < 0 || column.Numeric.Scale > column.Numeric.Precision {
+			int(column.Numeric.Scale) > column.Numeric.Precision {
 			return fmt.Errorf("column %d has invalid DECIMAL(%d,%d)", i+1, column.Numeric.Precision, column.Numeric.Scale)
 		}
 	}
@@ -365,7 +365,7 @@ func normalizeNumeric(payload []byte, target Numeric) ([]byte, error) {
 	}
 
 	unscaled := new(big.Int).Set(sourceUnscaled)
-	targetShift := target.Scale - sourceScale
+	targetShift := int(target.Scale) - sourceScale
 	if targetShift >= 0 {
 		unscaled.Mul(unscaled, powerOfTen(targetShift))
 	} else {
@@ -384,16 +384,17 @@ func normalizeNumeric(payload []byte, target Numeric) ([]byte, error) {
 	return encodeNumeric(unscaled, sign == numericNegative, target.Scale), nil
 }
 
-func encodeNumeric(unscaled *big.Int, negative bool, scale int) []byte {
+func encodeNumeric(unscaled *big.Int, negative bool, scale uint16) []byte {
 	value := new(big.Int).Abs(new(big.Int).Set(unscaled))
 	if value.Sign() == 0 {
 		result := make([]byte, 8)
-		binary.BigEndian.PutUint16(result[6:8], uint16(scale))
+		binary.BigEndian.PutUint16(result[6:8], scale)
 		return result
 	}
 
-	fractionalGroups := (scale + 3) / 4
-	padding := fractionalGroups*4 - scale
+	scaleInt := int(scale)
+	fractionalGroups := (scaleInt + 3) / 4
+	padding := fractionalGroups*4 - scaleInt
 	if padding > 0 {
 		value.Mul(value, powerOfTen(padding))
 	}
@@ -432,7 +433,7 @@ func encodeNumeric(unscaled *big.Int, negative bool, scale int) []byte {
 	if negative {
 		binary.BigEndian.PutUint16(result[4:6], numericNegative)
 	}
-	binary.BigEndian.PutUint16(result[6:8], uint16(scale))
+	binary.BigEndian.PutUint16(result[6:8], scale)
 	for i, digit := range digits {
 		binary.BigEndian.PutUint16(result[8+i*2:10+i*2], digit)
 	}

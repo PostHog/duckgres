@@ -48,10 +48,13 @@ func numeric(t *testing.T, value string) []byte {
 	neg := strings.HasPrefix(value, "-")
 	value = strings.TrimPrefix(value, "-")
 	parts := strings.SplitN(value, ".", 2)
-	scale := 0
+	var scale uint16
 	digits := parts[0]
 	if len(parts) == 2 {
-		scale = len(parts[1])
+		if len(parts[1]) > int(^uint16(0)) {
+			t.Fatalf("test NUMERIC scale is too large: %d", len(parts[1]))
+		}
+		scale = uint16(len(parts[1]))
 		digits += parts[1]
 	}
 	unscaled, ok := new(big.Int).SetString(digits, 10)
@@ -133,6 +136,13 @@ func TestSchemaFromDatabaseTypesRejectsUnparameterizedNumeric(t *testing.T) {
 	_, err := SchemaFromDatabaseTypes([]string{"NUMERIC"})
 	if err == nil || !strings.Contains(err.Error(), "precision and scale") {
 		t.Fatalf("SchemaFromDatabaseTypes() error = %v, want typmod error", err)
+	}
+}
+
+func TestSchemaFromDatabaseTypesRejectsNumericScaleOutsideWireRange(t *testing.T) {
+	_, err := SchemaFromDatabaseTypes([]string{"NUMERIC(38,65536)"})
+	if err == nil || !strings.Contains(err.Error(), "invalid NUMERIC type") {
+		t.Fatalf("SchemaFromDatabaseTypes() error = %v, want wire-scale range error", err)
 	}
 }
 
