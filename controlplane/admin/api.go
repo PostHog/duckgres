@@ -132,6 +132,8 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	r.GET("/orgs/:id/users/:username", h.getUser)
 	r.PUT("/orgs/:id/users/:username", h.updateUser)
 	r.DELETE("/orgs/:id/users/:username", h.deleteUser)
+	// Peer-only fan-out target: see reloadSnapshot below.
+	r.POST("/internal/reload-snapshot", h.reloadSnapshot)
 
 	// Workers (read-only)
 	r.GET("/workers", h.listWorkers)
@@ -188,6 +190,12 @@ type apiStore interface {
 	// when concurrent PUTs target the same org. Returns (nil, false, nil) if
 	// the org doesn't exist.
 	MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error)
+
+	// ReloadSnapshot forces this replica's in-memory config snapshot to reload
+	// from the config-store DB immediately, bypassing the poll interval. Used
+	// by createUser/updateUser/deleteUser so a write is authable on this
+	// replica the instant the request returns — see notifyPeersOfChange.
+	ReloadSnapshot() error
 }
 
 type gormAPIStore struct {
@@ -585,6 +593,10 @@ func (s *gormAPIStore) DeleteUser(orgID, username string) (bool, error) {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+func (s *gormAPIStore) ReloadSnapshot() error {
+	return s.store.ReloadSnapshot()
 }
 
 func (s *gormAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -1573,6 +1585,10 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusCreated, user)
 }
 
@@ -1654,6 +1670,10 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, user)
 }
 
@@ -1669,7 +1689,44 @@ func (h *apiHandler) deleteUser(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"deleted": username})
+}
+
+// notifyPeersOfChange reloads THIS replica's config snapshot immediately
+// (bypassing the poll interval, default 30s) and fans the same reload out to
+// every other CP replica, mirroring the disable/enable reload pattern in
+// live.go. Unlike disable/enable, the write has already landed in the shared
+// config-store DB by the time this runs, so a peer only needs to reload — it
+// must never re-run the create/update/delete (that would 409 or double-apply
+// against a row that's already there). Peer fan-out is best-effort: PostPeers
+// already drops a slow/down peer without error, so only a failure to reload
+// THIS replica is surfaced to the caller.
+func (h *apiHandler) notifyPeersOfChange(c *gin.Context) error {
+	if err := h.store.ReloadSnapshot(); err != nil {
+		return err
+	}
+	if h.fetcher != nil {
+		h.fetcher.PostPeers(c.Request.Context(), "/api/v1/internal/reload-snapshot")
+	}
+	return nil
+}
+
+// reloadSnapshot is a peer-fan-out target only (see notifyPeersOfChange): it
+// forces this replica's config snapshot to reload immediately. There is
+// nothing to re-execute here — the write already landed in the shared
+// config-store DB — so unlike the per-user kill-switch actions this handler
+// has no scope=local branch to guard: it never calls PostPeers itself, so it
+// cannot recurse regardless of who calls it.
+func (h *apiHandler) reloadSnapshot(c *gin.Context) {
+	if err := h.store.ReloadSnapshot(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"reloaded": true})
 }
 
 // --- Workers ---
