@@ -236,6 +236,28 @@ func TestDrainOrgConnectionsWaitsForActiveQueryBoundary(t *testing.T) {
 	}
 }
 
+func TestDrainUserConnectionsOnlyDrainsMatchingUser(t *testing.T) {
+	s := &Server{}
+	s.initConnsMap()
+
+	matching := &clientConn{orgID: "org-a", username: "reader"}
+	otherUser := &clientConn{orgID: "org-a", username: "root"}
+	otherOrg := &clientConn{orgID: "org-b", username: "reader"}
+	s.conns[1] = matching
+	s.conns[2] = otherUser
+	s.conns[3] = otherOrg
+
+	if got := s.DrainUserConnections("org-a", "reader"); got != 1 {
+		t.Fatalf("DrainUserConnections returned %d, want 1", got)
+	}
+	if !matching.drainRequested.Load() {
+		t.Fatal("matching connection was not drained")
+	}
+	if otherUser.drainRequested.Load() || otherOrg.drainRequested.Load() {
+		t.Fatal("unrelated connection was drained")
+	}
+}
+
 // TestCopyStreamReArmsIdleDeadline proves the COPY-FROM-STDIN forwarding reader
 // (copyDataWireReader) re-arms the connection idle read deadline on EVERY
 // CopyData message, so a COPY that keeps putting bytes on the wire for LONGER

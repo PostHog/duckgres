@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -31,6 +32,8 @@ type fakeAPIStore struct {
 	// teamBillingRepoints records every billing repoint requested through
 	// UpdateOrgTeam (usage re-attribution rides along in the real store).
 	teamBillingRepoints []fakeReattributeCall
+	reloadSnapshotCalls int
+	reloadSnapshotErr   error
 }
 
 type fakeReattributeCall struct {
@@ -259,6 +262,32 @@ func (s *fakeAPIStore) DeleteUser(orgID, username string) (bool, error) {
 	return true, nil
 }
 
+func (s *fakeAPIStore) UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error) {
+	team := s.teams[orgID][teamID]
+	if team == nil || !team.Enabled {
+		return nil, configstore.ErrProjectReaderTeamUnavailable
+	}
+	boundTeamID := teamID
+	passwordHash, err := configstore.HashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+	user := &configstore.OrgUser{
+		OrgID:      orgID,
+		Username:   username,
+		Password:   passwordHash,
+		AccessMode: configstore.OrgUserAccessModeProjectReader,
+		TeamID:     &boundTeamID,
+	}
+	s.users[orgID+"/"+username] = user
+	return user, nil
+}
+
+func (s *fakeAPIStore) ReloadSnapshot() error {
+	s.reloadSnapshotCalls++
+	return s.reloadSnapshotErr
+}
+
 func (s *fakeAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
 	warehouse, ok := s.warehouses[orgID]
 	if !ok {
@@ -325,6 +354,15 @@ func newTestAPIRouter(store apiStore) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	registerAPIWithStore(r.Group("/api/v1"), store, nil, nil)
+	return r
+}
+
+// newTestAPIRouterWithFetcher is newTestAPIRouter plus a PeerFetcher, for
+// tests asserting the create/update/delete user reload + peer fan-out.
+func newTestAPIRouterWithFetcher(store apiStore, fetcher PeerFetcher) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	registerAPIWithStore(r.Group("/api/v1"), store, nil, fetcher)
 	return r
 }
 
@@ -574,6 +612,32 @@ func TestUpdateUserRejectsNegativeMaxVCPUs(t *testing.T) {
 	}
 }
 
+func TestUpdateUserRejectsPassthroughForProjectReader(t *testing.T) {
+	teamID := int64(42)
+	store := newFakeAPIStore()
+	store.users["analytics/project-reader"] = &configstore.OrgUser{
+		OrgID:       "analytics",
+		Username:    "project-reader",
+		Password:    "hash",
+		AccessMode:  configstore.OrgUserAccessModeProjectReader,
+		TeamID:      &teamID,
+		Passthrough: false,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/project-reader", bytes.NewReader([]byte(`{"passthrough":true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if store.users["analytics/project-reader"].Passthrough {
+		t.Fatal("project reader must remain non-passthrough")
+	}
+}
+
 func TestUpdateUserIgnoresRemovedDefaultCatalogField(t *testing.T) {
 	// default_catalog was removed with Iceberg support: a legacy update body
 	// carrying it still succeeds (unknown fields are ignored on the users
@@ -598,6 +662,231 @@ func TestUpdateUserIgnoresRemovedDefaultCatalogField(t *testing.T) {
 	}
 	if bytes.Contains(rec.Body.Bytes(), []byte("default_catalog")) {
 		t.Fatalf("response must not echo removed default_catalog field: %s", rec.Body.String())
+	}
+}
+
+// TestUserCRUDReloadsSnapshotAndNotifiesPeers covers create/update/delete: each
+// must reload THIS replica's snapshot immediately (bypassing the poll
+// interval) and fan the same reload out to every other CP replica, mirroring
+// the disable/enable reload pattern — so a freshly created/updated/deleted
+// user is authable cluster-wide right away instead of on each replica's next
+// poll tick.
+func TestUserCRUDReloadsSnapshotAndNotifiesPeers(t *testing.T) {
+	const reloadPath = "/api/v1/internal/reload-snapshot"
+
+	cases := []struct {
+		name    string
+		method  string
+		path    string
+		body    string
+		preseed bool // seed an existing "analytics/reader" row before the request
+	}{
+		{"create", http.MethodPost, "/api/v1/users", `{"org_id":"analytics","username":"reader","password":"secret"}`, false},
+		{"update", http.MethodPut, "/api/v1/orgs/analytics/users/reader", `{"passthrough":true}`, true},
+		{"delete", http.MethodDelete, "/api/v1/orgs/analytics/users/reader", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			if tc.preseed {
+				store.users["analytics/reader"] = &configstore.OrgUser{OrgID: "analytics", Username: "reader", Password: "hash"}
+			}
+			fetcher := &fakePeerFetcher{}
+			router := newTestAPIRouterWithFetcher(store, fetcher)
+
+			var body *bytes.Reader
+			if tc.body != "" {
+				body = bytes.NewReader([]byte(tc.body))
+			} else {
+				body = bytes.NewReader(nil)
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code < 200 || rec.Code >= 300 {
+				t.Fatalf("status = %d, want 2xx: %s", rec.Code, rec.Body.String())
+			}
+			if store.reloadSnapshotCalls != 1 {
+				t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+			}
+			if got := fetcher.postCallCount(); got != 1 {
+				t.Fatalf("peer fan-out POSTs = %d, want 1", got)
+			}
+			fetcher.mu.Lock()
+			paths := append([]string(nil), fetcher.postPaths...)
+			fetcher.mu.Unlock()
+			if len(paths) != 1 || paths[0] != reloadPath {
+				t.Fatalf("peer fan-out path = %v, want [%s]", paths, reloadPath)
+			}
+		})
+	}
+}
+
+// TestUserCRUDSkipsPeerFanOutWithoutFetcher: a single-CP deployment (no
+// PeerFetcher wired) must still reload locally and must not panic.
+func TestUserCRUDSkipsPeerFanOutWithoutFetcher(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"org_id":"analytics","username":"reader","password":"secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+	}
+}
+
+// TestUserCRUDPeerFanOutIsBestEffort: the DB write must succeed even when no
+// peer answers the fan-out (PostPeers already degrades gracefully — this just
+// proves the handler doesn't treat an empty peer response as an error).
+func TestUserCRUDPeerFanOutIsBestEffort(t *testing.T) {
+	store := newFakeAPIStore()
+	fetcher := &fakePeerFetcher{} // no bodies configured for any path
+	router := newTestAPIRouterWithFetcher(store, fetcher)
+
+	body := []byte(`{"org_id":"analytics","username":"reader","password":"secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if store.users["analytics/reader"] == nil {
+		t.Fatal("expected user to be created despite no peer responding")
+	}
+}
+
+// TestUserCRUDReturnsErrorWhenLocalReloadFails: mirrors disable/enable — a
+// failed LOCAL reload surfaces as a request error even though the write
+// already landed (the caller needs to know the change may not be immediately
+// visible on this replica).
+func TestUserCRUDReturnsErrorWhenLocalReloadFails(t *testing.T) {
+	store := newFakeAPIStore()
+	store.reloadSnapshotErr = errors.New("reload failed")
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"org_id":"analytics","username":"reader","password":"secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+	if store.users["analytics/reader"] == nil {
+		t.Fatal("expected the user row to still be created even though the reload response errored")
+	}
+}
+
+// TestReloadSnapshotEndpoint covers the peer-fan-out target itself: it reloads
+// and returns 200, or surfaces a reload error as 500.
+func TestReloadSnapshotEndpoint(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/internal/reload-snapshot", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+	}
+
+	store.reloadSnapshotErr = errors.New("boom")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/internal/reload-snapshot", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+}
+
+func TestUpsertProjectReaderBindsEnabledTeamAndReloadsSnapshot(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/project-reader", nil)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["username"] != "posthog_team_42" || body["password"] == "" {
+		t.Fatalf("unexpected credentials response: %v", body)
+	}
+	user := store.users["acme/posthog_team_42"]
+	if user == nil || user.TeamID == nil || *user.TeamID != 42 || user.AccessMode != configstore.OrgUserAccessModeProjectReader {
+		t.Fatalf("project reader was not bound to team 42: %#v", user)
+	}
+	if user.Passthrough {
+		t.Fatal("project readers must never use passthrough mode")
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+	}
+}
+
+func TestUpsertProjectReaderRejectsDisabledTeam(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: false})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/project-reader", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if len(store.users) != 0 {
+		t.Fatal("disabled team must not receive a project reader")
+	}
+}
+
+func TestUpsertProjectReaderAcceptsCallerManagedPassword(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newTestAPIRouter(store)
+	password := "caller-managed-password-with-32-characters"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/api/v1/orgs/acme/teams/42/project-reader",
+		strings.NewReader(`{"password":"`+password+`"}`),
+	)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["password"] != password {
+		t.Fatal("response did not return the caller-managed password")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(store.users["acme/posthog_team_42"].Password), []byte(password)); err != nil {
+		t.Fatal("stored hash does not authenticate the caller-managed password")
 	}
 }
 

@@ -988,9 +988,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// param no longer identifies the org — it selects which attached catalog
 	// (ducklake) the session defaults to.
 	var (
-		orgID            string
-		passthroughUser  bool
-		requestedCatalog string // "" | "ducklake" (validated below)
+		orgID             string
+		passthroughUser   bool
+		requestedCatalog  string // "" | "ducklake" (validated below)
+		queryAccessPolicy *server.QueryAccessPolicy
 	)
 	if cp.configStore != nil {
 		sni := tlsConn.ConnectionState().ServerName
@@ -1058,6 +1059,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog = clog.With("org", orgID)
 		passthroughUser = resolution.Passthrough
 		requestedCatalog = resolution.EffectiveCatalog
+		if resolution.QueryAccess != nil {
+			queryAccessPolicy = &server.QueryAccessPolicy{
+				ReadOnly:         resolution.QueryAccess.ReadOnly,
+				AllowedSchemas:   resolution.QueryAccess.AllowedSchemas,
+				AllowedRelations: resolution.QueryAccess.AllowedRelations,
+			}
+		}
 		// `database` is finalized post-session to the real catalog the session
 		// defaults to (once worker attachment is known), so logs and the
 		// current_database() macro surface the actual catalog.
@@ -1074,6 +1082,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+	clientSearchPath = authorizedClientSearchPath(clientSearchPath, queryAccessPolicy)
 
 	// Send auth OK
 	if err := server.WriteAuthOK(writer); err != nil {
@@ -1297,7 +1306,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// passthrough branch below).
 	if !passthroughUser {
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, effectiveCatalog); err != nil {
+		var metadataAccess *sessionmeta.MetadataAccessPolicy
+		if queryAccessPolicy != nil {
+			metadataAccess = &sessionmeta.MetadataAccessPolicy{
+				AllowedSchemas:   queryAccessPolicy.AllowedSchemas,
+				AllowedRelations: queryAccessPolicy.AllowedRelations,
+			}
+		}
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, executor, effectiveCatalog, metadataAccess); err != nil {
 			initCancel()
 			clog.Error("Failed to initialize session database metadata.", "database", database, "error", err)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
@@ -1388,6 +1404,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// catalog is attached.
 	server.SetCatalogUseRewrite(cc, duckLakeAttached && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
+	server.SetQueryAccessPolicy(cc, queryAccessPolicy)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)
 	}
@@ -1408,6 +1425,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog.Error("Message loop error.", "error", err)
 		return
 	}
+}
+
+func authorizedClientSearchPath(searchPath string, policy *server.QueryAccessPolicy) string {
+	if policy != nil {
+		// Scoped users must use fully qualified project relations. Ignoring a
+		// client-controlled startup search_path also prevents namespace changes
+		// from influencing catalog compatibility views.
+		return ""
+	}
+	return searchPath
 }
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
@@ -2144,6 +2171,13 @@ func (cp *ControlPlane) startFlightIngress() {
 	}
 
 	cp.flight = flightIngress
+	if router, ok := cp.orgRouter.(interface {
+		SetProjectReaderChangeHandler(func(orgID, username string))
+	}); ok {
+		router.SetProjectReaderChangeHandler(func(orgID, username string) {
+			flightIngress.DrainUserSessions(orgID, username)
+		})
+	}
 	cp.flight.Start()
 }
 

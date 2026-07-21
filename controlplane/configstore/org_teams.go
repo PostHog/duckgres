@@ -347,6 +347,13 @@ func DeleteOrgTeamTx(tx *gorm.DB, orgID string, teamID int64) (*OrgTeamDeleteRes
 		return nil, ErrLastOrgTeam
 	}
 
+	// Remove the team's scoped login before its mapping. This is deliberately
+	// explicit so deleting and recreating a team cannot reactivate old credentials.
+	if err := tx.Where("org_id = ? AND access_mode = ? AND team_id = ?", orgID, "project_reader", teamID).
+		Delete(&OrgUser{}).Error; err != nil {
+		return nil, fmt.Errorf("delete project reader (org=%s team=%d): %w", orgID, teamID, err)
+	}
+
 	if err := tx.Where("org_id = ? AND team_id = ?", orgID, teamID).
 		Delete(&OrgTeam{}).Error; err != nil {
 		return nil, fmt.Errorf("delete org team (org=%s team=%d): %w", orgID, teamID, err)

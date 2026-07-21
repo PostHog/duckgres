@@ -242,6 +242,7 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 | GRANT / REVOKE, column/default privileges | ❌ | — | `has_*_privilege()` return permissive stubs; privilege DDL untested |
 | CREATE / ALTER / DROP ROLE / USER | ❌ | — | |
 | Row-level security (RLS) | ⛔ | — | `pg_policy` empty stub |
+| Managed project readers | ✅ | `server/query_access_test.go`, `server/session_database_metadata_test.go`, `tests/mw-dev/e2e/harness.sh::project_reader_isolation` | Control-plane users with `access_mode=project_reader` are read-only and restricted to their project's schemas and legacy event/person relations. `USE ducklake` and a small set of client session settings are supported; SQL cursor statements are not. Catalog compatibility views expose only the same project-owned relations, and direct DuckDB introspection functions are unavailable. Flight session tokens retain their original access scope and are revoked when the user credentials or project policy changes. This is enforced by the query gateway, not PostgreSQL `GRANT` statements. |
 
 ---
 

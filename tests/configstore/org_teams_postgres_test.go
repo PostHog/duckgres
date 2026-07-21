@@ -164,6 +164,16 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 			t.Fatalf("seed team %d: %v", seed.team, err)
 		}
 	}
+	readerTeamID := int64(2)
+	if err := store.DB().Create(&configstore.OrgUser{
+		OrgID:      "acme",
+		Username:   "posthog_team_2",
+		Password:   "hash",
+		AccessMode: configstore.OrgUserAccessModeProjectReader,
+		TeamID:     &readerTeamID,
+	}).Error; err != nil {
+		t.Fatalf("seed project reader: %v", err)
+	}
 	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
 	seedUsage(t, store, "acme", 1, bucket, 10, 20, 1000)
 
@@ -174,6 +184,15 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 	}
 	if res.WasBilling || res.NewBillingTeamID != 0 {
 		t.Fatalf("non-billing delete result = %+v, want no handover", res)
+	}
+	var readerCount int64
+	if err := store.DB().Model(&configstore.OrgUser{}).
+		Where("org_id = ? AND username = ?", "acme", "posthog_team_2").
+		Count(&readerCount).Error; err != nil {
+		t.Fatalf("count deleted project reader: %v", err)
+	}
+	if readerCount != 0 {
+		t.Fatalf("project reader count = %d, want 0 after team deletion", readerCount)
 	}
 
 	// Deleting the billing team: the OLDEST remaining team (3) takes over and

@@ -173,6 +173,7 @@ type clientConn struct {
 	lastErrorCode      string                   // most recent SQLSTATE sent via sendError; observed by query metrics
 	activeQueryMetrics *queryMetricsScope       // active query attempt metrics scope for non-ErrorResponse failures
 	passthrough        bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	queryAccessPolicy  *QueryAccessPolicy       // non-nil for project-scoped read-only users
 	cursors            map[string]*cursorState  // server-side cursor emulation
 	catalogUseRewrite  bool                     // true when bare `USE ducklake` should expand to the reliable two-part target
 	ctx                context.Context          // connection context, cancelled when connection is closed
@@ -1266,6 +1267,12 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// PostgreSQL returns EmptyQueryResponse for queries like "" or ";" or ";;;"
 	if query == "" || isEmptyQuery(query) {
 		_ = wire.WriteEmptyQueryResponse(c.writer)
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
+	if err := c.queryAccessPolicy.Authorize(query); err != nil {
+		c.sendError("ERROR", "42501", err.Error())
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
