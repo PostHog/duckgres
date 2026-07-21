@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -18,7 +19,7 @@ import (
 )
 
 // IsCopyFromStdinDescriptor reports whether desc is the custom DoPut
-// descriptor used by the control plane to stream a CSV spool file for
+// descriptor used by the control plane to stream a COPY input spool file for
 // COPY FROM STDIN. customActionServer.DoPut peeks at the first frame
 // of every DoPut stream and routes here when this returns true.
 func IsCopyFromStdinDescriptor(desc *flight.FlightDescriptor) bool {
@@ -34,7 +35,12 @@ func IsCopyFromStdinDescriptor(desc *flight.FlightDescriptor) bool {
 	return desc.Path[0] == flightclient.CopyFromStdinDescriptorPath
 }
 
-// doCopyFromStdin handles a CSV spool DoPut from the control plane.
+func substituteCopyFromStdinPlaceholders(copySQL, tmpPath string, bytesWritten int64) string {
+	result := strings.ReplaceAll(copySQL, flightclient.CopyFromStdinPathPlaceholder, tmpPath)
+	return strings.ReplaceAll(result, flightclient.CopyFromStdinSizePlaceholder, strconv.FormatInt(bytesWritten, 10))
+}
+
+// doCopyFromStdin handles a COPY input spool DoPut from the control plane.
 // It writes streamed bytes to a worker-local tempfile, executes the
 // COPY SQL with the placeholder substituted, and returns the row count
 // in the standard DoPutUpdateResult AppMetadata so the existing client
@@ -79,7 +85,7 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 			"copy-from-stdin: COPY SQL missing %q placeholder", flightclient.CopyFromStdinPathPlaceholder)
 	}
 
-	tmpFile, err := os.CreateTemp("", "duckgres-worker-copy-*.csv")
+	tmpFile, err := os.CreateTemp("", "duckgres-worker-copy-*.copy")
 	if err != nil {
 		return status.Errorf(codes.Internal, "copy-from-stdin: create tempfile: %v", err)
 	}
@@ -130,8 +136,8 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	}
 	closeOnce()
 
-	finalSQL := strings.ReplaceAll(copySQL, flightclient.CopyFromStdinPathPlaceholder, tmpPath)
-	slog.Debug("copy-from-stdin: executing COPY",
+	finalSQL := substituteCopyFromStdinPlaceholders(copySQL, tmpPath, bytesWritten)
+	slog.Debug("copy-from-stdin: executing worker load statement",
 		"frames", frames, "bytes", bytesWritten, "tmp", tmpPath)
 
 	res, execErr := session.execConn(ctx, finalSQL)

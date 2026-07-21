@@ -12,7 +12,7 @@ import (
 )
 
 // CopyFromStdinDescriptorPath is the FlightDescriptor path that marks a
-// DoPut stream as a CSV-spool-and-COPY upload rather than a standard
+// DoPut stream as a spool-and-COPY upload rather than a standard
 // Flight SQL CommandStatementUpdate. The duckdbservice worker matches
 // on this path and routes to its CopyFromStdin handler.
 const CopyFromStdinDescriptorPath = "duckgres-copy-from-stdin"
@@ -23,13 +23,19 @@ const CopyFromStdinDescriptorPath = "duckgres-copy-from-stdin"
 // BuildDuckDBCopyFromSQL using this token as the file path.
 const CopyFromStdinPathPlaceholder = "__DUCKGRES_COPY_PATH__"
 
+// CopyFromStdinSizePlaceholder is replaced by the worker with the exact
+// number of bytes in its completed spool file. The postgres binary table
+// function needs this because its COPY-function wrapper currently ignores
+// buffer_size and cannot read files larger than its 32 MiB default.
+const CopyFromStdinSizePlaceholder = "__DUCKGRES_COPY_SIZE__"
+
 // CopyFromStdinChunkSize is the byte size of each FlightData frame sent
 // from the control plane to the worker during a COPY upload. Large
 // enough to amortise per-frame overhead, small enough to keep memory
 // bounded if the worker is slow to drain.
 const CopyFromStdinChunkSize = 1 << 20 // 1 MiB
 
-// CopyFromStdin streams CSV bytes from r to a remote worker, then runs
+// CopyFromStdin streams COPY input bytes from r to a remote worker, then runs
 // copySQL on the worker against a worker-local spool file. copySQL must
 // contain CopyFromStdinPathPlaceholder where the file path should appear.
 // Returns the number of rows the worker reports COPY-affected.
@@ -37,7 +43,7 @@ const CopyFromStdinChunkSize = 1 << 20 // 1 MiB
 // Wire layout:
 //
 //	frame 0: FlightDescriptor{Type=PATH, Path=[CopyFromStdinDescriptorPath], Cmd=copySQL}
-//	frame 1..N: DataBody=<chunk of CSV bytes>
+//	frame 1..N: DataBody=<chunk of COPY input bytes>
 //	(client closes send)
 //	server: PutResult{AppMetadata=DoPutUpdateResult{RecordCount=N}}
 func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io.Reader) (int64, error) {
@@ -64,7 +70,7 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io
 		return 0, fmt.Errorf("flight doput send descriptor: %w", err)
 	}
 
-	// Frames 1..N: CSV byte chunks. We re-use one buffer; gRPC marshals the
+	// Frames 1..N: COPY input byte chunks. We re-use one buffer; gRPC marshals the
 	// proto synchronously inside Send, so reusing is safe across iterations.
 	//
 	// On a non-EOF read error we return immediately WITHOUT calling
@@ -84,7 +90,7 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io
 			break
 		}
 		if readErr != nil {
-			return 0, fmt.Errorf("read csv stream: %w", readErr)
+			return 0, fmt.Errorf("read COPY stream: %w", readErr)
 		}
 	}
 

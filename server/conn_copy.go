@@ -189,6 +189,73 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 		tableName, columnList, filePath, strings.Join(copyOptions, ", "))
 }
 
+func postgresBinaryReaderType(typeName string) (string, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(typeName))
+	// Only opt into the native reader when the established depp encoder and
+	// PostgreSQL use the same binary field layout. In particular, depp writes
+	// every integer and float as eight bytes, while PostgreSQL uses the target
+	// type's width. The legacy decoder deliberately tolerates those mismatches.
+	if strings.HasSuffix(upper, "[]") {
+		// Arrow schema round-tripping does not preserve PostgreSQL array OIDs
+		// for every element type. Keep arrays on the established decoder path
+		// rather than risk interpreting text-encoded values as binary arrays.
+		return "", false
+	}
+
+	switch {
+	case upper == "BOOLEAN" || upper == "BOOL":
+		return "BOOLEAN", true
+	case upper == "BIGINT" || upper == "INT8":
+		return "BIGINT", true
+	case upper == "DOUBLE" || upper == "FLOAT8":
+		return "DOUBLE", true
+	case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
+		return upper, true
+	case upper == "VARCHAR" || strings.HasPrefix(upper, "VARCHAR(") || upper == "TEXT" || upper == "STRING":
+		return "VARCHAR", true
+	case upper == "BLOB" || upper == "BYTEA":
+		return "BLOB", true
+	case upper == "DATE":
+		return "DATE", true
+	case upper == "TIMESTAMP":
+		return "TIMESTAMP", true
+	case upper == "TIMESTAMP WITH TIME ZONE" || upper == "TIMESTAMPTZ":
+		return "TIMESTAMPTZ", true
+	default:
+		return "", false
+	}
+}
+
+func buildDuckDBBinaryInsertSQL(
+	tableName, columnList, filePath string,
+	colTypes []ColumnTyper,
+) (string, bool) {
+	if len(colTypes) == 0 {
+		return "", false
+	}
+
+	columns := make([]string, len(colTypes))
+	for i, colType := range colTypes {
+		readerType, ok := postgresBinaryReaderType(colType.DatabaseTypeName())
+		if !ok {
+			return "", false
+		}
+		columns[i] = fmt.Sprintf("c%d: '%s'", i, strings.ReplaceAll(readerType, "'", "''"))
+	}
+
+	target := tableName
+	if columnList != "" {
+		target += " " + columnList
+	}
+	return fmt.Sprintf(
+		"INSERT INTO %s SELECT * FROM read_postgres_binary('%s', columns = {%s}, buffer_size = %s)",
+		target,
+		strings.ReplaceAll(filePath, "'", "''"),
+		strings.Join(columns, ", "),
+		flightclient.CopyFromStdinSizePlaceholder,
+	), true
+}
+
 // handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
 func (c *clientConn) handleCopy(query, upperQuery string) error {
 	start := time.Now()
@@ -573,8 +640,28 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	colTypes, _ := testRows.ColumnTypes()
 	_ = testRows.Close()
 
-	// Branch to binary handler if binary format
+	// Remote workers can ingest PostgreSQL's binary COPY file format natively.
+	// Ship the opaque CopyData bytes through the existing worker spool path and
+	// let DuckDB decode them there. Local/process executors retain the legacy Go
+	// decoder because they do not have the worker's required-extension contract.
 	if opts.IsBinary {
+		if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
+			if len(cols) == len(colTypes) {
+				if copySQL, supported := buildDuckDBBinaryInsertSQL(
+					tableName,
+					columnList,
+					flightclient.CopyFromStdinPathPlaceholder,
+					colTypes,
+				); supported {
+					if err := wire.WriteCopyInResponse(c.writer, int16(len(cols)), false); err != nil {
+						return err
+					}
+					_ = c.flushWriter()
+					c.logger().Debug("COPY FROM STDIN binary: sent CopyInResponse, streaming to worker.")
+					return c.handleCopyInRemoteStreaming(query, copySQL, true, copyStartTime, streamer)
+				}
+			}
+		}
 		return c.handleCopyInBinary(query, opts, cols, colTypes)
 	}
 
@@ -605,7 +692,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	// only when CP and worker share a filesystem (standalone / process
 	// backend), so prefer the streaming path when it's available.
 	if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
-		return c.handleCopyInRemoteStreaming(query, opts, copyStartTime, streamer)
+		copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
+		return c.handleCopyInRemoteStreaming(query, copySQL, false, copyStartTime, streamer)
 	}
 
 	// Create temp file upfront and stream data directly to it (avoids memory buffering).
@@ -742,19 +830,14 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 // and runs the COPY against a worker-local spool file.
 func (c *clientConn) handleCopyInRemoteStreaming(
 	query string,
-	opts *CopyFromOptions,
+	copySQL string,
+	binary bool,
 	copyStartTime time.Time,
 	streamer sqlcore.CopyFromStdinExecutor,
 ) error {
-	tableName := opts.TableName
-	columnList := opts.ColumnList
-
-	// Build the COPY SQL with the path placeholder; the worker substitutes
-	// in its own tempfile path before executing.
-	copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
 	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "sql", copySQL)
 
-	r := &copyDataWireReader{c: c}
+	r := &copyDataWireReader{c: c, binary: binary}
 
 	loadStart := time.Now()
 	c.logQueryStarted(copySQL)
@@ -828,6 +911,9 @@ var errCopyAborted = errors.New("copy data stream aborted")
 // bytes already received.
 type copyDataWireReader struct {
 	c *clientConn
+	// binary keeps every CopyData byte opaque. In text mode only, PostgreSQL
+	// clients may send the legacy end marker before CopyDone.
+	binary bool
 
 	pending   []byte
 	bytesRead int64
@@ -855,8 +941,8 @@ func (r *copyDataWireReader) Read(p []byte) (int, error) {
 		switch msgType {
 		case wire.MsgCopyData:
 			// Skip the PostgreSQL text COPY end-of-data marker (\.\n).
-			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
-				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+			if !r.binary && ((len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.')) {
 				continue
 			}
 			r.pending = body

@@ -60,7 +60,7 @@ type QueryExecutor interface {
 }
 
 // CopyFromStdinExecutor is an optional capability implemented by executors
-// that need the CSV bytes shipped to a different filesystem than the one
+// that need the COPY input bytes shipped to a different filesystem than the one
 // the COPY FROM STDIN handler is running on. The remote (Flight) executor
 // implements this to spool the bytes onto the worker pod, where the
 // worker can then run COPY FROM <path>. Local executors do not need to
@@ -72,5 +72,5 @@ type QueryExecutor interface {
 // placeholder string is defined alongside the implementation
 // (flightclient.CopyFromStdinPathPlaceholder).
 type CopyFromStdinExecutor interface {
-	CopyFromStdin(ctx context.Context, copySQLTemplate string, csv io.Reader) (rowCount int64, err error)
+	CopyFromStdin(ctx context.Context, copySQLTemplate string, data io.Reader) (rowCount int64, err error)
 }
