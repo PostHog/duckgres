@@ -229,17 +229,27 @@ func postgresBinaryReaderType(typeName string) (string, bool) {
 func buildDuckDBBinaryInsertSQL(
 	tableName, columnList, filePath string,
 	colTypes []ColumnTyper,
-) (string, bool) {
+) (string, []string, bool) {
 	if len(colTypes) == 0 {
-		return "", false
+		return "", nil, false
 	}
 
 	columns := make([]string, len(colTypes))
+	databaseTypeNames := make([]string, len(colTypes))
 	for i, colType := range colTypes {
-		readerType, ok := postgresBinaryReaderType(colType.DatabaseTypeName())
+		exactColType, ok := colType.(sqlcore.ExactColumnTyper)
 		if !ok {
-			return "", false
+			return "", nil, false
 		}
+		databaseTypeName, ok := exactColType.ExactDatabaseTypeName()
+		if !ok {
+			return "", nil, false
+		}
+		readerType, ok := postgresBinaryReaderType(databaseTypeName)
+		if !ok {
+			return "", nil, false
+		}
+		databaseTypeNames[i] = databaseTypeName
 		columns[i] = fmt.Sprintf("c%d: '%s'", i, strings.ReplaceAll(readerType, "'", "''"))
 	}
 
@@ -253,7 +263,7 @@ func buildDuckDBBinaryInsertSQL(
 		strings.ReplaceAll(filePath, "'", "''"),
 		strings.Join(columns, ", "),
 		flightclient.CopyFromStdinSizePlaceholder,
-	), true
+	), databaseTypeNames, true
 }
 
 // handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
@@ -647,7 +657,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if opts.IsBinary {
 		if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
 			if len(cols) == len(colTypes) {
-				if copySQL, supported := buildDuckDBBinaryInsertSQL(
+				if copySQL, databaseTypeNames, supported := buildDuckDBBinaryInsertSQL(
 					tableName,
 					columnList,
 					flightclient.CopyFromStdinPathPlaceholder,
@@ -658,7 +668,11 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 					}
 					_ = c.flushWriter()
 					c.logger().Debug("COPY FROM STDIN binary: sent CopyInResponse, streaming to worker.")
-					return c.handleCopyInRemoteStreaming(query, copySQL, true, copyStartTime, streamer)
+					request := sqlcore.CopyFromStdinRequest{
+						SQLTemplate:                     copySQL,
+						PostgresBinaryDatabaseTypeNames: databaseTypeNames,
+					}
+					return c.handleCopyInRemoteStreaming(query, request, true, copyStartTime, streamer)
 				}
 			}
 		}
@@ -693,7 +707,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	// backend), so prefer the streaming path when it's available.
 	if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
 		copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
-		return c.handleCopyInRemoteStreaming(query, copySQL, false, copyStartTime, streamer)
+		return c.handleCopyInRemoteStreaming(query, sqlcore.CopyFromStdinRequest{SQLTemplate: copySQL}, false, copyStartTime, streamer)
 	}
 
 	// Create temp file upfront and stream data directly to it (avoids memory buffering).
@@ -830,19 +844,19 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 // and runs the COPY against a worker-local spool file.
 func (c *clientConn) handleCopyInRemoteStreaming(
 	query string,
-	copySQL string,
+	request sqlcore.CopyFromStdinRequest,
 	binary bool,
 	copyStartTime time.Time,
 	streamer sqlcore.CopyFromStdinExecutor,
 ) error {
-	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "sql", copySQL)
+	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "sql", request.SQLTemplate)
 
 	r := &copyDataWireReader{c: c, binary: binary}
 
 	loadStart := time.Now()
-	c.logQueryStarted(copySQL)
-	rowCount, err := streamer.CopyFromStdin(c.ctx, copySQL, r)
-	c.logQueryFinished(copySQL, loadStart, rowCount, err)
+	c.logQueryStarted(request.SQLTemplate)
+	rowCount, err := streamer.CopyFromStdin(c.ctx, request, r)
+	c.logQueryFinished(request.SQLTemplate, loadStart, rowCount, err)
 
 	// On wire-level CopyFail / unexpected message, the reader returns a
 	// non-EOF error so the streamer aborts the gRPC stream (its deferred
@@ -903,7 +917,8 @@ var errCopyAborted = errors.New("copy data stream aborted")
 //   - CopyDone           → io.EOF (clean end-of-stream)
 //   - CopyFail           → errCopyAborted, with cancelled / cancelMsg sticky
 //   - unexpected message → errCopyAborted, with protoErr sticky
-//   - wire transport err → that error is returned verbatim
+//   - wire transport err → a sticky non-EOF error; transport EOF before
+//     CopyDone is io.ErrUnexpectedEOF
 //
 // Returning a non-EOF error on cancellation matters for correctness:
 // if the reader pretended cancellation was a clean EOF, the streamer would
@@ -918,15 +933,19 @@ type copyDataWireReader struct {
 	pending   []byte
 	bytesRead int64
 
-	done      bool
-	cancelled bool
-	cancelMsg string
-	protoErr  string
+	done         bool
+	cancelled    bool
+	cancelMsg    string
+	protoErr     string
+	transportErr error
 }
 
 func (r *copyDataWireReader) Read(p []byte) (int, error) {
 	for len(r.pending) == 0 {
 		if r.done {
+			if r.transportErr != nil {
+				return 0, r.transportErr
+			}
 			if r.cancelled || r.protoErr != "" {
 				return 0, errCopyAborted
 			}
@@ -936,7 +955,14 @@ func (r *copyDataWireReader) Read(p []byte) (int, error) {
 		msgType, body, err := wire.ReadMessage(r.c.reader)
 		if err != nil {
 			r.done = true
-			return 0, err
+			if errors.Is(err, io.EOF) {
+				// The binary file trailer is part of CopyData; only a frontend
+				// CopyDone successfully terminates PostgreSQL COPY-in mode.
+				r.transportErr = fmt.Errorf("copy stream ended before CopyDone: %w", io.ErrUnexpectedEOF)
+			} else {
+				r.transportErr = err
+			}
+			return 0, r.transportErr
 		}
 		switch msgType {
 		case wire.MsgCopyData:

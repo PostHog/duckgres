@@ -7,24 +7,68 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/wire"
 )
 
 type recordingCopyFromStdinExecutor struct {
 	*LocalExecutor
 
-	calls   int
-	copySQL string
-	payload []byte
-	rows    int64
+	calls                   int
+	copySQL                 string
+	payload                 []byte
+	rows                    int64
+	binaryDatabaseTypeNames []string
+}
+
+type exactTypeRowSet struct {
+	RowSet
+}
+
+func (r *exactTypeRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	columnTypes, err := r.RowSet.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	exactTypes := make([]ColumnTyper, len(columnTypes))
+	for i, columnType := range columnTypes {
+		typeName := columnType.DatabaseTypeName()
+		exactTypes[i] = exactStaticColumnType{
+			reported: typeName,
+			exact:    typeName,
+			present:  true,
+		}
+	}
+	return exactTypes, nil
+}
+
+func (e *recordingCopyFromStdinExecutor) Query(query string, args ...any) (RowSet, error) {
+	rowSet, err := e.LocalExecutor.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &exactTypeRowSet{RowSet: rowSet}, nil
+}
+
+type exactStaticColumnType struct {
+	reported string
+	exact    string
+	present  bool
+}
+
+func (c exactStaticColumnType) DatabaseTypeName() string { return c.reported }
+
+func (c exactStaticColumnType) ExactDatabaseTypeName() (string, bool) {
+	return c.exact, c.present
 }
 
 func (e *recordingCopyFromStdinExecutor) CopyFromStdin(
 	_ context.Context,
-	copySQL string,
+	request sqlcore.CopyFromStdinRequest,
 	r io.Reader,
 ) (int64, error) {
 	payload, err := io.ReadAll(r)
@@ -32,7 +76,8 @@ func (e *recordingCopyFromStdinExecutor) CopyFromStdin(
 		return 0, err
 	}
 	e.calls++
-	e.copySQL = copySQL
+	e.copySQL = request.SQLTemplate
+	e.binaryDatabaseTypeNames = append([]string(nil), request.PostgresBinaryDatabaseTypeNames...)
 	e.payload = payload
 	return e.rows, nil
 }
@@ -55,11 +100,11 @@ func postgresBinaryCopyOneField(field []byte) (prefix, suffix, payload []byte) {
 }
 
 func TestBuildDuckDBBinaryInsertSQLUsesNativeReader(t *testing.T) {
-	got, ok := buildDuckDBBinaryInsertSQL(
+	got, databaseTypeNames, ok := buildDuckDBBinaryInsertSQL(
 		"events",
 		"(id)",
 		flightclient.CopyFromStdinPathPlaceholder,
-		[]ColumnTyper{staticColumnType("BIGINT")},
+		[]ColumnTyper{exactStaticColumnType{reported: "BIGINT", exact: "BIGINT", present: true}},
 	)
 	if !ok {
 		t.Fatal("buildDuckDBBinaryInsertSQL() rejected BIGINT")
@@ -70,6 +115,118 @@ func TestBuildDuckDBBinaryInsertSQLUsesNativeReader(t *testing.T) {
 		flightclient.CopyFromStdinSizePlaceholder + ")"
 	if got != want {
 		t.Fatalf("buildDuckDBBinaryInsertSQL() =\n  %q\nwant:\n  %q", got, want)
+	}
+	if got, want := strings.Join(databaseTypeNames, ","), "BIGINT"; got != want {
+		t.Fatalf("database type names = %q, want %q", got, want)
+	}
+}
+
+func TestBuildDuckDBBinaryInsertSQLRequiresLosslessDatabaseTypes(t *testing.T) {
+	tests := []struct {
+		name       string
+		columnType ColumnTyper
+		wantType   string
+		supported  bool
+	}{
+		{
+			name:       "metadata absent fails closed",
+			columnType: staticColumnType("BIGINT"),
+		},
+		{
+			name: "UUID hidden behind Arrow string remains on legacy path",
+			columnType: exactStaticColumnType{
+				reported: "VARCHAR", exact: "UUID", present: true,
+			},
+		},
+		{
+			name: "HUGEINT hidden behind Arrow decimal remains on legacy path",
+			columnType: exactStaticColumnType{
+				reported: "DECIMAL(38,0)", exact: "HUGEINT", present: true,
+			},
+		},
+		{
+			name: "remote BIGINT is compatible",
+			columnType: exactStaticColumnType{
+				reported: "BIGINT", exact: "BIGINT", present: true,
+			},
+			wantType: "BIGINT", supported: true,
+		},
+		{
+			name: "remote TEXT uses the compatible VARCHAR reader",
+			columnType: exactStaticColumnType{
+				reported: "VARCHAR", exact: "TEXT", present: true,
+			},
+			wantType: "VARCHAR", supported: true,
+		},
+		{
+			name: "remote NUMERIC keeps precision and scale",
+			columnType: exactStaticColumnType{
+				reported: "DECIMAL(18,4)", exact: "DECIMAL(18,4)", present: true,
+			},
+			wantType: "DECIMAL(18,4)", supported: true,
+		},
+		{
+			name: "remote BOOLEAN is compatible",
+			columnType: exactStaticColumnType{
+				reported: "BOOLEAN", exact: "BOOLEAN", present: true,
+			},
+			wantType: "BOOLEAN", supported: true,
+		},
+		{
+			name: "remote DATE is compatible",
+			columnType: exactStaticColumnType{
+				reported: "DATE", exact: "DATE", present: true,
+			},
+			wantType: "DATE", supported: true,
+		},
+		{
+			name: "remote TIMESTAMP is compatible",
+			columnType: exactStaticColumnType{
+				reported: "TIMESTAMP", exact: "TIMESTAMP", present: true,
+			},
+			wantType: "TIMESTAMP", supported: true,
+		},
+		{
+			name: "remote TIMESTAMPTZ is compatible",
+			columnType: exactStaticColumnType{
+				reported: "TIMESTAMPTZ", exact: "TIMESTAMP WITH TIME ZONE", present: true,
+			},
+			wantType: "TIMESTAMPTZ", supported: true,
+		},
+		{
+			name: "remote BLOB is compatible",
+			columnType: exactStaticColumnType{
+				reported: "BLOB", exact: "BLOB", present: true,
+			},
+			wantType: "BLOB", supported: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, databaseTypeNames, supported := buildDuckDBBinaryInsertSQL(
+				"events",
+				"(value)",
+				flightclient.CopyFromStdinPathPlaceholder,
+				[]ColumnTyper{tt.columnType},
+			)
+			if supported != tt.supported {
+				t.Fatalf("supported = %v, want %v; SQL = %q", supported, tt.supported, got)
+			}
+			if !tt.supported {
+				if got != "" {
+					t.Fatalf("unsupported type produced SQL %q", got)
+				}
+				return
+			}
+			if got, want := strings.Join(databaseTypeNames, ","), tt.columnType.(exactStaticColumnType).exact; got != want {
+				t.Fatalf("database type names = %q, want %q", got, want)
+			}
+			wantFragment := "columns = {c0: '" + tt.wantType + "'}"
+			if !strings.Contains(got, wantFragment) {
+				t.Fatalf("SQL %q does not contain %q", got, wantFragment)
+			}
+		})
 	}
 }
 
@@ -108,13 +265,13 @@ func TestPostgresBinaryReaderType(t *testing.T) {
 }
 
 func TestBuildDuckDBBinaryInsertSQLRejectsUnsupportedType(t *testing.T) {
-	if got, ok := buildDuckDBBinaryInsertSQL(
+	if got, databaseTypeNames, ok := buildDuckDBBinaryInsertSQL(
 		"events",
 		"(properties)",
 		flightclient.CopyFromStdinPathPlaceholder,
 		[]ColumnTyper{staticColumnType("MAP(VARCHAR, INTEGER)")},
-	); ok || got != "" {
-		t.Fatalf("buildDuckDBBinaryInsertSQL() = (%q, %v), want legacy fallback", got, ok)
+	); ok || got != "" || databaseTypeNames != nil {
+		t.Fatalf("buildDuckDBBinaryInsertSQL() = (%q, %v, %v), want legacy fallback", got, databaseTypeNames, ok)
 	}
 }
 
@@ -169,7 +326,55 @@ func TestHandleCopyInBinaryRemoteStreamsRawPayload(t *testing.T) {
 	if exec.copySQL != wantSQL {
 		t.Errorf("CopyFromStdin SQL = %q, want %q", exec.copySQL, wantSQL)
 	}
+	if got, want := strings.Join(exec.binaryDatabaseTypeNames, ","), "BLOB"; got != want {
+		t.Errorf("CopyFromStdin database types = %q, want %q", got, want)
+	}
 	if !bytes.Equal(exec.payload, payload) {
 		t.Errorf("CopyFromStdin payload changed: got %x, want %x", exec.payload, payload)
+	}
+}
+
+func TestHandleCopyInBinaryRemoteAbortsOnTransportEOFBeforeCopyDone(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("CREATE TABLE events (payload BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &recordingCopyFromStdinExecutor{
+		LocalExecutor: NewLocalExecutor(db),
+		rows:          1,
+	}
+	_, _, payload := postgresBinaryCopyOneField([]byte("complete binary file"))
+
+	// The PostgreSQL binary trailer is present, but the frontend transport ends
+	// without the CopyDone message that successfully terminates COPY-in mode.
+	var input bytes.Buffer
+	writePGMessage(&input, wire.MsgCopyData, payload)
+
+	var output bytes.Buffer
+	c := &clientConn{
+		reader:   bufio.NewReader(&input),
+		writer:   bufio.NewWriter(&output),
+		executor: exec,
+		server:   &Server{},
+		txStatus: txStatusIdle,
+		ctx:      context.Background(),
+	}
+
+	query := "COPY public.events (payload) FROM STDIN (FORMAT binary)"
+	if err := c.handleCopyIn(query, "COPY PUBLIC.EVENTS (PAYLOAD) FROM STDIN (FORMAT BINARY)"); err != nil {
+		t.Fatalf("handleCopyIn: %v", err)
+	}
+	_ = c.writer.Flush()
+
+	if exec.calls != 0 {
+		t.Fatalf("CopyFromStdin completed %d times without frontend CopyDone, want 0", exec.calls)
+	}
+	if got, want := frameTypes(scanWireFrames(t, output.Bytes())), "GEZ"; got != want {
+		t.Fatalf("response frame sequence = %q, want %q", got, want)
 	}
 }

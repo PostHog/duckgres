@@ -699,7 +699,7 @@ func (r *FlightRowSet) Columns() ([]string, error) {
 func (r *FlightRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
 	types := make([]sqlcore.ColumnTyper, r.schema.NumFields())
 	for i := 0; i < r.schema.NumFields(); i++ {
-		types[i] = &arrowColumnType{dt: r.schema.Field(i).Type}
+		types[i] = newArrowColumnType(r.schema.Field(i))
 	}
 	return types, nil
 }
@@ -811,7 +811,7 @@ func (e *emptySchemaRowSet) Columns() ([]string, error) {
 func (e *emptySchemaRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
 	types := make([]sqlcore.ColumnTyper, e.schema.NumFields())
 	for i := 0; i < e.schema.NumFields(); i++ {
-		types[i] = &arrowColumnType{dt: e.schema.Field(i).Type}
+		types[i] = newArrowColumnType(e.schema.Field(i))
 	}
 	return types, nil
 }
@@ -832,11 +832,26 @@ func (r *flightExecResult) RowsAffected() (int64, error) {
 
 // arrowColumnType implements ColumnTyper by mapping Arrow DataType to DuckDB type names.
 type arrowColumnType struct {
-	dt arrow.DataType
+	dt                    arrow.DataType
+	exactDatabaseTypeName string
+	hasExactDatabaseType  bool
+}
+
+func newArrowColumnType(field arrow.Field) *arrowColumnType {
+	exactType, ok := field.Metadata.GetValue(sqlcore.ExactDatabaseTypeNameMetadataKey)
+	return &arrowColumnType{
+		dt:                    field.Type,
+		exactDatabaseTypeName: exactType,
+		hasExactDatabaseType:  ok && exactType != "",
+	}
 }
 
 func (c *arrowColumnType) DatabaseTypeName() string {
 	return arrowTypeToDuckDB(c.dt)
+}
+
+func (c *arrowColumnType) ExactDatabaseTypeName() (string, bool) {
+	return c.exactDatabaseTypeName, c.hasExactDatabaseType
 }
 
 // arrowTypeToDuckDB maps an Arrow DataType back to a DuckDB type name string.

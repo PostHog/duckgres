@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 // DuckDBTypeToArrow re-exports arrowmap.DuckDBTypeToArrow for backward
@@ -190,7 +191,15 @@ func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx con
 
 	fields := make([]arrow.Field, len(colTypes))
 	for i, ct := range colTypes {
-		fields[i] = arrow.Field{Name: ct.Name(), Type: DuckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
+		databaseTypeName := ct.DatabaseTypeName()
+		fields[i] = arrow.Field{
+			Name:     ct.Name(),
+			Type:     DuckDBTypeToArrow(databaseTypeName),
+			Nullable: true,
+			Metadata: arrow.MetadataFrom(map[string]string{
+				sqlcore.ExactDatabaseTypeNameMetadataKey: databaseTypeName,
+			}),
+		}
 	}
 	return arrow.NewSchema(fields, nil), nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,24 @@ type blockingDrainExecutor struct {
 	QueryExecutor
 	entered chan struct{}
 	release chan struct{}
+}
+
+type blockAfterFirstRead struct {
+	first             []byte
+	firstDelivered    bool
+	secondReadStarted chan struct{}
+	releaseSecondRead chan struct{}
+	secondReadOnce    sync.Once
+}
+
+func (r *blockAfterFirstRead) Read(p []byte) (int, error) {
+	if !r.firstDelivered {
+		r.firstDelivered = true
+		return copy(p, r.first), nil
+	}
+	r.secondReadOnce.Do(func() { close(r.secondReadStarted) })
+	<-r.releaseSecondRead
+	return 0, io.EOF
 }
 
 func (e *blockingDrainExecutor) LastProfilingOutput() string { return "" }
@@ -65,6 +84,50 @@ func TestMessageLoopIdleTimeoutClosesConnection(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("messageLoop did not return on idle timeout")
+	}
+}
+
+func TestLateCopyFramesPreserveReadyBoundary(t *testing.T) {
+	for _, msgType := range []byte{wire.MsgCopyData, wire.MsgCopyDone, wire.MsgCopyFail} {
+		t.Run(string(msgType), func(t *testing.T) {
+			input := &blockAfterFirstRead{
+				first:             pgFrame(msgType, nil),
+				secondReadStarted: make(chan struct{}),
+				releaseSecondRead: make(chan struct{}),
+			}
+			c := &clientConn{
+				server: &Server{},
+				reader: bufio.NewReader(input),
+				writer: bufio.NewWriter(io.Discard),
+				ctx:    context.Background(),
+			}
+
+			done := make(chan error, 1)
+			go func() { done <- c.messageLoop() }()
+
+			select {
+			case <-input.secondReadStarted:
+			case <-time.After(time.Second):
+				t.Fatal("messageLoop did not consume the late COPY frame")
+			}
+
+			// A backend COPY error may race with already-sent frontend COPY
+			// frames. PostgreSQL silently drops those frames after ErrorResponse /
+			// ReadyForQuery; they must not make the connection look active again.
+			atReadyBoundary := c.idleRead.Load()
+			close(input.releaseSecondRead)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("messageLoop returned error: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("messageLoop did not exit after test reader EOF")
+			}
+			if !atReadyBoundary {
+				t.Fatal("late COPY frame moved connection away from ReadyForQuery boundary")
+			}
+		})
 	}
 }
 

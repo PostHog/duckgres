@@ -20,6 +20,21 @@ type ColumnTyper interface {
 	DatabaseTypeName() string
 }
 
+// ExactColumnTyper exposes the database's original logical type name when a
+// transport has to project it onto a less expressive result type. Arrow, for
+// example, represents DuckDB UUID as String and HUGEINT as Decimal128. Callers
+// making encoding decisions must use this lossless name and fail closed when
+// it is unavailable; DatabaseTypeName remains the projected result type used
+// by existing pgwire result handling.
+type ExactColumnTyper interface {
+	ColumnTyper
+	ExactDatabaseTypeName() (name string, ok bool)
+}
+
+// ExactDatabaseTypeNameMetadataKey is the Arrow field metadata key used to
+// carry DuckDB's original DatabaseTypeName from worker to control plane.
+const ExactDatabaseTypeNameMetadataKey = "duckgres.database_type_name"
+
 // RowSet represents a set of rows from a query result.
 type RowSet interface {
 	Columns() ([]string, error)
@@ -67,10 +82,20 @@ type QueryExecutor interface {
 // implement it; the standard local-tempfile path works for them since
 // the executor and the COPY FROM SQL run in the same process / host.
 //
-// copySQLTemplate must contain a path placeholder that the receiver
-// substitutes with the destination spool path before executing. The
-// placeholder string is defined alongside the implementation
+// request.SQLTemplate must contain a path placeholder that the receiver
+// substitutes with the destination spool path before executing. The request
+// also carries exact binary column types when scanner validation is required.
+// The placeholder string is defined alongside the implementation
 // (flightclient.CopyFromStdinPathPlaceholder).
 type CopyFromStdinExecutor interface {
-	CopyFromStdin(ctx context.Context, copySQLTemplate string, data io.Reader) (rowCount int64, err error)
+	CopyFromStdin(ctx context.Context, request CopyFromStdinRequest, data io.Reader) (rowCount int64, err error)
+}
+
+// CopyFromStdinRequest carries the worker-local SQL template plus optional
+// lossless PostgreSQL binary COPY schema metadata. The latter lets the worker
+// validate tuple width and normalize scanner-sensitive values without parsing
+// generated SQL or reconstructing types from lossy Arrow physical types.
+type CopyFromStdinRequest struct {
+	SQLTemplate                     string   `json:"sql_template"`
+	PostgresBinaryDatabaseTypeNames []string `json:"postgres_binary_database_type_names,omitempty"`
 }

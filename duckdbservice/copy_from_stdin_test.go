@@ -1,10 +1,15 @@
 package duckdbservice
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -183,6 +189,132 @@ func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("table row count = %d, want 3", n)
+	}
+}
+
+func TestDoCopyFromStdinRejectsBinaryTupleWidthBeforeScannerExecution(t *testing.T) {
+	session, cleanup := newSessionWithInMemoryDuckDB(t)
+	defer cleanup()
+
+	pool := &SessionPool{sessions: map[string]*Session{session.ID: session}}
+	handler := &FlightSQLHandler{pool: pool}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+
+	var payload bytes.Buffer
+	payload.Write([]byte("PGCOPY\n\xff\r\n\x00"))
+	_ = binary.Write(&payload, binary.BigEndian, uint32(0))
+	_ = binary.Write(&payload, binary.BigEndian, uint32(0))
+	_ = binary.Write(&payload, binary.BigEndian, int16(2))
+	for _, value := range []int64{1, 2} {
+		_ = binary.Write(&payload, binary.BigEndian, int32(8))
+		_ = binary.Write(&payload, binary.BigEndian, value)
+	}
+	_ = binary.Write(&payload, binary.BigEndian, int16(-1))
+
+	copySQL := "INSERT INTO t (a) SELECT * FROM read_postgres_binary('" +
+		flightclient.CopyFromStdinPathPlaceholder +
+		"', columns = {c0: 'BIGINT'}, buffer_size = " +
+		flightclient.CopyFromStdinSizePlaceholder + ")"
+	requestBytes, err := json.Marshal(sqlcore.CopyFromStdinRequest{
+		SQLTemplate:                     copySQL,
+		PostgresBinaryDatabaseTypeNames: []string{"BIGINT"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &flight.FlightData{
+		FlightDescriptor: &flight.FlightDescriptor{
+			Type: flight.DescriptorPATH,
+			Path: []string{
+				flightclient.CopyFromStdinDescriptorPath,
+				flightclient.CopyFromStdinPostgresBinaryPathVersion,
+			},
+			Cmd: requestBytes,
+		},
+	}
+	stream := &fakeDoPutStream{
+		ctx:     ctx,
+		inbound: []*flight.FlightData{{DataBody: payload.Bytes()}},
+	}
+
+	err = handler.doCopyFromStdin(ctx, first, stream)
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "2 fields, expected 1") {
+		t.Fatalf("doCopyFromStdin() error = %v, want tuple-width validation error", err)
+	}
+	if len(stream.outbound) != 0 {
+		t.Fatalf("worker sent %d results after validation failure", len(stream.outbound))
+	}
+	var rows int
+	if err := session.Conn.QueryRowContext(ctx, "SELECT count(*) FROM t").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("rows inserted after validation failure = %d, want 0", rows)
+	}
+}
+
+func TestDoCopyFromStdinRejectsNativeBinarySQLWithoutSchemaMetadata(t *testing.T) {
+	session, cleanup := newSessionWithInMemoryDuckDB(t)
+	defer cleanup()
+
+	pool := &SessionPool{sessions: map[string]*Session{session.ID: session}}
+	handler := &FlightSQLHandler{pool: pool}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.ID))
+	first := &flight.FlightData{
+		FlightDescriptor: &flight.FlightDescriptor{
+			Type: flight.DescriptorPATH,
+			Path: []string{flightclient.CopyFromStdinDescriptorPath},
+			Cmd: []byte("SELECT * FROM read_postgres_binary('" +
+				flightclient.CopyFromStdinPathPlaceholder + "', columns = {c0: 'BIGINT'})"),
+		},
+	}
+	err := handler.doCopyFromStdin(ctx, first, &fakeDoPutStream{ctx: ctx})
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "schema metadata") {
+		t.Fatalf("doCopyFromStdin() error = %v, want missing schema metadata error", err)
+	}
+}
+
+func TestCopyFromStdinDescriptorRequestAllowsLegacyTextCopyTargetContainingNativeReaderName(t *testing.T) {
+	copySQL := "COPY read_postgres_binary_staging FROM '" +
+		flightclient.CopyFromStdinPathPlaceholder + "' (FORMAT CSV)"
+	desc := &flight.FlightDescriptor{
+		Type: flight.DescriptorPATH,
+		Path: []string{flightclient.CopyFromStdinDescriptorPath},
+		Cmd:  []byte(copySQL),
+	}
+
+	gotSQL, databaseTypeNames, err := copyFromStdinDescriptorRequest(desc)
+	if err != nil {
+		t.Fatalf("copyFromStdinDescriptorRequest() error = %v", err)
+	}
+	if gotSQL != copySQL {
+		t.Fatalf("copyFromStdinDescriptorRequest() SQL = %q, want %q", gotSQL, copySQL)
+	}
+	if databaseTypeNames != nil {
+		t.Fatalf("copyFromStdinDescriptorRequest() database types = %v, want nil", databaseTypeNames)
+	}
+}
+
+func TestPreparePostgresBinaryCopyHonorsCanceledContext(t *testing.T) {
+	var payload bytes.Buffer
+	payload.Write([]byte("PGCOPY\n\xff\r\n\x00"))
+	_ = binary.Write(&payload, binary.BigEndian, uint32(0))
+	_ = binary.Write(&payload, binary.BigEndian, uint32(0))
+	_ = binary.Write(&payload, binary.BigEndian, int16(1))
+	_ = binary.Write(&payload, binary.BigEndian, int32(8))
+	_ = binary.Write(&payload, binary.BigEndian, int64(1))
+	_ = binary.Write(&payload, binary.BigEndian, int16(-1))
+	path := filepath.Join(t.TempDir(), "copy.bin")
+	if err := os.WriteFile(path, payload.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, cleanup, err := preparePostgresBinaryCopy(ctx, path, []string{"BIGINT"})
+	defer cleanup()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("preparePostgresBinaryCopy() error = %v, want context.Canceled", err)
 	}
 }
 

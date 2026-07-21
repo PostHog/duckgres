@@ -2,12 +2,14 @@ package flightclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -16,6 +18,12 @@ import (
 // Flight SQL CommandStatementUpdate. The duckdbservice worker matches
 // on this path and routes to its CopyFromStdin handler.
 const CopyFromStdinDescriptorPath = "duckgres-copy-from-stdin"
+
+// CopyFromStdinPostgresBinaryPathVersion marks descriptor.Cmd as a structured,
+// versioned PostgreSQL binary COPY request. An older worker fails closed when
+// it receives the JSON request instead of executing scanner SQL without the
+// accompanying validation metadata.
+const CopyFromStdinPostgresBinaryPathVersion = "postgres-binary-v1"
 
 // CopyFromStdinPathPlaceholder is the substring inside the COPY SQL that
 // the worker replaces with the worker-local spool file path before
@@ -36,17 +44,17 @@ const CopyFromStdinSizePlaceholder = "__DUCKGRES_COPY_SIZE__"
 const CopyFromStdinChunkSize = 1 << 20 // 1 MiB
 
 // CopyFromStdin streams COPY input bytes from r to a remote worker, then runs
-// copySQL on the worker against a worker-local spool file. copySQL must
-// contain CopyFromStdinPathPlaceholder where the file path should appear.
-// Returns the number of rows the worker reports COPY-affected.
+// request.SQLTemplate against a worker-local spool file. The SQL template must
+// contain CopyFromStdinPathPlaceholder where the file path should appear. It
+// returns the number of rows the worker reports COPY-affected.
 //
 // Wire layout:
 //
-//	frame 0: FlightDescriptor{Type=PATH, Path=[CopyFromStdinDescriptorPath], Cmd=copySQL}
+//	frame 0: FlightDescriptor{Type=PATH, Path=[CopyFromStdinDescriptorPath, optional version], Cmd=SQL or structured request}
 //	frame 1..N: DataBody=<chunk of COPY input bytes>
 //	(client closes send)
 //	server: PutResult{AppMetadata=DoPutUpdateResult{RecordCount=N}}
-func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io.Reader) (int64, error) {
+func (e *FlightExecutor) CopyFromStdin(ctx context.Context, request sqlcore.CopyFromStdinRequest, r io.Reader) (int64, error) {
 	if e.dead.Load() {
 		return 0, ErrWorkerDead
 	}
@@ -61,10 +69,19 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io
 	}
 
 	// Frame 0: descriptor + COPY SQL.
+	path := []string{CopyFromStdinDescriptorPath}
+	cmd := []byte(request.SQLTemplate)
+	if len(request.PostgresBinaryDatabaseTypeNames) > 0 {
+		path = append(path, CopyFromStdinPostgresBinaryPathVersion)
+		cmd, err = json.Marshal(request)
+		if err != nil {
+			return 0, fmt.Errorf("marshal binary COPY request: %w", err)
+		}
+	}
 	desc := &flight.FlightDescriptor{
 		Type: flight.DescriptorPATH,
-		Path: []string{CopyFromStdinDescriptorPath},
-		Cmd:  []byte(copySQL),
+		Path: path,
+		Cmd:  cmd,
 	}
 	if err := stream.Send(&flight.FlightData{FlightDescriptor: desc}); err != nil {
 		return 0, fmt.Errorf("flight doput send descriptor: %w", err)

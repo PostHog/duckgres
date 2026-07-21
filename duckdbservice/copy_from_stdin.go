@@ -2,6 +2,7 @@ package duckdbservice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/pgbinary"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -38,6 +41,112 @@ func IsCopyFromStdinDescriptor(desc *flight.FlightDescriptor) bool {
 func substituteCopyFromStdinPlaceholders(copySQL, tmpPath string, bytesWritten int64) string {
 	result := strings.ReplaceAll(copySQL, flightclient.CopyFromStdinPathPlaceholder, tmpPath)
 	return strings.ReplaceAll(result, flightclient.CopyFromStdinSizePlaceholder, strconv.FormatInt(bytesWritten, 10))
+}
+
+func copyFromStdinDescriptorRequest(desc *flight.FlightDescriptor) (string, []string, error) {
+	if desc == nil || len(desc.Cmd) == 0 {
+		return "", nil, status.Error(codes.InvalidArgument, "copy-from-stdin: missing COPY SQL in descriptor.Cmd")
+	}
+	if len(desc.Path) == 1 {
+		copySQL := string(desc.Cmd)
+		// Unversioned descriptors are the legacy text/CSV protocol and always
+		// carry a COPY statement. Native PostgreSQL binary loads use the
+		// versioned structured request below; reject any unversioned non-COPY
+		// command without inferring its format from table or function names.
+		fields := strings.Fields(copySQL)
+		if len(fields) == 0 || !strings.EqualFold(fields[0], "COPY") {
+			return "", nil, status.Error(codes.InvalidArgument,
+				"copy-from-stdin: native PostgreSQL binary COPY is missing exact schema metadata")
+		}
+		return copySQL, nil, nil
+	}
+	if len(desc.Path) != 2 || desc.Path[1] != flightclient.CopyFromStdinPostgresBinaryPathVersion {
+		return "", nil, status.Error(codes.InvalidArgument, "copy-from-stdin: unsupported binary COPY schema metadata")
+	}
+	var request sqlcore.CopyFromStdinRequest
+	if err := json.Unmarshal(desc.Cmd, &request); err != nil {
+		return "", nil, status.Errorf(codes.InvalidArgument, "copy-from-stdin: invalid binary COPY request: %v", err)
+	}
+	if request.SQLTemplate == "" || len(request.PostgresBinaryDatabaseTypeNames) == 0 {
+		return "", nil, status.Error(codes.InvalidArgument, "copy-from-stdin: incomplete binary COPY request")
+	}
+	return request.SQLTemplate, request.PostgresBinaryDatabaseTypeNames, nil
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
+func preparePostgresBinaryCopy(ctx context.Context, tmpPath string, databaseTypeNames []string) (string, int64, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, func() {}, err
+	}
+	schema, err := pgbinary.SchemaFromDatabaseTypes(databaseTypeNames)
+	if err != nil {
+		return "", 0, func() {}, err
+	}
+
+	source, err := os.Open(tmpPath)
+	if err != nil {
+		return "", 0, func() {}, fmt.Errorf("open binary COPY spool: %w", err)
+	}
+	inspection, inspectErr := pgbinary.Inspect(&contextReader{ctx: ctx, r: source}, schema)
+	closeErr := source.Close()
+	if inspectErr != nil {
+		return "", 0, func() {}, inspectErr
+	}
+	if closeErr != nil {
+		return "", 0, func() {}, fmt.Errorf("close binary COPY spool: %w", closeErr)
+	}
+
+	if !inspection.NeedsRewrite {
+		info, err := os.Stat(tmpPath)
+		if err != nil {
+			return "", 0, func() {}, fmt.Errorf("stat binary COPY spool: %w", err)
+		}
+		return tmpPath, info.Size(), func() {}, nil
+	}
+
+	source, err = os.Open(tmpPath)
+	if err != nil {
+		return "", 0, func() {}, fmt.Errorf("reopen binary COPY spool: %w", err)
+	}
+	normalized, err := os.CreateTemp("", "duckgres-worker-copy-normalized-*.copy")
+	if err != nil {
+		_ = source.Close()
+		return "", 0, func() {}, fmt.Errorf("create normalized binary COPY spool: %w", err)
+	}
+	normalizedPath := normalized.Name()
+	cleanup := func() { _ = os.Remove(normalizedPath) }
+	_, rewriteErr := pgbinary.Rewrite(normalized, &contextReader{ctx: ctx, r: source}, schema)
+	sourceCloseErr := source.Close()
+	normalizedCloseErr := normalized.Close()
+	if rewriteErr != nil {
+		cleanup()
+		return "", 0, func() {}, rewriteErr
+	}
+	if sourceCloseErr != nil {
+		cleanup()
+		return "", 0, func() {}, fmt.Errorf("close binary COPY spool: %w", sourceCloseErr)
+	}
+	if normalizedCloseErr != nil {
+		cleanup()
+		return "", 0, func() {}, fmt.Errorf("close normalized binary COPY spool: %w", normalizedCloseErr)
+	}
+	info, err := os.Stat(normalizedPath)
+	if err != nil {
+		cleanup()
+		return "", 0, func() {}, fmt.Errorf("stat normalized binary COPY spool: %w", err)
+	}
+	return normalizedPath, info.Size(), cleanup, nil
 }
 
 // doCopyFromStdin handles a COPY input spool DoPut from the control plane.
@@ -76,10 +185,10 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	defer finishDrain()
 
 	desc := first.GetFlightDescriptor()
-	if desc == nil || len(desc.Cmd) == 0 {
-		return status.Error(codes.InvalidArgument, "copy-from-stdin: missing COPY SQL in descriptor.Cmd")
+	copySQL, binaryDatabaseTypeNames, err := copyFromStdinDescriptorRequest(desc)
+	if err != nil {
+		return err
 	}
-	copySQL := string(desc.Cmd)
 	if !strings.Contains(copySQL, flightclient.CopyFromStdinPathPlaceholder) {
 		return status.Errorf(codes.InvalidArgument,
 			"copy-from-stdin: COPY SQL missing %q placeholder", flightclient.CopyFromStdinPathPlaceholder)
@@ -136,7 +245,21 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	}
 	closeOnce()
 
-	finalSQL := substituteCopyFromStdinPlaceholders(copySQL, tmpPath, bytesWritten)
+	loadPath := tmpPath
+	loadBytes := bytesWritten
+	cleanupPrepared := func() {}
+	if len(binaryDatabaseTypeNames) > 0 {
+		loadPath, loadBytes, cleanupPrepared, err = preparePostgresBinaryCopy(ctx, tmpPath, binaryDatabaseTypeNames)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return status.FromContextError(err).Err()
+			}
+			return status.Errorf(codes.InvalidArgument, "copy-from-stdin: invalid PostgreSQL binary COPY: %v", err)
+		}
+	}
+	defer cleanupPrepared()
+
+	finalSQL := substituteCopyFromStdinPlaceholders(copySQL, loadPath, loadBytes)
 	slog.Debug("copy-from-stdin: executing worker load statement",
 		"frames", frames, "bytes", bytesWritten, "tmp", tmpPath)
 

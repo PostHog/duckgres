@@ -6,6 +6,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 )
@@ -72,6 +73,80 @@ func TestArrowTypeToDuckDB_ListOfStruct(t *testing.T) {
 	expected := `STRUCT("i" INTEGER)[]`
 	if got != expected {
 		t.Errorf("arrowTypeToDuckDB(LIST of STRUCT) = %q, want %q", got, expected)
+	}
+}
+
+func TestRemoteColumnTypesExposeExactDatabaseTypeNameSeparately(t *testing.T) {
+	fields := []arrow.Field{
+		{
+			Name:     "u",
+			Type:     arrow.BinaryTypes.String,
+			Nullable: true,
+			Metadata: arrow.MetadataFrom(map[string]string{"duckgres.database_type_name": "UUID"}),
+		},
+		{
+			Name:     "h",
+			Type:     &arrow.Decimal128Type{Precision: 38, Scale: 0},
+			Nullable: true,
+			Metadata: arrow.MetadataFrom(map[string]string{"duckgres.database_type_name": "HUGEINT"}),
+		},
+		{
+			Name:     "id",
+			Type:     arrow.PrimitiveTypes.Int64,
+			Nullable: true,
+			Metadata: arrow.MetadataFrom(map[string]string{"duckgres.database_type_name": "BIGINT"}),
+		},
+		{
+			Name:     "legacy_worker",
+			Type:     arrow.PrimitiveTypes.Int64,
+			Nullable: true,
+		},
+	}
+
+	// Flight serializes this schema on the worker and deserializes it on the
+	// control plane. Exercise that boundary so this test catches metadata that
+	// exists only in-process but is dropped by Arrow IPC.
+	encoded := flight.SerializeSchema(arrow.NewSchema(fields, nil), memory.DefaultAllocator)
+	remoteSchema, err := flight.DeserializeSchema(encoded, memory.DefaultAllocator)
+	if err != nil {
+		t.Fatalf("deserialize remote schema: %v", err)
+	}
+	rowSet := &emptySchemaRowSet{schema: remoteSchema}
+	columnTypes, err := rowSet.ColumnTypes()
+	if err != nil {
+		t.Fatalf("ColumnTypes: %v", err)
+	}
+
+	tests := []struct {
+		index         int
+		wantReported  string
+		wantExact     string
+		wantExactType bool
+	}{
+		{index: 0, wantReported: "VARCHAR", wantExact: "UUID", wantExactType: true},
+		{index: 1, wantReported: "DECIMAL(38,0)", wantExact: "HUGEINT", wantExactType: true},
+		{index: 2, wantReported: "BIGINT", wantExact: "BIGINT", wantExactType: true},
+		{index: 3, wantReported: "BIGINT", wantExactType: false},
+	}
+	for _, tt := range tests {
+		columnType := columnTypes[tt.index]
+		if got := columnType.DatabaseTypeName(); got != tt.wantReported {
+			t.Errorf("column %d DatabaseTypeName = %q, want %q", tt.index, got, tt.wantReported)
+		}
+		exact, implementsExact := columnType.(interface {
+			ExactDatabaseTypeName() (string, bool)
+		})
+		if !implementsExact {
+			t.Errorf("column %d does not expose exact database type metadata", tt.index)
+			continue
+		}
+		gotExact, gotExactType := exact.ExactDatabaseTypeName()
+		if gotExactType != tt.wantExactType || gotExact != tt.wantExact {
+			t.Errorf(
+				"column %d ExactDatabaseTypeName = (%q, %v), want (%q, %v)",
+				tt.index, gotExact, gotExactType, tt.wantExact, tt.wantExactType,
+			)
+		}
 	}
 }
 
@@ -1855,4 +1930,3 @@ func appendValue(builder array.Builder, val interface{}) {
 		builder.AppendNull()
 	}
 }
-

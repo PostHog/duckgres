@@ -3,6 +3,7 @@ package flightclient
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
@@ -87,7 +89,11 @@ func TestCopyFromStdinStreamsBytesAndDescriptor(t *testing.T) {
 	payload := bytes.Repeat([]byte("a,b,c\n"), CopyFromStdinChunkSize/3)
 	copySQL := "COPY t FROM '" + CopyFromStdinPathPlaceholder + "' (FORMAT CSV)"
 
-	rows, err := exec.CopyFromStdin(ctx, copySQL, bytes.NewReader(payload))
+	request := sqlcore.CopyFromStdinRequest{
+		SQLTemplate:                     copySQL,
+		PostgresBinaryDatabaseTypeNames: []string{"BIGINT", "DECIMAL(18,4)"},
+	}
+	rows, err := exec.CopyFromStdin(ctx, request, bytes.NewReader(payload))
 	if err != nil {
 		t.Fatalf("CopyFromStdin: %v", err)
 	}
@@ -103,8 +109,23 @@ func TestCopyFromStdinStreamsBytesAndDescriptor(t *testing.T) {
 		srv.gotDescriptor.Path[0] != CopyFromStdinDescriptorPath {
 		t.Errorf("descriptor routing wrong: %+v", srv.gotDescriptor)
 	}
-	if string(srv.gotDescriptor.Cmd) != copySQL {
-		t.Errorf("descriptor.Cmd = %q, want %q", srv.gotDescriptor.Cmd, copySQL)
+	if string(srv.gotDescriptor.Cmd) == copySQL {
+		t.Error("binary descriptor.Cmd contains executable SQL instead of a versioned request")
+	}
+	var gotRequest sqlcore.CopyFromStdinRequest
+	if err := json.Unmarshal(srv.gotDescriptor.Cmd, &gotRequest); err != nil {
+		t.Fatalf("descriptor.Cmd is not a structured binary request: %v", err)
+	}
+	if gotRequest.SQLTemplate != request.SQLTemplate ||
+		strings.Join(gotRequest.PostgresBinaryDatabaseTypeNames, "|") != strings.Join(request.PostgresBinaryDatabaseTypeNames, "|") {
+		t.Errorf("descriptor request = %#v, want %#v", gotRequest, request)
+	}
+	wantPath := []string{
+		CopyFromStdinDescriptorPath,
+		CopyFromStdinPostgresBinaryPathVersion,
+	}
+	if strings.Join(srv.gotDescriptor.Path, "|") != strings.Join(wantPath, "|") {
+		t.Errorf("descriptor.Path = %q, want %q", srv.gotDescriptor.Path, wantPath)
 	}
 	if !bytes.Equal(srv.gotBytes.Bytes(), payload) {
 		t.Errorf("payload mismatch: got %d bytes, want %d", srv.gotBytes.Len(), len(payload))
