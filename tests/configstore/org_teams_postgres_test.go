@@ -243,3 +243,153 @@ func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 		t.Fatal("first team must be enabled")
 	}
 }
+
+// TestCreateOrgTeamDisabledPostgres pins the gorm default-tag pitfall: a team
+// created with enabled=false must be STORED as false — gorm omits zero-valued
+// default-tagged fields from the INSERT unless the create forces every
+// column, and the DB default TRUE would silently enable the team (serving it
+// on the query path and, via discovery, keeping it in ingest include-lists).
+func TestCreateOrgTeamDisabledPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "held")
+	pstore := provisioning.NewGormStore(store)
+
+	if _, err := pstore.UpsertOrgTeam("held", configstore.OrgTeamUpsert{
+		TeamID:     5,
+		SchemaName: "team_5",
+		Enabled:    boolPtr(false),
+	}); err != nil {
+		t.Fatalf("create disabled team: %v", err)
+	}
+	if got := readTeam(t, store, "held", 5); got.Enabled {
+		t.Fatal("team created with enabled=false was stored as enabled=true (gorm default-tag pitfall)")
+	}
+}
+
+// TestListOrgTeamsByOrgIDsPostgres pins the discovery batch fetch: only the
+// requested orgs, deterministic (org_id, team_id) order.
+func TestListOrgTeamsByOrgIDsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	pstore := provisioning.NewGormStore(store)
+	for _, org := range []string{"orga", "orgb", "orgc"} {
+		seedOrg(t, store, org)
+	}
+	for _, seed := range []struct {
+		org  string
+		team int64
+	}{{"orga", 9}, {"orga", 2}, {"orgb", 5}, {"orgc", 1}} {
+		if _, err := pstore.UpsertOrgTeam(seed.org, configstore.OrgTeamUpsert{
+			TeamID:     seed.team,
+			SchemaName: "s" + seed.org + "_" + string(rune('0'+seed.team)),
+		}); err != nil {
+			t.Fatalf("seed team %s/%d: %v", seed.org, seed.team, err)
+		}
+	}
+
+	teams, err := store.ListOrgTeamsByOrgIDs([]string{"orga", "orgb"})
+	if err != nil {
+		t.Fatalf("ListOrgTeamsByOrgIDs: %v", err)
+	}
+	var got []string
+	for _, tm := range teams {
+		got = append(got, tm.OrgID+"/"+string(rune('0'+tm.TeamID)))
+	}
+	want := []string{"orga/2", "orga/9", "orgb/5"}
+	if len(got) != len(want) {
+		t.Fatalf("teams = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("teams = %v, want %v (ordered org_id, team_id; only requested orgs)", got, want)
+		}
+	}
+}
+
+// TestLatestConfigChangeCoversTeamsPostgres pins the discovery change marker
+// against the real store: a team-row edit advances it, and — the case a
+// plain DELETE would hide — deleting a NON-billing team advances it too
+// (DeleteOrgTeamTx touches the parent org row in the same transaction).
+func TestLatestConfigChangeCoversTeamsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	pstore := provisioning.NewGormStore(store)
+
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 1, SchemaName: "team_1"}); err != nil {
+		t.Fatalf("seed team 1: %v", err)
+	}
+	if err := store.DB().Transaction(func(tx *gorm.DB) error {
+		return configstore.SetOrgBillingTeamTx(tx, "acme", 1)
+	}); err != nil {
+		t.Fatalf("set billing: %v", err)
+	}
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 2, SchemaName: "team_2"}); err != nil {
+		t.Fatalf("seed team 2: %v", err)
+	}
+
+	before, err := store.LatestConfigChange()
+	if err != nil {
+		t.Fatalf("LatestConfigChange (before): %v", err)
+	}
+
+	// A team-row UPDATE advances the marker.
+	time.Sleep(1100 * time.Millisecond) // unix-second granularity on the wire; updated_at itself is finer
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 2, SchemaName: "team_2_repointed"}); err != nil {
+		t.Fatalf("update team 2: %v", err)
+	}
+	afterUpdate, err := store.LatestConfigChange()
+	if err != nil {
+		t.Fatalf("LatestConfigChange (after update): %v", err)
+	}
+	if !afterUpdate.After(before) {
+		t.Fatalf("marker did not advance on team update: before=%v after=%v", before, afterUpdate)
+	}
+
+	// Deleting a NON-billing team must advance it as well — the removal is
+	// exactly the signal a change-marker poller must not skip.
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := pstore.DeleteOrgTeam("acme", 2); err != nil {
+		t.Fatalf("delete team 2: %v", err)
+	}
+	afterDelete, err := store.LatestConfigChange()
+	if err != nil {
+		t.Fatalf("LatestConfigChange (after delete): %v", err)
+	}
+	if !afterDelete.After(afterUpdate) {
+		t.Fatalf("marker did not advance on non-billing team delete: afterUpdate=%v afterDelete=%v", afterUpdate, afterDelete)
+	}
+}
+
+// TestUpsertOrgTeamRejectsQualifiedOverridesPostgres pins the bare-name
+// contract: legacy overrides are bare identifiers within the team's schema
+// (see resolveTeamTables in provisioning/discovery.go); a schema-qualified
+// name stored here would be silently ambiguous to every discovery consumer,
+// so the upsert rejects it at write time.
+func TestUpsertOrgTeamRejectsQualifiedOverridesPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "bare")
+	pstore := provisioning.NewGormStore(store)
+
+	_, err := pstore.UpsertOrgTeam("bare", configstore.OrgTeamUpsert{
+		TeamID:          1,
+		SchemaName:      "team_1",
+		EventsTableName: strPtr("posthog.legacy_events"),
+	})
+	if err == nil {
+		t.Fatal("schema-qualified events_table_name must be rejected")
+	}
+	// Bare override + explicit clear ("") both pass.
+	if _, err := pstore.UpsertOrgTeam("bare", configstore.OrgTeamUpsert{
+		TeamID:          1,
+		SchemaName:      "team_1",
+		EventsTableName: strPtr("legacy_events"),
+	}); err != nil {
+		t.Fatalf("bare override rejected: %v", err)
+	}
+	if _, err := pstore.UpsertOrgTeam("bare", configstore.OrgTeamUpsert{
+		TeamID:          1,
+		SchemaName:      "team_1",
+		EventsTableName: strPtr(""),
+	}); err != nil {
+		t.Fatalf("clear sentinel rejected: %v", err)
+	}
+}

@@ -3,6 +3,7 @@ package configstore
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -676,10 +677,51 @@ func (cs *ConfigStore) GetManagedWarehouse(orgID string) (*ManagedWarehouse, err
 
 func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvisioningState) ([]ManagedWarehouse, error) {
 	var warehouses []ManagedWarehouse
-	if err := cs.db.Where("state IN ?", states).Find(&warehouses).Error; err != nil {
+	// Deterministic order: without it Postgres heap order shuffles between
+	// reads, and discovery consumers diffing successive responses see
+	// phantom changes.
+	if err := cs.db.Where("state IN ?", states).Order("org_id").Find(&warehouses).Error; err != nil {
 		return nil, fmt.Errorf("list warehouses by states: %w", err)
 	}
 	return warehouses, nil
+}
+
+// ListOrgTeamsByOrgIDs batch-fetches duckgres_org_teams rows for a set of
+// orgs (discovery endpoints). Orgs with no rows are simply absent from the
+// result — callers decide how to degrade. Deterministic order for stable
+// consumer diffs.
+func (cs *ConfigStore) ListOrgTeamsByOrgIDs(orgIDs []string) ([]OrgTeam, error) {
+	if len(orgIDs) == 0 {
+		return nil, nil
+	}
+	var teams []OrgTeam
+	if err := cs.db.Where("org_id IN ?", orgIDs).Order("org_id, team_id").Find(&teams).Error; err != nil {
+		return nil, fmt.Errorf("list org teams by org ids: %w", err)
+	}
+	return teams, nil
+}
+
+// LatestConfigChange returns the max updated_at across ALL warehouse, org,
+// and org-team rows regardless of state — the discovery change token.
+// Unfiltered deliberately: a deprovision moves a row OUT of the
+// discoverable states while bumping its updated_at, and that transition is
+// exactly a change a poller must not skip. Team-row DELETEs leave no
+// updated_at behind, so DeleteOrgTeamTx touches the parent org row — this
+// function's delete-visibility DEPENDS on that touch; change either side
+// with the other in view (TestLatestConfigChangeCoversTeamsPostgres pins
+// the pair).
+func (cs *ConfigStore) LatestConfigChange() (time.Time, error) {
+	var latest time.Time
+	for _, model := range []any{&ManagedWarehouse{}, &Org{}, &OrgTeam{}} {
+		var t sql.NullTime
+		if err := cs.db.Model(model).Select("MAX(updated_at)").Scan(&t).Error; err != nil {
+			return time.Time{}, fmt.Errorf("latest config change: %w", err)
+		}
+		if t.Valid && t.Time.After(latest) {
+			latest = t.Time
+		}
+	}
+	return latest, nil
 }
 
 // UpdateWarehouseState performs a compare-and-swap update on a warehouse row.
