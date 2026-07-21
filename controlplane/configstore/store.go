@@ -3,7 +3,6 @@ package configstore
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -69,6 +68,7 @@ type Snapshot struct {
 	DatabaseOrg        map[string]string     // database name -> org ID
 	HostnameAliasOrg   map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
 	OrgUserPassword    map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	OrgUserRevision    map[OrgUserKey]string // (orgID, username) -> non-secret session credential revision
 	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
 	OrgUserDisabled    map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
 	OrgUserMaxVCPUs    map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
@@ -217,6 +217,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		DatabaseOrg:        make(map[string]string),
 		HostnameAliasOrg:   make(map[string]string),
 		OrgUserPassword:    make(map[OrgUserKey]string),
+		OrgUserRevision:    make(map[OrgUserKey]string),
 		OrgUserPassthrough: make(map[OrgUserKey]bool),
 		OrgUserDisabled:    make(map[OrgUserKey]bool),
 		OrgUserMaxVCPUs:    make(map[OrgUserKey]int),
@@ -264,6 +265,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			oc.Users[u.Username] = u.Password
 			key := OrgUserKey{OrgID: o.Name, Username: u.Username}
 			snap.OrgUserPassword[key] = u.Password
+			snap.OrgUserRevision[key] = u.UpdatedAt.UTC().Format(time.RFC3339Nano)
 			snap.OrgUserAccess[key] = OrgUserAccessConfig{Mode: u.AccessMode, TeamID: u.TeamID}
 			if u.Passthrough {
 				snap.OrgUserPassthrough[key] = true
@@ -327,11 +329,11 @@ func (cs *ConfigStore) OrgUserSessionQueryAccess(orgID, username string) (*OrgUs
 		return nil, "", false
 	}
 	key := OrgUserKey{OrgID: orgID, Username: username}
-	passwordHash, exists := cs.snapshot.OrgUserPassword[key]
-	if !exists || cs.snapshot.OrgUserDisabled[key] {
+	_, exists := cs.snapshot.OrgUserPassword[key]
+	revision, revisionExists := cs.snapshot.OrgUserRevision[key]
+	if !exists || !revisionExists || revision == "" || cs.snapshot.OrgUserDisabled[key] {
 		return nil, "", false
 	}
-	revision := fmt.Sprintf("%x", sha256.Sum256([]byte(passwordHash)))
 	access, scoped := orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username)
 	if !scoped {
 		return nil, revision, true

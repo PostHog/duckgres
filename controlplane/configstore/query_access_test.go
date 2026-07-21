@@ -67,6 +67,7 @@ func TestOrgUserSessionQueryAccessDistinguishesUnrestrictedFromRevoked(t *testin
 	disabled := OrgUserKey{OrgID: "acme", Username: "disabled"}
 	cs := &ConfigStore{snapshot: &Snapshot{
 		OrgUserPassword: map[OrgUserKey]string{unrestricted: "hash", disabled: "hash"},
+		OrgUserRevision: map[OrgUserKey]string{unrestricted: "revision-1", disabled: "revision-1"},
 		OrgUserDisabled: map[OrgUserKey]bool{disabled: true},
 		OrgUserAccess:   map[OrgUserKey]OrgUserAccessConfig{},
 	}}
@@ -75,7 +76,7 @@ func TestOrgUserSessionQueryAccessDistinguishesUnrestrictedFromRevoked(t *testin
 	if !ok || policy != nil || revision == "" {
 		t.Fatalf("unrestricted user = (%#v, %q, %v), want (nil, non-empty, true)", policy, revision, ok)
 	}
-	cs.snapshot.OrgUserPassword[unrestricted] = "rotated-hash"
+	cs.snapshot.OrgUserRevision[unrestricted] = "revision-2"
 	_, rotatedRevision, ok := cs.OrgUserSessionQueryAccess("acme", "root")
 	if !ok || rotatedRevision == "" || rotatedRevision == revision {
 		t.Fatalf("password rotation did not change credential revision: before=%q after=%q", revision, rotatedRevision)

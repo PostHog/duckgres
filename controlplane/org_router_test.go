@@ -146,7 +146,9 @@ func TestOrgRouterHandleConfigChangeNotifiesFlightSessionRevocation(t *testing.T
 	updated.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new"}
 
 	var revokedOrg, revokedUser string
-	router := &OrgRouter{orgs: make(map[string]*OrgStack)}
+	router := &OrgRouter{orgs: map[string]*OrgStack{
+		"analytics": {Config: old.Orgs["analytics"]},
+	}}
 	router.setProjectReaderChangeHandler(func(orgID, username string) {
 		revokedOrg, revokedUser = orgID, username
 	})
