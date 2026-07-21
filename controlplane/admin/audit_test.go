@@ -39,7 +39,6 @@ func TestAuditActionFor(t *testing.T) {
 		{"user secret delete", http.MethodDelete, "/api/v1/orgs/acme/users/bob/secrets/mysecret", "secret.delete"},
 		{"session cancel", http.MethodPost, "/api/v1/sessions/1234/cancel", "session.cancel"},
 		{"session cancel by worker", http.MethodPost, "/api/v1/sessions/by-worker/w-1/cancel", "session.cancel"},
-		{"activate admission offers", http.MethodPost, "/api/v1/admission/offers/activate", "admission_offers.activate"},
 		{"unknown resource", http.MethodPost, "/api/v1/something", "config.create"},
 	}
 	for _, tc := range cases {

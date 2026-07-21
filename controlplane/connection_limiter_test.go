@@ -13,6 +13,7 @@ type scheduleAndClaimTestStore struct {
 	enqueuedEntry *configstore.OrgConnectionQueueEntry
 	scheduleCalls []scheduleAndClaimCall
 	scheduleErr   error
+	scheduleCtxFn func(context.Context, string, string) (*configstore.OrgConnectionLease, error)
 	legacyTries   int
 	cancelID      string
 	releaseID     string
@@ -29,6 +30,10 @@ func (s *scheduleAndClaimTestStore) EnqueueOrgConnectionRequest(entry *configsto
 	return nil
 }
 
+func (s *scheduleAndClaimTestStore) EnqueueOrgConnectionRequestContext(_ context.Context, entry *configstore.OrgConnectionQueueEntry) error {
+	return s.EnqueueOrgConnectionRequest(entry)
+}
+
 func (s *scheduleAndClaimTestStore) ScheduleAndClaimOrgConnectionLease(requestID, cpInstanceID string) (*configstore.OrgConnectionLease, error) {
 	s.scheduleCalls = append(s.scheduleCalls, scheduleAndClaimCall{
 		requestID:    requestID,
@@ -43,6 +48,14 @@ func (s *scheduleAndClaimTestStore) ScheduleAndClaimOrgConnectionLease(requestID
 	return &configstore.OrgConnectionLease{LeaseID: requestID, RequestID: requestID}, nil
 }
 
+func (s *scheduleAndClaimTestStore) ScheduleAndClaimOrgConnectionLeaseContext(ctx context.Context, requestID, cpInstanceID string) (*configstore.OrgConnectionLease, error) {
+	if s.scheduleCtxFn != nil {
+		s.scheduleCalls = append(s.scheduleCalls, scheduleAndClaimCall{requestID: requestID, cpInstanceID: cpInstanceID})
+		return s.scheduleCtxFn(ctx, requestID, cpInstanceID)
+	}
+	return s.ScheduleAndClaimOrgConnectionLease(requestID, cpInstanceID)
+}
+
 func (s *scheduleAndClaimTestStore) TryAcquireOrgConnectionLease(string, configstore.OrgResourceLimits, time.Time) (*configstore.OrgConnectionLease, error) {
 	s.legacyTries++
 	return nil, errors.New("legacy TryAcquireOrgConnectionLease called")
@@ -53,9 +66,17 @@ func (s *scheduleAndClaimTestStore) ReleaseOrgConnectionLease(leaseID string) er
 	return nil
 }
 
+func (s *scheduleAndClaimTestStore) ReleaseOrgConnectionLeaseContext(_ context.Context, leaseID string) error {
+	return s.ReleaseOrgConnectionLease(leaseID)
+}
+
 func (s *scheduleAndClaimTestStore) CancelOrgConnectionRequest(requestID string, _ time.Time) error {
 	s.cancelID = requestID
 	return nil
+}
+
+func (s *scheduleAndClaimTestStore) CancelOrgConnectionRequestContext(_ context.Context, requestID string, canceledAt time.Time) error {
+	return s.CancelOrgConnectionRequest(requestID, canceledAt)
 }
 
 func TestRuntimeOrgConnectionLimiterPrefersScheduleAndClaimHandshake(t *testing.T) {
@@ -150,5 +171,91 @@ func TestRuntimeOrgConnectionLimiterCancelsAfterScheduleAndClaimError(t *testing
 	}
 	if store.cancelID != "request-error" {
 		t.Fatalf("canceled request = %q, want request-error", store.cancelID)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterCancellationInterruptsScheduleAndReclaimsRequest(t *testing.T) {
+	entered := make(chan struct{})
+	store := &scheduleAndClaimTestStore{}
+	store.scheduleCtxFn = func(ctx context.Context, _, _ string) (*configstore.OrgConnectionLease, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	limiter := &runtimeOrgConnectionLimiter{
+		store: store, orgID: "org-1", cpInstanceID: "cp-owner",
+		queueTTL: time.Minute, pollInterval: time.Millisecond, now: time.Now,
+		newID: func() (string, error) { return "request-canceled-lock-wait", nil },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+			PID: 1001, Username: "alice", Protocol: "postgres", RequestedVCPUs: 1,
+		}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{OrgMaxVCPUs: 1} })
+		errCh <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("schedule call did not start")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Acquire error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Acquire did not return after context cancellation")
+	}
+	if store.cancelID != "request-canceled-lock-wait" {
+		t.Fatalf("canceled request = %q", store.cancelID)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterReclaimsLeaseGrantedWithCancellation(t *testing.T) {
+	entered := make(chan struct{})
+	store := &scheduleAndClaimTestStore{}
+	store.scheduleCtxFn = func(ctx context.Context, requestID, _ string) (*configstore.OrgConnectionLease, error) {
+		close(entered)
+		<-ctx.Done()
+		return &configstore.OrgConnectionLease{LeaseID: requestID, RequestID: requestID}, nil
+	}
+	limiter := &runtimeOrgConnectionLimiter{
+		store: store, orgID: "org-1", cpInstanceID: "cp-owner",
+		queueTTL: time.Minute, pollInterval: time.Millisecond, now: time.Now,
+		newID: func() (string, error) { return "request-grant-cancel-race", nil },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+			PID: 1001, Username: "alice", Protocol: "postgres", RequestedVCPUs: 1,
+		}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{OrgMaxVCPUs: 1} })
+		if lease != nil {
+			errCh <- errors.New("canceled admission returned a lease")
+			return
+		}
+		errCh <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("schedule call did not start")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Acquire error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Acquire did not return after grant/cancel race")
+	}
+	if store.cancelID != "request-grant-cancel-race" {
+		t.Fatalf("canceled request = %q", store.cancelID)
 	}
 }

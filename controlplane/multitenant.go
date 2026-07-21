@@ -82,6 +82,10 @@ func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
 }
 
+func (a *orgRouterAdapter) BeginDrain() {
+	a.router.BeginDrain()
+}
+
 func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }

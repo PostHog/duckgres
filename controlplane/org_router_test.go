@@ -59,6 +59,37 @@ func (l *recordingOrgRouterLease) Release(ctx context.Context) error {
 	return nil
 }
 
+func TestOrgRouterBeginDrainStopsCreationWithoutDestroyingEstablishedSessions(t *testing.T) {
+	first := NewSessionManager(nil, nil)
+	second := NewSessionManager(nil, nil)
+	first.sessions[1010] = &ManagedSession{PID: 1010}
+	second.sessions[2020] = &ManagedSession{PID: 2020}
+
+	router := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"first":  {Sessions: first},
+			"second": {Sessions: second},
+		},
+	}
+
+	router.BeginDrain()
+
+	for name, sessions := range map[string]*SessionManager{"first": first, "second": second} {
+		if !sessions.lifecycle.isClosed() {
+			t.Fatalf("expected %s org session manager to stop creation", name)
+		}
+		if got := sessions.SessionCount(); got != 1 {
+			t.Fatalf("expected %s org established session to survive BeginDrain, got %d", name, got)
+		}
+	}
+
+	late := NewSessionManager(nil, nil)
+	router.publishOrgStack("late", &OrgStack{Sessions: late})
+	if !late.lifecycle.isClosed() {
+		t.Fatal("expected an org stack published after BeginDrain to start drained")
+	}
+}
+
 func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSessionLeases(t *testing.T) {
 	events := []string{}
 	pool := &recordingOrgRouterPool{events: &events}

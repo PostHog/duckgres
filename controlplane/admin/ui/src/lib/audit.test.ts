@@ -28,7 +28,6 @@ describe("actionLabel", () => {
     expect(actionLabel("secret.delete")).toBe("Deleted user secret");
     expect(actionLabel("session.cancel")).toBe("Cancelled session");
     expect(actionLabel("impersonate.query")).toBe("Ran impersonated query");
-    expect(actionLabel("admission_offers.activate")).toBe("Activated admission offers");
   });
 
   it("degrades gracefully for the generic config bucket and unknown codes", () => {

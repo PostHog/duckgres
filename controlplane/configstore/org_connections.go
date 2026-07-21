@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,21 +14,51 @@ import (
 const (
 	missingOwnerOrgConnectionLeaseGrace = 5 * time.Minute
 	legacyOrgConnectionRequestedVCPUs   = 1
-	defaultOrgConnectionOfferTTL        = 5 * time.Second
-	maxOrgConnectionOffersPerDispatch   = 64
 )
 
-// ErrAdmissionOfferProtocolActivationBlocked means the irreversible durable
-// offer protocol cannot be enabled while an incompatible control plane or
-// runtime row remains. Callers may surface this as an operator-actionable
-// conflict and retry after the reported fleet/runtime state is reconciled.
-var ErrAdmissionOfferProtocolActivationBlocked = errors.New("admission offer protocol activation blocked")
+// ErrOrgConnectionAdmissionRejected identifies a request that can never fit
+// under its configured hard vCPU ceiling. Temporary saturation does not wrap
+// this sentinel; those requests stay queued until capacity becomes available.
+var ErrOrgConnectionAdmissionRejected = errors.New("org connection admission rejected")
+
+type OrgConnectionAdmissionRejectionReason string
+
+const (
+	OrgConnectionAdmissionRejectedOrgVCPU  OrgConnectionAdmissionRejectionReason = "org_vcpu"
+	OrgConnectionAdmissionRejectedUserVCPU OrgConnectionAdmissionRejectionReason = "user_vcpu"
+)
+
+// OrgConnectionAdmissionRejectedError carries the stable reason and values
+// needed to return an actionable PostgreSQL configuration-limit error.
+type OrgConnectionAdmissionRejectedError struct {
+	Reason         OrgConnectionAdmissionRejectionReason
+	RequestedVCPUs int
+	MaximumVCPUs   int
+}
+
+func (e *OrgConnectionAdmissionRejectedError) Error() string {
+	if e == nil {
+		return ErrOrgConnectionAdmissionRejected.Error()
+	}
+	return fmt.Sprintf("%s: requested %d vCPUs exceeds %s maximum of %d vCPUs", ErrOrgConnectionAdmissionRejected, e.RequestedVCPUs, e.Reason, e.MaximumVCPUs)
+}
+
+func (e *OrgConnectionAdmissionRejectedError) Unwrap() error {
+	return ErrOrgConnectionAdmissionRejected
+}
 
 // EnqueueOrgConnectionRequest inserts a pending cluster-wide connection
 // admission request. FIFO ordering is scoped to org_id and ordered by
 // enqueued_at, then request_id. RequestedVCPUs is charged against active
 // resource leases when the request is granted.
 func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntry) error {
+	return cs.EnqueueOrgConnectionRequestContext(context.Background(), entry)
+}
+
+// EnqueueOrgConnectionRequestContext is the context-aware production path.
+// In particular, control-plane drain can interrupt a request waiting for the
+// per-org admission lock before it has entered the durable queue.
+func (cs *ConfigStore) EnqueueOrgConnectionRequestContext(ctx context.Context, entry *OrgConnectionQueueEntry) error {
 	if entry == nil {
 		return fmt.Errorf("org connection queue entry is required")
 	}
@@ -55,16 +86,8 @@ func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntr
 	}
 
 	entryCopy := *entry
-	if entryCopy.State == "" {
-		entryCopy.State = OrgConnectionRequestStatePending
-	}
-	if entryCopy.State != OrgConnectionRequestStatePending {
-		return fmt.Errorf("new org connection request must be pending")
-	}
-	entryCopy.OfferedAt = nil
-	entryCopy.OfferExpiresAt = nil
 	entryCopy.GrantedAt = nil
-	if err := cs.db.Transaction(func(tx *gorm.DB) error {
+	if err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockOrgConnectionAdmission(tx, entryCopy.OrgID); err != nil {
 			return err
 		}
@@ -92,11 +115,10 @@ func (cs *ConfigStore) TryAcquireOrgConnectionLease(requestID string, limits Org
 	}, now)
 }
 
-// TryAcquireOrgConnectionLeaseWithLimitLookup is the rolling-upgrade adapter
-// for the pre-offer API. Once the offer protocol is explicitly activated, the
-// callback is ignored and limits are read directly from PostgreSQL. Before
-// activation, the callback is only a fallback for test or orphan rows whose org
-// no longer exists in the authoritative config tables.
+// TryAcquireOrgConnectionLeaseWithLimitLookup is the compatibility adapter for
+// callers that supply their own limit snapshot. Production callers use
+// ScheduleAndClaimOrgConnectionLease, which reads authoritative limits inside
+// the serialized PostgreSQL transaction.
 func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookup(requestID string, limitLookup func(string) OrgResourceLimits, _ time.Time) (*OrgConnectionLease, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return nil, fmt.Errorf("org connection request id is required")
@@ -113,25 +135,33 @@ func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookup(requestID str
 	}()
 
 	for {
-		lease, retry, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(requestID, "", limitLookup)
+		lease, retry, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(context.Background(), requestID, "", limitLookup)
 		stats = attemptStats
 		outcome = attemptOutcome
 		if retry {
 			continue
 		}
 		if err != nil {
-			outcome = orgConnectionAdmissionOutcomeError
+			if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
+				outcome = orgConnectionAdmissionOutcomeError
+			}
 			return nil, fmt.Errorf("try acquire org connection lease: %w", err)
 		}
 		return lease, nil
 	}
 }
 
-// ScheduleAndClaimOrgConnectionLease runs one authoritative scheduling pass
-// for the request's org and then claims only this control plane's own durable
-// offer. A scheduling pass may reserve capacity for other owners, but it never
-// creates their active leases.
+// ScheduleAndClaimOrgConnectionLease runs one authoritative admission
+// evaluation and can create only the caller's own lease. It never reserves or
+// mutates another request.
 func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLease(requestID, cpInstanceID string) (*OrgConnectionLease, error) {
+	return cs.ScheduleAndClaimOrgConnectionLeaseContext(context.Background(), requestID, cpInstanceID)
+}
+
+// ScheduleAndClaimOrgConnectionLeaseContext is the context-aware production
+// path. PostgreSQL lock waits and queries are canceled when the client goes
+// away or the owning control plane starts draining.
+func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseContext(ctx context.Context, requestID, cpInstanceID string) (*OrgConnectionLease, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return nil, fmt.Errorf("org connection request id is required")
 	}
@@ -147,173 +177,21 @@ func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLease(requestID, cpInstanceI
 	}()
 
 	for {
-		lease, retry, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(requestID, cpInstanceID, nil)
+		if err := ctx.Err(); err != nil {
+			outcome = orgConnectionAdmissionOutcomeError
+			return nil, err
+		}
+		lease, retry, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, requestID, cpInstanceID, nil)
 		stats = attemptStats
 		outcome = attemptOutcome
 		if retry {
 			continue
 		}
 		if err != nil {
-			outcome = orgConnectionAdmissionOutcomeError
+			if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
+				outcome = orgConnectionAdmissionOutcomeError
+			}
 			return nil, fmt.Errorf("schedule and claim org connection lease: %w", err)
-		}
-		return lease, nil
-	}
-}
-
-// ActivateOrgConnectionAdmissionOffers explicitly crosses the irreversible
-// cluster-wide rollout boundary. It serializes with pre-activation queue and
-// lease inserts through the protocol singleton, then fences CP registration
-// while rechecking that no incompatible process or runtime owner remains.
-func (cs *ConfigStore) ActivateOrgConnectionAdmissionOffers() error {
-	tables := cs.orgConnectionRuntimeTables()
-	protocolTable := cs.runtimeTable((&OrgConnectionAdmissionProtocol{}).TableName())
-	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
-
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		var protocol OrgConnectionAdmissionProtocol
-		if err := tx.Table(protocolTable).
-			Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ?", 1).
-			Take(&protocol).Error; err != nil {
-			return err
-		}
-		if protocol.OffersEnabled {
-			return nil
-		}
-
-		// SHARE conflicts with the ROW EXCLUSIVE lock taken by CP INSERT/UPDATE.
-		// Together with the CP trigger, this closes registration and heartbeat
-		// races across the capability check and protocol update.
-		if err := tx.Exec("LOCK TABLE " + cpTable + " IN SHARE MODE").Error; err != nil {
-			return err
-		}
-
-		var unsupportedLiveCPs int64
-		if err := tx.Table(cpTable).
-			Where("state <> ? AND supports_admission_offers = ?", ControlPlaneInstanceStateExpired, false).
-			Count(&unsupportedLiveCPs).Error; err != nil {
-			return err
-		}
-
-		countIncompatibleOwners := func(table string) (int64, error) {
-			var count int64
-			err := tx.Raw(
-				"SELECT COUNT(*) FROM " + table + " AS runtime_row " +
-					"LEFT JOIN " + cpTable + " AS cp ON cp.id = runtime_row.cp_instance_id " +
-					"WHERE cp.id IS NULL OR NOT cp.supports_admission_offers",
-			).Scan(&count).Error
-			return count, err
-		}
-		incompatibleQueueRows, err := countIncompatibleOwners(tables.queue)
-		if err != nil {
-			return err
-		}
-		incompatibleLeaseRows, err := countIncompatibleOwners(tables.lease)
-		if err != nil {
-			return err
-		}
-		if unsupportedLiveCPs != 0 || incompatibleQueueRows != 0 || incompatibleLeaseRows != 0 {
-			return fmt.Errorf(
-				"%w: live unsupported control planes=%d, queue rows with unsupported or missing owners=%d, lease rows with unsupported or missing owners=%d",
-				ErrAdmissionOfferProtocolActivationBlocked,
-				unsupportedLiveCPs,
-				incompatibleQueueRows,
-				incompatibleLeaseRows,
-			)
-		}
-
-		now, err := cs.orgConnectionDatabaseNow(tx)
-		if err != nil {
-			return err
-		}
-		result := tx.Table(protocolTable).
-			Where("id = ? AND offers_enabled = ?", 1, false).
-			Updates(map[string]any{
-				"offers_enabled": true,
-				"enabled_at":     now,
-				"updated_at":     now,
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return fmt.Errorf("offer protocol activation updated %d rows, want 1", result.RowsAffected)
-		}
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("activate org connection admission offers: %w", err)
-	}
-	return nil
-}
-
-// DispatchOrgConnectionAdmissions creates a bounded FIFO batch of durable
-// offers for one org. The per-org advisory transaction lock makes this a
-// single-writer scheduling decision even when every control-plane replica is
-// eligible to invoke it.
-func (cs *ConfigStore) DispatchOrgConnectionAdmissions(orgID string) (int, error) {
-	if strings.TrimSpace(orgID) == "" {
-		return 0, fmt.Errorf("org connection org id is required")
-	}
-
-	tables := cs.orgConnectionRuntimeTables()
-	offered := 0
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		if err := lockOrgConnectionAdmission(tx, orgID); err != nil {
-			return err
-		}
-		now, err := cs.orgConnectionDatabaseNow(tx)
-		if err != nil {
-			return err
-		}
-		if err := cs.cleanupOrgConnectionRowsLocked(tx, orgID, now); err != nil {
-			return err
-		}
-
-		ready, err := cs.orgConnectionOffersEnabled(tx)
-		if err != nil {
-			return err
-		}
-		if !ready {
-			return cs.revokeOrgConnectionOffersLocked(tx, tables.queue, orgID, now)
-		}
-		resharding, err := cs.warehouseReshardingLocked(tx, orgID)
-		if err != nil || resharding {
-			return err
-		}
-
-		limits, found, err := cs.authoritativeOrgConnectionLimits(tx, orgID)
-		if err != nil || !found {
-			return err
-		}
-		offered, _, _, err = cs.dispatchOrgConnectionAdmissionsLocked(tx, tables, orgID, limits, now)
-		return err
-	})
-	if err != nil {
-		return 0, fmt.Errorf("dispatch org connection admissions: %w", err)
-	}
-	return offered, nil
-}
-
-// ClaimOrgConnectionOffer atomically converts an unexpired offer into an
-// active lease. A foreign control-plane identity is a clean miss: it cannot
-// claim, cancel, or otherwise mutate the owner's reservation.
-func (cs *ConfigStore) ClaimOrgConnectionOffer(requestID, cpInstanceID string) (*OrgConnectionLease, error) {
-	if strings.TrimSpace(requestID) == "" {
-		return nil, fmt.Errorf("org connection request id is required")
-	}
-	if strings.TrimSpace(cpInstanceID) == "" {
-		return nil, fmt.Errorf("control-plane instance id is required")
-	}
-
-	for {
-		lease, retry, err := cs.claimOrgConnectionOfferOnce(requestID, cpInstanceID)
-		if retry {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("claim org connection offer: %w", err)
 		}
 		return lease, nil
 	}
@@ -331,14 +209,15 @@ func (cs *ConfigStore) orgConnectionRuntimeTables() orgConnectionRuntimeTables {
 	}
 }
 
-func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(requestID, cpInstanceID string, fallbackLimitLookup func(string) OrgResourceLimits) (*OrgConnectionLease, bool, orgConnectionAdmissionStats, string, error) {
+func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Context, requestID, cpInstanceID string, fallbackLimitLookup func(string) OrgResourceLimits) (*OrgConnectionLease, bool, orgConnectionAdmissionStats, string, error) {
 	tables := cs.orgConnectionRuntimeTables()
 	var lease *OrgConnectionLease
+	var rejection *OrgConnectionAdmissionRejectedError
 	retryWithFreshOrg := false
 	var stats orgConnectionAdmissionStats
 	outcome := orgConnectionAdmissionOutcomeMissing
 
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
+	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		orgID, found, err := cs.orgIDForConnectionRequest(tx, tables.queue, requestID)
 		if err != nil || !found {
 			return err
@@ -372,6 +251,14 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(requestID, cpInsta
 			return nil
 		}
 
+		ownerActive, err := cs.lockActiveControlPlaneOwner(tx, ownerID)
+		if err != nil {
+			return err
+		}
+		if !ownerActive {
+			outcome = orgConnectionAdmissionOutcomeInactive
+			return nil
+		}
 		existing, found, err := cs.existingOrgConnectionLease(tx, tables.lease, requestID)
 		if err != nil || found {
 			if found && existing.CPInstanceID == ownerID {
@@ -382,13 +269,13 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(requestID, cpInsta
 			}
 			return err
 		}
-		if !request.ExpiresAt.After(now) || request.State == OrgConnectionRequestStateActive || request.GrantedAt != nil {
+		if !request.ExpiresAt.After(now) || request.GrantedAt != nil {
 			outcome = orgConnectionAdmissionOutcomeInactive
 			return nil
 		}
 
 		// Cleanup deliberately runs before this barrier. Resharding prevents
-		// offers and claims, but must not pin expired queue rows and wedge drain.
+		// grants, but must not pin expired queue rows and wedge drain.
 		resharding, err := cs.warehouseReshardingLocked(tx, orgID)
 		if err != nil {
 			return err
@@ -398,45 +285,9 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(requestID, cpInsta
 			return nil
 		}
 
-		ready, err := cs.orgConnectionOffersEnabled(tx)
-		if err != nil {
-			return err
-		}
-		if !ready {
-			if err := cs.revokeOrgConnectionOffersLocked(tx, tables.queue, orgID, now); err != nil {
-				return err
-			}
-			request, found, err = cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
-			if err != nil || !found {
-				return err
-			}
-		}
 		limits, authoritative, err := cs.authoritativeOrgConnectionLimits(tx, orgID)
 		if err != nil {
 			return err
-		}
-		if ready && authoritative {
-			_, selectionStats, selectionOutcome, err := cs.dispatchOrgConnectionAdmissionsLocked(tx, tables, orgID, limits, now)
-			stats = selectionStats
-			if err != nil {
-				return err
-			}
-			request, found, err = cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
-			if err != nil || !found {
-				return err
-			}
-			lease, err = cs.claimOrgConnectionOfferLocked(tx, tables, request, ownerID, now)
-			if err != nil {
-				return err
-			}
-			if lease != nil {
-				outcome = orgConnectionAdmissionOutcomeGranted
-			} else if selectionOutcome == orgConnectionAdmissionOutcomeGranted {
-				outcome = orgConnectionAdmissionOutcomeGrantedOther
-			} else {
-				outcome = selectionOutcome
-			}
-			return nil
 		}
 		if !authoritative && fallbackLimitLookup == nil {
 			// The explicit production API must never reinterpret a deleted or
@@ -455,6 +306,35 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(requestID, cpInsta
 		if limitLookup == nil {
 			limitLookup = func(string) OrgResourceLimits { return OrgResourceLimits{} }
 		}
+
+		// Reject only requests that cannot fit even when the org and user are
+		// otherwise idle. Capacity consumed by active leases is temporary and
+		// remains ordinary queueing. The delete and rejection decision commit in
+		// this transaction; returning the typed error from inside the callback
+		// would roll the delete back.
+		requestLimits := limitLookup(request.Username)
+		switch {
+		case requestLimits.OrgMaxVCPUs > 0 && request.RequestedVCPUs > requestLimits.OrgMaxVCPUs:
+			rejection = &OrgConnectionAdmissionRejectedError{
+				Reason:         OrgConnectionAdmissionRejectedOrgVCPU,
+				RequestedVCPUs: request.RequestedVCPUs,
+				MaximumVCPUs:   requestLimits.OrgMaxVCPUs,
+			}
+			outcome = orgConnectionAdmissionOutcomeRejectedOrgVCPU
+		case requestLimits.UserMaxVCPUs > 0 && request.RequestedVCPUs > requestLimits.UserMaxVCPUs:
+			rejection = &OrgConnectionAdmissionRejectedError{
+				Reason:         OrgConnectionAdmissionRejectedUserVCPU,
+				RequestedVCPUs: request.RequestedVCPUs,
+				MaximumVCPUs:   requestLimits.UserMaxVCPUs,
+			}
+			outcome = orgConnectionAdmissionOutcomeRejectedUserVCPU
+		}
+		if rejection != nil {
+			return tx.Table(tables.queue).
+				Where("request_id = ? AND granted_at IS NULL", requestID).
+				Delete(&OrgConnectionQueueEntry{}).Error
+		}
+
 		next, selectionStats, selectionOutcome, err := cs.nextEligibleOrgConnectionRequestLocked(tx, tables, orgID, limitLookup, userAllowed, now)
 		stats = selectionStats
 		if err != nil {
@@ -475,7 +355,33 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(requestID, cpInsta
 		outcome = orgConnectionAdmissionOutcomeGranted
 		return nil
 	})
+	if err == nil && rejection != nil {
+		err = rejection
+	}
 	return lease, retryWithFreshOrg, stats, outcome, err
+}
+
+// lockActiveControlPlaneOwner closes the race between cleanup's active-owner
+// snapshot and lease creation. The SHARE row lock conflicts with draining and
+// expiry updates, so either the state transition commits first and admission
+// observes a non-active owner, or the lease commits before the owner can leave
+// active state.
+func (cs *ConfigStore) lockActiveControlPlaneOwner(tx *gorm.DB, cpInstanceID string) (bool, error) {
+	var owner struct {
+		State ControlPlaneInstanceState
+	}
+	err := tx.Table(cs.runtimeTable((&ControlPlaneInstance{}).TableName())).
+		Select("state").
+		Clauses(clause.Locking{Strength: "SHARE"}).
+		Where("id = ?", cpInstanceID).
+		Take(&owner).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return owner.State == ControlPlaneInstanceStateActive, nil
 }
 
 func lockOrgConnectionAdmission(tx *gorm.DB, orgID string) error {
@@ -623,267 +529,6 @@ func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID strin
 	return limits, true, nil
 }
 
-func (cs *ConfigStore) orgConnectionOffersEnabled(tx *gorm.DB) (bool, error) {
-	protocolTable := cs.runtimeTable((&OrgConnectionAdmissionProtocol{}).TableName())
-	var protocol OrgConnectionAdmissionProtocol
-	if err := tx.Table(protocolTable).
-		Where("id = ?", 1).
-		Take(&protocol).Error; err != nil {
-		return false, err
-	}
-	return protocol.OffersEnabled, nil
-}
-
-func (cs *ConfigStore) revokeOrgConnectionOffersLocked(tx *gorm.DB, queueTable, orgID string, now time.Time) error {
-	return tx.Table(queueTable).
-		Where("org_id = ? AND state = ? AND granted_at IS NULL", orgID, OrgConnectionRequestStateOffered).
-		Updates(map[string]any{
-			"state":            OrgConnectionRequestStatePending,
-			"offered_at":       nil,
-			"offer_expires_at": nil,
-			"updated_at":       now,
-		}).Error
-}
-
-func (cs *ConfigStore) dispatchOrgConnectionAdmissionsLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, orgID string, limits authoritativeOrgConnectionLimitSet, now time.Time) (int, orgConnectionAdmissionStats, string, error) {
-	orgUsed, userUsed, legacyUserUsed, err := cs.activeOrgConnectionLeaseVCPUUsage(tx, orgID)
-	if err != nil {
-		return 0, orgConnectionAdmissionStats{}, orgConnectionAdmissionOutcomeError, err
-	}
-	offeredOrg, offeredUsers, err := cs.reconcileOrgConnectionOffersLocked(tx, tables.queue, orgID, limits, now, orgUsed, userUsed, legacyUserUsed)
-	if err != nil {
-		return 0, orgConnectionAdmissionStats{}, orgConnectionAdmissionOutcomeError, err
-	}
-	orgUsed += offeredOrg
-	for username, used := range offeredUsers {
-		userUsed[username] += used
-	}
-
-	var pending []OrgConnectionQueueEntry
-	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
-	if err := tx.Table(tables.queue+" AS q").
-		Select("q.*").
-		Joins("JOIN "+cpTable+" AS cp ON cp.id = q.cp_instance_id AND cp.state = ?", ControlPlaneInstanceStateActive).
-		Where("q.org_id = ? AND q.state = ? AND q.granted_at IS NULL AND q.expires_at > ?", orgID, OrgConnectionRequestStatePending, now).
-		Order("q.enqueued_at ASC, q.request_id ASC").
-		Find(&pending).Error; err != nil {
-		return 0, orgConnectionAdmissionStats{}, orgConnectionAdmissionOutcomeError, err
-	}
-
-	stats := orgConnectionAdmissionStats{queueDepth: int64(len(pending))}
-	usersSeen := make(map[string]struct{})
-	for i := range pending {
-		usersSeen[pending[i].Username] = struct{}{}
-	}
-	stats.userQueues = len(usersSeen)
-
-	offered := 0
-	outcome := orgConnectionAdmissionOutcomeWaiting
-	blockedUsers := make(map[string]struct{})
-	for i := range pending {
-		if offered >= maxOrgConnectionOffersPerDispatch {
-			break
-		}
-		request := &pending[i]
-		if _, blocked := blockedUsers[request.Username]; blocked {
-			continue
-		}
-		userLimit, exists := limits.users[request.Username]
-		if !exists || userLimit.disabled {
-			blockedUsers[request.Username] = struct{}{}
-			stats.ineligibleUserSkips++
-			if outcome == orgConnectionAdmissionOutcomeWaiting {
-				outcome = orgConnectionAdmissionOutcomeIneligibleUser
-			}
-			continue
-		}
-
-		requested := int64(request.RequestedVCPUs)
-		if userLimit.maxVCPUs > 0 && legacyUserUsed+userUsed[request.Username]+requested > userLimit.maxVCPUs {
-			blockedUsers[request.Username] = struct{}{}
-			stats.userLimitSkips++
-			outcome = orgConnectionAdmissionOutcomeBlockedUserVCPU
-			continue
-		}
-		if limits.orgMaxVCPUs > 0 && orgUsed+requested > limits.orgMaxVCPUs {
-			outcome = orgConnectionAdmissionOutcomeBlockedOrgVCPU
-			break
-		}
-
-		expiresAt := now.Add(defaultOrgConnectionOfferTTL)
-		if request.ExpiresAt.Before(expiresAt) {
-			expiresAt = request.ExpiresAt
-		}
-		if !expiresAt.After(now) {
-			continue
-		}
-		result := tx.Table(tables.queue).
-			Where("request_id = ? AND state = ? AND granted_at IS NULL", request.RequestID, OrgConnectionRequestStatePending).
-			Updates(map[string]any{
-				"state":            OrgConnectionRequestStateOffered,
-				"offered_at":       now,
-				"offer_expires_at": expiresAt,
-				"updated_at":       now,
-			})
-		if result.Error != nil {
-			return offered, stats, orgConnectionAdmissionOutcomeError, result.Error
-		}
-		if result.RowsAffected == 0 {
-			continue
-		}
-		offered++
-		orgUsed += requested
-		userUsed[request.Username] += requested
-		outcome = orgConnectionAdmissionOutcomeGranted
-	}
-	return offered, stats, outcome, nil
-}
-
-func (cs *ConfigStore) reconcileOrgConnectionOffersLocked(tx *gorm.DB, queueTable, orgID string, limits authoritativeOrgConnectionLimitSet, now time.Time, activeOrg int64, activeUsers map[string]int64, legacyUserUsed int64) (int64, map[string]int64, error) {
-	var offers []OrgConnectionQueueEntry
-	if err := tx.Table(queueTable).
-		Where("org_id = ? AND state = ? AND granted_at IS NULL AND expires_at > ?", orgID, OrgConnectionRequestStateOffered, now).
-		Order("enqueued_at ASC, request_id ASC").
-		Find(&offers).Error; err != nil {
-		return 0, nil, err
-	}
-
-	var offeredOrg int64
-	offeredUsers := make(map[string]int64)
-	blockedUsers := make(map[string]struct{})
-	orgBlocked := false
-	for i := range offers {
-		offer := &offers[i]
-		requested := int64(offer.RequestedVCPUs)
-		userLimit, exists := limits.users[offer.Username]
-		_, userBlocked := blockedUsers[offer.Username]
-		keep := !orgBlocked && !userBlocked && exists && !userLimit.disabled
-		if keep && userLimit.maxVCPUs > 0 && legacyUserUsed+activeUsers[offer.Username]+offeredUsers[offer.Username]+requested > userLimit.maxVCPUs {
-			keep = false
-			blockedUsers[offer.Username] = struct{}{}
-		}
-		if keep && limits.orgMaxVCPUs > 0 && activeOrg+offeredOrg+requested > limits.orgMaxVCPUs {
-			keep = false
-			orgBlocked = true
-		}
-		if keep {
-			offeredOrg += requested
-			offeredUsers[offer.Username] += requested
-			continue
-		}
-		if err := tx.Table(queueTable).
-			Where("request_id = ? AND state = ?", offer.RequestID, OrgConnectionRequestStateOffered).
-			Updates(map[string]any{
-				"state":            OrgConnectionRequestStatePending,
-				"offered_at":       nil,
-				"offer_expires_at": nil,
-				"updated_at":       now,
-			}).Error; err != nil {
-			return 0, nil, err
-		}
-	}
-	return offeredOrg, offeredUsers, nil
-}
-
-func (cs *ConfigStore) claimOrgConnectionOfferOnce(requestID, cpInstanceID string) (*OrgConnectionLease, bool, error) {
-	tables := cs.orgConnectionRuntimeTables()
-	var lease *OrgConnectionLease
-	retryWithFreshOrg := false
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		orgID, found, err := cs.orgIDForConnectionRequest(tx, tables.queue, requestID)
-		if err != nil || !found {
-			return err
-		}
-		if err := lockOrgConnectionAdmission(tx, orgID); err != nil {
-			return err
-		}
-		now, err := cs.orgConnectionDatabaseNow(tx)
-		if err != nil {
-			return err
-		}
-		if err := cs.cleanupOrgConnectionRowsLocked(tx, orgID, now); err != nil {
-			return err
-		}
-		request, found, err := cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
-		if err != nil || !found {
-			return err
-		}
-		if request.OrgID != orgID {
-			retryWithFreshOrg = true
-			return nil
-		}
-		if request.CPInstanceID != cpInstanceID {
-			return nil
-		}
-		existing, found, err := cs.existingOrgConnectionLease(tx, tables.lease, requestID)
-		if err != nil {
-			return err
-		}
-		if found {
-			if existing.CPInstanceID == cpInstanceID {
-				lease = existing
-			}
-			return nil
-		}
-		ready, err := cs.orgConnectionOffersEnabled(tx)
-		if err != nil {
-			return err
-		}
-		if !ready {
-			return cs.revokeOrgConnectionOffersLocked(tx, tables.queue, orgID, now)
-		}
-		resharding, err := cs.warehouseReshardingLocked(tx, orgID)
-		if err != nil || resharding {
-			return err
-		}
-		limits, authoritative, err := cs.authoritativeOrgConnectionLimits(tx, orgID)
-		if err != nil {
-			return err
-		}
-		if !authoritative {
-			return nil
-		}
-		if _, _, err := cs.reconcileCurrentOrgConnectionOffersLocked(tx, tables, orgID, limits, now); err != nil {
-			return err
-		}
-		request, found, err = cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
-		if err != nil || !found {
-			return err
-		}
-		lease, err = cs.claimOrgConnectionOfferLocked(tx, tables, request, cpInstanceID, now)
-		return err
-	})
-	return lease, retryWithFreshOrg, err
-}
-
-func (cs *ConfigStore) reconcileCurrentOrgConnectionOffersLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, orgID string, limits authoritativeOrgConnectionLimitSet, now time.Time) (int64, map[string]int64, error) {
-	activeOrg, activeUsers, legacyUserUsed, err := cs.activeOrgConnectionLeaseVCPUUsage(tx, orgID)
-	if err != nil {
-		return 0, nil, err
-	}
-	return cs.reconcileOrgConnectionOffersLocked(tx, tables.queue, orgID, limits, now, activeOrg, activeUsers, legacyUserUsed)
-}
-
-func (cs *ConfigStore) claimOrgConnectionOfferLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, request *OrgConnectionQueueEntry, cpInstanceID string, now time.Time) (*OrgConnectionLease, error) {
-	if request == nil || request.CPInstanceID != cpInstanceID {
-		return nil, nil
-	}
-	if request.State != OrgConnectionRequestStateOffered || request.GrantedAt != nil || request.OfferExpiresAt == nil || !request.OfferExpiresAt.After(now) || !request.ExpiresAt.After(now) {
-		return nil, nil
-	}
-	var activeOwner int64
-	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
-	if err := tx.Table(cpTable).
-		Where("id = ? AND state = ? AND supports_admission_offers = ?", cpInstanceID, ControlPlaneInstanceStateActive, true).
-		Count(&activeOwner).Error; err != nil {
-		return nil, err
-	}
-	if activeOwner != 1 {
-		return nil, nil
-	}
-	return cs.createOrgConnectionLease(tx, request, now)
-}
-
 func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, orgID string, limitLookup func(string) OrgResourceLimits, userAllowed func(string) bool, now time.Time) (*OrgConnectionQueueEntry, orgConnectionAdmissionStats, string, error) {
 	heads, stats, err := cs.pendingOrgConnectionUserQueueHeads(tx, tables.queue, orgID, now)
 	if err != nil {
@@ -906,6 +551,15 @@ func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, table
 		}
 		limits := limitLookup(head.Username)
 		requested := int64(head.RequestedVCPUs)
+		// A permanently impossible foreign head must not block unrelated
+		// requests. Only that request's owner deletes and receives the typed
+		// rejection; other evaluators simply skip it.
+		if limits.UserMaxVCPUs > 0 && requested > int64(limits.UserMaxVCPUs) {
+			continue
+		}
+		if limits.OrgMaxVCPUs > 0 && requested > int64(limits.OrgMaxVCPUs) {
+			continue
+		}
 		if limits.UserMaxVCPUs > 0 {
 			used := legacyUserUsed + userUsed[head.Username]
 			if used+requested > int64(limits.UserMaxVCPUs) {
@@ -932,7 +586,7 @@ func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, table
 func (cs *ConfigStore) pendingOrgConnectionUserQueueHeads(tx *gorm.DB, queueTable, orgID string, now time.Time) ([]OrgConnectionQueueEntry, orgConnectionAdmissionStats, error) {
 	var stats orgConnectionAdmissionStats
 	if err := tx.Table(queueTable).
-		Where("org_id = ? AND state = ? AND granted_at IS NULL AND expires_at > ?", orgID, OrgConnectionRequestStatePending, now).
+		Where("org_id = ? AND granted_at IS NULL AND expires_at > ?", orgID, now).
 		Count(&stats.queueDepth).Error; err != nil {
 		return nil, stats, err
 	}
@@ -941,10 +595,10 @@ func (cs *ConfigStore) pendingOrgConnectionUserQueueHeads(tx *gorm.DB, queueTabl
 	if err := tx.Raw(
 		"SELECT * FROM ("+
 			"SELECT DISTINCT ON (username) * FROM "+queueTable+" "+
-			"WHERE org_id = ? AND state = ? AND granted_at IS NULL AND expires_at > ? "+
+			"WHERE org_id = ? AND granted_at IS NULL AND expires_at > ? "+
 			"ORDER BY username ASC, enqueued_at ASC, request_id ASC"+
 			") AS user_heads ORDER BY enqueued_at ASC, request_id ASC",
-		orgID, OrgConnectionRequestStatePending, now,
+		orgID, now,
 	).Scan(&heads).Error; err != nil {
 		return nil, stats, err
 	}
@@ -1006,10 +660,8 @@ func (cs *ConfigStore) createOrgConnectionLease(tx *gorm.DB, request *OrgConnect
 	if err := tx.Table(cs.runtimeTable(request.TableName())).
 		Where("request_id = ?", request.RequestID).
 		Updates(map[string]any{
-			"state":            OrgConnectionRequestStateActive,
-			"granted_at":       granted,
-			"offer_expires_at": nil,
-			"updated_at":       now,
+			"granted_at": granted,
+			"updated_at": now,
 		}).Error; err != nil {
 		return nil, err
 	}
@@ -1018,18 +670,20 @@ func (cs *ConfigStore) createOrgConnectionLease(tx *gorm.DB, request *OrgConnect
 
 // ReleaseOrgConnectionLease releases one active cluster-wide connection lease.
 func (cs *ConfigStore) ReleaseOrgConnectionLease(leaseID string) error {
+	return cs.ReleaseOrgConnectionLeaseContext(context.Background(), leaseID)
+}
+
+func (cs *ConfigStore) ReleaseOrgConnectionLeaseContext(ctx context.Context, leaseID string) error {
 	if strings.TrimSpace(leaseID) == "" {
 		return nil
 	}
 	tables := cs.orgConnectionRuntimeTables()
-	var orgID string
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
+	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		resolvedOrgID, found, err := cs.orgIDForConnectionLeaseOrRequest(tx, tables, leaseID)
 		if err != nil || !found {
 			return err
 		}
-		orgID = resolvedOrgID
-		if err := lockOrgConnectionAdmission(tx, orgID); err != nil {
+		if err := lockOrgConnectionAdmission(tx, resolvedOrgID); err != nil {
 			return err
 		}
 		if err := tx.Table(tables.lease).
@@ -1044,11 +698,6 @@ func (cs *ConfigStore) ReleaseOrgConnectionLease(leaseID string) error {
 	if err != nil {
 		return fmt.Errorf("release org connection lease: %w", err)
 	}
-	// Refill immediately for low wake latency. Dispatch is best-effort here:
-	// release is already durable, and owner polling is the recovery path.
-	if orgID != "" {
-		_, _ = cs.DispatchOrgConnectionAdmissions(orgID)
-	}
 	return nil
 }
 
@@ -1056,26 +705,28 @@ func (cs *ConfigStore) ReleaseOrgConnectionLease(leaseID string) error {
 // Acquire returned. If acquisition committed but its response was lost, the
 // owner still has no lease handle, so cancellation must also reclaim that
 // unclaimed lease.
-func (cs *ConfigStore) CancelOrgConnectionRequest(requestID string, _ time.Time) error {
+func (cs *ConfigStore) CancelOrgConnectionRequest(requestID string, canceledAt time.Time) error {
+	return cs.CancelOrgConnectionRequestContext(context.Background(), requestID, canceledAt)
+}
+
+func (cs *ConfigStore) CancelOrgConnectionRequestContext(ctx context.Context, requestID string, _ time.Time) error {
 	if strings.TrimSpace(requestID) == "" {
 		return nil
 	}
 	tables := cs.orgConnectionRuntimeTables()
-	var orgID string
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
+	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		resolvedOrgID, found, err := cs.orgIDForConnectionRequest(tx, tables.queue, requestID)
 		if err != nil || !found {
 			return err
 		}
-		orgID = resolvedOrgID
-		if err := lockOrgConnectionAdmission(tx, orgID); err != nil {
+		if err := lockOrgConnectionAdmission(tx, resolvedOrgID); err != nil {
 			return err
 		}
 		request, found, err := cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
 		if err != nil || !found {
 			return err
 		}
-		if request.OrgID != orgID {
+		if request.OrgID != resolvedOrgID {
 			return nil
 		}
 		if err := tx.Table(tables.lease).
@@ -1089,11 +740,6 @@ func (cs *ConfigStore) CancelOrgConnectionRequest(requestID string, _ time.Time)
 	})
 	if err != nil {
 		return fmt.Errorf("cancel org connection request: %w", err)
-	}
-	// As with release, a failed refill must not undo a successful cancellation;
-	// the next waiter poll retries scheduling from durable queue state.
-	if orgID != "" {
-		_, _ = cs.DispatchOrgConnectionAdmissions(orgID)
 	}
 	return nil
 }
@@ -1133,52 +779,28 @@ func (cs *ConfigStore) cleanupOrgConnectionRowsLocked(tx *gorm.DB, orgID string,
 	leaseTable := cs.runtimeTable((&OrgConnectionLease{}).TableName())
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
 
-	// During the mixed-version window an old binary can commit the legacy
-	// lease+granted_at pair without updating the new state column. Repair that
-	// pair before any pending/offered cleanup so a real active lease can never
-	// be expired or reset as a reservation.
+	// A granted marker without its atomic lease is not active. Restore it to
+	// pending so a still-live owner can retry instead of pinning a zombie row.
 	if err := tx.Exec(
-		"UPDATE "+queueTable+" AS q SET state = ?, offer_expires_at = NULL, updated_at = ? "+
-			"WHERE q.org_id = ? AND q.granted_at IS NOT NULL AND q.state <> ? "+
-			"AND EXISTS (SELECT 1 FROM "+leaseTable+" AS l WHERE l.request_id = q.request_id)",
-		OrgConnectionRequestStateActive, now, orgID, OrgConnectionRequestStateActive,
-	).Error; err != nil {
-		return err
-	}
-	// Conversely, a granted marker without its atomic lease is not active.
-	// Restore it to pending so the owner can retry instead of pinning a zombie
-	// row until an operator intervenes.
-	if err := tx.Exec(
-		"UPDATE "+queueTable+" AS q SET state = ?, granted_at = NULL, offered_at = NULL, offer_expires_at = NULL, updated_at = ? "+
+		"UPDATE "+queueTable+" AS q SET granted_at = NULL, updated_at = ? "+
 			"WHERE q.org_id = ? AND q.granted_at IS NOT NULL "+
 			"AND NOT EXISTS (SELECT 1 FROM "+leaseTable+" AS l WHERE l.request_id = q.request_id)",
-		OrgConnectionRequestStatePending, now, orgID,
+		now, orgID,
 	).Error; err != nil {
 		return err
 	}
 
 	if err := tx.Table(queueTable).
-		Where("org_id = ? AND state IN ? AND granted_at IS NULL AND expires_at <= ?", orgID, []OrgConnectionRequestState{OrgConnectionRequestStatePending, OrgConnectionRequestStateOffered}, now).
+		Where("org_id = ? AND granted_at IS NULL AND expires_at <= ?", orgID, now).
 		Delete(&OrgConnectionQueueEntry{}).Error; err != nil {
 		return err
 	}
 	if err := tx.Exec(
-		"DELETE FROM "+queueTable+" AS q WHERE q.org_id = ? AND q.state IN ? AND q.granted_at IS NULL "+
+		"DELETE FROM "+queueTable+" AS q WHERE q.org_id = ? AND q.granted_at IS NULL "+
 			"AND NOT EXISTS (SELECT 1 FROM "+cpTable+" AS cp WHERE cp.id = q.cp_instance_id AND cp.state = ?)",
 		orgID,
-		[]OrgConnectionRequestState{OrgConnectionRequestStatePending, OrgConnectionRequestStateOffered},
 		ControlPlaneInstanceStateActive,
 	).Error; err != nil {
-		return err
-	}
-	if err := tx.Table(queueTable).
-		Where("org_id = ? AND state = ? AND granted_at IS NULL AND (offer_expires_at IS NULL OR offer_expires_at <= ?)", orgID, OrgConnectionRequestStateOffered, now).
-		Updates(map[string]any{
-			"state":            OrgConnectionRequestStatePending,
-			"offered_at":       nil,
-			"offer_expires_at": nil,
-			"updated_at":       now,
-		}).Error; err != nil {
 		return err
 	}
 
@@ -1197,9 +819,9 @@ func (cs *ConfigStore) cleanupOrgConnectionRowsLocked(tx *gorm.DB, orgID string,
 		return err
 	}
 	return tx.Exec(
-		"DELETE FROM "+queueTable+" AS q WHERE q.org_id = ? AND q.state = ? "+
+		"DELETE FROM "+queueTable+" AS q WHERE q.org_id = ? AND q.granted_at IS NOT NULL "+
 			"AND NOT EXISTS (SELECT 1 FROM "+leaseTable+" AS l WHERE l.request_id = q.request_id)",
-		orgID, OrgConnectionRequestStateActive,
+		orgID,
 	).Error
 }
 

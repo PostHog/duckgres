@@ -41,8 +41,6 @@ const ACTION_LABELS: Record<string, string> = {
   "session.cancel": "Cancelled session",
 
   "impersonate.query": "Ran impersonated query",
-
-  "admission_offers.activate": "Activated admission offers",
 };
 
 // Fallback labels for the generic config.<verb> bucket and any unmapped verb.

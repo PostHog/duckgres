@@ -486,12 +486,11 @@ func (d OrgConnectionDrainStatus) Drained() bool {
 	return d.ActiveLeases == 0 && d.QueuedConns == 0
 }
 
-// OrgConnectionDrainState reads, in one statement, the org's active lease
-// count AND its pending or offered queue rows. The org admission lock keeps the
-// offer-to-lease transition stable while both categories are classified. Both
-// counts must be zero for a sound drain barrier: an unclaimed offer still
-// reserves a waiting connection, while the queue mirror for an active lease
-// must not be counted a second time.
+// OrgConnectionDrainState reads, in one statement, the org's active leases and
+// pending queue rows. The org admission lock keeps the pending-to-lease
+// transition stable while both categories are classified. Both counts must be
+// zero for a sound drain barrier; the queue mirror for an active lease is not
+// counted a second time.
 func (cs *ConfigStore) OrgConnectionDrainState(orgID string) (OrgConnectionDrainStatus, error) {
 	tables := cs.orgConnectionRuntimeTables()
 	var status OrgConnectionDrainStatus
@@ -512,13 +511,9 @@ func (cs *ConfigStore) OrgConnectionDrainState(orgID string) (OrgConnectionDrain
 		return tx.Raw(
 			"SELECT "+
 				"(SELECT COUNT(*) FROM "+tables.lease+" WHERE org_id = ?) AS active_leases, "+
-				"(SELECT COUNT(*) FROM "+tables.queue+" WHERE org_id = ? AND state IN ? AND granted_at IS NULL) AS queued_conns",
+				"(SELECT COUNT(*) FROM "+tables.queue+" WHERE org_id = ? AND granted_at IS NULL) AS queued_conns",
 			orgID,
 			orgID,
-			[]OrgConnectionRequestState{
-				OrgConnectionRequestStatePending,
-				OrgConnectionRequestStateOffered,
-			},
 		).Scan(&status).Error
 	})
 	if err != nil {

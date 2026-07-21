@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,9 +16,70 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
+
+type blockingSessionCreatedLogHandler struct {
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func TestSessionLifecycleFinishLinearizesWithDrain(t *testing.T) {
+	t.Run("drain wins", func(t *testing.T) {
+		lifecycle := newSessionLifecycle()
+		ctx, finish, err := lifecycle.begin(context.Background())
+		if err != nil {
+			t.Fatalf("begin lifecycle: %v", err)
+		}
+
+		lifecycle.close()
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("close did not cancel the active lifecycle context")
+		}
+		if !finish() {
+			t.Fatal("finish must report that drain linearized first")
+		}
+	})
+
+	t.Run("finish wins", func(t *testing.T) {
+		lifecycle := newSessionLifecycle()
+		_, finish, err := lifecycle.begin(context.Background())
+		if err != nil {
+			t.Fatalf("begin lifecycle: %v", err)
+		}
+
+		if finish() {
+			t.Fatal("finish unexpectedly reported a closed lifecycle")
+		}
+		lifecycle.close()
+		if finish() {
+			t.Fatal("repeated finish changed the original linearization result")
+		}
+	})
+}
+
+func (h *blockingSessionCreatedLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *blockingSessionCreatedLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message != "Session created on worker." {
+		return nil
+	}
+	h.once.Do(func() { close(h.reached) })
+	select {
+	case <-h.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *blockingSessionCreatedLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *blockingSessionCreatedLogHandler) WithGroup(string) slog.Handler      { return h }
 
 type recordingWorkerPool struct {
 	events *[]string
@@ -792,6 +854,74 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	}
 }
 
+func TestSessionManagerBeginDrainRejectsCreateThatRegisteredBeforeReturn(t *testing.T) {
+	allowCreate := make(chan struct{})
+	close(allowCreate)
+	flightClient := &blockingCreateSessionFlightClient{
+		createStarted: make(chan struct{}),
+		allowCreate:   allowCreate,
+	}
+	lease := &countingConnectionLease{}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+		done:   make(chan struct{}),
+	}
+	sm := NewSessionManager(&blockingCreateSessionPool{worker: worker}, nil)
+	sm.SetConnectionLimiter(&blockingCreateSessionLimiter{lease: lease})
+
+	handler := &blockingSessionCreatedLogHandler{
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	sm.log = slog.New(handler)
+
+	type createResult struct {
+		pid      int32
+		executor *flightclient.FlightExecutor
+		err      error
+	}
+	resultCh := make(chan createResult, 1)
+	go func() {
+		pid, executor, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres", nil)
+		resultCh <- createResult{pid: pid, executor: executor, err: err}
+	}()
+
+	select {
+	case <-handler.reached:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the session to register")
+	}
+	if got := sm.SessionCount(); got != 1 {
+		t.Fatalf("expected the raced session to be registered before drain, got %d", got)
+	}
+
+	sm.BeginDrain()
+	close(handler.release)
+
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result.err, ErrSessionManagerDraining) {
+			t.Fatalf("CreateSessionWithProtocol error = %v, want %v", result.err, ErrSessionManagerDraining)
+		}
+		if result.pid != 0 || result.executor != nil {
+			t.Fatalf("drain-raced creation returned pid=%d executor=%v", result.pid, result.executor)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for drain-raced creation to return")
+	}
+
+	if got := sm.SessionCount(); got != 0 {
+		t.Fatalf("expected the drain-raced session to be destroyed, got %d", got)
+	}
+	if got := flightClient.destroyCalls.Load(); got != 1 {
+		t.Fatalf("expected worker session destruction once, got %d", got)
+	}
+	if got := lease.releases.Load(); got != 1 {
+		t.Fatalf("expected lease release once, got %d", got)
+	}
+}
+
 func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
 	lease := &countingConnectionLease{}
 	limiter := &blockingAcquireLimiter{
@@ -839,6 +969,73 @@ func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
 	}
 	if got := lease.releases.Load(); got != 0 {
 		t.Fatalf("expected no lease release before limiter returned a lease, got %d", got)
+	}
+}
+
+func TestSessionManagerBeginDrainCancelsCreationWithoutDestroyingEstablishedSessions(t *testing.T) {
+	establishedLease := &countingConnectionLease{}
+	limiter := &blockingAcquireLimiter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	sm := NewSessionManager(&acquireErrorPool{err: errors.New("worker should not be acquired")}, nil)
+	sm.SetConnectionLimiter(limiter)
+
+	const establishedPID int32 = 2020
+	sm.mu.Lock()
+	sm.sessions[establishedPID] = &ManagedSession{
+		PID:      establishedPID,
+		Username: "established-user",
+		lease:    establishedLease,
+	}
+	sm.mu.Unlock()
+
+	createErr := make(chan error, 1)
+	go func() {
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "queued-user", 3030, "", 0, "postgres", nil)
+		createErr <- err
+	}()
+
+	select {
+	case <-limiter.entered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for limiter acquire")
+	}
+
+	sm.BeginDrain()
+
+	select {
+	case err := <-createErr:
+		if !errors.Is(err, ErrSessionManagerDraining) {
+			t.Fatalf("BeginDrain creation error = %v, want %v", err, ErrSessionManagerDraining)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for BeginDrain to cancel session creation")
+	}
+
+	if !sm.lifecycle.isClosed() {
+		t.Fatal("expected BeginDrain to close the session-creation lifecycle")
+	}
+	if got := sm.SessionCount(); got != 1 {
+		t.Fatalf("expected established session to survive BeginDrain, got %d sessions", got)
+	}
+	if got := establishedLease.releases.Load(); got != 0 {
+		t.Fatalf("expected established lease to remain held during drain, got %d releases", got)
+	}
+
+	_, _, err := sm.CreateSessionWithProtocol(context.Background(), "late-user", 4040, "", 0, "postgres", nil)
+	if !errors.Is(err, ErrSessionManagerDraining) {
+		t.Fatalf("new session after BeginDrain error = %v, want %v", err, ErrSessionManagerDraining)
+	}
+
+	// BeginDrain is intentionally idempotent: multiple shutdown paths may
+	// converge on it without disturbing established sessions.
+	sm.BeginDrain()
+	if got := sm.SessionCount(); got != 1 {
+		t.Fatalf("expected established session to survive repeated BeginDrain, got %d sessions", got)
+	}
+	if got := establishedLease.releases.Load(); got != 0 {
+		t.Fatalf("expected repeated BeginDrain not to release established lease, got %d releases", got)
 	}
 }
 

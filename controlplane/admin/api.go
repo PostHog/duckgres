@@ -88,9 +88,6 @@ type OrgStackInfo interface {
 // replicas so the dashboard shows cluster-wide numbers instead of one CP's slice.
 func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo, fetcher PeerFetcher) {
 	registerAPIWithStore(r, newGormAPIStore(store), info, fetcher)
-	// Activating durable admission offers raises the minimum rollback version,
-	// so it is a separate admin-only, explicit operator action.
-	registerAdmissionOfferProtocolAPI(r, store)
 	// Generic read-only models explorer (sidebar + table + detail UI). Reads
 	// the concrete store directly because it needs the runtime schema name and
 	// raw DB for tables the typed apiStore interface doesn't surface.

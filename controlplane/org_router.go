@@ -37,6 +37,7 @@ type OrgRouter struct {
 	userSecrets           *CPUserSecretManager
 	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
 	nextWorkerID          atomic.Int32
+	draining              atomic.Bool
 	sharedCancel          context.CancelFunc
 
 	// migrating tracks which orgs have a DuckLake migration in progress.
@@ -157,13 +158,23 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		cancel:     cancel,
 	}
 
-	tr.mu.Lock()
-	tr.orgs[tc.Name] = stack
-	tr.mu.Unlock()
+	tr.publishOrgStack(tc.Name, stack)
 
 	slog.Info("Org stack created.", "org", tc.Name, "max_workers", maxWorkers)
 	_ = ctx // keep linter happy
 	return stack, nil
+}
+
+// publishOrgStack closes the creation lifecycle before making a late-created
+// stack visible when the router is already draining. Holding mu across the
+// drain check and publication closes the race with BeginDrain's stack snapshot.
+func (tr *OrgRouter) publishOrgStack(orgID string, stack *OrgStack) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.draining.Load() && stack != nil && stack.Sessions != nil {
+		stack.Sessions.BeginDrain()
+	}
+	tr.orgs[orgID] = stack
 }
 
 func (tr *OrgRouter) resourceLimitsForOrg(orgID string) func(username string) configstore.OrgResourceLimits {
@@ -349,6 +360,18 @@ func (tr *OrgRouter) AllStacks() map[string]*OrgStack {
 		result[k] = v
 	}
 	return result
+}
+
+// BeginDrain stops new and in-progress session creation for every org while
+// leaving established sessions intact so they can drain naturally.
+func (tr *OrgRouter) BeginDrain() {
+	tr.draining.Store(true)
+	stacks := tr.AllStacks()
+	for _, stack := range stacks {
+		if stack.Sessions != nil {
+			stack.Sessions.BeginDrain()
+		}
+	}
 }
 
 // ShutdownAll shuts down all org stacks.

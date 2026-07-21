@@ -4,7 +4,6 @@ package configstore_test
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -14,7 +13,7 @@ import (
 
 const blockedOrgConnectionRequestID = "request-blocked-insert"
 
-func TestEnqueueOrgConnectionRequestSerializesFIFOWithDispatcherPostgres(t *testing.T) {
+func TestEnqueueOrgConnectionRequestSerializesFIFOWithAdmissionPostgres(t *testing.T) {
 	storeA, storeB, appA, appB := newSharedConfigStores(t)
 	const (
 		cpID  = "cp-enqueue-fifo"
@@ -25,9 +24,6 @@ func TestEnqueueOrgConnectionRequestSerializesFIFOWithDispatcherPostgres(t *test
 		"alice": 0,
 		"bob":   0,
 	})
-	if err := storeA.ActivateOrgConnectionAdmissionOffers(); err != nil {
-		t.Fatalf("activate admission offers: %v", err)
-	}
 
 	blockKey := installBlockingOrgConnectionQueueInsertTrigger(t, storeA)
 	holder, holderPID := holdTestAdvisoryLock(t, storeA, blockKey)
@@ -56,8 +52,8 @@ func TestEnqueueOrgConnectionRequestSerializesFIFOWithDispatcherPostgres(t *test
 	}()
 
 	// The first enqueue already owns the org admission linearization point even
-	// though its INSERT is uncommitted. A later enqueue must wait instead of
-	// becoming visible to a dispatcher with a later enqueued_at timestamp.
+	// though its INSERT is uncommitted. A later enqueue must wait and receive a
+	// later database timestamp.
 	waitForBlockedApplicationPID(t, sqlDB, firstPID, appB)
 
 	if err := holder.Commit(); err != nil {
@@ -66,108 +62,28 @@ func TestEnqueueOrgConnectionRequestSerializesFIFOWithDispatcherPostgres(t *test
 	waitForAsyncError(t, firstDone, "first enqueue")
 	waitForAsyncError(t, secondDone, "second enqueue")
 
-	if offered, err := storeA.DispatchOrgConnectionAdmissions(orgID); err != nil || offered != 1 {
-		t.Fatalf("dispatch after serialized enqueues = %d, err = %v; want one offer", offered, err)
+	var first, second cpconfigstore.OrgConnectionQueueEntry
+	if err := storeA.DB().Table(storeA.RuntimeSchema()+".org_connection_queue").
+		Where("request_id = ?", blockedOrgConnectionRequestID).Take(&first).Error; err != nil {
+		t.Fatalf("load first request: %v", err)
 	}
-	first := assertOrgConnectionOffer(t, storeA, blockedOrgConnectionRequestID)
-	second := assertOrgConnectionRequestState(t, storeA, "request-enqueue-second", cpconfigstore.OrgConnectionRequestStatePending)
+	if err := storeA.DB().Table(storeA.RuntimeSchema()+".org_connection_queue").
+		Where("request_id = ?", "request-enqueue-second").Take(&second).Error; err != nil {
+		t.Fatalf("load second request: %v", err)
+	}
 	if !first.EnqueuedAt.Before(second.EnqueuedAt) {
 		t.Fatalf("serialized enqueue timestamps: first=%s second=%s, want first before second", first.EnqueuedAt, second.EnqueuedAt)
 	}
-}
 
-func TestAdmissionOfferActivationWaitsForInFlightQueueInsertPostgres(t *testing.T) {
-	storeA, storeB, appA, appB := newSharedConfigStores(t)
-	now := time.Now()
-	upsertActiveCP(t, storeA, "cp-activation-capable")
-
-	blockKey := installBlockingOrgConnectionQueueInsertTrigger(t, storeA)
-	holder, holderPID := holdTestAdvisoryLock(t, storeA, blockKey)
-	defer func() { _ = holder.Rollback() }()
-
-	enqueueDone := make(chan error, 1)
-	go func() {
-		enqueueDone <- storeB.EnqueueOrgConnectionRequest(&cpconfigstore.OrgConnectionQueueEntry{
-			RequestID: blockedOrgConnectionRequestID, OrgID: "org-activation-in-flight", Username: "alice",
-			CPInstanceID: "cp-missing", PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
-			EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
-		})
-	}()
-
-	sqlDB := configStoreSQLDB(t, storeA)
-	enqueuePID := waitForBlockedApplicationPID(t, sqlDB, holderPID, appB)
-
-	activateDone := make(chan error, 1)
-	go func() { activateDone <- storeA.ActivateOrgConnectionAdmissionOffers() }()
-
-	// The queue INSERT's BEFORE trigger holds the disabled protocol singleton
-	// FOR SHARE until commit. Activation must wait, then include the committed
-	// row in its incompatible-owner validation.
-	waitForBlockedApplicationPID(t, sqlDB, enqueuePID, appA)
-	if err := holder.Commit(); err != nil {
-		t.Fatalf("release queue-insert blocker: %v", err)
+	lease, err := storeA.ScheduleAndClaimOrgConnectionLease(first.RequestID, cpID)
+	if err != nil || lease == nil || lease.RequestID != first.RequestID {
+		t.Fatalf("admit serialized head = %#v, err = %v", lease, err)
 	}
-	waitForAsyncError(t, enqueueDone, "pre-activation enqueue")
-
-	select {
-	case err := <-activateDone:
-		if !errors.Is(err, cpconfigstore.ErrAdmissionOfferProtocolActivationBlocked) {
-			t.Fatalf("activation error = %v, want activation-blocked sentinel", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for activation after queue insert committed")
+	waiting, err := storeB.ScheduleAndClaimOrgConnectionLease(second.RequestID, cpID)
+	if err != nil || waiting != nil {
+		t.Fatalf("second request admission = %#v, err = %v; want pending at org cap", waiting, err)
 	}
-}
-
-func TestQueueInsertRechecksOwnerAfterConcurrentAdmissionOfferActivationPostgres(t *testing.T) {
-	storeA, storeB, appA, appB := newSharedConfigStores(t)
-	now := time.Now()
-	upsertActiveCP(t, storeA, "cp-activation-capable")
-
-	sqlDB := configStoreSQLDB(t, storeA)
-	cpTableHolder, err := sqlDB.Begin()
-	if err != nil {
-		t.Fatalf("begin CP-table blocker: %v", err)
-	}
-	defer func() { _ = cpTableHolder.Rollback() }()
-	var holderPID int
-	if err := cpTableHolder.QueryRow("SELECT pg_backend_pid()").Scan(&holderPID); err != nil {
-		t.Fatalf("read CP-table blocker pid: %v", err)
-	}
-	if _, err := cpTableHolder.Exec("LOCK TABLE " + storeA.RuntimeSchema() + ".cp_instances IN ROW EXCLUSIVE MODE"); err != nil {
-		t.Fatalf("lock CP table: %v", err)
-	}
-
-	activateDone := make(chan error, 1)
-	go func() { activateDone <- storeA.ActivateOrgConnectionAdmissionOffers() }()
-	activationPID := waitForBlockedApplicationPID(t, sqlDB, holderPID, appA)
-
-	enqueueDone := make(chan error, 1)
-	go func() {
-		enqueueDone <- storeB.EnqueueOrgConnectionRequest(&cpconfigstore.OrgConnectionQueueEntry{
-			RequestID: "request-concurrent-activation", OrgID: "org-concurrent-activation", Username: "alice",
-			CPInstanceID: "cp-missing", PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
-			EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
-		})
-	}()
-
-	// Activation owns the protocol row while waiting for its CP-table fence.
-	// The INSERT must wait on that row, then observe the enabled value and reject
-	// its missing owner rather than committing against its pre-wait snapshot.
-	waitForBlockedApplicationPID(t, sqlDB, activationPID, appB)
-	if err := cpTableHolder.Commit(); err != nil {
-		t.Fatalf("release CP-table blocker: %v", err)
-	}
-	waitForAsyncError(t, activateDone, "admission offer activation")
-
-	select {
-	case err := <-enqueueDone:
-		if err == nil {
-			t.Fatal("missing-owner queue insert succeeded after concurrent protocol activation")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for queue insert after protocol activation")
-	}
+	assertOrgConnectionRequestPending(t, storeA, second.RequestID)
 }
 
 func installBlockingOrgConnectionQueueInsertTrigger(t *testing.T, store *cpconfigstore.ConfigStore) int64 {

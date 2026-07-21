@@ -70,12 +70,6 @@ func TestControlPlaneRuntimeTrackerStartHeartbeats(t *testing.T) {
 	if records[0].ID != "cp-1:boot-a" {
 		t.Fatalf("expected id cp-1:boot-a, got %q", records[0].ID)
 	}
-	if !records[0].SupportsAdmissionOffers {
-		t.Fatal("expected runtime tracker to advertise admission-offer support on startup")
-	}
-	if !records[1].SupportsAdmissionOffers {
-		t.Fatal("expected runtime tracker to preserve admission-offer support on heartbeat")
-	}
 }
 
 func TestControlPlaneRuntimeTrackerMarkDraining(t *testing.T) {
@@ -102,8 +96,5 @@ func TestControlPlaneRuntimeTrackerMarkDraining(t *testing.T) {
 	}
 	if last.DrainingAt == nil {
 		t.Fatal("expected draining_at to be set")
-	}
-	if !last.SupportsAdmissionOffers {
-		t.Fatal("expected draining heartbeat to preserve admission-offer support")
 	}
 }

@@ -186,13 +186,6 @@ func auditActionFor(method, path string) string {
 			return "session.cancel"
 		}
 		return "session." + verb
-	case "admission":
-		// POST /admission/offers/activate crosses a one-way compatibility
-		// boundary, so keep it distinct from generic config creation.
-		if hasSeg(segs, "offers") && last == "activate" {
-			return "admission_offers.activate"
-		}
-		return "admission." + verb
 	case "orgs":
 		// Sub-resources under an org each get their own action; the org row
 		// itself is "org.<verb>". Order matters: the more specific

@@ -15,11 +15,14 @@ Replace Duckgres control-plane replicas without breaking most existing sessions 
 ## Expected behavior
 
 1. The old replica receives `SIGTERM`.
-2. It marks itself `draining` in runtime state and fails `/health`.
-3. New pgwire sessions are rejected on the draining replica.
-4. New Flight bootstrap sessions are rejected on the draining replica.
+2. It closes local pgwire and Flight admission and fails `/health`.
+3. It publishes `draining` in runtime state.
+4. New pgwire and Flight bootstrap sessions are rejected on the draining replica.
 5. Existing pgwire connections and existing Flight sessions continue until they finish or the drain timeout expires.
 6. When the timeout expires, the replica force-shuts down remaining sessions and workers.
+
+See [Org connection admission](org-connection-admission.md) for the
+mixed-version admission boundary during a rolling deployment.
 
 Unplanned control-plane failure is different:
 
@@ -49,10 +52,6 @@ Unplanned control-plane failure is different:
    - `sum(duckgres_worker_lifecycle_count{state="spawning"})` settles back toward 0 (on-demand spawns succeed)
    - `sum(duckgres_worker_lifecycle_count{state="hot"})` does not drop unexpectedly
    - client reconnect errors do not spike
-
-If the release introduces the durable org-connection offer protocol, complete
-the separate two-phase activation only after the rolling rollout is healthy.
-See [Org Connection Admission](./org-connection-admission.md).
 
 ## If a rollout stalls
 

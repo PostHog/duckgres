@@ -77,10 +77,10 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
 | `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
 | `duckgres_control_plane_worker_spawn_seconds` | Histogram | Time spent spawning and health-checking a new worker |
-| `duckgres_org_connection_admission_duration_seconds{outcome}` | Histogram | DB-backed org connection admission scheduler evaluation latency by outcome |
+| `duckgres_org_connection_admission_duration_seconds{outcome}` | Histogram | DB-backed request-owned org connection admission evaluation latency by outcome |
 | `duckgres_org_connection_admission_queue_depth` | Histogram | Pending org connection queue depth observed during admission evaluation |
 | `duckgres_org_connection_admission_user_queues` | Histogram | Number of per-user queue heads considered during admission evaluation |
-| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome, including `ineligible_user` for a missing or disabled configured user |
+| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome, including terminal `rejected_org_vcpu` / `rejected_user_vcpu` and `ineligible_user` for a missing or disabled configured user |
 | `duckgres_org_connection_admission_user_limit_skips_total` | Counter | Per-user queue heads skipped because that user was at its vCPU limit |
 | `duckgres_org_connection_admission_ineligible_user_skips_total` | Counter | Per-user queue heads skipped because that configured user was missing or disabled |
 | `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
