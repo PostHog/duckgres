@@ -96,8 +96,9 @@ export interface OrgTeam {
   schema_data_imports_name?: string | null;
   // PostHog's cached earliest-event date ("YYYY-MM-DD"): the historical
   // backfill floor its sensor computes from ClickHouse. null = not yet
-  // resolved; 1970-01-01 is the "no event history" sentinel. Owned and
-  // written by PostHog — duckgres only stores and serves it.
+  // resolved; 9999-12-31 (PostHog's NO_HISTORY_SENTINEL) is the "no event
+  // history" sentinel. Owned and written by PostHog — duckgres only stores
+  // and serves it.
   earliest_event_date?: string | null;
   created_at: string;
   updated_at: string;

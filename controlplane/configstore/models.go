@@ -90,8 +90,10 @@ type OrgTeam struct {
 	// EarliestEventDate is PostHog's cached "earliest event date" for the team:
 	// the historical-backfill floor its Dagster sensor computes from ClickHouse.
 	// NULL = not yet resolved (the sensor computes and sets it); the sentinel
-	// 1970-01-01 means "team has no event history", stored so the sensor never
-	// re-queries. The value is a cache owned by PostHog — duckgres stores and
+	// 9999-12-31 (PostHog's NO_HISTORY_SENTINEL) means "team has no event
+	// history", stored so the sensor never re-queries — a date in the far
+	// future cannot collide with a real minimum timestamp, unlike 1970-01-01.
+	// The value is a cache owned by PostHog — duckgres stores and
 	// serves it ("YYYY-MM-DD" or null on the wire) but never computes or
 	// interprets it.
 	EarliestEventDate *EventDate `gorm:"type:date" json:"earliest_event_date"`

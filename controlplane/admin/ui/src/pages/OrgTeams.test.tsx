@@ -54,7 +54,7 @@ const TEAMS: OrgTeam[] = [
     enabled: true,
     is_billing_team: true,
     backfill_enabled: false,
-    earliest_event_date: "1970-01-01",
+    earliest_event_date: "9999-12-31",
     created_at: "2026-07-03T00:00:00Z",
     updated_at: "2026-07-03T00:00:00Z",
   },
@@ -90,7 +90,7 @@ describe("Org teams page", () => {
     // Both billing rows carry the badge; the disabled team is flagged.
     expect(screen.getAllByText("billing")).toHaveLength(2);
     expect(screen.getByText("disabled")).toBeInTheDocument();
-    // Earliest event date: plain date, "none" for the 1970-01-01 no-history
+    // Earliest event date: plain date, "none" for the 9999-12-31 no-history
     // sentinel, em dash while unresolved.
     expect(screen.getByText("2023-04-17")).toBeInTheDocument();
     expect(screen.getByText("none")).toBeInTheDocument();

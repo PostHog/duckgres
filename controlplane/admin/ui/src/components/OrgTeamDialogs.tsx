@@ -38,13 +38,14 @@ export function BackfillBadge({ value }: { value: boolean }) {
 }
 
 // EarliestEventDateCell renders PostHog's cached earliest-event date: em dash
-// while the PostHog sensor hasn't resolved it yet, "none" for the 1970-01-01
-// "no event history" sentinel, the plain date otherwise.
+// while the PostHog sensor hasn't resolved it yet, "none" for the 9999-12-31
+// "no event history" sentinel (PostHog's NO_HISTORY_SENTINEL), the plain date
+// otherwise.
 export function EarliestEventDateCell({ value }: { value: string | null | undefined }) {
   if (!value) return <span className="text-muted-foreground">—</span>;
-  if (value === "1970-01-01") {
+  if (value === "9999-12-31") {
     return (
-      <span className="text-muted-foreground" title="1970-01-01 sentinel: the team has no event history">
+      <span className="text-muted-foreground" title="9999-12-31 sentinel: the team has no event history">
         none
       </span>
     );
@@ -341,7 +342,7 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
             />
           </FieldRow>
           <p className="text-xs text-muted-foreground">
-            Cached by PostHog's backfill sensor; 1970-01-01 means the team has no event history.
+            Cached by PostHog's backfill sensor; 9999-12-31 means the team has no event history.
             Clearing it makes the sensor re-discover the team's backfill range.
           </p>
           {isBilling ? (

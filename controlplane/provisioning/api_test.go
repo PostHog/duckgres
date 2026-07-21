@@ -1204,14 +1204,14 @@ func TestOrgTeamUpsertEarliestEventDateTriState(t *testing.T) {
 		t.Fatalf("omitted earliest_event_date must be preserved, got %v", got)
 	}
 
-	// The 1970-01-01 "no event history" sentinel is stored verbatim — duckgres
-	// never interprets it.
+	// The 9999-12-31 "no event history" sentinel (PostHog's
+	// NO_HISTORY_SENTINEL) is stored verbatim — duckgres never interprets it.
 	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
-		`{"team_id":7,"schema_name":"team_7","earliest_event_date":"1970-01-01"}`)
+		`{"team_id":7,"schema_name":"team_7","earliest_event_date":"9999-12-31"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sentinel: status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if got := store.teams["acme"][7].EarliestEventDate; got == nil || got.String() != "1970-01-01" {
+	if got := store.teams["acme"][7].EarliestEventDate; got == nil || got.String() != "9999-12-31" {
 		t.Fatalf("sentinel date not stored, got %v", got)
 	}
 
