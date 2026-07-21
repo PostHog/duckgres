@@ -64,6 +64,11 @@ COPY --from=uibuilder /ui/dist ./controlplane/admin/ui/dist
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_TAGS=""
+RUN CGO_ENABLED=1 \
+    DUCKGRES_TEST_DUCKDB_EXTENSION_DIRECTORY=/build/duckdb-extensions \
+    go test -count=1 -tags "${BUILD_TAGS}" \
+      -run '^TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner$' \
+      ./duckdbservice
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 
 FROM debian:bookworm-slim
