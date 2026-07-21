@@ -53,6 +53,48 @@ func ValidateOrgTeamSchemaName(name string) error {
 	return nil
 }
 
+// ValidateOrgTeamTableName rejects legacy table/schema override names that
+// are not safe bare identifiers. The override contract (pinned at the
+// discovery derivation site, provisioning/discovery.go resolveTeamTables):
+// events/persons overrides are BARE TABLE NAMES within the team's schema,
+// and the data-imports override is a bare SCHEMA name — never
+// schema-qualified. A dot in a stored name would be silently ambiguous to
+// every consumer of the resolved locations, so reject at write time on
+// every surface.
+func ValidateOrgTeamTableName(field, name string) error {
+	if name == "" {
+		return nil // empty = clear back to derive-from-schema
+	}
+	if len(name) > maxOrgTeamSchemaNameLength {
+		return fmt.Errorf("%s must be at most %d characters", field, maxOrgTeamSchemaNameLength)
+	}
+	if !orgTeamSchemaNamePattern.MatchString(name) {
+		return fmt.Errorf("%s must be a bare lowercase identifier: [a-z0-9_], not starting with a digit, no schema qualification", field)
+	}
+	return nil
+}
+
+// validateOrgTeamTableNames applies ValidateOrgTeamTableName to every legacy
+// override present in the upsert.
+func validateOrgTeamTableNames(up OrgTeamUpsert) error {
+	for _, f := range []struct {
+		field string
+		value *string
+	}{
+		{"events_table_name", up.EventsTableName},
+		{"persons_table_name", up.PersonsTableName},
+		{"schema_data_imports_name", up.SchemaDataImportsName},
+	} {
+		if f.value == nil {
+			continue
+		}
+		if err := ValidateOrgTeamTableName(f.field, *f.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // OrgBillingTeamIDTx returns the org's current billing team id (the
 // duckgres_org_teams row with is_billing_team = TRUE) inside the caller's
 // transaction, or 0 when the org has none.
@@ -134,6 +176,9 @@ type OrgTeamUpsert struct {
 // migration 000025 — a concurrent insert that slips past the pre-check still
 // fails with a 23505 on that index).
 func UpsertOrgTeamTx(tx *gorm.DB, orgID string, up OrgTeamUpsert) (*OrgTeam, error) {
+	if err := validateOrgTeamTableNames(up); err != nil {
+		return nil, err
+	}
 	if err := ValidateOrgTeamSchemaName(up.SchemaName); err != nil {
 		return nil, err
 	}
@@ -173,6 +218,19 @@ func UpsertOrgTeamTx(tx *gorm.DB, orgID string, up OrgTeamUpsert) (*OrgTeam, err
 		applyOrgTeamTableNames(&row, up)
 		if err := tx.Create(&row).Error; err != nil {
 			return nil, fmt.Errorf("create org team (org=%s team=%d): %w", orgID, up.TeamID, err)
+		}
+		// Enabled carries gorm's `default:true` tag, and gorm omits
+		// zero-valued default-tagged fields from the INSERT — so a create
+		// with enabled=false silently stores (and serves, and ingests)
+		// TRUE, with row.Enabled lying to the caller. Pinned by
+		// TestCreateOrgTeamDisabledPostgres; force the column explicitly.
+		if up.Enabled != nil && !*up.Enabled {
+			if err := tx.Model(&OrgTeam{}).
+				Where("org_id = ? AND team_id = ?", orgID, up.TeamID).
+				Update("enabled", false).Error; err != nil {
+				return nil, fmt.Errorf("persist enabled=false (org=%s team=%d): %w", orgID, up.TeamID, err)
+			}
+			row.Enabled = false
 		}
 		return &row, nil
 	case err != nil:
@@ -292,6 +350,15 @@ func DeleteOrgTeamTx(tx *gorm.DB, orgID string, teamID int64) (*OrgTeamDeleteRes
 	if err := tx.Where("org_id = ? AND team_id = ?", orgID, teamID).
 		Delete(&OrgTeam{}).Error; err != nil {
 		return nil, fmt.Errorf("delete org team (org=%s team=%d): %w", orgID, teamID, err)
+	}
+	// A DELETE leaves no updated_at bump behind, so a non-billing deletion
+	// would be invisible to change-marker consumers (discovery's
+	// config_generation is MAX(updated_at) over the three config tables) —
+	// the exact removal signal a poller must not skip. Touch the parent
+	// org row in the same transaction so the marker advances.
+	if err := tx.Model(&Org{}).Where("name = ?", orgID).
+		Update("updated_at", gorm.Expr("now()")).Error; err != nil {
+		return nil, fmt.Errorf("touch org row after team delete (org=%s): %w", orgID, err)
 	}
 
 	res := &OrgTeamDeleteResult{

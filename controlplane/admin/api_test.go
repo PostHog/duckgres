@@ -2550,3 +2550,23 @@ func TestAdminListOrgTeams(t *testing.T) {
 		t.Fatalf("global teams order = %+v, want acme[1,2] then zeta[9]", global.Teams)
 	}
 }
+
+func TestAdminUpdateOrgTeamRejectsQualifiedLegacyName(t *testing.T) {
+	// Bare-name contract on the admin surface: a schema-qualified override
+	// is a 400 (configstore.ValidateOrgTeamTableName), because a stored dot
+	// is silently ambiguous to every discovery consumer, and the stored
+	// value must stay untouched.
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"events_table_name":"posthog.legacy_events"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("qualified events_table_name: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if stored := store.teams["acme"][1]; stored.EventsTableName != nil {
+		t.Fatalf("rejected PUT must not store anything, got %+v", stored)
+	}
+}

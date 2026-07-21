@@ -1429,6 +1429,79 @@ org_teams_crud() { # org billing_team_id
   log "org teams OK: list/upsert/grandfather/409/delete rules on $org"
 }
 
+# ---- discovery endpoints (external-writer tenant listing) -------------------
+# GET /warehouses + GET /warehouse-team-ids are the read-only discovery
+# surface external writers poll (viaduck destination discovery, millpond's
+# include-values source). Contract asserted against the real config store:
+#   1. Both provisioned orgs (cnpg + ext) appear in /warehouses with
+#      state=ready, writable=true, and a teams array carrying the org's
+#      billing team (duckgres_org_teams row) with its conventional
+#      team_<id> schema and enabled=true. (org_teams_crud runs before this
+#      on the EXT org and leaves it with exactly its billing team; the CNPG
+#      org may carry extra demoted rows from earlier legs — the assertions
+#      select by team_id so extras are tolerated.)
+#   2. The ext org's metadata_store block round-trips endpoint/database —
+#      cnpg rows carry only the kind today (CR-status backfill pending), so
+#      only kind is asserted there. No password-ish key may appear anywhere
+#      in the payload outside password_secret_ref (secret REFS only).
+#   3. /warehouse-team-ids is a bare sorted JSON array containing both
+#      provisioned team ids — the exact shape millpond's poller consumes.
+#      An erroneous omission here silently stops a team's ingestion after
+#      consumer-side damping, which is why the transient-error contract
+#      (store failure => 500, never a 200 with a team absent) matters; that
+#      split is pinned by unit tests (discovery_test.go).
+discovery_endpoints() { # cnpg_org ext_org
+  cnpg_org="$1"; ext_org="$2"
+  log "discovery: /warehouses + /warehouse-team-ids list $cnpg_org/$ext_org"
+
+  curl -fsS -H "$H" "$API/api/v1/warehouses" > /tmp/discovery_out     || fail "discovery: GET /warehouses failed"
+
+  for org in "$cnpg_org" "$ext_org"; do
+    state="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .state' /tmp/discovery_out)"
+    [ "$state" = "ready" ]       || fail "discovery: $org state = '$state' want 'ready': $(cat /tmp/discovery_out)"
+    writable="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .writable' /tmp/discovery_out)"
+    [ "$writable" = "true" ]       || fail "discovery: $org writable = '$writable' want 'true'"
+  done
+  for pair in "$cnpg_org:$CNPG_DEFAULT_TEAM_ID" "$ext_org:$EXT_DEFAULT_TEAM_ID"; do
+    org="${pair%%:*}"; team="${pair##*:}"
+    jq -e --arg o "$org" --argjson t "$team" \
+      '.warehouses[] | select(.org_id == $o) | .teams
+       | map(select(.team_id==$t and .schema_name=="team_\($t)" and .enabled==true)) | length == 1' \
+      /tmp/discovery_out >/dev/null \
+      || fail "discovery: $org must carry billing team $team with schema team_$team, enabled: $(cat /tmp/discovery_out)"
+    # Resolved table names: no legacy overrides on these teams, so the CP
+    # must serve the derived names (the derivation lives in the CP, not in
+    # every consumer).
+    jq -e --arg o "$org" --argjson t "$team" \
+      '.warehouses[] | select(.org_id == $o) | .teams[] | select(.team_id==$t)
+       | .events_table == "team_\($t).events" and .persons_table == "team_\($t).persons" and .data_imports_schema == "team_\($t)_data_imports"' \
+      /tmp/discovery_out >/dev/null \
+      || fail "discovery: $org team $team resolved table names wrong: $(cat /tmp/discovery_out)"
+  done
+
+  # Ext metadata_store round-trip (the row carries real connection details
+  # for external stores); cnpg asserts kind only until the CR-status
+  # backfill lands.
+  ep="$(jq -r --arg o "$ext_org" '.warehouses[] | select(.org_id == $o) | .metadata_store.endpoint' /tmp/discovery_out)"
+  [ "$ep" = "$EXT_RDS_ENDPOINT" ]     || fail "discovery: $ext_org metadata_store.endpoint = '$ep' want '$EXT_RDS_ENDPOINT'"
+  kind="$(jq -r --arg o "$cnpg_org" '.warehouses[] | select(.org_id == $o) | .metadata_store.kind' /tmp/discovery_out)"
+  [ "$kind" = "cnpg-shard" ]     || fail "discovery: $cnpg_org metadata_store.kind = '$kind' want 'cnpg-shard'"
+
+  # No password material: the only key containing "password" anywhere in the
+  # payload must be password_secret_ref (k8s Secret reference, not material).
+  badkeys="$(jq -r '[.. | objects | keys[] | select(test("password")) | select(. != "password_secret_ref")] | unique | join(",")' /tmp/discovery_out)"
+  [ -z "$badkeys" ]     || fail "discovery: payload carries password-ish keys: $badkeys"
+
+  # Values projection: bare sorted array containing both team ids.
+  curl -fsS -H "$H" "$API/api/v1/warehouse-team-ids" > /tmp/discovery_ids     || fail "discovery: GET /warehouse-team-ids failed"
+  jq -e 'type == "array"' /tmp/discovery_ids >/dev/null     || fail "discovery: /warehouse-team-ids must be a bare JSON array: $(cat /tmp/discovery_ids)"
+  for team in "$CNPG_DEFAULT_TEAM_ID" "$EXT_DEFAULT_TEAM_ID"; do
+    jq -e --argjson t "$team" 'index($t) != null' /tmp/discovery_ids >/dev/null       || fail "discovery: /warehouse-team-ids missing team $team: $(cat /tmp/discovery_ids)"
+  done
+  jq -e '. == sort' /tmp/discovery_ids >/dev/null     || fail "discovery: /warehouse-team-ids must be sorted: $(cat /tmp/discovery_ids)"
+  log "discovery OK: both orgs listed writable with their billing team rows + resolved table names; team-ids array carries both teams"
+}
+
 # ---- user persistent secrets ------------------------------------------------
 # CREATE PERSISTENT SECRET must survive across sessions: worker pods are
 # ephemeral, so the CP intercepts the statement, stores it encrypted in the
@@ -3251,6 +3324,7 @@ lane_ext() { # external-RDS metadata backend + org default profile
   # Team CRUD on the ext org (no other test mutates its team rows); ends with
   # the org back at exactly its provisioned billing team.
   org_teams_crud "$EXT" "$EXT_DEFAULT_TEAM_ID"
+  discovery_endpoints "$CNPG" "$EXT"
 }
 
 main() {

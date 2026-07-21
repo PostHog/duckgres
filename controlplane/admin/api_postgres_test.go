@@ -513,3 +513,34 @@ func TestAdminUpdateOrgTeamBreakGlassPostgres(t *testing.T) {
 		t.Fatalf("schema_name = %q, want shared preserved on omit", updated.SchemaName)
 	}
 }
+
+// TestAdminCreateOrgTeamDisabledPostgres pins the gorm default-tag pitfall on
+// the ADMIN create surface (POST /teams {"enabled":false}): Enabled carries
+// `default:true`, gorm omits zero-valued default-tagged fields from the
+// INSERT, and without the explicit follow-up column write the DB default
+// silently stores TRUE. Same bug class as configstore.UpsertOrgTeamTx's
+// create path (TestCreateOrgTeamDisabledPostgres).
+func TestAdminCreateOrgTeamDisabledPostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	if err := store.DB().Create(&configstore.Org{Name: "heldorg", DatabaseName: "heldorgdb"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	team := &configstore.OrgTeam{TeamID: 5, SchemaName: "team_5", Enabled: false}
+	if err := apiStore.CreateOrgTeam("heldorg", team); err != nil {
+		t.Fatalf("create disabled team: %v", err)
+	}
+	var got configstore.OrgTeam
+	if err := store.DB().First(&got, "org_id = ? AND team_id = ?", "heldorg", 5).Error; err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got.Enabled {
+		t.Fatal("admin-created team with enabled=false was stored as enabled=true (gorm default-tag pitfall)")
+	}
+	// The struct handed back to the handler (the 201 body) must not carry
+	// gorm's RETURNING write-back either.
+	if team.Enabled {
+		t.Fatal("returned team struct carries enabled=true (RETURNING write-back not undone)")
+	}
+}
