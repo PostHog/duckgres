@@ -8,6 +8,7 @@ import (
 	"time"
 
 	cpconfigstore "github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioning"
 )
 
 func TestSetOrgUserDisabledSerializesWithAdmissionPostgres(t *testing.T) {
@@ -36,6 +37,47 @@ func TestSetOrgUserDisabledSerializesWithAdmissionPostgres(t *testing.T) {
 	}
 	if !user.Disabled {
 		t.Fatal("expected user to be disabled after the admission lock was released")
+	}
+}
+
+func TestDeleteOrgTeamSerializesWithAdmissionPostgres(t *testing.T) {
+	storeA, storeB, _, _ := newSharedConfigStores(t)
+	const orgID = "config-mutation-delete-team"
+	targetTeamID := int64(2)
+
+	if err := storeA.DB().Create(&cpconfigstore.Org{Name: orgID, DatabaseName: orgID}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if err := storeA.DB().Create([]cpconfigstore.OrgTeam{
+		{OrgID: orgID, TeamID: 1, SchemaName: "team_1", Enabled: true},
+		{OrgID: orgID, TeamID: targetTeamID, SchemaName: "team_2", Enabled: true},
+	}).Error; err != nil {
+		t.Fatalf("create org teams: %v", err)
+	}
+	if err := storeA.DB().Create(&cpconfigstore.OrgUser{
+		OrgID:      orgID,
+		Username:   "project-reader",
+		Password:   "hash",
+		AccessMode: cpconfigstore.OrgUserAccessModeProjectReader,
+		TeamID:     &targetTeamID,
+	}).Error; err != nil {
+		t.Fatalf("create project reader: %v", err)
+	}
+
+	pstore := provisioning.NewGormStore(storeB)
+	assertConfigMutationWaitsForAdmissionLock(t, storeA, orgID, func() error {
+		_, err := pstore.DeleteOrgTeam(orgID, targetTeamID)
+		return err
+	})
+
+	var readerCount int64
+	if err := storeA.DB().Model(&cpconfigstore.OrgUser{}).
+		Where("org_id = ? AND username = ?", orgID, "project-reader").
+		Count(&readerCount).Error; err != nil {
+		t.Fatalf("count project reader: %v", err)
+	}
+	if readerCount != 0 {
+		t.Fatalf("project reader count = %d, want 0 after team deletion", readerCount)
 	}
 }
 

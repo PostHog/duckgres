@@ -12,7 +12,7 @@ import (
 )
 
 func TestScheduleAndClaimContextCancellationInterruptsOrgLockWait(t *testing.T) {
-	storeA, storeB, _, _ := newSharedConfigStores(t)
+	storeA, storeB, _, appB := newSharedConfigStores(t)
 	upsertActiveCP(t, storeA, "cp-a")
 
 	const orgID = "org-context-lock-cancel"
@@ -32,6 +32,10 @@ func TestScheduleAndClaimContextCancellationInterruptsOrgLockWait(t *testing.T) 
 		t.Fatalf("begin lock blocker: %v", blocker.Error)
 	}
 	defer func() { _ = blocker.Rollback().Error }()
+	var blockerPID int
+	if err := blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error; err != nil {
+		t.Fatalf("read lock blocker pid: %v", err)
+	}
 	if err := cpconfigstore.LockOrgConnectionAdmissionTx(blocker, orgID); err != nil {
 		t.Fatalf("hold org admission lock: %v", err)
 	}
@@ -42,11 +46,7 @@ func TestScheduleAndClaimContextCancellationInterruptsOrgLockWait(t *testing.T) 
 		_, err := storeB.ScheduleAndClaimOrgConnectionLeaseContext(ctx, request.RequestID, request.CPInstanceID)
 		result <- err
 	}()
-	select {
-	case err := <-result:
-		t.Fatalf("schedule returned before cancellation while lock was held: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
+	waitForAdvisoryLockWaiterFromApplication(t, configStoreSQLDB(t, storeA), blockerPID, appB)
 	cancel()
 	select {
 	case err := <-result:
@@ -70,7 +70,8 @@ func TestScheduleAndClaimContextCancellationInterruptsOrgLockWait(t *testing.T) 
 }
 
 func TestScheduleAndClaimSerializesWithOwnerLeavingActiveState(t *testing.T) {
-	storeA, storeB, _, _ := newSharedConfigStores(t)
+	storeA, storeB, _, appB := newSharedConfigStores(t)
+	sqlDB := configStoreSQLDB(t, storeA)
 	const cpID = "cp-owner-state-race"
 	upsertActiveCP(t, storeA, cpID)
 
@@ -96,6 +97,10 @@ func TestScheduleAndClaimSerializesWithOwnerLeavingActiveState(t *testing.T) {
 		Update("state", cpconfigstore.ControlPlaneInstanceStateDraining).Error; err != nil {
 		t.Fatalf("stage owner draining state: %v", err)
 	}
+	var stateChangePID int
+	if err := stateChange.Raw("SELECT pg_backend_pid()").Scan(&stateChangePID).Error; err != nil {
+		t.Fatalf("read owner state-change pid: %v", err)
+	}
 
 	type scheduleResult struct {
 		lease *cpconfigstore.OrgConnectionLease
@@ -106,33 +111,20 @@ func TestScheduleAndClaimSerializesWithOwnerLeavingActiveState(t *testing.T) {
 		lease, err := storeB.ScheduleAndClaimOrgConnectionLease(request.RequestID, cpID)
 		resultCh <- scheduleResult{lease: lease, err: err}
 	}()
-
-	var (
-		result               scheduleResult
-		returnedBeforeCommit bool
-	)
-	select {
-	case result = <-resultCh:
-		returnedBeforeCommit = true
-	case <-time.After(150 * time.Millisecond):
-	}
+	waitForBlockedApplicationPID(t, sqlDB, stateChangePID, appB)
 
 	if err := stateChange.Commit().Error; err != nil {
 		t.Fatalf("commit owner draining state: %v", err)
 	}
-	if !returnedBeforeCommit {
-		select {
-		case result = <-resultCh:
-		case <-time.After(2 * time.Second):
-			t.Fatal("schedule did not resume after owner state commit")
-		}
+	var result scheduleResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("schedule did not resume after owner state commit")
 	}
 
 	if cancelErr := storeA.CancelOrgConnectionRequest(request.RequestID, time.Now()); cancelErr != nil {
 		t.Fatalf("cleanup raced request: %v", cancelErr)
-	}
-	if returnedBeforeCommit {
-		t.Fatal("admission committed without serializing against the owner's in-flight draining transition")
 	}
 	if result.err != nil {
 		t.Fatalf("schedule after owner started draining: %v", result.err)
@@ -167,33 +159,27 @@ func TestScheduleAndClaimSerializesWithOwnerLeavingActiveState(t *testing.T) {
 		Update("state", cpconfigstore.ControlPlaneInstanceStateDraining).Error; err != nil {
 		t.Fatalf("stage retry owner draining state: %v", err)
 	}
+	var retryStateChangePID int
+	if err := retryStateChange.Raw("SELECT pg_backend_pid()").Scan(&retryStateChangePID).Error; err != nil {
+		t.Fatalf("read retry owner state-change pid: %v", err)
+	}
 
 	retryResultCh := make(chan scheduleResult, 1)
 	go func() {
 		lease, err := storeB.ScheduleAndClaimOrgConnectionLease(existingRequest.RequestID, cpID)
 		retryResultCh <- scheduleResult{lease: lease, err: err}
 	}()
-	returnedBeforeCommit = false
-	select {
-	case result = <-retryResultCh:
-		returnedBeforeCommit = true
-	case <-time.After(150 * time.Millisecond):
-	}
+	waitForBlockedApplicationPID(t, sqlDB, retryStateChangePID, appB)
 	if err := retryStateChange.Commit().Error; err != nil {
 		t.Fatalf("commit retry owner draining state: %v", err)
 	}
-	if !returnedBeforeCommit {
-		select {
-		case result = <-retryResultCh:
-		case <-time.After(2 * time.Second):
-			t.Fatal("existing-lease retry did not resume after owner state commit")
-		}
+	select {
+	case result = <-retryResultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("existing-lease retry did not resume after owner state commit")
 	}
 	if cancelErr := storeA.CancelOrgConnectionRequest(existingRequest.RequestID, time.Now()); cancelErr != nil {
 		t.Fatalf("cleanup existing-lease request: %v", cancelErr)
-	}
-	if returnedBeforeCommit {
-		t.Fatal("existing-lease claim committed without serializing against the owner's draining transition")
 	}
 	if result.err != nil {
 		t.Fatalf("existing-lease retry after owner started draining: %v", result.err)
