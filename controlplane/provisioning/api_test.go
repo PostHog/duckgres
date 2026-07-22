@@ -381,6 +381,9 @@ func newTestRouterWithBucketSuffix(store Store, bucketSuffix string) *gin.Engine
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	RegisterAPI(r.Group("/api/v1"), store, bucketSuffix)
+	// Mirror prod topology (multitenant.go): discovery is a separate group
+	// on the same base path, so both surfaces stay reachable in tests.
+	RegisterDiscoveryAPI(r.Group("/api/v1"), store)
 	return r
 }
 

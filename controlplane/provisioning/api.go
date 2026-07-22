@@ -119,8 +119,17 @@ func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
 	r.GET("/orgs/:id/teams", h.listOrgTeams)
 	r.POST("/orgs/:id/teams", h.upsertOrgTeam)
 	r.DELETE("/orgs/:id/teams/:team_id", h.deleteOrgTeam)
-	// Discovery: read-only tenant listing for external writers (see
-	// discovery.go for payload semantics).
+}
+
+// RegisterDiscoveryAPI registers the read-only discovery endpoints for
+// external writers (millpond, viaduck) on their OWN router group — see
+// discovery.go for payload semantics. Deliberately separate from
+// RegisterAPI: the discovery group's auth accepts the scoped
+// read-only-secret (which must never reach the admin/provisioning
+// surface), so these routes must not be mounted behind the admin
+// middleware chain.
+func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
+	h := &handler{store: store}
 	r.GET("/warehouses", h.listWarehouses)
 	r.GET("/warehouse-team-ids", h.listWarehouseTeamIDs)
 }
