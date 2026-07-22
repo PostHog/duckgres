@@ -143,14 +143,18 @@ func (s *fakeStore) UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*
 	}
 	existing, ok := s.teams[orgID][up.TeamID]
 	if !ok {
+		backfill := up.BackfillEnabled == nil || *up.BackfillEnabled
 		row := &configstore.OrgTeam{
 			OrgID:           orgID,
 			TeamID:          up.TeamID,
 			SchemaName:      up.SchemaName,
 			Enabled:         up.Enabled == nil || *up.Enabled,
-			BackfillEnabled: up.BackfillEnabled,
+			BackfillEnabled: &backfill,
 		}
 		applyFakeTableNames(row, up)
+		if up.EarliestEventDateSet {
+			row.EarliestEventDate = up.EarliestEventDate
+		}
 		s.teams[orgID][up.TeamID] = row
 		clone := *row
 		return &clone, nil
@@ -163,6 +167,9 @@ func (s *fakeStore) UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*
 		existing.BackfillEnabled = up.BackfillEnabled
 	}
 	applyFakeTableNames(existing, up)
+	if up.EarliestEventDateSet {
+		existing.EarliestEventDate = up.EarliestEventDate
+	}
 	clone := *existing
 	return &clone, nil
 }
@@ -1125,6 +1132,14 @@ func TestOrgTeamUpsertValidation(t *testing.T) {
 		"hyphenated schema_name": {`{"team_id":1,"schema_name":"team-1"}`, http.StatusBadRequest, "lowercase"},
 		"digit-led schema_name":  {`{"team_id":1,"schema_name":"1team"}`, http.StatusBadRequest, "lowercase"},
 		"overlong schema_name":   {`{"team_id":1,"schema_name":"` + strings.Repeat("a", 64) + `"}`, http.StatusBadRequest, "63"},
+		"invalid earliest_event_date": {
+			`{"team_id":1,"schema_name":"team_1","earliest_event_date":"17-04-2023"}`,
+			http.StatusBadRequest, "earliest_event_date",
+		},
+		"null backfill_enabled": {
+			`{"team_id":1,"schema_name":"team_1","backfill_enabled":null}`,
+			http.StatusBadRequest, "backfill_enabled",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := newFakeStore()
@@ -1212,6 +1227,77 @@ func TestOrgTeamUpsertGrandfathersExistingRow(t *testing.T) {
 	}
 	if !stored.Enabled {
 		t.Fatal("omitted enabled must preserve the stored value on update")
+	}
+}
+
+// TestOrgTeamUpsertBackfillDefaultsTrue pins the NOT NULL DEFAULT TRUE stance
+// of backfill_enabled (migration 000028): a create that omits the field gets
+// TRUE, matching the Django BooleanField(default=True) the column mirrors.
+func TestOrgTeamUpsertBackfillDefaultsTrue(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"backfill_enabled":true`) {
+		t.Fatalf("omitted backfill_enabled must default to true: %s", rec.Body.String())
+	}
+}
+
+// TestOrgTeamUpsertEarliestEventDateTriState pins the tri-state wire contract
+// of PostHog's cached earliest-event date on the upsert: a value sets it (and
+// reads back as "YYYY-MM-DD"), an absent key preserves it, an explicit null
+// clears it (serialized as null so the sensor sees "not yet resolved").
+func TestOrgTeamUpsertEarliestEventDateTriState(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7","earliest_event_date":"2023-04-17"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":"2023-04-17"`) {
+		t.Fatalf("response must carry the date as YYYY-MM-DD: %s", rec.Body.String())
+	}
+
+	// Omitted key preserves the stored value.
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preserve: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][7].EarliestEventDate; got == nil || got.String() != "2023-04-17" {
+		t.Fatalf("omitted earliest_event_date must be preserved, got %v", got)
+	}
+
+	// The 9999-12-31 "no event history" sentinel (PostHog's
+	// NO_HISTORY_SENTINEL) is stored verbatim — duckgres never interprets it.
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7","earliest_event_date":"9999-12-31"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sentinel: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][7].EarliestEventDate; got == nil || got.String() != "9999-12-31" {
+		t.Fatalf("sentinel date not stored, got %v", got)
+	}
+
+	// Explicit null clears back to NULL, serialized as null.
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7","earliest_event_date":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][7].EarliestEventDate; got != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL after explicit null", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":null`) {
+		t.Fatalf("cleared date must serialize as null: %s", rec.Body.String())
 	}
 }
 

@@ -65,9 +65,12 @@ func (o *Org) BillingTeamID() *int64 {
 // one may be the billing team — the team pull-based billing keys the org's
 // usage buckets by (enforced by a partial unique index, migration 000024).
 // Two teams in one org must never share a schema name (unique index on
-// (org_id, schema_name), migration 000025). IsBillingTeam and BackfillEnabled
-// are tri-state (*bool): NULL means "not the billing team" / "backfill
-// preference unset".
+// (org_id, schema_name), migration 000025). IsBillingTeam is tri-state
+// (*bool): NULL means "not the billing team". BackfillEnabled mirrors a
+// Django BooleanField(default=True) on the PostHog side, so its column is NOT
+// NULL DEFAULT TRUE (migration 000028) — it stays *bool in Go only so an
+// explicit false survives gorm's zero-value-uses-column-default Create
+// behavior; a stored row always carries a value.
 //
 // The *TableName fields are legacy overrides. NULL — the value for every team
 // created going forward — means "derive from schema_name": events live at
@@ -84,17 +87,27 @@ type OrgTeam struct {
 	SchemaName      string `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
 	Enabled         bool   `gorm:"not null;default:true" json:"enabled"`
 	IsBillingTeam   *bool  `json:"is_billing_team,omitempty"`
-	BackfillEnabled *bool  `json:"backfill_enabled,omitempty"`
+	BackfillEnabled *bool  `gorm:"not null;default:true" json:"backfill_enabled"`
 	// The legacy overrides are BARE identifiers (never schema-qualified):
 	// events/persons are table names within SchemaName's schema, the
 	// data-imports override is a schema name. Enforced by
 	// ValidateOrgTeamTableName on every write surface; resolved for
 	// consumers in provisioning/discovery.go resolveTeamTables.
-	EventsTableName       *string   `gorm:"size:255" json:"events_table_name,omitempty"`
-	PersonsTableName      *string   `gorm:"size:255" json:"persons_table_name,omitempty"`
-	SchemaDataImportsName *string   `gorm:"size:255" json:"schema_data_imports_name,omitempty"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	EventsTableName       *string `gorm:"size:255" json:"events_table_name,omitempty"`
+	PersonsTableName      *string `gorm:"size:255" json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string `gorm:"size:255" json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate is PostHog's cached "earliest event date" for the team:
+	// the historical-backfill floor its Dagster sensor computes from ClickHouse.
+	// NULL = not yet resolved (the sensor computes and sets it); the sentinel
+	// 9999-12-31 (PostHog's NO_HISTORY_SENTINEL) means "team has no event
+	// history", stored so the sensor never re-queries — a date in the far
+	// future cannot collide with a real minimum timestamp, unlike 1970-01-01.
+	// The value is a cache owned by PostHog — duckgres stores and
+	// serves it ("YYYY-MM-DD" or null on the wire) but never computes or
+	// interprets it.
+	EarliestEventDate *EventDate `gorm:"type:date" json:"earliest_event_date"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 func (OrgTeam) TableName() string { return "duckgres_org_teams" }

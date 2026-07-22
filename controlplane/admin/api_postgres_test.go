@@ -512,7 +512,41 @@ func TestAdminUpdateOrgTeamBreakGlassPostgres(t *testing.T) {
 	if updated.SchemaName != "shared" {
 		t.Fatalf("schema_name = %q, want shared preserved on omit", updated.SchemaName)
 	}
+
+	// earliest_event_date: set (real DATE round-trip), preserve on omit, clear.
+	date, err := configstore.ParseEventDate("2023-04-17")
+	if err != nil {
+		t.Fatalf("parse date: %v", err)
+	}
+	prev, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{
+		EarliestEventDateSet: true, EarliestEventDate: &date,
+	})
+	if err != nil {
+		t.Fatalf("set earliest_event_date: %v", err)
+	}
+	if prev.EarliestEventDate != nil {
+		t.Fatalf("prev earliest_event_date = %v, want NULL", prev.EarliestEventDate)
+	}
+	if updated.EarliestEventDate == nil || updated.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("earliest_event_date = %v, want 2023-04-17", updated.EarliestEventDate)
+	}
+	_, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{Enabled: boolPtrAdmin(false)})
+	if err != nil {
+		t.Fatalf("unrelated update: %v", err)
+	}
+	if updated.EarliestEventDate == nil || updated.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("omitted earliest_event_date must be preserved, got %v", updated.EarliestEventDate)
+	}
+	prev, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{EarliestEventDateSet: true})
+	if err != nil {
+		t.Fatalf("clear earliest_event_date: %v", err)
+	}
+	if prev.EarliestEventDate == nil || updated.EarliestEventDate != nil {
+		t.Fatalf("clear: prev/updated = %v/%v, want 2023-04-17/NULL", prev.EarliestEventDate, updated.EarliestEventDate)
+	}
 }
+
+func boolPtrAdmin(b bool) *bool { return &b }
 
 // TestAdminCreateOrgTeamDisabledPostgres pins the gorm default-tag pitfall on
 // the ADMIN create surface (POST /teams {"enabled":false}): Enabled carries

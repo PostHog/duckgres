@@ -30,7 +30,7 @@ const TEAMS: OrgTeam[] = [
     schema_name: "team_1",
     enabled: true,
     is_billing_team: true,
-    backfill_enabled: null,
+    backfill_enabled: true,
     created_at: "2026-07-01T00:00:00Z",
     updated_at: "2026-07-01T00:00:00Z",
   },
@@ -43,6 +43,7 @@ const TEAMS: OrgTeam[] = [
     backfill_enabled: true,
     events_table_name: "legacy_events",
     persons_table_name: "legacy_persons",
+    earliest_event_date: "2023-04-17",
     created_at: "2026-07-02T00:00:00Z",
     updated_at: "2026-07-02T00:00:00Z",
   },
@@ -53,6 +54,7 @@ const TEAMS: OrgTeam[] = [
     enabled: true,
     is_billing_team: true,
     backfill_enabled: false,
+    earliest_event_date: "9999-12-31",
     created_at: "2026-07-03T00:00:00Z",
     updated_at: "2026-07-03T00:00:00Z",
   },
@@ -88,6 +90,10 @@ describe("Org teams page", () => {
     // Both billing rows carry the badge; the disabled team is flagged.
     expect(screen.getAllByText("billing")).toHaveLength(2);
     expect(screen.getByText("disabled")).toBeInTheDocument();
+    // Earliest event date: plain date, "none" for the 9999-12-31 no-history
+    // sentinel, em dash while unresolved.
+    expect(screen.getByText("2023-04-17")).toBeInTheDocument();
+    expect(screen.getByText("none")).toBeInTheDocument();
     // Admin affordance present.
     expect(screen.getByRole("button", { name: /add team/i })).toBeInTheDocument();
   });
@@ -124,6 +130,8 @@ describe("Org teams page", () => {
     expect(screen.getByText(/does not move any data/i)).toBeInTheDocument();
     // Legacy table-name fields render with the derived-name hint.
     expect(screen.getByText(/leave a field empty to derive/i)).toBeInTheDocument();
+    // The cached-date field explains what clearing it does.
+    expect(screen.getByText(/re-discover the team's backfill range/i)).toBeInTheDocument();
   });
 
   it("warns that deleting a billing team hands billing to the oldest remaining team", async () => {

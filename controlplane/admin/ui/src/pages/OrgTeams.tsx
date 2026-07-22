@@ -13,6 +13,7 @@ import {
   BackfillBadge,
   CreateTeamDialog,
   DeleteTeamDialog,
+  EarliestEventDateCell,
   EditTeamDialog,
   LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
@@ -85,10 +86,15 @@ export function OrgTeams() {
           getValue() ? <Badge variant="success">billing</Badge> : <span className="text-muted-foreground">—</span>,
       },
       {
-        id: "backfill",
+        accessorKey: "backfill_enabled",
         header: "Backfill",
-        accessorFn: (t) => t.backfill_enabled ?? null,
         cell: ({ row }) => <BackfillBadge value={row.original.backfill_enabled} />,
+      },
+      {
+        id: "earliest_event",
+        header: "Earliest event",
+        accessorFn: (t) => t.earliest_event_date ?? "",
+        cell: ({ row }) => <EarliestEventDateCell value={row.original.earliest_event_date} />,
       },
       {
         accessorKey: "created_at",

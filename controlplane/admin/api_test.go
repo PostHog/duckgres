@@ -181,7 +181,7 @@ func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 	if upd.Enabled != nil {
 		team.Enabled = *upd.Enabled
 	}
-	if upd.BackfillSet {
+	if upd.Backfill != nil {
 		team.BackfillEnabled = upd.Backfill
 	}
 	if upd.EventsTableNameSet {
@@ -192,6 +192,9 @@ func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 	}
 	if upd.SchemaDataImportsNameSet {
 		team.SchemaDataImportsName = upd.SchemaDataImportsName
+	}
+	if upd.EarliestEventDateSet {
+		team.EarliestEventDate = upd.EarliestEventDate
 	}
 	if upd.MakeBilling && (team.IsBillingTeam == nil || !*team.IsBillingTeam) {
 		for _, t := range s.teams[orgID] {
@@ -2726,7 +2729,7 @@ func TestAdminUpdateOrgTeamAuditDetail(t *testing.T) {
 	registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
 
 	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
-		`{"schema_name":"repaired_wh","enabled":false,"events_table_name":"legacy_events"}`)
+		`{"schema_name":"repaired_wh","enabled":false,"events_table_name":"legacy_events","earliest_event_date":"2023-04-17"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -2735,6 +2738,7 @@ func TestAdminUpdateOrgTeamAuditDetail(t *testing.T) {
 		"schema_name team_1 → repaired_wh",
 		"enabled true → false",
 		"events_table_name (unset) → legacy_events",
+		"earliest_event_date (unset) → 2023-04-17",
 	} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("audit detail %q missing %q", detail, want)
@@ -2759,9 +2763,19 @@ func TestAdminUpdateOrgTeamFields(t *testing.T) {
 	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, BackfillEnabled: &backfill})
 	router := newTestAPIRouter(store)
 
-	// enabled=false + explicit backfill null clears the tri-state.
+	// backfill_enabled is NOT NULL (migration 000028): an explicit null is a
+	// 400 that names the field, and nothing changes.
 	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
 		`{"enabled":false,"backfill_enabled":null}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "backfill_enabled") {
+		t.Fatalf("explicit null: status = %d, body = %s, want 400 naming backfill_enabled", rec.Code, rec.Body.String())
+	}
+	if stored := store.teams["acme"][1]; !stored.Enabled || stored.BackfillEnabled == nil || !*stored.BackfillEnabled {
+		t.Fatalf("refused update must not change the row, got %+v", stored)
+	}
+
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":false,"backfill_enabled":false}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -2769,8 +2783,58 @@ func TestAdminUpdateOrgTeamFields(t *testing.T) {
 	if stored.Enabled {
 		t.Fatal("enabled must be cleared")
 	}
-	if stored.BackfillEnabled != nil {
-		t.Fatalf("backfill_enabled = %v, want NULL after explicit null", *stored.BackfillEnabled)
+	if stored.BackfillEnabled == nil || *stored.BackfillEnabled {
+		t.Fatalf("backfill_enabled = %v, want false", stored.BackfillEnabled)
+	}
+}
+
+// TestAdminUpdateOrgTeamEarliestEventDate pins the tri-state handling of
+// PostHog's cached earliest-event date on the break-glass PUT: a value sets it
+// (400 when it doesn't parse), an absent key preserves it, an explicit null
+// clears it back to NULL (the PostHog sensor then re-resolves it).
+func TestAdminUpdateOrgTeamEarliestEventDate(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Invalid date is a 400 that names the field; nothing is stored.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"earliest_event_date":"17-04-2023"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "earliest_event_date") {
+		t.Fatalf("invalid date: status = %d, body = %s, want 400 naming the field", rec.Code, rec.Body.String())
+	}
+
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"earliest_event_date":"2023-04-17"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":"2023-04-17"`) {
+		t.Fatalf("response must carry the date as YYYY-MM-DD: %s", rec.Body.String())
+	}
+
+	// Omitted key preserves the stored value.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preserve: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][1].EarliestEventDate; got == nil || got.String() != "2023-04-17" {
+		t.Fatalf("omitted earliest_event_date must be preserved, got %v", got)
+	}
+
+	// Explicit null clears back to NULL.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"earliest_event_date":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][1].EarliestEventDate; got != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL after explicit null", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":null`) {
+		t.Fatalf("cleared date must serialize as null: %s", rec.Body.String())
 	}
 }
 
