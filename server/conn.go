@@ -1183,6 +1183,7 @@ func (c *clientConn) messageLoop() error {
 		if atReadyBoundary && c.drainRequested.Load() {
 			return nil
 		}
+		wasAtReadyBoundary := atReadyBoundary
 		atReadyBoundary = false
 
 		switch msgType {
@@ -1245,6 +1246,12 @@ func (c *clientConn) messageLoop() error {
 
 		case wire.MsgTerminate:
 			return nil
+
+		case wire.MsgCopyData, wire.MsgCopyDone, wire.MsgCopyFail:
+			// PostgreSQL accepts and silently discards COPY messages that arrive
+			// after a backend-detected COPY failure. Preserve the prior readiness
+			// state: these are stale input frames, not new work.
+			atReadyBoundary = wasAtReadyBoundary
 
 		default:
 			c.logger().Warn("Unknown message type.", "type", string(msgType))

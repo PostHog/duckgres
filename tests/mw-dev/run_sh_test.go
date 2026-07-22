@@ -462,6 +462,35 @@ func TestE2EHarnessUsesOnlyCnpgMetadataStores(t *testing.T) {
 	}
 }
 
+func TestE2EHarnessCoversRemoteBinaryCopy(t *testing.T) {
+	harnessRaw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	harness := string(harnessRaw)
+	for _, want := range []string{
+		"binary_copy_round_trip()",
+		`PGPASSWORD="$2" timeout 120 psql "$conn"`,
+		"binary COPY: backpressure never cleared",
+		`CREATE TABLE $route_guard_src AS SELECT 7::INTEGER AS id;`,
+		`CREATE TABLE $route_guard_dst (id BIGINT);`,
+		`\copy $native_src TO '$native_file' WITH (FORMAT binary)`,
+		`\copy $native_dst (label, id, payload, enabled, ratio, event_date, event_time, received_at, amount) FROM '$native_file' WITH (FORMAT binary)`,
+		`\copy $route_guard_src TO '$route_guard_file' WITH (FORMAT binary)`,
+		`\copy $route_guard_dst (id) FROM '$route_guard_file' WITH (FORMAT binary)`,
+		`\echo route_guard_sqlstate=:SQLSTATE`,
+		`route_guard_sqlstate=22P02`,
+		"BIGINT field length 4, expected 8",
+		`want_copies="$(printf 'COPY 3\nCOPY 3\nCOPY 1\nCOPY 1\nCOPY 1\nCOPY 1')"`,
+		`(SELECT count(*) FROM $route_guard_dst)`,
+		`binary_copy_round_trip "$CNPG" "$cnpg_pw"`,
+	} {
+		if !strings.Contains(harness, want) {
+			t.Errorf("e2e harness is missing remote binary COPY coverage marker %q", want)
+		}
+	}
+}
+
 func TestDeployCreatesConfiguredSecretDirectoryPrivately(t *testing.T) {
 	fakes := newRunSHFakes(t)
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "generated", "secrets")

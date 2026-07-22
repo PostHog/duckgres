@@ -82,6 +82,17 @@ func (n *nonClosingConnector) Driver() driver.Driver { return n.inner.Driver() }
 
 func (*nonClosingConnector) Close() error { return nil }
 
+type workerRequiredExtensionExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func loadWorkerRequiredExtensions(db workerRequiredExtensionExecer) error {
+	if _, err := db.Exec("LOAD postgres_scanner"); err != nil {
+		return fmt.Errorf("load required worker extension postgres_scanner: %w", err)
+	}
+	return nil
+}
+
 // OpenDuckDBPair builds the DSN that openBaseDB would have used, opens one
 // DuckDB Database via *duckdb.Connector, and returns a Main + Control
 // *sql.DB sharing it. The Main DB still goes through the same configuration
@@ -131,6 +142,12 @@ func OpenDuckDBPair(cfg server.Config, username string) (*DuckDBPair, error) {
 	}
 
 	if err := server.ConfigureMainDB(mainDB, cfg, username); err != nil {
+		_ = mainDB.Close()
+		_ = controlDB.Close()
+		_ = connector.Close()
+		return nil, err
+	}
+	if err := loadWorkerRequiredExtensions(mainDB); err != nil {
 		_ = mainDB.Close()
 		_ = controlDB.Close()
 		_ = connector.Close()

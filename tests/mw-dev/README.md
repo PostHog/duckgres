@@ -80,6 +80,11 @@ client-go:
   backpressure was observed **and** handles it (queries retry through it).
 - **activation** — DuckLake catalogs attach, read/write, and run
   `EXPLAIN`/`EXPLAIN ANALYZE` on CNPG-backed tenants.
+- **binary COPY** — a `psql`-generated PostgreSQL binary fixture traverses the
+  deployed pgwire → control-plane → Flight → worker → `postgres_scanner` →
+  DuckLake path. It checks every natively routed scalar type, reordered/subset
+  columns, NULLs/defaults, DECIMAL scale normalization, fresh-session
+  persistence, the unsupported-type legacy fallback, and transaction rollback.
 - **worker sizing** (TTL-pool model, `docs/design/worker-ttl-pool.md`) — a
   client-sized connection (`duckgres.worker_cpu`/`worker_memory`/`worker_ttl`
   startup options, sent via `PGOPTIONS`; CP runs `allowClientWorkerProfile=true`
