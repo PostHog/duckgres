@@ -17,7 +17,7 @@ import (
 )
 
 // stubProvisioningStore satisfies provisioning.Store with zero values so
-// registerDiscoveryGroup's REAL routes can be exercised for auth behavior.
+// registerReadOnlyGroup's REAL routes can be exercised for auth behavior.
 type stubProvisioningStore struct{}
 
 func (stubProvisioningStore) GetManagedWarehouse(string) (*configstore.ManagedWarehouse, error) {
@@ -51,8 +51,8 @@ func (stubProvisioningStore) ListOrgTeamsByOrgIDs([]string) ([]configstore.OrgTe
 }
 func (stubProvisioningStore) LatestConfigChange() (time.Time, error) { return time.Time{}, nil }
 
-// TestDiscoveryGroupTopology pins the surface the discovery credential can
-// reach, against the REAL wiring multitenant.go uses (registerDiscoveryGroup
+// TestReadOnlyGroupTopology pins the surface the discovery credential can
+// reach, against the REAL wiring multitenant.go uses (registerReadOnlyGroup
 // is the only mount point for discovery routes). Two assertions:
 //
 //  1. The group registers EXACTLY the two discovery GETs — a new route
@@ -62,13 +62,13 @@ func (stubProvisioningStore) LatestConfigChange() (time.Time, error) { return ti
 //     token on admin routes — is pinned in admin/dashboard_test.go; a
 //     duplicate mount of a discovery path on the admin group would panic
 //     at startup, so drift in that direction is fail-loud already.)
-func TestDiscoveryGroupTopology(t *testing.T) {
+func TestReadOnlyGroupTopology(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	adminTokens := admin.NewTokenSet("admin-secret", nil)
-	discoveryTokens := admin.NewTokenSet("discovery-secret", nil)
+	readOnlyTokens := admin.NewTokenSet("read-only-secret", nil)
 
 	engine := gin.New()
-	registerDiscoveryGroup(engine, discoveryTokens, adminTokens, stubProvisioningStore{})
+	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, stubProvisioningStore{})
 
 	var got []string
 	for _, r := range engine.Routes() {
@@ -93,7 +93,7 @@ func TestDiscoveryGroupTopology(t *testing.T) {
 		return rec.Code
 	}
 	for _, path := range []string{"/api/v1/warehouses", "/api/v1/warehouse-team-ids"} {
-		if code := serve(path, "discovery-secret"); code != http.StatusOK {
+		if code := serve(path, "read-only-secret"); code != http.StatusOK {
 			t.Errorf("%s with discovery token: %d, want 200", path, code)
 		}
 		if code := serve(path, "admin-secret"); code != http.StatusOK {
@@ -108,7 +108,7 @@ func TestDiscoveryGroupTopology(t *testing.T) {
 	}
 }
 
-func TestValidateDistinctDiscoverySecret(t *testing.T) {
+func TestValidateDistinctReadOnlySecret(t *testing.T) {
 	cases := []struct {
 		name               string
 		discovery          string
@@ -126,7 +126,7 @@ func TestValidateDistinctDiscoverySecret(t *testing.T) {
 		{"empty strings never collide", "", []string{""}, "", nil, false},
 	}
 	for _, tc := range cases {
-		err := validateDistinctDiscoverySecret(tc.discovery, tc.discoveryFallbacks, tc.internal, tc.internalFallbacks)
+		err := validateDistinctReadOnlySecret(tc.discovery, tc.discoveryFallbacks, tc.internal, tc.internalFallbacks)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("%s: err = %v, wantErr = %v", tc.name, err, tc.wantErr)
 		}

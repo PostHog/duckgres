@@ -512,16 +512,16 @@ func SetupMultiTenant(
 	// internal secret (pre-rollout behavior). A discovery value colliding
 	// with the internal set would silently un-scope the credential, so
 	// that's a startup failure, not a warning.
-	if err := validateDistinctDiscoverySecret(cfg.DiscoverySecret, cfg.DiscoverySecretFallbacks, internalSecret, cfg.InternalSecretFallbacks); err != nil {
+	if err := validateDistinctReadOnlySecret(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks, internalSecret, cfg.InternalSecretFallbacks); err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	discoveryTokens := admin.NewTokenSet(cfg.DiscoverySecret, cfg.DiscoverySecretFallbacks)
-	if discoveryTokens.Count() == 0 {
-		// Keyed off the TokenSet, not just cfg.DiscoverySecret: fallbacks
+	readOnlyTokens := admin.NewTokenSet(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks)
+	if readOnlyTokens.Count() == 0 {
+		// Keyed off the TokenSet, not just cfg.ReadOnlySecret: fallbacks
 		// alone (mid-rotation) still validate, and saying otherwise here
 		// would mislead an operator debugging exactly that state.
-		slog.Info("Discovery secret not set; discovery endpoints accept only the internal secret. Set --discovery-secret or DUCKGRES_DISCOVERY_SECRET to give external writers a scoped credential.")
-	} else if n := len(cfg.DiscoverySecretFallbacks); n > 0 {
+		slog.Info("Discovery secret not set; discovery endpoints accept only the internal secret. Set --read-only-secret or DUCKGRES_READ_ONLY_SECRET to give external writers a scoped credential.")
+	} else if n := len(cfg.ReadOnlySecretFallbacks); n > 0 {
 		// Count only — never log the secret values.
 		slog.Info("Discovery secret rotation fallbacks active.", "fallback_count", n)
 	}
@@ -596,7 +596,7 @@ func SetupMultiTenant(
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
-	registerDiscoveryGroup(engine, discoveryTokens, adminTokens, provisioning.NewGormStore(store))
+	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
 	// Pull-based compute-billing API (GET /billing/usage + POST /billing/ack).
 	// The billing service authenticates with the internal secret (→ admin);
 	// RequireAdmin keeps SSO viewers away from raw usage + the ack mutation.

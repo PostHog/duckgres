@@ -621,20 +621,20 @@ are load-bearing for those consumers:
   backfills the row on Ready); external rows round-trip fully.
 - **Auth is a SEPARATE, scoped surface** (`RegisterDiscoveryAPI` + its own
   group in `multitenant.go` behind `admin.AnyTokenAuthMiddleware`): the
-  read-only discovery secret (`--discovery-secret` /
-  `DUCKGRES_DISCOVERY_SECRET`, sent in `X-Duckgres-Internal-Secret`, same
+  read-only discovery secret (`--read-only-secret` /
+  `DUCKGRES_READ_ONLY_SECRET`, sent in `X-Duckgres-Internal-Secret`, same
   fallback-rotation semantics as the internal secret) works ONLY on these
   two GETs; the admin internal secret also works here (operator/debug +
   rotation window). Never register discovery routes inside the admin
-  `api` group and never accept `discoveryTokens` anywhere else — external
+  `api` group and never accept `readOnlyTokens` anywhere else — external
   writer pods carry this credential, and its blast radius must stay "read
   the tenant list and its connection topology (RDS endpoints, bucket
   names, k8s Secret names — never values)". Tripwires:
   `TestAnyTokenAuthMiddlewareScoping` (token matrix incl. cross-surface
-  rejection) and `TestDiscoveryGroupTopology` (the group's exact route
-  set, against the real `registerDiscoveryGroup` wiring). A discovery
+  rejection) and `TestReadOnlyGroupTopology` (the group's exact route
+  set, against the real `registerReadOnlyGroup` wiring). A discovery
   value equal to the internal secret (or any fallback) FAILS STARTUP —
-  `validateDistinctDiscoverySecret` — because a shared value silently
+  `validateDistinctReadOnlySecret` — because a shared value silently
   un-scopes the credential.
 - Touching the payload shape, states, team derivation, or the generation →
   update `controlplane/provisioning/discovery_test.go`,

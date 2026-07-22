@@ -125,7 +125,7 @@ func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
 // external writers (millpond, viaduck) on their OWN router group — see
 // discovery.go for payload semantics. Deliberately separate from
 // RegisterAPI: the discovery group's auth accepts the scoped
-// discovery-secret (which must never reach the admin/provisioning
+// read-only-secret (which must never reach the admin/provisioning
 // surface), so these routes must not be mounted behind the admin
 // middleware chain.
 func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {

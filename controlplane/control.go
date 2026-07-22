@@ -74,19 +74,19 @@ type ControlPlaneConfig struct {
 	// {primary ∪ fallbacks}. Mirrors posthog's SECRET_KEY_FALLBACKS.
 	InternalSecretFallbacks []string
 
-	// DiscoverySecret is a read-only secret accepted ONLY on the discovery
+	// ReadOnlySecret is a read-only secret accepted ONLY on the discovery
 	// endpoints (GET /api/v1/warehouses, GET /api/v1/warehouse-team-ids), so
 	// external writers (millpond, viaduck) don't have to carry the
 	// admin-capable InternalSecret. It never grants access to any other
 	// route. Empty disables the scoped path; the InternalSecret keeps
 	// working on the discovery endpoints either way (operator/debug access
 	// and rotation-window compatibility).
-	DiscoverySecret string
+	ReadOnlySecret string
 
-	// DiscoverySecretFallbacks are previous discovery secrets still
+	// ReadOnlySecretFallbacks are previous read-only secrets still
 	// accepted during a rotation (newest first). Same semantics as
 	// InternalSecretFallbacks.
-	DiscoverySecretFallbacks []string
+	ReadOnlySecretFallbacks []string
 
 	// UserSecretKey is the base64-encoded 32-byte AES key for encrypting
 	// user persistent secrets in the config store (env-only:

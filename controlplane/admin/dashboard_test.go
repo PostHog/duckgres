@@ -274,21 +274,21 @@ func serveWithSecret(r *gin.Engine, path, secret string) int {
 func TestAnyTokenAuthMiddlewareScoping(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	adminTokens := NewTokenSet("admin-secret", nil)
-	discoveryTokens := NewTokenSet("discovery-secret", []string{"old-discovery"})
+	readOnlyTokens := NewTokenSet("read-only-secret", []string{"old-discovery"})
 
 	r := gin.New()
 	ok := func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) }
 	r.GET("/api/v1/orgs", APIAuthMiddleware(adminTokens), ok)
-	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(discoveryTokens, adminTokens), ok)
+	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(readOnlyTokens, adminTokens), ok)
 
 	cases := []struct {
 		name, path, secret string
 		want               int
 	}{
-		{"discovery token on discovery route", "/api/v1/warehouses", "discovery-secret", http.StatusOK},
+		{"discovery token on discovery route", "/api/v1/warehouses", "read-only-secret", http.StatusOK},
 		{"discovery fallback on discovery route", "/api/v1/warehouses", "old-discovery", http.StatusOK},
 		{"admin token on discovery route", "/api/v1/warehouses", "admin-secret", http.StatusOK},
-		{"discovery token on admin route", "/api/v1/orgs", "discovery-secret", http.StatusUnauthorized},
+		{"discovery token on admin route", "/api/v1/orgs", "read-only-secret", http.StatusUnauthorized},
 		{"discovery fallback on admin route", "/api/v1/orgs", "old-discovery", http.StatusUnauthorized},
 		{"admin token on admin route", "/api/v1/orgs", "admin-secret", http.StatusOK},
 		{"junk on discovery route", "/api/v1/warehouses", "junk", http.StatusUnauthorized},
@@ -301,17 +301,17 @@ func TestAnyTokenAuthMiddlewareScoping(t *testing.T) {
 	}
 }
 
-// TestAnyTokenAuthMiddlewareUnsetDiscoverySecret pins the pre-rollout
-// behavior: with no discovery secret configured (empty TokenSet), the
+// TestAnyTokenAuthMiddlewareUnsetReadOnlySecret pins the pre-rollout
+// behavior: with no read-only secret configured (empty TokenSet), the
 // discovery surface still accepts the internal secret and nothing else —
 // in particular an empty header must not match the empty token set.
-func TestAnyTokenAuthMiddlewareUnsetDiscoverySecret(t *testing.T) {
+func TestAnyTokenAuthMiddlewareUnsetReadOnlySecret(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	adminTokens := NewTokenSet("admin-secret", nil)
-	discoveryTokens := NewTokenSet("", nil) // unset secret ⇒ empty set
+	readOnlyTokens := NewTokenSet("", nil) // unset secret ⇒ empty set
 
 	r := gin.New()
-	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(discoveryTokens, adminTokens), func(c *gin.Context) {
+	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(readOnlyTokens, adminTokens), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
@@ -331,7 +331,7 @@ func TestAnyTokenAuthMiddlewareUnsetDiscoverySecret(t *testing.T) {
 // authenticate the service-to-service discovery surface.
 func TestAnyTokenAuthMiddlewareIgnoresCookies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokens := NewTokenSet("discovery-secret", nil)
+	tokens := NewTokenSet("read-only-secret", nil)
 
 	r := gin.New()
 	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(tokens), func(c *gin.Context) {
@@ -339,7 +339,7 @@ func TestAnyTokenAuthMiddlewareIgnoresCookies(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/warehouses", nil)
-	req.AddCookie(&http.Cookie{Name: adminTokenCookieName, Value: "discovery-secret"})
+	req.AddCookie(&http.Cookie{Name: adminTokenCookieName, Value: "read-only-secret"})
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 

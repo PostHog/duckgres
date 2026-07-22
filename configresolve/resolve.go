@@ -64,8 +64,8 @@ type CLIInputs struct {
 	ConfigPollInterval          string
 	InternalSecret              string
 	InternalSecretFallbacks     string
-	DiscoverySecret             string
-	DiscoverySecretFallbacks    string
+	ReadOnlySecret             string
+	ReadOnlySecretFallbacks    string
 	SNIRoutingMode              string
 	ManagedHostnameSuffixes     string
 	WorkerBackend               string
@@ -126,8 +126,8 @@ type Resolved struct {
 	ConfigPollInterval              time.Duration
 	InternalSecret                  string
 	InternalSecretFallbacks         []string
-	DiscoverySecret                 string
-	DiscoverySecretFallbacks        []string
+	ReadOnlySecret                 string
+	ReadOnlySecretFallbacks        []string
 	UserSecretKey                   string
 	SNIRoutingMode                  string
 	ManagedHostnameSuffixes         []string
@@ -210,8 +210,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var configPollInterval time.Duration
 	var internalSecret string
 	var internalSecretFallbacks []string
-	var discoverySecret string
-	var discoverySecretFallbacks []string
+	var readOnlySecret string
+	var readOnlySecretFallbacks []string
 	var userSecretKey string
 	var sniRoutingMode string
 	var managedHostnameSuffixes []string
@@ -742,11 +742,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_INTERNAL_SECRET_FALLBACKS"); v != "" {
 		internalSecretFallbacks = splitAndTrim(v, ",")
 	}
-	if v := getenv("DUCKGRES_DISCOVERY_SECRET"); v != "" {
-		discoverySecret = v
+	if v := getenv("DUCKGRES_READ_ONLY_SECRET"); v != "" {
+		readOnlySecret = v
 	}
-	if v := getenv("DUCKGRES_DISCOVERY_SECRET_FALLBACKS"); v != "" {
-		discoverySecretFallbacks = splitAndTrim(v, ",")
+	if v := getenv("DUCKGRES_READ_ONLY_SECRET_FALLBACKS"); v != "" {
+		readOnlySecretFallbacks = splitAndTrim(v, ",")
 	}
 	// Env-only (no CLI flag, no YAML): the AES key for user persistent
 	// secrets should only arrive via a mounted K8s Secret.
@@ -1047,12 +1047,12 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		// JWT_SIGNING_KEY_FALLBACKS.
 		internalSecretFallbacks = splitAndTrim(cli.InternalSecretFallbacks, ",")
 	}
-	if cli.Set["discovery-secret"] {
-		discoverySecret = cli.DiscoverySecret
+	if cli.Set["read-only-secret"] {
+		readOnlySecret = cli.ReadOnlySecret
 	}
-	if cli.Set["discovery-secret-fallbacks"] {
+	if cli.Set["read-only-secret-fallbacks"] {
 		// Same explicit-empty-clears semantics as internal-secret-fallbacks.
-		discoverySecretFallbacks = splitAndTrim(cli.DiscoverySecretFallbacks, ",")
+		readOnlySecretFallbacks = splitAndTrim(cli.ReadOnlySecretFallbacks, ",")
 	}
 	if cli.Set["sni-routing-mode"] {
 		sniRoutingMode = cli.SNIRoutingMode
@@ -1192,8 +1192,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		ConfigPollInterval:              configPollInterval,
 		InternalSecret:                  internalSecret,
 		InternalSecretFallbacks:         internalSecretFallbacks,
-		DiscoverySecret:                 discoverySecret,
-		DiscoverySecretFallbacks:        discoverySecretFallbacks,
+		ReadOnlySecret:                 readOnlySecret,
+		ReadOnlySecretFallbacks:        readOnlySecretFallbacks,
 		UserSecretKey:                   userSecretKey,
 		SNIRoutingMode:                  sniRoutingMode,
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,

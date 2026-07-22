@@ -87,7 +87,7 @@ func APIAuthMiddleware(tokens TokenSet) gin.HandlerFunc {
 // must never be drivable from a browser session), no SSO, no role
 // resolution; routes behind this middleware must not consult Identity or
 // RoleGate. Used for the discovery endpoints, which accept the scoped
-// discovery secret OR the admin internal secret (operator/debug access and
+// read-only secret OR the admin internal secret (operator/debug access and
 // rotation-window compatibility) but grant nothing beyond the routes they
 // are mounted on. Failed requests always traverse every set (the only
 // early exit is on success), so a rejected probe learns nothing about
