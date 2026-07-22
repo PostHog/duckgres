@@ -3,16 +3,14 @@
 # control-plane ClusterIP service over the PG wire protocol and to the in-cluster
 # Kubernetes API (via the Job's own ServiceAccount token) for pod-level checks.
 #
-# This is the SUCCESSOR to the kind-based tests/k8s/ Go suite: every behavior
-# that suite asserted against a fake kind cluster is re-asserted here against the
-# REAL posthog-mw-dev cluster (real Cilium, real Crossplane ducklings, real
-# cnpg-shard + external-RDS metadata). Covers the two real metadata backends
-# cnpg + ext (aurora is retired — out of scope).
+# This is the SUCCESSOR to the kind-based tests/k8s/ Go suite: its portable
+# black-box behavior is re-asserted here against the REAL posthog-mw-dev cluster
+# (real Cilium, real Crossplane ducklings, and real cnpg-shard metadata).
 #
-# STRUCTURE: assertions run in four PARALLEL per-org lanes (see main() and the
+# STRUCTURE: assertions run in three PARALLEL per-org lanes (see main() and the
 # lane_* functions) — cnpg (wire/catalog/concurrency/sizing), res1 (worker-kill
-# resilience), res2 (scheduling-shape resilience), ext (external-RDS backend +
-# org defaults). All worker churn is org-scoped, so lanes can't interfere, and
+# resilience), and res2 (scheduling-shape resilience + org defaults). All
+# worker churn is org-scoped, so lanes can't interfere, and
 # the wall-clock is the slowest lane instead of the sum (~halves the runtime).
 # Anything that kills/drains/counts worker pods MUST stay inside its org's lane
 # and select pods via the org label (newest_org_worker), never globally.
@@ -33,7 +31,7 @@
 #                  transpilation (#716), and a pipelined extended-query error
 #                  discards queued messages until Sync (#718). A same pgwire
 #                  session remains usable immediately after CancelRequest.
-#   activation   : DuckLake catalogs attach, read/write, and EXPLAIN/ANALYZE on cnpg + ext.
+#   activation   : DuckLake catalogs attach, read/write, and EXPLAIN/ANALYZE on cnpg.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
@@ -42,7 +40,7 @@
 #                  /orgs/:id default_worker_cpu/memory/ttl) sizes a PLAIN
 #                  connection's worker pod (no client GUCs); garbage values are
 #                  rejected with 400 at the API boundary; clearing the default
-#                  restores the deployment default shape — asserted on ext.
+#                  restores the deployment default shape — asserted on cnpg.
 #   ext forks    : the bundled ducklake/httpfs extensions are the PostHog forks,
 #                  not upstream (detects an accidental upstream swap in the image).
 #   worker pods  : labels, securityContext (non-root, no priv-esc), Downward-API
@@ -88,7 +86,6 @@ SECRET="${INTERNAL_SECRET:?}"
 NS="${NAMESPACE:?}"
 H="X-Duckgres-Internal-Secret: $SECRET"
 CNPG="ci-pr-${PR_NUMBER}-cnpg"
-EXT="ci-pr-${PR_NUMBER}-ext"
 # Two extra cnpg-shard/ducklake-only orgs so the heavyweight resilience
 # assertions get their OWN org each and run in parallel lanes (see main()):
 # worker-kill/drain/spawn churn is org-scoped, so lanes never interfere.
@@ -96,19 +93,19 @@ RES1="ci-pr-${PR_NUMBER}-res1"
 RES2="ci-pr-${PR_NUMBER}-res2"
 
 # How long each org may take to reach warehouse state=ready (wait_state below).
-# All four orgs are cnpg-shard/DuckLake ducklings, and "ready" is a PROVISIONING
+# All three orgs are cnpg-shard/DuckLake ducklings, and "ready" is a PROVISIONING
 # gate, not a worker-spawn one: the CP provisioner only flips ready after the
 # Crossplane Duckling is Ready (bucket + shard role/DB + IAM + secrets), the
 # per-org Lakekeeper catalog has bootstrapped, AND an end-to-end SELECT 1 probe
 # against the metadata store actually connects (controller.go reconcileProvisioning).
 #
-# 600s was too tight for that last probe. All four ducklings share ONE cnpg
+# 600s was too tight for that last probe. All three ducklings share ONE cnpg
 # shard cluster (shard-001-pooler), and after Crossplane reports the role/DB
 # Available there is a credential-propagation tail before the freshly-set role
 # password is accepted at the pooler — the probe fails "SASL authentication
 # failed (SQLSTATE 08P01)" and the org correctly stays in `provisioning` while
 # the reconcile loop retries every 10s. Observed on a single org (e.g. res1)
-# while its three siblings went ready inside 600s: the probe kept failing SASL
+# while its siblings went ready inside 600s: the probe kept failing SASL
 # for ~9 min, right up to the old 600s deadline, then the harness gave up
 # (last=provisioning) even though the CP had NOT failed it — the CP's own
 # provisioning hard-timeout is 30 min (controller.go), so we were failing the
@@ -127,25 +124,6 @@ READY_TIMEOUT="${READY_TIMEOUT:-1200}"
 # If the image accidentally ships upstream, the version differs and we fail.
 EXPECT_DUCKLAKE_SHA="49ec0dc8"
 EXPECT_HTTPFS_SHA="0dac6fc"
-
-# duckling-example RDS — the shared external metadata store (same one the
-# manual validation used). Endpoint is stable in mw-dev.
-EXT_RDS_ENDPOINT="duckling-example-managed-warehouse-dev-us-east-1.c8jy2c68kipq.us-east-1.rds.amazonaws.com"
-EXT_RDS_SECRET="duckling-example-managed-warehouse-dev-us-east-1-rds-password"
-EXT_RDS_USER="ducklingexample"
-# Per-run metadata DATABASE on that shared RDS. Every run used to point its
-# ext org at the one shared database, whose DuckLake catalog therefore grew
-# monotonically across runs (20k+ ducklake_* tables observed) — inflating
-# every catalog copy (the reshard ext→cnpg lane went to ~6 min / ~95MB) and
-# exposing runs to each other's writers. Instead each run CREATEs its own
-# database (ext_rds_setup, once the run's own duckling status carries the
-# ESO-synced RDS password) and DROPs it at the end (ext_rds_teardown); the
-# name embeds a UTC timestamp so ext_rds_setup can also GC databases leaked
-# by aborted runs (>24h old). The RDS user/password/secret are unchanged —
-# only the database is per-run. run.sh teardown cannot do this drop itself
-# (the GitHub runner has neither psql nor any path to the RDS password), so
-# crash-leaked databases are reaped by the NEXT run's GC instead.
-EXT_RDS_DB="mdstore_e2e_$(date -u +%Y%m%d%H%M%S)_pr$(printf %s "${PR_NUMBER:-0}" | tr -cd 'a-z0-9')"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -206,96 +184,6 @@ provision() { # org metadata_json
   log "provision $1"
   curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
     "$API/api/v1/orgs/$1/provision"
-}
-
-# ---- per-run external metadata database (see EXT_RDS_DB above) --------------
-# rds_psql runs one statement against the shared RDS as the shared tenant user.
-# It anchors the session on the long-lived legacy database (connect only —
-# never written) because CREATE/DROP DATABASE cannot run against the database
-# being created/dropped. EXT_RDS_PW must be set (ext_rds_setup below).
-rds_psql() { # sql
-  PGPASSWORD="$EXT_RDS_PW" psql \
-    "host=$EXT_RDS_ENDPOINT port=5432 user=$EXT_RDS_USER dbname=$EXT_RDS_USER sslmode=require connect_timeout=10" \
-    -v ON_ERROR_STOP=1 -qtA -c "$1"
-}
-
-# ext_rds_setup creates this run's metadata database and GCs databases leaked
-# by aborted runs. It needs the RDS password, which the harness obtains
-# in-cluster from its OWN ext duckling's referenced Kubernetes Secret. During
-# the deploy-ordered migration, an older composition may not publish
-# credentialSecretRef yet, so the harness accepts the legacy plaintext status
-# field only when the reference is absent. Once the reference exists, failure
-# to read it is a hard failure rather than silently masking broken Secret RBAC.
-# The credential only becomes readable once ESO has synced the secret, so this
-# runs as a lane CONCURRENT with the readiness waits: the CP's end-to-end
-# provisioning probe (controller.go reconcileProvisioning) targets the per-run
-# database and simply retries until we create it — never terminal before the
-# CP's 30-minute provisioning timeout — so ready_ext flips shortly after the
-# CREATE DATABASE lands. Requires bootstrap_kubectl to have completed in the
-# MAIN shell first (the lane subshell must not race the background download).
-ext_rds_setup() {
-  d="$(echo "$EXT" | tr 'A-Z' 'a-z')"
-  log "ext metadata db: waiting for the ESO-synced RDS password on duckling/${d}…"
-  deadline=$(( $(date +%s) + 300 ))
-  EXT_RDS_PW=""
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    secret_name="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.credentialSecretRef.name}' 2>/dev/null || true)"
-    secret_key="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.credentialSecretRef.key}' 2>/dev/null || true)"
-    if [ -n "$secret_name" ]; then
-      [ -n "$secret_key" ] || secret_key=password
-      encoded="$("$KUBECTL" -n ducklings get secret "$secret_name" -o "jsonpath={.data.${secret_key}}" 2>/dev/null || true)"
-      [ -z "$encoded" ] || EXT_RDS_PW="$(printf %s "$encoded" | base64 -d)"
-    else
-      EXT_RDS_PW="$("$KUBECTL" -n ducklings get "duckling/$d" -o jsonpath='{.status.metadataStore.password}' 2>/dev/null || true)"
-    fi
-    [ -n "$EXT_RDS_PW" ] && break
-    sleep 5
-  done
-  [ -n "$EXT_RDS_PW" ] || fail "ext metadata db: duckling/$d credential Secret never became readable (ESO sync or RBAC stuck?)"
-  # Stash for ext_rds_teardown: this runs in a lane subshell, so a shell var
-  # would not survive back to main() (same pattern as the prov_*.json files).
-  printf %s "$EXT_RDS_PW" > "$LANE_DIR/ext_rds_pw"
-
-  # GC databases leaked by aborted runs: strictly name-gated (full per-run
-  # pattern with a parseable 14-digit UTC timestamp) and >24h old, so a
-  # concurrent run on another PR can never lose its live database and nothing
-  # outside the mdstore_e2e_* namespace is ever touched.
-  cutoff="$(python3 -c 'from datetime import datetime,timedelta,timezone;print((datetime.now(timezone.utc)-timedelta(hours=24)).strftime("%Y%m%d%H%M%S"))')"
-  for db in $(rds_psql "SELECT datname FROM pg_database WHERE datname LIKE 'mdstore\_e2e\_%'" || true); do
-    case "$db" in
-      *[!a-z0-9_]*) log "ext metadata db: GC skipping odd name '$db'"; continue ;;
-    esac
-    ts="${db#mdstore_e2e_}"; ts="${ts%%_*}"
-    case "$ts" in
-      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
-      *) log "ext metadata db: GC skipping unparseable name '$db'"; continue ;;
-    esac
-    if [ "$ts" -lt "$cutoff" ]; then
-      log "ext metadata db: GC dropping stale $db (leaked by an aborted run >24h ago)"
-      rds_psql "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null \
-        || log "ext metadata db: GC drop of $db failed (the next run retries)"
-    fi
-  done
-
-  log "ext metadata db: creating per-run database $EXT_RDS_DB"
-  rds_psql "CREATE DATABASE \"$EXT_RDS_DB\"" >/dev/null \
-    || fail "ext metadata db: CREATE DATABASE $EXT_RDS_DB failed (does $EXT_RDS_USER still have CREATEDB?)"
-  log "ext metadata db: $EXT_RDS_DB ready"
-}
-
-# ext_rds_teardown drops this run's database and asserts it is gone. By this
-# point the ext org has been resharded onto cnpg (reshard_ext_to_cnpg leaves
-# the external source untouched but unused), so the drop can never yank a
-# live catalog. On any failure the >24h GC in the next run reaps it.
-ext_rds_teardown() {
-  EXT_RDS_PW="$(cat "$LANE_DIR/ext_rds_pw" 2>/dev/null || true)"
-  [ -n "$EXT_RDS_PW" ] || { log "ext metadata db: no stashed password — skipping drop (GC will reap)"; return 0; }
-  log "ext metadata db: dropping per-run database $EXT_RDS_DB"
-  rds_psql "DROP DATABASE IF EXISTS \"$EXT_RDS_DB\" WITH (FORCE)" >/dev/null \
-    || fail "ext metadata db: DROP DATABASE $EXT_RDS_DB failed"
-  left="$(rds_psql "SELECT 1 FROM pg_database WHERE datname = '$EXT_RDS_DB'")" || left=""
-  [ -z "$left" ] || fail "ext metadata db: $EXT_RDS_DB still exists after DROP"
-  log "ext metadata db: per-run database dropped"
 }
 
 wait_state() { # org target timeout_s
@@ -1224,7 +1112,7 @@ hot_idle_retired() { # org password catalog cpu memory
 #      sized shape, so reuse/spawn goes back to default-profile workers).
 # Uses a shape (2/8Gi) no other test on this org uses, so the newest worker pod
 # after the connect is unambiguously ours (same technique as sized_worker; the
-# ext org runs no client-sized assertions).
+# dedicated RES2 org runs no client-sized assertions).
 put_org() { # org json -> prints http code; body in /tmp/put_org_out
   curl -s -o /tmp/put_org_out -w '%{http_code}' -X PUT -H "$H" \
     -H 'Content-Type: application/json' -d "$2" "$API/api/v1/orgs/$1"
@@ -1306,12 +1194,12 @@ org_default_profile() { # org password catalog
 # TestReprovisionExistingOrgKeepsDefaultTeamID, since same-id re-provision
 # in-run is off-limits here, see the lifecycle NOTE below). Asserts on real orgs
 # against the real config store:
-#   1. Set path: CNPG + EXT orgs were provisioned WITH default_team_id in their
-#      bodies (mandatory now); GET /orgs/:id must round-trip exactly each value.
+#   1. Set path: the CNPG org was provisioned WITH default_team_id in its body
+#      (mandatory now); GET /orgs/:id must round-trip exactly that value.
 #   2. Reject path: provisioning a brand-new org WITHOUT default_team_id must be
 #      400 naming the field, and must create nothing (org GET stays 404).
-#   3. Mutate path: PUT /orgs/:id can set it to a positive team id on the EXT
-#      org, round-tripping on GET; clearing (0 or null) is REJECTED with a 400
+#   3. Mutate path: PUT /orgs/:id can set it to a positive team id on the org,
+#      round-tripping on GET; clearing (0 or null) is REJECTED with a 400
 #      and must leave the stored value untouched — every org must keep its
 #      billing team (the billing bucket key). The provisioned value is
 #      restored afterwards so the org stays contract-conformant.
@@ -1320,18 +1208,15 @@ org_default_profile() { # org password catalog
 get_org_default_team_id() { # org -> prints default_team_id (jq raw; "null" when unset)
   curl -fsS -H "$H" "$API/api/v1/orgs/$1" | jq -r '.default_team_id'
 }
-default_team_id_mandatory() { # cnpg_org ext_org
-  cnpg_org="$1"; ext_org="$2"
-  log "default_team_id: provision round-trips on $cnpg_org/$ext_org, new-org-without rejected"
+default_team_id_mandatory() { # org provisioned_team_id
+  org="$1"; provisioned_team_id="$2"
+  log "default_team_id: provision round-trips on $org, new-org-without rejected"
 
-  # 1. Set path: both orgs provisioned WITH default_team_id must read it back.
-  got="$(get_org_default_team_id "$cnpg_org")"
-  [ "$got" = "$CNPG_DEFAULT_TEAM_ID" ] \
-    || fail "default_team_id: GET /orgs/$cnpg_org = '$got' want '$CNPG_DEFAULT_TEAM_ID' (provision default_team_id did not persist)"
-  got="$(get_org_default_team_id "$ext_org")"
-  [ "$got" = "$EXT_DEFAULT_TEAM_ID" ] \
-    || fail "default_team_id: GET /orgs/$ext_org = '$got' want '$EXT_DEFAULT_TEAM_ID' (provision default_team_id did not persist)"
-  log "default_team_id OK: $cnpg_org/$ext_org round-tripped from provision"
+  # 1. Set path: an org provisioned WITH default_team_id must read it back.
+  got="$(get_org_default_team_id "$org")"
+  [ "$got" = "$provisioned_team_id" ] \
+    || fail "default_team_id: GET /orgs/$org = '$got' want '$provisioned_team_id' (provision default_team_id did not persist)"
+  log "default_team_id OK: $org round-tripped from provision"
 
   # 2. Reject path: a NEW org without default_team_id must 400 and create nothing.
   noteam="e2e-noteam"
@@ -1350,25 +1235,25 @@ default_team_id_mandatory() { # cnpg_org ext_org
   # 3. Mutate path: PUT with a positive value sets; clearing (0 or JSON null)
   # is rejected with a 400 and must not change the stored value (the column is
   # NOT NULL — every org must keep a default team).
-  code="$(put_org "$ext_org" '{"default_team_id":424242}')"
+  code="$(put_org "$org" '{"default_team_id":424242}')"
   [ "$code" = "200" ] || fail "default_team_id: PUT set -> HTTP $code: $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$ext_org")"
+  got="$(get_org_default_team_id "$org")"
   [ "$got" = "424242" ] || fail "default_team_id: after PUT set, GET = '$got' want '424242'"
-  code="$(put_org "$ext_org" '{"default_team_id":0}')"
+  code="$(put_org "$org" '{"default_team_id":0}')"
   [ "$code" = "400" ] || fail "default_team_id: PUT clear (0) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
   grep -q "default_team_id" /tmp/put_org_out \
     || fail "default_team_id: PUT clear rejection should name the field: $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$ext_org")"
+  got="$(get_org_default_team_id "$org")"
   [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT clear, GET = '$got' want '424242' (stored value must be unchanged)"
-  code="$(put_org "$ext_org" '{"default_team_id":null}')"
+  code="$(put_org "$org" '{"default_team_id":null}')"
   [ "$code" = "400" ] || fail "default_team_id: PUT clear (null) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$ext_org")"
+  got="$(get_org_default_team_id "$org")"
   [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT null, GET = '$got' want '424242' (stored value must be unchanged)"
-  code="$(put_org "$ext_org" "{\"default_team_id\":$EXT_DEFAULT_TEAM_ID}")"
+  code="$(put_org "$org" "{\"default_team_id\":$provisioned_team_id}")"
   [ "$code" = "200" ] || fail "default_team_id: PUT restore -> HTTP $code: $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$ext_org")"
-  [ "$got" = "$EXT_DEFAULT_TEAM_ID" ] || fail "default_team_id: after PUT restore, GET = '$got' want '$EXT_DEFAULT_TEAM_ID'"
-  log "default_team_id OK: PUT set round-trips, clear (0/null) rejected 400, value preserved on $ext_org"
+  got="$(get_org_default_team_id "$org")"
+  [ "$got" = "$provisioned_team_id" ] || fail "default_team_id: after PUT restore, GET = '$got' want '$provisioned_team_id'"
+  log "default_team_id OK: PUT set round-trips, clear (0/null) rejected 400, value preserved on $org"
 }
 
 # ---- org teams CRUD (duckgres_org_teams via the provisioning API) -----------
@@ -1438,73 +1323,57 @@ org_teams_crud() { # org billing_team_id
 # GET /warehouses + GET /warehouse-team-ids are the read-only discovery
 # surface external writers poll (viaduck destination discovery, millpond's
 # include-values source). Contract asserted against the real config store:
-#   1. Both provisioned orgs (cnpg + ext) appear in /warehouses with
+#   1. The provisioned CNPG org appears in /warehouses with
 #      state=ready, writable=true, and a teams array carrying the org's
 #      billing team (duckgres_org_teams row) with its conventional
-#      team_<id> schema and enabled=true. (org_teams_crud runs before this
-#      on the EXT org and leaves it with exactly its billing team; the CNPG
-#      org may carry extra demoted rows from earlier legs — the assertions
-#      select by team_id so extras are tolerated.)
-#   2. The ext org's metadata_store block round-trips endpoint/database —
-#      cnpg rows carry only the kind today (CR-status backfill pending), so
-#      only kind is asserted there. No password-ish key may appear anywhere
+#      team_<id> schema and enabled=true. org_teams_crud runs before this and
+#      leaves the org with exactly its billing team.
+#   2. The metadata_store block reports cnpg-shard. No password-ish key may appear anywhere
 #      in the payload outside password_secret_ref (secret REFS only).
-#   3. /warehouse-team-ids is a bare sorted JSON array containing both
-#      provisioned team ids — the exact shape millpond's poller consumes.
+#   3. /warehouse-team-ids is a bare sorted JSON array containing the
+#      provisioned team id — the exact shape millpond's poller consumes.
 #      An erroneous omission here silently stops a team's ingestion after
 #      consumer-side damping, which is why the transient-error contract
 #      (store failure => 500, never a 200 with a team absent) matters; that
 #      split is pinned by unit tests (discovery_test.go).
-discovery_endpoints() { # cnpg_org ext_org
-  cnpg_org="$1"; ext_org="$2"
-  log "discovery: /warehouses + /warehouse-team-ids list $cnpg_org/$ext_org"
+discovery_endpoints() { # org billing_team_id
+  org="$1"; team="$2"
+  log "discovery: /warehouses + /warehouse-team-ids list $org"
 
   curl -fsS -H "$H" "$API/api/v1/warehouses" > /tmp/discovery_out     || fail "discovery: GET /warehouses failed"
 
-  for org in "$cnpg_org" "$ext_org"; do
-    state="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .state' /tmp/discovery_out)"
-    [ "$state" = "ready" ]       || fail "discovery: $org state = '$state' want 'ready': $(cat /tmp/discovery_out)"
-    writable="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .writable' /tmp/discovery_out)"
-    [ "$writable" = "true" ]       || fail "discovery: $org writable = '$writable' want 'true'"
-  done
-  for pair in "$cnpg_org:$CNPG_DEFAULT_TEAM_ID" "$ext_org:$EXT_DEFAULT_TEAM_ID"; do
-    org="${pair%%:*}"; team="${pair##*:}"
-    jq -e --arg o "$org" --argjson t "$team" \
-      '.warehouses[] | select(.org_id == $o) | .teams
-       | map(select(.team_id==$t and .schema_name=="team_\($t)" and .enabled==true)) | length == 1' \
-      /tmp/discovery_out >/dev/null \
-      || fail "discovery: $org must carry billing team $team with schema team_$team, enabled: $(cat /tmp/discovery_out)"
-    # Resolved table names: no legacy overrides on these teams, so the CP
-    # must serve the derived names (the derivation lives in the CP, not in
-    # every consumer).
-    jq -e --arg o "$org" --argjson t "$team" \
-      '.warehouses[] | select(.org_id == $o) | .teams[] | select(.team_id==$t)
-       | .events_table == "team_\($t).events" and .persons_table == "team_\($t).persons" and .data_imports_schema == "team_\($t)_data_imports"' \
-      /tmp/discovery_out >/dev/null \
-      || fail "discovery: $org team $team resolved table names wrong: $(cat /tmp/discovery_out)"
-  done
+  state="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .state' /tmp/discovery_out)"
+  [ "$state" = "ready" ] || fail "discovery: $org state = '$state' want 'ready': $(cat /tmp/discovery_out)"
+  writable="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .writable' /tmp/discovery_out)"
+  [ "$writable" = "true" ] || fail "discovery: $org writable = '$writable' want 'true'"
+  jq -e --arg o "$org" --argjson t "$team" \
+    '.warehouses[] | select(.org_id == $o) | .teams
+     | map(select(.team_id==$t and .schema_name=="team_\($t)" and .enabled==true)) | length == 1' \
+    /tmp/discovery_out >/dev/null \
+    || fail "discovery: $org must carry billing team $team with schema team_$team, enabled: $(cat /tmp/discovery_out)"
+  # Resolved table names: no legacy overrides on this team, so the CP must
+  # serve the derived names (the derivation lives in the CP, not in every consumer).
+  jq -e --arg o "$org" --argjson t "$team" \
+    '.warehouses[] | select(.org_id == $o) | .teams[] | select(.team_id==$t)
+     | .events_table == "team_\($t).events" and .persons_table == "team_\($t).persons" and .data_imports_schema == "team_\($t)_data_imports"' \
+    /tmp/discovery_out >/dev/null \
+    || fail "discovery: $org team $team resolved table names wrong: $(cat /tmp/discovery_out)"
 
-  # Ext metadata_store round-trip (the row carries real connection details
-  # for external stores); cnpg asserts kind only until the CR-status
-  # backfill lands.
-  ep="$(jq -r --arg o "$ext_org" '.warehouses[] | select(.org_id == $o) | .metadata_store.endpoint' /tmp/discovery_out)"
-  [ "$ep" = "$EXT_RDS_ENDPOINT" ]     || fail "discovery: $ext_org metadata_store.endpoint = '$ep' want '$EXT_RDS_ENDPOINT'"
-  kind="$(jq -r --arg o "$cnpg_org" '.warehouses[] | select(.org_id == $o) | .metadata_store.kind' /tmp/discovery_out)"
-  [ "$kind" = "cnpg-shard" ]     || fail "discovery: $cnpg_org metadata_store.kind = '$kind' want 'cnpg-shard'"
+  kind="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .metadata_store.kind' /tmp/discovery_out)"
+  [ "$kind" = "cnpg-shard" ] || fail "discovery: $org metadata_store.kind = '$kind' want 'cnpg-shard'"
 
   # No password material: the only key containing "password" anywhere in the
   # payload must be password_secret_ref (k8s Secret reference, not material).
   badkeys="$(jq -r '[.. | objects | keys[] | select(test("password")) | select(. != "password_secret_ref")] | unique | join(",")' /tmp/discovery_out)"
   [ -z "$badkeys" ]     || fail "discovery: payload carries password-ish keys: $badkeys"
 
-  # Values projection: bare sorted array containing both team ids.
+  # Values projection: bare sorted array containing the team id.
   curl -fsS -H "$H" "$API/api/v1/warehouse-team-ids" > /tmp/discovery_ids     || fail "discovery: GET /warehouse-team-ids failed"
   jq -e 'type == "array"' /tmp/discovery_ids >/dev/null     || fail "discovery: /warehouse-team-ids must be a bare JSON array: $(cat /tmp/discovery_ids)"
-  for team in "$CNPG_DEFAULT_TEAM_ID" "$EXT_DEFAULT_TEAM_ID"; do
-    jq -e --argjson t "$team" 'index($t) != null' /tmp/discovery_ids >/dev/null       || fail "discovery: /warehouse-team-ids missing team $team: $(cat /tmp/discovery_ids)"
-  done
+  jq -e --argjson t "$team" 'index($t) != null' /tmp/discovery_ids >/dev/null \
+    || fail "discovery: /warehouse-team-ids missing team $team: $(cat /tmp/discovery_ids)"
   jq -e '. == sort' /tmp/discovery_ids >/dev/null     || fail "discovery: /warehouse-team-ids must be sorted: $(cat /tmp/discovery_ids)"
-  log "discovery OK: both orgs listed writable with their billing team rows + resolved table names; team-ids array carries both teams"
+  log "discovery OK: $org listed writable with its billing team row + resolved table names; team-ids array carries $team"
 }
 
 # ---- project-scoped read-only users ----------------------------------------
@@ -2638,12 +2507,11 @@ admin_impersonation_audited() { # org
 # GET /ducklings/metadata surfaces each Duckling CR's status.metadataStore for
 # the org overview/detail pages — notably WHICH cnpg shard a cnpg tenant's
 # metadata landed on (composition-assigned; not in the config store). Asserts
-# the cnpg org's entry is kind=cnpg-shard with a parsed shard name, and the ext
-# org's entry is kind=external with no shard. Guards
+# the cnpg org's entry is kind=cnpg-shard with a parsed shard name. Guards
 # provisioner.CRMetadataStores + admin/ducklings_metadata.go.
-admin_ducklings_metadata() { # cnpgOrg extOrg
-  cnpg_d="$(echo "$1" | tr 'A-Z' 'a-z')"; ext_d="$(echo "$2" | tr 'A-Z' 'a-z')"
-  log "admin ducklings metadata: shard assignment for $cnpg_d + $ext_d"
+admin_ducklings_metadata() { # cnpgOrg
+  cnpg_d="$(echo "$1" | tr 'A-Z' 'a-z')"
+  log "admin ducklings metadata: shard assignment for $cnpg_d"
   out="$(curl -fsS -H "$H" "$API/api/v1/ducklings/metadata")" \
     || fail "ducklings metadata: request failed"
   echo "$out" | jq -e '.available == true' >/dev/null \
@@ -2651,9 +2519,6 @@ admin_ducklings_metadata() { # cnpgOrg extOrg
   echo "$out" | jq -e --arg d "$cnpg_d" \
     '.entries[$d] | .kind == "cnpg-shard" and (.cnpg_shard | test("^shard-"))' >/dev/null \
     || fail "ducklings metadata: no cnpg-shard entry with parsed shard for $cnpg_d: $(echo "$out" | jq -c --arg d "$cnpg_d" '.entries[$d]')"
-  echo "$out" | jq -e --arg d "$ext_d" \
-    '.entries[$d] | .kind == "external" and (has("cnpg_shard") | not)' >/dev/null \
-    || fail "ducklings metadata: ext entry wrong for $ext_d: $(echo "$out" | jq -c --arg d "$ext_d" '.entries[$d]')"
   log "admin ducklings metadata OK ($cnpg_d on $(echo "$out" | jq -r --arg d "$cnpg_d" '.entries[$d].cnpg_shard'))"
 }
 
@@ -2707,57 +2572,8 @@ duckling_shard_backfill() { # cnpgOrg
 #     cutover_timeout_seconds keeps it fast). Also asserts the wait-loop
 #     diagnostics: deadline announce, periodic "waiting for target"
 #     observations, and the flip-timeout error carrying the last observation.
-#     (The cnpg→ext RECOVERY loop's stranded-password/SASL classification
-#     can't be provoked here — it needs a role whose actual password diverged
-#     from the status password — so that path is pinned by
-#     provisioner/reshard_runner_test.go instead.)
-#   * ext→cnpg POSITIVE path (real catalog copy off the harness RDS onto
-#     shard-001, data intact after, report in the log) — including the pod
-#     model: every reshard executes in a dedicated duckgres-reshard-op-<id>
-#     pod (NOT in the CP process), so this lane also asserts the runner pod
-#     appears while the op runs and is reaped by the leader reconciler after
-#     it finishes. Ops now start PENDING (the pod claims the row itself), and
-#     every wait below carries pod-schedule + image-pull latency on top of
-#     what the step itself needs.
-# cnpg→ext stays unit-test-only: the harness knows the RDS SM secret NAME but
-# not the password, and the start API requires the password (ephemerally).
-# That includes the reused-/shared-target index-replay idempotency (a stale or
-# concurrently ensured idx_ducklake_* on the shared ext RDS 42P07'd a real
-# cnpg→ext copy): the collision only arises on the cnpg→ext COPY onto that
-# reused RDS, so it is pinned by the replayIndexes unit tests
-# (provisioner/catalog_copy_test.go) instead.
-# That also keeps the in-cutover ESO-sync-error surfacing (the deduped warn in
-# flipToExternal when the ExternalSecret is SecretSyncedError) unit-test-only
-# (provisioner/reshard_runner_test.go): asserting it live needs a real
-# cnpg→ext flip against an unreadable secret. The validation loop below does
-# pin the rds-master-name 400, the up-front defense for the same failure.
-
-reshard_backup_debug() { # opid — focused debug for a backup-assert failure:
-  # the op log's backup-related lines (bounded, so stream truncation can't eat
-  # them) plus the runner pod's own stdout (the slog lines carry the exact
-  # error the op log only summarizes). Best effort — the reconciler may have
-  # reaped the pod already.
-  echo "---- op $1 backup-related log lines ----"
-  reshard_log_fetch "$1" 2>/dev/null | grep -iE 'backup|sts|assume|s3' || true
-  echo "---- runner pod duckgres-reshard-op-$1 logs (tail) ----"
-  k logs "duckgres-reshard-op-$1" --tail=150 2>/dev/null || echo "(runner pod already gone)"
-}
-
-reshard_pod_wait() { # opid timeout_s — wait until the runner pod exists
-  deadline=$(( $(date +%s) + $2 ))
-  until k get pod "duckgres-reshard-op-$1" >/dev/null 2>&1; do
-    [ "$(date +%s)" -lt "$deadline" ] || fail "reshard runner pod duckgres-reshard-op-$1 never appeared"
-    sleep 3
-  done
-}
-
-reshard_pod_wait_gone() { # opid timeout_s — wait until the reconciler reaped it
-  deadline=$(( $(date +%s) + $2 ))
-  while k get pod "duckgres-reshard-op-$1" >/dev/null 2>&1; do
-    [ "$(date +%s)" -lt "$deadline" ] || fail "reshard runner pod duckgres-reshard-op-$1 not reaped after the op finished"
-    sleep 5
-  done
-}
+# External-store migrations are covered by the focused admin/provisioner unit
+# tests. This live harness intentionally provisions CNPG metadata stores only.
 
 reshard_post() { # org body
   curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
@@ -2787,11 +2603,8 @@ reshard_wait_step() { # opid step timeout_s
 
 reshard_log_fetch() { # opid -> the FULL op log, one "level: message" line per entry
   # Pages with after_id until exhausted. A single first-page fetch is NOT
-  # enough: the catalog copy logs one op-log line per table, and the shared
-  # ext-RDS catalog has accumulated 20k+ ducklake_* tables across e2e runs —
-  # far past the server's 2000-per-page cap — so a one-shot fetch saw only the
-  # first page and the asserts on END-of-log lines (the terminal "reshard
-  # report" block) failed on an op that actually succeeded.
+  # enough: long operations can exceed the server's 2000-entry page cap, so a
+  # one-shot fetch can miss the terminal report at the end of the log.
   _after=0
   while :; do
     _page="$(curl -fsS -H "$H" "$API/api/v1/reshards/$1/log?after_id=${_after}&limit=2000")" || break
@@ -2811,7 +2624,7 @@ reshard_dump_log() { # opid — the log TAIL (where the failure/report lands)
   reshard_log_fetch "$1" | tail -30 || true
 }
 
-reshard_targets() { # destination discovery; ext org's RDS must appear too
+reshard_targets() { # destination discovery response shape
   log "reshard targets: destination discovery"
   out="$(curl -fsS -H "$H" "$API/api/v1/reshards/targets")" \
     || fail "reshard targets: request failed"
@@ -2820,10 +2633,8 @@ reshard_targets() { # destination discovery; ext org's RDS must appear too
   # real deployment cluster_discovery=true additionally surfaces EMPTY shards.
   echo "$out" | jq -e '.shards | index("shard-001") != null' >/dev/null \
     || fail "reshard targets: shard-001 missing: $out"
-  echo "$out" | jq -e '.external_stores | length >= 1 and (.[0].endpoint | length > 0) and (.[0].password_aws_secret | length > 0)' >/dev/null \
-    || fail "reshard targets: external store from the ext org missing: $out"
-  echo "$out" | jq -e '.external_stores | all(has("password") | not)' >/dev/null \
-    || fail "reshard targets: response carries a password field: $out"
+  echo "$out" | jq -e '.external_stores | type == "array" and all(has("password") | not)' >/dev/null \
+    || fail "reshard targets: external_stores shape wrong or response carries a password field: $out"
   log "reshard targets OK ($(echo "$out" | jq -c '{shards, cluster_discovery}'))"
 }
 
@@ -2839,8 +2650,7 @@ reshard_validation() { # cnpg-org currently on shard-001
   # (TestReshardStartSourceIdentityValidation) and
   # provisioner/reshard_runner_test.go (the recordSource drift + rollback
   # guards). The positive side — from_shard/source_kind being derived from the
-  # duckling STATUS — IS asserted on the live ops below (cancel + ext→cnpg
-  # lanes).
+  # duckling STATUS — IS asserted on the live cancel operation below.
   # The RDS-managed-master and generic-prefix rows pin Fix 1's positive ESO
   # allowlist: the external-secrets IAM policy only allows GetSecretValue on
   # posthog-*/duckling-* names, so the start handler 400s an SM secret name
@@ -2962,82 +2772,8 @@ reshard_bogus_shard_rollback() { # org password
   log "reshard rollback OK (op $opid)"
 }
 
-reshard_ext_to_cnpg() { # ext-org password
-  org="$1"; pw="$2"; d="$(echo "$org" | tr 'A-Z' 'a-z')"
-  log "reshard ext→cnpg POSITIVE path: move $org off the RDS onto shard-001 with data intact"
-  pg "$org" "$pw" ducklake "DROP TABLE IF EXISTS reshard_move; CREATE TABLE reshard_move AS SELECT range AS v FROM range(100);"
-
-  # Real cutover: provider-sql role/DB creation + cnpg SASL propagation can
-  # take minutes (same tail READY_TIMEOUT covers at provision time).
-  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-001"},"drain_timeout_seconds":300,"cutover_timeout_seconds":600}')" \
-    || fail "reshard ext→cnpg: start failed: $out"
-  opid="$(echo "$out" | jq -r .id)"
-
-  # Pod model: the op is created PENDING — the dedicated runner pod
-  # (duckgres-reshard-op-<id>, spawned by the CP on this POST) claims the row
-  # itself. This ext-SOURCE op needs no password URL (the source password is
-  # read from the CR status pre-flip), so password_url stays empty.
-  echo "$out" | jq -e '.state == "pending"' >/dev/null \
-    || fail "reshard ext→cnpg: op not created pending (pod model): $out"
-  # Source identity: derived from the duckling STATUS (external) and complete
-  # (endpoint + SM secret name recorded from the warehouse row — the rollback
-  # needs them to re-render the external spec; incomplete would have been a
-  # submit-time 400).
-  echo "$out" | jq -e '.source_kind == "external" and (.source_endpoint | length > 0) and (.source_password_secret | length > 0)' >/dev/null \
-    || fail "reshard ext→cnpg: op source identity incomplete or not status-derived: $out"
-
-  # The dedicated runner pod appears (spawned by the start handler; the leader
-  # reconciler would backstop it) and carries the op-id label.
-  reshard_pod_wait "$opid" 120
-  lbl="$(k get pod "duckgres-reshard-op-$opid" -o jsonpath='{.metadata.labels.app}/{.metadata.labels.duckgres-op-id}')"
-  [ "$lbl" = "duckgres-reshard/$opid" ] || fail "reshard ext→cnpg: runner pod labels wrong: $lbl"
-
-  # Budget: drain (org quiet) + provider-sql role/db create on the shard (the
-  # cnpg SASL propagation tail can add minutes — see READY_TIMEOUT) + copy +
-  # verify.
-  st="$(reshard_wait_terminal "$opid" 900)"
-  [ "$st" = "succeeded" ] || { reshard_dump_log "$opid"; fail "reshard ext→cnpg: final state $st, want succeeded"; }
-  reshard_log_has "$opid" "reshard report (succeeded)" || fail "reshard ext→cnpg: report missing"
-  reshard_log_has "$opid" "maintenance mode (connections blocked)" || fail "reshard ext→cnpg: maintenance duration missing from report"
-  reshard_log_has "$opid" "external source left untouched" || fail "reshard ext→cnpg: missing ext-source-untouched line"
-
-  # Pre-flip catalog backup (safety-net layer C): the runner pg_dumps the SOURCE
-  # catalog to the org's own data bucket under _reshard_catalog_backups/ before
-  # the flip, records the artifact URI on the op row, and logs a runnable
-  # pg_restore command. The CP image now carries pg_dump (postgresql-client-18)
-  # and holds the org's STS creds, so this SHOULD succeed here — assert it did.
-  # (The Job has no aws CLI, so we cannot LIST S3 to confirm the object exists;
-  # we assert the recorded URI + restore command instead — same limitation the
-  # tenant_isolation object-store-prefix half documents. The S3 write itself is
-  # proven by the runner not warning "pre-flip catalog backup failed".)
-  reshard_log_has "$opid" "catalog backup complete" || { reshard_backup_debug "$opid"; reshard_dump_log "$opid"; fail "reshard ext→cnpg: pre-flip catalog backup did not complete"; }
-  reshard_log_has "$opid" "pg_restore --no-owner" || fail "reshard ext→cnpg: restore command missing from op log"
-  if reshard_log_has "$opid" "pre-flip catalog backup failed"; then
-    reshard_backup_debug "$opid"; reshard_dump_log "$opid"; fail "reshard ext→cnpg: catalog backup failed (best-effort warning present)"
-  fi
-  buri="$(curl -fsS -H "$H" "$API/api/v1/reshards/$opid" | jq -r '.backup_s3_uri // ""')"
-  case "$buri" in
-    s3://*/_reshard_catalog_backups/op-"$opid"-*.dump) log "reshard ext→cnpg: backup artifact recorded at $buri" ;;
-    *) reshard_dump_log "$opid"; fail "reshard ext→cnpg: backup_s3_uri not recorded/shaped: '$buri'" ;;
-  esac
-
-  # The duckling is now a cnpg-shard tenant…
-  typ="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.type}')"
-  [ "$typ" = "cnpg-shard" ] || fail "reshard ext→cnpg: duckling type $typ, want cnpg-shard"
-  # …and the data reads back from the moved catalog (cold worker spawn against
-  # the new store happens implicitly on this connect).
-  got="$(pg "$org" "$pw" ducklake "SELECT COUNT(*) || ':' || SUM(v) FROM reshard_move")"
-  echo "$got" | grep -q "100:4950" || fail "reshard ext→cnpg: data mismatch after move (got '$got')"
-  pg "$org" "$pw" ducklake "DROP TABLE reshard_move;"
-
-  # The runner pod exits 0 once the op is terminal and the leader reconciler
-  # reaps it (30s tick; give it a couple of ticks plus pod-exit time).
-  reshard_pod_wait_gone "$opid" 180
-  log "reshard ext→cnpg OK (op $opid): catalog moved, data intact, runner pod reaped"
-}
-
 # ---- tenant isolation -----------------------------------------------------
-# Two tenants (cnpg + ext) back onto distinct DuckLake metadata stores, so a
+# Two CNPG-backed tenants use distinct DuckLake metadata stores, so a
 # table created by one is invisible to the other. Ported (logical half) from
 # TestK8sTenantIsolation_DifferentTenantsSeeDistinctCatalogs. (The physical
 # object-store-prefix half needs S3 list creds the Job doesn't hold against real
@@ -3133,16 +2869,6 @@ CNPG_DEFAULT_TEAM_ID='90210'
 CNPG_BODY='{"database_name":"'"$CNPG"'","metadata_store":{"type":"cnpg-shard"},
   "default_team_id":'"$CNPG_DEFAULT_TEAM_ID"',
   "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
-
-# ---- ext duckling: external RDS metadata + DuckLake -----------------------
-EXT_DEFAULT_TEAM_ID='31337'
-EXT_BODY='{"database_name":"'"$EXT"'",
-  "default_team_id":'"$EXT_DEFAULT_TEAM_ID"',
-  "metadata_store":{"type":"external","external":{
-    "endpoint":"'"$EXT_RDS_ENDPOINT"'","password_aws_secret":"'"$EXT_RDS_SECRET"'",
-    "user":"'"$EXT_RDS_USER"'","database":"'"$EXT_RDS_DB"'"}},
-  "data_store":{"type":"external","bucket_name":"posthog-duckling-example-managed-warehouse-dev","region":"us-east-1"},
-  "ducklake":{"enabled":true}}'
 
 # ---- resilience ducklings: cnpg-shard metadata + DuckLake only -------------
 # DuckLake-only: these orgs exist purely to host the worker-churn-heavy
@@ -3249,7 +2975,7 @@ user_kill_switch_attempt() { # org rootpw vic vicpw
 # time (distinct "disabled" error, not a password/transient error), while a
 # different user still connects; enable restores access. The block is effective
 # immediately because the disable handler reloads the snapshot cluster-wide (no
-# poll wait). Run on BOTH metadata backends since the flag is config-store-backed.
+# poll wait).
 user_disable_block() { # org rootpw
   org="$1"; pw="$2"; vic="e2edisableuser"; vicpw="e2e-$(openssl rand -hex 12)"
   log "user disable/enable block on $org"
@@ -3410,29 +3136,9 @@ lane_res2() { # scheduling-shape resilience on its own org (heavy, cold spawns)
   # parallel and the heavy query holds each worker well past the others' spawn.
   one_session_per_worker     "$RES2" "$res2_pw"
   cold_burst_parallel_spawns "$RES2" "$res2_pw"
-}
-
-lane_ext() { # external-RDS metadata backend + org default profile
-  wait_worker "$EXT" "$ext_pw" ducklake
-  basic_query  "$EXT" "$ext_pw"
-  pg_compat_functions "$EXT" "$ext_pw"
-  query_source_guc    "$EXT" "$ext_pw"
-  rw_ducklake         "$EXT" "$ext_pw"
-  explain_ducklake    "$EXT" "$ext_pw"
-  httpfs_retry_budget "$EXT" "$ext_pw"    # S3-503 retry budget per worker, ext-metadata backend too
-  persistent_user_secret "$EXT" "$ext_pw"   # secret replay on the ext-metadata org too
-  # Org default profile on ext: no client-sized assertions run on this org, so
+  # No client-sized assertions run on this org, so
   # the 2-CPU shape is unambiguously the org default's.
-  org_default_profile "$EXT" "$ext_pw" ducklake
-  # default_team_id contract: both orgs provisioned WITH one (round-trips), a
-  # NEW org WITHOUT one is rejected (400, nothing created) + PUT set/clear/
-  # restore on EXT. Runs here because both orgs are provisioned by now; it only
-  # touches the provisioning + admin APIs, no worker/DB.
-  default_team_id_mandatory "$CNPG" "$EXT"
-  # Team CRUD on the ext org (no other test mutates its team rows); ends with
-  # the org back at exactly its provisioned billing team.
-  org_teams_crud "$EXT" "$EXT_DEFAULT_TEAM_ID"
-  discovery_endpoints "$CNPG" "$EXT"
+  org_default_profile "$RES2" "$res2_pw" ducklake
 }
 
 main() {
@@ -3448,44 +3154,30 @@ main() {
   # then retry-connect in a tight loop: the CP rate-limiter bans the source IP
   # after a handful of failed auths, and a fresh password isn't live until the
   # next config-store poll. Provision returns the live password directly.
-  # All four orgs provision CONCURRENTLY (independent ducklings), then all four
+  # All three orgs provision CONCURRENTLY (independent ducklings), then all three
   # readiness waits run concurrently too — provisioning cost is paid once, not
   # per org.
   provision "$CNPG" "$CNPG_BODY"        > "$LANE_DIR/prov_cnpg.json" &
   prov1=$!
-  provision "$EXT"  "$EXT_BODY"         > "$LANE_DIR/prov_ext.json" &
-  prov2=$!
   provision "$RES1" "$(res_body "$RES1")" > "$LANE_DIR/prov_res1.json" &
-  prov3=$!
+  prov2=$!
   provision "$RES2" "$(res_body "$RES2")" > "$LANE_DIR/prov_res2.json" &
-  prov4=$!
+  prov3=$!
   wait "$prov1" || fail "provision $CNPG failed"
-  wait "$prov2" || fail "provision $EXT failed"
-  wait "$prov3" || fail "provision $RES1 failed"
-  wait "$prov4" || fail "provision $RES2 failed"
+  wait "$prov2" || fail "provision $RES1 failed"
+  wait "$prov3" || fail "provision $RES2 failed"
   cnpg_pw="$(jq -r .password "$LANE_DIR/prov_cnpg.json")"
-  ext_pw="$(jq -r .password "$LANE_DIR/prov_ext.json")"
   res1_pw="$(jq -r .password "$LANE_DIR/prov_res1.json")"
   res2_pw="$(jq -r .password "$LANE_DIR/prov_res2.json")"
-  for v in "$cnpg_pw" "$ext_pw" "$res1_pw" "$res2_pw"; do
+  for v in "$cnpg_pw" "$res1_pw" "$res2_pw"; do
     case "$v" in ""|null) fail "a provision call returned no password" ;; esac
   done
-  # kubectl must be usable BEFORE the extdb lane below (the lane subshell
-  # reads the ext duckling's CR status and must not race the background
-  # download). This trades away only the readiness-phase overlap; the fetch
-  # already overlapped the whole provisioning phase above.
   bootstrap_kubectl
 
-  # The extdb lane creates the run's external metadata database (and GCs
-  # leaked ones) CONCURRENTLY with the readiness waits: ready_ext cannot flip
-  # before the database exists (the CP's end-to-end probe targets it and
-  # retries), so this lane completing is a hard prerequisite it races ahead of.
   run_lane ready_cnpg wait_state "$CNPG" ready "$READY_TIMEOUT"
-  run_lane ready_ext  wait_state "$EXT"  ready "$READY_TIMEOUT"
   run_lane ready_res1 wait_state "$RES1" ready "$READY_TIMEOUT"
   run_lane ready_res2 wait_state "$RES2" ready "$READY_TIMEOUT"
-  run_lane extdb ext_rds_setup
-  join_lanes ready_cnpg ready_ext ready_res1 ready_res2 extdb
+  join_lanes ready_cnpg ready_res1 ready_res2
 
   # Settle: let the CP's config-store poll pick up the provisioned orgs/users
   # before the first connection, so we don't burn failed-auth attempts against
@@ -3506,13 +3198,18 @@ main() {
   admin_operators
   admin_rbac_viewer "$CNPG"
 
-  # ---- the four parallel assertion lanes (see lane_* above) ----
+  # ---- the three parallel assertion lanes (see lane_* above) ----
   # (kubectl was bootstrapped before the readiness lanes above.)
   run_lane cnpg lane_cnpg
   run_lane res1 lane_res1
   run_lane res2 lane_res2
-  run_lane ext  lane_ext
-  join_lanes cnpg res1 res2 ext
+  join_lanes cnpg res1 res2
+
+  # Provisioning/admin contracts are backend-independent; retain their live
+  # coverage on the primary CNPG org.
+  default_team_id_mandatory "$CNPG" "$CNPG_DEFAULT_TEAM_ID"
+  org_teams_crud "$CNPG" "$CNPG_DEFAULT_TEAM_ID"
+  discovery_endpoints "$CNPG" "$CNPG_DEFAULT_TEAM_ID"
 
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
@@ -3521,7 +3218,7 @@ main() {
   project_reader_isolation "$CNPG" "$cnpg_pw" "$CNPG_DEFAULT_TEAM_ID"
 
   # ---- admin ducklings metadata: live cnpg shard assignment ----------------
-  admin_ducklings_metadata "$CNPG" "$EXT"
+  admin_ducklings_metadata "$CNPG"
 
   # ---- provisioner backfills pinned shard into duckling spec (cnpg) --------
   duckling_shard_backfill "$CNPG"
@@ -3550,9 +3247,6 @@ main() {
   # ---- per-user kill switch + disable/enable block (cnpg stack is warm) ----
   user_kill_switch   "$CNPG" "$cnpg_pw"
   user_disable_block "$CNPG" "$cnpg_pw"
-  # The disabled flag is config-store-backed, so exercise the ext metadata
-  # backend too (CLAUDE.md: metadata-touching changes run on cnpg + ext).
-  user_disable_block "$EXT" "$ext_pw"
 
   # ---- connection-duration observability (any org; lanes already churned
   #      many connect/disconnects, so the disconnect log is warm) ----
@@ -3561,34 +3255,25 @@ main() {
   # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
 
-  # ---- cross-tenant isolation (cnpg vs ext) — needs both lanes done ----
-  tenant_isolation "$CNPG" "$cnpg_pw" "$EXT" "$ext_pw"
+  # ---- cross-tenant isolation between independent CNPG-backed orgs ----
+  tenant_isolation "$CNPG" "$cnpg_pw" "$RES1" "$res1_pw"
 
-  # ---- reshard operations (validation, cancel, rollback on res2; then the
-  #      ext→cnpg POSITIVE path on the ext org — must run AFTER every assert
-  #      that needs the ext org on the RDS, notably tenant_isolation) ----
+  # ---- reshard operations (validation, cancel, and rollback on res2) ----
   reshard_targets
   reshard_validation "$CNPG"
   reshard_cancel_during_drain "$RES2" "$res2_pw"
   reshard_bogus_shard_rollback "$RES2" "$res2_pw"
-  reshard_ext_to_cnpg "$EXT" "$ext_pw"
 
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
-  # (res1/res2/ext are deprovisioned by run.sh teardown; the cascade assertion
+  # (res1/res2 are deprovisioned by run.sh teardown; the cascade assertion
   # only needs one cnpg-shard org.)
   lifecycle_teardown_cnpg "$CNPG"
-
-  # ---- per-run external metadata database: drop + assert gone ----------------
-  # (Safe now: reshard_ext_to_cnpg moved the ext org off the RDS, so the
-  # per-run database is an orphaned source. A crashed run skips this and the
-  # next run's >24h GC in ext_rds_setup reaps the leftover.)
-  ext_rds_teardown
 
   # NOTE: the version-mismatch worker reaper is not exercised in-Job (it needs a
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(ext) + persistent-user-secrets(cnpg+ext, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg+ext) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback + ext-to-cnpg positive path) + lifecycle-teardown(+org-delete/name-release) + per-run-ext-metadata-db(create/stale-GC/drop), on cnpg & ext (4 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

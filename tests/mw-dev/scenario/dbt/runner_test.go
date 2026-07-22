@@ -60,9 +60,11 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 		ID:   "dbt_models",
 		Type: StepTypeDBTRun,
 		With: map[string]any{
-			"org_id":      "scenario-org",
-			"project_dir": projectDir,
-			"commands":    []any{"debug", "run", "test", "docs_generate"},
+			"org_id":        "scenario-org",
+			"project_dir":   projectDir,
+			"worker_cpu":    "2",
+			"worker_memory": "4Gi",
+			"commands":      []any{"debug", "run", "test", "docs_generate"},
 		},
 	})
 	if err != nil {
@@ -96,6 +98,9 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 	}
 	if envValue(first.Env, "PGHOSTADDR") != "10.0.0.10" {
 		t.Fatalf("PGHOSTADDR = %q", envValue(first.Env, "PGHOSTADDR"))
+	}
+	if got := envValue(first.Env, "PGOPTIONS"); got != "-c duckgres.worker_cpu=2 -c duckgres.worker_memory=4Gi" {
+		t.Fatalf("PGOPTIONS = %q, want dbt worker sizing options", got)
 	}
 	if envValue(first.Env, "DBT_ENV_SECRET_DUCKGRES_PASSWORD") != "root-password" {
 		t.Fatal("expected command environment to include provision password as a dbt secret")

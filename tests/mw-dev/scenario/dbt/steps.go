@@ -82,6 +82,8 @@ type stepSpec struct {
 	Database       string
 	Schema         string
 	SSLMode        string
+	WorkerCPU      string
+	WorkerMemory   string
 	ConnectTimeout int
 	Commands       []commandSpec
 	Retry          retrySpec
@@ -287,6 +289,8 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		Database:       stringFromWith(step, "catalog", "ducklake"),
 		Schema:         stringFromWith(step, "schema", "dbt_models"),
 		SSLMode:        stringFromWith(step, "sslmode", "require"),
+		WorkerCPU:      stringFromWith(step, "worker_cpu", ""),
+		WorkerMemory:   stringFromWith(step, "worker_memory", ""),
 		ConnectTimeout: intFromWith(step, "connect_timeout", e.connection.ConnectTimeout),
 		Commands:       commands,
 		Retry:          retry,
@@ -363,6 +367,16 @@ func (e *Executor) commandEnv(spec stepSpec) []string {
 	}
 	if _, err := netip.ParseAddr(e.connection.DialHost); err == nil {
 		env = append(env, "PGHOSTADDR="+e.connection.DialHost)
+	}
+	workerOptions := make([]string, 0, 4)
+	if spec.WorkerCPU != "" {
+		workerOptions = append(workerOptions, "-c", "duckgres.worker_cpu="+spec.WorkerCPU)
+	}
+	if spec.WorkerMemory != "" {
+		workerOptions = append(workerOptions, "-c", "duckgres.worker_memory="+spec.WorkerMemory)
+	}
+	if len(workerOptions) > 0 {
+		env = append(env, "PGOPTIONS="+strings.Join(workerOptions, " "))
 	}
 	return env
 }

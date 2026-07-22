@@ -23,7 +23,11 @@ Optional environment:
   DUCKGRES_SCENARIO_DBT_BIN
   DUCKGRES_SCENARIO_MAX_RUNTIME
   DUCKGRES_SCENARIO_GO_TEST_TIMEOUT
+
+Scenario-specific required environment:
+  DUCKGRES_SCENARIO_ORG_ID       (required by successful provisioning scenarios)
   DUCKGRES_SCENARIO_FROZEN_S3_URI (required by frozen dataset scenarios)
+  DUCKGRES_SCENARIO_FLIGHT_ADDR   (required when a scenario targets Flight)
 USAGE
 }
 
