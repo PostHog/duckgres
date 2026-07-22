@@ -1311,13 +1311,6 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		_ = c.flushWriter()
 		return nil
 	}
-	if err := c.queryAccessPolicy.Authorize(query); err != nil {
-		c.sendError("ERROR", "42501", err.Error())
-		_ = c.writeReadyForQuery(c.txStatus)
-		_ = c.flushWriter()
-		return nil
-	}
-
 	// Redacted form for everything observable (pg_stat_activity, spans,
 	// logs): CREATE SECRET option lists carry credential material.
 	loggableQuery := usersecrets.RedactForLog(query)
@@ -1353,6 +1346,12 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		}
 		c.finishQueryMetrics(queryMetrics)
 	}()
+	if err := c.queryAccessPolicy.Authorize(query); err != nil {
+		c.sendError("ERROR", "42501", err.Error())
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
 
 	c.logger().Debug("Query received.", "query", loggableQuery)
 

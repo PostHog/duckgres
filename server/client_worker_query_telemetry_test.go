@@ -188,6 +188,82 @@ func TestClientWorkerTelemetrySimpleQuery(t *testing.T) {
 	requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
 }
 
+func TestDeniedSimpleQueryOwnsOneRedactedClientLifecycleWithoutWorkerOrDurableDispatch(t *testing.T) {
+	logs := captureClientWorkerTelemetryLogs(t)
+	tracker := installClientWorkerTelemetryTracker(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	c.username = "project-reader"
+	c.orgID = "denied-simple-query-lifecycle"
+	c.queryAccessPolicy = &QueryAccessPolicy{
+		ReadOnly:       true,
+		AllowedSchemas: []string{"allowed_project"},
+	}
+	executor := &lifecycleExecutor{execResult: emptyExecResult{}}
+	c.executor = executor
+	sink := &copyFallbackTelemetryQueryLogSink{}
+	c.server.queryLogSink = sink
+
+	errorBefore := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeError))
+	successBefore := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeSuccess))
+	canceledBefore := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeCanceled))
+	const query = "CREATE SECRET denied_secret (TYPE S3, KEY_ID 'denied-key-marker', SECRET 'denied-secret-marker')"
+
+	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	output := logs.String()
+	clientStarts := requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
+	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
+	assertClientWorkerTelemetryAttrs(t, clientStarts, "scope=client", "protocol=simple", "(…redacted)")
+	assertClientWorkerTelemetryAttrs(t, clientFinishes,
+		"scope=client", "protocol=simple", "outcome=error", "sqlstate=42501", "error_category=user")
+	for _, credential := range []string{"denied-key-marker", "denied-secret-marker"} {
+		if strings.Contains(output, credential) {
+			t.Errorf("denied query lifecycle leaked credential marker %q:\n%s", credential, output)
+		}
+	}
+	requireClientWorkerTelemetryLogCount(t, output, "Worker statement started.", 0)
+	requireClientWorkerTelemetryLogCount(t, output, "Worker statement finished.", 0)
+
+	initiated := requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
+	failed := requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 1)
+	if len(initiated) == 1 && initiated[0].orgID != c.orgID {
+		t.Errorf("query_initiated org = %q, want %q", initiated[0].orgID, c.orgID)
+	}
+	if len(failed) == 1 {
+		if got := failed[0].props["error_code"]; got != "42501" {
+			t.Errorf("query_failed error_code = %#v, want 42501", got)
+		}
+		if got := failed[0].props["error_category"]; got != "user" {
+			t.Errorf("query_failed error_category = %#v, want user", got)
+		}
+	}
+	if c.lastErrorCode != "42501" {
+		t.Errorf("last error SQLSTATE = %q, want 42501", c.lastErrorCode)
+	}
+	if got := executor.queryCalls.Load(); got != 0 {
+		t.Errorf("worker query calls = %d, want 0", got)
+	}
+	if got := executor.execCalls.Load(); got != 0 {
+		t.Errorf("worker exec calls = %d, want 0", got)
+	}
+	if got := len(sink.entries); got != 0 {
+		t.Errorf("durable query-log entries = %d, want 0", got)
+	}
+	if got := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeError)); got != errorBefore+1 {
+		t.Errorf("error query total = %v, want %v", got, errorBefore+1)
+	}
+	if got := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeSuccess)); got != successBefore {
+		t.Errorf("success query total = %v, want %v", got, successBefore)
+	}
+	if got := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeCanceled)); got != canceledBefore {
+		t.Errorf("canceled query total = %v, want %v", got, canceledBefore)
+	}
+}
+
 func TestClientWorkerTelemetryExtendedExecuteUsesQueryTrace(t *testing.T) {
 	installClientWorkerTelemetryTracing(t)
 	logs := captureClientWorkerTelemetryLogs(t)
