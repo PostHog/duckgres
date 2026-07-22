@@ -12,8 +12,10 @@ metadata, perf, and dbt workloads with one shared warehouse lifecycle. Manual
 runs also default to `full-suite`.
 
 Scenario jobs override the shared harness's default worker request to 2 CPU and
-4Gi memory for the frozen pgwire perf workload. The shared e2e workflow keeps
-the harness defaults documented in `tests/mw-dev/README.md`.
+8Gi memory for the frozen pgwire perf workload. This adds process headroom for
+repeated full-dataset aggregates without increasing DuckDB's thread count. The
+shared e2e workflow keeps the harness defaults documented in
+`tests/mw-dev/README.md`.
 
 To omit dbt, manually run the workflow with `scenario` set to `fast-suite`.
 The input directly names a YAML file under

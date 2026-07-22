@@ -87,7 +87,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
 		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"2\"",
-		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 4Gi",
+		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 8Gi",
 		"role-duration-seconds: 16200",
 		"tests/mw-dev/run.sh deploy",
 		"tests/mw-dev/run.sh test-scenario",
