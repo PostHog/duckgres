@@ -386,6 +386,8 @@ func main() {
 			ConfigPollInterval:         resolved.ConfigPollInterval,
 			InternalSecret:             resolved.InternalSecret,
 			InternalSecretFallbacks:    resolved.InternalSecretFallbacks,
+			ReadOnlySecret:             resolved.ReadOnlySecret,
+			ReadOnlySecretFallbacks:    resolved.ReadOnlySecretFallbacks,
 			UserSecretKey:              resolved.UserSecretKey,
 			SNIRoutingMode:             resolved.SNIRoutingMode,
 			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
