@@ -31,20 +31,12 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	ctx, cleanup := c.queryContextForCursor()
 	cursor.cleanup = cleanup
 
-	// The cursor's underlying SELECT is a physical worker statement at OPEN
-	// time. Rows stream through later FETCH calls, so this records only the
-	// metadata phase (rows=0) and its initial failure, if any.
-	statement := workerStatementWithQuery(workerOriginCursor, workerOperationCursorOpen, cursor.query)
+	workerStatement := workerStatementWithQuery(workerOriginCursor, workerOperationCursorOpen, cursor.query)
 	cursorStart := time.Now()
-	var workerErr error
-	c.logWorkerStatementStarted(statement)
-	defer func() {
-		c.logWorkerStatementFinished(statement, cursorStart, 0, workerErr)
-	}()
-
+	c.logWorkerStatementStarted(workerStatement)
 	rows, err := c.executor.QueryContext(ctx, cursor.query)
 	if err != nil {
-		workerErr = err
+		c.logWorkerStatementFinished(workerStatement, cursorStart, 0, err)
 		cleanup()
 		cursor.cleanup = nil
 		return err
@@ -53,7 +45,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		workerErr = err
+		c.logWorkerStatementFinished(workerStatement, cursorStart, 0, err)
 		_ = rows.Close()
 		cursor.rows = nil
 		cleanup()
@@ -64,7 +56,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		workerErr = err
+		c.logWorkerStatementFinished(workerStatement, cursorStart, 0, err)
 		_ = rows.Close()
 		cursor.rows = nil
 		cleanup()
@@ -72,6 +64,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 		return err
 	}
 	cursor.colTypes = colTypes
+	c.logWorkerStatementFinished(workerStatement, cursorStart, 0, nil)
 
 	typeOIDs := make([]int32, len(colTypes))
 	for i, ct := range colTypes {
@@ -306,7 +299,12 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	// Open cursor on first FETCH
 	if cursor.rows == nil {
 		if err := c.openCursor(cursor); err != nil {
-			errCode, errMsg := c.clientErrorResponse(err)
+			errCode := "42000"
+			errMsg := err.Error()
+			if c.isCallerCancellation(err) {
+				errCode = "57014"
+				errMsg = "canceling statement due to user request"
+			}
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
 			c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
@@ -361,10 +359,9 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 		}
 
 		if err := cursor.rows.Scan(valuePtrs...); err != nil {
-			errCode, errMsg := c.clientErrorResponse(err)
-			c.sendError("ERROR", errCode, errMsg)
+			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
-			c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
+			c.logQuery(start, query, query, "FETCH", 0, 0, "42000", err.Error(), "simple")
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
@@ -377,7 +374,12 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	}
 
 	if err := cursor.rows.Err(); err != nil {
-		errCode, errMsg := c.clientErrorResponse(err)
+		errCode := "42000"
+		errMsg := err.Error()
+		if c.isCallerCancellation(err) {
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
+		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
@@ -441,8 +443,11 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 	// Open cursor on first FETCH
 	if cursor.rows == nil {
 		if err := c.openCursor(cursor); err != nil {
-			errCode, errMsg := c.clientErrorResponse(err)
-			c.sendError("ERROR", errCode, errMsg)
+			if c.isCallerCancellation(err) {
+				c.sendError("ERROR", "57014", "canceling statement due to user request")
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
 			c.setTxError()
 			return
 		}
@@ -485,8 +490,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 		}
 
 		if err := cursor.rows.Scan(valuePtrs...); err != nil {
-			errCode, errMsg := c.clientErrorResponse(err)
-			c.sendError("ERROR", errCode, errMsg)
+			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			return
 		}
@@ -498,8 +502,11 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 	}
 
 	if err := cursor.rows.Err(); err != nil {
-		errCode, errMsg := c.clientErrorResponse(err)
-		c.sendError("ERROR", errCode, errMsg)
+		if c.isCallerCancellation(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			c.sendError("ERROR", "42000", err.Error())
+		}
 		c.setTxError()
 		return
 	}

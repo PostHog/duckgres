@@ -16,7 +16,6 @@ import (
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/pgbinary"
 	"github.com/posthog/duckgres/server/sqlcore"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -79,122 +78,6 @@ type contextReader struct {
 	r   io.Reader
 }
 
-type copyFromStdinPreparationIOError struct {
-	err error
-}
-
-func (e *copyFromStdinPreparationIOError) Error() string { return e.err.Error() }
-func (e *copyFromStdinPreparationIOError) Unwrap() error { return e.err }
-
-func copyFromStdinPreparationIOFailure(err error) error {
-	return &copyFromStdinPreparationIOError{err: err}
-}
-
-func copyFromStdinPreparationErrorClass(err error) copyFromStdinErrorClass {
-	var ioErr *copyFromStdinPreparationIOError
-	if errors.As(err, &ioErr) {
-		return copyFromStdinErrorInternal
-	}
-	return copyFromStdinErrorInvalidInput
-}
-
-type copyFromStdinPreparationReader struct {
-	r io.Reader
-}
-
-func (r *copyFromStdinPreparationReader) Read(p []byte) (int, error) {
-	n, err := r.r.Read(p)
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return n, err
-	}
-	return n, copyFromStdinPreparationIOFailure(err)
-}
-
-type copyFromStdinPreparationWriter struct {
-	w io.Writer
-}
-
-func (w *copyFromStdinPreparationWriter) Write(p []byte) (int, error) {
-	n, err := w.w.Write(p)
-	if err != nil {
-		return n, copyFromStdinPreparationIOFailure(err)
-	}
-	return n, nil
-}
-
-const copyFromStdinErrorDomain = "duckgres.copy"
-
-type copyFromStdinErrorClass uint8
-
-const (
-	copyFromStdinErrorInternal copyFromStdinErrorClass = iota
-	copyFromStdinErrorInvalidRequest
-	copyFromStdinErrorInvalidInput
-	copyFromStdinErrorLoadRejected
-	copyFromStdinErrorCanceled
-	copyFromStdinErrorDeadlineExceeded
-	copyFromStdinErrorUnavailable
-)
-
-func (c copyFromStdinErrorClass) reasonAndMessage() (reason, message string) {
-	switch c {
-	case copyFromStdinErrorInvalidRequest:
-		return "INVALID_REQUEST", "copy-from-stdin: invalid request"
-	case copyFromStdinErrorInvalidInput:
-		return "INVALID_INPUT", "copy-from-stdin: invalid input"
-	case copyFromStdinErrorLoadRejected:
-		return "LOAD_REJECTED", "copy-from-stdin: load rejected"
-	case copyFromStdinErrorCanceled:
-		return "CANCELED", "copy-from-stdin: canceled"
-	case copyFromStdinErrorDeadlineExceeded:
-		return "DEADLINE_EXCEEDED", "copy-from-stdin: deadline exceeded"
-	case copyFromStdinErrorUnavailable:
-		return "UNAVAILABLE", "copy-from-stdin: unavailable"
-	default:
-		return "INTERNAL", "copy-from-stdin: internal error"
-	}
-}
-
-// sanitizeCopyFromStdinRPCError is the sole error boundary for the custom COPY
-// DoPut RPC. DuckDB errors can echo generated SQL, input values, and worker-local
-// spool paths, so only a fixed classification is allowed to cross this boundary.
-// The original gRPC code is retained; ErrorInfo provides a stable reason for
-// rolling control-plane/worker compatibility without carrying raw details.
-func sanitizeCopyFromStdinRPCError(err error, class copyFromStdinErrorClass) error {
-	if err == nil {
-		return nil
-	}
-
-	code := status.Code(err)
-	switch {
-	case errors.Is(err, context.Canceled) || code == codes.Canceled:
-		class = copyFromStdinErrorCanceled
-		if code == codes.Unknown {
-			code = codes.Canceled
-		}
-	case errors.Is(err, context.DeadlineExceeded) || code == codes.DeadlineExceeded:
-		class = copyFromStdinErrorDeadlineExceeded
-		if code == codes.Unknown {
-			code = codes.DeadlineExceeded
-		}
-	}
-	if code == codes.OK {
-		code = codes.Unknown
-	}
-
-	reason, message := class.reasonAndMessage()
-	sanitized := status.New(code, message)
-	withDetails, detailsErr := sanitized.WithDetails(&errdetails.ErrorInfo{
-		Reason: reason,
-		Domain: copyFromStdinErrorDomain,
-	})
-	if detailsErr != nil {
-		return sanitized.Err()
-	}
-	return withDetails.Err()
-}
-
 func (r *contextReader) Read(p []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
 		return 0, err
@@ -213,43 +96,37 @@ func preparePostgresBinaryCopy(ctx context.Context, tmpPath string, databaseType
 
 	source, err := os.Open(tmpPath)
 	if err != nil {
-		return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("open binary COPY spool: %w", err))
+		return "", 0, func() {}, fmt.Errorf("open binary COPY spool: %w", err)
 	}
-	inspection, inspectErr := pgbinary.InspectProtocolCompleted(&copyFromStdinPreparationReader{
-		r: &contextReader{ctx: ctx, r: source},
-	}, schema)
+	inspection, inspectErr := pgbinary.InspectProtocolCompleted(&contextReader{ctx: ctx, r: source}, schema)
 	closeErr := source.Close()
 	if inspectErr != nil {
 		return "", 0, func() {}, inspectErr
 	}
 	if closeErr != nil {
-		return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("close binary COPY spool: %w", closeErr))
+		return "", 0, func() {}, fmt.Errorf("close binary COPY spool: %w", closeErr)
 	}
 
 	if !inspection.NeedsRewrite {
 		info, err := os.Stat(tmpPath)
 		if err != nil {
-			return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("stat binary COPY spool: %w", err))
+			return "", 0, func() {}, fmt.Errorf("stat binary COPY spool: %w", err)
 		}
 		return tmpPath, info.Size(), func() {}, nil
 	}
 
 	source, err = os.Open(tmpPath)
 	if err != nil {
-		return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("reopen binary COPY spool: %w", err))
+		return "", 0, func() {}, fmt.Errorf("reopen binary COPY spool: %w", err)
 	}
 	normalized, err := os.CreateTemp("", "duckgres-worker-copy-normalized-*.copy")
 	if err != nil {
 		_ = source.Close()
-		return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("create normalized binary COPY spool: %w", err))
+		return "", 0, func() {}, fmt.Errorf("create normalized binary COPY spool: %w", err)
 	}
 	normalizedPath := normalized.Name()
 	cleanup := func() { _ = os.Remove(normalizedPath) }
-	_, rewriteErr := pgbinary.RewriteProtocolCompleted(
-		&copyFromStdinPreparationWriter{w: normalized},
-		&copyFromStdinPreparationReader{r: &contextReader{ctx: ctx, r: source}},
-		schema,
-	)
+	_, rewriteErr := pgbinary.RewriteProtocolCompleted(normalized, &contextReader{ctx: ctx, r: source}, schema)
 	sourceCloseErr := source.Close()
 	normalizedCloseErr := normalized.Close()
 	if rewriteErr != nil {
@@ -258,16 +135,16 @@ func preparePostgresBinaryCopy(ctx context.Context, tmpPath string, databaseType
 	}
 	if sourceCloseErr != nil {
 		cleanup()
-		return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("close binary COPY spool: %w", sourceCloseErr))
+		return "", 0, func() {}, fmt.Errorf("close binary COPY spool: %w", sourceCloseErr)
 	}
 	if normalizedCloseErr != nil {
 		cleanup()
-		return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("close normalized binary COPY spool: %w", normalizedCloseErr))
+		return "", 0, func() {}, fmt.Errorf("close normalized binary COPY spool: %w", normalizedCloseErr)
 	}
 	info, err := os.Stat(normalizedPath)
 	if err != nil {
 		cleanup()
-		return "", 0, func() {}, copyFromStdinPreparationIOFailure(fmt.Errorf("stat normalized binary COPY spool: %w", err))
+		return "", 0, func() {}, fmt.Errorf("stat normalized binary COPY spool: %w", err)
 	}
 	return normalizedPath, info.Size(), cleanup, nil
 }
@@ -281,18 +158,11 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	ctx context.Context,
 	first *flight.FlightData,
 	stream flight.FlightService_DoPutServer,
-) (retErr error) {
-	errorClass := copyFromStdinErrorInternal
-	defer func() {
-		retErr = sanitizeCopyFromStdinRPCError(retErr, errorClass)
-	}()
-
-	errorClass = copyFromStdinErrorInvalidRequest
+) error {
 	session, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	errorClass = copyFromStdinErrorUnavailable
 	finishOperation, ok := session.beginOperation()
 	if busyErr := sessionBusyStatus(ok); busyErr != nil {
 		return busyErr
@@ -315,7 +185,6 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	defer finishDrain()
 
 	desc := first.GetFlightDescriptor()
-	errorClass = copyFromStdinErrorInvalidRequest
 	copySQL, binaryDatabaseTypeNames, err := copyFromStdinDescriptorRequest(desc)
 	if err != nil {
 		return err
@@ -325,7 +194,6 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 			"copy-from-stdin: COPY SQL missing %q placeholder", flightclient.CopyFromStdinPathPlaceholder)
 	}
 
-	errorClass = copyFromStdinErrorInternal
 	tmpFile, err := os.CreateTemp("", "duckgres-worker-copy-*.copy")
 	if err != nil {
 		return status.Errorf(codes.Internal, "copy-from-stdin: create tempfile: %v", err)
@@ -356,17 +224,10 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 			data = first
 			first = nil
 		} else {
-			errorClass = copyFromStdinErrorUnavailable
 			data, err = stream.Recv()
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					break
-				}
-				switch status.Code(err) {
-				case codes.Canceled:
-					errorClass = copyFromStdinErrorCanceled
-				case codes.DeadlineExceeded:
-					errorClass = copyFromStdinErrorDeadlineExceeded
 				}
 				return status.Errorf(codes.Aborted, "copy-from-stdin: recv: %v", err)
 			}
@@ -375,7 +236,6 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 		if len(body) == 0 {
 			continue
 		}
-		errorClass = copyFromStdinErrorInternal
 		n, werr := tmpFile.Write(body)
 		if werr != nil {
 			return status.Errorf(codes.Internal, "copy-from-stdin: write tempfile: %v", werr)
@@ -397,10 +257,6 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return status.FromContextError(err).Err()
 			}
-			errorClass = copyFromStdinPreparationErrorClass(err)
-			if errorClass == copyFromStdinErrorInternal {
-				return status.Errorf(codes.Internal, "copy-from-stdin: prepare PostgreSQL binary COPY: %v", err)
-			}
 			return status.Errorf(codes.InvalidArgument, "copy-from-stdin: invalid PostgreSQL binary COPY: %v", err)
 		}
 	}
@@ -408,13 +264,11 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 
 	finalSQL := substituteCopyFromStdinPlaceholders(copySQL, loadPath, loadBytes)
 	slog.Debug("copy-from-stdin: executing worker load statement",
-		"frames", frames, "bytes", bytesWritten)
+		"frames", frames, "bytes", bytesWritten, "tmp", tmpPath)
 
-	errorClass = copyFromStdinErrorLoadRejected
 	res, execErr := session.execConn(ctx, finalSQL)
 	if execErr != nil {
 		if closedErr := sessionClosedStatus(execErr); closedErr != nil {
-			errorClass = copyFromStdinErrorUnavailable
 			return closedErr
 		}
 		return status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
@@ -425,7 +279,6 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	}
 
 	updateResult := &pb.DoPutUpdateResult{RecordCount: rowCount}
-	errorClass = copyFromStdinErrorInternal
 	app, mErr := proto.Marshal(updateResult)
 	if mErr != nil {
 		return status.Errorf(codes.Internal, "marshal DoPutUpdateResult: %v", mErr)
@@ -435,7 +288,6 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 		return ctx.Err()
 	default:
 	}
-	errorClass = copyFromStdinErrorUnavailable
 	if err := stream.Send(&flight.PutResult{AppMetadata: app}); err != nil {
 		return fmt.Errorf("copy-from-stdin: send PutResult: %w", err)
 	}

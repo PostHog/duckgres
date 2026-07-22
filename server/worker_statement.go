@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/posthog/duckgres/server/observe"
@@ -20,7 +19,6 @@ const (
 	workerOriginCopy         workerStatementOrigin = "copy"
 	workerOriginCopyFallback workerStatementOrigin = "copy_fallback"
 	workerOriginCursor       workerStatementOrigin = "cursor"
-	workerOriginInternal     workerStatementOrigin = "internal"
 )
 
 // workerStatementOperation names the stable physical operation. Operations
@@ -87,81 +85,6 @@ func generatedWorkerStatement(origin workerStatementOrigin, operation workerStat
 	}
 }
 
-func generatedWorkerTelemetryErrorMessage(sqlState string) string {
-	return fmt.Sprintf("generated worker statement failed (SQLSTATE %s)", sqlState)
-}
-
-// generatedWorkerErrorTelemetry returns the logical telemetry-safe form of a
-// generated worker failure without writing a second ErrorResponse. Callers
-// that already surfaced the wire error (for example result streaming) use it
-// to retain the real SQLSTATE in durable history.
-func (c *clientConn) generatedWorkerErrorTelemetry(err error) (code, telemetryMessage string) {
-	code, clientMessage := c.clientErrorResponse(err)
-	if c.isCallerCancellation(err) {
-		return code, clientMessage
-	}
-	return code, generatedWorkerTelemetryErrorMessage(code)
-}
-
-// sendGeneratedWorkerError writes an error without allowing generated SQL or
-// worker-local paths to reach logical lifecycle telemetry. The wire keeps the
-// original message except for a caller-requested cancellation, where pgwire's
-// standard cancellation text is more useful.
-func (c *clientConn) sendGeneratedWorkerError(err error) (code, telemetryMessage string) {
-	code, clientMessage := c.clientErrorResponse(err)
-	if c.isCallerCancellation(err) {
-		c.sendError("ERROR", code, clientMessage)
-		return code, clientMessage
-	}
-	_, telemetryMessage = c.generatedWorkerErrorTelemetry(err)
-	c.sendErrorWithTelemetryMessage("ERROR", code, clientMessage, telemetryMessage)
-	return code, telemetryMessage
-}
-
-// logicalWorkerTranspiledQuery returns the execution text that is safe to
-// retain on the enclosing logical client operation. Generated rewrites have
-// their own worker lifecycle records, but their implementation SQL must not
-// become a transpiled form of client input in durable history.
-func logicalWorkerTranspiledQuery(origin workerStatementOrigin, executedQuery string) string {
-	if origin == workerOriginRewrite {
-		return ""
-	}
-	return executedQuery
-}
-
-// sendLogicalWorkerError keeps generated worker failures out of the enclosing
-// client telemetry. Non-generated statements preserve the caller's existing
-// query-error logging behavior while sending their client-facing response.
-func (c *clientConn) sendLogicalWorkerError(origin workerStatementOrigin, query string, err error, recordQueryError bool) (code, telemetryMessage string) {
-	if origin == workerOriginRewrite {
-		return c.sendGeneratedWorkerError(err)
-	}
-
-	code, telemetryMessage = c.clientErrorResponse(err)
-	if recordQueryError && !c.isCallerCancellation(err) {
-		c.logQueryError(query, err)
-	}
-	c.sendError("ERROR", code, telemetryMessage)
-	return code, telemetryMessage
-}
-
-// sendLogicalResultWorkerError is the result-streaming counterpart to
-// sendLogicalWorkerError. It retains pgwire's legacy 42000 classification for
-// normal cursor errors while still keeping generated-rewrite details out of
-// the enclosing client lifecycle and durable telemetry.
-func (c *clientConn) sendLogicalResultWorkerError(origin workerStatementOrigin, query string, err error, recordQueryError bool) (code, telemetryMessage string) {
-	if origin == workerOriginRewrite {
-		return c.sendGeneratedWorkerError(err)
-	}
-
-	code, telemetryMessage = c.clientResultStreamErrorResponse(err)
-	if recordQueryError && !c.isCallerCancellation(err) {
-		c.logQueryError(query, err)
-	}
-	c.sendError("ERROR", code, telemetryMessage)
-	return code, telemetryMessage
-}
-
 func workerOriginForQueries(original, transpiled, executed string) workerStatementOrigin {
 	if transpiled == "" {
 		transpiled = original
@@ -202,6 +125,14 @@ func (c *clientConn) logWorkerStatementStarted(statement workerStatement) {
 	c.logger().Info("Worker statement started.", c.workerStatementAttrs(statement)...)
 }
 
+func (c *clientConn) runGeneratedWorkerStatement(statement workerStatement, run func() (ExecResult, error)) (ExecResult, error) {
+	start := time.Now()
+	c.logWorkerStatementStarted(statement)
+	result, err := run()
+	c.logWorkerStatementFinished(statement, start, 0, err)
+	return result, err
+}
+
 func (c *clientConn) logWorkerStatementFinished(statement workerStatement, start time.Time, rows int64, err error) {
 	attrs := c.workerStatementAttrs(statement)
 	attrs = append(attrs,
@@ -210,13 +141,6 @@ func (c *clientConn) logWorkerStatementFinished(statement workerStatement, start
 	)
 	if err != nil {
 		attrs = append(attrs, "error_code", classifyErrorCode(err))
-		if statement.query != "" {
-			attrs = append(attrs, "error", boundQueryLogText(usersecrets.RedactErrorForLog(statement.query, err.Error())))
-		} else {
-			// Generated errors frequently echo generated SQL. Keep the event
-			// useful via SQLSTATE without exposing generated text or arguments.
-			attrs = append(attrs, "error", "generated worker statement failed")
-		}
 	}
 	c.logger().Info("Worker statement finished.", attrs...)
 }

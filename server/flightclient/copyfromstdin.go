@@ -10,9 +10,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/posthog/duckgres/server/sqlcore"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -46,120 +43,6 @@ const CopyFromStdinSizePlaceholder = "__DUCKGRES_COPY_SIZE__"
 // bounded if the worker is slow to drain.
 const CopyFromStdinChunkSize = 1 << 20 // 1 MiB
 
-const copyFromStdinErrorDomain = "duckgres.copy"
-
-// copyFromStdinRPCError is the privacy boundary between a worker and the
-// control plane. It deliberately retains only a gRPC code and fixed text, not
-// the original status description or cause, because legacy workers may echo
-// generated SQL, copied values, or worker-local paths in that description.
-type copyFromStdinRPCError struct {
-	code             codes.Code
-	message          string
-	canceled         bool
-	deadlineExceeded bool
-}
-
-func (e *copyFromStdinRPCError) Error() string { return e.message }
-
-func (e *copyFromStdinRPCError) GRPCStatus() *status.Status {
-	return status.New(e.code, e.message)
-}
-
-func (e *copyFromStdinRPCError) Is(target error) bool {
-	return (e.canceled && target == context.Canceled) ||
-		(e.deadlineExceeded && target == context.DeadlineExceeded)
-}
-
-func sanitizeCopyFromStdinRPCError(err error) error {
-	if err == nil {
-		return nil
-	}
-
-	code := status.Code(err)
-	reason := ""
-	switch {
-	case errors.Is(err, context.Canceled):
-		reason = "CANCELED"
-		if code == codes.Unknown {
-			code = codes.Canceled
-		}
-	case errors.Is(err, context.DeadlineExceeded):
-		reason = "DEADLINE_EXCEEDED"
-		if code == codes.Unknown {
-			code = codes.DeadlineExceeded
-		}
-	}
-	if rpcStatus, ok := status.FromError(err); ok {
-		for _, detail := range rpcStatus.Details() {
-			info, ok := detail.(*errdetails.ErrorInfo)
-			if !ok || info.GetDomain() != copyFromStdinErrorDomain {
-				continue
-			}
-			if copyFromStdinReasonMatchesCode(info.GetReason(), code) {
-				reason = info.GetReason()
-			}
-			break
-		}
-	}
-
-	return &copyFromStdinRPCError{
-		code:             code,
-		message:          copyFromStdinSafeMessage(code, reason),
-		canceled:         code == codes.Canceled || reason == "CANCELED",
-		deadlineExceeded: code == codes.DeadlineExceeded || reason == "DEADLINE_EXCEEDED",
-	}
-}
-
-func copyFromStdinReasonMatchesCode(reason string, code codes.Code) bool {
-	switch reason {
-	case "INVALID_REQUEST", "INVALID_INPUT", "LOAD_REJECTED":
-		return code == codes.InvalidArgument
-	case "CANCELED", "DEADLINE_EXCEEDED":
-		return code == codes.Aborted ||
-			(reason == "CANCELED" && code == codes.Canceled) ||
-			(reason == "DEADLINE_EXCEEDED" && code == codes.DeadlineExceeded)
-	case "UNAVAILABLE":
-		return code == codes.Aborted || code == codes.FailedPrecondition || code == codes.NotFound ||
-			code == codes.ResourceExhausted || code == codes.Unavailable
-	case "INTERNAL":
-		return code == codes.Internal || code == codes.Unknown
-	default:
-		return false
-	}
-}
-
-func copyFromStdinSafeMessage(code codes.Code, reason string) string {
-	switch reason {
-	case "INVALID_REQUEST":
-		return "COPY request is invalid"
-	case "INVALID_INPUT":
-		return "COPY input is invalid"
-	case "LOAD_REJECTED":
-		return "COPY input was rejected by the destination"
-	case "CANCELED":
-		return "COPY load canceled"
-	case "DEADLINE_EXCEEDED":
-		return "COPY load deadline exceeded"
-	case "UNAVAILABLE":
-		return "COPY worker is unavailable"
-	case "INTERNAL":
-		return "COPY worker failed"
-	}
-
-	switch code {
-	case codes.Canceled:
-		return "COPY load canceled"
-	case codes.DeadlineExceeded:
-		return "COPY load deadline exceeded"
-	case codes.InvalidArgument:
-		return "COPY input is invalid"
-	case codes.NotFound, codes.Unavailable:
-		return "COPY worker is unavailable"
-	default:
-		return "COPY worker failed"
-	}
-}
-
 // CopyFromStdin streams COPY input bytes from r to a remote worker, then runs
 // request.SQLTemplate against a worker-local spool file. The SQL template must
 // contain CopyFromStdinPathPlaceholder where the file path should appear. It
@@ -182,7 +65,7 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, request sqlcore.Copy
 
 	stream, err := e.client.Client.DoPut(reqCtx)
 	if err != nil {
-		return 0, sanitizeCopyFromStdinRPCError(err)
+		return 0, fmt.Errorf("flight doput: %w", err)
 	}
 
 	// Frame 0: descriptor + COPY SQL.
@@ -201,7 +84,7 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, request sqlcore.Copy
 		Cmd:  cmd,
 	}
 	if err := stream.Send(&flight.FlightData{FlightDescriptor: desc}); err != nil {
-		return 0, sanitizeCopyFromStdinRPCError(err)
+		return 0, fmt.Errorf("flight doput send descriptor: %w", err)
 	}
 
 	// Frames 1..N: COPY input byte chunks. We re-use one buffer; gRPC marshals the
@@ -217,7 +100,7 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, request sqlcore.Copy
 		n, readErr := r.Read(buf)
 		if n > 0 {
 			if sendErr := stream.Send(&flight.FlightData{DataBody: buf[:n]}); sendErr != nil {
-				return 0, sanitizeCopyFromStdinRPCError(sendErr)
+				return 0, fmt.Errorf("flight doput send chunk: %w", sendErr)
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
@@ -229,12 +112,12 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, request sqlcore.Copy
 	}
 
 	if err := stream.CloseSend(); err != nil {
-		return 0, sanitizeCopyFromStdinRPCError(err)
+		return 0, fmt.Errorf("flight doput close-send: %w", err)
 	}
 
 	res, err := stream.Recv()
 	if err != nil {
-		return 0, sanitizeCopyFromStdinRPCError(err)
+		return 0, fmt.Errorf("flight doput recv: %w", err)
 	}
 
 	// Drain to EOF so any trailing metadata is materialised.
@@ -246,7 +129,7 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, request sqlcore.Copy
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		return 0, sanitizeCopyFromStdinRPCError(err)
+		return 0, err
 	}
 
 	var updateResult pb.DoPutUpdateResult

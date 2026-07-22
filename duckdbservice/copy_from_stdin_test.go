@@ -7,9 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -21,9 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/posthog/duckgres/server/flightclient"
-	"github.com/posthog/duckgres/server/pgbinary"
 	"github.com/posthog/duckgres/server/sqlcore"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -226,200 +222,6 @@ func assertNoWorkerCopyTempfiles(t *testing.T, tmpDir string) {
 	}
 }
 
-type failingCopyPreparationReader struct {
-	err error
-}
-
-func (r failingCopyPreparationReader) Read([]byte) (int, error) { return 0, r.err }
-
-type failingCopyPreparationWriter struct {
-	err error
-}
-
-func (w failingCopyPreparationWriter) Write([]byte) (int, error) { return 0, w.err }
-
-func assertCopyFromStdinRPCError(
-	t *testing.T,
-	err error,
-	wantCode codes.Code,
-	wantReason string,
-	wantMessage string,
-	forbidden ...string,
-) {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("doCopyFromStdin() error = nil, want %s", wantCode)
-	}
-	if got := status.Code(err); got != wantCode {
-		t.Fatalf("doCopyFromStdin() code = %s, want %s: %v", got, wantCode, err)
-	}
-	if got := status.Convert(err).Message(); got != wantMessage {
-		t.Fatalf("doCopyFromStdin() message = %q, want %q", got, wantMessage)
-	}
-	var gotInfo *errdetails.ErrorInfo
-	for _, detail := range status.Convert(err).Details() {
-		if info, ok := detail.(*errdetails.ErrorInfo); ok {
-			gotInfo = info
-			break
-		}
-	}
-	if gotInfo == nil {
-		t.Fatalf("doCopyFromStdin() details = %v, want google.rpc.ErrorInfo", status.Convert(err).Details())
-	}
-	if gotInfo.Domain != "duckgres.copy" || gotInfo.Reason != wantReason {
-		t.Errorf("doCopyFromStdin() ErrorInfo = {domain:%q reason:%q}, want {domain:%q reason:%q}",
-			gotInfo.Domain, gotInfo.Reason, "duckgres.copy", wantReason)
-	}
-	for _, marker := range forbidden {
-		if strings.Contains(err.Error(), marker) {
-			t.Errorf("doCopyFromStdin() error leaked %q: %v", marker, err)
-		}
-	}
-}
-
-func TestSanitizeCopyFromStdinRPCErrorPreservesCodesAndUsesFixedTaxonomy(t *testing.T) {
-	tests := []struct {
-		name        string
-		err         error
-		class       copyFromStdinErrorClass
-		wantCode    codes.Code
-		wantReason  string
-		wantMessage string
-	}{
-		{
-			name:        "invalid request",
-			err:         status.Error(codes.InvalidArgument, "request leaked __DUCKGRES_COPY_PATH__"),
-			class:       copyFromStdinErrorInvalidRequest,
-			wantCode:    codes.InvalidArgument,
-			wantReason:  "INVALID_REQUEST",
-			wantMessage: "copy-from-stdin: invalid request",
-		},
-		{
-			name:        "invalid input",
-			err:         status.Error(codes.InvalidArgument, "row value leaked"),
-			class:       copyFromStdinErrorInvalidInput,
-			wantCode:    codes.InvalidArgument,
-			wantReason:  "INVALID_INPUT",
-			wantMessage: "copy-from-stdin: invalid input",
-		},
-		{
-			name:        "load rejected",
-			err:         status.Error(codes.InvalidArgument, "INSERT INTO private_table FROM '/tmp/private.copy'"),
-			class:       copyFromStdinErrorLoadRejected,
-			wantCode:    codes.InvalidArgument,
-			wantReason:  "LOAD_REJECTED",
-			wantMessage: "copy-from-stdin: load rejected",
-		},
-		{
-			name:        "canceled context",
-			err:         fmt.Errorf("wrapped cancellation detail: %w", context.Canceled),
-			class:       copyFromStdinErrorInternal,
-			wantCode:    codes.Canceled,
-			wantReason:  "CANCELED",
-			wantMessage: "copy-from-stdin: canceled",
-		},
-		{
-			name:        "deadline context",
-			err:         fmt.Errorf("wrapped deadline detail: %w", context.DeadlineExceeded),
-			class:       copyFromStdinErrorInternal,
-			wantCode:    codes.DeadlineExceeded,
-			wantReason:  "DEADLINE_EXCEEDED",
-			wantMessage: "copy-from-stdin: deadline exceeded",
-		},
-		{
-			name:        "unavailable",
-			err:         status.Error(codes.NotFound, "worker path leaked"),
-			class:       copyFromStdinErrorUnavailable,
-			wantCode:    codes.NotFound,
-			wantReason:  "UNAVAILABLE",
-			wantMessage: "copy-from-stdin: unavailable",
-		},
-		{
-			name:        "internal",
-			err:         errors.New("/tmp/duckgres-worker-copy-private.copy"),
-			class:       copyFromStdinErrorInternal,
-			wantCode:    codes.Unknown,
-			wantReason:  "INTERNAL",
-			wantMessage: "copy-from-stdin: internal error",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := sanitizeCopyFromStdinRPCError(tt.err, tt.class)
-			assertCopyFromStdinRPCError(t, err, tt.wantCode, tt.wantReason, tt.wantMessage,
-				"__DUCKGRES_COPY_PATH__", "row value leaked", "private_table", "/tmp/", "worker path leaked")
-		})
-	}
-}
-
-func TestPreparePostgresBinaryCopySeparatesInputAndFilesystemFailures(t *testing.T) {
-	t.Run("missing worker spool is internal", func(t *testing.T) {
-		_, _, cleanup, err := preparePostgresBinaryCopy(
-			context.Background(),
-			filepath.Join(t.TempDir(), "missing.copy"),
-			[]string{"BIGINT"},
-		)
-		defer cleanup()
-		if err == nil {
-			t.Fatal("preparePostgresBinaryCopy() error = nil, want missing-spool error")
-		}
-		if got := copyFromStdinPreparationErrorClass(err); got != copyFromStdinErrorInternal {
-			t.Fatalf("preparation error class = %v, want internal", got)
-		}
-	})
-
-	t.Run("malformed client payload is invalid input", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "malformed.copy")
-		if err := os.WriteFile(path, []byte("not a PostgreSQL binary COPY stream"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		_, _, cleanup, err := preparePostgresBinaryCopy(context.Background(), path, []string{"BIGINT"})
-		defer cleanup()
-		if err == nil {
-			t.Fatal("preparePostgresBinaryCopy() error = nil, want malformed-input error")
-		}
-		if got := copyFromStdinPreparationErrorClass(err); got != copyFromStdinErrorInvalidInput {
-			t.Fatalf("preparation error class = %v, want invalid input", got)
-		}
-	})
-
-	t.Run("worker spool read failure is internal", func(t *testing.T) {
-		schema, err := pgbinary.SchemaFromDatabaseTypes([]string{"BIGINT"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = pgbinary.InspectProtocolCompleted(&copyFromStdinPreparationReader{
-			r: failingCopyPreparationReader{err: errors.New("synthetic spool read failure")},
-		}, schema)
-		if err == nil {
-			t.Fatal("InspectProtocolCompleted() error = nil, want read failure")
-		}
-		if got := copyFromStdinPreparationErrorClass(err); got != copyFromStdinErrorInternal {
-			t.Fatalf("preparation error class = %v, want internal", got)
-		}
-	})
-
-	t.Run("worker spool write failure is internal", func(t *testing.T) {
-		schema, err := pgbinary.SchemaFromDatabaseTypes([]string{"BIGINT"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		payload := postgresBinaryCopyFixture(t, nil, [][]byte{postgresBinaryInt64Fixture(1)})
-		_, err = pgbinary.RewriteProtocolCompleted(
-			&copyFromStdinPreparationWriter{w: failingCopyPreparationWriter{err: errors.New("synthetic spool write failure")}},
-			bytes.NewReader(payload),
-			schema,
-		)
-		if err == nil {
-			t.Fatal("RewriteProtocolCompleted() error = nil, want write failure")
-		}
-		if got := copyFromStdinPreparationErrorClass(err); got != copyFromStdinErrorInternal {
-			t.Fatalf("preparation error class = %v, want internal", got)
-		}
-	})
-}
-
 func newPostgresBinaryCopyFixture(
 	t *testing.T,
 	ctx context.Context,
@@ -476,11 +278,6 @@ func runPostgresBinaryCopyFixture(
 }
 
 func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
-	previousLogger := slog.Default()
-	var logs bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(previousLogger) })
-
 	tmpDir := useIsolatedWorkerCopyTempDir(t)
 	session, cleanup := newSessionWithInMemoryDuckDB(t)
 	defer cleanup()
@@ -534,11 +331,6 @@ func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("table row count = %d, want 3", n)
-	}
-	for _, forbidden := range []string{tmpDir, "duckgres-worker-copy-"} {
-		if strings.Contains(logs.String(), forbidden) {
-			t.Errorf("COPY worker telemetry leaked generated tempfile metadata %q:\n%s", forbidden, logs.String())
-		}
 	}
 	assertNoWorkerCopyTempfiles(t, tmpDir)
 }
@@ -893,10 +685,9 @@ func TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner(t *testing.T) {
 			"', columns = {c0: 'DECIMAL(10,2)'}, buffer_size = " + flightclient.CopyFromStdinSizePlaceholder + ")"
 		first, stream := newPostgresBinaryCopyFixture(t, ctx, copySQL, []string{"DECIMAL(10,2)"}, payload)
 		err := handler.doCopyFromStdin(ctx, first, stream)
-		assertCopyFromStdinRPCError(t, err, codes.InvalidArgument, "LOAD_REJECTED",
-			"copy-from-stdin: load rejected",
-			"CHECK constraint", "-23.5", "read_postgres_binary", copySQL,
-			flightclient.CopyFromStdinPathPlaceholder, flightclient.CopyFromStdinSizePlaceholder, tmpDir)
+		if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "failed to execute update") {
+			t.Fatalf("doCopyFromStdin() error = %v, want scanner execution failure", err)
+		}
 		if len(stream.outbound) != 0 {
 			t.Fatalf("worker sent %d results after failed INSERT", len(stream.outbound))
 		}
@@ -1064,9 +855,9 @@ func TestDoCopyFromStdinRejectsBinaryTupleWidthBeforeScannerExecution(t *testing
 	}
 
 	err = handler.doCopyFromStdin(ctx, first, stream)
-	assertCopyFromStdinRPCError(t, err, codes.InvalidArgument, "INVALID_INPUT",
-		"copy-from-stdin: invalid input", "2 fields, expected 1", copySQL,
-		flightclient.CopyFromStdinPathPlaceholder, flightclient.CopyFromStdinSizePlaceholder, tmpDir)
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "2 fields, expected 1") {
+		t.Fatalf("doCopyFromStdin() error = %v, want tuple-width validation error", err)
+	}
 	if len(stream.outbound) != 0 {
 		t.Fatalf("worker sent %d results after validation failure", len(stream.outbound))
 	}
@@ -1096,9 +887,9 @@ func TestDoCopyFromStdinRejectsNativeBinarySQLWithoutSchemaMetadata(t *testing.T
 		},
 	}
 	err := handler.doCopyFromStdin(ctx, first, &fakeDoPutStream{ctx: ctx})
-	assertCopyFromStdinRPCError(t, err, codes.InvalidArgument, "INVALID_REQUEST",
-		"copy-from-stdin: invalid request", "schema metadata", "read_postgres_binary",
-		flightclient.CopyFromStdinPathPlaceholder)
+	if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "schema metadata") {
+		t.Fatalf("doCopyFromStdin() error = %v, want missing schema metadata error", err)
+	}
 }
 
 func TestCopyFromStdinDescriptorRequestAllowsLegacyTextCopyTargetContainingNativeReaderName(t *testing.T) {
@@ -1190,9 +981,12 @@ func TestDoCopyFromStdinRejectsMissingPlaceholder(t *testing.T) {
 	stream := &fakeDoPutStream{ctx: ctx}
 
 	err := handler.doCopyFromStdin(ctx, first, stream)
-	assertCopyFromStdinRPCError(t, err, codes.InvalidArgument, "INVALID_REQUEST",
-		"copy-from-stdin: invalid request", "placeholder", "/no-placeholder",
-		flightclient.CopyFromStdinPathPlaceholder)
+	if err == nil {
+		t.Fatal("expected error when placeholder missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "placeholder") {
+		t.Errorf("error should mention placeholder, got: %v", err)
+	}
 }
 
 func TestDoCopyFromStdinRequiresSession(t *testing.T) {
@@ -1262,9 +1056,12 @@ func TestDoCopyFromStdinAbortsOnStreamCancellation(t *testing.T) {
 	}
 
 	err := handler.doCopyFromStdin(ctx, first, stream)
-	assertCopyFromStdinRPCError(t, err, codes.Aborted, "CANCELED",
-		"copy-from-stdin: canceled", "client cancelled", copySQL,
-		flightclient.CopyFromStdinPathPlaceholder)
+	if err == nil {
+		t.Fatal("expected error from cancelled stream, got nil")
+	}
+	if status.Code(err) != codes.Aborted {
+		t.Errorf("expected codes.Aborted, got %v: %v", status.Code(err), err)
+	}
 
 	// The smoking gun: even though one row's worth of CSV was buffered to
 	// the worker tempfile, the COPY must NOT have run.

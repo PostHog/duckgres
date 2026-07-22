@@ -1,58 +1,53 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"log/slog"
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/posthog/duckgres/internal/analytics"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-// clientWorkerTelemetryEvent captures the product events emitted while a
-// handler runs. It keeps these lifecycle tests independent from the older
-// worker-helper analytics tests.
-type clientWorkerTelemetryEvent struct {
+type clientQueryTelemetryEvent struct {
 	event string
 	orgID string
 	props map[string]any
 }
 
-type clientWorkerTelemetryTracker struct {
-	events []clientWorkerTelemetryEvent
+type clientQueryTelemetryTracker struct {
+	events []clientQueryTelemetryEvent
 }
 
-func (t *clientWorkerTelemetryTracker) Capture(event, orgID string, props map[string]any) {
+func (t *clientQueryTelemetryTracker) Capture(event, orgID string, props map[string]any) {
 	copyProps := make(map[string]any, len(props))
 	for key, value := range props {
 		copyProps[key] = value
 	}
-	t.events = append(t.events, clientWorkerTelemetryEvent{
+	t.events = append(t.events, clientQueryTelemetryEvent{
 		event: event,
 		orgID: orgID,
 		props: copyProps,
 	})
 }
 
-func (*clientWorkerTelemetryTracker) Close() {}
+func (*clientQueryTelemetryTracker) Close() {}
 
-func installClientWorkerTelemetryTracker(t *testing.T) *clientWorkerTelemetryTracker {
+func installClientQueryTelemetryTracker(t *testing.T) *clientQueryTelemetryTracker {
 	t.Helper()
 
-	tracker := &clientWorkerTelemetryTracker{}
+	tracker := &clientQueryTelemetryTracker{}
 	previous := analytics.Default()
 	analytics.SetDefault(tracker)
 	t.Cleanup(func() { analytics.SetDefault(previous) })
 	return tracker
 }
 
+// captureClientWorkerTelemetryLogs is also used by conn_results_test.go.
 func captureClientWorkerTelemetryLogs(t *testing.T) *bytes.Buffer {
 	t.Helper()
 
@@ -63,7 +58,7 @@ func captureClientWorkerTelemetryLogs(t *testing.T) *bytes.Buffer {
 	return &logs
 }
 
-func installClientWorkerTelemetryTracing(t *testing.T) {
+func installClientQueryTelemetryTracing(t *testing.T) {
 	t.Helper()
 
 	previous := otel.GetTracerProvider()
@@ -75,7 +70,7 @@ func installClientWorkerTelemetryTracing(t *testing.T) {
 	})
 }
 
-func clientWorkerTelemetryLogLines(output, message string) []string {
+func telemetryLogLines(output, message string) []string {
 	needle := `msg="` + message + `"`
 	var lines []string
 	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
@@ -86,9 +81,9 @@ func clientWorkerTelemetryLogLines(output, message string) []string {
 	return lines
 }
 
-func clientWorkerTelemetryLogLinesWithAttr(output, message, attr string) []string {
+func telemetryLogLinesWithAttr(output, message, attr string) []string {
 	var lines []string
-	for _, line := range clientWorkerTelemetryLogLines(output, message) {
+	for _, line := range telemetryLogLines(output, message) {
 		if strings.Contains(line, attr) {
 			lines = append(lines, line)
 		}
@@ -96,17 +91,17 @@ func clientWorkerTelemetryLogLinesWithAttr(output, message, attr string) []strin
 	return lines
 }
 
-func requireClientWorkerTelemetryLogCount(t *testing.T, output, message string, want int) []string {
+func requireTelemetryLogCount(t *testing.T, output, message string, want int) []string {
 	t.Helper()
 
-	lines := clientWorkerTelemetryLogLines(output, message)
+	lines := telemetryLogLines(output, message)
 	if got := len(lines); got != want {
 		t.Errorf("%q log count = %d, want %d; logs:\n%s", message, got, want, output)
 	}
 	return lines
 }
 
-func assertClientWorkerTelemetryAttrs(t *testing.T, lines []string, attrs ...string) {
+func assertTelemetryAttrs(t *testing.T, lines []string, attrs ...string) {
 	t.Helper()
 
 	for _, line := range lines {
@@ -118,8 +113,17 @@ func assertClientWorkerTelemetryAttrs(t *testing.T, lines []string, attrs ...str
 	}
 }
 
-func clientWorkerTelemetryEvents(tracker *clientWorkerTelemetryTracker, event string) []clientWorkerTelemetryEvent {
-	var events []clientWorkerTelemetryEvent
+func requireSingleClientReceived(t *testing.T, output string) []string {
+	t.Helper()
+
+	received := requireTelemetryLogCount(t, output, "Client query received.", 1)
+	requireTelemetryLogCount(t, output, "Client query started.", 0)
+	requireTelemetryLogCount(t, output, "Client query finished.", 0)
+	return received
+}
+
+func telemetryEvents(tracker *clientQueryTelemetryTracker, event string) []clientQueryTelemetryEvent {
+	var events []clientQueryTelemetryEvent
 	for _, captured := range tracker.events {
 		if captured.event == event {
 			events = append(events, captured)
@@ -128,22 +132,22 @@ func clientWorkerTelemetryEvents(tracker *clientWorkerTelemetryTracker, event st
 	return events
 }
 
-func requireClientWorkerTelemetryEventCount(t *testing.T, tracker *clientWorkerTelemetryTracker, event string, want int) []clientWorkerTelemetryEvent {
+func requireTelemetryEventCount(t *testing.T, tracker *clientQueryTelemetryTracker, event string, want int) []clientQueryTelemetryEvent {
 	t.Helper()
 
-	events := clientWorkerTelemetryEvents(tracker, event)
+	events := telemetryEvents(tracker, event)
 	if got := len(events); got != want {
 		t.Errorf("%q analytics event count = %d, want %d", event, got, want)
 	}
 	return events
 }
 
-var clientWorkerTelemetryTraceID = regexp.MustCompile(`(?:^|\s)trace_id=("[^"]*"|\S+)`)
+var telemetryTraceID = regexp.MustCompile(`(?:^|\s)trace_id=("[^"]*"|\S+)`)
 
-func clientWorkerTelemetryTraceIDFromLog(t *testing.T, line string) string {
+func traceIDFromTelemetryLog(t *testing.T, line string) string {
 	t.Helper()
 
-	match := clientWorkerTelemetryTraceID.FindStringSubmatch(line)
+	match := telemetryTraceID.FindStringSubmatch(line)
 	if len(match) != 2 {
 		t.Errorf("log line has no trace_id:\n%s", line)
 		return ""
@@ -155,9 +159,9 @@ func clientWorkerTelemetryTraceIDFromLog(t *testing.T, line string) string {
 	return traceID
 }
 
-func TestClientWorkerTelemetrySimpleQuery(t *testing.T) {
+func TestClientQueryReceivedSimpleSeparatesWorkerLifecycle(t *testing.T) {
 	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
+	tracker := installClientQueryTelemetryTracker(t)
 	c, cleanup := newLifecycleClientConn(t)
 	defer cleanup()
 
@@ -171,113 +175,34 @@ func TestClientWorkerTelemetrySimpleQuery(t *testing.T) {
 	}
 
 	output := logs.String()
-	clientStarts := requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	workerStarts := requireClientWorkerTelemetryLogCount(t, output, "Worker statement started.", 1)
-	workerFinishes := requireClientWorkerTelemetryLogCount(t, output, "Worker statement finished.", 1)
+	received := requireSingleClientReceived(t, output)
+	workerStarts := requireTelemetryLogCount(t, output, "Worker statement started.", 1)
+	workerFinishes := requireTelemetryLogCount(t, output, "Worker statement finished.", 1)
+	assertTelemetryAttrs(t, received, "scope=client", "protocol=simple", `query="`+query+`"`)
+	assertTelemetryAttrs(t, workerStarts, "scope=worker", "origin=client")
+	assertTelemetryAttrs(t, workerFinishes, "scope=worker", "origin=client")
 
-	assertClientWorkerTelemetryAttrs(t, clientStarts, "scope=client", "protocol=simple", `query="`+query+`"`)
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "scope=client", "protocol=simple", "outcome=success")
-	assertClientWorkerTelemetryAttrs(t, workerStarts, "scope=worker", "origin=client")
-	assertClientWorkerTelemetryAttrs(t, workerFinishes, "scope=worker", "origin=client")
-
-	initiated := requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
+	initiated := requireTelemetryEventCount(t, tracker, "query_initiated", 1)
 	if len(initiated) == 1 && initiated[0].orgID != c.orgID {
 		t.Errorf("query_initiated org = %q, want %q", initiated[0].orgID, c.orgID)
 	}
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
 }
 
-func TestDeniedSimpleQueryOwnsOneRedactedClientLifecycleWithoutWorkerOrDurableDispatch(t *testing.T) {
+func TestClientQueryReceivedExtendedUsesQueryTrace(t *testing.T) {
+	installClientQueryTelemetryTracing(t)
 	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-
-	c.username = "project-reader"
-	c.orgID = "denied-simple-query-lifecycle"
-	c.queryAccessPolicy = &QueryAccessPolicy{
-		ReadOnly:       true,
-		AllowedSchemas: []string{"allowed_project"},
-	}
-	executor := &lifecycleExecutor{execResult: emptyExecResult{}}
-	c.executor = executor
-	sink := &copyFallbackTelemetryQueryLogSink{}
-	c.server.queryLogSink = sink
-
-	errorBefore := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeError))
-	successBefore := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeSuccess))
-	canceledBefore := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeCanceled))
-	const query = "CREATE SECRET denied_secret (TYPE S3, KEY_ID 'denied-key-marker', SECRET 'denied-secret-marker')"
-
-	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
-		t.Fatalf("handleQuery: %v", err)
-	}
-
-	output := logs.String()
-	clientStarts := requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	assertClientWorkerTelemetryAttrs(t, clientStarts, "scope=client", "protocol=simple", "(…redacted)")
-	assertClientWorkerTelemetryAttrs(t, clientFinishes,
-		"scope=client", "protocol=simple", "outcome=error", "sqlstate=42501", "error_category=user")
-	for _, credential := range []string{"denied-key-marker", "denied-secret-marker"} {
-		if strings.Contains(output, credential) {
-			t.Errorf("denied query lifecycle leaked credential marker %q:\n%s", credential, output)
-		}
-	}
-	requireClientWorkerTelemetryLogCount(t, output, "Worker statement started.", 0)
-	requireClientWorkerTelemetryLogCount(t, output, "Worker statement finished.", 0)
-
-	initiated := requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	failed := requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 1)
-	if len(initiated) == 1 && initiated[0].orgID != c.orgID {
-		t.Errorf("query_initiated org = %q, want %q", initiated[0].orgID, c.orgID)
-	}
-	if len(failed) == 1 {
-		if got := failed[0].props["error_code"]; got != "42501" {
-			t.Errorf("query_failed error_code = %#v, want 42501", got)
-		}
-		if got := failed[0].props["error_category"]; got != "user" {
-			t.Errorf("query_failed error_category = %#v, want user", got)
-		}
-	}
-	if c.lastErrorCode != "42501" {
-		t.Errorf("last error SQLSTATE = %q, want 42501", c.lastErrorCode)
-	}
-	if got := executor.queryCalls.Load(); got != 0 {
-		t.Errorf("worker query calls = %d, want 0", got)
-	}
-	if got := executor.execCalls.Load(); got != 0 {
-		t.Errorf("worker exec calls = %d, want 0", got)
-	}
-	if got := len(sink.entries); got != 0 {
-		t.Errorf("durable query-log entries = %d, want 0", got)
-	}
-	if got := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeError)); got != errorBefore+1 {
-		t.Errorf("error query total = %v, want %v", got, errorBefore+1)
-	}
-	if got := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeSuccess)); got != successBefore {
-		t.Errorf("success query total = %v, want %v", got, successBefore)
-	}
-	if got := serverCounterVecValue(t, queryTotalCounter, c.orgID, string(queryOutcomeCanceled)); got != canceledBefore {
-		t.Errorf("canceled query total = %v, want %v", got, canceledBefore)
-	}
-}
-
-func TestClientWorkerTelemetryExtendedExecuteUsesQueryTrace(t *testing.T) {
-	installClientWorkerTelemetryTracing(t)
-	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
+	tracker := installClientQueryTelemetryTracker(t)
 	c, cleanup := newLifecycleClientConn(t)
 	defer cleanup()
 
 	c.username = "telemetry-user"
 	c.orgID = "telemetry-org"
 	c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
-	const query = "UPDATE trace_target SET value = 1"
+	const query = "UPDATE client_trace_target SET value = 1"
+	const convertedQuery = "UPDATE worker_trace_target SET value = 1"
 	c.portals["telemetry-portal"] = &portal{stmt: &preparedStmt{
 		query:          query,
-		convertedQuery: query,
+		convertedQuery: convertedQuery,
 	}}
 	body := append([]byte("telemetry-portal"), 0)
 	body = append(body, 0, 0, 0, 0)
@@ -285,34 +210,116 @@ func TestClientWorkerTelemetryExtendedExecuteUsesQueryTrace(t *testing.T) {
 	c.handleExecute(body)
 
 	output := logs.String()
-	clientStarts := requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	requireClientWorkerTelemetryLogCount(t, output, "Worker statement started.", 1)
-	requireClientWorkerTelemetryLogCount(t, output, "Worker statement finished.", 1)
-	assertClientWorkerTelemetryAttrs(t, clientStarts, "scope=client", "protocol=extended")
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "scope=client", "protocol=extended", "outcome=success")
+	received := requireSingleClientReceived(t, output)
+	workerStarts := requireTelemetryLogCount(t, output, "Worker statement started.", 1)
+	workerFinishes := requireTelemetryLogCount(t, output, "Worker statement finished.", 1)
+	assertTelemetryAttrs(t, received, "scope=client", "protocol=extended", `query="`+query+`"`)
+	assertTelemetryAttrs(t, workerStarts, "scope=worker", "origin=transpiled", `query="`+convertedQuery+`"`)
+	assertTelemetryAttrs(t, workerFinishes, "scope=worker", "origin=transpiled", `query="`+convertedQuery+`"`)
+	if len(received) == 1 && strings.Contains(received[0], convertedQuery) {
+		t.Errorf("client event contains worker SQL:\n%s", received[0])
+	}
+	for _, line := range append(workerStarts, workerFinishes...) {
+		if strings.Contains(line, query) {
+			t.Errorf("worker event contains original client SQL:\n%s", line)
+		}
+	}
+	initiated := requireTelemetryEventCount(t, tracker, "query_initiated", 1)
 
-	initiated := requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	if len(clientStarts) != 1 || len(clientFinishes) != 1 || len(initiated) != 1 {
+	if len(received) != 1 || len(workerStarts) != 1 || len(workerFinishes) != 1 || len(initiated) != 1 {
 		return
 	}
-
-	startTraceID := clientWorkerTelemetryTraceIDFromLog(t, clientStarts[0])
-	finishTraceID := clientWorkerTelemetryTraceIDFromLog(t, clientFinishes[0])
+	receivedTraceID := traceIDFromTelemetryLog(t, received[0])
+	workerStartTraceID := traceIDFromTelemetryLog(t, workerStarts[0])
+	workerFinishTraceID := traceIDFromTelemetryLog(t, workerFinishes[0])
 	analyticsTraceID, ok := initiated[0].props["trace_id"].(string)
 	if !ok || analyticsTraceID == "" {
 		t.Errorf("query_initiated trace_id = %#v, want non-empty string", initiated[0].props["trace_id"])
 		return
 	}
-	if startTraceID != finishTraceID || startTraceID != analyticsTraceID {
-		t.Errorf("extended lifecycle trace IDs = start %q, finish %q, analytics %q; want one matching non-empty query trace",
-			startTraceID, finishTraceID, analyticsTraceID)
+	if receivedTraceID != workerStartTraceID || receivedTraceID != workerFinishTraceID || receivedTraceID != analyticsTraceID {
+		t.Errorf("trace IDs = received %q, worker start %q, worker finish %q, analytics %q; want one query trace",
+			receivedTraceID, workerStartTraceID, workerFinishTraceID, analyticsTraceID)
 	}
 }
 
-func TestClientWorkerTelemetryServerHandledSimpleQuery(t *testing.T) {
+func TestNestedBeginDoesNotLogWorkerStatement(t *testing.T) {
+	t.Run("extended", func(t *testing.T) {
+		logs := captureClientWorkerTelemetryLogs(t)
+		tracker := installClientQueryTelemetryTracker(t)
+		c, cleanup := newLifecycleClientConn(t)
+		defer cleanup()
+
+		c.txStatus = txStatusTransaction
+		c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+		c.portals["nested-begin"] = &portal{stmt: &preparedStmt{query: "BEGIN", convertedQuery: "BEGIN"}}
+		body := append([]byte("nested-begin"), 0)
+		body = append(body, 0, 0, 0, 0)
+
+		c.handleExecute(body)
+
+		requireSingleClientReceived(t, logs.String())
+		requireTelemetryLogCount(t, logs.String(), "Worker statement started.", 0)
+		requireTelemetryLogCount(t, logs.String(), "Worker statement finished.", 0)
+		requireTelemetryEventCount(t, tracker, "query_initiated", 1)
+	})
+
+	t.Run("simple batch statement", func(t *testing.T) {
+		logs := captureClientWorkerTelemetryLogs(t)
+		c, cleanup := newLifecycleClientConn(t)
+		defer cleanup()
+
+		c.txStatus = txStatusTransaction
+		c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+		errSent, fatalErr := c.executeSingleStatement("BEGIN")
+		if errSent || fatalErr != nil {
+			t.Fatalf("executeSingleStatement(BEGIN) = (%v, %v), want (false, nil)", errSent, fatalErr)
+		}
+		requireTelemetryLogCount(t, logs.String(), "Worker statement started.", 0)
+		requireTelemetryLogCount(t, logs.String(), "Worker statement finished.", 0)
+	})
+}
+
+func TestCompatibilityFallbackLogsGeneratedWorkerStatement(t *testing.T) {
 	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
+	tracker := installClientQueryTelemetryTracker(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	const originalQuery = "ALTER TABLE some_view RENAME TO renamed_view"
+	const fallbackQuery = "ALTER VIEW some_view RENAME TO renamed_view"
+	c.executor = &abortedExecAlterViewRecoveryExecutor{
+		originalQuery: originalQuery,
+		rewritten:     fallbackQuery,
+	}
+
+	if err := c.handleQuery([]byte(originalQuery + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	var fallbackLines []string
+	for _, message := range []string{"Worker statement started.", "Worker statement finished."} {
+		for _, line := range telemetryLogLines(logs.String(), message) {
+			if strings.Contains(line, "operation=compatibility_fallback") {
+				fallbackLines = append(fallbackLines, line)
+			}
+		}
+	}
+	if len(fallbackLines) != 2 {
+		t.Fatalf("compatibility fallback log lines = %d, want start and finish; logs:\n%s", len(fallbackLines), logs.String())
+	}
+	assertTelemetryAttrs(t, fallbackLines, "scope=worker", "origin=rewrite", "operation=compatibility_fallback")
+	for _, line := range fallbackLines {
+		if strings.Contains(line, fallbackQuery) || strings.Contains(line, " query=") {
+			t.Errorf("generated fallback event exposed SQL:\n%s", line)
+		}
+	}
+	requireTelemetryEventCount(t, tracker, "query_initiated", 1)
+}
+
+func TestClientQueryReceivedServerHandledHasNoWorker(t *testing.T) {
+	logs := captureClientWorkerTelemetryLogs(t)
+	tracker := installClientQueryTelemetryTracker(t)
 	c, cleanup := newLifecycleClientConn(t)
 	defer cleanup()
 
@@ -325,590 +332,77 @@ func TestClientWorkerTelemetryServerHandledSimpleQuery(t *testing.T) {
 	}
 
 	output := logs.String()
-	clientStarts := requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	requireClientWorkerTelemetryLogCount(t, output, "Worker statement started.", 0)
-	requireClientWorkerTelemetryLogCount(t, output, "Worker statement finished.", 0)
-	assertClientWorkerTelemetryAttrs(t, clientStarts, "scope=client", "protocol=simple", `query="`+query+`"`)
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "scope=client", "protocol=simple", "outcome=success")
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
+	received := requireSingleClientReceived(t, output)
+	assertTelemetryAttrs(t, received, "scope=client", "protocol=simple", `query="`+query+`"`)
+	requireTelemetryLogCount(t, output, "Worker statement started.", 0)
+	requireTelemetryLogCount(t, output, "Worker statement finished.", 0)
+	requireTelemetryEventCount(t, tracker, "query_initiated", 1)
 }
 
-func TestClientWorkerTelemetrySimpleBatch(t *testing.T) {
+func TestRejectedQueryIsNotNewlyLogged(t *testing.T) {
 	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
+	tracker := installClientQueryTelemetryTracker(t)
 	c, cleanup := newLifecycleClientConn(t)
 	defer cleanup()
 
-	c.username = "telemetry-user"
-	c.orgID = "telemetry-org"
-	c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
-	const query = "UPDATE batch_target SET value = 1; UPDATE batch_target SET value = 2"
+	c.queryAccessPolicy = &QueryAccessPolicy{ReadOnly: true}
+	const query = "CREATE SECRET rejected_secret (TYPE S3, KEY_ID 'private-key-marker', SECRET 'private-secret-marker')"
 
 	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
 		t.Fatalf("handleQuery: %v", err)
 	}
 
 	output := logs.String()
-	clientStarts := requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	workerStarts := requireClientWorkerTelemetryLogCount(t, output, "Worker statement started.", 2)
-	workerFinishes := requireClientWorkerTelemetryLogCount(t, output, "Worker statement finished.", 2)
-	assertClientWorkerTelemetryAttrs(t, clientStarts, "scope=client", "protocol=simple", `query="`+query+`"`)
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "scope=client", "outcome=success")
-	assertClientWorkerTelemetryAttrs(t, workerStarts, "scope=worker", "origin=client", "operation=simple_batch_statement")
-	assertClientWorkerTelemetryAttrs(t, workerFinishes, "scope=worker", "origin=client", "operation=simple_batch_statement")
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
-}
-
-func TestClientWorkerTelemetryFailureHasOneTerminalAnalyticsEvent(t *testing.T) {
-	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-
-	c.username = "telemetry-user"
-	c.orgID = "telemetry-org"
-	c.executor = &lifecycleExecutor{execErr: errors.New("Catalog Error: Table with name missing does not exist")}
-
-	if err := c.handleQuery([]byte("UPDATE missing SET value = 1\x00")); err != nil {
-		t.Fatalf("handleQuery: %v", err)
-	}
-
-	output := logs.String()
-	requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "scope=client", "outcome=error")
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	failed := requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 1)
-	if len(failed) == 1 && failed[0].props["error_category"] != "user" {
-		t.Errorf("query_failed error_category = %#v, want user", failed[0].props["error_category"])
-	}
-}
-
-func TestClientWorkerTelemetryCancellationHasOneCanceledFinish(t *testing.T) {
-	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-
-	c.username = "telemetry-user"
-	c.orgID = "telemetry-org"
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.cancel()
-	c.executor = &lifecycleExecutor{execErr: context.Canceled}
-
-	if err := c.handleQuery([]byte("UPDATE cancelled_target SET value = 1\x00")); err != nil {
-		t.Fatalf("handleQuery: %v", err)
-	}
-
-	output := logs.String()
-	requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "scope=client", "outcome=canceled", "sqlstate=57014")
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
-}
-
-// cancellationMetadataRowSet simulates a worker whose result metadata fails
-// only after Query has successfully opened a cursor.
-type cancellationMetadataRowSet struct{}
-
-func (*cancellationMetadataRowSet) Columns() ([]string, error)          { return nil, context.Canceled }
-func (*cancellationMetadataRowSet) ColumnTypes() ([]ColumnTyper, error) { return nil, nil }
-func (*cancellationMetadataRowSet) Next() bool                          { return false }
-func (*cancellationMetadataRowSet) Scan(...any) error                   { return nil }
-func (*cancellationMetadataRowSet) Close() error                        { return nil }
-func (*cancellationMetadataRowSet) Err() error                          { return nil }
-
-func TestClientWorkerTelemetryCancellationDuringResultMetadata(t *testing.T) {
-	for _, protocol := range []string{"simple", "extended"} {
-		t.Run(protocol, func(t *testing.T) {
-			logs := captureClientWorkerTelemetryLogs(t)
-			tracker := installClientWorkerTelemetryTracker(t)
-			c, cleanup := newLifecycleClientConn(t)
-			defer cleanup()
-
-			c.username = "telemetry-user"
-			c.orgID = "telemetry-org"
-			c.ctx, c.cancel = context.WithCancel(context.Background())
-			c.cancel()
-			c.executor = &lifecycleExecutor{queryRows: &cancellationMetadataRowSet{}}
-
-			const query = "SELECT * FROM cancellation_target"
-			if protocol == "simple" {
-				if err := c.handleQuery([]byte(query + "\x00")); err != nil {
-					t.Fatalf("handleQuery: %v", err)
-				}
-			} else {
-				c.portals["telemetry-portal"] = &portal{stmt: &preparedStmt{
-					query:          query,
-					convertedQuery: query,
-				}}
-				body := append([]byte("telemetry-portal"), 0)
-				body = append(body, 0, 0, 0, 0)
-				c.handleExecute(body)
-			}
-
-			output := logs.String()
-			clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-			assertClientWorkerTelemetryAttrs(t, clientFinishes, "outcome=canceled", "sqlstate=57014")
-			requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-			requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
-		})
-	}
-}
-
-type compatibilityFallbackTelemetryExecutor struct {
-	noopProfiling
-	fallbackErr error
-}
-
-func (e *compatibilityFallbackTelemetryExecutor) execute(query string) (ExecResult, error) {
-	switch {
-	case strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "ALTER TABLE"):
-		return nil, errors.New("Binder Error: cannot use ALTER TABLE on a view because it is not a table")
-	case strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "ALTER VIEW"):
-		if e.fallbackErr != nil {
-			return nil, e.fallbackErr
-		}
-		return emptyExecResult{}, nil
-	default:
-		return nil, errors.New("unexpected compatibility fallback query: " + query)
-	}
-}
-
-func (e *compatibilityFallbackTelemetryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
-	return nil, errors.New("not implemented")
-}
-func (e *compatibilityFallbackTelemetryExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
-	return e.execute(query)
-}
-func (e *compatibilityFallbackTelemetryExecutor) Query(string, ...any) (RowSet, error) {
-	return nil, errors.New("not implemented")
-}
-func (e *compatibilityFallbackTelemetryExecutor) Exec(query string, _ ...any) (ExecResult, error) {
-	return e.execute(query)
-}
-func (*compatibilityFallbackTelemetryExecutor) ConnContext(context.Context) (RawConn, error) {
-	return nil, errors.New("not implemented")
-}
-func (*compatibilityFallbackTelemetryExecutor) PingContext(context.Context) error { return nil }
-func (*compatibilityFallbackTelemetryExecutor) Close() error                      { return nil }
-
-func TestClientWorkerTelemetrySeparatesCompatibilityFallbackWorkerStatement(t *testing.T) {
-	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-
-	c.username = "telemetry-user"
-	c.orgID = "telemetry-org"
-	c.executor = &compatibilityFallbackTelemetryExecutor{}
-	const query = "ALTER TABLE some_view RENAME TO renamed_view"
-
-	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
-		t.Fatalf("handleQuery: %v", err)
-	}
-
-	output := logs.String()
-	requireClientWorkerTelemetryLogCount(t, output, "Client query started.", 1)
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "outcome=success")
-
-	clientWorkerStarts := clientWorkerTelemetryLogLinesWithAttr(output, "Worker statement started.", "origin=client")
-	clientWorkerFinishes := clientWorkerTelemetryLogLinesWithAttr(output, "Worker statement finished.", "origin=client")
-	if got := len(clientWorkerStarts); got != 1 {
-		t.Fatalf("client-derived worker starts = %d, want 1; logs:\n%s", got, output)
-	}
-	if got := len(clientWorkerFinishes); got != 1 {
-		t.Fatalf("client-derived worker finishes = %d, want 1; logs:\n%s", got, output)
-	}
-	assertClientWorkerTelemetryAttrs(t, clientWorkerFinishes, "query=", "error_code=", "error=")
-
-	fallbackStarts := clientWorkerTelemetryLogLinesWithAttr(output, "Worker statement started.", "origin=rewrite")
-	fallbackFinishes := clientWorkerTelemetryLogLinesWithAttr(output, "Worker statement finished.", "origin=rewrite")
-	if got := len(fallbackStarts); got != 1 {
-		t.Fatalf("fallback worker starts = %d, want 1; logs:\n%s", got, output)
-	}
-	if got := len(fallbackFinishes); got != 1 {
-		t.Fatalf("fallback worker finishes = %d, want 1; logs:\n%s", got, output)
-	}
-	assertClientWorkerTelemetryAttrs(t, fallbackStarts, "operation=compatibility_fallback")
-	assertClientWorkerTelemetryAttrs(t, fallbackFinishes, "operation=compatibility_fallback")
-	for _, line := range append(fallbackStarts, fallbackFinishes...) {
-		if strings.Contains(line, "query=") || strings.Contains(line, "ALTER VIEW") {
-			t.Errorf("generated fallback worker event leaked rewritten SQL:\n%s", line)
+	requireTelemetryLogCount(t, output, "Client query received.", 0)
+	requireTelemetryLogCount(t, output, "Worker statement started.", 0)
+	requireTelemetryLogCount(t, output, "Worker statement finished.", 0)
+	requireTelemetryEventCount(t, tracker, "query_initiated", 0)
+	for _, marker := range []string{"private-key-marker", "private-secret-marker"} {
+		if strings.Contains(output, marker) {
+			t.Errorf("rejected query leaked %q:\n%s", marker, output)
 		}
 	}
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
 }
 
-func TestClientWorkerTelemetryKeepsFallbackFailureDetailsOutOfLogicalTelemetry(t *testing.T) {
-	logs := captureClientWorkerTelemetryLogs(t)
-	tracker := installClientWorkerTelemetryTracker(t)
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-
-	const generatedMarker = "generated-compatibility-rewrite-marker"
-	const query = "ALTER TABLE some_view RENAME TO renamed_view"
-	sink := &copyFallbackTelemetryQueryLogSink{}
-	c.server.queryLogSink = sink
-	c.executor = &compatibilityFallbackTelemetryExecutor{
-		fallbackErr: errors.New("Binder Error: " + generatedMarker + " in ALTER VIEW generated_internal_view"),
-	}
-
-	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
-		t.Fatalf("handleQuery: %v", err)
-	}
-
-	output := logs.String()
-	clientFinishes := requireClientWorkerTelemetryLogCount(t, output, "Client query finished.", 1)
-	assertClientWorkerTelemetryAttrs(t, clientFinishes, "outcome=error")
-	if strings.Contains(output, generatedMarker) {
-		t.Errorf("logical telemetry leaked generated fallback details:\n%s", output)
-	}
-	if got := len(sink.entries); got != 1 {
-		t.Fatalf("durable query-log entries = %d, want 1", got)
-	} else if strings.Contains(sink.entries[0].Exception, generatedMarker) {
-		t.Errorf("durable query log leaked generated fallback details: %#v", sink.entries[0])
-	}
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-	requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 1)
-}
-
-func TestDirectRewriteKeepsGeneratedSQLAndErrorsOutOfLogicalTelemetry(t *testing.T) {
-	const query = "USE ducklake"
-	const generatedMarker = "direct-rewrite-sensitive-marker"
-
-	tests := []struct {
-		name     string
-		protocol string
-		run      func(*testing.T, *clientConn, bool)
-	}{
-		{
-			name:     "simple",
-			protocol: "simple",
-			run: func(t *testing.T, c *clientConn, _ bool) {
-				t.Helper()
-				if err := c.handleQuery([]byte(query + "\x00")); err != nil {
-					t.Fatalf("handleQuery: %v", err)
-				}
-			},
-		},
-		{
-			name:     "extended",
-			protocol: "extended",
-			run: func(t *testing.T, c *clientConn, _ bool) {
-				t.Helper()
-				c.portals["direct-rewrite-portal"] = &portal{stmt: &preparedStmt{
-					query:          query,
-					convertedQuery: "USE ducklake.main",
-					workerOrigin:   workerOriginRewrite,
-				}}
-				body := append([]byte("direct-rewrite-portal"), 0)
-				body = append(body, 0, 0, 0, 0)
-				c.handleExecute(body)
-			},
-		},
-		{
-			name:     "simple_batch_statement",
-			protocol: "simple-batch",
-			run: func(t *testing.T, c *clientConn, wantFailure bool) {
-				t.Helper()
-				errSent, err := c.executeSingleStatement(query)
-				if err != nil {
-					t.Fatalf("executeSingleStatement: %v", err)
-				}
-				if errSent != wantFailure {
-					t.Fatalf("executeSingleStatement errSent = %t, want %t", errSent, wantFailure)
-				}
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, outcome := range []struct {
-				name        string
-				wantFailure bool
-			}{
-				{name: "success"},
-				{name: "failure", wantFailure: true},
-			} {
-				t.Run(outcome.name, func(t *testing.T) {
-					logs := captureClientWorkerTelemetryLogs(t)
-					c, cleanup := newLifecycleClientConn(t)
-					defer cleanup()
-
-					c.catalogUseRewrite = true
-					sink := &copyFallbackTelemetryQueryLogSink{}
-					c.server.queryLogSink = sink
-					if outcome.wantFailure {
-						c.executor = &lifecycleExecutor{execErr: errors.New("Binder Error: " + generatedMarker + " in USE ducklake.main")}
-					} else {
-						c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
-					}
-
-					tc.run(t, c, outcome.wantFailure)
-
-					if strings.Contains(logs.String(), "USE ducklake.main") {
-						t.Errorf("logical telemetry leaked generated direct-rewrite SQL:\n%s", logs.String())
-					}
-					if got := len(sink.entries); got != 1 {
-						t.Fatalf("durable query-log entries = %d, want 1", got)
-					}
-					entry := sink.entries[0]
-					if entry.Query != query || entry.Protocol != tc.protocol {
-						t.Errorf("durable entry = %#v, want original %s query", entry, tc.protocol)
-					}
-					if entry.TranspiledQuery != nil || entry.IsTranspiled {
-						t.Errorf("durable entry persisted generated direct-rewrite SQL: %#v", entry)
-					}
-					if outcome.wantFailure {
-						if entry.ExceptionCode == "" {
-							t.Errorf("durable failure entry = %#v, want SQLSTATE", entry)
-						}
-						if strings.Contains(entry.Exception, generatedMarker) {
-							t.Errorf("durable query log leaked generated direct-rewrite details: %#v", entry)
-						}
-						if strings.Contains(logs.String(), generatedMarker) {
-							t.Errorf("logical telemetry leaked generated direct-rewrite details:\n%s", logs.String())
-						}
-					}
-				})
-			}
-		})
-	}
-}
-
-func TestMultiStatementRewriteKeepsOneLogicalDurableRecord(t *testing.T) {
-	const query = "ALTER TABLE telemetry_target ADD COLUMN x INT, ADD COLUMN y TEXT"
-
-	t.Run("simple", func(t *testing.T) {
-		c, cleanup := newLifecycleClientConn(t)
-		defer cleanup()
-		executor := &lifecycleExecutor{execResult: emptyExecResult{}}
-		c.executor = executor
-		c.server.cfg.AlwaysDuckLake = true
-		sink := &copyFallbackTelemetryQueryLogSink{}
-		c.server.queryLogSink = sink
-
-		if err := c.handleQuery([]byte(query + "\x00")); err != nil {
-			t.Fatalf("handleQuery: %v", err)
-		}
-		if got := executor.execCalls.Load(); got < 3 {
-			t.Fatalf("rewrite exec calls = %d, want multiple generated statements", got)
-		}
-		if got := len(sink.entries); got != 1 {
-			t.Fatalf("durable query-log entries = %d, want 1", got)
-		}
-		entry := sink.entries[0]
-		if entry.Query != query || entry.Protocol != "simple" {
-			t.Errorf("durable entry = %#v, want original simple query", entry)
-		}
-		if entry.TranspiledQuery != nil || entry.IsTranspiled {
-			t.Errorf("durable entry persisted generated rewrite SQL: %#v", entry)
-		}
-	})
-
-	t.Run("extended", func(t *testing.T) {
-		c, cleanup := newLifecycleClientConn(t)
-		defer cleanup()
-		c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
-		sink := &copyFallbackTelemetryQueryLogSink{}
-		c.server.queryLogSink = sink
-		c.portals["rewrite-portal"] = &portal{stmt: &preparedStmt{
-			query: query,
-			statements: []string{
-				"BEGIN",
-				"ALTER TABLE telemetry_target ADD COLUMN IF NOT EXISTS x INT",
-				"ALTER TABLE telemetry_target ADD COLUMN IF NOT EXISTS y INT",
-			},
-			cleanupStatements: []string{"COMMIT"},
-		}}
-
-		body := append([]byte("rewrite-portal"), 0)
-		body = append(body, 0, 0, 0, 0)
-		c.handleExecute(body)
-
-		if got := len(sink.entries); got != 1 {
-			t.Fatalf("durable query-log entries = %d, want 1", got)
-		}
-		entry := sink.entries[0]
-		if entry.Query != query || entry.Protocol != "extended" {
-			t.Errorf("durable entry = %#v, want original extended query", entry)
-		}
-		if entry.TranspiledQuery != nil || entry.IsTranspiled {
-			t.Errorf("durable entry persisted generated rewrite SQL: %#v", entry)
-		}
-	})
-}
-
-func TestMultiStatementStreamingCancellationKeepsWorkerSQLState(t *testing.T) {
-	for _, protocol := range []string{"simple", "extended"} {
-		t.Run(protocol, func(t *testing.T) {
-			logs := captureClientWorkerTelemetryLogs(t)
-			c, cleanup := newLifecycleClientConn(t)
-			defer cleanup()
-
-			c.ctx, c.cancel = context.WithCancel(context.Background())
-			c.cancel()
-			c.executor = &lifecycleExecutor{queryRows: &cancellationMetadataRowSet{}}
-
-			if protocol == "simple" {
-				if err := c.executeMultiStatement(time.Now(), "WITH rewritten AS (SELECT 1) SELECT * FROM rewritten", []string{"SELECT 1"}, nil); err != nil {
-					t.Fatalf("executeMultiStatement: %v", err)
-				}
-			} else {
-				c.executeMultiStatementExtended(time.Now(), "WITH rewritten AS (SELECT 1) SELECT * FROM rewritten", []string{"SELECT 1"}, nil, nil, nil, false)
-			}
-
-			workerFinishes := clientWorkerTelemetryLogLinesWithAttr(logs.String(), "Worker statement finished.", "operation=rewrite_final")
-			if got := len(workerFinishes); got != 1 {
-				t.Fatalf("rewrite-final worker finishes = %d, want 1; logs:\n%s", got, logs.String())
-			}
-			assertClientWorkerTelemetryAttrs(t, workerFinishes, "error_code=57014")
-		})
-	}
-}
-
-type multiStatementContextExecutor struct {
-	noopProfiling
-	execCalls        int
-	execContextCalls int
-}
-
-func (e *multiStatementContextExecutor) QueryContext(ctx context.Context, _ string, _ ...any) (RowSet, error) {
-	return nil, ctx.Err()
-}
-func (e *multiStatementContextExecutor) ExecContext(ctx context.Context, _ string, _ ...any) (ExecResult, error) {
-	e.execContextCalls++
-	return nil, ctx.Err()
-}
-func (*multiStatementContextExecutor) Query(string, ...any) (RowSet, error) {
-	return nil, errors.New("multi-statement rewrite used bare Query")
-}
-func (e *multiStatementContextExecutor) Exec(string, ...any) (ExecResult, error) {
-	e.execCalls++
-	return emptyExecResult{}, nil
-}
-func (*multiStatementContextExecutor) ConnContext(context.Context) (RawConn, error) {
-	return nil, errors.New("not implemented")
-}
-func (*multiStatementContextExecutor) PingContext(context.Context) error { return nil }
-func (*multiStatementContextExecutor) Close() error                      { return nil }
-
-func TestMultiStatementRewriteUsesLogicalQueryContext(t *testing.T) {
-	logs := captureClientWorkerTelemetryLogs(t)
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.cancel()
-	executor := &multiStatementContextExecutor{}
-	c.executor = executor
-
-	if err := c.executeMultiStatement(time.Now(), "ALTER TABLE telemetry_target ADD COLUMN value INT", []string{"ALTER TABLE telemetry_target ADD COLUMN value INT"}, nil); err != nil {
-		t.Fatalf("executeMultiStatement: %v", err)
-	}
-	if executor.execCalls != 0 {
-		t.Fatalf("bare generated Exec calls = %d, want 0", executor.execCalls)
-	}
-	if executor.execContextCalls != 1 {
-		t.Fatalf("context-aware generated Exec calls = %d, want 1", executor.execContextCalls)
-	}
-	workerFinishes := clientWorkerTelemetryLogLinesWithAttr(logs.String(), "Worker statement finished.", "operation=rewrite_final")
-	if got := len(workerFinishes); got != 1 {
-		t.Fatalf("rewrite-final worker finishes = %d, want 1; logs:\n%s", got, logs.String())
-	}
-	assertClientWorkerTelemetryAttrs(t, workerFinishes, "error_code=57014")
-}
-
-type batchCancellationRowSet struct{}
-
-func (*batchCancellationRowSet) Columns() ([]string, error) {
-	return []string{"value"}, nil
-}
-func (*batchCancellationRowSet) ColumnTypes() ([]ColumnTyper, error) {
-	return []ColumnTyper{staticColumnType("INTEGER")}, nil
-}
-func (*batchCancellationRowSet) Next() bool        { return false }
-func (*batchCancellationRowSet) Scan(...any) error { return nil }
-func (*batchCancellationRowSet) Close() error      { return nil }
-func (*batchCancellationRowSet) Err() error        { return context.Canceled }
-
-func TestSimpleQueryBatchKeepsOneLogicalDurableRecord(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		c, cleanup := newLifecycleClientConn(t)
-		defer cleanup()
-		c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
-		sink := &copyFallbackTelemetryQueryLogSink{}
-		c.server.queryLogSink = sink
-
-		const query = "CREATE TABLE batch_one (value INT); CREATE TABLE batch_two (value INT)"
-		if err := c.handleQuery([]byte(query + "\x00")); err != nil {
-			t.Fatalf("handleQuery: %v", err)
-		}
-		if got := len(sink.entries); got != 1 {
-			t.Fatalf("durable query-log entries = %d, want 1", got)
-		}
-		entry := sink.entries[0]
-		if entry.Query != query || entry.Protocol != "simple" || entry.ExceptionCode != "" {
-			t.Errorf("durable batch entry = %#v, want one successful original query", entry)
-		}
-	})
-
-	t.Run("late_cancellation", func(t *testing.T) {
+func TestClientQueryReceivedBoundsAndRedactsText(t *testing.T) {
+	t.Run("bounded", func(t *testing.T) {
 		logs := captureClientWorkerTelemetryLogs(t)
-		tracker := installClientWorkerTelemetryTracker(t)
+		tracker := installClientQueryTelemetryTracker(t)
 		c, cleanup := newLifecycleClientConn(t)
 		defer cleanup()
-		c.ctx, c.cancel = context.WithCancel(context.Background())
-		c.cancel()
-		c.executor = &lifecycleExecutor{queryRows: &batchCancellationRowSet{}}
-		sink := &copyFallbackTelemetryQueryLogSink{}
-		c.server.queryLogSink = sink
 
-		const query = "SELECT 1; SELECT 2"
+		c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
+		const tailMarker = "client-query-tail-marker"
+		query := "UPDATE telemetry_bound SET value = 1 /*" + strings.Repeat("q", maxQueryLength) + tailMarker + "*/"
+
 		if err := c.handleQuery([]byte(query + "\x00")); err != nil {
 			t.Fatalf("handleQuery: %v", err)
 		}
-		if got := len(sink.entries); got != 1 {
-			t.Fatalf("durable query-log entries = %d, want 1", got)
-		} else if entry := sink.entries[0]; entry.ExceptionCode != "57014" {
-			t.Errorf("durable batch SQLSTATE = %q, want 57014", entry.ExceptionCode)
+
+		received := requireSingleClientReceived(t, logs.String())
+		if len(received) == 1 && strings.Contains(received[0], tailMarker) {
+			t.Errorf("client query event retained text beyond the bound:\n%s", received[0])
 		}
-		clientFinishes := requireClientWorkerTelemetryLogCount(t, logs.String(), "Client query finished.", 1)
-		assertClientWorkerTelemetryAttrs(t, clientFinishes, "outcome=canceled", "sqlstate=57014")
-		requireClientWorkerTelemetryEventCount(t, tracker, "query_initiated", 1)
-		requireClientWorkerTelemetryEventCount(t, tracker, "query_failed", 0)
+		requireTelemetryEventCount(t, tracker, "query_initiated", 1)
 	})
-}
 
-type telemetryFailingWriter struct{}
+	t.Run("redacted", func(t *testing.T) {
+		logs := captureClientWorkerTelemetryLogs(t)
+		tracker := installClientQueryTelemetryTracker(t)
+		c, cleanup := newLifecycleClientConn(t)
+		defer cleanup()
 
-func (telemetryFailingWriter) Write([]byte) (int, error) {
-	return 0, errors.New("simulated client write failure")
-}
+		const query = "CREATE SECRET safe_name (TYPE S3, KEY_ID 'private-key-marker', SECRET 'private-secret-marker')"
+		c.logClientQueryReceived(context.Background(), "simple", query)
 
-func TestMultiStatementDurableLogReflectsTransportFailure(t *testing.T) {
-	c, cleanup := newLifecycleClientConn(t)
-	defer cleanup()
-	c.writer = bufio.NewWriter(telemetryFailingWriter{})
-	c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
-	sink := &copyFallbackTelemetryQueryLogSink{}
-	c.server.queryLogSink = sink
-
-	if err := c.executeMultiStatement(time.Now(), "ALTER TABLE telemetry_target ADD COLUMN value INT", []string{"ALTER TABLE telemetry_target ADD COLUMN value INT"}, nil); err == nil {
-		t.Fatal("executeMultiStatement succeeded despite client write failure")
-	}
-	if got := len(sink.entries); got != 1 {
-		t.Fatalf("durable query-log entries = %d, want 1", got)
-	} else if entry := sink.entries[0]; entry.ExceptionCode == "" || entry.Type != "ExceptionWhileProcessing" {
-		t.Errorf("durable entry = %#v, want terminal transport exception", entry)
-	}
+		output := logs.String()
+		received := requireSingleClientReceived(t, output)
+		assertTelemetryAttrs(t, received, "scope=client", "protocol=simple", "(…redacted)")
+		for _, marker := range []string{"private-key-marker", "private-secret-marker"} {
+			if strings.Contains(output, marker) {
+				t.Errorf("client query telemetry leaked %q:\n%s", marker, output)
+			}
+		}
+		requireTelemetryEventCount(t, tracker, "query_initiated", 1)
+	})
 }

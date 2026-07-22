@@ -13,34 +13,25 @@ import (
 	"github.com/posthog/duckgres/server/wire"
 )
 
-// streamRowsResult distinguishes a worker-side terminal error (which was
-// already surfaced through sendError) from a pgwire transport error. Keeping
-// the original worker error lets the caller log the correct SQLSTATE without
-// turning a canceled generated statement into XX000.
-type streamRowsResult struct {
-	workerErr    error
-	transportErr error
-}
-
 // streamRowsToClientExtended sends result rows for the extended query protocol.
 // Unlike streamRowsToClient, this does NOT send ReadyForQuery, and supports
 // binary result formats and the described flag.
-func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, resultFormats []int16, described bool) streamRowsResult {
+func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, resultFormats []int16, described bool, query string) {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("Failed to get column info.", "error_code", classifyErrorCode(err))
-		c.sendGeneratedWorkerError(err)
+		c.logger().Error("Failed to get column info.", "query", query, "error", err)
+		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		return streamRowsResult{workerErr: err}
+		return
 	}
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.logger().Error("Failed to get column types.", "error_code", classifyErrorCode(err))
-		c.sendGeneratedWorkerError(err)
+		c.logger().Error("Failed to get column types.", "query", query, "error", err)
+		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		return streamRowsResult{workerErr: err}
+		return
 	}
 
 	// Get type OIDs for binary encoding
@@ -52,7 +43,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	// Send RowDescription if Describe wasn't called before Execute
 	if !described && len(cols) > 0 {
 		if err := c.sendRowDescriptionWithFormats(cols, colTypes, resultFormats); err != nil {
-			return streamRowsResult{transportErr: err}
+			return
 		}
 	}
 
@@ -66,62 +57,61 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.logger().Error("Failed to scan row.", "error_code", classifyErrorCode(err))
-			c.sendGeneratedWorkerError(err)
+			c.logger().Error("Failed to scan row.", "query", query, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
-			return streamRowsResult{workerErr: err}
+			return
 		}
 
 		if err := c.sendDataRowWithFormats(values, resultFormats, typeOIDs); err != nil {
-			return streamRowsResult{transportErr: err}
+			return
 		}
 		rowCount++
 	}
 
 	if err := rows.Err(); err != nil {
-		if !c.isCallerCancellation(err) {
-			c.logger().Error("Row iteration error.", "error_code", classifyErrorCode(err))
+		if c.isCallerCancellation(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			c.logger().Error("Row iteration error.", "query", query, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
 		}
-		c.sendGeneratedWorkerError(err)
 		c.setTxError()
-		return streamRowsResult{workerErr: err}
+		return
 	}
 
 	// Send completion (no ReadyForQuery - that's done by Sync)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
-	if err := c.writeCommandComplete(tag); err != nil {
-		return streamRowsResult{transportErr: err}
-	}
-	return streamRowsResult{}
+	_ = c.writeCommandComplete(tag)
 }
 
 // streamRowsToClient sends result rows over the wire protocol.
 // The rows cursor must already be obtained before calling this function.
-func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string) streamRowsResult {
+func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query string) error {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		c.logger().Error("Failed to get column info.", "error_code", classifyErrorCode(err))
-		c.sendGeneratedWorkerError(err)
+		c.logger().Error("Failed to get column info.", "query", query, "error", err)
+		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
-		return streamRowsResult{workerErr: err}
+		return nil
 	}
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.logger().Error("Failed to get column types.", "error_code", classifyErrorCode(err))
-		c.sendGeneratedWorkerError(err)
+		c.logger().Error("Failed to get column types.", "query", query, "error", err)
+		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
-		return streamRowsResult{workerErr: err}
+		return nil
 	}
 
 	// Send row description
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
-		return streamRowsResult{transportErr: err}
+		return err
 	}
 
 	// Extract type OIDs for JSON-aware text formatting
@@ -140,43 +130,38 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string) streamRowsR
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.logger().Error("Failed to scan row.", "error_code", classifyErrorCode(err))
-			c.sendGeneratedWorkerError(err)
+			c.logger().Error("Failed to scan row.", "query", query, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
-			return streamRowsResult{workerErr: err}
+			return nil
 		}
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
-			return streamRowsResult{transportErr: err}
+			return err
 		}
 		rowCount++
 	}
 
 	if err := rows.Err(); err != nil {
-		if !c.isCallerCancellation(err) {
-			c.logger().Error("Row iteration error.", "error_code", classifyErrorCode(err))
+		if c.isCallerCancellation(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			c.logger().Error("Row iteration error.", "query", query, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
 		}
-		c.sendGeneratedWorkerError(err)
 		c.setTxError()
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
-		return streamRowsResult{workerErr: err}
+		return nil
 	}
 
 	// Send completion
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
-	if err := c.writeCommandComplete(tag); err != nil {
-		return streamRowsResult{transportErr: err}
-	}
-	if err := c.writeReadyForQuery(c.txStatus); err != nil {
-		return streamRowsResult{transportErr: err}
-	}
-	if err := c.flushWriter(); err != nil {
-		return streamRowsResult{transportErr: err}
-	}
-	return streamRowsResult{}
+	_ = c.writeCommandComplete(tag)
+	_ = c.writeReadyForQuery(c.txStatus)
+	return c.flushWriter()
 }
 
 func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) error {
@@ -598,13 +583,6 @@ func (c *clientConn) flushWriter() error {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
-	c.sendErrorWithTelemetryMessage(severity, code, message, message)
-}
-
-// sendErrorWithTelemetryMessage keeps a client-facing wire error intact while
-// allowing generated worker paths to keep implementation SQL and temporary
-// paths out of lifecycle telemetry. Most callers should use sendError.
-func (c *clientConn) sendErrorWithTelemetryMessage(severity, code, message, telemetryMessage string) {
 	// Class 28 = "Invalid Authorization Specification" (auth failures).
 	// All current FATAL errors use class 28, so this covers both auth
 	// failures and connection rejections (no SSL, no user, wrong password).
@@ -616,7 +594,6 @@ func (c *clientConn) sendErrorWithTelemetryMessage(severity, code, message, tele
 	if severity != "" {
 		c.lastErrorCode = code
 	}
-	c.recordActiveClientQueryErrorResponse(code, telemetryMessage)
 	c.logger().Debug("Sending error to client.", "severity", severity, "code", code)
 	c.errorResponsesSent++
 	_ = wire.WriteErrorResponse(c.writer, severity, code, message)

@@ -13,20 +13,17 @@ import (
 	"github.com/posthog/duckgres/server/wire"
 )
 
-func TestSendErrorWithTelemetryMessageDoesNotLogErrorContents(t *testing.T) {
+func TestSendErrorDoesNotLogErrorContents(t *testing.T) {
 	logs := captureClientWorkerTelemetryLogs(t)
 	var out bytes.Buffer
 	conn := &clientConn{writer: bufio.NewWriter(&out)}
 
-	const clientMessage = "client-visible-error"
-	const telemetryMessage = "sensitive-telemetry-marker"
-	conn.sendErrorWithTelemetryMessage("ERROR", "XX000", clientMessage, telemetryMessage)
+	const clientMessage = "sensitive-client-error-marker"
+	conn.sendError("ERROR", "XX000", clientMessage)
 
 	logOutput := logs.String()
-	for _, unexpected := range []string{clientMessage, telemetryMessage} {
-		if strings.Contains(logOutput, unexpected) {
-			t.Fatalf("sendError logged error contents %q: %s", unexpected, logOutput)
-		}
+	if strings.Contains(logOutput, clientMessage) {
+		t.Fatalf("sendError logged error contents: %s", logOutput)
 	}
 	for _, want := range []string{`msg="Sending error to client."`, "severity=ERROR", "code=XX000"} {
 		if !strings.Contains(logOutput, want) {

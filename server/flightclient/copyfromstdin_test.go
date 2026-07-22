@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -17,7 +16,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/posthog/duckgres/server/sqlcore"
-	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -335,16 +333,13 @@ func TestCopyFromStdinCancelsUploadOnSourceFailure(t *testing.T) {
 	}
 }
 
-func TestCopyFromStdinSanitizesChunkSendFailure(t *testing.T) {
+func TestCopyFromStdinReportsChunkSendFailure(t *testing.T) {
 	executor, ctx := newCopyFromStdinTestExecutor(t, &rejectCopyFromStdinServer{})
 	reader := &boundedZeroReader{remaining: 64 * CopyFromStdinChunkSize}
 
 	rows, err := executor.CopyFromStdin(ctx, copyFromStdinTestRequest(), reader)
-	if rows != 0 || err == nil || err.Error() != "COPY worker failed" {
-		t.Fatalf("CopyFromStdin() = (%d, %v), want sanitized chunk-send error", rows, err)
-	}
-	if strings.Contains(err.Error(), "reject COPY upload") {
-		t.Fatalf("chunk-send error leaked worker status: %q", err)
+	if rows != 0 || err == nil || !strings.Contains(err.Error(), "flight doput send chunk") {
+		t.Fatalf("CopyFromStdin() = (%d, %v), want chunk-send error", rows, err)
 	}
 }
 
@@ -357,7 +352,7 @@ func TestCopyFromStdinReportsAckFailures(t *testing.T) {
 		{
 			name:        "missing acknowledgement",
 			server:      &scriptedCopyFromStdinServer{},
-			wantMessage: "COPY worker failed",
+			wantMessage: "flight doput recv",
 		},
 		{
 			name: "malformed acknowledgement",
@@ -371,7 +366,7 @@ func TestCopyFromStdinReportsAckFailures(t *testing.T) {
 			server: &scriptedCopyFromStdinServer{
 				terminalErr: status.Error(codes.Internal, "COPY failed before acknowledgement"),
 			},
-			wantMessage: "COPY worker failed",
+			wantMessage: "flight doput recv",
 		},
 		{
 			name: "server error after acknowledgement",
@@ -379,210 +374,14 @@ func TestCopyFromStdinReportsAckFailures(t *testing.T) {
 				results:     []*pb.PutResult{copyFromStdinAck(t, 7)},
 				terminalErr: status.Error(codes.Internal, "COPY failed after acknowledgement"),
 			},
-			wantMessage: "COPY worker failed",
+			wantMessage: "COPY failed after acknowledgement",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			executor, ctx := newCopyFromStdinTestExecutor(t, tt.server)
 			rows, err := executor.CopyFromStdin(ctx, copyFromStdinTestRequest(), strings.NewReader("one\n"))
 			if rows != 0 || err == nil || !strings.Contains(err.Error(), tt.wantMessage) {
-				t.Fatalf("CopyFromStdin() = (%d, %v), want safe error containing %q", rows, err, tt.wantMessage)
-			}
-		})
-	}
-}
-
-func TestCopyFromStdinSanitizesLegacyWorkerStatus(t *testing.T) {
-	const leakMarker = "generated COPY SQL VALUES ('private-value') /tmp/duckgres-copy-secret"
-	executor, ctx := newCopyFromStdinTestExecutor(t, &scriptedCopyFromStdinServer{
-		terminalErr: status.Error(codes.Internal, leakMarker),
-	})
-
-	rows, err := executor.CopyFromStdin(ctx, copyFromStdinTestRequest(), strings.NewReader("one\n"))
-	if rows != 0 || err == nil {
-		t.Fatalf("CopyFromStdin() = (%d, %v), want a sanitized worker error", rows, err)
-	}
-	if got := err.Error(); got != "COPY worker failed" {
-		t.Fatalf("error = %q, want fixed worker failure text", got)
-	}
-	if strings.Contains(err.Error(), leakMarker) {
-		t.Fatalf("sanitized error leaked worker status: %q", err)
-	}
-	if got := status.Code(err); got != codes.Internal {
-		t.Fatalf("status.Code(error) = %s, want %s", got, codes.Internal)
-	}
-}
-
-func TestCopyFromStdinUsesSafeWorkerErrorClassification(t *testing.T) {
-	const leakMarker = "generated COPY SQL with private-value and /tmp/private-copy"
-	rpcStatus, err := status.New(codes.InvalidArgument, leakMarker).WithDetails(&errdetails.ErrorInfo{
-		Domain: "duckgres.copy",
-		Reason: "LOAD_REJECTED",
-	})
-	if err != nil {
-		t.Fatalf("attach ErrorInfo: %v", err)
-	}
-	executor, ctx := newCopyFromStdinTestExecutor(t, &scriptedCopyFromStdinServer{
-		terminalErr: rpcStatus.Err(),
-	})
-
-	rows, copyErr := executor.CopyFromStdin(ctx, copyFromStdinTestRequest(), strings.NewReader("one\n"))
-	if rows != 0 || copyErr == nil {
-		t.Fatalf("CopyFromStdin() = (%d, %v), want classified worker error", rows, copyErr)
-	}
-	if got := copyErr.Error(); got != "COPY input was rejected by the destination" {
-		t.Fatalf("error = %q, want fixed load-rejected message", got)
-	}
-	if strings.Contains(copyErr.Error(), leakMarker) {
-		t.Fatalf("classified worker error leaked status text: %q", copyErr)
-	}
-	if got := status.Code(copyErr); got != codes.InvalidArgument {
-		t.Fatalf("status.Code(error) = %s, want %s", got, codes.InvalidArgument)
-	}
-}
-
-func TestCopyFromStdinPreservesSafeCancellationStatus(t *testing.T) {
-	for _, tt := range []struct {
-		name        string
-		code        codes.Code
-		wantMessage string
-		wantTarget  error
-	}{
-		{
-			name:        "canceled",
-			code:        codes.Canceled,
-			wantMessage: "COPY load canceled",
-			wantTarget:  context.Canceled,
-		},
-		{
-			name:        "deadline exceeded",
-			code:        codes.DeadlineExceeded,
-			wantMessage: "COPY load deadline exceeded",
-			wantTarget:  context.DeadlineExceeded,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			executor, ctx := newCopyFromStdinTestExecutor(t, &scriptedCopyFromStdinServer{
-				terminalErr: status.Error(tt.code, "private worker detail"),
-			})
-
-			rows, err := executor.CopyFromStdin(ctx, copyFromStdinTestRequest(), strings.NewReader("one\n"))
-			if rows != 0 || err == nil {
-				t.Fatalf("CopyFromStdin() = (%d, %v), want cancellation error", rows, err)
-			}
-			if got := err.Error(); got != tt.wantMessage {
-				t.Fatalf("error = %q, want %q", got, tt.wantMessage)
-			}
-			if got := status.Code(err); got != tt.code {
-				t.Fatalf("status.Code(error) = %s, want %s", got, tt.code)
-			}
-			if !errors.Is(err, tt.wantTarget) {
-				t.Fatalf("errors.Is(%v, %v) = false", err, tt.wantTarget)
-			}
-		})
-	}
-}
-
-func TestCopyFromStdinUsesWorkerCancellationReasonWithAbortedCode(t *testing.T) {
-	for _, tt := range []struct {
-		name        string
-		reason      string
-		wantMessage string
-		wantTarget  error
-	}{
-		{
-			name:        "canceled",
-			reason:      "CANCELED",
-			wantMessage: "COPY load canceled",
-			wantTarget:  context.Canceled,
-		},
-		{
-			name:        "deadline exceeded",
-			reason:      "DEADLINE_EXCEEDED",
-			wantMessage: "COPY load deadline exceeded",
-			wantTarget:  context.DeadlineExceeded,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			rpcStatus, detailsErr := status.New(codes.Aborted, "legacy private worker detail").WithDetails(&errdetails.ErrorInfo{
-				Domain: "duckgres.copy",
-				Reason: tt.reason,
-			})
-			if detailsErr != nil {
-				t.Fatalf("attach ErrorInfo: %v", detailsErr)
-			}
-
-			err := sanitizeCopyFromStdinRPCError(rpcStatus.Err())
-
-			if got := err.Error(); got != tt.wantMessage {
-				t.Fatalf("error = %q, want %q", got, tt.wantMessage)
-			}
-			if got := status.Code(err); got != codes.Aborted {
-				t.Fatalf("status.Code(error) = %s, want preserved %s", got, codes.Aborted)
-			}
-			if !errors.Is(err, tt.wantTarget) {
-				t.Fatalf("errors.Is(%v, %v) = false", err, tt.wantTarget)
-			}
-		})
-	}
-}
-
-func TestCopyFromStdinAcceptsWorkerUnavailableReasonForEmittedCodes(t *testing.T) {
-	for _, code := range []codes.Code{codes.FailedPrecondition, codes.Aborted} {
-		t.Run(code.String(), func(t *testing.T) {
-			rpcStatus, detailsErr := status.New(code, "private worker state").WithDetails(&errdetails.ErrorInfo{
-				Domain: "duckgres.copy",
-				Reason: "UNAVAILABLE",
-			})
-			if detailsErr != nil {
-				t.Fatalf("attach ErrorInfo: %v", detailsErr)
-			}
-
-			err := sanitizeCopyFromStdinRPCError(rpcStatus.Err())
-
-			if got := err.Error(); got != "COPY worker is unavailable" {
-				t.Fatalf("error = %q, want fixed unavailable message", got)
-			}
-			if got := status.Code(err); got != code {
-				t.Fatalf("status.Code(error) = %s, want preserved %s", got, code)
-			}
-		})
-	}
-}
-
-func TestSanitizeCopyFromStdinRPCErrorPreservesWrappedContextCancellation(t *testing.T) {
-	for _, tt := range []struct {
-		name        string
-		err         error
-		wantCode    codes.Code
-		wantMessage string
-		wantTarget  error
-	}{
-		{
-			name:        "direct cancellation",
-			err:         context.Canceled,
-			wantCode:    codes.Canceled,
-			wantMessage: "COPY load canceled",
-			wantTarget:  context.Canceled,
-		},
-		{
-			name:        "wrapped deadline",
-			err:         fmt.Errorf("transport stopped: %w", context.DeadlineExceeded),
-			wantCode:    codes.DeadlineExceeded,
-			wantMessage: "COPY load deadline exceeded",
-			wantTarget:  context.DeadlineExceeded,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			err := sanitizeCopyFromStdinRPCError(tt.err)
-			if got := err.Error(); got != tt.wantMessage {
-				t.Fatalf("error = %q, want %q", got, tt.wantMessage)
-			}
-			if got := status.Code(err); got != tt.wantCode {
-				t.Fatalf("status.Code(error) = %s, want %s", got, tt.wantCode)
-			}
-			if !errors.Is(err, tt.wantTarget) {
-				t.Fatalf("errors.Is(%v, %v) = false", err, tt.wantTarget)
+				t.Fatalf("CopyFromStdin() = (%d, %v), want error containing %q", rows, err, tt.wantMessage)
 			}
 		})
 	}
