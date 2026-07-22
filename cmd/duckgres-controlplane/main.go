@@ -242,6 +242,8 @@ func main() {
 		ConfigPollInterval:         resolved.ConfigPollInterval,
 		InternalSecret:             resolved.InternalSecret,
 		InternalSecretFallbacks:    resolved.InternalSecretFallbacks,
+		DiscoverySecret:            resolved.DiscoverySecret,
+		DiscoverySecretFallbacks:   resolved.DiscoverySecretFallbacks,
 		SNIRoutingMode:             resolved.SNIRoutingMode,
 		ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 		DucklingBucketSuffix:       resolved.DucklingBucketSuffix,

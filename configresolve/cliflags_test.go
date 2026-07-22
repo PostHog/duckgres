@@ -55,6 +55,8 @@ func fieldNameToFlagName(name string) string {
 		{"ConfigPollInterval", "config-poll-interval"},
 		{"InternalSecretFallbacks", "internal-secret-fallbacks"},
 		{"InternalSecret", "internal-secret"},
+		{"DiscoverySecretFallbacks", "discovery-secret-fallbacks"},
+		{"DiscoverySecret", "discovery-secret"},
 		{"WorkerBackend", "worker-backend"},
 		{"WorkerQueueTimeout", "worker-queue-timeout"},
 		{"WorkerIdleTimeout", "worker-idle-timeout"},
