@@ -139,6 +139,7 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
 		"name: artifact-keeper",
 		"value: \"isolated-test-secret\"",
+		"name: DUCKGRES_SCENARIO_ORG_ID, value: \"ci-pr-123-cnpg\"",
 		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f pod/duckgres-scenario-pod",
 		"-c scenario",
 		"kubectl --context test-context -n duckgres-ci-pr-123 wait --for=jsonpath={.status.containerStatuses[?(@.name==\"scenario\")].state.terminated.reason} pod/duckgres-scenario-pod",

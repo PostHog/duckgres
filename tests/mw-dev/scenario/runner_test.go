@@ -123,11 +123,15 @@ func TestScenarioRunner(t *testing.T) {
 	}
 }
 
-func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
+func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSteps(t *testing.T) {
+	const scenarioOrgID = "ci-pr-123-cnpg"
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", scenarioOrgID)
+
 	scenario, err := core.LoadScenario(filepath.Join("scenarios", "provision_smoke.yaml"))
 	if err != nil {
 		t.Fatalf("load provision smoke: %v", err)
 	}
+	requireScenarioEnv(t, scenario, "DUCKGRES_SCENARIO_ORG_ID")
 	resolved, err := resolveRunTemplates(scenario, "scenario-smoke-20260102t030405z")
 	if err != nil {
 		t.Fatalf("resolve templates: %v", err)
@@ -139,12 +143,15 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 		if containsTemplate(step.With) {
 			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
 		}
+		orgID, ok := step.With["org_id"].(string)
+		if !ok {
+			t.Fatalf("step %s is missing org_id", step.ID)
+		}
+		if orgID != scenarioOrgID {
+			t.Fatalf("step %s org_id = %q, want isolated-stack identity %q", step.ID, orgID, scenarioOrgID)
+		}
 	}
 	provisionStep := resolved.Steps[0]
-	orgID, _ := provisionStep.With["org_id"].(string)
-	if orgID == "scenario-smoke" || len(orgID) > 35 {
-		t.Fatalf("org_id = %q, want run-unique valid provisioning slug of at most 35 chars", orgID)
-	}
 	request, ok := provisionStep.With["request"].(map[string]any)
 	if !ok {
 		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
@@ -156,7 +163,9 @@ func TestProvisionSmokeScenarioUsesRunUniqueSupportedSteps(t *testing.T) {
 	requireScenarioDefaultTeamID(t, request)
 }
 
-func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
+func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
+	const scenarioOrgID = "ci-pr-123-cnpg"
+
 	for _, scenarioFile := range []string{
 		"posthog_frozen_metadata.yaml",
 		"posthog_frozen_perf.yaml",
@@ -166,10 +175,12 @@ func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
 	} {
 		t.Run(scenarioFile, func(t *testing.T) {
 			t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "grpc://flight.example:8815")
+			t.Setenv("DUCKGRES_SCENARIO_ORG_ID", scenarioOrgID)
 			scenario, err := core.LoadScenario(filepath.Join("scenarios", scenarioFile))
 			if err != nil {
 				t.Fatalf("load scenario: %v", err)
 			}
+			requireScenarioEnv(t, scenario, "DUCKGRES_SCENARIO_ORG_ID")
 			runID := scenario.RunIDPrefix + "-20260701t135927z"
 			resolved, err := resolveRunTemplates(scenario, runID)
 			if err != nil {
@@ -182,14 +193,12 @@ func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
 				if containsTemplate(step.With) {
 					t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
 				}
-				if step.Type != provision.StepTypeProvisionWarehouse &&
-					step.Type != provision.StepTypeWaitWarehouseReady &&
-					step.Type != provision.StepTypeDeprovisionWarehouse {
-					continue
+				orgID, hasOrgID := step.With["org_id"].(string)
+				if !hasOrgID {
+					t.Fatalf("step %s is missing org_id", step.ID)
 				}
-				orgID, _ := step.With["org_id"].(string)
-				if orgID == "" || len(orgID) > 35 {
-					t.Fatalf("step %s org_id = %q, want valid provisioning slug of at most 35 chars", step.ID, orgID)
+				if orgID != scenarioOrgID {
+					t.Fatalf("step %s org_id = %q, want isolated-stack identity %q", step.ID, orgID, scenarioOrgID)
 				}
 				if step.Type == provision.StepTypeProvisionWarehouse {
 					request, ok := step.With["request"].(map[string]any)
@@ -206,6 +215,7 @@ func TestFrozenSuccessScenariosUseValidProvisioningSlugs(t *testing.T) {
 func TestFastSuiteScenarioComposesWorkloadsWithoutDBT(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "fast-suite.yaml"))
 	if err != nil {
@@ -268,6 +278,7 @@ func TestFastSuiteScenarioComposesWorkloadsWithoutDBT(t *testing.T) {
 func TestFullSuiteScenarioComposesWorkloadsAsDAG(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "full-suite.yaml"))
 	if err != nil {
@@ -364,6 +375,7 @@ func TestProvisionRejectionScenarioUsesExpectedProvisionFailure(t *testing.T) {
 
 func TestFrozenMetadataScenarioRequiresDatasetURI(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, err := core.LoadScenario(filepath.Join("scenarios", "posthog_frozen_metadata.yaml"))
 	if err != nil {
@@ -377,6 +389,7 @@ func TestFrozenMetadataScenarioRequiresDatasetURI(t *testing.T) {
 
 func TestFrozenMetadataScenarioResolvesEnvTemplates(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, err := core.LoadScenario(filepath.Join("scenarios", "posthog_frozen_metadata.yaml"))
 	if err != nil {
@@ -436,6 +449,7 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
 	if err != nil {
@@ -485,6 +499,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 
 func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_dbt.yaml"))
 	if err != nil {
@@ -736,6 +751,16 @@ func requireScenarioDefaultTeamID(t *testing.T, request map[string]any) {
 	if fmt.Sprint(defaultTeamID) != "1" {
 		t.Fatalf("default_team_id = %#v, want numeric 1", defaultTeamID)
 	}
+}
+
+func requireScenarioEnv(t *testing.T, scenario core.Scenario, want string) {
+	t.Helper()
+	for _, name := range scenario.RequiredEnv {
+		if name == want {
+			return
+		}
+	}
+	t.Fatalf("scenario %s required_env = %#v, want %s", scenario.Name, scenario.RequiredEnv, want)
 }
 
 func mustEnv(t *testing.T, key string) string {

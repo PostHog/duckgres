@@ -1,13 +1,14 @@
 name: full-suite
 run_id_prefix: scenario-full-suite
 required_env:
+  - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_SCENARIO_FLIGHT_ADDR
 steps:
   - id: provision
     type: provision_warehouse
     with:
-      org_id: scenario-full-suite-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       request:
         database_name: scenario_full_suite_${run_id_token}
         default_team_id: 1
@@ -22,7 +23,7 @@ steps:
     type: wait_warehouse_ready
     depends_on: [provision]
     with:
-      org_id: scenario-full-suite-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       timeout: 15m
       poll_interval: 10s
 
@@ -30,7 +31,7 @@ steps:
     type: sql
     depends_on: [wait_ready]
     with:
-      org_id: scenario-full-suite-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       file: ../sql/setup_frozen_views.sql
       max_attempts: 12
@@ -40,7 +41,7 @@ steps:
     type: sql_catalog
     depends_on: [setup_frozen_views]
     with:
-      org_id: scenario-full-suite-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       file: ../sql/metadata_catalog.yaml
       max_attempts: 3
@@ -50,7 +51,7 @@ steps:
     type: perf_queries
     depends_on: [setup_frozen_views]
     with:
-      org_id: scenario-full-suite-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       catalog_file: ../../../perf/queries/ducklake_frozen.yaml
       run_id: ${run_id}
@@ -62,7 +63,7 @@ steps:
     type: dbt_run
     depends_on: [setup_frozen_views]
     with:
-      org_id: scenario-full-suite-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       schema: dbt_frozen
       project_dir: ../dbt/posthog_frozen_project
@@ -78,7 +79,7 @@ steps:
     depends_on: [metadata_exploration, perf_queries, dbt_models]
     always_run: true
     with:
-      org_id: scenario-full-suite-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       verify_deleted: true
       cleanup_timeout: 15m
       poll_interval: 10s
