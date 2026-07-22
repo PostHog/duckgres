@@ -56,6 +56,32 @@ func (c *clientConn) copyLoadErrorResponse(err error) (code, clientMessage, tele
 	return code, clientMessage, generatedWorkerTelemetryErrorMessage(code)
 }
 
+// generatedCopyLoadErrorResponse is used only when Duckgres-generated COPY
+// work fails. Unlike local parser diagnostics, arbitrary executor error text is
+// not safe for pgwire because it can contain generated SQL, copied values, or
+// a worker-local spool path.
+func (c *clientConn) generatedCopyLoadErrorResponse(err error) (code, clientMessage, telemetryMessage string) {
+	code, clientMessage = c.clientErrorResponse(err)
+	if c.isCallerCancellation(err) {
+		return code, clientMessage, clientMessage
+	}
+	if code == "57014" {
+		clientMessage = "COPY load canceled"
+	} else {
+		code = "22P02"
+		clientMessage = "COPY failed: worker load failed"
+	}
+	return code, clientMessage, generatedWorkerTelemetryErrorMessage(code)
+}
+
+func copyAppenderFallbackLogAttributes(tableName string, err error) []any {
+	return []any{
+		"target_table", tableName,
+		"fallback_reason", "appender_failed",
+		"error_code", classifyErrorCode(err),
+	}
+}
+
 // Regular expressions for parsing COPY commands
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
@@ -953,7 +979,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			c.logWorkerStatementFinished(workerStatement, loadStart, copyRowsAffected, err)
 			if err != nil {
 				c.logger().Error("COPY FROM STDIN DuckDB COPY failed.", "error_code", classifyErrorCode(err))
-				errCode, clientErrMsg, telemetryErrMsg := c.copyLoadErrorResponse(err)
+				errCode, clientErrMsg, telemetryErrMsg := c.generatedCopyLoadErrorResponse(err)
 				c.sendErrorWithTelemetryMessage("ERROR", errCode, clientErrMsg, telemetryErrMsg)
 				c.setTxError()
 				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), errCode, telemetryErrMsg, "simple")
@@ -1049,7 +1075,7 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 	}
 	if err != nil {
 		c.logger().Error("COPY FROM STDIN remote streaming failed.", "error_code", classifyErrorCode(err))
-		errCode, clientErrMsg, telemetryErrMsg := c.copyLoadErrorResponse(err)
+		errCode, clientErrMsg, telemetryErrMsg := c.generatedCopyLoadErrorResponse(err)
 		c.sendErrorWithTelemetryMessage("ERROR", errCode, clientErrMsg, telemetryErrMsg)
 		c.setTxError()
 		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, errCode, telemetryErrMsg, "simple")
@@ -1555,7 +1581,7 @@ func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList
 		if err == nil {
 			return count, nil
 		}
-		c.logger().Warn("Appender failed, falling back to batched INSERT.", "table", tableName, "error", err)
+		c.logger().Warn("Appender failed, falling back to batched INSERT.", copyAppenderFallbackLogAttributes(tableName, err)...)
 	}
 
 	// Fallback: batched multi-row INSERT

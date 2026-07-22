@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -24,6 +25,7 @@ type recordingCopyFromStdinExecutor struct {
 	copySQL                 string
 	payload                 []byte
 	rows                    int64
+	copyErr                 error
 	readErr                 error
 	binaryDatabaseTypeNames []string
 }
@@ -84,7 +86,7 @@ func (e *recordingCopyFromStdinExecutor) CopyFromStdin(
 	e.copySQL = request.SQLTemplate
 	e.binaryDatabaseTypeNames = append([]string(nil), request.PostgresBinaryDatabaseTypeNames...)
 	e.payload = payload
-	return e.rows, nil
+	return e.rows, e.copyErr
 }
 
 func postgresBinaryCopyOneField(field []byte) (prefix, suffix, payload []byte) {
@@ -410,6 +412,75 @@ func TestHandleCopyInBinaryRemoteKeepsNativeLoadTelemetryGenerated(t *testing.T)
 	}
 	if entry := sink.entries[0]; entry.Query != query || entry.Protocol != "simple" || entry.ExceptionCode != "" {
 		t.Errorf("durable query-log entry = %#v, want one successful outer COPY", entry)
+	}
+}
+
+func TestHandleCopyInBinaryRemoteLoadFailureDoesNotLeakGeneratedDetails(t *testing.T) {
+	logs := captureCopyFallbackTelemetryLogs(t)
+	tracker := installCopyFallbackTelemetryTracker(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("CREATE TABLE native_copy_failure_target (payload BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+
+	const leakMarker = "generated INSERT private-value /tmp/duckgres-worker-copy-secret.copy"
+	exec := &recordingCopyFromStdinExecutor{
+		LocalExecutor: NewLocalExecutor(db),
+		copyErr:       errors.New(leakMarker),
+	}
+	_, _, payload := postgresBinaryCopyOneField([]byte("private-value"))
+	var input bytes.Buffer
+	writePGMessage(&input, wire.MsgCopyData, payload)
+	writePGMessage(&input, wire.MsgCopyDone, nil)
+	var output bytes.Buffer
+	c.reader = bufio.NewReader(&input)
+	c.writer = bufio.NewWriter(&output)
+	c.executor = exec
+	sink := &copyFallbackTelemetryQueryLogSink{}
+	c.server.queryLogSink = sink
+
+	const query = "COPY native_copy_failure_target (payload) FROM STDIN (FORMAT binary)"
+	if err := c.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+	_ = c.writer.Flush()
+
+	if got := extractErrorResponseField(t, output.Bytes(), 'C'); got != "22P02" {
+		t.Fatalf("ErrorResponse SQLSTATE = %q, want 22P02", got)
+	}
+	if got := extractErrorResponseField(t, output.Bytes(), 'M'); got != "COPY failed: worker load failed" {
+		t.Fatalf("ErrorResponse message = %q, want fixed generated COPY failure", got)
+	}
+	for surface, content := range map[string]string{
+		"pgwire":    output.String(),
+		"logs":      logs.String(),
+		"durable":   fmt.Sprint(sink.entries),
+		"analytics": fmt.Sprint(tracker.events),
+	} {
+		for _, forbidden := range []string{leakMarker, "private-value", "/tmp/duckgres-worker-copy-secret.copy"} {
+			if strings.Contains(content, forbidden) {
+				t.Errorf("%s leaked %q: %s", surface, forbidden, content)
+			}
+		}
+	}
+	if got := copyFallbackTelemetryEventCount(tracker, "query_initiated"); got != 1 {
+		t.Errorf("query_initiated analytics events = %d, want 1", got)
+	}
+	if got := copyFallbackTelemetryEventCount(tracker, "query_failed"); got != 1 {
+		t.Errorf("query_failed analytics events = %d, want 1", got)
+	}
+	if got := len(sink.entries); got != 1 {
+		t.Fatalf("durable query-log entries = %d, want 1", got)
+	}
+	if entry := sink.entries[0]; entry.ExceptionCode != "22P02" || strings.Contains(entry.Exception, leakMarker) {
+		t.Errorf("durable query-log entry = %#v, want sanitized 22P02 failure", entry)
 	}
 }
 

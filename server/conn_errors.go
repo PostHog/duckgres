@@ -15,7 +15,10 @@ import (
 // since infra cancels are real failures we want surfaced. Use
 // (*clientConn).isCallerCancellation for that.
 func isQueryCancelled(err error) bool {
-	return errors.Is(err, context.Canceled) || (err != nil && strings.Contains(err.Error(), "context canceled"))
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		(err != nil && (strings.Contains(err.Error(), "context canceled") ||
+			strings.Contains(err.Error(), "context deadline exceeded")))
 }
 
 // isCallerCancellation reports whether err is a cancellation that the caller
