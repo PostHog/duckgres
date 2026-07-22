@@ -617,7 +617,7 @@ func (c *clientConn) sendErrorWithTelemetryMessage(severity, code, message, tele
 		c.lastErrorCode = code
 	}
 	c.recordActiveClientQueryErrorResponse(code, telemetryMessage)
-	c.logger().Debug("Sending error to client.", "severity", severity, "code", code, "message", telemetryMessage)
+	c.logger().Debug("Sending error to client.", "severity", severity, "code", code)
 	c.errorResponsesSent++
 	_ = wire.WriteErrorResponse(c.writer, severity, code, message)
 	_ = c.flushWriter()

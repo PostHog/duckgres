@@ -5,12 +5,41 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/binary"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/server/wire"
 )
+
+func TestSendErrorWithTelemetryMessageDoesNotLogErrorContents(t *testing.T) {
+	logs := captureClientWorkerTelemetryLogs(t)
+	var out bytes.Buffer
+	conn := &clientConn{writer: bufio.NewWriter(&out)}
+
+	const clientMessage = "client-visible-error"
+	const telemetryMessage = "sensitive-telemetry-marker"
+	conn.sendErrorWithTelemetryMessage("ERROR", "XX000", clientMessage, telemetryMessage)
+
+	logOutput := logs.String()
+	for _, unexpected := range []string{clientMessage, telemetryMessage} {
+		if strings.Contains(logOutput, unexpected) {
+			t.Fatalf("sendError logged error contents %q: %s", unexpected, logOutput)
+		}
+	}
+	for _, want := range []string{`msg="Sending error to client."`, "severity=ERROR", "code=XX000"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("sendError log missing %q: %s", want, logOutput)
+		}
+	}
+	if strings.Contains(logOutput, " message=") {
+		t.Errorf("sendError log unexpectedly contains a message attribute: %s", logOutput)
+	}
+	if got := extractErrorResponseField(t, out.Bytes(), 'M'); got != clientMessage {
+		t.Fatalf("ErrorResponse message = %q, want %q", got, clientMessage)
+	}
+}
 
 func TestSendDataRowWithFormatsUsesTypeOIDForTextDates(t *testing.T) {
 	date := time.Date(2022, 4, 1, 0, 0, 0, 0, time.UTC)
