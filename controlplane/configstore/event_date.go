@@ -71,5 +71,5 @@ func (d *EventDate) Scan(v interface{}) error {
 }
 
 // GormDataType pins the column type so AutoMigrate (and the goose/GORM
-// metadata-match test) agree with migration 000026's DATE column.
+// metadata-match test) agree with migration 000027's DATE column.
 func (EventDate) GormDataType() string { return "date" }

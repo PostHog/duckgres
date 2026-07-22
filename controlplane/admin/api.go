@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -125,6 +126,7 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	r.GET("/teams", h.listAllOrgTeams)
 	r.POST("/teams", h.createOrgTeam)
 	r.PUT("/orgs/:id/teams/:team_id", h.updateOrgTeam)
+	r.PUT("/orgs/:id/teams/:team_id/project-reader", h.upsertProjectReader)
 
 	// Users CRUD
 	r.GET("/users", h.listUsers)
@@ -132,6 +134,8 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	r.GET("/orgs/:id/users/:username", h.getUser)
 	r.PUT("/orgs/:id/users/:username", h.updateUser)
 	r.DELETE("/orgs/:id/users/:username", h.deleteUser)
+	// Peer-only fan-out target: see reloadSnapshot below.
+	r.POST("/internal/reload-snapshot", h.reloadSnapshot)
 
 	// Workers (read-only)
 	r.GET("/workers", h.listWorkers)
@@ -178,6 +182,7 @@ type apiStore interface {
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
 	UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
+	UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
@@ -188,6 +193,12 @@ type apiStore interface {
 	// when concurrent PUTs target the same org. Returns (nil, false, nil) if
 	// the org doesn't exist.
 	MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error)
+
+	// ReloadSnapshot forces this replica's in-memory config snapshot to reload
+	// from the config-store DB immediately, bypassing the poll interval. Used
+	// by createUser/updateUser/deleteUser so a write is authable on this
+	// replica the instant the request returns — see notifyPeersOfChange.
+	ReloadSnapshot() error
 }
 
 type gormAPIStore struct {
@@ -367,7 +378,7 @@ type orgTeamUpdate struct {
 	// warehouse data; tables under the old schema are not renamed.
 	SchemaName *string
 	Enabled    *bool
-	// Backfill: nil = preserve. The column is NOT NULL (migration 000027), so
+	// Backfill: nil = preserve. The column is NOT NULL (migration 000028), so
 	// there is no clear path — the handler rejects an explicit null.
 	Backfill *bool
 	// Legacy explicit table names for grandfathered teams (NULL = derive from
@@ -423,7 +434,27 @@ func (s *gormAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) er
 			return configstore.ErrOrgTeamSchemaConflict
 		}
 		team.OrgID = orgID
-		return tx.Create(team).Error
+		// Capture intent BEFORE Create: gorm's RETURNING write-back stamps
+		// the DB row (enabled defaulted TRUE) back onto the struct, so the
+		// post-Create value lies about what the caller asked for.
+		wantDisabled := !team.Enabled
+		if err := tx.Create(team).Error; err != nil {
+			return err
+		}
+		// Enabled carries gorm's `default:true` tag: a zero-valued (false)
+		// field is omitted from the INSERT and the DB default TRUE wins —
+		// the same pitfall fixed in configstore.UpsertOrgTeamTx, on this
+		// surface reachable via POST /teams {"enabled":false}. Force the
+		// column explicitly. Pinned by TestAdminCreateOrgTeamDisabledPostgres.
+		if wantDisabled {
+			if err := tx.Model(&configstore.OrgTeam{}).
+				Where("org_id = ? AND team_id = ?", orgID, team.TeamID).
+				Update("enabled", false).Error; err != nil {
+				return err
+			}
+			team.Enabled = false // undo the RETURNING write-back for the caller
+		}
+		return nil
 	})
 }
 
@@ -574,6 +605,69 @@ func (s *gormAPIStore) DeleteUser(orgID, username string) (bool, error) {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+func (s *gormAPIStore) UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error) {
+	var stored configstore.OrgUser
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		var team configstore.OrgTeam
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&team, "org_id = ? AND team_id = ? AND enabled IS TRUE", orgID, teamID,
+		).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return configstore.ErrProjectReaderTeamUnavailable
+			}
+			return err
+		}
+		passwordHash := ""
+		var existing configstore.OrgUser
+		existingResult := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&existing, "org_id = ? AND username = ?", orgID, username,
+		)
+		if existingResult.Error == nil && bcrypt.CompareHashAndPassword([]byte(existing.Password), []byte(password)) == nil {
+			passwordHash = existing.Password
+		} else if existingResult.Error != nil && !errors.Is(existingResult.Error, gorm.ErrRecordNotFound) {
+			return existingResult.Error
+		} else {
+			var err error
+			passwordHash, err = configstore.HashPassword(password)
+			if err != nil {
+				return err
+			}
+		}
+		boundTeamID := teamID
+		user := configstore.OrgUser{
+			OrgID:       orgID,
+			Username:    username,
+			Password:    passwordHash,
+			Passthrough: false,
+			AccessMode:  configstore.OrgUserAccessModeProjectReader,
+			TeamID:      &boundTeamID,
+			Disabled:    false,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "org_id"}, {Name: "username"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"password":    passwordHash,
+				"passthrough": false,
+				"access_mode": configstore.OrgUserAccessModeProjectReader,
+				"team_id":     teamID,
+				"disabled":    false,
+				"updated_at":  time.Now().UTC(),
+			}),
+		}).Create(&user).Error; err != nil {
+			return err
+		}
+		return tx.First(&stored, "org_id = ? AND username = ?", orgID, username).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &stored, nil
+}
+
+func (s *gormAPIStore) ReloadSnapshot() error {
+	return s.store.ReloadSnapshot()
 }
 
 func (s *gormAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -1024,7 +1118,7 @@ func (h *apiHandler) createOrgTeam(c *gin.Context) {
 // preserve). schema_name may be CHANGED here (immutability is a user-facing
 // flow rule, not an operator one) but never cleared — it stays NOT NULL, and
 // backfill_enabled likewise rejects an explicit null (NOT NULL DEFAULT TRUE,
-// migration 000027). The nullable columns (earliest_event_date and the three
+// migration 000028). The nullable columns (earliest_event_date and the three
 // legacy table-name overrides) treat an explicit JSON null — and, for the
 // table names, "" — as "clear back to NULL". Billing can only be pointed AT a
 // team (is_billing_team: true), never cleared.
@@ -1041,10 +1135,6 @@ type updateOrgTeamRequest struct {
 	// re-discovers the team's backfill range.
 	EarliestEventDate *string `json:"earliest_event_date,omitempty"`
 }
-
-// maxOrgTeamTableNameLength caps the legacy table-name overrides at the
-// column width (varchar(255)) so a typo'd blob is a 400, not a DB error.
-const maxOrgTeamTableNameLength = 255
 
 // legacyTableNameUpdate folds one presence-aware legacy table-name field of
 // the PUT body into (set, value): absent = (false, nil); explicit null or ""
@@ -1104,8 +1194,14 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 		"persons_table_name":       req.PersonsTableName,
 		"schema_data_imports_name": req.SchemaDataImportsName,
 	} {
-		if v != nil && len(*v) > maxOrgTeamTableNameLength {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%s must be at most %d characters", name, maxOrgTeamTableNameLength)})
+		if v == nil {
+			continue
+		}
+		// Shared bare-identifier contract (see configstore.ValidateOrgTeamTableName):
+		// overrides are never schema-qualified; a dot stored here would be
+		// silently ambiguous to every discovery consumer. "" passes (clear).
+		if err := configstore.ValidateOrgTeamTableName(name, *v); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 	}
@@ -1590,6 +1686,10 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusCreated, user)
 }
 
@@ -1646,6 +1746,21 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
 		return
 	}
+	if raw.Passthrough != nil && *raw.Passthrough {
+		user, err := h.store.GetUser(orgID, username)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if user.AccessMode == configstore.OrgUserAccessModeProjectReader {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "project readers cannot enable passthrough"})
+			return
+		}
+	}
 	// Audit detail: which fields the update touched. The password is NEVER
 	// logged — only that it was reset.
 	var changes []string
@@ -1671,6 +1786,10 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, user)
 }
 
@@ -1686,7 +1805,97 @@ func (h *apiHandler) deleteUser(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"deleted": username})
+}
+
+// upsertProjectReader creates or rotates the single read-only credential for
+// one PostHog project. The plaintext password is returned only in this
+// response; the config store persists only its bcrypt hash.
+func (h *apiHandler) upsertProjectReader(c *gin.Context) {
+	orgID := c.Param("id")
+	teamID, err := strconv.ParseInt(c.Param("team_id"), 10, 64)
+	if err != nil || teamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
+		return
+	}
+	var request struct {
+		Password string `json:"password"`
+	}
+	if c.Request.ContentLength > 0 {
+		decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	password := request.Password
+	if password == "" {
+		password, err = configstore.GeneratePassword()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate password"})
+			return
+		}
+	} else if len(password) < 32 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password must be at least 32 characters"})
+		return
+	}
+	username := fmt.Sprintf("posthog_team_%d", teamID)
+	user, err := h.store.UpsertProjectReader(orgID, teamID, username, password)
+	if err != nil {
+		if errors.Is(err, configstore.ErrProjectReaderTeamUnavailable) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	setAuditDetail(c, fmt.Sprintf("created or rotated project reader for team %d", teamID))
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"username": user.Username,
+		"password": password,
+	})
+}
+
+// notifyPeersOfChange reloads THIS replica's config snapshot immediately
+// (bypassing the poll interval, default 30s) and fans the same reload out to
+// every other CP replica, mirroring the disable/enable reload pattern in
+// live.go. Unlike disable/enable, the write has already landed in the shared
+// config-store DB by the time this runs, so a peer only needs to reload — it
+// must never re-run the create/update/delete (that would 409 or double-apply
+// against a row that's already there). Peer fan-out is best-effort: PostPeers
+// already drops a slow/down peer without error, so only a failure to reload
+// THIS replica is surfaced to the caller.
+func (h *apiHandler) notifyPeersOfChange(c *gin.Context) error {
+	if err := h.store.ReloadSnapshot(); err != nil {
+		return err
+	}
+	if h.fetcher != nil {
+		h.fetcher.PostPeers(c.Request.Context(), "/api/v1/internal/reload-snapshot")
+	}
+	return nil
+}
+
+// reloadSnapshot is a peer-fan-out target only (see notifyPeersOfChange): it
+// forces this replica's config snapshot to reload immediately. There is
+// nothing to re-execute here — the write already landed in the shared
+// config-store DB — so unlike the per-user kill-switch actions this handler
+// has no scope=local branch to guard: it never calls PostPeers itself, so it
+// cannot recurse regardless of who calls it.
+func (h *apiHandler) reloadSnapshot(c *gin.Context) {
+	if err := h.store.ReloadSnapshot(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"reloaded": true})
 }
 
 // --- Workers ---

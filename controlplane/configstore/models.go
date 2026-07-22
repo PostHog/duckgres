@@ -38,7 +38,11 @@ type Org struct {
 	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	// UpdatedAt doubles as an input to the discovery change marker
+	// (ConfigStore.LatestConfigChange): DeleteOrgTeamTx touches it so a
+	// team-row DELETE — which leaves no updated_at of its own behind —
+	// still advances the marker external pollers gate on.
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -64,7 +68,7 @@ func (o *Org) BillingTeamID() *int64 {
 // (org_id, schema_name), migration 000025). IsBillingTeam is tri-state
 // (*bool): NULL means "not the billing team". BackfillEnabled mirrors a
 // Django BooleanField(default=True) on the PostHog side, so its column is NOT
-// NULL DEFAULT TRUE (migration 000027) — it stays *bool in Go only so an
+// NULL DEFAULT TRUE (migration 000028) — it stays *bool in Go only so an
 // explicit false survives gorm's zero-value-uses-column-default Create
 // behavior; a stored row always carries a value.
 //
@@ -79,11 +83,16 @@ type OrgTeam struct {
 	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_billing_org,unique,where:is_billing_team IS TRUE;index:idx_duckgres_org_teams_org_schema,unique,priority:1" json:"org_id"`
 	// autoIncrement:false — int fields in a composite primary key default to
 	// auto-increment in gorm, which would make this a bigserial.
-	TeamID                int64   `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
-	SchemaName            string  `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
-	Enabled               bool    `gorm:"not null;default:true" json:"enabled"`
-	IsBillingTeam         *bool   `json:"is_billing_team,omitempty"`
-	BackfillEnabled       *bool   `gorm:"not null;default:true" json:"backfill_enabled"`
+	TeamID          int64  `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
+	SchemaName      string `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
+	Enabled         bool   `gorm:"not null;default:true" json:"enabled"`
+	IsBillingTeam   *bool  `json:"is_billing_team,omitempty"`
+	BackfillEnabled *bool  `gorm:"not null;default:true" json:"backfill_enabled"`
+	// The legacy overrides are BARE identifiers (never schema-qualified):
+	// events/persons are table names within SchemaName's schema, the
+	// data-imports override is a schema name. Enforced by
+	// ValidateOrgTeamTableName on every write surface; resolved for
+	// consumers in provisioning/discovery.go resolveTeamTables.
 	EventsTableName       *string `gorm:"size:255" json:"events_table_name,omitempty"`
 	PersonsTableName      *string `gorm:"size:255" json:"persons_table_name,omitempty"`
 	SchemaDataImportsName *string `gorm:"size:255" json:"schema_data_imports_name,omitempty"`
@@ -111,10 +120,12 @@ func (OrgTeam) TableName() string { return "duckgres_org_teams" }
 // (org_id, username) so the same login name can be passthrough in one tenant
 // and not in another.
 type OrgUser struct {
-	OrgID       string `gorm:"primaryKey;size:255" json:"org_id"`
+	OrgID       string `gorm:"primaryKey;size:255;index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:1" json:"org_id"`
 	Username    string `gorm:"primaryKey;size:255" json:"username"`
 	Password    string `gorm:"size:255;not null" json:"-"`
 	Passthrough bool   `gorm:"not null;default:false" json:"passthrough"`
+	AccessMode  string `gorm:"size:32;not null;default:unrestricted" json:"access_mode"`
+	TeamID      *int64 `gorm:"index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:2" json:"team_id,omitempty"`
 	// Disabled is the per-user kill switch: when true the user is refused at
 	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
 	// user's live sessions (see admin disable endpoint).
@@ -472,18 +483,23 @@ const (
 
 // FlightSessionRecord is the durable reconnect record for Flight sessions.
 type FlightSessionRecord struct {
-	SessionToken string             `gorm:"primaryKey;size:255" json:"session_token"`
-	Username     string             `gorm:"size:255;not null" json:"username"`
-	OrgID        string             `gorm:"size:255;not null" json:"org_id"`
-	WorkerID     int                `gorm:"not null;index" json:"worker_id"`
-	PID          int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
-	OwnerEpoch   int64              `gorm:"not null" json:"owner_epoch"`
-	CPInstanceID string             `gorm:"size:255" json:"cp_instance_id"`
-	State        FlightSessionState `gorm:"size:32;not null" json:"state"`
-	ExpiresAt    time.Time          `gorm:"index" json:"expires_at"`
-	LastSeenAt   time.Time          `json:"last_seen_at"`
-	CreatedAt    time.Time          `json:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at"`
+	SessionToken         string             `gorm:"primaryKey;size:255" json:"session_token"`
+	Username             string             `gorm:"size:255;not null" json:"username"`
+	OrgID                string             `gorm:"size:255;not null" json:"org_id"`
+	WorkerID             int                `gorm:"not null;index" json:"worker_id"`
+	PID                  int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
+	OwnerEpoch           int64              `gorm:"not null" json:"owner_epoch"`
+	CPInstanceID         string             `gorm:"size:255" json:"cp_instance_id"`
+	State                FlightSessionState `gorm:"size:32;not null" json:"state"`
+	ExpiresAt            time.Time          `gorm:"index" json:"expires_at"`
+	LastSeenAt           time.Time          `json:"last_seen_at"`
+	AccessPolicyRecorded bool               `gorm:"not null;default:false" json:"access_policy_recorded"`
+	AccessRevision       string             `gorm:"size:64" json:"access_revision,omitempty"`
+	AccessReadOnly       bool               `gorm:"not null;default:false" json:"access_read_only"`
+	AllowedSchemas       []string           `gorm:"serializer:json;type:text" json:"allowed_schemas,omitempty"`
+	AllowedRelations     []string           `gorm:"serializer:json;type:text" json:"allowed_relations,omitempty"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
 }
 
 func (FlightSessionRecord) TableName() string { return "flight_session_records" }
@@ -560,10 +576,13 @@ type OrgConfig struct {
 // IsBillingTeam folds the tri-state column to a plain bool (NULL == false) —
 // snapshot consumers only care whether a row IS the billing team.
 type OrgTeamConfig struct {
-	TeamID        int64
-	SchemaName    string
-	Enabled       bool
-	IsBillingTeam bool
+	TeamID                int64
+	SchemaName            string
+	Enabled               bool
+	IsBillingTeam         bool
+	EventsTableName       *string
+	PersonsTableName      *string
+	SchemaDataImportsName *string
 }
 
 // BillingTeamID returns the org's billing PostHog team id (the team with

@@ -55,6 +55,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_partitioned_table":    "pg_partitioned_table",
 			"pg_type":                 "pg_type",
 			"pg_attribute":            "pg_attribute",
+			"pg_index":                "pg_index",
 			"pg_constraint":           "pg_constraint",
 			"pg_enum":                 "pg_enum",
 			"pg_indexes":              "pg_indexes",
@@ -140,56 +141,56 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
 			// PostgreSQL builtin-compat macros
-			"set_config":                        true, // Session-setting writer (value-returning)
-			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
-			"statement_timestamp":               true, // now() alias
-			"timeofday":                         true, // PG-shaped wall-clock text
-			"pg_get_function_arguments":         true, // \df signature stub
-			"pg_get_function_result":            true, // \df result-type stub
+			"set_config":                         true, // Session-setting writer (value-returning)
+			"uuid_generate_v4":                   true, // uuid-ossp v4 alias
+			"statement_timestamp":                true, // now() alias
+			"timeofday":                          true, // PG-shaped wall-clock text
+			"pg_get_function_arguments":          true, // \df signature stub
+			"pg_get_function_result":             true, // \df result-type stub
 			"pg_get_function_identity_arguments": true, // identity-arg stub
-			"pg_get_triggerdef":                 true, // Trigger DDL stub (NULL)
-			"pg_jit_available":                  true, // JIT stub (false)
-			"row_security_active":               true, // RLS stub (false)
-			"pg_collation_for":                  true, // Collation stub
-			"pg_input_is_valid":                 true, // Bounded input validator
-			"to_regclass":                       true, // Name->oid probe
-			"to_regtype":                        true, // Type-name->oid probe
-			"to_regproc":                        true, // Function-name->oid probe
-			"jsonb_pretty":                      true, // Indented JSON
-			"json_typeof":                       true, // PG-vocabulary JSON type name
-			"jsonb_typeof":                      true, // PG-vocabulary JSON type name
-			"duckgres_string_to_array3":         true, // 3-arg string_to_array (nullstr)
-			"to_ascii":                          true, // Accent-stripping transliteration
-			"convert_from":                      true, // bytea->text (UTF8)
-			"width_bucket":                      true, // Equi-width histogram bucketing
-			"scale":                             true, // Numeric scale
-			"min_scale":                         true, // Numeric min scale
-			"masklen":                           true, // inet prefix length
-			"hostmask":                          true, // inet host mask
-			"set_masklen":                       true, // inet set prefix length
-			"inet_same_family":                  true, // inet family compare
-			"array_positions":                   true, // indices of all matching elements
-			"array_replace":                     true, // replace all matching elements
-			"array_fill":                        true, // 1-D fill
-			"trim_array":                        true, // drop last n elements
-			"array_dims":                        true, // 1-D bounds string
-			"date_bin":                          true, // bin timestamp to stride
-			"make_interval":                     true, // interval from components
-			"justify_hours":                     true, // roll 24h into days
-			"justify_days":                      true, // roll 30d into months
-			"justify_interval":                  true, // roll hours and days
-			"decode":                            true, // bytea decode (base64/hex/escape) macro
-			"encode":                            true, // bytea encode (base64/hex/escape) macro
-			"inet_server_addr":                  true, // INET-typed NULL stub
-			"json_array_elements":               true, // SRF: array elements (json)
-			"jsonb_array_elements":              true, // SRF: array elements (jsonb)
-			"json_array_elements_text":          true, // SRF: array elements (text)
-			"jsonb_each":                        true, // SRF: object key/value (json)
-			"json_each_text":                    true, // SRF: object key/value (text)
-			"pg_options_to_table":               true, // SRF: reloptions split
-			"aclexplode":                        true, // SRF: ACL explode (empty)
-			"pg_get_keywords":                   true, // SRF: keyword catalog
-			"pg_identify_object":                true, // object address -> identity row
+			"pg_get_triggerdef":                  true, // Trigger DDL stub (NULL)
+			"pg_jit_available":                   true, // JIT stub (false)
+			"row_security_active":                true, // RLS stub (false)
+			"pg_collation_for":                   true, // Collation stub
+			"pg_input_is_valid":                  true, // Bounded input validator
+			"to_regclass":                        true, // Name->oid probe
+			"to_regtype":                         true, // Type-name->oid probe
+			"to_regproc":                         true, // Function-name->oid probe
+			"jsonb_pretty":                       true, // Indented JSON
+			"json_typeof":                        true, // PG-vocabulary JSON type name
+			"jsonb_typeof":                       true, // PG-vocabulary JSON type name
+			"duckgres_string_to_array3":          true, // 3-arg string_to_array (nullstr)
+			"to_ascii":                           true, // Accent-stripping transliteration
+			"convert_from":                       true, // bytea->text (UTF8)
+			"width_bucket":                       true, // Equi-width histogram bucketing
+			"scale":                              true, // Numeric scale
+			"min_scale":                          true, // Numeric min scale
+			"masklen":                            true, // inet prefix length
+			"hostmask":                           true, // inet host mask
+			"set_masklen":                        true, // inet set prefix length
+			"inet_same_family":                   true, // inet family compare
+			"array_positions":                    true, // indices of all matching elements
+			"array_replace":                      true, // replace all matching elements
+			"array_fill":                         true, // 1-D fill
+			"trim_array":                         true, // drop last n elements
+			"array_dims":                         true, // 1-D bounds string
+			"date_bin":                           true, // bin timestamp to stride
+			"make_interval":                      true, // interval from components
+			"justify_hours":                      true, // roll 24h into days
+			"justify_days":                       true, // roll 30d into months
+			"justify_interval":                   true, // roll hours and days
+			"decode":                             true, // bytea decode (base64/hex/escape) macro
+			"encode":                             true, // bytea encode (base64/hex/escape) macro
+			"inet_server_addr":                   true, // INET-typed NULL stub
+			"json_array_elements":                true, // SRF: array elements (json)
+			"jsonb_array_elements":               true, // SRF: array elements (jsonb)
+			"json_array_elements_text":           true, // SRF: array elements (text)
+			"jsonb_each":                         true, // SRF: object key/value (json)
+			"json_each_text":                     true, // SRF: object key/value (text)
+			"pg_options_to_table":                true, // SRF: reloptions split
+			"aclexplode":                         true, // SRF: ACL explode (empty)
+			"pg_get_keywords":                    true, // SRF: keyword catalog
+			"pg_identify_object":                 true, // object address -> identity row
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -238,56 +239,56 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
 			// PostgreSQL builtin-compat macros
-			"set_config":                        true, // Session-setting writer (value-returning)
-			"uuid_generate_v4":                  true, // uuid-ossp v4 alias
-			"statement_timestamp":               true, // now() alias
-			"timeofday":                         true, // PG-shaped wall-clock text
-			"pg_get_function_arguments":         true, // \df signature stub
-			"pg_get_function_result":            true, // \df result-type stub
+			"set_config":                         true, // Session-setting writer (value-returning)
+			"uuid_generate_v4":                   true, // uuid-ossp v4 alias
+			"statement_timestamp":                true, // now() alias
+			"timeofday":                          true, // PG-shaped wall-clock text
+			"pg_get_function_arguments":          true, // \df signature stub
+			"pg_get_function_result":             true, // \df result-type stub
 			"pg_get_function_identity_arguments": true, // identity-arg stub
-			"pg_get_triggerdef":                 true, // Trigger DDL stub (NULL)
-			"pg_jit_available":                  true, // JIT stub (false)
-			"row_security_active":               true, // RLS stub (false)
-			"pg_collation_for":                  true, // Collation stub
-			"pg_input_is_valid":                 true, // Bounded input validator
-			"to_regclass":                       true, // Name->oid probe
-			"to_regtype":                        true, // Type-name->oid probe
-			"to_regproc":                        true, // Function-name->oid probe
-			"jsonb_pretty":                      true, // Indented JSON
-			"json_typeof":                       true, // PG-vocabulary JSON type name
-			"jsonb_typeof":                      true, // PG-vocabulary JSON type name
-			"duckgres_string_to_array3":         true, // 3-arg string_to_array (nullstr)
-			"to_ascii":                          true, // Accent-stripping transliteration
-			"convert_from":                      true, // bytea->text (UTF8)
-			"width_bucket":                      true, // Equi-width histogram bucketing
-			"scale":                             true, // Numeric scale
-			"min_scale":                         true, // Numeric min scale
-			"masklen":                           true, // inet prefix length
-			"hostmask":                          true, // inet host mask
-			"set_masklen":                       true, // inet set prefix length
-			"inet_same_family":                  true, // inet family compare
-			"array_positions":                   true, // indices of all matching elements
-			"array_replace":                     true, // replace all matching elements
-			"array_fill":                        true, // 1-D fill
-			"trim_array":                        true, // drop last n elements
-			"array_dims":                        true, // 1-D bounds string
-			"date_bin":                          true, // bin timestamp to stride
-			"make_interval":                     true, // interval from components
-			"justify_hours":                     true, // roll 24h into days
-			"justify_days":                      true, // roll 30d into months
-			"justify_interval":                  true, // roll hours and days
-			"decode":                            true, // bytea decode (base64/hex/escape) macro
-			"encode":                            true, // bytea encode (base64/hex/escape) macro
-			"inet_server_addr":                  true, // INET-typed NULL stub
-			"json_array_elements":               true, // SRF: array elements (json)
-			"jsonb_array_elements":              true, // SRF: array elements (jsonb)
-			"json_array_elements_text":          true, // SRF: array elements (text)
-			"jsonb_each":                        true, // SRF: object key/value (json)
-			"json_each_text":                    true, // SRF: object key/value (text)
-			"pg_options_to_table":               true, // SRF: reloptions split
-			"aclexplode":                        true, // SRF: ACL explode (empty)
-			"pg_get_keywords":                   true, // SRF: keyword catalog
-			"pg_identify_object":                true, // object address -> identity row
+			"pg_get_triggerdef":                  true, // Trigger DDL stub (NULL)
+			"pg_jit_available":                   true, // JIT stub (false)
+			"row_security_active":                true, // RLS stub (false)
+			"pg_collation_for":                   true, // Collation stub
+			"pg_input_is_valid":                  true, // Bounded input validator
+			"to_regclass":                        true, // Name->oid probe
+			"to_regtype":                         true, // Type-name->oid probe
+			"to_regproc":                         true, // Function-name->oid probe
+			"jsonb_pretty":                       true, // Indented JSON
+			"json_typeof":                        true, // PG-vocabulary JSON type name
+			"jsonb_typeof":                       true, // PG-vocabulary JSON type name
+			"duckgres_string_to_array3":          true, // 3-arg string_to_array (nullstr)
+			"to_ascii":                           true, // Accent-stripping transliteration
+			"convert_from":                       true, // bytea->text (UTF8)
+			"width_bucket":                       true, // Equi-width histogram bucketing
+			"scale":                              true, // Numeric scale
+			"min_scale":                          true, // Numeric min scale
+			"masklen":                            true, // inet prefix length
+			"hostmask":                           true, // inet host mask
+			"set_masklen":                        true, // inet set prefix length
+			"inet_same_family":                   true, // inet family compare
+			"array_positions":                    true, // indices of all matching elements
+			"array_replace":                      true, // replace all matching elements
+			"array_fill":                         true, // 1-D fill
+			"trim_array":                         true, // drop last n elements
+			"array_dims":                         true, // 1-D bounds string
+			"date_bin":                           true, // bin timestamp to stride
+			"make_interval":                      true, // interval from components
+			"justify_hours":                      true, // roll 24h into days
+			"justify_days":                       true, // roll 30d into months
+			"justify_interval":                   true, // roll hours and days
+			"decode":                             true, // bytea decode (base64/hex/escape) macro
+			"encode":                             true, // bytea encode (base64/hex/escape) macro
+			"inet_server_addr":                   true, // INET-typed NULL stub
+			"json_array_elements":                true, // SRF: array elements (json)
+			"jsonb_array_elements":               true, // SRF: array elements (jsonb)
+			"json_array_elements_text":           true, // SRF: array elements (text)
+			"jsonb_each":                         true, // SRF: object key/value (json)
+			"json_each_text":                     true, // SRF: object key/value (text)
+			"pg_options_to_table":                true, // SRF: reloptions split
+			"aclexplode":                         true, // SRF: ACL explode (empty)
+			"pg_get_keywords":                    true, // SRF: keyword catalog
+			"pg_identify_object":                 true, // object address -> identity row
 
 			// ClickHouse SQL macros (server/chsql.go initClickHouseMacros)
 			"tostring":          true,

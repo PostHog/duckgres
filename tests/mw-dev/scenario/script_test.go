@@ -21,6 +21,7 @@ func TestScenarioRunScriptValidatesRequiredEnvVars(t *testing.T) {
 	for _, name := range []string{
 		"DUCKGRES_SCENARIO_API_BASE",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET",
+		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_PG_HOST",
 		"DUCKGRES_SCENARIO_SNI_SUFFIX",
 	} {
@@ -47,6 +48,7 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	}
 	text := string(out)
 	for _, name := range []string{
+		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
 		"DUCKGRES_SCENARIO_FLIGHT_ADDR",
 	} {

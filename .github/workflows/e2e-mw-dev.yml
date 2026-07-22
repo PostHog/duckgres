@@ -1,10 +1,9 @@
 # Per-PR end-to-end test against the real posthog-mw-dev EKS cluster.
 #
 # Replaces what kind (tests/k8s/) cannot exercise: real Cilium network
-# policies, real Crossplane Duckling provisioning, and real cnpg-shard +
-# external RDS metadata stores — the production-like layers where this
-# quarter's bugs actually lived (Cilium egress, cnpg role drift, RBAC delete
-# gaps).
+# policies, real Crossplane Duckling provisioning, and real cnpg-shard metadata
+# stores — the production-like layers where this quarter's bugs actually lived
+# (Cilium egress, cnpg role drift, RBAC delete gaps).
 #
 # Flow:
 #   1. build arm64-only worker + control-plane images, tagged pr-<N>-<sha>,
@@ -15,7 +14,7 @@
 #      spawning worker pods in the same namespace.
 #   4. run the e2e harness as a Job INSIDE the namespace, talking to the CP
 #      ClusterIP service (no public DNS / NLB needed). Covers the cnpg-shard
-#      and external metadata backends.
+#      metadata backend.
 #   5. always tear the namespace down (and deprovision the ci-pr ducklings so
 #      no S3 / cnpg role leaks on shared infra).
 #

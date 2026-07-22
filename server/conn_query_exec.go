@@ -503,7 +503,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	// Intercept pg_stat_activity queries
 	if matchPgStatActivityQuery(query) {
 		_ = c.sendPgStatActivityRowDescriptionWithFormats(nil)
-		conns := c.server.listConns()
+		conns := c.visiblePgStatActivityConns()
 		sort.Slice(conns, func(i, j int) bool { return conns[i].pid < conns[j].pid })
 		for _, conn := range conns {
 			_ = c.sendPgStatActivityDataRow(conn, nil)

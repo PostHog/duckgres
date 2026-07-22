@@ -27,6 +27,10 @@ type fakeStore struct {
 	// tests can assert the request-field → store-request threading (the real
 	// billing-row/schema writes are covered by the Postgres-backed tests).
 	lastProvision *ProvisionRequest
+
+	listWarehousesErr error // set non-nil to fail ListWarehousesByStates
+	listOrgTeamsErr   error // set non-nil to fail ListOrgTeamsByOrgIDs
+	latestChangeErr   error // set non-nil to fail LatestConfigChange
 }
 
 func newFakeStore() *fakeStore {
@@ -277,6 +281,74 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	// declared-and-unused on the success path.
 	_, _ = shadowUserHash, hadUser
 	return nil
+}
+
+func (s *fakeStore) ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error) {
+	if s.listWarehousesErr != nil {
+		return nil, s.listWarehousesErr
+	}
+	want := make(map[configstore.ManagedWarehouseProvisioningState]struct{}, len(states))
+	for _, st := range states {
+		want[st] = struct{}{}
+	}
+	// Deterministic order, mirroring the production ORDER BY org_id.
+	ids := make([]string, 0, len(s.warehouses))
+	for id := range s.warehouses {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var out []configstore.ManagedWarehouse
+	for _, id := range ids {
+		if _, ok := want[s.warehouses[id].State]; ok {
+			out = append(out, *s.warehouses[id])
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) ListOrgTeamsByOrgIDs(orgIDs []string) ([]configstore.OrgTeam, error) {
+	if s.listOrgTeamsErr != nil {
+		return nil, s.listOrgTeamsErr
+	}
+	var out []configstore.OrgTeam
+	for _, id := range orgIDs {
+		ids := make([]int64, 0, len(s.teams[id]))
+		for tid := range s.teams[id] {
+			ids = append(ids, tid)
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		for _, tid := range ids {
+			out = append(out, *s.teams[id][tid])
+		}
+	}
+	return out, nil
+}
+
+// LatestConfigChange mirrors production: max updated_at across ALL
+// warehouse, org, and org-team rows regardless of state.
+func (s *fakeStore) LatestConfigChange() (time.Time, error) {
+	if s.latestChangeErr != nil {
+		return time.Time{}, s.latestChangeErr
+	}
+	var latest time.Time
+	for _, w := range s.warehouses {
+		if w.UpdatedAt.After(latest) {
+			latest = w.UpdatedAt
+		}
+	}
+	for _, o := range s.orgs {
+		if o.UpdatedAt.After(latest) {
+			latest = o.UpdatedAt
+		}
+	}
+	for _, byTeam := range s.teams {
+		for _, t := range byTeam {
+			if t.UpdatedAt.After(latest) {
+				latest = t.UpdatedAt
+			}
+		}
+	}
+	return latest, nil
 }
 
 func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {
@@ -1159,7 +1231,7 @@ func TestOrgTeamUpsertGrandfathersExistingRow(t *testing.T) {
 }
 
 // TestOrgTeamUpsertBackfillDefaultsTrue pins the NOT NULL DEFAULT TRUE stance
-// of backfill_enabled (migration 000027): a create that omits the field gets
+// of backfill_enabled (migration 000028): a create that omits the field gets
 // TRUE, matching the Django BooleanField(default=True) the column mirrors.
 func TestOrgTeamUpsertBackfillDefaultsTrue(t *testing.T) {
 	store := newFakeStore()

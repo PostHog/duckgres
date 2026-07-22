@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -80,6 +81,45 @@ type orgRoutedSessionProvider struct {
 
 	mu         sync.RWMutex
 	pidSession map[int32]flightOwnedSession // pid → owning session manager
+}
+
+func (p *orgRoutedSessionProvider) SessionOrgID(pid int32) (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	owned, ok := p.pidSession[pid]
+	return owned.orgID, ok
+}
+
+func (p *orgRoutedSessionProvider) QueryAccessPolicy(ctx context.Context, username string) *server.QueryAccessPolicy {
+	orgID, ok := p.resolveOrg(ctx)
+	if !ok || orgID == "" {
+		// Session creation will reject the same unresolved SNI. Returning an
+		// empty policy here keeps this helper independently fail-closed.
+		return &server.QueryAccessPolicy{ReadOnly: true}
+	}
+	policy, _, valid := p.queryAccessPolicyForOrg(orgID, username)
+	if !valid {
+		return &server.QueryAccessPolicy{ReadOnly: true}
+	}
+	return policy
+}
+
+func (p *orgRoutedSessionProvider) queryAccessPolicyForOrg(orgID, username string) (*server.QueryAccessPolicy, string, bool) {
+	store, ok := p.configStore.(interface {
+		OrgUserSessionQueryAccess(orgID, username string) (*configstore.OrgUserQueryAccess, string, bool)
+	})
+	if !ok {
+		return nil, "", false
+	}
+	access, revision, valid := store.OrgUserSessionQueryAccess(orgID, username)
+	if !valid || access == nil {
+		return nil, revision, valid
+	}
+	return &server.QueryAccessPolicy{
+		ReadOnly:         access.ReadOnly,
+		AllowedSchemas:   access.AllowedSchemas,
+		AllowedRelations: access.AllowedRelations,
+	}, revision, true
 }
 
 func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
@@ -161,16 +201,27 @@ func (p *orgRoutedSessionProvider) DurableSessionMetadata(pid int32, username st
 	if !ok {
 		return flightsqlingress.DurableSessionMetadata{}, fmt.Errorf("worker %d not found for pid %d", workerID, pid)
 	}
+	_, accessRevision, valid := p.queryAccessPolicyForOrg(owned.orgID, username)
+	if !valid {
+		return flightsqlingress.DurableSessionMetadata{}, fmt.Errorf("user access changed before Flight session persistence")
+	}
 	return flightsqlingress.DurableSessionMetadata{
-		Username:     username,
-		OrgID:        owned.orgID,
-		WorkerID:     workerID,
-		OwnerEpoch:   worker.OwnerEpoch(),
-		CPInstanceID: worker.OwnerCPInstanceID(),
+		Username:       username,
+		OrgID:          owned.orgID,
+		WorkerID:       workerID,
+		OwnerEpoch:     worker.OwnerEpoch(),
+		CPInstanceID:   worker.OwnerCPInstanceID(),
+		AccessRevision: accessRevision,
 	}, nil
 }
 
 func (p *orgRoutedSessionProvider) ReconnectSession(ctx context.Context, record flightsqlingress.DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
+	currentPolicy, accessRevision, valid := p.queryAccessPolicyForOrg(record.OrgID, record.Username)
+	if !record.AccessPolicyRecorded || record.AccessRevision == "" || !valid ||
+		accessRevision != record.AccessRevision || !sameQueryAccessPolicy(currentPolicy, record.QueryAccessPolicy) {
+		return 0, nil, flightsqlingress.MarkDurableReconnectTerminal(
+			fmt.Errorf("flight session access changed; authenticate again"))
+	}
 	if p.orgResharding(record.OrgID) {
 		// Terminal, not retry-later: the reshard runner drains parked flight
 		// sessions; letting a reconnect re-acquire a worker mid-reshard would
@@ -197,6 +248,17 @@ func (p *orgRoutedSessionProvider) ReconnectSession(ctx context.Context, record 
 	return pid, executor, nil
 }
 
+func sameQueryAccessPolicy(a, b *server.QueryAccessPolicy) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	normalizedA := server.NormalizeQueryAccessPolicy(*a)
+	normalizedB := server.NormalizeQueryAccessPolicy(*b)
+	return normalizedA.ReadOnly == normalizedB.ReadOnly &&
+		slices.Equal(normalizedA.AllowedSchemas, normalizedB.AllowedSchemas) &&
+		slices.Equal(normalizedA.AllowedRelations, normalizedB.AllowedRelations)
+}
+
 func (p *orgRoutedSessionProvider) DurableSessionStore() flightsqlingress.DurableSessionStore {
 	if p == nil || p.configStore == nil {
 		return nil
@@ -209,17 +271,29 @@ type configStoreFlightSessionStore struct {
 }
 
 func (s *configStoreFlightSessionStore) UpsertSession(record flightsqlingress.DurableSessionRecord) error {
+	var accessReadOnly bool
+	var allowedSchemas, allowedRelations []string
+	if record.QueryAccessPolicy != nil {
+		accessReadOnly = record.QueryAccessPolicy.ReadOnly
+		allowedSchemas = record.QueryAccessPolicy.AllowedSchemas
+		allowedRelations = record.QueryAccessPolicy.AllowedRelations
+	}
 	return s.store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
-		SessionToken: record.SessionToken,
-		Username:     record.Username,
-		OrgID:        record.OrgID,
-		WorkerID:     record.WorkerID,
-		PID:          record.PID,
-		OwnerEpoch:   record.OwnerEpoch,
-		CPInstanceID: record.CPInstanceID,
-		State:        configstore.FlightSessionState(record.State),
-		ExpiresAt:    record.ExpiresAt,
-		LastSeenAt:   record.LastSeenAt,
+		SessionToken:         record.SessionToken,
+		Username:             record.Username,
+		OrgID:                record.OrgID,
+		WorkerID:             record.WorkerID,
+		PID:                  record.PID,
+		OwnerEpoch:           record.OwnerEpoch,
+		CPInstanceID:         record.CPInstanceID,
+		State:                configstore.FlightSessionState(record.State),
+		ExpiresAt:            record.ExpiresAt,
+		LastSeenAt:           record.LastSeenAt,
+		AccessPolicyRecorded: record.AccessPolicyRecorded,
+		AccessRevision:       record.AccessRevision,
+		AccessReadOnly:       accessReadOnly,
+		AllowedSchemas:       allowedSchemas,
+		AllowedRelations:     allowedRelations,
 	})
 }
 
@@ -228,17 +302,28 @@ func (s *configStoreFlightSessionStore) GetSession(sessionToken string) (*flight
 	if err != nil || record == nil {
 		return nil, err
 	}
+	var queryAccessPolicy *server.QueryAccessPolicy
+	if record.AccessPolicyRecorded && (record.AccessReadOnly || len(record.AllowedSchemas) > 0 || len(record.AllowedRelations) > 0) {
+		queryAccessPolicy = &server.QueryAccessPolicy{
+			ReadOnly:         record.AccessReadOnly,
+			AllowedSchemas:   record.AllowedSchemas,
+			AllowedRelations: record.AllowedRelations,
+		}
+	}
 	return &flightsqlingress.DurableSessionRecord{
-		SessionToken: record.SessionToken,
-		Username:     record.Username,
-		OrgID:        record.OrgID,
-		WorkerID:     record.WorkerID,
-		PID:          record.PID,
-		OwnerEpoch:   record.OwnerEpoch,
-		CPInstanceID: record.CPInstanceID,
-		State:        flightsqlingress.DurableSessionState(record.State),
-		ExpiresAt:    record.ExpiresAt,
-		LastSeenAt:   record.LastSeenAt,
+		SessionToken:         record.SessionToken,
+		Username:             record.Username,
+		OrgID:                record.OrgID,
+		WorkerID:             record.WorkerID,
+		PID:                  record.PID,
+		OwnerEpoch:           record.OwnerEpoch,
+		CPInstanceID:         record.CPInstanceID,
+		State:                flightsqlingress.DurableSessionState(record.State),
+		ExpiresAt:            record.ExpiresAt,
+		LastSeenAt:           record.LastSeenAt,
+		AccessPolicyRecorded: record.AccessPolicyRecorded,
+		AccessRevision:       record.AccessRevision,
+		QueryAccessPolicy:    queryAccessPolicy,
 	}, nil
 }
 

@@ -579,6 +579,51 @@ touching this path:
   `compute_usage_pull_api` assertion (compute + storage) in
   `tests/mw-dev/e2e/harness.sh`.
 
+## Discovery Endpoints (external-writer tenant listing)
+
+`GET /api/v1/warehouses` + `GET /api/v1/warehouse-team-ids` on the internal
+provisioning API (`controlplane/provisioning/discovery.go`) are the read-only
+"which tenants exist and where do I write" surface for EXTERNAL writers
+(viaduck destination discovery; millpond's include-values poller). Semantics
+are load-bearing for those consumers:
+
+- **Warehouse set = ready + resharding** (`discoveryStates`). Resharding is
+  listed with `writable=false` — vanishing would read as tenant REMOVAL
+  downstream, not a pause. The state enum is open: a new state MUST be
+  classified into `discoveryStates`/`discoveryExcludedStates`
+  (`TestDiscoveryStateClassification` is the tripwire; an unclassified state
+  reads as fleet-wide removal to every consumer).
+- **Teams come from `duckgres_org_teams`**, with RESOLVED table locations:
+  `events_table`/`persons_table` = `<schema_name>.<override-or-derived>`,
+  `data_imports_schema` = override-or-`<schema>_data_imports`. The
+  derivation lives ONCE, in `resolveTeamTables`; the legacy overrides are
+  BARE identifiers (never schema-qualified), enforced at every write surface
+  by `configstore.ValidateOrgTeamTableName`.
+- **`enabled` is passed through as information only** — it is the per-team
+  query-serving switch (migration 000024, not yet enforced), NOT an
+  ingestion signal. Disabled teams stay in BOTH endpoints; deriving
+  "stop ingesting" from it would turn a serving hold into permanent event
+  loss. The only ingestion-stop signal is row absence.
+- **Error contract:** transient store failures fail the WHOLE request (a
+  polling consumer keeps last-known-good — the safe direction); only a
+  warehouse with zero team rows degrades, per-warehouse, to an empty teams
+  array (`duckgres_discovery_broken_team_rows_total{reason}` counts it — a
+  sustained nonzero means a live tenant is silently unroutable).
+- **`config_generation` is an opaque change token**: max `updated_at` over
+  ALL warehouse+org+org-team rows regardless of state, read BEFORE the data
+  queries. Its delete-visibility depends on `DeleteOrgTeamTx` touching the
+  parent org row (a bare team DELETE leaves no timestamp behind) —
+  `TestLatestConfigChangeCoversTeamsPostgres` pins that pair; keep them in
+  sync. Compare for equality only.
+- **No plaintext credentials in the payload** — metadata-store passwords are
+  k8s SecretRefs. cnpg rows currently carry only the metadata-store KIND
+  (endpoint/db/user live in the Duckling CR status until the provisioner
+  backfills the row on Ready); external rows round-trip fully.
+- Touching the payload shape, states, team derivation, or the generation →
+  update `controlplane/provisioning/discovery_test.go`,
+  `tests/configstore/org_teams_postgres_test.go`, AND the
+  `discovery_endpoints` assertion in `tests/mw-dev/e2e/harness.sh`.
+
 ## Resharding (metadata-store migrations) — LOAD-BEARING CONTRACT
 
 Operator-driven moves of an org's DuckLake catalog between metadata stores

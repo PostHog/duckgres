@@ -309,7 +309,7 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
             <Input
               value={eventsName}
               onChange={(e) => setEventsName(e.target.value)}
-              placeholder={`${team.schema_name}.events (derived)`}
+              placeholder={`events (derived → ${team.schema_name}.events)`}
               className="font-mono text-xs"
             />
           </FieldRow>
@@ -317,7 +317,7 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
             <Input
               value={personsName}
               onChange={(e) => setPersonsName(e.target.value)}
-              placeholder={`${team.schema_name}.persons (derived)`}
+              placeholder={`persons (derived → ${team.schema_name}.persons)`}
               className="font-mono text-xs"
             />
           </FieldRow>
@@ -325,7 +325,7 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
             <Input
               value={importsName}
               onChange={(e) => setImportsName(e.target.value)}
-              placeholder={`${team.schema_name}_data_imports (derived)`}
+              placeholder={`${team.schema_name}_data_imports (derived; bare schema name)`}
               className="font-mono text-xs"
             />
           </FieldRow>

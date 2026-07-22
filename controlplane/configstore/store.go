@@ -3,11 +3,13 @@ package configstore
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,26 @@ type OrgUserKey struct {
 	Username string
 }
 
+const (
+	OrgUserAccessModeUnrestricted  = "unrestricted"
+	OrgUserAccessModeProjectReader = "project_reader"
+)
+
+// OrgUserAccessConfig is the persisted identity binding loaded into a config
+// snapshot. Namespace permissions are derived from the matching OrgTeam row.
+type OrgUserAccessConfig struct {
+	Mode   string
+	TeamID *int64
+}
+
+// OrgUserQueryAccess is the protocol-neutral project policy returned to the
+// PostgreSQL and Flight SQL ingress layers.
+type OrgUserQueryAccess struct {
+	ReadOnly         bool
+	AllowedSchemas   []string
+	AllowedRelations []string
+}
+
 var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 
 // ErrWorkerRecordUpsertFenceMiss indicates an UpsertWorkerRecord conflict was
@@ -36,15 +58,21 @@ var ErrWorkerRecordUpsertFenceMiss = errors.New("worker record upsert fence miss
 // no row matches (orgID, username). Callers map it to a 404.
 var ErrOrgUserNotFound = errors.New("org user not found")
 
+// ErrProjectReaderTeamUnavailable is returned when a project-reader user is
+// requested for a team that does not exist or is disabled.
+var ErrProjectReaderTeamUnavailable = errors.New("project reader requires an enabled org team")
+
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
 	Orgs               map[string]*OrgConfig
 	DatabaseOrg        map[string]string     // database name -> org ID
 	HostnameAliasOrg   map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
 	OrgUserPassword    map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	OrgUserRevision    map[OrgUserKey]string // (orgID, username) -> non-secret session credential revision
 	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
 	OrgUserDisabled    map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
 	OrgUserMaxVCPUs    map[OrgUserKey]int    // (orgID, username) -> max active requested vCPUs; 0 = unlimited
+	OrgUserAccess      map[OrgUserKey]OrgUserAccessConfig
 }
 
 // Selectable catalog names. The startup `database` param now names the catalog
@@ -85,6 +113,8 @@ type PostgresConnectionResolution struct {
 	// set together with Valid=true — a wrong password / unknown user returns
 	// Valid=false and never leaks the disabled state.
 	Disabled bool
+	// QueryAccess is non-nil for a project-scoped read-only user.
+	QueryAccess *OrgUserQueryAccess
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -187,9 +217,11 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		DatabaseOrg:        make(map[string]string),
 		HostnameAliasOrg:   make(map[string]string),
 		OrgUserPassword:    make(map[OrgUserKey]string),
+		OrgUserRevision:    make(map[OrgUserKey]string),
 		OrgUserPassthrough: make(map[OrgUserKey]bool),
 		OrgUserDisabled:    make(map[OrgUserKey]bool),
 		OrgUserMaxVCPUs:    make(map[OrgUserKey]int),
+		OrgUserAccess:      make(map[OrgUserKey]OrgUserAccessConfig),
 	}
 
 	for _, o := range orgs {
@@ -200,10 +232,13 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		teams := make([]OrgTeamConfig, 0, len(o.Teams))
 		for _, team := range o.Teams {
 			teams = append(teams, OrgTeamConfig{
-				TeamID:        team.TeamID,
-				SchemaName:    team.SchemaName,
-				Enabled:       team.Enabled,
-				IsBillingTeam: team.IsBillingTeam != nil && *team.IsBillingTeam,
+				TeamID:                team.TeamID,
+				SchemaName:            team.SchemaName,
+				Enabled:               team.Enabled,
+				IsBillingTeam:         team.IsBillingTeam != nil && *team.IsBillingTeam,
+				EventsTableName:       team.EventsTableName,
+				PersonsTableName:      team.PersonsTableName,
+				SchemaDataImportsName: team.SchemaDataImportsName,
 			})
 		}
 		oc := &OrgConfig{
@@ -230,6 +265,8 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			oc.Users[u.Username] = u.Password
 			key := OrgUserKey{OrgID: o.Name, Username: u.Username}
 			snap.OrgUserPassword[key] = u.Password
+			snap.OrgUserRevision[key] = u.UpdatedAt.UTC().Format(time.RFC3339Nano)
+			snap.OrgUserAccess[key] = OrgUserAccessConfig{Mode: u.AccessMode, TeamID: u.TeamID}
 			if u.Passthrough {
 				snap.OrgUserPassthrough[key] = true
 			}
@@ -267,6 +304,85 @@ func (cs *ConfigStore) ReloadSnapshot() error {
 		fn(oldSnap, newSnap)
 	}
 	return nil
+}
+
+// OrgUserQueryAccess returns the project-scoped read policy for a user. A
+// false result means the user is unrestricted. A project reader whose team is
+// absent or disabled returns an empty, read-only policy and therefore fails
+// closed for every persistent project relation.
+func (cs *ConfigStore) OrgUserQueryAccess(orgID, username string) (OrgUserQueryAccess, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return OrgUserQueryAccess{}, false
+	}
+	return orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username)
+}
+
+// OrgUserSessionQueryAccess resolves the current enabled user, its optional
+// project policy, and a non-secret credential revision in one snapshot read.
+// A nil policy with ok=true is unrestricted; ok=false is missing or disabled.
+func (cs *ConfigStore) OrgUserSessionQueryAccess(orgID, username string) (*OrgUserQueryAccess, string, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return nil, "", false
+	}
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	_, exists := cs.snapshot.OrgUserPassword[key]
+	revision, revisionExists := cs.snapshot.OrgUserRevision[key]
+	if !exists || !revisionExists || revision == "" || cs.snapshot.OrgUserDisabled[key] {
+		return nil, "", false
+	}
+	access, scoped := orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username)
+	if !scoped {
+		return nil, revision, true
+	}
+	return &access, revision, true
+}
+
+func orgUserQueryAccessFromSnapshot(snapshot *Snapshot, orgID, username string) (OrgUserQueryAccess, bool) {
+	access, ok := snapshot.OrgUserAccess[OrgUserKey{OrgID: orgID, Username: username}]
+	if !ok || access.Mode != OrgUserAccessModeProjectReader {
+		return OrgUserQueryAccess{}, false
+	}
+	policy := OrgUserQueryAccess{ReadOnly: true}
+	if access.TeamID == nil {
+		return policy, true
+	}
+	org := snapshot.Orgs[orgID]
+	if org == nil {
+		return policy, true
+	}
+	for _, team := range org.Teams {
+		if team.TeamID != *access.TeamID || !team.Enabled {
+			continue
+		}
+		importsSchema := team.SchemaName + "_data_imports"
+		if team.SchemaDataImportsName != nil && *team.SchemaDataImportsName != "" {
+			importsSchema = *team.SchemaDataImportsName
+		}
+		policy.AllowedSchemas = []string{
+			importsSchema,
+			fmt.Sprintf("shadow_%d_models", team.TeamID),
+			team.SchemaName,
+		}
+		// A non-NULL override means the team's table lives in the shared
+		// legacy posthog schema — even when the override spells the derived
+		// default name (posthog org team 2 is events_table_name="events" →
+		// posthog.events). NULL means derive from schema_name, which the
+		// AllowedSchemas grant above already covers.
+		if team.EventsTableName != nil && *team.EventsTableName != "" {
+			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.EventsTableName)
+		}
+		if team.PersonsTableName != nil && *team.PersonsTableName != "" {
+			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.PersonsTableName)
+		}
+		sort.Strings(policy.AllowedSchemas)
+		sort.Strings(policy.AllowedRelations)
+		return policy, true
+	}
+	return policy, true
 }
 
 // Snapshot returns the current config snapshot.
@@ -423,6 +539,9 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	// so a disabled user gets a distinct "account disabled" error while a wrong
 	// password still looks identical to an unknown user.
 	result.Disabled = cs.snapshot.OrgUserDisabled[key]
+	if access, ok := orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username); ok {
+		result.QueryAccess = &access
+	}
 	return result
 }
 
@@ -670,10 +789,51 @@ func (cs *ConfigStore) GetManagedWarehouse(orgID string) (*ManagedWarehouse, err
 
 func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvisioningState) ([]ManagedWarehouse, error) {
 	var warehouses []ManagedWarehouse
-	if err := cs.db.Where("state IN ?", states).Find(&warehouses).Error; err != nil {
+	// Deterministic order: without it Postgres heap order shuffles between
+	// reads, and discovery consumers diffing successive responses see
+	// phantom changes.
+	if err := cs.db.Where("state IN ?", states).Order("org_id").Find(&warehouses).Error; err != nil {
 		return nil, fmt.Errorf("list warehouses by states: %w", err)
 	}
 	return warehouses, nil
+}
+
+// ListOrgTeamsByOrgIDs batch-fetches duckgres_org_teams rows for a set of
+// orgs (discovery endpoints). Orgs with no rows are simply absent from the
+// result — callers decide how to degrade. Deterministic order for stable
+// consumer diffs.
+func (cs *ConfigStore) ListOrgTeamsByOrgIDs(orgIDs []string) ([]OrgTeam, error) {
+	if len(orgIDs) == 0 {
+		return nil, nil
+	}
+	var teams []OrgTeam
+	if err := cs.db.Where("org_id IN ?", orgIDs).Order("org_id, team_id").Find(&teams).Error; err != nil {
+		return nil, fmt.Errorf("list org teams by org ids: %w", err)
+	}
+	return teams, nil
+}
+
+// LatestConfigChange returns the max updated_at across ALL warehouse, org,
+// and org-team rows regardless of state — the discovery change token.
+// Unfiltered deliberately: a deprovision moves a row OUT of the
+// discoverable states while bumping its updated_at, and that transition is
+// exactly a change a poller must not skip. Team-row DELETEs leave no
+// updated_at behind, so DeleteOrgTeamTx touches the parent org row — this
+// function's delete-visibility DEPENDS on that touch; change either side
+// with the other in view (TestLatestConfigChangeCoversTeamsPostgres pins
+// the pair).
+func (cs *ConfigStore) LatestConfigChange() (time.Time, error) {
+	var latest time.Time
+	for _, model := range []any{&ManagedWarehouse{}, &Org{}, &OrgTeam{}} {
+		var t sql.NullTime
+		if err := cs.db.Model(model).Select("MAX(updated_at)").Scan(&t).Error; err != nil {
+			return time.Time{}, fmt.Errorf("latest config change: %w", err)
+		}
+		if t.Valid && t.Time.After(latest) {
+			latest = t.Time
+		}
+	}
+	return latest, nil
 }
 
 // UpdateWarehouseState performs a compare-and-swap update on a warehouse row.
@@ -1795,7 +1955,7 @@ func advisoryLockKey(s string) int64 {
 func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "session_token"}},
-		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "p_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "p_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "access_policy_recorded", "access_revision", "access_read_only", "allowed_schemas", "allowed_relations", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert flight session record: %w", err)
 	}
@@ -1852,6 +2012,7 @@ func (cs *ConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(stale 
 		Where("p_id = ?", stale.PID).
 		Where("owner_epoch = ?", stale.OwnerEpoch).
 		Where("cp_instance_id = ?", stale.CPInstanceID).
+		Where("access_revision = ?", stale.AccessRevision).
 		Updates(map[string]any{
 			"state":        FlightSessionStateClosed,
 			"last_seen_at": closedAt,

@@ -95,6 +95,11 @@ type Store interface {
 	ListOrgTeams(orgID string) ([]configstore.OrgTeam, error)
 	UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*configstore.OrgTeam, error)
 	DeleteOrgTeam(orgID string, teamID int64) (*configstore.OrgTeamDeleteResult, error)
+	// Discovery backing (discovery.go): list live warehouses, batch-fetch
+	// their team rows, and the unfiltered change marker.
+	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
+	ListOrgTeamsByOrgIDs(orgIDs []string) ([]configstore.OrgTeam, error)
+	LatestConfigChange() (time.Time, error)
 }
 
 // RegisterAPI registers provisioning endpoints on the given router group.
@@ -114,6 +119,10 @@ func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
 	r.GET("/orgs/:id/teams", h.listOrgTeams)
 	r.POST("/orgs/:id/teams", h.upsertOrgTeam)
 	r.DELETE("/orgs/:id/teams/:team_id", h.deleteOrgTeam)
+	// Discovery: read-only tenant listing for external writers (see
+	// discovery.go for payload semantics).
+	r.GET("/warehouses", h.listWarehouses)
+	r.GET("/warehouse-team-ids", h.listWarehouseTeamIDs)
 }
 
 type handler struct {
@@ -564,7 +573,7 @@ type orgTeamUpsertRequest struct {
 	SchemaName string `json:"schema_name"`
 	Enabled    *bool  `json:"enabled,omitempty"`
 	// BackfillEnabled: absent = TRUE on insert / preserve on update. The
-	// column is NOT NULL DEFAULT TRUE (migration 000027), so an explicit null
+	// column is NOT NULL DEFAULT TRUE (migration 000028), so an explicit null
 	// is a 400 — there is no "unset" to clear back to.
 	BackfillEnabled       *bool   `json:"backfill_enabled,omitempty"`
 	EventsTableName       *string `json:"events_table_name,omitempty"`

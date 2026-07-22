@@ -1,13 +1,14 @@
 name: posthog-frozen-perf
 run_id_prefix: scenario-frozen-perf
 required_env:
+  - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_SCENARIO_FLIGHT_ADDR
 steps:
   - id: provision
     type: provision_warehouse
     with:
-      org_id: scenario-frozen-perf-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       request:
         database_name: scenario_frozen_perf_${run_id_token}
         default_team_id: 1
@@ -21,14 +22,14 @@ steps:
   - id: wait_ready
     type: wait_warehouse_ready
     with:
-      org_id: scenario-frozen-perf-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       timeout: 15m
       poll_interval: 10s
 
   - id: setup_frozen_views
     type: sql
     with:
-      org_id: scenario-frozen-perf-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       file: ../sql/setup_frozen_views.sql
       max_attempts: 12
@@ -37,7 +38,7 @@ steps:
   - id: perf_queries
     type: perf_queries
     with:
-      org_id: scenario-frozen-perf-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       catalog_file: ../../../perf/queries/ducklake_frozen.yaml
       run_id: ${run_id}
@@ -50,7 +51,7 @@ steps:
     depends_on: [perf_queries]
     always_run: true
     with:
-      org_id: scenario-frozen-perf-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       verify_deleted: true
       cleanup_timeout: 15m
       poll_interval: 10s
