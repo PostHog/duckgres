@@ -59,8 +59,33 @@ jobs:
               env:
                   PLATFORM: ${{ matrix.platform }}
 
+            # Skip the build+push when this commit's arch image is already in ECR, so a
+            # re-run/dispatch doesn't collide with the now-immutable <sha>-<arch> tag.
+            - name: Check if image already in ECR
+              id: check
+              env:
+                  SHA: ${{ github.sha }}
+                  ARCH: ${{ steps.slug.outputs.arch }}
+              run: |
+                  set -euo pipefail
+                  if aws ecr batch-get-image \
+                      --repository-name "$IMAGE_NAME" \
+                      --image-ids imageTag="${SHA}-${ARCH}" \
+                      --accepted-media-types \
+                          "application/vnd.oci.image.index.v1+json" \
+                          "application/vnd.oci.image.manifest.v1+json" \
+                          "application/vnd.docker.distribution.manifest.list.v2+json" \
+                          "application/vnd.docker.distribution.manifest.v2+json" \
+                      --query 'images[0].imageId.imageDigest' --output text 2>/dev/null | grep -q '^sha256:'; then
+                      echo "exists=true" >> "$GITHUB_OUTPUT"
+                      echo "Image ${SHA}-${ARCH} already in ECR; skipping build."
+                  else
+                      echo "exists=false" >> "$GITHUB_OUTPUT"
+                  fi
+
             - name: Build and push by digest
               id: build
+              if: steps.check.outputs.exists != 'true'
               uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
               with:
                   context: .
@@ -106,13 +131,32 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
+            # Create the multi-arch manifest only if the immutable <sha> tag isn't already
+            # in ECR, so a re-run still reaches the deploy dispatch. The digest is resolved
+            # from the existing or newly-created manifest either way.
             - name: Create and push ECR manifest
               id: ecr-manifest
+              env:
+                  SHA: ${{ github.sha }}
               run: |
-                  docker buildx imagetools create --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
-                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-                  digest=$(docker buildx imagetools inspect --raw ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
+                  set -euo pipefail
+                  IMG="${ECR_REGISTRY}/${IMAGE_NAME}"
+                  if aws ecr batch-get-image \
+                      --repository-name "$IMAGE_NAME" \
+                      --image-ids imageTag="${SHA}" \
+                      --accepted-media-types \
+                          "application/vnd.oci.image.index.v1+json" \
+                          "application/vnd.oci.image.manifest.v1+json" \
+                          "application/vnd.docker.distribution.manifest.list.v2+json" \
+                          "application/vnd.docker.distribution.manifest.v2+json" \
+                      --query 'images[0].imageId.imageDigest' --output text 2>/dev/null | grep -q '^sha256:'; then
+                      echo "Manifest ${SHA} already in ECR; skipping create."
+                  else
+                      docker buildx imagetools create --tag "${IMG}:${SHA}" \
+                          "${IMG}:${SHA}-arm64" \
+                          "${IMG}:${SHA}-amd64"
+                  fi
+                  digest=$(docker buildx imagetools inspect --raw "${IMG}:${SHA}" | sha256sum | awk '{print "sha256:"$1}')
                   echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
             - name: Create and push GHCR manifests
