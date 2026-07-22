@@ -90,6 +90,7 @@ func modelDescriptors() []modelDescriptor {
 	}
 	return []modelDescriptor{
 		mk("orgs", "Orgs", modelGroupTenants, false, configstore.Org{}),
+		mk("org-teams", "Org Teams", modelGroupTenants, false, configstore.OrgTeam{}),
 		mk("org-users", "Org Users", modelGroupTenants, false, configstore.OrgUser{}),
 		mk("org-user-secrets", "Org User Secrets", modelGroupTenants, false, configstore.OrgUserSecret{}),
 		mk("managed-warehouses", "Managed Warehouses", modelGroupTenants, false, configstore.ManagedWarehouse{}),

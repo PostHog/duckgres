@@ -20,6 +20,10 @@ const ACTION_LABELS: Record<string, string> = {
   "warehouse.update": "Updated warehouse config",
   "warehouse.delete": "Deleted warehouse config",
 
+  "team.create": "Created org team",
+  "team.update": "Updated org team",
+  "team.delete": "Deleted org team",
+
   "user.create": "Created user",
   "user.update": "Updated user",
   "user.delete": "Deleted user",

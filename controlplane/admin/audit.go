@@ -177,6 +177,9 @@ func auditActionFor(method, path string) string {
 	case "users":
 		// Top-level user create (POST /users) — not nested under an org.
 		return "user." + verb
+	case "teams":
+		// Top-level team create (POST /teams) — the org rides in the body.
+		return "team." + verb
 	case "sessions":
 		// /sessions/:pid/cancel and /sessions/by-worker/:wid/cancel.
 		if last == "cancel" {
@@ -198,6 +201,9 @@ func auditActionFor(method, path string) string {
 		case hasSeg(segs, "warehouse"):
 			// PUT /warehouse and PATCH /warehouse/pinning both map here.
 			return "warehouse." + verb
+		case hasSeg(segs, "teams"):
+			// /orgs/:id/teams and /orgs/:id/teams/:team_id.
+			return "team." + verb
 		case hasSeg(segs, "impersonate"):
 			// Impersonation records its own richer row; this is a fallback.
 			return "impersonate." + verb

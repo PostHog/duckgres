@@ -365,6 +365,107 @@ func TestSessionPoolActivateTenantAllowsSameOwnerSameEpochCredentialRetry(t *tes
 	}
 }
 
+// Regression test for the mw-prod-us 2026-07-17 cache bypass: the hot-idle
+// credential refresh rebuilt ducklake_s3 from the RAW activation payload,
+// dropping the cache-proxy transport (HTTPProxy + USE_SSL=false + pinned
+// endpoint) the attach path applies. The first CP-driven STS rotation then
+// flipped every worker to vhost/HTTPS CONNECT tunnels that the NVMe cache
+// proxy cannot cache. The refresh must see the same overridden config the
+// attach saw.
+func TestSessionPoolCredentialRefreshKeepsCacheProxyTransport(t *testing.T) {
+	t.Setenv("DUCKGRES_CACHE_ENABLED", "true")
+	t.Setenv("NODE_IP", "10.0.0.9")
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	var opened *sql.DB
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		opened = db
+		return PairFromMain(db), nil
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+	defer func() {
+		if opened != nil {
+			_ = opened.Close()
+		}
+	}()
+
+	first := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch:   2,
+			CPInstanceID: "cp-live:boot-a",
+			WorkerID:     17,
+		},
+		OrgID: "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore:  "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+			ObjectStore:    "s3://analytics/warehouse/",
+			S3Region:       "us-east-1",
+			S3AccessKey:    "OLD_ACCESS_KEY",
+			S3SecretKey:    "OLD_SECRET_KEY",
+			S3SessionToken: "OLD_SESSION_TOKEN",
+		},
+	}
+	if err := pool.activateTenant(first); err != nil {
+		t.Fatalf("first ActivateTenant: %v", err)
+	}
+
+	var refreshCalls int
+	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
+		refreshCalls++
+		if dlCfg.HTTPProxy != "http://10.0.0.9:8080" {
+			t.Errorf("refresh config lost cache-proxy HTTPProxy: got %q", dlCfg.HTTPProxy)
+		}
+		if dlCfg.S3UseSSL {
+			t.Error("refresh config lost USE_SSL=false override — secret would be rebuilt as HTTPS and bypass the cache proxy")
+		}
+		if dlCfg.S3Endpoint != "s3.us-east-1.amazonaws.com" {
+			t.Errorf("refresh config lost pinned S3 endpoint: got %q", dlCfg.S3Endpoint)
+		}
+		if dlCfg.S3AccessKey != "NEW_ACCESS_KEY" {
+			t.Errorf("expected refresh with rotated credentials, got %q", dlCfg.S3AccessKey)
+		}
+		return nil
+	}
+
+	second := first
+	second.DuckLake.S3AccessKey = "NEW_ACCESS_KEY"
+	second.DuckLake.S3SecretKey = "NEW_SECRET_KEY"
+	second.DuckLake.S3SessionToken = "NEW_SESSION_TOKEN"
+	if err := pool.activateTenant(second); err != nil {
+		t.Fatalf("credential rotation re-activation: %v", err)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("expected one credential refresh, got %d", refreshCalls)
+	}
+
+	// The stored payload must keep the RAW config (no proxy fields) so
+	// needsRefresh DeepEqual comparisons against future raw payloads stay
+	// meaningful — the override belongs only to the exec'd refresh.
+	current := pool.currentActivation()
+	if current == nil {
+		t.Fatal("expected activation to remain present")
+	}
+	if current.payload.DuckLake.HTTPProxy != "" {
+		t.Fatalf("stored payload must stay raw, got HTTPProxy %q", current.payload.DuckLake.HTTPProxy)
+	}
+}
+
 func TestSessionPoolValidateControlMetadataAcceptsMismatchedCPInstanceID(t *testing.T) {
 	pool := &SessionPool{
 		sharedWarmMode:    true,

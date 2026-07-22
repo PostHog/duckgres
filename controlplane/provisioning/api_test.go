@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -19,7 +21,16 @@ type fakeStore struct {
 	orgs                  map[string]*configstore.Org
 	users                 map[configstore.OrgUserKey]string
 	warehouses            map[string]*configstore.ManagedWarehouse
+	teams                 map[string]map[int64]*configstore.OrgTeam
 	provisionUserFailHook error // set non-nil to simulate user-step failure inside Provision
+	// lastProvision records the ProvisionRequest the handler dispatched, so
+	// tests can assert the request-field → store-request threading (the real
+	// billing-row/schema writes are covered by the Postgres-backed tests).
+	lastProvision *ProvisionRequest
+
+	listWarehousesErr error // set non-nil to fail ListWarehousesByStates
+	listOrgTeamsErr   error // set non-nil to fail ListOrgTeamsByOrgIDs
+	latestChangeErr   error // set non-nil to fail LatestConfigChange
 }
 
 func newFakeStore() *fakeStore {
@@ -27,6 +38,7 @@ func newFakeStore() *fakeStore {
 		orgs:       make(map[string]*configstore.Org),
 		users:      make(map[configstore.OrgUserKey]string),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
+		teams:      make(map[string]map[int64]*configstore.OrgTeam),
 	}
 }
 
@@ -93,7 +105,125 @@ func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // handler treats partial failure as a complete rollback.
 func (s *fakeStore) setProvisionUserFailHook(err error) { s.provisionUserFailHook = err }
 
+// seedTeam plants one team row (nil billing/backfill unless set by the caller).
+func (s *fakeStore) seedTeam(team configstore.OrgTeam) {
+	if s.teams[team.OrgID] == nil {
+		s.teams[team.OrgID] = make(map[int64]*configstore.OrgTeam)
+	}
+	clone := team
+	s.teams[team.OrgID][team.TeamID] = &clone
+}
+
+func (s *fakeStore) ListOrgTeams(orgID string) ([]configstore.OrgTeam, error) {
+	if _, ok := s.orgs[orgID]; !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var out []configstore.OrgTeam
+	for _, t := range s.teams[orgID] {
+		out = append(out, *t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TeamID < out[j].TeamID })
+	return out, nil
+}
+
+// UpsertOrgTeam mirrors configstore.UpsertOrgTeamTx's contract in memory:
+// unknown org → gorm.ErrRecordNotFound, schema held by another team →
+// ErrOrgTeamSchemaConflict, presence-aware merge otherwise.
+func (s *fakeStore) UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*configstore.OrgTeam, error) {
+	if _, ok := s.orgs[orgID]; !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	for _, t := range s.teams[orgID] {
+		if t.SchemaName == up.SchemaName && t.TeamID != up.TeamID {
+			return nil, configstore.ErrOrgTeamSchemaConflict
+		}
+	}
+	if s.teams[orgID] == nil {
+		s.teams[orgID] = make(map[int64]*configstore.OrgTeam)
+	}
+	existing, ok := s.teams[orgID][up.TeamID]
+	if !ok {
+		backfill := up.BackfillEnabled == nil || *up.BackfillEnabled
+		row := &configstore.OrgTeam{
+			OrgID:           orgID,
+			TeamID:          up.TeamID,
+			SchemaName:      up.SchemaName,
+			Enabled:         up.Enabled == nil || *up.Enabled,
+			BackfillEnabled: &backfill,
+		}
+		applyFakeTableNames(row, up)
+		if up.EarliestEventDateSet {
+			row.EarliestEventDate = up.EarliestEventDate
+		}
+		s.teams[orgID][up.TeamID] = row
+		clone := *row
+		return &clone, nil
+	}
+	existing.SchemaName = up.SchemaName
+	if up.Enabled != nil {
+		existing.Enabled = *up.Enabled
+	}
+	if up.BackfillEnabled != nil {
+		existing.BackfillEnabled = up.BackfillEnabled
+	}
+	applyFakeTableNames(existing, up)
+	if up.EarliestEventDateSet {
+		existing.EarliestEventDate = up.EarliestEventDate
+	}
+	clone := *existing
+	return &clone, nil
+}
+
+func applyFakeTableNames(row *configstore.OrgTeam, up configstore.OrgTeamUpsert) {
+	set := func(dst **string, src *string) {
+		if src == nil {
+			return
+		}
+		if *src == "" {
+			*dst = nil
+			return
+		}
+		v := *src
+		*dst = &v
+	}
+	set(&row.EventsTableName, up.EventsTableName)
+	set(&row.PersonsTableName, up.PersonsTableName)
+	set(&row.SchemaDataImportsName, up.SchemaDataImportsName)
+}
+
+// DeleteOrgTeam mirrors configstore.DeleteOrgTeamTx's rules in memory: 404 for
+// a missing row, refusal on the last team, billing handover to the remaining
+// team with the oldest created_at.
+func (s *fakeStore) DeleteOrgTeam(orgID string, teamID int64) (*configstore.OrgTeamDeleteResult, error) {
+	target, ok := s.teams[orgID][teamID]
+	if !ok {
+		return nil, configstore.ErrOrgTeamNotFound
+	}
+	if len(s.teams[orgID]) == 1 {
+		return nil, configstore.ErrLastOrgTeam
+	}
+	delete(s.teams[orgID], teamID)
+	res := &configstore.OrgTeamDeleteResult{
+		WasBilling: target.IsBillingTeam != nil && *target.IsBillingTeam,
+	}
+	if res.WasBilling {
+		var successor *configstore.OrgTeam
+		for _, t := range s.teams[orgID] {
+			if successor == nil || t.CreatedAt.Before(successor.CreatedAt) ||
+				(t.CreatedAt.Equal(successor.CreatedAt) && t.TeamID < successor.TeamID) {
+				successor = t
+			}
+		}
+		billing := true
+		successor.IsBillingTeam = &billing
+		res.NewBillingTeamID = successor.TeamID
+	}
+	return res, nil
+}
+
 func (s *fakeStore) Provision(req ProvisionRequest) error {
+	reqCopy := req
+	s.lastProvision = &reqCopy
 	// Pre-check: warehouse already exists in non-terminal state? Mirrors
 	// createPendingWarehouseTx so the handler's 409 branch is exercised.
 	if existing, ok := s.warehouses[req.OrgID]; ok &&
@@ -153,6 +283,74 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	return nil
 }
 
+func (s *fakeStore) ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error) {
+	if s.listWarehousesErr != nil {
+		return nil, s.listWarehousesErr
+	}
+	want := make(map[configstore.ManagedWarehouseProvisioningState]struct{}, len(states))
+	for _, st := range states {
+		want[st] = struct{}{}
+	}
+	// Deterministic order, mirroring the production ORDER BY org_id.
+	ids := make([]string, 0, len(s.warehouses))
+	for id := range s.warehouses {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var out []configstore.ManagedWarehouse
+	for _, id := range ids {
+		if _, ok := want[s.warehouses[id].State]; ok {
+			out = append(out, *s.warehouses[id])
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) ListOrgTeamsByOrgIDs(orgIDs []string) ([]configstore.OrgTeam, error) {
+	if s.listOrgTeamsErr != nil {
+		return nil, s.listOrgTeamsErr
+	}
+	var out []configstore.OrgTeam
+	for _, id := range orgIDs {
+		ids := make([]int64, 0, len(s.teams[id]))
+		for tid := range s.teams[id] {
+			ids = append(ids, tid)
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		for _, tid := range ids {
+			out = append(out, *s.teams[id][tid])
+		}
+	}
+	return out, nil
+}
+
+// LatestConfigChange mirrors production: max updated_at across ALL
+// warehouse, org, and org-team rows regardless of state.
+func (s *fakeStore) LatestConfigChange() (time.Time, error) {
+	if s.latestChangeErr != nil {
+		return time.Time{}, s.latestChangeErr
+	}
+	var latest time.Time
+	for _, w := range s.warehouses {
+		if w.UpdatedAt.After(latest) {
+			latest = w.UpdatedAt
+		}
+	}
+	for _, o := range s.orgs {
+		if o.UpdatedAt.After(latest) {
+			latest = o.UpdatedAt
+		}
+	}
+	for _, byTeam := range s.teams {
+		for _, t := range byTeam {
+			if t.UpdatedAt.After(latest) {
+				latest = t.UpdatedAt
+			}
+		}
+	}
+	return latest, nil
+}
+
 func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {
 	for _, org := range s.orgs {
 		if org.DatabaseName == name {
@@ -183,6 +381,9 @@ func newTestRouterWithBucketSuffix(store Store, bucketSuffix string) *gin.Engine
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	RegisterAPI(r.Group("/api/v1"), store, bucketSuffix)
+	// Mirror prod topology (multitenant.go): discovery is a separate group
+	// on the same base path, so both surfaces stay reachable in tests.
+	RegisterDiscoveryAPI(r.Group("/api/v1"), store)
 	return r
 }
 
@@ -899,5 +1100,384 @@ func TestProvisionRejectsStringDefaultTeamID(t *testing.T) {
 	}
 	if _, ok := store.orgs["strteam-org"]; ok {
 		t.Fatal("org must not be created on a malformed default_team_id")
+	}
+}
+
+// --- Org team CRUD (provisioning API) ---
+
+func doJSON(t *testing.T, router *gin.Engine, method, path string, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader *bytes.Reader
+	if body == "" {
+		reader = bytes.NewReader(nil)
+	} else {
+		reader = bytes.NewReader([]byte(body))
+	}
+	req := httptest.NewRequest(method, path, reader)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestOrgTeamUpsertValidation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body       string
+		wantStatus int
+		wantSubstr string
+	}{
+		"missing team_id":        {`{"schema_name":"team_1"}`, http.StatusBadRequest, "team_id"},
+		"negative team_id":       {`{"team_id":-1,"schema_name":"team_1"}`, http.StatusBadRequest, "team_id"},
+		"missing schema_name":    {`{"team_id":1}`, http.StatusBadRequest, "schema_name"},
+		"uppercase schema_name":  {`{"team_id":1,"schema_name":"Team_1"}`, http.StatusBadRequest, "lowercase"},
+		"hyphenated schema_name": {`{"team_id":1,"schema_name":"team-1"}`, http.StatusBadRequest, "lowercase"},
+		"digit-led schema_name":  {`{"team_id":1,"schema_name":"1team"}`, http.StatusBadRequest, "lowercase"},
+		"overlong schema_name":   {`{"team_id":1,"schema_name":"` + strings.Repeat("a", 64) + `"}`, http.StatusBadRequest, "63"},
+		"invalid earliest_event_date": {
+			`{"team_id":1,"schema_name":"team_1","earliest_event_date":"17-04-2023"}`,
+			http.StatusBadRequest, "earliest_event_date",
+		},
+		"null backfill_enabled": {
+			`{"team_id":1,"schema_name":"team_1","backfill_enabled":null}`,
+			http.StatusBadRequest, "backfill_enabled",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeStore()
+			store.orgs["acme"] = &configstore.Org{Name: "acme"}
+			router := newTestRouter(store)
+			rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams", tc.body)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantSubstr) {
+				t.Fatalf("error should mention %q: %s", tc.wantSubstr, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestOrgTeamUpsertCreatesAndLists(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7","backfill_enabled":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var team configstore.OrgTeam
+	if err := json.Unmarshal(rec.Body.Bytes(), &team); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if team.TeamID != 7 || team.SchemaName != "team_7" || !team.Enabled {
+		t.Fatalf("created team = %+v, want team 7, schema team_7, enabled default true", team)
+	}
+	if team.BackfillEnabled == nil || !*team.BackfillEnabled {
+		t.Fatalf("backfill_enabled = %v, want true", team.BackfillEnabled)
+	}
+
+	rec = doJSON(t, router, http.MethodGet, "/api/v1/orgs/acme/teams", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var listing struct {
+		Teams []configstore.OrgTeam `json:"teams"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listing); err != nil {
+		t.Fatalf("decode listing: %v", err)
+	}
+	if len(listing.Teams) != 1 || listing.Teams[0].TeamID != 7 {
+		t.Fatalf("listing = %+v, want the created team", listing.Teams)
+	}
+}
+
+func TestOrgTeamListUnknownOrg404(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+	rec := doJSON(t, router, http.MethodGet, "/api/v1/orgs/nope/teams", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestOrgTeamUpsertGrandfathersExistingRow pins the grandfather contract: an
+// upsert of an existing (org, team) MAY overwrite schema_name and the legacy
+// table names — the PostHog backfill replaces the migration's "team_<id>"
+// placeholder through this exact path.
+func TestOrgTeamUpsertGrandfathersExistingRow(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 7, SchemaName: "team_7", Enabled: true})
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"legacy_wh","events_table_name":"legacy_events","persons_table_name":"legacy_persons","schema_data_imports_name":"legacy_imports"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.teams["acme"][7]
+	if stored.SchemaName != "legacy_wh" {
+		t.Fatalf("schema_name = %q, want overwritten legacy_wh", stored.SchemaName)
+	}
+	if stored.EventsTableName == nil || *stored.EventsTableName != "legacy_events" ||
+		stored.PersonsTableName == nil || *stored.PersonsTableName != "legacy_persons" ||
+		stored.SchemaDataImportsName == nil || *stored.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("legacy table names not stored: %+v", stored)
+	}
+	if !stored.Enabled {
+		t.Fatal("omitted enabled must preserve the stored value on update")
+	}
+}
+
+// TestOrgTeamUpsertBackfillDefaultsTrue pins the NOT NULL DEFAULT TRUE stance
+// of backfill_enabled (migration 000028): a create that omits the field gets
+// TRUE, matching the Django BooleanField(default=True) the column mirrors.
+func TestOrgTeamUpsertBackfillDefaultsTrue(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"backfill_enabled":true`) {
+		t.Fatalf("omitted backfill_enabled must default to true: %s", rec.Body.String())
+	}
+}
+
+// TestOrgTeamUpsertEarliestEventDateTriState pins the tri-state wire contract
+// of PostHog's cached earliest-event date on the upsert: a value sets it (and
+// reads back as "YYYY-MM-DD"), an absent key preserves it, an explicit null
+// clears it (serialized as null so the sensor sees "not yet resolved").
+func TestOrgTeamUpsertEarliestEventDateTriState(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7","earliest_event_date":"2023-04-17"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":"2023-04-17"`) {
+		t.Fatalf("response must carry the date as YYYY-MM-DD: %s", rec.Body.String())
+	}
+
+	// Omitted key preserves the stored value.
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preserve: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][7].EarliestEventDate; got == nil || got.String() != "2023-04-17" {
+		t.Fatalf("omitted earliest_event_date must be preserved, got %v", got)
+	}
+
+	// The 9999-12-31 "no event history" sentinel (PostHog's
+	// NO_HISTORY_SENTINEL) is stored verbatim — duckgres never interprets it.
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7","earliest_event_date":"9999-12-31"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sentinel: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][7].EarliestEventDate; got == nil || got.String() != "9999-12-31" {
+		t.Fatalf("sentinel date not stored, got %v", got)
+	}
+
+	// Explicit null clears back to NULL, serialized as null.
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":7,"schema_name":"team_7","earliest_event_date":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][7].EarliestEventDate; got != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL after explicit null", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":null`) {
+		t.Fatalf("cleared date must serialize as null: %s", rec.Body.String())
+	}
+}
+
+func TestOrgTeamUpsertDuplicateSchema409(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
+		`{"team_id":2,"schema_name":"team_1"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "schema_name") {
+		t.Fatalf("error should name schema_name: %s", rec.Body.String())
+	}
+}
+
+func TestOrgTeamDeleteRules(t *testing.T) {
+	billing := true
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("last team refused", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &billing})
+		router := newTestRouter(store)
+
+		rec := doJSON(t, router, http.MethodDelete, "/api/v1/orgs/acme/teams/1", "")
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "deleting the org") {
+			t.Fatalf("error should state that deleting the org is the only way: %s", rec.Body.String())
+		}
+		if store.teams["acme"][1] == nil {
+			t.Fatal("last team must not be deleted")
+		}
+	})
+
+	t.Run("billing team delete promotes oldest remaining", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		b := billing
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &b, CreatedAt: base})
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 3, SchemaName: "team_3", Enabled: true, CreatedAt: base.Add(2 * time.Hour)})
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true, CreatedAt: base.Add(time.Hour)})
+		router := newTestRouter(store)
+
+		rec := doJSON(t, router, http.MethodDelete, "/api/v1/orgs/acme/teams/1", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		// Team 2 has the oldest created_at among the remaining rows.
+		if resp["new_billing_team_id"] != float64(2) {
+			t.Fatalf("new_billing_team_id = %v, want 2", resp["new_billing_team_id"])
+		}
+		if got := store.teams["acme"][2]; got.IsBillingTeam == nil || !*got.IsBillingTeam {
+			t.Fatalf("team 2 must carry the billing mark, got %+v", got)
+		}
+	})
+
+	t.Run("non-billing delete has no handover", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		b := billing
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &b, CreatedAt: base})
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true, CreatedAt: base.Add(time.Hour)})
+		router := newTestRouter(store)
+
+		rec := doJSON(t, router, http.MethodDelete, "/api/v1/orgs/acme/teams/2", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "new_billing_team_id") {
+			t.Fatalf("non-billing delete must not report a handover: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("unknown team 404", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		router := newTestRouter(store)
+		rec := doJSON(t, router, http.MethodDelete, "/api/v1/orgs/acme/teams/9", "")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("non-numeric team id 400", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		router := newTestRouter(store)
+		rec := doJSON(t, router, http.MethodDelete, "/api/v1/orgs/acme/teams/abc", "")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// --- provision team_id/schema_name resolution ---
+
+func TestProvisionTeamIDAndSchemaName(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := `{"database_name":"d","team_id":42,"schema_name":"custom_wh","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/neworg/provision", body)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	if store.lastProvision == nil {
+		t.Fatal("Provision not dispatched")
+	}
+	if store.lastProvision.DefaultTeamID != 42 || store.lastProvision.SchemaName != "custom_wh" {
+		t.Fatalf("provision request = %+v, want team 42 schema custom_wh", store.lastProvision)
+	}
+}
+
+func TestProvisionTeamIDFieldsMustAgree(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := `{"database_name":"d","team_id":42,"default_team_id":7,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/neworg/provision", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "disagree") {
+		t.Fatalf("error should state the fields disagree: %s", rec.Body.String())
+	}
+	if store.lastProvision != nil {
+		t.Fatal("nothing must be provisioned on disagreement")
+	}
+}
+
+func TestProvisionAgreeingTeamIDFieldsAccepted(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := `{"database_name":"d","team_id":42,"default_team_id":42,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/neworg/provision", body)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	if store.lastProvision.DefaultTeamID != 42 {
+		t.Fatalf("effective team = %d, want 42", store.lastProvision.DefaultTeamID)
+	}
+}
+
+func TestProvisionSchemaNameRequiresTeamID(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	body := `{"database_name":"d","schema_name":"custom_wh","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/provision", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "schema_name requires team_id") {
+		t.Fatalf("error should say schema_name requires team_id: %s", rec.Body.String())
+	}
+}
+
+func TestProvisionInvalidSchemaNameRejected(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := `{"database_name":"d","team_id":42,"schema_name":"Bad-Name","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/neworg/provision", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 }

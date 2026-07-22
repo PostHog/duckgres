@@ -24,7 +24,7 @@ func (cs *ConfigStore) ReattributeUsageTeam(orgID string, newTeamID int64) (int6
 // ReattributeUsageTeamTx re-attributes the org's buffered usage buckets
 // (duckgres_org_compute_usage + duckgres_org_storage_usage) to newTeamID
 // inside the caller's transaction, so the move commits atomically with the
-// org-row update that changes default_team_id.
+// billing-team change (SetOrgBillingTeamTx).
 //
 // team_id is part of both tables' primary keys, so this is a fold-then-delete
 // per table, not a blind UPDATE: an additive upsert copies every row keyed

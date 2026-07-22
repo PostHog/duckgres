@@ -139,6 +139,7 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
 		"name: artifact-keeper",
 		"value: \"isolated-test-secret\"",
+		"name: DUCKGRES_SCENARIO_ORG_ID, value: \"ci-pr-123-cnpg\"",
 		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f pod/duckgres-scenario-pod",
 		"-c scenario",
 		"kubectl --context test-context -n duckgres-ci-pr-123 wait --for=jsonpath={.status.containerStatuses[?(@.name==\"scenario\")].state.terminated.reason} pod/duckgres-scenario-pod",
@@ -427,6 +428,65 @@ func TestRunScriptUsesMwDevPayloadLayout(t *testing.T) {
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("run.sh still contains shared-dev/config-secret path %q", forbidden)
+		}
+	}
+}
+
+func TestE2EHarnessUsesOnlyCnpgMetadataStores(t *testing.T) {
+	harnessRaw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	runRaw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+
+	harness := string(harnessRaw)
+	for _, legacy := range []string{
+		`EXT="ci-pr-${PR_NUMBER}-ext"`,
+		"EXT_BODY=",
+		"EXT_RDS_",
+		"ext_rds_",
+		"mdstore_e2e_",
+		"lane_ext",
+		"reshard_ext_to_cnpg",
+		`"metadata_store":{"type":"external"`,
+	} {
+		if strings.Contains(harness, legacy) {
+			t.Errorf("e2e harness still contains external-metadata lane or RDS lifecycle marker %q", legacy)
+		}
+	}
+	if strings.Contains(string(runRaw), "ci-pr-${pr}-ext") {
+		t.Error("run.sh still includes the external-metadata org in e2e lifecycle cleanup")
+	}
+}
+
+func TestE2EHarnessCoversRemoteBinaryCopy(t *testing.T) {
+	harnessRaw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	harness := string(harnessRaw)
+	for _, want := range []string{
+		"binary_copy_round_trip()",
+		`PGPASSWORD="$2" timeout 120 psql "$conn"`,
+		"binary COPY: backpressure never cleared",
+		`CREATE TABLE $route_guard_src AS SELECT 7::INTEGER AS id;`,
+		`CREATE TABLE $route_guard_dst (id BIGINT);`,
+		`\copy $native_src TO '$native_file' WITH (FORMAT binary)`,
+		`\copy $native_dst (label, id, payload, enabled, ratio, event_date, event_time, received_at, amount) FROM '$native_file' WITH (FORMAT binary)`,
+		`\copy $route_guard_src TO '$route_guard_file' WITH (FORMAT binary)`,
+		`\copy $route_guard_dst (id) FROM '$route_guard_file' WITH (FORMAT binary)`,
+		`\echo route_guard_sqlstate=:SQLSTATE`,
+		`route_guard_sqlstate=22P02`,
+		"BIGINT field length 4, expected 8",
+		`want_copies="$(printf 'COPY 3\nCOPY 3\nCOPY 1\nCOPY 1\nCOPY 1\nCOPY 1')"`,
+		`(SELECT count(*) FROM $route_guard_dst)`,
+		`binary_copy_round_trip "$CNPG" "$cnpg_pw"`,
+	} {
+		if !strings.Contains(harness, want) {
+			t.Errorf("e2e harness is missing remote binary COPY coverage marker %q", want)
 		}
 	}
 }

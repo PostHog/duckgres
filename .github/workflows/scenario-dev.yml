@@ -93,6 +93,9 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
+          # Covers this job's 270-minute timeout so long dbt runs can still
+          # collect artifacts and tear down the isolated namespace.
+          role-duration-seconds: 16200
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2

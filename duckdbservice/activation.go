@@ -242,7 +242,16 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 			refreshFn = server.RefreshS3Secret
 		}
 		if payload.DuckLake.ObjectStore != "" {
-			if err := refreshFn(refreshDB, payload.DuckLake, sem); err != nil {
+			// The refresh rebuilds the ducklake_s3 secret from this config, so
+			// it must carry the same cache-proxy transport (HTTPProxy +
+			// USE_SSL=false + pinned endpoint) the attach path applies —
+			// otherwise the first CP-driven credential rotation replaces the
+			// path-style plain-HTTP secret with a vhost/HTTPS one and every S3
+			// read CONNECT-tunnels past the NVMe cache for the rest of the
+			// worker's life (mw-prod-us 2026-07-17).
+			refreshCfg := payload.DuckLake
+			overrideS3EndpointForCacheProxy(&refreshCfg)
+			if err := refreshFn(refreshDB, refreshCfg, sem); err != nil {
 				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
 				return false
 			}

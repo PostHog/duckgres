@@ -473,12 +473,14 @@ worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
 ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
 **MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
 sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
-decimals (vCPU / GiB). `team_id` is the org's `default_team_id` (an integer —
-PostHog's `Team.id`; a JSON NUMBER on every API surface, a **NOT NULL** BIGINT
-in the config store — required at org creation on both the provisioning and
-admin APIs, never clearable via the admin API, so every org always has one;
-resolved from the config snapshot at connection end, where 0 can still appear
-only for an unknown org / stale snapshot); `query_source` is the
+decimals (vCPU / GiB). `team_id` is the org's **billing team** (an integer —
+PostHog's `Team.id`; a JSON NUMBER on every API surface, kept under the
+historical `default_team_id` field name; stored as the org's
+`duckgres_org_teams` row with `is_billing_team = TRUE` — required at org
+creation on both the provisioning and admin APIs, never clearable via the
+admin API, so every org always has one; resolved from the config snapshot at
+connection end, where 0 can still appear only for an unknown org / stale
+snapshot); `query_source` is the
 `duckgres.query_source` session GUC (`standard` unless set; a mid-connection
 change bills the whole connection under the final value). The GUC is a **closed
 enum validated at SET time** (`transform.NormalizeQuerySource`): only
@@ -525,8 +527,9 @@ touching this path:
 - **Graceful shutdown does a final flush** after connections drain to their
   natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
   last interval before exit.
-- **Changing an org's `default_team_id` re-attributes its unacked buckets** to
-  the new team in the SAME transaction as the org update, on BOTH paths (admin
+- **Changing an org's billing team (`default_team_id` on the wire)
+  re-attributes its unacked buckets** to
+  the new team in the SAME transaction as the billing-team repoint, on BOTH paths (admin
   `PUT /orgs/:id` and provisioning re-provision) via
   `configstore.ReattributeUsageTeamTx` — additive fold on PK collisions; a
   small in-flight residual under the old team is tolerated (snapshot poll
@@ -534,6 +537,26 @@ touching this path:
   `controlplane/admin/api_test.go` + `api_postgres_test.go`
   (`TestUpdateOrg*Reattribut*`), and the re-attribution leg of
   `compute_usage_pull_api` in the e2e harness.
+- **Org team CRUD (`duckgres_org_teams`)**: the PostHog backend manages an
+  org's team rows via `GET/POST /api/v1/orgs/:id/teams` +
+  `DELETE /api/v1/orgs/:id/teams/:team_id` (internal secret,
+  `controlplane/provisioning`). The POST is the **grandfather upsert**: it MAY
+  overwrite an existing row's `schema_name` and the legacy
+  `events_table_name`/`persons_table_name`/`schema_data_imports_name`
+  overrides (NULL = derive from `schema_name`: `<schema>.events`,
+  `<schema>.persons`, `<schema>_data_imports`), because the PostHog backfill
+  replaces migration 000024's `team_<id>` placeholder through it. Two teams in
+  one org can never share a schema (unique `(org_id, schema_name)`, migration
+  000025 → 409). DELETE removes CONFIG only (never warehouse data); deleting
+  the billing team promotes the remaining team with the OLDEST `created_at`
+  and re-attributes unacked usage in the same TXN; the org's LAST team is
+  undeletable (409 — delete the org). The admin console mirrors this on a
+  user-facing surface (`GET /teams`, `POST /teams`,
+  `PUT /orgs/:id/teams/:team_id`) where `schema_name` is immutable and
+  billing can only be repointed, never cleared. Shared rules live in
+  `configstore.UpsertOrgTeamTx` / `DeleteOrgTeamTx`; tests:
+  `tests/configstore/org_teams_postgres_test.go`, the provisioning/admin API
+  tests, and `org_teams_crud` in the e2e harness.
 - **Storage metric** (`managed_warehouse_storage_gib_seconds`,
   `storage_meter.go`): a LEADER-ONLY sampler (double writers would
   double-bill — the UPSERT is additive) visits each Ready warehouse's DuckLake
@@ -557,6 +580,68 @@ touching this path:
   `tests/configstore/migrations_postgres_test.go`, and the
   `compute_usage_pull_api` assertion (compute + storage) in
   `tests/mw-dev/e2e/harness.sh`.
+
+## Discovery Endpoints (external-writer tenant listing)
+
+`GET /api/v1/warehouses` + `GET /api/v1/warehouse-team-ids` on the internal
+provisioning API (`controlplane/provisioning/discovery.go`) are the read-only
+"which tenants exist and where do I write" surface for EXTERNAL writers
+(viaduck destination discovery; millpond's include-values poller). Semantics
+are load-bearing for those consumers:
+
+- **Warehouse set = ready + resharding** (`discoveryStates`). Resharding is
+  listed with `writable=false` — vanishing would read as tenant REMOVAL
+  downstream, not a pause. The state enum is open: a new state MUST be
+  classified into `discoveryStates`/`discoveryExcludedStates`
+  (`TestDiscoveryStateClassification` is the tripwire; an unclassified state
+  reads as fleet-wide removal to every consumer).
+- **Teams come from `duckgres_org_teams`**, with RESOLVED table locations:
+  `events_table`/`persons_table` = `<schema_name>.<override-or-derived>`,
+  `data_imports_schema` = override-or-`<schema>_data_imports`. The
+  derivation lives ONCE, in `resolveTeamTables`; the legacy overrides are
+  BARE identifiers (never schema-qualified), enforced at every write surface
+  by `configstore.ValidateOrgTeamTableName`.
+- **`enabled` is passed through as information only** — it is the per-team
+  query-serving switch (migration 000024, not yet enforced), NOT an
+  ingestion signal. Disabled teams stay in BOTH endpoints; deriving
+  "stop ingesting" from it would turn a serving hold into permanent event
+  loss. The only ingestion-stop signal is row absence.
+- **Error contract:** transient store failures fail the WHOLE request (a
+  polling consumer keeps last-known-good — the safe direction); only a
+  warehouse with zero team rows degrades, per-warehouse, to an empty teams
+  array (`duckgres_discovery_broken_team_rows_total{reason}` counts it — a
+  sustained nonzero means a live tenant is silently unroutable).
+- **`config_generation` is an opaque change token**: max `updated_at` over
+  ALL warehouse+org+org-team rows regardless of state, read BEFORE the data
+  queries. Its delete-visibility depends on `DeleteOrgTeamTx` touching the
+  parent org row (a bare team DELETE leaves no timestamp behind) —
+  `TestLatestConfigChangeCoversTeamsPostgres` pins that pair; keep them in
+  sync. Compare for equality only.
+- **No plaintext credentials in the payload** — metadata-store passwords are
+  k8s SecretRefs. cnpg rows currently carry only the metadata-store KIND
+  (endpoint/db/user live in the Duckling CR status until the provisioner
+  backfills the row on Ready); external rows round-trip fully.
+- **Auth is a SEPARATE, scoped surface** (`RegisterDiscoveryAPI` + its own
+  group in `multitenant.go` behind `admin.AnyTokenAuthMiddleware`): the
+  read-only discovery secret (`--read-only-secret` /
+  `DUCKGRES_READ_ONLY_SECRET`, sent in `X-Duckgres-Internal-Secret`, same
+  fallback-rotation semantics as the internal secret) works ONLY on these
+  two GETs; the admin internal secret also works here (operator/debug +
+  rotation window). Never register discovery routes inside the admin
+  `api` group and never accept `readOnlyTokens` anywhere else — external
+  writer pods carry this credential, and its blast radius must stay "read
+  the tenant list and its connection topology (RDS endpoints, bucket
+  names, k8s Secret names — never values)". Tripwires:
+  `TestAnyTokenAuthMiddlewareScoping` (token matrix incl. cross-surface
+  rejection) and `TestReadOnlyGroupTopology` (the group's exact route
+  set, against the real `registerReadOnlyGroup` wiring). A discovery
+  value equal to the internal secret (or any fallback) FAILS STARTUP —
+  `validateDistinctReadOnlySecret` — because a shared value silently
+  un-scopes the credential.
+- Touching the payload shape, states, team derivation, or the generation →
+  update `controlplane/provisioning/discovery_test.go`,
+  `tests/configstore/org_teams_postgres_test.go`, AND the
+  `discovery_endpoints` assertion in `tests/mw-dev/e2e/harness.sh`.
 
 ## Resharding (metadata-store migrations) — LOAD-BEARING CONTRACT
 
@@ -663,6 +748,15 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   — it pointed a flip-before-copy reshard at a phantom cnpg source while the
   org lived on an external RDS (prod incident: org re-pointed onto an empty
   catalog, rollback patch rejected).
+- **Metadata credentials come from a referenced Secret, never CR status.**
+  `status.metadataStore.credentialSecretRef` names one key in a Secret in the
+  `ducklings` namespace; `DucklingClient.Get` resolves it before returning the
+  status used by activation, probes, metering, and resharding. References to
+  any other namespace are rejected. The plaintext `status.metadataStore.password`
+  read is a temporary deploy-order fallback only: it is used when no reference
+  exists, or when a referenced Secret is temporarily unreadable while the
+  legacy password is still present. Once charts stops publishing plaintext,
+  an unreadable/missing Secret is a hard error.
 - **Rollback patches the source shard VALUE back — never removes the key**
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).

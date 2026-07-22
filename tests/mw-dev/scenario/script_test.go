@@ -21,6 +21,7 @@ func TestScenarioRunScriptValidatesRequiredEnvVars(t *testing.T) {
 	for _, name := range []string{
 		"DUCKGRES_SCENARIO_API_BASE",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET",
+		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_PG_HOST",
 		"DUCKGRES_SCENARIO_SNI_SUFFIX",
 	} {
@@ -47,6 +48,7 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	}
 	text := string(out)
 	for _, name := range []string{
+		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
 		"DUCKGRES_SCENARIO_FLIGHT_ADDR",
 	} {
@@ -82,6 +84,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"CLUSTER_NAME: posthog-mw-dev",
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
+		"role-duration-seconds: 16200",
 		"tests/mw-dev/run.sh deploy",
 		"tests/mw-dev/run.sh test-scenario",
 		"tests/mw-dev/run.sh diagnostics",

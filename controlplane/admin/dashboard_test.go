@@ -253,3 +253,97 @@ func TestLoginWithFallbackTokenWorksEndToEnd(t *testing.T) {
 		t.Fatalf("GET /api/v1/ping with fallback cookie status = %d, want %d", rec.Code, http.StatusOK)
 	}
 }
+
+// serveWithSecret hits the router with X-Duckgres-Internal-Secret set (the
+// same header carries admin and discovery tokens; the value decides).
+func serveWithSecret(r *gin.Engine, path, secret string) int {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if secret != "" {
+		req.Header.Set("X-Duckgres-Internal-Secret", secret)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestAnyTokenAuthMiddlewareScoping pins the two-surface topology from
+// multitenant.go: the discovery secret works ONLY on the discovery group,
+// the admin secret works on both, and neither surface accepts junk. This
+// is the security property the scoped token exists for — a discovery
+// credential must never reach the admin/provisioning surface.
+func TestAnyTokenAuthMiddlewareScoping(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	adminTokens := NewTokenSet("admin-secret", nil)
+	readOnlyTokens := NewTokenSet("read-only-secret", []string{"old-discovery"})
+
+	r := gin.New()
+	ok := func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) }
+	r.GET("/api/v1/orgs", APIAuthMiddleware(adminTokens), ok)
+	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(readOnlyTokens, adminTokens), ok)
+
+	cases := []struct {
+		name, path, secret string
+		want               int
+	}{
+		{"discovery token on discovery route", "/api/v1/warehouses", "read-only-secret", http.StatusOK},
+		{"discovery fallback on discovery route", "/api/v1/warehouses", "old-discovery", http.StatusOK},
+		{"admin token on discovery route", "/api/v1/warehouses", "admin-secret", http.StatusOK},
+		{"discovery token on admin route", "/api/v1/orgs", "read-only-secret", http.StatusUnauthorized},
+		{"discovery fallback on admin route", "/api/v1/orgs", "old-discovery", http.StatusUnauthorized},
+		{"admin token on admin route", "/api/v1/orgs", "admin-secret", http.StatusOK},
+		{"junk on discovery route", "/api/v1/warehouses", "junk", http.StatusUnauthorized},
+		{"missing token on discovery route", "/api/v1/warehouses", "", http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		if got := serveWithSecret(r, tc.path, tc.secret); got != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestAnyTokenAuthMiddlewareUnsetReadOnlySecret pins the pre-rollout
+// behavior: with no read-only secret configured (empty TokenSet), the
+// discovery surface still accepts the internal secret and nothing else —
+// in particular an empty header must not match the empty token set.
+func TestAnyTokenAuthMiddlewareUnsetReadOnlySecret(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	adminTokens := NewTokenSet("admin-secret", nil)
+	readOnlyTokens := NewTokenSet("", nil) // unset secret ⇒ empty set
+
+	r := gin.New()
+	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(readOnlyTokens, adminTokens), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	if got := serveWithSecret(r, "/api/v1/warehouses", "admin-secret"); got != http.StatusOK {
+		t.Errorf("admin token: status = %d, want %d", got, http.StatusOK)
+	}
+	if got := serveWithSecret(r, "/api/v1/warehouses", ""); got != http.StatusUnauthorized {
+		t.Errorf("empty token: status = %d, want %d", got, http.StatusUnauthorized)
+	}
+	if got := serveWithSecret(r, "/api/v1/warehouses", "anything"); got != http.StatusUnauthorized {
+		t.Errorf("junk token: status = %d, want %d", got, http.StatusUnauthorized)
+	}
+}
+
+// TestAnyTokenAuthMiddlewareIgnoresCookies pins the header-only contract:
+// unlike the admin surface, a browser cookie holding a valid token must NOT
+// authenticate the service-to-service discovery surface.
+func TestAnyTokenAuthMiddlewareIgnoresCookies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokens := NewTokenSet("read-only-secret", nil)
+
+	r := gin.New()
+	r.GET("/api/v1/warehouses", AnyTokenAuthMiddleware(tokens), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/warehouses", nil)
+	req.AddCookie(&http.Cookie{Name: adminTokenCookieName, Value: "read-only-secret"})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("cookie-carried token: status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}

@@ -500,6 +500,7 @@ func TestTableNames(t *testing.T) {
 	}{
 		{Org{}, "duckgres_orgs"},
 		{OrgUser{}, "duckgres_org_users"},
+		{OrgTeam{}, "duckgres_org_teams"},
 		{OrgUserSecret{}, "duckgres_org_user_secrets"},
 		{ManagedWarehouse{}, "duckgres_managed_warehouses"},
 	}
@@ -548,6 +549,49 @@ func TestOrgDefaultWorkerProfile(t *testing.T) {
 	empty := &ConfigStore{}
 	if cpu, mem, ttl := empty.OrgDefaultWorkerProfile("full"); cpu != "" || mem != "" || ttl != "" {
 		t.Errorf("nil-snapshot OrgDefaultWorkerProfile = (%q,%q,%q); want all empty", cpu, mem, ttl)
+	}
+}
+
+func TestOrgBillingTeamID(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"no-teams": {Name: "no-teams"},
+				"no-billing-team": {
+					Name:  "no-billing-team",
+					Teams: []OrgTeamConfig{{TeamID: 7, SchemaName: "team_7", Enabled: true}},
+				},
+				"billing": {
+					Name: "billing",
+					Teams: []OrgTeamConfig{
+						{TeamID: 7, SchemaName: "team_7", Enabled: true},
+						{TeamID: 42, SchemaName: "team_42", Enabled: true, IsBillingTeam: true},
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID string
+		want  int64
+	}{
+		{"unknown", 0},
+		{"no-teams", 0},
+		{"no-billing-team", 0},
+		{"billing", 42},
+	}
+	for _, tt := range tests {
+		if got := cs.OrgBillingTeamID(tt.orgID); got != tt.want {
+			t.Errorf("OrgBillingTeamID(%q) = %d; want %d", tt.orgID, got, tt.want)
+		}
+	}
+
+	// Nil snapshot (store not yet loaded) must read as 0, not panic — callers
+	// tolerate 0 per the documented contract.
+	empty := &ConfigStore{}
+	if got := empty.OrgBillingTeamID("billing"); got != 0 {
+		t.Errorf("nil-snapshot OrgBillingTeamID = %d; want 0", got)
 	}
 }
 

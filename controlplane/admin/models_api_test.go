@@ -25,7 +25,7 @@ func TestModelDescriptorsRedaction(t *testing.T) {
 
 	// Registry must cover exactly the persisted models we expect.
 	wantKeys := map[string]bool{
-		"orgs": true, "org-users": true, "org-user-secrets": true, "managed-warehouses": true,
+		"orgs": true, "org-teams": true, "org-users": true, "org-user-secrets": true, "managed-warehouses": true,
 		"cp-instances": true, "worker-records": true, "flight-session-records": true,
 		"org-connection-queue": true, "org-connection-leases": true,
 		"operators": true,
@@ -81,7 +81,7 @@ func TestModelsAPIPostgres(t *testing.T) {
 	store := newPostgresConfigStore(t)
 
 	const secretHash = "$2a$10$DEADBEEFdeadbeefDEADBEEFdeadbeefDEADBEEFdeadbeefDEADBE"
-	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acme_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acme_db"}).Error; err != nil {
 		t.Fatalf("seed org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.OrgUser{OrgID: "acme", Username: "reader", Password: secretHash}).Error; err != nil {
@@ -155,7 +155,10 @@ func TestModelsAPIPostgres(t *testing.T) {
 	// list. Tables with no typed descriptor (goose bookkeeping, migrations
 	// added later) must show up under "Other" with information_schema columns,
 	// and credential-shaped column VALUES must come back redacted.
+	// IF-NOT-EXISTS-proof: the shared schema persists across local runs, so a
+	// previous run's probe table must not fail the seed.
 	if err := store.DB().Exec(`
+		DROP TABLE IF EXISTS explorer_probe;
 		CREATE TABLE explorer_probe (
 			id BIGSERIAL PRIMARY KEY,
 			note TEXT NOT NULL,

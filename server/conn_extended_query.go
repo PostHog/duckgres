@@ -39,6 +39,10 @@ func (c *clientConn) handleParse(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid Parse message")
 		return
 	}
+	if err := c.queryAccessPolicy.Authorize(query); err != nil {
+		c.observeExtendedParseQueryError("42501", err.Error())
+		return
+	}
 	// Read number of parameter types
 	var numParamTypes int16
 	if err := binary.Read(reader, binary.BigEndian, &numParamTypes); err != nil {

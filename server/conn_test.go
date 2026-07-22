@@ -3862,6 +3862,58 @@ func TestPgStatActivityColumnsAndOIDs(t *testing.T) {
 	}
 }
 
+func TestProjectReaderPgStatActivityCTECannotSeeOtherConnections(t *testing.T) {
+	var output bytes.Buffer
+	srv := &Server{conns: make(map[int32]*clientConn)}
+	reader := &clientConn{
+		server:   srv,
+		writer:   bufio.NewWriter(&output),
+		ctx:      context.Background(),
+		username: "project-reader-a",
+		orgID:    "org-a",
+		pid:      100,
+		txStatus: txStatusIdle,
+		queryAccessPolicy: &QueryAccessPolicy{
+			ReadOnly:       true,
+			AllowedSchemas: []string{"team_1"},
+		},
+	}
+	sameProject := &clientConn{username: "project-reader-a", orgID: "org-a", pid: 101}
+	sameProject.currentQuery.Store("same-project-visible-marker")
+	otherProject := &clientConn{username: "project-reader-b", orgID: "org-a", pid: 102}
+	otherProject.currentQuery.Store("same-org-hidden-marker")
+	otherOrg := &clientConn{username: "project-reader-a", orgID: "org-b", pid: 103}
+	otherOrg.currentQuery.Store("other-org-hidden-marker")
+
+	for _, conn := range []*clientConn{reader, sameProject, otherProject, otherOrg} {
+		srv.registerConn(conn)
+	}
+
+	query := "WITH pg_stat_activity AS (SELECT * FROM team_1.events) SELECT * FROM pg_stat_activity"
+	if err := reader.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	if !bytes.Contains(output.Bytes(), []byte("same-project-visible-marker")) {
+		t.Fatal("project reader should see sessions for its own project credential")
+	}
+	for _, hidden := range []string{"same-org-hidden-marker", "other-org-hidden-marker"} {
+		if bytes.Contains(output.Bytes(), []byte(hidden)) {
+			t.Fatalf("project reader saw another project's pg_stat_activity row %q", hidden)
+		}
+	}
+}
+
+func TestSetQueryAccessPolicyDisablesPassthrough(t *testing.T) {
+	conn := &clientConn{passthrough: true}
+
+	SetQueryAccessPolicy(conn, &QueryAccessPolicy{ReadOnly: true})
+
+	if conn.passthrough {
+		t.Fatal("project-scoped connections must never use passthrough mode")
+	}
+}
+
 func TestConnectionRegistry(t *testing.T) {
 	srv := &Server{
 		conns: make(map[int32]*clientConn),

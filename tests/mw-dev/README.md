@@ -2,8 +2,8 @@
 
 Shared isolated-stack harness for dev-backed e2e and scenario tests. It owns
 the real mw-dev infrastructure boundary that `tests/k8s/` (kind) cannot model:
-real Cilium network policies, real Crossplane Duckling provisioning, real
-cnpg-shard metadata stores, and external metadata fixtures.
+real Cilium network policies, real Crossplane Duckling provisioning, and real
+cnpg-shard metadata stores.
 
 ## Flow
 
@@ -23,6 +23,11 @@ cnpg-shard metadata stores, and external metadata fixtures.
    unique `<scenario>-<token>/` directory; failed or incomplete copies are
    preserved as visible `<scenario>-<token>.partial/` directories with an
    `artifact_collection_error.txt` marker.
+   Successful CNPG scenarios receive `DUCKGRES_SCENARIO_ORG_ID` as
+   `ci-pr-<N>-cnpg`, where `<N>` is `PR_NUMBER` (the workflow run id for
+   `scenario-dev`). This exact identity is shared by Crossplane's scoped
+   credential RoleBinding and the harness cleanup path; it is not a separate
+   user-configurable default.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
 
@@ -42,9 +47,9 @@ died hard before their `always()` teardown could fire. (Named e2e-cleanup, not
 
 ## What the e2e payload asserts (`e2e/harness.sh`)
 
-This suite is the **successor to the retired kind suite** (`tests/k8s/`): every
-behavior that suite asserted against a fake kind cluster is re-asserted here
-against real mw-dev, on both the cnpg and external-RDS metadata backends. The
+This suite is the **successor to the retired kind suite** (`tests/k8s/`): its
+portable black-box behavior is re-asserted here against real mw-dev using
+CNPG-backed metadata stores. The
 in-cluster Job runs as the `duckgres` SA and uses `kubectl` (in-cluster config
 from its mounted SA token) for the pod-level checks the Go suite made via
 client-go:
@@ -74,7 +79,12 @@ client-go:
   the pool must then serve a retrying connection. The harness logs whether
   backpressure was observed **and** handles it (queries retry through it).
 - **activation** — DuckLake catalogs attach, read/write, and run
-  `EXPLAIN`/`EXPLAIN ANALYZE` on cnpg and ext.
+  `EXPLAIN`/`EXPLAIN ANALYZE` on CNPG-backed tenants.
+- **binary COPY** — a `psql`-generated PostgreSQL binary fixture traverses the
+  deployed pgwire → control-plane → Flight → worker → `postgres_scanner` →
+  DuckLake path. It checks every natively routed scalar type, reordered/subset
+  columns, NULLs/defaults, DECIMAL scale normalization, fresh-session
+  persistence, the unsupported-type legacy fallback, and transaction rollback.
 - **worker sizing** (TTL-pool model, `docs/design/worker-ttl-pool.md`) — a
   client-sized connection (`duckgres.worker_cpu`/`worker_memory`/`worker_ttl`
   startup options, sent via `PGOPTIONS`; CP runs `allowClientWorkerProfile=true`
@@ -89,9 +99,9 @@ client-go:
   + hot-idle TTL (config-store columns `default_worker_cpu`/`memory`/`ttl`, set
   via the admin API `PUT /orgs/:id`) must size a **plain** connection — one that
   sends no `duckgres.worker_*` startup options at all (the external-customer
-  case). The harness sets `2/8Gi/10m` on the ext org, asserts the admin API
-  round-trips the fields and 400s garbage values, then connects without
-  `PGOPTIONS` and asserts the worker pod carries the org default on requests
+  case). The harness sets `2/8Gi/10m` on a dedicated CNPG-backed org, asserts
+  the admin API round-trips the fields and 400s garbage values, then connects
+  without `PGOPTIONS` and asserts the worker pod carries the org default on requests
   **and** limits; finally it clears the default (explicit empty strings) and
   asserts a fresh plain connection no longer produces org-default-shaped pods.
   Per-field client-GUC-over-org-default precedence and the
@@ -116,13 +126,13 @@ client-go:
   them in-Job would need a dedicated max_workers=1 org and deterministic cold-spawn
   timing the shared cluster can't guarantee.
 - **persistent user secrets** — `CREATE PERSISTENT SECRET` survives across
-  sessions on both metadata-backend orgs (the CP stores the statement encrypted
+  sessions (the CP stores the statement encrypted
   in the config store and replays it at session creation — worker pods are
   ephemeral); reserved system names (`ducklake_s3`, …) and unnamed persistent
   secrets are rejected; `DROP PERSISTENT SECRET` removes it durably; and a
   second user of the same org never sees the first user's secret, even on a
   reused hot-idle worker (cnpg lane).
-- **isolation** — two tenants (cnpg vs ext) see distinct catalogs; a
+- **isolation** — two CNPG-backed tenants see distinct catalogs; a
   cross-tenant read is denied.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling
   CR **fully** deletes (`kubectl wait --for=delete`, asserting the finalizer
@@ -161,10 +171,13 @@ normal `go test ./...` lane.
   request paths against real S3.
 - **Version-mismatch worker reaper** — needs a mid-run image bump, so it stays
   covered by `controlplane/` unit tests rather than in-Job.
-- **Reshard runner-pod crash respawn** — the reshard e2e lanes run in the
-  dedicated `duckgres-reshard-op-<id>` pods and assert the pod appears and is
-  reaped after the op finishes, but deliberately do NOT kill a runner pod
-  mid-operation to exercise the leader reconciler's respawn/takeover: a
+- **External-store resharding** — the live harness provisions CNPG metadata
+  stores only. External-source/target cutovers, rollback/recovery, ESO errors,
+  and stale or concurrently-created index replay are covered by
+  `controlplane/admin` and `provisioner` unit tests.
+- **Reshard runner-pod crash respawn** — the live reshard operations run in
+  dedicated `duckgres-reshard-op-<id>` pods, but deliberately do NOT kill a
+  runner pod mid-operation to exercise the leader reconciler's respawn/takeover: a
   mid-copy kill races the drain/flip waits and would add minutes of
   deterministic-flake risk per run. Respawn, the retry bound + force-fail, and
   the stale-heartbeat takeover claim (incl. `reconstructProgress`) are covered
@@ -248,8 +261,8 @@ normal `go test ./...` lane.
   `warehouse_provision_begin`/`_success`/`_failed`,
   `warehouse_deprovision_begin`/`_success`/`_failed`, `warehouse_password_reset`,
   `query_initiated`/`query_failed`) — the harness already drives every path that
-  fires these (it provisions, deprovisions, resets, and runs queries on both
-  metadata backends), but the events are sent asynchronously to PostHog's
+  fires these (it provisions, deprovisions, resets, and runs queries), but the
+  events are sent asynchronously to PostHog's
   external capture API and the in-cluster Job holds no PostHog query-API creds
   to read them back, so ingestion cannot be asserted in-Job. The emission logic
   (event name, org group-analytics attribution, properties, failure-category
@@ -262,28 +275,14 @@ normal `go test ./...` lane.
 
 ## Isolation model
 
-Dedicated CP + throwaway config-store **per PR**, provisioning **real**
-ducklings (org IDs `ci-pr-<N>-cnpg`, `ci-pr-<N>-ext`, plus the
-ducklake-only resilience-lane orgs `ci-pr-<N>-res1`/`-res2`) through the **shared**
-Crossplane / cnpg-shards / external RDS infra. The config-store
+Dedicated CP + throwaway config-store **per PR**, provisioning three **real**
+CNPG-backed ducklings (org IDs `ci-pr-<N>-cnpg` plus the ducklake-only
+resilience-lane orgs `ci-pr-<N>-res1`/`-res2`) through the **shared**
+Crossplane / cnpg-shards infra. The config-store
 uses a namespace-scoped PVC so a pod recreation during the harness does not
 erase provisioned org rows. Everything PR-specific lives in the namespace and
 is deleted; the shared-infra footprint is removed by deprovisioning the
 ducklings first.
-
-The ext org's metadata store is a **per-run database** on the shared RDS
-(`mdstore_e2e_<utc-ts>_pr<pr>`), not a shared one: a shared database's
-DuckLake catalog grows monotonically across runs (20k+ `ducklake_*` tables
-observed), inflating every catalog copy and exposing runs to each other's
-writers. The harness creates it once its own duckling status carries the
-ESO-synced RDS password (`ext_rds_setup`, concurrent with the readiness
-waits — the CP's provisioning probe retries until the database exists), drops
-it at the end of a passing run (`ext_rds_teardown`), and GCs databases leaked
-by aborted runs (name-gated, >24h old) at the start of every run. The runner
-side (`run.sh` teardown / `e2e-cleanup`) cannot drop them — no psql and no
-path to the RDS password — so the next run's GC is the backstop. The RDS
-user/secret are unchanged; only the database is per-run, and nothing outside
-`mdstore_e2e_*` is ever touched.
 
 Each deploy first reaps any existing resources for the same PR number (namespace,
 Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role).
@@ -301,6 +300,11 @@ finalizers are still running.
 | secret | `AWS_ECR_PUBLISH_IAM_ROLE` | ECR push (already exists; used by CD) |
 | (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP role + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
 | repo setting | "Require approval for all outside collaborators" | the access gate (see below) |
+
+The `scenario-dev` workflow requests a 16,200-second session from
+`github-duckgres-e2e`, matching its 270-minute job timeout. The role's
+`max_session_duration` in posthog-cloud-infra must be at least 16,200 seconds
+before this workflow setting is deployed.
 
 The Tailscale tailnet ACL must allow `tag:github-runner` to reach the mw-dev
 VPC subnet router (same pattern hogland set up for its dev cluster).
@@ -378,8 +382,8 @@ id committed).
   ["*"]` from charts#11522 does the drop; the `--for=delete` wait is what makes
   it synchronous from our side.)
 - **Shared-infra contention.** Concurrent PRs provision real ducklings against
-  the same cnpg-shards / RDS infra. Org-ID prefix keeps them
-  distinct; watch quay.io / cnpg pooler / RDS limits under parallelism.
+  the same cnpg-shards infra. Org-ID prefix keeps them
+  distinct; watch quay.io / cnpg pooler limits under parallelism.
 - **e2e-cleanup** is wired: the `e2e-mw-dev.yml` `schedule` trigger runs
   `run.sh e2e-cleanup` every 6h, reaping `duckgres-ci-pr-*` namespaces older than
   6h (`E2E_CLEANUP_MAX_AGE_HOURS`) along with their ducklings, cnpg role+db, Pod

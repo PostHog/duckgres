@@ -151,7 +151,10 @@ sizes; stored as `NUMERIC` so grouping is exact.)
 
 ## Changing an org's default team
 
-Buckets are stamped with the org's `default_team_id` **at record time**, so an
+Buckets are stamped with the org's billing team (historically the
+`default_team_id` column, now the `duckgres_org_teams` row with
+`is_billing_team = TRUE`; the wire field keeps the `default_team_id` name)
+**at record time**, so an
 update to the org (admin `PUT /orgs/:id` or a re-provision carrying a different
 `default_team_id`) would otherwise strand already-buffered usage under the old
 team — including a team that was just deleted in PostHog (duckgres treats the
@@ -195,7 +198,9 @@ folds it in.
 - **Add:** a `default_team_id` column on the org (BIGINT **NOT NULL** — required
   at org creation on both the provisioning and admin APIs, and not clearable
   via the admin API; used as the bucket `team_id` — fixed per org, no per-team
-  logic yet); a `duckgres.query_source` session GUC
+  logic yet. Since replaced by the `duckgres_org_teams` table, migration
+  000024: the bucket `team_id` is now the org's `is_billing_team = TRUE` row,
+  still surfaced as `default_team_id` on the wire); a `duckgres.query_source` session GUC
   (`standard` | `endpoints`, default `standard`, validated at SET time — anything
   else is a `22023` error) read by the meter; a bearer secret
   for the API.

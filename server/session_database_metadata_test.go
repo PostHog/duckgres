@@ -647,3 +647,68 @@ func TestPgCatalogConvenienceViewsMatchNativeShape(t *testing.T) {
 		})
 	}
 }
+
+func TestProjectMetadataViewsHideRelationsOutsideAccessPolicy(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() { _ = db.Close() }()
+
+	for _, statement := range []string{
+		`ATTACH ':memory:' AS ducklake`,
+		`CREATE SCHEMA ducklake.posthog`,
+		`CREATE SCHEMA ducklake.team_42`,
+		`CREATE SCHEMA ducklake.team_7`,
+		`CREATE TABLE ducklake.posthog.events_prod(id INTEGER)`,
+		`CREATE TABLE ducklake.posthog.events_other(id INTEGER)`,
+		`CREATE TABLE ducklake.team_42.owned(id INTEGER)`,
+		`CREATE VIEW ducklake.team_42.owned_view AS SELECT id FROM ducklake.team_42.owned`,
+		`CREATE SEQUENCE ducklake.team_42.owned_seq`,
+		`CREATE TABLE ducklake.team_7.hidden(id INTEGER)`,
+		`CREATE SEQUENCE ducklake.team_7.hidden_seq`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("exec %q: %v", statement, err)
+		}
+	}
+
+	executor := NewLocalExecutor(db)
+	err = sessionmeta.InitSessionDatabaseMetadataWithAccess(
+		context.Background(),
+		executor,
+		"ducklake",
+		&sessionmeta.MetadataAccessPolicy{
+			AllowedSchemas:   []string{"team_42"},
+			AllowedRelations: []string{"posthog.events_prod"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("init filtered session metadata: %v", err)
+	}
+
+	assertNames := func(query, want string) {
+		t.Helper()
+		var got string
+		if err := db.QueryRow(query).Scan(&got); err != nil {
+			t.Fatalf("metadata query: %v", err)
+		}
+		if got != want {
+			t.Fatalf("metadata names = %q, want %q", got, want)
+		}
+	}
+	assertNames(`
+		SELECT string_agg(table_schema || '.' || table_name, ',' ORDER BY table_schema, table_name)
+		FROM memory.main.information_schema_tables_compat
+	`, "posthog.events_prod,team_42.owned,team_42.owned_view")
+	assertNames(`
+		SELECT string_agg(nspname || '.' || relname, ',' ORDER BY nspname, relname)
+		FROM memory.main.pg_class_full c
+		JOIN memory.main.pg_namespace n ON n.oid = c.relnamespace
+	`, "posthog.events_prod,team_42.owned,team_42.owned_seq,team_42.owned_view")
+	assertNames(`
+		SELECT string_agg(sequence_schema || '.' || sequence_name, ',' ORDER BY sequence_schema, sequence_name)
+		FROM memory.main.information_schema_sequences_compat
+	`, "team_42.owned_seq")
+}

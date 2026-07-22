@@ -241,6 +241,83 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 		tableName, columnList, filePath, strings.Join(copyOptions, ", "))
 }
 
+func postgresBinaryReaderType(typeName string) (string, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(typeName))
+	// Only opt into the native reader when the established depp encoder and
+	// PostgreSQL use the same binary field layout. In particular, depp writes
+	// every integer and float as eight bytes, while PostgreSQL uses the target
+	// type's width. The legacy decoder deliberately tolerates those mismatches.
+	if strings.HasSuffix(upper, "[]") {
+		// Arrow schema round-tripping does not preserve PostgreSQL array OIDs
+		// for every element type. Keep arrays on the established decoder path
+		// rather than risk interpreting text-encoded values as binary arrays.
+		return "", false
+	}
+
+	switch {
+	case upper == "BOOLEAN" || upper == "BOOL":
+		return "BOOLEAN", true
+	case upper == "BIGINT" || upper == "INT8":
+		return "BIGINT", true
+	case upper == "DOUBLE" || upper == "FLOAT8":
+		return "DOUBLE", true
+	case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
+		return upper, true
+	case upper == "VARCHAR" || strings.HasPrefix(upper, "VARCHAR(") || upper == "TEXT" || upper == "STRING":
+		return "VARCHAR", true
+	case upper == "BLOB" || upper == "BYTEA":
+		return "BLOB", true
+	case upper == "DATE":
+		return "DATE", true
+	case upper == "TIMESTAMP":
+		return "TIMESTAMP", true
+	case upper == "TIMESTAMP WITH TIME ZONE" || upper == "TIMESTAMPTZ":
+		return "TIMESTAMPTZ", true
+	default:
+		return "", false
+	}
+}
+
+func buildDuckDBBinaryInsertSQL(
+	tableName, columnList, filePath string,
+	colTypes []ColumnTyper,
+) (string, []string, bool) {
+	if len(colTypes) == 0 {
+		return "", nil, false
+	}
+
+	columns := make([]string, len(colTypes))
+	databaseTypeNames := make([]string, len(colTypes))
+	for i, colType := range colTypes {
+		exactColType, ok := colType.(sqlcore.ExactColumnTyper)
+		if !ok {
+			return "", nil, false
+		}
+		databaseTypeName, ok := exactColType.ExactDatabaseTypeName()
+		if !ok {
+			return "", nil, false
+		}
+		readerType, ok := postgresBinaryReaderType(databaseTypeName)
+		if !ok {
+			return "", nil, false
+		}
+		databaseTypeNames[i] = databaseTypeName
+		columns[i] = fmt.Sprintf("c%d: '%s'", i, strings.ReplaceAll(readerType, "'", "''"))
+	}
+
+	target := tableName
+	if columnList != "" {
+		target += " " + columnList
+	}
+	return fmt.Sprintf(
+		"INSERT INTO %s SELECT * FROM read_postgres_binary('%s', columns = {%s}, buffer_size = %s)",
+		target,
+		strings.ReplaceAll(filePath, "'", "''"),
+		strings.Join(columns, ", "),
+		flightclient.CopyFromStdinSizePlaceholder,
+	), databaseTypeNames, true
+}
+
 // handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
 func (c *clientConn) handleCopy(query, upperQuery string) error {
 	start := time.Now()
@@ -731,8 +808,32 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return nil
 	}
 
-	// Branch to binary handler if binary format
+	// Remote workers can ingest PostgreSQL's binary COPY file format natively.
+	// Ship the opaque CopyData bytes through the existing worker spool path and
+	// let DuckDB decode them there. Local/process executors retain the legacy Go
+	// decoder because they do not have the worker's required-extension contract.
 	if opts.IsBinary {
+		if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
+			if len(cols) == len(colTypes) {
+				if copySQL, databaseTypeNames, supported := buildDuckDBBinaryInsertSQL(
+					tableName,
+					columnList,
+					flightclient.CopyFromStdinPathPlaceholder,
+					colTypes,
+				); supported {
+					if err := wire.WriteCopyInResponse(c.writer, int16(len(cols)), false); err != nil {
+						return err
+					}
+					_ = c.flushWriter()
+					c.logger().Debug("COPY FROM STDIN binary: sent CopyInResponse, streaming to worker.")
+					request := sqlcore.CopyFromStdinRequest{
+						SQLTemplate:                     copySQL,
+						PostgresBinaryDatabaseTypeNames: databaseTypeNames,
+					}
+					return c.handleCopyInRemoteStreaming(query, request, true, copyStartTime, streamer)
+				}
+			}
+		}
 		return c.handleCopyInBinary(query, opts, cols, colTypes)
 	}
 
@@ -763,7 +864,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	// only when CP and worker share a filesystem (standalone / process
 	// backend), so prefer the streaming path when it's available.
 	if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
-		return c.handleCopyInRemoteStreaming(query, opts, copyStartTime, streamer)
+		copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
+		return c.handleCopyInRemoteStreaming(query, sqlcore.CopyFromStdinRequest{SQLTemplate: copySQL}, false, copyStartTime, streamer)
 	}
 
 	// Create temp file upfront and stream data directly to it (avoids memory buffering).
@@ -904,30 +1006,23 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 // and runs the COPY against a worker-local spool file.
 func (c *clientConn) handleCopyInRemoteStreaming(
 	query string,
-	opts *CopyFromOptions,
+	request sqlcore.CopyFromStdinRequest,
+	binary bool,
 	copyStartTime time.Time,
 	streamer sqlcore.CopyFromStdinExecutor,
 ) error {
-	tableName := opts.TableName
-	columnList := opts.ColumnList
+	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "binary", binary)
 
-	// Build the COPY SQL with the path placeholder; the worker substitutes
-	// in its own tempfile path before executing. It is generated work, so
-	// neither this text nor the local path belongs in structured logs.
-	copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
-	c.logger().Debug("COPY FROM STDIN streaming to remote worker.", "target_table", tableName, "column_list_specified", columnList != "")
-
-	r := &copyDataWireReader{c: c}
+	r := &copyDataWireReader{c: c, binary: binary}
 
 	loadStart := time.Now()
 	workerStatement := generatedWorkerStatement(
 		workerOriginCopy,
 		workerOperationCopyFromStdinStream,
-		"target_table", tableName,
-		"column_list_specified", columnList != "",
+		"binary", binary,
 	)
 	c.logWorkerStatementStarted(workerStatement)
-	rowCount, err := streamer.CopyFromStdin(c.ctx, copySQL, r)
+	rowCount, err := streamer.CopyFromStdin(c.ctx, request, r)
 	c.logWorkerStatementFinished(workerStatement, loadStart, rowCount, err)
 
 	// On wire-level CopyFail / unexpected message, the reader returns a
@@ -989,7 +1084,8 @@ var errCopyAborted = errors.New("copy data stream aborted")
 //   - CopyDone           → io.EOF (clean end-of-stream)
 //   - CopyFail           → errCopyAborted, with cancelled / cancelMsg sticky
 //   - unexpected message → errCopyAborted, with protoErr sticky
-//   - wire transport err → that error is returned verbatim
+//   - wire transport err → a sticky non-EOF error; transport EOF before
+//     CopyDone is io.ErrUnexpectedEOF
 //
 // Returning a non-EOF error on cancellation matters for correctness:
 // if the reader pretended cancellation was a clean EOF, the streamer would
@@ -997,19 +1093,26 @@ var errCopyAborted = errors.New("copy data stream aborted")
 // bytes already received.
 type copyDataWireReader struct {
 	c *clientConn
+	// binary keeps every CopyData byte opaque. In text mode only, PostgreSQL
+	// clients may send the legacy end marker before CopyDone.
+	binary bool
 
 	pending   []byte
 	bytesRead int64
 
-	done      bool
-	cancelled bool
-	cancelMsg string
-	protoErr  string
+	done         bool
+	cancelled    bool
+	cancelMsg    string
+	protoErr     string
+	transportErr error
 }
 
 func (r *copyDataWireReader) Read(p []byte) (int, error) {
 	for len(r.pending) == 0 {
 		if r.done {
+			if r.transportErr != nil {
+				return 0, r.transportErr
+			}
 			if r.cancelled || r.protoErr != "" {
 				return 0, errCopyAborted
 			}
@@ -1019,13 +1122,20 @@ func (r *copyDataWireReader) Read(p []byte) (int, error) {
 		msgType, body, err := wire.ReadMessage(r.c.reader)
 		if err != nil {
 			r.done = true
-			return 0, err
+			if errors.Is(err, io.EOF) {
+				// The binary file trailer is part of CopyData; only a frontend
+				// CopyDone successfully terminates PostgreSQL COPY-in mode.
+				r.transportErr = fmt.Errorf("copy stream ended before CopyDone: %w", io.ErrUnexpectedEOF)
+			} else {
+				r.transportErr = err
+			}
+			return 0, r.transportErr
 		}
 		switch msgType {
 		case wire.MsgCopyData:
 			// Skip the PostgreSQL text COPY end-of-data marker (\.\n).
-			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
-				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+			if !r.binary && ((len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.')) {
 				continue
 			}
 			r.pending = body

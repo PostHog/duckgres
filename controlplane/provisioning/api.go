@@ -1,10 +1,13 @@
 package provisioning
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -82,6 +85,21 @@ type Store interface {
 	UpdateOrgUserPassword(orgID, username, passwordHash string) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 	IsDatabaseNameAvailable(name string) (bool, error)
+	// Team CRUD for the PostHog backend (duckgres_org_teams rows — config
+	// only, never warehouse data). ListOrgTeams returns
+	// gorm.ErrRecordNotFound for an unknown org. UpsertOrgTeam is the
+	// grandfather path: it MAY overwrite schema_name and the legacy table
+	// names of an existing row (see configstore.UpsertOrgTeamTx).
+	// DeleteOrgTeam enforces the last-team refusal and the billing handover
+	// (see configstore.DeleteOrgTeamTx).
+	ListOrgTeams(orgID string) ([]configstore.OrgTeam, error)
+	UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*configstore.OrgTeam, error)
+	DeleteOrgTeam(orgID string, teamID int64) (*configstore.OrgTeamDeleteResult, error)
+	// Discovery backing (discovery.go): list live warehouses, batch-fetch
+	// their team rows, and the unfiltered change marker.
+	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
+	ListOrgTeamsByOrgIDs(orgIDs []string) ([]configstore.OrgTeam, error)
+	LatestConfigChange() (time.Time, error)
 }
 
 // RegisterAPI registers provisioning endpoints on the given router group.
@@ -95,6 +113,25 @@ func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
 	r.POST("/orgs/:id/reset-password", h.resetPassword)
 	r.GET("/database-name/check", h.checkDatabaseName)
+	// Team CRUD: the PostHog backend manages the org's duckgres_org_teams
+	// rows through these (config only — deleting a team never touches
+	// warehouse data).
+	r.GET("/orgs/:id/teams", h.listOrgTeams)
+	r.POST("/orgs/:id/teams", h.upsertOrgTeam)
+	r.DELETE("/orgs/:id/teams/:team_id", h.deleteOrgTeam)
+}
+
+// RegisterDiscoveryAPI registers the read-only discovery endpoints for
+// external writers (millpond, viaduck) on their OWN router group — see
+// discovery.go for payload semantics. Deliberately separate from
+// RegisterAPI: the discovery group's auth accepts the scoped
+// read-only-secret (which must never reach the admin/provisioning
+// surface), so these routes must not be mounted behind the admin
+// middleware chain.
+func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
+	h := &handler{store: store}
+	r.GET("/warehouses", h.listWarehouses)
+	r.GET("/warehouse-team-ids", h.listWarehouseTeamIDs)
 }
 
 type handler struct {
@@ -135,13 +172,22 @@ type connectionDetails struct {
 
 type provisionRequest struct {
 	DatabaseName string `json:"database_name"`
-	// DefaultTeamID links the org to its default PostHog team id — a JSON
-	// NUMBER, matching PostHog's integer Team.id (a quoted string is a 400 at
-	// decode time). REQUIRED when the provision creates a NEW org (400
-	// otherwise — every org carries its team id from birth; pull-based compute
-	// billing keys usage buckets by it). Optional on re-provision of an
-	// existing org: absent/0 keeps the stored value, never wipes it.
-	DefaultTeamID int64                  `json:"default_team_id,omitempty"`
+	// DefaultTeamID is the org's billing PostHog team id — a JSON NUMBER,
+	// matching PostHog's integer Team.id (a quoted string is a 400 at decode
+	// time). Stored as the org's duckgres_org_teams billing row. REQUIRED
+	// when the provision creates a NEW org (400 otherwise — every org carries
+	// its billing team from birth; pull-based compute billing keys usage
+	// buckets by it). Optional on re-provision of an existing org: absent/0
+	// keeps the stored billing team, never wipes it.
+	DefaultTeamID int64 `json:"default_team_id,omitempty"`
+	// TeamID + SchemaName are the successor of DefaultTeamID: they create the
+	// org's first duckgres_org_teams row (billing = TRUE) with an explicit
+	// warehouse schema instead of the conventional "team_<id>". They COEXIST
+	// with the legacy field (this ships before the PostHog-side change): when
+	// both team ids are given they must agree (400 otherwise), and
+	// schema_name requires a team id via either field.
+	TeamID        int64                  `json:"team_id,omitempty"`
+	SchemaName    string                 `json:"schema_name,omitempty"`
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
 	DuckLake      *provisionDuckLakeReq  `json:"ducklake,omitempty"`
@@ -223,6 +269,28 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	if req.MetadataStore == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store is required"})
 		return
+	}
+
+	// Resolve the legacy default_team_id and the new team_id/schema_name pair
+	// into one effective billing team. Both fields keep working — this ships
+	// before the PostHog-side switch — but disagreement is a caller bug.
+	if req.TeamID != 0 && req.DefaultTeamID != 0 && req.TeamID != req.DefaultTeamID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("team_id (%d) and default_team_id (%d) disagree; send one, or the same value in both", req.TeamID, req.DefaultTeamID)})
+		return
+	}
+	effectiveTeamID := req.DefaultTeamID
+	if req.TeamID != 0 {
+		effectiveTeamID = req.TeamID
+	}
+	if req.SchemaName != "" {
+		if effectiveTeamID == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "schema_name requires team_id"})
+			return
+		}
+		if err := configstore.ValidateOrgTeamSchemaName(req.SchemaName); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	// The catalog is decoupled from the metadata backend: a duckling runs
@@ -314,7 +382,8 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	if err := h.store.Provision(ProvisionRequest{
 		OrgID:         orgID,
 		DatabaseName:  req.DatabaseName,
-		DefaultTeamID: req.DefaultTeamID,
+		DefaultTeamID: effectiveTeamID,
+		SchemaName:    req.SchemaName,
 		Warehouse:     warehouse,
 		RootUserHash:  hash,
 	}); err != nil {
@@ -499,4 +568,152 @@ func (h *handler) checkDatabaseName(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"name": name, "available": available})
+}
+
+// --- Org teams (duckgres_org_teams CRUD for the PostHog backend) ---
+
+// orgTeamUpsertRequest is the POST /orgs/:id/teams body. Pointer fields are
+// presence-aware: absent preserves the stored value on an existing row (and
+// takes the documented default on a new one). The legacy *_name fields exist
+// for grandfathering pre-existing teams whose warehouse tables predate the
+// schema-per-team convention; NULL means "derive from schema_name".
+type orgTeamUpsertRequest struct {
+	TeamID     int64  `json:"team_id"`
+	SchemaName string `json:"schema_name"`
+	Enabled    *bool  `json:"enabled,omitempty"`
+	// BackfillEnabled: absent = TRUE on insert / preserve on update. The
+	// column is NOT NULL DEFAULT TRUE (migration 000028), so an explicit null
+	// is a 400 — there is no "unset" to clear back to.
+	BackfillEnabled       *bool   `json:"backfill_enabled,omitempty"`
+	EventsTableName       *string `json:"events_table_name,omitempty"`
+	PersonsTableName      *string `json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate is PostHog's cached backfill floor as a "YYYY-MM-DD"
+	// string (see configstore.OrgTeam.EarliestEventDate). Tri-state: an absent
+	// key preserves the stored value; an explicit null (or "") clears it back
+	// to NULL so the PostHog sensor re-resolves it; a value must parse.
+	EarliestEventDate *string `json:"earliest_event_date,omitempty"`
+}
+
+func (h *handler) listOrgTeams(c *gin.Context) {
+	orgID := c.Param("id")
+	teams, err := h.store.ListOrgTeams(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"teams": teams})
+}
+
+// upsertOrgTeam creates or overwrites one (org, team) row. This endpoint IS
+// the grandfather path: upserting an existing (org, team) MAY overwrite
+// schema_name and the legacy table names, because the PostHog-side backfill
+// needs to replace the migration's conventional "team_<id>" placeholder with
+// the team's real pre-existing names. Schema immutability is therefore NOT
+// enforced here — it is enforced on the user-facing surfaces (the admin API
+// update rejects schema changes).
+func (h *handler) upsertOrgTeam(c *gin.Context) {
+	orgID := c.Param("id")
+
+	// Read the body once: the typed struct gives values, the raw key set gives
+	// presence, so an explicit `"earliest_event_date": null` (clear) is
+	// distinguishable from an absent key (preserve) — same idiom as the admin
+	// team PUT.
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req orgTeamUpsertRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawFields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.TeamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id)"})
+		return
+	}
+	if err := configstore.ValidateOrgTeamSchemaName(req.SchemaName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if _, ok := rawFields["backfill_enabled"]; ok && req.BackfillEnabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "backfill_enabled cannot be null (the column always has a value); pass true or false, or omit the field to preserve it"})
+		return
+	}
+	_, earliestSet := rawFields["earliest_event_date"]
+	var earliest *configstore.EventDate
+	if earliestSet && req.EarliestEventDate != nil && *req.EarliestEventDate != "" {
+		d, err := configstore.ParseEventDate(*req.EarliestEventDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "earliest_event_date " + err.Error()})
+			return
+		}
+		earliest = &d
+	}
+
+	team, err := h.store.UpsertOrgTeam(orgID, configstore.OrgTeamUpsert{
+		TeamID:                req.TeamID,
+		SchemaName:            req.SchemaName,
+		Enabled:               req.Enabled,
+		BackfillEnabled:       req.BackfillEnabled,
+		EventsTableName:       req.EventsTableName,
+		PersonsTableName:      req.PersonsTableName,
+		SchemaDataImportsName: req.SchemaDataImportsName,
+		EarliestEventDateSet:  earliestSet,
+		EarliestEventDate:     earliest,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		case errors.Is(err, configstore.ErrOrgTeamSchemaConflict), isUniqueViolation(err):
+			// The pre-check catches the common case with a clean message; the
+			// unique (org_id, schema_name) index catches the concurrent one.
+			c.JSON(http.StatusConflict, gin.H{"error": configstore.ErrOrgTeamSchemaConflict.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, team)
+}
+
+// deleteOrgTeam removes one (org, team) CONFIG row — never warehouse data.
+// Deleting the billing team promotes the oldest remaining team (usage buckets
+// re-attributed atomically); deleting the org's last team is refused.
+func (h *handler) deleteOrgTeam(c *gin.Context) {
+	orgID := c.Param("id")
+	teamID, err := strconv.ParseInt(c.Param("team_id"), 10, 64)
+	if err != nil || teamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
+		return
+	}
+
+	res, err := h.store.DeleteOrgTeam(orgID, teamID)
+	if err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrOrgTeamNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org team not found"})
+		case errors.Is(err, configstore.ErrLastOrgTeam):
+			c.JSON(http.StatusConflict, gin.H{"error": configstore.ErrLastOrgTeam.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	resp := gin.H{"deleted": teamID, "org": orgID}
+	if res.WasBilling {
+		resp["new_billing_team_id"] = res.NewBillingTeamID
+	}
+	c.JSON(http.StatusOK, resp)
 }

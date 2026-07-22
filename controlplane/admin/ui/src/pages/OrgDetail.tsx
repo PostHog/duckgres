@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, Database, Save, Trash2, Warehouse } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Database, Layers, Pencil, Plus, Save, Trash2, Warehouse } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -29,11 +29,21 @@ import {
   useDucklingsMetadata,
   useOrg,
   useOrgReshards,
+  useOrgTeams,
   useUpdateOrg,
   useUpdateWarehouse,
   useWarehouse,
 } from "@/hooks/useApi";
-import type { ManagedWarehouse, OrgUpdate } from "@/types/api";
+import {
+  BackfillBadge,
+  CreateTeamDialog,
+  DeleteTeamDialog,
+  EarliestEventDateCell,
+  EditTeamDialog,
+  LegacyNamesBadge,
+} from "@/components/OrgTeamDialogs";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import type { ManagedWarehouse, OrgTeam, OrgUpdate } from "@/types/api";
 
 interface FormState {
   max_workers: string;
@@ -54,7 +64,7 @@ function orgToForm(o: {
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
   hostname_alias: string | null;
-  default_team_id: number | null;
+  default_team_id?: number | null;
 }): FormState {
   return {
     max_workers: String(o.max_workers),
@@ -250,12 +260,15 @@ export function OrgDetail() {
                   onChange={(e) => set("hostname_alias", e.target.value)}
                 />
               </Field>
-              <Field label="Default team id (required)">
+              <Field label="Billing team id (wire field default_team_id)">
                 <Input
                   value={form.default_team_id}
                   placeholder="PostHog team id, e.g. 12345"
                   onChange={(e) => set("default_team_id", e.target.value)}
                 />
+                <p className="text-[11px] text-muted-foreground">
+                  Repoints the org's billing team. All of the org's teams are listed below.
+                </p>
               </Field>
 
               <div className="flex items-center gap-3 pt-1">
@@ -275,6 +288,7 @@ export function OrgDetail() {
 
           <WarehousePanel orgId={id} data={warehouse.data ?? null} loading={warehouse.isLoading} error={warehouse.error} />
         </div>
+        <OrgTeamsCard orgId={id} />
       </PageBody>
 
       <Dialog open={confirmDelete} onOpenChange={(open) => (open ? setConfirmDelete(true) : closeDelete())}>
@@ -661,6 +675,124 @@ function ReshardHistory({ orgId }: { orgId: string }) {
         ))}
       </div>
     </div>
+  );
+}
+
+// OrgTeamsCard lists the org's duckgres_org_teams rows with full CRUD.
+// The billing team is also editable as "default_team_id" in the config form
+// above (the legacy wire field) — both paths repoint the same row.
+function OrgTeamsCard({ orgId }: { orgId: string }) {
+  const teams = useOrgTeams(orgId);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<OrgTeam | null>(null);
+  const [deleting, setDeleting] = useState<OrgTeam | null>(null);
+  const rows = teams.data ?? [];
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle className="flex items-center gap-2">
+          <Layers className="h-4 w-4" /> Teams
+        </CardTitle>
+        <AdminGate>
+          <Button size="sm" variant="outline" onClick={() => setCreating(true)}>
+            <Plus className="h-4 w-4" /> Add team
+          </Button>
+        </AdminGate>
+      </CardHeader>
+      <CardContent>
+        {teams.isLoading ? (
+          <LoadingState />
+        ) : teams.isError ? (
+          <ErrorState error={teams.error} onRetry={() => teams.refetch()} />
+        ) : rows.length === 0 ? (
+          <p className="py-4 text-center text-sm text-muted-foreground">
+            No PostHog teams are mapped to this org.
+          </p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead>Team id</TableHead>
+                <TableHead>Schema</TableHead>
+                <TableHead>Enabled</TableHead>
+                <TableHead>Billing</TableHead>
+                <TableHead>Backfill</TableHead>
+                <TableHead>Earliest event</TableHead>
+                <TableHead>Created</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((t) => (
+                <TableRow key={t.team_id} className="[&>td]:py-1.5">
+                  <TableCell className="font-mono text-xs font-medium tabular-nums">{t.team_id}</TableCell>
+                  <TableCell>
+                    <span className="flex items-center gap-1.5">
+                      <span className="font-mono text-xs">{t.schema_name}</span>
+                      <LegacyNamesBadge team={t} />
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    {t.enabled ? (
+                      <Badge variant="secondary">enabled</Badge>
+                    ) : (
+                      <Badge variant="destructive">disabled</Badge>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {t.is_billing_team ? (
+                      <Badge variant="success">billing</Badge>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <BackfillBadge value={t.backfill_enabled} />
+                  </TableCell>
+                  <TableCell>
+                    <EarliestEventDateCell value={t.earliest_event_date} />
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{fmtTime(t.created_at)}</TableCell>
+                  <TableCell>
+                    <div className="-my-1 flex justify-end gap-1">
+                      <AdminGate>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6"
+                          title="Edit"
+                          onClick={() => setEditing(t)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                      </AdminGate>
+                      <AdminGate>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6"
+                          title="Delete"
+                          onClick={() => setDeleting(t)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                        </Button>
+                      </AdminGate>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+
+      <CreateTeamDialog open={creating} onClose={() => setCreating(false)} org={orgId} />
+      {editing && <EditTeamDialog team={editing} onClose={() => setEditing(null)} />}
+      {deleting && (
+        <DeleteTeamDialog team={deleting} teamCount={rows.length} onClose={() => setDeleting(null)} />
+      )}
+    </Card>
   );
 }
 

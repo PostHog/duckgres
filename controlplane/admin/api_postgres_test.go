@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,14 +17,6 @@ import (
 )
 
 const testConfigStoreConnString = "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable"
-
-// testDefaultTeamID returns a pointer to a placeholder PostHog team id for
-// seeded org rows — default_team_id is NOT NULL (migration 000020), so every
-// test fixture that inserts an org must carry one.
-func testDefaultTeamID() *int64 {
-	teamID := int64(1)
-	return &teamID
-}
 
 func newPostgresConfigStore(t *testing.T) *configstore.ConfigStore {
 	t.Helper()
@@ -115,7 +108,7 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 
@@ -180,8 +173,11 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics_db"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
+	}
+	if err := configstore.SetOrgBillingTeamTx(store.DB(), "analytics", 1); err != nil {
+		t.Fatalf("seed billing team: %v", err)
 	}
 	wh := &configstore.ManagedWarehouse{OrgID: "analytics", State: configstore.ManagedWarehouseStateReady}
 	if err := store.DB().Create(wh).Error; err != nil {
@@ -209,18 +205,22 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 		t.Fatal("expected org row to be deleted")
 	}
 
-	var orgs, warehouses int64
+	var orgs, warehouses, teams int64
 	store.DB().Model(&configstore.Org{}).Where("name = ?", "analytics").Count(&orgs)
 	store.DB().Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", "analytics").Count(&warehouses)
+	store.DB().Model(&configstore.OrgTeam{}).Where("org_id = ?", "analytics").Count(&teams)
 	if orgs != 0 {
 		t.Fatalf("expected org row gone, found %d", orgs)
 	}
 	if warehouses != 0 {
 		t.Fatalf("expected deleted warehouse row cascaded away, found %d", warehouses)
 	}
+	if teams != 0 {
+		t.Fatalf("expected org team rows cascaded away (FK ON DELETE CASCADE), found %d", teams)
+	}
 
 	// The database_name is now free for reuse (no unique-index squat).
-	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db"}).Error; err != nil {
 		t.Fatalf("expected database_name to be reusable after org deletion: %v", err)
 	}
 }
@@ -235,8 +235,11 @@ func TestUpdateOrgReattributesUsagePostgres(t *testing.T) {
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
 	oldTeam := int64(1)
-	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acmedb", DefaultTeamID: &oldTeam}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "acme", DatabaseName: "acmedb"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
+	}
+	if err := configstore.SetOrgBillingTeamTx(store.DB(), "acme", oldTeam); err != nil {
+		t.Fatalf("seed billing team: %v", err)
 	}
 
 	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
@@ -281,6 +284,14 @@ func TestUpdateOrgReattributesUsagePostgres(t *testing.T) {
 	if updated.DefaultTeamID == nil || *updated.DefaultTeamID != 2 {
 		t.Fatalf("org default_team_id = %v, want 2", updated.DefaultTeamID)
 	}
+	// The billing mark moved to team 2; the old team row stays, demoted.
+	var billingTeams []int64
+	if err := store.DB().Raw(`SELECT team_id FROM duckgres_org_teams WHERE org_id = 'acme' AND is_billing_team IS TRUE`).Scan(&billingTeams).Error; err != nil {
+		t.Fatalf("read billing teams: %v", err)
+	}
+	if len(billingTeams) != 1 || billingTeams[0] != 2 {
+		t.Fatalf("billing team rows = %v, want [2]", billingTeams)
+	}
 	var compute []struct {
 		TeamID        int64
 		CPUSeconds    int64
@@ -308,7 +319,7 @@ func TestMutateManagedWarehouseSerializesConcurrentWriters(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics", DefaultTeamID: testDefaultTeamID()}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{
@@ -348,5 +359,222 @@ func TestMutateManagedWarehouseSerializesConcurrentWriters(t *testing.T) {
 	want := fmt.Sprintf("n=%d", writers)
 	if final.StatusMessage != want {
 		t.Fatalf("status_message = %q, want %q (lost updates under concurrency)", final.StatusMessage, want)
+	}
+}
+
+// TestAdminOrgTeamStorePostgres exercises the real gormAPIStore team methods:
+// billing repoint carries the buffered usage buckets, and create enforces
+// per-org schema uniqueness. (Delete rules live in configstore.DeleteOrgTeamTx
+// and are covered by tests/configstore/org_teams_postgres_test.go — the admin
+// UI deletes through the provisioning-registered route.)
+func TestAdminOrgTeamStorePostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	if err := store.DB().Create(&configstore.Org{Name: "teamsorg", DatabaseName: "teamsorgdb"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
+		VALUES ('teamsorg', 1, 'team_1', TRUE, TRUE, ?, ?), ('teamsorg', 2, 'team_2', TRUE, NULL, ?, ?)`,
+		base, base, base.Add(time.Hour), base.Add(time.Hour)).Error; err != nil {
+		t.Fatalf("seed teams: %v", err)
+	}
+	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	if err := store.FlushComputeUsage([]configstore.ComputeUsageDelta{{
+		OrgID: "teamsorg", TeamID: 1, QuerySource: "standard",
+		Millicores: 2000, MiB: 4096, BucketStart: bucket,
+		CPUSeconds: 10, MemorySeconds: 20,
+	}}); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	// Repoint billing to team 2: the buffered bucket must follow atomically.
+	prev, updated, err := apiStore.UpdateOrgTeam("teamsorg", 2, orgTeamUpdate{MakeBilling: true})
+	if err != nil {
+		t.Fatalf("repoint billing: %v", err)
+	}
+	if prev.IsBillingTeam != nil {
+		t.Fatalf("prev must be the pre-update row (not billing), got %+v", prev)
+	}
+	if updated.IsBillingTeam == nil || !*updated.IsBillingTeam {
+		t.Fatalf("team 2 must be billing, got %+v", updated)
+	}
+	var usageTeams []int64
+	if err := store.DB().Raw(`SELECT team_id FROM duckgres_org_compute_usage WHERE org_id = 'teamsorg'`).Scan(&usageTeams).Error; err != nil {
+		t.Fatalf("read usage teams: %v", err)
+	}
+	if len(usageTeams) != 1 || usageTeams[0] != 2 {
+		t.Fatalf("usage teams after repoint = %v, want [2]", usageTeams)
+	}
+
+	// Create with a schema another team already holds: refused.
+	err = apiStore.CreateOrgTeam("teamsorg", &configstore.OrgTeam{TeamID: 3, SchemaName: "team_1", Enabled: true})
+	if !errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+		t.Fatalf("duplicate schema create err = %v, want ErrOrgTeamSchemaConflict", err)
+	}
+	// A duplicate (org, team) is the other conflict shape.
+	err = apiStore.CreateOrgTeam("teamsorg", &configstore.OrgTeam{TeamID: 1, SchemaName: "fresh", Enabled: true})
+	if !errors.Is(err, errOrgTeamExists) {
+		t.Fatalf("duplicate team create err = %v, want errOrgTeamExists", err)
+	}
+	// A fresh schema works and appears in the cross-org list.
+	if err := apiStore.CreateOrgTeam("teamsorg", &configstore.OrgTeam{TeamID: 3, SchemaName: "team_3", Enabled: true}); err != nil {
+		t.Fatalf("create team 3: %v", err)
+	}
+	teams, err := apiStore.ListAllOrgTeams()
+	if err != nil {
+		t.Fatalf("list all teams: %v", err)
+	}
+	var got []int64
+	for _, tm := range teams {
+		if tm.OrgID == "teamsorg" {
+			got = append(got, tm.TeamID)
+		}
+	}
+	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+		t.Fatalf("teamsorg teams = %v, want [1 2 3]", got)
+	}
+}
+
+// TestAdminUpdateOrgTeamBreakGlassPostgres exercises the operator break-glass
+// fields of gormAPIStore.UpdateOrgTeam against real Postgres: schema_name
+// change (happy path, per-org 409, cross-org reuse) and the tri-state legacy
+// table-name set / clear / preserve-on-omit semantics, including that the
+// pre-update row comes back for audit.
+func TestAdminUpdateOrgTeamBreakGlassPostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	for _, org := range []string{"repairorg", "otherorg"} {
+		if err := store.DB().Create(&configstore.Org{Name: org, DatabaseName: org + "db"}).Error; err != nil {
+			t.Fatalf("create org %s: %v", org, err)
+		}
+	}
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
+		VALUES ('repairorg', 1, 'team_1', TRUE, TRUE, now(), now()),
+		       ('repairorg', 2, 'team_2', TRUE, NULL, now(), now()),
+		       ('otherorg', 9, 'shared', TRUE, TRUE, now(), now())`).Error; err != nil {
+		t.Fatalf("seed teams: %v", err)
+	}
+
+	str := func(s string) *string { return &s }
+
+	// Schema change happy path; prev carries the replaced value.
+	prev, updated, err := apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{SchemaName: str("repaired_wh")})
+	if err != nil {
+		t.Fatalf("schema change: %v", err)
+	}
+	if prev.SchemaName != "team_1" || updated.SchemaName != "repaired_wh" {
+		t.Fatalf("schema change prev/updated = %q/%q, want team_1/repaired_wh", prev.SchemaName, updated.SchemaName)
+	}
+
+	// Conflict with another team in the same org.
+	if _, _, err := apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{SchemaName: str("team_2")}); !errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+		t.Fatalf("same-org conflict err = %v, want ErrOrgTeamSchemaConflict", err)
+	}
+
+	// The same schema in a different org is allowed (uniqueness is per org).
+	if _, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{SchemaName: str("shared")}); err != nil || updated.SchemaName != "shared" {
+		t.Fatalf("cross-org schema reuse: updated = %+v, err = %v", updated, err)
+	}
+
+	// Legacy names: set all three...
+	_, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{
+		EventsTableNameSet: true, EventsTableName: str("legacy_events"),
+		PersonsTableNameSet: true, PersonsTableName: str("legacy_persons"),
+		SchemaDataImportsNameSet: true, SchemaDataImportsName: str("legacy_imports"),
+	})
+	if err != nil {
+		t.Fatalf("set legacy names: %v", err)
+	}
+	if updated.EventsTableName == nil || *updated.EventsTableName != "legacy_events" ||
+		updated.PersonsTableName == nil || *updated.PersonsTableName != "legacy_persons" ||
+		updated.SchemaDataImportsName == nil || *updated.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("legacy names not stored: %+v", updated)
+	}
+
+	// ...then clear one; the omitted others must be preserved.
+	_, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{EventsTableNameSet: true})
+	if err != nil {
+		t.Fatalf("clear events_table_name: %v", err)
+	}
+	if updated.EventsTableName != nil {
+		t.Fatalf("events_table_name = %v, want NULL after clear", *updated.EventsTableName)
+	}
+	if updated.PersonsTableName == nil || *updated.PersonsTableName != "legacy_persons" ||
+		updated.SchemaDataImportsName == nil || *updated.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("omitted legacy names must be preserved, got %+v", updated)
+	}
+	// The schema change earlier must have survived unrelated updates.
+	if updated.SchemaName != "shared" {
+		t.Fatalf("schema_name = %q, want shared preserved on omit", updated.SchemaName)
+	}
+
+	// earliest_event_date: set (real DATE round-trip), preserve on omit, clear.
+	date, err := configstore.ParseEventDate("2023-04-17")
+	if err != nil {
+		t.Fatalf("parse date: %v", err)
+	}
+	prev, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{
+		EarliestEventDateSet: true, EarliestEventDate: &date,
+	})
+	if err != nil {
+		t.Fatalf("set earliest_event_date: %v", err)
+	}
+	if prev.EarliestEventDate != nil {
+		t.Fatalf("prev earliest_event_date = %v, want NULL", prev.EarliestEventDate)
+	}
+	if updated.EarliestEventDate == nil || updated.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("earliest_event_date = %v, want 2023-04-17", updated.EarliestEventDate)
+	}
+	_, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{Enabled: boolPtrAdmin(false)})
+	if err != nil {
+		t.Fatalf("unrelated update: %v", err)
+	}
+	if updated.EarliestEventDate == nil || updated.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("omitted earliest_event_date must be preserved, got %v", updated.EarliestEventDate)
+	}
+	prev, updated, err = apiStore.UpdateOrgTeam("repairorg", 1, orgTeamUpdate{EarliestEventDateSet: true})
+	if err != nil {
+		t.Fatalf("clear earliest_event_date: %v", err)
+	}
+	if prev.EarliestEventDate == nil || updated.EarliestEventDate != nil {
+		t.Fatalf("clear: prev/updated = %v/%v, want 2023-04-17/NULL", prev.EarliestEventDate, updated.EarliestEventDate)
+	}
+}
+
+func boolPtrAdmin(b bool) *bool { return &b }
+
+// TestAdminCreateOrgTeamDisabledPostgres pins the gorm default-tag pitfall on
+// the ADMIN create surface (POST /teams {"enabled":false}): Enabled carries
+// `default:true`, gorm omits zero-valued default-tagged fields from the
+// INSERT, and without the explicit follow-up column write the DB default
+// silently stores TRUE. Same bug class as configstore.UpsertOrgTeamTx's
+// create path (TestCreateOrgTeamDisabledPostgres).
+func TestAdminCreateOrgTeamDisabledPostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	if err := store.DB().Create(&configstore.Org{Name: "heldorg", DatabaseName: "heldorgdb"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	team := &configstore.OrgTeam{TeamID: 5, SchemaName: "team_5", Enabled: false}
+	if err := apiStore.CreateOrgTeam("heldorg", team); err != nil {
+		t.Fatalf("create disabled team: %v", err)
+	}
+	var got configstore.OrgTeam
+	if err := store.DB().First(&got, "org_id = ? AND team_id = ?", "heldorg", 5).Error; err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got.Enabled {
+		t.Fatal("admin-created team with enabled=false was stored as enabled=true (gorm default-tag pitfall)")
+	}
+	// The struct handed back to the handler (the 201 body) must not carry
+	// gorm's RETURNING write-back either.
+	if team.Enabled {
+		t.Fatal("returned team struct carries enabled=true (RETURNING write-back not undone)")
 	}
 }

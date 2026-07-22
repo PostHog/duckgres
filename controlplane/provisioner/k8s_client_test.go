@@ -4,14 +4,103 @@ package provisioner
 
 import (
 	"context"
+	"encoding/base64"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
+
+func ducklingWithCredentialRef(name, legacyPassword string, ref SecretReference) *unstructured.Unstructured {
+	metadataStore := map[string]interface{}{
+		"type":     configstore.MetadataStoreKindCnpgShard,
+		"endpoint": "metadata.internal",
+		"user":     "tenant",
+		"database": "tenant",
+	}
+	if legacyPassword != "" {
+		metadataStore["password"] = legacyPassword
+	}
+	if ref.Name != "" {
+		metadataStore["credentialSecretRef"] = map[string]interface{}{
+			"name": ref.Name, "namespace": ref.Namespace, "key": ref.Key,
+		}
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ducklingNamespace},
+		"status":     map[string]interface{}{"metadataStore": metadataStore},
+	}}
+}
+
+func credentialSecret(name, password string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ducklingNamespace},
+		"data":       map[string]interface{}{"password": base64.StdEncoding.EncodeToString([]byte(password))},
+	}}
+}
+
+func TestGetResolvesMetadataPasswordFromCredentialSecretRef(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", "stale-status-password", SecretReference{
+		Name: "cnpg-tenant-acme-password", Namespace: ducklingNamespace, Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr, credentialSecret("cnpg-tenant-acme-password", "live-secret-password"))
+
+	status, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := status.MetadataStore.Password; got != "live-secret-password" {
+		t.Fatalf("password = %q, want Secret value", got)
+	}
+}
+
+func TestGetFallsBackToLegacyStatusPasswordDuringRollout(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", "legacy-password", SecretReference{
+		Name: "missing-password", Namespace: ducklingNamespace, Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+
+	status, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := status.MetadataStore.Password; got != "legacy-password" {
+		t.Fatalf("password = %q, want legacy fallback", got)
+	}
+}
+
+func TestGetFailsWhenReferencedCredentialIsUnavailableWithoutLegacyFallback(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", "", SecretReference{
+		Name: "missing-password", Namespace: ducklingNamespace, Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), "missing-password") {
+		t.Fatalf("Get error = %v, want missing Secret error", err)
+	}
+}
+
+func TestGetRejectsCredentialSecretOutsideDucklingsNamespace(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", "", SecretReference{
+		Name: "password", Namespace: "other-namespace", Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), `namespace "other-namespace" is not allowed`) {
+		t.Fatalf("Get error = %v, want namespace rejection", err)
+	}
+}
 
 func mrWithPolicies(policies []interface{}) *unstructured.Unstructured {
 	spec := map[string]interface{}{}

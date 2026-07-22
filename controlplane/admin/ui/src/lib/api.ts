@@ -24,6 +24,10 @@ import type {
   ModelSummary,
   Operator,
   Org,
+  OrgTeam,
+  OrgTeamCreateBody,
+  OrgTeamDeleteResult,
+  OrgTeamUpdateBody,
   OrgUpdate,
   OrgUser,
   OrgUserSecret,
@@ -137,6 +141,17 @@ export const api = {
   // warehouse state isn't ready/failed/provisioning.
   deprovisionWarehouse: (id: string) =>
     post<{ status: string; org: string }>(`/orgs/${enc(id)}/deprovision`, {}),
+
+  // org teams (duckgres_org_teams). Schema names are immutable after create
+  // on this surface; delete removes config only (never warehouse data).
+  listAllOrgTeams: () => get<{ teams: OrgTeam[] }>("/teams").then((r) => r.teams ?? []),
+  listOrgTeams: (org: string) =>
+    get<{ teams: OrgTeam[] }>(`/orgs/${enc(org)}/teams`).then((r) => r.teams ?? []),
+  createOrgTeam: (body: OrgTeamCreateBody) => post<OrgTeam>("/teams", body),
+  updateOrgTeam: (org: string, teamId: number, body: OrgTeamUpdateBody) =>
+    put<OrgTeam>(`/orgs/${enc(org)}/teams/${teamId}`, body),
+  deleteOrgTeam: (org: string, teamId: number) =>
+    del<OrgTeamDeleteResult>(`/orgs/${enc(org)}/teams/${teamId}`),
 
   // ducklings (admin-only)
   getDucklingDrift: () => get<DucklingDriftResponse>("/ducklings/drift"),

@@ -151,11 +151,11 @@ type computeUsageStore interface {
 
 // computeMeter wires the per-org counter to a flusher. Nil-safe: a disabled
 // meter (non-remote backend) leaves this nil and every call site no-ops.
-// resolveTeam maps an org to its default PostHog team id at record time (a
-// config-snapshot read — no I/O); 0 is tolerated per the OrgDefaultTeamID
-// contract and the bucket then carries team_id 0. The column is NOT NULL and
-// required at org creation, so 0 can only mean an unknown org or a
-// not-yet-loaded snapshot — never a stored "no default team".
+// resolveTeam maps an org to its billing PostHog team id at record time (a
+// config-snapshot read — no I/O); 0 is tolerated per the OrgBillingTeamID
+// contract and the bucket then carries team_id 0. Every org create path
+// establishes a billing team row, so 0 can only mean an unknown org or a
+// not-yet-loaded snapshot — never a stored "no billing team".
 type computeMeter struct {
 	counter     *computeUsageCounter
 	store       computeUsageStore

@@ -86,6 +86,10 @@ func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }
 
+func (a *orgRouterAdapter) SetProjectReaderChangeHandler(handler func(orgID, username string)) {
+	a.router.setProjectReaderChangeHandler(handler)
+}
+
 func (a *orgRouterAdapter) ReleaseIdleHotWorkers() int {
 	return a.router.ReleaseIdleHotWorkers()
 }
@@ -503,6 +507,24 @@ func SetupMultiTenant(
 		// Count only — never log the secret values.
 		slog.Info("Internal secret rotation fallbacks active.", "fallback_count", n)
 	}
+	// Scoped read-only token for the discovery endpoints. Empty secret ⇒
+	// empty TokenSet ⇒ never validates; discovery then accepts only the
+	// internal secret (pre-rollout behavior). A discovery value colliding
+	// with the internal set would silently un-scope the credential, so
+	// that's a startup failure, not a warning.
+	if err := validateDistinctReadOnlySecret(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks, internalSecret, cfg.InternalSecretFallbacks); err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	readOnlyTokens := admin.NewTokenSet(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks)
+	if readOnlyTokens.Count() == 0 {
+		// Keyed off the TokenSet, not just cfg.ReadOnlySecret: fallbacks
+		// alone (mid-rotation) still validate, and saying otherwise here
+		// would mislead an operator debugging exactly that state.
+		slog.Info("Read-only secret not set; discovery endpoints accept only the internal secret. Set --read-only-secret or DUCKGRES_READ_ONLY_SECRET to give external writers a scoped credential.")
+	} else if n := len(cfg.ReadOnlySecretFallbacks); n > 0 {
+		// Count only — never log the secret values.
+		slog.Info("Discovery secret rotation fallbacks active.", "fallback_count", n)
+	}
 
 	// Set up API server (admin + provisioning + dashboard on :8080).
 	// The existing metrics server on :9090 stays running separately.
@@ -572,6 +594,9 @@ func SetupMultiTenant(
 	)
 	admin.RegisterAPI(api, store, adpt, liveFetcher)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// Discovery endpoints live in their OWN group (see discovery_group.go
+	// for the security rationale and the topology tripwire test).
+	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
 	// Pull-based compute-billing API (GET /billing/usage + POST /billing/ack).
 	// The billing service authenticates with the internal secret (→ admin);
 	// RequireAdmin keeps SSO viewers away from raw usage + the ack mutation.
@@ -650,7 +675,7 @@ func SetupMultiTenant(
 	// GET/ack API registered above. Best-effort throughout — queries are NEVER
 	// failed on its account. The 30-day safety GC is leader-only, co-located
 	// under the janitor lease so exactly one CP pod sweeps.
-	meter := newComputeMeter(store, store.OrgDefaultTeamID)
+	meter := newComputeMeter(store, store.OrgBillingTeamID)
 	go meter.Run(context.Background())
 	if janitorLeader != nil {
 		janitorLeader.AttachLeaderLoop(func(ctx context.Context) { runComputeUsageGC(ctx, store) })
@@ -673,7 +698,7 @@ func SetupMultiTenant(
 			var orgs []storageOrg
 			for _, org := range snap.Orgs {
 				if org.Warehouse != nil && org.Warehouse.State == configstore.ManagedWarehouseStateReady {
-					orgs = append(orgs, storageOrg{OrgID: org.Name, TeamID: org.DefaultTeamID})
+					orgs = append(orgs, storageOrg{OrgID: org.Name, TeamID: org.BillingTeamID()})
 				}
 			}
 			return orgs

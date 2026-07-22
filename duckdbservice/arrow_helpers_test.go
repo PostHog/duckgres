@@ -1220,6 +1220,68 @@ func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 	}
 }
 
+func TestGetQuerySchemaPreservesExactDatabaseTypeNamesForRemoteCopyRouting(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`
+		CREATE TABLE remote_copy_schema (
+			u UUID,
+			h HUGEINT,
+			id BIGINT,
+			score DOUBLE,
+			amount DECIMAL(18,4),
+			label VARCHAR,
+			enabled BOOLEAN,
+			usage_date DATE,
+			created_at TIMESTAMP,
+			observed_at TIMESTAMPTZ,
+			payload BLOB
+		)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	schema, err := GetQuerySchema(
+		context.Background(),
+		db,
+		"SELECT u, h, id, score, amount, label, enabled, usage_date, created_at, observed_at, payload FROM remote_copy_schema",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("GetQuerySchema: %v", err)
+	}
+
+	want := []string{
+		"UUID",
+		"HUGEINT",
+		"BIGINT",
+		"DOUBLE",
+		"DECIMAL(18,4)",
+		"VARCHAR",
+		"BOOLEAN",
+		"DATE",
+		"TIMESTAMP",
+		"TIMESTAMPTZ",
+		"BLOB",
+	}
+	if schema.NumFields() != len(want) {
+		t.Fatalf("schema fields = %d, want %d", schema.NumFields(), len(want))
+	}
+	for i, exactType := range want {
+		got, ok := schema.Field(i).Metadata.GetValue("duckgres.database_type_name")
+		if !ok {
+			t.Errorf("field %q has no exact database type metadata", schema.Field(i).Name)
+			continue
+		}
+		if got != exactType {
+			t.Errorf("field %q exact database type = %q, want %q", schema.Field(i).Name, got, exactType)
+		}
+	}
+}
+
 // TestRowsToRecordNoRowsLostAtBatchBoundary reproduces the production bug where
 // RowsToRecord silently dropped one row at every batch transition for unbounded
 // SELECTs. The driver-level cursor was being advanced by the loop condition

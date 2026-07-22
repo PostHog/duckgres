@@ -25,22 +25,92 @@ type Org struct {
 	DefaultWorkerMemory     string `gorm:"size:32" json:"default_worker_memory"`
 	DefaultWorkerTTL        string `gorm:"size:32" json:"default_worker_ttl"`
 	DefaultWorkerMinHotIdle int    `gorm:"default:0" json:"default_worker_min_hot_idle"`
-	// DefaultTeamID links the org to its default PostHog team id (an integer,
-	// matching PostHog's Team.id). It is a prerequisite for pull-based compute
-	// billing — usage buckets are keyed by team_id = the org's default team.
-	// The column is a NOT NULL BIGINT (migration 000020) and 0 is never stored:
-	// every create path (provisioning + admin API) requires a positive team id
-	// and the admin API rejects clears. The field stays *int64 anyway — the
-	// admin PUT presence-merge relies on nil = "field absent, preserve", and a
-	// plain int64 would make gorm treat 0 as a zero value to skip.
-	DefaultTeamID *int64            `gorm:"not null" json:"default_team_id,omitempty"`
+	// DefaultTeamID is NOT a column — it is the admin/provisioning API view of
+	// the org's billing team (the duckgres_org_teams row with is_billing_team
+	// = TRUE, see OrgTeam). The JSON field name is kept for wire compat with
+	// existing callers and the admin UI. Read paths populate it from the
+	// preloaded Teams association; write paths (admin create/update org,
+	// provisioning) translate it into a billing-team upsert via
+	// SetOrgBillingTeamTx. *int64 because the admin PUT presence-merge relies
+	// on nil = "field absent, preserve".
+	DefaultTeamID *int64            `gorm:"-" json:"default_team_id,omitempty"`
+	Teams         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
 	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	// UpdatedAt doubles as an input to the discovery change marker
+	// (ConfigStore.LatestConfigChange): DeleteOrgTeamTx touches it so a
+	// team-row DELETE — which leaves no updated_at of its own behind —
+	// still advances the marker external pollers gate on.
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
+
+// BillingTeamID returns the org's billing PostHog team id from the loaded
+// Teams association (the row with is_billing_team = TRUE), or nil when the
+// org has none — including when Teams was not preloaded.
+func (o *Org) BillingTeamID() *int64 {
+	for i := range o.Teams {
+		t := &o.Teams[i]
+		if t.IsBillingTeam != nil && *t.IsBillingTeam {
+			return &t.TeamID
+		}
+	}
+	return nil
+}
+
+// OrgTeam maps one PostHog team to an org and the warehouse schema its data
+// lives in (conventionally "team_<id>"). An org can carry many teams; exactly
+// one may be the billing team — the team pull-based billing keys the org's
+// usage buckets by (enforced by a partial unique index, migration 000024).
+// Two teams in one org must never share a schema name (unique index on
+// (org_id, schema_name), migration 000025). IsBillingTeam is tri-state
+// (*bool): NULL means "not the billing team". BackfillEnabled mirrors a
+// Django BooleanField(default=True) on the PostHog side, so its column is NOT
+// NULL DEFAULT TRUE (migration 000028) — it stays *bool in Go only so an
+// explicit false survives gorm's zero-value-uses-column-default Create
+// behavior; a stored row always carries a value.
+//
+// The *TableName fields are legacy overrides. NULL — the value for every team
+// created going forward — means "derive from schema_name": events live at
+// <schema_name>.events, persons at <schema_name>.persons, and data imports
+// under the <schema_name>_data_imports schema. Non-NULL values are
+// grandfathered explicit names for pre-existing teams whose warehouse tables
+// predate the schema-per-team convention; the PostHog-side backfill sets them
+// via the provisioning team upsert.
+type OrgTeam struct {
+	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_billing_org,unique,where:is_billing_team IS TRUE;index:idx_duckgres_org_teams_org_schema,unique,priority:1" json:"org_id"`
+	// autoIncrement:false — int fields in a composite primary key default to
+	// auto-increment in gorm, which would make this a bigserial.
+	TeamID          int64  `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
+	SchemaName      string `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
+	Enabled         bool   `gorm:"not null;default:true" json:"enabled"`
+	IsBillingTeam   *bool  `json:"is_billing_team,omitempty"`
+	BackfillEnabled *bool  `gorm:"not null;default:true" json:"backfill_enabled"`
+	// The legacy overrides are BARE identifiers (never schema-qualified):
+	// events/persons are table names within SchemaName's schema, the
+	// data-imports override is a schema name. Enforced by
+	// ValidateOrgTeamTableName on every write surface; resolved for
+	// consumers in provisioning/discovery.go resolveTeamTables.
+	EventsTableName       *string `gorm:"size:255" json:"events_table_name,omitempty"`
+	PersonsTableName      *string `gorm:"size:255" json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string `gorm:"size:255" json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate is PostHog's cached "earliest event date" for the team:
+	// the historical-backfill floor its Dagster sensor computes from ClickHouse.
+	// NULL = not yet resolved (the sensor computes and sets it); the sentinel
+	// 9999-12-31 (PostHog's NO_HISTORY_SENTINEL) means "team has no event
+	// history", stored so the sensor never re-queries — a date in the far
+	// future cannot collide with a real minimum timestamp, unlike 1970-01-01.
+	// The value is a cache owned by PostHog — duckgres stores and
+	// serves it ("YYYY-MM-DD" or null on the wire) but never computes or
+	// interprets it.
+	EarliestEventDate *EventDate `gorm:"type:date" json:"earliest_event_date"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+func (OrgTeam) TableName() string { return "duckgres_org_teams" }
 
 // OrgUser maps a username to an org with credentials.
 //
@@ -50,10 +120,12 @@ func (Org) TableName() string { return "duckgres_orgs" }
 // (org_id, username) so the same login name can be passthrough in one tenant
 // and not in another.
 type OrgUser struct {
-	OrgID       string `gorm:"primaryKey;size:255" json:"org_id"`
+	OrgID       string `gorm:"primaryKey;size:255;index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:1" json:"org_id"`
 	Username    string `gorm:"primaryKey;size:255" json:"username"`
 	Password    string `gorm:"size:255;not null" json:"-"`
 	Passthrough bool   `gorm:"not null;default:false" json:"passthrough"`
+	AccessMode  string `gorm:"size:32;not null;default:unrestricted" json:"access_mode"`
+	TeamID      *int64 `gorm:"index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:2" json:"team_id,omitempty"`
 	// Disabled is the per-user kill switch: when true the user is refused at
 	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
 	// user's live sessions (see admin disable endpoint).
@@ -411,18 +483,23 @@ const (
 
 // FlightSessionRecord is the durable reconnect record for Flight sessions.
 type FlightSessionRecord struct {
-	SessionToken string             `gorm:"primaryKey;size:255" json:"session_token"`
-	Username     string             `gorm:"size:255;not null" json:"username"`
-	OrgID        string             `gorm:"size:255;not null" json:"org_id"`
-	WorkerID     int                `gorm:"not null;index" json:"worker_id"`
-	PID          int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
-	OwnerEpoch   int64              `gorm:"not null" json:"owner_epoch"`
-	CPInstanceID string             `gorm:"size:255" json:"cp_instance_id"`
-	State        FlightSessionState `gorm:"size:32;not null" json:"state"`
-	ExpiresAt    time.Time          `gorm:"index" json:"expires_at"`
-	LastSeenAt   time.Time          `json:"last_seen_at"`
-	CreatedAt    time.Time          `json:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at"`
+	SessionToken         string             `gorm:"primaryKey;size:255" json:"session_token"`
+	Username             string             `gorm:"size:255;not null" json:"username"`
+	OrgID                string             `gorm:"size:255;not null" json:"org_id"`
+	WorkerID             int                `gorm:"not null;index" json:"worker_id"`
+	PID                  int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
+	OwnerEpoch           int64              `gorm:"not null" json:"owner_epoch"`
+	CPInstanceID         string             `gorm:"size:255" json:"cp_instance_id"`
+	State                FlightSessionState `gorm:"size:32;not null" json:"state"`
+	ExpiresAt            time.Time          `gorm:"index" json:"expires_at"`
+	LastSeenAt           time.Time          `json:"last_seen_at"`
+	AccessPolicyRecorded bool               `gorm:"not null;default:false" json:"access_policy_recorded"`
+	AccessRevision       string             `gorm:"size:64" json:"access_revision,omitempty"`
+	AccessReadOnly       bool               `gorm:"not null;default:false" json:"access_read_only"`
+	AllowedSchemas       []string           `gorm:"serializer:json;type:text" json:"allowed_schemas,omitempty"`
+	AllowedRelations     []string           `gorm:"serializer:json;type:text" json:"allowed_relations,omitempty"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
 }
 
 func (FlightSessionRecord) TableName() string { return "flight_session_records" }
@@ -490,9 +567,34 @@ type OrgConfig struct {
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
 	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
 	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
-	DefaultTeamID           int64             // org's default PostHog team id (NOT NULL in the store; 0 only for a missing org / stale snapshot); prereq for pull-based compute billing
+	Teams                   []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams); at most one is the billing team
 	Users                   map[string]string // username -> password
 	Warehouse               *ManagedWarehouseConfig
+}
+
+// OrgTeamConfig is the in-memory snapshot view of one duckgres_org_teams row.
+// IsBillingTeam folds the tri-state column to a plain bool (NULL == false) —
+// snapshot consumers only care whether a row IS the billing team.
+type OrgTeamConfig struct {
+	TeamID                int64
+	SchemaName            string
+	Enabled               bool
+	IsBillingTeam         bool
+	EventsTableName       *string
+	PersonsTableName      *string
+	SchemaDataImportsName *string
+}
+
+// BillingTeamID returns the org's billing PostHog team id (the team with
+// is_billing_team = TRUE), or 0 when the org has none. Prereq for pull-based
+// compute billing — usage buckets are keyed by it.
+func (oc *OrgConfig) BillingTeamID() int64 {
+	for _, t := range oc.Teams {
+		if t.IsBillingTeam {
+			return t.TeamID
+		}
+	}
+	return 0
 }
 
 // ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.

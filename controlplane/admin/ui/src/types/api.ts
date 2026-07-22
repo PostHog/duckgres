@@ -44,7 +44,11 @@ export interface Org {
   name: string;
   database_name: string;
   hostname_alias: string | null;
-  default_team_id: number | null;
+  // The org's billing PostHog team (stored server-side as the
+  // duckgres_org_teams row with is_billing_team = TRUE; the wire field keeps
+  // its historical name). Absent only for legacy orgs with no billing team.
+  default_team_id?: number | null;
+  teams?: OrgTeam[];
   max_workers: number;
   max_vcpus: number;
   default_worker_cpu: string;
@@ -66,9 +70,79 @@ export interface OrgUpdate {
   default_worker_ttl?: string;
   default_worker_min_hot_idle?: number;
   hostname_alias?: string | null;
-  // Positive number sets, absent preserves. Clearing is not possible: the
-  // column is NOT NULL and the backend rejects 0/null/negative with a 400.
+  // Positive number sets (repointing the org's billing team), absent
+  // preserves. Clearing is not possible: every org must keep a billing team
+  // and the backend rejects 0/null/negative with a 400.
   default_team_id?: number;
+}
+
+// One duckgres_org_teams row: a PostHog team mapped to this org and the
+// warehouse schema its data lives in. At most one row per org is the billing
+// team. The *_name fields are legacy overrides for grandfathered pre-existing
+// teams; null means "derive from schema_name" (events at
+// <schema_name>.events, persons at <schema_name>.persons, data imports under
+// <schema_name>_data_imports).
+export interface OrgTeam {
+  org_id: string;
+  team_id: number;
+  schema_name: string;
+  enabled: boolean;
+  is_billing_team?: boolean | null;
+  // Always set: the column is NOT NULL DEFAULT TRUE, mirroring the
+  // PostHog-side Django BooleanField(default=True).
+  backfill_enabled: boolean;
+  events_table_name?: string | null;
+  persons_table_name?: string | null;
+  schema_data_imports_name?: string | null;
+  // PostHog's cached earliest-event date ("YYYY-MM-DD"): the historical
+  // backfill floor its sensor computes from ClickHouse. null = not yet
+  // resolved; 9999-12-31 (PostHog's NO_HISTORY_SENTINEL) is the "no event
+  // history" sentinel. Owned and written by PostHog — duckgres only stores
+  // and serves it.
+  earliest_event_date?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// POST /api/v1/teams — admin create (org_id in the body, mirroring
+// POST /users). schema_name is set once here and immutable afterwards on the
+// admin surface.
+export interface OrgTeamCreateBody {
+  org_id: string;
+  team_id: number;
+  schema_name: string;
+  enabled?: boolean;
+  backfill_enabled?: boolean;
+}
+
+// PUT /api/v1/orgs/:id/teams/:team_id — the operator break-glass: every team
+// setting is editable. All fields are presence-aware (omit = preserve).
+// schema_name may be changed (409 when another team in the org holds it) but
+// never cleared; changing it does NOT move any warehouse data. backfill_enabled
+// always has a value (NOT NULL DEFAULT TRUE) — null is rejected. An explicit
+// null (or "") on a legacy table-name field clears it back to NULL ("derive
+// from schema_name"). is_billing_team may only be true: billing is repointed
+// by marking another team, never cleared.
+export interface OrgTeamUpdateBody {
+  schema_name?: string;
+  enabled?: boolean;
+  backfill_enabled?: boolean;
+  is_billing_team?: true;
+  events_table_name?: string | null;
+  persons_table_name?: string | null;
+  schema_data_imports_name?: string | null;
+  // "YYYY-MM-DD"; explicit null clears the cached date so PostHog's sensor
+  // re-discovers the team's backfill range.
+  earliest_event_date?: string | null;
+}
+
+// DELETE /api/v1/orgs/:id/teams/:team_id response. new_billing_team_id is set
+// when the deleted row was the billing team — the remaining team with the
+// oldest created_at took over (usage buckets re-attributed server-side).
+export interface OrgTeamDeleteResult {
+  deleted: number;
+  org: string;
+  new_billing_team_id?: number;
 }
 
 // ---- Users (confirmed) ----
