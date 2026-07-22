@@ -1472,7 +1472,7 @@ func stuckExtOp() *configstore.ReshardOperation {
 }
 
 // TestReshardExtFlipTimeoutRecovers pins the ORPHAN-ADOPT recovery: when the
-// cnpg→ext cutover never becomes ready (the target's status password never
+// cnpg→ext cutover never becomes ready (the target's credential Secret never
 // syncs), the flip times out and the runner recovers by flipping back to the
 // source shard and RE-ADOPTING the still-present (orphaned) cnpg role/DB — NO
 // copy-back, NO empty-recreate — leaving the org in service. The source is
@@ -1846,7 +1846,7 @@ func TestProbeErrorAuthClassification(t *testing.T) {
 // TestReshardExtRecoveryProbeAuthFailureDiagnosed is the regression for the
 // mw-dev incident where the cnpg→ext post-flip recovery spun silently for ~8
 // minutes on `FATAL: SASL authentication failed` (the re-adopted role's actual
-// password differed from the freshly regenerated status password) and the
+// password differed from the freshly regenerated referenced Secret password) and the
 // operator had to reproduce the probe from a shell to see why. The recovery
 // wait must (a) announce its deadline, (b) periodically log the classified
 // probe failure naming the stranded-password condition + the manual ALTER ROLE

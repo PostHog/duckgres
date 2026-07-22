@@ -340,10 +340,10 @@ got through, in order — each was a real fix:
 5. ✅ catalog selection — `dbname` must be `ducklake`, not the org
    (PR #651: *database = catalog selection*). harness.sh now does this.
 
-6. ✅ **activation (cnpg DuckLake)** — the blocker was NOT a metadata
-   SecretRef; the duckling-status path reads the metadata password straight
-   from the CR. It failed at **S3 STS brokering** because the isolated CP had no
-   AWS identity. Fixed by binding the per-PR `duckgres` SA to the **same EKS Pod
+6. ✅ **activation (cnpg DuckLake)** — the control plane resolves the metadata
+   password from the Secret referenced by Duckling status. Activation failed at
+   **S3 STS brokering** because the isolated CP had no AWS identity. Fixed by
+   binding the per-PR `duckgres` SA to the **same EKS Pod
    Identity role the real mw-dev control plane uses**
    (`duckgres-control-plane-dev`), via `aws eks create-pod-identity-association`
    in `run.sh` deploy (deleted in teardown). With it, the CP brokers per-duckling

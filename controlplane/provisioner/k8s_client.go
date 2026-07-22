@@ -332,16 +332,17 @@ func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus,
 	}
 	ref := status.MetadataCredentialSecretRef
 	if ref.Name == "" {
-		return status, nil // Legacy composition: plaintext status fallback.
+		// A newly-created or failed Duckling can legitimately have no resolved
+		// metadata-store status yet. Return its conditions so provisioning can
+		// report Crossplane failures; once a metadata store is published, its
+		// credential reference is mandatory.
+		if status.MetadataStore.Type == "" {
+			return status, nil
+		}
+		return nil, fmt.Errorf("duckling %q status.metadataStore.credentialSecretRef.name is required", name)
 	}
 	password, err := d.readSecretKey(ctx, ref)
 	if err != nil {
-		// During the staged rollout an older/temporarily unavailable Secret must
-		// not strand tenants whose legacy status password is still populated.
-		if status.MetadataStore.Password != "" {
-			slog.Warn("Failed to resolve Duckling metadata credential Secret; using legacy status password.", "duckling", name, "secret", ref.Name, "error", err)
-			return status, nil
-		}
 		return nil, fmt.Errorf("resolve metadata credential Secret for duckling %q: %w", name, err)
 	}
 	status.MetadataStore.Password = password
@@ -351,14 +352,14 @@ func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus,
 func (d *DucklingClient) readSecretKey(ctx context.Context, ref SecretReference) (string, error) {
 	namespace := ref.Namespace
 	if namespace == "" {
-		namespace = ducklingNamespace
+		return "", fmt.Errorf("namespace is required")
 	}
 	if namespace != ducklingNamespace {
 		return "", fmt.Errorf("namespace %q is not allowed", namespace)
 	}
 	key := ref.Key
 	if key == "" {
-		key = "password"
+		return "", fmt.Errorf("key is required")
 	}
 	secret, err := d.client.Resource(secretGVR).Namespace(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
@@ -1086,7 +1087,6 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		ds.MetadataStore.Type = getNestedString(md, "type")
 		ds.MetadataStore.Endpoint = getNestedString(md, "endpoint")
 		ds.MetadataStore.PgBouncerEndpoint = getNestedString(md, "pgbouncerEndpoint")
-		ds.MetadataStore.Password = getNestedString(md, "password")
 		ds.MetadataStore.User = getNestedString(md, "user")
 		ds.MetadataStore.Database = getNestedString(md, "database")
 		if ref, ok := md["credentialSecretRef"].(map[string]interface{}); ok {

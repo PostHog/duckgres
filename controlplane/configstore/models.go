@@ -238,7 +238,7 @@ type ManagedWarehouseMetadataStore struct {
 	// metadata DB password. Only meaningful when Kind == "external": it's
 	// passed through to the Duckling CR's spec.metadataStore.external.
 	// passwordAwsSecret, where the composition resolves it (via ESO) into the
-	// status password the worker activator reads. Empty for cnpg-shard
+	// Kubernetes Secret referenced by Duckling status. Empty for cnpg-shard
 	// (which mints its own credentials).
 	PasswordAWSSecret string `gorm:"size:255" json:"password_aws_secret,omitempty"`
 }

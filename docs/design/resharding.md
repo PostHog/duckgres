@@ -71,9 +71,9 @@ identity is incomplete or contradicted:
 
 The status contains only a non-sensitive `credentialSecretRef`; Duckgres reads
 the referenced key from the Secret in the `ducklings` namespace before any
-catalog copy, verification, or rollback. During the ordered rollout it still
-accepts the legacy plaintext status password as a fallback, but the reference
-is authoritative whenever it can be resolved.
+catalog copy, verification, or rollback. The complete reference is mandatory;
+missing or unreadable credentials stop the operation instead of falling back
+to credential material in custom-resource status.
 
 - **kind drift** — the row's `metadata_store_kind` (when set) disagrees with
   the status type → 400 naming both values ("refusing to reshard until
@@ -433,7 +433,7 @@ allowlist** — the SM secret name MUST start with `posthog-` or `duckling-`
 message; any other non-allowlisted name gets the general allowlist message.
 The two prefixes are identical across every env, so they're hardcoded (not
 resolved per-env). If a name that slips through is
-still unreadable by ESO, the cutover simply waits for the status password
+still unreadable by ESO, the cutover simply waits for the credential Secret
 until its per-op timeout and then recovers (below) — the op log shows the
 generic "waiting for external target" line. (Surfacing the ExternalSecret's
 own AccessDenied into the op log would need an `external-secrets.io` read
@@ -473,12 +473,12 @@ recovery) announces its deadline on entry and logs what it observes every ~15s
 error/log line carries the LAST observation — a stuck reshard is diagnosable
 from the op log alone. One recovery failure mode deserves naming: the
 re-adopted role's ACTUAL Postgres password can differ from the freshly
-regenerated status password (a **stranded password** — the probe fails with
+regenerated referenced Secret password (a **stranded password** — the probe fails with
 `FATAL: SASL authentication failed` / SQLSTATE 28P01 until the composition
 converges the password). The runner classifies auth probe failures
 (`isAuthProbeError`) and the observation names the condition and the manual
-remedy — `ALTER ROLE <role> WITH PASSWORD '<status password>'` on the source
-shard primary — but it still polls to the deadline rather than bailing early,
+remedy — `ALTER ROLE <role> WITH PASSWORD '<referenced Secret password>'` on
+the source shard primary — but it still polls to the deadline rather than bailing early,
 since a charts/composition fix can converge the password mid-wait. Passwords
 never appear in the op log.
 
