@@ -21,6 +21,29 @@ const (
 // this sentinel; those requests stay queued until capacity becomes available.
 var ErrOrgConnectionAdmissionRejected = errors.New("org connection admission rejected")
 
+// OrgConnectionAdmissionRef is the immutable identity of one connection
+// admission attempt. RequestID is a randomly generated generation token;
+// OrgID and CPInstanceID fence stale callers from following a reused request ID
+// into another org or control-plane lifetime.
+type OrgConnectionAdmissionRef struct {
+	RequestID    string
+	OrgID        string
+	CPInstanceID string
+}
+
+func (r OrgConnectionAdmissionRef) validate() error {
+	if strings.TrimSpace(r.RequestID) == "" {
+		return fmt.Errorf("org connection request id is required")
+	}
+	if strings.TrimSpace(r.OrgID) == "" {
+		return fmt.Errorf("org connection org id is required")
+	}
+	if strings.TrimSpace(r.CPInstanceID) == "" {
+		return fmt.Errorf("control-plane instance id is required")
+	}
+	return nil
+}
+
 type OrgConnectionAdmissionRejectionReason string
 
 const (
@@ -107,8 +130,12 @@ func (cs *ConfigStore) EnqueueOrgConnectionRequestContext(ctx context.Context, e
 // TryAcquireOrgConnectionLease attempts to grant one queued request under
 // cluster-wide per-org and per-user vCPU budgets. It is retained for callers
 // that do not yet pass their control-plane identity explicitly. New runtime
-// callers should use ScheduleAndClaimOrgConnectionLease so owner validation is
+// callers use ScheduleAndClaimOrgConnectionLeaseForRef so owner validation is
 // part of the claim transaction.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// request IDs are globally unique and never reused. New callers use
+// TryAcquireOrgConnectionLeaseForRef.
 func (cs *ConfigStore) TryAcquireOrgConnectionLease(requestID string, limits OrgResourceLimits, now time.Time) (*OrgConnectionLease, error) {
 	return cs.TryAcquireOrgConnectionLeaseWithLimitLookup(requestID, func(string) OrgResourceLimits {
 		return limits
@@ -117,11 +144,45 @@ func (cs *ConfigStore) TryAcquireOrgConnectionLease(requestID string, limits Org
 
 // TryAcquireOrgConnectionLeaseWithLimitLookup is the compatibility adapter for
 // callers that supply their own limit snapshot. Production callers use
-// ScheduleAndClaimOrgConnectionLease, which reads authoritative limits inside
-// the serialized PostgreSQL transaction.
+// ScheduleAndClaimOrgConnectionLeaseForRef, which reads authoritative limits
+// inside the serialized PostgreSQL transaction.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// request IDs are globally unique and never reused. New callers use
+// TryAcquireOrgConnectionLeaseWithLimitLookupForRef.
 func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookup(requestID string, limitLookup func(string) OrgResourceLimits, _ time.Time) (*OrgConnectionLease, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return nil, fmt.Errorf("org connection request id is required")
+	}
+	ref, found, err := cs.orgConnectionAdmissionRefForRequest(context.Background(), requestID, "")
+	if err != nil {
+		return nil, fmt.Errorf("try acquire org connection lease: %w", err)
+	}
+	if !found {
+		return nil, nil
+	}
+	return cs.TryAcquireOrgConnectionLeaseWithLimitLookupForRef(ref, limitLookup, time.Time{})
+}
+
+// TryAcquireOrgConnectionLeaseForRef is the exact-identity compatibility path
+// for callers that still supply an external resource-limit snapshot.
+func (cs *ConfigStore) TryAcquireOrgConnectionLeaseForRef(ref OrgConnectionAdmissionRef, limits OrgResourceLimits, now time.Time) (*OrgConnectionLease, error) {
+	return cs.TryAcquireOrgConnectionLeaseForRefContext(context.Background(), ref, limits, now)
+}
+
+func (cs *ConfigStore) TryAcquireOrgConnectionLeaseForRefContext(ctx context.Context, ref OrgConnectionAdmissionRef, limits OrgResourceLimits, now time.Time) (*OrgConnectionLease, error) {
+	return cs.TryAcquireOrgConnectionLeaseWithLimitLookupForRefContext(ctx, ref, func(string) OrgResourceLimits {
+		return limits
+	}, now)
+}
+
+func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookupForRef(ref OrgConnectionAdmissionRef, limitLookup func(string) OrgResourceLimits, now time.Time) (*OrgConnectionLease, error) {
+	return cs.TryAcquireOrgConnectionLeaseWithLimitLookupForRefContext(context.Background(), ref, limitLookup, now)
+}
+
+func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookupForRefContext(ctx context.Context, ref OrgConnectionAdmissionRef, limitLookup func(string) OrgResourceLimits, _ time.Time) (*OrgConnectionLease, error) {
+	if err := ref.validate(); err != nil {
+		return nil, err
 	}
 	if limitLookup == nil {
 		limitLookup = func(string) OrgResourceLimits { return OrgResourceLimits{} }
@@ -134,39 +195,63 @@ func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookup(requestID str
 		observeOrgConnectionAdmission(time.Since(start), outcome, stats)
 	}()
 
-	for {
-		lease, retry, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(context.Background(), requestID, "", limitLookup)
-		stats = attemptStats
-		outcome = attemptOutcome
-		if retry {
-			continue
+	lease, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, ref, limitLookup)
+	stats = attemptStats
+	outcome = attemptOutcome
+	if err != nil {
+		if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
+			outcome = orgConnectionAdmissionOutcomeError
 		}
-		if err != nil {
-			if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
-				outcome = orgConnectionAdmissionOutcomeError
-			}
-			return nil, fmt.Errorf("try acquire org connection lease: %w", err)
-		}
-		return lease, nil
+		return nil, fmt.Errorf("try acquire org connection lease: %w", err)
 	}
+	return lease, nil
 }
 
 // ScheduleAndClaimOrgConnectionLease runs one authoritative admission
 // evaluation and can create only the caller's own lease. It never reserves or
 // mutates another request.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// request IDs are globally unique and never reused. New callers use
+// ScheduleAndClaimOrgConnectionLeaseForRef.
 func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLease(requestID, cpInstanceID string) (*OrgConnectionLease, error) {
 	return cs.ScheduleAndClaimOrgConnectionLeaseContext(context.Background(), requestID, cpInstanceID)
 }
 
-// ScheduleAndClaimOrgConnectionLeaseContext is the context-aware production
-// path. PostgreSQL lock waits and queries are canceled when the client goes
-// away or the owning control plane starts draining.
+// ScheduleAndClaimOrgConnectionLeaseContext is the context-aware ID-only
+// compatibility path. PostgreSQL lock waits and queries are canceled when the
+// client goes away or the owning control plane starts draining.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// request IDs are globally unique and never reused. New callers use
+// ScheduleAndClaimOrgConnectionLeaseForRefContext.
 func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseContext(ctx context.Context, requestID, cpInstanceID string) (*OrgConnectionLease, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return nil, fmt.Errorf("org connection request id is required")
 	}
 	if strings.TrimSpace(cpInstanceID) == "" {
 		return nil, fmt.Errorf("control-plane instance id is required")
+	}
+	ref, found, err := cs.orgConnectionAdmissionRefForRequest(ctx, requestID, cpInstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("schedule and claim org connection lease: %w", err)
+	}
+	if !found {
+		return nil, nil
+	}
+	return cs.ScheduleAndClaimOrgConnectionLeaseForRefContext(ctx, ref)
+}
+
+// ScheduleAndClaimOrgConnectionLeaseForRef runs one authoritative admission
+// evaluation for exactly ref. It never follows RequestID if that ID is removed
+// and reused under another org or control-plane owner.
+func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseForRef(ref OrgConnectionAdmissionRef) (*OrgConnectionLease, error) {
+	return cs.ScheduleAndClaimOrgConnectionLeaseForRefContext(context.Background(), ref)
+}
+
+func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseForRefContext(ctx context.Context, ref OrgConnectionAdmissionRef) (*OrgConnectionLease, error) {
+	if err := ref.validate(); err != nil {
+		return nil, err
 	}
 
 	start := time.Now()
@@ -176,25 +261,20 @@ func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseContext(ctx context.Con
 		observeOrgConnectionAdmission(time.Since(start), outcome, stats)
 	}()
 
-	for {
-		if err := ctx.Err(); err != nil {
-			outcome = orgConnectionAdmissionOutcomeError
-			return nil, err
-		}
-		lease, retry, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, requestID, cpInstanceID, nil)
-		stats = attemptStats
-		outcome = attemptOutcome
-		if retry {
-			continue
-		}
-		if err != nil {
-			if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
-				outcome = orgConnectionAdmissionOutcomeError
-			}
-			return nil, fmt.Errorf("schedule and claim org connection lease: %w", err)
-		}
-		return lease, nil
+	if err := ctx.Err(); err != nil {
+		outcome = orgConnectionAdmissionOutcomeError
+		return nil, err
 	}
+	lease, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, ref, nil)
+	stats = attemptStats
+	outcome = attemptOutcome
+	if err != nil {
+		if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
+			outcome = orgConnectionAdmissionOutcomeError
+		}
+		return nil, fmt.Errorf("schedule and claim org connection lease: %w", err)
+	}
+	return lease, nil
 }
 
 type orgConnectionRuntimeTables struct {
@@ -209,49 +289,31 @@ func (cs *ConfigStore) orgConnectionRuntimeTables() orgConnectionRuntimeTables {
 	}
 }
 
-func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Context, requestID, cpInstanceID string, fallbackLimitLookup func(string) OrgResourceLimits) (*OrgConnectionLease, bool, orgConnectionAdmissionStats, string, error) {
+func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Context, ref OrgConnectionAdmissionRef, fallbackLimitLookup func(string) OrgResourceLimits) (*OrgConnectionLease, orgConnectionAdmissionStats, string, error) {
 	tables := cs.orgConnectionRuntimeTables()
 	var lease *OrgConnectionLease
 	var rejection *OrgConnectionAdmissionRejectedError
-	retryWithFreshOrg := false
 	var stats orgConnectionAdmissionStats
 	outcome := orgConnectionAdmissionOutcomeMissing
 
 	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		orgID, found, err := cs.orgIDForConnectionRequest(tx, tables.queue, requestID)
-		if err != nil || !found {
-			return err
-		}
-		if err := lockOrgConnectionAdmission(tx, orgID); err != nil {
+		if err := lockOrgConnectionAdmission(tx, ref.OrgID); err != nil {
 			return err
 		}
 		now, err := cs.orgConnectionDatabaseNow(tx)
 		if err != nil {
 			return err
 		}
-		if err := cs.cleanupOrgConnectionRowsLocked(tx, orgID, now); err != nil {
+		if err := cs.cleanupOrgConnectionRowsLocked(tx, ref.OrgID, now); err != nil {
 			return err
 		}
 
-		request, found, err := cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
+		request, found, err := cs.lockOrgConnectionRequestForRef(tx, tables.queue, ref)
 		if err != nil || !found {
 			return err
 		}
-		if request.OrgID != orgID {
-			retryWithFreshOrg = true
-			outcome = orgConnectionAdmissionOutcomeRetry
-			return nil
-		}
-		ownerID := cpInstanceID
-		if ownerID == "" {
-			ownerID = request.CPInstanceID
-		}
-		if request.CPInstanceID != ownerID {
-			outcome = orgConnectionAdmissionOutcomeWaiting
-			return nil
-		}
 
-		ownerActive, err := cs.lockActiveControlPlaneOwner(tx, ownerID)
+		ownerActive, err := cs.lockActiveControlPlaneOwner(tx, ref.CPInstanceID)
 		if err != nil {
 			return err
 		}
@@ -259,9 +321,9 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 			outcome = orgConnectionAdmissionOutcomeInactive
 			return nil
 		}
-		existing, found, err := cs.existingOrgConnectionLease(tx, tables.lease, requestID)
+		existing, found, err := cs.existingOrgConnectionLeaseForRef(tx, tables.lease, ref)
 		if err != nil || found {
-			if found && existing.CPInstanceID == ownerID {
+			if found {
 				lease = existing
 			}
 			if found {
@@ -276,7 +338,7 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 
 		// Cleanup deliberately runs before this barrier. Resharding prevents
 		// grants, but must not pin expired queue rows and wedge drain.
-		resharding, err := cs.warehouseReshardingLocked(tx, orgID)
+		resharding, err := cs.warehouseReshardingLocked(tx, ref.OrgID)
 		if err != nil {
 			return err
 		}
@@ -285,7 +347,7 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 			return nil
 		}
 
-		limits, authoritative, err := cs.authoritativeOrgConnectionLimits(tx, orgID)
+		limits, authoritative, err := cs.authoritativeOrgConnectionLimits(tx, ref.OrgID)
 		if err != nil {
 			return err
 		}
@@ -331,11 +393,11 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 		}
 		if rejection != nil {
 			return tx.Table(tables.queue).
-				Where("request_id = ? AND granted_at IS NULL", requestID).
+				Where("request_id = ? AND org_id = ? AND cp_instance_id = ? AND granted_at IS NULL", ref.RequestID, ref.OrgID, ref.CPInstanceID).
 				Delete(&OrgConnectionQueueEntry{}).Error
 		}
 
-		next, selectionStats, selectionOutcome, err := cs.nextEligibleOrgConnectionRequestLocked(tx, tables, orgID, limitLookup, userAllowed, now)
+		next, selectionStats, selectionOutcome, err := cs.nextEligibleOrgConnectionRequestLocked(tx, tables, ref.OrgID, limitLookup, userAllowed, now)
 		stats = selectionStats
 		if err != nil {
 			return err
@@ -344,7 +406,7 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 			outcome = selectionOutcome
 			return nil
 		}
-		if next.RequestID != requestID {
+		if next.RequestID != ref.RequestID || next.OrgID != ref.OrgID || next.CPInstanceID != ref.CPInstanceID {
 			outcome = orgConnectionAdmissionOutcomeWaiting
 			return nil
 		}
@@ -358,7 +420,7 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 	if err == nil && rejection != nil {
 		err = rejection
 	}
-	return lease, retryWithFreshOrg, stats, outcome, err
+	return lease, stats, outcome, err
 }
 
 // lockActiveControlPlaneOwner closes the race between cleanup's active-owner
@@ -410,27 +472,46 @@ func (cs *ConfigStore) orgConnectionDatabaseNow(tx *gorm.DB) (time.Time, error) 
 	return now, nil
 }
 
-func (cs *ConfigStore) orgIDForConnectionRequest(tx *gorm.DB, queueTable, requestID string) (string, bool, error) {
-	var requestOrg struct {
-		OrgID string
+// orgConnectionAdmissionRefForRequest resolves identity once for compatibility
+// callers that only have a request ID. The returned exact ref fences reuse that
+// happens after this lookup, but cannot distinguish an ID that was already
+// reused before the lookup; callers of these compatibility paths therefore
+// assume randomly generated request IDs are globally unique and never reused.
+// When expectedCPInstanceID is non-empty it is deliberately retained instead
+// of trusting the row's owner; the canonical operation then treats an owner
+// mismatch as a missing request.
+func (cs *ConfigStore) orgConnectionAdmissionRefForRequest(ctx context.Context, requestID, expectedCPInstanceID string) (OrgConnectionAdmissionRef, bool, error) {
+	var row struct {
+		OrgID        string
+		CPInstanceID string
 	}
-	if err := tx.Table(queueTable).
-		Select("org_id").
+	err := cs.db.WithContext(ctx).
+		Table(cs.orgConnectionRuntimeTables().queue).
+		Select("org_id, cp_instance_id").
 		Where("request_id = ?", requestID).
-		Take(&requestOrg).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", false, nil
-		}
-		return "", false, err
+		Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return OrgConnectionAdmissionRef{}, false, nil
 	}
-	return requestOrg.OrgID, true, nil
+	if err != nil {
+		return OrgConnectionAdmissionRef{}, false, err
+	}
+	ownerID := row.CPInstanceID
+	if expectedCPInstanceID != "" {
+		ownerID = expectedCPInstanceID
+	}
+	return OrgConnectionAdmissionRef{
+		RequestID:    requestID,
+		OrgID:        row.OrgID,
+		CPInstanceID: ownerID,
+	}, true, nil
 }
 
-func (cs *ConfigStore) lockOrgConnectionRequest(tx *gorm.DB, queueTable, requestID string) (*OrgConnectionQueueEntry, bool, error) {
+func (cs *ConfigStore) lockOrgConnectionRequestForRef(tx *gorm.DB, queueTable string, ref OrgConnectionAdmissionRef) (*OrgConnectionQueueEntry, bool, error) {
 	var request OrgConnectionQueueEntry
 	if err := tx.Table(queueTable).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("request_id = ?", requestID).
+		Where("request_id = ? AND org_id = ? AND cp_instance_id = ?", ref.RequestID, ref.OrgID, ref.CPInstanceID).
 		Take(&request).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, false, nil
@@ -440,10 +521,10 @@ func (cs *ConfigStore) lockOrgConnectionRequest(tx *gorm.DB, queueTable, request
 	return &request, true, nil
 }
 
-func (cs *ConfigStore) existingOrgConnectionLease(tx *gorm.DB, leaseTable, requestID string) (*OrgConnectionLease, bool, error) {
+func (cs *ConfigStore) existingOrgConnectionLeaseForRef(tx *gorm.DB, leaseTable string, ref OrgConnectionAdmissionRef) (*OrgConnectionLease, bool, error) {
 	var existing OrgConnectionLease
 	if err := tx.Table(leaseTable).
-		Where("request_id = ?", requestID).
+		Where("request_id = ? AND org_id = ? AND cp_instance_id = ?", ref.RequestID, ref.OrgID, ref.CPInstanceID).
 		Take(&existing).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, false, nil
@@ -669,33 +750,32 @@ func (cs *ConfigStore) createOrgConnectionLease(tx *gorm.DB, request *OrgConnect
 }
 
 // ReleaseOrgConnectionLease releases one active cluster-wide connection lease.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// lease/request IDs are globally unique and never reused. New callers use
+// ReclaimOrgConnectionAdmissionContext.
 func (cs *ConfigStore) ReleaseOrgConnectionLease(leaseID string) error {
 	return cs.ReleaseOrgConnectionLeaseContext(context.Background(), leaseID)
 }
 
+// ReleaseOrgConnectionLeaseContext is the context-aware ID-only compatibility
+// path for ReleaseOrgConnectionLease.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// lease/request IDs are globally unique and never reused. New callers use
+// ReclaimOrgConnectionAdmissionContext.
 func (cs *ConfigStore) ReleaseOrgConnectionLeaseContext(ctx context.Context, leaseID string) error {
 	if strings.TrimSpace(leaseID) == "" {
 		return nil
 	}
-	tables := cs.orgConnectionRuntimeTables()
-	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		resolvedOrgID, found, err := cs.orgIDForConnectionLeaseOrRequest(tx, tables, leaseID)
-		if err != nil || !found {
-			return err
-		}
-		if err := lockOrgConnectionAdmission(tx, resolvedOrgID); err != nil {
-			return err
-		}
-		if err := tx.Table(tables.lease).
-			Where("lease_id = ?", leaseID).
-			Delete(&OrgConnectionLease{}).Error; err != nil {
-			return err
-		}
-		return tx.Table(tables.queue).
-			Where("request_id = ?", leaseID).
-			Delete(&OrgConnectionQueueEntry{}).Error
-	})
+	ref, found, err := cs.orgConnectionAdmissionRefForLeaseOrRequest(ctx, leaseID)
 	if err != nil {
+		return fmt.Errorf("release org connection lease: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	if err := cs.ReclaimOrgConnectionAdmissionContext(ctx, ref); err != nil {
 		return fmt.Errorf("release org connection lease: %w", err)
 	}
 	return nil
@@ -705,58 +785,85 @@ func (cs *ConfigStore) ReleaseOrgConnectionLeaseContext(ctx context.Context, lea
 // Acquire returned. If acquisition committed but its response was lost, the
 // owner still has no lease handle, so cancellation must also reclaim that
 // unclaimed lease.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// request IDs are globally unique and never reused. New callers use
+// ReclaimOrgConnectionAdmissionContext.
 func (cs *ConfigStore) CancelOrgConnectionRequest(requestID string, canceledAt time.Time) error {
 	return cs.CancelOrgConnectionRequestContext(context.Background(), requestID, canceledAt)
 }
 
+// CancelOrgConnectionRequestContext is the context-aware ID-only compatibility
+// path for CancelOrgConnectionRequest.
+//
+// Legacy compatibility: This ID-only adapter assumes randomly generated
+// request IDs are globally unique and never reused. New callers use
+// ReclaimOrgConnectionAdmissionContext.
 func (cs *ConfigStore) CancelOrgConnectionRequestContext(ctx context.Context, requestID string, _ time.Time) error {
 	if strings.TrimSpace(requestID) == "" {
 		return nil
 	}
-	tables := cs.orgConnectionRuntimeTables()
-	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		resolvedOrgID, found, err := cs.orgIDForConnectionRequest(tx, tables.queue, requestID)
-		if err != nil || !found {
-			return err
-		}
-		if err := lockOrgConnectionAdmission(tx, resolvedOrgID); err != nil {
-			return err
-		}
-		request, found, err := cs.lockOrgConnectionRequest(tx, tables.queue, requestID)
-		if err != nil || !found {
-			return err
-		}
-		if request.OrgID != resolvedOrgID {
-			return nil
-		}
-		if err := tx.Table(tables.lease).
-			Where("request_id = ?", requestID).
-			Delete(&OrgConnectionLease{}).Error; err != nil {
-			return err
-		}
-		return tx.Table(tables.queue).
-			Where("request_id = ?", requestID).
-			Delete(&OrgConnectionQueueEntry{}).Error
-	})
+	ref, found, err := cs.orgConnectionAdmissionRefForRequest(ctx, requestID, "")
 	if err != nil {
+		return fmt.Errorf("cancel org connection request: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	if err := cs.ReclaimOrgConnectionAdmissionContext(ctx, ref); err != nil {
 		return fmt.Errorf("cancel org connection request: %w", err)
 	}
 	return nil
 }
 
-func (cs *ConfigStore) orgIDForConnectionLeaseOrRequest(tx *gorm.DB, tables orgConnectionRuntimeTables, id string) (string, bool, error) {
-	var row struct {
-		OrgID string
+// ReclaimOrgConnectionAdmissionContext atomically removes both durable halves
+// of exactly ref. It intentionally locks ref.OrgID before reading or deleting
+// rows: the lock is both the enqueue/claim serialization barrier and the fence
+// that prevents a stale cleanup from following a reused RequestID elsewhere.
+// Absence is success, making the operation safe to retry after ambiguous errors.
+func (cs *ConfigStore) ReclaimOrgConnectionAdmissionContext(ctx context.Context, ref OrgConnectionAdmissionRef) error {
+	if err := ref.validate(); err != nil {
+		return err
 	}
-	if err := tx.Table(tables.lease).
-		Select("org_id").
+	tables := cs.orgConnectionRuntimeTables()
+	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockOrgConnectionAdmission(tx, ref.OrgID); err != nil {
+			return err
+		}
+		if err := tx.Table(tables.lease).
+			Where("request_id = ? AND org_id = ? AND cp_instance_id = ?", ref.RequestID, ref.OrgID, ref.CPInstanceID).
+			Delete(&OrgConnectionLease{}).Error; err != nil {
+			return err
+		}
+		return tx.Table(tables.queue).
+			Where("request_id = ? AND org_id = ? AND cp_instance_id = ?", ref.RequestID, ref.OrgID, ref.CPInstanceID).
+			Delete(&OrgConnectionQueueEntry{}).Error
+	})
+	if err != nil {
+		return fmt.Errorf("reclaim org connection admission: %w", err)
+	}
+	return nil
+}
+
+func (cs *ConfigStore) orgConnectionAdmissionRefForLeaseOrRequest(ctx context.Context, id string) (OrgConnectionAdmissionRef, bool, error) {
+	tables := cs.orgConnectionRuntimeTables()
+	var row struct {
+		RequestID    string
+		OrgID        string
+		CPInstanceID string
+	}
+	if err := cs.db.WithContext(ctx).
+		Table(tables.lease).
+		Select("request_id, org_id, cp_instance_id").
 		Where("lease_id = ?", id).
 		Take(&row).Error; err == nil {
-		return row.OrgID, true, nil
+		return OrgConnectionAdmissionRef{
+			RequestID: row.RequestID, OrgID: row.OrgID, CPInstanceID: row.CPInstanceID,
+		}, true, nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return "", false, err
+		return OrgConnectionAdmissionRef{}, false, err
 	}
-	return cs.orgIDForConnectionRequest(tx, tables.queue, id)
+	return cs.orgConnectionAdmissionRefForRequest(ctx, id, "")
 }
 
 // ActiveOrgConnectionLeaseCount returns the active cluster-wide lease count for

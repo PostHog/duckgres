@@ -624,3 +624,23 @@ func TestOrgDefaultWorkerMinHotIdle(t *testing.T) {
 		t.Errorf("nil-snapshot OrgDefaultWorkerMinHotIdle = %d; want 0", got)
 	}
 }
+
+func TestWithSnapshotHoldsPublicationReadLock(t *testing.T) {
+	snapshot := &Snapshot{Orgs: map[string]*OrgConfig{"analytics": {Name: "analytics"}}}
+	store := &ConfigStore{snapshot: snapshot}
+	called := false
+
+	store.WithSnapshot(func(got *Snapshot) {
+		called = true
+		if got != snapshot {
+			t.Fatal("WithSnapshot did not expose the currently published snapshot")
+		}
+		if store.mu.TryLock() {
+			store.mu.Unlock()
+			t.Fatal("WithSnapshot callback ran without holding the publication read lock")
+		}
+	})
+	if !called {
+		t.Fatal("WithSnapshot did not invoke callback")
+	}
+}

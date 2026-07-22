@@ -17,7 +17,6 @@ const (
 	orgConnectionAdmissionOutcomeIneligibleUser   = "ineligible_user"
 	orgConnectionAdmissionOutcomeInactive         = "inactive_request"
 	orgConnectionAdmissionOutcomeMissing          = "missing_request"
-	orgConnectionAdmissionOutcomeRetry            = "retry"
 	orgConnectionAdmissionOutcomeWaiting          = "waiting"
 	orgConnectionAdmissionOutcomeError            = "error"
 	orgConnectionAdmissionOutcomeResharding       = "blocked_resharding"

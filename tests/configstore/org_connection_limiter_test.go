@@ -1879,9 +1879,11 @@ func TestTryAcquireOrgConnectionLeaseTakesOrgLockBeforeExpiredRowLock(t *testing
 	}
 }
 
-func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(t *testing.T) {
+func TestScheduleAndClaimForRefDoesNotFollowRequestIDReusedWithDifferentOrg(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
+	seedAuthoritativeOrgConnectionLimits(t, store, "org-old", 1, map[string]int{"alice": 0})
+	seedAuthoritativeOrgConnectionLimits(t, store, "org-new", 1, map[string]int{"alice": 0})
 
 	now := time.Now()
 	oldEntry := &cpconfigstore.OrgConnectionQueueEntry{
@@ -1918,8 +1920,11 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 	}
 
 	acquireDone := make(chan acquireResult, 1)
+	oldRef := cpconfigstore.OrgConnectionAdmissionRef{
+		RequestID: oldEntry.RequestID, OrgID: oldEntry.OrgID, CPInstanceID: oldEntry.CPInstanceID,
+	}
 	go func() {
-		lease, err := store.TryAcquireOrgConnectionLease(oldEntry.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+		lease, err := store.ScheduleAndClaimOrgConnectionLeaseForRef(oldRef)
 		acquireDone <- acquireResult{lease: lease, err: err}
 	}()
 
@@ -1953,18 +1958,23 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 	select {
 	case result := <-acquireDone:
 		if result.err != nil {
-			t.Fatalf("acquire reused request: %v", result.err)
+			t.Fatalf("stale exact-ref acquire: %v", result.err)
 		}
-		if result.lease == nil {
-			t.Fatal("expected reused request to acquire after retrying under new org")
-		}
-		if result.lease.OrgID != newEntry.OrgID {
-			t.Fatalf("expected lease for org %q, got %q", newEntry.OrgID, result.lease.OrgID)
+		if result.lease != nil {
+			t.Fatalf("stale ref followed reused request into org %q: %#v", newEntry.OrgID, result.lease)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for reused request acquire")
+		t.Fatal("timed out waiting for stale exact-ref acquire")
 	}
 
+	assertOrgConnectionRequestPending(t, store, newEntry.RequestID)
+	newRef := cpconfigstore.OrgConnectionAdmissionRef{
+		RequestID: newEntry.RequestID, OrgID: newEntry.OrgID, CPInstanceID: newEntry.CPInstanceID,
+	}
+	lease, err := store.ScheduleAndClaimOrgConnectionLeaseForRef(newRef)
+	if err != nil || lease == nil {
+		t.Fatalf("new owner exact-ref acquire = %#v, err = %v", lease, err)
+	}
 	count, err := store.ActiveOrgConnectionLeaseCount(newEntry.OrgID)
 	if err != nil {
 		t.Fatalf("count active leases: %v", err)

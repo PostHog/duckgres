@@ -392,6 +392,19 @@ func (cs *ConfigStore) Snapshot() *Snapshot {
 	return cs.snapshot
 }
 
+// WithSnapshot calls fn with the currently published immutable snapshot while
+// holding the store's read lock. Use this only when a decision must be atomic
+// with respect to snapshot publication; fn must be short and must not call a
+// ConfigStore method that takes the store lock.
+func (cs *ConfigStore) WithSnapshot(fn func(*Snapshot)) {
+	if fn == nil {
+		return
+	}
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	fn(cs.snapshot)
+}
+
 // ResolveDatabase maps a database name to an org ID. Returns "" if not found.
 func (cs *ConfigStore) ResolveDatabase(database string) string {
 	cs.mu.RLock()

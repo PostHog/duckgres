@@ -31,6 +31,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// DefaultAdmissionReclaimerMaxReservations bounds cleanup ownership retained by
+// one control-plane process when the operator does not configure a value.
+const DefaultAdmissionReclaimerMaxReservations = defaultAdmissionReclaimerReservations
+
 // ControlPlaneConfig extends server.Config with control-plane-specific settings.
 type ControlPlaneConfig struct {
 	server.Config
@@ -45,6 +49,8 @@ type ControlPlaneConfig struct {
 	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade. 0 = unbounded (wait until k8s SIGKILL via terminationGracePeriodSeconds). Default: 0 in remote mode (so a CP rolling out doesn't kill in-flight customer queries at a self-imposed wall — see drainAndShutdown), 24h in process mode.
 	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
+
+	AdmissionReclaimerMaxReservations int // Max queued/live admission identities whose cleanup ownership this CP may retain (default: 4096)
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.

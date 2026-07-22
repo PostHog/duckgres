@@ -37,10 +37,33 @@ exact change boundary matters.
 The connection queue timeout is configured by
 `DUCKGRES_WORKER_QUEUE_TIMEOUT` (default `60s`). Owners poll every `100ms` while
 waiting. Client disconnect, PostgreSQL cancellation, and control-plane drain
-cancel the owning admission context and remove its durable queue row.
+cancel the owning admission context and submit its exact
+`(request, org, control-plane instance)` identity to the control-plane-wide
+admission reclaimer.
 
 ## Failure recovery
 
+- Each live control-plane instance has one admission reclaimer shared by all
+  orgs. Before enqueue, it reserves one cleanup-ownership slot, from a default
+  capacity of 4096 configured by
+  `DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS` (or
+  `admission_reclaimer_max_reservations` in YAML); the
+  same slot stays attached to the request and then its live lease. If all slots
+  are occupied, a new connection is rejected before PostgreSQL is mutated.
+  This bounds retained memory without ever dropping an older cleanup. It
+  retains activated cleanup intents before attempting PostgreSQL, retries
+  transient or ambiguous failures with bounded-duration attempts and jittered
+  backoff, and removes an intent only after the idempotent database transaction
+  succeeds. Removing one org stack does not stop this control-plane-wide
+  reclaimer.
+- The reclaimer is the normal cleanup path for canceled requests and released
+  leases while their owner is alive. It atomically removes the exact queue and
+  lease rows under the org admission lock; it cannot mutate a row belonging to
+  another org or control-plane instance.
+- A crashed control plane loses its in-memory reclaimer. The liveness janitor
+  first marks that control-plane instance expired; a later serialized admission
+  for each affected org then removes rows owned by the expired instance. This
+  expired-owner path is crash recovery, not the routine release path.
 - Expired requests and requests owned by an inactive control plane are removed
   during admission and drain checks, so an abandoned head cannot block the
   queue indefinitely.
@@ -53,6 +76,17 @@ cancel the owning admission context and remove its durable queue row.
   control-plane runtime record and let the serialized cleanup path reclaim its
   admission rows.
 
+Monitor `duckgres_org_connection_reclaim_pending` for activated cleanup work,
+`duckgres_org_connection_reclaim_attempts_total{outcome}` for retry outcomes,
+and the ratio of `duckgres_org_connection_reclaim_reservations_in_use` to
+`duckgres_org_connection_reclaim_reservation_capacity` for ownership headroom.
+`duckgres_org_connection_reclaim_reservation_rejections_total{reason}` records
+requests rejected before enqueue. Diagnose sustained backlog growth or high
+reservation utilization together with reclaim error rate; a continuously
+non-zero pending count can be healthy during steady connection churn. Reclaim
+logs include the request, org, retry count, and age; the metrics deliberately
+omit request and org labels.
+
 For local verification, run `just test-configstore-integration`; it exercises
-cross-replica ordering, cancellation races, hard-limit rejection, resharding,
-and stale-owner cleanup against PostgreSQL.
+cross-replica ordering, cancellation races, eventual live-owner reclamation,
+hard-limit rejection, resharding, and stale-owner cleanup against PostgreSQL.

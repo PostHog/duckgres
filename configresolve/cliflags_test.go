@@ -57,6 +57,7 @@ func fieldNameToFlagName(name string) string {
 		{"InternalSecret", "internal-secret"},
 		{"WorkerBackend", "worker-backend"},
 		{"WorkerQueueTimeout", "worker-queue-timeout"},
+		{"AdmissionReclaimerMaxReservations", "admission-reclaimer-max-reservations"},
 		{"WorkerIdleTimeout", "worker-idle-timeout"},
 		{"HandoverDrainTimeout", "handover-drain-timeout"},
 		{"ProcessMinWorkers", "process-min-workers"},
