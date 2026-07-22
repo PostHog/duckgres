@@ -61,6 +61,7 @@ type stepSpec struct {
 	Username                 string
 	Password                 string
 	CatalogFile              string
+	Targets                  []perfcore.Protocol
 	RunID                    string
 	DatasetVersion           string
 	Database                 string
@@ -133,6 +134,10 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		return err
 	}
 	catalog, err := perfcore.LoadCatalog(spec.CatalogFile)
+	if err != nil {
+		return classified(ErrorClassConfig, err)
+	}
+	catalog, err = restrictCatalogTargets(catalog, spec.Targets)
 	if err != nil {
 		return classified(ErrorClassConfig, err)
 	}
@@ -215,6 +220,10 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	if e.outputDir == "" {
 		return stepSpec{}, classified(ErrorClassConfig, fmt.Errorf("perf output dir is required"))
 	}
+	targets, err := targetsFromWith(step)
+	if err != nil {
+		return stepSpec{}, err
+	}
 
 	username := stringFromWith(step, "username", "root")
 	password := stringFromWith(step, "password", "")
@@ -237,6 +246,7 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		Username:                 username,
 		Password:                 password,
 		CatalogFile:              catalogFile,
+		Targets:                  targets,
 		RunID:                    runID,
 		DatasetVersion:           stringFromWith(step, "dataset_version", ""),
 		Database:                 stringFromWith(step, "catalog", "ducklake"),
@@ -247,6 +257,56 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		FlightServerName:         stringFromWith(step, "flight_server_name", e.defaultFlightServerName(orgID)),
 		FlightInsecureSkipVerify: boolFromWith(step, "flight_insecure_skip_verify", e.flightInsecureSkipVerify),
 	}, nil
+}
+
+func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
+	raw, ok := step.With["targets"]
+	if !ok {
+		return nil, nil
+	}
+	values, ok := raw.([]any)
+	if !ok || len(values) == 0 {
+		return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets must be a non-empty list", step.ID))
+	}
+
+	targets := make([]perfcore.Protocol, 0, len(values))
+	seen := make(map[perfcore.Protocol]struct{}, len(values))
+	for i, rawTarget := range values {
+		value, ok := rawTarget.(string)
+		if !ok || value == "" {
+			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] must be a non-empty string", step.ID, i))
+		}
+		target := perfcore.Protocol(value)
+		switch target {
+		case perfcore.ProtocolPGWire, perfcore.ProtocolFlight:
+		default:
+			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
+		}
+		if _, exists := seen[target]; exists {
+			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets contains duplicate protocol %q", step.ID, target))
+		}
+		seen[target] = struct{}{}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+func restrictCatalogTargets(catalog perfcore.Catalog, targets []perfcore.Protocol) (perfcore.Catalog, error) {
+	if targets == nil {
+		return catalog, nil
+	}
+
+	available := make(map[perfcore.Protocol]struct{}, len(catalog.Targets))
+	for _, target := range catalog.Targets {
+		available[target] = struct{}{}
+	}
+	for _, target := range targets {
+		if _, ok := available[target]; !ok {
+			return perfcore.Catalog{}, fmt.Errorf("perf target %q is not present in perf catalog", target)
+		}
+	}
+	catalog.Targets = append([]perfcore.Protocol(nil), targets...)
+	return catalog, nil
 }
 
 func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (map[perfcore.Protocol]perfcore.ProtocolDriver, error) {

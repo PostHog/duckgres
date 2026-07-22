@@ -12,9 +12,8 @@ metadata, perf, and dbt workloads with one shared warehouse lifecycle. Manual
 runs also default to `full-suite`.
 
 Scenario jobs override the shared harness's default worker request to 2 CPU and
-4Gi memory. The override applies to both pgwire and Flight workers, preventing
-the frozen perf queries from exhausting the smaller e2e worker. The shared e2e
-workflow keeps the harness defaults documented in `tests/mw-dev/README.md`.
+4Gi memory for the frozen pgwire perf workload. The shared e2e workflow keeps
+the harness defaults documented in `tests/mw-dev/README.md`.
 
 To omit dbt, manually run the workflow with `scenario` set to `fast-suite`.
 The input directly names a YAML file under
@@ -51,8 +50,8 @@ exact CI credential ownership boundary and the harness's cleanup convention.
 For a direct local run with `just scenario`, set
 `DUCKGRES_SCENARIO_ORG_ID` explicitly to an authorized, disposable org id.
 The local runner has no default because reusing a fixed warehouse identity can
-collide with another run. Scenario-specific Flight and frozen-dataset variables
-remain required as reported by `scripts/scenario_run.sh --check-env`.
+collide with another run. Scenario-specific frozen-dataset variables remain
+required as reported by `scripts/scenario_run.sh --check-env`.
 
 ## Failure Recovery
 

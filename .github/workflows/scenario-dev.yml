@@ -72,8 +72,7 @@ jobs:
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
-      # Frozen perf needs more than the shared e2e harness defaults. This sizes
-      # both pgwire and Flight workers because Flight has no startup GUCs.
+      # Frozen pgwire perf needs more than the shared e2e harness defaults.
       DUCKGRES_K8S_WORKER_CPU_REQUEST: "2"
       DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 4Gi
     steps:

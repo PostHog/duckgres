@@ -50,11 +50,13 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	for _, name := range []string{
 		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
-		"DUCKGRES_SCENARIO_FLIGHT_ADDR",
 	} {
 		if !strings.Contains(text, name) {
 			t.Fatalf("script output %q missing %s", text, name)
 		}
+	}
+	if strings.Contains(text, "DUCKGRES_SCENARIO_FLIGHT") {
+		t.Fatalf("frozen perf scenario should not require the deprecated Flight endpoint; output: %q", text)
 	}
 }
 
