@@ -402,6 +402,9 @@ spec:
             - { name: DUCKGRES_SCENARIO_FLIGHT_ADDR, value: "$flight" }
             - { name: DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY, value: "true" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
+            # The Crossplane composition grants this isolated service account
+            # exact-name access to only the matching CNPG credential Secret.
+            - { name: DUCKGRES_SCENARIO_ORG_ID, value: "ci-pr-${PR_NUMBER}-cnpg" }
             - { name: DUCKGRES_SCENARIO_OUTPUT_BASE, value: "/artifacts/scenario-dev" }
             - { name: DUCKGRES_SCENARIO_RUN_ID, value: "$DUCKGRES_SCENARIO_RUN_ID" }
             - { name: DUCKGRES_SCENARIO_MAX_RUNTIME, value: "${DUCKGRES_SCENARIO_MAX_RUNTIME:-4h}" }

@@ -1,10 +1,12 @@
 name: provision-smoke
 run_id_prefix: scenario-smoke
+required_env:
+  - DUCKGRES_SCENARIO_ORG_ID
 steps:
   - id: provision
     type: provision_warehouse
     with:
-      org_id: scenario-smoke-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       request:
         database_name: scenario_smoke_${run_id_token}
         default_team_id: 1
@@ -17,13 +19,13 @@ steps:
   - id: wait_ready
     type: wait_warehouse_ready
     with:
-      org_id: scenario-smoke-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       timeout: 15m
       poll_interval: 10s
   - id: select_one
     type: sql
     with:
-      org_id: scenario-smoke-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       sql: SELECT 1
       max_attempts: 12
@@ -33,7 +35,7 @@ steps:
     depends_on: [select_one]
     always_run: true
     with:
-      org_id: scenario-smoke-${run_id_token}
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       verify_deleted: true
       cleanup_timeout: 15m
       poll_interval: 10s

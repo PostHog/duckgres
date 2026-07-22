@@ -13,6 +13,7 @@ Set these before running a real scenario:
 ```bash
 export DUCKGRES_SCENARIO_API_BASE="<control-plane-api-base-url>"
 export DUCKGRES_SCENARIO_INTERNAL_SECRET="<internal-secret>"
+export DUCKGRES_SCENARIO_ORG_ID="<authorized-disposable-org-id>"
 export DUCKGRES_SCENARIO_PG_HOST="<pgwire-direct-tcp-host>"
 export DUCKGRES_SCENARIO_SNI_SUFFIX="<managed-hostname-suffix>"
 ```
@@ -150,7 +151,7 @@ The provisioned Duckgres worker role also needs read/list access to that prefix;
 
 The smoke scenario has an `always_run` deprovision step, but an interrupted process can still leave dev resources behind. To clean up:
 
-1. Identify the scenario org ID from the scenario file and artifact directory.
+1. Recover the `DUCKGRES_SCENARIO_ORG_ID` value supplied for the interrupted run.
 2. Call the control-plane deprovision endpoint with the internal secret.
 3. Poll `/warehouse/status` until the state is `deleted` or the warehouse returns `404`.
 4. If deletion does not complete, inspect the dev control-plane logs and the managed warehouse deprovision runbook.

@@ -23,6 +23,11 @@ cnpg-shard metadata stores.
    unique `<scenario>-<token>/` directory; failed or incomplete copies are
    preserved as visible `<scenario>-<token>.partial/` directories with an
    `artifact_collection_error.txt` marker.
+   Successful CNPG scenarios receive `DUCKGRES_SCENARIO_ORG_ID` as
+   `ci-pr-<N>-cnpg`, where `<N>` is `PR_NUMBER` (the workflow run id for
+   `scenario-dev`). This exact identity is shared by Crossplane's scoped
+   credential RoleBinding and the harness cleanup path; it is not a separate
+   user-configurable default.
 5. **Teardown** always: deprovision the ci-pr ducklings (clean shared-infra
    footprint) then delete the namespace.
 
