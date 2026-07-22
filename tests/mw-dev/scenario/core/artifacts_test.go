@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,7 +40,7 @@ steps:
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	for _, name := range []string{"scenario_summary.json", "step_results.csv", "events.jsonl"} {
+	for _, name := range []string{"scenario_summary.json", "scenario_summary.md", "step_results.csv", "events.jsonl"} {
 		if _, err := os.Stat(filepath.Join(outputDir, name)); err != nil {
 			t.Fatalf("expected artifact %s: %v", name, err)
 		}
@@ -73,6 +75,16 @@ steps:
 	if summary.RunID != "artifact-run" || summary.TotalSteps != 2 || summary.SucceededSteps != 2 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
+	markdownBody, err := os.ReadFile(filepath.Join(outputDir, "scenario_summary.md"))
+	if err != nil {
+		t.Fatalf("read scenario_summary.md: %v", err)
+	}
+	markdown := string(markdownBody)
+	for _, want := range []string{"# Scenario result: artifact-smoke", "**Status:** success", "`provision`", "`query`"} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("scenario_summary.md missing %q:\n%s", want, markdown)
+		}
+	}
 
 	eventsBody, err := os.ReadFile(filepath.Join(outputDir, "events.jsonl"))
 	if err != nil {
@@ -92,6 +104,73 @@ steps:
 	}
 	if len(events) != 2 || events[1].StepID != "query" || events[1].Status != StepStatusOK {
 		t.Fatalf("unexpected events: %+v", events)
+	}
+}
+
+func TestRunnerMarkdownSummaryHighlightsFailuresAndSkips(t *testing.T) {
+	scenario, err := ParseScenario([]byte(`
+name: artifact-failure
+steps:
+  - id: setup
+    type: fake
+  - id: perf
+    type: fake
+    depends_on: [setup]
+  - id: perf-report
+    type: fake
+    depends_on: [perf]
+  - id: dbt
+    type: fake
+    depends_on: [setup]
+  - id: cleanup
+    type: fake
+    depends_on: [perf, dbt]
+    always_run: true
+`))
+	if err != nil {
+		t.Fatalf("ParseScenario returned error: %v", err)
+	}
+
+	outputDir := t.TempDir()
+	runner := NewRunner(RunnerConfig{
+		RunID:      "artifact-failure-run",
+		Scenario:   scenario,
+		OutputDir:  outputDir,
+		WriteFiles: true,
+		Executor: StepExecutorFunc(func(_ context.Context, step Step) error {
+			if step.ID == "perf" {
+				return errors.New("31 of 36 queries failed\nworker unavailable")
+			}
+			return nil
+		}),
+		Now: fixedClock(time.Unix(1700000000, 0).UTC()),
+	})
+	if _, err := runner.Run(context.Background()); err == nil {
+		t.Fatal("expected scenario failure")
+	}
+
+	body, err := os.ReadFile(filepath.Join(outputDir, "scenario_summary.md"))
+	if err != nil {
+		t.Fatalf("read scenario_summary.md: %v", err)
+	}
+	markdown := string(body)
+	for _, want := range []string{
+		"# Scenario result: artifact-failure",
+		"**Status:** failed",
+		"## Failed and skipped steps",
+		"`perf`",
+		"execution_error",
+		"`perf-report`",
+		"dependency_failed",
+		"`dbt`",
+		"`cleanup`",
+	} {
+		if !strings.Contains(markdown, want) {
+			t.Fatalf("scenario_summary.md missing %q:\n%s", want, markdown)
+		}
+	}
+	if strings.Contains(markdown, "queries failed\nworker") {
+		t.Fatalf("scenario_summary.md contains an unescaped multiline table value:\n%s", markdown)
 	}
 }
 

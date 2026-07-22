@@ -326,11 +326,28 @@ func TestScenarioSuccessfulRerunsPreserveEachArtifactSet(t *testing.T) {
 		t.Fatalf("successful artifact directories = %v, want two run-specific directories", successful)
 	}
 	for _, dir := range successful {
-		for _, artifact := range []string{"scenario_summary.json", "step_results.csv", "events.jsonl"} {
+		for _, artifact := range []string{"scenario_summary.json", "scenario_summary.md", "step_results.csv", "events.jsonl"} {
 			if _, err := os.Stat(filepath.Join(dir, artifact)); err != nil {
 				t.Fatalf("successful artifact directory %s missing %s: %v", dir, artifact, err)
 			}
 		}
+	}
+}
+
+func TestScenarioFailsWhenMarkdownSummaryIsMissing(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
+		"SCENARIO_NAME=fast-suite",
+		"SCENARIO_DEV_MISSING_MARKDOWN_SUMMARY=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("scenario succeeded without scenario_summary.md; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "scenario_summary.md") {
+		t.Fatalf("scenario did not identify the missing Markdown summary; output:\n%s", out)
 	}
 }
 
@@ -565,6 +582,65 @@ func TestControlPlaneServiceExposesFlight(t *testing.T) {
 	t.Fatal("duckgres-control-plane Service missing from manifests template")
 }
 
+func TestControlPlaneWorkerDefaultsAreConfigurable(t *testing.T) {
+	raw, err := os.ReadFile("manifests.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+
+	rendered := strings.NewReplacer(
+		"${NAMESPACE}", "test-namespace",
+		"${PR_NUMBER}", "123",
+		"${CONTROLPLANE_IMAGE}", "example.invalid/duckgres:test",
+		"${WORKER_IMAGE}", "example.invalid/duckgres:test",
+		"${INTERNAL_SECRET}", "test-secret",
+		"${INTERNAL_SECRET_FALLBACK}", "test-secret-fallback",
+		"${USER_SECRET_KEY}", "test-user-secret-key",
+		"${DUCKGRES_K8S_WORKER_CPU_REQUEST}", "2",
+		"${DUCKGRES_K8S_WORKER_MEMORY_REQUEST}", "4Gi",
+	).Replace(string(raw))
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
+	for {
+		var manifest map[string]any
+		err := decoder.Decode(&manifest)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode manifests template: %v", err)
+		}
+		if manifest["kind"] != "Deployment" || manifestName(manifest) != "duckgres-control-plane" {
+			continue
+		}
+		env := deploymentContainerEnv(manifest, "controlplane")
+		if got := env["DUCKGRES_K8S_WORKER_CPU_REQUEST"]; got != "2" {
+			t.Fatalf("worker CPU request = %q, want configurable 2", got)
+		}
+		if got := env["DUCKGRES_K8S_WORKER_MEMORY_REQUEST"]; got != "4Gi" {
+			t.Fatalf("worker memory request = %q, want configurable 4Gi", got)
+		}
+		return
+	}
+	t.Fatal("duckgres-control-plane Deployment missing from manifests template")
+}
+
+func TestRenderDocumentsSafeWorkerResourceDefaults(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	for _, want := range []string{
+		`DUCKGRES_K8S_WORKER_CPU_REQUEST="${DUCKGRES_K8S_WORKER_CPU_REQUEST:-750m}"`,
+		`DUCKGRES_K8S_WORKER_MEMORY_REQUEST="${DUCKGRES_K8S_WORKER_MEMORY_REQUEST:-1536Mi}"`,
+		`$DUCKGRES_K8S_WORKER_CPU_REQUEST $DUCKGRES_K8S_WORKER_MEMORY_REQUEST`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("run.sh missing worker render contract %q", want)
+		}
+	}
+}
+
 func TestE2EHarnessPodIsProtectedFromKarpenterDisruption(t *testing.T) {
 	raw, err := os.ReadFile("run.sh")
 	if err != nil {
@@ -612,6 +688,29 @@ func manifestPorts(manifest map[string]any) []map[string]any {
 	return ports
 }
 
+func deploymentContainerEnv(manifest map[string]any, containerName string) map[string]string {
+	spec, _ := manifest["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	podSpec, _ := template["spec"].(map[string]any)
+	containers, _ := podSpec["containers"].([]any)
+	for _, rawContainer := range containers {
+		container, _ := rawContainer.(map[string]any)
+		if container["name"] != containerName {
+			continue
+		}
+		values := make(map[string]string)
+		env, _ := container["env"].([]any)
+		for _, rawVar := range env {
+			variable, _ := rawVar.(map[string]any)
+			name, _ := variable["name"].(string)
+			value, _ := variable["value"].(string)
+			values[name] = value
+		}
+		return values
+	}
+	return nil
+}
+
 type runSHFakes struct {
 	binDir  string
 	logPath string
@@ -652,6 +751,9 @@ if [[ "$*" == *" cp "* ]]; then
   dest="${@: -1}"
   mkdir -p "$dest"
   printf '{}\n' > "$dest/scenario_summary.json"
+  if [[ -z "${SCENARIO_DEV_MISSING_MARKDOWN_SUMMARY:-}" ]]; then
+    printf '# Scenario result\n' > "$dest/scenario_summary.md"
+  fi
   printf 'header\n' > "$dest/step_results.csv"
   printf '{}\n' > "$dest/events.jsonl"
   exit 0

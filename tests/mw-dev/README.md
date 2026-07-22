@@ -40,6 +40,13 @@ to a concurrent local run. A missing configured directory is created with mode
 `SCENARIO_POD_START_TIMEOUT_SECONDS` both default to `180` seconds and can be
 raised for unusually slow local clusters.
 
+The isolated control plane's default worker request is configurable through
+`DUCKGRES_K8S_WORKER_CPU_REQUEST` and
+`DUCKGRES_K8S_WORKER_MEMORY_REQUEST`; `run.sh` defaults them to `750m` and
+`1536Mi`, respectively, preserving the e2e harness's worker-packing behavior.
+`scenario-dev.yml` explicitly overrides them to 2 CPU and 4Gi for the frozen
+perf workload. Direct `run.sh` callers can make the same explicit override.
+
 A scheduled (`cron`) **e2e-cleanup** job (`run.sh e2e-cleanup`) runs every 6h and
 reaps any `duckgres-ci-pr-*` namespace older than 6h — a backstop for runs that
 died hard before their `always()` teardown could fire. (Named e2e-cleanup, not

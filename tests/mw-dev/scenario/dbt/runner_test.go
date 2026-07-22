@@ -60,11 +60,12 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 		ID:   "dbt_models",
 		Type: StepTypeDBTRun,
 		With: map[string]any{
-			"org_id":        "scenario-org",
-			"project_dir":   projectDir,
-			"worker_cpu":    "2",
-			"worker_memory": "4Gi",
-			"commands":      []any{"debug", "run", "test", "docs_generate"},
+			"org_id":          "scenario-org",
+			"project_dir":     projectDir,
+			"worker_cpu":      "2",
+			"worker_memory":   "4Gi",
+			"connect_timeout": 360,
+			"commands":        []any{"debug", "run", "test", "docs_generate"},
 		},
 	})
 	if err != nil {
@@ -101,6 +102,9 @@ func TestExecutorRunsCommandsCapturesLogsAndCopiesTargetArtifacts(t *testing.T) 
 	}
 	if got := envValue(first.Env, "PGOPTIONS"); got != "-c duckgres.worker_cpu=2 -c duckgres.worker_memory=4Gi" {
 		t.Fatalf("PGOPTIONS = %q, want dbt worker sizing options", got)
+	}
+	if got := envValue(first.Env, "DUCKGRES_DBT_CONNECT_TIMEOUT"); got != "360" {
+		t.Fatalf("DUCKGRES_DBT_CONNECT_TIMEOUT = %q, want 360", got)
 	}
 	if envValue(first.Env, "DBT_ENV_SECRET_DUCKGRES_PASSWORD") != "root-password" {
 		t.Fatal("expected command environment to include provision password as a dbt secret")

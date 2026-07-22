@@ -266,6 +266,7 @@ func TestFastSuiteScenarioComposesWorkloadsWithoutDBT(t *testing.T) {
 			t.Fatalf("step %s dependencies = %#v, want [setup_frozen_views]", stepID, got)
 		}
 	}
+	assertPerfQueryErrorsFailStep(t, steps["perf_queries"])
 	deprovision := steps["deprovision"]
 	if !deprovision.AlwaysRun {
 		t.Fatal("deprovision should always run")
@@ -324,6 +325,7 @@ func TestFullSuiteScenarioComposesWorkloadsAsDAG(t *testing.T) {
 			t.Fatalf("step %s dependencies = %#v, want [setup_frozen_views]", stepID, got)
 		}
 	}
+	assertPerfQueryErrorsFailStep(t, steps["perf_queries"])
 	assertDBTWorkerSize(t, steps["dbt_models"])
 	deprovision := steps["deprovision"]
 	if !deprovision.AlwaysRun {
@@ -485,9 +487,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		if flightAddr, _ := step.With["flight_addr"].(string); flightAddr != "flight.dev.example:443" {
 			t.Fatalf("perf flight_addr = %q, want env-provided Flight address", flightAddr)
 		}
-		if failOnQueryErrors, _ := step.With["fail_on_query_errors"].(bool); failOnQueryErrors {
-			t.Fatal("frozen perf scenario should report query errors without failing the scenario")
-		}
+		assertPerfQueryErrorsFailStep(t, step)
 		if _, ok := step.With["flight_insecure_skip_verify"]; ok {
 			t.Fatal("perf scenario should use DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY default instead of hardcoding TLS behavior")
 		}
@@ -553,6 +553,16 @@ func assertDBTWorkerSize(t *testing.T, step core.Step) {
 	}
 	if got, _ := step.With["worker_memory"].(string); got != "4Gi" {
 		t.Fatalf("dbt worker_memory = %q, want 4Gi", got)
+	}
+	if got := fmt.Sprint(step.With["connect_timeout"]); got != "360" {
+		t.Fatalf("dbt connect_timeout = %q, want 360 seconds", got)
+	}
+}
+
+func assertPerfQueryErrorsFailStep(t *testing.T, step core.Step) {
+	t.Helper()
+	if failOnQueryErrors, _ := step.With["fail_on_query_errors"].(bool); !failOnQueryErrors {
+		t.Fatalf("perf step %s should record query errors as a failed DAG step", step.ID)
 	}
 }
 

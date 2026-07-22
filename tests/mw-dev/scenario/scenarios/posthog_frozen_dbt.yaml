@@ -43,6 +43,7 @@ steps:
       project_dir: ../dbt/posthog_frozen_project
       worker_cpu: "2"
       worker_memory: 4Gi
+      connect_timeout: 360
       commands: [debug, run, test, docs_generate]
       retry:
         enabled: true

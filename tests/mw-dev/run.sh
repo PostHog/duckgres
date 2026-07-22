@@ -26,6 +26,8 @@ SCENARIO_JOB_CLEANUP_TIMEOUT_SECONDS="${SCENARIO_JOB_CLEANUP_TIMEOUT_SECONDS:-18
 SCENARIO_POD_START_TIMEOUT_SECONDS="${SCENARIO_POD_START_TIMEOUT_SECONDS:-180}"
 SCENARIO_NAME="${SCENARIO_NAME:-full-suite}"
 SCENARIO_ARTIFACTS_DIR="${SCENARIO_ARTIFACTS_DIR:-$HERE/../../artifacts/scenario-dev}"
+DUCKGRES_K8S_WORKER_CPU_REQUEST="${DUCKGRES_K8S_WORKER_CPU_REQUEST:-750m}"
+DUCKGRES_K8S_WORKER_MEMORY_REQUEST="${DUCKGRES_K8S_WORKER_MEMORY_REQUEST:-1536Mi}"
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -68,7 +70,9 @@ render() {
   USER_SECRET_KEY="$(cat "$user_secret_key_file")" \
   NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
   WORKER_IMAGE="$WORKER_IMAGE" CONTROLPLANE_IMAGE="$CONTROLPLANE_IMAGE" \
-    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY' \
+  DUCKGRES_K8S_WORKER_CPU_REQUEST="$DUCKGRES_K8S_WORKER_CPU_REQUEST" \
+  DUCKGRES_K8S_WORKER_MEMORY_REQUEST="$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" \
+    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY $DUCKGRES_K8S_WORKER_CPU_REQUEST $DUCKGRES_K8S_WORKER_MEMORY_REQUEST' \
     < "$HERE/manifests.tmpl.yaml"
 }
 
@@ -554,7 +558,7 @@ copy_scenario_artifacts() {
 
   if [ "$copy_failed" -eq 0 ] && "${KUBECTL[@]}" -n "$NS" cp -c artifact-keeper \
       "$pod:/artifacts/scenario-dev/$DUCKGRES_SCENARIO_RUN_ID/." "$staging"; then
-    for artifact in scenario_summary.json step_results.csv events.jsonl; do
+    for artifact in scenario_summary.json scenario_summary.md step_results.csv events.jsonl; do
       if [ -z "$(find "$staging" -type f -name "$artifact" -print -quit)" ]; then
         echo "Failed to copy scenario artifacts: missing required scenario artifact $artifact." >&2
         copy_failed=1

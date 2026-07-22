@@ -11,6 +11,11 @@ The scheduled trigger runs `full-suite`, which covers the frozen dataset
 metadata, perf, and dbt workloads with one shared warehouse lifecycle. Manual
 runs also default to `full-suite`.
 
+Scenario jobs override the shared harness's default worker request to 2 CPU and
+4Gi memory. The override applies to both pgwire and Flight workers, preventing
+the frozen perf queries from exhausting the smaller e2e worker. The shared e2e
+workflow keeps the harness defaults documented in `tests/mw-dev/README.md`.
+
 To omit dbt, manually run the workflow with `scenario` set to `fast-suite`.
 The input directly names a YAML file under
 `tests/mw-dev/scenario/scenarios/`, without the `.yaml` suffix. This also makes
@@ -61,8 +66,16 @@ uploadable in a visible `*.partial/` directory with an
 `scenario-dev-*` artifact first:
 
 - `scenario_summary.json` contains the overall run verdict.
+- `scenario_summary.md` highlights failed and skipped steps and is also
+  published in the GitHub Actions job summary.
 - `step_results.csv` contains per-step duration, status, and error class.
 - `events.jsonl` contains the execution timeline.
+
+Perf query errors mark the `perf_queries` DAG step failed. They do not stop
+independent sibling branches: for example, `dbt_models` still runs because it
+depends on `setup_frozen_views`, not `perf_queries`. Only true dependants are
+skipped, and `always_run` teardown still executes. The final workflow result is
+reported after all eligible steps and artifact collection finish.
 
 If cleanup did not complete, the scenario-created org is
 `ci-pr-<workflow-run-id>-cnpg`; deprovision it manually through the relevant dev

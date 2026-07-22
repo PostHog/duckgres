@@ -72,6 +72,10 @@ jobs:
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
+      # Frozen perf needs more than the shared e2e harness defaults. This sizes
+      # both pgwire and Flight workers because Flight has no startup GUCs.
+      DUCKGRES_K8S_WORKER_CPU_REQUEST: "2"
+      DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 4Gi
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -117,6 +121,21 @@ jobs:
         env:
           SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}
         run: tests/mw-dev/run.sh test-scenario
+
+      - name: Publish scenario summary
+        if: always()
+        run: |
+          set -euo pipefail
+          summary_file="$(find artifacts/scenario-dev -type f -name scenario_summary.md -print -quit 2>/dev/null || true)"
+          if [ -n "$summary_file" ]; then
+            cat "$summary_file" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Scenario result"
+              echo
+              echo "Scenario summary unavailable. Inspect the job log and any uploaded partial artifact."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Collect diagnostics
         if: failure()
