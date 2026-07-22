@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -18,10 +19,12 @@ import (
 type recordingCopyFromStdinExecutor struct {
 	*LocalExecutor
 
+	attempts                int
 	calls                   int
 	copySQL                 string
 	payload                 []byte
 	rows                    int64
+	readErr                 error
 	binaryDatabaseTypeNames []string
 }
 
@@ -71,8 +74,10 @@ func (e *recordingCopyFromStdinExecutor) CopyFromStdin(
 	request sqlcore.CopyFromStdinRequest,
 	r io.Reader,
 ) (int64, error) {
+	e.attempts++
 	payload, err := io.ReadAll(r)
 	if err != nil {
+		e.readErr = err
 		return 0, err
 	}
 	e.calls++
@@ -376,5 +381,64 @@ func TestHandleCopyInBinaryRemoteAbortsOnTransportEOFBeforeCopyDone(t *testing.T
 	}
 	if got, want := frameTypes(scanWireFrames(t, output.Bytes())), "GEZ"; got != want {
 		t.Fatalf("response frame sequence = %q, want %q", got, want)
+	}
+}
+
+func TestHandleCopyInBinaryRemotePropagatesFrontendCopyFail(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("CREATE TABLE events (payload BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &recordingCopyFromStdinExecutor{
+		LocalExecutor: NewLocalExecutor(db),
+		rows:          1,
+	}
+	prefix, _, _ := postgresBinaryCopyOneField([]byte("partial payload"))
+
+	var input bytes.Buffer
+	writePGMessage(&input, wire.MsgCopyData, prefix)
+	writePGMessage(&input, wire.MsgCopyFail, []byte("client stopped producing rows\x00"))
+
+	var output bytes.Buffer
+	c := &clientConn{
+		reader:   bufio.NewReader(&input),
+		writer:   bufio.NewWriter(&output),
+		executor: exec,
+		server:   &Server{},
+		txStatus: txStatusTransaction,
+		ctx:      context.Background(),
+	}
+
+	query := "COPY public.events (payload) FROM STDIN (FORMAT binary)"
+	if err := c.handleCopyIn(query, "COPY PUBLIC.EVENTS (PAYLOAD) FROM STDIN (FORMAT BINARY)"); err != nil {
+		t.Fatalf("handleCopyIn: %v", err)
+	}
+	_ = c.writer.Flush()
+
+	if exec.attempts != 1 {
+		t.Fatalf("CopyFromStdin attempts = %d, want 1", exec.attempts)
+	}
+	if exec.calls != 0 {
+		t.Fatalf("CopyFromStdin completed %d times after CopyFail, want 0", exec.calls)
+	}
+	if !errors.Is(exec.readErr, errCopyAborted) {
+		t.Fatalf("CopyFromStdin read error = %v, want errCopyAborted", exec.readErr)
+	}
+	if c.txStatus != txStatusError {
+		t.Fatalf("transaction status = %c, want failed transaction status %c", c.txStatus, txStatusError)
+	}
+	if got, want := frameTypes(scanWireFrames(t, output.Bytes())), "GEZ"; got != want {
+		t.Fatalf("response frame sequence = %q, want %q", got, want)
+	}
+	if got, want := extractErrorResponseField(t, output.Bytes(), 'C'), "57014"; got != want {
+		t.Fatalf("ErrorResponse SQLSTATE = %q, want %q", got, want)
+	}
+	if got := extractErrorResponseField(t, output.Bytes(), 'M'); !strings.Contains(got, "client stopped producing rows") {
+		t.Fatalf("ErrorResponse message = %q, want client CopyFail reason", got)
 	}
 }

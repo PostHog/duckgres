@@ -3,6 +3,8 @@ package pgbinary
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
 	"math/big"
 	"strconv"
 	"strings"
@@ -160,6 +162,166 @@ func TestInspectRequiresCompleteTrailerAndNoTrailingBytes(t *testing.T) {
 			_, err := Inspect(bytes.NewReader(tt.payload), Schema{Columns: []Column{{}}})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Inspect() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectRejectsTruncatedFramingAtEveryBoundary(t *testing.T) {
+	payload := binaryCopy(t, nil, [][][]byte{{[]byte("one")}})
+	headerLength := len(copySignature) + 4 + 4
+	invalidSignature := append([]byte{}, payload...)
+	invalidSignature[0] ^= 0xff
+
+	truncatedExtension := append([]byte{}, payload[:len(copySignature)+4]...)
+	var extensionLength [4]byte
+	binary.BigEndian.PutUint32(extensionLength[:], 4)
+	truncatedExtension = append(truncatedExtension, extensionLength[:]...)
+	truncatedExtension = append(truncatedExtension, 0xaa, 0xbb)
+
+	for _, tt := range []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{
+			name:    "signature",
+			payload: payload[:len(copySignature)-1],
+			want:    "header",
+		},
+		{
+			name:    "signature contents",
+			payload: invalidSignature,
+			want:    "signature",
+		},
+		{
+			name:    "flags",
+			payload: payload[:len(copySignature)+3],
+			want:    "flags",
+		},
+		{
+			name:    "extension length",
+			payload: payload[:len(copySignature)+4+3],
+			want:    "header extension length",
+		},
+		{
+			name:    "extension payload",
+			payload: truncatedExtension,
+			want:    "truncated PostgreSQL binary COPY header extension",
+		},
+		{
+			name:    "row field count",
+			payload: payload[:headerLength+1],
+			want:    "trailer",
+		},
+		{
+			name:    "field length",
+			payload: payload[:headerLength+2+3],
+			want:    "row 1 column 1 has truncated field length",
+		},
+		{
+			name:    "field payload",
+			payload: payload[:headerLength+2+4+2],
+			want:    "row 1 column 1 has truncated field data",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Inspect(bytes.NewReader(tt.payload), Schema{Columns: []Column{{}}})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Inspect() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectRejectsInvalidNegativeRowFraming(t *testing.T) {
+	headerLength := len(copySignature) + 4 + 4
+	for _, tt := range []struct {
+		name   string
+		mutate func([]byte)
+		want   string
+	}{
+		{
+			name: "field count",
+			mutate: func(payload []byte) {
+				binary.BigEndian.PutUint16(payload[headerLength:headerLength+2], uint16(0xfffe))
+			},
+			want: "invalid field count -2",
+		},
+		{
+			name: "field length",
+			mutate: func(payload []byte) {
+				binary.BigEndian.PutUint32(payload[headerLength+2:headerLength+6], uint32(0xfffffffe))
+			},
+			want: "invalid field length -2",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := binaryCopy(t, nil, [][][]byte{{[]byte("one")}})
+			tt.mutate(payload)
+			_, err := Inspect(bytes.NewReader(payload), Schema{Columns: []Column{{}}})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Inspect() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectRejectsMalformedNumericFraming(t *testing.T) {
+	schema := Schema{Columns: []Column{{Numeric: &Numeric{Precision: 18, Scale: 2}}}}
+	for _, tt := range []struct {
+		name   string
+		field  []byte
+		mutate func([]byte)
+		want   string
+	}{
+		{
+			name:  "shorter than numeric header",
+			field: []byte{0, 0, 0, 0, 0, 0, 0},
+			want:  "smaller than the 8-byte header",
+		},
+		{
+			name:  "ndigits disagrees with field length",
+			field: numeric(t, "1.23"),
+			mutate: func(field []byte) {
+				binary.BigEndian.PutUint16(field[0:2], 3)
+			},
+			want: "does not match ndigits 3",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			field := append([]byte{}, tt.field...)
+			if tt.mutate != nil {
+				tt.mutate(field)
+			}
+			payload := binaryCopy(t, nil, [][][]byte{{field}})
+			_, err := Inspect(bytes.NewReader(payload), schema)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Inspect() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectRejectsTruncatedNumericPayload(t *testing.T) {
+	schema := Schema{Columns: []Column{{Numeric: &Numeric{Precision: 18, Scale: 2}}}}
+	payload := binaryCopy(t, nil, [][][]byte{{numeric(t, "1.23")}})
+	numericPayloadOffset := len(copySignature) + 4 + 4 + 2 + 4
+
+	for _, tt := range []struct {
+		name        string
+		bytesToKeep int
+	}{
+		{name: "numeric header", bytesToKeep: 7},
+		{name: "numeric digits", bytesToKeep: 9},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Inspect(
+				bytes.NewReader(payload[:numericPayloadOffset+tt.bytesToKeep]),
+				schema,
+			)
+			if err == nil || !strings.Contains(err.Error(), "invalid NUMERIC") || !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("Inspect() error = %v, want truncated NUMERIC framing error", err)
 			}
 		})
 	}

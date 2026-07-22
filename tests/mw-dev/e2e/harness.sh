@@ -866,6 +866,140 @@ rw_ducklake() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
+# Full regression path for PostgreSQL binary COPY into DuckLake:
+# psql/libpq -> CP pgwire -> Flight DoPut -> worker spool -> bundled
+# postgres_scanner -> DuckLake. Duckgres serves both COPY OUT and COPY IN, so
+# these are Duckgres-generated round trips, not an independent PostgreSQL
+# conformance oracle. DECIMAL(10,3) -> DECIMAL(10,2) forces a worker rewrite.
+binary_copy_round_trip() { # org password
+  log "binary COPY native/fallback/route-guard/transaction round-trip on $1"
+  native_src=e2e_binary_native_src native_dst=e2e_binary_native_dst
+  fallback_src=e2e_binary_fallback_src fallback_dst=e2e_binary_fallback_dst
+  route_guard_src=e2e_binary_route_guard_src route_guard_dst=e2e_binary_route_guard_dst
+  tx_dst=e2e_binary_tx_dst
+
+  pg "$1" "$2" ducklake "
+    DROP TABLE IF EXISTS $native_src; DROP TABLE IF EXISTS $native_dst;
+    DROP TABLE IF EXISTS $fallback_src; DROP TABLE IF EXISTS $fallback_dst;
+    DROP TABLE IF EXISTS $route_guard_src; DROP TABLE IF EXISTS $route_guard_dst;
+    DROP TABLE IF EXISTS $tx_dst;
+    CREATE TABLE $native_src (
+      label VARCHAR, id BIGINT, payload BLOB, enabled BOOLEAN, ratio DOUBLE,
+      event_date DATE, event_time TIMESTAMP, received_at TIMESTAMPTZ,
+      amount DECIMAL(10,3)
+    );
+    INSERT INTO $native_src VALUES
+      ('alpha', 42, unhex('005C2EFF'), true, -123.5, DATE '1999-12-31',
+       TIMESTAMP '1999-12-31 23:59:59.999999',
+       TIMESTAMPTZ '2000-01-01 00:00:01.000001+00', 1.235),
+      ('negative', -7, unhex('00'), false, 0, DATE '2000-01-01',
+       TIMESTAMP '2000-01-01 00:00:00',
+       TIMESTAMPTZ '1999-12-31 23:59:59.999999+00', -1.235),
+      (NULL, -9, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    CREATE TABLE $native_dst (
+      id BIGINT, untouched VARCHAR DEFAULT 'kept', label VARCHAR, payload BLOB,
+      enabled BOOLEAN, ratio DOUBLE, event_date DATE, event_time TIMESTAMP,
+      received_at TIMESTAMPTZ, amount DECIMAL(10,2)
+    );
+    CREATE TABLE $fallback_src AS SELECT 123456::BIGINT AS id;
+    CREATE TABLE $fallback_dst (id INTEGER);
+    CREATE TABLE $route_guard_src AS SELECT 7::INTEGER AS id;
+    CREATE TABLE $route_guard_dst (id BIGINT);
+    CREATE TABLE $tx_dst (id BIGINT);
+  " >/dev/null
+
+  native_file="$(mktemp)" fallback_file="$(mktemp)" route_guard_file="$(mktemp)"
+  conn="sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake"
+  out="$(mktemp)"
+  a=0
+  while :; do
+    rm -f "$native_file" "$fallback_file" "$route_guard_file"
+    : >"$out"
+    if PGPASSWORD="$2" timeout 120 psql "$conn" -X -v ON_ERROR_STOP=1 -tA >"$out" 2>&1 <<SQL
+\set VERBOSITY verbose
+\copy $native_src TO '$native_file' WITH (FORMAT binary)
+\copy $native_dst (label, id, payload, enabled, ratio, event_date, event_time, received_at, amount) FROM '$native_file' WITH (FORMAT binary)
+\copy $fallback_src TO '$fallback_file' WITH (FORMAT binary)
+\copy $fallback_dst (id) FROM '$fallback_file' WITH (FORMAT binary)
+\copy $route_guard_src TO '$route_guard_file' WITH (FORMAT binary)
+\set ON_ERROR_STOP off
+\copy $route_guard_dst (id) FROM '$route_guard_file' WITH (FORMAT binary)
+\echo route_guard_sqlstate=:SQLSTATE
+\set ON_ERROR_STOP on
+BEGIN;
+\copy $tx_dst (id) FROM '$fallback_file' WITH (FORMAT binary)
+ROLLBACK;
+SQL
+    then
+      break
+    fi
+    text="$(tr '\n' ' ' <"$out" | tail -c 600)"
+    case "$text" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
+        [ "$a" -lt 12 ] || {
+          rm -f "$out" "$native_file" "$fallback_file" "$route_guard_file"
+          fail "$1 binary COPY: backpressure never cleared ($(printf %s "$text" | tail -c 120))"
+        }
+        sleep 10; a=$((a + 1)); continue ;;
+      *)
+        rm -f "$out" "$native_file" "$fallback_file" "$route_guard_file"
+        fail "$1 binary COPY: full-path regression ($text)" ;;
+    esac
+  done
+
+  # INTEGER COPY OUT has a four-byte field. BIGINT COPY IN selects the native
+  # reader and must reject it; the legacy width-tolerant decoder would accept it.
+  route_guard_state="$(grep '^route_guard_sqlstate=' "$out" || true)"
+  if [ "$route_guard_state" != "route_guard_sqlstate=22P02" ] || \
+     ! grep -q 'BIGINT field length 4, expected 8' "$out"; then
+    text="$(tr '\n' ' ' <"$out" | tail -c 600)"
+    rm -f "$out" "$native_file" "$fallback_file" "$route_guard_file"
+    fail "$1 binary COPY: native route guard failed ($text)"
+  fi
+  copies="$(grep '^COPY [0-9][0-9]*$' "$out" || true)"
+  want_copies="$(printf 'COPY 3\nCOPY 3\nCOPY 1\nCOPY 1\nCOPY 1\nCOPY 1')"
+  rm -f "$out" "$native_file" "$fallback_file" "$route_guard_file"
+  [ "$copies" = "$want_copies" ] || \
+    fail "binary COPY tags='$(printf %s "$copies" | tr '\n' ' ')' want='$(printf %s "$want_copies" | tr '\n' ' ')'"
+
+  got="$(pg "$1" "$2" ducklake "
+    SELECT concat_ws('|',
+      (SELECT count(*) FROM $native_dst),
+      (SELECT count(*) FROM $native_dst WHERE id=42 AND untouched='kept'
+        AND label='alpha' AND hex(payload)='005C2EFF' AND enabled
+        AND ratio=-123.5 AND event_date=DATE '1999-12-31'
+        AND event_time=TIMESTAMP '1999-12-31 23:59:59.999999'
+        AND received_at=TIMESTAMPTZ '2000-01-01 00:00:01.000001+00'
+        AND amount=1.24),
+      (SELECT count(*) FROM $native_dst WHERE id=-7 AND untouched='kept'
+        AND label='negative' AND hex(payload)='00' AND NOT enabled AND ratio=0
+        AND event_date=DATE '2000-01-01'
+        AND event_time=TIMESTAMP '2000-01-01 00:00:00'
+        AND received_at=TIMESTAMPTZ '1999-12-31 23:59:59.999999+00'
+        AND amount=-1.24),
+      (SELECT count(*) FROM $native_dst WHERE id=-9 AND untouched='kept'
+        AND label IS NULL AND payload IS NULL AND enabled IS NULL AND ratio IS NULL
+        AND event_date IS NULL AND event_time IS NULL AND received_at IS NULL
+        AND amount IS NULL),
+      (SELECT count(*) FROM $fallback_dst WHERE id=123456),
+      (SELECT count(*) FROM $route_guard_dst),
+      (SELECT count(*) FROM $tx_dst)
+    )
+  ")"
+  [ "$got" = "3|1|1|1|1|0|0" ] || \
+    fail "binary COPY persisted checks=$got want 3|1|1|1|1|0|0"
+
+  pg "$1" "$2" ducklake "
+    DROP TABLE $native_src; DROP TABLE $native_dst;
+    DROP TABLE $fallback_src; DROP TABLE $fallback_dst;
+    DROP TABLE $route_guard_src; DROP TABLE $route_guard_dst; DROP TABLE $tx_dst;
+  " >/dev/null
+  log "binary COPY native/fallback/route-guard/transaction round-trip OK on $1"
+}
+
 explain_ducklake() { # org password
   log "EXPLAIN on DuckLake table on $1"
   t="e2e_explain_$(echo "$1" | tr -c 'a-z0-9' _)"
@@ -3070,6 +3204,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  binary_copy_round_trip "$CNPG" "$cnpg_pw"
   explain_ducklake       "$CNPG" "$cnpg_pw"
   httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
   persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
@@ -3273,7 +3408,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

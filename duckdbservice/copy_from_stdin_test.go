@@ -203,14 +203,32 @@ func postgresBinaryNumericFixture(t *testing.T, weight int16, sign, scale uint16
 	return payload.Bytes()
 }
 
-func runPostgresBinaryCopyFixture(
+func useIsolatedWorkerCopyTempDir(t *testing.T) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
+	t.Cleanup(func() { assertNoWorkerCopyTempfiles(t, tmpDir) })
+	return tmpDir
+}
+
+func assertNoWorkerCopyTempfiles(t *testing.T, tmpDir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(tmpDir, "duckgres-worker-copy-*.copy"))
+	if err != nil {
+		t.Fatalf("glob worker COPY tempfiles: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("worker COPY tempfiles leaked: %v", matches)
+	}
+}
+
+func newPostgresBinaryCopyFixture(
 	t *testing.T,
-	handler *FlightSQLHandler,
 	ctx context.Context,
 	copySQL string,
 	databaseTypeNames []string,
 	payload []byte,
-) int64 {
+) (*flight.FlightData, *fakeDoPutStream) {
 	t.Helper()
 	requestBytes, err := json.Marshal(sqlcore.CopyFromStdinRequest{
 		SQLTemplate:                     copySQL,
@@ -233,6 +251,19 @@ func runPostgresBinaryCopyFixture(
 		ctx:     ctx,
 		inbound: []*flight.FlightData{{DataBody: payload}},
 	}
+	return first, stream
+}
+
+func runPostgresBinaryCopyFixture(
+	t *testing.T,
+	handler *FlightSQLHandler,
+	ctx context.Context,
+	copySQL string,
+	databaseTypeNames []string,
+	payload []byte,
+) int64 {
+	t.Helper()
+	first, stream := newPostgresBinaryCopyFixture(t, ctx, copySQL, databaseTypeNames, payload)
 	if err := handler.doCopyFromStdin(ctx, first, stream); err != nil {
 		t.Fatalf("doCopyFromStdin: %v", err)
 	}
@@ -247,6 +278,7 @@ func runPostgresBinaryCopyFixture(
 }
 
 func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
+	tmpDir := useIsolatedWorkerCopyTempDir(t)
 	session, cleanup := newSessionWithInMemoryDuckDB(t)
 	defer cleanup()
 
@@ -300,6 +332,7 @@ func TestDoCopyFromStdinIngestsCSVAndRunsCOPY(t *testing.T) {
 	if n != 3 {
 		t.Errorf("table row count = %d, want 3", n)
 	}
+	assertNoWorkerCopyTempfiles(t, tmpDir)
 }
 
 func TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner(t *testing.T) {
@@ -479,6 +512,156 @@ func TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner(t *testing.T) {
 			t.Fatalf("unexpected rows/error after expected values: %v", rows.Err())
 		}
 	})
+
+	t.Run("zero-row stream returns zero and cleans its spool", func(t *testing.T) {
+		tmpDir := useIsolatedWorkerCopyTempDir(t)
+		if _, err := session.Conn.ExecContext(ctx, "CREATE TABLE binary_empty (id BIGINT)"); err != nil {
+			t.Fatal(err)
+		}
+		payload := postgresBinaryCopyFixture(t, nil)
+		copySQL := "INSERT INTO binary_empty " +
+			"SELECT * FROM read_postgres_binary('" + flightclient.CopyFromStdinPathPlaceholder +
+			"', columns = {c0: 'BIGINT'}, buffer_size = " + flightclient.CopyFromStdinSizePlaceholder + ")"
+		if rows := runPostgresBinaryCopyFixture(t, handler, ctx, copySQL, []string{"BIGINT"}, payload); rows != 0 {
+			t.Fatalf("row count = %d, want 0", rows)
+		}
+		var count int
+		if err := session.Conn.QueryRowContext(ctx, "SELECT count(*) FROM binary_empty").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("stored row count = %d, want 0", count)
+		}
+		assertNoWorkerCopyTempfiles(t, tmpDir)
+	})
+
+	t.Run("blob larger than scanner default buffer preserves bytes", func(t *testing.T) {
+		tmpDir := useIsolatedWorkerCopyTempDir(t)
+		if _, err := session.Conn.ExecContext(ctx, "CREATE TABLE binary_large_blob (payload BLOB)"); err != nil {
+			t.Fatal(err)
+		}
+
+		const blobSize = 32<<20 + 1
+		blob := make([]byte, blobSize)
+		copy(blob[:4], []byte{0x00, 0xff, 0x5a, 0xa5})
+		middle := len(blob) / 2
+		copy(blob[middle:middle+4], []byte{0xde, 0xad, 0xbe, 0xef})
+		copy(blob[len(blob)-4:], []byte{0x13, 0x37, 0xc0, 0xde})
+
+		payload := postgresBinaryCopyFixture(t, nil, [][]byte{blob})
+		if len(payload) <= 32<<20 {
+			t.Fatalf("test binary COPY size = %d, want more than 32 MiB", len(payload))
+		}
+		copySQL := "INSERT INTO binary_large_blob " +
+			"SELECT * FROM read_postgres_binary('" + flightclient.CopyFromStdinPathPlaceholder +
+			"', columns = {c0: 'BLOB'}, buffer_size = " + flightclient.CopyFromStdinSizePlaceholder + ")"
+		if rows := runPostgresBinaryCopyFixture(t, handler, ctx, copySQL, []string{"BLOB"}, payload); rows != 1 {
+			t.Fatalf("row count = %d, want 1", rows)
+		}
+
+		var stored []byte
+		if err := session.Conn.QueryRowContext(ctx, "SELECT payload FROM binary_large_blob").Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if len(stored) != blobSize {
+			t.Fatalf("stored BLOB length = %d, want %d", len(stored), blobSize)
+		}
+		if !bytes.Equal(stored, blob) {
+			t.Fatal("stored BLOB differs from the PostgreSQL binary COPY payload")
+		}
+		assertNoWorkerCopyTempfiles(t, tmpDir)
+	})
+
+	t.Run("raw transaction controls native copy commit and rollback", func(t *testing.T) {
+		tmpDir := useIsolatedWorkerCopyTempDir(t)
+		t.Cleanup(func() {
+			if session.sqlTxActive.Load() {
+				_, _ = handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "ROLLBACK"})
+			}
+		})
+		if _, err := session.Conn.ExecContext(ctx, "CREATE TABLE binary_transaction (id BIGINT)"); err != nil {
+			t.Fatal(err)
+		}
+		copySQL := "INSERT INTO binary_transaction " +
+			"SELECT * FROM read_postgres_binary('" + flightclient.CopyFromStdinPathPlaceholder +
+			"', columns = {c0: 'BIGINT'}, buffer_size = " + flightclient.CopyFromStdinSizePlaceholder + ")"
+
+		if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "BEGIN"}); err != nil {
+			t.Fatalf("BEGIN before rollback case: %v", err)
+		}
+		if rows := runPostgresBinaryCopyFixture(t, handler, ctx, copySQL, []string{"BIGINT"},
+			postgresBinaryCopyFixture(t, nil, [][]byte{postgresBinaryInt64Fixture(11)})); rows != 1 {
+			t.Fatalf("rollback case row count = %d, want 1", rows)
+		}
+		var inTransactionCount int
+		if err := session.Conn.QueryRowContext(ctx,
+			"SELECT count(*) FROM binary_transaction WHERE id = 11").Scan(&inTransactionCount); err != nil {
+			t.Fatal(err)
+		}
+		if inTransactionCount != 1 {
+			t.Fatalf("rows visible before rollback = %d, want 1", inTransactionCount)
+		}
+		if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "ROLLBACK"}); err != nil {
+			t.Fatalf("ROLLBACK after native COPY: %v", err)
+		}
+		var count int
+		if err := session.Conn.QueryRowContext(ctx, "SELECT count(*) FROM binary_transaction").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("rows after rollback = %d, want 0", count)
+		}
+
+		if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "BEGIN"}); err != nil {
+			t.Fatalf("BEGIN before commit case: %v", err)
+		}
+		if rows := runPostgresBinaryCopyFixture(t, handler, ctx, copySQL, []string{"BIGINT"},
+			postgresBinaryCopyFixture(t, nil, [][]byte{postgresBinaryInt64Fixture(22)})); rows != 1 {
+			t.Fatalf("commit case row count = %d, want 1", rows)
+		}
+		if _, err := handler.DoPutCommandStatementUpdate(ctx, testStatementUpdate{query: "COMMIT"}); err != nil {
+			t.Fatalf("COMMIT after native COPY: %v", err)
+		}
+		var id int64
+		if err := session.Conn.QueryRowContext(ctx, "SELECT id FROM binary_transaction").Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if id != 22 {
+			t.Fatalf("committed id = %d, want 22", id)
+		}
+		assertNoWorkerCopyTempfiles(t, tmpDir)
+	})
+
+	t.Run("rewritten copy failure is atomic and cleans both spools", func(t *testing.T) {
+		tmpDir := useIsolatedWorkerCopyTempDir(t)
+		if _, err := session.Conn.ExecContext(ctx,
+			"CREATE TABLE binary_atomic_failure (amount DECIMAL(10,2) CHECK (amount > 0))"); err != nil {
+			t.Fatal(err)
+		}
+		payload := postgresBinaryCopyFixture(t, nil,
+			[][]byte{postgresBinaryNumericFixture(t, 0, 0x0000, 3, 1, 2350)},
+			[][]byte{postgresBinaryNumericFixture(t, 0, 0x4000, 3, 1, 2350)},
+		)
+		copySQL := "INSERT INTO binary_atomic_failure " +
+			"SELECT * FROM read_postgres_binary('" + flightclient.CopyFromStdinPathPlaceholder +
+			"', columns = {c0: 'DECIMAL(10,2)'}, buffer_size = " + flightclient.CopyFromStdinSizePlaceholder + ")"
+		first, stream := newPostgresBinaryCopyFixture(t, ctx, copySQL, []string{"DECIMAL(10,2)"}, payload)
+		err := handler.doCopyFromStdin(ctx, first, stream)
+		if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "failed to execute update") {
+			t.Fatalf("doCopyFromStdin() error = %v, want scanner execution failure", err)
+		}
+		if len(stream.outbound) != 0 {
+			t.Fatalf("worker sent %d results after failed INSERT", len(stream.outbound))
+		}
+		var count int
+		if err := session.Conn.QueryRowContext(ctx, "SELECT count(*) FROM binary_atomic_failure").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("rows after failed atomic INSERT = %d, want 0", count)
+		}
+		assertNoWorkerCopyTempfiles(t, tmpDir)
+	})
 }
 
 func TestPreparePostgresBinaryCopyReusesCanonicalSpool(t *testing.T) {
@@ -546,6 +729,7 @@ func TestPreparePostgresBinaryCopyNormalizesHeaderExtension(t *testing.T) {
 }
 
 func TestDoCopyFromStdinRejectsBinaryTupleWidthBeforeScannerExecution(t *testing.T) {
+	tmpDir := useIsolatedWorkerCopyTempDir(t)
 	session, cleanup := newSessionWithInMemoryDuckDB(t)
 	defer cleanup()
 
@@ -604,6 +788,7 @@ func TestDoCopyFromStdinRejectsBinaryTupleWidthBeforeScannerExecution(t *testing
 	if rows != 0 {
 		t.Fatalf("rows inserted after validation failure = %d, want 0", rows)
 	}
+	assertNoWorkerCopyTempfiles(t, tmpDir)
 }
 
 func TestDoCopyFromStdinRejectsNativeBinarySQLWithoutSchemaMetadata(t *testing.T) {
@@ -757,6 +942,7 @@ func TestDoCopyFromStdinRequiresSession(t *testing.T) {
 // before EOF; the worker MUST return the error and MUST NOT run COPY on
 // the partial bytes already buffered to the tempfile.
 func TestDoCopyFromStdinAbortsOnStreamCancellation(t *testing.T) {
+	tmpDir := useIsolatedWorkerCopyTempDir(t)
 	session, cleanup := newSessionWithInMemoryDuckDB(t)
 	defer cleanup()
 
@@ -812,6 +998,7 @@ func TestDoCopyFromStdinAbortsOnStreamCancellation(t *testing.T) {
 	if len(stream.outbound) != 0 {
 		t.Errorf("worker should not send PutResult on cancellation, got %d", len(stream.outbound))
 	}
+	assertNoWorkerCopyTempfiles(t, tmpDir)
 }
 
 func TestDoCopyFromStdinKeepsRawSQLTransactionDrainOpenWhileReceiving(t *testing.T) {
