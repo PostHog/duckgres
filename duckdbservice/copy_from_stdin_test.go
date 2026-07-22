@@ -443,6 +443,42 @@ func TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner(t *testing.T) {
 		}
 	})
 
+	t.Run("protocol-completed subset without trailer preserves values and nulls", func(t *testing.T) {
+		if _, err := session.Conn.ExecContext(ctx, `
+			CREATE TABLE binary_protocol_completed (
+				id BIGINT,
+				label VARCHAR,
+				untouched VARCHAR DEFAULT 'kept'
+			)`); err != nil {
+			t.Fatal(err)
+		}
+		payload := postgresBinaryCopyFixture(t, nil,
+			[][]byte{postgresBinaryInt64Fixture(1), []byte("one")},
+			[][]byte{postgresBinaryInt64Fixture(2), nil},
+		)
+		payload = payload[:len(payload)-2]
+		copySQL := "INSERT INTO binary_protocol_completed (id, label) " +
+			"SELECT * FROM read_postgres_binary('" + flightclient.CopyFromStdinPathPlaceholder +
+			"', columns = {c0: 'BIGINT', c1: 'VARCHAR'}, buffer_size = " +
+			flightclient.CopyFromStdinSizePlaceholder + ")"
+		if rows := runPostgresBinaryCopyFixture(t, handler, ctx, copySQL,
+			[]string{"BIGINT", "VARCHAR"}, payload); rows != 2 {
+			t.Fatalf("row count = %d, want 2", rows)
+		}
+
+		var valuesMatch bool
+		if err := session.Conn.QueryRowContext(ctx, `
+			SELECT count(*) = 2
+			   AND count(*) FILTER (WHERE id = 1 AND label = 'one' AND untouched = 'kept') = 1
+			   AND count(*) FILTER (WHERE id = 2 AND label IS NULL AND untouched = 'kept') = 1
+			FROM binary_protocol_completed`).Scan(&valuesMatch); err != nil {
+			t.Fatal(err)
+		}
+		if !valuesMatch {
+			t.Fatal("protocol-completed rows, NULL, or default value were not preserved")
+		}
+	})
+
 	t.Run("header-only rewrite reaches scanner", func(t *testing.T) {
 		if _, err := session.Conn.ExecContext(ctx, "CREATE TABLE binary_header (label VARCHAR)"); err != nil {
 			t.Fatal(err)
@@ -478,6 +514,7 @@ func TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner(t *testing.T) {
 			[][]byte{[]byte("positive"), postgresBinaryNumericFixture(t, 0, 0x0000, 3, 1, 2350)},
 			[][]byte{[]byte("negative"), postgresBinaryNumericFixture(t, 0, 0x4000, 3, 1, 2350)},
 		)
+		payload = payload[:len(payload)-2]
 		copySQL := "INSERT INTO binary_rewrite (label, amount) " +
 			"SELECT * FROM read_postgres_binary('" + flightclient.CopyFromStdinPathPlaceholder +
 			"', columns = {c0: 'VARCHAR', c1: 'DECIMAL(10,2)'}, buffer_size = " +
@@ -519,6 +556,7 @@ func TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner(t *testing.T) {
 			t.Fatal(err)
 		}
 		payload := postgresBinaryCopyFixture(t, nil)
+		payload = payload[:len(payload)-2]
 		copySQL := "INSERT INTO binary_empty " +
 			"SELECT * FROM read_postgres_binary('" + flightclient.CopyFromStdinPathPlaceholder +
 			"', columns = {c0: 'BIGINT'}, buffer_size = " + flightclient.CopyFromStdinSizePlaceholder + ")"
@@ -688,6 +726,48 @@ func TestPreparePostgresBinaryCopyReusesCanonicalSpool(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("canonical cleanup removed caller-owned spool: %v", err)
+	}
+}
+
+func TestPreparePostgresBinaryCopyCanonicalizesProtocolCompletedSpool(t *testing.T) {
+	canonical := postgresBinaryCopyFixture(t, nil,
+		[][]byte{postgresBinaryInt64Fixture(42)},
+	)
+	trailerless := canonical[:len(canonical)-2]
+	path := filepath.Join(t.TempDir(), "protocol-completed.copy")
+	if err := os.WriteFile(path, trailerless, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loadPath, loadBytes, cleanup, err := preparePostgresBinaryCopy(
+		context.Background(), path, []string{"BIGINT"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadPath == path {
+		cleanup()
+		t.Fatal("protocol-completed spool reused the trailerless input, want normalized spool")
+	}
+	if loadBytes != int64(len(canonical)) {
+		cleanup()
+		t.Fatalf("normalized load size = %d, want %d", loadBytes, len(canonical))
+	}
+	got, err := os.ReadFile(loadPath)
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, canonical) {
+		cleanup()
+		t.Fatalf("normalized spool differs\n got: %x\nwant: %x", got, canonical)
+	}
+	cleanup()
+	if _, err := os.Stat(loadPath); !os.IsNotExist(err) {
+		t.Fatalf("normalized spool still exists after cleanup: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("normalization removed caller-owned spool: %v", err)
 	}
 }
 

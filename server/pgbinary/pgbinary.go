@@ -105,22 +105,45 @@ type Inspection struct {
 	NeedsRewrite bool
 }
 
+type completionMode uint8
+
+const (
+	requireFileTrailer completionMode = iota
+	allowProtocolCompletion
+)
+
 // Inspect validates a complete PostgreSQL binary COPY stream without retaining
 // it in memory. It reports whether NUMERIC scales or a header extension require
 // a scanner-compatible rewrite.
 func Inspect(src io.Reader, schema Schema) (Inspection, error) {
-	return process(nil, src, schema)
+	return process(nil, src, schema, requireFileTrailer)
+}
+
+// InspectProtocolCompleted validates a PostgreSQL binary COPY stream after its
+// surrounding protocol has explicitly confirmed successful completion. In
+// that mode, EOF between complete tuples is equivalent to the canonical file
+// trailer and requests a rewrite that adds the canonical trailer.
+func InspectProtocolCompleted(src io.Reader, schema Schema) (Inspection, error) {
+	return process(nil, src, schema, allowProtocolCompletion)
 }
 
 // Rewrite validates src and writes a scanner-compatible PostgreSQL binary COPY
 // stream to dst. NUMERIC values are coerced to their destination scale using
 // round-half-away-from-zero, matching PostgreSQL's numeric typmod behavior.
 func Rewrite(dst io.Writer, src io.Reader, schema Schema) (int64, error) {
-	inspection, err := process(dst, src, schema)
+	inspection, err := process(dst, src, schema, requireFileTrailer)
 	return inspection.Rows, err
 }
 
-func process(dst io.Writer, src io.Reader, schema Schema) (Inspection, error) {
+// RewriteProtocolCompleted validates a protocol-completed binary COPY stream
+// and writes scanner-compatible file framing, including one canonical trailer
+// when the protocol ended cleanly between tuples without one.
+func RewriteProtocolCompleted(dst io.Writer, src io.Reader, schema Schema) (int64, error) {
+	inspection, err := process(dst, src, schema, allowProtocolCompletion)
+	return inspection.Rows, err
+}
+
+func process(dst io.Writer, src io.Reader, schema Schema, completion completionMode) (Inspection, error) {
 	if err := validateSchema(schema); err != nil {
 		return Inspection{}, err
 	}
@@ -175,9 +198,15 @@ func process(dst io.Writer, src io.Reader, schema Schema) (Inspection, error) {
 	for {
 		fieldCount, err := readInt16(src)
 		if err != nil {
-			// PostgreSQL accepts EOF at a row boundary for historical files, but
-			// Duckgres requires the explicit trailer so a truncated upload cannot
-			// be mistaken for a complete scanner input.
+			if err == io.EOF && completion == allowProtocolCompletion {
+				inspection.NeedsRewrite = true
+				if dst != nil {
+					if err := writeInt16(dst, -1); err != nil {
+						return inspection, err
+					}
+				}
+				return inspection, nil
+			}
 			return inspection, fmt.Errorf("missing or truncated PostgreSQL binary COPY trailer: %w", err)
 		}
 		if fieldCount == -1 {

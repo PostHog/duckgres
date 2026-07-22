@@ -98,7 +98,7 @@ func preparePostgresBinaryCopy(ctx context.Context, tmpPath string, databaseType
 	if err != nil {
 		return "", 0, func() {}, fmt.Errorf("open binary COPY spool: %w", err)
 	}
-	inspection, inspectErr := pgbinary.Inspect(&contextReader{ctx: ctx, r: source}, schema)
+	inspection, inspectErr := pgbinary.InspectProtocolCompleted(&contextReader{ctx: ctx, r: source}, schema)
 	closeErr := source.Close()
 	if inspectErr != nil {
 		return "", 0, func() {}, inspectErr
@@ -126,7 +126,7 @@ func preparePostgresBinaryCopy(ctx context.Context, tmpPath string, databaseType
 	}
 	normalizedPath := normalized.Name()
 	cleanup := func() { _ = os.Remove(normalizedPath) }
-	_, rewriteErr := pgbinary.Rewrite(normalized, &contextReader{ctx: ctx, r: source}, schema)
+	_, rewriteErr := pgbinary.RewriteProtocolCompleted(normalized, &contextReader{ctx: ctx, r: source}, schema)
 	sourceCloseErr := source.Close()
 	normalizedCloseErr := normalized.Close()
 	if rewriteErr != nil {
@@ -249,6 +249,9 @@ func (h *FlightSQLHandler) doCopyFromStdin(
 	loadBytes := bytesWritten
 	cleanupPrepared := func() {}
 	if len(binaryDatabaseTypeNames) > 0 {
+		// Reaching preparation means Flight ended cleanly. The control plane only
+		// closes its send side after the frontend sent pgwire CopyDone; CopyFail
+		// and transport loss abort the Flight stream before this point.
 		loadPath, loadBytes, cleanupPrepared, err = preparePostgresBinaryCopy(ctx, tmpPath, binaryDatabaseTypeNames)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

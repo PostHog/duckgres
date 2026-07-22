@@ -155,6 +155,7 @@ func TestInspectRequiresCompleteTrailerAndNoTrailingBytes(t *testing.T) {
 		payload []byte
 		want    string
 	}{
+		{name: "missing trailer", payload: payload[:len(payload)-2], want: "trailer"},
 		{name: "truncated trailer", payload: payload[:len(payload)-1], want: "trailer"},
 		{name: "trailing bytes", payload: append(append([]byte{}, payload...), 0), want: "trailing data"},
 	} {
@@ -162,6 +163,91 @@ func TestInspectRequiresCompleteTrailerAndNoTrailingBytes(t *testing.T) {
 			_, err := Inspect(bytes.NewReader(tt.payload), Schema{Columns: []Column{{}}})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Inspect() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectProtocolCompletedAcceptsMissingTrailerAtTupleBoundary(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		rows [][][]byte
+	}{
+		{name: "zero rows"},
+		{name: "one row", rows: [][][]byte{{[]byte("one")}}},
+		{name: "multiple rows with null", rows: [][][]byte{{[]byte("one")}, {nil}, {[]byte("three")}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			canonical := binaryCopy(t, nil, tt.rows)
+			trailerless := canonical[:len(canonical)-2]
+
+			inspection, err := InspectProtocolCompleted(bytes.NewReader(trailerless), Schema{Columns: []Column{{}}})
+			if err != nil {
+				t.Fatalf("InspectProtocolCompleted() error = %v", err)
+			}
+			if inspection.Rows != int64(len(tt.rows)) {
+				t.Fatalf("InspectProtocolCompleted() rows = %d, want %d", inspection.Rows, len(tt.rows))
+			}
+			if !inspection.NeedsRewrite {
+				t.Fatal("InspectProtocolCompleted() did not request a canonical trailer rewrite")
+			}
+
+			var rewritten bytes.Buffer
+			rows, err := RewriteProtocolCompleted(&rewritten, bytes.NewReader(trailerless), Schema{Columns: []Column{{}}})
+			if err != nil {
+				t.Fatalf("RewriteProtocolCompleted() error = %v", err)
+			}
+			if rows != int64(len(tt.rows)) {
+				t.Fatalf("RewriteProtocolCompleted() rows = %d, want %d", rows, len(tt.rows))
+			}
+			if !bytes.Equal(rewritten.Bytes(), canonical) {
+				t.Fatalf("RewriteProtocolCompleted() output differs\n got: %x\nwant: %x", rewritten.Bytes(), canonical)
+			}
+		})
+	}
+}
+
+func TestProtocolCompletedParsingPreservesExplicitTrailer(t *testing.T) {
+	payload := binaryCopy(t, nil, [][][]byte{{[]byte("one")}})
+	schema := Schema{Columns: []Column{{}}}
+
+	inspection, err := InspectProtocolCompleted(bytes.NewReader(payload), schema)
+	if err != nil {
+		t.Fatalf("InspectProtocolCompleted() error = %v", err)
+	}
+	if inspection.NeedsRewrite {
+		t.Fatal("InspectProtocolCompleted() requested rewrite for canonical input")
+	}
+
+	var rewritten bytes.Buffer
+	if _, err := RewriteProtocolCompleted(&rewritten, bytes.NewReader(payload), schema); err != nil {
+		t.Fatalf("RewriteProtocolCompleted() error = %v", err)
+	}
+	if !bytes.Equal(rewritten.Bytes(), payload) {
+		t.Fatalf("RewriteProtocolCompleted() doubled or changed the trailer\n got: %x\nwant: %x", rewritten.Bytes(), payload)
+	}
+}
+
+func TestProtocolCompletedParsingRejectsMalformedTerminationAndTruncation(t *testing.T) {
+	payload := binaryCopy(t, nil, [][][]byte{{[]byte("one")}})
+	headerLength := len(copySignature) + 4 + 4
+	for _, tt := range []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{name: "half trailer", payload: payload[:len(payload)-1], want: "trailer"},
+		{name: "half field count", payload: payload[:headerLength+1], want: "trailer"},
+		{name: "missing field length", payload: payload[:headerLength+2], want: "truncated field length"},
+		{name: "partial field length", payload: payload[:headerLength+2+3], want: "truncated field length"},
+		{name: "missing field payload", payload: payload[:headerLength+2+4], want: "truncated field data"},
+		{name: "partial field payload", payload: payload[:headerLength+2+4+2], want: "truncated field data"},
+		{name: "data after explicit trailer", payload: append(append([]byte{}, payload...), 0), want: "trailing data"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := InspectProtocolCompleted(bytes.NewReader(tt.payload), Schema{Columns: []Column{{}}})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("InspectProtocolCompleted() error = %v, want %q", err, tt.want)
 			}
 		})
 	}

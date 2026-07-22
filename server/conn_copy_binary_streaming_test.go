@@ -339,6 +339,51 @@ func TestHandleCopyInBinaryRemoteStreamsRawPayload(t *testing.T) {
 	}
 }
 
+func TestHandleCopyInBinaryRemoteStreamsProtocolCompletedPayloadWithoutTrailer(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("CREATE TABLE events (payload BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &recordingCopyFromStdinExecutor{
+		LocalExecutor: NewLocalExecutor(db),
+		rows:          1,
+	}
+	field := []byte("protocol-completed")
+	prefix, _, canonical := postgresBinaryCopyOneField(field)
+	trailerless := canonical[:len(canonical)-2]
+
+	var input bytes.Buffer
+	writePGMessage(&input, wire.MsgCopyData, prefix)
+	writePGMessage(&input, wire.MsgCopyData, field)
+	writePGMessage(&input, wire.MsgCopyDone, nil)
+
+	var output bytes.Buffer
+	c := &clientConn{
+		reader:   bufio.NewReader(&input),
+		writer:   bufio.NewWriter(&output),
+		executor: exec,
+		server:   &Server{},
+		txStatus: txStatusIdle,
+		ctx:      context.Background(),
+	}
+
+	query := "COPY public.events (payload) FROM STDIN (FORMAT binary)"
+	if err := c.handleCopyIn(query, "COPY PUBLIC.EVENTS (PAYLOAD) FROM STDIN (FORMAT BINARY)"); err != nil {
+		t.Fatalf("handleCopyIn: %v", err)
+	}
+	if exec.calls != 1 {
+		t.Fatalf("CopyFromStdin calls = %d, want 1", exec.calls)
+	}
+	if !bytes.Equal(exec.payload, trailerless) {
+		t.Fatalf("CopyFromStdin payload changed: got %x, want trailerless %x", exec.payload, trailerless)
+	}
+}
+
 func TestHandleCopyInBinaryRemoteAbortsOnTransportEOFBeforeCopyDone(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
