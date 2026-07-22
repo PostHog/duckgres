@@ -520,7 +520,7 @@ func SetupMultiTenant(
 		// Keyed off the TokenSet, not just cfg.ReadOnlySecret: fallbacks
 		// alone (mid-rotation) still validate, and saying otherwise here
 		// would mislead an operator debugging exactly that state.
-		slog.Info("Discovery secret not set; discovery endpoints accept only the internal secret. Set --read-only-secret or DUCKGRES_READ_ONLY_SECRET to give external writers a scoped credential.")
+		slog.Info("Read-only secret not set; discovery endpoints accept only the internal secret. Set --read-only-secret or DUCKGRES_READ_ONLY_SECRET to give external writers a scoped credential.")
 	} else if n := len(cfg.ReadOnlySecretFallbacks); n > 0 {
 		// Count only — never log the secret values.
 		slog.Info("Discovery secret rotation fallbacks active.", "fallback_count", n)
