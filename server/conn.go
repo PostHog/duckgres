@@ -76,6 +76,7 @@ type cursorState struct {
 
 type preparedStmt struct {
 	query             string
+	transpiledQuery   string // Transpiler output before direct execution rewrites; telemetry only
 	convertedQuery    string
 	paramTypes        []int32
 	numParams         int

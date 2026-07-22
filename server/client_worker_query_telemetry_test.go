@@ -243,6 +243,127 @@ func TestClientQueryReceivedExtendedUsesQueryTrace(t *testing.T) {
 	}
 }
 
+func TestClientQueryReceivedExtendedDirectRewriteClassifiedAsRewrite(t *testing.T) {
+	logs := captureClientWorkerTelemetryLogs(t)
+	tracker := installClientQueryTelemetryTracker(t)
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	c.catalogUseRewrite = true
+	executor := &passthroughRecordingExecutor{}
+	c.executor = executor
+
+	const query = "USE ducklake"
+	parseBody := append([]byte("rewrite-stmt\x00"+query+"\x00"), 0, 0)
+	c.handleParse(parseBody)
+	if _, ok := c.stmts["rewrite-stmt"]; !ok {
+		t.Fatalf("Parse did not retain the rewritten statement")
+	}
+
+	c.handleBind(bindMessageBody(
+		"rewrite-portal",
+		"rewrite-stmt",
+		int16(0), // parameter format count
+		int16(0), // parameter count
+		int16(0), // result format count
+	))
+	if _, ok := c.portals["rewrite-portal"]; !ok {
+		t.Fatalf("Bind did not create the rewrite portal")
+	}
+
+	executeBody := append([]byte("rewrite-portal"), 0)
+	executeBody = append(executeBody, 0, 0, 0, 0)
+	c.handleExecute(executeBody)
+
+	output := logs.String()
+	received := requireSingleClientReceived(t, output)
+	assertTelemetryAttrs(t, received, "scope=client", "protocol=extended", `query="`+query+`"`)
+	workerStarts := requireTelemetryLogCount(t, output, "Worker statement started.", 1)
+	workerFinishes := requireTelemetryLogCount(t, output, "Worker statement finished.", 1)
+	workerLines := append(workerStarts, workerFinishes...)
+	assertTelemetryAttrs(t, workerLines, "scope=worker", "origin=rewrite", "operation=execute")
+	for _, line := range workerLines {
+		if strings.Contains(line, " query=") || strings.Contains(line, "ducklake.main") {
+			t.Errorf("generated direct rewrite exposed worker SQL:\n%s", line)
+		}
+	}
+	if len(executor.execQueries) == 0 || executor.execQueries[len(executor.execQueries)-1] != "USE ducklake.main" {
+		t.Fatalf("last executor query = %q, want %q", executor.execQueries, "USE ducklake.main")
+	}
+	requireTelemetryEventCount(t, tracker, "query_initiated", 1)
+}
+
+func TestCopyOutWorkerTelemetryDistinguishesQueryAndTableSources(t *testing.T) {
+	tests := []struct {
+		name          string
+		outerQuery    string
+		workerQuery   string
+		wantOrigin    string
+		wantSource    string
+		wantQueryText bool
+	}{
+		{
+			name:          "query source logs client-derived worker SQL",
+			outerQuery:    "COPY (SELECT 1 AS copy_query_marker) TO STDOUT",
+			workerQuery:   "SELECT 1 AS copy_query_marker",
+			wantOrigin:    "client",
+			wantSource:    "query",
+			wantQueryText: true,
+		},
+		{
+			name:        "table source keeps generated SQL private",
+			outerQuery:  "COPY copy_table_private_marker TO STDOUT",
+			workerQuery: "SELECT * FROM copy_table_private_marker",
+			wantOrigin:  "copy",
+			wantSource:  "table",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureClientWorkerTelemetryLogs(t)
+			c, _, cleanup := newFeedbackClientConn(t)
+			defer cleanup()
+			c.passthrough = true
+
+			var executedQuery string
+			c.executor = &feedbackExecutor{queryFn: func(query string, _ ...any) (RowSet, error) {
+				executedQuery = query
+				return &feedbackErrRows{}, nil
+			}}
+
+			if err := c.handleCopyOut(tt.outerQuery, strings.ToUpper(tt.outerQuery)); err != nil {
+				t.Fatalf("handleCopyOut: %v", err)
+			}
+			if executedQuery != tt.workerQuery {
+				t.Fatalf("executor query = %q, want %q", executedQuery, tt.workerQuery)
+			}
+
+			workerStarts := requireTelemetryLogCount(t, logs.String(), "Worker statement started.", 1)
+			workerFinishes := requireTelemetryLogCount(t, logs.String(), "Worker statement finished.", 1)
+			workerLines := append(workerStarts, workerFinishes...)
+			assertTelemetryAttrs(t, workerLines,
+				"scope=worker",
+				"origin="+tt.wantOrigin,
+				"operation=copy_out_select",
+				"source_kind="+tt.wantSource,
+			)
+			for _, line := range workerLines {
+				if strings.Contains(line, tt.outerQuery) {
+					t.Errorf("worker event exposed outer COPY query:\n%s", line)
+				}
+				if tt.wantQueryText {
+					if !strings.Contains(line, `query="`+tt.workerQuery+`"`) {
+						t.Errorf("worker event omitted query-source SQL:\n%s", line)
+					}
+				} else if strings.Contains(line, " query=") || strings.Contains(line, "copy_table_private_marker") {
+					t.Errorf("generated table-source event exposed SQL or identifiers:\n%s", line)
+				}
+			}
+		})
+	}
+}
+
 func TestNestedBeginDoesNotLogWorkerStatement(t *testing.T) {
 	t.Run("extended", func(t *testing.T) {
 		logs := captureClientWorkerTelemetryLogs(t)

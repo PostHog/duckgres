@@ -153,10 +153,11 @@ func (c *clientConn) handleParse(body []byte) {
 		paramCount := countDollarParams(query)
 		delete(c.stmts, stmtName)
 		c.stmts[stmtName] = &preparedStmt{
-			query:          query,
-			convertedQuery: query, // No transpilation
-			paramTypes:     paramTypes,
-			numParams:      paramCount,
+			query:           query,
+			transpiledQuery: query, // No transpilation or execution rewrite
+			convertedQuery:  query,
+			paramTypes:      paramTypes,
+			numParams:       paramCount,
 		}
 		_ = wire.WriteParseComplete(c.writer)
 		return
@@ -191,6 +192,7 @@ func (c *clientConn) handleParse(body []byte) {
 
 	c.stmts[stmtName] = &preparedStmt{
 		query:             query,                            // Keep original for logging and Describe
+		transpiledQuery:   result.SQL,                       // Before direct execution rewrites
 		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
@@ -635,14 +637,20 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	originalQuery := p.stmt.query
+	transpiledQuery := p.stmt.transpiledQuery
 	convertedQuery := p.stmt.convertedQuery
+	if transpiledQuery == "" {
+		// Preserve the existing classification for preparedStmt values built by
+		// tests and internal helpers that predate the explicit three-stage form.
+		transpiledQuery = convertedQuery
+	}
 	if !returnsResults && cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 		c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
 		_ = c.writeCommandComplete("BEGIN")
 		return
 	}
 
-	workerOrigin := workerOriginForQueries(originalQuery, convertedQuery, convertedQuery)
+	workerOrigin := workerOriginForQueries(originalQuery, transpiledQuery, convertedQuery)
 	workerOperation := workerOperationExecute
 	if returnsResults {
 		workerOperation = workerOperationSelect

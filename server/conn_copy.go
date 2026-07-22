@@ -323,12 +323,14 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	// The source can be a table name or a query in parentheses
 	source := strings.TrimSpace(matches[1])
+	sourceIsQuery := strings.HasPrefix(source, "(") && strings.HasSuffix(source, ")")
 	var selectQuery string
-	if strings.HasPrefix(source, "(") && strings.HasSuffix(source, ")") {
+	if sourceIsQuery {
 		selectQuery = source[1 : len(source)-1]
 	} else {
 		selectQuery = fmt.Sprintf("SELECT * FROM %s", source)
 	}
+	originalSelectQuery := selectQuery
 
 	// Transpile the inner SELECT to handle schema mappings (e.g., public -> main)
 	// The outer COPY statement may not have been transpiled if pg_query can't parse
@@ -344,15 +346,20 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	workerStart := time.Now()
 	var workerRows int64
 	var workerErr error
-	sourceKind := "table"
-	if strings.HasPrefix(source, "(") {
-		sourceKind = "query"
-	}
 	workerStatement := generatedWorkerStatement(
 		workerOriginCopy,
 		workerOperationCopyOutSelect,
-		"source_kind", sourceKind,
+		"source_kind", "table",
 	)
+	if sourceIsQuery {
+		workerOrigin := workerOriginForQueries(originalSelectQuery, selectQuery, selectQuery)
+		workerStatement = workerStatementForQuery(
+			workerOrigin,
+			workerOperationCopyOutSelect,
+			selectQuery,
+			"source_kind", "query",
+		)
+	}
 	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
 		c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
