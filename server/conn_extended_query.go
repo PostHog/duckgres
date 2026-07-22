@@ -153,10 +153,11 @@ func (c *clientConn) handleParse(body []byte) {
 		paramCount := countDollarParams(query)
 		delete(c.stmts, stmtName)
 		c.stmts[stmtName] = &preparedStmt{
-			query:          query,
-			convertedQuery: query, // No transpilation
-			paramTypes:     paramTypes,
-			numParams:      paramCount,
+			query:           query,
+			transpiledQuery: query, // No transpilation or execution rewrite
+			convertedQuery:  query,
+			paramTypes:      paramTypes,
+			numParams:       paramCount,
 		}
 		_ = wire.WriteParseComplete(c.writer)
 		return
@@ -191,6 +192,7 @@ func (c *clientConn) handleParse(body []byte) {
 
 	c.stmts[stmtName] = &preparedStmt{
 		query:             query,                            // Keep original for logging and Describe
+		transpiledQuery:   result.SQL,                       // Before direct execution rewrites
 		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
@@ -539,6 +541,20 @@ func (c *clientConn) handleExecute(body []byte) {
 	queryMetrics := c.beginQueryMetrics(start)
 	defer c.finishQueryMetrics(queryMetrics)
 
+	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
+		trace.WithAttributes(
+			attribute.String("duckgres.protocol", "extended"),
+			attribute.String("duckgres.org_id", c.orgID),
+			attribute.String("db.user", c.username),
+			attribute.String("db.statement", observe.TruncateForSpan(loggableQuery)),
+		),
+	)
+	defer span.End()
+	prevCtx := c.ctx
+	c.ctx = queryCtx
+	defer func() { c.ctx = prevCtx }()
+	c.logClientQueryReceived(queryCtx, "extended", p.stmt.query)
+
 	// Handle cursor operations before normal execution
 	switch p.stmt.cursorOp {
 	case cursorOpDeclare:
@@ -557,16 +573,6 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.handlePgStatActivityExtended(p)
 		return
 	}
-
-	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
-		trace.WithAttributes(
-			attribute.String("duckgres.protocol", "extended"),
-			attribute.String("duckgres.org_id", c.orgID),
-			attribute.String("db.user", c.username),
-			attribute.String("db.statement", observe.TruncateForSpan(loggableQuery)),
-		),
-	)
-	defer span.End()
 
 	// Convert parameter values to interface{}, handling binary format
 	args, err := p.decodeParams()
@@ -631,34 +637,34 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	originalQuery := p.stmt.query
+	transpiledQuery := p.stmt.transpiledQuery
 	convertedQuery := p.stmt.convertedQuery
+	if transpiledQuery == "" {
+		// Preserve the existing classification for preparedStmt values built by
+		// tests and internal helpers that predate the explicit three-stage form.
+		transpiledQuery = convertedQuery
+	}
+	if !returnsResults && cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+		c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+		_ = c.writeCommandComplete("BEGIN")
+		return
+	}
 
-	// Lifecycle log pair for the extended-query path. logQueryStarted /
-	// logQueryFinished are the canonical "did a query run on a worker?"
-	// signal for Loki / Grafana (PR #519). Without these, the only log a
-	// successful extended-query produces is the structured logQuery() to
-	// the queryLogger channel, which doesn't carry worker_id and isn't
-	// scrape-friendly. queryFinalErr is captured by the deferred call so
-	// every termination path — success, ALTER-TABLE-as-VIEW retry,
-	// transaction-conflict retry, recovery rollback, fatal error — emits
-	// exactly one Finished log per Started.
+	workerOrigin := workerOriginForQueries(originalQuery, transpiledQuery, convertedQuery)
+	workerOperation := workerOperationExecute
+	if returnsResults {
+		workerOperation = workerOperationSelect
+	}
+	workerStatement := workerStatementForQuery(workerOrigin, workerOperation, convertedQuery)
 	queryStart := time.Now()
 	var queryRowsAff int64
 	var queryFinalErr error
-	c.logQueryStarted(convertedQuery)
+	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
-		c.logQueryFinished(convertedQuery, queryStart, queryRowsAff, queryFinalErr)
+		c.logWorkerStatementFinished(workerStatement, queryStart, queryRowsAff, queryFinalErr)
 	}()
 
 	if !returnsResults {
-		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
-		// while DuckDB throws an error. Match PostgreSQL behavior.
-		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
-			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			_ = c.writeCommandComplete("BEGIN")
-			return
-		}
-
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
 		c.closeCursorsAtTxEnd(cmdType)
@@ -668,7 +674,10 @@ func (c *clientConn) handleExecute(body []byte) {
 			result, err := c.executor.Exec(convertedQuery, args...)
 			if err != nil {
 				if fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(convertedQuery, err, func(fallbackQuery string) (ExecResult, error) {
-					return c.executor.Exec(fallbackQuery, args...)
+					return c.runGeneratedWorkerStatement(
+						generatedWorkerStatement(workerOriginRewrite, workerOperationCompatibilityFallback),
+						func() (ExecResult, error) { return c.executor.Exec(fallbackQuery, args...) },
+					)
 				}); handled {
 					return fallbackResult, fallbackErr
 				}

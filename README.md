@@ -310,7 +310,7 @@ teardown), so you can build a provisioning funnel and alert on failures.
 | `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
 | `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
-| `query_initiated` | A client query begins execution | `user`, `trace_id` |
+| `query_initiated` | An accepted, non-empty client query is received | `user`, `trace_id` |
 | `query_failed` | A query errors | `user`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
 
 > Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
@@ -324,9 +324,26 @@ teardown), so you can build a provisioning funnel and alert on failures.
 > `-tags kubernetes`). The `_begin` events fire wherever the admin provisioning
 > API runs.
 
-> Note: `query_initiated` fires once per query with no sampling, so its volume
-> scales 1:1 with query throughput. Capture is asynchronous and batched, so it
-> stays off the query latency path.
+> Note: `query_initiated` fires once per accepted, non-empty simple-protocol
+> Query or extended-protocol Execute. Retries, rewrites, cursor helpers, and
+> generated COPY batches do not emit additional events. Capture is asynchronous
+> and batched, so it stays off the query latency path.
+
+### Query Logs
+
+Structured logs separate the SQL received from a client from the statements
+executed by a worker:
+
+| Event | Scope | Meaning |
+| --- | --- | --- |
+| `Client query received.` | `client` | Emitted once with the bounded/redacted client SQL and `protocol=simple` or `protocol=extended`. |
+| `Worker statement started.` | `worker` | A physical statement is about to run for the client operation. |
+| `Worker statement finished.` | `worker` | The physical statement completed, with duration, affected rows, and SQLSTATE when applicable. |
+
+Client-derived worker statements carry bounded/redacted executed SQL. Generated
+rewrite and COPY work instead carries a typed `origin`, stable `operation`, and
+compact metadata; generated SQL, placeholders, arguments, and values are not
+logged. Worker statements do not create additional durable query-log records.
 
 ### CLI Flags
 

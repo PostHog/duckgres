@@ -84,7 +84,7 @@ func (emptyExecResult) RowsAffected() (int64, error) { return 0, nil }
 
 // captureSlog redirects slog.Default to a buffer, returns the buffer and a
 // restore function. Each test in this file uses it to assert the presence
-// of "Query started." / "Query finished." log lines per entrypoint.
+// of "Worker statement started." / "Worker statement finished." log lines per entrypoint.
 func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
 	t.Helper()
 	prev := slog.Default()
@@ -94,18 +94,18 @@ func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
 }
 
 // assertLifecyclePair asserts that the captured slog output contains both
-// a "Query started." line and a "Query finished." line — the invariant
+// a "Worker statement started." line and a "Worker statement finished." line — the invariant
 // PR #519 enforces: every query that runs on a worker, regardless of which
 // pgwire protocol path serviced it, gets a matched start/finish pair so a
 // LogQL filter on the message catches all of them.
 func assertLifecyclePair(t *testing.T, buf *bytes.Buffer, label string) {
 	t.Helper()
 	out := buf.String()
-	if !strings.Contains(out, `msg="Query started."`) {
-		t.Errorf("[%s] missing 'Query started.' in:\n%s", label, out)
+	if !strings.Contains(out, `msg="Worker statement started."`) {
+		t.Errorf("[%s] missing 'Worker statement started.' in:\n%s", label, out)
 	}
-	if !strings.Contains(out, `msg="Query finished."`) {
-		t.Errorf("[%s] missing 'Query finished.' in:\n%s", label, out)
+	if !strings.Contains(out, `msg="Worker statement finished."`) {
+		t.Errorf("[%s] missing 'Worker statement finished.' in:\n%s", label, out)
 	}
 }
 
@@ -117,8 +117,9 @@ func TestLifecycleLogsBoundOversizedQueryText(t *testing.T) {
 	defer cleanup()
 
 	query := "SELECT " + strings.Repeat("q", maxQueryLength) + " query-tail-marker"
-	c.logQueryStarted(query)
-	c.logQueryFinished(query, time.Now(), 0, errors.New("engine error: "+query))
+	statement := workerStatementWithQuery(workerOriginClient, workerOperationSelect, query)
+	c.logWorkerStatementStarted(statement)
+	c.logWorkerStatementFinished(statement, time.Now(), 0, errors.New("engine error: "+query))
 
 	out := buf.String()
 	assertLifecyclePair(t, buf, "oversized-query")
@@ -151,9 +152,9 @@ func TestLifecyclePairFiresOnExecuteQueryDirect(t *testing.T) {
 }
 
 // TestLifecyclePairFiresOnExecuteQueryDirectOnError verifies the deferred
-// logQueryFinished fires even when the executor returns an error — pre-PR #519
+// the worker finish event fires even when the executor returns an error — pre-PR #519
 // the error path emitted only logQueryError, so a LogQL filter on
-// "Query finished." would miss failed queries entirely.
+// "Worker statement finished." would miss failed queries entirely.
 func TestLifecyclePairFiresOnExecuteQueryDirectOnError(t *testing.T) {
 	buf, restore := captureSlog(t)
 	defer restore()
@@ -169,14 +170,19 @@ func TestLifecyclePairFiresOnExecuteQueryDirectOnError(t *testing.T) {
 		t.Fatalf("executeQueryDirect returned non-nil err: %v", err)
 	}
 	assertLifecyclePair(t, buf, "executeQueryDirect-error")
-	if !strings.Contains(buf.String(), `error=`) {
-		t.Errorf("expected error= attr on Finished log for failed query:\n%s", buf.String())
+	if !strings.Contains(buf.String(), `error_code=`) {
+		t.Errorf("expected error_code= attr on Finished log for failed query:\n%s", buf.String())
+	}
+	for _, line := range telemetryLogLines(buf.String(), "Worker statement finished.") {
+		if strings.Contains(line, ` error=`) {
+			t.Errorf("worker lifecycle log exposed raw error text:\n%s", line)
+		}
 	}
 }
 
 // TestLifecyclePairFiresOnExecuteSelectQuery covers the simple-query SELECT
-// path. This path already had logQueryStarted pre-#519, but error returns
-// (Scan errors, Columns errors, rows.Err()) skipped logQueryFinished —
+// path. This path already had a worker start event pre-#519, but error returns
+// (Scan errors, Columns errors, rows.Err()) skipped the worker finish event —
 // verify the deferred close pattern now balances every Started.
 func TestLifecyclePairFiresOnExecuteSelectQuery(t *testing.T) {
 	buf, restore := captureSlog(t)
@@ -275,7 +281,7 @@ func (f failingWriter) Write(_ []byte) (int, error) { return 0, f.err }
 // from the posthog-mw-prod-us TCP-write-timeout incident: when a mid-stream
 // wire write fails (sendRowDescription / sendDataRowWithFormats), the CP must
 // emit Error-level "Query execution errored." so alerts fire. Pre-fix only
-// the deferred Info-level "Query finished." was emitted, hiding the failure
+// the deferred Info-level "Worker statement finished." was emitted, hiding the failure
 // below alerting thresholds.
 func TestExecuteSelectQuery_LogsErrorOnWireWriteFailure(t *testing.T) {
 	buf, restore := captureSlog(t)

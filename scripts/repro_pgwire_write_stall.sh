@@ -6,7 +6,7 @@
 # the idle 350s+ connection while the CP was streaming results). Without the
 # TCP_USER_TIMEOUT fix the CP blocks on the unacked write for ~15 minutes
 # before the kernel collapses the socket, and the only log line emitted is
-# Info-level "Query finished.". With the fix the CP fails the write in ~60s
+# Info-level "Worker statement finished.". With the fix the CP fails the write in ~60s
 # and emits Error-level "Query execution errored.".
 #
 # How the simulation works:
@@ -25,7 +25,7 @@
 #     ./scripts/repro_pgwire_write_stall.sh
 #
 # Then watch the CP's logs and confirm:
-#   - Pre-fix: ~15 min of silence, then a single "Query finished." Info line.
+#   - Pre-fix: ~15 min of silence, then a single "Worker statement finished." Info line.
 #   - Post-fix: ~60 s, then "Query execution errored." at Error level with
 #     SQLSTATE 57P03 (or class 08 connection_exception, depending on how the
 #     kernel surfaces the ETIMEDOUT).
@@ -77,10 +77,10 @@ kill -STOP "$SOCAT_PID"
 echo "[$(date +%H:%M:%S)] socat stopped. Watch the CP logs now."
 echo
 echo "  kubectl -n duckgres logs -f -l app=duckgres-cp --tail=100 \\"
-echo "      | grep -E 'Query (started|finished|execution errored)'"
+echo "      | grep -E 'Worker statement (started|finished)|Query execution errored'"
 echo
 echo "Expected timeline:"
-echo "  pre-fix : ~15 min until ETIMEDOUT, then Info-level 'Query finished.'"
+echo "  pre-fix : ~15 min until ETIMEDOUT, then Info-level 'Worker statement finished.'"
 echo "  post-fix: ~60 s until TCP_USER_TIMEOUT fires, then Error-level"
 echo "            'Query execution errored.' with the wire-write error."
 echo

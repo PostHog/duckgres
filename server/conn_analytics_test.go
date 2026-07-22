@@ -31,11 +31,11 @@ func installFakeQueryTracker(t *testing.T) *fakeQueryTracker {
 	return fake
 }
 
-func TestLogQueryStartedEmitsQueryInitiated(t *testing.T) {
+func TestLogClientQueryReceivedEmitsQueryInitiated(t *testing.T) {
 	fake := installFakeQueryTracker(t)
 	c := &clientConn{orgID: "acme", username: "root", ctx: context.Background()}
 
-	c.logQueryStarted("SELECT 1")
+	c.logClientQueryReceived(context.Background(), "simple", "SELECT 1")
 
 	if len(fake.events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(fake.events))

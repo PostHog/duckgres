@@ -116,14 +116,12 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	// Lifecycle log pair, like the normal exec paths. logQueryStarted/
-	// Finished/Error redact secret DDL internally (see usersecrets.
-	// RedactForLog) — they own redaction, callers pass raw text.
+	workerStatement := workerStatementWithQuery(workerOriginClient, workerOperationPersistentSecretDDL, query)
 	queryStart := time.Now()
 	var queryFinalErr error
-	c.logQueryStarted(query)
+	c.logWorkerStatementStarted(workerStatement)
 	defer func() {
-		c.logQueryFinished(query, queryStart, 0, queryFinalErr)
+		c.logWorkerStatementFinished(workerStatement, queryStart, 0, queryFinalErr)
 	}()
 
 	upperQuery := strings.ToUpper(query)

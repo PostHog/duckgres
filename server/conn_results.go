@@ -594,7 +594,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	if severity != "" {
 		c.lastErrorCode = code
 	}
-	c.logger().Debug("Sending error to client.", "severity", severity, "code", code, "message", message)
+	c.logger().Debug("Sending error to client.", "severity", severity, "code", code)
 	c.errorResponsesSent++
 	_ = wire.WriteErrorResponse(c.writer, severity, code, message)
 	_ = c.flushWriter()

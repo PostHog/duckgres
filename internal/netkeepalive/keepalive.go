@@ -7,8 +7,8 @@
 // CP write blocked on TCP retransmits for ~15 minutes before the connection
 // finally errors. That window swallows the symptom: the CP keeps the query
 // "open" with no error log, the pgwire client has long since given up, and
-// the operator only sees a Query finished. line at Info severity once the
-// kernel finally collapses the socket.
+// the operator only sees a Worker statement finished. line at Info severity
+// once the kernel finally collapses the socket.
 //
 // TuneAcceptedConn does two things to bound the window to ~60s:
 //   - Tighter SO_KEEPALIVE: probe every 10s after 30s idle, give up after 3

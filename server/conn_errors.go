@@ -25,7 +25,7 @@ func isQueryCancelled(err error) bool {
 // that case c.ctx is still healthy, c.ctx.Err() is nil, and the surface error
 // must be logged as an infra failure rather than suppressed as "user
 // cancelled". This matters for alerting — "Query execution errored." should
-// fire on worker kills, not get silently downgraded to "Query finished.".
+// fire on worker kills, not get silently downgraded to "Worker statement finished.".
 func (c *clientConn) isCallerCancellation(err error) bool {
 	if !isQueryCancelled(err) {
 		return false

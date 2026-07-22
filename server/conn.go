@@ -76,6 +76,7 @@ type cursorState struct {
 
 type preparedStmt struct {
 	query             string
+	transpiledQuery   string // Transpiler output before direct execution rewrites; telemetry only
 	convertedQuery    string
 	paramTypes        []int32
 	numParams         int
@@ -445,15 +446,6 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 	}
 }
 
-// logQueryStarted records a query handing off to a worker. Pairs with
-// logQueryFinished at every termination point so logs and traces can
-// be cross-referenced — the trace_id attribute matches the OTEL span
-// ID exported by the same query, so a search like trace_id=abc123 in
-// Loki/Grafana lines up directly with the trace view.
-//
-// Includes worker_id and worker_pod so an operator chasing a specific
-// worker incident (e.g. the one in the worker-40761 postmortem) can
-// filter to just that worker's queries without joining across logs.
 // logger returns the connection-scoped logger: every line carries the session
 // identity (user, org, worker, worker_pod) so the full request/query lifecycle
 // is filterable by org or worker without joining log streams. Built per call —
@@ -476,42 +468,22 @@ func (c *clientConn) logger() *slog.Logger {
 	return slog.With(attrs...)
 }
 
-func (c *clientConn) logQueryStarted(query string) {
-	query = boundQueryLogText(usersecrets.RedactForLog(query))
-	c.logger().Info("Query started.",
-		"query", query,
-		"trace_id", observe.TraceIDFromContext(c.ctx))
-	// Per-org product analytics. No SQL text or secrets are sent — only
-	// metadata — so this is unaffected by the secret-redaction concerns above.
+// logClientQueryReceived records the logical client request once it has been
+// authorized and attached to its query span. Worker execution has a separate
+// statement lifecycle, so this event deliberately has no matching finish.
+func (c *clientConn) logClientQueryReceived(ctx context.Context, protocol, query string) {
+	traceID := observe.TraceIDFromContext(ctx)
+	c.logger().Info("Client query received.",
+		"scope", "client",
+		"protocol", protocol,
+		"query", boundQueryLogText(usersecrets.RedactForLog(query)),
+		"query_source", c.QuerySource(),
+		"trace_id", traceID,
+	)
 	analytics.Default().Capture("query_initiated", c.orgID, map[string]any{
 		"user":     c.username,
-		"trace_id": observe.TraceIDFromContext(c.ctx),
+		"trace_id": traceID,
 	})
-}
-
-// logQueryFinished records a query terminating on the worker. Counter-
-// part to logQueryStarted; emit once per query regardless of outcome
-// so the start/finish pair is always balanced.
-//
-// On error paths logQueryError still fires for severity routing
-// (Info vs Error based on SQLSTATE class). logQueryFinished
-// deliberately stays at Info even on error so the lifecycle pair stays
-// readable as a stream — operators following one trace see both a
-// "started" and a "finished" line, and can look at the separate error
-// line for severity context.
-func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64, err error) {
-	attrs := []any{
-		"query", boundQueryLogText(usersecrets.RedactForLog(query)),
-		"duration_ms", time.Since(start).Milliseconds(),
-		"rows", rows,
-		"trace_id", observe.TraceIDFromContext(c.ctx),
-	}
-	if err != nil {
-		// Engine errors echo the offending SQL, so a failed CREATE SECRET
-		// leaks the credential here unless the error is redacted too.
-		attrs = append(attrs, "error", boundQueryLogText(usersecrets.RedactErrorForLog(query, err.Error())))
-	}
-	c.logger().Info("Query finished.", attrs...)
 }
 
 // logQueryError logs a query execution failure. DuckLake-specific
@@ -1313,6 +1285,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	c.ctx = ctx
 	defer func() { c.ctx = prevCtx }()
 
+	c.logClientQueryReceived(ctx, "simple", query)
 	c.logger().Debug("Query received.", "query", loggableQuery)
 
 	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
@@ -1473,6 +1446,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// Use the transpiled SQL
 	originalQuery := query
 	query = c.rewriteDirectQuery(result.SQL)
+	workerOrigin := workerOriginForQueries(originalQuery, result.SQL, query)
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
@@ -1507,13 +1481,25 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
+		workerStatement := workerStatementForQuery(workerOrigin, workerOperationExecute, query)
+		workerStart := time.Now()
+		var workerRows int64
+		var workerErr error
+		c.logWorkerStatementStarted(workerStatement)
+		defer func() {
+			c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
+		}()
+
 		execStart := time.Now()
 		execCtx, execSpan := observe.Tracer().Start(ctx, "duckgres.execute")
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
 				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(query, err, func(fallbackQuery string) (ExecResult, error) {
-					return c.executor.ExecContext(ctx, fallbackQuery)
+					return c.runGeneratedWorkerStatement(
+						generatedWorkerStatement(workerOriginRewrite, workerOperationCompatibilityFallback),
+						func() (ExecResult, error) { return c.executor.ExecContext(ctx, fallbackQuery) },
+					)
 				})
 				if handled {
 					return fallbackResult, fallbackErr
@@ -1542,6 +1528,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 				)
 			}
 			if err != nil {
+				workerErr = err
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
@@ -1562,6 +1549,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		if execResult != nil {
 			writtenRows, _ = execResult.RowsAffected()
 		}
+		workerRows = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = c.writeCommandComplete(tag)
@@ -1572,7 +1560,11 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	}
 
 	// Execute query that returns results (SELECT, DML RETURNING, etc.)
-	rowCount, errCode, errMsg, err := c.executeSelectQuery(query, cmdType)
+	rowCount, errCode, errMsg, err := c.executeSelectQuery(
+		query,
+		cmdType,
+		workerStatementForQuery(workerOrigin, workerOperationSelect, query),
+	)
 	if err == nil {
 		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, errCode, errMsg, "simple")
 	}
