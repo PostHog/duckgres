@@ -98,3 +98,4 @@ USER duckgres
 EXPOSE 5432 8816 9090
 
 ENTRYPOINT ["/app/duckgres"]
+
