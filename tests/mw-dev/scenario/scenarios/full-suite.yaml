@@ -3,7 +3,6 @@ run_id_prefix: scenario-full-suite
 required_env:
   - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
-  - DUCKGRES_SCENARIO_FLIGHT_ADDR
 steps:
   - id: provision
     type: provision_warehouse
@@ -54,10 +53,10 @@ steps:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       catalog_file: ../../../perf/queries/ducklake_frozen.yaml
+      targets: [pgwire]
       run_id: ${run_id}
       dataset_version: posthog-file-views-v1
-      flight_addr: ${env:DUCKGRES_SCENARIO_FLIGHT_ADDR}
-      fail_on_query_errors: false
+      fail_on_query_errors: true
 
   - id: dbt_models
     type: dbt_run
@@ -69,6 +68,7 @@ steps:
       project_dir: ../dbt/posthog_frozen_project
       worker_cpu: "2"
       worker_memory: 4Gi
+      connect_timeout: 360
       commands: [debug, run, test, docs_generate]
       retry:
         enabled: true

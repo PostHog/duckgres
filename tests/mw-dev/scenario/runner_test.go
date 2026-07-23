@@ -174,7 +174,6 @@ func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 		"full-suite.yaml",
 	} {
 		t.Run(scenarioFile, func(t *testing.T) {
-			t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "grpc://flight.example:8815")
 			t.Setenv("DUCKGRES_SCENARIO_ORG_ID", scenarioOrgID)
 			scenario, err := core.LoadScenario(filepath.Join("scenarios", scenarioFile))
 			if err != nil {
@@ -214,7 +213,6 @@ func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 
 func TestFastSuiteScenarioComposesWorkloadsWithoutDBT(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
-	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "fast-suite.yaml"))
@@ -266,6 +264,8 @@ func TestFastSuiteScenarioComposesWorkloadsWithoutDBT(t *testing.T) {
 			t.Fatalf("step %s dependencies = %#v, want [setup_frozen_views]", stepID, got)
 		}
 	}
+	assertPerfQueryErrorsFailStep(t, steps["perf_queries"])
+	assertPerfTargetsOnlyPGWire(t, steps["perf_queries"])
 	deprovision := steps["deprovision"]
 	if !deprovision.AlwaysRun {
 		t.Fatal("deprovision should always run")
@@ -277,7 +277,6 @@ func TestFastSuiteScenarioComposesWorkloadsWithoutDBT(t *testing.T) {
 
 func TestFullSuiteScenarioComposesWorkloadsAsDAG(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
-	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "full-suite.yaml"))
@@ -324,6 +323,8 @@ func TestFullSuiteScenarioComposesWorkloadsAsDAG(t *testing.T) {
 			t.Fatalf("step %s dependencies = %#v, want [setup_frozen_views]", stepID, got)
 		}
 	}
+	assertPerfQueryErrorsFailStep(t, steps["perf_queries"])
+	assertPerfTargetsOnlyPGWire(t, steps["perf_queries"])
 	assertDBTWorkerSize(t, steps["dbt_models"])
 	deprovision := steps["deprovision"]
 	if !deprovision.AlwaysRun {
@@ -448,7 +449,6 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 
 func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
-	t.Setenv("DUCKGRES_SCENARIO_FLIGHT_ADDR", "flight.dev.example:443")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
@@ -482,12 +482,11 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-perf-20260102t030405z" {
 			t.Fatalf("perf run_id = %q, want scenario run id", runID)
 		}
-		if flightAddr, _ := step.With["flight_addr"].(string); flightAddr != "flight.dev.example:443" {
-			t.Fatalf("perf flight_addr = %q, want env-provided Flight address", flightAddr)
+		if _, ok := step.With["flight_addr"]; ok {
+			t.Fatal("frozen perf scenario should not configure the deprecated Flight endpoint")
 		}
-		if failOnQueryErrors, _ := step.With["fail_on_query_errors"].(bool); failOnQueryErrors {
-			t.Fatal("frozen perf scenario should report query errors without failing the scenario")
-		}
+		assertPerfQueryErrorsFailStep(t, step)
+		assertPerfTargetsOnlyPGWire(t, step)
 		if _, ok := step.With["flight_insecure_skip_verify"]; ok {
 			t.Fatal("perf scenario should use DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY default instead of hardcoding TLS behavior")
 		}
@@ -553,6 +552,24 @@ func assertDBTWorkerSize(t *testing.T, step core.Step) {
 	}
 	if got, _ := step.With["worker_memory"].(string); got != "4Gi" {
 		t.Fatalf("dbt worker_memory = %q, want 4Gi", got)
+	}
+	if got := fmt.Sprint(step.With["connect_timeout"]); got != "360" {
+		t.Fatalf("dbt connect_timeout = %q, want 360 seconds", got)
+	}
+}
+
+func assertPerfQueryErrorsFailStep(t *testing.T, step core.Step) {
+	t.Helper()
+	if failOnQueryErrors, _ := step.With["fail_on_query_errors"].(bool); !failOnQueryErrors {
+		t.Fatalf("perf step %s should record query errors as a failed DAG step", step.ID)
+	}
+}
+
+func assertPerfTargetsOnlyPGWire(t *testing.T, step core.Step) {
+	t.Helper()
+	targets, ok := step.With["targets"].([]any)
+	if !ok || len(targets) != 1 || targets[0] != "pgwire" {
+		t.Fatalf("perf step %s targets = %#v, want [pgwire]", step.ID, step.With["targets"])
 	}
 }
 

@@ -38,15 +38,17 @@ Frozen dataset scenarios additionally require:
 export DUCKGRES_SCENARIO_FROZEN_S3_URI="s3://<dev-managed-bucket>/frozen_v1/"
 ```
 
-The full suite, fast suite, and targeted perf scenarios additionally require the Flight SQL address because the perf catalog exercises both PGWire and Flight:
+The full suite, fast suite, and targeted frozen perf scenarios exercise PGWire
+only. Frozen perf records per-query success and failure rows in
+`query_results.csv`.
+Measured query errors fail the perf DAG step after its artifacts are written;
+independent sibling steps continue to run.
 
-```bash
-export DUCKGRES_SCENARIO_FLIGHT_ADDR="<flight-sql-address>"
-export DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY="true"
-```
-
-Frozen perf records per-query success and failure rows in `query_results.csv`.
-The scenario is configured to preserve those query failures as reported perf results instead of failing the scenario step.
+A `perf_queries` step can set `with.targets` to a non-empty subset of the
+catalog's targets. If omitted, every target declared by the catalog runs. The
+frozen scenarios set `targets: [pgwire]` so they do not call the deprecated
+DuckHog Flight endpoint while the shared catalog remains usable by legacy perf
+jobs during the deprecation period.
 
 Do not commit concrete dev endpoints, secrets, org IDs, or private bucket names.
 
@@ -132,7 +134,12 @@ The frozen dbt scenario uses:
 
 dbt artifacts are written under `artifacts/scenario/<run_id>/dbt/`, including per-command stdout/stderr logs, `target/` artifacts, and dbt logs. Install `dbt-postgres` locally or set `DUCKGRES_SCENARIO_DBT_BIN` to the dbt executable to use.
 
-The frozen dbt workload requests a 2 CPU, 4Gi worker through the dbt connection's `duckgres.worker_cpu` and `duckgres.worker_memory` startup options. Other scenario workloads continue to use the warehouse's default worker size. A `dbt_run` step can opt into a different size with `with.worker_cpu` and `with.worker_memory`.
+The frozen dbt workload requests a 2 CPU, 4Gi worker through the dbt connection's `duckgres.worker_cpu` and `duckgres.worker_memory` startup options. It also sets `with.connect_timeout: 360`, long enough for the control plane's five-minute worker queue to provision a cold Karpenter node. Other scenario workloads use the isolated control plane's default worker size; `scenario-dev` sets that default to 2 CPU and 8Gi to add process headroom for repeated frozen pgwire aggregates. A `dbt_run` step can opt into a different size or connection window with `with.worker_cpu`, `with.worker_memory`, and `with.connect_timeout`.
+
+`perf_queries` defaults `with.fail_on_query_errors` to `true`. A measured query
+error therefore marks that DAG step failed and appears in the scenario result,
+while independent sibling steps continue. Set it to `false` only for a
+diagnostic scenario whose query failures are intentionally non-verdict data.
 
 dbt retry is opt-in per scenario step:
 

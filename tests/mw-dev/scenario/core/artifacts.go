@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type RunSummary struct {
@@ -82,6 +84,9 @@ func WriteArtifacts(dir string, summary RunSummary, results []StepResult) error 
 	if err := writeSummary(filepath.Join(dir, "scenario_summary.json"), summary); err != nil {
 		return err
 	}
+	if err := writeMarkdownSummary(filepath.Join(dir, "scenario_summary.md"), summary, results); err != nil {
+		return err
+	}
 	if err := writeStepResults(filepath.Join(dir, "step_results.csv"), results); err != nil {
 		return err
 	}
@@ -89,6 +94,100 @@ func WriteArtifacts(dir string, summary RunSummary, results []StepResult) error 
 		return err
 	}
 	return nil
+}
+
+func writeMarkdownSummary(path string, summary RunSummary, results []StepResult) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create Markdown scenario summary: %w", err)
+	}
+
+	var body strings.Builder
+	fmt.Fprintf(&body, "# Scenario result: %s\n\n", markdownInline(summary.ScenarioName))
+	fmt.Fprintf(&body, "**Status:** %s\n\n", summary.Status)
+	fmt.Fprintf(
+		&body,
+		"**Steps:** %d succeeded, %d failed, %d skipped, %d recovered\n\n",
+		summary.SucceededSteps,
+		summary.FailedSteps,
+		summary.SkippedSteps,
+		summary.RecoveredSteps,
+	)
+
+	if summary.FailedSteps > 0 || summary.SkippedSteps > 0 {
+		body.WriteString("## Failed and skipped steps\n\n")
+		writeMarkdownStepTable(&body, results, func(status StepStatus) bool {
+			return status == StepStatusFailed || status == StepStatusSkipped
+		})
+	}
+
+	body.WriteString("## All steps\n\n")
+	writeMarkdownStepTable(&body, results, func(StepStatus) bool { return true })
+
+	if _, err := f.WriteString(body.String()); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write Markdown scenario summary: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close Markdown scenario summary: %w", err)
+	}
+	return nil
+}
+
+func writeMarkdownStepTable(body *strings.Builder, results []StepResult, include func(StepStatus) bool) {
+	body.WriteString("| Status | Step | Type | Duration | Attempts | Details |\n")
+	body.WriteString("|---|---|---|---:|---:|---|\n")
+	for _, result := range results {
+		if !include(result.Status) {
+			continue
+		}
+		details := markdownInline(result.Error)
+		if result.ErrorClass != "" {
+			class := "`" + markdownInline(result.ErrorClass) + "`"
+			if details == "" {
+				details = class
+			} else {
+				details = class + ": " + details
+			}
+		}
+		fmt.Fprintf(
+			body,
+			"| %s | `%s` | `%s` | %s | %d | %s |\n",
+			result.Status,
+			markdownInline(result.StepID),
+			markdownInline(result.StepType),
+			markdownDuration(result.Duration),
+			result.Attempts,
+			details,
+		)
+	}
+	body.WriteString("\n")
+}
+
+func markdownInline(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	value = truncateRunes(value, 240)
+	replacer := strings.NewReplacer(
+		"\\", "\\\\",
+		"|", "\\|",
+		"`", "\\`",
+	)
+	return replacer.Replace(value)
+}
+
+func truncateRunes(value string, max int) string {
+	if utf8.RuneCountInString(value) <= max {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:max-1]) + "…"
+}
+
+func markdownDuration(duration time.Duration) string {
+	if duration <= 0 {
+		return "0s"
+	}
+	return duration.Round(time.Millisecond).String()
 }
 
 func PrepareArtifactDir(dir string) error {

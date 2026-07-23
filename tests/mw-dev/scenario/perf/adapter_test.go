@@ -102,6 +102,128 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	}
 }
 
+func TestExecutorRestrictsCatalogToStepTargets(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire, perfcore.ProtocolFlight})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			DialHost:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir:     t.TempDir(),
+		DriverFactory: factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":       "scenario-org",
+			"catalog_file": catalogPath,
+			"run_id":       "scenario-run-1",
+			"targets":      []any{"pgwire"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+
+	result, ok := executor.State().Result("perf_queries")
+	if !ok {
+		t.Fatal("expected perf result to be recorded")
+	}
+	if result.Summary.TotalQueries != 1 || result.Summary.TotalErrors != 0 {
+		t.Fatalf("summary = %+v, want one successful pgwire query", result.Summary)
+	}
+	if factory.flightAddr != "" {
+		t.Fatalf("flight driver was configured with %q despite pgwire-only override", factory.flightAddr)
+	}
+	csvBytes, err := os.ReadFile(filepath.Join(executor.OutputDir(), "perf", "query_results.csv"))
+	if err != nil {
+		t.Fatalf("read query_results.csv: %v", err)
+	}
+	if strings.Contains(string(csvBytes), ",flight,") {
+		t.Fatalf("query_results.csv contains a Flight result despite pgwire-only override: %q", string(csvBytes))
+	}
+}
+
+func TestExecutorRejectsTargetOverrideOutsideCatalog(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			DialHost:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir:     t.TempDir(),
+		FlightAddr:    "flight.dev.example:443",
+		DriverFactory: &fakeDriverFactory{},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":       "scenario-org",
+			"catalog_file": catalogPath,
+			"run_id":       "scenario-run-1",
+			"targets":      []any{"flight"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "is not present in perf catalog") {
+		t.Fatalf("error = %v, want target subset validation error", err)
+	}
+}
+
+func TestExecutorRejectsInvalidTargetOverride(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			DialHost:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir:     t.TempDir(),
+		DriverFactory: &fakeDriverFactory{},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":       "scenario-org",
+			"catalog_file": catalogPath,
+			"run_id":       "scenario-run-1",
+			"targets":      "pgwire",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "with.targets must be a non-empty list") {
+		t.Fatalf("error = %v, want invalid target list error", err)
+	}
+}
+
 func TestExecutorFailsPerfStepWhenMeasuredQueryErrors(t *testing.T) {
 	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
 	provisionState := provision.NewState()

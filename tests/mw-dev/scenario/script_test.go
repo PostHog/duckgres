@@ -50,11 +50,13 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	for _, name := range []string{
 		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
-		"DUCKGRES_SCENARIO_FLIGHT_ADDR",
 	} {
 		if !strings.Contains(text, name) {
 			t.Fatalf("script output %q missing %s", text, name)
 		}
+	}
+	if strings.Contains(text, "DUCKGRES_SCENARIO_FLIGHT") {
+		t.Fatalf("frozen perf scenario should not require the deprecated Flight endpoint; output: %q", text)
 	}
 }
 
@@ -84,9 +86,15 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"CLUSTER_NAME: posthog-mw-dev",
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
+		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"2\"",
+		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 8Gi",
 		"role-duration-seconds: 16200",
 		"tests/mw-dev/run.sh deploy",
 		"tests/mw-dev/run.sh test-scenario",
+		"- name: Publish scenario summary",
+		"if: always()",
+		"scenario_summary.md",
+		"$GITHUB_STEP_SUMMARY",
 		"tests/mw-dev/run.sh diagnostics",
 		"tests/mw-dev/run.sh teardown",
 		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev",
