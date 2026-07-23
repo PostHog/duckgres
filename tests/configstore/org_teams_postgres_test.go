@@ -184,34 +184,28 @@ func TestUpsertOrgTeamSchemaConflictPostgres(t *testing.T) {
 }
 
 // TestDeleteOrgTeamPostgres covers the transactional delete rules: last-team
-// refusal, billing handover to the OLDEST remaining team, and the usage
-// bucket re-attribution riding in the same transaction.
+// refusal (an org must always have at least one team), the project-reader
+// cleanup riding in the same transaction, and that a delete never touches
+// usage buckets or other team rows (no billing handover exists anymore).
 func TestDeleteOrgTeamPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	seedOrg(t, store, "acme")
 	pstore := provisioning.NewGormStore(store)
 
-	// Billing team 1 (oldest), then 3, then 2 — created_at decides succession,
-	// NOT team id, so the successor must be team 3.
 	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	for _, seed := range []struct {
 		team      int64
 		schema    string
 		createdAt time.Time
-		billing   bool
 	}{
-		{1, "team_1", base, true},
-		{3, "team_3", base.Add(time.Hour), false},
-		{2, "team_2", base.Add(2 * time.Hour), false},
+		{1, "team_1", base},
+		{3, "team_3", base.Add(time.Hour)},
+		{2, "team_2", base.Add(2 * time.Hour)},
 	} {
-		var billing interface{}
-		if seed.billing {
-			billing = true
-		}
 		if err := store.DB().Exec(`
-			INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
-			VALUES ('acme', ?, ?, TRUE, ?, ?, ?)`,
-			seed.team, seed.schema, billing, seed.createdAt, seed.createdAt).Error; err != nil {
+			INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, created_at, updated_at)
+			VALUES ('acme', ?, ?, TRUE, ?, ?)`,
+			seed.team, seed.schema, seed.createdAt, seed.createdAt).Error; err != nil {
 			t.Fatalf("seed team %d: %v", seed.team, err)
 		}
 	}
@@ -226,15 +220,18 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 		t.Fatalf("seed project reader: %v", err)
 	}
 	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
-	seedUsage(t, store, "acme", 1, bucket, 10, 20, 1000)
-
-	// Deleting a non-billing team: no handover, billing untouched.
-	res, err := pstore.DeleteOrgTeam("acme", 2)
-	if err != nil {
-		t.Fatalf("delete non-billing team: %v", err)
+	if err := store.FlushComputeUsage([]configstore.ComputeUsageDelta{{
+		OrgID: "acme", TeamID: 1, QuerySource: "standard",
+		Millicores: 2000, MiB: 4096, BucketStart: bucket,
+		CPUSeconds: 10, MemorySeconds: 20,
+	}}); err != nil {
+		t.Fatalf("seed compute usage: %v", err)
 	}
-	if res.WasBilling || res.NewBillingTeamID != 0 {
-		t.Fatalf("non-billing delete result = %+v, want no handover", res)
+
+	// Deleting a team removes its row and its project-reader login — nothing
+	// else.
+	if err := pstore.DeleteOrgTeam("acme", 2); err != nil {
+		t.Fatalf("delete team: %v", err)
 	}
 	var readerCount int64
 	if err := store.DB().Model(&configstore.OrgUser{}).
@@ -245,31 +242,23 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 	if readerCount != 0 {
 		t.Fatalf("project reader count = %d, want 0 after team deletion", readerCount)
 	}
+	if err := pstore.DeleteOrgTeam("acme", 1); err != nil {
+		t.Fatalf("delete team 1: %v", err)
+	}
 
-	// Deleting the billing team: the OLDEST remaining team (3) takes over and
-	// the buffered usage moves to it atomically.
-	res, err = pstore.DeleteOrgTeam("acme", 1)
-	if err != nil {
-		t.Fatalf("delete billing team: %v", err)
+	// Usage buckets are NEVER re-attributed on team deletion: the bucket
+	// keeps its stamped (informational) team id — attribution belongs to the
+	// external billing service.
+	var usageTeams []int64
+	if err := store.DB().Raw(`SELECT team_id FROM duckgres_org_compute_usage WHERE org_id = 'acme'`).Scan(&usageTeams).Error; err != nil {
+		t.Fatalf("read usage teams: %v", err)
 	}
-	if !res.WasBilling || res.NewBillingTeamID != 3 {
-		t.Fatalf("billing delete result = %+v, want handover to team 3", res)
-	}
-	successor := readTeam(t, store, "acme", 3)
-	if successor.IsBillingTeam == nil || !*successor.IsBillingTeam {
-		t.Fatalf("team 3 must carry the billing mark, got %+v", successor)
-	}
-	compute := computeRowsForOrg(t, store, "acme")
-	if len(compute) != 1 || compute[0].TeamID != 3 || compute[0].CPUSeconds != 10 {
-		t.Fatalf("compute usage not re-attributed to team 3: %+v", compute)
-	}
-	storage := storageRowsForOrg(t, store, "acme")
-	if len(storage) != 1 || storage[0].TeamID != 3 || storage[0].ByteSeconds != 1000 {
-		t.Fatalf("storage usage not re-attributed to team 3: %+v", storage)
+	if len(usageTeams) != 1 || usageTeams[0] != 1 {
+		t.Fatalf("usage teams after deletes = %v, want stamped [1] untouched", usageTeams)
 	}
 
 	// The last team cannot be deleted.
-	if _, err := pstore.DeleteOrgTeam("acme", 3); !errors.Is(err, configstore.ErrLastOrgTeam) {
+	if err := pstore.DeleteOrgTeam("acme", 3); !errors.Is(err, configstore.ErrLastOrgTeam) {
 		t.Fatalf("last-team delete: err = %v, want ErrLastOrgTeam", err)
 	}
 	if got := readTeam(t, store, "acme", 3); got.TeamID != 3 {
@@ -277,27 +266,27 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 	}
 
 	// Unknown team → not found.
-	if _, err := pstore.DeleteOrgTeam("acme", 99); !errors.Is(err, configstore.ErrOrgTeamNotFound) {
+	if err := pstore.DeleteOrgTeam("acme", 99); !errors.Is(err, configstore.ErrOrgTeamNotFound) {
 		t.Fatalf("unknown team delete: err = %v, want ErrOrgTeamNotFound", err)
 	}
 }
 
 // TestProvisionWithTeamIDAndSchemaNamePostgres: the org-create path with the
-// new team_id+schema_name pair creates the first team row as the billing team
-// with the EXPLICIT schema instead of the conventional "team_<id>". (The
-// legacy default_team_id path — conventional schema — is pinned by
-// TestProvisionReattributesUsageOnTeamChangePostgres.)
+// team_id+schema_name pair creates the first plain team row with the EXPLICIT
+// schema instead of the conventional "team_<id>"; a provision without a
+// schema keeps the convention, and a re-provision without a schema preserves
+// a grandfathered one.
 func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	pstore := provisioning.NewGormStore(store)
 
 	if err := pstore.Provision(provisioning.ProvisionRequest{
-		OrgID:         "schemaorg",
-		DatabaseName:  "schemaorgdb",
-		DefaultTeamID: 42,
-		SchemaName:    "custom_wh",
-		Warehouse:     &configstore.ManagedWarehouse{DucklingName: "schemaorg"},
-		RootUserHash:  "hash",
+		OrgID:        "schemaorg",
+		DatabaseName: "schemaorgdb",
+		TeamID:       42,
+		SchemaName:   "custom_wh",
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "schemaorg"},
+		RootUserHash: "hash",
 	}); err != nil {
 		t.Fatalf("provision with schema: %v", err)
 	}
@@ -306,11 +295,33 @@ func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 	if team.SchemaName != "custom_wh" {
 		t.Fatalf("schema_name = %q, want explicit custom_wh", team.SchemaName)
 	}
-	if team.IsBillingTeam == nil || !*team.IsBillingTeam {
-		t.Fatalf("first team must be the billing team, got %+v", team)
-	}
 	if !team.Enabled {
 		t.Fatal("first team must be enabled")
+	}
+
+	// Without a schema the conventional name applies.
+	if err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "convorg",
+		DatabaseName: "convorgdb",
+		TeamID:       7,
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "convorg"},
+		RootUserHash: "hash",
+	}); err != nil {
+		t.Fatalf("provision without schema: %v", err)
+	}
+	if got := readTeam(t, store, "convorg", 7); got.SchemaName != "team_7" {
+		t.Fatalf("schema_name = %q, want conventional team_7", got.SchemaName)
+	}
+
+	// A NEW org without a team id is refused before any write.
+	err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "noteam",
+		DatabaseName: "noteamdb",
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "noteam"},
+		RootUserHash: "hash",
+	})
+	if !errors.Is(err, provisioning.ErrProvisionTeamRequired) {
+		t.Fatalf("teamless new-org provision: err = %v, want ErrProvisionTeamRequired", err)
 	}
 }
 
@@ -377,7 +388,7 @@ func TestListOrgTeamsByOrgIDsPostgres(t *testing.T) {
 
 // TestLatestConfigChangeCoversTeamsPostgres pins the discovery change marker
 // against the real store: a team-row edit advances it, and — the case a
-// plain DELETE would hide — deleting a NON-billing team advances it too
+// plain DELETE would hide — deleting a team advances it too
 // (DeleteOrgTeamTx touches the parent org row in the same transaction).
 func TestLatestConfigChangeCoversTeamsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
@@ -386,11 +397,6 @@ func TestLatestConfigChangeCoversTeamsPostgres(t *testing.T) {
 
 	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 1, SchemaName: "team_1"}); err != nil {
 		t.Fatalf("seed team 1: %v", err)
-	}
-	if err := store.DB().Transaction(func(tx *gorm.DB) error {
-		return configstore.SetOrgBillingTeamTx(tx, "acme", 1)
-	}); err != nil {
-		t.Fatalf("set billing: %v", err)
 	}
 	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 2, SchemaName: "team_2"}); err != nil {
 		t.Fatalf("seed team 2: %v", err)
@@ -414,10 +420,10 @@ func TestLatestConfigChangeCoversTeamsPostgres(t *testing.T) {
 		t.Fatalf("marker did not advance on team update: before=%v after=%v", before, afterUpdate)
 	}
 
-	// Deleting a NON-billing team must advance it as well — the removal is
-	// exactly the signal a change-marker poller must not skip.
+	// Deleting a team must advance it as well — the removal is exactly the
+	// signal a change-marker poller must not skip.
 	time.Sleep(1100 * time.Millisecond)
-	if _, err := pstore.DeleteOrgTeam("acme", 2); err != nil {
+	if err := pstore.DeleteOrgTeam("acme", 2); err != nil {
 		t.Fatalf("delete team 2: %v", err)
 	}
 	afterDelete, err := store.LatestConfigChange()
@@ -425,7 +431,7 @@ func TestLatestConfigChangeCoversTeamsPostgres(t *testing.T) {
 		t.Fatalf("LatestConfigChange (after delete): %v", err)
 	}
 	if !afterDelete.After(afterUpdate) {
-		t.Fatalf("marker did not advance on non-billing team delete: afterUpdate=%v afterDelete=%v", afterUpdate, afterDelete)
+		t.Fatalf("marker did not advance on team delete: afterUpdate=%v afterDelete=%v", afterUpdate, afterDelete)
 	}
 }
 

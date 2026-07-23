@@ -55,8 +55,8 @@ func TestComputeConnectionUsage(t *testing.T) {
 	}
 }
 
-// keyA is the billing key most tests share: orgA's default team, standard
-// source, an 8-vCPU/16-GiB worker.
+// keyA is the billing key most tests share: orgA's informational team,
+// standard source, an 8-vCPU/16-GiB worker.
 func keyA(bucket time.Time) computeUsageKey {
 	return computeUsageKey{orgID: "orgA", teamID: 42, querySource: "standard", millicores: 8000, mib: 16 * 1024, bucket: bucket}
 }
@@ -146,18 +146,23 @@ func (f *fakeFlushStore) FlushComputeUsage(d []configstore.ComputeUsageDelta) er
 	return nil
 }
 
-func teamResolverA(orgID string) int64 {
+// teamResolverA mimics OrgUsageTeamID's chain: the connecting user's team
+// when it has one, else the org's oldest team, else 0.
+func teamResolverA(orgID, username string) int64 {
 	if orgID == "orgA" {
-		return 42
+		if username == "reader" {
+			return 99 // user's own team (e.g. a project-reader login)
+		}
+		return 42 // oldest-team fallback
 	}
-	return 0
+	return 0 // unknown org / teamless org
 }
 
 func TestComputeMeterFlush(t *testing.T) {
 	store := &fakeFlushStore{}
 	m := newComputeMeter(store, teamResolverA)
 	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
-	m.Record("orgA", "standard", 8000, 16*1024, base, 10*time.Second)
+	m.Record("orgA", "root", "standard", 8000, 16*1024, base, 10*time.Second)
 
 	if n := m.Flush(); n != 1 {
 		t.Fatalf("Flush rows = %d, want 1", n)
@@ -165,7 +170,8 @@ func TestComputeMeterFlush(t *testing.T) {
 	if len(store.flushed) != 1 || store.flushed[0].CPUSeconds != 80 || store.flushed[0].MemorySeconds != 160 {
 		t.Fatalf("flushed = %v, want one (80,160)", store.flushed)
 	}
-	// The meter resolves the org's default team at record time.
+	// The meter resolves the informational team at record time (root has no
+	// team of its own → the org's oldest team).
 	if store.flushed[0].TeamID != 42 || store.flushed[0].QuerySource != "standard" {
 		t.Fatalf("flushed key = (team=%d, source=%q), want (42, standard)", store.flushed[0].TeamID, store.flushed[0].QuerySource)
 	}
@@ -175,24 +181,34 @@ func TestComputeMeterFlush(t *testing.T) {
 	}
 }
 
-func TestComputeMeterUnknownTeamTolerated(t *testing.T) {
-	// An org with no billing team (or a nil resolver) still meters — the
-	// bucket carries team_id 0 rather than dropping usage.
+func TestComputeMeterTeamResolutionChain(t *testing.T) {
+	// The informational team stamp: the connecting user's own team wins, a
+	// user without one falls back to the org's oldest team, and an unknown /
+	// teamless org still meters under team_id 0 (usage is never dropped).
 	store := &fakeFlushStore{}
 	m := newComputeMeter(store, teamResolverA)
-	m.Record("orgB", "standard", 1000, 1024, time.Now(), 2*time.Second)
-	if n := m.Flush(); n != 1 {
-		t.Fatalf("Flush rows = %d, want 1", n)
+	base := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	m.Record("orgA", "reader", "standard", 8000, 16*1024, base, 10*time.Second) // user team 99
+	m.Record("orgA", "root", "standard", 4000, 8*1024, base, 10*time.Second)    // oldest team 42
+	m.Record("orgB", "anyone", "standard", 1000, 1024, base, 2*time.Second)     // teamless → 0
+	if n := m.Flush(); n != 3 {
+		t.Fatalf("Flush rows = %d, want 3", n)
 	}
-	if store.flushed[0].TeamID != 0 {
-		t.Fatalf("team = %d, want 0 for unknown org", store.flushed[0].TeamID)
+	teams := map[int64]bool{}
+	for _, d := range store.flushed {
+		teams[d.TeamID] = true
+	}
+	for _, want := range []int64{99, 42, 0} {
+		if !teams[want] {
+			t.Fatalf("flushed teams = %v, want {99, 42, 0}", teams)
+		}
 	}
 }
 
 func TestComputeMeterFlushErrorIsBestEffort(t *testing.T) {
 	store := &fakeFlushStore{err: errors.New("db down")}
 	m := newComputeMeter(store, teamResolverA)
-	m.Record("orgA", "standard", 8000, 16*1024, time.Now(), 10*time.Second)
+	m.Record("orgA", "root", "standard", 8000, 16*1024, time.Now(), 10*time.Second)
 	// A flush error must not panic; the count for this interval is dropped.
 	_ = m.Flush()
 }
@@ -200,7 +216,7 @@ func TestComputeMeterFlushErrorIsBestEffort(t *testing.T) {
 func TestComputeMeterRecordNeverPanicsOnNilOrDisabled(t *testing.T) {
 	// A nil meter (metering disabled) is a no-op.
 	var m *computeMeter
-	m.Record("orgA", "standard", 8000, 16*1024, time.Now(), time.Second)
+	m.Record("orgA", "root", "standard", 8000, 16*1024, time.Now(), time.Second)
 	if got := m.Flush(); got != 0 {
 		t.Fatalf("nil meter Flush = %d, want 0", got)
 	}
@@ -208,7 +224,7 @@ func TestComputeMeterRecordNeverPanicsOnNilOrDisabled(t *testing.T) {
 	// A meter with a nil store (and nil resolver) flushes nothing and never
 	// panics.
 	m2 := &computeMeter{counter: newComputeUsageCounter()}
-	m2.Record("orgA", "standard", 8000, 16*1024, time.Now(), time.Second)
+	m2.Record("orgA", "root", "standard", 8000, 16*1024, time.Now(), time.Second)
 	if got := m2.Flush(); got != 0 {
 		t.Fatalf("nil-store meter Flush = %d, want 0", got)
 	}
@@ -217,7 +233,7 @@ func TestComputeMeterRecordNeverPanicsOnNilOrDisabled(t *testing.T) {
 func TestComputeMeterRunFinalFlushOnCancel(t *testing.T) {
 	store := &fakeFlushStore{}
 	m := newComputeMeter(store, teamResolverA)
-	m.Record("orgA", "standard", 8000, 16*1024, time.Now(), 10*time.Second)
+	m.Record("orgA", "root", "standard", 8000, 16*1024, time.Now(), 10*time.Second)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

@@ -29,7 +29,6 @@ const TEAMS: OrgTeam[] = [
     team_id: 1,
     schema_name: "team_1",
     enabled: true,
-    is_billing_team: true,
     backfill_enabled: true,
     created_at: "2026-07-01T00:00:00Z",
     updated_at: "2026-07-01T00:00:00Z",
@@ -39,7 +38,6 @@ const TEAMS: OrgTeam[] = [
     team_id: 2,
     schema_name: "team_2",
     enabled: false,
-    is_billing_team: null,
     backfill_enabled: true,
     events_table_name: "legacy_events",
     persons_table_name: "legacy_persons",
@@ -52,7 +50,6 @@ const TEAMS: OrgTeam[] = [
     team_id: 7,
     schema_name: "custom_schema",
     enabled: true,
-    is_billing_team: true,
     backfill_enabled: false,
     earliest_event_date: "9999-12-31",
     created_at: "2026-07-03T00:00:00Z",
@@ -79,7 +76,7 @@ describe("Org teams page", () => {
     hooks.useDeleteOrgTeam.mockReturnValue(mut());
   });
 
-  it("lists every team with schema, enabled, billing and backfill state", () => {
+  it("lists every team with schema, enabled and backfill state", () => {
     renderPage();
 
     expect(screen.getAllByText("acme")).toHaveLength(2);
@@ -87,8 +84,9 @@ describe("Org teams page", () => {
     expect(screen.getByText("team_1")).toBeInTheDocument();
     expect(screen.getByText("team_2")).toBeInTheDocument();
     expect(screen.getByText("custom_schema")).toBeInTheDocument();
-    // Both billing rows carry the badge; the disabled team is flagged.
-    expect(screen.getAllByText("billing")).toHaveLength(2);
+    // No billing column exists anymore (duckgres does not own billing-team
+    // attribution); the disabled team is flagged.
+    expect(screen.queryByText("billing")).not.toBeInTheDocument();
     expect(screen.getByText("disabled")).toBeInTheDocument();
     // Earliest event date: plain date, "none" for the 9999-12-31 no-history
     // sentinel, em dash while unresolved.
@@ -134,14 +132,14 @@ describe("Org teams page", () => {
     expect(screen.getByText(/re-discover the team's backfill range/i)).toBeInTheDocument();
   });
 
-  it("warns that deleting a billing team hands billing to the oldest remaining team", async () => {
+  it("allows deleting a non-last team without any billing warning", async () => {
     renderPage();
 
-    // acme team 1 is billing and acme has two teams → warning, not refusal.
+    // acme has two teams → plain confirm, no billing handover copy anywhere.
     const deleteButtons = screen.getAllByTitle("Delete");
     await userEvent.click(deleteButtons[0]);
 
-    expect(screen.getByText(/oldest remaining team automatically becomes billing/i)).toBeInTheDocument();
+    expect(screen.queryByText(/billing/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /delete team/i })).toBeEnabled();
   });
 });

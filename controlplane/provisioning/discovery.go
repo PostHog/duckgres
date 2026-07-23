@@ -20,7 +20,7 @@ import (
 // Teams come from duckgres_org_teams (schema-per-team model): each row
 // carries the team's schema_name — its tables live at <schema>.events /
 // <schema>.persons — plus nullable grandfathered explicit table names for
-// pre-convention teams, an enabled flag, and the billing-team marker.
+// pre-convention teams, and an enabled flag.
 // The enabled flag is duckgres's per-team QUERY-SERVING switch (migration
 // 000024) — it says nothing about ingestion. Discovery therefore passes it
 // through as information and derives NOTHING from it: disabled teams stay
@@ -79,9 +79,9 @@ type discoveryTeam struct {
 	// Enabled is duckgres's per-team QUERY-SERVING switch (not yet
 	// enforced on the serve path), passed through as information — see the
 	// module comment: nothing ingestion-shaped may be derived from it.
-	// Billing internals (is_billing_team) and backfill_enabled are
-	// deliberately NOT served: neither is a routing concern, and adding a
-	// field later is wire-compatible while removing one is not.
+	// backfill_enabled is deliberately NOT served: it is not a routing
+	// concern, and adding a field later is wire-compatible while removing
+	// one is not.
 	Enabled bool `json:"enabled"`
 	// Resolved, always-populated locations — the derivation from
 	// schema_name + grandfathered overrides happens HERE, once, so no
@@ -216,7 +216,7 @@ func (h *handler) assembleDiscovery() (*discoveryResponse, error) {
 		teams := []discoveryTeam{}
 		rows, ok := teamsByOrg[w.OrgID]
 		if !ok {
-			// Every org gets a billing team row at provision (migration 000024
+			// Every org gets its first team row at provision (migration 000024
 			// backfilled the fleet); a live warehouse with zero rows is a data
 			// inconsistency. Surface the warehouse with no teams instead of
 			// hiding it (hiding reads as removal downstream).

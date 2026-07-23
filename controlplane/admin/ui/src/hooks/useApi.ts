@@ -194,8 +194,7 @@ export function useOrgTeams(org: string | undefined) {
 }
 
 // Team mutations invalidate the global + per-org team lists, the org queries
-// (the billing team surfaces there as default_team_id) and the models sidebar
-// counts.
+// (teams are embedded on the org payload) and the models sidebar counts.
 function invalidateOrgTeams(qc: ReturnType<typeof useQueryClient>) {
   qc.invalidateQueries({ queryKey: ["org-teams"] });
   qc.invalidateQueries({ queryKey: ["orgs"] });

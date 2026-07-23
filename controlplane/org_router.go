@@ -723,7 +723,6 @@ func sameOrgTeam(a, b configstore.OrgTeamConfig) bool {
 	return a.TeamID == b.TeamID &&
 		a.SchemaName == b.SchemaName &&
 		a.Enabled == b.Enabled &&
-		a.IsBillingTeam == b.IsBillingTeam &&
 		sameOptionalString(a.EventsTableName, b.EventsTableName) &&
 		sameOptionalString(a.PersonsTableName, b.PersonsTableName) &&
 		sameOptionalString(a.SchemaDataImportsName, b.SchemaDataImportsName)

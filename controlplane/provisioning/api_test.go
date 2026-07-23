@@ -191,34 +191,18 @@ func applyFakeTableNames(row *configstore.OrgTeam, up configstore.OrgTeamUpsert)
 	set(&row.SchemaDataImportsName, up.SchemaDataImportsName)
 }
 
-// DeleteOrgTeam mirrors configstore.DeleteOrgTeamTx's rules in memory: 404 for
-// a missing row, refusal on the last team, billing handover to the remaining
-// team with the oldest created_at.
-func (s *fakeStore) DeleteOrgTeam(orgID string, teamID int64) (*configstore.OrgTeamDeleteResult, error) {
-	target, ok := s.teams[orgID][teamID]
-	if !ok {
-		return nil, configstore.ErrOrgTeamNotFound
+// DeleteOrgTeam mirrors configstore.DeleteOrgTeamTx's rules in memory: 404
+// for a missing row, refusal on the last team (an org must always have at
+// least one).
+func (s *fakeStore) DeleteOrgTeam(orgID string, teamID int64) error {
+	if _, ok := s.teams[orgID][teamID]; !ok {
+		return configstore.ErrOrgTeamNotFound
 	}
 	if len(s.teams[orgID]) == 1 {
-		return nil, configstore.ErrLastOrgTeam
+		return configstore.ErrLastOrgTeam
 	}
 	delete(s.teams[orgID], teamID)
-	res := &configstore.OrgTeamDeleteResult{
-		WasBilling: target.IsBillingTeam != nil && *target.IsBillingTeam,
-	}
-	if res.WasBilling {
-		var successor *configstore.OrgTeam
-		for _, t := range s.teams[orgID] {
-			if successor == nil || t.CreatedAt.Before(successor.CreatedAt) ||
-				(t.CreatedAt.Equal(successor.CreatedAt) && t.TeamID < successor.TeamID) {
-				successor = t
-			}
-		}
-		billing := true
-		successor.IsBillingTeam = &billing
-		res.NewBillingTeamID = successor.TeamID
-	}
-	return res, nil
+	return nil
 }
 
 func (s *fakeStore) Provision(req ProvisionRequest) error {
@@ -239,17 +223,26 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	shadowUserHash, hadUser := s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}]
 
 	// 1. Warehouse + Org. Mirrors createPendingWarehouseTx: a NEW org
-	// requires default_team_id (rejected before any write); an existing org
-	// keeps its stored value when the field is omitted (set-only, never wipe).
+	// requires team_id (rejected before any write); an existing org keeps
+	// its stored teams when the field is omitted (set-only, never wipe).
 	if _, ok := s.orgs[req.OrgID]; !ok {
-		if req.DefaultTeamID == 0 {
-			return ErrDefaultTeamIDRequired
+		if req.TeamID == 0 {
+			return ErrProvisionTeamRequired
 		}
 		s.orgs[req.OrgID] = &configstore.Org{Name: req.OrgID, DatabaseName: req.DatabaseName}
 	}
-	if req.DefaultTeamID != 0 {
-		teamID := req.DefaultTeamID
-		s.orgs[req.OrgID].DefaultTeamID = &teamID
+	if req.TeamID != 0 {
+		schema := req.SchemaName
+		if schema == "" {
+			if existing, ok := s.teams[req.OrgID][req.TeamID]; ok {
+				schema = existing.SchemaName
+			} else {
+				schema = fmt.Sprintf("team_%d", req.TeamID)
+			}
+		}
+		if _, err := s.UpsertOrgTeam(req.OrgID, configstore.OrgTeamUpsert{TeamID: req.TeamID, SchemaName: schema}); err != nil {
+			return err
+		}
 	}
 	clone := *req.Warehouse
 	clone.OrgID = req.OrgID
@@ -434,13 +427,14 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	}
 }
 
-// TestProvisionPersistsDefaultTeamID checks the default_team_id in the
-// provision body is threaded through to the org record.
-func TestProvisionPersistsDefaultTeamID(t *testing.T) {
+// TestProvisionCreatesFirstTeamRow checks the team_id in the provision body
+// is threaded through and creates the org's first plain team row (the
+// transitional default_team_id alias is covered separately).
+func TestProvisionCreatesFirstTeamRow(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "team-db", "default_team_id": 12345, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	body := []byte(`{"database_name": "team-db", "team_id": 12345, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/team-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -449,23 +443,42 @@ func TestProvisionPersistsDefaultTeamID(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	org, ok := store.orgs["team-org"]
-	if !ok {
+	if _, ok := store.orgs["team-org"]; !ok {
 		t.Fatal("expected org to be auto-created")
 	}
-	if org.DefaultTeamID == nil {
-		t.Fatal("expected default_team_id to be set, got nil")
+	team, ok := store.teams["team-org"][12345]
+	if !ok {
+		t.Fatal("expected the provision team row to be created")
 	}
-	if *org.DefaultTeamID != 12345 {
-		t.Fatalf("default_team_id = %d, want %d", *org.DefaultTeamID, 12345)
+	if team.SchemaName != "team_12345" {
+		t.Fatalf("schema = %q, want conventional team_12345", team.SchemaName)
 	}
 }
 
-// TestProvisionNewOrgRequiresDefaultTeamID locks in the mandatory contract:
-// provisioning a NEW org without default_team_id is rejected with 400 and
-// creates nothing (no org, no warehouse) — every org carries its default team
-// id from birth.
-func TestProvisionNewOrgRequiresDefaultTeamID(t *testing.T) {
+// TestProvisionDefaultTeamIDAlias: the transitional default_team_id field is
+// treated exactly as team_id (remove once the PostHog backend sends team_id).
+func TestProvisionDefaultTeamIDAlias(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "alias-db", "default_team_id": 4242, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/alias-org/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if _, ok := store.teams["alias-org"][4242]; !ok {
+		t.Fatal("expected the aliased team row to be created")
+	}
+}
+
+// TestProvisionNewOrgRequiresTeamID locks in the mandatory contract:
+// provisioning a NEW org without team_id is rejected with 400 and creates
+// nothing (no org, no warehouse) — a warehouse cannot exist without a team.
+func TestProvisionNewOrgRequiresTeamID(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
@@ -478,24 +491,24 @@ func TestProvisionNewOrgRequiresDefaultTeamID(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "default_team_id") {
-		t.Fatalf("error body should name default_team_id: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "team_id") {
+		t.Fatalf("error body should name team_id: %s", rec.Body.String())
 	}
 	if _, ok := store.orgs["noteam-org"]; ok {
-		t.Fatal("org must not be created when default_team_id is missing")
+		t.Fatal("org must not be created when team_id is missing")
 	}
 	if store.warehouses["noteam-org"] != nil {
-		t.Fatal("warehouse must not be created when default_team_id is missing")
+		t.Fatal("warehouse must not be created when team_id is missing")
 	}
 }
 
-// TestReprovisionExistingOrgKeepsDefaultTeamID: re-provisioning an EXISTING org
-// without default_team_id stays valid (not the new-org 400) and keeps the
-// stored value — the field is set-only, never wiped by omission.
-func TestReprovisionExistingOrgKeepsDefaultTeamID(t *testing.T) {
+// TestReprovisionExistingOrgKeepsTeams: re-provisioning an EXISTING org
+// without team_id stays valid (not the new-org 400) and keeps the stored
+// team rows — the field is set-only, never wiped by omission.
+func TestReprovisionExistingOrgKeepsTeams(t *testing.T) {
 	store := newFakeStore()
-	teamID := int64(777)
-	store.orgs["backfilled"] = &configstore.Org{Name: "backfilled", DefaultTeamID: &teamID}
+	store.orgs["backfilled"] = &configstore.Org{Name: "backfilled"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "backfilled", TeamID: 777, SchemaName: "legacy_wh", Enabled: true})
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "backfilled-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
@@ -507,9 +520,9 @@ func TestReprovisionExistingOrgKeepsDefaultTeamID(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	org := store.orgs["backfilled"]
-	if org.DefaultTeamID == nil || *org.DefaultTeamID != teamID {
-		t.Fatalf("default_team_id must survive re-provision without the field, got %v", org.DefaultTeamID)
+	team, ok := store.teams["backfilled"][777]
+	if !ok || team.SchemaName != "legacy_wh" {
+		t.Fatalf("stored team must survive re-provision without the field, got %+v", team)
 	}
 }
 
@@ -1321,13 +1334,12 @@ func TestOrgTeamUpsertDuplicateSchema409(t *testing.T) {
 }
 
 func TestOrgTeamDeleteRules(t *testing.T) {
-	billing := true
 	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 
 	t.Run("last team refused", func(t *testing.T) {
 		store := newFakeStore()
 		store.orgs["acme"] = &configstore.Org{Name: "acme"}
-		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &billing})
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
 		router := newTestRouter(store)
 
 		rec := doJSON(t, router, http.MethodDelete, "/api/v1/orgs/acme/teams/1", "")
@@ -1342,37 +1354,10 @@ func TestOrgTeamDeleteRules(t *testing.T) {
 		}
 	})
 
-	t.Run("billing team delete promotes oldest remaining", func(t *testing.T) {
+	t.Run("non-last delete removes the row, nothing else", func(t *testing.T) {
 		store := newFakeStore()
 		store.orgs["acme"] = &configstore.Org{Name: "acme"}
-		b := billing
-		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &b, CreatedAt: base})
-		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 3, SchemaName: "team_3", Enabled: true, CreatedAt: base.Add(2 * time.Hour)})
-		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true, CreatedAt: base.Add(time.Hour)})
-		router := newTestRouter(store)
-
-		rec := doJSON(t, router, http.MethodDelete, "/api/v1/orgs/acme/teams/1", "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
-		}
-		var resp map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		// Team 2 has the oldest created_at among the remaining rows.
-		if resp["new_billing_team_id"] != float64(2) {
-			t.Fatalf("new_billing_team_id = %v, want 2", resp["new_billing_team_id"])
-		}
-		if got := store.teams["acme"][2]; got.IsBillingTeam == nil || !*got.IsBillingTeam {
-			t.Fatalf("team 2 must carry the billing mark, got %+v", got)
-		}
-	})
-
-	t.Run("non-billing delete has no handover", func(t *testing.T) {
-		store := newFakeStore()
-		store.orgs["acme"] = &configstore.Org{Name: "acme"}
-		b := billing
-		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &b, CreatedAt: base})
+		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, CreatedAt: base})
 		store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true, CreatedAt: base.Add(time.Hour)})
 		router := newTestRouter(store)
 
@@ -1380,8 +1365,22 @@ func TestOrgTeamDeleteRules(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 		}
-		if strings.Contains(rec.Body.String(), "new_billing_team_id") {
-			t.Fatalf("non-billing delete must not report a handover: %s", rec.Body.String())
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["deleted"] != float64(2) || resp["org"] != "acme" {
+			t.Fatalf("response = %v, want deleted=2 org=acme", resp)
+		}
+		// No billing handover exists anymore — the response is just the delete.
+		if _, ok := resp["new_billing_team_id"]; ok {
+			t.Fatalf("delete must not report a billing handover: %s", rec.Body.String())
+		}
+		if store.teams["acme"][2] != nil {
+			t.Fatal("team 2 must be deleted")
+		}
+		if store.teams["acme"][1] == nil {
+			t.Fatal("team 1 must survive")
 		}
 	})
 
@@ -1420,7 +1419,7 @@ func TestProvisionTeamIDAndSchemaName(t *testing.T) {
 	if store.lastProvision == nil {
 		t.Fatal("Provision not dispatched")
 	}
-	if store.lastProvision.DefaultTeamID != 42 || store.lastProvision.SchemaName != "custom_wh" {
+	if store.lastProvision.TeamID != 42 || store.lastProvision.SchemaName != "custom_wh" {
 		t.Fatalf("provision request = %+v, want team 42 schema custom_wh", store.lastProvision)
 	}
 }
@@ -1451,8 +1450,8 @@ func TestProvisionAgreeingTeamIDFieldsAccepted(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
 	}
-	if store.lastProvision.DefaultTeamID != 42 {
-		t.Fatalf("effective team = %d, want 42", store.lastProvision.DefaultTeamID)
+	if store.lastProvision.TeamID != 42 {
+		t.Fatalf("effective team = %d, want 42", store.lastProvision.TeamID)
 	}
 }
 

@@ -47,7 +47,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 26)
 	requireGooseMigrationRecorded(t, db, 27)
 	requireGooseMigrationRecorded(t, db, 28)
-	requireGooseLatestVersion(t, db, 28)
+	requireGooseMigrationRecorded(t, db, 29)
+	requireGooseLatestVersion(t, db, 29)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -198,7 +199,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -240,7 +241,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 26)
 	requireGooseMigrationRecorded(t, upgradedDB, 27)
 	requireGooseMigrationRecorded(t, upgradedDB, 28)
-	requireGooseLatestVersion(t, upgradedDB, 28)
+	requireGooseMigrationRecorded(t, upgradedDB, 29)
+	requireGooseLatestVersion(t, upgradedDB, 29)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -325,7 +327,7 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	requireGooseMigrationRecorded(t, sqlDB, 3)
 
 	// Migration 000024 backfilled the legacy default_team_id value into the
-	// org's (billing) team row and dropped the column.
+	// org's team row and dropped the column.
 	requireColumnAbsent(t, sqlDB, "duckgres_orgs", "default_team_id")
 	var team cpconfigstore.OrgTeam
 	if err := store.DB().First(&team, "org_id = ?", "old-org").Error; err != nil {
@@ -334,13 +336,13 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	if team.TeamID != 1 || team.SchemaName != "team_1" || !team.Enabled {
 		t.Fatalf("backfilled team row = %+v, want team 1, schema team_1, enabled", team)
 	}
-	if team.IsBillingTeam == nil || !*team.IsBillingTeam {
-		t.Fatalf("backfilled team row must be the billing team, got %+v", team)
-	}
 	// 000024 seeded the row with backfill_enabled NULL; 000027 pins it TRUE.
 	if team.BackfillEnabled == nil || !*team.BackfillEnabled {
 		t.Fatalf("backfilled team row backfill_enabled = %v, want TRUE after migration 000028", team.BackfillEnabled)
 	}
+	// Migration 000029 dropped the billing-team marker entirely — duckgres no
+	// longer owns team-level billing attribution.
+	requireColumnAbsent(t, sqlDB, "duckgres_org_teams", "is_billing_team")
 }
 
 // TestConfigStoreMigrationFailsLoudlyOnNullDefaultTeamID pins the deploy-time

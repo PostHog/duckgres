@@ -25,15 +25,6 @@ type Org struct {
 	DefaultWorkerMemory     string `gorm:"size:32" json:"default_worker_memory"`
 	DefaultWorkerTTL        string `gorm:"size:32" json:"default_worker_ttl"`
 	DefaultWorkerMinHotIdle int    `gorm:"default:0" json:"default_worker_min_hot_idle"`
-	// DefaultTeamID is NOT a column — it is the admin/provisioning API view of
-	// the org's billing team (the duckgres_org_teams row with is_billing_team
-	// = TRUE, see OrgTeam). The JSON field name is kept for wire compat with
-	// existing callers and the admin UI. Read paths populate it from the
-	// preloaded Teams association; write paths (admin create/update org,
-	// provisioning) translate it into a billing-team upsert via
-	// SetOrgBillingTeamTx. *int64 because the admin PUT presence-merge relies
-	// on nil = "field absent, preserve".
-	DefaultTeamID *int64            `gorm:"-" json:"default_team_id,omitempty"`
 	Teams         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
 	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
@@ -47,26 +38,12 @@ type Org struct {
 
 func (Org) TableName() string { return "duckgres_orgs" }
 
-// BillingTeamID returns the org's billing PostHog team id from the loaded
-// Teams association (the row with is_billing_team = TRUE), or nil when the
-// org has none — including when Teams was not preloaded.
-func (o *Org) BillingTeamID() *int64 {
-	for i := range o.Teams {
-		t := &o.Teams[i]
-		if t.IsBillingTeam != nil && *t.IsBillingTeam {
-			return &t.TeamID
-		}
-	}
-	return nil
-}
-
 // OrgTeam maps one PostHog team to an org and the warehouse schema its data
-// lives in (conventionally "team_<id>"). An org can carry many teams; exactly
-// one may be the billing team — the team pull-based billing keys the org's
-// usage buckets by (enforced by a partial unique index, migration 000024).
-// Two teams in one org must never share a schema name (unique index on
-// (org_id, schema_name), migration 000025). IsBillingTeam is tri-state
-// (*bool): NULL means "not the billing team". BackfillEnabled mirrors a
+// lives in (conventionally "team_<id>"). An org can carry many teams; every
+// org must always have at least one (DeleteOrgTeamTx refuses to delete the
+// last team — a teamless org would be an unroutable warehouse). Two teams in
+// one org must never share a schema name (unique index on
+// (org_id, schema_name), migration 000025). BackfillEnabled mirrors a
 // Django BooleanField(default=True) on the PostHog side, so its column is NOT
 // NULL DEFAULT TRUE (migration 000028) — it stays *bool in Go only so an
 // explicit false survives gorm's zero-value-uses-column-default Create
@@ -80,13 +57,12 @@ func (o *Org) BillingTeamID() *int64 {
 // predate the schema-per-team convention; the PostHog-side backfill sets them
 // via the provisioning team upsert.
 type OrgTeam struct {
-	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_billing_org,unique,where:is_billing_team IS TRUE;index:idx_duckgres_org_teams_org_schema,unique,priority:1" json:"org_id"`
+	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_org_schema,unique,priority:1" json:"org_id"`
 	// autoIncrement:false — int fields in a composite primary key default to
 	// auto-increment in gorm, which would make this a bigserial.
 	TeamID          int64  `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
 	SchemaName      string `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
 	Enabled         bool   `gorm:"not null;default:true" json:"enabled"`
-	IsBillingTeam   *bool  `json:"is_billing_team,omitempty"`
 	BackfillEnabled *bool  `gorm:"not null;default:true" json:"backfill_enabled"`
 	// The legacy overrides are BARE identifiers (never schema-qualified):
 	// events/persons are table names within SchemaName's schema, the
@@ -567,34 +543,45 @@ type OrgConfig struct {
 	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
 	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
 	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
-	Teams                   []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams); at most one is the billing team
+	Teams                   []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams)
 	Users                   map[string]string // username -> password
 	Warehouse               *ManagedWarehouseConfig
 }
 
 // OrgTeamConfig is the in-memory snapshot view of one duckgres_org_teams row.
-// IsBillingTeam folds the tri-state column to a plain bool (NULL == false) —
-// snapshot consumers only care whether a row IS the billing team.
+// CreatedAt is carried so OldestTeamID can order rows deterministically.
 type OrgTeamConfig struct {
 	TeamID                int64
 	SchemaName            string
 	Enabled               bool
-	IsBillingTeam         bool
 	EventsTableName       *string
 	PersonsTableName      *string
 	SchemaDataImportsName *string
+	CreatedAt             time.Time
 }
 
-// BillingTeamID returns the org's billing PostHog team id (the team with
-// is_billing_team = TRUE), or 0 when the org has none. Prereq for pull-based
-// compute billing — usage buckets are keyed by it.
-func (oc *OrgConfig) BillingTeamID() int64 {
-	for _, t := range oc.Teams {
-		if t.IsBillingTeam {
-			return t.TeamID
+// OldestTeamID returns the org's oldest PostHog team id (min created_at,
+// ties broken by the smaller team_id) — in practice the provision-time first
+// team. It is the INFORMATIONAL team id stamped onto usage buckets: duckgres
+// no longer owns team-level billing attribution (that mapping lives in the
+// external billing service); the stamp just records "the org's oldest team at
+// record time". Returns 0 when the org has no team rows — defensive only
+// (stale snapshot / mid-provision): a committed org always has at least one
+// team (provision requires one, DeleteOrgTeamTx keeps the last).
+func (oc *OrgConfig) OldestTeamID() int64 {
+	var best *OrgTeamConfig
+	for i := range oc.Teams {
+		t := &oc.Teams[i]
+		if best == nil ||
+			t.CreatedAt.Before(best.CreatedAt) ||
+			(t.CreatedAt.Equal(best.CreatedAt) && t.TeamID < best.TeamID) {
+			best = t
 		}
 	}
-	return 0
+	if best == nil {
+		return 0
+	}
+	return best.TeamID
 }
 
 // ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.

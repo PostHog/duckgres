@@ -90,11 +90,11 @@ type Store interface {
 	// gorm.ErrRecordNotFound for an unknown org. UpsertOrgTeam is the
 	// grandfather path: it MAY overwrite schema_name and the legacy table
 	// names of an existing row (see configstore.UpsertOrgTeamTx).
-	// DeleteOrgTeam enforces the last-team refusal and the billing handover
-	// (see configstore.DeleteOrgTeamTx).
+	// DeleteOrgTeam enforces the last-team refusal (see
+	// configstore.DeleteOrgTeamTx).
 	ListOrgTeams(orgID string) ([]configstore.OrgTeam, error)
 	UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*configstore.OrgTeam, error)
-	DeleteOrgTeam(orgID string, teamID int64) (*configstore.OrgTeamDeleteResult, error)
+	DeleteOrgTeam(orgID string, teamID int64) error
 	// Discovery backing (discovery.go): list live warehouses, batch-fetch
 	// their team rows, and the unfiltered change marker.
 	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
@@ -172,20 +172,18 @@ type connectionDetails struct {
 
 type provisionRequest struct {
 	DatabaseName string `json:"database_name"`
-	// DefaultTeamID is the org's billing PostHog team id — a JSON NUMBER,
-	// matching PostHog's integer Team.id (a quoted string is a 400 at decode
-	// time). Stored as the org's duckgres_org_teams billing row. REQUIRED
-	// when the provision creates a NEW org (400 otherwise — every org carries
-	// its billing team from birth; pull-based compute billing keys usage
-	// buckets by it). Optional on re-provision of an existing org: absent/0
-	// keeps the stored billing team, never wipes it.
+	// DefaultTeamID is a TRANSITIONAL alias for TeamID (the historical field
+	// name from when duckgres tracked a billing/default team). Treated
+	// exactly as team_id; remove once the PostHog backend sends team_id.
 	DefaultTeamID int64 `json:"default_team_id,omitempty"`
-	// TeamID + SchemaName are the successor of DefaultTeamID: they create the
-	// org's first duckgres_org_teams row (billing = TRUE) with an explicit
-	// warehouse schema instead of the conventional "team_<id>". They COEXIST
-	// with the legacy field (this ships before the PostHog-side change): when
-	// both team ids are given they must agree (400 otherwise), and
-	// schema_name requires a team id via either field.
+	// TeamID is the org's first PostHog team — a JSON NUMBER, matching
+	// PostHog's integer Team.id (a quoted string is a 400 at decode time).
+	// REQUIRED when the provision creates a NEW org (400 otherwise — a
+	// warehouse cannot exist without a team; the row becomes the org's first
+	// duckgres_org_teams entry, no billing semantics attached). Optional on
+	// re-provision of an existing org: absent/0 leaves the stored teams
+	// untouched. SchemaName optionally overrides the conventional "team_<id>"
+	// warehouse schema for that first row; it requires a team id.
 	TeamID        int64                  `json:"team_id,omitempty"`
 	SchemaName    string                 `json:"schema_name,omitempty"`
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
@@ -271,9 +269,9 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Resolve the legacy default_team_id and the new team_id/schema_name pair
-	// into one effective billing team. Both fields keep working — this ships
-	// before the PostHog-side switch — but disagreement is a caller bug.
+	// Resolve the transitional default_team_id alias and team_id into one
+	// effective team. Both fields keep working — the alias goes away once the
+	// PostHog backend sends team_id — but disagreement is a caller bug.
 	if req.TeamID != 0 && req.DefaultTeamID != 0 && req.TeamID != req.DefaultTeamID {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("team_id (%d) and default_team_id (%d) disagree; send one, or the same value in both", req.TeamID, req.DefaultTeamID)})
 		return
@@ -380,12 +378,12 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	// sub-step rolls the others back so the caller's retry sees the same
 	// starting state (no half-provisioned row blocking re-creation).
 	if err := h.store.Provision(ProvisionRequest{
-		OrgID:         orgID,
-		DatabaseName:  req.DatabaseName,
-		DefaultTeamID: effectiveTeamID,
-		SchemaName:    req.SchemaName,
-		Warehouse:     warehouse,
-		RootUserHash:  hash,
+		OrgID:        orgID,
+		DatabaseName: req.DatabaseName,
+		TeamID:       effectiveTeamID,
+		SchemaName:   req.SchemaName,
+		Warehouse:    warehouse,
+		RootUserHash: hash,
 	}); err != nil {
 		// The warehouse-already-exists conflict is the only error
 		// shape that maps to 409. Everything else (DB write failure,
@@ -397,11 +395,18 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
-		// Creating a NEW org requires default_team_id — a caller input
-		// problem, not a server failure. Decided in the store (only it knows
-		// whether the org exists), surfaced here as 400.
-		if errors.Is(err, ErrDefaultTeamIDRequired) {
+		// Creating a NEW org requires team_id — a caller input problem, not
+		// a server failure. Decided in the store (only it knows whether the
+		// org exists), surfaced here as 400.
+		if errors.Is(err, ErrProvisionTeamRequired) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		// The provision team's schema_name collides with another team in the
+		// org (pre-checked in UpsertOrgTeamTx; the unique index catches the
+		// concurrent case below via isUniqueViolation).
+		if errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
 		if isUniqueViolation(err) {
@@ -689,8 +694,9 @@ func (h *handler) upsertOrgTeam(c *gin.Context) {
 }
 
 // deleteOrgTeam removes one (org, team) CONFIG row — never warehouse data.
-// Deleting the billing team promotes the oldest remaining team (usage buckets
-// re-attributed atomically); deleting the org's last team is refused.
+// Deleting the org's last team is refused (an org must always have at least
+// one team). Buffered usage buckets are not touched — the stamped team_id is
+// informational; attribution is owned by the external billing service.
 func (h *handler) deleteOrgTeam(c *gin.Context) {
 	orgID := c.Param("id")
 	teamID, err := strconv.ParseInt(c.Param("team_id"), 10, 64)
@@ -699,8 +705,7 @@ func (h *handler) deleteOrgTeam(c *gin.Context) {
 		return
 	}
 
-	res, err := h.store.DeleteOrgTeam(orgID, teamID)
-	if err != nil {
+	if err := h.store.DeleteOrgTeam(orgID, teamID); err != nil {
 		switch {
 		case errors.Is(err, configstore.ErrOrgTeamNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "org team not found"})
@@ -711,9 +716,5 @@ func (h *handler) deleteOrgTeam(c *gin.Context) {
 		}
 		return
 	}
-	resp := gin.H{"deleted": teamID, "org": orgID}
-	if res.WasBilling {
-		resp["new_billing_team_id"] = res.NewBillingTeamID
-	}
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, gin.H{"deleted": teamID, "org": orgID})
 }

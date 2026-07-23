@@ -79,13 +79,6 @@ export function OrgTeams() {
           getValue() ? <Badge variant="secondary">enabled</Badge> : <Badge variant="destructive">disabled</Badge>,
       },
       {
-        id: "billing",
-        header: "Billing",
-        accessorFn: (t) => Boolean(t.is_billing_team),
-        cell: ({ getValue }) =>
-          getValue() ? <Badge variant="success">billing</Badge> : <span className="text-muted-foreground">—</span>,
-      },
-      {
         accessorKey: "backfill_enabled",
         header: "Backfill",
         cell: ({ row }) => <BackfillBadge value={row.original.backfill_enabled} />,

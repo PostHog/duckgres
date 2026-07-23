@@ -457,7 +457,7 @@ side of that doc still applies). Scope is **only** the remote/k8s backend
 (per-org worker pod with a known `WorkerProfile` size). Pipeline:
 
 ```
-compute: conn end → in-proc counter keyed (org, default team, query_source, worker size)
+compute: conn end → in-proc counter keyed (org, informational team, query_source, worker size)
               │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
               ▼  duckgres_org_compute_usage (+ duckgres_compute_billing_cursor)
 storage: leader sampler (~30m) → org's DuckLake metadata Postgres
@@ -472,14 +472,18 @@ worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
 ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
 **MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
 sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
-decimals (vCPU / GiB). `team_id` is the org's **billing team** (an integer —
-PostHog's `Team.id`; a JSON NUMBER on every API surface, kept under the
-historical `default_team_id` field name; stored as the org's
-`duckgres_org_teams` row with `is_billing_team = TRUE` — required at org
-creation on both the provisioning and admin APIs, never clearable via the
-admin API, so every org always has one; resolved from the config snapshot at
-connection end, where 0 can still appear only for an unknown org / stale
-snapshot); `query_source` is the
+decimals (vCPU / GiB). `team_id` is **informational only** (an integer —
+PostHog's `Team.id`; a JSON NUMBER on every API surface): duckgres does NOT
+own team-level billing attribution — the external billing service maps
+org → team(s) itself. The stamp is resolved from the config snapshot at
+record time: compute buckets get the CONNECTING USER's team
+(`duckgres_org_users.team_id`, e.g. a project-reader login) when it has one,
+else the org's OLDEST team (min `created_at`, ties broken by the smaller
+`team_id` — in practice the provision-time first team; `ConfigStore.OrgUsageTeamID`);
+storage buckets always get the oldest team (`OrgOldestTeamID`). 0 appears
+only defensively (unknown org / stale snapshot — a committed org always has
+at least one team). Team changes/deletions NEVER re-attribute existing
+buckets; `query_source` is the
 `duckgres.query_source` session GUC (`standard` unless set; a mid-connection
 change bills the whole connection under the final value). The GUC is a **closed
 enum validated at SET time** (`transform.NormalizeQuerySource`): only
@@ -526,16 +530,6 @@ touching this path:
 - **Graceful shutdown does a final flush** after connections drain to their
   natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
   last interval before exit.
-- **Changing an org's billing team (`default_team_id` on the wire)
-  re-attributes its unacked buckets** to
-  the new team in the SAME transaction as the billing-team repoint, on BOTH paths (admin
-  `PUT /orgs/:id` and provisioning re-provision) via
-  `configstore.ReattributeUsageTeamTx` — additive fold on PK collisions; a
-  small in-flight residual under the old team is tolerated (snapshot poll
-  lag, ~30s). Tests: `tests/configstore/reattribute_usage_postgres_test.go`,
-  `controlplane/admin/api_test.go` + `api_postgres_test.go`
-  (`TestUpdateOrg*Reattribut*`), and the re-attribution leg of
-  `compute_usage_pull_api` in the e2e harness.
 - **Org team CRUD (`duckgres_org_teams`)**: the PostHog backend manages an
   org's team rows via `GET/POST /api/v1/orgs/:id/teams` +
   `DELETE /api/v1/orgs/:id/teams/:team_id` (internal secret,
@@ -546,13 +540,15 @@ touching this path:
   `<schema>.persons`, `<schema>_data_imports`), because the PostHog backfill
   replaces migration 000024's `team_<id>` placeholder through it. Two teams in
   one org can never share a schema (unique `(org_id, schema_name)`, migration
-  000025 → 409). DELETE removes CONFIG only (never warehouse data); deleting
-  the billing team promotes the remaining team with the OLDEST `created_at`
-  and re-attributes unacked usage in the same TXN; the org's LAST team is
-  undeletable (409 — delete the org). The admin console mirrors this on a
-  user-facing surface (`GET /teams`, `POST /teams`,
-  `PUT /orgs/:id/teams/:team_id`) where `schema_name` is immutable and
-  billing can only be repointed, never cleared. Shared rules live in
+  000025 → 409). Provisioning a warehouse for a NEW org REQUIRES `team_id`
+  (`ErrProvisionTeamRequired` → 400; `default_team_id` is accepted as a
+  transitional alias) and creates the org's first plain team row — a
+  warehouse cannot exist without a team. DELETE removes CONFIG only (never
+  warehouse data) and never touches usage buckets; the org's LAST team is
+  undeletable (409 — an org must always have at least one team; delete the
+  org instead). The admin console mirrors this on a user-facing surface
+  (`GET /teams`, `POST /teams`, `PUT /orgs/:id/teams/:team_id`) where
+  `schema_name` is immutable. Shared rules live in
   `configstore.UpsertOrgTeamTx` / `DeleteOrgTeamTx`; tests:
   `tests/configstore/org_teams_postgres_test.go`, the provisioning/admin API
   tests, and `org_teams_crud` in the e2e harness.

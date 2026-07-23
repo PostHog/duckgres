@@ -35,15 +35,20 @@ Internally, one row per unique key, values accumulated:
   same bucket and fractional sizes keep full precision.
 - **Values:** `cpu_seconds` (vCPU-seconds), `memory_seconds` (GiB-seconds) —
   summed over every connection that falls in that key + minute.
-- `team_id` is the org's **default team** for now — a fixed value per org (from the
-  config-store org→team default; an **integer**, matching PostHog's `Team.id` —
-  the provisioning/admin APIs and this response all carry it as a JSON number),
-  reported so the shape is right, but **no per-team attribution logic** yet. A "team" is really a schema and one connection can span
-  several, so true per-team split is future work; today every bucket carries the
-  org's default team. `query_source` (`standard` | `endpoints`) is set by a session
+- `team_id` is **informational** (an **integer**, matching PostHog's `Team.id` —
+  a JSON number on every surface): duckgres does NOT own team-level billing
+  attribution — the **external billing service maps org → team(s) itself**. The
+  stamped value is a best-effort hint recorded at connection end: the
+  **connecting user's team** (`duckgres_org_users.team_id`, e.g. a
+  project-reader login) when it has one, else the **org's oldest team** (min
+  `created_at`, ties broken by the smaller `team_id` — in practice the
+  provision-time first team), else `0` (defensive: unknown org / stale
+  snapshot). Team changes/deletions never re-attribute existing buckets — an
+  already-stamped bucket keeps whatever team id it was recorded under.
+  `query_source` (`standard` | `endpoints`) is set by a session
   GUC (`duckgres.query_source`), defaulting to `standard` when unset; the meter
   reads it per connection. (If it's changed mid-connection the per-connection meter
-  uses a single value — same future refinement as team.) The GUC is **validated at
+  uses a single value — the final one.) The GUC is **validated at
   SET time** against the closed `{standard, endpoints}` set — case-insensitive,
   normalized to lowercase; empty resets to the default; any other value is
   rejected with SQLSTATE `22023` (`invalid value for "duckgres.query_source":
@@ -149,27 +154,15 @@ sizes; stored as `NUMERIC` so grouping is exact.)
   minute is never in the window, so an ack can't delete buckets that were never
   served.
 
-## Changing an org's default team
+## Team attribution is external
 
-Buckets are stamped with the org's billing team (historically the
-`default_team_id` column, now the `duckgres_org_teams` row with
-`is_billing_team = TRUE`; the wire field keeps the `default_team_id` name)
-**at record time**, so an
-update to the org (admin `PUT /orgs/:id` or a re-provision carrying a different
-`default_team_id`) would otherwise strand already-buffered usage under the old
-team — including a team that was just deleted in PostHog (duckgres treats the
-id as opaque and never validates it against PostHog). Both update paths
-therefore **re-attribute every unacked bucket** — both metric families — to the
-new team id in the **same transaction** as the org-row update
-(`configstore.ReattributeUsageTeamTx`; colliding target keys, e.g. after an
-A→B→A flip, merge additively since `team_id` is part of both primary keys).
-The next pull reports the org's whole buffered window under the new team.
-
-One bounded race: connections and storage samples record under the team id from
-the config snapshot, which trails the update by up to the poll interval
-(~30s) — a flush landing just after the flip can leave a **small residual
-old-team row** on a later pull. Billing tolerates it, and re-running the update
-folds it in.
+duckgres has no "billing team" / "default team" concept: the external billing
+service owns the org → team(s) mapping. The `team_id` in every bucket key and
+API row is **informational only** — "the best-effort team at record time"
+(compute: the connecting user's team else the org's oldest team; storage: the
+org's oldest team; see above). Team changes and deletions **never re-attribute
+existing buckets**: unacked buckets keep whatever team id they were stamped
+with, and consumers must treat the field as a hint, not authority.
 
 ## No infinite accumulation
 
@@ -195,15 +188,13 @@ folds it in.
   (`NUMERIC`) in the key (new migration); add a single `last_acked` cursor row; add
   the HTTP API (aggregate-on-read into one row per key per UTC day + watermark ack)
   + safety GC.
-- **Add:** a `default_team_id` column on the org (BIGINT **NOT NULL** — required
-  at org creation on both the provisioning and admin APIs, and not clearable
-  via the admin API; used as the bucket `team_id` — fixed per org, no per-team
-  logic yet. Since replaced by the `duckgres_org_teams` table, migration
-  000024: the bucket `team_id` is now the org's `is_billing_team = TRUE` row,
-  still surfaced as `default_team_id` on the wire); a `duckgres.query_source` session GUC
-  (`standard` | `endpoints`, default `standard`, validated at SET time — anything
-  else is a `22023` error) read by the meter; a bearer secret
-  for the API.
+- **Add:** the `duckgres_org_teams` table (migration 000024) as the source of
+  the informational bucket `team_id` (connecting user's team else the org's
+  oldest team — no billing ownership; the `is_billing_team` marker was dropped
+  in migration 000029, and team attribution is owned by the external billing
+  service); a `duckgres.query_source` session GUC (`standard` | `endpoints`,
+  default `standard`, validated at SET time — anything else is a `22023`
+  error) read by the meter; a bearer secret for the API.
 
 ## Storage metric
 
@@ -232,7 +223,9 @@ with a Ready DuckLake warehouse every **30 minutes** (env-only override
 `DUCKGRES_STORAGE_SAMPLE_INTERVAL`, used by e2e). Each successful sample
 credits exactly `tracked_bytes × interval_seconds` byte-seconds into the
 sample-minute's bucket, keyed `(org_id, team_id, bucket_start)` — no
-query_source or worker size (compute dimensions). No elapsed-time tracking: a
+query_source or worker size (compute dimensions); `team_id` is the org's
+**oldest team** (informational, same external-attribution contract as
+compute). No elapsed-time tracking: a
 missed sample (org unreachable, leader failover) under-bills one interval and
 is deliberately best-effort, like compute. Values accumulate as NUMERIC
 byte-seconds; the API serves exact-decimal GiB-seconds (÷2³⁰ is a finite
