@@ -16,8 +16,6 @@ import (
 
 func i64(v int64) *int64 { return &v }
 
-func boolPtrD(v bool) *bool { return &v }
-
 func strPtrD(v string) *string { return &v }
 
 // seedTeam adds one duckgres_org_teams row to the fake (delegates to the
