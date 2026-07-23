@@ -77,11 +77,17 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
 | `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
 | `duckgres_control_plane_worker_spawn_seconds` | Histogram | Time spent spawning and health-checking a new worker |
-| `duckgres_org_connection_admission_duration_seconds{outcome}` | Histogram | DB-backed org connection admission scheduler evaluation latency by outcome |
+| `duckgres_org_connection_admission_duration_seconds{outcome}` | Histogram | DB-backed request-owned org connection admission evaluation latency by outcome |
 | `duckgres_org_connection_admission_queue_depth` | Histogram | Pending org connection queue depth observed during admission evaluation |
 | `duckgres_org_connection_admission_user_queues` | Histogram | Number of per-user queue heads considered during admission evaluation |
-| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome |
+| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome, including terminal `rejected_org_vcpu` / `rejected_user_vcpu` and `ineligible_user` for a missing or disabled configured user |
 | `duckgres_org_connection_admission_user_limit_skips_total` | Counter | Per-user queue heads skipped because that user was at its vCPU limit |
+| `duckgres_org_connection_admission_ineligible_user_skips_total` | Counter | Per-user queue heads skipped because that configured user was missing or disabled |
+| `duckgres_org_connection_reclaim_pending` | Gauge | Activated org connection cleanup intents awaiting or executing exact database reclamation |
+| `duckgres_org_connection_reclaim_attempts_total{outcome}` | Counter | Exact org connection cleanup attempts by `success` or `error` outcome |
+| `duckgres_org_connection_reclaim_reservations_in_use` | Gauge | Bounded cleanup-ownership slots held by queued admissions, live leases, and pending cleanup |
+| `duckgres_org_connection_reclaim_reservation_capacity` | Gauge | Cleanup-ownership slot capacity for this control-plane process (4096 per reclaimer by default) |
+| `duckgres_org_connection_reclaim_reservation_rejections_total{reason}` | Counter | Reservations rejected before durable enqueue because capacity was `full`, the reclaimer was `closed`, or the exact reference was a `duplicate` |
 | `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
 | `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
@@ -113,6 +119,7 @@ DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
+- [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
 
@@ -175,6 +182,7 @@ flight_handle_idle_ttl: "15m"
 flight_session_token_ttl: "1h"
 data_dir: "./data"
 session_init_timeout: "10s"
+admission_reclaimer_max_reservations: 4096
 
 tls:
   cert: "./certs/server.crt"
@@ -245,6 +253,7 @@ Run with config file:
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
 | `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
+| `DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS` | Max queued/live admission identities whose cleanup ownership one control plane may retain; new admissions are rejected before enqueue when full | `4096` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |

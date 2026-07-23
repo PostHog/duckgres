@@ -17,6 +17,11 @@ port: 5432
 # Default: 60s
 # worker_queue_timeout: "60s"
 
+# Max queued/live admission identities whose cleanup ownership one control
+# plane may retain. New admissions are rejected before enqueue when full.
+# Default: 4096
+# admission_reclaimer_max_reservations: 4096
+
 # Directory for DuckDB database files (one per user)
 data_dir: "./data"
 

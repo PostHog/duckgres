@@ -84,6 +84,8 @@ type CLIInputs struct {
 	K8sWorkerTolerationValue    string
 	AWSRegion                   string
 	QueryLog                    bool
+
+	AdmissionReclaimerMaxReservations int
 }
 
 type Resolved struct {
@@ -133,6 +135,8 @@ type Resolved struct {
 	ManagedHostnameSuffixes         []string
 	DucklingBucketSuffix            string
 	DuckLakeDefaultSpecVersion      string
+
+	AdmissionReclaimerMaxReservations int
 }
 
 func intPtr(n int) *int    { return &n }
@@ -187,6 +191,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	cfg := DefaultServerConfig()
 	defaultQueryLog := cfg.QueryLog
 	workerQueueTimeout := 60 * time.Second
+	admissionReclaimerMaxReservations := controlplane.DefaultAdmissionReclaimerMaxReservations
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
 	var processMinWorkers, processMaxWorkers int
@@ -397,6 +402,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			} else {
 				warn("Invalid worker_queue_timeout duration: " + err.Error())
 			}
+		}
+		if fileCfg.AdmissionReclaimerMaxReservations > 0 {
+			admissionReclaimerMaxReservations = fileCfg.AdmissionReclaimerMaxReservations
+		} else if fileCfg.AdmissionReclaimerMaxReservations < 0 {
+			warn("admission_reclaimer_max_reservations must be > 0")
 		}
 		if fileCfg.WorkerIdleTimeout != "" {
 			if d, err := time.ParseDuration(fileCfg.WorkerIdleTimeout); err == nil {
@@ -688,6 +698,15 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			workerQueueTimeout = d
 		} else {
 			warn("Invalid DUCKGRES_WORKER_QUEUE_TIMEOUT duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			admissionReclaimerMaxReservations = n
+		} else if err != nil {
+			warn("Invalid DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS: " + err.Error())
+		} else {
+			warn("DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS must be > 0")
 		}
 	}
 	if v := getenv("DUCKGRES_WORKER_IDLE_TIMEOUT"); v != "" {
@@ -996,6 +1015,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid --worker-queue-timeout duration: " + err.Error())
 		}
 	}
+	if cli.Set["admission-reclaimer-max-reservations"] {
+		if cli.AdmissionReclaimerMaxReservations > 0 {
+			admissionReclaimerMaxReservations = cli.AdmissionReclaimerMaxReservations
+		} else {
+			warn("--admission-reclaimer-max-reservations must be > 0")
+		}
+	}
 	if cli.Set["worker-idle-timeout"] {
 		if d, err := time.ParseDuration(cli.WorkerIdleTimeout); err == nil {
 			workerIdleTimeout = d
@@ -1199,6 +1225,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,
 		DucklingBucketSuffix:            ducklingBucketSuffix,
 		DuckLakeDefaultSpecVersion:      cfg.DuckLake.SpecVersion,
+
+		AdmissionReclaimerMaxReservations: admissionReclaimerMaxReservations,
 	}
 }
 

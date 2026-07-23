@@ -31,6 +31,17 @@ func seedReadyWarehouse(t *testing.T, store *cpconfigstore.ConfigStore, orgID st
 	}
 }
 
+func seedOrgConnectionUser(t *testing.T, store *cpconfigstore.ConfigStore, orgID, username string) {
+	t.Helper()
+	if err := store.DB().Create(&cpconfigstore.OrgUser{
+		OrgID:    orgID,
+		Username: username,
+		Password: "test-password-hash",
+	}).Error; err != nil {
+		t.Fatalf("seed org connection user %s/%s: %v", orgID, username, err)
+	}
+}
+
 func newReshardOp(orgID string) *cpconfigstore.ReshardOperation {
 	return &cpconfigstore.ReshardOperation{
 		OrgID:        orgID,
@@ -275,6 +286,8 @@ func TestWarehouseReshardingBlocksLeaseGrantsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
 	seedReadyWarehouse(t, store, "org-block")
+	seedOrgConnectionUser(t, store, "org-block", "alice")
+	seedOrgConnectionUser(t, store, "org-block", "bob")
 
 	now := time.Now()
 	limits := cpconfigstore.OrgResourceLimits{}
@@ -320,6 +333,7 @@ func TestWarehouseReshardingBlocksLeaseGrantsPostgres(t *testing.T) {
 
 	// Other orgs are unaffected.
 	seedReadyWarehouse(t, store, "org-free")
+	seedOrgConnectionUser(t, store, "org-free", "carol")
 	free := &cpconfigstore.OrgConnectionQueueEntry{
 		RequestID: "req-free", OrgID: "org-free", Username: "carol",
 		CPInstanceID: "cp-a", PID: 3, Protocol: "postgres", RequestedVCPUs: 1,

@@ -31,6 +31,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// DefaultAdmissionReclaimerMaxReservations bounds cleanup ownership retained by
+// one control-plane process when the operator does not configure a value.
+const DefaultAdmissionReclaimerMaxReservations = defaultAdmissionReclaimerReservations
+
 // ControlPlaneConfig extends server.Config with control-plane-specific settings.
 type ControlPlaneConfig struct {
 	server.Config
@@ -45,6 +49,8 @@ type ControlPlaneConfig struct {
 	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade. 0 = unbounded (wait until k8s SIGKILL via terminationGracePeriodSeconds). Default: 0 in remote mode (so a CP rolling out doesn't kill in-flight customer queries at a self-imposed wall — see drainAndShutdown), 24h in process mode.
 	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
+
+	AdmissionReclaimerMaxReservations int // Max queued/live admission identities whose cleanup ownership this CP may retain (default: 4096)
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
@@ -218,6 +224,8 @@ type ControlPlane struct {
 	wg              sync.WaitGroup
 	reloading       atomic.Bool            // guards against concurrent upgrade from double SIGUSR1
 	upgradeDraining atomic.Bool            // true after upgrade succeeded; SIGTERM should exit immediately
+	sessionDraining atomic.Bool            // true once any shutdown path closes session creation
+	preReady        sessionLifecycle       // authenticated pgwire handshakes not yet handed to the message loop
 	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
@@ -276,6 +284,7 @@ type ConfigStoreInterface interface {
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	IsMigratingForOrg(orgID string) bool
+	BeginDrain()
 	ShutdownAll()
 	// ReleaseIdleHotWorkers parks idle (zero-session) Hot workers into hot_idle
 	// at drain start so the TTL reaper reclaims them instead of letting them
@@ -652,6 +661,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(0)
 		}
 		slog.Info("Received shutdown signal.", "signal", s)
+		// Close local admission before publishing the durable draining state.
+		// MarkDraining performs a database write and may block; no connection
+		// creation may remain live behind that write.
+		cp.stopAcceptingPGConnections()
+		cp.beginSessionDrain()
 		if cp.runtimeTracker != nil {
 			if err := cp.runtimeTracker.MarkDraining(); err != nil {
 				slog.Warn("Failed to mark control plane draining.", "error", err)
@@ -749,25 +763,42 @@ func (cp *ControlPlane) acceptLoop() {
 }
 
 func createSessionWithRegisteredCancel(
+	parent context.Context,
 	srv *server.Server,
 	timeout time.Duration,
 	key server.BackendKey,
 	createFn func(context.Context) (int32, *flightclient.FlightExecutor, error),
 ) (int32, *flightclient.FlightExecutor, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	srv.RegisterQuery(key, cancel)
 	defer srv.UnregisterQuery(key)
 
-	return createFn(ctx)
+	pid, executor, err := createFn(ctx)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return pid, executor, err
 }
 
 func sessionCreationErrorResponse(err error) (code string, message string) {
 	var capacityErr *WorkerCapacityExhaustedError
+	var rejection *configstore.OrgConnectionAdmissionRejectedError
 	switch {
 	case errors.As(err, &capacityErr):
 		return "53300", capacityMissPolicyForReason(capacityErr.missReason()).sqlMessage(capacityErr.RetryAfter)
+	case errors.As(err, &rejection):
+		scope := "organization"
+		if rejection.Reason == configstore.OrgConnectionAdmissionRejectedUserVCPU {
+			scope = "user"
+		}
+		return "53400", fmt.Sprintf("requested worker requires %d vCPUs, exceeding the %s limit of %d vCPUs; request a smaller worker or raise the limit", rejection.RequestedVCPUs, scope, rejection.MaximumVCPUs)
+	case errors.Is(err, ErrSessionManagerDraining):
+		return "57P03", "control plane is draining, retry shortly"
 	case errors.Is(err, context.Canceled):
 		return "57014", "canceling authentication due to user request"
 	case errors.Is(err, context.DeadlineExceeded):
@@ -1211,6 +1242,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
+	preReadyCtx, finishPreReady, err := cp.beginPreReadyHandshake(context.Background())
+	if err != nil {
+		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
+		_ = writer.Flush()
+		return
+	}
+	defer finishPreReady()
 
 	// Feed initial parameters and backend key data to the client IMMEDIATELY.
 	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
@@ -1241,7 +1279,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		threads = rebalancer.PerSessionThreads()
 	}
 
-	_, executor, err := createSessionWithRegisteredCancel(
+	admissionCtx, disconnectWatcher := startPreReadyDisconnectWatcher(preReadyCtx, tlsConn, reader)
+	defer disconnectWatcher.Stop()
+	createdPID, executor, err := createSessionWithRegisteredCancel(
+		admissionCtx,
 		cp.srv,
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
@@ -1249,7 +1290,20 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return sessions.CreateSession(ctx, username, pid, memLimit, threads, workerProfile)
 		},
 	)
+	if cp.isDraining() {
+		err = ErrSessionManagerDraining
+	}
 	if err != nil {
+		// Session creation may have committed at the same instant a CancelRequest,
+		// client FIN/RST, or drain canceled its context. Never retain that raced
+		// session without a live client to own it.
+		if executor != nil {
+			if createdPID == 0 {
+				createdPID = pid
+			}
+			sessions.DestroySession(createdPID)
+			executor = nil
+		}
 		clog.Error("Failed to create session.", "error", err)
 		code, message := sessionCreationErrorResponse(err)
 		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
@@ -1274,7 +1328,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// resolve the real catalog the session defaults to. The startup `database`
 	// selected "ducklake"/"" (default); fail closed (3D000) if the
 	// requested catalog isn't attached.
-	attachCtx, attachCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+	attachCtx, attachCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
 	attachCancel()
 	if probeErr != nil {
@@ -1319,7 +1373,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// worker session stays in DuckDB's empty in-memory catalog (see the
 	// passthrough branch below).
 	if !passthroughUser {
-		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+		initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 		var metadataAccess *sessionmeta.MetadataAccessPolicy
 		if queryAccessPolicy != nil {
 			metadataAccess = &sessionmeta.MetadataAccessPolicy{
@@ -1342,7 +1396,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// earlier value would be clobbered. A client-supplied search_path is
 		// best-effort.
 		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
-			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+			spCtx, spCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(spCtx, cmd)
 			spCancel()
 			if err != nil {
@@ -1364,7 +1418,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", clientSearchPath)
 		}
 		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
-			initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+			initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(initCtx, cmd)
 			initCancel()
 			if err != nil {
@@ -1421,6 +1475,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.SetQueryAccessPolicy(cc, queryAccessPolicy)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)
+	}
+
+	// The normal PostgreSQL message loop is about to take ownership of reader.
+	// Join the disconnect watcher first; a FIN/RST at any point during session
+	// admission or metadata initialization tears down the session via the defer
+	// above instead of retaining its worker and vCPU lease.
+	if disconnectWatcher.Stop().ClientCanceled || finishPreReady() {
+		return
 	}
 
 	// Send ReadyForQuery to signal that the handshake is complete
@@ -1715,6 +1777,7 @@ func fullRead(conn net.Conn, buf []byte) (int, error) {
 
 func (cp *ControlPlane) shutdown() {
 	cp.stopAcceptingPGConnections()
+	cp.beginSessionDrain()
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
@@ -1739,6 +1802,7 @@ func (cp *ControlPlane) shutdown() {
 
 func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
 	cp.stopAcceptingPGConnections()
+	cp.beginSessionDrain()
 	if cp.flight != nil {
 		cp.flight.BeginDrain()
 	}
@@ -1781,6 +1845,22 @@ func (cp *ControlPlane) stopAcceptingPGConnections() {
 	if cp.pgListener != nil {
 		_ = cp.pgListener.Close()
 	}
+}
+
+func (cp *ControlPlane) beginSessionDrain() {
+	cp.sessionDraining.Store(true)
+	cp.preReady.close()
+	if cp.orgRouter != nil {
+		cp.orgRouter.BeginDrain()
+		return
+	}
+	if cp.sessions != nil {
+		cp.sessions.BeginDrain()
+	}
+}
+
+func (cp *ControlPlane) beginPreReadyHandshake(ctx context.Context) (context.Context, func() bool, error) {
+	return cp.preReady.begin(ctx)
 }
 
 // waitForDrain blocks until both the pgwire and Flight server report
@@ -1858,7 +1938,7 @@ func (cp *ControlPlane) shutdownRuntimeResources() {
 }
 
 func (cp *ControlPlane) isDraining() bool {
-	return cp.runtimeTracker != nil && cp.runtimeTracker.Draining()
+	return cp.sessionDraining.Load() || cp.upgradeDraining.Load() || (cp.runtimeTracker != nil && cp.runtimeTracker.Draining())
 }
 
 func (cp *ControlPlane) healthReady() bool {
@@ -1948,7 +2028,7 @@ func (cp *ControlPlane) handleUpgrade() {
 		if strings.Contains(err.Error(), "parent hasn't exited") && cp.killStuckParent() {
 			if retryErr := cp.upgrader.Upgrade(); retryErr == nil {
 				slog.Info("Upgrade succeeded after terminating stuck parent.")
-				cp.upgradeDraining.Store(true)
+				cp.beginUpgradeDrain()
 				cp.reloading.Store(false)
 				return
 			} else {
@@ -1966,7 +2046,7 @@ func (cp *ControlPlane) handleUpgrade() {
 	}
 
 	slog.Info("Upgrade succeeded, child process is ready. Draining connections.")
-	cp.upgradeDraining.Store(true)
+	cp.beginUpgradeDrain()
 	cp.reloading.Store(false)
 	// upg.Exit() channel closes now, triggering drainAfterUpgrade in the main goroutine.
 }
@@ -2008,22 +2088,26 @@ func (cp *ControlPlane) killStuckParent() bool {
 	}
 }
 
+func (cp *ControlPlane) beginUpgradeDrain() {
+	cp.upgradeDraining.Store(true)
+	cp.beginSessionDrain()
+}
+
 // drainAfterUpgrade is called after a successful tableflip upgrade. It stops
 // accepting new connections, waits for in-flight connections to finish, shuts
 // down workers, and exits.
 func (cp *ControlPlane) drainAfterUpgrade() {
-	// Shut down Flight ingress now that the new CP has started.
+	// Stop accepting new connections. The new CP has its own listener copy
+	// (inherited via tableflip), so closing ours doesn't affect it.
+	cp.stopAcceptingPGConnections()
+	cp.beginSessionDrain()
+
+	// Shut down Flight ingress only after the shared session-creation barrier is
+	// closed; Flight shutdown may block while existing RPCs unwind.
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
 	}
-
-	// Stop accepting new connections. The new CP has its own listener copy
-	// (inherited via tableflip), so closing ours doesn't affect it.
-	cp.closeMu.Lock()
-	cp.closed = true
-	cp.closeMu.Unlock()
-	_ = cp.pgListener.Close()
 
 	// Wait for in-flight connections to finish (with timeout)
 	drainDone := make(chan struct{})

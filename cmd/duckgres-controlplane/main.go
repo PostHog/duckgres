@@ -248,6 +248,8 @@ func main() {
 		ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 		DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 		DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
+
+		AdmissionReclaimerMaxReservations: resolved.AdmissionReclaimerMaxReservations,
 		K8s: controlplane.K8sConfig{
 			WorkerImage:                  resolved.K8sWorkerImage,
 			WorkerNamespace:              resolved.K8sWorkerNamespace,

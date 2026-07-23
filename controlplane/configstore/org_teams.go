@@ -336,9 +336,15 @@ type OrgTeamDeleteResult struct {
 //     the org's buffered usage buckets to it (ReattributeUsageTeamTx), the
 //     same handover a billing repoint does.
 //
-// All of the org's team rows are locked up front so two concurrent deletes
+// The org admission lock is acquired before any row locks so removing a
+// project-reader login serializes with admission decisions that read it. All
+// of the org's team rows are then locked up front so two concurrent deletes
 // can't each see the other's row as "remaining" and empty the org.
 func DeleteOrgTeamTx(tx *gorm.DB, orgID string, teamID int64) (*OrgTeamDeleteResult, error) {
+	if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+		return nil, fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
+	}
+
 	var teams []OrgTeam
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("org_id = ?", orgID).

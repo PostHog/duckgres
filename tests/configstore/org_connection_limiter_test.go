@@ -29,6 +29,140 @@ func upsertActiveCP(t *testing.T, store *cpconfigstore.ConfigStore, id string) {
 	}
 }
 
+func newSharedConfigStores(t *testing.T) (*cpconfigstore.ConfigStore, *cpconfigstore.ConfigStore, string, string) {
+	t.Helper()
+
+	_, connStr := newIsolatedConfigStoreSchema(t)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	appA := "admission-a-" + suffix
+	appB := "admission-b-" + suffix
+
+	newStore := func(applicationName string) *cpconfigstore.ConfigStore {
+		t.Helper()
+		store, err := cpconfigStoreNew(connStr + " application_name=" + applicationName)
+		if err != nil {
+			t.Fatalf("new shared config store %q: %v", applicationName, err)
+		}
+		sqlDB, err := store.DB().DB()
+		if err != nil {
+			t.Fatalf("shared config store %q sql db: %v", applicationName, err)
+		}
+		t.Cleanup(func() { _ = sqlDB.Close() })
+		return store
+	}
+
+	return newStore(appA), newStore(appB), appA, appB
+}
+
+func assertOrgConnectionRequestPending(t *testing.T, store *cpconfigstore.ConfigStore, requestID string) {
+	t.Helper()
+
+	var leaseCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_leases").
+		Where("request_id = ?", requestID).
+		Count(&leaseCount).Error; err != nil {
+		t.Fatalf("count leases for request %q: %v", requestID, err)
+	}
+	if leaseCount != 0 {
+		t.Fatalf("expected request %q to have no lease, got %d", requestID, leaseCount)
+	}
+
+	var pendingCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_queue").
+		Where("request_id = ? AND granted_at IS NULL", requestID).
+		Count(&pendingCount).Error; err != nil {
+		t.Fatalf("count pending queue rows for request %q: %v", requestID, err)
+	}
+	if pendingCount != 1 {
+		t.Fatalf("expected request %q to remain pending, got %d pending rows", requestID, pendingCount)
+	}
+}
+
+func assertOrgConnectionRequestAbsent(t *testing.T, store *cpconfigstore.ConfigStore, requestID string) {
+	t.Helper()
+
+	var leaseCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_leases").
+		Where("request_id = ?", requestID).
+		Count(&leaseCount).Error; err != nil {
+		t.Fatalf("count leases for request %q: %v", requestID, err)
+	}
+	if leaseCount != 0 {
+		t.Fatalf("expected request %q to have no lease, got %d", requestID, leaseCount)
+	}
+
+	var queueCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_queue").
+		Where("request_id = ?", requestID).
+		Count(&queueCount).Error; err != nil {
+		t.Fatalf("count queue rows for request %q: %v", requestID, err)
+	}
+	if queueCount != 0 {
+		t.Fatalf("expected request %q to have no queue row, got %d", requestID, queueCount)
+	}
+}
+
+func assertOrgConnectionRequestGranted(t *testing.T, store *cpconfigstore.ConfigStore, requestID string) {
+	t.Helper()
+
+	var leaseCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_leases").
+		Where("request_id = ?", requestID).
+		Count(&leaseCount).Error; err != nil {
+		t.Fatalf("count leases for request %q: %v", requestID, err)
+	}
+	if leaseCount != 1 {
+		t.Fatalf("expected request %q to have one lease, got %d", requestID, leaseCount)
+	}
+
+	var grantedCount int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_queue").
+		Where("request_id = ? AND granted_at IS NOT NULL", requestID).
+		Count(&grantedCount).Error; err != nil {
+		t.Fatalf("count granted queue rows for request %q: %v", requestID, err)
+	}
+	if grantedCount != 1 {
+		t.Fatalf("expected request %q to have one granted queue row, got %d", requestID, grantedCount)
+	}
+}
+
+func assertOrgConnectionActiveVCPUs(t *testing.T, store *cpconfigstore.ConfigStore, orgID string, want int64) {
+	t.Helper()
+
+	var got int64
+	if err := store.DB().Table(store.RuntimeSchema()+".org_connection_leases").
+		Select("COALESCE(SUM(requested_vcpus), 0)").
+		Where("org_id = ?", orgID).
+		Scan(&got).Error; err != nil {
+		t.Fatalf("sum active vCPUs for org %q: %v", orgID, err)
+	}
+	if got != want {
+		t.Fatalf("active vCPUs for org %q = %d, want %d", orgID, got, want)
+	}
+}
+
+func seedAuthoritativeOrgConnectionLimits(t *testing.T, store *cpconfigstore.ConfigStore, orgID string, orgMaxVCPUs int, userMaxVCPUs map[string]int) {
+	t.Helper()
+
+	if err := store.DB().Create(&cpconfigstore.Org{
+		Name:         orgID,
+		DatabaseName: orgID,
+		MaxVCPUs:     orgMaxVCPUs,
+	}).Error; err != nil {
+		t.Fatalf("seed org %q limits: %v", orgID, err)
+	}
+	for username, maxVCPUs := range userMaxVCPUs {
+		if err := store.DB().Create(&cpconfigstore.OrgUser{
+			OrgID:    orgID,
+			Username: username,
+			Password: "test-password-hash",
+			MaxVCPUs: maxVCPUs,
+		}).Error; err != nil {
+			t.Fatalf("seed limits for %s/%s: %v", orgID, username, err)
+		}
+	}
+}
+
 func TestOrgConnectionLeasesEnforceOrgVCPUBudget(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
@@ -300,7 +434,7 @@ func TestOrgConnectionLeasesQueueUsesEachUsersOwnLimit(t *testing.T) {
 	}
 }
 
-func TestOrgConnectionLeasesOutOfOrderPollGrantsOldestEligibleUserHead(t *testing.T) {
+func TestOrgConnectionLeasesOutOfOrderPollDoesNotGrantForeignRequest(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
 	upsertActiveCP(t, store, "cp-b")
@@ -340,22 +474,179 @@ func TestOrgConnectionLeasesOutOfOrderPollGrantsOldestEligibleUserHead(t *testin
 		t.Fatalf("out-of-order acquire: %v", err)
 	}
 	if outOfOrder != nil {
-		t.Fatalf("expected bob to keep waiting while alice is granted first, got lease %q", outOfOrder.LeaseID)
+		t.Fatalf("expected bob to keep waiting behind alice, got lease %q", outOfOrder.LeaseID)
 	}
+	count, err := store.ActiveOrgConnectionLeaseCount(alice.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after bob poll: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected bob's poll not to reserve capacity for alice, got %d active leases", count)
+	}
+	assertOrgConnectionRequestPending(t, store, alice.RequestID)
 
 	aliceLease, err := store.TryAcquireOrgConnectionLease(alice.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
 	if err != nil {
-		t.Fatalf("acquire alice after scheduler grant: %v", err)
+		t.Fatalf("acquire alice: %v", err)
 	}
 	if aliceLease == nil || aliceLease.RequestID != alice.RequestID {
-		t.Fatalf("expected alice lease to have been granted by bob's poll, got %#v", aliceLease)
+		t.Fatalf("expected alice to grant only her own request, got %#v", aliceLease)
+	}
+
+	bobLease, err := store.TryAcquireOrgConnectionLease(bob.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
+	if err != nil {
+		t.Fatalf("acquire bob: %v", err)
+	}
+	if bobLease == nil || bobLease.RequestID != bob.RequestID {
+		t.Fatalf("expected bob to grant only his own request, got %#v", bobLease)
 	}
 }
 
-func TestCancelOrgConnectionRequestReleasesForeignGrantedLease(t *testing.T) {
+func TestOrgConnectionLeasesConcurrentCrossCPOwnerPolls(t *testing.T) {
+	for _, orgMaxVCPUs := range []int{1, 2} {
+		t.Run(fmt.Sprintf("org_cap_%d", orgMaxVCPUs), func(t *testing.T) {
+			storeA, storeB, appA, appB := newSharedConfigStores(t)
+			upsertActiveCP(t, storeA, "cp-a")
+			upsertActiveCP(t, storeB, "cp-b")
+
+			now := time.Now()
+			alice := &cpconfigstore.OrgConnectionQueueEntry{
+				RequestID:      "request-alice",
+				OrgID:          "org-concurrent",
+				Username:       "alice",
+				CPInstanceID:   "cp-a",
+				PID:            1001,
+				Protocol:       "postgres",
+				RequestedVCPUs: 1,
+				EnqueuedAt:     now,
+				ExpiresAt:      now.Add(time.Minute),
+			}
+			bob := &cpconfigstore.OrgConnectionQueueEntry{
+				RequestID:      "request-bob",
+				OrgID:          alice.OrgID,
+				Username:       "bob",
+				CPInstanceID:   "cp-b",
+				PID:            1002,
+				Protocol:       "postgres",
+				RequestedVCPUs: 1,
+				EnqueuedAt:     now.Add(time.Millisecond),
+				ExpiresAt:      now.Add(time.Minute),
+			}
+			if err := storeA.EnqueueOrgConnectionRequest(alice); err != nil {
+				t.Fatalf("enqueue alice: %v", err)
+			}
+			if err := storeB.EnqueueOrgConnectionRequest(bob); err != nil {
+				t.Fatalf("enqueue bob: %v", err)
+			}
+
+			sqlDB, err := storeA.DB().DB()
+			if err != nil {
+				t.Fatalf("store sql db: %v", err)
+			}
+			holder, err := sqlDB.Begin()
+			if err != nil {
+				t.Fatalf("begin advisory holder tx: %v", err)
+			}
+			defer func() { _ = holder.Rollback() }()
+
+			var holderPID int
+			if err := holder.QueryRow("SELECT pg_backend_pid()").Scan(&holderPID); err != nil {
+				t.Fatalf("get advisory holder backend pid: %v", err)
+			}
+			if _, err := holder.Exec("SELECT pg_advisory_xact_lock($1)", orgConnectionAdvisoryLockKey(alice.OrgID)); err != nil {
+				t.Fatalf("take org advisory lock: %v", err)
+			}
+			aliceRowHolder, err := sqlDB.Begin()
+			if err != nil {
+				t.Fatalf("begin alice row holder tx: %v", err)
+			}
+			defer func() { _ = aliceRowHolder.Rollback() }()
+			var lockedRequestID string
+			if err := aliceRowHolder.QueryRow(
+				"SELECT request_id FROM "+storeA.RuntimeSchema()+".org_connection_queue WHERE request_id = $1 FOR UPDATE",
+				alice.RequestID,
+			).Scan(&lockedRequestID); err != nil {
+				t.Fatalf("lock alice queue row: %v", err)
+			}
+
+			limits := cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: orgMaxVCPUs}
+			aliceDone := make(chan acquireResult, 1)
+			bobDone := make(chan acquireResult, 1)
+			go func() {
+				lease, err := storeB.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
+				bobDone <- acquireResult{lease: lease, err: err}
+			}()
+			waitForAdvisoryLockWaiterFromApplication(t, sqlDB, holderPID, appB)
+			go func() {
+				lease, err := storeA.TryAcquireOrgConnectionLease(alice.RequestID, limits, now)
+				aliceDone <- acquireResult{lease: lease, err: err}
+			}()
+
+			waitForAdvisoryLockWaitersFromApplications(t, sqlDB, holderPID, appA, appB)
+			if err := holder.Commit(); err != nil {
+				t.Fatalf("release org advisory lock: %v", err)
+			}
+
+			bobResult := waitForAcquireResult(t, bobDone, "bob concurrent poll")
+			if bobResult.err != nil {
+				t.Fatalf("bob concurrent poll: %v", bobResult.err)
+			}
+			if bobResult.lease != nil {
+				t.Fatalf("bob's earlier poll granted a lease: %#v", bobResult.lease)
+			}
+			assertOrgConnectionRequestPending(t, storeA, alice.RequestID)
+			assertOrgConnectionActiveVCPUs(t, storeA, alice.OrgID, 0)
+
+			if err := aliceRowHolder.Commit(); err != nil {
+				t.Fatalf("release alice queue row: %v", err)
+			}
+			aliceResult := waitForAcquireResult(t, aliceDone, "alice concurrent poll")
+			if aliceResult.err != nil {
+				t.Fatalf("alice concurrent poll: %v", aliceResult.err)
+			}
+			if aliceResult.lease == nil || aliceResult.lease.RequestID != alice.RequestID {
+				t.Fatalf("alice result = %#v, want alice's own lease", aliceResult.lease)
+			}
+
+			assertOrgConnectionRequestGranted(t, storeA, alice.RequestID)
+			if orgMaxVCPUs == 1 {
+				if bobResult.lease != nil {
+					t.Fatalf("bob acquired over the org cap: %#v", bobResult.lease)
+				}
+				assertOrgConnectionRequestPending(t, storeB, bob.RequestID)
+				assertOrgConnectionActiveVCPUs(t, storeA, alice.OrgID, 1)
+
+				if err := storeA.ReleaseOrgConnectionLease(aliceResult.lease.LeaseID); err != nil {
+					t.Fatalf("release alice: %v", err)
+				}
+				bobResult.lease, bobResult.err = storeB.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
+				if bobResult.err != nil {
+					t.Fatalf("bob retry after release: %v", bobResult.err)
+				}
+			}
+
+			if bobResult.lease == nil {
+				bobResult.lease, bobResult.err = storeB.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
+				if bobResult.err != nil {
+					t.Fatalf("bob owner retry: %v", bobResult.err)
+				}
+			}
+			if bobResult.lease == nil || bobResult.lease.RequestID != bob.RequestID {
+				t.Fatalf("bob result after owner retry = %#v, want bob's own lease", bobResult.lease)
+			}
+			assertOrgConnectionRequestGranted(t, storeB, bob.RequestID)
+			if orgMaxVCPUs == 2 {
+				assertOrgConnectionActiveVCPUs(t, storeA, alice.OrgID, 2)
+			} else {
+				assertOrgConnectionActiveVCPUs(t, storeA, alice.OrgID, 1)
+			}
+		})
+	}
+}
+
+func TestCancelOrgConnectionRequestReleasesUnclaimedOwnLease(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
-	upsertActiveCP(t, store, "cp-b")
 
 	now := time.Now()
 	alice := &cpconfigstore.OrgConnectionQueueEntry{
@@ -369,36 +660,23 @@ func TestCancelOrgConnectionRequestReleasesForeignGrantedLease(t *testing.T) {
 		EnqueuedAt:     now,
 		ExpiresAt:      now.Add(time.Minute),
 	}
-	bob := &cpconfigstore.OrgConnectionQueueEntry{
-		RequestID:      "request-bob",
-		OrgID:          "org-1",
-		Username:       "bob",
-		CPInstanceID:   "cp-b",
-		PID:            1002,
-		Protocol:       "postgres",
-		RequestedVCPUs: 1,
-		EnqueuedAt:     now.Add(time.Millisecond),
-		ExpiresAt:      now.Add(time.Minute),
-	}
-	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{alice, bob} {
-		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
-			t.Fatalf("enqueue %s: %v", entry.RequestID, err)
-		}
+	if err := store.EnqueueOrgConnectionRequest(alice); err != nil {
+		t.Fatalf("enqueue alice: %v", err)
 	}
 
-	outOfOrder, err := store.TryAcquireOrgConnectionLease(bob.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+	lease, err := store.TryAcquireOrgConnectionLease(alice.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
-		t.Fatalf("out-of-order acquire: %v", err)
+		t.Fatalf("acquire alice: %v", err)
 	}
-	if outOfOrder != nil {
-		t.Fatalf("expected bob to keep waiting while alice is granted first, got lease %q", outOfOrder.LeaseID)
+	if lease == nil || lease.RequestID != alice.RequestID {
+		t.Fatalf("expected alice lease, got %#v", lease)
 	}
 	count, err := store.ActiveOrgConnectionLeaseCount(alice.OrgID)
 	if err != nil {
 		t.Fatalf("count active leases before cancel: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("expected alice foreign-granted lease to reserve capacity, got %d active leases", count)
+		t.Fatalf("expected alice lease to reserve capacity, got %d active leases", count)
 	}
 
 	if err := store.CancelOrgConnectionRequest(alice.RequestID, now.Add(time.Second)); err != nil {
@@ -409,8 +687,145 @@ func TestCancelOrgConnectionRequestReleasesForeignGrantedLease(t *testing.T) {
 		t.Fatalf("count active leases after cancel: %v", err)
 	}
 	if count != 0 {
-		t.Fatalf("expected cancel to release unclaimed foreign-granted lease, got %d active leases", count)
+		t.Fatalf("expected cancel to release unclaimed own lease, got %d active leases", count)
 	}
+	assertOrgConnectionRequestAbsent(t, store, alice.RequestID)
+}
+
+func TestCancelPendingOrgConnectionRequestUnblocksNextOwner(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	alice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-alice",
+		OrgID:          "org-cancel-pending",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-bob",
+		OrgID:          alice.OrgID,
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	for _, request := range []*cpconfigstore.OrgConnectionQueueEntry{alice, bob} {
+		if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+			t.Fatalf("enqueue %s: %v", request.RequestID, err)
+		}
+	}
+
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}
+	lease, err := store.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("bob poll behind alice: %v", err)
+	}
+	if lease != nil {
+		t.Fatalf("bob acquired before alice was canceled: %#v", lease)
+	}
+	assertOrgConnectionRequestPending(t, store, alice.RequestID)
+	assertOrgConnectionRequestPending(t, store, bob.RequestID)
+	assertOrgConnectionActiveVCPUs(t, store, alice.OrgID, 0)
+
+	if err := store.CancelOrgConnectionRequest(alice.RequestID, now); err != nil {
+		t.Fatalf("cancel pending alice: %v", err)
+	}
+	assertOrgConnectionRequestAbsent(t, store, alice.RequestID)
+
+	lease, err = store.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("bob poll after alice cancellation: %v", err)
+	}
+	if lease == nil || lease.RequestID != bob.RequestID {
+		t.Fatalf("bob result after alice cancellation = %#v, want bob's own lease", lease)
+	}
+	assertOrgConnectionRequestGranted(t, store, bob.RequestID)
+	assertOrgConnectionActiveVCPUs(t, store, alice.OrgID, 1)
+}
+
+func TestCancelOrgConnectionRequestWinsWhileAcquireWaitsForOrgLock(t *testing.T) {
+	storeA, storeB, appA, appB := newSharedConfigStores(t)
+	upsertActiveCP(t, storeA, "cp-a")
+
+	now := time.Now()
+	request := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-cancel-race",
+		OrgID:          "org-cancel-race",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := storeA.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue request: %v", err)
+	}
+
+	sqlDB, err := storeA.DB().DB()
+	if err != nil {
+		t.Fatalf("store sql db: %v", err)
+	}
+	holder, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatalf("begin advisory holder tx: %v", err)
+	}
+	defer func() { _ = holder.Rollback() }()
+
+	var holderPID int
+	if err := holder.QueryRow("SELECT pg_backend_pid()").Scan(&holderPID); err != nil {
+		t.Fatalf("get advisory holder backend pid: %v", err)
+	}
+	if _, err := holder.Exec("SELECT pg_advisory_xact_lock($1)", orgConnectionAdvisoryLockKey(request.OrgID)); err != nil {
+		t.Fatalf("take org advisory lock: %v", err)
+	}
+
+	cancelDone := make(chan error, 1)
+	go func() {
+		cancelDone <- storeB.CancelOrgConnectionRequest(request.RequestID, now)
+	}()
+	waitForAdvisoryLockWaiterFromApplication(t, sqlDB, holderPID, appB)
+
+	acquireDone := make(chan acquireResult, 1)
+	go func() {
+		lease, err := storeA.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+		acquireDone <- acquireResult{lease: lease, err: err}
+	}()
+	waitForAdvisoryLockWaitersFromApplications(t, sqlDB, holderPID, appA, appB)
+
+	if err := holder.Commit(); err != nil {
+		t.Fatalf("release org advisory lock: %v", err)
+	}
+	select {
+	case err := <-cancelDone:
+		if err != nil {
+			t.Fatalf("cancel request while acquire waits: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cancel-first transaction")
+	}
+	result := waitForAcquireResult(t, acquireDone, "acquire after cancellation")
+	if result.err != nil {
+		t.Fatalf("acquire after cancellation: %v", result.err)
+	}
+	if result.lease != nil {
+		t.Fatalf("canceled request acquired lease %#v", result.lease)
+	}
+	assertOrgConnectionRequestAbsent(t, storeB, request.RequestID)
+	assertOrgConnectionRequestAbsent(t, storeA, request.RequestID)
+	assertOrgConnectionActiveVCPUs(t, storeA, request.OrgID, 0)
 }
 
 func TestOrgConnectionLeasesUserCapSkipDoesNotBypassSameUserFIFO(t *testing.T) {
@@ -494,6 +909,14 @@ func TestOrgConnectionLeasesUserCapSkipDoesNotBypassSameUserFIFO(t *testing.T) {
 	}
 	if aliceSmallLease != nil {
 		t.Fatalf("expected alice small request to wait behind alice big FIFO head, got lease %q", aliceSmallLease.LeaseID)
+	}
+	assertOrgConnectionRequestPending(t, store, bob.RequestID)
+	count, err := store.ActiveOrgConnectionLeaseCount(activeAlice.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after alice small poll: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected alice small poll not to grant bob, got %d active leases", count)
 	}
 
 	bobLease, err := store.TryAcquireOrgConnectionLeaseWithLimitLookup(bob.RequestID, limitLookup, now)
@@ -675,6 +1098,14 @@ func TestOrgConnectionLeasesReordersUserQueueAfterHeadGranted(t *testing.T) {
 	if aliceSecondLease != nil {
 		t.Fatalf("expected alice second to wait behind bob after alice first is granted, got lease %q", aliceSecondLease.LeaseID)
 	}
+	assertOrgConnectionRequestPending(t, store, bob.RequestID)
+	count, err := store.ActiveOrgConnectionLeaseCount(aliceFirst.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after alice second poll: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected alice second poll not to grant bob, got %d active leases", count)
+	}
 
 	bobLease, err := store.TryAcquireOrgConnectionLease(bob.RequestID, limits, now)
 	if err != nil {
@@ -733,6 +1164,93 @@ func TestOrgConnectionAdmissionMetricsObserveAttemptsAndQueueShape(t *testing.T)
 	}
 	if outcomesAfter-outcomesBefore != 1 {
 		t.Fatalf("expected admission attempts counter delta 1, got %f", outcomesAfter-outcomesBefore)
+	}
+}
+
+func TestOrgConnectionAdmissionMetricsDoNotCountDisabledUserAsVCPULimit(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-disabled-metrics")
+
+	const (
+		orgID     = "org-disabled-metrics"
+		username  = "alice"
+		requestID = "request-disabled-metrics"
+	)
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, map[string]int{username: 1})
+	if err := store.DB().Model(&cpconfigstore.OrgUser{}).
+		Where("org_id = ? AND username = ?", orgID, username).
+		Update("disabled", true).Error; err != nil {
+		t.Fatalf("disable metrics user: %v", err)
+	}
+
+	now := time.Now()
+	if err := store.EnqueueOrgConnectionRequest(&cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: requestID, OrgID: orgID, Username: username, CPInstanceID: "cp-disabled-metrics",
+		PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
+		EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("enqueue disabled-user metrics request: %v", err)
+	}
+
+	userLimitBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total")
+	ineligibleBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_ineligible_user_skips_total")
+	outcomeBefore := configstoreMetricCounterValue(t, "duckgres_org_connection_admission_attempts_total", "outcome", "ineligible_user")
+
+	lease, err := store.ScheduleAndClaimOrgConnectionLease(requestID, "cp-disabled-metrics")
+	if err != nil {
+		t.Fatalf("admit disabled-user metrics request: %v", err)
+	}
+	if lease != nil {
+		t.Fatalf("disabled user received lease %#v", lease)
+	}
+
+	if delta := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total") - userLimitBefore; delta != 0 {
+		t.Fatalf("disabled user changed vCPU-limit skip counter by %f, want 0", delta)
+	}
+	if delta := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_ineligible_user_skips_total") - ineligibleBefore; delta != 1 {
+		t.Fatalf("disabled user changed ineligible-user skip counter by %f, want 1", delta)
+	}
+	if delta := configstoreMetricCounterValue(t, "duckgres_org_connection_admission_attempts_total", "outcome", "ineligible_user") - outcomeBefore; delta != 1 {
+		t.Fatalf("disabled user changed ineligible outcome counter by %f, want 1", delta)
+	}
+}
+
+func TestOrgConnectionAdmissionMetricsDoNotCountPermanentlyImpossibleForeignHeadAsSaturation(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-impossible-head")
+	upsertActiveCP(t, store, "cp-eligible-behind")
+
+	const orgID = "org-impossible-head-metrics"
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 4, map[string]int{
+		"alice": 2,
+		"bob":   0,
+	})
+	now := time.Now()
+	requests := []*cpconfigstore.OrgConnectionQueueEntry{
+		{
+			RequestID: "request-impossible-head", OrgID: orgID, Username: "alice", CPInstanceID: "cp-impossible-head",
+			PID: 1001, Protocol: "postgres", RequestedVCPUs: 3,
+			EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+		},
+		{
+			RequestID: "request-eligible-behind", OrgID: orgID, Username: "bob", CPInstanceID: "cp-eligible-behind",
+			PID: 1002, Protocol: "postgres", RequestedVCPUs: 1,
+			EnqueuedAt: now.Add(time.Millisecond), ExpiresAt: now.Add(time.Minute),
+		},
+	}
+	for _, request := range requests {
+		if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+			t.Fatalf("enqueue %s: %v", request.RequestID, err)
+		}
+	}
+
+	userLimitBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total")
+	lease, err := store.ScheduleAndClaimOrgConnectionLease("request-eligible-behind", "cp-eligible-behind")
+	if err != nil || lease == nil {
+		t.Fatalf("eligible request behind impossible head = %#v, err = %v", lease, err)
+	}
+	if delta := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total") - userLimitBefore; delta != 0 {
+		t.Fatalf("permanently impossible foreign head changed saturation skip counter by %f, want 0", delta)
 	}
 }
 
@@ -926,6 +1444,14 @@ func TestOrgConnectionLeasesPreserveFIFOAcrossControlPlanes(t *testing.T) {
 	if outOfOrder != nil {
 		t.Fatalf("expected FIFO to block request-b while request-a is pending, got lease %q", outOfOrder.LeaseID)
 	}
+	assertOrgConnectionRequestPending(t, store, "request-a")
+	count, err := store.ActiveOrgConnectionLeaseCount("org-1")
+	if err != nil {
+		t.Fatalf("count active leases after request-b poll: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected request-b poll not to grant request-a, got %d active leases", count)
+	}
 
 	first, err := store.TryAcquireOrgConnectionLease("request-a", cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
@@ -978,6 +1504,14 @@ func TestOrgConnectionQueueUsesDatabaseInsertionTimeForFIFO(t *testing.T) {
 	if outOfOrder != nil {
 		t.Fatalf("expected database insertion order to block request-second-inserted, got lease %q", outOfOrder.LeaseID)
 	}
+	assertOrgConnectionRequestPending(t, store, first.RequestID)
+	count, err := store.ActiveOrgConnectionLeaseCount(first.OrgID)
+	if err != nil {
+		t.Fatalf("count active leases after second request poll: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected second request poll not to grant first request, got %d active leases", count)
+	}
 
 	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
 	if err != nil {
@@ -986,6 +1520,58 @@ func TestOrgConnectionQueueUsesDatabaseInsertionTimeForFIFO(t *testing.T) {
 	if lease == nil {
 		t.Fatal("expected first inserted request to acquire first")
 	}
+}
+
+func TestOrgConnectionLeasesExpiredForeignHeadDoesNotBlockOwner(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	alice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-expired-alice",
+		OrgID:          "org-expired-head",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	bob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-live-bob",
+		OrgID:          alice.OrgID,
+		Username:       "bob",
+		CPInstanceID:   "cp-b",
+		PID:            1002,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now.Add(time.Millisecond),
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	for _, request := range []*cpconfigstore.OrgConnectionQueueEntry{alice, bob} {
+		if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+			t.Fatalf("enqueue %s: %v", request.RequestID, err)
+		}
+	}
+	if err := store.DB().Exec(
+		"UPDATE "+store.RuntimeSchema()+".org_connection_queue SET expires_at = clock_timestamp() - interval '1 second' WHERE request_id = ?",
+		alice.RequestID,
+	).Error; err != nil {
+		t.Fatalf("expire alice request: %v", err)
+	}
+
+	lease, err := store.TryAcquireOrgConnectionLease(bob.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+	if err != nil {
+		t.Fatalf("bob poll after alice expiry: %v", err)
+	}
+	if lease == nil || lease.RequestID != bob.RequestID {
+		t.Fatalf("bob result after alice expiry = %#v, want bob's own lease", lease)
+	}
+	assertOrgConnectionRequestAbsent(t, store, alice.RequestID)
+	assertOrgConnectionRequestGranted(t, store, bob.RequestID)
+	assertOrgConnectionActiveVCPUs(t, store, alice.OrgID, 1)
 }
 
 func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
@@ -1143,6 +1729,78 @@ func TestTryAcquireOrgConnectionLeaseRetryReturnsExistingLease(t *testing.T) {
 	}
 }
 
+func TestTryAcquireOrgConnectionLeaseConcurrentRetriesReturnSameOwnLease(t *testing.T) {
+	storeA, storeB, appA, appB := newSharedConfigStores(t)
+	upsertActiveCP(t, storeA, "cp-a")
+
+	now := time.Now()
+	request := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:      "request-concurrent-retry",
+		OrgID:          "org-concurrent-retry",
+		Username:       "alice",
+		CPInstanceID:   "cp-a",
+		PID:            1001,
+		Protocol:       "postgres",
+		RequestedVCPUs: 1,
+		EnqueuedAt:     now,
+		ExpiresAt:      now.Add(time.Minute),
+	}
+	if err := storeA.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue request: %v", err)
+	}
+
+	sqlDB, err := storeA.DB().DB()
+	if err != nil {
+		t.Fatalf("store sql db: %v", err)
+	}
+	holder, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatalf("begin advisory holder tx: %v", err)
+	}
+	defer func() { _ = holder.Rollback() }()
+
+	var holderPID int
+	if err := holder.QueryRow("SELECT pg_backend_pid()").Scan(&holderPID); err != nil {
+		t.Fatalf("get advisory holder backend pid: %v", err)
+	}
+	if _, err := holder.Exec("SELECT pg_advisory_xact_lock($1)", orgConnectionAdvisoryLockKey(request.OrgID)); err != nil {
+		t.Fatalf("take org advisory lock: %v", err)
+	}
+
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}
+	firstDone := make(chan acquireResult, 1)
+	secondDone := make(chan acquireResult, 1)
+	go func() {
+		lease, err := storeA.TryAcquireOrgConnectionLease(request.RequestID, limits, now)
+		firstDone <- acquireResult{lease: lease, err: err}
+	}()
+	go func() {
+		lease, err := storeB.TryAcquireOrgConnectionLease(request.RequestID, limits, now)
+		secondDone <- acquireResult{lease: lease, err: err}
+	}()
+
+	waitForAdvisoryLockWaitersFromApplications(t, sqlDB, holderPID, appA, appB)
+	if err := holder.Commit(); err != nil {
+		t.Fatalf("release org advisory lock: %v", err)
+	}
+
+	first := waitForAcquireResult(t, firstDone, "first concurrent retry")
+	second := waitForAcquireResult(t, secondDone, "second concurrent retry")
+	for i, result := range []acquireResult{first, second} {
+		if result.err != nil {
+			t.Fatalf("concurrent retry %d: %v", i, result.err)
+		}
+		if result.lease == nil || result.lease.RequestID != request.RequestID {
+			t.Fatalf("concurrent retry %d lease = %#v, want own lease", i, result.lease)
+		}
+	}
+	if first.lease.LeaseID != second.lease.LeaseID {
+		t.Fatalf("concurrent retries returned different leases %q and %q", first.lease.LeaseID, second.lease.LeaseID)
+	}
+	assertOrgConnectionRequestGranted(t, storeA, request.RequestID)
+	assertOrgConnectionActiveVCPUs(t, storeA, request.OrgID, 1)
+}
+
 func TestTryAcquireOrgConnectionLeaseTakesOrgLockBeforeExpiredRowLock(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
@@ -1221,9 +1879,11 @@ func TestTryAcquireOrgConnectionLeaseTakesOrgLockBeforeExpiredRowLock(t *testing
 	}
 }
 
-func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(t *testing.T) {
+func TestScheduleAndClaimForRefDoesNotFollowRequestIDReusedWithDifferentOrg(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
+	seedAuthoritativeOrgConnectionLimits(t, store, "org-old", 1, map[string]int{"alice": 0})
+	seedAuthoritativeOrgConnectionLimits(t, store, "org-new", 1, map[string]int{"alice": 0})
 
 	now := time.Now()
 	oldEntry := &cpconfigstore.OrgConnectionQueueEntry{
@@ -1260,8 +1920,11 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 	}
 
 	acquireDone := make(chan acquireResult, 1)
+	oldRef := cpconfigstore.OrgConnectionAdmissionRef{
+		RequestID: oldEntry.RequestID, OrgID: oldEntry.OrgID, CPInstanceID: oldEntry.CPInstanceID,
+	}
 	go func() {
-		lease, err := store.TryAcquireOrgConnectionLease(oldEntry.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 1}, now)
+		lease, err := store.ScheduleAndClaimOrgConnectionLeaseForRef(oldRef)
 		acquireDone <- acquireResult{lease: lease, err: err}
 	}()
 
@@ -1295,18 +1958,23 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 	select {
 	case result := <-acquireDone:
 		if result.err != nil {
-			t.Fatalf("acquire reused request: %v", result.err)
+			t.Fatalf("stale exact-ref acquire: %v", result.err)
 		}
-		if result.lease == nil {
-			t.Fatal("expected reused request to acquire after retrying under new org")
-		}
-		if result.lease.OrgID != newEntry.OrgID {
-			t.Fatalf("expected lease for org %q, got %q", newEntry.OrgID, result.lease.OrgID)
+		if result.lease != nil {
+			t.Fatalf("stale ref followed reused request into org %q: %#v", newEntry.OrgID, result.lease)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for reused request acquire")
+		t.Fatal("timed out waiting for stale exact-ref acquire")
 	}
 
+	assertOrgConnectionRequestPending(t, store, newEntry.RequestID)
+	newRef := cpconfigstore.OrgConnectionAdmissionRef{
+		RequestID: newEntry.RequestID, OrgID: newEntry.OrgID, CPInstanceID: newEntry.CPInstanceID,
+	}
+	lease, err := store.ScheduleAndClaimOrgConnectionLeaseForRef(newRef)
+	if err != nil || lease == nil {
+		t.Fatalf("new owner exact-ref acquire = %#v, err = %v", lease, err)
+	}
 	count, err := store.ActiveOrgConnectionLeaseCount(newEntry.OrgID)
 	if err != nil {
 		t.Fatalf("count active leases: %v", err)
@@ -1319,6 +1987,18 @@ func TestTryAcquireOrgConnectionLeaseRetriesWhenRequestIDReusedWithDifferentOrg(
 type acquireResult struct {
 	lease *cpconfigstore.OrgConnectionLease
 	err   error
+}
+
+func waitForAcquireResult(t *testing.T, results <-chan acquireResult, description string) acquireResult {
+	t.Helper()
+
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return acquireResult{}
+	}
 }
 
 func orgConnectionAdvisoryLockKey(orgID string) int64 {
@@ -1369,6 +2049,86 @@ func waitForAdvisoryLockWaiter(t *testing.T, db *sql.DB, holderPID int) {
 	t.Fatalf("timed out waiting for advisory lock waiter; activities: %s", strings.Join(activities, "; "))
 }
 
+func waitForAdvisoryLockWaiterFromApplication(t *testing.T, db *sql.DB, holderPID int, applicationName string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiters int
+		err := db.QueryRow(`
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock'
+			  AND wait_event = 'advisory'
+			  AND datname = current_database()
+			  AND $1 = ANY(pg_blocking_pids(pid))
+			  AND application_name = $2
+		`, holderPID, applicationName).Scan(&waiters)
+		if err != nil {
+			t.Fatalf("poll advisory lock waiter by application: %v", err)
+		}
+		if waiters > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for advisory lock waiter from application %q", applicationName)
+}
+
+func waitForAdvisoryLockWaitersFromApplications(
+	t *testing.T,
+	db *sql.DB,
+	holderPID int,
+	applicationNameA string,
+	applicationNameB string,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiters int
+		err := db.QueryRow(`
+			SELECT count(DISTINCT application_name)
+			FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock'
+			  AND wait_event = 'advisory'
+			  AND datname = current_database()
+			  AND $1 = ANY(pg_blocking_pids(pid))
+			  AND application_name IN ($2, $3)
+		`, holderPID, applicationNameA, applicationNameB).Scan(&waiters)
+		if err != nil {
+			t.Fatalf("poll advisory lock waiters by application: %v", err)
+		}
+		if waiters == 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var activities []string
+	rows, err := db.Query(`
+		SELECT application_name || ' ' || COALESCE(wait_event_type, '') || '/' || COALESCE(wait_event, '') || ' ' || query
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND ($1 = ANY(pg_blocking_pids(pid)) OR pid = $1)
+	`, holderPID)
+	if err == nil {
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var activity string
+			if err := rows.Scan(&activity); err == nil {
+				activities = append(activities, activity)
+			}
+		}
+	}
+	t.Fatalf(
+		"timed out waiting for advisory lock waiters from applications %q; activities: %s",
+		[]string{applicationNameA, applicationNameB},
+		strings.Join(activities, "; "),
+	)
+}
+
 func configstoreMetricHistogramCount(t *testing.T, metricName string) uint64 {
 	t.Helper()
 	families, err := prometheus.DefaultGatherer.Gather()
@@ -1409,6 +2169,31 @@ func configstoreMetricCounterFamilyTotal(t *testing.T, metricName string) float6
 			total += metric.GetCounter().GetValue()
 		}
 		return total
+	}
+	return 0
+}
+
+func configstoreMetricCounterValue(t *testing.T, metricName, labelName, labelValue string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_COUNTER {
+			t.Fatalf("metric %q is not a counter", metricName)
+		}
+		for _, metric := range fam.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == labelName && label.GetValue() == labelValue {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+		return 0
 	}
 	return 0
 }

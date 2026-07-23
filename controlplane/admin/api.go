@@ -276,6 +276,10 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org, reattribu
 	// and only passes reattributeUsageTeam when the value actually changes.
 	found := false
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, name); err != nil {
+			return err
+		}
+
 		result := tx.Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 		if result.Error != nil {
 			return result.Error
@@ -324,6 +328,10 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org, reattribu
 func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 	returnRows := int64(0)
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, name); err != nil {
+			return err
+		}
+
 		// Deleting an org while a managed warehouse row is in a non-terminal
 		// state would leak the Duckling CR + AWS infra behind it, so those
 		// still block deletion. But deprovisioning does NOT remove the
@@ -585,11 +593,25 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 		}
 		return user, true, nil
 	}
-	result := s.db().Model(&configstore.OrgUser{}).Where("org_id = ? AND username = ?", orgID, username).Updates(updates)
-	if result.Error != nil {
-		return nil, false, result.Error
+	found := false
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+
+		result := tx.Model(&configstore.OrgUser{}).
+			Where("org_id = ? AND username = ?", orgID, username).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		found = result.RowsAffected > 0
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
 	}
-	if result.RowsAffected == 0 {
+	if !found {
 		return nil, false, nil
 	}
 	user, err := s.GetUser(orgID, username)
@@ -600,11 +622,20 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 }
 
 func (s *gormAPIStore) DeleteUser(orgID, username string) (bool, error) {
-	result := s.db().Where("org_id = ? AND username = ?", orgID, username).Delete(&configstore.OrgUser{})
-	if result.Error != nil {
-		return false, result.Error
-	}
-	return result.RowsAffected > 0, nil
+	found := false
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+
+		result := tx.Where("org_id = ? AND username = ?", orgID, username).Delete(&configstore.OrgUser{})
+		if result.Error != nil {
+			return result.Error
+		}
+		found = result.RowsAffected > 0
+		return nil
+	})
+	return found, err
 }
 
 func (s *gormAPIStore) UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error) {

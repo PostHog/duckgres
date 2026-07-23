@@ -36,6 +36,38 @@ func TestRuntimeStorePostgres(t *testing.T) {
 			t.Fatalf("expected runtime table %s.%s to exist", runtimeSchema, table)
 		}
 	}
+
+	var obsoleteTableCount int64
+	if err := store.DB().Raw(
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+		runtimeSchema,
+		"org_connection_admission_protocol",
+	).Scan(&obsoleteTableCount).Error; err != nil {
+		t.Fatalf("lookup obsolete admission protocol table: %v", err)
+	}
+	if obsoleteTableCount != 0 {
+		t.Fatal("fresh runtime schema unexpectedly contains the retired admission protocol table")
+	}
+
+	for table, columns := range map[string][]string{
+		"cp_instances":         {"supports_admission_offers"},
+		"org_connection_queue": {"state", "offered_at", "offer_expires_at"},
+	} {
+		for _, column := range columns {
+			var count int64
+			if err := store.DB().Raw(
+				"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
+				runtimeSchema,
+				table,
+				column,
+			).Scan(&count).Error; err != nil {
+				t.Fatalf("lookup obsolete runtime column %s.%s: %v", table, column, err)
+			}
+			if count != 0 {
+				t.Fatalf("fresh runtime schema unexpectedly contains retired column %s.%s", table, column)
+			}
+		}
+	}
 	requireRuntimeIndexDefinition(t, store, "org_connection_queue", "idx_org_connection_queue_user_heads",
 		"(org_id, username, enqueued_at, request_id)", "WHERE (granted_at IS NULL)")
 	requireRuntimeIndexDefinition(t, store, "org_connection_leases", "idx_org_connection_leases_org_user",

@@ -60,6 +60,7 @@ func (r *reconnectTestOrgRouter) StackForOrg(orgID string) (WorkerPool, *Session
 }
 
 func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (r *reconnectTestOrgRouter) BeginDrain()                     {}
 func (r *reconnectTestOrgRouter) ShutdownAll()                    {}
 func (r *reconnectTestOrgRouter) ReleaseIdleHotWorkers() int      { return 0 }
 
@@ -77,6 +78,7 @@ func (r *recordingOrgRouter) StackForOrg(orgID string) (WorkerPool, *SessionMana
 	return nil, nil, nil, false
 }
 func (r *recordingOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (r *recordingOrgRouter) BeginDrain()                     {}
 func (r *recordingOrgRouter) ShutdownAll()                    {}
 func (r *recordingOrgRouter) ReleaseIdleHotWorkers() int      { return 0 }
 

@@ -42,6 +42,8 @@ type FileConfig struct {
 	LogLevel                  string              `yaml:"log_level"`
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`
 
+	AdmissionReclaimerMaxReservations int `yaml:"admission_reclaimer_max_reservations"`
+
 	// Worker backend configuration
 	WorkerBackend string        `yaml:"worker_backend"` // "process" (default) or "remote"
 	K8s           K8sFileConfig `yaml:"k8s"`

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,9 +16,70 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
+
+type blockingSessionCreatedLogHandler struct {
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func TestSessionLifecycleFinishLinearizesWithDrain(t *testing.T) {
+	t.Run("drain wins", func(t *testing.T) {
+		lifecycle := newSessionLifecycle()
+		ctx, finish, err := lifecycle.begin(context.Background())
+		if err != nil {
+			t.Fatalf("begin lifecycle: %v", err)
+		}
+
+		lifecycle.close()
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("close did not cancel the active lifecycle context")
+		}
+		if !finish() {
+			t.Fatal("finish must report that drain linearized first")
+		}
+	})
+
+	t.Run("finish wins", func(t *testing.T) {
+		lifecycle := newSessionLifecycle()
+		_, finish, err := lifecycle.begin(context.Background())
+		if err != nil {
+			t.Fatalf("begin lifecycle: %v", err)
+		}
+
+		if finish() {
+			t.Fatal("finish unexpectedly reported a closed lifecycle")
+		}
+		lifecycle.close()
+		if finish() {
+			t.Fatal("repeated finish changed the original linearization result")
+		}
+	})
+}
+
+func (h *blockingSessionCreatedLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *blockingSessionCreatedLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message != "Session created on worker." {
+		return nil
+	}
+	h.once.Do(func() { close(h.reached) })
+	select {
+	case <-h.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *blockingSessionCreatedLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *blockingSessionCreatedLogHandler) WithGroup(string) slog.Handler      { return h }
 
 type recordingWorkerPool struct {
 	events *[]string
@@ -171,7 +233,7 @@ func (l *observingConnectionLimiter) Acquire(ctx context.Context, request connec
 type runtimeLimiterTestStore struct {
 	mu          sync.Mutex
 	tryLimits   []configstore.OrgResourceLimits
-	cancels     int
+	tryRefs     []configstore.OrgConnectionAdmissionRef
 	firstTry    chan struct{}
 	leaseID     string
 	acquireErr  error
@@ -186,10 +248,11 @@ func (s *runtimeLimiterTestStore) EnqueueOrgConnectionRequest(entry *configstore
 	return nil
 }
 
-func (s *runtimeLimiterTestStore) TryAcquireOrgConnectionLease(requestID string, limits configstore.OrgResourceLimits, now time.Time) (*configstore.OrgConnectionLease, error) {
+func (s *runtimeLimiterTestStore) TryAcquireOrgConnectionLeaseForRef(ref configstore.OrgConnectionAdmissionRef, limits configstore.OrgResourceLimits, _ time.Time) (*configstore.OrgConnectionLease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tryLimits = append(s.tryLimits, limits)
+	s.tryRefs = append(s.tryRefs, ref)
 	if s.acquireErr != nil {
 		return nil, s.acquireErr
 	}
@@ -199,33 +262,22 @@ func (s *runtimeLimiterTestStore) TryAcquireOrgConnectionLease(requestID string,
 		}
 		return nil, nil
 	}
-	return &configstore.OrgConnectionLease{LeaseID: s.leaseID, RequestID: requestID}, nil
+	return &configstore.OrgConnectionLease{LeaseID: s.leaseID, RequestID: ref.RequestID}, nil
 }
 
-func (s *runtimeLimiterTestStore) ReleaseOrgConnectionLease(leaseID string) error {
-	return nil
-}
-
-func (s *runtimeLimiterTestStore) CancelOrgConnectionRequest(requestID string, canceledAt time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cancels++
-	return nil
-}
-
-func (s *runtimeLimiterTestStore) snapshot() ([]configstore.OrgResourceLimits, int, *configstore.OrgConnectionQueueEntry) {
+func (s *runtimeLimiterTestStore) snapshot() ([]configstore.OrgResourceLimits, []configstore.OrgConnectionAdmissionRef, *configstore.OrgConnectionQueueEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tryLimits := append([]configstore.OrgResourceLimits(nil), s.tryLimits...)
-	return tryLimits, s.cancels, s.queuedEntry
+	tryRefs := append([]configstore.OrgConnectionAdmissionRef(nil), s.tryRefs...)
+	return tryLimits, tryRefs, s.queuedEntry
 }
 
 type reconnectRuntimeStore struct {
-	enqueues  int
-	tries     int
-	releaseID string
-	cancelID  string
-	entry     *configstore.OrgConnectionQueueEntry
+	enqueues int
+	tries    int
+	entry    *configstore.OrgConnectionQueueEntry
+	tryRef   configstore.OrgConnectionAdmissionRef
 }
 
 func (s *reconnectRuntimeStore) EnqueueOrgConnectionRequest(entry *configstore.OrgConnectionQueueEntry) error {
@@ -235,19 +287,10 @@ func (s *reconnectRuntimeStore) EnqueueOrgConnectionRequest(entry *configstore.O
 	return nil
 }
 
-func (s *reconnectRuntimeStore) TryAcquireOrgConnectionLease(requestID string, limits configstore.OrgResourceLimits, now time.Time) (*configstore.OrgConnectionLease, error) {
+func (s *reconnectRuntimeStore) TryAcquireOrgConnectionLeaseForRef(ref configstore.OrgConnectionAdmissionRef, _ configstore.OrgResourceLimits, _ time.Time) (*configstore.OrgConnectionLease, error) {
 	s.tries++
-	return &configstore.OrgConnectionLease{LeaseID: requestID, RequestID: requestID}, nil
-}
-
-func (s *reconnectRuntimeStore) ReleaseOrgConnectionLease(leaseID string) error {
-	s.releaseID = leaseID
-	return nil
-}
-
-func (s *reconnectRuntimeStore) CancelOrgConnectionRequest(requestID string, canceledAt time.Time) error {
-	s.cancelID = requestID
-	return nil
+	s.tryRef = ref
+	return &configstore.OrgConnectionLease{LeaseID: ref.RequestID, RequestID: ref.RequestID}, nil
 }
 
 type blockingCreateSessionPool struct {
@@ -534,7 +577,7 @@ func TestDestroySession_ReleasesLeaseAfterWorkerRelease(t *testing.T) {
 	}
 }
 
-func TestDestroySessionRetriesTransientLeaseReleaseFailure(t *testing.T) {
+func TestDestroySessionSubmitsLeaseReleaseOnlyOnce(t *testing.T) {
 	pool := &recordingWorkerPool{events: &[]string{}}
 	sm := NewSessionManager(pool, nil)
 	lease := &flakyReleaseConnectionLease{failures: 2}
@@ -551,8 +594,8 @@ func TestDestroySessionRetriesTransientLeaseReleaseFailure(t *testing.T) {
 
 	sm.DestroySession(pid)
 
-	if got := lease.attempts.Load(); got != 3 {
-		t.Fatalf("expected lease release to retry until third attempt succeeds, got %d attempts", got)
+	if got := lease.attempts.Load(); got != 1 {
+		t.Fatalf("expected lease release to be submitted once to the retry-owning lease, got %d attempts", got)
 	}
 }
 
@@ -792,6 +835,74 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	}
 }
 
+func TestSessionManagerBeginDrainRejectsCreateThatRegisteredBeforeReturn(t *testing.T) {
+	allowCreate := make(chan struct{})
+	close(allowCreate)
+	flightClient := &blockingCreateSessionFlightClient{
+		createStarted: make(chan struct{}),
+		allowCreate:   allowCreate,
+	}
+	lease := &countingConnectionLease{}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+		done:   make(chan struct{}),
+	}
+	sm := NewSessionManager(&blockingCreateSessionPool{worker: worker}, nil)
+	sm.SetConnectionLimiter(&blockingCreateSessionLimiter{lease: lease})
+
+	handler := &blockingSessionCreatedLogHandler{
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	sm.log = slog.New(handler)
+
+	type createResult struct {
+		pid      int32
+		executor *flightclient.FlightExecutor
+		err      error
+	}
+	resultCh := make(chan createResult, 1)
+	go func() {
+		pid, executor, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres", nil)
+		resultCh <- createResult{pid: pid, executor: executor, err: err}
+	}()
+
+	select {
+	case <-handler.reached:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the session to register")
+	}
+	if got := sm.SessionCount(); got != 1 {
+		t.Fatalf("expected the raced session to be registered before drain, got %d", got)
+	}
+
+	sm.BeginDrain()
+	close(handler.release)
+
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result.err, ErrSessionManagerDraining) {
+			t.Fatalf("CreateSessionWithProtocol error = %v, want %v", result.err, ErrSessionManagerDraining)
+		}
+		if result.pid != 0 || result.executor != nil {
+			t.Fatalf("drain-raced creation returned pid=%d executor=%v", result.pid, result.executor)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for drain-raced creation to return")
+	}
+
+	if got := sm.SessionCount(); got != 0 {
+		t.Fatalf("expected the drain-raced session to be destroyed, got %d", got)
+	}
+	if got := flightClient.destroyCalls.Load(); got != 1 {
+		t.Fatalf("expected worker session destruction once, got %d", got)
+	}
+	if got := lease.releases.Load(); got != 1 {
+		t.Fatalf("expected lease release once, got %d", got)
+	}
+}
+
 func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
 	lease := &countingConnectionLease{}
 	limiter := &blockingAcquireLimiter{
@@ -839,6 +950,73 @@ func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
 	}
 	if got := lease.releases.Load(); got != 0 {
 		t.Fatalf("expected no lease release before limiter returned a lease, got %d", got)
+	}
+}
+
+func TestSessionManagerBeginDrainCancelsCreationWithoutDestroyingEstablishedSessions(t *testing.T) {
+	establishedLease := &countingConnectionLease{}
+	limiter := &blockingAcquireLimiter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	sm := NewSessionManager(&acquireErrorPool{err: errors.New("worker should not be acquired")}, nil)
+	sm.SetConnectionLimiter(limiter)
+
+	const establishedPID int32 = 2020
+	sm.mu.Lock()
+	sm.sessions[establishedPID] = &ManagedSession{
+		PID:      establishedPID,
+		Username: "established-user",
+		lease:    establishedLease,
+	}
+	sm.mu.Unlock()
+
+	createErr := make(chan error, 1)
+	go func() {
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "queued-user", 3030, "", 0, "postgres", nil)
+		createErr <- err
+	}()
+
+	select {
+	case <-limiter.entered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for limiter acquire")
+	}
+
+	sm.BeginDrain()
+
+	select {
+	case err := <-createErr:
+		if !errors.Is(err, ErrSessionManagerDraining) {
+			t.Fatalf("BeginDrain creation error = %v, want %v", err, ErrSessionManagerDraining)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for BeginDrain to cancel session creation")
+	}
+
+	if !sm.lifecycle.isClosed() {
+		t.Fatal("expected BeginDrain to close the session-creation lifecycle")
+	}
+	if got := sm.SessionCount(); got != 1 {
+		t.Fatalf("expected established session to survive BeginDrain, got %d sessions", got)
+	}
+	if got := establishedLease.releases.Load(); got != 0 {
+		t.Fatalf("expected established lease to remain held during drain, got %d releases", got)
+	}
+
+	_, _, err := sm.CreateSessionWithProtocol(context.Background(), "late-user", 4040, "", 0, "postgres", nil)
+	if !errors.Is(err, ErrSessionManagerDraining) {
+		t.Fatalf("new session after BeginDrain error = %v, want %v", err, ErrSessionManagerDraining)
+	}
+
+	// BeginDrain is intentionally idempotent: multiple shutdown paths may
+	// converge on it without disturbing established sessions.
+	sm.BeginDrain()
+	if got := sm.SessionCount(); got != 1 {
+		t.Fatalf("expected established session to survive repeated BeginDrain, got %d sessions", got)
+	}
+	if got := establishedLease.releases.Load(); got != 0 {
+		t.Fatalf("expected repeated BeginDrain not to release established lease, got %d releases", got)
 	}
 }
 
@@ -1115,8 +1293,10 @@ func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenResourceLimitBecomesUnli
 		firstTry: make(chan struct{}),
 		leaseID:  "lease-1",
 	}
+	reclaimer := &recordingAdmissionReclaimer{}
 	limiter := &runtimeOrgConnectionLimiter{
 		store:        store,
+		reclaimer:    reclaimer,
 		orgID:        "org-1",
 		cpInstanceID: "cp-1",
 		queueTTL:     time.Second,
@@ -1170,7 +1350,7 @@ func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenResourceLimitBecomesUnli
 		t.Fatal("timed out waiting for limiter acquire error")
 	}
 
-	tryLimits, cancels, queuedEntry := store.snapshot()
+	tryLimits, tryRefs, queuedEntry := store.snapshot()
 	if queuedEntry == nil {
 		t.Fatal("expected request to be queued")
 	}
@@ -1183,15 +1363,20 @@ func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenResourceLimitBecomesUnli
 	if tryLimits[0].OrgMaxVCPUs != 1 || tryLimits[1].OrgMaxVCPUs != 0 {
 		t.Fatalf("expected lease attempts with org max vcpus [1 0], got %v", tryLimits)
 	}
-	if cancels != 0 {
-		t.Fatalf("expected queued request not to be canceled, got %d cancels", cancels)
+	wantRef := configstore.OrgConnectionAdmissionRef{RequestID: "request-1", OrgID: "org-1", CPInstanceID: "cp-1"}
+	for i, ref := range tryRefs {
+		if ref != wantRef {
+			t.Fatalf("lease attempt %d ref = %#v, want %#v", i, ref, wantRef)
+		}
 	}
 }
 
 func TestRuntimeOrgConnectionLimiterReconnectCapableStoreUsesQueue(t *testing.T) {
 	store := &reconnectRuntimeStore{}
+	reclaimer := &recordingAdmissionReclaimer{}
 	limiter := &runtimeOrgConnectionLimiter{
 		store:        store,
+		reclaimer:    reclaimer,
 		orgID:        "org-1",
 		cpInstanceID: "cp-new",
 		queueTTL:     time.Second,
@@ -1215,8 +1400,12 @@ func TestRuntimeOrgConnectionLimiterReconnectCapableStoreUsesQueue(t *testing.T)
 	if lease == nil {
 		t.Fatal("expected reconnect admission to return a lease")
 	}
-	if store.enqueues != 1 || store.tries != 1 || store.cancelID != "" {
-		t.Fatalf("expected reconnect admission to use queue path, got enqueues=%d tries=%d cancelID=%q", store.enqueues, store.tries, store.cancelID)
+	if store.enqueues != 1 || store.tries != 1 {
+		t.Fatalf("expected reconnect admission to use queue path, got enqueues=%d tries=%d", store.enqueues, store.tries)
+	}
+	wantRef := configstore.OrgConnectionAdmissionRef{RequestID: "reconnect-lease", OrgID: "org-1", CPInstanceID: "cp-new"}
+	if store.tryRef != wantRef {
+		t.Fatalf("reconnect admission ref = %#v, want %#v", store.tryRef, wantRef)
 	}
 	if store.entry == nil {
 		t.Fatal("expected reconnect admission to enqueue a request")
@@ -1227,8 +1416,13 @@ func TestRuntimeOrgConnectionLimiterReconnectCapableStoreUsesQueue(t *testing.T)
 	if err := lease.Release(context.Background()); err != nil {
 		t.Fatalf("release reconnect lease: %v", err)
 	}
-	if store.releaseID != "reconnect-lease" {
-		t.Fatalf("expected release of normal lease id, got %q", store.releaseID)
+	submissions, _ := reclaimer.snapshot()
+	want := admissionReclaimSubmission{
+		ref:   configstore.OrgConnectionAdmissionRef{RequestID: "reconnect-lease", OrgID: "org-1", CPInstanceID: "cp-new"},
+		cause: admissionReclaimCauseLeaseRelease,
+	}
+	if len(submissions) != 1 || submissions[0] != want {
+		t.Fatalf("reconnect lease cleanup submissions = %#v, want %#v", submissions, want)
 	}
 }
 
@@ -1237,8 +1431,10 @@ func TestRuntimeOrgConnectionLimiterCancelsQueuedRequestAfterAcquireError(t *tes
 	store := &runtimeLimiterTestStore{
 		acquireErr: boom,
 	}
+	reclaimer := &recordingAdmissionReclaimer{}
 	limiter := &runtimeOrgConnectionLimiter{
 		store:        store,
+		reclaimer:    reclaimer,
 		orgID:        "org-1",
 		cpInstanceID: "cp-1",
 		queueTTL:     time.Second,
@@ -1260,14 +1456,23 @@ func TestRuntimeOrgConnectionLimiterCancelsQueuedRequestAfterAcquireError(t *tes
 	if !errors.Is(err, boom) {
 		t.Fatalf("expected acquire error %v, got lease=%v err=%v", boom, lease, err)
 	}
-	tryLimits, cancels, queuedEntry := store.snapshot()
+	tryLimits, tryRefs, queuedEntry := store.snapshot()
 	if len(tryLimits) != 1 {
 		t.Fatalf("expected one acquire attempt, got %d", len(tryLimits))
+	}
+	wantRef := configstore.OrgConnectionAdmissionRef{RequestID: "request-error", OrgID: "org-1", CPInstanceID: "cp-1"}
+	if len(tryRefs) != 1 || tryRefs[0] != wantRef {
+		t.Fatalf("acquire attempt refs = %#v, want [%#v]", tryRefs, wantRef)
 	}
 	if queuedEntry == nil || queuedEntry.RequestID != "request-error" {
 		t.Fatalf("expected queued request-error entry, got %#v", queuedEntry)
 	}
-	if cancels != 1 {
-		t.Fatalf("expected acquire error to cancel queued request once, got %d", cancels)
+	submissions, _ := reclaimer.snapshot()
+	want := admissionReclaimSubmission{
+		ref:   configstore.OrgConnectionAdmissionRef{RequestID: "request-error", OrgID: "org-1", CPInstanceID: "cp-1"},
+		cause: admissionReclaimCauseAcquireAbandoned,
+	}
+	if len(submissions) != 1 || submissions[0] != want {
+		t.Fatalf("acquire failure cleanup submissions = %#v, want %#v", submissions, want)
 	}
 }

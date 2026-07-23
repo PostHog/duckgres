@@ -3,8 +3,10 @@
 package admin
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,183 @@ import (
 	integrationtest "github.com/posthog/duckgres/tests/integration"
 	"gorm.io/gorm"
 )
+
+func TestAdminAdmissionConfigMutationsSerializePostgres(t *testing.T) {
+	tests := []struct {
+		name     string
+		orgID    string
+		seed     func(t *testing.T, store *configstore.ConfigStore)
+		mutation func(store *gormAPIStore) error
+	}{
+		{
+			name:  "update org",
+			orgID: "admission-update-org",
+			seed: func(t *testing.T, store *configstore.ConfigStore) {
+				t.Helper()
+				if err := store.DB().Create(&configstore.Org{Name: "admission-update-org", DatabaseName: "admission_update_org"}).Error; err != nil {
+					t.Fatalf("create org: %v", err)
+				}
+			},
+			mutation: func(store *gormAPIStore) error {
+				_, found, err := store.UpdateOrg("admission-update-org", configstore.Org{MaxWorkers: 3, MaxVCPUs: 4}, nil)
+				if err == nil && !found {
+					return errors.New("updated org was not found")
+				}
+				return err
+			},
+		},
+		{
+			name:  "delete org",
+			orgID: "admission-delete-org",
+			seed: func(t *testing.T, store *configstore.ConfigStore) {
+				t.Helper()
+				if err := store.DB().Create(&configstore.Org{Name: "admission-delete-org", DatabaseName: "admission_delete_org"}).Error; err != nil {
+					t.Fatalf("create org: %v", err)
+				}
+			},
+			mutation: func(store *gormAPIStore) error {
+				found, err := store.DeleteOrg("admission-delete-org")
+				if err == nil && !found {
+					return errors.New("deleted org was not found")
+				}
+				return err
+			},
+		},
+		{
+			name:  "update user",
+			orgID: "admission-update-user",
+			seed: func(t *testing.T, store *configstore.ConfigStore) {
+				t.Helper()
+				seedAdmissionMutationUser(t, store, "admission-update-user", "alice")
+			},
+			mutation: func(store *gormAPIStore) error {
+				maxVCPUs := 2
+				_, found, err := store.UpdateUser("admission-update-user", "alice", "", nil, &maxVCPUs)
+				if err == nil && !found {
+					return errors.New("updated user was not found")
+				}
+				return err
+			},
+		},
+		{
+			name:  "delete user",
+			orgID: "admission-delete-user",
+			seed: func(t *testing.T, store *configstore.ConfigStore) {
+				t.Helper()
+				seedAdmissionMutationUser(t, store, "admission-delete-user", "alice")
+			},
+			mutation: func(store *gormAPIStore) error {
+				found, err := store.DeleteUser("admission-delete-user", "alice")
+				if err == nil && !found {
+					return errors.New("deleted user was not found")
+				}
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newPostgresConfigStore(t)
+			apiStore := newGormAPIStore(store).(*gormAPIStore)
+			tt.seed(t, store)
+			assertAdminMutationWaitsForAdmissionLock(t, store, tt.orgID, func() error {
+				return tt.mutation(apiStore)
+			})
+		})
+	}
+}
+
+func seedAdmissionMutationUser(t *testing.T, store *configstore.ConfigStore, orgID, username string) {
+	t.Helper()
+	if err := store.DB().Create(&configstore.Org{Name: orgID, DatabaseName: orgID}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if err := store.DB().Create(&configstore.OrgUser{OrgID: orgID, Username: username, Password: "hash"}).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+}
+
+func assertAdminMutationWaitsForAdmissionLock(
+	t *testing.T,
+	store *configstore.ConfigStore,
+	orgID string,
+	mutation func() error,
+) {
+	t.Helper()
+
+	sqlDB, err := store.DB().DB()
+	if err != nil {
+		t.Fatalf("sql db: %v", err)
+	}
+	holder, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatalf("begin admission lock holder: %v", err)
+	}
+	defer func() { _ = holder.Rollback() }()
+
+	var holderPID int
+	if err := holder.QueryRow("SELECT pg_backend_pid()").Scan(&holderPID); err != nil {
+		t.Fatalf("read admission lock holder pid: %v", err)
+	}
+	if _, err := holder.Exec("SELECT pg_advisory_xact_lock($1)", adminAdmissionLockKey(orgID)); err != nil {
+		t.Fatalf("take admission lock: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- mutation() }()
+
+	waitForBlockedAdminMutation(t, sqlDB, holderPID, result)
+	if err := holder.Commit(); err != nil {
+		t.Fatalf("release admission lock: %v", err)
+	}
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("admin mutation after admission lock release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for admin mutation after admission lock release")
+	}
+}
+
+func waitForBlockedAdminMutation(t *testing.T, db *sql.DB, holderPID int, result <-chan error) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-result:
+			t.Fatalf("admin mutation completed before admission lock release: %v", err)
+		default:
+		}
+
+		var waiters int
+		if err := db.QueryRow(`
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock'
+			  AND wait_event = 'advisory'
+			  AND datname = current_database()
+			  AND $1 = ANY(pg_blocking_pids(pid))
+		`, holderPID).Scan(&waiters); err != nil {
+			t.Fatalf("poll admin mutation admission-lock waiter: %v", err)
+		}
+		if waiters > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("timed out waiting for admin mutation to block on the admission lock")
+}
+
+func adminAdmissionLockKey(orgID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("duckgres:org-connections:" + orgID))
+	return int64(h.Sum64() & 0x7fffffffffffffff)
+}
 
 const testConfigStoreConnString = "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable"
 

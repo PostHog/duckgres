@@ -20,11 +20,6 @@ import (
 var ErrTooManyConnections = errors.New("too many connections")
 var ErrSessionManagerDraining = errors.New("session manager is draining")
 
-const (
-	connectionLeaseReleaseMaxAttempts = 3
-	connectionLeaseReleaseRetryDelay  = 50 * time.Millisecond
-)
-
 // SessionProgress holds cached query progress from a worker health check.
 type SessionProgress struct {
 	Percentage float64
@@ -276,7 +271,7 @@ func (sm *SessionManager) releaseSlot() {
 
 func (sm *SessionManager) releaseConnectionSlot(lease connectionLease) {
 	if lease != nil {
-		releaseConnectionLeaseWithRetry(lease)
+		releaseConnectionLease(lease)
 		return
 	}
 
@@ -331,12 +326,25 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	return sm.CreateSessionWithProtocol(ctx, username, pid, memoryLimit, threads, "postgres", profile)
 }
 
-func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, username string, pid int32, memoryLimit string, threads int, protocol string, profile *WorkerProfile) (int32, *flightclient.FlightExecutor, error) {
-	ctx, endCreation, err := sm.beginSessionCreation(ctx)
+func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, username string, pid int32, memoryLimit string, threads int, protocol string, profile *WorkerProfile) (resultPID int32, resultExecutor *flightclient.FlightExecutor, resultErr error) {
+	ctx, finishCreation, err := sm.beginSessionCreation(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer endCreation()
+	defer func() {
+		if !finishCreation() {
+			return
+		}
+		if resultErr == nil && resultPID != 0 {
+			// Drain can close the lifecycle just after createSessionOnWorker
+			// publishes the session. Reclaim that raced success before returning
+			// it to a client that shutdown has already rejected.
+			sm.DestroySession(resultPID)
+			resultPID = 0
+			resultExecutor = nil
+		}
+		resultErr = ErrSessionManagerDraining
+	}()
 
 	if protocol == "flight" && pid == 0 {
 		pid = sm.ReservePID()
@@ -486,12 +494,22 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 	return memoryLimit, threads
 }
 
-func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *flightclient.FlightExecutor, error) {
-	ctx, endCreation, err := sm.beginSessionCreation(ctx)
+func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (resultPID int32, resultExecutor *flightclient.FlightExecutor, resultErr error) {
+	ctx, finishCreation, err := sm.beginSessionCreation(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer endCreation()
+	defer func() {
+		if !finishCreation() {
+			return
+		}
+		if resultErr == nil && resultPID != 0 {
+			sm.DestroySession(resultPID)
+			resultPID = 0
+			resultExecutor = nil
+		}
+		resultErr = ErrSessionManagerDraining
+	}()
 
 	var profile *WorkerProfile
 	if provider, ok := sm.pool.(flightReconnectProfileProvider); ok {
@@ -533,7 +551,7 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	return pid, exec, nil
 }
 
-func (sm *SessionManager) beginSessionCreation(ctx context.Context) (context.Context, func(), error) {
+func (sm *SessionManager) beginSessionCreation(ctx context.Context) (context.Context, func() bool, error) {
 	return sm.lifecycle.begin(ctx)
 }
 
@@ -733,13 +751,23 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	}
 }
 
+// BeginDrain prevents new session creation and cancels every creation already
+// in progress without disturbing established sessions. It is intentionally
+// non-blocking: callers can continue waiting for established sessions to end
+// naturally before invoking DestroyAllSessions for final teardown.
+func (sm *SessionManager) BeginDrain() {
+	sm.lifecycle.close()
+	sm.mu.Lock()
+	sm.failWaitersLocked(ErrSessionManagerDraining)
+	sm.mu.Unlock()
+}
+
 // DestroyAllSessions destroys every active session without holding the manager
 // lock while running per-session cleanup.
 func (sm *SessionManager) DestroyAllSessions() {
 	for {
-		sm.lifecycle.close()
+		sm.BeginDrain()
 		sm.mu.Lock()
-		sm.failWaitersLocked(ErrSessionManagerDraining)
 		pids := sm.sessionPIDsLocked()
 		sm.mu.Unlock()
 		if len(pids) == 0 {
@@ -829,23 +857,14 @@ func (sm *SessionManager) releaseSessionLease(session *ManagedSession, attrs ...
 	if session == nil || session.lease == nil {
 		return
 	}
-	releaseConnectionLeaseWithRetry(session.lease, attrs...)
+	releaseConnectionLease(session.lease, attrs...)
 }
 
-func releaseConnectionLeaseWithRetry(lease connectionLease, attrs ...any) {
-	var err error
-	for attempt := 1; attempt <= connectionLeaseReleaseMaxAttempts; attempt++ {
-		err = lease.Release(context.Background())
-		if err == nil {
-			return
-		}
-		if attempt < connectionLeaseReleaseMaxAttempts {
-			time.Sleep(time.Duration(attempt) * connectionLeaseReleaseRetryDelay)
-		}
+func releaseConnectionLease(lease connectionLease, attrs ...any) {
+	if err := lease.Release(context.Background()); err != nil {
+		args := append([]any{"error", err}, attrs...)
+		slog.Warn("Failed to submit org connection lease for reclamation.", args...)
 	}
-
-	args := append([]any{"error", err, "attempts", connectionLeaseReleaseMaxAttempts}, attrs...)
-	slog.Warn("Failed to release org connection lease.", args...)
 }
 
 // OnWorkerCrash handles a worker crash by marking all affected executors as

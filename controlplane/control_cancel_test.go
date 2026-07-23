@@ -23,6 +23,7 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 	errCh := make(chan error, 1)
 	go func() {
 		_, _, err := createSessionWithRegisteredCancel(
+			context.Background(),
 			srv,
 			200*time.Millisecond,
 			key,
@@ -63,6 +64,33 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 	}
 }
 
+func TestCreateSessionWithRegisteredCancelPreservesCanceledSuccessForCleanup(t *testing.T) {
+	srv := &server.Server{}
+	server.InitMinimalServer(srv, server.Config{}, nil)
+
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	wantExecutor := &flightclient.FlightExecutor{}
+	pid, executor, err := createSessionWithRegisteredCancel(
+		parent,
+		srv,
+		time.Second,
+		server.BackendKey{Pid: 4321, SecretKey: 8765},
+		func(context.Context) (int32, *flightclient.FlightExecutor, error) {
+			// Model a grant committing concurrently with cancellation. The helper
+			// must surface cancellation without discarding the session identity
+			// the caller needs to destroy the raced session.
+			return 4321, wantExecutor, nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if pid != 4321 || executor != wantExecutor {
+		t.Fatalf("canceled success = pid %d, executor %p; want pid 4321, executor %p", pid, executor, wantExecutor)
+	}
+}
+
 func TestSessionCreationErrorResponse(t *testing.T) {
 	t.Run("cancelled", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(context.Canceled)
@@ -91,6 +119,31 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		}
 		if message != "too many connections" {
 			t.Fatalf("message = %q", message)
+		}
+	})
+
+	t.Run("session manager draining", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(ErrSessionManagerDraining)
+		if code != "57P03" {
+			t.Fatalf("code = %q, want 57P03", code)
+		}
+		if message != "control plane is draining, retry shortly" {
+			t.Fatalf("message = %q", message)
+		}
+	})
+
+	t.Run("request exceeds org vcpu limit", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(&configstore.OrgConnectionAdmissionRejectedError{
+			Reason:         configstore.OrgConnectionAdmissionRejectedOrgVCPU,
+			RequestedVCPUs: 4,
+			MaximumVCPUs:   2,
+		})
+		if code != "53400" {
+			t.Fatalf("code = %q, want 53400", code)
+		}
+		want := "requested worker requires 4 vCPUs, exceeding the organization limit of 2 vCPUs; request a smaller worker or raise the limit"
+		if message != want {
+			t.Fatalf("message = %q, want %q", message, want)
 		}
 	})
 
@@ -141,6 +194,84 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 			t.Fatalf("message = %q", message)
 		}
 	})
+}
+
+func TestBeginSessionDrainMarksControlPlaneDraining(t *testing.T) {
+	sessions := NewSessionManager(nil, nil)
+	cp := &ControlPlane{sessions: sessions}
+	if cp.isDraining() {
+		t.Fatal("new control plane unexpectedly reports draining")
+	}
+
+	cp.beginSessionDrain()
+
+	if !cp.isDraining() {
+		t.Fatal("beginSessionDrain must make subsequent connection checks fail closed")
+	}
+	if !sessions.lifecycle.isClosed() {
+		t.Fatal("beginSessionDrain must close the session manager lifecycle")
+	}
+}
+
+func TestControlPlanePreReadyLifecycleLinearizesWithDrain(t *testing.T) {
+	t.Run("drain wins", func(t *testing.T) {
+		cp := &ControlPlane{}
+		ctx, finish, err := cp.beginPreReadyHandshake(context.Background())
+		if err != nil {
+			t.Fatalf("begin pre-ready handshake: %v", err)
+		}
+
+		cp.beginSessionDrain()
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("drain did not cancel the pre-ready handshake")
+		}
+		if !finish() {
+			t.Fatal("pre-ready finish must report that drain linearized first")
+		}
+
+		if _, _, err := cp.beginPreReadyHandshake(context.Background()); !errors.Is(err, ErrSessionManagerDraining) {
+			t.Fatalf("begin after drain error = %v, want %v", err, ErrSessionManagerDraining)
+		}
+	})
+
+	t.Run("handshake wins", func(t *testing.T) {
+		cp := &ControlPlane{}
+		_, finish, err := cp.beginPreReadyHandshake(context.Background())
+		if err != nil {
+			t.Fatalf("begin pre-ready handshake: %v", err)
+		}
+		if finish() {
+			t.Fatal("pre-ready finish unexpectedly reported drain")
+		}
+
+		cp.beginSessionDrain()
+		if finish() {
+			t.Fatal("repeated finish changed the original linearization result")
+		}
+	})
+}
+
+func TestBeginUpgradeDrainClosesPreReadyLifecycleSynchronously(t *testing.T) {
+	cp := &ControlPlane{}
+	ctx, finish, err := cp.beginPreReadyHandshake(context.Background())
+	if err != nil {
+		t.Fatalf("begin pre-ready handshake: %v", err)
+	}
+
+	cp.beginUpgradeDrain()
+	if !cp.upgradeDraining.Load() {
+		t.Fatal("upgrade drain flag was not set")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("upgrade drain did not cancel the pre-ready handshake")
+	}
+	if !finish() {
+		t.Fatal("pre-ready finish must report that upgrade drain linearized first")
+	}
 }
 
 func TestCapacityMissPolicyForKnownReasons(t *testing.T) {

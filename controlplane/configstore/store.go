@@ -392,6 +392,19 @@ func (cs *ConfigStore) Snapshot() *Snapshot {
 	return cs.snapshot
 }
 
+// WithSnapshot calls fn with the currently published immutable snapshot while
+// holding the store's read lock. Use this only when a decision must be atomic
+// with respect to snapshot publication; fn must be short and must not call a
+// ConfigStore method that takes the store lock.
+func (cs *ConfigStore) WithSnapshot(fn func(*Snapshot)) {
+	if fn == nil {
+		return
+	}
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	fn(cs.snapshot)
+}
+
 // ResolveDatabase maps a database name to an org ID. Returns "" if not found.
 func (cs *ConfigStore) ResolveDatabase(database string) string {
 	cs.mu.RLock()
@@ -740,20 +753,26 @@ func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash strin
 }
 
 // SetOrgUserDisabled flips the per-user kill switch for an existing user. The
-// change is persisted immediately; it becomes effective for new connections on
-// the next snapshot poll (or sooner on the writing replica, which can read its
-// own write). Returns an error if the user does not exist.
+// write serializes with admission decisions, which read it directly;
+// snapshot-backed authentication observes it on the next poll. Returns an
+// error if the user does not exist.
 func (cs *ConfigStore) SetOrgUserDisabled(orgID, username string, disabled bool) error {
-	result := cs.db.Model(&OrgUser{}).
-		Where("org_id = ? AND username = ?", orgID, username).
-		Updates(map[string]any{"disabled": disabled, "updated_at": time.Now()})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("user %q in org %q: %w", username, orgID, ErrOrgUserNotFound)
-	}
-	return nil
+	return cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+
+		result := tx.Model(&OrgUser{}).
+			Where("org_id = ? AND username = ?", orgID, username).
+			Updates(map[string]any{"disabled": disabled, "updated_at": time.Now()})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("user %q in org %q: %w", username, orgID, ErrOrgUserNotFound)
+		}
+		return nil
+	})
 }
 
 // OnChange registers a callback that fires when the config snapshot changes.
