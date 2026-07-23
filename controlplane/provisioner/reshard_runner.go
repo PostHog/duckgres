@@ -200,9 +200,9 @@ func isAuthProbeError(err error) bool {
 
 // describeProbeFailure renders a tenant-role probe failure for the op log.
 // Authentication failures are named explicitly, with the operator remedy: the
-// role's ACTUAL Postgres password differing from the freshly published status
-// password (a stranded password — e.g. a re-adopted role whose status password
-// the composition regenerated) is effectively permanent, and retrying to the
+// role's ACTUAL Postgres password differing from the referenced Secret
+// password (a stranded password — e.g. a re-adopted role whose credential the
+// composition regenerated) is effectively permanent, and retrying to the
 // timeout cannot fix it by itself. We keep polling anyway (a composition fix
 // can converge the password mid-wait, and bailing early would leave the org
 // worse off), but the log must tell the operator what to do.
@@ -214,7 +214,7 @@ func describeProbeFailure(err error, role string) string {
 	if !isAuthProbeError(err) {
 		return fmt.Sprintf("tenant-role probe failing: %v", err)
 	}
-	return fmt.Sprintf("tenant-role probe failing with an AUTHENTICATION error: %v — the role's actual Postgres password likely differs from the published status password (stranded password). If this persists, align it manually on the shard primary: ALTER ROLE %s WITH PASSWORD '<status password>' (take the password from the duckling CR status — it is never logged here)", err, role)
+	return fmt.Sprintf("tenant-role probe failing with an AUTHENTICATION error: %v — the role's actual Postgres password likely differs from the referenced Secret (stranded password). If this persists, align it manually on the shard primary: ALTER ROLE %s WITH PASSWORD '<referenced Secret password>' (read the key named by status.metadataStore.credentialSecretRef — it is never logged here)", err, role)
 }
 
 // StashExternalPassword hands the runner the ephemeral external-target

@@ -111,7 +111,21 @@ func newFakeDucklingClient() (*DucklingClient, *dynamicfake.FakeDynamicClient) {
 	}, &unstructured.UnstructuredList{})
 
 	fakeClient := dynamicfake.NewSimpleDynamicClient(scheme)
+	installFakeCredentialSecretReader(fakeClient)
 	return NewDucklingClientWithDynamic(fakeClient), fakeClient
+}
+
+func testCredentialSecretRef(name string) map[string]interface{} {
+	return map[string]interface{}{
+		"name": name + "-metadata-password", "namespace": ducklingNamespace, "key": "password",
+	}
+}
+
+func installFakeCredentialSecretReader(fakeClient *dynamicfake.FakeDynamicClient) {
+	fakeClient.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		name := action.(k8stesting.GetAction).GetName()
+		return true, credentialSecret(name, "test-metadata-password"), nil
+	})
 }
 
 func TestReconcilePendingCreatesCR(t *testing.T) {
@@ -524,11 +538,11 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 			},
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":     "external",
-					"endpoint": "org-b.cluster.us-east-1.rds.amazonaws.com",
-					"password": "supersecret123",
-					"user":     "postgres",
-					"database": "postgres",
+					"type":                "external",
+					"endpoint":            "org-b.cluster.us-east-1.rds.amazonaws.com",
+					"credentialSecretRef": testCredentialSecretRef("org-b"),
+					"user":                "postgres",
+					"database":            "postgres",
 				},
 				"dataStore": map[string]interface{}{
 					"type":       "s3bucket",
@@ -609,12 +623,12 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 			},
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":              "external",
-					"endpoint":          "org-probe.cluster.us-east-1.rds.amazonaws.com",
-					"pgbouncerEndpoint": "pgbouncer-duckling-org-probe.ducklings.svc.cluster.local:6543",
-					"password":          "supersecret123",
-					"user":              "postgres",
-					"database":          "postgres",
+					"type":                "external",
+					"endpoint":            "org-probe.cluster.us-east-1.rds.amazonaws.com",
+					"pgbouncerEndpoint":   "pgbouncer-duckling-org-probe.ducklings.svc.cluster.local:6543",
+					"credentialSecretRef": testCredentialSecretRef("org-probe"),
+					"user":                "postgres",
+					"database":            "postgres",
 				},
 				"dataStore": map[string]interface{}{
 					"type":       "s3bucket",
@@ -700,12 +714,12 @@ func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
 			},
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":              "external",
-					"endpoint":          "org-pgb.cluster.us-east-1.rds.amazonaws.com",
-					"pgbouncerEndpoint": "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543",
-					"password":          "supersecret123",
-					"user":              "postgres",
-					"database":          "postgres",
+					"type":                "external",
+					"endpoint":            "org-pgb.cluster.us-east-1.rds.amazonaws.com",
+					"pgbouncerEndpoint":   "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543",
+					"credentialSecretRef": testCredentialSecretRef("org-pgb"),
+					"user":                "postgres",
+					"database":            "postgres",
 				},
 				"dataStore":  map[string]interface{}{"type": "s3bucket", "bucketName": "org-pgb-bucket"},
 				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-pgb",
@@ -842,7 +856,6 @@ func TestParseDucklingStatusPgBouncerEndpoint(t *testing.T) {
 					"pgbouncerEndpoint": "pgbouncer-duckling-foo.ducklings.svc.cluster.local:6543",
 					"user":              "postgres",
 					"database":          "postgres",
-					"password":          "s3cret",
 				},
 			},
 		},
@@ -981,6 +994,7 @@ func newFakeDucklingClientWithComposed(objects ...runtime.Object) *DucklingClien
 		bucketGVR:   "BucketList",
 	}
 	fake := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objects...)
+	installFakeCredentialSecretReader(fake)
 	return NewDucklingClientWithDynamic(fake)
 }
 
@@ -1008,7 +1022,7 @@ func TestReconcileProvisioningStuckBucketSurfacesError(t *testing.T) {
 		},
 		"status": map[string]interface{}{
 			// Populated infra fields — what fooled the old presence check.
-			"metadataStore": map[string]interface{}{"type": "external", "endpoint": "org-stuck.rds.amazonaws.com", "password": "pw", "user": "postgres", "database": "postgres"},
+			"metadataStore": map[string]interface{}{"type": "external", "endpoint": "org-stuck.rds.amazonaws.com", "credentialSecretRef": testCredentialSecretRef("org-stuck"), "user": "postgres", "database": "postgres"},
 			"dataStore":     map[string]interface{}{"type": "s3bucket", "bucketName": bucketName},
 			"iamRoleArn":    "arn:aws:iam::123456789012:role/duckling-org-stuck",
 			// XR composed fine but the bucket never reconciled.
@@ -1164,11 +1178,11 @@ func TestReconcileProvisioningCnpgShardReadiness(t *testing.T) {
 			},
 			"status": map[string]interface{}{
 				"metadataStore": map[string]interface{}{
-					"type":     configstore.MetadataStoreKindCnpgShard,
-					"endpoint": "shard-001-pooler.cnpg-shards.svc.cluster.local",
-					"password": "from-provider-sql",
-					"user":     "duckgres_org_cs",
-					"database": "duckgres_org_cs",
+					"type":                configstore.MetadataStoreKindCnpgShard,
+					"endpoint":            "shard-001-pooler.cnpg-shards.svc.cluster.local",
+					"credentialSecretRef": testCredentialSecretRef("org-cs"),
+					"user":                "duckgres_org_cs",
+					"database":            "duckgres_org_cs",
 				},
 				"dataStore": map[string]interface{}{
 					"type":       "s3bucket",

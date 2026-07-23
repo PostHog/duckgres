@@ -93,7 +93,7 @@ func TestReconcileProvisioningSuccessEmitsEvent(t *testing.T) {
 		"metadata":   map[string]interface{}{"name": "org-ok", "namespace": ducklingNamespace},
 		"status": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
-				"type": "external", "endpoint": "rds.example", "password": "secret", "user": "postgres", "database": "postgres",
+				"type": "external", "endpoint": "rds.example", "credentialSecretRef": testCredentialSecretRef("org-ok"), "user": "postgres", "database": "postgres",
 			},
 			"dataStore":  map[string]interface{}{"type": "s3bucket", "bucketName": "org-ok-bucket"},
 			"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-ok",

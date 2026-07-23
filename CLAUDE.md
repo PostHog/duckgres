@@ -751,11 +751,9 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   `status.metadataStore.credentialSecretRef` names one key in a Secret in the
   `ducklings` namespace; `DucklingClient.Get` resolves it before returning the
   status used by activation, probes, metering, and resharding. References to
-  any other namespace are rejected. The plaintext `status.metadataStore.password`
-  read is a temporary deploy-order fallback only: it is used when no reference
-  exists, or when a referenced Secret is temporarily unreadable while the
-  legacy password is still present. Once charts stops publishing plaintext,
-  an unreadable/missing Secret is a hard error.
+  any other namespace are rejected. The name, namespace, and key are all
+  mandatory; an incomplete reference or an unreadable/missing Secret is a hard
+  error. Duckgres never reads credential material from Duckling CR status.
 - **Rollback patches the source shard VALUE back — never removes the key**
   (precedence would fall through to the freshly-stamped bogus status pin);
   ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
