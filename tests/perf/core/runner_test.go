@@ -9,12 +9,14 @@ import (
 type testDriver struct {
 	protocol Protocol
 	calls    int
+	queryIDs []string
 }
 
 func (d *testDriver) Protocol() Protocol { return d.protocol }
 
-func (d *testDriver) Execute(_ context.Context, _ Query, _ []any) (ExecutionResult, error) {
+func (d *testDriver) Execute(_ context.Context, query Query, _ []any) (ExecutionResult, error) {
 	d.calls++
+	d.queryIDs = append(d.queryIDs, query.QueryID)
 	return ExecutionResult{Rows: 1}, nil
 }
 
@@ -135,5 +137,36 @@ func TestRunnerUsesConfiguredRunID(t *testing.T) {
 	}
 	if summary.RunID != "nightly-v1-20260311T234300Z" {
 		t.Fatalf("summary run_id = %q", summary.RunID)
+	}
+}
+
+func TestRunnerAlternatesQueryOrderAcrossIterations(t *testing.T) {
+	pg := &testDriver{protocol: ProtocolPGWire}
+	runner := NewQueryRunner(RunnerConfig{
+		Catalog: Catalog{
+			Name:                "paired-ab",
+			DatasetScale:        1,
+			MeasureIterations:   4,
+			AlternateQueryOrder: true,
+			Targets:             []Protocol{ProtocolPGWire},
+			Queries: []Query{
+				{QueryID: "a", IntentID: "pair", PGWireSQL: "SELECT 1", DuckhogSQL: "SELECT 1"},
+				{QueryID: "b", IntentID: "pair", PGWireSQL: "SELECT 1", DuckhogSQL: "SELECT 1"},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{ProtocolPGWire: pg},
+	})
+
+	if _, err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	want := []string{"a", "b", "b", "a", "a", "b", "b", "a"}
+	if len(pg.queryIDs) != len(want) {
+		t.Fatalf("query order = %#v, want %#v", pg.queryIDs, want)
+	}
+	for i := range want {
+		if pg.queryIDs[i] != want[i] {
+			t.Fatalf("query order = %#v, want %#v", pg.queryIDs, want)
+		}
 	}
 }

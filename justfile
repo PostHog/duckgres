@@ -433,6 +433,11 @@ scenario-frozen-metadata:
 scenario-frozen-perf:
     ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml
 
+# Rewrite one frozen events sample with 128 MiB and 1 GiB row-group byte caps and compare latency
+[group('test')]
+scenario-events-rowgroup-perf:
+    DUCKGRES_SCENARIO_MAX_RUNTIME="${DUCKGRES_SCENARIO_MAX_RUNTIME:-60m}" DUCKGRES_SCENARIO_GO_TEST_TIMEOUT="${DUCKGRES_SCENARIO_GO_TEST_TIMEOUT:-75m}" ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/events_rowgroup_perf.yaml
+
 # Run the dev frozen dataset dbt scenario
 [group('test')]
 scenario-frozen-dbt:

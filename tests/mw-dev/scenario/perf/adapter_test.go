@@ -319,6 +319,90 @@ func TestExecutorCanReportPerfQueryErrorsWithoutFailingStep(t *testing.T) {
 	}
 }
 
+func TestExecutorAppliesWorkerProfileToPGWire(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			DialHost:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir:     t.TempDir(),
+		DriverFactory: factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":        "scenario-org",
+			"catalog_file":  catalogPath,
+			"run_id":        "scenario-run-1",
+			"worker_cpu":    "4",
+			"worker_memory": "16Gi",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	const want = "options='-c duckgres.worker_cpu=4 -c duckgres.worker_memory=16Gi'"
+	if !strings.Contains(factory.pgwireConnection.DSN, want) {
+		t.Fatalf("PGWire DSN %q missing worker startup options %q", factory.pgwireConnection.DSN, want)
+	}
+}
+
+func TestExecutorDisablesExternalFileCacheBeforePerfQueries(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			DialHost:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			SSLMode:   "require",
+		},
+		OutputDir:     t.TempDir(),
+		DriverFactory: factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":                      "scenario-org",
+			"catalog_file":                catalogPath,
+			"run_id":                      "scenario-run-1",
+			"disable_external_file_cache": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if factory.pgwireDriver == nil || len(factory.pgwireDriver.queries) < 2 {
+		t.Fatal("expected PGWire setup query")
+	}
+	if got := factory.pgwireDriver.queries[0]; got != "SET enable_external_file_cache = false" {
+		t.Fatalf("first PGWire query = %q, want external cache disabled before warmup", got)
+	}
+	if got := factory.pgwireDriver.queries[len(factory.pgwireDriver.queries)-1]; got != "RESET enable_external_file_cache" {
+		t.Fatalf("last PGWire query = %q, want external cache restored after measurement", got)
+	}
+}
+
 func TestExecutorRequiresFlightAddrWhenCatalogTargetsFlight(t *testing.T) {
 	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolFlight})
 	provisionState := provision.NewState()
@@ -453,11 +537,18 @@ type fakeProtocolDriver struct {
 	protocol perfcore.Protocol
 	err      error
 	closed   bool
+	queries  []string
 }
 
 func (d *fakeProtocolDriver) Protocol() perfcore.Protocol { return d.protocol }
 
-func (d *fakeProtocolDriver) Execute(context.Context, perfcore.Query, []any) (perfcore.ExecutionResult, error) {
+func (d *fakeProtocolDriver) Execute(_ context.Context, query perfcore.Query, _ []any) (perfcore.ExecutionResult, error) {
+	switch d.protocol {
+	case perfcore.ProtocolPGWire:
+		d.queries = append(d.queries, query.PGWireSQL)
+	case perfcore.ProtocolFlight:
+		d.queries = append(d.queries, query.DuckhogSQL)
+	}
 	return perfcore.ExecutionResult{Rows: 1, Duration: time.Millisecond}, d.err
 }
 

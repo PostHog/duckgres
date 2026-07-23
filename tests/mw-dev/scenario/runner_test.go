@@ -17,6 +17,7 @@ import (
 	scenarioperf "github.com/posthog/duckgres/tests/mw-dev/scenario/perf"
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
+	perfcore "github.com/posthog/duckgres/tests/perf/core"
 )
 
 var (
@@ -169,6 +170,7 @@ func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 	for _, scenarioFile := range []string{
 		"posthog_frozen_metadata.yaml",
 		"posthog_frozen_perf.yaml",
+		"events_rowgroup_perf.yaml",
 		"posthog_frozen_dbt.yaml",
 		"fast-suite.yaml",
 		"full-suite.yaml",
@@ -494,6 +496,159 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	if !foundPerf {
 		t.Fatal("expected frozen perf scenario to include a perf_queries step")
 	}
+}
+
+func TestEventsRowGroupPerfScenarioBuildsControlledAB(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "events_rowgroup_perf.yaml"))
+	if err != nil {
+		t.Fatalf("load events row-group perf scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-events-rowgroup-perf-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	steps := make(map[string]core.Step, len(resolved.Steps))
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+		steps[step.ID] = step
+	}
+
+	rewrite, ok := steps["rewrite_events_rowgroups"]
+	if !ok {
+		t.Fatal("missing rewrite_events_rowgroups step")
+	}
+	assertScenarioFileExists(t, rewrite, "file")
+	if got, _ := rewrite.With["worker_cpu"].(string); got != "4" {
+		t.Fatalf("rewrite worker_cpu = %q, want 4", got)
+	}
+	if got, _ := rewrite.With["worker_memory"].(string); got != "16Gi" {
+		t.Fatalf("rewrite worker_memory = %q, want 16Gi", got)
+	}
+	rewriteSQL := readScenarioStepFile(t, rewrite, "file")
+	for _, required := range []string{
+		"SET threads = 1;",
+		"SET preserve_insertion_order = false;",
+		"events/*year=2024__month=10__day=01__*.parquet",
+		"LIMIT 524288",
+		"'parquet_row_group_size_bytes', '128MiB'",
+		"'parquet_row_group_size_bytes', '1GiB'",
+		"'target_file_size', '10GB'",
+		"INSERT INTO rowgroup_ab.events_rg_1gib\nSELECT * FROM rowgroup_ab.events_rg_128mib",
+		"RESET threads;",
+		"RESET preserve_insertion_order;",
+	} {
+		if !strings.Contains(rewriteSQL, required) {
+			t.Fatalf("row-group rewrite SQL missing %q", required)
+		}
+	}
+	if got := strings.Count(rewriteSQL, "'parquet_row_group_size', 250000"); got != 2 {
+		t.Fatalf("row-group rewrite SQL sets the shared 250000-row cap %d times, want 2", got)
+	}
+
+	perfStep, ok := steps["compare_rowgroup_queries"]
+	if !ok {
+		t.Fatal("missing compare_rowgroup_queries step")
+	}
+	assertScenarioFileExists(t, perfStep, "catalog_file")
+	if got, _ := perfStep.With["worker_cpu"].(string); got != "4" {
+		t.Fatalf("perf worker_cpu = %q, want 4", got)
+	}
+	if got, _ := perfStep.With["worker_memory"].(string); got != "16Gi" {
+		t.Fatalf("perf worker_memory = %q, want 16Gi", got)
+	}
+	if disabled, _ := perfStep.With["disable_external_file_cache"].(bool); !disabled {
+		t.Fatal("row-group perf must disable the external file cache before warmup")
+	}
+	if got := perfStep.DependsOn; len(got) != 1 || got[0] != "validate_rowgroup_rewrite" {
+		t.Fatalf("perf dependencies = %#v, want validated rewrite first", got)
+	}
+	catalogPath, _ := perfStep.With["catalog_file"].(string)
+	catalog, err := perfcore.LoadCatalog(catalogPath)
+	if err != nil {
+		t.Fatalf("load row-group perf catalog: %v", err)
+	}
+	if len(catalog.Targets) != 1 || catalog.Targets[0] != perfcore.ProtocolPGWire {
+		t.Fatalf("row-group perf targets = %#v, want PGWire only", catalog.Targets)
+	}
+	if !catalog.AlternateQueryOrder || catalog.MeasureIterations%2 != 0 {
+		t.Fatalf("row-group perf order must alternate across an even measurement count: %+v", catalog)
+	}
+	intentCounts := make(map[string]int)
+	for _, query := range catalog.Queries {
+		intentCounts[query.IntentID]++
+		uses128MiB := strings.Contains(query.PGWireSQL, "rowgroup_ab.events_rg_128mib")
+		uses1GiB := strings.Contains(query.PGWireSQL, "rowgroup_ab.events_rg_1gib")
+		if uses128MiB == uses1GiB {
+			t.Fatalf("query %s should select exactly one A/B table: %s", query.QueryID, query.PGWireSQL)
+		}
+	}
+	if len(intentCounts) < 4 {
+		t.Fatalf("row-group perf intents = %#v, want at least four workloads", intentCounts)
+	}
+	for intent, count := range intentCounts {
+		if count != 2 {
+			t.Fatalf("intent %s has %d queries, want one 128MiB/1GiB pair", intent, count)
+		}
+	}
+
+	validate, ok := steps["validate_rowgroup_rewrite"]
+	if !ok {
+		t.Fatal("missing validate_rowgroup_rewrite step")
+	}
+	assertScenarioFileExists(t, validate, "file")
+	validationSQL := readScenarioStepFile(t, validate, "file")
+	for _, required := range []string{
+		"SET VARIABLE events_rg_128mib_files",
+		"parquet_file_metadata(getvariable('events_rg_128mib_files'))",
+		"row_groups_1gib < row_groups_128mib",
+		"('rowgroup_ab.events_rg_128mib', 'parquet_row_group_size_bytes', '134217728')",
+		"('rowgroup_ab.events_rg_1gib', 'parquet_row_group_size_bytes', '1073741824')",
+		"bit_xor(hash(",
+	} {
+		if !strings.Contains(validationSQL, required) {
+			t.Fatalf("row-group validation SQL missing %q", required)
+		}
+	}
+	if got := validate.DependsOn; len(got) != 1 || got[0] != "rewrite_events_rowgroups" {
+		t.Fatalf("validation dependencies = %#v, want rewrite preflight", got)
+	}
+	deprovision := steps["deprovision"]
+	if !deprovision.AlwaysRun {
+		t.Fatal("deprovision should always run")
+	}
+	if got := deprovision.DependsOn; len(got) != 1 || got[0] != "compare_rowgroup_queries" {
+		t.Fatalf("deprovision dependencies = %#v, want benchmark completion", got)
+	}
+}
+
+func assertScenarioFileExists(t *testing.T, step core.Step, key string) {
+	t.Helper()
+	path, ok := step.With[key].(string)
+	if !ok || !filepath.IsAbs(path) {
+		t.Fatalf("step %s %s = %#v, want absolute path", step.ID, key, step.With[key])
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("step %s %s %q should exist: %v", step.ID, key, path, err)
+	}
+}
+
+func readScenarioStepFile(t *testing.T, step core.Step, key string) string {
+	t.Helper()
+	path, _ := step.With[key].(string)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read step %s %s %q: %v", step.ID, key, path, err)
+	}
+	return string(raw)
 }
 
 func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {

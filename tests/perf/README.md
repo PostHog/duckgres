@@ -63,6 +63,13 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 `duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
 No CSV schema mutation is expected in this phase.
 
+## Catalog Query Order
+
+Catalogs execute queries in declaration order by default. Set
+`alternate_query_order: true` to reverse the full query list on every second
+warmup and measured iteration. Paired A/B catalogs should also use an even
+`measure_iterations` value so each variant runs in each order equally often.
+
 ## Nightly Run
 
 ```bash

@@ -38,8 +38,8 @@ Frozen dataset scenarios additionally require:
 export DUCKGRES_SCENARIO_FROZEN_S3_URI="s3://<dev-managed-bucket>/frozen_v1/"
 ```
 
-The full suite, fast suite, and targeted frozen perf scenarios exercise PGWire
-only. Frozen perf records per-query success and failure rows in
+The full suite, fast suite, targeted frozen perf scenario, and row-group A/B
+scenario exercise PGWire only. Frozen perf records per-query success and failure rows in
 `query_results.csv`.
 Measured query errors fail the perf DAG step after its artifacts are written;
 independent sibling steps continue to run.
@@ -90,6 +90,12 @@ Run frozen perf queries:
 just scenario-frozen-perf
 ```
 
+Run the manual frozen-events row-group A/B:
+
+```bash
+just scenario-events-rowgroup-perf
+```
+
 Run frozen dbt lifecycle:
 
 ```bash
@@ -127,6 +133,19 @@ The frozen perf scenario uses:
 
 Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `summary.json`, and `server_metrics.prom`.
 
+### Frozen events row-group A/B
+
+`events_rowgroup_perf.yaml` is a standalone, manual experiment; it is not part of the scheduled full or fast suite. It takes the first 524,288 rows from one stable day in the existing frozen events fixture and writes the same 25 columns twice:
+
+- `rowgroup_ab.events_rg_128mib`: 128 MiB maximum row-group byte size
+- `rowgroup_ab.events_rg_1gib`: 1 GiB maximum row-group byte size
+
+Both writes use the same 250,000-row upper bound, one thread, disabled insertion-order preservation as required by DuckDB's row-group byte guard, Zstandard compression, and 10 GB target file size. Each produces one output file. The 1 GiB table is populated from the completed 128 MiB table, so the candidate cannot select a different source slice. The scenario uses a 4 CPU, 16Gi worker to leave headroom while constructing the larger groups from this wide events schema.
+
+The perf catalog is PGWire-only and covers five workloads: a five-minute timestamp count, minute time series, event aggregation, distinct-person count, and a wide properties scan. It reverses the full query order on alternating iterations, so each 128 MiB/1 GiB pair runs first and second three times. The perf session disables DuckDB's external file cache before one warmup and six measured iterations, so repeated scans continue to exercise object-store range reads. Compare query IDs ending in `_rg128mib` and `_rg1gib` within the same `intent_id` in `query_results.csv`; timings are recorded but never used as a CI pass/fail threshold.
+
+Validation runs before the timed queries so an ineffective rewrite fails fast. It checks both tables have 524,288 rows, hashes all 25 columns to confirm identical contents, verifies one data file each, checks the persisted writer options, and inspects the Parquet footers to confirm that the larger byte cap produces fewer physical row groups. The benchmark then disables and clears DuckDB's external file cache on its pinned PGWire connection; the isolated scenario deployment has no node cache proxy, so validation reads do not warm the measured object-store path. Exact row counts per group are deliberately not assumed because the wide variable-length columns make the byte limit decisive. The recipe defaults the scenario runtime to 60 minutes and the enclosing Go test timeout to 75 minutes; override `DUCKGRES_SCENARIO_MAX_RUNTIME` or `DUCKGRES_SCENARIO_GO_TEST_TIMEOUT` if the dev environment is slower.
+
 The frozen dbt scenario uses:
 
 - `tests/mw-dev/scenario/scenarios/posthog_frozen_dbt.yaml`
@@ -134,12 +153,14 @@ The frozen dbt scenario uses:
 
 dbt artifacts are written under `artifacts/scenario/<run_id>/dbt/`, including per-command stdout/stderr logs, `target/` artifacts, and dbt logs. Install `dbt-postgres` locally or set `DUCKGRES_SCENARIO_DBT_BIN` to the dbt executable to use.
 
-The frozen dbt workload requests a 2 CPU, 4Gi worker through the dbt connection's `duckgres.worker_cpu` and `duckgres.worker_memory` startup options. It also sets `with.connect_timeout: 360`, long enough for the control plane's five-minute worker queue to provision a cold Karpenter node. Other scenario workloads use the isolated control plane's default worker size; `scenario-dev` sets that default to 2 CPU and 8Gi to add process headroom for repeated frozen pgwire aggregates. A `dbt_run` step can opt into a different size or connection window with `with.worker_cpu`, `with.worker_memory`, and `with.connect_timeout`.
+The frozen dbt workload requests a 2 CPU, 4Gi worker through the dbt connection's `duckgres.worker_cpu` and `duckgres.worker_memory` startup options. It also sets `with.connect_timeout: 360`, long enough for the control plane's five-minute worker queue to provision a cold Karpenter node. Other scenario workloads use the isolated control plane's default worker size; `scenario-dev` sets that default to 2 CPU and 8Gi to add process headroom for repeated frozen pgwire aggregates. SQL, PGWire perf, and dbt steps can opt into a worker profile with `with.worker_cpu` and `with.worker_memory`; dbt can also set `with.connect_timeout`. Flight perf connections do not currently carry these PGWire startup options.
 
 `perf_queries` defaults `with.fail_on_query_errors` to `true`. A measured query
 error therefore marks that DAG step failed and appears in the scenario result,
 while independent sibling steps continue. Set it to `false` only for a
 diagnostic scenario whose query failures are intentionally non-verdict data.
+
+A PGWire `perf_queries` step can set `with.disable_external_file_cache: true` to run `SET enable_external_file_cache = false` on its pinned benchmark connection before warmup. The runner resets the setting before closing that connection. The option defaults to `false`; use it when the benchmark is intended to retain remote object-store I/O across iterations.
 
 dbt retry is opt-in per scenario step:
 

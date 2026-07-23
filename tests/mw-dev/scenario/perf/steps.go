@@ -71,6 +71,9 @@ type stepSpec struct {
 	FlightAddr               string
 	FlightServerName         string
 	FlightInsecureSkipVerify bool
+	WorkerCPU                string
+	WorkerMemory             string
+	DisableExternalFileCache bool
 }
 
 type defaultDriverFactory struct{}
@@ -125,7 +128,7 @@ func (s *State) Result(stepID string) (StepResult, bool) {
 	return result, ok
 }
 
-func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
+func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) (retErr error) {
 	if step.Type != StepTypePerfQueries {
 		return classified(ErrorClassUnsupportedStep, fmt.Errorf("unsupported perf step type %q", step.Type))
 	}
@@ -147,11 +150,16 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		}
 	}
 
-	drivers, err := e.driversForCatalog(catalog, spec)
+	drivers, err := e.driversForCatalog(ctx, catalog, spec)
 	if err != nil {
 		return err
 	}
-	defer closeDrivers(drivers)
+	defer func() {
+		cleanupErr := cleanupDrivers(ctx, drivers, spec.DisableExternalFileCache)
+		if retErr == nil && cleanupErr != nil {
+			retErr = classified(ErrorClassConfig, cleanupErr)
+		}
+	}()
 
 	perfDir := filepath.Join(e.outputDir, spec.OutputSubdir)
 	sink, err := perfcore.NewArtifactSink(perfDir)
@@ -256,6 +264,9 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		FlightAddr:               stringFromWith(step, "flight_addr", e.flightAddr),
 		FlightServerName:         stringFromWith(step, "flight_server_name", e.defaultFlightServerName(orgID)),
 		FlightInsecureSkipVerify: boolFromWith(step, "flight_insecure_skip_verify", e.flightInsecureSkipVerify),
+		WorkerCPU:                stringFromWith(step, "worker_cpu", ""),
+		WorkerMemory:             stringFromWith(step, "worker_memory", ""),
+		DisableExternalFileCache: boolFromWith(step, "disable_external_file_cache", false),
 	}, nil
 }
 
@@ -309,12 +320,12 @@ func restrictCatalogTargets(catalog perfcore.Catalog, targets []perfcore.Protoco
 	return catalog, nil
 }
 
-func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (map[perfcore.Protocol]perfcore.ProtocolDriver, error) {
+func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catalog, spec stepSpec) (map[perfcore.Protocol]perfcore.ProtocolDriver, error) {
 	drivers := make(map[perfcore.Protocol]perfcore.ProtocolDriver, len(catalog.Targets))
 	var success bool
 	defer func() {
 		if !success {
-			closeDrivers(drivers)
+			_ = cleanupDrivers(ctx, drivers, spec.DisableExternalFileCache)
 		}
 	}()
 	for _, target := range catalog.Targets {
@@ -332,6 +343,17 @@ func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (m
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
 			drivers[target] = driver
+			if spec.DisableExternalFileCache {
+				_, err := driver.Execute(ctx, perfcore.Query{
+					QueryID:    "__setup_disable_external_file_cache",
+					IntentID:   "__setup_disable_external_file_cache",
+					PGWireSQL:  "SET enable_external_file_cache = false",
+					DuckhogSQL: "SELECT 1",
+				}, nil)
+				if err != nil {
+					return nil, classified(ErrorClassConfig, fmt.Errorf("disable external file cache for pgwire perf driver: %w", err))
+				}
+			}
 		case perfcore.ProtocolFlight:
 			if spec.FlightAddr == "" {
 				return nil, classified(ErrorClassConfig, fmt.Errorf("with.flight_addr or DUCKGRES_SCENARIO_FLIGHT_ADDR is required when perf catalog targets flight"))
@@ -365,6 +387,10 @@ func (e *Executor) pgwireConnection(spec stepSpec) (scenariosql.PGWireConnection
 	cfg.Database = spec.Database
 	cfg.Username = spec.Username
 	cfg.Password = spec.Password
+	cfg.Options = scenariosql.AppendStartupOptions(cfg.Options, scenariosql.WorkerProfileStartupOptions(
+		spec.WorkerCPU,
+		spec.WorkerMemory,
+	))
 	connection, err := cfg.PGWire()
 	if err != nil {
 		return scenariosql.PGWireConnection{}, classified(ErrorClassConfig, err)
@@ -378,11 +404,36 @@ func closeDrivers(drivers map[perfcore.Protocol]perfcore.ProtocolDriver) {
 	}
 }
 
+func cleanupDrivers(ctx context.Context, drivers map[perfcore.Protocol]perfcore.ProtocolDriver, resetExternalFileCache bool) error {
+	var resetErr error
+	if resetExternalFileCache {
+		if driver, ok := drivers[perfcore.ProtocolPGWire]; ok {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_, err := driver.Execute(cleanupCtx, perfcore.Query{
+				QueryID:    "__teardown_reset_external_file_cache",
+				IntentID:   "__teardown_reset_external_file_cache",
+				PGWireSQL:  "RESET enable_external_file_cache",
+				DuckhogSQL: "SELECT 1",
+			}, nil)
+			cancel()
+			if err != nil {
+				resetErr = fmt.Errorf("restore external file cache for pgwire perf driver: %w", err)
+			}
+		}
+	}
+	closeDrivers(drivers)
+	return resetErr
+}
+
 func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
 	db, err := connection.OpenDB()
 	if err != nil {
 		return nil, err
 	}
+	// Perf session setup uses SET statements, so keep every measured query and
+	// teardown RESET on the same physical PGWire connection.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	return pgdriver.NewWithDB(db), nil
 }
 

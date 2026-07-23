@@ -1,0 +1,71 @@
+name: posthog-events-rowgroup-perf
+run_id_prefix: scenario-events-rowgroup-perf
+required_env:
+  - DUCKGRES_SCENARIO_ORG_ID
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      request:
+        database_name: scenario_events_rowgroup_perf_${run_id_token}
+        default_team_id: 1
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: rewrite_events_rowgroups
+    type: sql
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/setup_events_rowgroup_ab.sql
+      worker_cpu: "4"
+      worker_memory: 16Gi
+      max_attempts: 3
+      retry_interval: 10s
+
+  - id: validate_rowgroup_rewrite
+    type: sql
+    depends_on: [rewrite_events_rowgroups]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/validate_events_rowgroup_ab.sql
+      worker_cpu: "4"
+      worker_memory: 16Gi
+
+  - id: compare_rowgroup_queries
+    type: perf_queries
+    depends_on: [validate_rowgroup_rewrite]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      catalog_file: ../../../perf/queries/events_rowgroup_ab.yaml
+      run_id: ${run_id}
+      dataset_version: posthog-events-rowgroup-byte-cap-ab-v1
+      worker_cpu: "4"
+      worker_memory: 16Gi
+      disable_external_file_cache: true
+      fail_on_query_errors: true
+
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [compare_rowgroup_queries]
+    always_run: true
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s

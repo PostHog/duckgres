@@ -23,6 +23,7 @@ type ConnectionConfig struct {
 	SSLMode         string
 	ConnectTimeout  int
 	ApplicationName string
+	Options         string
 }
 
 // PGWireConnection separates the hostname used for managed-warehouse TLS
@@ -75,6 +76,9 @@ func (c ConnectionConfig) PGWire() (PGWireConnection, error) {
 	if c.ApplicationName != "" {
 		values = append(values, [2]string{"application_name", c.ApplicationName})
 	}
+	if c.Options != "" {
+		values = append(values, [2]string{"options", c.Options})
+	}
 
 	parts := make([]string, 0, len(values))
 	for _, kv := range values {
@@ -84,6 +88,26 @@ func (c ConnectionConfig) PGWire() (PGWireConnection, error) {
 		DSN:         strings.Join(parts, " "),
 		DialAddress: net.JoinHostPort(c.DialHost, strconv.Itoa(c.Port)),
 	}, nil
+}
+
+// WorkerProfileStartupOptions returns libpq startup options for requesting a
+// sized Duckgres worker. Empty values are omitted so callers can set either
+// dimension independently, matching the control-plane startup contract.
+func WorkerProfileStartupOptions(cpu, memory string) string {
+	parts := make([]string, 0, 4)
+	if cpu != "" {
+		parts = append(parts, "-c", "duckgres.worker_cpu="+cpu)
+	}
+	if memory != "" {
+		parts = append(parts, "-c", "duckgres.worker_memory="+memory)
+	}
+	return strings.Join(parts, " ")
+}
+
+// AppendStartupOptions combines existing connection options with options
+// supplied by a scenario step.
+func AppendStartupOptions(existing, extra string) string {
+	return strings.TrimSpace(strings.Join([]string{existing, extra}, " "))
 }
 
 func (c ConnectionConfig) DSN() (string, error) {

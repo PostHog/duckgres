@@ -216,6 +216,10 @@ func (e *Executor) queryRequest(step core.Step, spec querySpec, resultID string)
 	cfg.Database = spec.Catalog
 	cfg.Username = username
 	cfg.Password = password
+	cfg.Options = AppendStartupOptions(cfg.Options, WorkerProfileStartupOptions(
+		stringFromWith(step, "worker_cpu", ""),
+		stringFromWith(step, "worker_memory", ""),
+	))
 	connection, err := cfg.PGWire()
 	if err != nil {
 		return QueryRequest{}, err

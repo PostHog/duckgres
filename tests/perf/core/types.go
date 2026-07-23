@@ -10,14 +10,15 @@ const (
 )
 
 type Catalog struct {
-	Name              string     `yaml:"name"`
-	Description       string     `yaml:"description"`
-	Seed              int64      `yaml:"seed"`
-	DatasetScale      int        `yaml:"dataset_scale"`
-	Targets           []Protocol `yaml:"targets"`
-	WarmupIterations  int        `yaml:"warmup_iterations"`
-	MeasureIterations int        `yaml:"measure_iterations"`
-	Queries           []Query    `yaml:"queries"`
+	Name                string     `yaml:"name"`
+	Description         string     `yaml:"description"`
+	Seed                int64      `yaml:"seed"`
+	DatasetScale        int        `yaml:"dataset_scale"`
+	Targets             []Protocol `yaml:"targets"`
+	WarmupIterations    int        `yaml:"warmup_iterations"`
+	MeasureIterations   int        `yaml:"measure_iterations"`
+	AlternateQueryOrder bool       `yaml:"alternate_query_order"`
+	Queries             []Query    `yaml:"queries"`
 }
 
 type Query struct {

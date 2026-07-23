@@ -24,6 +24,15 @@ type QueryResult struct {
 	Duration time.Duration
 }
 
+type queryRows interface {
+	Columns() ([]string, error)
+	Next() bool
+	Scan(...any) error
+	Err() error
+	NextResultSet() bool
+	Close() error
+}
+
 type DatabaseDriver struct{}
 
 func NewDatabaseDriver() *DatabaseDriver {
@@ -42,27 +51,9 @@ func (d *DatabaseDriver) Execute(ctx context.Context, req QueryRequest) (QueryRe
 
 	rows, err := db.QueryContext(ctx, req.SQL)
 	if err == nil {
-		defer func() {
-			_ = rows.Close()
-		}()
-		var count int64
-		cols, err := rows.Columns()
-		if err != nil {
-			return QueryResult{}, err
-		}
-		values := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range values {
-			ptrs[i] = &values[i]
-		}
-		for rows.Next() {
-			if err := rows.Scan(ptrs...); err != nil {
-				return QueryResult{}, err
-			}
-			count++
-		}
-		if err := rows.Err(); err != nil {
-			return QueryResult{}, err
+		count, consumeErr := consumeQueryRows(rows)
+		if consumeErr != nil {
+			return QueryResult{}, consumeErr
 		}
 		return QueryResult{Rows: count, Duration: time.Since(started)}, nil
 	}
@@ -76,4 +67,39 @@ func (d *DatabaseDriver) Execute(ctx context.Context, req QueryRequest) (QueryRe
 		affected = 0
 	}
 	return QueryResult{Rows: affected, Duration: time.Since(started)}, nil
+}
+
+func consumeQueryRows(rows queryRows) (count int64, err error) {
+	defer func() {
+		if closeErr := rows.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
+	for {
+		cols, columnsErr := rows.Columns()
+		if columnsErr != nil {
+			return count, columnsErr
+		}
+		values := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		for rows.Next() {
+			if scanErr := rows.Scan(ptrs...); scanErr != nil {
+				return count, scanErr
+			}
+			count++
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			return count, rowsErr
+		}
+		if !rows.NextResultSet() {
+			if rowsErr := rows.Err(); rowsErr != nil {
+				return count, rowsErr
+			}
+			return count, nil
+		}
+	}
 }

@@ -80,13 +80,15 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 
 	warmupIterations := r.cfg.Catalog.WarmupIterations
 	for i := 0; i < warmupIterations; i++ {
-		if err := r.executeIteration(ctx, false, 0, &summary); err != nil {
+		reverse := r.cfg.Catalog.AlternateQueryOrder && i%2 == 1
+		if err := r.executeIteration(ctx, false, 0, reverse, &summary); err != nil {
 			return summary, err
 		}
 	}
 	measureIterations := r.cfg.Catalog.MeasureIterations
 	for i := 0; i < measureIterations; i++ {
-		if err := r.executeIteration(ctx, true, i+1, &summary); err != nil {
+		reverse := r.cfg.Catalog.AlternateQueryOrder && i%2 == 1
+		if err := r.executeIteration(ctx, true, i+1, reverse, &summary); err != nil {
 			return summary, err
 		}
 	}
@@ -108,8 +110,14 @@ func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 	return r.metrics.Gatherer()
 }
 
-func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measureIteration int, summary *RunSummary) error {
-	for _, query := range r.cfg.Catalog.Queries {
+func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measureIteration int, reverse bool, summary *RunSummary) error {
+	queries := r.cfg.Catalog.Queries
+	for i := range queries {
+		queryIndex := i
+		if reverse {
+			queryIndex = len(queries) - 1 - i
+		}
+		query := queries[queryIndex]
 		args := orderedParamValues(query.Params)
 		for _, protocol := range r.cfg.Catalog.Targets {
 			driver := r.cfg.Drivers[protocol]

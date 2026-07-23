@@ -1,0 +1,79 @@
+name: posthog-events-rowgroup-byte-cap-ab-v1
+description: Paired latency corpus over identical frozen events rewritten with 128 MiB and 1 GiB Parquet row-group byte caps.
+seed: 42
+dataset_scale: 1
+targets:
+  - pgwire
+warmup_iterations: 1
+measure_iterations: 6
+alternate_query_order: true
+queries:
+  - query_id: q_events_five_minute_count_rg128mib
+    intent_id: intent_events_five_minute_count
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-128mib, narrow]
+    params: {}
+    pgwire_sql: SELECT count(*) AS events FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 12:05:00+00'
+    duckhog_sql: SELECT count(*) AS events FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 12:05:00+00'
+
+  - query_id: q_events_five_minute_count_rg1gib
+    intent_id: intent_events_five_minute_count
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-1gib, narrow]
+    params: {}
+    pgwire_sql: SELECT count(*) AS events FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 12:05:00+00'
+    duckhog_sql: SELECT count(*) AS events FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 12:05:00+00'
+
+  - query_id: q_events_hourly_minutes_rg1gib
+    intent_id: intent_events_hourly_minutes
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-1gib, time-series]
+    params: {}
+    pgwire_sql: SELECT date_trunc('minute', "timestamp") AS minute, count(*) AS events FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY 1 ORDER BY 1
+    duckhog_sql: SELECT date_trunc('minute', "timestamp") AS minute, count(*) AS events FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY 1 ORDER BY 1
+
+  - query_id: q_events_hourly_minutes_rg128mib
+    intent_id: intent_events_hourly_minutes
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-128mib, time-series]
+    params: {}
+    pgwire_sql: SELECT date_trunc('minute', "timestamp") AS minute, count(*) AS events FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY 1 ORDER BY 1
+    duckhog_sql: SELECT date_trunc('minute', "timestamp") AS minute, count(*) AS events FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY 1 ORDER BY 1
+
+  - query_id: q_events_by_name_rg128mib
+    intent_id: intent_events_by_name
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-128mib, aggregate]
+    params: {}
+    pgwire_sql: SELECT event, count(*) AS events FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+    duckhog_sql: SELECT event, count(*) AS events FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+
+  - query_id: q_events_by_name_rg1gib
+    intent_id: intent_events_by_name
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-1gib, aggregate]
+    params: {}
+    pgwire_sql: SELECT event, count(*) AS events FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+    duckhog_sql: SELECT event, count(*) AS events FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 12:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-01 13:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+
+  - query_id: q_events_distinct_persons_rg1gib
+    intent_id: intent_events_distinct_persons
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-1gib, distinct]
+    params: {}
+    pgwire_sql: SELECT count(DISTINCT person_id) AS persons FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'
+    duckhog_sql: SELECT count(DISTINCT person_id) AS persons FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'
+
+  - query_id: q_events_distinct_persons_rg128mib
+    intent_id: intent_events_distinct_persons
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-128mib, distinct]
+    params: {}
+    pgwire_sql: SELECT count(DISTINCT person_id) AS persons FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'
+    duckhog_sql: SELECT count(DISTINCT person_id) AS persons FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'
+
+  - query_id: q_events_wide_properties_rg128mib
+    intent_id: intent_events_wide_properties
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-128mib, wide]
+    params: {}
+    pgwire_sql: SELECT sum(length(coalesce(properties, '')) + length(coalesce(person_properties, '')) + length(coalesce(group0_properties, '')) + length(coalesce(group1_properties, '')) + length(coalesce(group2_properties, '')) + length(coalesce(group3_properties, '')) + length(coalesce(group4_properties, ''))) AS property_bytes FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'
+    duckhog_sql: SELECT sum(length(coalesce(properties, '')) + length(coalesce(person_properties, '')) + length(coalesce(group0_properties, '')) + length(coalesce(group1_properties, '')) + length(coalesce(group2_properties, '')) + length(coalesce(group3_properties, '')) + length(coalesce(group4_properties, ''))) AS property_bytes FROM rowgroup_ab.events_rg_128mib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'
+
+  - query_id: q_events_wide_properties_rg1gib
+    intent_id: intent_events_wide_properties
+    tags: [manual, frozen, posthog, events, rowgroup-ab, rg-1gib, wide]
+    params: {}
+    pgwire_sql: SELECT sum(length(coalesce(properties, '')) + length(coalesce(person_properties, '')) + length(coalesce(group0_properties, '')) + length(coalesce(group1_properties, '')) + length(coalesce(group2_properties, '')) + length(coalesce(group3_properties, '')) + length(coalesce(group4_properties, ''))) AS property_bytes FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'
+    duckhog_sql: SELECT sum(length(coalesce(properties, '')) + length(coalesce(person_properties, '')) + length(coalesce(group0_properties, '')) + length(coalesce(group1_properties, '')) + length(coalesce(group2_properties, '')) + length(coalesce(group3_properties, '')) + length(coalesce(group4_properties, ''))) AS property_bytes FROM rowgroup_ab.events_rg_1gib WHERE "timestamp" >= TIMESTAMPTZ '2024-10-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2024-10-02 00:00:00+00'

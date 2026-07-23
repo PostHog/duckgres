@@ -550,6 +550,49 @@ func TestExecutorUsesProvisionCredentialsInDSN(t *testing.T) {
 	}
 }
 
+func TestExecutorAppliesWorkerProfileStartupOptions(t *testing.T) {
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	var gotConnection PGWireConnection
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: ConnectionConfig{
+			DialHost:  "10.0.0.10",
+			SNISuffix: ".dev.example",
+			Port:      5432,
+			SSLMode:   "require",
+		},
+		Driver: &fakeDriver{
+			executeFunc: func(_ context.Context, req QueryRequest) (QueryResult, error) {
+				gotConnection = req.PGWire
+				return QueryResult{Rows: 1}, nil
+			},
+		},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "rewrite_events",
+		Type: StepTypeSQL,
+		With: map[string]any{
+			"org_id":        "scenario-org",
+			"sql":           "SELECT 1",
+			"worker_cpu":    "4",
+			"worker_memory": "16Gi",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	const want = "options='-c duckgres.worker_cpu=4 -c duckgres.worker_memory=16Gi'"
+	if !strings.Contains(gotConnection.DSN, want) {
+		t.Fatalf("DSN %q missing worker startup options %q", gotConnection.DSN, want)
+	}
+}
+
 func TestExecutorFailsWithoutProvisionState(t *testing.T) {
 	executor := NewExecutor(ExecutorConfig{
 		Connection: ConnectionConfig{

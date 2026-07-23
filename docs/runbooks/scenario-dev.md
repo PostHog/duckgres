@@ -21,7 +21,7 @@ To omit dbt, manually run the workflow with `scenario` set to `fast-suite`.
 The input directly names a YAML file under
 `tests/mw-dev/scenario/scenarios/`, without the `.yaml` suffix. This also makes
 targeted scenarios such as `provision_rejection`, `provision_smoke`,
-`posthog_frozen_metadata`, `posthog_frozen_perf`, and `posthog_frozen_dbt`
+`posthog_frozen_metadata`, `posthog_frozen_perf`, `events_rowgroup_perf`, and `posthog_frozen_dbt`
 individually runnable. Invalid or missing scenario names fail before a payload
 Job is created.
 
