@@ -106,6 +106,10 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnNotNull(t, db, "duckgres_org_teams", "backfill_enabled")
 	requireColumnDefault(t, db, "duckgres_org_teams", "backfill_enabled", "true")
 
+	// Migration 000029 dropped the billing-team marker: duckgres no longer
+	// owns team-level billing attribution (the external billing service does).
+	requireColumnAbsent(t, db, "duckgres_org_teams", "is_billing_team")
+
 	// Migration 000007 added the compute-usage billing buffer; 000015 widened
 	// its key for pull-based billing (team_id, query_source, worker size),
 	// added the single ack cursor and dropped the push-drain state table.

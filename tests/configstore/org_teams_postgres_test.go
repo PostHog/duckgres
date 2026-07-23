@@ -299,6 +299,63 @@ func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 		t.Fatal("first team must be enabled")
 	}
 
+	// Grandfather a legacy override onto the provisioned team (the PostHog
+	// backfill path), then RE-provision the same org with the same team_id
+	// and NO schema_name: the stored custom schema AND the override must
+	// survive — the provision team-upsert looks up the existing row's schema
+	// instead of resetting it to the conventional "team_<id>", and its
+	// presence-aware merge leaves the override alone.
+	if _, err := pstore.UpsertOrgTeam("schemaorg", configstore.OrgTeamUpsert{
+		TeamID:          42,
+		SchemaName:      "custom_wh",
+		EventsTableName: strPtr("legacy_events"),
+	}); err != nil {
+		t.Fatalf("grandfather override: %v", err)
+	}
+	markWarehouseDeleted(t, store, "schemaorg")
+	if err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "schemaorg",
+		DatabaseName: "schemaorgdb",
+		TeamID:       42,
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "schemaorg"},
+		RootUserHash: "hash",
+	}); err != nil {
+		t.Fatalf("re-provision without schema: %v", err)
+	}
+	team = readTeam(t, store, "schemaorg", 42)
+	if team.SchemaName != "custom_wh" {
+		t.Fatalf("re-provision without schema reset schema_name to %q, want grandfathered custom_wh preserved", team.SchemaName)
+	}
+	if team.EventsTableName == nil || *team.EventsTableName != "legacy_events" {
+		t.Fatalf("re-provision without schema lost the legacy override: %+v", team)
+	}
+
+	// Re-provision whose requested schema collides with a DIFFERENT team's
+	// schema in the same org → ErrOrgTeamSchemaConflict (the provision
+	// handler maps it to 409).
+	if _, err := pstore.UpsertOrgTeam("schemaorg", configstore.OrgTeamUpsert{
+		TeamID:     43,
+		SchemaName: "other_wh",
+	}); err != nil {
+		t.Fatalf("seed second team: %v", err)
+	}
+	markWarehouseDeleted(t, store, "schemaorg")
+	err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "schemaorg",
+		DatabaseName: "schemaorgdb",
+		TeamID:       42,
+		SchemaName:   "other_wh",
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "schemaorg"},
+		RootUserHash: "hash",
+	})
+	if !errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+		t.Fatalf("colliding re-provision schema: err = %v, want ErrOrgTeamSchemaConflict", err)
+	}
+	// The refused provision must leave the stored schema untouched.
+	if got := readTeam(t, store, "schemaorg", 42); got.SchemaName != "custom_wh" {
+		t.Fatalf("refused provision mutated schema_name to %q, want custom_wh", got.SchemaName)
+	}
+
 	// Without a schema the conventional name applies.
 	if err := pstore.Provision(provisioning.ProvisionRequest{
 		OrgID:        "convorg",
@@ -314,7 +371,7 @@ func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 	}
 
 	// A NEW org without a team id is refused before any write.
-	err := pstore.Provision(provisioning.ProvisionRequest{
+	err = pstore.Provision(provisioning.ProvisionRequest{
 		OrgID:        "noteam",
 		DatabaseName: "noteamdb",
 		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "noteam"},
@@ -322,6 +379,19 @@ func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 	})
 	if !errors.Is(err, provisioning.ErrProvisionTeamRequired) {
 		t.Fatalf("teamless new-org provision: err = %v, want ErrProvisionTeamRequired", err)
+	}
+}
+
+// markWarehouseDeleted parks the org's warehouse row in the terminal
+// "deleted" state so a re-provision is accepted (a non-terminal row is a
+// 409/ErrWarehouseNonTerminal).
+func markWarehouseDeleted(t *testing.T, store *configstore.ConfigStore, orgID string) {
+	t.Helper()
+	res := store.DB().Model(&configstore.ManagedWarehouse{}).
+		Where("org_id = ?", orgID).
+		Update("state", configstore.ManagedWarehouseStateDeleted)
+	if res.Error != nil || res.RowsAffected == 0 {
+		t.Fatalf("mark warehouse deleted (org=%s): rows=%d err=%v", orgID, res.RowsAffected, res.Error)
 	}
 }
 

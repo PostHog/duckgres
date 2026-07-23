@@ -1424,6 +1424,29 @@ func TestProvisionTeamIDAndSchemaName(t *testing.T) {
 	}
 }
 
+// TestProvisionTeamSchemaConflict409 pins the handler's dedicated
+// ErrOrgTeamSchemaConflict branch: a provision whose team schema_name is
+// already held by a DIFFERENT team in the same org (re-provision path —
+// uniqueness is per org) surfaces as a 409, not a 500.
+func TestProvisionTeamSchemaConflict409(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "shared", Enabled: true})
+	router := newTestRouter(store)
+
+	body := `{"database_name":"acmedb","team_id":2,"schema_name":"shared","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}`
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/provision", body)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "schema_name") {
+		t.Fatalf("error should name schema_name: %s", rec.Body.String())
+	}
+	if store.warehouses["acme"] != nil {
+		t.Fatal("refused provision must not create a warehouse")
+	}
+}
+
 func TestProvisionTeamIDFieldsMustAgree(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
