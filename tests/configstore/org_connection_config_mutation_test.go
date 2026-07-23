@@ -66,8 +66,7 @@ func TestDeleteOrgTeamSerializesWithAdmissionPostgres(t *testing.T) {
 
 	pstore := provisioning.NewGormStore(storeB)
 	assertConfigMutationWaitsForAdmissionLock(t, storeA, orgID, func() error {
-		_, err := pstore.DeleteOrgTeam(orgID, targetTeamID)
-		return err
+		return pstore.DeleteOrgTeam(orgID, targetTeamID)
 	})
 
 	var readerCount int64

@@ -35,7 +35,7 @@ func TestAdminAdmissionConfigMutationsSerializePostgres(t *testing.T) {
 				}
 			},
 			mutation: func(store *gormAPIStore) error {
-				_, found, err := store.UpdateOrg("admission-update-org", configstore.Org{MaxWorkers: 3, MaxVCPUs: 4}, nil)
+				_, found, err := store.UpdateOrg("admission-update-org", configstore.Org{MaxWorkers: 3, MaxVCPUs: 4})
 				if err == nil && !found {
 					return errors.New("updated org was not found")
 				}

@@ -261,58 +261,24 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
-<<<<<<< HEAD
-	// The billing team (wire field default_team_id) is not an org column: a
-	// change repoints the org's duckgres_org_teams billing row inside the same
-	// transaction below. The handler rejects 0/null/negative before this runs
-	// and only passes reattributeUsageTeam when the value actually changes.
 	found := false
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		// Serialize with org connection admission (request-owned leases read
+		// org limits under this lock) — see LockOrgConnectionAdmissionTx.
 		if err := configstore.LockOrgConnectionAdmissionTx(tx, name); err != nil {
 			return err
 		}
-
 		result := tx.Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 		if result.Error != nil {
 			return result.Error
 		}
-		if result.RowsAffected == 0 {
-			return nil
-		}
-		found = true
-		if reattributeUsageTeam != nil {
-			// Read the pre-update team id purely for the log line — the
-			// handler already decided the billing team changes.
-			oldTeam, err := configstore.OrgBillingTeamIDTx(tx, name)
-			if err != nil {
-				return err
-			}
-			if err := configstore.SetOrgBillingTeamTx(tx, name, *reattributeUsageTeam); err != nil {
-				return err
-			}
-			// Same transaction as the billing-team repoint: a committed team
-			// change always carries its buffered buckets along. In-flight
-			// metering under the old team can still land a small residual row
-			// right after this (config-snapshot poll lag, ~30s) — tolerated,
-			// see configstore.ReattributeUsageTeamTx.
-			moved, err := configstore.ReattributeUsageTeamTx(tx, name, *reattributeUsageTeam)
-			if err != nil {
-				return err
-			}
-			slog.Info("Re-attributed org usage buckets to new billing team.",
-				"org", name, "old_team", oldTeam, "new_team", *reattributeUsageTeam, "rows", moved)
-		}
+		found = result.RowsAffected > 0
 		return nil
 	})
 	if err != nil {
 		return nil, false, err
-=======
-	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
-	if result.Error != nil {
-		return nil, false, result.Error
->>>>>>> 2c61233 (Remove billing-team ownership from duckgres)
 	}
-	if result.RowsAffected == 0 {
+	if !found {
 		return nil, false, nil
 	}
 	org, err := s.GetOrg(name)

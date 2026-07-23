@@ -21,10 +21,10 @@ import (
 )
 
 type fakeAPIStore struct {
-	orgs       map[string]*configstore.Org
-	users      map[string]*configstore.OrgUser
-	warehouses map[string]*configstore.ManagedWarehouse
-	teams      map[string]map[int64]*configstore.OrgTeam
+	orgs                map[string]*configstore.Org
+	users               map[string]*configstore.OrgUser
+	warehouses          map[string]*configstore.ManagedWarehouse
+	teams               map[string]map[int64]*configstore.OrgTeam
 	reloadSnapshotCalls int
 	reloadSnapshotErr   error
 }
