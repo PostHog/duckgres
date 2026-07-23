@@ -85,6 +85,126 @@ func TestScheduledCleanupDropsCnpgIdentifiers(t *testing.T) {
 	}
 }
 
+func TestTeardownDropsCNPGIdentifiersOnDiscoveredPrimary(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "teardown",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"CNPG_DEV_PRIMARY=shard-001-2",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("teardown failed: %v\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	if !strings.Contains(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary") {
+		t.Fatalf("teardown did not discover the shard-001 primary by CNPG labels; calls:\n%s", calls)
+	}
+	if !strings.Contains(calls, "exec shard-001-2 -c postgres -- psql -U postgres -c DROP DATABASE IF EXISTS mdstore_ci_pr_123_cnpg WITH (FORCE);") {
+		t.Fatalf("teardown did not drop the database on the discovered primary; calls:\n%s", calls)
+	}
+	if !strings.Contains(calls, "exec shard-001-2 -c postgres -- psql -U postgres -c DROP ROLE IF EXISTS mdstore_ci_pr_123_cnpg;") {
+		t.Fatalf("teardown did not drop the role on the discovered primary; calls:\n%s", calls)
+	}
+	if strings.Contains(calls, "exec shard-001-1 -c postgres -- psql") {
+		t.Fatalf("teardown still targets the fixed shard-001-1 pod; calls:\n%s", calls)
+	}
+}
+
+func TestTeardownRetriesCNPGCleanupAfterPrimaryFailover(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "teardown",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"CNPG_DEV_PRIMARY_SEQUENCE=shard-001-1,shard-001-2",
+		"CNPG_DEV_FAILOVER_ONCE=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("teardown failed after retrying a primary transition: %v\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	firstDiscovery := strings.Index(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary")
+	staleExec := strings.Index(calls, "exec shard-001-1 -c postgres -- psql")
+	secondDiscovery := -1
+	if firstDiscovery >= 0 {
+		if next := strings.Index(calls[firstDiscovery+1:], "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); next >= 0 {
+			secondDiscovery = firstDiscovery + 1 + next
+		}
+	}
+	newPrimaryDBExec := strings.Index(calls, "exec shard-001-2 -c postgres -- psql -U postgres -c DROP DATABASE IF EXISTS mdstore_ci_pr_123_cnpg WITH (FORCE);")
+	newPrimaryRoleExec := strings.Index(calls, "exec shard-001-2 -c postgres -- psql -U postgres -c DROP ROLE IF EXISTS mdstore_ci_pr_123_cnpg;")
+	if firstDiscovery < 0 || staleExec < firstDiscovery || secondDiscovery < staleExec || newPrimaryDBExec < secondDiscovery || newPrimaryRoleExec < newPrimaryDBExec {
+		t.Fatalf("teardown did not rediscover and retry on the replacement primary; calls:\n%s", calls)
+	}
+}
+
+func TestTeardownFailsWhenCNPGCleanupCannotReachAPrimary(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+	}{
+		{name: "discovery fails", env: "CNPG_DEV_FAIL_DISCOVERY=1"},
+		{name: "all psql executions fail", env: "CNPG_DEV_FAIL_EXEC=1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+
+			cmd := runSHCommand(t, fakes.binDir, "teardown",
+				"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+				"CNPG_DEV_PRIMARY=shard-001-2",
+				tt.env,
+			)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("teardown succeeded despite %s; output:\n%s", tt.name, out)
+			}
+			if !strings.Contains(string(out), "after 3 attempts") {
+				t.Fatalf("teardown did not report exhausted CNPG cleanup retries; output:\n%s", out)
+			}
+
+			calls := fakes.calls(t)
+			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 9 {
+				t.Fatalf("primary discovery calls = %d, want 9 (three retries for each CI org); calls:\n%s", got, calls)
+			}
+			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 9 {
+				t.Fatalf("psql attempts were not bounded to three per CI org; calls:\n%s", calls)
+			}
+			if !strings.Contains(calls, "delete namespace duckgres-ci-pr-123 --ignore-not-found --wait=false") {
+				t.Fatalf("teardown did not continue namespace cleanup after CNPG cleanup failed; calls:\n%s", calls)
+			}
+		})
+	}
+}
+
+func TestTeardownSucceedsWhenCNPGIdentifiersAreAlreadyAbsent(t *testing.T) {
+	fakes := newRunSHFakes(t)
+
+	cmd := runSHCommand(t, fakes.binDir, "teardown",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"CNPG_DEV_PRIMARY=shard-001-2",
+		"CNPG_DEV_MISSING_IDENTIFIERS=1",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("teardown failed when CNPG identifiers were already absent: %v\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	for _, want := range []string{
+		"DROP DATABASE IF EXISTS mdstore_ci_pr_123_cnpg WITH (FORCE);",
+		"DROP ROLE IF EXISTS mdstore_ci_pr_123_cnpg;",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("teardown did not preserve idempotent SQL %q; calls:\n%s", want, calls)
+		}
+	}
+}
+
 func TestTeardownContinuesCleanupWhenDucklingsDoNotDelete(t *testing.T) {
 	fakes := newRunSHFakes(t)
 
@@ -667,6 +787,43 @@ func newRunSHFakes(t *testing.T) runSHFakes {
 	writeFake(t, binDir, "kubectl", `#!/usr/bin/env bash
 printf 'kubectl %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
 
+if [[ "$*" == *" -n cnpg-shards get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary "* ]]; then
+  if [[ -n "${CNPG_DEV_FAIL_DISCOVERY:-}" ]]; then
+    exit 1
+  fi
+  primary="${CNPG_DEV_PRIMARY:-shard-001-1}"
+  if [[ -n "${CNPG_DEV_PRIMARY_SEQUENCE:-}" ]]; then
+    IFS=',' read -r -a primaries <<< "$CNPG_DEV_PRIMARY_SEQUENCE"
+    discovery=0
+    if [[ -e "$RUN_SH_TEST_CNPG_DISCOVERY_STATE" ]]; then
+      discovery="$(<"$RUN_SH_TEST_CNPG_DISCOVERY_STATE")"
+    fi
+    if (( discovery < ${#primaries[@]} )); then
+      primary="${primaries[$discovery]}"
+    else
+      primary="${primaries[${#primaries[@]}-1]}"
+    fi
+    printf '%s' $((discovery + 1)) > "$RUN_SH_TEST_CNPG_DISCOVERY_STATE"
+  fi
+  printf '%s' "$primary"
+  exit 0
+fi
+if [[ "$*" == *" -n cnpg-shards exec "* && "$*" == *" psql -U postgres -c "* ]]; then
+  if [[ -n "${CNPG_DEV_FAILOVER_ONCE:-}" && ! -e "$RUN_SH_TEST_CNPG_FAILOVER_STATE" ]]; then
+    touch "$RUN_SH_TEST_CNPG_FAILOVER_STATE"
+    exit 1
+  fi
+  if [[ -n "${CNPG_DEV_FAIL_EXEC:-}" ]]; then
+    exit 1
+  fi
+  if [[ -n "${CNPG_DEV_PRIMARY:-}" && "$*" != *" exec ${CNPG_DEV_PRIMARY} -c postgres "* ]]; then
+    exit 1
+  fi
+  if [[ -n "${CNPG_DEV_MISSING_IDENTIFIERS:-}" && "$*" != *"DROP DATABASE IF EXISTS"* && "$*" != *"DROP ROLE IF EXISTS"* ]]; then
+    exit 1
+  fi
+  exit 0
+fi
 if [[ "$*" == *" apply -f -"* ]]; then
   tee -a "$RUN_SH_TEST_CALLS" >/dev/null
   exit 0
@@ -843,6 +1000,8 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"RUN_SH_TEST_CALLS="+filepath.Join(filepath.Dir(binDir), "calls.log"),
 		"RUN_SH_TEST_MKTEMP_STATE="+filepath.Join(filepath.Dir(binDir), "mktemp-state"),
+		"RUN_SH_TEST_CNPG_DISCOVERY_STATE="+filepath.Join(filepath.Dir(binDir), "cnpg-discovery-state"),
+		"RUN_SH_TEST_CNPG_FAILOVER_STATE="+filepath.Join(filepath.Dir(binDir), "cnpg-failover-state"),
 		"KUBE_CONTEXT=test-context",
 		"NAMESPACE=duckgres-ci-pr-123",
 		"PR_NUMBER=123",
