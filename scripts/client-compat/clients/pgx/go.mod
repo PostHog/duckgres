@@ -1,9 +1,9 @@
 module duckgres-compat-pgx
 
-go 1.24.0
+go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 
