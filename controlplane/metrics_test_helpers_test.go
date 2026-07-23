@@ -33,6 +33,19 @@ func metricGaugeValue(t *testing.T, metricName string) float64 {
 	return 0
 }
 
+func gaugeVecLabelValue(t *testing.T, gv *prometheus.GaugeVec, labels ...string) float64 {
+	t.Helper()
+	gauge, err := gv.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		t.Fatalf("gauge labels %v: %v", labels, err)
+	}
+	metric := &dto.Metric{}
+	if err := gauge.Write(metric); err != nil {
+		t.Fatalf("gauge write labels %v: %v", labels, err)
+	}
+	return metric.GetGauge().GetValue()
+}
+
 func metricHistogramCount(t *testing.T, metricName string) uint64 {
 	t.Helper()
 	families, err := prometheus.DefaultGatherer.Gather()

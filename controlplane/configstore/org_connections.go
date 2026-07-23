@@ -190,17 +190,15 @@ func (cs *ConfigStore) TryAcquireOrgConnectionLeaseWithLimitLookupForRefContext(
 
 	start := time.Now()
 	outcome := orgConnectionAdmissionOutcomeWaiting
-	var stats orgConnectionAdmissionStats
 	defer func() {
-		observeOrgConnectionAdmission(time.Since(start), outcome, stats)
+		observeOrgConnectionAdmission(time.Since(start), outcome)
 	}()
 
-	lease, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, ref, limitLookup)
-	stats = attemptStats
+	lease, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, ref, limitLookup)
 	outcome = attemptOutcome
 	if err != nil {
 		if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
-			outcome = orgConnectionAdmissionOutcomeError
+			outcome = orgConnectionAdmissionOutcomeForError(ctx, err)
 		}
 		return nil, fmt.Errorf("try acquire org connection lease: %w", err)
 	}
@@ -250,31 +248,51 @@ func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseForRef(ref OrgConnectio
 }
 
 func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseForRefContext(ctx context.Context, ref OrgConnectionAdmissionRef) (*OrgConnectionLease, error) {
+	lease, _, err := cs.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(ctx, ref)
+	return lease, err
+}
+
+// ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext is the
+// structured exact-identity admission API used by the runtime limiter. The
+// returned evaluation and the exported admission metrics describe only ref.
+func (cs *ConfigStore) ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(ctx context.Context, ref OrgConnectionAdmissionRef) (lease *OrgConnectionLease, evaluation OrgConnectionAdmissionEvaluation, err error) {
 	if err := ref.validate(); err != nil {
-		return nil, err
+		return nil, OrgConnectionAdmissionEvaluation{}, err
 	}
 
 	start := time.Now()
 	outcome := orgConnectionAdmissionOutcomeWaiting
-	var stats orgConnectionAdmissionStats
 	defer func() {
-		observeOrgConnectionAdmission(time.Since(start), outcome, stats)
+		evaluation = observeOrgConnectionAdmission(time.Since(start), outcome)
 	}()
 
 	if err := ctx.Err(); err != nil {
-		outcome = orgConnectionAdmissionOutcomeError
-		return nil, err
+		outcome = orgConnectionAdmissionOutcomeForError(ctx, err)
+		return nil, OrgConnectionAdmissionEvaluation{}, err
 	}
-	lease, attemptStats, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, ref, nil)
-	stats = attemptStats
+	lease, attemptOutcome, err := cs.scheduleAndClaimOrgConnectionLeaseOnce(ctx, ref, nil)
 	outcome = attemptOutcome
 	if err != nil {
 		if !errors.Is(err, ErrOrgConnectionAdmissionRejected) {
-			outcome = orgConnectionAdmissionOutcomeError
+			outcome = orgConnectionAdmissionOutcomeForError(ctx, err)
 		}
-		return nil, fmt.Errorf("schedule and claim org connection lease: %w", err)
+		return nil, OrgConnectionAdmissionEvaluation{}, fmt.Errorf("schedule and claim org connection lease: %w", err)
 	}
-	return lease, nil
+	return lease, OrgConnectionAdmissionEvaluation{}, nil
+}
+
+func orgConnectionAdmissionOutcomeForError(ctx context.Context, err error) string {
+	if ctx != nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return orgConnectionAdmissionOutcomeCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return orgConnectionAdmissionOutcomeTimeout
+	default:
+		return orgConnectionAdmissionOutcomeError
+	}
 }
 
 type orgConnectionRuntimeTables struct {
@@ -289,11 +307,10 @@ func (cs *ConfigStore) orgConnectionRuntimeTables() orgConnectionRuntimeTables {
 	}
 }
 
-func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Context, ref OrgConnectionAdmissionRef, fallbackLimitLookup func(string) OrgResourceLimits) (*OrgConnectionLease, orgConnectionAdmissionStats, string, error) {
+func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Context, ref OrgConnectionAdmissionRef, fallbackLimitLookup func(string) OrgResourceLimits) (*OrgConnectionLease, string, error) {
 	tables := cs.orgConnectionRuntimeTables()
 	var lease *OrgConnectionLease
 	var rejection *OrgConnectionAdmissionRejectedError
-	var stats orgConnectionAdmissionStats
 	outcome := orgConnectionAdmissionOutcomeMissing
 
 	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -397,8 +414,7 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 				Delete(&OrgConnectionQueueEntry{}).Error
 		}
 
-		next, selectionStats, selectionOutcome, err := cs.nextEligibleOrgConnectionRequestLocked(tx, tables, ref.OrgID, limitLookup, userAllowed, now)
-		stats = selectionStats
+		next, selectionOutcome, err := cs.nextEligibleOrgConnectionRequestLocked(tx, tables, request, limitLookup, userAllowed, now)
 		if err != nil {
 			return err
 		}
@@ -420,7 +436,7 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 	if err == nil && rejection != nil {
 		err = rejection
 	}
-	return lease, stats, outcome, err
+	return lease, outcome, err
 }
 
 // lockActiveControlPlaneOwner closes the race between cleanup's active-owner
@@ -610,27 +626,57 @@ func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID strin
 	return limits, true, nil
 }
 
-func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, orgID string, limitLookup func(string) OrgResourceLimits, userAllowed func(string) bool, now time.Time) (*OrgConnectionQueueEntry, orgConnectionAdmissionStats, string, error) {
-	heads, stats, err := cs.pendingOrgConnectionUserQueueHeads(tx, tables.queue, orgID, now)
+// nextEligibleOrgConnectionRequestLocked preserves the admission selection
+// policy while reporting why target itself did not advance. It never grants or
+// mutates a foreign request; the caller creates a lease only for target.
+func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, tables orgConnectionRuntimeTables, target *OrgConnectionQueueEntry, limitLookup func(string) OrgResourceLimits, userAllowed func(string) bool, now time.Time) (*OrgConnectionQueueEntry, string, error) {
+	heads, err := cs.pendingOrgConnectionUserQueueHeads(tx, tables.queue, target.OrgID, now)
 	if err != nil {
-		return nil, stats, orgConnectionAdmissionOutcomeError, err
+		return nil, orgConnectionAdmissionOutcomeError, err
 	}
 	if len(heads) == 0 {
-		return nil, stats, orgConnectionAdmissionOutcomeWaiting, nil
+		return nil, orgConnectionAdmissionOutcomeWaiting, nil
 	}
 
-	orgUsed, userUsed, legacyUserUsed, err := cs.activeOrgConnectionLeaseVCPUUsage(tx, orgID)
+	orgUsed, userUsed, legacyUserUsed, err := cs.activeOrgConnectionLeaseVCPUUsage(tx, target.OrgID)
 	if err != nil {
-		return nil, stats, orgConnectionAdmissionOutcomeError, err
+		return nil, orgConnectionAdmissionOutcomeError, err
+	}
+
+	targetIsUserHead := false
+	for i := range heads {
+		if sameOrgConnectionAdmissionRequest(&heads[i], target) {
+			targetIsUserHead = true
+			break
+		}
+	}
+	if !targetIsUserHead {
+		return nil, orgConnectionAdmissionOutcomeWaiting, nil
+	}
+	if userAllowed != nil && !userAllowed(target.Username) {
+		return nil, orgConnectionAdmissionOutcomeIneligibleUser, nil
+	}
+
+	targetLimits := limitLookup(target.Username)
+	targetRequested := int64(target.RequestedVCPUs)
+	targetUserBlocked := targetLimits.UserMaxVCPUs > 0 && legacyUserUsed+userUsed[target.Username]+targetRequested > int64(targetLimits.UserMaxVCPUs)
+	targetOrgBlocked := targetLimits.OrgMaxVCPUs > 0 && orgUsed+targetRequested > int64(targetLimits.OrgMaxVCPUs)
+	if targetUserBlocked {
+		if targetOrgBlocked {
+			return nil, orgConnectionAdmissionOutcomeBlockedOrgUserVCPU, nil
+		}
+		return nil, orgConnectionAdmissionOutcomeBlockedUserVCPU, nil
 	}
 
 	for i := range heads {
 		head := &heads[i]
 		if userAllowed != nil && !userAllowed(head.Username) {
-			stats.ineligibleUserSkips++
 			continue
 		}
 		limits := limitLookup(head.Username)
+		if sameOrgConnectionAdmissionRequest(head, target) {
+			limits = targetLimits
+		}
 		requested := int64(head.RequestedVCPUs)
 		// A permanently impossible foreign head must not block unrelated
 		// requests. Only that request's owner deletes and receives the typed
@@ -644,34 +690,30 @@ func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, table
 		if limits.UserMaxVCPUs > 0 {
 			used := legacyUserUsed + userUsed[head.Username]
 			if used+requested > int64(limits.UserMaxVCPUs) {
-				stats.userLimitSkips++
 				continue
 			}
 		}
 		if limits.OrgMaxVCPUs > 0 && orgUsed+requested > int64(limits.OrgMaxVCPUs) {
-			return nil, stats, orgConnectionAdmissionOutcomeBlockedOrgVCPU, nil
+			return nil, orgConnectionAdmissionOutcomeBlockedOrgVCPU, nil
 		}
 
-		return head, stats, orgConnectionAdmissionOutcomeGranted, nil
+		if sameOrgConnectionAdmissionRequest(head, target) {
+			return head, orgConnectionAdmissionOutcomeGranted, nil
+		}
+		return head, orgConnectionAdmissionOutcomeWaiting, nil
 	}
 
-	if stats.userLimitSkips > 0 {
-		return nil, stats, orgConnectionAdmissionOutcomeBlockedUserVCPU, nil
-	}
-	if stats.ineligibleUserSkips > 0 {
-		return nil, stats, orgConnectionAdmissionOutcomeIneligibleUser, nil
-	}
-	return nil, stats, orgConnectionAdmissionOutcomeWaiting, nil
+	return nil, orgConnectionAdmissionOutcomeWaiting, nil
 }
 
-func (cs *ConfigStore) pendingOrgConnectionUserQueueHeads(tx *gorm.DB, queueTable, orgID string, now time.Time) ([]OrgConnectionQueueEntry, orgConnectionAdmissionStats, error) {
-	var stats orgConnectionAdmissionStats
-	if err := tx.Table(queueTable).
-		Where("org_id = ? AND granted_at IS NULL AND expires_at > ?", orgID, now).
-		Count(&stats.queueDepth).Error; err != nil {
-		return nil, stats, err
-	}
+func sameOrgConnectionAdmissionRequest(a, b *OrgConnectionQueueEntry) bool {
+	return a != nil && b != nil &&
+		a.RequestID == b.RequestID &&
+		a.OrgID == b.OrgID &&
+		a.CPInstanceID == b.CPInstanceID
+}
 
+func (cs *ConfigStore) pendingOrgConnectionUserQueueHeads(tx *gorm.DB, queueTable, orgID string, now time.Time) ([]OrgConnectionQueueEntry, error) {
 	var heads []OrgConnectionQueueEntry
 	if err := tx.Raw(
 		"SELECT * FROM ("+
@@ -681,10 +723,9 @@ func (cs *ConfigStore) pendingOrgConnectionUserQueueHeads(tx *gorm.DB, queueTabl
 			") AS user_heads ORDER BY enqueued_at ASC, request_id ASC",
 		orgID, now,
 	).Scan(&heads).Error; err != nil {
-		return nil, stats, err
+		return nil, err
 	}
-	stats.userQueues = len(heads)
-	return heads, stats, nil
+	return heads, nil
 }
 
 func (cs *ConfigStore) activeOrgConnectionLeaseVCPUUsage(tx *gorm.DB, orgID string) (int64, map[string]int64, int64, error) {

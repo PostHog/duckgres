@@ -63,6 +63,9 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is currently fixed at 9090 and cannot be changed via configuration.
 
+See [docs/metrics.md](docs/metrics.md) for exact request-path boundaries,
+labels, aggregation rules, PromQL examples, and admission metric migration.
+
 | Metric | Type | Description |
 |--------|------|-------------|
 | `duckgres_connections_open` | Gauge | Number of currently open client connections |
@@ -77,17 +80,19 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
 | `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
 | `duckgres_control_plane_worker_spawn_seconds` | Histogram | Time spent spawning and health-checking a new worker |
-| `duckgres_org_connection_admission_duration_seconds{outcome}` | Histogram | DB-backed request-owned org connection admission evaluation latency by outcome |
-| `duckgres_org_connection_admission_queue_depth` | Histogram | Pending org connection queue depth observed during admission evaluation |
-| `duckgres_org_connection_admission_user_queues` | Histogram | Number of per-user queue heads considered during admission evaluation |
-| `duckgres_org_connection_admission_attempts_total{outcome}` | Counter | Total org connection admission evaluations by outcome, including terminal `rejected_org_vcpu` / `rejected_user_vcpu` and `ineligible_user` for a missing or disabled configured user |
-| `duckgres_org_connection_admission_user_limit_skips_total` | Counter | Per-user queue heads skipped because that user was at its vCPU limit |
-| `duckgres_org_connection_admission_ineligible_user_skips_total` | Counter | Per-user queue heads skipped because that configured user was missing or disabled |
-| `duckgres_org_connection_reclaim_pending` | Gauge | Activated org connection cleanup intents awaiting or executing exact database reclamation |
-| `duckgres_org_connection_reclaim_attempts_total{outcome}` | Counter | Exact org connection cleanup attempts by `success` or `error` outcome |
-| `duckgres_org_connection_reclaim_reservations_in_use` | Gauge | Bounded cleanup-ownership slots held by queued admissions, live leases, and pending cleanup |
-| `duckgres_org_connection_reclaim_reservation_capacity` | Gauge | Cleanup-ownership slot capacity for this control-plane process (4096 per reclaimer by default) |
-| `duckgres_org_connection_reclaim_reservation_rejections_total{reason}` | Counter | Reservations rejected before durable enqueue because capacity was `full`, the reclaimer was `closed`, or the exact reference was a `duplicate` |
+| `duckgres_session_admission_evaluation_duration_seconds{decision,reason}` | Histogram | Latency of one DB-backed admission poll for the polling request |
+| `duckgres_session_admission_evaluations_total{decision,reason}` | Counter | Admission request polls; repeated polls are distinct evaluations |
+| `duckgres_session_admission_wait_seconds{org,outcome,reason}` | Histogram | End-to-end wait for one successfully enqueued admission request |
+| `duckgres_session_admission_requests_total{org,outcome,reason}` | Counter | Exactly one terminal event per successfully enqueued admission request |
+| `duckgres_session_admission_queue_depth{org}` | Gauge | Local callers waiting after successful durable enqueue; sum across replicas |
+| `duckgres_session_admission_active_vcpus{org}` | Gauge | Requested vCPUs held by local live lease handles; cleanup-pending durable rows are excluded |
+| `duckgres_session_admission_limit_vcpus{org}` | Gauge | Config-reconciled effective org cap for active org stacks; zero means unlimited, max across replicas |
+| `duckgres_session_admission_reclaim_pending` | Gauge | Activated cleanup intents awaiting or executing exact database reclamation |
+| `duckgres_session_admission_reclaim_attempts_total{outcome}` | Counter | Exact cleanup attempts by `success` or `error` outcome |
+| `duckgres_session_admission_reclaim_reservations_in_use` | Gauge | Cleanup-ownership slots held before enqueue, while queued or live, and during pending cleanup |
+| `duckgres_session_admission_reclaim_reservation_capacity` | Gauge | Cleanup-ownership slot capacity for this control-plane process (4096 per reclaimer by default) |
+| `duckgres_session_admission_reclaim_reservation_rejections_total{reason}` | Counter | Reservations rejected because capacity was `full`, the reclaimer was `closed`, or the exact reference was a `duplicate` |
+| `duckgres_session_start_duration_seconds{org,protocol,outcome}` | Histogram | Authenticated PostgreSQL session bootstrap through flushed `ReadyForQuery` |
 | `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
 | `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |

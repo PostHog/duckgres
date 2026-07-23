@@ -376,6 +376,13 @@ func (tr *OrgRouter) publishOrgStack(orgID string, stack *OrgStack) orgStackPubl
 		stack.Sessions.BeginDrain()
 	}
 	tr.orgs[orgID] = stack
+	if stack != nil && stack.Config != nil {
+		sessionAdmissionLimitVCPUsGauge.WithLabelValues(orgID).Set(float64(stack.Config.MaxVCPUs))
+	} else {
+		// Minimal stacks are valid in lifecycle and concurrency paths. Without a
+		// config there is no authoritative limit value to publish.
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
+	}
 	tr.mu.Unlock()
 	return orgStackPublishAccepted
 }
@@ -491,6 +498,7 @@ func (tr *OrgRouter) refreshOrgStackWhileMutationHeld(orgID string, stack *OrgSt
 	}
 	oldTC := stack.Config
 	stack.Config = tc
+	sessionAdmissionLimitVCPUsGauge.WithLabelValues(orgID).Set(float64(tc.MaxVCPUs))
 	tr.mu.Unlock()
 
 	limitsChanged := oldTC == nil || oldTC.MaxWorkers != tc.MaxWorkers
@@ -541,11 +549,17 @@ func (tr *OrgRouter) refreshOrgStackWhileMutationHeld(orgID string, stack *OrgSt
 func (tr *OrgRouter) removeOrgStackWhileMutationHeld(orgID string, expected *OrgStack) {
 	tr.mu.Lock()
 	stack, ok := tr.orgs[orgID]
-	if !ok || (expected != nil && stack != expected) {
+	if !ok {
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
+		tr.mu.Unlock()
+		return
+	}
+	if expected != nil && stack != expected {
 		tr.mu.Unlock()
 		return
 	}
 	delete(tr.orgs, orgID)
+	sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
 	tr.mu.Unlock()
 
 	slog.Info("Destroying org stack.", "org", orgID)
@@ -800,6 +814,7 @@ func (tr *OrgRouter) shutdownAll() {
 	orgs := make(map[string]*OrgStack, len(tr.orgs))
 	for k, v := range tr.orgs {
 		orgs[k] = v
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(k)
 	}
 	tr.orgs = make(map[string]*OrgStack)
 	tr.mu.Unlock()

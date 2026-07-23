@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -57,6 +58,10 @@ type runtimeOrgConnectionScheduleAndClaimStore interface {
 
 type runtimeOrgConnectionScheduleAndClaimContextStore interface {
 	ScheduleAndClaimOrgConnectionLeaseForRefContext(ctx context.Context, ref configstore.OrgConnectionAdmissionRef) (*configstore.OrgConnectionLease, error)
+}
+
+type runtimeOrgConnectionScheduleAndClaimEvaluationContextStore interface {
+	ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(ctx context.Context, ref configstore.OrgConnectionAdmissionRef) (*configstore.OrgConnectionLease, configstore.OrgConnectionAdmissionEvaluation, error)
 }
 
 type runtimeOrgConnectionLimiter struct {
@@ -157,15 +162,32 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, request conne
 		return nil, enqueueErr
 	}
 
+	waitStarted := time.Now()
+	outcome := "error"
+	var reasons sessionAdmissionReasons
+	sessionAdmissionQueueDepthGauge.WithLabelValues(l.orgID).Inc()
+	defer func() {
+		sessionAdmissionQueueDepthGauge.WithLabelValues(l.orgID).Dec()
+		observeSessionAdmissionTerminal(l.orgID, outcome, reasons.value(), time.Since(waitStarted))
+	}()
+
 	for {
+		if err := ctx.Err(); err != nil {
+			outcome = sessionAdmissionContextOutcome(err)
+			return nil, runtimeAdmissionContextError(err)
+		}
 		now := l.now()
 		if !now.Before(expiresAt) {
+			outcome = "timeout"
 			return nil, ErrTooManyConnections
 		}
 
 		var lease *configstore.OrgConnectionLease
+		var evaluation configstore.OrgConnectionAdmissionEvaluation
 		var err error
-		if schedulerStore, ok := l.store.(runtimeOrgConnectionScheduleAndClaimContextStore); ok {
+		if schedulerStore, ok := l.store.(runtimeOrgConnectionScheduleAndClaimEvaluationContextStore); ok {
+			lease, evaluation, err = schedulerStore.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(ctx, ref)
+		} else if schedulerStore, ok := l.store.(runtimeOrgConnectionScheduleAndClaimContextStore); ok {
 			lease, err = schedulerStore.ScheduleAndClaimOrgConnectionLeaseForRefContext(ctx, ref)
 		} else if schedulerStore, ok := l.store.(runtimeOrgConnectionScheduleAndClaimStore); ok {
 			lease, err = schedulerStore.ScheduleAndClaimOrgConnectionLeaseForRef(ref)
@@ -176,15 +198,42 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, request conne
 		} else {
 			return nil, errRuntimeOrgConnectionExactAcquisitionUnsupported
 		}
-		if ctx.Err() != nil {
-			return nil, runtimeAdmissionContextError(ctx.Err())
+		if contextErr := runtimeAdmissionContextCause(ctx, err); contextErr != nil {
+			// A completed blocking evaluation may race with cancellation. Retain
+			// that real blocker, but never reinterpret an interrupted DB call as
+			// a store failure on the logical request.
+			if err == nil && evaluation.Decision != "canceled" && evaluation.Decision != "timeout" && evaluation.Decision != "error" {
+				if evaluation.Decision == "waiting" && (evaluation.Reason == "" || evaluation.Reason == "none") {
+					evaluation.Reason = "fifo"
+				}
+				reasons.add(evaluation.Reason)
+			}
+			outcome = sessionAdmissionContextOutcome(contextErr)
+			return nil, runtimeAdmissionContextError(contextErr)
 		}
+		if evaluation.Decision == "waiting" && (evaluation.Reason == "" || evaluation.Reason == "none") {
+			evaluation.Reason = "fifo"
+		}
+		reasons.add(evaluation.Reason)
 		if err != nil {
+			var rejection *configstore.OrgConnectionAdmissionRejectedError
+			if errors.As(err, &rejection) {
+				outcome = "rejected"
+				reasons.add(sessionAdmissionRejectionReason(rejection))
+				return nil, err
+			}
+			reasons.add("store_error")
 			return nil, err
 		}
 		if lease != nil {
+			outcome = "granted"
+			sessionAdmissionActiveVCPUsGauge.WithLabelValues(l.orgID).Add(float64(request.RequestedVCPUs))
 			cleanupArmed = false
-			return &runtimeOrgConnectionLease{reservation: reservation}, nil
+			return &runtimeOrgConnectionLease{
+				reservation:    reservation,
+				orgID:          l.orgID,
+				requestedVCPUs: request.RequestedVCPUs,
+			}, nil
 		}
 
 		wait := l.pollInterval
@@ -195,9 +244,45 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, request conne
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			outcome = sessionAdmissionContextOutcome(ctx.Err())
 			return nil, runtimeAdmissionContextError(ctx.Err())
 		case <-timer.C:
 		}
+	}
+}
+
+func sessionAdmissionContextOutcome(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "canceled"
+}
+
+func runtimeAdmissionContextCause(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func sessionAdmissionRejectionReason(rejection *configstore.OrgConnectionAdmissionRejectedError) string {
+	if rejection == nil {
+		return "store_error"
+	}
+	switch rejection.Reason {
+	case configstore.OrgConnectionAdmissionRejectedOrgVCPU:
+		return "org_vcpu"
+	case configstore.OrgConnectionAdmissionRejectedUserVCPU:
+		return "user_vcpu"
+	default:
+		return "store_error"
 	}
 }
 
@@ -209,14 +294,20 @@ func runtimeAdmissionContextError(err error) error {
 }
 
 type runtimeOrgConnectionLease struct {
-	reservation AdmissionReclaimReservation
+	reservation    AdmissionReclaimReservation
+	orgID          string
+	requestedVCPUs int
+	released       sync.Once
 }
 
 func (l *runtimeOrgConnectionLease) Release(context.Context) error {
 	if l == nil || l.reservation == nil {
 		return nil
 	}
-	l.reservation.Reclaim(admissionReclaimCauseLeaseRelease)
+	l.released.Do(func() {
+		l.reservation.Reclaim(admissionReclaimCauseLeaseRelease)
+		sessionAdmissionActiveVCPUsGauge.WithLabelValues(l.orgID).Sub(float64(l.requestedVCPUs))
+	})
 	return nil
 }
 

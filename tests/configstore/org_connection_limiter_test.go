@@ -3,7 +3,9 @@
 package configstore_test
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -1116,16 +1118,15 @@ func TestOrgConnectionLeasesReordersUserQueueAfterHeadGranted(t *testing.T) {
 	}
 }
 
-func TestOrgConnectionAdmissionMetricsObserveAttemptsAndQueueShape(t *testing.T) {
+func TestOrgConnectionAdmissionMetricsObservePollingRequestEvaluation(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
 
-	durationBefore := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_duration_seconds")
-	queueBefore := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_queue_depth")
-	userQueuesBefore := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_user_queues")
-	outcomesBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_attempts_total")
+	durationBefore := configstoreMetricHistogramCount(t, "duckgres_session_admission_evaluation_duration_seconds")
+	evaluationsBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_session_admission_evaluations_total")
 
 	now := time.Now()
+	seedAuthoritativeOrgConnectionLimits(t, store, "org-metrics", 2, map[string]int{"alice": 0})
 	request := &cpconfigstore.OrgConnectionQueueEntry{
 		RequestID:      "request-metrics",
 		OrgID:          "org-metrics",
@@ -1140,30 +1141,38 @@ func TestOrgConnectionAdmissionMetricsObserveAttemptsAndQueueShape(t *testing.T)
 	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
 		t.Fatalf("enqueue metrics request: %v", err)
 	}
-	lease, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxVCPUs: 2}, now)
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: request.RequestID, OrgID: request.OrgID, CPInstanceID: request.CPInstanceID}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
 	if err != nil {
 		t.Fatalf("acquire metrics request: %v", err)
 	}
 	if lease == nil {
 		t.Fatal("expected metrics request to acquire")
 	}
+	if evaluation.Decision != "granted_current" || evaluation.Reason != "none" {
+		t.Fatalf("evaluation = %#v, want granted_current/none", evaluation)
+	}
 
-	durationAfter := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_duration_seconds")
-	queueAfter := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_queue_depth")
-	userQueuesAfter := configstoreMetricHistogramCount(t, "duckgres_org_connection_admission_user_queues")
-	outcomesAfter := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_attempts_total")
+	durationAfter := configstoreMetricHistogramCount(t, "duckgres_session_admission_evaluation_duration_seconds")
+	evaluationsAfter := configstoreMetricCounterFamilyTotal(t, "duckgres_session_admission_evaluations_total")
 
 	if durationAfter-durationBefore != 1 {
 		t.Fatalf("expected admission duration sample delta 1, got %d", durationAfter-durationBefore)
 	}
-	if queueAfter-queueBefore != 1 {
-		t.Fatalf("expected queue depth sample delta 1, got %d", queueAfter-queueBefore)
+	if evaluationsAfter-evaluationsBefore != 1 {
+		t.Fatalf("expected admission evaluations counter delta 1, got %f", evaluationsAfter-evaluationsBefore)
 	}
-	if userQueuesAfter-userQueuesBefore != 1 {
-		t.Fatalf("expected user queues sample delta 1, got %d", userQueuesAfter-userQueuesBefore)
-	}
-	if outcomesAfter-outcomesBefore != 1 {
-		t.Fatalf("expected admission attempts counter delta 1, got %f", outcomesAfter-outcomesBefore)
+	for _, retired := range []string{
+		"duckgres_org_connection_admission_duration_seconds",
+		"duckgres_org_connection_admission_attempts_total",
+		"duckgres_org_connection_admission_queue_depth",
+		"duckgres_org_connection_admission_user_queues",
+		"duckgres_org_connection_admission_user_limit_skips_total",
+		"duckgres_org_connection_admission_ineligible_user_skips_total",
+	} {
+		if configstoreMetricExists(t, retired) {
+			t.Fatalf("retired metric %q is still registered", retired)
+		}
 	}
 }
 
@@ -1192,26 +1201,21 @@ func TestOrgConnectionAdmissionMetricsDoNotCountDisabledUserAsVCPULimit(t *testi
 		t.Fatalf("enqueue disabled-user metrics request: %v", err)
 	}
 
-	userLimitBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total")
-	ineligibleBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_ineligible_user_skips_total")
-	outcomeBefore := configstoreMetricCounterValue(t, "duckgres_org_connection_admission_attempts_total", "outcome", "ineligible_user")
+	evaluationBefore := configstoreMetricCounterValue(t, "duckgres_session_admission_evaluations_total", "decision", "blocked", "reason", "user_ineligible")
 
-	lease, err := store.ScheduleAndClaimOrgConnectionLease(requestID, "cp-disabled-metrics")
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requestID, OrgID: orgID, CPInstanceID: "cp-disabled-metrics"}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
 	if err != nil {
 		t.Fatalf("admit disabled-user metrics request: %v", err)
 	}
 	if lease != nil {
 		t.Fatalf("disabled user received lease %#v", lease)
 	}
-
-	if delta := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total") - userLimitBefore; delta != 0 {
-		t.Fatalf("disabled user changed vCPU-limit skip counter by %f, want 0", delta)
+	if evaluation.Decision != "blocked" || evaluation.Reason != "user_ineligible" {
+		t.Fatalf("disabled-user evaluation = %#v, want blocked/user_ineligible", evaluation)
 	}
-	if delta := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_ineligible_user_skips_total") - ineligibleBefore; delta != 1 {
-		t.Fatalf("disabled user changed ineligible-user skip counter by %f, want 1", delta)
-	}
-	if delta := configstoreMetricCounterValue(t, "duckgres_org_connection_admission_attempts_total", "outcome", "ineligible_user") - outcomeBefore; delta != 1 {
-		t.Fatalf("disabled user changed ineligible outcome counter by %f, want 1", delta)
+	if delta := configstoreMetricCounterValue(t, "duckgres_session_admission_evaluations_total", "decision", "blocked", "reason", "user_ineligible") - evaluationBefore; delta != 1 {
+		t.Fatalf("disabled user changed blocked/user_ineligible evaluations by %f, want 1", delta)
 	}
 }
 
@@ -1244,13 +1248,188 @@ func TestOrgConnectionAdmissionMetricsDoNotCountPermanentlyImpossibleForeignHead
 		}
 	}
 
-	userLimitBefore := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total")
-	lease, err := store.ScheduleAndClaimOrgConnectionLease("request-eligible-behind", "cp-eligible-behind")
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: "request-eligible-behind", OrgID: orgID, CPInstanceID: "cp-eligible-behind"}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
 	if err != nil || lease == nil {
 		t.Fatalf("eligible request behind impossible head = %#v, err = %v", lease, err)
 	}
-	if delta := configstoreMetricCounterFamilyTotal(t, "duckgres_org_connection_admission_user_limit_skips_total") - userLimitBefore; delta != 0 {
-		t.Fatalf("permanently impossible foreign head changed saturation skip counter by %f, want 0", delta)
+	if evaluation.Decision != "granted_current" || evaluation.Reason != "none" {
+		t.Fatalf("eligible request evaluation = %#v, want granted_current/none", evaluation)
+	}
+}
+
+func TestOrgConnectionAdmissionEvaluationUsesPollingRequestCapacity(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+	const orgID = "org-evaluation-attribution"
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 4, map[string]int{
+		"alice": 1,
+		"bob":   0,
+		"carol": 0,
+	})
+
+	now := time.Now()
+	active := []*cpconfigstore.OrgConnectionQueueEntry{
+		{RequestID: "request-active-alice", OrgID: orgID, Username: "alice", CPInstanceID: "cp-a", PID: 1001, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute)},
+		{RequestID: "request-active-carol", OrgID: orgID, Username: "carol", CPInstanceID: "cp-b", PID: 1002, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now.Add(time.Millisecond), ExpiresAt: now.Add(time.Minute)},
+	}
+	for _, entry := range active {
+		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+			t.Fatalf("enqueue active request %q: %v", entry.RequestID, err)
+		}
+		ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: entry.RequestID, OrgID: entry.OrgID, CPInstanceID: entry.CPInstanceID}
+		lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+		if err != nil || lease == nil || evaluation.Decision != "granted_current" {
+			t.Fatalf("grant active request %q = lease %#v, evaluation %#v, err %v", entry.RequestID, lease, evaluation, err)
+		}
+	}
+
+	blockedAlice := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: "request-blocked-alice", OrgID: orgID, Username: "alice", CPInstanceID: "cp-a",
+		PID: 1003, Protocol: "postgres", RequestedVCPUs: 1,
+		EnqueuedAt: now.Add(2 * time.Millisecond), ExpiresAt: now.Add(time.Minute),
+	}
+	blockedBob := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: "request-blocked-bob", OrgID: orgID, Username: "bob", CPInstanceID: "cp-b",
+		PID: 1004, Protocol: "postgres", RequestedVCPUs: 3,
+		EnqueuedAt: now.Add(3 * time.Millisecond), ExpiresAt: now.Add(time.Minute),
+	}
+	for _, entry := range []*cpconfigstore.OrgConnectionQueueEntry{blockedAlice, blockedBob} {
+		if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+			t.Fatalf("enqueue blocked request %q: %v", entry.RequestID, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		entry  *cpconfigstore.OrgConnectionQueueEntry
+		reason string
+	}{
+		{entry: blockedAlice, reason: "user_vcpu"},
+		{entry: blockedBob, reason: "org_vcpu"},
+	} {
+		ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: tc.entry.RequestID, OrgID: tc.entry.OrgID, CPInstanceID: tc.entry.CPInstanceID}
+		lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+		if err != nil || lease != nil {
+			t.Fatalf("evaluate %q = lease %#v, err %v", tc.entry.RequestID, lease, err)
+		}
+		if evaluation.Decision != "blocked" || evaluation.Reason != tc.reason {
+			t.Fatalf("evaluation for %q = %#v, want blocked/%s", tc.entry.RequestID, evaluation, tc.reason)
+		}
+	}
+}
+
+func TestOrgConnectionAdmissionEvaluationReportsCombinedVCPULimits(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	const orgID = "org-evaluation-combined"
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, map[string]int{"alice": 2})
+	now := time.Now()
+	active := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: "request-active", OrgID: orgID, Username: "alice", CPInstanceID: "cp-a",
+		PID: 1001, Protocol: "postgres", RequestedVCPUs: 2, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(active); err != nil {
+		t.Fatalf("enqueue active request: %v", err)
+	}
+	activeRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: active.RequestID, OrgID: orgID, CPInstanceID: active.CPInstanceID}
+	if lease, _, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), activeRef); err != nil || lease == nil {
+		t.Fatalf("grant active request = %#v, err %v", lease, err)
+	}
+
+	blocked := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: "request-blocked", OrgID: orgID, Username: "alice", CPInstanceID: "cp-a",
+		PID: 1002, Protocol: "postgres", RequestedVCPUs: 1,
+		EnqueuedAt: now.Add(time.Millisecond), ExpiresAt: now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(blocked); err != nil {
+		t.Fatalf("enqueue blocked request: %v", err)
+	}
+	blockedRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: blocked.RequestID, OrgID: orgID, CPInstanceID: blocked.CPInstanceID}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), blockedRef)
+	if err != nil || lease != nil {
+		t.Fatalf("evaluate blocked request = lease %#v, err %v", lease, err)
+	}
+	if evaluation.Decision != "blocked" || evaluation.Reason != "org_user_vcpu" {
+		t.Fatalf("evaluation = %#v, want blocked/org_user_vcpu", evaluation)
+	}
+}
+
+func TestOrgConnectionAdmissionEvaluationReportsHardRejection(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	const orgID = "org-evaluation-rejected"
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, map[string]int{"alice": 0})
+	now := time.Now()
+	request := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: "request-rejected", OrgID: orgID, Username: "alice", CPInstanceID: "cp-a",
+		PID: 1001, Protocol: "postgres", RequestedVCPUs: 3, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue rejected request: %v", err)
+	}
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: request.RequestID, OrgID: orgID, CPInstanceID: request.CPInstanceID}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+	if lease != nil || !errors.Is(err, cpconfigstore.ErrOrgConnectionAdmissionRejected) {
+		t.Fatalf("hard rejection = lease %#v, err %v", lease, err)
+	}
+	if evaluation.Decision != "rejected" || evaluation.Reason != "org_vcpu" {
+		t.Fatalf("hard-rejection evaluation = %#v, want rejected/org_vcpu", evaluation)
+	}
+	assertOrgConnectionRequestAbsent(t, store, request.RequestID)
+}
+
+func TestOrgConnectionAdmissionEvaluationKeepsSameUserNonHeadInFIFO(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	const orgID = "org-evaluation-same-user-fifo"
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 4, map[string]int{"alice": 4})
+	now := time.Now()
+	requests := []*cpconfigstore.OrgConnectionQueueEntry{
+		{
+			RequestID: "request-first", OrgID: orgID, Username: "alice", CPInstanceID: "cp-a",
+			PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
+			EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+		},
+		{
+			RequestID: "request-second", OrgID: orgID, Username: "alice", CPInstanceID: "cp-a",
+			PID: 1002, Protocol: "postgres", RequestedVCPUs: 1,
+			EnqueuedAt: now.Add(time.Millisecond), ExpiresAt: now.Add(time.Minute),
+		},
+	}
+	for _, request := range requests {
+		if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+			t.Fatalf("enqueue %q: %v", request.RequestID, err)
+		}
+	}
+
+	second := requests[1]
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: second.RequestID, OrgID: orgID, CPInstanceID: second.CPInstanceID}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+	if err != nil || lease != nil {
+		t.Fatalf("evaluate same-user non-head = lease %#v, err %v", lease, err)
+	}
+	if evaluation.Decision != "waiting" || evaluation.Reason != "fifo" {
+		t.Fatalf("same-user non-head evaluation = %#v, want waiting/fifo", evaluation)
+	}
+	assertOrgConnectionRequestPending(t, store, requests[0].RequestID)
+	assertOrgConnectionRequestPending(t, store, requests[1].RequestID)
+}
+
+func TestOrgConnectionAdmissionEvaluationClassifiesCanceledContext(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	ref := cpconfigstore.OrgConnectionAdmissionRef{
+		RequestID: "request-context-canceled", OrgID: "org-context-canceled", CPInstanceID: "cp-context-canceled",
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(ctx, ref)
+	if lease != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled evaluation = lease %#v, err %v", lease, err)
+	}
+	if evaluation.Decision != "canceled" || evaluation.Reason != "none" {
+		t.Fatalf("canceled evaluation = %#v, want canceled/none", evaluation)
 	}
 }
 
@@ -2151,6 +2330,20 @@ func configstoreMetricHistogramCount(t *testing.T, metricName string) uint64 {
 	return 0
 }
 
+func configstoreMetricExists(t *testing.T, metricName string) bool {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() == metricName {
+			return true
+		}
+	}
+	return false
+}
+
 func configstoreMetricCounterFamilyTotal(t *testing.T, metricName string) float64 {
 	t.Helper()
 	families, err := prometheus.DefaultGatherer.Gather()
@@ -2173,8 +2366,11 @@ func configstoreMetricCounterFamilyTotal(t *testing.T, metricName string) float6
 	return 0
 }
 
-func configstoreMetricCounterValue(t *testing.T, metricName, labelName, labelValue string) float64 {
+func configstoreMetricCounterValue(t *testing.T, metricName string, labelPairs ...string) float64 {
 	t.Helper()
+	if len(labelPairs)%2 != 0 {
+		t.Fatalf("metric %q label pairs must be name/value pairs: %v", metricName, labelPairs)
+	}
 	families, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
 		t.Fatalf("failed to gather metrics: %v", err)
@@ -2187,10 +2383,22 @@ func configstoreMetricCounterValue(t *testing.T, metricName, labelName, labelVal
 			t.Fatalf("metric %q is not a counter", metricName)
 		}
 		for _, metric := range fam.GetMetric() {
-			for _, label := range metric.GetLabel() {
-				if label.GetName() == labelName && label.GetValue() == labelValue {
-					return metric.GetCounter().GetValue()
+			matches := true
+			for i := 0; i < len(labelPairs); i += 2 {
+				found := false
+				for _, label := range metric.GetLabel() {
+					if label.GetName() == labelPairs[i] && label.GetValue() == labelPairs[i+1] {
+						found = true
+						break
+					}
 				}
+				if !found {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				return metric.GetCounter().GetValue()
 			}
 		}
 		return 0

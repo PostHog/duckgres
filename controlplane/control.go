@@ -27,6 +27,7 @@ import (
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/flightsqlingress"
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -1137,6 +1138,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	clog.Info("User authenticated.")
+	sessionStart := observe.BeginSessionStart(orgID, "postgres")
+	defer sessionStart.Finish("error")
 
 	// Resolve the requested worker shape from the connection-string startup
 	// options (duckgres.worker_cpu / worker_memory / worker_ttl), layered on
@@ -1238,12 +1241,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		rebalancer = cp.rebalancer
 	}
 	if cp.isDraining() {
+		sessionStart.Finish("draining")
 		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
 		_ = writer.Flush()
 		return
 	}
 	preReadyCtx, finishPreReady, err := cp.beginPreReadyHandshake(context.Background())
 	if err != nil {
+		sessionStart.Finish("draining")
 		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
 		_ = writer.Flush()
 		return
@@ -1304,6 +1309,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			sessions.DestroySession(createdPID)
 			executor = nil
 		}
+		sessionStart.Finish(controlPlaneSessionStartOutcome(err))
 		clog.Error("Failed to create session.", "error", err)
 		code, message := sessionCreationErrorResponse(err)
 		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
@@ -1330,8 +1336,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// requested catalog isn't attached.
 	attachCtx, attachCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
+	attachContextErr := attachCtx.Err()
 	attachCancel()
 	if probeErr != nil {
+		sessionStart.Finish(controlPlaneSessionStartOperationOutcome(probeErr, attachContextErr, cp.isDraining()))
 		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
 		_ = writer.Flush()
@@ -1382,7 +1390,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			}
 		}
 		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, executor, effectiveCatalog, metadataAccess); err != nil {
+			initContextErr := initCtx.Err()
 			initCancel()
+			sessionStart.Finish(controlPlaneSessionStartOperationOutcome(err, initContextErr, cp.isDraining()))
 			clog.Error("Failed to initialize session database metadata.", "database", database, "error", err)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
 			_ = writer.Flush()
@@ -1398,9 +1408,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
 			spCtx, spCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(spCtx, cmd)
+			spContextErr := spCtx.Err()
 			spCancel()
 			if err != nil {
 				if source == sessionDefaultSourceConfiguredCatalog {
+					sessionStart.Finish(controlPlaneSessionStartOperationOutcome(err, spContextErr, cp.isDraining()))
 					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
 					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 					_ = writer.Flush()
@@ -1420,8 +1432,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
 			initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(initCtx, cmd)
+			initContextErr := initCtx.Err()
 			initCancel()
 			if err != nil {
+				sessionStart.Finish(controlPlaneSessionStartOperationOutcome(err, initContextErr, cp.isDraining()))
 				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
 				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 				_ = writer.Flush()
@@ -1473,15 +1487,18 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.SetCatalogUseRewrite(cc, duckLakeAttached && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
 	server.SetQueryAccessPolicy(cc, queryAccessPolicy)
-	if orgID != "" {
-		observeOrgPgSessionAccepted(orgID, passthroughUser)
-	}
-
 	// The normal PostgreSQL message loop is about to take ownership of reader.
 	// Join the disconnect watcher first; a FIN/RST at any point during session
 	// admission or metadata initialization tears down the session via the defer
 	// above instead of retaining its worker and vCPU lease.
-	if disconnectWatcher.Stop().ClientCanceled || finishPreReady() {
+	disconnect := disconnectWatcher.Stop()
+	drained := finishPreReady()
+	if disconnect.ClientCanceled {
+		sessionStart.Finish("canceled")
+		return
+	}
+	if drained {
+		sessionStart.Finish("draining")
 		return
 	}
 
@@ -1494,6 +1511,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog.Error("Failed to flush writer.", "error", err)
 		return
 	}
+	sessionStart.Finish("success")
+	if orgID != "" {
+		observeOrgPgSessionAccepted(orgID, passthroughUser)
+	}
 
 	// Run message loop. Disconnect log + duration histogram are emitted by the
 	// deferred CloseConnectionMetrics above on every return path.
@@ -1501,6 +1522,35 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog.Error("Message loop error.", "error", err)
 		return
 	}
+}
+
+func controlPlaneSessionStartOutcome(err error) string {
+	var capacityErr *WorkerCapacityExhaustedError
+	var rejection *configstore.OrgConnectionAdmissionRejectedError
+	switch {
+	case err == nil:
+		return "success"
+	case errors.As(err, &capacityErr), errors.As(err, &rejection):
+		return "capacity"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, ErrTooManyConnections):
+		return "timeout"
+	case errors.Is(err, ErrSessionManagerDraining):
+		return "draining"
+	default:
+		return "error"
+	}
+}
+
+func controlPlaneSessionStartOperationOutcome(err, contextErr error, draining bool) string {
+	if draining {
+		return "draining"
+	}
+	if contextErr != nil {
+		return controlPlaneSessionStartOutcome(contextErr)
+	}
+	return controlPlaneSessionStartOutcome(err)
 }
 
 func authorizedClientSearchPath(searchPath string, policy *server.QueryAccessPolicy) string {

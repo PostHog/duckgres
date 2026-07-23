@@ -27,7 +27,8 @@ transaction determines the eligible queue head, but creates a lease only when
 that head is the polling request. Otherwise the caller remains queued and the
 head's owner admits itself on its next poll.
 
-During a rolling deployment from the previous scheduler, old replicas may
+During a rolling deployment from the previous admission implementation, old
+replicas may
 still grant a foreign queue head and evaluate limits from their local config
 snapshot. Capacity remains protected by the shared org lock, but the strict
 request-owned and authoritative-limit invariants begin only after every old
@@ -76,16 +77,24 @@ admission reclaimer.
   control-plane runtime record and let the serialized cleanup path reclaim its
   admission rows.
 
-Monitor `duckgres_org_connection_reclaim_pending` for activated cleanup work,
-`duckgres_org_connection_reclaim_attempts_total{outcome}` for retry outcomes,
-and the ratio of `duckgres_org_connection_reclaim_reservations_in_use` to
-`duckgres_org_connection_reclaim_reservation_capacity` for ownership headroom.
-`duckgres_org_connection_reclaim_reservation_rejections_total{reason}` records
+Monitor `duckgres_session_admission_reclaim_pending` for activated cleanup work,
+`duckgres_session_admission_reclaim_attempts_total{outcome}` for cleanup-attempt
+outcomes,
+and the ratio of `duckgres_session_admission_reclaim_reservations_in_use` to
+`duckgres_session_admission_reclaim_reservation_capacity` for ownership
+headroom.
+`duckgres_session_admission_reclaim_reservation_rejections_total{reason}` records
 requests rejected before enqueue. Diagnose sustained backlog growth or high
 reservation utilization together with reclaim error rate; a continuously
 non-zero pending count can be healthy during steady connection churn. Reclaim
 logs include the request, org, retry count, and age; the metrics deliberately
 omit request and org labels.
+
+The org-labeled admission queue and active-vCPU gauges are logical local
+contributions, not exact durable row counts. Active vCPUs drop when cleanup is
+transferred to the reclaimer, before the durable lease row is necessarily
+deleted. Use the reclaim backlog and attempt metrics above when that distinction
+matters; [the metrics reference](../metrics.md) documents aggregation rules.
 
 For local verification, run `just test-configstore-integration`; it exercises
 cross-replica ordering, cancellation races, eventual live-owner reclamation,

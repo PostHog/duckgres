@@ -196,6 +196,55 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 	})
 }
 
+func TestControlPlaneSessionStartOutcome(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "success", want: "success"},
+		{name: "canceled", err: context.Canceled, want: "canceled"},
+		{name: "deadline", err: context.DeadlineExceeded, want: "timeout"},
+		{name: "queue timeout", err: ErrTooManyConnections, want: "timeout"},
+		{name: "draining", err: ErrSessionManagerDraining, want: "draining"},
+		{name: "worker capacity", err: NewWorkerCapacityExhaustedError(time.Second), want: "capacity"},
+		{
+			name: "admission hard rejection",
+			err: &configstore.OrgConnectionAdmissionRejectedError{
+				Reason:         configstore.OrgConnectionAdmissionRejectedOrgVCPU,
+				RequestedVCPUs: 4,
+				MaximumVCPUs:   2,
+			},
+			want: "capacity",
+		},
+		{name: "generic error", err: errors.New("bootstrap failed"), want: "error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := controlPlaneSessionStartOutcome(tt.err); got != tt.want {
+				t.Fatalf("controlPlaneSessionStartOutcome(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestControlPlaneSessionStartOperationOutcomePrefersContext(t *testing.T) {
+	operationErr := errors.New("metadata initialization failed")
+	if got := controlPlaneSessionStartOperationOutcome(operationErr, context.Canceled, false); got != "canceled" {
+		t.Fatalf("canceled operation outcome = %q, want canceled", got)
+	}
+	if got := controlPlaneSessionStartOperationOutcome(operationErr, context.DeadlineExceeded, false); got != "timeout" {
+		t.Fatalf("timed-out operation outcome = %q, want timeout", got)
+	}
+	if got := controlPlaneSessionStartOperationOutcome(operationErr, nil, false); got != "error" {
+		t.Fatalf("ordinary operation outcome = %q, want error", got)
+	}
+	if got := controlPlaneSessionStartOperationOutcome(operationErr, context.Canceled, true); got != "draining" {
+		t.Fatalf("drain-canceled operation outcome = %q, want draining", got)
+	}
+}
+
 func TestBeginSessionDrainMarksControlPlaneDraining(t *testing.T) {
 	sessions := NewSessionManager(nil, nil)
 	cp := &ControlPlane{sessions: sessions}
