@@ -523,3 +523,377 @@ func TestRuntimeOrgConnectionLimiterReclaimsLeaseGrantedWithCancellation(t *test
 		t.Fatalf("cleanup submissions = %#v, want exact grant/cancel request ref", submissions)
 	}
 }
+
+type admissionMetricsScheduleResult struct {
+	evaluation configstore.OrgConnectionAdmissionEvaluation
+	err        error
+}
+
+type admissionMetricsScheduleStore struct {
+	mu           sync.Mutex
+	results      []admissionMetricsScheduleResult
+	enqueueErr   error
+	enqueueCalls int
+	onEvaluate   func()
+}
+
+func (s *admissionMetricsScheduleStore) EnqueueOrgConnectionRequest(*configstore.OrgConnectionQueueEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enqueueCalls++
+	return s.enqueueErr
+}
+
+func (s *admissionMetricsScheduleStore) ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(_ context.Context, ref configstore.OrgConnectionAdmissionRef) (*configstore.OrgConnectionLease, configstore.OrgConnectionAdmissionEvaluation, error) {
+	s.mu.Lock()
+	if len(s.results) == 0 {
+		s.mu.Unlock()
+		return nil, configstore.OrgConnectionAdmissionEvaluation{Decision: "waiting", Reason: "fifo"}, nil
+	}
+	result := s.results[0]
+	s.results = s.results[1:]
+	onEvaluate := s.onEvaluate
+	s.mu.Unlock()
+	if onEvaluate != nil {
+		onEvaluate()
+	}
+	if result.evaluation.Decision == "granted_current" {
+		return &configstore.OrgConnectionLease{LeaseID: ref.RequestID, RequestID: ref.RequestID}, result.evaluation, result.err
+	}
+	return nil, result.evaluation, result.err
+}
+
+func newAdmissionMetricsLimiter(store runtimeOrgConnectionStore, reclaimer admissionReclaimer, org, requestID string) *runtimeOrgConnectionLimiter {
+	return &runtimeOrgConnectionLimiter{
+		store:        store,
+		reclaimer:    reclaimer,
+		orgID:        org,
+		cpInstanceID: "cp-metrics",
+		queueTTL:     time.Minute,
+		pollInterval: time.Millisecond,
+		now:          time.Now,
+		newID:        func() (string, error) { return requestID, nil },
+	}
+}
+
+func resetSessionAdmissionMetricGauges(t *testing.T, org string) {
+	t.Helper()
+	sessionAdmissionQueueDepthGauge.DeleteLabelValues(org)
+	sessionAdmissionActiveVCPUsGauge.DeleteLabelValues(org)
+	sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+	t.Cleanup(func() {
+		sessionAdmissionQueueDepthGauge.DeleteLabelValues(org)
+		sessionAdmissionActiveVCPUsGauge.DeleteLabelValues(org)
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+	})
+}
+
+func TestRuntimeOrgConnectionLimiterObservesGrantedRequestLifecycle(t *testing.T) {
+	const org = "org-admission-metrics-granted"
+	resetSessionAdmissionMetricGauges(t, org)
+	sessionAdmissionLimitVCPUsGauge.WithLabelValues(org).Set(7)
+	store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{
+		{evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "org_vcpu"}},
+		{evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "granted_current", Reason: "none"}},
+	}}
+	reclaimer := &recordingAdmissionReclaimer{}
+	limiter := newAdmissionMetricsLimiter(store, reclaimer, org, "request-metrics-granted")
+
+	requestsBefore := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "granted", "org_vcpu")
+	waitsBefore := histogramVecLabelSampleCount(t, sessionAdmissionWaitHistogram, org, "granted", "org_vcpu")
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID: 1001, Username: "alice", Protocol: "postgres", RequestedVCPUs: 2,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if err != nil || lease == nil {
+		t.Fatalf("Acquire = (%v, %v), want lease", lease, err)
+	}
+	if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "granted", "org_vcpu") - requestsBefore; got != 1 {
+		t.Fatalf("request counter delta = %v, want 1", got)
+	}
+	if got := histogramVecLabelSampleCount(t, sessionAdmissionWaitHistogram, org, "granted", "org_vcpu") - waitsBefore; got != 1 {
+		t.Fatalf("wait histogram count delta = %d, want 1", got)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionQueueDepthGauge, org); got != 0 {
+		t.Fatalf("queue depth = %v, want 0", got)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionActiveVCPUsGauge, org); got != 2 {
+		t.Fatalf("active vCPUs = %v, want 2", got)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 7 {
+		t.Fatalf("limit vCPUs = %v, want config-reconciled value 7", got)
+	}
+
+	if err := lease.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := lease.Release(context.Background()); err != nil {
+		t.Fatalf("second Release: %v", err)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionActiveVCPUsGauge, org); got != 0 {
+		t.Fatalf("active vCPUs after repeated release = %v, want 0", got)
+	}
+	submissions, _ := reclaimer.snapshot()
+	if len(submissions) != 1 || submissions[0].cause != admissionReclaimCauseLeaseRelease {
+		t.Fatalf("lease cleanup submissions = %#v, want exactly one release", submissions)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterRetainsCombinedVCPULimitReason(t *testing.T) {
+	const org = "org-admission-metrics-combined"
+	resetSessionAdmissionMetricGauges(t, org)
+	store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{
+		{evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "org_vcpu"}},
+		{evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "user_vcpu"}},
+		{evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "granted_current", Reason: "none"}},
+	}}
+	limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-combined")
+	before := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "granted", "org_user_vcpu")
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID: 1002, Username: "alice", Protocol: "postgres", RequestedVCPUs: 1,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if err != nil || lease == nil {
+		t.Fatalf("Acquire = (%v, %v), want lease", lease, err)
+	}
+	t.Cleanup(func() { _ = lease.Release(context.Background()) })
+	if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "granted", "org_user_vcpu") - before; got != 1 {
+		t.Fatalf("combined-vCPU request counter delta = %v, want 1", got)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterObservesCancellationAfterEnqueue(t *testing.T) {
+	const org = "org-admission-metrics-canceled"
+	resetSessionAdmissionMetricGauges(t, org)
+	ctx, cancel := context.WithCancel(context.Background())
+	store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{{
+		evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "user_vcpu"},
+	}}}
+	store.onEvaluate = cancel
+	reclaimer := &recordingAdmissionReclaimer{}
+	limiter := newAdmissionMetricsLimiter(store, reclaimer, org, "request-metrics-canceled")
+	before := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "canceled", "user_vcpu")
+	lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+		PID: 1003, Username: "bob", Protocol: "postgres", RequestedVCPUs: 1,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if lease != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire = (%v, %v), want context.Canceled", lease, err)
+	}
+	if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "canceled", "user_vcpu") - before; got != 1 {
+		t.Fatalf("canceled request counter delta = %v, want 1", got)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionQueueDepthGauge, org); got != 0 {
+		t.Fatalf("queue depth = %v, want 0", got)
+	}
+	submissions, _ := reclaimer.snapshot()
+	if len(submissions) != 1 || submissions[0].cause != admissionReclaimCauseAcquireAbandoned {
+		t.Fatalf("cleanup submissions = %#v, want one abandoned request", submissions)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterTracksQueueDepthWhileEvaluationIsInFlight(t *testing.T) {
+	const org = "org-admission-metrics-queue-depth"
+	resetSessionAdmissionMetricGauges(t, org)
+	evaluationStarted := make(chan struct{})
+	releaseEvaluation := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseEvaluation) }) })
+
+	store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{{
+		evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "user_vcpu"},
+	}}}
+	store.onEvaluate = func() {
+		close(evaluationStarted)
+		<-releaseEvaluation
+	}
+	limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-queue-depth")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	type acquireResult struct {
+		lease connectionLease
+		err   error
+	}
+	result := make(chan acquireResult, 1)
+	go func() {
+		lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+			PID: 1009, Username: "heidi", Protocol: "postgres", RequestedVCPUs: 1,
+		}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+		result <- acquireResult{lease: lease, err: err}
+	}()
+
+	select {
+	case <-evaluationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("admission evaluation did not start")
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionQueueDepthGauge, org); got != 1 {
+		t.Fatalf("queue depth during evaluation = %v, want 1", got)
+	}
+
+	cancel()
+	releaseOnce.Do(func() { close(releaseEvaluation) })
+	select {
+	case got := <-result:
+		if got.lease != nil || !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("Acquire = (%v, %v), want context.Canceled", got.lease, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admission acquire did not stop after cancellation")
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionQueueDepthGauge, org); got != 0 {
+		t.Fatalf("queue depth after cancellation = %v, want 0", got)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterClassifiesInterruptedEvaluationErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		evaluation  error
+		wantOutcome string
+		wantError   error
+	}{
+		{name: "canceled", evaluation: context.Canceled, wantOutcome: "canceled", wantError: context.Canceled},
+		{name: "deadline", evaluation: context.DeadlineExceeded, wantOutcome: "timeout", wantError: ErrTooManyConnections},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			org := "org-admission-metrics-interrupted-" + tc.name
+			resetSessionAdmissionMetricGauges(t, org)
+			store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{{
+				err: tc.evaluation,
+			}}}
+			limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-interrupted-"+tc.name)
+			before := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, tc.wantOutcome, "none")
+			storeErrorsBefore := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "error", "store_error")
+
+			lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+				PID: int32(1010 + i), Username: "ivan", Protocol: "postgres", RequestedVCPUs: 1,
+			}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+			if lease != nil || !errors.Is(err, tc.wantError) {
+				t.Fatalf("Acquire = (%v, %v), want %v", lease, err, tc.wantError)
+			}
+			if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, tc.wantOutcome, "none") - before; got != 1 {
+				t.Fatalf("%s/none request counter delta = %v, want 1", tc.wantOutcome, got)
+			}
+			if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "error", "store_error") - storeErrorsBefore; got != 0 {
+				t.Fatalf("error/store_error request counter delta = %v, want 0", got)
+			}
+		})
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterObservesPermanentRejection(t *testing.T) {
+	const org = "org-admission-metrics-rejected"
+	resetSessionAdmissionMetricGauges(t, org)
+	rejection := &configstore.OrgConnectionAdmissionRejectedError{
+		Reason: configstore.OrgConnectionAdmissionRejectedOrgVCPU, RequestedVCPUs: 4, MaximumVCPUs: 2,
+	}
+	store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{{
+		evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "rejected", Reason: "org_vcpu"},
+		err:        rejection,
+	}}}
+	limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-rejected")
+	before := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "rejected", "org_vcpu")
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID: 1004, Username: "carol", Protocol: "postgres", RequestedVCPUs: 4,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if lease != nil || !errors.Is(err, configstore.ErrOrgConnectionAdmissionRejected) {
+		t.Fatalf("Acquire = (%v, %v), want permanent rejection", lease, err)
+	}
+	if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "rejected", "org_vcpu") - before; got != 1 {
+		t.Fatalf("rejected request counter delta = %v, want 1", got)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterExcludesPreEnqueueFailuresFromRequestMetrics(t *testing.T) {
+	const org = "org-admission-metrics-enqueue-error"
+	resetSessionAdmissionMetricGauges(t, org)
+	store := &admissionMetricsScheduleStore{enqueueErr: errors.New("enqueue unavailable")}
+	limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-enqueue-error")
+	before := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "error", "store_error")
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID: 1005, Username: "dana", Protocol: "postgres", RequestedVCPUs: 1,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if lease != nil || err == nil {
+		t.Fatalf("Acquire = (%v, %v), want enqueue error", lease, err)
+	}
+	if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "error", "store_error") - before; got != 0 {
+		t.Fatalf("request counter delta = %v, want 0 before successful enqueue", got)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterExcludesPreCanceledRequestFromMetrics(t *testing.T) {
+	const org = "org-admission-metrics-pre-canceled"
+	resetSessionAdmissionMetricGauges(t, org)
+	store := &admissionMetricsScheduleStore{}
+	limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-pre-canceled")
+	before := metricCounterFamilyTotal(t, "duckgres_session_admission_requests_total")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+		PID: 1006, Username: "erin", Protocol: "postgres", RequestedVCPUs: 1,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if lease != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire = (%v, %v), want pre-enqueue context cancellation", lease, err)
+	}
+	if got := metricCounterFamilyTotal(t, "duckgres_session_admission_requests_total") - before; got != 0 {
+		t.Fatalf("request counter delta = %v, want 0 before successful enqueue", got)
+	}
+	if store.enqueueCalls != 0 {
+		t.Fatalf("enqueue calls = %d, want 0", store.enqueueCalls)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterObservesTimeoutAfterEnqueue(t *testing.T) {
+	const org = "org-admission-metrics-timeout"
+	resetSessionAdmissionMetricGauges(t, org)
+	store := &admissionMetricsScheduleStore{}
+	limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-timeout")
+	start := time.Now()
+	nowCalls := 0
+	limiter.queueTTL = time.Millisecond
+	limiter.now = func() time.Time {
+		nowCalls++
+		if nowCalls == 1 {
+			return start
+		}
+		return start.Add(2 * time.Millisecond)
+	}
+	before := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "timeout", "none")
+
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID: 1007, Username: "frank", Protocol: "postgres", RequestedVCPUs: 1,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if lease != nil || !errors.Is(err, ErrTooManyConnections) {
+		t.Fatalf("Acquire = (%v, %v), want admission timeout", lease, err)
+	}
+	if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "timeout", "none") - before; got != 1 {
+		t.Fatalf("timeout request counter delta = %v, want 1", got)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionQueueDepthGauge, org); got != 0 {
+		t.Fatalf("queue depth = %v, want 0", got)
+	}
+}
+
+func TestRuntimeOrgConnectionLimiterObservesEvaluationError(t *testing.T) {
+	const org = "org-admission-metrics-error"
+	resetSessionAdmissionMetricGauges(t, org)
+	boom := errors.New("config store unavailable")
+	store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{{
+		evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "error", Reason: "store_error"},
+		err:        boom,
+	}}}
+	limiter := newAdmissionMetricsLimiter(store, &recordingAdmissionReclaimer{}, org, "request-metrics-error")
+	before := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "error", "store_error")
+
+	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
+		PID: 1008, Username: "grace", Protocol: "postgres", RequestedVCPUs: 1,
+	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
+	if lease != nil || !errors.Is(err, boom) {
+		t.Fatalf("Acquire = (%v, %v), want evaluation error", lease, err)
+	}
+	if got := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "error", "store_error") - before; got != 1 {
+		t.Fatalf("error request counter delta = %v, want 1", got)
+	}
+}

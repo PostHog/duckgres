@@ -36,23 +36,23 @@ var (
 	errAdmissionReclaimerDuplicateReservation = errors.New("admission reclaimer reference is already reserved")
 
 	orgConnectionReclaimPendingGauge = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "duckgres_org_connection_reclaim_pending",
-		Help: "Number of org connection admission cleanup intents retained by this control-plane replica.",
+		Name: "duckgres_session_admission_reclaim_pending",
+		Help: "Number of activated session admission cleanup intents retained by this control-plane replica.",
 	})
 	orgConnectionReclaimAttemptsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "duckgres_org_connection_reclaim_attempts_total",
-		Help: "Org connection admission cleanup attempts by outcome.",
+		Name: "duckgres_session_admission_reclaim_attempts_total",
+		Help: "Session admission cleanup attempts by outcome.",
 	}, []string{"outcome"})
 	orgConnectionReclaimReservationsInUseGauge = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "duckgres_org_connection_reclaim_reservations_in_use",
-		Help: "Number of admission cleanup reservations held by this control-plane process, including live leases and pending cleanup.",
+		Name: "duckgres_session_admission_reclaim_reservations_in_use",
+		Help: "Number of admission cleanup reservations held before enqueue, while queued, by live leases, or by pending cleanup in this control-plane process.",
 	})
 	orgConnectionReclaimReservationCapacityGauge = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "duckgres_org_connection_reclaim_reservation_capacity",
+		Name: "duckgres_session_admission_reclaim_reservation_capacity",
 		Help: "Total admission cleanup reservation capacity of reclaimers in this control-plane process.",
 	})
 	orgConnectionReclaimReservationRejectionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "duckgres_org_connection_reclaim_reservation_rejections_total",
+		Name: "duckgres_session_admission_reclaim_reservation_rejections_total",
 		Help: "Admission cleanup reservation attempts rejected before durable admission work, by reason.",
 	}, []string{"reason"})
 )

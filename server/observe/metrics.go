@@ -1,6 +1,7 @@
 package observe
 
 import (
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,6 +39,48 @@ var connectionDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramO
 // ObserveConnectionDuration records one completed connection's lifetime.
 func ObserveConnectionDuration(org string, seconds float64) {
 	connectionDurationHistogram.WithLabelValues(org).Observe(seconds)
+}
+
+var sessionStartDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "duckgres_session_start_duration_seconds",
+	Help:    "Authenticated session bootstrap time through protocol readiness, partitioned by org, protocol, and terminal outcome.",
+	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
+}, []string{"org", "protocol", "outcome"})
+
+// SessionStartScope records one logical protocol bootstrap. Finish is
+// idempotent so a default-error defer can coexist with an explicit success.
+type SessionStartScope struct {
+	started  time.Time
+	org      string
+	protocol string
+	once     sync.Once
+}
+
+func BeginSessionStart(org, protocol string) *SessionStartScope {
+	switch protocol {
+	case "postgres":
+	default:
+		protocol = "unknown"
+	}
+	return &SessionStartScope{started: time.Now(), org: org, protocol: protocol}
+}
+
+func (s *SessionStartScope) Finish(outcome string) {
+	if s == nil {
+		return
+	}
+	switch outcome {
+	case "success", "timeout", "canceled", "capacity", "draining", "error":
+	default:
+		outcome = "error"
+	}
+	s.once.Do(func() {
+		duration := time.Since(s.started)
+		if duration < 0 {
+			duration = 0
+		}
+		sessionStartDurationHistogram.WithLabelValues(s.org, s.protocol, outcome).Observe(duration.Seconds())
+	})
 }
 
 // S3BytesReadTotal counts bytes read from S3 by DuckDB, labeled by org.

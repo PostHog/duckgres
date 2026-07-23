@@ -82,6 +82,35 @@ func TestObserveConnectionDurationRecordsPerOrgSample(t *testing.T) {
 	}
 }
 
+func TestSessionStartScopeRecordsExactlyOnce(t *testing.T) {
+	const org = "session-start-test-org"
+	before := sessionStartSampleCount(t, org, "postgres", "success")
+
+	scope := BeginSessionStart(org, "postgres")
+	scope.Finish("success")
+	scope.Finish("error")
+
+	if got := sessionStartSampleCount(t, org, "postgres", "success"); got != before+1 {
+		t.Fatalf("success sample count = %d, want %d", got, before+1)
+	}
+	if got := sessionStartSampleCount(t, org, "postgres", "error"); got != 0 {
+		t.Fatalf("error sample count = %d, want 0", got)
+	}
+}
+
+func sessionStartSampleCount(t *testing.T, org, protocol, outcome string) uint64 {
+	t.Helper()
+	observer, err := sessionStartDurationHistogram.GetMetricWithLabelValues(org, protocol, outcome)
+	if err != nil {
+		t.Fatalf("session start histogram labels: %v", err)
+	}
+	metric := &dto.Metric{}
+	if err := observer.(interface{ Write(*dto.Metric) error }).Write(metric); err != nil {
+		t.Fatalf("session start histogram write: %v", err)
+	}
+	return metric.GetHistogram().GetSampleCount()
+}
+
 func TestQueryLogMetricsHelpersRecordBufferFlushAndDrops(t *testing.T) {
 	enqueuedBefore := counterValue(t, queryLogEnqueuedEntriesTotal)
 	flushedBefore := counterValue(t, queryLogFlushedEntriesTotal)

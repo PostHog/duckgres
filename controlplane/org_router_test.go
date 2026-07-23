@@ -154,6 +154,13 @@ func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSess
 }
 
 func TestOrgRouterShutdownAllDrainsAdmissionReclaimerAfterAllSessions(t *testing.T) {
+	orgs := []string{"first", "second"}
+	for i, org := range orgs {
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+		sessionAdmissionLimitVCPUsGauge.WithLabelValues(org).Set(float64(i + 1))
+		org := org
+		t.Cleanup(func() { sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org) })
+	}
 	events := []string{}
 	firstPool := &recordingOrgRouterPool{events: &events}
 	secondPool := &recordingOrgRouterPool{events: &events}
@@ -193,6 +200,11 @@ func TestOrgRouterShutdownAllDrainsAdmissionReclaimerAfterAllSessions(t *testing
 	_, drainCalls := reclaimer.snapshot()
 	if drainCalls != 1 {
 		t.Fatalf("admission reclaimer drain calls = %d, want 1", drainCalls)
+	}
+	for _, org := range orgs {
+		if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_session_admission_limit_vcpus", map[string]string{"org": org}); ok {
+			t.Fatalf("shutdown left admission limit series for org %q", org)
+		}
 	}
 }
 
@@ -1117,6 +1129,57 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 
 	if got := tr.orgs["analytics"].Config.Warehouse.MetadataStore.Endpoint; got != "new-metadata.internal" {
 		t.Fatalf("expected runtime-only update to refresh stack config, got %q", got)
+	}
+}
+
+func TestOrgRouterReconcilesAdmissionLimitGaugeWithOrgStackLifecycle(t *testing.T) {
+	const org = "admission-limit-lifecycle"
+	sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+
+	sharedPool, _ := newTestK8sPool(t, 10)
+	initial := &configstore.OrgConfig{Name: org, MaxVCPUs: 16}
+	initialSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{org: initial}}
+	store := newTestConfigStoreWithSnapshot(initialSnapshot)
+	tr := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
+		configStore: store,
+		baseCfg:     K8sWorkerPoolConfig{},
+		sharedPool:  sharedPool,
+		globalCfg:   ControlPlaneConfig{},
+	}
+	t.Cleanup(func() {
+		tr.DestroyOrgStack(org)
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+	})
+
+	if _, err := tr.createOrgStack(initial); err != nil {
+		t.Fatalf("createOrgStack: %v", err)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 16 {
+		t.Fatalf("initial admission limit = %v, want 16", got)
+	}
+
+	lowered := &configstore.OrgConfig{Name: org, MaxVCPUs: 8}
+	loweredSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{org: lowered}}
+	setTestConfigStoreSnapshot(store, loweredSnapshot)
+	tr.HandleConfigChange(initialSnapshot, loweredSnapshot)
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 8 {
+		t.Fatalf("lowered admission limit = %v, want 8", got)
+	}
+
+	unlimited := &configstore.OrgConfig{Name: org, MaxVCPUs: 0}
+	unlimitedSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{org: unlimited}}
+	setTestConfigStoreSnapshot(store, unlimitedSnapshot)
+	tr.HandleConfigChange(loweredSnapshot, unlimitedSnapshot)
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 0 {
+		t.Fatalf("unlimited admission limit = %v, want 0", got)
+	}
+
+	removedSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}}
+	setTestConfigStoreSnapshot(store, removedSnapshot)
+	tr.HandleConfigChange(unlimitedSnapshot, removedSnapshot)
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_session_admission_limit_vcpus", map[string]string{"org": org}); ok {
+		t.Fatal("expected removed org's admission limit series to be deleted")
 	}
 }
 

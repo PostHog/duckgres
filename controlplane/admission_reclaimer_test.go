@@ -13,8 +13,55 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+func TestAdmissionReclaimerMetricFamiliesUseCanonicalNames(t *testing.T) {
+	orgConnectionReclaimAttemptsCounter.WithLabelValues(admissionReclaimAttemptOutcomeSuccess)
+	orgConnectionReclaimReservationRejectionsCounter.WithLabelValues(admissionReclaimReservationRejectFull)
+
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(
+		orgConnectionReclaimPendingGauge,
+		orgConnectionReclaimAttemptsCounter,
+		orgConnectionReclaimReservationsInUseGauge,
+		orgConnectionReclaimReservationCapacityGauge,
+		orgConnectionReclaimReservationRejectionsCounter,
+	)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather reclaimer metrics: %v", err)
+	}
+
+	want := map[string]bool{
+		"duckgres_session_admission_reclaim_pending":                      false,
+		"duckgres_session_admission_reclaim_attempts_total":               false,
+		"duckgres_session_admission_reclaim_reservations_in_use":          false,
+		"duckgres_session_admission_reclaim_reservation_capacity":         false,
+		"duckgres_session_admission_reclaim_reservation_rejections_total": false,
+	}
+	for _, family := range families {
+		if _, ok := want[family.GetName()]; ok {
+			want[family.GetName()] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("canonical reclaimer metric %q was not registered", name)
+		}
+	}
+
+	defaultFamilies, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather default metrics registry: %v", err)
+	}
+	for _, family := range defaultFamilies {
+		if strings.HasPrefix(family.GetName(), "duckgres_org_connection_reclaim_") {
+			t.Fatalf("retired reclaimer metric %q is still registered", family.GetName())
+		}
+	}
+}
 
 func TestAdmissionReclaimerSubmitRetainsAndDeduplicates(t *testing.T) {
 	entered := make(chan struct{}, 1)
