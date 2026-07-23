@@ -156,15 +156,44 @@ restart_cp_with_identity() {
 # rerun never inherits stranded state) and at teardown (deterministic clean
 # exit). Scoped to this PR's unique org ids, so it can't touch another PR's
 # tenant.
+discover_cnpg_primary() {
+  local primary
+  if ! primary="$("${KUBECTL[@]}" -n cnpg-shards get pod \
+    -l 'cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary' \
+    -o jsonpath='{.items[0].metadata.name}')"; then
+    echo "Failed to discover the shard-001 CNPG primary." >&2
+    return 1
+  fi
+  if [ -z "$primary" ]; then
+    echo "No shard-001 CNPG primary was found." >&2
+    return 1
+  fi
+  printf '%s\n' "$primary"
+}
+
 drop_cnpg_role() { # org-id
-  local suffix ident
+  local suffix ident primary attempt
   # Mirror the composition's PG identifier suffix: lower, [^a-z0-9_] -> _.
   suffix="$(printf %s "$1" | tr 'A-Z-' 'a-z_' | tr -cd 'a-z0-9_')"
   ident="mdstore_${suffix}"
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP DATABASE IF EXISTS ${ident} WITH (FORCE);" >/dev/null 2>&1 || true
-  "${KUBECTL[@]}" -n cnpg-shards exec shard-001-1 -c postgres -- \
-    psql -U postgres -c "DROP ROLE IF EXISTS ${ident};" >/dev/null 2>&1 || true
+  # A failover may happen after discovery. Retry the complete pair against a
+  # newly discovered primary; both statements are idempotent, so retrying is
+  # safe even if the database drop succeeded before the role command failed.
+  for attempt in 1 2 3; do
+    if ! primary="$(discover_cnpg_primary)"; then
+      echo "CNPG cleanup attempt $attempt/3 could not discover a primary for $ident." >&2
+      continue
+    fi
+    if "${KUBECTL[@]}" -n cnpg-shards exec "$primary" -c postgres -- \
+      psql -U postgres -c "DROP DATABASE IF EXISTS ${ident} WITH (FORCE);" \
+      && "${KUBECTL[@]}" -n cnpg-shards exec "$primary" -c postgres -- \
+      psql -U postgres -c "DROP ROLE IF EXISTS ${ident};"; then
+      return 0
+    fi
+    echo "CNPG cleanup attempt $attempt/3 failed on primary $primary for $ident." >&2
+  done
+  echo "Failed to drop CNPG database and role $ident after 3 attempts." >&2
+  return 1
 }
 
 # Every CNPG-backed duckling org a harness run provisions for a PR
@@ -648,7 +677,7 @@ cmd_diagnostics() {
 }
 
 cmd_teardown() {
-  local duckling_delete_rc=0
+  local duckling_delete_rc=0 cnpg_cleanup_rc=0 org
 
   # Deprovision the ci-pr ducklings FIRST so shared-infra resources (S3 bucket,
   # cnpg role+db) are cleaned up by the control plane
@@ -704,7 +733,9 @@ cmd_teardown() {
 
   # Deterministically drop the cnpg role+db in case the composition's async
   # cascade lagged the CR delete above (see drop_cnpg_role). Idempotent.
-  for org in $(ci_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
+  for org in $(ci_orgs "$PR_NUMBER"); do
+    drop_cnpg_role "$org" || cnpg_cleanup_rc=1
+  done
 
   # Drop the Pod Identity association (it's an EKS resource, not in the ns).
   delete_pod_identity
@@ -712,7 +743,9 @@ cmd_teardown() {
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=false
-  return "$duckling_delete_rc"
+  if [ "$duckling_delete_rc" -ne 0 ] || [ "$cnpg_cleanup_rc" -ne 0 ]; then
+    return 1
+  fi
 }
 
 # Sweep stale per-PR namespaces left behind by runs that died hard (cancelled
