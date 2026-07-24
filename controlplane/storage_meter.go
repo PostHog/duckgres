@@ -54,8 +54,12 @@ var storageSampleErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Storage-billing samples skipped due to an error (org unreachable, query failed). Each miss under-bills one interval.",
 }, []string{"org"})
 
-// storageOrg is one samplable org: a Ready DuckLake warehouse and its default
-// team (the storage bucket key's team_id; 0 = no default team).
+// storageOrg is one samplable org: a Ready DuckLake warehouse and the
+// informational team id stamped onto its storage buckets — the org's OLDEST
+// team (min created_at, ties broken by team_id; 0 only defensively, e.g. a
+// stale snapshot — a committed org always has at least one team). duckgres
+// does not own team-level billing attribution; the external billing service
+// maps org → team(s) itself.
 type storageOrg struct {
 	OrgID  string
 	TeamID int64
@@ -73,7 +77,7 @@ type storageSampler struct {
 	store    storageUsageStore
 	interval time.Duration
 	// listOrgs returns the orgs to sample (Ready DuckLake warehouses) with
-	// their default team ids, from the config snapshot.
+	// their informational team ids (oldest team), from the config snapshot.
 	listOrgs func() []storageOrg
 	// resolveDSN maps an org to its metadata-Postgres URL
 	// (SharedWorkerActivator.MetadataPostgresURL on the k8s backend).

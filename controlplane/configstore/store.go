@@ -235,10 +235,10 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 				TeamID:                team.TeamID,
 				SchemaName:            team.SchemaName,
 				Enabled:               team.Enabled,
-				IsBillingTeam:         team.IsBillingTeam != nil && *team.IsBillingTeam,
 				EventsTableName:       team.EventsTableName,
 				PersonsTableName:      team.PersonsTableName,
 				SchemaDataImportsName: team.SchemaDataImportsName,
+				CreatedAt:             team.CreatedAt,
 			})
 		}
 		oc := &OrgConfig{
@@ -621,13 +621,15 @@ func (cs *ConfigStore) OrgDefaultWorkerMinHotIdle(orgID string) int {
 	return oc.DefaultWorkerMinHotIdle
 }
 
-// OrgBillingTeamID returns the org's billing PostHog team id (the org team
-// with is_billing_team = TRUE) from the current snapshot, or 0 when unset
-// (including unknown orgs and a not-yet-loaded snapshot). A zero return is a
-// valid, non-error state — callers must tolerate it and MUST NOT fail a
-// connection or activation on it. Prerequisite for pull-based compute billing
-// (usage keyed by team id).
-func (cs *ConfigStore) OrgBillingTeamID(orgID string) int64 {
+// OrgOldestTeamID returns the org's oldest PostHog team id (min created_at,
+// ties broken by team_id) from the current snapshot, or 0 when unknown
+// (unknown org / not-yet-loaded snapshot / mid-provision teamless org —
+// defensive only, since a committed org always has at least one team). The
+// value is the INFORMATIONAL team id stamped onto usage buckets: duckgres
+// does not own team-level billing attribution (the external billing service
+// does). A zero return is a valid, non-error state — callers must tolerate
+// it and MUST NOT fail a connection or activation on it.
+func (cs *ConfigStore) OrgOldestTeamID(orgID string) int64 {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if cs.snapshot == nil {
@@ -637,7 +639,30 @@ func (cs *ConfigStore) OrgBillingTeamID(orgID string) int64 {
 	if !ok {
 		return 0
 	}
-	return oc.BillingTeamID()
+	return oc.OldestTeamID()
+}
+
+// OrgUsageTeamID resolves the informational team id stamped onto a
+// connection's compute-usage buckets: the CONNECTING USER's team
+// (duckgres_org_users.team_id, e.g. a project-reader login) when it has one,
+// else the org's oldest team (OrgOldestTeamID), else 0 (defensive — see
+// OrgOldestTeamID). Best-effort snapshot read, never an error.
+func (cs *ConfigStore) OrgUsageTeamID(orgID, username string) int64 {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return 0
+	}
+	if access, ok := cs.snapshot.OrgUserAccess[OrgUserKey{OrgID: orgID, Username: username}]; ok {
+		if access.TeamID != nil && *access.TeamID > 0 {
+			return *access.TeamID
+		}
+	}
+	oc, ok := cs.snapshot.Orgs[orgID]
+	if !ok {
+		return 0
+	}
+	return oc.OldestTeamID()
 }
 
 // ValidateOrgUser checks username/password scoped to a specific org.

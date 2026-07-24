@@ -21,24 +21,12 @@ import (
 )
 
 type fakeAPIStore struct {
-	orgs       map[string]*configstore.Org
-	users      map[string]*configstore.OrgUser
-	warehouses map[string]*configstore.ManagedWarehouse
-	teams      map[string]map[int64]*configstore.OrgTeam
-	// reattributeCalls records every non-nil reattributeUsageTeam passed to
-	// UpdateOrg (org → new team ids, in order), so tests can assert the handler
-	// requests bucket re-attribution exactly when default_team_id changes.
-	reattributeCalls []fakeReattributeCall
-	// teamBillingRepoints records every billing repoint requested through
-	// UpdateOrgTeam (usage re-attribution rides along in the real store).
-	teamBillingRepoints []fakeReattributeCall
+	orgs                map[string]*configstore.Org
+	users               map[string]*configstore.OrgUser
+	warehouses          map[string]*configstore.ManagedWarehouse
+	teams               map[string]map[int64]*configstore.OrgTeam
 	reloadSnapshotCalls int
 	reloadSnapshotErr   error
-}
-
-type fakeReattributeCall struct {
-	org    string
-	teamID int64
 }
 
 func newFakeAPIStore() *fakeAPIStore {
@@ -58,13 +46,19 @@ func (s *fakeAPIStore) ListOrgs() ([]configstore.Org, error) {
 	return orgs, nil
 }
 
-func (s *fakeAPIStore) CreateOrg(org *configstore.Org) error {
+func (s *fakeAPIStore) CreateOrg(org *configstore.Org, teamID int64, schemaName string) error {
 	if _, ok := s.orgs[org.Name]; ok {
 		return errors.New("duplicate org")
+	}
+	for _, t := range s.teams[org.Name] {
+		if t.SchemaName == schemaName {
+			return configstore.ErrOrgTeamSchemaConflict
+		}
 	}
 	clone := copyOrg(org)
 	clone.Warehouse = nil
 	s.orgs[org.Name] = clone
+	s.seedTeam(configstore.OrgTeam{OrgID: org.Name, TeamID: teamID, SchemaName: schemaName, Enabled: true})
 	return nil
 }
 
@@ -76,13 +70,10 @@ func (s *fakeAPIStore) GetOrg(name string) (*configstore.Org, error) {
 	return copyOrg(org), nil
 }
 
-func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error) {
+func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	org, ok := s.orgs[name]
 	if !ok {
 		return nil, false, nil
-	}
-	if reattributeUsageTeam != nil {
-		s.reattributeCalls = append(s.reattributeCalls, fakeReattributeCall{org: name, teamID: *reattributeUsageTeam})
 	}
 	org.MaxWorkers = updates.MaxWorkers
 	org.MaxVCPUs = updates.MaxVCPUs
@@ -99,12 +90,6 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org, reattribu
 			alias := *updates.HostnameAlias
 			org.HostnameAlias = &alias
 		}
-	}
-	// Mirrors gormAPIStore: nil = preserve, n = set (repointing the billing
-	// team). No clear path — the handler rejects 0/null/negative.
-	if updates.DefaultTeamID != nil {
-		teamID := *updates.DefaultTeamID
-		org.DefaultTeamID = &teamID
 	}
 	return copyOrg(org), true, nil
 }
@@ -195,14 +180,6 @@ func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 	}
 	if upd.EarliestEventDateSet {
 		team.EarliestEventDate = upd.EarliestEventDate
-	}
-	if upd.MakeBilling && (team.IsBillingTeam == nil || !*team.IsBillingTeam) {
-		for _, t := range s.teams[orgID] {
-			t.IsBillingTeam = nil
-		}
-		billing := true
-		team.IsBillingTeam = &billing
-		s.teamBillingRepoints = append(s.teamBillingRepoints, fakeReattributeCall{org: orgID, teamID: teamID})
 	}
 	clone := *team
 	return &prev, &clone, nil
@@ -1802,7 +1779,7 @@ func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant_alpha","hostname_alias":"entirely-chief-wildcat","default_team_id":12345}`)
+	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant_alpha","hostname_alias":"entirely-chief-wildcat","team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1824,7 +1801,7 @@ func TestCreateOrgEmptyHostnameAliasIsTreatedAsNone(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"plain","database_name":"plain","hostname_alias":"","default_team_id":12345}`)
+	body := []byte(`{"name":"plain","database_name":"plain","hostname_alias":"","team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1909,7 +1886,7 @@ func TestCreateOrgAcceptsLongValidHostnameAlias(t *testing.T) {
 
 	// 63 chars exactly — at the RFC 1035 DNS label limit.
 	alias := strings.Repeat("a", 63)
-	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q,"default_team_id":12345}`, alias))
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q,"team_id":12345}`, alias))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1925,7 +1902,7 @@ func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	alias := strings.Repeat("a", 64) // one over the limit
-	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q,"default_team_id":12345}`, alias))
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q,"team_id":12345}`, alias))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1961,35 +1938,26 @@ func TestUpdateOrgOmittingHostnameAliasPreservesIt(t *testing.T) {
 	}
 }
 
-func TestCreateOrgRequiresDefaultTeamID(t *testing.T) {
-	store := newFakeAPIStore()
-	router := newTestAPIRouter(store)
-
-	body := []byte(`{"name":"acme","database_name":"acme"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "default_team_id") {
-		t.Fatalf("rejection should name default_team_id: %s", rec.Body.String())
-	}
-	if _, ok := store.orgs["acme"]; ok {
-		t.Fatal("org should NOT have been created without default_team_id")
-	}
-}
-
-func TestCreateOrgRejectsNonPositiveDefaultTeamID(t *testing.T) {
-	for _, teamID := range []int64{0, -5} {
-		t.Run(fmt.Sprintf("team_id=%d", teamID), func(t *testing.T) {
+// TestCreateOrgRequiresTeamID: the admin org create carries the same
+// contract as provisioning — an org cannot exist without a team, so a create
+// without team_id is a 400 naming the field and creates nothing. The legacy
+// default_team_id key is NOT an alias here (admin is our own surface): a body
+// carrying only it still fails the team_id requirement.
+func TestCreateOrgRequiresTeamID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"missing team_id", `{"name":"acme","database_name":"acme"}`},
+		{"zero team_id", `{"name":"acme","database_name":"acme","team_id":0}`},
+		{"negative team_id", `{"name":"acme","database_name":"acme","team_id":-4}`},
+		{"legacy default_team_id is not an alias", `{"name":"acme","database_name":"acme","default_team_id":42}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			store := newFakeAPIStore()
 			router := newTestAPIRouter(store)
 
-			body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","default_team_id":%d}`, teamID))
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader([]byte(tc.body)))
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
@@ -1997,21 +1965,24 @@ func TestCreateOrgRejectsNonPositiveDefaultTeamID(t *testing.T) {
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 			}
-			if !strings.Contains(rec.Body.String(), "default_team_id") {
-				t.Fatalf("rejection should name default_team_id: %s", rec.Body.String())
+			if !strings.Contains(rec.Body.String(), "team_id") {
+				t.Fatalf("rejection should name team_id: %s", rec.Body.String())
 			}
 			if _, ok := store.orgs["acme"]; ok {
-				t.Fatal("org should NOT have been created")
+				t.Fatal("org should NOT have been created without a valid team_id")
 			}
 		})
 	}
 }
 
-func TestCreateOrgPersistsDefaultTeamID(t *testing.T) {
+// TestCreateOrgCreatesFirstTeamRow: a create with team_id lands the org AND
+// its first plain team row atomically; an omitted schema_name derives the
+// conventional "team_<id>", an explicit one is used verbatim.
+func TestCreateOrgCreatesFirstTeamRow(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"acme","database_name":"acme","default_team_id":42424}`)
+	body := []byte(`{"name":"acme","database_name":"acme","team_id":42424}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -2020,87 +1991,45 @@ func TestCreateOrgPersistsDefaultTeamID(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	stored := store.orgs["acme"]
-	if stored == nil || stored.DefaultTeamID == nil || *stored.DefaultTeamID != 42424 {
-		t.Fatalf("DefaultTeamID = %v, want pointer to 42424", stored.DefaultTeamID)
+	if _, ok := store.orgs["acme"]; !ok {
+		t.Fatal("org not created")
 	}
-}
-
-// TestUpdateOrgRejectsClearingDefaultTeamID pins the closed hole: the column is
-// NOT NULL, so the old clear semantics (0 or explicit JSON null → NULL) must be
-// rejected with a 400 and must not mutate the stored value. Negative values are
-// rejected too.
-func TestUpdateOrgRejectsClearingDefaultTeamID(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		body string
-	}{
-		{"zero clear sentinel", `{"default_team_id":0}`},
-		{"explicit JSON null", `{"default_team_id":null}`},
-		{"negative", `{"default_team_id":-3}`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeAPIStore()
-			teamID := int64(12345)
-			store.orgs["acme"] = &configstore.Org{
-				Name:          "acme",
-				DatabaseName:  "acme",
-				DefaultTeamID: &teamID,
-			}
-			router := newTestAPIRouter(store)
-
-			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(tc.body)))
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			router.ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
-			}
-			if !strings.Contains(rec.Body.String(), "default_team_id") {
-				t.Fatalf("rejection should name default_team_id: %s", rec.Body.String())
-			}
-			stored := store.orgs["acme"]
-			if stored.DefaultTeamID == nil || *stored.DefaultTeamID != 12345 {
-				t.Fatalf("DefaultTeamID mutated by rejected PUT: %v, want 12345", stored.DefaultTeamID)
-			}
-		})
+	team := store.teams["acme"][42424]
+	if team == nil || team.SchemaName != "team_42424" || !team.Enabled {
+		t.Fatalf("first team row = %+v, want team 42424 with conventional schema", team)
 	}
-}
 
-func TestUpdateOrgOmittingDefaultTeamIDPreservesIt(t *testing.T) {
-	store := newFakeAPIStore()
-	teamID := int64(12345)
-	store.orgs["acme"] = &configstore.Org{
-		Name:          "acme",
-		DatabaseName:  "acme",
-		DefaultTeamID: &teamID,
-	}
-	router := newTestAPIRouter(store)
-
-	body := []byte(`{"max_workers":8}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	body = []byte(`{"name":"beta","database_name":"beta","team_id":7,"schema_name":"custom_wh"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("explicit schema: status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	stored := store.orgs["acme"]
-	if stored.DefaultTeamID == nil || *stored.DefaultTeamID != 12345 {
-		t.Fatalf("DefaultTeamID not preserved: %v, want 12345", stored.DefaultTeamID)
+	if team := store.teams["beta"][7]; team == nil || team.SchemaName != "custom_wh" {
+		t.Fatalf("explicit schema team row = %+v, want custom_wh", team)
+	}
+
+	// An invalid schema name is rejected before anything is created.
+	body = []byte(`{"name":"gamma","database_name":"gamma","team_id":7,"schema_name":"Bad.Schema"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad schema: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := store.orgs["gamma"]; ok {
+		t.Fatal("org must not be created with an invalid schema name")
 	}
 }
 
-func TestUpdateOrgSetsDefaultTeamID(t *testing.T) {
+// TestUpdateOrgIgnoresLegacyDefaultTeamID: same accept-and-ignore stance on
+// the PUT — the field neither errors nor mutates anything.
+func TestUpdateOrgIgnoresLegacyDefaultTeamID(t *testing.T) {
 	store := newFakeAPIStore()
-	teamID := int64(12345)
-	store.orgs["acme"] = &configstore.Org{
-		Name:          "acme",
-		DatabaseName:  "acme",
-		DefaultTeamID: &teamID,
-	}
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme", MaxWorkers: 3}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{"default_team_id":67890}`)
@@ -2112,49 +2041,8 @@ func TestUpdateOrgSetsDefaultTeamID(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	stored := store.orgs["acme"]
-	if stored.DefaultTeamID == nil || *stored.DefaultTeamID != 67890 {
-		t.Fatalf("DefaultTeamID = %v, want 67890", stored.DefaultTeamID)
-	}
-}
-
-// TestUpdateOrgDefaultTeamIDChangeReattributesUsage pins the billing contract:
-// a PUT that CHANGES default_team_id must ask the store to re-attribute the
-// org's buffered usage buckets to the new team (in the same transaction as the
-// org update), while a PUT carrying the SAME value — or not carrying the field
-// at all — must not.
-func TestUpdateOrgDefaultTeamIDChangeReattributesUsage(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		body string
-		want []fakeReattributeCall
-	}{
-		{"changed value triggers reattribution", `{"default_team_id":67890}`, []fakeReattributeCall{{org: "acme", teamID: 67890}}},
-		{"same value does not", `{"default_team_id":12345}`, nil},
-		{"omitted field does not", `{"max_workers":8}`, nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeAPIStore()
-			teamID := int64(12345)
-			store.orgs["acme"] = &configstore.Org{
-				Name:          "acme",
-				DatabaseName:  "acme",
-				DefaultTeamID: &teamID,
-			}
-			router := newTestAPIRouter(store)
-
-			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(tc.body)))
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			router.ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-			}
-			if !slices.Equal(store.reattributeCalls, tc.want) {
-				t.Fatalf("reattribute calls = %+v, want %+v", store.reattributeCalls, tc.want)
-			}
-		})
+	if store.orgs["acme"].MaxWorkers != 3 {
+		t.Fatalf("unrelated field mutated: %+v", store.orgs["acme"])
 	}
 }
 
@@ -2492,7 +2380,7 @@ func TestCreateOrgAcceptsDefaultWorkerProfile(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"acme","database_name":"acme","default_worker_cpu":"2","default_worker_memory":"8Gi","default_worker_ttl":"75m","default_team_id":12345}`)
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_cpu":"2","default_worker_memory":"8Gi","default_worker_ttl":"75m","team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -2512,7 +2400,7 @@ func TestCreateOrgAcceptsDefaultWorkerMinHotIdle(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"acme","database_name":"acme","default_worker_min_hot_idle":1,"default_team_id":12345}`)
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_min_hot_idle":1,"team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -2838,41 +2726,22 @@ func TestAdminUpdateOrgTeamEarliestEventDate(t *testing.T) {
 	}
 }
 
-func TestAdminUpdateOrgTeamBillingRepoint(t *testing.T) {
+// TestAdminUpdateOrgTeamIgnoresLegacyBillingField: is_billing_team is gone
+// from the team PUT — a body still carrying it is accepted (unknown JSON key,
+// ignored), and nothing billing-shaped happens.
+func TestAdminUpdateOrgTeamIgnoresLegacyBillingField(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
-	billing := true
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, IsBillingTeam: &billing})
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
 	router := newTestAPIRouter(store)
 
-	// Clearing billing is rejected — repoint only.
 	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
-		`{"is_billing_team":false}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("clear billing: status = %d, want 400: %s", rec.Code, rec.Body.String())
-	}
-
-	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/2",
-		`{"is_billing_team":true}`)
+		`{"is_billing_team":true,"enabled":false}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("repoint: status = %d, want 200: %s", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if got := store.teams["acme"][2]; got.IsBillingTeam == nil || !*got.IsBillingTeam {
-		t.Fatalf("team 2 must be billing after repoint, got %+v", got)
-	}
-	if len(store.teamBillingRepoints) != 1 || store.teamBillingRepoints[0] != (fakeReattributeCall{org: "acme", teamID: 2}) {
-		t.Fatalf("billing repoint (with usage re-attribution) not requested: %+v", store.teamBillingRepoints)
-	}
-
-	// Marking the current billing team again is a no-op, not a re-attribution.
-	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/2",
-		`{"is_billing_team":true}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("idempotent repoint: status = %d, want 200: %s", rec.Code, rec.Body.String())
-	}
-	if len(store.teamBillingRepoints) != 1 {
-		t.Fatalf("idempotent repoint must not re-attribute again: %+v", store.teamBillingRepoints)
+	if store.teams["acme"][1].Enabled {
+		t.Fatal("the real field in the same body must still apply")
 	}
 }
 

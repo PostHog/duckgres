@@ -1472,8 +1472,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if cp.computeMeter != nil {
 			func() {
 				defer func() { _ = recover() }()
-				billOrg, billSource, millicores, mib, billDur := server.ConnectionBilling(cc)
-				cp.computeMeter.Record(billOrg, billSource, millicores, mib, time.Now(), billDur)
+				billOrg, billUser, billSource, millicores, mib, billDur := server.ConnectionBilling(cc)
+				cp.computeMeter.Record(billOrg, billUser, billSource, millicores, mib, time.Now(), billDur)
 			}()
 		}
 	}()

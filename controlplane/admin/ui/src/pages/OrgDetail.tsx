@@ -53,7 +53,6 @@ interface FormState {
   default_worker_ttl: string;
   default_worker_min_hot_idle: string;
   hostname_alias: string;
-  default_team_id: string;
 }
 
 function orgToForm(o: {
@@ -64,7 +63,6 @@ function orgToForm(o: {
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
   hostname_alias: string | null;
-  default_team_id?: number | null;
 }): FormState {
   return {
     max_workers: String(o.max_workers),
@@ -74,7 +72,6 @@ function orgToForm(o: {
     default_worker_ttl: o.default_worker_ttl,
     default_worker_min_hot_idle: String(o.default_worker_min_hot_idle),
     hostname_alias: o.hostname_alias ?? "",
-    default_team_id: o.default_team_id == null ? "" : String(o.default_team_id),
   };
 }
 
@@ -118,15 +115,6 @@ export function OrgDetail() {
 
   const save = async () => {
     setMsg(null);
-    // default_team_id is an integer on the wire (PostHog team id); the text
-    // input needs a digits-only guard so junk can't reach the backend. It is
-    // required (NOT NULL) server-side and cannot be cleared, so only a
-    // positive value is ever sent.
-    const teamIdText = form.default_team_id.trim();
-    if (teamIdText !== "" && (!/^\d+$/.test(teamIdText) || Number(teamIdText) === 0)) {
-      setMsg({ kind: "err", text: "Default team id must be a positive number." });
-      return;
-    }
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
       max_vcpus: Number(form.max_vcpus) || 0,
@@ -136,11 +124,6 @@ export function OrgDetail() {
       default_worker_min_hot_idle: Number(form.default_worker_min_hot_idle) || 0,
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
     };
-    // Empty input = preserve the stored value (omit the field). Sending 0 or
-    // null would be a clear, which the backend now rejects with a 400.
-    if (teamIdText !== "") {
-      body.default_team_id = Number(teamIdText);
-    }
     try {
       await update.mutateAsync(body);
       setMsg({ kind: "ok", text: "Saved." });
@@ -260,17 +243,6 @@ export function OrgDetail() {
                   onChange={(e) => set("hostname_alias", e.target.value)}
                 />
               </Field>
-              <Field label="Billing team id (wire field default_team_id)">
-                <Input
-                  value={form.default_team_id}
-                  placeholder="PostHog team id, e.g. 12345"
-                  onChange={(e) => set("default_team_id", e.target.value)}
-                />
-                <p className="text-[11px] text-muted-foreground">
-                  Repoints the org's billing team. All of the org's teams are listed below.
-                </p>
-              </Field>
-
               <div className="flex items-center gap-3 pt-1">
                 <AdminGate>
                   <Button size="sm" onClick={save} disabled={update.isPending}>
@@ -679,8 +651,6 @@ function ReshardHistory({ orgId }: { orgId: string }) {
 }
 
 // OrgTeamsCard lists the org's duckgres_org_teams rows with full CRUD.
-// The billing team is also editable as "default_team_id" in the config form
-// above (the legacy wire field) — both paths repoint the same row.
 function OrgTeamsCard({ orgId }: { orgId: string }) {
   const teams = useOrgTeams(orgId);
   const [creating, setCreating] = useState(false);
@@ -716,7 +686,6 @@ function OrgTeamsCard({ orgId }: { orgId: string }) {
                 <TableHead>Team id</TableHead>
                 <TableHead>Schema</TableHead>
                 <TableHead>Enabled</TableHead>
-                <TableHead>Billing</TableHead>
                 <TableHead>Backfill</TableHead>
                 <TableHead>Earliest event</TableHead>
                 <TableHead>Created</TableHead>
@@ -738,13 +707,6 @@ function OrgTeamsCard({ orgId }: { orgId: string }) {
                       <Badge variant="secondary">enabled</Badge>
                     ) : (
                       <Badge variant="destructive">disabled</Badge>
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    {t.is_billing_team ? (
-                      <Badge variant="success">billing</Badge>
-                    ) : (
-                      <span className="text-muted-foreground">—</span>
                     )}
                   </TableCell>
                   <TableCell>

@@ -1,11 +1,10 @@
 // Create / edit / delete dialogs for org teams (duckgres_org_teams rows),
 // shared by the Org teams page and the org detail page. The dialogs encode the
-// surface rules: billing is repointed (never cleared) and carries the org's
-// buffered usage with it; the org's last team cannot be deleted. The edit
-// dialog is the operator break-glass — it can change EVERY setting, including
-// the schema name (a config-only rename that moves no warehouse data) and the
-// legacy table-name overrides; schema immutability remains a user-facing-flow
-// rule, not an admin one.
+// surface rules: the org's last team cannot be deleted (an org must always
+// have at least one team). The edit dialog is the operator break-glass — it
+// can change EVERY setting, including the schema name (a config-only rename
+// that moves no warehouse data) and the legacy table-name overrides; schema
+// immutability remains a user-facing-flow rule, not an admin one.
 import { useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -220,15 +219,12 @@ function legacyNameBody(edited: string, current: string | null | undefined): str
 }
 
 // EditTeamDialog: the operator break-glass — every setting is editable,
-// including the schema name and the legacy table-name overrides. Billing can
-// only be pointed at this team, never cleared.
+// including the schema name and the legacy table-name overrides.
 export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () => void }) {
   const update = useUpdateOrgTeam();
-  const isBilling = Boolean(team.is_billing_team);
   const [schemaName, setSchemaName] = useState(team.schema_name);
   const [enabled, setEnabled] = useState(team.enabled);
   const [backfill, setBackfill] = useState(team.backfill_enabled);
-  const [makeBilling, setMakeBilling] = useState(false);
   const [eventsName, setEventsName] = useState(team.events_table_name ?? "");
   const [personsName, setPersonsName] = useState(team.persons_table_name ?? "");
   const [importsName, setImportsName] = useState(team.schema_data_imports_name ?? "");
@@ -243,7 +239,6 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
     if (schemaChanged) body.schema_name = schemaName.trim();
     if (enabled !== team.enabled) body.enabled = enabled;
     if (backfill !== team.backfill_enabled) body.backfill_enabled = backfill;
-    if (makeBilling && !isBilling) body.is_billing_team = true;
     const events = legacyNameBody(eventsName, team.events_table_name);
     if (events !== undefined) body.events_table_name = events;
     const persons = legacyNameBody(personsName, team.persons_table_name);
@@ -345,27 +340,6 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
             Cached by PostHog's backfill sensor; 9999-12-31 means the team has no event history.
             Clearing it makes the sensor re-discover the team's backfill range.
           </p>
-          {isBilling ? (
-            <p className="text-xs text-muted-foreground">
-              This is the org's billing team. To change it, mark another team as billing.
-            </p>
-          ) : (
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <Label>Make billing team</Label>
-                <Switch checked={makeBilling} onCheckedChange={setMakeBilling} />
-              </div>
-              {makeBilling && (
-                <p className="flex items-start gap-2 text-xs text-warning">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>
-                    Repoints the org's billing to this team and moves its buffered usage buckets
-                    along with it.
-                  </span>
-                </p>
-              )}
-            </div>
-          )}
           {error && <p className="text-xs text-destructive">{error}</p>}
         </div>
         <DialogFooter>
@@ -381,9 +355,9 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
   );
 }
 
-// DeleteTeamDialog: config-only delete with the two rules surfaced up front —
-// last-team deletion is refused (delete the org instead), and deleting the
-// billing team hands billing to the oldest remaining team.
+// DeleteTeamDialog: config-only delete with the last-team rule surfaced up
+// front — an org must always have at least one team, so deleting the last one
+// is refused (delete the org instead).
 export function DeleteTeamDialog({
   team,
   teamCount,
@@ -398,7 +372,6 @@ export function DeleteTeamDialog({
   const del = useDeleteOrgTeam();
   const [error, setError] = useState<string | null>(null);
   const isLast = teamCount <= 1;
-  const isBilling = Boolean(team.is_billing_team);
 
   const submit = async () => {
     setError(null);
@@ -423,24 +396,14 @@ export function DeleteTeamDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
-          {isLast ? (
+          {isLast && (
             <p className="flex items-start gap-2 text-xs text-destructive">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
               <span>
-                This is the org's last team and cannot be deleted. The only way to remove it is
-                deleting the org.
+                This is the org's last team and cannot be deleted (an org must always have at
+                least one team). The only way to remove it is deleting the org.
               </span>
             </p>
-          ) : (
-            isBilling && (
-              <p className="flex items-start gap-2 text-xs text-warning">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                <span>
-                  This is the billing team. The org's oldest remaining team automatically becomes
-                  billing, and buffered usage buckets move to it.
-                </span>
-              </p>
-            )
           )}
           {error && <p className="text-xs text-destructive">{error}</p>}
         </div>

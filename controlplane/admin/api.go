@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -25,10 +24,10 @@ import (
 
 var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
 
-// The teams association is read-only through the org endpoints: the billing
-// team is managed via the default_team_id field, and there is no direct
-// team-list mutation surface yet.
-var errOrgTeamsPayloadNotAllowed = errors.New("teams cannot be set directly; set the billing team via default_team_id")
+// The teams association is read-only through the org endpoints: team rows are
+// managed via the dedicated team routes (POST /teams, PUT/DELETE
+// /orgs/:id/teams/:team_id), never inline on the org payload.
+var errOrgTeamsPayloadNotAllowed = errors.New("teams cannot be set directly on the org payload; use the team endpoints")
 
 var errWarehouseStillExists = errors.New("managed warehouse still exists for org")
 
@@ -149,16 +148,13 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 
 type apiStore interface {
 	ListOrgs() ([]configstore.Org, error)
-	CreateOrg(org *configstore.Org) error
+	// CreateOrg creates the org row AND its required first team row (plain —
+	// no billing semantics) in one transaction; the handler validates
+	// teamID/schemaName before calling.
+	CreateOrg(org *configstore.Org, teamID int64, schemaName string) error
 	GetOrg(name string) (*configstore.Org, error)
-	// UpdateOrg persists the merged org row. reattributeUsageTeam is non-nil
-	// when the update changes the org's billing team (the wire field
-	// default_team_id): the store must then repoint the org's billing team row
-	// (duckgres_org_teams) AND re-attribute the org's buffered (unacked)
-	// billing buckets to that new team id in the SAME transaction as the
-	// org-row update, so a committed team change never leaves usage stranded
-	// under the old team.
-	UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error)
+	// UpdateOrg persists the merged org row.
+	UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error)
 	DeleteOrg(name string) (bool, error)
 
 	// Org teams. CreateOrgTeam is create-only (the admin surface never
@@ -166,13 +162,12 @@ type apiStore interface {
 	// configstore.ErrOrgTeamSchemaConflict for the two conflict shapes,
 	// gorm.ErrRecordNotFound for an unknown org. UpdateOrgTeam applies the
 	// presence-aware orgTeamUpdate (every column is editable — operator
-	// break-glass) and can repoint the billing team (usage buckets
-	// re-attributed in the same transaction); it returns the row as it was
-	// BEFORE the update alongside the stored result so the handler can audit
-	// old → new per field. A schema_name change that collides with another
-	// team in the org returns configstore.ErrOrgTeamSchemaConflict.
-	// Per-org list and delete are served by the provisioning API's routes on
-	// the same router group (identical rules — configstore.DeleteOrgTeamTx).
+	// break-glass); it returns the row as it was BEFORE the update alongside
+	// the stored result so the handler can audit old → new per field. A
+	// schema_name change that collides with another team in the org returns
+	// configstore.ErrOrgTeamSchemaConflict. Per-org list and delete are
+	// served by the provisioning API's routes on the same router group
+	// (identical rules — configstore.DeleteOrgTeamTx).
 	ListAllOrgTeams() ([]configstore.OrgTeam, error)
 	CreateOrgTeam(orgID string, team *configstore.OrgTeam) error
 	UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (prev, stored *configstore.OrgTeam, err error)
@@ -218,25 +213,22 @@ func (s *gormAPIStore) ListOrgs() ([]configstore.Org, error) {
 	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").Find(&orgs).Error; err != nil {
 		return nil, err
 	}
-	for i := range orgs {
-		orgs[i].DefaultTeamID = orgs[i].BillingTeamID()
-	}
 	return orgs, nil
 }
 
-func (s *gormAPIStore) CreateOrg(org *configstore.Org) error {
+func (s *gormAPIStore) CreateOrg(org *configstore.Org, teamID int64, schemaName string) error {
 	org.Warehouse = nil
-	// One transaction: org row + its billing team row (duckgres_org_teams).
-	// The handler already required a positive DefaultTeamID, so a created org
-	// is always born with its billing team.
+	// One transaction: org row + its first team row (same contract as the
+	// provisioning path — an org cannot exist without a team).
 	return s.db().Transaction(func(tx *gorm.DB) error {
 		if err := tx.Omit("Warehouse", "Teams").Create(org).Error; err != nil {
 			return err
 		}
-		if org.DefaultTeamID == nil {
-			return nil
-		}
-		return configstore.SetOrgBillingTeamTx(tx, org.Name, *org.DefaultTeamID)
+		_, err := configstore.UpsertOrgTeamTx(tx, org.Name, configstore.OrgTeamUpsert{
+			TeamID:     teamID,
+			SchemaName: schemaName,
+		})
+		return err
 	})
 }
 
@@ -245,11 +237,10 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").First(&org, "name = ?", name).Error; err != nil {
 		return nil, err
 	}
-	org.DefaultTeamID = org.BillingTeamID()
 	return &org, nil
 }
 
-func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org, reattributeUsageTeam *int64) (*configstore.Org, bool, error) {
+func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	fields := map[string]interface{}{
 		"max_workers": updates.MaxWorkers,
 		"max_vcpus":   updates.MaxVCPUs,
@@ -270,46 +261,18 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org, reattribu
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
-	// The billing team (wire field default_team_id) is not an org column: a
-	// change repoints the org's duckgres_org_teams billing row inside the same
-	// transaction below. The handler rejects 0/null/negative before this runs
-	// and only passes reattributeUsageTeam when the value actually changes.
 	found := false
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		// Serialize with org connection admission (request-owned leases read
+		// org limits under this lock) — see LockOrgConnectionAdmissionTx.
 		if err := configstore.LockOrgConnectionAdmissionTx(tx, name); err != nil {
 			return err
 		}
-
 		result := tx.Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 		if result.Error != nil {
 			return result.Error
 		}
-		if result.RowsAffected == 0 {
-			return nil
-		}
-		found = true
-		if reattributeUsageTeam != nil {
-			// Read the pre-update team id purely for the log line — the
-			// handler already decided the billing team changes.
-			oldTeam, err := configstore.OrgBillingTeamIDTx(tx, name)
-			if err != nil {
-				return err
-			}
-			if err := configstore.SetOrgBillingTeamTx(tx, name, *reattributeUsageTeam); err != nil {
-				return err
-			}
-			// Same transaction as the billing-team repoint: a committed team
-			// change always carries its buffered buckets along. In-flight
-			// metering under the old team can still land a small residual row
-			// right after this (config-snapshot poll lag, ~30s) — tolerated,
-			// see configstore.ReattributeUsageTeamTx.
-			moved, err := configstore.ReattributeUsageTeamTx(tx, name, *reattributeUsageTeam)
-			if err != nil {
-				return err
-			}
-			slog.Info("Re-attributed org usage buckets to new billing team.",
-				"org", name, "old_team", oldTeam, "new_team", *reattributeUsageTeam, "rows", moved)
-		}
+		found = result.RowsAffected > 0
 		return nil
 	})
 	if err != nil {
@@ -402,10 +365,6 @@ type orgTeamUpdate struct {
 	// clears the column back to NULL, making the sensor re-resolve it.
 	EarliestEventDateSet bool
 	EarliestEventDate    *configstore.EventDate
-	// MakeBilling repoints the org's billing team to this row (the buffered
-	// usage buckets follow atomically). There is no "unset billing" — every
-	// org must keep a billing team; repoint by marking another team.
-	MakeBilling bool
 }
 
 func (s *gormAPIStore) ListAllOrgTeams() ([]configstore.OrgTeam, error) {
@@ -521,25 +480,6 @@ func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpda
 				Updates(fields).Error; err != nil {
 				return err
 			}
-		}
-
-		if upd.MakeBilling && (team.IsBillingTeam == nil || !*team.IsBillingTeam) {
-			// Repointing billing carries the org's buffered usage buckets
-			// along in the SAME transaction — identical to the
-			// default_team_id repoint on the org endpoints.
-			oldTeam, err := configstore.OrgBillingTeamIDTx(tx, orgID)
-			if err != nil {
-				return err
-			}
-			if err := configstore.SetOrgBillingTeamTx(tx, orgID, teamID); err != nil {
-				return err
-			}
-			moved, err := configstore.ReattributeUsageTeamTx(tx, orgID, teamID)
-			if err != nil {
-				return err
-			}
-			slog.Info("Re-attributed org usage buckets to new billing team.",
-				"org", orgID, "old_team", oldTeam, "new_team", teamID, "rows", moved)
 		}
 
 		return tx.First(&stored, "org_id = ? AND team_id = ?", orgID, teamID).Error
@@ -897,12 +837,23 @@ func (h *apiHandler) listOrgs(c *gin.Context) {
 	c.JSON(http.StatusOK, orgs)
 }
 
+// createOrgRequest is the POST /orgs body: the org config plus its REQUIRED
+// first team (same contract as the provisioning API — an org cannot exist
+// without a team). schema_name is optional; omitted derives the conventional
+// "team_<id>". No billing semantics — the row is a plain team.
+type createOrgRequest struct {
+	configstore.Org
+	TeamID     int64  `json:"team_id"`
+	SchemaName string `json:"schema_name"`
+}
+
 func (h *apiHandler) createOrg(c *gin.Context) {
-	var org configstore.Org
-	if err := c.ShouldBindJSON(&org); err != nil {
+	var req createOrgRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	org := req.Org
 	if err := validateOrgMutationPayload(&org); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -911,14 +862,16 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	// Every org must be born with its billing PostHog team — it is the
-	// billing bucket key, stored as the org's duckgres_org_teams row with
-	// is_billing_team = TRUE (same invariant as the provisioning API's
-	// ErrDefaultTeamIDRequired). The wire field keeps its historical
-	// default_team_id name. Positivity of a present value is enforced by
-	// validateOrgMutationPayload above.
-	if org.DefaultTeamID == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id is required (the org's billing PostHog team id)"})
+	if req.TeamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id — every org must have at least one team)"})
+		return
+	}
+	schemaName := req.SchemaName
+	if schemaName == "" {
+		schemaName = fmt.Sprintf("team_%d", req.TeamID)
+	}
+	if err := configstore.ValidateOrgTeamSchemaName(schemaName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	// Normalize empty hostname_alias to NULL on insert so the unique index
@@ -930,8 +883,8 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 	}
 	// POST /orgs has no :id param, so the audit org column is blank — record the
 	// created org's name here instead.
-	setAuditDetail(c, "created org "+org.Name)
-	if err := h.store.CreateOrg(&org); err != nil {
+	setAuditDetail(c, fmt.Sprintf("created org %s (first team %d, schema %s)", org.Name, req.TeamID, schemaName))
+	if err := h.store.CreateOrg(&org, req.TeamID, schemaName); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
@@ -1002,28 +955,6 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
-	// Set when the PUT actually changes default_team_id (the org's billing
-	// team): the store then repoints the org's duckgres_org_teams billing row
-	// and re-attributes the buffered (unacked) billing buckets to the new
-	// team in the same transaction as the org update, so the next billing pull
-	// reports them under the new team (docs/design/billing-pull-api.md,
-	// "Changing an org's default team").
-	var reattributeUsageTeam *int64
-	if _, ok := fields["default_team_id"]; ok {
-		// Key present: a positive number sets. Clearing is rejected — every
-		// org must keep a billing team (the billing bucket key). An explicit
-		// JSON null unmarshals to a nil pointer here; 0 and negatives are
-		// already rejected by validateOrgMutationPayload above.
-		if updates.DefaultTeamID == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "default_team_id cannot be cleared (every org must keep a billing team); pass a valid team id"})
-			return
-		}
-		merged.DefaultTeamID = updates.DefaultTeamID
-		if existing.DefaultTeamID == nil || *existing.DefaultTeamID != *updates.DefaultTeamID {
-			reattributeUsageTeam = updates.DefaultTeamID
-		}
-	}
-
 	// Audit detail: which fields changed and their old → new values, so the
 	// console shows "max_workers 4 → 10" instead of a bare "org.update". These
 	// are all non-sensitive config columns (no credentials among them).
@@ -1040,12 +971,11 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
 	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
 	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
-	addChange("default_team_id", orgInt64Ptr(existing.DefaultTeamID), orgInt64Ptr(merged.DefaultTeamID))
 	if len(changes) > 0 {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}
 
-	org, ok, err := h.store.UpdateOrg(name, merged, reattributeUsageTeam)
+	org, ok, err := h.store.UpdateOrg(name, merged)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1151,13 +1081,11 @@ func (h *apiHandler) createOrgTeam(c *gin.Context) {
 // backfill_enabled likewise rejects an explicit null (NOT NULL DEFAULT TRUE,
 // migration 000028). The nullable columns (earliest_event_date and the three
 // legacy table-name overrides) treat an explicit JSON null — and, for the
-// table names, "" — as "clear back to NULL". Billing can only be pointed AT a
-// team (is_billing_team: true), never cleared.
+// table names, "" — as "clear back to NULL".
 type updateOrgTeamRequest struct {
 	SchemaName            *string `json:"schema_name,omitempty"`
 	Enabled               *bool   `json:"enabled,omitempty"`
 	BackfillEnabled       *bool   `json:"backfill_enabled,omitempty"`
-	IsBillingTeam         *bool   `json:"is_billing_team,omitempty"`
 	EventsTableName       *string `json:"events_table_name,omitempty"`
 	PersonsTableName      *string `json:"persons_table_name,omitempty"`
 	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
@@ -1216,10 +1144,6 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 			return
 		}
 	}
-	if _, ok := fields["is_billing_team"]; ok && (req.IsBillingTeam == nil || !*req.IsBillingTeam) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "is_billing_team can only be set to true (repoint billing by marking another team); every org must keep a billing team"})
-		return
-	}
 	for name, v := range map[string]*string{
 		"events_table_name":        req.EventsTableName,
 		"persons_table_name":       req.PersonsTableName,
@@ -1257,7 +1181,6 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 		SchemaName:           req.SchemaName,
 		Enabled:              req.Enabled,
 		Backfill:             req.BackfillEnabled,
-		MakeBilling:          req.IsBillingTeam != nil && *req.IsBillingTeam,
 		EarliestEventDateSet: earliestSet,
 		EarliestEventDate:    earliest,
 	}
@@ -1291,7 +1214,6 @@ func (h *apiHandler) updateOrgTeam(c *gin.Context) {
 	addChange("schema_name", prev.SchemaName, team.SchemaName)
 	addChange("enabled", fmt.Sprintf("%v", prev.Enabled), fmt.Sprintf("%v", team.Enabled))
 	addChange("backfill_enabled", orgBoolPtr(prev.BackfillEnabled), orgBoolPtr(team.BackfillEnabled))
-	addChange("is_billing_team", orgBoolPtr(prev.IsBillingTeam), orgBoolPtr(team.IsBillingTeam))
 	addChange("events_table_name", orgStrPtr(prev.EventsTableName), orgStrPtr(team.EventsTableName))
 	addChange("persons_table_name", orgStrPtr(prev.PersonsTableName), orgStrPtr(team.PersonsTableName))
 	addChange("schema_data_imports_name", orgStrPtr(prev.SchemaDataImportsName), orgStrPtr(team.SchemaDataImportsName))
@@ -1355,16 +1277,6 @@ func orgBoolPtr(b *bool) string {
 	return fmt.Sprintf("%v", *b)
 }
 
-// orgInt64Ptr renders an optional org config integer (nil or 0 == unset) for
-// audit detail. Every org keeps a billing team nowadays, so "(unset)" only
-// ever renders for legacy display of orgs predating that.
-func orgInt64Ptr(v *int64) string {
-	if v == nil || *v == 0 {
-		return "(unset)"
-	}
-	return fmt.Sprintf("%d", *v)
-}
-
 func validateOrgMutationPayload(org *configstore.Org) error {
 	if org == nil {
 		return nil
@@ -1388,13 +1300,6 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	if org.MaxVCPUs < 0 {
 		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
-	}
-	// Shared by create and update: nil stays allowed here (create requires
-	// the field itself; update treats an absent field as "preserve"), but a
-	// present value must be a positive PostHog team id — a billing team row
-	// is never stored with team 0, so there is no clear sentinel.
-	if org.DefaultTeamID != nil && *org.DefaultTeamID <= 0 {
-		return fmt.Errorf("default_team_id: value %d must be a positive PostHog team id (it cannot be cleared — every org must keep a billing team)", *org.DefaultTeamID)
 	}
 	return nil
 }

@@ -54,14 +54,6 @@ export function Orgs() {
         },
       },
       {
-        accessorKey: "default_team_id",
-        header: "Default team",
-        cell: ({ getValue }) => {
-          const v = getValue() as number | null;
-          return v ? <span className="font-mono text-xs">{v}</span> : <span className="text-muted-foreground">—</span>;
-        },
-      },
-      {
         accessorKey: "max_workers",
         header: "Max workers",
         cell: ({ getValue }) => {

@@ -16,8 +16,6 @@ import (
 
 func i64(v int64) *int64 { return &v }
 
-func boolPtrD(v bool) *bool { return &v }
-
 func strPtrD(v string) *string { return &v }
 
 // seedTeam adds one duckgres_org_teams row to the fake (delegates to the
@@ -39,11 +37,10 @@ func seedWarehouse(s *fakeStore, orgID string, teamID *int64, state configstore.
 	}
 	if teamID != nil {
 		seedTeam(s, orgID, configstore.OrgTeam{
-			TeamID:        *teamID,
-			SchemaName:    fmt.Sprintf("team_%d", *teamID),
-			Enabled:       true,
-			IsBillingTeam: boolPtrD(true),
-			UpdatedAt:     updatedAt,
+			TeamID:     *teamID,
+			SchemaName: fmt.Sprintf("team_%d", *teamID),
+			Enabled:    true,
+			UpdatedAt:  updatedAt,
 		})
 	}
 	s.warehouses[orgID] = &configstore.ManagedWarehouse{
@@ -165,7 +162,7 @@ func TestListWarehousesPayload(t *testing.T) {
 		t.Fatalf("teams from duckgres_org_teams rows, got %+v", w.Teams)
 	}
 	if !w.Teams[0].Enabled {
-		t.Fatalf("billing team must serve enabled=true, got %+v", w.Teams[0])
+		t.Fatalf("team must serve enabled=true, got %+v", w.Teams[0])
 	}
 	if w.Teams[0].EventsTable != "team_50689.events" {
 		t.Fatalf("derived events_table wrong: %+v", w.Teams[0])
@@ -228,8 +225,8 @@ func TestListWarehousesBrokenTeamRows(t *testing.T) {
 	s := newFakeStore()
 	now := time.Now()
 	seedWarehouse(s, "org-ok", i64(2), configstore.ManagedWarehouseStateReady, now)
-	// Warehouse with NO team rows at all (every org gets a billing row at
-	// provision; zero rows is a data inconsistency — degrade to empty
+	// Warehouse with NO team rows at all (every org gets its first team row
+	// at provision; zero rows is a data inconsistency — degrade to empty
 	// teams, never hide the warehouse).
 	seedWarehouse(s, "org-noteams", nil, configstore.ManagedWarehouseStateReady, now)
 
@@ -417,7 +414,6 @@ func TestResolvedTableNames(t *testing.T) {
 		TeamID:          2,
 		SchemaName:      "posthog",
 		Enabled:         true,
-		IsBillingTeam:   boolPtrD(true),
 		EventsTableName: strPtrD("legacy_events"),
 	})
 

@@ -14,10 +14,10 @@ import (
 var ErrOrgTeamNotFound = errors.New("org team not found")
 
 // ErrLastOrgTeam is returned by DeleteOrgTeamTx when the row is the org's LAST
-// team. An org must always keep at least one team (the billing team is the
-// billing bucket key); the only way to remove the last team is deleting the
-// org itself. HTTP handlers map it to 409.
-var ErrLastOrgTeam = errors.New("cannot delete the org's last team; deleting the org is the only way to remove it")
+// team. An org must always have at least one team — deleting the last one
+// would leave a teamless, unroutable warehouse; deleting the org is the only
+// way to remove it. HTTP handlers map it to 409.
+var ErrLastOrgTeam = errors.New("cannot delete the org's last team (an org must always have at least one team); deleting the org is the only way to remove it")
 
 // ErrOrgTeamSchemaConflict is returned by UpsertOrgTeamTx when the requested
 // schema_name is already used by a DIFFERENT team in the same org (two teams
@@ -91,52 +91,6 @@ func validateOrgTeamTableNames(up OrgTeamUpsert) error {
 		if err := ValidateOrgTeamTableName(f.field, *f.value); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// OrgBillingTeamIDTx returns the org's current billing team id (the
-// duckgres_org_teams row with is_billing_team = TRUE) inside the caller's
-// transaction, or 0 when the org has none.
-func OrgBillingTeamIDTx(tx *gorm.DB, orgID string) (int64, error) {
-	var ids []int64
-	if err := tx.Model(&OrgTeam{}).
-		Where("org_id = ? AND is_billing_team IS TRUE", orgID).
-		Pluck("team_id", &ids).Error; err != nil {
-		return 0, fmt.Errorf("read billing team (org=%s): %w", orgID, err)
-	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	return ids[0], nil
-}
-
-// SetOrgBillingTeamTx points the org's billing team at teamID inside the
-// caller's transaction. Any other row currently marked billing is demoted
-// first — the partial unique index (at most one billing row per org, migration
-// 000024) is checked immediately, not deferred, so the order matters. When the
-// org doesn't have teamID yet the row is inserted with the conventional
-// "team_<id>" schema and enabled = TRUE; an existing row keeps its
-// schema/enabled/backfill state and only gains the billing mark.
-//
-// Callers that change an EXISTING org's billing team must re-attribute its
-// buffered usage buckets in the same transaction (ReattributeUsageTeamTx) so
-// the billing pull never strands usage under the stale team.
-func SetOrgBillingTeamTx(tx *gorm.DB, orgID string, teamID int64) error {
-	if err := tx.Exec(`
-		UPDATE duckgres_org_teams
-		SET is_billing_team = NULL, updated_at = now()
-		WHERE org_id = ? AND team_id <> ? AND is_billing_team IS TRUE`,
-		orgID, teamID).Error; err != nil {
-		return fmt.Errorf("demote billing team (org=%s): %w", orgID, err)
-	}
-	if err := tx.Exec(`
-		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, is_billing_team, created_at, updated_at)
-		VALUES (?, ?, ?, TRUE, TRUE, now(), now())
-		ON CONFLICT (org_id, team_id)
-		DO UPDATE SET is_billing_team = TRUE, updated_at = now()`,
-		orgID, teamID, fmt.Sprintf("team_%d", teamID)).Error; err != nil {
-		return fmt.Errorf("set billing team (org=%s team=%d): %w", orgID, teamID, err)
 	}
 	return nil
 }
@@ -310,39 +264,26 @@ func applyOrgTeamTableNames(row *OrgTeam, up OrgTeamUpsert) {
 	}
 }
 
-// OrgTeamDeleteResult reports what DeleteOrgTeamTx did beyond the delete
-// itself, so callers can surface the billing handover.
-type OrgTeamDeleteResult struct {
-	// WasBilling is true when the deleted row carried the billing mark.
-	WasBilling bool
-	// NewBillingTeamID is the remaining team that automatically became the
-	// billing team (the one with the OLDEST created_at). 0 when the deleted
-	// row was not the billing team.
-	NewBillingTeamID int64
-	// UsageRowsMoved counts the buffered usage-bucket rows re-attributed to
-	// the new billing team.
-	UsageRowsMoved int64
-}
-
 // DeleteOrgTeamTx deletes the (org, team) CONFIG row inside the caller's
 // transaction. It never touches warehouse data — the team's schema and tables
 // stay untouched; only the mapping goes away.
 //
-// Rules, atomic with the delete:
-//   - The org's LAST team cannot be deleted (ErrLastOrgTeam) — deleting the
-//     org is the only way to remove it. Every org must keep a billing team.
-//   - Deleting the billing team automatically promotes the remaining team
-//     with the OLDEST created_at (ties broken by team_id) and re-attributes
-//     the org's buffered usage buckets to it (ReattributeUsageTeamTx), the
-//     same handover a billing repoint does.
+// The org's LAST team cannot be deleted (ErrLastOrgTeam): an org must always
+// have at least one team — deleting the last one would leave a teamless,
+// unroutable warehouse. Deleting the org is the only way to remove it.
+//
+// Buffered usage buckets are NOT re-attributed: the stamped team_id is
+// informational (the org's oldest team / the connecting user's team at record
+// time) and team-level billing attribution is owned by the external billing
+// service.
 //
 // The org admission lock is acquired before any row locks so removing a
 // project-reader login serializes with admission decisions that read it. All
 // of the org's team rows are then locked up front so two concurrent deletes
 // can't each see the other's row as "remaining" and empty the org.
-func DeleteOrgTeamTx(tx *gorm.DB, orgID string, teamID int64) (*OrgTeamDeleteResult, error) {
+func DeleteOrgTeamTx(tx *gorm.DB, orgID string, teamID int64) error {
 	if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
-		return nil, fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
+		return fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
 	}
 
 	var teams []OrgTeam
@@ -350,66 +291,44 @@ func DeleteOrgTeamTx(tx *gorm.DB, orgID string, teamID int64) (*OrgTeamDeleteRes
 		Where("org_id = ?", orgID).
 		Order("created_at, team_id").
 		Find(&teams).Error; err != nil {
-		return nil, fmt.Errorf("lock org teams (org=%s): %w", orgID, err)
+		return fmt.Errorf("lock org teams (org=%s): %w", orgID, err)
 	}
 
-	var target *OrgTeam
-	var successor *OrgTeam
+	found := false
+	remaining := 0
 	for i := range teams {
 		if teams[i].TeamID == teamID {
-			target = &teams[i]
-		} else if successor == nil {
-			// First non-target in (created_at, team_id) order = the oldest
-			// remaining team.
-			successor = &teams[i]
+			found = true
+		} else {
+			remaining++
 		}
 	}
-	if target == nil {
-		return nil, ErrOrgTeamNotFound
+	if !found {
+		return ErrOrgTeamNotFound
 	}
-	if successor == nil {
-		return nil, ErrLastOrgTeam
+	if remaining == 0 {
+		return ErrLastOrgTeam
 	}
 
 	// Remove the team's scoped login before its mapping. This is deliberately
 	// explicit so deleting and recreating a team cannot reactivate old credentials.
 	if err := tx.Where("org_id = ? AND access_mode = ? AND team_id = ?", orgID, "project_reader", teamID).
 		Delete(&OrgUser{}).Error; err != nil {
-		return nil, fmt.Errorf("delete project reader (org=%s team=%d): %w", orgID, teamID, err)
+		return fmt.Errorf("delete project reader (org=%s team=%d): %w", orgID, teamID, err)
 	}
 
 	if err := tx.Where("org_id = ? AND team_id = ?", orgID, teamID).
 		Delete(&OrgTeam{}).Error; err != nil {
-		return nil, fmt.Errorf("delete org team (org=%s team=%d): %w", orgID, teamID, err)
+		return fmt.Errorf("delete org team (org=%s team=%d): %w", orgID, teamID, err)
 	}
-	// A DELETE leaves no updated_at bump behind, so a non-billing deletion
-	// would be invisible to change-marker consumers (discovery's
-	// config_generation is MAX(updated_at) over the three config tables) —
-	// the exact removal signal a poller must not skip. Touch the parent
-	// org row in the same transaction so the marker advances.
+	// A DELETE leaves no updated_at bump behind, so a deletion would be
+	// invisible to change-marker consumers (discovery's config_generation is
+	// MAX(updated_at) over the three config tables) — the exact removal
+	// signal a poller must not skip. Touch the parent org row in the same
+	// transaction so the marker advances.
 	if err := tx.Model(&Org{}).Where("name = ?", orgID).
 		Update("updated_at", gorm.Expr("now()")).Error; err != nil {
-		return nil, fmt.Errorf("touch org row after team delete (org=%s): %w", orgID, err)
+		return fmt.Errorf("touch org row after team delete (org=%s): %w", orgID, err)
 	}
-
-	res := &OrgTeamDeleteResult{
-		WasBilling: target.IsBillingTeam != nil && *target.IsBillingTeam,
-	}
-	if !res.WasBilling {
-		return res, nil
-	}
-
-	// The billing team is gone: the oldest remaining team takes over, and the
-	// org's buffered usage buckets follow it in the same transaction — exactly
-	// the handover a billing repoint performs.
-	if err := SetOrgBillingTeamTx(tx, orgID, successor.TeamID); err != nil {
-		return nil, err
-	}
-	moved, err := ReattributeUsageTeamTx(tx, orgID, successor.TeamID)
-	if err != nil {
-		return nil, err
-	}
-	res.NewBillingTeamID = successor.TeamID
-	res.UsageRowsMoved = moved
-	return res, nil
+	return nil
 }

@@ -160,7 +160,7 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "scenario_smoke_") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
 	}
-	requireScenarioDefaultTeamID(t, request)
+	requireScenarioTeamID(t, request)
 }
 
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
@@ -204,7 +204,7 @@ func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 					if !ok {
 						t.Fatalf("provision request = %#v, want map", step.With["request"])
 					}
-					requireScenarioDefaultTeamID(t, request)
+					requireScenarioTeamID(t, request)
 				}
 			}
 		})
@@ -371,7 +371,7 @@ func TestProvisionRejectionScenarioUsesExpectedProvisionFailure(t *testing.T) {
 	if !ok {
 		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
 	}
-	requireScenarioDefaultTeamID(t, request)
+	requireScenarioTeamID(t, request)
 }
 
 func TestFrozenMetadataScenarioRequiresDatasetURI(t *testing.T) {
@@ -759,14 +759,14 @@ func dispatchSupports(stepType string) bool {
 	}
 }
 
-func requireScenarioDefaultTeamID(t *testing.T, request map[string]any) {
+func requireScenarioTeamID(t *testing.T, request map[string]any) {
 	t.Helper()
-	defaultTeamID, ok := request["default_team_id"]
+	teamID, ok := request["team_id"]
 	if !ok {
-		t.Fatal("provision request should include default_team_id")
+		t.Fatal("provision request should include team_id (required for new orgs)")
 	}
-	if fmt.Sprint(defaultTeamID) != "1" {
-		t.Fatalf("default_team_id = %#v, want numeric 1", defaultTeamID)
+	if fmt.Sprint(teamID) != "1" {
+		t.Fatalf("team_id = %#v, want numeric 1", teamID)
 	}
 }
 

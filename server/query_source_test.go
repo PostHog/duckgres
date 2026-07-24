@@ -420,7 +420,7 @@ func TestConnectionBillingClampsQuerySource(t *testing.T) {
 	}
 	for stored, want := range cases {
 		cc := &clientConn{querySource: stored, backendStart: time.Now(), workerMillicores: 1000, workerMiB: 1024}
-		_, qs, _, _, _ := ConnectionBilling(cc)
+		_, _, qs, _, _, _ := ConnectionBilling(cc)
 		if qs != want {
 			t.Fatalf("ConnectionBilling with stored %q: querySource = %q, want %q", stored, qs, want)
 		}

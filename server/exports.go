@@ -207,11 +207,13 @@ func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 }
 
 // ConnectionBilling returns the data needed to meter one connection's
-// compute-usage at teardown: the org, the session's query source (the
-// `duckgres.query_source` GUC — "standard" unless the client set it), the
-// provisioned worker size in milli-units, and the connection's elapsed
-// lifetime. millicores == 0 means metering should be skipped (unknown worker
-// size). Call at the same teardown point as CloseConnectionMetrics. A
+// compute-usage at teardown: the org, the authenticated username (used to
+// resolve the informational team id stamped onto the bucket — the user's own
+// team when it has one, else the org's oldest team), the session's query
+// source (the `duckgres.query_source` GUC — "standard" unless the client set
+// it), the provisioned worker size in milli-units, and the connection's
+// elapsed lifetime. millicores == 0 means metering should be skipped (unknown
+// worker size). Call at the same teardown point as CloseConnectionMetrics. A
 // mid-connection GUC change is not split: the whole connection is metered
 // under the final value (documented in docs/design/billing-pull-api.md).
 //
@@ -220,9 +222,9 @@ func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 // time), so a non-canonical value here means a validation bypass — degrade it
 // to the default rather than writing unbounded-cardinality client input into
 // the billing bucket key (and onward into billing exports).
-func ConnectionBilling(cc *clientConn) (orgID, querySource string, millicores, mib int64, dur time.Duration) {
+func ConnectionBilling(cc *clientConn) (orgID, username, querySource string, millicores, mib int64, dur time.Duration) {
 	if cc == nil {
-		return "", "", 0, 0, 0
+		return "", "", "", 0, 0, 0
 	}
 	qs := cc.QuerySource()
 	if qs != transform.QuerySourceStandard && qs != transform.QuerySourceEndpoints {
@@ -232,7 +234,7 @@ func ConnectionBilling(cc *clientConn) (orgID, querySource string, millicores, m
 			"value_len", len(qs))
 		qs = defaultQuerySource
 	}
-	return cc.orgID, qs, cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
+	return cc.orgID, cc.username, qs, cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
 }
 
 // CancelClientConn cancels the context of a clientConn.

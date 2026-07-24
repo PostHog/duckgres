@@ -552,20 +552,29 @@ func TestOrgDefaultWorkerProfile(t *testing.T) {
 	}
 }
 
-func TestOrgBillingTeamID(t *testing.T) {
+func TestOrgOldestTeamID(t *testing.T) {
+	older := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
 			Orgs: map[string]*OrgConfig{
 				"no-teams": {Name: "no-teams"},
-				"no-billing-team": {
-					Name:  "no-billing-team",
-					Teams: []OrgTeamConfig{{TeamID: 7, SchemaName: "team_7", Enabled: true}},
+				"one-team": {
+					Name:  "one-team",
+					Teams: []OrgTeamConfig{{TeamID: 7, SchemaName: "team_7", Enabled: true, CreatedAt: newer}},
 				},
-				"billing": {
-					Name: "billing",
+				"multi": {
+					Name: "multi",
 					Teams: []OrgTeamConfig{
-						{TeamID: 7, SchemaName: "team_7", Enabled: true},
-						{TeamID: 42, SchemaName: "team_42", Enabled: true, IsBillingTeam: true},
+						{TeamID: 7, SchemaName: "team_7", Enabled: true, CreatedAt: newer},
+						{TeamID: 42, SchemaName: "team_42", Enabled: true, CreatedAt: older},
+					},
+				},
+				"tie": {
+					Name: "tie",
+					Teams: []OrgTeamConfig{
+						{TeamID: 9, SchemaName: "team_9", Enabled: true, CreatedAt: older},
+						{TeamID: 3, SchemaName: "team_3", Enabled: true, CreatedAt: older},
 					},
 				},
 			},
@@ -577,21 +586,70 @@ func TestOrgBillingTeamID(t *testing.T) {
 		want  int64
 	}{
 		{"unknown", 0},
-		{"no-teams", 0},
-		{"no-billing-team", 0},
-		{"billing", 42},
+		{"no-teams", 0}, // defensive: a committed org always has ≥1 team
+		{"one-team", 7},
+		{"multi", 42}, // oldest created_at wins
+		{"tie", 3},    // created_at tie broken by the smaller team_id
 	}
 	for _, tt := range tests {
-		if got := cs.OrgBillingTeamID(tt.orgID); got != tt.want {
-			t.Errorf("OrgBillingTeamID(%q) = %d; want %d", tt.orgID, got, tt.want)
+		if got := cs.OrgOldestTeamID(tt.orgID); got != tt.want {
+			t.Errorf("OrgOldestTeamID(%q) = %d; want %d", tt.orgID, got, tt.want)
 		}
 	}
 
 	// Nil snapshot (store not yet loaded) must read as 0, not panic — callers
 	// tolerate 0 per the documented contract.
 	empty := &ConfigStore{}
-	if got := empty.OrgBillingTeamID("billing"); got != 0 {
-		t.Errorf("nil-snapshot OrgBillingTeamID = %d; want 0", got)
+	if got := empty.OrgOldestTeamID("multi"); got != 0 {
+		t.Errorf("nil-snapshot OrgOldestTeamID = %d; want 0", got)
+	}
+}
+
+func TestOrgUsageTeamID(t *testing.T) {
+	older := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	userTeam := int64(99)
+	zeroTeam := int64(0)
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"multi": {
+					Name: "multi",
+					Teams: []OrgTeamConfig{
+						{TeamID: 7, SchemaName: "team_7", Enabled: true, CreatedAt: newer},
+						{TeamID: 42, SchemaName: "team_42", Enabled: true, CreatedAt: older},
+					},
+				},
+				"no-teams": {Name: "no-teams"},
+			},
+			OrgUserAccess: map[OrgUserKey]OrgUserAccessConfig{
+				{OrgID: "multi", Username: "reader"}:   {Mode: OrgUserAccessModeProjectReader, TeamID: &userTeam},
+				{OrgID: "multi", Username: "zeroteam"}: {Mode: OrgUserAccessModeUnrestricted, TeamID: &zeroTeam},
+				{OrgID: "multi", Username: "root"}:     {Mode: OrgUserAccessModeUnrestricted},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID, username string
+		want            int64
+	}{
+		{"multi", "reader", 99},    // user's own team wins
+		{"multi", "root", 42},      // user without a team → org's oldest team
+		{"multi", "zeroteam", 42},  // non-positive user team → oldest-team fallback
+		{"multi", "unknown", 42},   // unknown user → oldest-team fallback
+		{"no-teams", "anyone", 0},  // defensive: teamless org
+		{"unknown", "anyone", 0},   // unknown org
+	}
+	for _, tt := range tests {
+		if got := cs.OrgUsageTeamID(tt.orgID, tt.username); got != tt.want {
+			t.Errorf("OrgUsageTeamID(%q, %q) = %d; want %d", tt.orgID, tt.username, got, tt.want)
+		}
+	}
+
+	empty := &ConfigStore{}
+	if got := empty.OrgUsageTeamID("multi", "reader"); got != 0 {
+		t.Errorf("nil-snapshot OrgUsageTeamID = %d; want 0", got)
 	}
 }
 

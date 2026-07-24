@@ -20,10 +20,11 @@ const (
 )
 
 // computeUsageKey identifies one accumulator bucket: the full billing key —
-// org, the org's default team, the session's query source and the provisioned
-// worker size (milli-units) — plus an aligned time-bucket (connection-end time
-// floored to computeBucketWidth). Distinct sizes/teams/sources accumulate (and
-// bill) separately.
+// org, the informational team id (the connecting user's team, else the org's
+// oldest team — see computeMeter.resolveTeam), the session's query source and
+// the provisioned worker size (milli-units) — plus an aligned time-bucket
+// (connection-end time floored to computeBucketWidth). Distinct
+// sizes/teams/sources accumulate (and bill) separately.
 type computeUsageKey struct {
 	orgID       string
 	teamID      int64
@@ -151,29 +152,33 @@ type computeUsageStore interface {
 
 // computeMeter wires the per-org counter to a flusher. Nil-safe: a disabled
 // meter (non-remote backend) leaves this nil and every call site no-ops.
-// resolveTeam maps an org to its billing PostHog team id at record time (a
-// config-snapshot read — no I/O); 0 is tolerated per the OrgBillingTeamID
-// contract and the bucket then carries team_id 0. Every org create path
-// establishes a billing team row, so 0 can only mean an unknown org or a
-// not-yet-loaded snapshot — never a stored "no billing team".
+// resolveTeam maps (org, connecting user) to the INFORMATIONAL team id
+// stamped onto the bucket at record time (a config-snapshot read — no I/O):
+// the user's own team (duckgres_org_users.team_id, e.g. a project-reader
+// login) when it has one, else the org's oldest team. duckgres does not own
+// team-level billing attribution — the external billing service does; the
+// stamp just records "best-effort team at record time". 0 is tolerated
+// (unknown org / not-yet-loaded snapshot / mid-provision teamless org — the
+// last is defensive only, since a committed org always has at least one team)
+// and the bucket then carries team_id 0.
 type computeMeter struct {
 	counter     *computeUsageCounter
 	store       computeUsageStore
-	resolveTeam func(orgID string) int64
+	resolveTeam func(orgID, username string) int64
 }
 
-func newComputeMeter(store computeUsageStore, resolveTeam func(orgID string) int64) *computeMeter {
+func newComputeMeter(store computeUsageStore, resolveTeam func(orgID, username string) int64) *computeMeter {
 	return &computeMeter{counter: newComputeUsageCounter(), store: store, resolveTeam: resolveTeam}
 }
 
 // Record forwards a connection-end record to the in-process counter. Best-effort.
-func (m *computeMeter) Record(orgID, querySource string, millicores, mib int64, endTime time.Time, dur time.Duration) {
+func (m *computeMeter) Record(orgID, username, querySource string, millicores, mib int64, endTime time.Time, dur time.Duration) {
 	if m == nil {
 		return
 	}
 	teamID := int64(0)
 	if m.resolveTeam != nil {
-		teamID = m.resolveTeam(orgID)
+		teamID = m.resolveTeam(orgID, username)
 	}
 	m.counter.Record(orgID, querySource, teamID, millicores, mib, endTime, dur)
 }

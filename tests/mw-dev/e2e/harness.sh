@@ -484,22 +484,24 @@ connection_duration_logged() { # org password
 # Managed-warehouse compute-usage billing (pull API, docs/design/billing-pull-api.md).
 # At connection teardown the CP meters cpu_seconds/memory_seconds from the
 # provisioned worker size over the connection lifetime into an in-proc counter
-# keyed (org, default team, query_source, worker size), flushes it to the
-# durable config-store buffer (~15s), and serves it aggregated over
+# keyed (org, informational team, query_source, worker size), flushes it to
+# the durable config-store buffer (~15s), and serves it aggregated over
 # GET /api/v1/billing/usage; POST /api/v1/billing/ack advances the cursor and
 # deletes acked buckets. This asserts the FULL round-trip against the real
 # stack: two real connections (one standard, one with the duckgres.query_source
-# GUC set to endpoints) must surface as separate usage rows carrying the org's
-# provisioned default_team_id and a positive worker size, then an ack of the
-# served watermark_high must 200 and the next GET's watermark_low must equal it
-# (cursor advanced, acked buckets deleted). The storage family is asserted in
-# the same round-trip: the leader's sampler (60s here) must serve a storage row
-# with gib_seconds > 0 for the org, and the shared ack must advance past it. A bucket closes ~90s after the
-# connection ends (60s width + 30s grace) plus ≤15s flush, so the poll allows
-# ~4 minutes. Between serve and ack, an admin PUT changing the org's
-# default_team_id must re-attribute the unacked buckets to the new team (and a
-# restore PUT moves them back — the merge path). This e2e stack has its own
-# config store, so acking here cannot eat production usage.
+# GUC set to endpoints) must surface as separate usage rows carrying the
+# stamped team id and a positive worker size, then an ack of the served
+# watermark_high must 200 and the next GET's watermark_low must equal it
+# (cursor advanced, acked buckets deleted). The stamped team_id is
+# INFORMATIONAL only (attribution is the external billing service's job): root
+# has no team of its own, so both compute rows and the storage rows carry the
+# org's OLDEST team = the provision-time first team ($CNPG_TEAM_ID). The
+# storage family is asserted in the same round-trip: the leader's sampler (60s
+# here) must serve a storage row with gib_seconds > 0 for the org, and the
+# shared ack must advance past it. A bucket closes ~90s after the connection
+# ends (60s width + 30s grace) plus ≤15s flush, so the poll allows ~4
+# minutes. This e2e stack has its own config store, so acking here cannot eat
+# production usage.
 compute_usage_pull_api() { # org password
   org="$1"; pw="$2"
   log "compute-usage pull API round-trip on $org"
@@ -513,7 +515,7 @@ compute_usage_pull_api() { # org password
   a=0 body=""
   while [ "$a" -lt 30 ]; do
     body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
-    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_DEFAULT_TEAM_ID" '
+    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" '
         (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="standard"  and .cpu_seconds>0 and .cpu>0 and .mem_gib>0)) | length >= 1)
         and
         (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="endpoints" and .cpu_seconds>0)) | length >= 1)' >/dev/null 2>&1; then
@@ -521,42 +523,10 @@ compute_usage_pull_api() { # org password
     fi
     sleep 10; a=$((a + 1))
   done
-  [ "$a" -lt 30 ] || fail "compute-usage: rows for $org (standard+endpoints, team=$CNPG_DEFAULT_TEAM_ID) never appeared in GET /billing/usage: $(echo "$body" | head -c 600)"
+  [ "$a" -lt 30 ] || fail "compute-usage: rows for $org (standard+endpoints, team=$CNPG_TEAM_ID) never appeared in GET /billing/usage: $(echo "$body" | head -c 600)"
   wl="$(echo "$body" | jq -r '.watermark_low')"
   wh="$(echo "$body" | jq -r '.watermark_high')"
   log "compute-usage OK: usage served (low=$wl high=$wh)"
-
-  # ---- default_team_id re-attribution (unacked buckets follow the org) ----
-  # Changing an org's default_team_id must re-attribute ALL buffered (unacked)
-  # buckets to the NEW team in the same transaction as the org update, so the
-  # next pull reports them under the new team and none stay stranded under the
-  # old one. Only the compute (.usage) family is asserted team-exclusively:
-  # the storage sampler keeps stamping the stale snapshot's team until the
-  # config poll catches up, so a fresh old-team storage bucket may legitimately
-  # appear; compute rows for this org can only come from the two connections
-  # above, whose buckets are already closed and flushed (that's why the poll
-  # found them — anything metered after the flip lands in a not-yet-served
-  # open bucket). The provisioned team id is restored right after (the restore
-  # PUT re-attributes back — the A→B→A merge path), so the ack flow and every
-  # later assertion still see the canonical team.
-  reattr_team=515151
-  code="$(put_org "$org" "{\"default_team_id\":$reattr_team}")"
-  [ "$code" = "200" ] || fail "reattribute: PUT default_team_id=$reattr_team -> HTTP $code: $(cat /tmp/put_org_out)"
-  rbody="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" \
-    || fail "reattribute: GET /billing/usage after team change failed"
-  echo "$rbody" | jq -e --arg o "$org" --argjson new "$reattr_team" --argjson old "$CNPG_DEFAULT_TEAM_ID" '
-      (.usage | map(select(.org_id==$o and .team_id==$new)) | length >= 2)
-      and (.usage | map(select(.org_id==$o and .team_id==$old)) | length == 0)' >/dev/null \
-    || fail "reattribute: after default_team_id $CNPG_DEFAULT_TEAM_ID -> $reattr_team, unacked compute rows not re-attributed: $(echo "$rbody" | jq -c --arg o "$org" '[.usage[] | select(.org_id==$o)]' | head -c 600)"
-  code="$(put_org "$org" "{\"default_team_id\":$CNPG_DEFAULT_TEAM_ID}")"
-  [ "$code" = "200" ] || fail "reattribute: PUT restore default_team_id=$CNPG_DEFAULT_TEAM_ID -> HTTP $code: $(cat /tmp/put_org_out)"
-  rbody="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" \
-    || fail "reattribute: GET /billing/usage after team restore failed"
-  echo "$rbody" | jq -e --arg o "$org" --argjson new "$reattr_team" --argjson old "$CNPG_DEFAULT_TEAM_ID" '
-      (.usage | map(select(.org_id==$o and .team_id==$old)) | length >= 2)
-      and (.usage | map(select(.org_id==$o and .team_id==$new)) | length == 0)' >/dev/null \
-    || fail "reattribute: after restoring default_team_id=$CNPG_DEFAULT_TEAM_ID, compute rows not moved back: $(echo "$rbody" | jq -c --arg o "$org" '[.usage[] | select(.org_id==$o)]' | head -c 600)"
-  log "compute-usage OK: default_team_id change re-attributed unacked buckets ($CNPG_DEFAULT_TEAM_ID -> $reattr_team -> restored)"
 
   # Ack the served watermark; the cursor must advance and acked buckets die.
   ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
@@ -587,13 +557,13 @@ compute_usage_pull_api() { # org password
   a=0
   while [ "$a" -lt 30 ]; do
     body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
-    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_DEFAULT_TEAM_ID" '
+    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" '
         .storage | map(select(.org_id==$o and .team_id==$t and .gib_seconds>0)) | length >= 1' >/dev/null 2>&1; then
       break
     fi
     sleep 10; a=$((a + 1))
   done
-  [ "$a" -lt 30 ] || fail "storage-usage: no storage row for $org (team=$CNPG_DEFAULT_TEAM_ID, gib_seconds>0) in GET /billing/usage: $(echo "$body" | head -c 600)"
+  [ "$a" -lt 30 ] || fail "storage-usage: no storage row for $org (team=$CNPG_TEAM_ID, gib_seconds>0) in GET /billing/usage: $(echo "$body" | head -c 600)"
   gib="$(echo "$body" | jq -r --arg o "$org" '[.storage[] | select(.org_id==$o)][0].gib_seconds')"
   wh2="$(echo "$body" | jq -r '.watermark_high')"
   log "storage-usage OK: $org gib_seconds=$gib served"
@@ -1317,110 +1287,97 @@ org_default_profile() { # org password catalog
   log "org default OK: audit shows org.update with field-change detail on $org"
 }
 
-# ---- org default_team_id (mandatory on new orgs) ----------------------------
-# default_team_id is the org's billing PostHog team id (a JSON NUMBER on the
-# wire, matching PostHog's integer Team.id; stored as the org's
-# duckgres_org_teams row with is_billing_team = TRUE; prereq for pull-based
-# compute billing where usage buckets are keyed by team_id). Contract:
-# MANDATORY when a provision creates a NEW org (400, nothing
-# created); optional on re-provision of an existing org, where omission keeps
-# the stored value (set-only, never a wipe — the keep path is covered by
-# TestReprovisionExistingOrgKeepsDefaultTeamID, since same-id re-provision
-# in-run is off-limits here, see the lifecycle NOTE below). Asserts on real orgs
-# against the real config store:
-#   1. Set path: the CNPG org was provisioned WITH default_team_id in its body
-#      (mandatory now); GET /orgs/:id must round-trip exactly that value.
-#   2. Reject path: provisioning a brand-new org WITHOUT default_team_id must be
-#      400 naming the field, and must create nothing (org GET stays 404).
-#   3. Mutate path: PUT /orgs/:id can set it to a positive team id on the org,
-#      round-tripping on GET; clearing (0 or null) is REJECTED with a 400
-#      and must leave the stored value untouched — every org must keep its
-#      billing team (the billing bucket key). The provisioned value is
-#      restored afterwards so the org stays contract-conformant.
-# get_org_default_team_id prints the raw JSON value ("null" when NULL) so the
-# assertions can distinguish an unset column from an empty string.
-get_org_default_team_id() { # org -> prints default_team_id (jq raw; "null" when unset)
-  curl -fsS -H "$H" "$API/api/v1/orgs/$1" | jq -r '.default_team_id'
-}
-default_team_id_mandatory() { # org provisioned_team_id
+# ---- provision team contract (team_id mandatory on new orgs) ----------------
+# team_id is the org's first PostHog team (a JSON NUMBER on the wire, matching
+# PostHog's integer Team.id), stored as a plain duckgres_org_teams row — no
+# billing semantics; duckgres does not own team-level billing attribution
+# (the external billing service does). Contract:
+#
+#   provision (POST /orgs/:id/provision):
+#     - REQUIRED when the provision creates a NEW org (400 naming team_id,
+#       creating nothing) — a warehouse cannot exist without a team.
+#     - default_team_id is a TRANSITIONAL alias for team_id (the resilience
+#       provisions exercise the alias accept path live); sending both with
+#       different values is a 400 ("disagree").
+#   admin (PUT /orgs/:id):
+#     - the org payload no longer has a team field; a leftover
+#       default_team_id key is accepted and IGNORED (never an error, never a
+#       mutation) so PostHog deploy order doesn't matter.
+#
+# Assertions run against the CNPG org (provisioned with team_id in its body).
+provision_team_contract() { # org provisioned_team_id
   org="$1"; provisioned_team_id="$2"
-  log "default_team_id: provision round-trips on $org, new-org-without rejected"
+  log "provision team contract: round-trip on $org, new-org-without rejected, alias parsed"
 
-  # 1. Set path: an org provisioned WITH default_team_id must read it back.
-  got="$(get_org_default_team_id "$org")"
-  [ "$got" = "$provisioned_team_id" ] \
-    || fail "default_team_id: GET /orgs/$org = '$got' want '$provisioned_team_id' (provision default_team_id did not persist)"
-  log "default_team_id OK: $org round-tripped from provision"
+  # 1. Round-trip: an org provisioned WITH team_id must carry the team row
+  # (conventional schema, enabled).
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" \
+    | jq -e --argjson t "$provisioned_team_id" '.teams | map(select(.team_id==$t and .schema_name=="team_\($t)" and .enabled==true)) | length == 1' >/dev/null \
+    || fail "provision team: provisioned team row $provisioned_team_id missing on $org: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" | head -c 400)"
+  log "provision team OK: $org round-tripped its provision-time first team"
 
-  # 2. Reject path: a NEW org without default_team_id must 400 and create nothing.
+  # 2. Reject path: a NEW org without any team field must 400 and create nothing.
   noteam="e2e-noteam"
   code="$(curl -s -o /tmp/noteam_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
-    -d '{"database_name":"e2enoteamdb","metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true}}' \
+    -d '{"database_name":"'"$noteam"'","metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' \
     "$API/api/v1/orgs/$noteam/provision")"
   [ "$code" = "400" ] \
-    || fail "default_team_id: new-org provision without it -> HTTP $code want 400: $(cat /tmp/noteam_out)"
-  grep -q "default_team_id" /tmp/noteam_out \
-    || fail "default_team_id: rejection error should name the field: $(cat /tmp/noteam_out)"
+    || fail "provision team: new-org provision without team_id -> HTTP $code want 400: $(cat /tmp/noteam_out)"
+  grep -q "team_id" /tmp/noteam_out \
+    || fail "provision team: rejection error should name team_id: $(cat /tmp/noteam_out)"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs/$noteam")"
   [ "$code" = "404" ] \
-    || fail "default_team_id: rejected provision must create nothing, GET /orgs/$noteam -> HTTP $code want 404"
-  log "default_team_id OK: new org without it rejected with 400, nothing created"
+    || fail "provision team: rejected provision must create nothing, GET /orgs/$noteam -> HTTP $code want 404"
+  log "provision team OK: new org without team_id rejected with 400, nothing created"
 
-  # 3. Mutate path: PUT with a positive value sets; clearing (0 or JSON null)
-  # is rejected with a 400 and must not change the stored value (the column is
-  # NOT NULL — every org must keep a default team).
+  # 3. Transitional alias: default_team_id is parsed as team_id — disagreeing
+  # values are a caller bug (400 "disagree"), which proves the alias field
+  # still reaches the resolution logic. (The alias ACCEPT path is exercised
+  # live by the resilience provisions, whose bodies send only default_team_id.)
+  code="$(curl -s -o /tmp/alias_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d '{"database_name":"'"$noteam"'","team_id":1,"default_team_id":2,"metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' \
+    "$API/api/v1/orgs/$noteam/provision")"
+  [ "$code" = "400" ] || fail "provision team: disagreeing team_id/default_team_id -> HTTP $code want 400: $(cat /tmp/alias_out)"
+  grep -q "disagree" /tmp/alias_out \
+    || fail "provision team: disagreement error should say the fields disagree: $(cat /tmp/alias_out)"
+
+  # 4. Admin PUT: the org payload has no team field anymore; a leftover
+  # default_team_id key is accepted and ignored (no error, no mutation).
   code="$(put_org "$org" '{"default_team_id":424242}')"
-  [ "$code" = "200" ] || fail "default_team_id: PUT set -> HTTP $code: $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$org")"
-  [ "$got" = "424242" ] || fail "default_team_id: after PUT set, GET = '$got' want '424242'"
-  code="$(put_org "$org" '{"default_team_id":0}')"
-  [ "$code" = "400" ] || fail "default_team_id: PUT clear (0) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
-  grep -q "default_team_id" /tmp/put_org_out \
-    || fail "default_team_id: PUT clear rejection should name the field: $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$org")"
-  [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT clear, GET = '$got' want '424242' (stored value must be unchanged)"
-  code="$(put_org "$org" '{"default_team_id":null}')"
-  [ "$code" = "400" ] || fail "default_team_id: PUT clear (null) -> HTTP $code want 400 (clearing must be rejected): $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$org")"
-  [ "$got" = "424242" ] || fail "default_team_id: after rejected PUT null, GET = '$got' want '424242' (stored value must be unchanged)"
-  code="$(put_org "$org" "{\"default_team_id\":$provisioned_team_id}")"
-  [ "$code" = "200" ] || fail "default_team_id: PUT restore -> HTTP $code: $(cat /tmp/put_org_out)"
-  got="$(get_org_default_team_id "$org")"
-  [ "$got" = "$provisioned_team_id" ] || fail "default_team_id: after PUT restore, GET = '$got' want '$provisioned_team_id'"
-  log "default_team_id OK: PUT set round-trips, clear (0/null) rejected 400, value preserved on $org"
+  [ "$code" = "200" ] || fail "provision team: PUT with legacy default_team_id -> HTTP $code want 200 (accept-and-ignore): $(cat /tmp/put_org_out)"
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org" | jq -e 'has("default_team_id") | not' >/dev/null \
+    || fail "provision team: GET /orgs/$org must not serve default_team_id anymore"
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" \
+    | jq -e --argjson t "$provisioned_team_id" '.teams | map(select(.team_id==$t)) | length == 1 and (map(select(.team_id==424242)) | length == 0)' >/dev/null \
+    || fail "provision team: ignored legacy PUT must not touch team rows on $org"
+  log "provision team OK: legacy default_team_id on the admin PUT is accepted and ignored"
 }
 
 # ---- org teams CRUD (duckgres_org_teams via the provisioning API) -----------
 # The PostHog backend manages an org's team rows through
 # GET/POST /orgs/:id/teams + DELETE /orgs/:id/teams/:team_id. Contract asserted
 # on a real org against the real config store, additively and self-cleaning
-# (the org ends the function with exactly its provisioned billing team):
-#   1. List: the provisioned billing team row exists with the conventional
-#      "team_<id>" schema and is_billing_team=true.
+# (the org ends the function with exactly its provisioned first team):
+#   1. List: the provision-time first team row exists with the conventional
+#      "team_<id>" schema, enabled.
 #   2. Upsert: a second team is created (enabled defaults true); re-POSTing it
 #      is the GRANDFATHER path — schema_name and the legacy table-name
 #      overrides are overwritten (the PostHog backfill replaces the
 #      migration's placeholder through this route).
 #   3. Conflict: a third team claiming an existing schema_name is a 409.
-#   4. Delete: removing the second team is 200 with no billing handover;
-#      deleting the org's LAST team (the billing one) is refused with a 409
-#      naming org deletion as the only way.
-org_teams_crud() { # org billing_team_id
+#   4. Delete: removing the second team is 200 (a bare delete — no billing
+#      handover exists; usage buckets are untouched); deleting the org's LAST
+#      team is refused with a 409 naming org deletion as the only way (an org
+#      must always have at least one team — a teamless org would be an
+#      unroutable warehouse).
+org_teams_crud() { # org team_id
   org="$1"; team="$2"; extra=$((team + 1)); clash=$((team + 2))
-  log "org teams CRUD on $org (billing team $team)"
+  log "org teams CRUD on $org (team $team)"
 
-  # Earlier default_team_id repoints (set → restore) leave DEMOTED team rows
-  # behind (SetOrgBillingTeamTx demotes, never deletes). Delete every
-  # non-billing row first so the last-team refusal below is deterministic.
-  for tid in $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" | jq -r '.teams[] | select(.is_billing_team != true) | .team_id'); do
-    code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X DELETE -H "$H" "$API/api/v1/orgs/$org/teams/$tid")"
-    [ "$code" = "200" ] || fail "org teams: cleanup delete of leftover team $tid -> HTTP $code: $(cat /tmp/team_out)"
-  done
-
-  # 1. Provisioned billing row present.
+  # 1. Provisioned first-team row present.
   curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" \
-    | jq -e --argjson t "$team" '.teams | map(select(.team_id==$t and .schema_name=="team_\($t)" and .is_billing_team==true and .enabled==true)) | length == 1' >/dev/null \
-    || fail "org teams: provisioned billing row for team $team missing/wrong: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" | head -c 400)"
+    | jq -e --argjson t "$team" '.teams | map(select(.team_id==$t and .schema_name=="team_\($t)" and .enabled==true)) | length == 1' >/dev/null \
+    || fail "org teams: provisioned row for team $team missing/wrong: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" | head -c 400)"
 
   # 2. Create a second team, then grandfather-overwrite its schema + legacy names.
   code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
@@ -1429,7 +1386,7 @@ org_teams_crud() { # org billing_team_id
   code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
     -d "{\"team_id\":$extra,\"schema_name\":\"e2e_legacy_wh\",\"events_table_name\":\"legacy_events\"}" "$API/api/v1/orgs/$org/teams")"
   [ "$code" = "200" ] || fail "org teams: grandfather upsert of team $extra -> HTTP $code: $(cat /tmp/team_out)"
-  jq -e '.schema_name=="e2e_legacy_wh" and .events_table_name=="legacy_events" and .is_billing_team==null' /tmp/team_out >/dev/null \
+  jq -e '.schema_name=="e2e_legacy_wh" and .events_table_name=="legacy_events"' /tmp/team_out >/dev/null \
     || fail "org teams: grandfather upsert did not overwrite schema/legacy names: $(cat /tmp/team_out)"
 
   # 3. Duplicate schema within the org -> 409.
@@ -1437,19 +1394,19 @@ org_teams_crud() { # org billing_team_id
     -d "{\"team_id\":$clash,\"schema_name\":\"e2e_legacy_wh\"}" "$API/api/v1/orgs/$org/teams")"
   [ "$code" = "409" ] || fail "org teams: duplicate schema -> HTTP $code want 409: $(cat /tmp/team_out)"
 
-  # 4. Delete the extra team (non-billing: no handover), then assert the LAST
-  # (billing) team refuses deletion — a refused delete leaves state untouched.
+  # 4. Delete the extra team (bare delete — no handover fields), then assert
+  # the LAST team refuses deletion — a refused delete leaves state untouched.
   code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X DELETE -H "$H" "$API/api/v1/orgs/$org/teams/$extra")"
   [ "$code" = "200" ] || fail "org teams: delete team $extra -> HTTP $code: $(cat /tmp/team_out)"
   jq -e 'has("new_billing_team_id") | not' /tmp/team_out >/dev/null \
-    || fail "org teams: non-billing delete must not hand billing over: $(cat /tmp/team_out)"
+    || fail "org teams: delete response must carry no billing-handover field: $(cat /tmp/team_out)"
   code="$(curl -s -o /tmp/team_out -w '%{http_code}' -X DELETE -H "$H" "$API/api/v1/orgs/$org/teams/$team")"
   [ "$code" = "409" ] || fail "org teams: last-team delete -> HTTP $code want 409: $(cat /tmp/team_out)"
   grep -q "deleting the org" /tmp/team_out \
     || fail "org teams: last-team refusal should name org deletion as the only way: $(cat /tmp/team_out)"
   curl -fsS -H "$H" "$API/api/v1/orgs/$org/teams" \
-    | jq -e --argjson t "$team" '.teams | length == 1 and (.[0].team_id==$t) and (.[0].is_billing_team==true)' >/dev/null \
-    || fail "org teams: org must end with exactly its billing team $team"
+    | jq -e --argjson t "$team" '.teams | length == 1 and (.[0].team_id==$t)' >/dev/null \
+    || fail "org teams: org must end with exactly its provisioned team $team"
   log "org teams OK: list/upsert/grandfather/409/delete rules on $org"
 }
 
@@ -1459,9 +1416,9 @@ org_teams_crud() { # org billing_team_id
 # include-values source). Contract asserted against the real config store:
 #   1. The provisioned CNPG org appears in /warehouses with
 #      state=ready, writable=true, and a teams array carrying the org's
-#      billing team (duckgres_org_teams row) with its conventional
-#      team_<id> schema and enabled=true. org_teams_crud runs before this and
-#      leaves the org with exactly its billing team.
+#      provision-time first team (duckgres_org_teams row) with its
+#      conventional team_<id> schema and enabled=true. org_teams_crud runs
+#      before this and leaves the org with exactly that team.
 #   2. The metadata_store block reports cnpg-shard. No password-ish key may appear anywhere
 #      in the payload outside password_secret_ref (secret REFS only).
 #   3. /warehouse-team-ids is a bare sorted JSON array containing the
@@ -1470,7 +1427,7 @@ org_teams_crud() { # org billing_team_id
 #      consumer-side damping, which is why the transient-error contract
 #      (store failure => 500, never a 200 with a team absent) matters; that
 #      split is pinned by unit tests (discovery_test.go).
-discovery_endpoints() { # org billing_team_id
+discovery_endpoints() { # org team_id
   org="$1"; team="$2"
   log "discovery: /warehouses + /warehouse-team-ids list $org"
 
@@ -1484,7 +1441,7 @@ discovery_endpoints() { # org billing_team_id
     '.warehouses[] | select(.org_id == $o) | .teams
      | map(select(.team_id==$t and .schema_name=="team_\($t)" and .enabled==true)) | length == 1' \
     /tmp/discovery_out >/dev/null \
-    || fail "discovery: $org must carry billing team $team with schema team_$team, enabled: $(cat /tmp/discovery_out)"
+    || fail "discovery: $org must carry team $team with schema team_$team, enabled: $(cat /tmp/discovery_out)"
   # Resolved table names: no legacy overrides on this team, so the CP must
   # serve the derived names (the derivation lives in the CP, not in every consumer).
   jq -e --arg o "$org" --argjson t "$team" \
@@ -1507,7 +1464,7 @@ discovery_endpoints() { # org billing_team_id
   jq -e --argjson t "$team" 'index($t) != null' /tmp/discovery_ids >/dev/null \
     || fail "discovery: /warehouse-team-ids missing team $team: $(cat /tmp/discovery_ids)"
   jq -e '. == sort' /tmp/discovery_ids >/dev/null     || fail "discovery: /warehouse-team-ids must be sorted: $(cat /tmp/discovery_ids)"
-  log "discovery OK: $org listed writable with its billing team row + resolved table names; team-ids array carries $team"
+  log "discovery OK: $org listed writable with its team row + resolved table names; team-ids array carries $team"
 }
 
 # ---- project-scoped read-only users ----------------------------------------
@@ -2995,18 +2952,23 @@ lifecycle_teardown_cnpg() { # org
 }
 
 # ---- cnpg duckling: cnpg-shard metadata + DuckLake ------------------------
-# default_team_id is MANDATORY at provision time for new orgs (prereq for
-# pull-based compute billing: usage buckets keyed by team_id = the org's default
-# team) — every provision body below carries one; default_team_id_mandatory
-# asserts the round-trips and that omitting it on a new org is rejected.
-CNPG_DEFAULT_TEAM_ID='90210'
+# team_id is MANDATORY at provision time for new orgs (a warehouse cannot
+# exist without a team; the id becomes the org's first duckgres_org_teams
+# row — no billing semantics, duckgres does not own team attribution) — every
+# provision body below carries one; provision_team_contract asserts the
+# round-trip, that omitting it on a new org is rejected, and the transitional
+# default_team_id alias.
+CNPG_TEAM_ID='90210'
 CNPG_BODY='{"database_name":"'"$CNPG"'","metadata_store":{"type":"cnpg-shard"},
-  "default_team_id":'"$CNPG_DEFAULT_TEAM_ID"',
+  "team_id":'"$CNPG_TEAM_ID"',
   "data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
 
 # ---- resilience ducklings: cnpg-shard metadata + DuckLake only -------------
 # DuckLake-only: these orgs exist purely to host the worker-churn-heavy
-# resilience lanes, so keep their provision footprint small.
+# resilience lanes, so keep their provision footprint small. They deliberately
+# send the TRANSITIONAL default_team_id alias (not team_id): a successful
+# resilience provision is the live proof the alias still creates the first
+# team row (remove the alias once the PostHog backend sends team_id).
 res_body() { # org
   printf '{"database_name":"%s","default_team_id":1,"metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}' "$1"
 }
@@ -3342,15 +3304,15 @@ main() {
 
   # Provisioning/admin contracts are backend-independent; retain their live
   # coverage on the primary CNPG org.
-  default_team_id_mandatory "$CNPG" "$CNPG_DEFAULT_TEAM_ID"
-  org_teams_crud "$CNPG" "$CNPG_DEFAULT_TEAM_ID"
-  discovery_endpoints "$CNPG" "$CNPG_DEFAULT_TEAM_ID"
+  provision_team_contract "$CNPG" "$CNPG_TEAM_ID"
+  org_teams_crud "$CNPG" "$CNPG_TEAM_ID"
+  discovery_endpoints "$CNPG" "$CNPG_TEAM_ID"
 
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
 
   # ---- generated project reader: team-wide reads, no writes/cross-project ----
-  project_reader_isolation "$CNPG" "$cnpg_pw" "$CNPG_DEFAULT_TEAM_ID"
+  project_reader_isolation "$CNPG" "$cnpg_pw" "$CNPG_TEAM_ID"
 
   # ---- admin ducklings metadata: live cnpg shard assignment ----------------
   admin_ducklings_metadata "$CNPG"

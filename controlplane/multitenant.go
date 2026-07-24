@@ -679,7 +679,7 @@ func SetupMultiTenant(
 	// GET/ack API registered above. Best-effort throughout — queries are NEVER
 	// failed on its account. The 30-day safety GC is leader-only, co-located
 	// under the janitor lease so exactly one CP pod sweeps.
-	meter := newComputeMeter(store, store.OrgBillingTeamID)
+	meter := newComputeMeter(store, store.OrgUsageTeamID)
 	go meter.Run(context.Background())
 	if janitorLeader != nil {
 		janitorLeader.AttachLeaderLoop(func(ctx context.Context) { runComputeUsageGC(ctx, store) })
@@ -702,7 +702,7 @@ func SetupMultiTenant(
 			var orgs []storageOrg
 			for _, org := range snap.Orgs {
 				if org.Warehouse != nil && org.Warehouse.State == configstore.ManagedWarehouseStateReady {
-					orgs = append(orgs, storageOrg{OrgID: org.Name, TeamID: org.BillingTeamID()})
+					orgs = append(orgs, storageOrg{OrgID: org.Name, TeamID: org.OldestTeamID()})
 				}
 			}
 			return orgs

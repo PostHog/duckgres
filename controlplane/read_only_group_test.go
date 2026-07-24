@@ -40,8 +40,8 @@ func (stubProvisioningStore) ListOrgTeams(string) ([]configstore.OrgTeam, error)
 func (stubProvisioningStore) UpsertOrgTeam(string, configstore.OrgTeamUpsert) (*configstore.OrgTeam, error) {
 	return nil, nil
 }
-func (stubProvisioningStore) DeleteOrgTeam(string, int64) (*configstore.OrgTeamDeleteResult, error) {
-	return nil, nil
+func (stubProvisioningStore) DeleteOrgTeam(string, int64) error {
+	return nil
 }
 func (stubProvisioningStore) ListWarehousesByStates([]configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error) {
 	return nil, nil
