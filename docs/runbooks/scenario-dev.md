@@ -89,7 +89,10 @@ After teardown, scheduled and manually dispatched runs on `main` publish any
 collected `perf/summary.json` and `perf/query_results.csv` into the persistent
 scenario perf result schema. Publishing runs with `if: always()` so measured
 query failures remain visible. Runs without a perf artifact skip publishing,
-and non-`main` branch runs never publish into the shared history.
+and non-`main` branch runs never publish into the shared history. Each artifact
+has a two-minute publish timeout so one stalled database operation cannot
+prevent later artifacts from being attempted; the workflow step retains a
+ten-minute overall timeout.
 
 If cleanup did not complete, the scenario-created org is
 `ci-pr-<workflow-run-id>-cnpg`; deprovision it manually through the relevant dev

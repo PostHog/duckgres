@@ -179,6 +179,7 @@ jobs:
               | go run ./cmd/duckgres-perf-publisher \
                   --run-dir "$perf_dir" \
                   --connection-secret-stdin \
+                  --publish-timeout 2m \
                   --schema duckgres_scenario_perf \
                   --bootstrap-schema=true; then
               echo "::error::Failed to publish scenario perf artifacts from $perf_dir"

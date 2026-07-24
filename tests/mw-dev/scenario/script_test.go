@@ -157,6 +157,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"timeout-minutes: 10",
 		"mapfile -d '' perf_summaries",
 		"for perf_summary in \"${perf_summaries[@]}\"",
+		"--publish-timeout 2m",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("perf publishing must support bounded publication of every result: missing %q", required)

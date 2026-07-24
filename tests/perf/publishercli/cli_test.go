@@ -2,6 +2,7 @@ package publishercli
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -99,5 +100,40 @@ func TestRunRequiresExactlyOneConnectionSource(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "exactly one of --dsn and --connection-secret-stdin") {
 		t.Fatalf("expected connection-source error, got %v", err)
+	}
+}
+
+func TestRunBoundsPublishingWithTimeout(t *testing.T) {
+	t.Parallel()
+
+	err := Run(context.Background(), []string{
+		"--run-dir", "/artifacts/run/perf",
+		"--dsn", "host=localhost",
+		"--publish-timeout", "1ms",
+	}, Dependencies{
+		Stdout: io.Discard,
+		Publish: func(ctx context.Context, _ publisher.Config, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected publish deadline, got %v", err)
+	}
+}
+
+func TestRunRejectsNonPositivePublishTimeout(t *testing.T) {
+	t.Parallel()
+
+	err := Run(context.Background(), []string{
+		"--run-dir", "/artifacts/run/perf",
+		"--dsn", "host=localhost",
+		"--publish-timeout", "0s",
+	}, Dependencies{
+		Stdout:  io.Discard,
+		Publish: func(context.Context, publisher.Config, string) error { return nil },
+	})
+	if err == nil || !strings.Contains(err.Error(), "publish-timeout must be greater than zero") {
+		t.Fatalf("expected invalid publish-timeout error, got %v", err)
 	}
 }

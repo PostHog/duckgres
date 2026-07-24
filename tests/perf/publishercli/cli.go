@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/posthog/duckgres/tests/perf/publisher"
 )
@@ -51,6 +52,7 @@ func Run(ctx context.Context, args []string, deps Dependencies) error {
 	secretStdin := flags.Bool("connection-secret-stdin", false, "read host, port, database, username, and password JSON from stdin")
 	schema := flags.String("schema", "", "target schema (publisher default when empty)")
 	bootstrap := flags.Bool("bootstrap-schema", true, "create the target schema and tables when missing")
+	publishTimeout := flags.Duration("publish-timeout", 2*time.Minute, "maximum duration for publishing one perf artifact")
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
@@ -62,6 +64,9 @@ func Run(ctx context.Context, args []string, deps Dependencies) error {
 	}
 	if (strings.TrimSpace(*dsn) == "") == !*secretStdin {
 		return errors.New("exactly one of --dsn and --connection-secret-stdin is required")
+	}
+	if *publishTimeout <= 0 {
+		return errors.New("publish-timeout must be greater than zero")
 	}
 
 	cfg := publisher.Config{
@@ -79,7 +84,10 @@ func Run(ctx context.Context, args []string, deps Dependencies) error {
 		cfg.Password = secret.Password
 	}
 
-	if err := publish(ctx, cfg, *runDir); err != nil {
+	publishCtx, cancel := context.WithTimeout(ctx, *publishTimeout)
+	err := publish(publishCtx, cfg, *runDir)
+	cancel()
+	if err != nil {
 		return fmt.Errorf("publish perf artifacts: %w", err)
 	}
 	_, _ = fmt.Fprintf(stdout, "published perf artifacts from %s\n", *runDir)
