@@ -97,7 +97,14 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"$GITHUB_STEP_SUMMARY",
 		"tests/mw-dev/run.sh diagnostics",
 		"tests/mw-dev/run.sh teardown",
-		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev",
+		"- name: Publish scenario perf results",
+		"github.ref == 'refs/heads/main'",
+		"MW_DEV_SCENARIO_PERF_SECRET_ID: ${{ vars.MW_DEV_SCENARIO_PERF_SECRET_ID }}",
+		"aws secretsmanager get-secret-value",
+		"go run ./cmd/duckgres-perf-publisher",
+		"--connection-secret-stdin",
+		"--schema duckgres_scenario_perf",
+		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev ./tests/perf/publishercli",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("workflow missing %q", required)
@@ -125,13 +132,38 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.",
 		"DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.",
-		"373313242555",
-		"645773004826",
-		"posthog-duckling-perfprodus",
+		"MW_DEV_SCENARIO_PERF_HOST",
+		"MW_DEV_SCENARIO_PERF_PORT",
+		"MW_DEV_SCENARIO_PERF_DATABASE",
+		"MW_DEV_SCENARIO_PERF_USERNAME",
+		"MW_DEV_SCENARIO_PERF_PASSWORD",
+		"postgres://",
+		"postgresql://",
+		"--dsn",
+		"--password",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("workflow contains internal detail %q", forbidden)
 		}
+	}
+
+	teardownIndex := strings.Index(workflow, "- name: Teardown")
+	publishPerfIndex := strings.Index(workflow, "- name: Publish scenario perf results")
+	uploadIndex := strings.Index(workflow, "- name: Upload scenario artifacts")
+	if teardownIndex < 0 || uploadIndex < teardownIndex || publishPerfIndex < uploadIndex {
+		t.Fatalf("artifact upload must run after teardown and before perf publishing")
+	}
+	for _, required := range []string{
+		"timeout-minutes: 10",
+		"mapfile -d '' perf_summaries",
+		"for perf_summary in \"${perf_summaries[@]}\"",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("perf publishing must support bounded publication of every result: missing %q", required)
+		}
+	}
+	if strings.Contains(workflow, "-path '*/perf/summary.json' -print -quit") {
+		t.Fatal("perf publishing must not silently select only the first result")
 	}
 }
 

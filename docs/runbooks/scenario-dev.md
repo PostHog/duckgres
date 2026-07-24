@@ -40,6 +40,13 @@ Configure these repository variables:
 
 - `TS_WIF_CLIENT_ID_MW_DEV`
 - `TS_WIF_AUDIENCE_MW_DEV`
+- `MW_DEV_SCENARIO_PERF_SECRET_ID`
+
+`MW_DEV_SCENARIO_PERF_SECRET_ID` names the AWS Secrets Manager JSON secret used
+only by historical perf publishing. The secret must contain `host`, `port`,
+`database`, `username`, and `password`. The workflow pipes it directly from
+AWS CLI into the publisher process so the password is not placed in a shell
+argument, environment variable, or log.
 
 The workflow hardcodes the stable mw-dev cluster name/context and builds the
 control-plane pod identity role ARN from `MW_DEV_ACCOUNT_ID`, matching
@@ -77,6 +84,12 @@ independent sibling branches: for example, `dbt_models` still runs because it
 depends on `setup_frozen_views`, not `perf_queries`. Only true dependants are
 skipped, and `always_run` teardown still executes. The final workflow result is
 reported after all eligible steps and artifact collection finish.
+
+After teardown, scheduled and manually dispatched runs on `main` publish any
+collected `perf/summary.json` and `perf/query_results.csv` into the persistent
+scenario perf result schema. Publishing runs with `if: always()` so measured
+query failures remain visible. Runs without a perf artifact skip publishing,
+and non-`main` branch runs never publish into the shared history.
 
 If cleanup did not complete, the scenario-created org is
 `ci-pr-<workflow-run-id>-cnpg`; deprovision it manually through the relevant dev
