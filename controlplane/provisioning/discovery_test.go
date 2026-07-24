@@ -58,7 +58,9 @@ func seedWarehouse(s *fakeStore, orgID string, teamID *int64, state configstore.
 			// the discovery payload (see TestListWarehousesPayloadNoSecrets).
 			PasswordAWSSecret: "rds-master-secret-value",
 		},
-		MetadataStoreCredentials: configstore.SecretRef{
+		// The discovery-only mirror columns (NOT MetadataStoreCredentials,
+		// the activation-validated set) — what password_secret_ref serves.
+		MetadataStoreSecretRef: configstore.SecretRef{
 			Namespace: "ducklings",
 			Name:      "duckling-" + orgID + "-password",
 			Key:       "password",

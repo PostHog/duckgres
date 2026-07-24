@@ -1450,8 +1450,35 @@ discovery_endpoints() { # org team_id
     /tmp/discovery_out >/dev/null \
     || fail "discovery: $org team $team resolved table names wrong: $(cat /tmp/discovery_out)"
 
-  kind="$(jq -r --arg o "$org" '.warehouses[] | select(.org_id == $o) | .metadata_store.kind' /tmp/discovery_out)"
-  [ "$kind" = "cnpg-shard" ] || fail "discovery: $org metadata_store.kind = '$kind' want 'cnpg-shard'"
+  # cnpg metadata_store block: mirrored from the Duckling CR status by the
+  # provisioner's ready-reconcile (reconcileMetadataStoreRow), which fires on
+  # the tick AFTER the warehouse turns ready — poll briefly rather than
+  # asserting the first response. The mirror must carry the pooler endpoint,
+  # the per-tenant mdstore identifiers, and a ducklings-namespace credential
+  # Secret ref (never plaintext).
+  cnpg_ok=""
+  for _ in $(seq 1 12); do
+    # Write-through-temp so a failed curl leaves the last good payload for
+    # the failure diagnostic instead of a truncated file (|| true: transient
+    # poll failures must re-loop, not trip set -e).
+    { curl -fsS -H "$H" "$API/api/v1/warehouses" > /tmp/discovery_out.tmp \
+      && mv /tmp/discovery_out.tmp /tmp/discovery_out; } || true
+    if jq -e --arg o "$org" '
+        .warehouses[] | select(.org_id == $o) | .metadata_store
+        | .kind == "cnpg-shard"
+          and (.endpoint | test("pooler"))
+          and (.database | startswith("mdstore_"))
+          and (.username | startswith("mdstore_"))
+          and .port == 5432
+          and .password_secret_ref.namespace == "ducklings"
+          and (.password_secret_ref.name | length > 0)
+          and .password_secret_ref.key == "password"
+      ' /tmp/discovery_out >/dev/null; then
+      cnpg_ok=1; break
+    fi
+    sleep 10
+  done
+  [ -n "$cnpg_ok" ]     || fail "discovery: $org metadata_store block never mirrored from CR status: $(jq --arg o "$org" '.warehouses[] | select(.org_id == $o) | .metadata_store' /tmp/discovery_out)"
 
   # No password material: the only key containing "password" anywhere in the
   # payload must be password_secret_ref (k8s Secret reference, not material).
@@ -2715,6 +2742,25 @@ reshard_dump_log() { # opid — the log TAIL (where the failure/report lands)
   reshard_log_fetch "$1" | tail -30 || true
 }
 
+discovery_metadata_converged() { # org — poll until discovery serves writable=true + a complete cnpg mirror block
+  # Post-reshard convergence: whatever the op did to the row (rollback leaves
+  # the mirror untouched; a successful finalize clears it for the
+  # ready-reconcile to repopulate), the discovery surface must end up serving
+  # writable=true with the FULL metadata_store mirror again.
+  for _ in $(seq 1 18); do
+    if curl -fsS -H "$H" "$API/api/v1/warehouses" 2>/dev/null | jq -e --arg o "$1" '
+        .warehouses[] | select(.org_id == $o)
+        | .writable == true and .metadata_store.kind == "cnpg-shard"
+          and (.metadata_store.endpoint | test("pooler"))
+          and (.metadata_store.password_secret_ref.name | length > 0)
+      ' >/dev/null; then
+      return 0
+    fi
+    sleep 10
+  done
+  fail "discovery: $1 metadata_store mirror never re-converged after the reshard op: $(curl -fsS -H "$H" "$API/api/v1/warehouses" | jq --arg o "$1" '.warehouses[] | select(.org_id == $o)')"
+}
+
 reshard_targets() { # destination discovery response shape
   log "reshard targets: destination discovery"
   out="$(curl -fsS -H "$H" "$API/api/v1/reshards/targets")" \
@@ -2813,6 +2859,13 @@ reshard_cancel_during_drain() { # org password
   echo "$out2" | grep -qi "reshard" \
     || fail "reshard cancel: blocked-connection error did not mention reshard: $out2"
 
+  # The discovery fence: while resharding, polling external writers must see
+  # writable=false — until the lease protocol exists this flag is their ONLY
+  # fence, so it must flip with the state, not lag it.
+  curl -fsS -H "$H" "$API/api/v1/warehouses" | jq -e --arg o "$org" \
+    '.warehouses[] | select(.org_id == $o) | .state == "resharding" and .writable == false' >/dev/null \
+    || fail "reshard cancel: discovery must report $org resharding/writable=false during the op"
+
   curl -fsS -X POST -H "$H" "$API/api/v1/reshards/$opid/cancel" >/dev/null \
     || fail "reshard cancel: cancel POST failed"
   st="$(reshard_wait_terminal "$opid" 300)"
@@ -2823,6 +2876,7 @@ reshard_cancel_during_drain() { # org password
   wait "$holder" 2>/dev/null || true
   [ "$(state_of "$org")" = "ready" ] || fail "reshard cancel: warehouse state $(state_of "$org"), want ready"
   pg "$org" "$pw" ducklake "SELECT 1" >/dev/null
+  discovery_metadata_converged "$org"
   log "reshard cancel OK (op $opid)"
 }
 
@@ -2860,6 +2914,7 @@ reshard_bogus_shard_rollback() { # org password
   got="$(pg "$org" "$pw" ducklake "SELECT v FROM reshard_marker")"
   echo "$got" | grep -q 42 || fail "reshard rollback: marker data lost (got '$got')"
   pg "$org" "$pw" ducklake "DROP TABLE reshard_marker;"
+  discovery_metadata_converged "$org"
   log "reshard rollback OK (op $opid)"
 }
 

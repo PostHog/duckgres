@@ -656,6 +656,13 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	if !store.hasLog("COPY command tags matched for 3 tables") {
 		t.Fatalf("COPY verification log missing: %v", store.logs)
 	}
+	// A cnpg→cnpg shard move must clear the row's mirrored connection block
+	// and the discovery-only secret ref — both describe the SOURCE shard;
+	// the ready-reconcile re-mirrors the target from CR status.
+	last := store.warehouseUpds[len(store.warehouseUpds)-1]
+	if last["metadata_store_endpoint"] != "" || last["metadata_store_secret_ref_name"] != "" {
+		t.Fatalf("cnpg→cnpg finalize must clear the mirrored connection block + secret ref: %v", last)
+	}
 }
 
 // TestReshardHappyPathExtToCnpg pins that an external source is NEVER
@@ -697,6 +704,9 @@ func TestReshardHappyPathExtToCnpg(t *testing.T) {
 	last := store.warehouseUpds[len(store.warehouseUpds)-1]
 	if last["metadata_store_kind"] != configstore.MetadataStoreKindCnpgShard {
 		t.Fatalf("warehouse row not reconciled to cnpg: %v", last)
+	}
+	if last["metadata_store_secret_ref_name"] != "" {
+		t.Fatalf("finalize must clear the discovery secret-ref mirror: %v", last)
 	}
 }
 
@@ -763,6 +773,9 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	last := store.warehouseUpds[len(store.warehouseUpds)-1]
 	if last["metadata_store_kind"] != configstore.MetadataStoreKindExternal || last["metadata_store_endpoint"] != "escape.rds.amazonaws.com" {
 		t.Fatalf("warehouse row not reconciled to external: %v", last)
+	}
+	if last["metadata_store_secret_ref_name"] != "" {
+		t.Fatalf("finalize must clear the discovery secret-ref mirror: %v", last)
 	}
 	if !store.hasLog("COPY command tags matched for 1 tables") {
 		t.Fatalf("COPY verification log missing: %v", store.logs)
