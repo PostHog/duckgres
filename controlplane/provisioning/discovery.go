@@ -30,13 +30,14 @@ import (
 // removal (team deleted / warehouse leaving the discoverable states).
 //
 // Metadata-store note: for Kind == "external" the connection block comes
-// straight off the warehouse row. For Kind == "cnpg-shard" the row carries
-// ONLY the kind today — the composition picks the shard and the authoritative
-// endpoint/database/user + secret live in the Duckling CR status, which the
-// provisioner does not (yet) write back to the row. Until that backfill
-// exists, cnpg tenants serve an empty connection block here; the teams
-// array and lifecycle fields are correct regardless, so team-level
-// consumers (millpond) are unaffected.
+// straight off the warehouse row (provision-time inputs). For Kind ==
+// "cnpg-shard" the composition picks the shard and publishes the
+// authoritative endpoint/database/user + credential Secret ref in the
+// Duckling CR status; the provisioner MIRRORS that into the row on the
+// ready-reconcile tick (provisioner.reconcileMetadataStoreRow), so this
+// endpoint serves it without any Kubernetes dependency. A just-turned-ready
+// warehouse may serve an empty connection block for up to one reconcile
+// interval until the mirror lands.
 
 // discoveryStates are the lifecycle states external writers must see.
 // Resharding is INCLUDED, with writable=false: if a resharding warehouse
@@ -259,10 +260,13 @@ func (h *handler) assembleDiscovery() (*discoveryResponse, error) {
 				Port:     w.MetadataStore.Port,
 				Database: w.MetadataStore.DatabaseName,
 				Username: w.MetadataStore.Username,
+				// Served from the DISCOVERY-ONLY mirror columns (see
+				// ManagedWarehouse.MetadataStoreSecretRef) — NOT the
+				// activation-validated MetadataStoreCredentials.
 				PasswordSecretRef: discoverySecretRef{
-					Namespace: w.MetadataStoreCredentials.Namespace,
-					Name:      w.MetadataStoreCredentials.Name,
-					Key:       w.MetadataStoreCredentials.Key,
+					Namespace: w.MetadataStoreSecretRef.Namespace,
+					Name:      w.MetadataStoreSecretRef.Name,
+					Key:       w.MetadataStoreSecretRef.Key,
 				},
 			},
 			Bucket: w.DataStore.BucketName,

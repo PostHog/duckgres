@@ -300,6 +300,17 @@ type ManagedWarehouse struct {
 	DuckLake          ManagedWarehouseDuckLake       `gorm:"embedded;embeddedPrefix:ducklake_" json:"ducklake"`
 	WorkerIdentity    ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
 
+	// MetadataStoreSecretRef is the DISCOVERY-ONLY mirror of the Duckling
+	// CR's status.metadataStore.credentialSecretRef, written by the
+	// provisioner's ready-reconcile and served as password_secret_ref on
+	// GET /api/v1/warehouses. Deliberately separate from
+	// MetadataStoreCredentials below: that column set is a worker-activation
+	// input validated tenant-owned by ValidateManagedWarehouseSecretRefs —
+	// the composition-owned refs mirrored here (ducklings namespace,
+	// cnpg-tenant-<org>-password) fail that validation by design, and
+	// writing them there breaks every cold worker activation.
+	MetadataStoreSecretRef SecretRef `gorm:"embedded;embeddedPrefix:metadata_store_secret_ref_" json:"metadata_store_secret_ref"`
+
 	WarehouseDatabaseCredentials SecretRef `gorm:"embedded;embeddedPrefix:warehouse_database_credentials_" json:"warehouse_database_credentials"`
 	MetadataStoreCredentials     SecretRef `gorm:"embedded;embeddedPrefix:metadata_store_credentials_" json:"metadata_store_credentials"`
 	S3Credentials                SecretRef `gorm:"embedded;embeddedPrefix:s3_credentials_" json:"s3_credentials"`
