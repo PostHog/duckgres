@@ -132,11 +132,15 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.",
 		"DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.",
-		"373313242555",
-		"645773004826",
-		"posthog-duckling-perfprodus",
-		"scenario_perf_writer",
-		"perf.dw.dev.postwh.com",
+		"MW_DEV_SCENARIO_PERF_HOST",
+		"MW_DEV_SCENARIO_PERF_PORT",
+		"MW_DEV_SCENARIO_PERF_DATABASE",
+		"MW_DEV_SCENARIO_PERF_USERNAME",
+		"MW_DEV_SCENARIO_PERF_PASSWORD",
+		"postgres://",
+		"postgresql://",
+		"--dsn",
+		"--password",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("workflow contains internal detail %q", forbidden)
