@@ -569,6 +569,18 @@ type OrgTeamConfig struct {
 // (stale snapshot / mid-provision): a committed org always has at least one
 // team (provision requires one, DeleteOrgTeamTx keeps the last).
 func (oc *OrgConfig) OldestTeamID() int64 {
+	best := oc.OldestTeam()
+	if best == nil {
+		return 0
+	}
+	return best.TeamID
+}
+
+// OldestTeam returns the org's oldest team row under OldestTeamID's exact
+// ordering (min created_at, ties broken by the smaller team_id), or nil when
+// the org has no team rows. Shared by the org-info metric so its per-org
+// representative team matches the id usage buckets already stamp.
+func (oc *OrgConfig) OldestTeam() *OrgTeamConfig {
 	var best *OrgTeamConfig
 	for i := range oc.Teams {
 		t := &oc.Teams[i]
@@ -578,15 +590,19 @@ func (oc *OrgConfig) OldestTeamID() int64 {
 			best = t
 		}
 	}
-	if best == nil {
-		return 0
-	}
-	return best.TeamID
+	return best
 }
 
 // ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.
 type ManagedWarehouseConfig struct {
 	OrgID string
+
+	// DucklingName is the k8s Duckling CR name (and therefore the prefix of
+	// every composed per-tenant resource, e.g. the <name>-compaction
+	// maintenance CronJob). NOT derivable from OrgID: legacy tenants
+	// stripped uuid hyphens, newer ones keep them. Carried in the snapshot
+	// as the org-teams info metric's join key.
+	DucklingName string
 
 	Image           string
 	DuckLakeVersion string
@@ -619,6 +635,7 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 
 	cfg := &ManagedWarehouseConfig{
 		OrgID:                        warehouse.OrgID,
+		DucklingName:                 warehouse.DucklingName,
 		Image:                        warehouse.Image,
 		DuckLakeVersion:              warehouse.DuckLakeVersion,
 		WarehouseDatabase:            warehouse.WarehouseDatabase,

@@ -193,6 +193,10 @@ func SetupMultiTenant(
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
+	// Identity info-metric for dashboards (org ↔ team ↔ duckling). Reads the
+	// snapshot at scrape time — registered here where the concrete store is
+	// in hand (the interface returned upward deliberately hides Snapshot).
+	registerOrgTeamsInfoMetric(store)
 
 	// Per-user persistent secret manager (CREATE PERSISTENT SECRET). With no
 	// key configured the manager still loads so DROP can clean up stale rows,
