@@ -83,6 +83,7 @@ func (h *blockingSessionCreatedLogHandler) WithGroup(string) slog.Handler      {
 
 type recordingWorkerPool struct {
 	events *[]string
+	worker *ManagedWorker
 }
 
 func (p *recordingWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
@@ -93,14 +94,16 @@ func (p *recordingWorkerPool) ReleaseWorker(id int) {
 	*p.events = append(*p.events, "pool ReleaseWorker")
 }
 
-func (p *recordingWorkerPool) RetireWorker(id int) {}
+func (p *recordingWorkerPool) RetireWorker(id int) {
+	*p.events = append(*p.events, "pool RetireWorker")
+}
 
 func (p *recordingWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 	return false
 }
 
 func (p *recordingWorkerPool) Worker(id int) (*ManagedWorker, bool) {
-	return nil, false
+	return p.worker, p.worker != nil && p.worker.ID == id
 }
 
 func (p *recordingWorkerPool) SpawnMinWorkers(count int) error {
@@ -427,6 +430,7 @@ type blockingCreateSessionFlightClient struct {
 	createStarted   chan struct{}
 	allowCreate     chan struct{}
 	createSucceeded chan struct{}
+	destroyRecvErr  error
 	startOnce       sync.Once
 	successOnce     sync.Once
 	destroyCalls    atomic.Int32
@@ -438,6 +442,9 @@ func (c *blockingCreateSessionFlightClient) DoAction(ctx context.Context, action
 		return &blockingCreateSessionActionClient{ctx: ctx, client: c}, nil
 	case "DestroySession":
 		c.destroyCalls.Add(1)
+		if c.destroyRecvErr != nil {
+			return &errorActionClient{ctx: ctx, err: c.destroyRecvErr}, nil
+		}
 		return &eofActionClient{ctx: ctx}, nil
 	default:
 		return nil, errors.New("unexpected action: " + action.Type)
@@ -554,6 +561,33 @@ func (c *eofActionClient) Context() context.Context      { return c.ctx }
 func (c *eofActionClient) SendMsg(m any) error           { return nil }
 func (c *eofActionClient) RecvMsg(m any) error           { return nil }
 
+type errorActionClient struct {
+	ctx context.Context
+	err error
+}
+
+func (c *errorActionClient) Recv() (*flight.Result, error) { return nil, c.err }
+func (c *errorActionClient) Header() (metadata.MD, error)  { return nil, nil }
+func (c *errorActionClient) Trailer() metadata.MD          { return nil }
+func (c *errorActionClient) CloseSend() error              { return nil }
+func (c *errorActionClient) Context() context.Context      { return c.ctx }
+func (c *errorActionClient) SendMsg(m any) error           { return nil }
+func (c *errorActionClient) RecvMsg(m any) error           { return nil }
+
+func TestManagedWorkerDestroySessionPropagatesStreamError(t *testing.T) {
+	want := errors.New("destroy stream timed out")
+	flightClient := &blockingCreateSessionFlightClient{destroyRecvErr: want}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+	}
+
+	err := worker.DestroySession(context.Background(), "session-1")
+	if !errors.Is(err, want) {
+		t.Fatalf("DestroySession() error = %v, want wrapped %v", err, want)
+	}
+}
+
 func TestDestroySession_ReleasesLeaseAfterWorkerRelease(t *testing.T) {
 	events := []string{}
 	pool := &recordingWorkerPool{events: &events}
@@ -574,6 +608,38 @@ func TestDestroySession_ReleasesLeaseAfterWorkerRelease(t *testing.T) {
 	want := []string{"pool ReleaseWorker", "lease Release"}
 	if strings.Join(events, ",") != strings.Join(want, ",") {
 		t.Fatalf("expected event order %v, got %v", want, events)
+	}
+}
+
+func TestDestroySessionRetiresWorkerWhenWorkerCleanupTimesOut(t *testing.T) {
+	events := []string{}
+	flightClient := &blockingCreateSessionFlightClient{
+		destroyRecvErr: context.DeadlineExceeded,
+	}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+		done:   make(chan struct{}),
+	}
+	pool := &recordingWorkerPool{events: &events, worker: worker}
+	sm := NewSessionManager(pool, nil)
+
+	pid := int32(1010)
+	sm.mu.Lock()
+	sm.sessions[pid] = &ManagedSession{
+		PID:          pid,
+		WorkerID:     worker.ID,
+		SessionToken: "session-1",
+		lease:        &recordingConnectionLease{events: &events},
+	}
+	sm.byWorker[worker.ID] = []int32{pid}
+	sm.mu.Unlock()
+
+	sm.DestroySession(pid)
+
+	want := []string{"pool RetireWorker", "lease Release"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v; a worker with incomplete cleanup must never return to the schedulable pool", events, want)
 	}
 }
 
