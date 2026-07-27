@@ -730,8 +730,15 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Release the worker for reuse after cleanup is complete.
-	sm.pool.ReleaseWorker(session.WorkerID)
+	// A failed destroy means worker-side cleanup may still own the session's
+	// sole DB connection. Never return that worker to the schedulable pool:
+	// the next CreateSession would block on db.Conn() until its 30s timeout.
+	if workerDestroyErr != nil {
+		sm.pool.RetireWorker(session.WorkerID)
+	} else {
+		// Release the worker for reuse only after cleanup completed.
+		sm.pool.ReleaseWorker(session.WorkerID)
+	}
 	sm.releaseSessionLease(session, "pid", pid)
 
 	sm.log.Info("Session destroyed.",
