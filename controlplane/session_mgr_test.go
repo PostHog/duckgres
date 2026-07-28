@@ -750,3 +750,22 @@ func TestIsWorkerConnPoolTimeoutError(t *testing.T) {
 		t.Fatal("nil misclassified")
 	}
 }
+
+func TestIsWorkerS3CacheRestoreError(t *testing.T) {
+	// The worker-side mandatory restore failure as it reaches the CP through
+	// the CreateSession RPC wrapping (duckdbservice doCreateSession maps it to
+	// ResourceExhausted). The CP must classify it for recycle-and-reacquire: a
+	// fresh worker's restore is a no-op, so the client's connect need not fail.
+	err := fmt.Errorf("create session: %w",
+		fmt.Errorf("create session on worker 31: create session recv: %w",
+			errors.New("rpc error: code = ResourceExhausted desc = create session: restore S3 cache transport before session start: swap S3 secret transport (s3_cache=true): refresh S3 secret: IO Error")))
+	if !isWorkerS3CacheRestoreError(err) {
+		t.Fatal("s3-cache restore failure not classified for recycle")
+	}
+	if isWorkerS3CacheRestoreError(errors.New("max sessions reached (1)")) {
+		t.Fatal("cap error misclassified as s3-cache restore failure")
+	}
+	if isWorkerS3CacheRestoreError(nil) {
+		t.Fatal("nil misclassified")
+	}
+}

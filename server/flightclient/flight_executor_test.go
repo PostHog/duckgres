@@ -603,3 +603,29 @@ func TestQueryContextCancelsDoGetBeforeWaitingAfterSchemaError(t *testing.T) {
 	default:
 	}
 }
+
+// TestWithSessionForwardsQueryID: the worker needs the control plane's
+// statement ID to tie its own logs — and a stuck-query warning in particular —
+// back to a query-log row that may never get a terminal event.
+func TestWithSessionForwardsQueryID(t *testing.T) {
+	e := &FlightExecutor{sessionToken: "tok", workerID: 3}
+
+	ctx := e.withSession(wire.WithQueryID(context.Background(), "qid-42"))
+	md, ok := metadata.FromOutgoingContext(ctx)
+	if !ok {
+		t.Fatal("expected outgoing metadata")
+	}
+	if got := md.Get(wire.QueryIDMetadataKey); len(got) != 1 || got[0] != "qid-42" {
+		t.Fatalf("query id header = %v, want [qid-42]", got)
+	}
+
+	// No ID in context: no header, rather than an empty one.
+	ctx = e.withSession(context.Background())
+	md, _ = metadata.FromOutgoingContext(ctx)
+	if got := md.Get(wire.QueryIDMetadataKey); len(got) != 0 {
+		t.Fatalf("expected no query id header, got %v", got)
+	}
+	if got := md.Get("x-duckgres-session"); len(got) != 1 || got[0] != "tok" {
+		t.Fatalf("session header must still be set, got %v", got)
+	}
+}

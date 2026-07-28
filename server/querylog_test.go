@@ -333,35 +333,7 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	_, err = db.Exec(`CREATE TABLE query_log (
-		event_time TIMESTAMPTZ,
-		query_duration_ms BIGINT,
-		type VARCHAR,
-		query VARCHAR,
-		transpiled_query VARCHAR,
-		query_kind VARCHAR,
-		normalized_query_hash BIGINT,
-		result_rows BIGINT,
-		written_rows BIGINT,
-		exception_code VARCHAR,
-		exception VARCHAR,
-		user_name VARCHAR,
-		org_id VARCHAR,
-		current_database VARCHAR,
-		client_address VARCHAR,
-		client_port INTEGER,
-		application_name VARCHAR,
-		pid INTEGER,
-		worker_id INTEGER,
-		is_transpiled BOOLEAN,
-		protocol VARCHAR,
-		trace_id VARCHAR,
-		span_id VARCHAR,
-		postgres_scan_ms BIGINT,
-		cpu_time_s DOUBLE,
-		peak_buffer_memory_bytes BIGINT
-	)`)
-	if err != nil {
+	if _, err = db.Exec(duckDBQueryLogTableSQL("query_log", false)); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
 
@@ -500,6 +472,89 @@ func TestLogQueryPrefersExecutorQueryLogSink(t *testing.T) {
 	case entry := <-ql.ch:
 		t.Fatalf("server query logger should not receive entry when executor sink is available: %#v", entry)
 	default:
+	}
+}
+
+// TestLogQueryStampsScopedQueryID pins the correlation contract: every event
+// logged for one statement carries that statement's ID, and a new statement
+// gets a new one. Reusing the previous statement's ID would silently merge two
+// statements in the query log.
+func TestLogQueryStampsScopedQueryID(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	first := c.beginQueryMetrics(time.Unix(1700000000, 0).UTC())
+	// Two events for one statement — e.g. a per-statement log inside a batch
+	// followed by the statement's terminal event.
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+	c.finishQueryMetrics(first)
+
+	second := c.beginQueryMetrics(time.Unix(1700000001, 0).UTC())
+	c.logQuery(time.Unix(1700000001, 0).UTC(), "SELECT 2", "", "SELECT", 1, 0, "", "", "simple")
+	c.finishQueryMetrics(second)
+
+	if len(exec.entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(exec.entries))
+	}
+	for i, entry := range exec.entries {
+		if entry.QueryID == "" {
+			t.Fatalf("entry %d has no query_id", i)
+		}
+	}
+	if exec.entries[0].QueryID != exec.entries[1].QueryID {
+		t.Fatalf("events for one statement must share a query_id: %q vs %q",
+			exec.entries[0].QueryID, exec.entries[1].QueryID)
+	}
+	if exec.entries[2].QueryID == exec.entries[0].QueryID {
+		t.Fatalf("a new statement must get a new query_id, got %q twice", exec.entries[2].QueryID)
+	}
+}
+
+// TestLogQueryWithoutScopeMintsFreshQueryID covers the paths that log without
+// opening a metrics scope: they must not inherit a stale ID.
+func TestLogQueryWithoutScopeMintsFreshQueryID(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	scope := c.beginQueryMetrics(time.Unix(1700000000, 0).UTC())
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+	c.finishQueryMetrics(scope)
+
+	// No active scope now.
+	c.logQuery(time.Unix(1700000002, 0).UTC(), "SELECT 3", "", "SELECT", 1, 0, "", "", "simple")
+
+	if len(exec.entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(exec.entries))
+	}
+	if exec.entries[1].QueryID == "" {
+		t.Fatal("scope-less entry must still carry a query_id")
+	}
+	if exec.entries[1].QueryID == exec.entries[0].QueryID {
+		t.Fatalf("scope-less entry must not inherit the previous statement's id %q", exec.entries[0].QueryID)
+	}
+}
+
+// TestNewQueryIDIsTimeOrdered pins the UUIDv7 choice: IDs minted in sequence
+// must sort in arrival order so they cluster in the query log's time-ordered
+// partitions instead of scattering writes like a random UUID.
+func TestNewQueryIDIsTimeOrdered(t *testing.T) {
+	previous := ""
+	for i := range 50 {
+		id := newQueryID()
+		if id == "" {
+			t.Fatalf("query id %d is empty", i)
+		}
+		if previous != "" && id <= previous {
+			t.Fatalf("query id %d (%q) does not sort after %q", i, id, previous)
+		}
+		previous = id
 	}
 }
 

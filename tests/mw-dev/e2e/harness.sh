@@ -21,7 +21,14 @@
 # duckgres-cache-proxy DaemonSet, and enabling DUCKGRES_CACHE_ENABLED without it
 # would hang worker startup on the proxy health wait. Covered by
 # TestSessionPoolCredentialRefreshKeepsCacheProxyTransport in
-# duckdbservice/activation_test.go.
+# duckdbservice/activation_test.go. The same applies to the per-session
+# duckgres.s3_cache secret-transport SWAP (SetS3CacheEnabled, its
+# restore-at-create/destroy, and its interplay with credential rotation):
+# unit-covered in duckdbservice/s3_cache_test.go, while the s3_cache_guc
+# assertion below exercises the full client-visible plumbing (CP interception,
+# the CP→worker SetSessionS3Cache action round-trip, closed-enum rejection,
+# startup options, fresh-session default) against real workers where the swap
+# itself no-ops.
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
 #                  a malformed startup-message length is rejected cleanly (no CP
@@ -409,6 +416,64 @@ query_source_guc() { # org password
   # Case-insensitive, normalized to lowercase.
   assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'ENDPOINTS'; SHOW duckgres.query_source" "endpoints" "query_source_case_insensitive"
   assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" "1" "query_source_set_then_query"
+}
+
+# s3_cache_guc exercises the duckgres.s3_cache session GUC end-to-end. When a
+# session sets it off, the CP asks the session's worker (SetSessionS3Cache
+# DoAction) to rebuild the tenant ducklake_s3 secret with the org's native
+# HTTPS transport so S3 traffic CONNECT-tunnels PAST the node-local cache
+# proxy; on/RESET restores the cache-proxy transport. mw-dev deploys no cache
+# proxy, so the worker-side swap no-ops here — what this asserts is the full
+# client-visible plumbing on a REAL worker: CP interception, the CP→worker
+# action round-trip on every state flip (a worker that rejected the action
+# would fail the SET), session-state SHOW, the 22023 closed-enum rejection,
+# batch splitting, DuckLake R/W inside a bypassed session, connect-time
+# startup options, and the fresh-session default. The actual secret-transport
+# swap and its restore/rotation invariants are unit-covered
+# (duckdbservice/s3_cache_test.go).
+s3_cache_guc() { # org password
+  log "duckgres.s3_cache session GUC on $1"
+  # Default is on; SET off round-trips within the session (this flip drives
+  # the worker RPC — a worker-side failure would error the SET).
+  assert_compat   "$1" "$2" ducklake "SHOW duckgres.s3_cache" "on" "s3_cache_default"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; SHOW duckgres.s3_cache" "off" "s3_cache_set_off"
+  # DuckLake R/W still works inside a bypassed session (real S3 round-trip
+  # over whatever transport the worker now carries).
+  t="e2e_s3cache_$(echo "$1" | tr -c 'a-z0-9' _)"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; DROP TABLE IF EXISTS $t; CREATE TABLE $t(id INT); INSERT INTO $t VALUES (1),(2); SELECT COUNT(*) FROM $t" "2" "s3_cache_off_ducklake_rw"
+  pg "$1" "$2" ducklake "DROP TABLE $t;"
+  # Closed enum: junk is rejected at SET time (22023) naming the valid values,
+  # and a fresh session still reports the default.
+  if out="$(pg_try "$1" "$2" ducklake "SET duckgres.s3_cache = 'junk'; SHOW duckgres.s3_cache")"; then
+    fail "s3_cache: invalid value 'junk' was accepted: $out"
+  fi
+  case "$out" in
+    *'must be "on" or "off"'*) ;;
+    *) fail "s3_cache: invalid-value rejection did not name the valid values: '$out'" ;;
+  esac
+  # Fresh-session default: a previous session's off must never leak into the
+  # org's next session (this org's hot-idle worker is reused across these
+  # connects, so this also crosses the worker-side restore path).
+  assert_compat "$1" "$2" ducklake "SHOW duckgres.s3_cache" "on" "s3_cache_fresh_session_default"
+  # RESET restores the default within a session.
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; RESET duckgres.s3_cache; SHOW duckgres.s3_cache" "on" "s3_cache_reset"
+
+  # Connect-time startup option (libpq options / PGOPTIONS): valid applies to
+  # the session, invalid is rejected pre-worker-acquisition with FATAL 22023.
+  got="$(PGPASSWORD="$2" psql \
+      "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake options='-c duckgres.s3_cache=off'" \
+      -v ON_ERROR_STOP=1 -tAc "SHOW duckgres.s3_cache" 2>&1)" \
+    || fail "s3_cache: connect with -c duckgres.s3_cache=off failed: $got"
+  [ "$got" = "off" ] || fail "s3_cache: startup option session reports '$got', want 'off'"
+  if out="$(PGPASSWORD="$2" psql \
+      "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake options='-c duckgres.s3_cache=junk'" \
+      -v ON_ERROR_STOP=1 -tAc "SELECT 1" 2>&1)"; then
+    fail "s3_cache: invalid startup option was accepted: $out"
+  fi
+  case "$out" in
+    *'must be "on" or "off"'*) ;;
+    *) fail "s3_cache: invalid startup-option rejection did not name the valid values: '$out'" ;;
+  esac
 }
 
 # Regression for #715: the CP reads the post-TLS startup message with the shared
@@ -3375,10 +3440,13 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   basic_query            "$CNPG" "$cnpg_pw"
   pg_compat_functions    "$CNPG" "$cnpg_pw"
   query_source_guc       "$CNPG" "$cnpg_pw"
+  s3_cache_guc           "$CNPG" "$cnpg_pw"
   malformed_startup_resilience "$CNPG" "$cnpg_pw"
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  query_log_round_trip   "$CNPG" "$cnpg_pw"   # after rw_ducklake (DuckLake attached, query-log surface ensured)
+  query_log_access_metadata "$CNPG" "$cnpg_pw"
   binary_copy_round_trip "$CNPG" "$cnpg_pw"
   explain_ducklake       "$CNPG" "$cnpg_pw"
   httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
@@ -3397,6 +3465,144 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   # Idle worker reclamation: a 3-CPU worker with a 1m TTL must be reaped after it
   # goes idle (catches the hot-idle-reaper-dark / persist-swallow idle leak).
   hot_idle_retired    "$CNPG" "$cnpg_pw" ducklake 3 6Gi
+}
+
+# query_log_round_trip proves the whole query-log pipeline end to end on a real
+# tenant: control plane builds the entry -> forwards it to the worker over
+# Flight -> the worker's batched sink INSERTs into the tenant metadata Postgres
+# -> it is readable through the ducklake.system.query_log view. Nothing else in
+# the suite covers this path, and every column added to the registry rides it.
+#
+# It also pins the two properties the rest of the query-log work depends on:
+#   * query_id is populated (the correlation key every later event joins on), and
+#   * the view exposes the current column set — an existing tenant's view is
+#     created once with CREATE VIEW IF NOT EXISTS, so a view that was not
+#     replaced on drift would still be missing query_id here.
+query_log_round_trip() { # org password
+  log "query_log round trip on $1"
+  marker="qlmark_$(date +%s)_$$"
+  # The marker rides in a comment: the transpiler deparses from the AST, so a
+  # literal would survive but a comment proves we log the ORIGINAL inbound text.
+  pg "$1" "$2" ducklake "SELECT 1 /* $marker */" >/dev/null
+
+  # The sink batches (5s flush) and the control plane forwards asynchronously,
+  # so poll rather than assuming the row has landed. Queries naming
+  # system.query_log are deliberately not logged themselves
+  # (isQueryLogSelfReferential), so this poll cannot recurse.
+  a=0
+  while [ "$a" -lt 30 ]; do
+    row="$(pg_try "$1" "$2" ducklake \
+      "SELECT query_id || '|' || type || '|' || query_kind || '|' || user_name
+         FROM ducklake.system.query_log
+        WHERE query LIKE '%$marker%' AND type = 'QueryFinish' LIMIT 1")" || row=""
+    [ -n "$row" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ -n "$row" ] || fail "query_log_round_trip: no QueryFinish row for $marker after 60s"
+
+  qid="${row%%|*}"; rest="${row#*|}"
+  etype="${rest%%|*}"; rest="${rest#*|}"
+  kind="${rest%%|*}"; who="${rest#*|}"
+
+  # query_id must be a real UUID, not an empty string the view happened to
+  # render as blank — this is the join key for every later query-log event.
+  case "$qid" in
+    ????????-????-????-????-????????????) : ;;
+    *) fail "query_log_round_trip: query_id '$qid' is not a uuid (row: $row)" ;;
+  esac
+  [ "$etype" = "QueryFinish" ] || fail "query_log_round_trip: type '$etype' (row: $row)"
+  [ "$kind" = "Select" ] || fail "query_log_round_trip: query_kind '$kind' (row: $row)"
+  [ "$who" = "root" ] || fail "query_log_round_trip: user_name '$who' (row: $row)"
+
+  # The QueryStart row for the SAME query_id must be there too. This is the
+  # ClickHouse event model end to end: the control plane emits QueryStart before
+  # execution and the terminal event after, and they join on query_id. A
+  # QueryStart with no terminal is how a query whose worker died mid-flight
+  # stays visible, so the pair has to actually pair.
+  a=0 starts=""
+  while [ "$a" -lt 15 ]; do
+    starts="$(pg_try "$1" "$2" ducklake \
+      "SELECT count(*) FROM ducklake.system.query_log
+        WHERE query_id = '$qid' AND type = 'QueryStart'")" || starts=""
+    [ "$starts" = "1" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ "$starts" = "1" ] || fail "query_log_round_trip: expected exactly 1 QueryStart for $qid, got '$starts'"
+
+  # Client chatter must NOT get a start event (query_log.start_events=data):
+  # BEGIN/SET/SHOW never hang, and logging starts for them doubles the row count
+  # of the noisiest statements a driver sends.
+  chatter="qlchatter_$(date +%s)_$$"
+  pg "$1" "$2" ducklake "SET application_name = '$chatter'" >/dev/null
+  sleep 8   # one flush interval plus slack
+  n="$(pg_try "$1" "$2" ducklake \
+    "SELECT count(*) FROM ducklake.system.query_log
+      WHERE query LIKE '%$chatter%' AND type = 'QueryStart'")" || n=""
+  [ "$n" = "0" ] || fail "query_log_round_trip: SET emitted $n QueryStart rows, expected 0"
+
+  log "query_log round trip OK on $1 (query_id=$qid, start+terminal paired)"
+}
+
+# query_log_access_metadata asserts the RBAC signals: every logged statement
+# records what it reads, what it writes, and the class of access it needs. These
+# columns are the substrate a future authorization policy is evaluated against,
+# so they are asserted on real traffic, not just in unit fixtures.
+#
+# The load-bearing property is the LAST check: a statement the PostgreSQL parser
+# cannot read must log metadata_complete=false, never an empty relation list. A
+# gate that read "touched nothing" from a failed parse would be a hole.
+query_log_access_metadata() { # org password
+  log "query_log access metadata on $1"
+  tbl="qlmeta_$$"
+  pg "$1" "$2" ducklake "CREATE TABLE IF NOT EXISTS $tbl (id INT)" >/dev/null
+
+  # A read and a write over the same table must be classified differently.
+  marker_r="qlread_$(date +%s)_$$"
+  marker_w="qlwrite_$(date +%s)_$$"
+  pg "$1" "$2" ducklake "SELECT count(*) FROM $tbl /* $marker_r */" >/dev/null
+  pg "$1" "$2" ducklake "INSERT INTO $tbl VALUES (1) /* $marker_w */" >/dev/null
+
+  ql_meta_row() { # marker -> "access_kinds|metadata_complete|query_metadata"
+    a=0 out=""
+    while [ "$a" -lt 30 ]; do
+      out="$(pg_try "$1" "$2" ducklake \
+        "SELECT access_kinds || '|' || metadata_complete::VARCHAR || '|' || coalesce(query_metadata,'')
+           FROM ducklake.system.query_log
+          WHERE query LIKE '%$3%' AND type <> 'QueryStart' LIMIT 1")" || out=""
+      [ -n "$out" ] && { printf %s "$out"; return 0; }
+      sleep 2; a=$((a + 1))
+    done
+    return 1
+  }
+
+  rrow="$(ql_meta_row "$1" "$2" "$marker_r")" || fail "query_log_access_metadata: no row for $marker_r"
+  case "$rrow" in
+    read\|*|*,read\|*|read,*\|*) : ;;
+    *) fail "query_log_access_metadata: SELECT access_kinds not 'read' (row: $rrow)" ;;
+  esac
+  case "$rrow" in *"\"name\":\"$tbl\""*) : ;; *) fail "query_log_access_metadata: SELECT did not record $tbl (row: $rrow)" ;; esac
+  case "$rrow" in *"read_relations"*) : ;; *) fail "query_log_access_metadata: SELECT recorded no read_relations (row: $rrow)" ;; esac
+
+  wrow="$(ql_meta_row "$1" "$2" "$marker_w")" || fail "query_log_access_metadata: no row for $marker_w"
+  case "$wrow" in *write*) : ;; *) fail "query_log_access_metadata: INSERT not classified as write (row: $wrow)" ;; esac
+  case "$wrow" in *"write_relations"*) : ;; *) fail "query_log_access_metadata: INSERT recorded no write_relations (row: $wrow)" ;; esac
+
+  # A DuckDB-native statement the PostgreSQL parser rejects must be logged as
+  # INCOMPLETE, not as a statement that touched nothing.
+  marker_n="qlnative_$(date +%s)_$$"
+  pg_try "$1" "$2" ducklake "SUMMARIZE SELECT 1 AS a /* $marker_n */" >/dev/null 2>&1 || true
+  nrow="$(ql_meta_row "$1" "$2" "$marker_n")" || nrow=""
+  if [ -n "$nrow" ]; then
+    case "$nrow" in
+      *"|false|"*) : ;;
+      *) fail "query_log_access_metadata: unparseable SQL must log metadata_complete=false (row: $nrow)" ;;
+    esac
+  else
+    log "query_log_access_metadata: no row for $marker_n (statement may have been rejected pre-log); skipping incomplete check"
+  fi
+
+  pg_try "$1" "$2" ducklake "DROP TABLE IF EXISTS $tbl" >/dev/null 2>&1 || true
+  log "query_log access metadata OK on $1"
 }
 
 # Busy-only Karpenter disruption protection: a worker pod must carry
@@ -3586,7 +3792,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

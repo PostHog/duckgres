@@ -56,6 +56,18 @@ type WorkerWaitSessionIdlePayload struct {
 	WorkerControlMetadata
 }
 
+// WorkerSetS3CachePayload asks a worker to route the tenant's S3 traffic
+// through the node-local cache proxy (Enabled=true, the default transport) or
+// to bypass it (Enabled=false: the S3 secret is rebuilt with the org's native
+// HTTPS transport, so the proxy blind-tunnels via CONNECT and never serves or
+// fills its cache). Session-scoped in effect because remote workers run one
+// session at a time; the worker restores the proxy transport before the next
+// session starts. Carries the `duckgres.s3_cache` session GUC.
+type WorkerSetS3CachePayload struct {
+	WorkerControlMetadata
+	Enabled bool `json:"enabled"`
+}
+
 // WorkerReleaseQueryHandlePayload asks a worker to release a statement query
 // handle that was created by GetFlightInfo but abandoned before DoGet could
 // consume it.
@@ -67,7 +79,24 @@ type WorkerReleaseQueryHandlePayload struct {
 // QueryLogEntry represents a completed client query event that the control
 // plane asks the activated worker to persist in tenant query-log storage.
 type QueryLogEntry struct {
-	EventID               string
+	// QueryID is the per-statement UUIDv7 the control plane mints when the
+	// query arrives. Every event for one statement carries the same value, so
+	// a QueryStart row and its terminal row join on it.
+	QueryID string
+	// ParentQueryID links a statement to the inbound protocol message it came
+	// from. A batched simple query ("SELECT 1; SELECT 2") runs N statements
+	// under one Query message: each gets its own QueryID and shares the
+	// message's ID here. Empty when the statement is the whole message.
+	ParentQueryID string
+	// StatementIndex is the statement's zero-based position within a batched
+	// simple query (ClickHouse's script_query_number).
+	StatementIndex int
+	// EventTime is the statement's START time on every event type, including
+	// terminal ones. This deliberately diverges from ClickHouse, where
+	// event_time is when the event was logged: pinning both rows of a
+	// start/terminal pair to the same instant keeps them in one monthly
+	// partition and lets them join without a window function. A terminal row's
+	// finish time is EventTime + QueryDurationMs.
 	EventTime             time.Time
 	QueryDurationMs       int64
 	Type                  string
@@ -94,6 +123,22 @@ type QueryLogEntry struct {
 	PostgresScanMs        int64
 	CPUTimeSeconds        float64
 	PeakBufferMemoryBytes int64
+
+	// QueryMetadata is the JSON-encoded querymeta.Metadata for the statement:
+	// what it reads, what it writes, which columns and functions it touches,
+	// and the access class each of those implies. Recorded for audit today and
+	// intended as the input a future authorization policy is evaluated against,
+	// which is why it carries its own completeness flag rather than letting an
+	// empty list stand for "nothing touched".
+	QueryMetadata string
+	// AccessKinds is the statement's access classes, comma-separated, lifted
+	// out of QueryMetadata so the common "show me every write" filter is a
+	// plain column scan instead of JSON extraction.
+	AccessKinds string
+	// MetadataComplete is false when extraction could not see the whole
+	// statement. A consumer that gates on QueryMetadata must treat false as
+	// "unknown", never as "nothing touched".
+	MetadataComplete bool
 }
 
 // WorkerQueryLogPayload carries a batch of completed query-log entries to the

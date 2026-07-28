@@ -304,6 +304,14 @@ type QueryLogConfig struct {
 	Enabled       bool
 	FlushInterval time.Duration
 	BatchSize     int
+	// StartEvents selects which statements emit a QueryStart event. Empty
+	// behaves as the default ("data") so a config that predates this field
+	// keeps working.
+	StartEvents QueryStartEvents
+	// Metadata enables per-statement extraction of the relations, columns,
+	// functions, and access classes a statement touches (server/querymeta).
+	// It costs one parse per distinct statement text, memoized.
+	Metadata bool
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
@@ -712,7 +720,7 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 	if ok && cancel != nil {
 		cancel()
 		queryCancellationsCounter.Inc()
-		slog.Info("Query cancelled via cancel request.", "pid", key.Pid, "secret_key", key.SecretKey)
+		slog.Info("Query cancelled via cancel request.", "pid", key.Pid)
 		return true
 	}
 	return false
@@ -2120,14 +2128,40 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 		if isTransactionAborted(err) {
 			_, _ = ae.Exec("ROLLBACK")
 			if _, retryErr := ae.Exec(secretStmt); retryErr != nil {
-				return fmt.Errorf("refresh S3 secret after rollback: %w", retryErr)
+				return fmt.Errorf("refresh S3 secret after rollback: %s", redactSecretStatementError(retryErr.Error()))
 			}
 		} else {
-			return fmt.Errorf("refresh S3 secret: %w", err)
+			return fmt.Errorf("refresh S3 secret: %s", redactSecretStatementError(err.Error()))
 		}
 	}
 	slog.Debug("Refreshed S3 secret for hot-idle reuse.", "provider", provider)
 	return nil
+}
+
+// redactSecretStatementError reduces an engine error from a CREATE SECRET
+// statement to its error-class prefix ("Parser Error", "IO Error", ...) plus
+// a fixed placeholder. RefreshS3Secret errors flow beyond internal logs —
+// via the duckgres.s3_cache SET / session-create restore paths into
+// client-facing error messages, the query log, and the admin recent-errors
+// ring — so no engine detail may survive: DuckDB errors can echo the
+// offending SQL, and the echo is ELLIPSIZED for long lines ("LINE 1:
+// ...oken' ..."), so matching-and-replacing complete credential values is NOT
+// sufficient — a truncated echo carries credential FRAGMENTS no exact match
+// catches, and even the first line's `at or near "..."` token can hold
+// string-literal content. Dropping everything after the class prefix is the
+// only airtight shape (the repo precedent is usersecrets.RedactErrorForLog's
+// whole-message placeholder; keeping the class preserves triage value at zero
+// leak surface, and works regardless of where the credentials came from —
+// dlCfg or buildAWSSdkSecret's internally-fetched ones).
+func redactSecretStatementError(msg string) string {
+	const placeholder = "[details redacted: engine errors may echo secret SQL]"
+	// An error class is a short leading tag; a "prefix" long enough to carry
+	// echoed SQL means the message doesn't follow the class-colon shape — drop
+	// it entirely.
+	if idx := strings.Index(msg, ":"); idx > 0 && idx <= 64 && !strings.ContainsAny(msg[:idx], "'\"\n") {
+		return msg[:idx] + ": " + placeholder
+	}
+	return placeholder
 }
 
 // resolveS3SecretTransport picks the URL_STYLE and USE_SSL values to embed in
@@ -2542,7 +2576,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// should be read by the child process after FD passing.
 	// The SSL request is a single, small message and the client waits for 'S'
 	// before sending the TLS ClientHello, so unbuffered reads are safe here.
-	params, err := wire.ReadStartupMessage(conn)
+	startup, err := wire.ReadStartupMessage(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
@@ -2557,7 +2591,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// Handle GSSENCRequest - decline and re-read for SSLRequest.
 	// Loop to handle the unlikely case of multiple GSSENCRequests.
 	for range 3 {
-		if params["__gssenc_request"] != "true" {
+		if !startup.GSSENCRequest {
 			break
 		}
 		slog.Debug("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
@@ -2568,7 +2602,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 			return
 		}
 		// Re-read: client will send SSLRequest next
-		params, err = wire.ReadStartupMessage(conn)
+		startup, err = wire.ReadStartupMessage(conn)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, io.EOF) {
 				slog.Debug("Client closed connection after GSSENC decline.", "remote_addr", remoteAddr)
@@ -2582,15 +2616,17 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	}
 
 	// Handle cancel request in parent (no child spawn needed)
-	if params["__cancel_request"] == "true" {
-		s.handleCancelRequestIsolated(params)
+	if startup.CancelRequest {
+		if startup.CancelCredentialsPresent {
+			s.handleCancelRequestIsolated(BackendKey{Pid: startup.CancelPID, SecretKey: startup.CancelSecretKey})
+		}
 		s.rateLimiter.UnregisterConnection(remoteAddr)
 		_ = conn.Close()
 		return
 	}
 
 	// Handle SSL request: send 'S' then spawn child for TLS handshake
-	if params["__ssl_request"] == "true" {
+	if startup.SSLRequest {
 		if err := conn.SetReadDeadline(time.Time{}); err != nil {
 			slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
 			s.rateLimiter.UnregisterConnection(remoteAddr)
@@ -2643,22 +2679,6 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 }
 
 // handleCancelRequestIsolated handles a cancel request in process isolation mode.
-func (s *Server) handleCancelRequestIsolated(params map[string]string) {
-	pidStr := params["__cancel_pid"]
-	secretKeyStr := params["__cancel_secret_key"]
-
-	if pidStr == "" || secretKeyStr == "" {
-		return
-	}
-
-	var pid, secretKey int64
-	if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
-		return
-	}
-	if _, err := fmt.Sscanf(secretKeyStr, "%d", &secretKey); err != nil {
-		return
-	}
-
-	key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
+func (s *Server) handleCancelRequestIsolated(key BackendKey) {
 	s.CancelQueryBySignal(key)
 }

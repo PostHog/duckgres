@@ -324,6 +324,14 @@ func formatTextValue(v interface{}, oid int32) string {
 		if dates, ok := normalizeDriverValue(v).([]any); ok {
 			return formatArrayValueWithElementOID(dates, OidDate)
 		}
+	case OidTimestamptz:
+		if timestamp, ok := normalizeDriverValue(v).(time.Time); ok {
+			return formatTimestamptz(timestamp)
+		}
+	case OidTimestamptzArray:
+		if timestamps, ok := normalizeDriverValue(v).([]any); ok {
+			return formatArrayValueWithElementOID(timestamps, OidTimestamptz)
+		}
 	}
 	return formatValue(v)
 }
@@ -348,6 +356,20 @@ func formatDate(date time.Time) string {
 		return fmt.Sprintf("%04d-%02d-%02d BC", 1-date.Year(), date.Month(), date.Day())
 	}
 	return date.Format("2006-01-02")
+}
+
+// formatTimestamptz returns the PostgreSQL text representation of a TIMESTAMPTZ
+// value. The server advertises UTC, so normalize the instant before including
+// the required UTC offset.
+func formatTimestamptz(timestamp time.Time) string {
+	if timestamp.IsZero() {
+		return ""
+	}
+	timestamp = timestamp.UTC()
+	if timestamp.Nanosecond() != 0 {
+		return timestamp.Format("2006-01-02 15:04:05.999999+00")
+	}
+	return timestamp.Format("2006-01-02 15:04:05+00")
 }
 
 func sameDate(a, b time.Time) bool {

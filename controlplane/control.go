@@ -969,12 +969,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	writer := bufio.NewWriter(tlsConn)
 
 	// Read startup message (user/database)
-	startupParams, err := server.ReadStartupMessage(reader)
+	startup, err := server.ReadStartupMessage(reader)
 	if err != nil {
 		clog.Error("Failed to read startup message.", "error", err)
 		return
 	}
 
+	startupParams := startup.Params
 	username := startupParams["user"]
 	database := startupParams["database"]
 	applicationName := startupParams["application_name"]
@@ -1159,12 +1160,28 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
+
 	for _, w := range profileWarns {
 		clog.Warn("Adjusted worker profile.", "detail", w)
 	}
 	if orgProfileApplied && workerProfile != nil {
 		// Once per connection so support can see which shape a tenant got.
 		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
+	}
+
+	// Validate a `-c duckgres.s3_cache=...` startup option BEFORE acquiring a
+	// worker (same early-reject treatment as an invalid duckgres.worker_*
+	// option). The option is applied after the session executor is bound,
+	// below — application swaps the worker's S3 secret transport off the
+	// node-local cache proxy for this session.
+	rawS3Cache, s3CacheRequested := startupOptions[server.S3CacheGUCName]
+	if s3CacheRequested {
+		if err := server.ValidateS3CacheOption(rawS3Cache); err != nil {
+			clog.Warn("Rejected s3_cache startup option.", "error", err)
+			_ = server.WriteErrorResponse(writer, "FATAL", "22023", err.Error())
+			_ = writer.Flush()
+			return
+		}
 	}
 
 	// Resolve the session manager and rebalancer for this connection.
@@ -1487,6 +1504,18 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.SetCatalogUseRewrite(cc, duckLakeAttached && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
 	server.SetQueryAccessPolicy(cc, queryAccessPolicy)
+	// Apply the connect-time `-c duckgres.s3_cache=...` option (validated
+	// before worker acquisition, above) now that the session executor is
+	// bound. Failure refuses the connection: a session that asked for
+	// s3_cache=off must never silently run through the cache.
+	if s3CacheRequested {
+		if err := server.ApplyConnectionS3CacheOption(cc, rawS3Cache); err != nil {
+			clog.Error("Failed to apply s3_cache startup option.", "error", err)
+			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", err.Error())
+			_ = writer.Flush()
+			return
+		}
+	}
 	// The normal PostgreSQL message loop is about to take ownership of reader.
 	// Join the disconnect watcher first; a FIN/RST at any point during session
 	// admission or metadata initialization tears down the session via the defer

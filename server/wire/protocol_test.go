@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"strings"
 	"testing"
@@ -40,12 +41,12 @@ func TestReadStartupMessageValid(t *testing.T) {
 		"user":     "alice",
 		"database": "db1",
 	})
-	params, err := ReadStartupMessage(bytes.NewReader(msg))
+	startup, err := ReadStartupMessage(bytes.NewReader(msg))
 	if err != nil {
 		t.Fatalf("ReadStartupMessage: %v", err)
 	}
-	if params["user"] != "alice" || params["database"] != "db1" {
-		t.Fatalf("unexpected params: %v", params)
+	if startup.Params["user"] != "alice" || startup.Params["database"] != "db1" {
+		t.Fatalf("unexpected params: %v", startup.Params)
 	}
 }
 
@@ -54,12 +55,35 @@ func TestReadStartupMessageSSLRequest(t *testing.T) {
 	// SSLRequest is exactly 8 bytes: length + request code.
 	msg = msg[:8]
 	binary.BigEndian.PutUint32(msg[:4], 8)
-	params, err := ReadStartupMessage(bytes.NewReader(msg))
+	startup, err := ReadStartupMessage(bytes.NewReader(msg))
 	if err != nil {
 		t.Fatalf("ReadStartupMessage: %v", err)
 	}
-	if params["__ssl_request"] != "true" {
-		t.Fatalf("expected SSL request, got: %v", params)
+	if !startup.SSLRequest {
+		t.Fatalf("expected SSL request, got: %+v", startup)
+	}
+}
+
+// Cancel-request credentials must not share the ordinary startup-parameter
+// container: that map is used by callers for loggable fields such as user and
+// application_name. Keeping the key in the typed cancel branch prevents an
+// accidental log sink from receiving it.
+func TestReadStartupMessageSeparatesCancelCredentials(t *testing.T) {
+	msg := buildRawStartup(16, []byte{
+		0x04, 0xd2, 0x16, 0x2e, // CancelRequest code (80877102)
+		0x00, 0x00, 0x00, 0x2a, // pid 42
+		0x00, 0x00, 0x01, 0x41, // secret key 321
+	})
+
+	startup, err := ReadStartupMessage(bytes.NewReader(msg))
+	if err != nil {
+		t.Fatalf("ReadStartupMessage: %v", err)
+	}
+	if !startup.CancelRequest || !startup.CancelCredentialsPresent || startup.CancelPID != 42 || startup.CancelSecretKey != 321 {
+		t.Fatalf("unexpected cancel request: %+v", startup)
+	}
+	if len(startup.Params) != 0 {
+		t.Fatalf("cancel credentials must not be returned in startup params: %v", startup.Params)
 	}
 }
 
@@ -117,13 +141,13 @@ func TestReadStartupMessageUnterminatedValue(t *testing.T) {
 	msg := buildRawStartup(int32(len(body)+4), body)
 
 	// Must not panic.
-	params, err := ReadStartupMessage(bytes.NewReader(msg))
+	startup, err := ReadStartupMessage(bytes.NewReader(msg))
 	if err != nil {
 		t.Fatalf("ReadStartupMessage on unterminated value: %v", err)
 	}
 	// The truncated final pair is dropped (break before assignment).
-	if _, ok := params["user"]; ok {
-		t.Fatalf("expected truncated final pair to be dropped, got: %v", params)
+	if _, ok := startup.Params["user"]; ok {
+		t.Fatalf("expected truncated final pair to be dropped, got: %v", startup.Params)
 	}
 }
 
@@ -182,5 +206,26 @@ func TestReadMessageInvalidLength(t *testing.T) {
 				t.Fatalf("unexpected error for length %d: %v", tc.length, err)
 			}
 		})
+	}
+}
+
+func TestQueryIDContextRoundTrip(t *testing.T) {
+	ctx := WithQueryID(context.Background(), "019fa916-0918-76dd-bc75-591a7ec4e8fa")
+	if got := QueryIDFromContext(ctx); got != "019fa916-0918-76dd-bc75-591a7ec4e8fa" {
+		t.Fatalf("query id = %q", got)
+	}
+	if got := QueryIDFromContext(context.Background()); got != "" {
+		t.Fatalf("unset context should yield an empty id, got %q", got)
+	}
+	// An empty id must not put a value in the context: the header is only
+	// appended when there is something to say.
+	if ctx := WithQueryID(context.Background(), ""); QueryIDFromContext(ctx) != "" {
+		t.Fatal("an empty id must not be stored")
+	}
+	// A nil-valued context interface — which a caller can hold without meaning
+	// to. Passing the literal trips staticcheck SA1012.
+	var nilCtx context.Context
+	if QueryIDFromContext(nilCtx) != "" {
+		t.Fatal("a nil context must be safe")
 	}
 }

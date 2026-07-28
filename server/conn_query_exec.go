@@ -9,6 +9,7 @@ import (
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/wire"
 	"github.com/posthog/duckgres/transpiler"
 )
@@ -340,7 +341,7 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 	}
 	c.logger().Debug("Multi-statement simple query.", "count", len(tree.Stmts))
 
-	for _, stmt := range tree.Stmts {
+	for index, stmt := range tree.Stmts {
 		// Deparse individual statement back to SQL
 		singleTree := &pg_query.ParseResult{
 			Stmts: []*pg_query.RawStmt{stmt},
@@ -352,7 +353,7 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 		}
 		singleSQL = transpiler.RestoreLongIdentifiers(singleSQL, longIdents)
 
-		errSent, fatalErr := c.executeSingleStatement(singleSQL)
+		errSent, fatalErr := c.executeStatementInBatch(singleSQL, index)
 		if fatalErr != nil {
 			return fatalErr
 		}
@@ -371,6 +372,16 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 // is responsible for that). Returns (true, nil) if an error was sent to the
 // client (so the caller can stop processing a batch), or (false, err) for
 // fatal connection errors.
+// executeStatementInBatch runs one statement of a batched simple query under
+// its own observation scope. Each statement is its own query_id — a QueryStart
+// and its terminal event must pair one-to-one — while parent_query_id and
+// statement_index keep the originating Query message reconstructable.
+func (c *clientConn) executeStatementInBatch(query string, index int) (errSent bool, fatalErr error) {
+	scope := c.beginStatementMetrics(time.Now(), index, usersecrets.RedactForLog(query))
+	defer c.endStatementScope(scope)
+	return c.executeSingleStatement(query)
+}
+
 func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
 	start := time.Now()
 
@@ -549,6 +560,24 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	if result.QuerySourceShow {
 		_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		_ = c.sendDataRowWithFormats([]interface{}{c.QuerySource()}, nil, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return false, nil
+	}
+
+	// duckgres.s3_cache custom GUC (SET / SHOW): intercepted session-side and
+	// applied via the worker transport swap. A failed swap aborts the rest of
+	// the batch — later statements may depend on the requested cache state.
+	if result.S3CacheSet != nil {
+		if err := c.applyS3CacheSetting(*result.S3CacheSet); err != nil {
+			c.sendError("ERROR", "XX000", err.Error())
+			return true, nil
+		}
+		_ = c.writeCommandComplete("SET")
+		return false, nil
+	}
+	if result.S3CacheShow {
+		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
 		_ = c.writeCommandComplete("SHOW")
 		return false, nil
 	}

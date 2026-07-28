@@ -357,6 +357,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 		key      string
 		conn     duckdbConnHandle
 		progress *progressState
+		queryID  string
 	}
 
 	h.pool.mu.RLock()
@@ -373,6 +374,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 			key:      key,
 			conn:     session.duckdbConn,
 			progress: &session.progress,
+			queryID:  session.CurrentQueryID(),
 		})
 	}
 	h.pool.mu.RUnlock()
@@ -413,9 +415,15 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 				if snap.progress.stalledChecks.Load() >= stallCheckThreshold {
 					stalled = true
 					if snap.progress.stalledChecks.Load() == stallCheckThreshold {
+						// Carry the control plane's query ID: a stuck statement
+						// is exactly the case whose query-log row may never get
+						// a terminal event, and this is what ties the two
+						// together.
 						slog.Warn("Query appears stuck — no progress detected.",
-							"session", snap.key, "rows_processed", pr.rows, "total_rows", pr.total,
-							"stalled_checks", stallCheckThreshold)
+							withQueryIDAttr([]any{
+								"session", snap.key, "rows_processed", pr.rows, "total_rows", pr.total,
+								"stalled_checks", stallCheckThreshold,
+							}, snap.queryID)...)
 					}
 				}
 			}
@@ -462,6 +470,32 @@ func (h *FlightSQLHandler) doWaitSessionIdle(body []byte, stream flight.FlightSe
 		default:
 			return status.Errorf(codes.Internal, "wait for session idle: %v", err)
 		}
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
+	return sendActionResult(stream, &flight.Result{Body: resp})
+}
+
+// doSetSessionS3Cache applies the `duckgres.s3_cache` session GUC: it swaps
+// the tenant S3 secret between the cache-proxy transport (enabled) and the
+// org's native HTTPS transport (bypassed). Requires a live session — the swap
+// is instance-global, which is session-scoped only under the one-session-per-
+// worker contract, and a sessionless caller has no business toggling it.
+// Errors surface to the control plane so the client's SET fails rather than
+// silently not taking effect.
+func (h *FlightSQLHandler) doSetSessionS3Cache(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerSetS3CachePayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid SetSessionS3Cache request: %v", err)
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+	if _, err := h.sessionFromContext(stream.Context()); err != nil {
+		return err
+	}
+	if err := h.pool.SetS3CacheEnabled(req.Enabled); err != nil {
+		return status.Errorf(codes.Internal, "set session s3 cache: %v", err)
 	}
 
 	resp, _ := json.Marshal(map[string]bool{"ok": true})
@@ -733,8 +767,17 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		}()
 		defer endConnWork()
 
+		// The query ID's lifetime mirrors queryActive exactly: the progress
+		// monitor reads both from its own goroutine, and a stuck-query warning
+		// naming the wrong statement is worse than one naming none.
+		if queryID := queryIDFromContext(ctx); queryID != "" {
+			session.setCurrentQueryID(queryID)
+		}
 		session.progress.queryActive.Store(true)
-		defer session.progress.queryActive.Store(false)
+		defer func() {
+			session.progress.queryActive.Store(false)
+			session.setCurrentQueryID("")
+		}()
 		endTxnWork := ttx.beginWork()
 		defer endTxnWork()
 
@@ -809,7 +852,11 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if busyErr := sessionBusyStatus(ok); busyErr != nil {
 		return 0, busyErr
 	}
-	defer finishOperation()
+	session.setCurrentQueryID(queryIDFromContext(ctx))
+	defer func() {
+		session.setCurrentQueryID("")
+		finishOperation()
+	}()
 
 	tx, _, ttx, err := session.getOpenTxn(cmd.GetTransactionId())
 	if err != nil {
