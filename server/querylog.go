@@ -426,7 +426,15 @@ func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
 	}
 
 	clientAddr, clientPort := c.clientAddrPort()
-	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(c.queryMetadata(scope))
+	meta := c.queryMetadata(scope)
+	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(meta)
+	// Prefer the parsed kind. A leading-keyword guess reads "WITH ..." as a
+	// utility statement, which would make a start event disagree with its own
+	// terminal about what the statement was.
+	queryKind := meta.QueryKind
+	if queryKind == "" {
+		queryKind = classifyQuery(leadingSQLKeyword(query))
+	}
 	ql.Log(QueryLogEntry{
 		QueryID:          scope.queryID,
 		ParentQueryID:    scope.parentQueryID,
@@ -434,7 +442,7 @@ func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
 		EventTime:        scope.start,
 		Type:             QueryEventStart,
 		Query:            query,
-		QueryKind:        classifyQuery(leadingSQLKeyword(query)),
+		QueryKind:        queryKind,
 		NormalizedHash:   normalizeQueryHash(query),
 		UserName:         c.username,
 		OrgID:            c.orgID,

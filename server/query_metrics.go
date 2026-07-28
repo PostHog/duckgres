@@ -91,6 +91,9 @@ func (c *clientConn) beginQueryMetrics(start time.Time) *queryMetricsScope {
 // simple query. The statement gets its own query ID — a QueryStart and its
 // terminal must pair one-to-one — while parentQueryID and statementIndex keep
 // the batch reconstructable.
+//
+// Close it with endStatementScope, NOT finishQueryMetrics: the enclosing Query
+// message owns the metrics for the whole batch (see endStatementScope).
 func (c *clientConn) beginStatementMetrics(start time.Time, index int, queryText string) *queryMetricsScope {
 	parentID := ""
 	if c.activeQueryMetrics != nil {
@@ -101,6 +104,23 @@ func (c *clientConn) beginStatementMetrics(start time.Time, index int, queryText
 	scope.statementIndex = index
 	scope.queryText = queryText
 	return scope
+}
+
+// endStatementScope closes a nested statement scope without emitting metrics.
+//
+// Metrics stay owned by the enclosing Query message, which is what they have
+// always counted: routing them through finishQueryMetrics would turn one
+// duckgres_query_total increment per message into one per statement plus one
+// for the message, silently changing the meaning of an existing metric and
+// double-counting every batch. It would also flush the wire buffer between
+// statements of a batch, which the protocol path deliberately does not do.
+func (c *clientConn) endStatementScope(scope *queryMetricsScope) {
+	if scope == nil {
+		return
+	}
+	if c.activeQueryMetrics == scope {
+		c.activeQueryMetrics = scope.previous
+	}
 }
 
 // markExecStarted records that the statement reached an engine, and emits its

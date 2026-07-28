@@ -551,7 +551,6 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	if busyErr := sessionBusyStatus(ok); busyErr != nil {
 		return nil, busyErr
 	}
-	session.setCurrentQueryID(queryIDFromContext(ctx))
 	releaseOperationOnReturn := true
 	defer func() {
 		if releaseOperationOnReturn {

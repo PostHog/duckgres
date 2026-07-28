@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server/usersecrets"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestTerminalQueryEventType(t *testing.T) {
@@ -336,4 +337,56 @@ func TestBeginStatementMetricsLinksBatchStatements(t *testing.T) {
 	if first.StatementIndex != 0 || second.StatementIndex != 1 {
 		t.Fatalf("statement indexes = %d, %d; want 0, 1", first.StatementIndex, second.StatementIndex)
 	}
+}
+
+// TestBatchedStatementScopesDoNotDoubleCountMetrics pins the boundary between
+// the two scope kinds. Per-statement scopes exist to give each statement of a
+// batch its own query_id; they must NOT emit query metrics, because those
+// metrics have always counted one attempt per Query message. Routing them
+// through finishQueryMetrics would turn a 3-statement batch into 4 counter
+// increments and flush the wire buffer between statements.
+func TestBatchedStatementScopesDoNotDoubleCountMetrics(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	c.orgID = "metrics_scope_probe"
+	c.server.cfg.QueryLog.Enabled = true
+	c.server.cfg.QueryLog.StartEvents = QueryStartEventsOff
+
+	counter := queryTotalCounter.WithLabelValues(c.orgID, string(queryStatusSuccess), string(queryReasonNone))
+	before := testutil.ToFloat64(counter)
+
+	start := time.Unix(1700000000, 0).UTC()
+	message := c.beginQueryMetrics(start)
+	message.queryText = "SELECT 1; SELECT 2; SELECT 3"
+	for i, sql := range []string{"SELECT 1", "SELECT 2", "SELECT 3"} {
+		statement := c.beginStatementMetrics(start, i, sql)
+		c.endStatementScope(statement)
+	}
+	c.finishQueryMetrics(message)
+
+	if got := testutil.ToFloat64(counter) - before; got != 1 {
+		t.Fatalf("a 3-statement batch produced %v query_total increments, want 1 (one per Query message)", got)
+	}
+	if c.activeQueryMetrics != nil {
+		t.Fatal("every scope should have been popped")
+	}
+}
+
+// TestEndStatementScopeRestoresParent: the statement scope must hand control
+// back to the message scope, or the next statement's events would be attributed
+// to a finished statement.
+func TestEndStatementScopeRestoresParent(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+
+	message := c.beginQueryMetrics(time.Now())
+	statement := c.beginStatementMetrics(time.Now(), 0, "SELECT 1")
+	if c.activeQueryMetrics != statement {
+		t.Fatal("the statement scope should be active while it runs")
+	}
+	c.endStatementScope(statement)
+	if c.activeQueryMetrics != message {
+		t.Fatal("ending a statement scope must restore the message scope")
+	}
+	c.finishQueryMetrics(message)
 }

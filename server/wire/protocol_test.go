@@ -199,7 +199,10 @@ func TestQueryIDContextRoundTrip(t *testing.T) {
 	if ctx := WithQueryID(context.Background(), ""); QueryIDFromContext(ctx) != "" {
 		t.Fatal("an empty id must not be stored")
 	}
-	if QueryIDFromContext(nil) != "" {
+	// A nil-valued context interface — which a caller can hold without meaning
+	// to. Passing the literal trips staticcheck SA1012.
+	var nilCtx context.Context
+	if QueryIDFromContext(nilCtx) != "" {
 		t.Fatal("a nil context must be safe")
 	}
 }

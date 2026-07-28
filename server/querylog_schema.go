@@ -79,8 +79,15 @@ var queryLogColumns = []queryLogColumn{
 	{Name: "query_metadata", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return truncateQueryMetadata(e.QueryMetadata) }},
 }
 
-// queryLogEntryColumns returns the columns duckgres writes, in INSERT order.
-func queryLogEntryColumns() []queryLogColumn {
+// The registry is static, so everything derived from it is built once at init.
+// queryLogEntryInsertArgs runs per entry inside the flush loop, and a batch is
+// up to BatchSize entries.
+var (
+	queryLogEntryColumnsCached = buildQueryLogEntryColumns()
+	queryLogEntryNamesCached   = buildQueryLogEntryColumnNames()
+)
+
+func buildQueryLogEntryColumns() []queryLogColumn {
 	entryColumns := make([]queryLogColumn, 0, len(queryLogColumns))
 	for _, column := range queryLogColumns {
 		if column.Arg != nil {
@@ -88,6 +95,20 @@ func queryLogEntryColumns() []queryLogColumn {
 		}
 	}
 	return entryColumns
+}
+
+func buildQueryLogEntryColumnNames() []string {
+	entryColumns := buildQueryLogEntryColumns()
+	names := make([]string, 0, len(entryColumns))
+	for _, column := range entryColumns {
+		names = append(names, column.Name)
+	}
+	return names
+}
+
+// queryLogEntryColumns returns the columns duckgres writes, in INSERT order.
+func queryLogEntryColumns() []queryLogColumn {
+	return queryLogEntryColumnsCached
 }
 
 // queryLogColumnNames returns the names of every column in the table,
@@ -104,12 +125,7 @@ func queryLogColumnNames() []string {
 // queryLogEntryColumnNames returns the names of the columns duckgres writes.
 // This is also the DuckLake view's column list.
 func queryLogEntryColumnNames() []string {
-	entryColumns := queryLogEntryColumns()
-	names := make([]string, 0, len(entryColumns))
-	for _, column := range entryColumns {
-		names = append(names, column.Name)
-	}
-	return names
+	return queryLogEntryNamesCached
 }
 
 // postgresQueryLogColumns is the comma-separated list of every column, used by

@@ -378,7 +378,7 @@ func (c *clientConn) handleMultiStatementQuery(query string) error {
 // statement_index keep the originating Query message reconstructable.
 func (c *clientConn) executeStatementInBatch(query string, index int) (errSent bool, fatalErr error) {
 	scope := c.beginStatementMetrics(time.Now(), index, usersecrets.RedactForLog(query))
-	defer c.finishQueryMetrics(scope)
+	defer c.endStatementScope(scope)
 	return c.executeSingleStatement(query)
 }
 

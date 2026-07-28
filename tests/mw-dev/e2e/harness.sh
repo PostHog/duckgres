@@ -3345,7 +3345,7 @@ query_log_access_metadata() { # org password
     a=0 out=""
     while [ "$a" -lt 30 ]; do
       out="$(pg_try "$1" "$2" ducklake \
-        "SELECT access_kinds || '|' || metadata_complete || '|' || coalesce(query_metadata,'')
+        "SELECT access_kinds || '|' || metadata_complete::VARCHAR || '|' || coalesce(query_metadata,'')
            FROM ducklake.system.query_log
           WHERE query LIKE '%$3%' AND type <> 'QueryStart' LIMIT 1")" || out=""
       [ -n "$out" ] && { printf %s "$out"; return 0; }
@@ -3373,7 +3373,7 @@ query_log_access_metadata() { # org password
   nrow="$(ql_meta_row "$1" "$2" "$marker_n")" || nrow=""
   if [ -n "$nrow" ]; then
     case "$nrow" in
-      *"|f|"*|*"|false|"*) : ;;
+      *"|false|"*) : ;;
       *) fail "query_log_access_metadata: unparseable SQL must log metadata_complete=false (row: $nrow)" ;;
     esac
   else
