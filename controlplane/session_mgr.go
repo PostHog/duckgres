@@ -659,16 +659,22 @@ func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker
 		_ = session.Executor.Close()
 	}
 	if worker != nil {
+		var destroyErr error
 		select {
 		case <-worker.done:
 		default:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := worker.DestroySession(ctx, session.SessionToken); err != nil {
-				sm.log.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", err)
+			destroyErr = worker.DestroySession(ctx, session.SessionToken)
+			if destroyErr != nil {
+				sm.log.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", destroyErr)
 			}
 			cancel()
 		}
-		sm.pool.ReleaseWorker(worker.ID)
+		if destroyErr != nil {
+			sm.pool.RetireWorker(worker.ID)
+		} else {
+			sm.pool.ReleaseWorker(worker.ID)
+		}
 	}
 }
 
