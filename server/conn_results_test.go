@@ -40,6 +40,7 @@ func TestSendErrorDoesNotLogErrorContents(t *testing.T) {
 
 func TestSendDataRowWithFormatsUsesTypeOIDForTextDates(t *testing.T) {
 	date := time.Date(2022, 4, 1, 0, 0, 0, 0, time.UTC)
+	timestampTZ := time.Date(2022, 3, 31, 20, 0, 0, 123456000, time.FixedZone("UTC-4", -4*60*60))
 	farFutureDate := time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC)
 	positiveInfinity := time.Date(5881580, time.July, 11, 0, 0, 0, 0, time.UTC)
 	negativeInfinity := time.Date(-5877641, time.June, 24, 0, 0, 0, 0, time.UTC)
@@ -71,6 +72,18 @@ func TestSendDataRowWithFormatsUsesTypeOIDForTextDates(t *testing.T) {
 			value:   date,
 			typeOID: OidTimestamp,
 			want:    "2022-04-01 00:00:00",
+		},
+		{
+			name:    "timestamp with timezone includes UTC offset",
+			value:   timestampTZ,
+			typeOID: OidTimestamptz,
+			want:    "2022-04-01 00:00:00.123456+00",
+		},
+		{
+			name:    "timestamp with timezone array includes UTC offsets",
+			value:   []any{timestampTZ, nil, timestampTZ.Add(time.Second)},
+			typeOID: OidTimestamptzArray,
+			want:    `{"2022-04-01 00:00:00.123456+00",NULL,"2022-04-01 00:00:01.123456+00"}`,
 		},
 		{
 			name:    "date array",
