@@ -262,6 +262,14 @@ var userErrorSQLSTATEClasses = map[string]struct{}{
 	"44": {}, // with_check_option_violation
 }
 
+func isUserQueryErrorCode(code string) bool {
+	if len(code) < 2 {
+		return false
+	}
+	_, ok := userErrorSQLSTATEClasses[code[:2]]
+	return ok
+}
+
 // isUserQueryError tells the log/observability path whether a query
 // failure is user-attributable (Info-level "Query execution failed.")
 // or a real system error worth alerting on (Error-level "Query
@@ -279,12 +287,23 @@ func isUserQueryError(err error) bool {
 	if err == nil {
 		return false
 	}
-	code := classifyErrorCode(err)
-	if len(code) < 2 {
-		return false
+	return isUserQueryErrorCode(classifyErrorCode(err))
+}
+
+// queryErrorCategory is the single classification used by logs, analytics,
+// the admin recent-error ring, and query metrics. Keep the values stable:
+// they are an observability API consumed outside this package.
+func queryErrorCategory(err error) string {
+	switch {
+	case isDuckLakeTransactionConflict(err):
+		return "conflict"
+	case isDuckLakeMetadataConnectionLost(err):
+		return "metadata_connection_lost"
+	case isUserQueryError(err):
+		return "user"
+	default:
+		return "system"
 	}
-	_, ok := userErrorSQLSTATEClasses[code[:2]]
-	return ok
 }
 
 // isConnectionBroken checks if an error indicates a broken connection

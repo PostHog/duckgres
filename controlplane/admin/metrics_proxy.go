@@ -36,11 +36,11 @@ func NewMetricsProxy(promURL string) *MetricsProxy {
 
 // panel maps a stable key to a PromQL template with named tokens substituted
 // server-side: $ORG = org label selector (e.g. {org="x"}, empty when no org),
-// $ORGERR = the same scoped to outcome="error", $WIN = rate window. A token
+// $ORGERR = the same scoped to status="error", $WIN = rate window. A token
 // replacer (not positional fmt) is used so a template that omits a token is
 // rendered cleanly — no surplus-argument corruption.
 var rangePanels = map[string]string{
-	"query_rate":      `sum by (outcome) (rate(duckgres_query_total$ORG[$WIN]))`,
+	"query_rate":      `sum by (status, reason) (rate(duckgres_query_total$ORG[$WIN]))`,
 	"error_ratio":     `sum(rate(duckgres_query_total$ORGERR[$WIN])) / clamp_min(sum(rate(duckgres_query_total$ORG[$WIN])), 1)`,
 	"duration_p95":    `histogram_quantile(0.95, sum by (le) (rate(duckgres_query_duration_seconds_bucket$ORG[$WIN])))`,
 	"duration_p50":    `histogram_quantile(0.50, sum by (le) (rate(duckgres_query_duration_seconds_bucket$ORG[$WIN])))`,
@@ -92,10 +92,10 @@ func (m *MetricsProxy) queryRange(c *gin.Context) {
 	// Org selectors: exact-match label selectors, empty (cluster-wide) when no
 	// org is given. orgErrSel additionally scopes to failed queries.
 	orgSel := ""
-	orgErrSel := `{outcome="error"}`
+	orgErrSel := `{status="error"}`
 	if org := c.Query("org"); org != "" {
 		orgSel = fmt.Sprintf(`{org=%q}`, org)
-		orgErrSel = fmt.Sprintf(`{org=%q,outcome="error"}`, org)
+		orgErrSel = fmt.Sprintf(`{org=%q,status="error"}`, org)
 	}
 	rateWindow := c.DefaultQuery("rate_window", "5m")
 	if d, err := time.ParseDuration(rateWindow); err != nil || d <= 0 {

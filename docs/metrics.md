@@ -110,7 +110,7 @@ The Kubernetes worker allocator keeps its existing names:
 | `duckgres_worker_acquire_total_seconds` | `org`, `source`, `outcome` | End-to-end worker allocation latency after admission. Sources are `idle_reuse`, `hot_idle_claim`, `spawn`, or `none`. |
 | `duckgres_worker_acquire_gate_wait_seconds` | `org`, `outcome` | Time waiting for the per-org FIFO worker-acquire gate. |
 | `duckgres_worker_acquire_phase_seconds` | `org`, `phase`, `outcome` | Individual `hot_idle_claim`, `spawn`, or `activate` phase latency. |
-| `duckgres_query_total` | `org`, `outcome` | One event per non-empty query attempt; outcomes are `success`, `error`, or `canceled`. |
+| `duckgres_query_total` | `org`, `status`, `reason` | One event per non-empty query attempt. Valid pairs: `success/none`; `failure/user`, `failure/canceled`, `failure/conflict`; `error/metadata_connection_lost`, `error/system`. |
 | `duckgres_query_duration_seconds` | `org` | Query execution latency. Use `duckgres_query_total` for terminal result counts. |
 
 The older fleet-level `duckgres_control_plane_worker_*` metrics remain useful

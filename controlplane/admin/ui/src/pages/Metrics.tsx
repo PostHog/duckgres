@@ -22,7 +22,7 @@ const COLORS = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a5fa"
 
 // Allow-listed panel keys (admin/metrics_proxy.go rangePanels) + presentation.
 const PANELS: { key: string; title: string; unit: string }[] = [
-  { key: "query_rate", title: "Query rate by outcome", unit: "ops/s" },
+  { key: "query_rate", title: "Query rate by status and reason", unit: "ops/s" },
   { key: "error_ratio", title: "Error ratio", unit: "" },
   { key: "duration_p95", title: "Query duration p95", unit: "s" },
   { key: "duration_p50", title: "Query duration p50", unit: "s" },
