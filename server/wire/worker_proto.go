@@ -70,7 +70,21 @@ type QueryLogEntry struct {
 	// QueryID is the per-statement UUIDv7 the control plane mints when the
 	// query arrives. Every event for one statement carries the same value, so
 	// a QueryStart row and its terminal row join on it.
-	QueryID               string
+	QueryID string
+	// ParentQueryID links a statement to the inbound protocol message it came
+	// from. A batched simple query ("SELECT 1; SELECT 2") runs N statements
+	// under one Query message: each gets its own QueryID and shares the
+	// message's ID here. Empty when the statement is the whole message.
+	ParentQueryID string
+	// StatementIndex is the statement's zero-based position within a batched
+	// simple query (ClickHouse's script_query_number).
+	StatementIndex int
+	// EventTime is the statement's START time on every event type, including
+	// terminal ones. This deliberately diverges from ClickHouse, where
+	// event_time is when the event was logged: pinning both rows of a
+	// start/terminal pair to the same instant keeps them in one monthly
+	// partition and lets them join without a window function. A terminal row's
+	// finish time is EventTime + QueryDurationMs.
 	EventTime             time.Time
 	QueryDurationMs       int64
 	Type                  string

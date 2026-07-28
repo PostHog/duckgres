@@ -169,6 +169,7 @@ func DefaultServerConfig() server.Config {
 			Enabled:       true,
 			FlushInterval: 5 * time.Second,
 			BatchSize:     1000,
+			StartEvents:   server.QueryStartEventsData,
 		},
 	}
 }
@@ -439,6 +440,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			} else {
 				warn("Invalid query_log.flush_interval duration: " + err.Error())
 			}
+		}
+		if fileCfg.QueryLog.StartEvents != "" {
+			cfg.QueryLog.StartEvents = server.NormalizeQueryStartEvents(fileCfg.QueryLog.StartEvents)
 		}
 		if fileCfg.QueryLog.BatchSize > 0 {
 			cfg.QueryLog.BatchSize = fileCfg.QueryLog.BatchSize
@@ -904,6 +908,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_QUERY_LOG_FLUSH_INTERVAL duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_QUERY_LOG_START_EVENTS"); v != "" {
+		cfg.QueryLog.StartEvents = server.NormalizeQueryStartEvents(v)
+	}
 	if v := getenv("DUCKGRES_QUERY_LOG_BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.QueryLog.BatchSize = n
@@ -1170,6 +1177,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		warn("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL must be > 0; using default")
 		cfg.QueryLog.FlushInterval = defaultQueryLog.FlushInterval
 	}
+	// An empty value means the config predates start events; normalize rather
+	// than leaving a zero value that would read as "off".
+	cfg.QueryLog.StartEvents = server.NormalizeQueryStartEvents(string(cfg.QueryLog.StartEvents))
 	if cfg.QueryLog.BatchSize <= 0 {
 		warn("DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0; using default")
 		cfg.QueryLog.BatchSize = defaultQueryLog.BatchSize

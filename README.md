@@ -121,7 +121,42 @@ DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
 `query_id` is a per-statement UUIDv7 minted when the query arrives. It is
 time-ordered, appears on the statement's OTEL span (`duckgres.query_id`) and its
 error logs, and is the key that correlates every query-log event for one
-statement.
+statement. A batched simple query (`SELECT 1; SELECT 2`) runs each statement
+under its own `query_id`, with `parent_query_id` and `statement_index`
+identifying the Query message they arrived in.
+
+Statements produce a pair of events, using ClickHouse's `type` vocabulary
+(`QueryStart` = 1, `QueryFinish` = 2, `ExceptionBeforeStart` = 3,
+`ExceptionWhileProcessing` = 4):
+
+- `QueryStart` is emitted when the statement begins executing.
+- One terminal event follows: `QueryFinish`, or `ExceptionWhileProcessing` if it
+  failed after execution began, or `ExceptionBeforeStart` if it failed before
+  any engine saw it (auth or policy denial, a transpile error, a rejected
+  Describe). `ExceptionBeforeStart` events have no `QueryStart`, by definition.
+
+**A `QueryStart` with no terminal event is a query that never came back** — a
+worker OOM-killed mid-statement, a pod evicted. That row is the only evidence
+such a query ever ran, so treat a sustained population of unpaired starts as an
+incident signal, allowing for queries still in flight.
+
+`event_time` is the statement's **start** time on every event type, including
+terminal ones. This diverges from ClickHouse, where `event_time` is when the
+event was logged: pinning both rows of a pair to the same instant keeps them in
+one monthly partition and lets them join without a window function. A terminal
+row's finish time is `event_time + query_duration_ms`.
+
+`query_log.start_events` selects which statements get a `QueryStart`:
+
+- `data` (default) — statements that touch data or change schema. Transaction
+  control, `SET`/`RESET`/`SHOW`, and catalog introspection are skipped: they
+  never hang, and they are the noisiest statements a driver sends.
+- `all` — every statement.
+- `off` — no start events.
+
+Terminal events are always logged regardless of this setting, so nothing
+disappears from the log; cheap statements simply have no paired start row. Also
+settable via `DUCKGRES_QUERY_LOG_START_EVENTS`.
 
 The column set has a single source of truth: `queryLogColumns` in
 `server/querylog_schema.go`. It generates the `CREATE TABLE` DDL, the

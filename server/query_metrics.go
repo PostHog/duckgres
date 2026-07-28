@@ -48,6 +48,24 @@ type queryMetricsScope struct {
 	// it, and an operator can trace one client complaint through logs, spans,
 	// and the query log.
 	queryID string
+	// parentQueryID and statementIndex place this statement inside the inbound
+	// protocol message it came from. Set only for statements of a batched
+	// simple query, which run under a nested scope.
+	parentQueryID  string
+	statementIndex int
+	// queryText is the redacted SQL this scope covers, used by the QueryStart
+	// event. For a batched simple query it is the individual statement, not the
+	// whole message.
+	queryText string
+	// execStarted records that the statement reached an engine. It is what
+	// separates ExceptionBeforeStart from ExceptionWhileProcessing, and it is
+	// set at the single point where a query becomes cancellable
+	// (queryContextInner) so every execution path — simple, batched, extended,
+	// COPY, cursor — marks it without its own call.
+	execStarted bool
+	// startLogged guards QueryStart emission so a statement that takes several
+	// cancellable contexts (COPY, cursor FETCH) still logs exactly one start.
+	startLogged bool
 }
 
 func (c *clientConn) beginQueryMetrics(start time.Time) *queryMetricsScope {
@@ -61,6 +79,39 @@ func (c *clientConn) beginQueryMetrics(start time.Time) *queryMetricsScope {
 	}
 	c.activeQueryMetrics = scope
 	return scope
+}
+
+// beginStatementMetrics opens a nested scope for one statement of a batched
+// simple query. The statement gets its own query ID — a QueryStart and its
+// terminal must pair one-to-one — while parentQueryID and statementIndex keep
+// the batch reconstructable.
+func (c *clientConn) beginStatementMetrics(start time.Time, index int, queryText string) *queryMetricsScope {
+	parentID := ""
+	if c.activeQueryMetrics != nil {
+		parentID = c.activeQueryMetrics.queryID
+	}
+	scope := c.beginQueryMetrics(start)
+	scope.parentQueryID = parentID
+	scope.statementIndex = index
+	scope.queryText = queryText
+	return scope
+}
+
+// markExecStarted records that the statement reached an engine, and emits its
+// QueryStart event the first time. Both happen here because this is the same
+// instant: the query has become cancellable, so it is live from the client's
+// point of view, and any failure from now on is ExceptionWhileProcessing.
+func (c *clientConn) markExecStarted() {
+	scope := c.activeQueryMetrics
+	if scope == nil {
+		return
+	}
+	scope.execStarted = true
+	if scope.startLogged {
+		return
+	}
+	scope.startLogged = true
+	c.logQueryStart(scope)
 }
 
 // currentQueryID returns the active statement's query ID.

@@ -72,6 +72,8 @@ var queryLogColumns = []queryLogColumn{
 	{Name: "peak_buffer_memory_bytes", PGType: "BIGINT DEFAULT 0", Arg: func(e QueryLogEntry) any { return e.PeakBufferMemoryBytes }},
 	// --- appended after the initial schema; reach existing tenants via ALTER TABLE ---
 	{Name: "query_id", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return e.QueryID }},
+	{Name: "parent_query_id", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return e.ParentQueryID }},
+	{Name: "statement_index", PGType: "INTEGER DEFAULT 0", Arg: func(e QueryLogEntry) any { return e.StatementIndex }},
 }
 
 // queryLogEntryColumns returns the columns duckgres writes, in INSERT order.

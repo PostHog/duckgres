@@ -347,6 +347,12 @@ func (c *clientConn) queryContextForCursor() (context.Context, func()) {
 
 func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	c.ensureConnectionContext()
+	// Registering for cancellation is the moment the statement becomes live to
+	// the client, which makes this the one place every execution path — simple,
+	// batched, extended, COPY, cursor — passes through on its way to an engine.
+	// The QueryStart event and the ExceptionBeforeStart boundary both hang off
+	// it rather than off a call added to each path.
+	c.markExecStarted()
 	ctx, cancel := context.WithCancel(c.ctx)
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
@@ -1263,6 +1269,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	start := time.Now()
 	queryMetrics := c.beginQueryMetrics(start)
+	queryMetrics.queryText = loggableQuery
 	defer func() {
 		if retErr != nil {
 			queryMetrics.markError(retErr)

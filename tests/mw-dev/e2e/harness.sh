@@ -3291,7 +3291,34 @@ query_log_round_trip() { # org password
   [ "$etype" = "QueryFinish" ] || fail "query_log_round_trip: type '$etype' (row: $row)"
   [ "$kind" = "Select" ] || fail "query_log_round_trip: query_kind '$kind' (row: $row)"
   [ "$who" = "root" ] || fail "query_log_round_trip: user_name '$who' (row: $row)"
-  log "query_log round trip OK on $1 (query_id=$qid)"
+
+  # The QueryStart row for the SAME query_id must be there too. This is the
+  # ClickHouse event model end to end: the control plane emits QueryStart before
+  # execution and the terminal event after, and they join on query_id. A
+  # QueryStart with no terminal is how a query whose worker died mid-flight
+  # stays visible, so the pair has to actually pair.
+  a=0 starts=""
+  while [ "$a" -lt 15 ]; do
+    starts="$(pg_try "$1" "$2" ducklake \
+      "SELECT count(*) FROM ducklake.system.query_log
+        WHERE query_id = '$qid' AND type = 'QueryStart'")" || starts=""
+    [ "$starts" = "1" ] && break
+    sleep 2; a=$((a + 1))
+  done
+  [ "$starts" = "1" ] || fail "query_log_round_trip: expected exactly 1 QueryStart for $qid, got '$starts'"
+
+  # Client chatter must NOT get a start event (query_log.start_events=data):
+  # BEGIN/SET/SHOW never hang, and logging starts for them doubles the row count
+  # of the noisiest statements a driver sends.
+  chatter="qlchatter_$(date +%s)_$$"
+  pg "$1" "$2" ducklake "SET application_name = '$chatter'" >/dev/null
+  sleep 8   # one flush interval plus slack
+  n="$(pg_try "$1" "$2" ducklake \
+    "SELECT count(*) FROM ducklake.system.query_log
+      WHERE query LIKE '%$chatter%' AND type = 'QueryStart'")" || n=""
+  [ "$n" = "0" ] || fail "query_log_round_trip: SET emitted $n QueryStart rows, expected 0"
+
+  log "query_log round trip OK on $1 (query_id=$qid, start+terminal paired)"
 }
 
 # Busy-only Karpenter disruption protection: a worker pod must carry
@@ -3478,7 +3505,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"
