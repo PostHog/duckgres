@@ -50,11 +50,11 @@ func TestReadStartupMessage(t *testing.T) {
 			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
-		if result["user"] != "testuser" {
-			t.Errorf("user = %q, want %q", result["user"], "testuser")
+		if result.Params["user"] != "testuser" {
+			t.Errorf("user = %q, want %q", result.Params["user"], "testuser")
 		}
-		if result["database"] != "testdb" {
-			t.Errorf("database = %q, want %q", result["database"], "testdb")
+		if result.Params["database"] != "testdb" {
+			t.Errorf("database = %q, want %q", result.Params["database"], "testdb")
 		}
 	})
 
@@ -70,7 +70,7 @@ func TestReadStartupMessage(t *testing.T) {
 			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
-		if result["__ssl_request"] != "true" {
+		if !result.SSLRequest {
 			t.Error("should detect SSL request")
 		}
 	})
@@ -87,7 +87,7 @@ func TestReadStartupMessage(t *testing.T) {
 			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
-		if result["__gssenc_request"] != "true" {
+		if !result.GSSENCRequest {
 			t.Error("should detect GSSENCRequest")
 		}
 	})
@@ -106,7 +106,7 @@ func TestReadStartupMessage(t *testing.T) {
 			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
-		if result["__cancel_request"] != "true" {
+		if !result.CancelRequest {
 			t.Error("should detect cancel request")
 		}
 	})

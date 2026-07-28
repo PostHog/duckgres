@@ -969,12 +969,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	writer := bufio.NewWriter(tlsConn)
 
 	// Read startup message (user/database)
-	startupParams, err := server.ReadStartupMessage(reader)
+	startup, err := server.ReadStartupMessage(reader)
 	if err != nil {
 		clog.Error("Failed to read startup message.", "error", err)
 		return
 	}
 
+	startupParams := startup.Params
 	username := startupParams["user"]
 	database := startupParams["database"]
 	applicationName := startupParams["application_name"]

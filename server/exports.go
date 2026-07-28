@@ -16,7 +16,7 @@ import (
 // Exported wrappers for protocol functions used by the control plane worker.
 // These delegate to the internal (lowercase) implementations.
 
-func ReadStartupMessage(r io.Reader) (map[string]string, error) {
+func ReadStartupMessage(r io.Reader) (wire.StartupMessage, error) {
 	return wire.ReadStartupMessage(r)
 }
 
