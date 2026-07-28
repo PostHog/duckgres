@@ -201,6 +201,8 @@ func (c *clientConn) handleParse(body []byte) {
 		noOpTag:           result.NoOpTag,
 		querySourceSet:    result.QuerySourceSet,    // SET duckgres.query_source (custom GUC)
 		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
+		s3CacheSet:        result.S3CacheSet,        // SET duckgres.s3_cache (custom GUC)
+		s3CacheShow:       result.S3CacheShow,       // SHOW duckgres.s3_cache
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
@@ -289,6 +291,17 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		if ps.querySourceShow {
 			_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+			ps.described = true
+			return
+		}
+
+		// duckgres.s3_cache custom GUC: same shape as query_source above.
+		if ps.s3CacheSet != nil {
+			_ = wire.WriteNoData(c.writer)
+			return
+		}
+		if ps.s3CacheShow {
+			_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 			ps.described = true
 			return
 		}
@@ -412,6 +425,25 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		case cursorOpPgStatActivity:
 			_ = c.sendPgStatActivityRowDescriptionWithFormats(p.resultFormats)
+			p.described = true
+			return
+		}
+
+		// duckgres-namespaced custom GUCs (query_source, s3_cache): answered
+		// from session state, never probed against DuckDB (which does not know
+		// these settings — the LIMIT-0 probe below would just fail and degrade
+		// to NoData). SET returns no rows; SHOW returns a single text column.
+		if p.stmt.querySourceSet != nil || p.stmt.s3CacheSet != nil {
+			_ = wire.WriteNoData(c.writer)
+			return
+		}
+		if p.stmt.querySourceShow {
+			_ = c.sendRowDescriptionWithFormats([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
+			p.described = true
+			return
+		}
+		if p.stmt.s3CacheShow {
+			_ = c.sendRowDescriptionWithFormats([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
 			p.described = true
 			return
 		}
@@ -611,6 +643,27 @@ func (c *clientConn) handleExecute(body []byte) {
 			_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		}
 		_ = c.sendDataRowWithFormats([]interface{}{c.QuerySource()}, p.resultFormats, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return
+	}
+
+	// duckgres.s3_cache custom GUC (SET / SHOW): intercepted session-side,
+	// applied via the worker transport swap. Determined by the transpiler
+	// during Parse. A failed swap errors the Execute so the session state
+	// never diverges from the worker's actual transport.
+	if p.stmt.s3CacheSet != nil {
+		if err := c.applyS3CacheSetting(*p.stmt.s3CacheSet); err != nil {
+			c.sendError("ERROR", "XX000", err.Error())
+			return
+		}
+		_ = c.writeCommandComplete("SET")
+		return
+	}
+	if p.stmt.s3CacheShow {
+		if !p.described {
+			_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		}
+		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, p.resultFormats, nil)
 		_ = c.writeCommandComplete("SHOW")
 		return
 	}

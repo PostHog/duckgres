@@ -21,7 +21,14 @@
 # duckgres-cache-proxy DaemonSet, and enabling DUCKGRES_CACHE_ENABLED without it
 # would hang worker startup on the proxy health wait. Covered by
 # TestSessionPoolCredentialRefreshKeepsCacheProxyTransport in
-# duckdbservice/activation_test.go.
+# duckdbservice/activation_test.go. The same applies to the per-session
+# duckgres.s3_cache secret-transport SWAP (SetS3CacheEnabled, its
+# restore-at-create/destroy, and its interplay with credential rotation):
+# unit-covered in duckdbservice/s3_cache_test.go, while the s3_cache_guc
+# assertion below exercises the full client-visible plumbing (CP interception,
+# the CP→worker SetSessionS3Cache action round-trip, closed-enum rejection,
+# startup options, fresh-session default) against real workers where the swap
+# itself no-ops.
 #
 #   wire/query   : SELECT 1 round-trips, N concurrent connections stay distinct,
 #                  a malformed startup-message length is rejected cleanly (no CP
@@ -409,6 +416,64 @@ query_source_guc() { # org password
   # Case-insensitive, normalized to lowercase.
   assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'ENDPOINTS'; SHOW duckgres.query_source" "endpoints" "query_source_case_insensitive"
   assert_lastline "$1" "$2" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" "1" "query_source_set_then_query"
+}
+
+# s3_cache_guc exercises the duckgres.s3_cache session GUC end-to-end. When a
+# session sets it off, the CP asks the session's worker (SetSessionS3Cache
+# DoAction) to rebuild the tenant ducklake_s3 secret with the org's native
+# HTTPS transport so S3 traffic CONNECT-tunnels PAST the node-local cache
+# proxy; on/RESET restores the cache-proxy transport. mw-dev deploys no cache
+# proxy, so the worker-side swap no-ops here — what this asserts is the full
+# client-visible plumbing on a REAL worker: CP interception, the CP→worker
+# action round-trip on every state flip (a worker that rejected the action
+# would fail the SET), session-state SHOW, the 22023 closed-enum rejection,
+# batch splitting, DuckLake R/W inside a bypassed session, connect-time
+# startup options, and the fresh-session default. The actual secret-transport
+# swap and its restore/rotation invariants are unit-covered
+# (duckdbservice/s3_cache_test.go).
+s3_cache_guc() { # org password
+  log "duckgres.s3_cache session GUC on $1"
+  # Default is on; SET off round-trips within the session (this flip drives
+  # the worker RPC — a worker-side failure would error the SET).
+  assert_compat   "$1" "$2" ducklake "SHOW duckgres.s3_cache" "on" "s3_cache_default"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; SHOW duckgres.s3_cache" "off" "s3_cache_set_off"
+  # DuckLake R/W still works inside a bypassed session (real S3 round-trip
+  # over whatever transport the worker now carries).
+  t="e2e_s3cache_$(echo "$1" | tr -c 'a-z0-9' _)"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; DROP TABLE IF EXISTS $t; CREATE TABLE $t(id INT); INSERT INTO $t VALUES (1),(2); SELECT COUNT(*) FROM $t" "2" "s3_cache_off_ducklake_rw"
+  pg "$1" "$2" ducklake "DROP TABLE $t;"
+  # Closed enum: junk is rejected at SET time (22023) naming the valid values,
+  # and a fresh session still reports the default.
+  if out="$(pg_try "$1" "$2" ducklake "SET duckgres.s3_cache = 'junk'; SHOW duckgres.s3_cache")"; then
+    fail "s3_cache: invalid value 'junk' was accepted: $out"
+  fi
+  case "$out" in
+    *'must be "on" or "off"'*) ;;
+    *) fail "s3_cache: invalid-value rejection did not name the valid values: '$out'" ;;
+  esac
+  # Fresh-session default: a previous session's off must never leak into the
+  # org's next session (this org's hot-idle worker is reused across these
+  # connects, so this also crosses the worker-side restore path).
+  assert_compat "$1" "$2" ducklake "SHOW duckgres.s3_cache" "on" "s3_cache_fresh_session_default"
+  # RESET restores the default within a session.
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; RESET duckgres.s3_cache; SHOW duckgres.s3_cache" "on" "s3_cache_reset"
+
+  # Connect-time startup option (libpq options / PGOPTIONS): valid applies to
+  # the session, invalid is rejected pre-worker-acquisition with FATAL 22023.
+  got="$(PGPASSWORD="$2" psql \
+      "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake options='-c duckgres.s3_cache=off'" \
+      -v ON_ERROR_STOP=1 -tAc "SHOW duckgres.s3_cache" 2>&1)" \
+    || fail "s3_cache: connect with -c duckgres.s3_cache=off failed: $got"
+  [ "$got" = "off" ] || fail "s3_cache: startup option session reports '$got', want 'off'"
+  if out="$(PGPASSWORD="$2" psql \
+      "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake options='-c duckgres.s3_cache=junk'" \
+      -v ON_ERROR_STOP=1 -tAc "SELECT 1" 2>&1)"; then
+    fail "s3_cache: invalid startup option was accepted: $out"
+  fi
+  case "$out" in
+    *'must be "on" or "off"'*) ;;
+    *) fail "s3_cache: invalid startup-option rejection did not name the valid values: '$out'" ;;
+  esac
 }
 
 # Regression for #715: the CP reads the post-TLS startup message with the shared
@@ -3220,6 +3285,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   basic_query            "$CNPG" "$cnpg_pw"
   pg_compat_functions    "$CNPG" "$cnpg_pw"
   query_source_guc       "$CNPG" "$cnpg_pw"
+  s3_cache_guc           "$CNPG" "$cnpg_pw"
   malformed_startup_resilience "$CNPG" "$cnpg_pw"
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold

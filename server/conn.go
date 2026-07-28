@@ -84,6 +84,8 @@ type preparedStmt struct {
 	noOpTag           string   // Command tag for no-op commands
 	querySourceSet    *string  // non-nil: SET duckgres.query_source; pointed-to value to store on session
 	querySourceShow   bool     // True if this is SHOW duckgres.query_source (answered from session state)
+	s3CacheSet        *string  // non-nil: SET duckgres.s3_cache; pointed-to value to apply to session
+	s3CacheShow       bool     // True if this is SHOW duckgres.s3_cache (answered from session state)
 	described         bool     // True if Describe(S) was called on this statement
 	statements        []string // Multi-statement rewrite (e.g., writable CTE)
 	cleanupStatements []string // Cleanup statements for multi-statement (DROP temp tables, COMMIT)
@@ -204,6 +206,14 @@ type clientConn struct {
 	// against the closed {standard, endpoints} set (22023 on anything else), so
 	// this only ever holds "", "standard", or "endpoints".
 	querySource string
+
+	// s3CacheOff holds the `duckgres.s3_cache` session GUC state (another
+	// duckgres-namespaced custom parameter, NOT forwarded to DuckDB): true
+	// when this session asked to bypass the node-local S3 cache proxy. Only
+	// flipped by applyS3CacheSetting AFTER the worker-side transport swap
+	// succeeded, so SHOW never reports a state the worker isn't in. See
+	// conn_s3_cache.go.
+	s3CacheOff bool
 
 	// Provisioned worker pod size for compute-usage billing (remote/k8s backend
 	// only). Counted in milli-units to avoid truncating a fractional-core or
@@ -1014,17 +1024,26 @@ func (c *clientConn) handleStartup() error {
 		c.database = params["database"]
 		c.applicationName = params["application_name"]
 
-		// Honor a `-c duckgres.query_source=...` startup option (libpq `options`
-		// keyword / PGOPTIONS). Other GUCs in `options` are not applied here.
-		// An invalid value rejects the connection with FATAL 22023 — the same
-		// treatment resolveWorkerProfile gives an invalid duckgres.worker_*
-		// startup option, and what PostgreSQL itself does with an invalid
-		// `options` GUC value.
+		// Honor `-c duckgres.query_source=...` / `-c duckgres.s3_cache=...`
+		// startup options (libpq `options` keyword / PGOPTIONS). Other GUCs in
+		// `options` are not applied here. An invalid value rejects the
+		// connection with FATAL 22023 — the same treatment
+		// resolveWorkerProfile gives an invalid duckgres.worker_* startup
+		// option, and what PostgreSQL itself does with an invalid `options`
+		// GUC value. (In standalone mode there is no cache proxy, so
+		// duckgres.s3_cache only records session state here; the worker-swap
+		// path is control-plane-only.)
 		if opts := ParseStartupOptions(params["options"]); len(opts) > 0 {
 			if v, ok := opts[querySourceGUCName]; ok {
 				if err := c.applyStartupQuerySource(v); err != nil {
 					c.sendError("FATAL", "22023", err.Error())
 					return fmt.Errorf("invalid %s startup option", querySourceGUCName)
+				}
+			}
+			if v, ok := opts[s3CacheGUCName]; ok {
+				if err := c.applyStartupS3Cache(v); err != nil {
+					c.sendError("FATAL", "22023", err.Error())
+					return fmt.Errorf("invalid %s startup option", s3CacheGUCName)
 				}
 			}
 		}
@@ -1418,6 +1437,29 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	if result.QuerySourceShow {
 		_ = c.sendRowDescription([]string{querySourceGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		_ = c.sendDataRowWithFormats([]interface{}{c.QuerySource()}, nil, nil)
+		_ = c.writeCommandComplete("SHOW")
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
+
+	// Handle the duckgres.s3_cache custom GUC (SET / SHOW). Intercepted
+	// session-side; applied by swapping the worker's S3 secret transport,
+	// never forwarded to DuckDB. A failed worker swap fails the SET so the
+	// session state never diverges from the worker's actual transport.
+	if result.S3CacheSet != nil {
+		if err := c.applyS3CacheSetting(*result.S3CacheSet); err != nil {
+			c.sendError("ERROR", "XX000", err.Error())
+		} else {
+			_ = c.writeCommandComplete("SET")
+		}
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
+	if result.S3CacheShow {
+		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
 		_ = c.writeCommandComplete("SHOW")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()

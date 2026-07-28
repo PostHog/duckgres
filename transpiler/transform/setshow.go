@@ -57,6 +57,48 @@ func errInvalidQuerySource() *CodedError {
 	}
 }
 
+// s3CacheParam is the duckgres-namespaced custom session GUC that controls
+// whether the session's DuckLake S3 traffic is served through the node-local
+// cache proxy (remote/k8s workers). Intercepted here and applied by the
+// connection layer (which swaps the worker's S3 secret transport); it is NEVER
+// forwarded to DuckDB. See clientConn.S3CacheEnabled in server/.
+const s3CacheParam = "duckgres.s3_cache"
+
+// Canonical values for the duckgres.s3_cache GUC.
+const (
+	S3CacheOn  = "on"
+	S3CacheOff = "off"
+)
+
+// NormalizeS3Cache validates a client-supplied duckgres.s3_cache value. The
+// PostgreSQL boolean spellings are accepted (case-insensitively, ignoring
+// surrounding whitespace) and normalized to "on"/"off". Empty is valid and
+// means "reset to default" (the session then reports "on"). An invalid value
+// returns a 22023 (invalid_parameter_value) CodedError that, like
+// NormalizeQuerySource, does not echo the offending client input.
+func NormalizeS3Cache(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case S3CacheOn, "true", "yes", "1":
+		return S3CacheOn, nil
+	case S3CacheOff, "false", "no", "0":
+		return S3CacheOff, nil
+	default:
+		return "", errInvalidS3Cache()
+	}
+}
+
+// errInvalidS3Cache is the SET-time rejection for a bad duckgres.s3_cache
+// value: 22023 invalid_parameter_value, same treatment as duckgres.query_source.
+func errInvalidS3Cache() *CodedError {
+	return &CodedError{
+		Code: "22023", // invalid_parameter_value
+		Message: fmt.Sprintf("invalid value for %q: must be %q or %q",
+			s3CacheParam, S3CacheOn, S3CacheOff),
+	}
+}
+
 // duckdbShowCommands are DuckDB-specific SHOW commands that should be passed
 // through to DuckDB rather than treated as PostgreSQL config parameters.
 var duckdbShowCommands = map[string]bool{
@@ -325,6 +367,35 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 					return true, nil
 				}
 
+				// duckgres.s3_cache: same interception contract as
+				// duckgres.query_source above (single-statement only; RESET /
+				// SET ... TO DEFAULT map to the empty value = default "on";
+				// closed value set rejected with 22023 via result.Error). The
+				// connection layer applies the value by asking the worker to
+				// swap its S3 secret transport — never forwarded to DuckDB.
+				if paramName == s3CacheParam && !multiStatement {
+					value := ""
+					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
+						extracted := false
+						if len(n.VariableSetStmt.Args) == 1 {
+							if v, ok := searchPathValue(n.VariableSetStmt.Args[0]); ok {
+								value, extracted = v, true
+							}
+						}
+						if !extracted {
+							result.Error = errInvalidS3Cache()
+							return true, nil
+						}
+					}
+					norm, err := NormalizeS3Cache(value)
+					if err != nil {
+						result.Error = err
+						return true, nil
+					}
+					result.S3CacheSet = &norm
+					return true, nil
+				}
+
 				if paramName == "search_path" {
 					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt); ok {
 						result.SQLOverride = sql
@@ -381,6 +452,13 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				// connection layer (defaulting to "standard"), not DuckDB.
 				if paramName == querySourceParam && !multiStatement {
 					result.QuerySourceShow = true
+					return true, nil
+				}
+
+				// duckgres.s3_cache: answered from session state by the
+				// connection layer (defaulting to "on"), not DuckDB.
+				if paramName == s3CacheParam && !multiStatement {
+					result.S3CacheShow = true
 					return true, nil
 				}
 

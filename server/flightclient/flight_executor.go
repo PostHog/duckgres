@@ -40,6 +40,7 @@ const (
 	waitSessionIdleAction    = "WaitSessionIdle"
 	releaseQueryHandleAction = "ReleaseQueryHandle"
 	logQueryAction           = "LogQuery"
+	setSessionS3CacheAction  = "SetSessionS3Cache"
 	queryCloseWaitTimeout    = 30 * time.Second
 	queryLogForwardTimeout   = 5 * time.Second
 	queryLogMaxInFlight      = 64
@@ -594,6 +595,57 @@ func (e *FlightExecutor) waitForSessionIdle() (err error) {
 			if isTerminalSessionIdleWaitError(err) {
 				return nil
 			}
+			return err
+		}
+	}
+}
+
+// SetS3CacheEnabled asks the session's worker to route the tenant's S3
+// traffic through the node-local cache proxy (true, the default) or to bypass
+// it (false) by swapping the S3 secret's transport. Implements the server
+// package's S3CacheControl capability, backing the `duckgres.s3_cache`
+// session GUC. Unlike the best-effort teardown actions above, errors are
+// surfaced: a SET that did not take effect on the worker must fail, not
+// silently leave the session in the wrong cache state. Workers running an
+// image that predates the action reject it with Unimplemented, which also
+// surfaces as an error.
+func (e *FlightExecutor) SetS3CacheEnabled(ctx context.Context, enabled bool) (err error) {
+	if e.dead.Load() {
+		return ErrWorkerDead
+	}
+	if e.client == nil || e.client.Client == nil {
+		return ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
+	payload, err := json.Marshal(wire.WorkerSetS3CachePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Enabled: enabled,
+	})
+	if err != nil {
+		return err
+	}
+
+	merged, cancel := e.mergedContext(ctx)
+	defer cancel()
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(merged),
+		&flight.Action{Type: setSessionS3CacheAction, Body: payload},
+	)
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
 			return err
 		}
 	}

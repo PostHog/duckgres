@@ -564,6 +564,24 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return false, nil
 	}
 
+	// duckgres.s3_cache custom GUC (SET / SHOW): intercepted session-side and
+	// applied via the worker transport swap. A failed swap aborts the rest of
+	// the batch — later statements may depend on the requested cache state.
+	if result.S3CacheSet != nil {
+		if err := c.applyS3CacheSetting(*result.S3CacheSet); err != nil {
+			c.sendError("ERROR", "XX000", err.Error())
+			return true, nil
+		}
+		_ = c.writeCommandComplete("SET")
+		return false, nil
+	}
+	if result.S3CacheShow {
+		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return false, nil
+	}
+
 	if result.IsIgnoredSet {
 		_ = c.writeCommandComplete("SET")
 		return false, nil
