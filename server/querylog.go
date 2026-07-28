@@ -485,6 +485,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	if errCode == "" {
 		analytics.Default().Capture("query_completed", c.orgID, map[string]any{
 			"user":        c.username,
+			"team_id":     c.teamID,
 			"trace_id":    observe.TraceIDFromContext(c.ctx),
 			"protocol":    protocol,
 			"query_kind":  classifyQuery(cmdType),

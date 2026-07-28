@@ -35,7 +35,7 @@ func installFakeQueryTracker(t *testing.T) *fakeQueryTracker {
 
 func TestLogClientQueryReceivedEmitsQueryInitiated(t *testing.T) {
 	fake := installFakeQueryTracker(t)
-	c := &clientConn{orgID: "acme", username: "root", ctx: context.Background()}
+	c := &clientConn{orgID: "acme", username: "root", teamID: 42, ctx: context.Background()}
 
 	c.logClientQueryReceived(context.Background(), "simple", "SELECT 1")
 
@@ -51,6 +51,9 @@ func TestLogClientQueryReceivedEmitsQueryInitiated(t *testing.T) {
 	}
 	if e.props["user"] != "root" {
 		t.Errorf("user = %v, want root", e.props["user"])
+	}
+	if e.props["team_id"] != int64(42) {
+		t.Errorf("team_id = %v, want 42", e.props["team_id"])
 	}
 }
 
@@ -96,7 +99,7 @@ func TestLogQueryEmitsQueryCompletedOnSuccess(t *testing.T) {
 	fake := installFakeQueryTracker(t)
 	// No server → queryLogSink is nil, so this exercises the analytics emission
 	// independently of the query-log sink.
-	c := &clientConn{orgID: "acme", username: "root", ctx: context.Background()}
+	c := &clientConn{orgID: "acme", username: "root", teamID: 42, ctx: context.Background()}
 	c.lastProfilingSummary = observe.QueryProfilingSummary{CPUTimeSeconds: 2.5}
 
 	c.logQuery(time.Now().Add(-100*time.Millisecond), "SELECT 1", "SELECT 1", "SELECT", 1, 0, "", "", "simple")
@@ -110,6 +113,9 @@ func TestLogQueryEmitsQueryCompletedOnSuccess(t *testing.T) {
 	}
 	if e.orgID != "acme" {
 		t.Errorf("orgID = %q, want acme", e.orgID)
+	}
+	if e.props["team_id"] != int64(42) {
+		t.Errorf("team_id = %v, want 42", e.props["team_id"])
 	}
 	if e.props["cpu_seconds"] != 2.5 {
 		t.Errorf("cpu_seconds = %v, want 2.5", e.props["cpu_seconds"])
