@@ -289,6 +289,38 @@ func TestS3CacheStartupOption(t *testing.T) {
 	}
 }
 
+// TestRedactS3SecretMaterial asserts RefreshS3Secret's error scrubber: a
+// DuckDB error echoing the CREATE SECRET SQL must have every credential value
+// replaced before the error leaves RefreshS3Secret — its errors reach worker
+// and CP logs and, via the duckgres.s3_cache SET / session-create restore
+// paths, client-facing error messages, the query log, and the admin
+// recent-errors ring.
+func TestRedactS3SecretMaterial(t *testing.T) {
+	cfg := DuckLakeConfig{
+		S3AccessKey:    "ASIAEXAMPLEKEY",
+		S3SecretKey:    "verysecretvalue",
+		S3SessionToken: "sessiontokenvalue",
+	}
+	echo := `Parser Error: syntax error at or near "SECRET"
+LINE 1: CREATE OR REPLACE SECRET ducklake_s3 (TYPE s3, KEY_ID 'ASIAEXAMPLEKEY', SECRET 'verysecretvalue', SESSION_TOKEN 'sessiontokenvalue')`
+	got := redactS3SecretMaterial(cfg, echo)
+	for _, leaked := range []string{"verysecretvalue", "sessiontokenvalue", "ASIAEXAMPLEKEY"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("redacted message still contains %q: %s", leaked, got)
+		}
+	}
+	if !strings.Contains(got, "Parser Error") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("redaction lost the diagnostic context: %s", got)
+	}
+
+	// Empty credential fields must not turn into degenerate replacements, and
+	// messages without credential material pass through unchanged.
+	plain := "IO Error: Connection refused (s3.us-east-1.amazonaws.com:443)"
+	if got := redactS3SecretMaterial(DuckLakeConfig{}, plain); got != plain {
+		t.Fatalf("credential-free message was altered: %q", got)
+	}
+}
+
 // TestS3CacheExtendedParse asserts the extended-protocol path: an invalid
 // value is rejected at Parse time; a valid SET parses, applies at Execute
 // time through the executor capability, and Describe returns NoData.

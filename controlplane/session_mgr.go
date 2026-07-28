@@ -441,6 +441,21 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 				"attempt", attempt,
 				"error", err,
 			)
+		case isWorkerS3CacheRestoreError(err):
+			// The worker couldn't restore the cache-proxy S3 transport a
+			// previous session's `duckgres.s3_cache = off` left behind (the
+			// mandatory pre-session restore in duckdbservice.CreateSession).
+			// The worker fails the create rather than start the session in an
+			// unknown transport state; a fresh (never-bypassed) worker's
+			// restore is a no-op, so recycle and re-acquire instead of failing
+			// the client — this is the retry the worker-side contract promises.
+			sm.log.Warn("Worker failed to restore its S3 cache transport before session start; recycling and re-acquiring.",
+				"pid", pid,
+				"user", username,
+				"worker", worker.ID,
+				"attempt", attempt,
+				"error", err,
+			)
 		default:
 			return 0, nil, err
 		}
@@ -468,6 +483,18 @@ const maxWorkerSessionCapDriftRetries = 2
 // "max sessions reached (N)", which propagates through the wrapped error chain.
 func isWorkerSessionCapError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "max sessions reached")
+}
+
+// isWorkerS3CacheRestoreError reports whether err is the worker-side failure
+// to restore the cache-proxy S3 transport before a new session starts (a
+// previous session's `duckgres.s3_cache = off` bypass that could not be
+// undone; duckdbservice.CreateSession's "restore S3 cache transport before
+// session start" error). The failed worker must not serve the session — its
+// transport state is unknown — but a fresh worker's restore is a no-op, so
+// this class is retried on a recycled acquisition instead of failing the
+// client's connect.
+func isWorkerS3CacheRestoreError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "restore S3 cache transport")
 }
 
 // isWorkerConnPoolTimeoutError reports whether err is the worker-side

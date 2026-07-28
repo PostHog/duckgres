@@ -412,6 +412,79 @@ func TestS3CacheToggleDuringRotationUsesRotatedCreds(t *testing.T) {
 	}
 }
 
+// TestS3CacheToggleRacesMetadataOnlyReactivation is the -race regression for
+// the retained-pointer read: metadata-only re-activations (needsRefresh=false,
+// e.g. an epoch-bump takeover with unchanged credentials) overwrite
+// p.activation.payload in place under p.mu WITHOUT taking secretSwapMu, so
+// SetS3CacheEnabled must copy the payload while holding p.mu instead of
+// reading through a retained *activatedTenantRuntime after the unlock.
+// Meaningful under `go test -race`; the toggles and reactivations here
+// interleave freely.
+func TestS3CacheToggleRacesMetadataOnlyReactivation(t *testing.T) {
+	t.Setenv("DUCKGRES_CACHE_ENABLED", "true")
+	t.Setenv("NODE_IP", "10.0.0.9")
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return PairFromMain(db), nil
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
+		return nil
+	}
+
+	base := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 1, CPInstanceID: "cp-live:boot-a", WorkerID: 17},
+		OrgID:                 "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+			ObjectStore:   "s3://analytics/warehouse/",
+			S3Region:      "us-east-1",
+			S3UseSSL:      true,
+			S3AccessKey:   "ACCESS_KEY", // unchanged across reactivations → needsRefresh=false
+			S3SecretKey:   "SECRET_KEY",
+		},
+	}
+	if err := pool.activateTenant(base); err != nil {
+		t.Fatalf("first ActivateTenant: %v", err)
+	}
+
+	const rounds = 100
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < rounds; i++ {
+			next := base
+			next.OwnerEpoch = int64(2 + i)
+			if err := pool.activateTenant(next); err != nil {
+				t.Errorf("metadata-only re-activation (epoch %d): %v", next.OwnerEpoch, err)
+				return
+			}
+		}
+	}()
+	for i := 0; i < rounds; i++ {
+		if err := pool.SetS3CacheEnabled(i%2 == 0); err != nil {
+			t.Fatalf("SetS3CacheEnabled toggle %d: %v", i, err)
+		}
+	}
+	<-done
+}
+
 // TestCreateSessionRestoresS3CacheTransport asserts the hard invariant that a
 // bypass can never leak into the org's next session: CreateSession on a worker
 // whose previous session disabled the cache rebuilds the secret with the

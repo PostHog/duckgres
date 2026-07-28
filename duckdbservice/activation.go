@@ -184,27 +184,40 @@ func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
 	p.secretSwapMu.Lock()
 	defer p.secretSwapMu.Unlock()
 
+	// Copy the activation payload fields while holding p.mu — never retain the
+	// *activatedTenantRuntime pointer past the unlock: reuseExistingActivation
+	// commits metadata-only re-activations (needsRefresh=false, e.g. an
+	// epoch-bump takeover with unchanged creds) by overwriting
+	// p.activation.payload in place WITHOUT taking secretSwapMu, so an
+	// unlocked read through a retained pointer is a data race.
 	p.mu.RLock()
-	act := p.activation
+	activated := p.activation != nil
+	var cfg server.DuckLakeConfig
+	var orgID string
+	var actDB *sql.DB
+	if activated {
+		cfg = p.activation.payload.DuckLake
+		orgID = p.activation.payload.OrgID
+		actDB = p.activation.db
+	}
 	bypassed := p.s3CacheBypassed
 	refreshDB := p.controlDB
 	refreshFn := p.refreshS3Secret
 	sem := p.duckLakeSem
 	p.mu.RUnlock()
 
-	if act == nil {
+	if !activated {
 		return fmt.Errorf("worker is not activated")
 	}
 	if bypassed == !enabled {
 		return nil
 	}
-	cfg := act.payload.DuckLake
 	if cfg.ObjectStore == "" {
 		// No S3-backed catalog — no secret to swap.
 		return nil
 	}
 	if refreshDB == nil {
-		refreshDB = act.db
+		refreshDB = actDB
 	}
 	if refreshFn == nil {
 		refreshFn = server.RefreshS3Secret
@@ -219,7 +232,7 @@ func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
 	p.mu.Lock()
 	p.s3CacheBypassed = !enabled
 	p.mu.Unlock()
-	slog.Info("Swapped tenant S3 secret transport.", "org", act.payload.OrgID, "s3_cache_enabled", enabled)
+	slog.Info("Swapped tenant S3 secret transport.", "org", orgID, "s3_cache_enabled", enabled)
 	return nil
 }
 
