@@ -196,8 +196,11 @@ func TestExtractQueryMetadataCaches(t *testing.T) {
 	if first.QueryKind != second.QueryKind || len(first.ReadRelations) != len(second.ReadRelations) {
 		t.Fatalf("cached extraction differs: %+v vs %+v", first, second)
 	}
+	// Not a skip: the cache is built with a positive constant size, so the only
+	// way it is nil is a construction bug — which would silently make every
+	// statement pay for a parse.
 	if queryMetadataCache == nil {
-		t.Skip("cache unavailable")
+		t.Fatal("the extraction cache must be constructed; a nil cache means every statement re-parses")
 	}
 	if _, ok := queryMetadataCache.Get(sql); !ok {
 		t.Fatal("extraction should be memoized by statement text")
