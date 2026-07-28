@@ -42,45 +42,87 @@ func serverHistogramVecSampleCount(t *testing.T, hv *prometheus.HistogramVec, la
 	return m.GetHistogram().GetSampleCount()
 }
 
-func TestObserveQueryOutcomeIncrementsCanonicalCounter(t *testing.T) {
+func TestObserveQueryResultIncrementsCanonicalCounter(t *testing.T) {
 	org := "query-metrics-outcomes"
 
-	successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess))
-	errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError))
-	canceledBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeCanceled))
+	successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone))
+	errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem))
+	canceledBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonCanceled))
 
-	observeQueryOutcome(org, queryOutcomeSuccess)
-	observeQueryOutcome(org, queryOutcomeError)
-	observeQueryOutcome(org, queryOutcomeCanceled)
+	observeQueryResult(org, queryStatusSuccess, queryReasonNone)
+	observeQueryResult(org, queryStatusError, queryReasonSystem)
+	observeQueryResult(org, queryStatusFailure, queryReasonCanceled)
 
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess)); got != successBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore+1 {
 		t.Fatalf("success query total = %v, want %v", got, successBefore+1)
 	}
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError)); got != errorBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem)); got != errorBefore+1 {
 		t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 	}
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeCanceled)); got != canceledBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonCanceled)); got != canceledBefore+1 {
 		t.Fatalf("canceled query total = %v, want %v", got, canceledBefore+1)
 	}
 }
 
-func TestFinishQueryMetricsClassifiesCanceledOutcomeSeparately(t *testing.T) {
+func TestQueryResultClassificationUsesStatusAndReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		category   string
+		wantStatus queryStatus
+		wantReason queryReason
+	}{
+		{name: "user", category: "user", wantStatus: queryStatusFailure, wantReason: queryReasonUser},
+		{name: "conflict", category: "conflict", wantStatus: queryStatusFailure, wantReason: queryReasonConflict},
+		{name: "metadata", category: "metadata_connection_lost", wantStatus: queryStatusError, wantReason: queryReasonMetadataConnectionLost},
+		{name: "system", category: "system", wantStatus: queryStatusError, wantReason: queryReasonSystem},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, reason := queryResultFromErrorCategory(tt.category)
+			if status != tt.wantStatus || reason != tt.wantReason {
+				t.Fatalf("result = (%q, %q), want (%q, %q)", status, reason, tt.wantStatus, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestQueryResultFromSQLState(t *testing.T) {
+	tests := []struct {
+		code       string
+		wantStatus queryStatus
+		wantReason queryReason
+	}{
+		{code: "42601", wantStatus: queryStatusFailure, wantReason: queryReasonUser},
+		{code: "57014", wantStatus: queryStatusFailure, wantReason: queryReasonCanceled},
+		{code: "XX000", wantStatus: queryStatusError, wantReason: queryReasonSystem},
+	}
+	for _, tt := range tests {
+		t.Run(tt.code, func(t *testing.T) {
+			status, reason := queryResultFromErrorCode(tt.code)
+			if status != tt.wantStatus || reason != tt.wantReason {
+				t.Fatalf("result = (%q, %q), want (%q, %q)", status, reason, tt.wantStatus, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestFinishQueryMetricsClassifiesCanceledStatusSeparately(t *testing.T) {
 	org := "query-metrics-canceled"
 	c := &clientConn{orgID: org}
 	scope := c.beginQueryMetrics(time.Now())
 
-	successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess))
-	canceledBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeCanceled))
+	successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone))
+	canceledBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonCanceled))
 	durationBefore := serverHistogramVecSampleCount(t, queryDurationHistogram, org)
 
 	c.lastErrorCode = "57014"
 	c.errorResponsesSent = scope.errorResponsesSent + 1
 	c.finishQueryMetrics(scope)
 
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess)); got != successBefore {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore {
 		t.Fatalf("success query total = %v, want unchanged %v", got, successBefore)
 	}
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeCanceled)); got != canceledBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonCanceled)); got != canceledBefore+1 {
 		t.Fatalf("canceled query total = %v, want %v", got, canceledBefore+1)
 	}
 	if got := serverHistogramVecSampleCount(t, queryDurationHistogram, org); got != durationBefore+1 {
@@ -88,16 +130,16 @@ func TestFinishQueryMetricsClassifiesCanceledOutcomeSeparately(t *testing.T) {
 	}
 }
 
-func TestFinishQueryMetricsClassifiesSuccessAndErrorOutcomes(t *testing.T) {
+func TestFinishQueryMetricsClassifiesSuccessAndErrorStatusesAndReasons(t *testing.T) {
 	successOrg := "query-metrics-finish-success"
 	successConn := &clientConn{orgID: successOrg}
 	successScope := successConn.beginQueryMetrics(time.Now())
-	successBefore := serverCounterVecValue(t, queryTotalCounter, successOrg, string(queryOutcomeSuccess))
+	successBefore := serverCounterVecValue(t, queryTotalCounter, successOrg, string(queryStatusSuccess), string(queryReasonNone))
 	successDurationBefore := serverHistogramVecSampleCount(t, queryDurationHistogram, successOrg)
 
 	successConn.finishQueryMetrics(successScope)
 
-	if got := serverCounterVecValue(t, queryTotalCounter, successOrg, string(queryOutcomeSuccess)); got != successBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, successOrg, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore+1 {
 		t.Fatalf("success query total = %v, want %v", got, successBefore+1)
 	}
 	if got := serverHistogramVecSampleCount(t, queryDurationHistogram, successOrg); got != successDurationBefore+1 {
@@ -107,13 +149,13 @@ func TestFinishQueryMetricsClassifiesSuccessAndErrorOutcomes(t *testing.T) {
 	errorOrg := "query-metrics-finish-error"
 	errorConn := &clientConn{orgID: errorOrg}
 	errorScope := errorConn.beginQueryMetrics(time.Now())
-	errorBefore := serverCounterVecValue(t, queryTotalCounter, errorOrg, string(queryOutcomeError))
+	errorBefore := serverCounterVecValue(t, queryTotalCounter, errorOrg, string(queryStatusFailure), string(queryReasonUser))
 
 	errorConn.lastErrorCode = "42P01"
 	errorConn.errorResponsesSent = errorScope.errorResponsesSent + 1
 	errorConn.finishQueryMetrics(errorScope)
 
-	if got := serverCounterVecValue(t, queryTotalCounter, errorOrg, string(queryOutcomeError)); got != errorBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, errorOrg, string(queryStatusFailure), string(queryReasonUser)); got != errorBefore+1 {
 		t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 	}
 }
@@ -126,14 +168,14 @@ func TestQueryMetricsWrapSimpleAndExtendedEntryPoints(t *testing.T) {
 		c.orgID = org
 		c.executor = &lifecycleExecutor{execResult: emptyExecResult{}}
 
-		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess))
+		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone))
 		durationBefore := serverHistogramVecSampleCount(t, queryDurationHistogram, org)
 
 		if err := c.handleQuery([]byte("UPDATE foo SET x = 1\x00")); err != nil {
 			t.Fatalf("handleQuery: %v", err)
 		}
 
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess)); got != successBefore+1 {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore+1 {
 			t.Fatalf("success query total = %v, want %v", got, successBefore+1)
 		}
 		if got := serverHistogramVecSampleCount(t, queryDurationHistogram, org); got != durationBefore+1 {
@@ -152,14 +194,14 @@ func TestQueryMetricsWrapSimpleAndExtendedEntryPoints(t *testing.T) {
 			convertedQuery: "UPDATE missing SET x = 1",
 		}}
 
-		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError))
+		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonUser))
 		durationBefore := serverHistogramVecSampleCount(t, queryDurationHistogram, org)
 
 		body := append([]byte("p1"), 0)
 		body = append(body, 0, 0, 0, 0)
 		c.handleExecute(body)
 
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError)); got != errorBefore+1 {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonUser)); got != errorBefore+1 {
 			t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 		}
 		if got := serverHistogramVecSampleCount(t, queryDurationHistogram, org); got != durationBefore+1 {
@@ -175,7 +217,7 @@ func TestQueryMetricsCountExtendedParseQueryErrorsWithoutDuration(t *testing.T) 
 	c.orgID = org
 	c.executor = &pipelineRecordingExecutor{}
 
-	errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError))
+	errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonUser))
 	durationBefore := serverHistogramVecSampleCount(t, queryDurationHistogram, org)
 
 	var body bytes.Buffer
@@ -188,7 +230,7 @@ func TestQueryMetricsCountExtendedParseQueryErrorsWithoutDuration(t *testing.T) 
 
 	c.handleParse(body.Bytes())
 
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError)); got != errorBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusFailure), string(queryReasonUser)); got != errorBefore+1 {
 		t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 	}
 	if got := serverHistogramVecSampleCount(t, queryDurationHistogram, org); got != durationBefore {
@@ -210,18 +252,18 @@ func TestQueryMetricsClassifiesSimpleWireWriteFailureAsError(t *testing.T) {
 		},
 	}
 
-	successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess))
-	errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError))
+	successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone))
+	errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem))
 	durationBefore := serverHistogramVecSampleCount(t, queryDurationHistogram, org)
 
 	if err := c.handleQuery([]byte("SELECT 'hello'\x00")); err == nil {
 		t.Fatal("handleQuery returned nil error, want pgwire write failure")
 	}
 
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess)); got != successBefore {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore {
 		t.Fatalf("success query total = %v, want unchanged %v", got, successBefore)
 	}
-	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError)); got != errorBefore+1 {
+	if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem)); got != errorBefore+1 {
 		t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 	}
 	if got := serverHistogramVecSampleCount(t, queryDurationHistogram, org); got != durationBefore+1 {
@@ -238,17 +280,17 @@ func TestQueryMetricsClassifiesTerminalWireWriteFailureAsError(t *testing.T) {
 		c.writer = bufio.NewWriterSize(failingWriter{err: errors.New("write tcp: broken pipe")}, 16)
 		c.executor = &lifecycleExecutor{execResult: &fakeExecResult{rowsAffected: 123456789012345678}}
 
-		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess))
-		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError))
+		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone))
+		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem))
 
 		if err := c.handleQuery([]byte("UPDATE foo SET x = 1\x00")); err != nil {
 			t.Fatalf("handleQuery: %v", err)
 		}
 
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess)); got != successBefore {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore {
 			t.Fatalf("success query total = %v, want unchanged %v", got, successBefore)
 		}
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError)); got != errorBefore+1 {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem)); got != errorBefore+1 {
 			t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 		}
 	})
@@ -265,17 +307,17 @@ func TestQueryMetricsClassifiesTerminalWireWriteFailureAsError(t *testing.T) {
 			convertedQuery: "UPDATE foo SET x = 1",
 		}}
 
-		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess))
-		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError))
+		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone))
+		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem))
 
 		body := append([]byte("p1"), 0)
 		body = append(body, 0, 0, 0, 0)
 		c.handleExecute(body)
 
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess)); got != successBefore {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore {
 			t.Fatalf("success query total = %v, want unchanged %v", got, successBefore)
 		}
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError)); got != errorBefore+1 {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem)); got != errorBefore+1 {
 			t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 		}
 	})
@@ -292,24 +334,24 @@ func TestQueryMetricsClassifiesTerminalWireWriteFailureAsError(t *testing.T) {
 			convertedQuery: "UPDATE foo SET x = 1",
 		}}
 
-		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess))
-		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError))
+		successBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone))
+		errorBefore := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem))
 
 		body := append([]byte("p1"), 0)
 		body = append(body, 0, 0, 0, 0)
 		c.handleExecute(body)
 
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeSuccess)); got != successBefore {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusSuccess), string(queryReasonNone)); got != successBefore {
 			t.Fatalf("success query total = %v, want unchanged %v", got, successBefore)
 		}
-		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryOutcomeError)); got != errorBefore+1 {
+		if got := serverCounterVecValue(t, queryTotalCounter, org, string(queryStatusError), string(queryReasonSystem)); got != errorBefore+1 {
 			t.Fatalf("error query total = %v, want %v", got, errorBefore+1)
 		}
 	})
 }
 
 func TestQueryErrorsLegacyMetricRemoved(t *testing.T) {
-	observeQueryOutcome("query-metrics-no-legacy-errors", queryOutcomeError)
+	observeQueryResult("query-metrics-no-legacy-errors", queryStatusError, queryReasonSystem)
 
 	metrics, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {

@@ -253,6 +253,14 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    that read the new CR status; no cache invalidation needed
    (`migrationChecked` is orgID-keyed and endpoint-independent;
    `ducklake.migrations` is DSN-keyed → new endpoint = new entry).
+   The row's discovery mirror is CLEARED here, never carried across: any cnpg
+   target clears the mirrored connection block (it describes the source
+   shard), and both directions clear `metadata_store_secret_ref_*` (the
+   discovery-only credential ref mirror — see `reconcileMetadataStoreRow`).
+   The provisioner's next ready-reconcile tick repopulates them from the
+   post-flip CR status; discovery consumers damp on the momentarily-empty
+   block. During the op the CAS state fence keeps the ready-reconcile's
+   mirror write out entirely — the runner owns these columns mid-flip.
 
 ## Pre-flip catalog backup (safety net)
 

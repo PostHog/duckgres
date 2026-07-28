@@ -686,16 +686,22 @@ func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker
 		_ = session.Executor.Close()
 	}
 	if worker != nil {
+		var destroyErr error
 		select {
 		case <-worker.done:
 		default:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := worker.DestroySession(ctx, session.SessionToken); err != nil {
-				sm.log.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", err)
+			destroyErr = worker.DestroySession(ctx, session.SessionToken)
+			if destroyErr != nil {
+				sm.log.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", destroyErr)
 			}
 			cancel()
 		}
-		sm.pool.ReleaseWorker(worker.ID)
+		if destroyErr != nil {
+			sm.pool.RetireWorker(worker.ID)
+		} else {
+			sm.pool.ReleaseWorker(worker.ID)
+		}
 	}
 }
 
@@ -757,8 +763,15 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Release the worker for reuse after cleanup is complete.
-	sm.pool.ReleaseWorker(session.WorkerID)
+	// A failed destroy means worker-side cleanup may still own the session's
+	// sole DB connection. Never return that worker to the schedulable pool:
+	// the next CreateSession would block on db.Conn() until its 30s timeout.
+	if workerDestroyErr != nil {
+		sm.pool.RetireWorker(session.WorkerID)
+	} else {
+		// Release the worker for reuse only after cleanup completed.
+		sm.pool.ReleaseWorker(session.WorkerID)
+	}
 	sm.releaseSessionLease(session, "pid", pid)
 
 	sm.log.Info("Session destroyed.",

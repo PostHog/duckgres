@@ -38,8 +38,8 @@ export function Overview() {
   const activeCPs = cpRows.filter((r) => (r.state ?? "").toLowerCase() === "active").length;
 
   // Derive a query-rate sparkline + error% from the `query_rate` panel (a
-  // per-second rate labeled by outcome). Each point is ops/s, so we average
-  // across the window per outcome rather than diffing a counter.
+  // per-second rate labeled by status and reason). Each point is ops/s, so we
+  // average across the window per status rather than diffing a counter.
   const { rateSeries, errorPct } = useMemo(() => {
     const series = promToSeries(qTotal.data);
     if (series.length === 0) return { rateSeries: [] as number[], errorPct: null as number | null };
@@ -47,9 +47,9 @@ export function Overview() {
     let error = 0;
     const totalByT = new Map<number, number>();
     for (const s of series) {
-      const outcome = s.labels?.outcome ?? "";
+      const status = s.labels?.status ?? "";
       const avg = s.points.length ? s.points.reduce((n, p) => n + p.v, 0) / s.points.length : 0;
-      if (outcome === "error" || outcome === "failure") error += avg;
+      if (status === "error") error += avg;
       else success += avg;
       for (const p of s.points) totalByT.set(p.t, (totalByT.get(p.t) ?? 0) + p.v);
     }

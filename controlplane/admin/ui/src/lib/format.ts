@@ -5,14 +5,16 @@ import type { MetricSeries, PromRangeResponse } from "@/types/api";
 // promToSeries flattens a raw Prometheus/VictoriaMetrics `matrix` range response
 // into chart-ready named series. Values arrive as [unixSeconds, "stringValue"];
 // we convert to { t: ms, v: number }. A series is named by its most meaningful
-// label (outcome/state/quantile) or the full label set.
+// label (status/reason/state/quantile) or the full label set.
 export function promToSeries(resp: PromRangeResponse | undefined): MetricSeries[] {
   const result = resp?.data?.result;
   if (!result || !Array.isArray(result)) return [];
   return result.map((r, i) => {
     const labels = r.metric ?? {};
     const name =
-      labels.outcome ??
+      (labels.status && labels.reason ? `${labels.status}/${labels.reason}` : undefined) ??
+      labels.status ??
+      labels.reason ??
       labels.state ??
       labels.quantile ??
       labels.le ??

@@ -12,8 +12,8 @@ import (
 // broke worker_states / queue_depth).
 func TestRenderPanelNoCorruption(t *testing.T) {
 	for _, org := range []struct{ sel, errSel string }{
-		{"", `{outcome="error"}`},
-		{`{org="acme"}`, `{org="acme",outcome="error"}`},
+		{"", `{status="error"}`},
+		{`{org="acme"}`, `{org="acme",status="error"}`},
 	} {
 		for key, tmpl := range rangePanels {
 			got := renderPanel(tmpl, org.sel, org.errSel, "5m")
@@ -27,17 +27,17 @@ func TestRenderPanelNoCorruption(t *testing.T) {
 	}
 }
 
-// error_ratio's numerator must filter outcome="error" and differ from the
+// error_ratio's numerator must filter status="error" and differ from the
 // denominator base (regression: it previously used the same org-only selector
 // for both, always reporting ~100%).
 func TestErrorRatioFiltersErrors(t *testing.T) {
-	got := renderPanel(rangePanels["error_ratio"], `{org="acme"}`, `{org="acme",outcome="error"}`, "5m")
-	if !strings.Contains(got, `outcome="error"`) {
+	got := renderPanel(rangePanels["error_ratio"], `{org="acme"}`, `{org="acme",status="error"}`, "5m")
+	if !strings.Contains(got, `status="error"`) {
 		t.Fatalf("error_ratio numerator does not filter errors: %s", got)
 	}
-	// Denominator (after the division) must NOT carry outcome="error".
+	// Denominator (after the division) must NOT carry status="error".
 	parts := strings.SplitN(got, "/", 2)
-	if len(parts) != 2 || strings.Contains(parts[1], `outcome="error"`) {
+	if len(parts) != 2 || strings.Contains(parts[1], `status="error"`) {
 		t.Fatalf("error_ratio denominator unexpectedly scoped to errors: %s", got)
 	}
 }

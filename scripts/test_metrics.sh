@@ -27,7 +27,7 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=$PORT user=postgres sslmode=requir
 # Check metrics
 METRICS=$(curl -s "http://localhost:$METRICS_PORT/metrics")
 QUERY_COUNT=$(echo "$METRICS" | awk '/^duckgres_query_duration_seconds_count/ {sum += $2} END {print sum}')
-QUERY_SUCCESS_TOTAL=$(echo "$METRICS" | awk '/^duckgres_query_total\{.*outcome="success"/ {sum += $2} END {print sum}')
+QUERY_SUCCESS_TOTAL=$(echo "$METRICS" | awk '/^duckgres_query_total\{.*status="success"/ {sum += $2} END {print sum}')
 
 if [ -z "$QUERY_COUNT" ]; then
     echo "FAIL: could not find 'duckgres_query_duration_seconds_count' metric in metrics output"
@@ -46,7 +46,7 @@ else
 fi
 
 if [ -z "$QUERY_SUCCESS_TOTAL" ]; then
-    echo "FAIL: could not find 'duckgres_query_total{outcome=\"success\"}' metric in metrics output"
+    echo "FAIL: could not find 'duckgres_query_total{status=\"success\",reason=\"none\"}' metric in metrics output"
     exit 1
 fi
 

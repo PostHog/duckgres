@@ -70,7 +70,7 @@ labels, aggregation rules, PromQL examples, and admission metric migration.
 |--------|------|-------------|
 | `duckgres_connections_open` | Gauge | Number of currently open client connections |
 | `duckgres_connection_duration_seconds{org}` | Histogram | Client connection lifetime, accept→disconnect (includes `_count`, `_sum`, `_bucket`); `_sum` is exact total connection-seconds (per org) with no scrape-integral bias. The disconnect log also carries `duration_ms` |
-| `duckgres_query_total{org,outcome}` | Counter | Total number of non-empty query attempts by terminal outcome (`success`, `error`, `canceled`) |
+| `duckgres_query_total{org,status,reason}` | Counter | Total non-empty query attempts. Valid status/reason pairs: `success/none`; `failure/user`, `failure/canceled`, `failure/conflict`; `error/metadata_connection_lost`, `error/system`. |
 | `duckgres_query_duration_seconds{org}` | Histogram | Simple/extended query execution latency (includes `_count`, `_sum`, `_bucket`); use `duckgres_query_total` for attempt totals |
 | `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
 | `duckgres_rate_limit_rejects_total` | Counter | Total number of connections rejected due to rate limiting |

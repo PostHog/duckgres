@@ -83,6 +83,7 @@ func (h *blockingSessionCreatedLogHandler) WithGroup(string) slog.Handler      {
 
 type recordingWorkerPool struct {
 	events *[]string
+	worker *ManagedWorker
 }
 
 func (p *recordingWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
@@ -93,14 +94,16 @@ func (p *recordingWorkerPool) ReleaseWorker(id int) {
 	*p.events = append(*p.events, "pool ReleaseWorker")
 }
 
-func (p *recordingWorkerPool) RetireWorker(id int) {}
+func (p *recordingWorkerPool) RetireWorker(id int) {
+	*p.events = append(*p.events, "pool RetireWorker")
+}
 
 func (p *recordingWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 	return false
 }
 
 func (p *recordingWorkerPool) Worker(id int) (*ManagedWorker, bool) {
-	return nil, false
+	return p.worker, p.worker != nil && p.worker.ID == id
 }
 
 func (p *recordingWorkerPool) SpawnMinWorkers(count int) error {
@@ -294,16 +297,22 @@ func (s *reconnectRuntimeStore) TryAcquireOrgConnectionLeaseForRef(ref configsto
 }
 
 type blockingCreateSessionPool struct {
-	worker *ManagedWorker
+	worker       *ManagedWorker
+	releaseCalls atomic.Int32
+	retireCalls  atomic.Int32
 }
 
 func (p *blockingCreateSessionPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	return p.worker, nil
 }
 
-func (p *blockingCreateSessionPool) ReleaseWorker(id int) {}
+func (p *blockingCreateSessionPool) ReleaseWorker(id int) {
+	p.releaseCalls.Add(1)
+}
 
-func (p *blockingCreateSessionPool) RetireWorker(id int) {}
+func (p *blockingCreateSessionPool) RetireWorker(id int) {
+	p.retireCalls.Add(1)
+}
 
 func (p *blockingCreateSessionPool) RetireWorkerIfNoSessions(id int) bool {
 	return false
@@ -427,6 +436,7 @@ type blockingCreateSessionFlightClient struct {
 	createStarted   chan struct{}
 	allowCreate     chan struct{}
 	createSucceeded chan struct{}
+	destroyRecvErr  error
 	startOnce       sync.Once
 	successOnce     sync.Once
 	destroyCalls    atomic.Int32
@@ -438,6 +448,9 @@ func (c *blockingCreateSessionFlightClient) DoAction(ctx context.Context, action
 		return &blockingCreateSessionActionClient{ctx: ctx, client: c}, nil
 	case "DestroySession":
 		c.destroyCalls.Add(1)
+		if c.destroyRecvErr != nil {
+			return &errorActionClient{ctx: ctx, err: c.destroyRecvErr}, nil
+		}
 		return &eofActionClient{ctx: ctx}, nil
 	default:
 		return nil, errors.New("unexpected action: " + action.Type)
@@ -554,6 +567,33 @@ func (c *eofActionClient) Context() context.Context      { return c.ctx }
 func (c *eofActionClient) SendMsg(m any) error           { return nil }
 func (c *eofActionClient) RecvMsg(m any) error           { return nil }
 
+type errorActionClient struct {
+	ctx context.Context
+	err error
+}
+
+func (c *errorActionClient) Recv() (*flight.Result, error) { return nil, c.err }
+func (c *errorActionClient) Header() (metadata.MD, error)  { return nil, nil }
+func (c *errorActionClient) Trailer() metadata.MD          { return nil }
+func (c *errorActionClient) CloseSend() error              { return nil }
+func (c *errorActionClient) Context() context.Context      { return c.ctx }
+func (c *errorActionClient) SendMsg(m any) error           { return nil }
+func (c *errorActionClient) RecvMsg(m any) error           { return nil }
+
+func TestManagedWorkerDestroySessionPropagatesStreamError(t *testing.T) {
+	want := errors.New("destroy stream timed out")
+	flightClient := &blockingCreateSessionFlightClient{destroyRecvErr: want}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+	}
+
+	err := worker.DestroySession(context.Background(), "session-1")
+	if !errors.Is(err, want) {
+		t.Fatalf("DestroySession() error = %v, want wrapped %v", err, want)
+	}
+}
+
 func TestDestroySession_ReleasesLeaseAfterWorkerRelease(t *testing.T) {
 	events := []string{}
 	pool := &recordingWorkerPool{events: &events}
@@ -574,6 +614,38 @@ func TestDestroySession_ReleasesLeaseAfterWorkerRelease(t *testing.T) {
 	want := []string{"pool ReleaseWorker", "lease Release"}
 	if strings.Join(events, ",") != strings.Join(want, ",") {
 		t.Fatalf("expected event order %v, got %v", want, events)
+	}
+}
+
+func TestDestroySessionRetiresWorkerWhenWorkerCleanupTimesOut(t *testing.T) {
+	events := []string{}
+	flightClient := &blockingCreateSessionFlightClient{
+		destroyRecvErr: context.DeadlineExceeded,
+	}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+		done:   make(chan struct{}),
+	}
+	pool := &recordingWorkerPool{events: &events, worker: worker}
+	sm := NewSessionManager(pool, nil)
+
+	pid := int32(1010)
+	sm.mu.Lock()
+	sm.sessions[pid] = &ManagedSession{
+		PID:          pid,
+		WorkerID:     worker.ID,
+		SessionToken: "session-1",
+		lease:        &recordingConnectionLease{events: &events},
+	}
+	sm.byWorker[worker.ID] = []int32{pid}
+	sm.mu.Unlock()
+
+	sm.DestroySession(pid)
+
+	want := []string{"pool RetireWorker", "lease Release"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v; a worker with incomplete cleanup must never return to the schedulable pool", events, want)
 	}
 }
 
@@ -832,6 +904,62 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	}
 	if got := flightClient.destroyCalls.Load(); got != 1 {
 		t.Fatalf("expected worker session to be destroyed once, got %d", got)
+	}
+}
+
+func TestDestroyAllSessionsRetiresWorkerWhenUnregisteredSessionCleanupTimesOut(t *testing.T) {
+	flightClient := &blockingCreateSessionFlightClient{
+		createStarted:   make(chan struct{}),
+		allowCreate:     make(chan struct{}),
+		createSucceeded: make(chan struct{}),
+		destroyRecvErr:  context.DeadlineExceeded,
+	}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+		done:   make(chan struct{}),
+	}
+	pool := &blockingCreateSessionPool{worker: worker}
+	sm := NewSessionManager(pool, nil)
+
+	createErr := make(chan error, 1)
+	go func() {
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres", nil)
+		createErr <- err
+	}()
+
+	select {
+	case <-flightClient.createStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CreateSession RPC to start")
+	}
+
+	sm.mu.Lock()
+	close(flightClient.allowCreate)
+	select {
+	case <-flightClient.createSucceeded:
+	case <-time.After(time.Second):
+		sm.mu.Unlock()
+		t.Fatal("timed out waiting for worker CreateSession to succeed")
+	}
+	go sm.BeginDrain()
+	waitForSessionManagerDraining(t, sm)
+	sm.mu.Unlock()
+
+	select {
+	case err := <-createErr:
+		if !errors.Is(err, ErrSessionManagerDraining) {
+			t.Fatalf("CreateSessionWithProtocol error = %v, want %v", err, ErrSessionManagerDraining)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CreateSession to return")
+	}
+
+	if got := pool.releaseCalls.Load(); got != 0 {
+		t.Fatalf("ReleaseWorker calls = %d after timed-out cleanup, want 0", got)
+	}
+	if got := pool.retireCalls.Load(); got != 1 {
+		t.Fatalf("RetireWorker calls = %d after timed-out cleanup, want 1", got)
 	}
 }
 

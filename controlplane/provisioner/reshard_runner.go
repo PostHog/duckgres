@@ -1325,14 +1325,22 @@ func (o *opRun) finalize(ctx context.Context) error {
 		"state":          configstore.ManagedWarehouseStateReady,
 		"status_message": "metadata-store reshard complete",
 	}
-	if o.op.TargetKind == configstore.MetadataStoreKindCnpgShard && o.op.SourceKind == configstore.MetadataStoreKindExternal {
+	if o.op.TargetKind == configstore.MetadataStoreKindCnpgShard {
+		// ALL cnpg targets (ext→cnpg AND cnpg→cnpg shard moves): clear the
+		// connection block rather than leaving the SOURCE store's mirrored
+		// details on a row that now claims the target — discovery consumers
+		// damp on an empty block, but they'd act on a stale one. The
+		// ready-reconcile mirror (reconcileMetadataStoreRow) repopulates
+		// from the post-flip CR status on the next tick.
 		updates["metadata_store_kind"] = configstore.MetadataStoreKindCnpgShard
 		updates["metadata_store_endpoint"] = ""
 		updates["metadata_store_port"] = 0
 		updates["metadata_store_database_name"] = ""
 		updates["metadata_store_username"] = ""
 		updates["metadata_store_password_aws_secret"] = ""
-		updates["pgbouncer_enabled"] = false
+		if o.op.SourceKind == configstore.MetadataStoreKindExternal {
+			updates["pgbouncer_enabled"] = false
+		}
 	}
 	if o.op.TargetKind == configstore.MetadataStoreKindExternal {
 		updates["metadata_store_kind"] = configstore.MetadataStoreKindExternal
@@ -1344,6 +1352,12 @@ func (o *opRun) finalize(ctx context.Context) error {
 		// The XRD defaults stand up a per-duckling pgbouncer for external.
 		updates["pgbouncer_enabled"] = true
 	}
+	// Both directions: the discovery-only credential Secret ref mirror
+	// (metadata_store_secret_ref_*) points at the SOURCE store's secret —
+	// stale either way. Cleared here, repopulated by the ready-reconcile.
+	updates["metadata_store_secret_ref_namespace"] = ""
+	updates["metadata_store_secret_ref_name"] = ""
+	updates["metadata_store_secret_ref_key"] = ""
 	now := time.Now().UTC()
 	if err := o.r.store.FinalizeReshardOperation(o.op.ID, o.r.cpID, o.op.RunnerEpoch, o.op.OrgID, updates, now); err != nil {
 		return fmt.Errorf("atomically finalize reshard and unblock warehouse: %w", err)

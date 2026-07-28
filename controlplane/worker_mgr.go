@@ -1375,10 +1375,12 @@ func (w *ManagedWorker) DestroySession(ctx context.Context, sessionToken string)
 	// Drain the stream
 	for {
 		if _, err := stream.Recv(); err != nil {
-			break
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("destroy session recv: %w", err)
 		}
 	}
-	return nil
 }
 
 // workerBearerCreds implements grpc.PerRPCCredentials for worker auth.

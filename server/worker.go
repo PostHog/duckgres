@@ -262,7 +262,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	writer := bufio.NewWriter(tlsConn)
 
 	// Read startup message (sent by client after TLS handshake)
-	params, err := wire.ReadStartupMessage(reader)
+	startup, err := wire.ReadStartupMessage(reader)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection after TLS handshake but before sending startup message.")
@@ -272,6 +272,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		return ExitError
 	}
 
+	params := startup.Params
 	username := params["user"]
 	database := params["database"]
 	applicationName := params["application_name"]

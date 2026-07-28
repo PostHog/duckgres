@@ -13,7 +13,6 @@ import (
 	"net"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -512,19 +511,16 @@ func (c *clientConn) logQueryError(query string, err error) {
 		"query", redactedQuery,
 		"error", redactedErr,
 	}
-	// category mirrors the severity routing below so the dashboard can split
-	// user-attributable failures from genuine system errors per org.
-	var category string
-	switch {
-	case isDuckLakeTransactionConflict(err):
-		category = "conflict"
-	case isDuckLakeMetadataConnectionLost(err):
-		category = "metadata_connection_lost"
-	case isUserQueryError(err):
-		category = "user"
-	default:
-		category = "system"
-	}
+	// This shared category also drives query metrics, analytics, and the
+	// recent-error ring so the observability surfaces cannot disagree.
+	category := queryErrorCategory(err)
+	// Preserve the category on the terminal query metric. Some protocol paths
+	// send an ErrorResponse and then return nil after handling it, so
+	// finishQueryMetrics cannot recover conflict/metadata reasons from the
+	// return value alone. Cancellations reaching this function are infra-driven
+	// (caller cancellations are gated upstream), so use the category rather
+	// than the generic cancellation shortcut in markError.
+	c.markActiveQueryMetricsErrorCategory(category)
 	sqlState := classifyErrorCode(err)
 	traceID := observe.TraceIDFromContext(c.ctx)
 	// Per-org product analytics. No SQL text or secrets are sent — only the
@@ -950,13 +946,13 @@ func (c *clientConn) handleStartup() error {
 	}
 
 	for {
-		params, err := wire.ReadStartupMessage(c.reader)
+		startup, err := wire.ReadStartupMessage(c.reader)
 		if err != nil {
 			return err
 		}
 
 		// Handle GSSENCRequest - decline and let client retry with SSL
-		if params["__gssenc_request"] == "true" {
+		if startup.GSSENCRequest {
 			c.logger().Debug("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
 			if _, err := c.conn.Write([]byte("N")); err != nil {
 				return err
@@ -965,7 +961,7 @@ func (c *clientConn) handleStartup() error {
 		}
 
 		// Handle SSL request - upgrade to TLS
-		if params["__ssl_request"] == "true" {
+		if startup.SSLRequest {
 			if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
 				return fmt.Errorf("failed to clear startup deadline: %w", err)
 			}
@@ -998,18 +994,13 @@ func (c *clientConn) handleStartup() error {
 		}
 
 		// Handle cancel request
-		if params["__cancel_request"] == "true" {
-			// Extract pid and secret key from the cancel request
-			if pidStr, ok := params["__cancel_pid"]; ok {
-				if secretKeyStr, ok := params["__cancel_secret_key"]; ok {
-					pid, _ := strconv.ParseInt(pidStr, 10, 32)
-					secretKey, _ := strconv.ParseInt(secretKeyStr, 10, 32)
-					key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
-					c.server.CancelQuery(key)
-				}
+		if startup.CancelRequest {
+			if startup.CancelCredentialsPresent {
+				c.server.CancelQuery(BackendKey{Pid: startup.CancelPID, SecretKey: startup.CancelSecretKey})
 			}
 			return errCancelHandled
 		}
+		params := startup.Params
 
 		// Reject non-TLS connections
 		if !tlsUpgraded {

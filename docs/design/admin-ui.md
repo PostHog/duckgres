@@ -58,7 +58,7 @@ The admin package currently sees only the narrow `OrgStackInfo`
 `GET /api/v1/metrics/query` and `/api/v1/metrics/query_range` forward to
 `PROMETHEUS_URL` (`DUCKGRES_PROMETHEUS_URL` env). Allow-list the metric names we chart so
 the proxy is not an open PromQL relay. Org-labelled metrics we expose:
-`duckgres_query_total{org,outcome}` (error/success rate — the gold metric),
+`duckgres_query_total{org,status,reason}` (error/success rate — the gold metric),
 `duckgres_query_duration_seconds{org}`, `duckgres_org_sessions_active{org}`,
 `duckgres_org_worker_crashes_total{org}`, `duckgres_s3_bytes_read_total{org}`,
 `duckgres_scan_*{org}`. Fleet (no org label): worker lifecycle/spawn/reap/queue/cap-drift.

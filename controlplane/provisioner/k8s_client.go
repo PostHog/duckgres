@@ -320,7 +320,21 @@ func (d *DucklingClient) CRStatus(ctx context.Context, name string) (present boo
 	return true, status.ReadyCondition, nil
 }
 
-// Get fetches the named Duckling CR and parses its status.
+// GetStatusUnresolved returns the parsed CR status WITHOUT resolving the
+// credential Secret — for consumers that need only the connection fields and
+// the Secret REFERENCE (the metadata-store row mirror). Skipping resolution
+// avoids one Secret GET + a plaintext credential read per call, and decouples
+// the mirror from Secret readability (endpoint/db/user need no secret).
+func (d *DucklingClient) GetStatusUnresolved(ctx context.Context, name string) (*DucklingStatus, error) {
+	cr, err := d.getCR(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	return parseDucklingStatus(cr)
+}
+
+// Get fetches the named Duckling CR, parses its status, and resolves the
+// metadata credential Secret into MetadataStore.Password.
 func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus, error) {
 	cr, err := d.getCR(ctx, name)
 	if err != nil {

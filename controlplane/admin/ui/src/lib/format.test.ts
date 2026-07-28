@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { fmtCompact, fmtMetricAxis, fmtMetricValue, orgLabel } from "./format";
+import { fmtCompact, fmtMetricAxis, fmtMetricValue, orgLabel, promToSeries } from "./format";
+
+describe("promToSeries", () => {
+  it("names query series by status and reason", () => {
+    const series = promToSeries({
+      status: "success",
+      data: {
+        resultType: "matrix",
+        result: [{ metric: { status: "failure", reason: "user" }, values: [[1, "2"]] }],
+      },
+    });
+    expect(series[0]?.name).toBe("failure/user");
+  });
+});
 
 describe("fmtCompact", () => {
   it("renders compact SI so large numbers don't overflow an axis", () => {
