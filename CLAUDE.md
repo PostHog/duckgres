@@ -613,9 +613,12 @@ are load-bearing for those consumers:
   `TestLatestConfigChangeCoversTeamsPostgres` pins that pair; keep them in
   sync. Compare for equality only.
 - **No plaintext credentials in the payload** — metadata-store passwords are
-  k8s SecretRefs. cnpg rows currently carry only the metadata-store KIND
-  (endpoint/db/user live in the Duckling CR status until the provisioner
-  backfills the row on Ready); external rows round-trip fully.
+  k8s SecretRefs. cnpg connection details are MIRRORED from the Duckling CR
+  status into the row by the provisioner's ready-reconcile
+  (`reconcileMetadataStoreRow`; drift-only writes so steady-state ticks
+  never bump `updated_at`/the change token; the state-CAS write is the
+  reshard fence — the runner owns those columns mid-flip). External rows
+  are provision-time inputs; only their credential Secret ref is mirrored.
 - **Auth is a SEPARATE, scoped surface** (`RegisterDiscoveryAPI` + its own
   group in `multitenant.go` behind `admin.AnyTokenAuthMiddleware`): the
   read-only discovery secret (`--read-only-secret` /

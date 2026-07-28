@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -452,6 +453,133 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 	// prerequisite for shard-migration cutovers, which patch this field to a
 	// DIFFERENT shard (an explicitly operator-driven step, never done here).
 	c.reconcileCnpgShard(ctx, w, log)
+
+	// Mirror the CR-status metadata-store connection details into the
+	// warehouse row so machine consumers (the provisioning API's discovery
+	// endpoints) can serve them without a Kubernetes dependency. Same
+	// derived-output → durable-copy move as the two backfills above.
+	c.reconcileMetadataStoreRow(ctx, w, log)
+}
+
+// metadataStoreRowUpdates computes the drift between the warehouse row's
+// metadata-store block and the Duckling CR status — the row is a MIRROR of
+// the CR for cnpg tenants (the provision handler writes only the kind; the
+// composition picks the shard and publishes endpoint/database/user + the
+// credential Secret ref in status). Pure function so the sync logic is
+// testable without a cluster.
+//
+// external tenants: endpoint/database/user are provision-time INPUTS on the
+// row — never overwritten from status; only the credential Secret ref (which
+// has no provisioning-time writer for either kind) is mirrored.
+//
+// Empty status fields are never synced over non-empty row values, and an
+// empty map means "no drift" — the caller must skip the write entirely so a
+// steady-state reconcile tick doesn't bump updated_at (which would churn the
+// discovery config_generation every tick).
+//
+// A status whose metadata-store TYPE contradicts the row kind (both
+// non-empty) produces no updates at all: that's identity drift (the condition
+// recordSource refuses a reshard over), and mirroring across it would stamp
+// one store's connection details onto a row claiming the other — worse than
+// serving nothing. Either side empty is "unknown", not "mismatched" — older
+// compositions publish no status type, and a kind-less row must not silently
+// strand the secret-ref mirror.
+func metadataStoreRowUpdates(w *configstore.ManagedWarehouse, status *DucklingStatus) map[string]interface{} {
+	updates := map[string]interface{}{}
+
+	if status.MetadataStore.Type != "" && w.MetadataStore.Kind != "" &&
+		status.MetadataStore.Type != w.MetadataStore.Kind {
+		return updates
+	}
+
+	if w.MetadataStore.Kind == configstore.MetadataStoreKindCnpgShard && status.MetadataStore.Endpoint != "" {
+		if w.MetadataStore.Endpoint != status.MetadataStore.Endpoint {
+			updates["metadata_store_endpoint"] = status.MetadataStore.Endpoint
+		}
+		if status.MetadataStore.Database != "" && w.MetadataStore.DatabaseName != status.MetadataStore.Database {
+			updates["metadata_store_database_name"] = status.MetadataStore.Database
+		}
+		if status.MetadataStore.User != "" && w.MetadataStore.Username != status.MetadataStore.User {
+			updates["metadata_store_username"] = status.MetadataStore.User
+		}
+		if w.MetadataStore.Port == 0 {
+			// The CR status carries no port; cnpg pooler serves 5432.
+			updates["metadata_store_port"] = 5432
+		}
+	}
+
+	ref := status.MetadataCredentialSecretRef
+	if ref.Name != "" {
+		if ref.Namespace == "" {
+			// The composition publishes same-namespace refs without an
+			// explicit namespace; Duckling CRs live in "ducklings". A
+			// non-ducklings namespace, if ever published, is mirrored
+			// verbatim — consumers' RBAC fails closed on it.
+			ref.Namespace = ducklingNamespace
+		}
+		if ref.Key == "" {
+			// Key-less refs are a real mid-migration shape (#972's harness
+			// defaults them the same way); every credential secret uses the
+			// conventional "password" key.
+			ref.Key = "password"
+		}
+		if w.MetadataStoreSecretRef.Namespace != ref.Namespace {
+			updates["metadata_store_secret_ref_namespace"] = ref.Namespace
+		}
+		if w.MetadataStoreSecretRef.Name != ref.Name {
+			updates["metadata_store_secret_ref_name"] = ref.Name
+		}
+		if w.MetadataStoreSecretRef.Key != ref.Key {
+			updates["metadata_store_secret_ref_key"] = ref.Key
+		}
+	}
+	return updates
+}
+
+// reconcileMetadataStoreRow syncs the row's metadata-store mirror from CR
+// status. Runs ONLY from reconcileReady, and the write itself is the
+// state-CAS UpdateWarehouseState(…, Ready, …) — so a warehouse that left
+// ready mid-tick (a reshard starting) is never written: during resharding
+// the reshard runner has exclusive ownership of these columns, and the
+// post-flip transition back to ready lets the next tick mirror the new
+// store.
+func (c *Controller) reconcileMetadataStoreRow(ctx context.Context, w *configstore.ManagedWarehouse, log *slog.Logger) {
+	// Unresolved read: the mirror needs connection fields and the Secret
+	// REFERENCE only — resolving would add a Secret GET (and a plaintext
+	// credential read) per ready tick for no consumer.
+	status, err := c.duckling.GetStatusUnresolved(ctx, ducklingCRName(w))
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		log.Warn("Failed to read Duckling CR status for metadata-store row sync.", "error", err)
+		return
+	}
+
+	if status.MetadataStore.Type != "" && w.MetadataStore.Kind != "" &&
+		status.MetadataStore.Type != w.MetadataStore.Kind {
+		// The pure function suppresses all updates on this contradiction;
+		// surface it — it's the same identity drift recordSource refuses a
+		// reshard over, and it needs an operator, not silence.
+		log.Warn("Metadata-store identity drift: CR status type contradicts the row kind — mirror suppressed.",
+			"status_type", status.MetadataStore.Type, "row_kind", w.MetadataStore.Kind)
+		return
+	}
+
+	updates := metadataStoreRowUpdates(w, status)
+	if len(updates) == 0 {
+		return
+	}
+	log.Info("Mirroring metadata-store connection details from CR status into the warehouse row.",
+		"fields", len(updates))
+	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateReady, updates); err != nil {
+		if errors.Is(err, configstore.ErrWarehouseStateMismatch) {
+			// Left ready mid-tick (reshard starting) — the runner owns the
+			// columns now; the post-flip tick will re-sync.
+			return
+		}
+		log.Warn("Failed to mirror metadata-store details into the warehouse row.", "error", err)
+	}
 }
 
 // reconcileBucketName backfills spec.dataStore.bucketName (and the config-store
