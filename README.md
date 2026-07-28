@@ -140,6 +140,12 @@ worker OOM-killed mid-statement, a pod evicted. That row is the only evidence
 such a query ever ran, so treat a sustained population of unpaired starts as an
 incident signal, allowing for queries still in flight.
 
+The `query_id` travels to the worker on every statement RPC
+(`x-duckgres-query-id`), and the worker stamps it on its own logs — notably the
+"Query appears stuck" warning. That is what closes the loop on an unpaired
+`QueryStart`: the statement's own log row cannot exist, but the pod's last words
+about it carry the same ID.
+
 `event_time` is the statement's **start** time on every event type, including
 terminal ones. This diverges from ClickHouse, where `event_time` is when the
 event was logged: pinning both rows of a pair to the same instant keeps them in

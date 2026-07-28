@@ -113,6 +113,11 @@ type Session struct {
 	CreatedAt time.Time
 	lastUsed  atomic.Int64 // unix nano
 
+	// currentQueryID is the control plane's ID for the statement running on
+	// this session, or "" when idle. Held as an atomic because the progress
+	// monitor reads it from its own goroutine while the RPC path writes it.
+	currentQueryID atomic.Value // string
+
 	mu            sync.RWMutex
 	connMu        sync.Mutex // serializes operations on Conn and session-owned transactions
 	queries       map[string]*QueryHandle
@@ -1806,4 +1811,23 @@ func NewFlightSQLHandler(pool *SessionPool) *FlightSQLHandler {
 	}
 
 	return h
+}
+
+// setCurrentQueryID records the control plane's ID for the statement now
+// running on this session. Pass "" when the statement ends.
+func (s *Session) setCurrentQueryID(queryID string) {
+	if s == nil {
+		return
+	}
+	s.currentQueryID.Store(queryID)
+}
+
+// CurrentQueryID returns the control plane's ID for the statement running on
+// this session, or "" when idle.
+func (s *Session) CurrentQueryID() string {
+	if s == nil {
+		return ""
+	}
+	queryID, _ := s.currentQueryID.Load().(string)
+	return queryID
 }

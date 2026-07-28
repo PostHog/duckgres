@@ -353,7 +353,10 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	// The QueryStart event and the ExceptionBeforeStart boundary both hang off
 	// it rather than off a call added to each path.
 	c.markExecStarted()
-	ctx, cancel := context.WithCancel(c.ctx)
+	// Carry the statement's ID to the engine. The worker stamps it on its own
+	// logs, so a client complaint can be followed from this connection into the
+	// pod that ran the statement.
+	ctx, cancel := context.WithCancel(wire.WithQueryID(c.ctx, c.currentQueryID()))
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 

@@ -192,13 +192,20 @@ func (e *FlightExecutor) IsDead() bool {
 
 // withSession adds the session token to the gRPC context.
 func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
-	return metadata.AppendToOutgoingContext(
+	ctx = metadata.AppendToOutgoingContext(
 		ctx,
 		"x-duckgres-session", e.sessionToken,
 		"x-duckgres-worker-id", strconv.Itoa(e.workerID),
 		"x-duckgres-cp-instance-id", e.cpInstanceID,
 		"x-duckgres-owner-epoch", strconv.FormatInt(e.ownerEpoch, 10),
 	)
+	// Sourced from the context rather than executor state: the executor is
+	// per-session and serves many statements, and both front-ends (PG wire and
+	// the Flight SQL ingress) reach it through the same call.
+	if queryID := wire.QueryIDFromContext(ctx); queryID != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, wire.QueryIDMetadataKey, queryID)
+	}
+	return ctx
 }
 
 func (e *FlightExecutor) SetOwnerEpoch(ownerEpoch int64) {
