@@ -124,6 +124,26 @@ func (f *fakeReshardStore) UpdateReshardFields(_ int64, _ string, _ int64, updat
 	if v, ok := updates["backup_s3_uri"].(string); ok {
 		f.op.BackupS3URI = v
 	}
+	for field, dst := range map[string]**time.Time{
+		"maintenance_prepared_at":   &f.op.MaintenancePreparedAt,
+		"source_fence_requested_at": &f.op.SourceFenceRequestedAt,
+		"source_fenced_at":          &f.op.SourceFencedAt,
+		"target_rendered_at":        &f.op.TargetRenderedAt,
+		"target_login_ready_at":     &f.op.TargetLoginReadyAt,
+		"external_verified_at":      &f.op.ExternalVerifiedAt,
+		"source_drop_committed_at":  &f.op.SourceDropCommittedAt,
+		"source_dropped_at":         &f.op.SourceDroppedAt,
+		"maintenance_disabled_at":   &f.op.MaintenanceDisabledAt,
+		"maintenance_cleaned_at":    &f.op.MaintenanceCleanedAt,
+	} {
+		if value, exists := updates[field]; exists {
+			if value == nil {
+				*dst = nil
+			} else if at, ok := value.(time.Time); ok {
+				*dst = &at
+			}
+		}
+	}
 	return nil
 }
 
@@ -256,6 +276,7 @@ type ducklingCall struct {
 	ext    ExternalMetadataStoreSpec
 	comp   *bool
 	retain *bool
+	phase  string
 }
 
 type fakeDuckling struct {
@@ -281,6 +302,10 @@ type fakeDuckling struct {
 	// mrsStuckWithDelete models a composition that never honors the retain
 	// flag: the MRs stay at full lifecycle ["*"] no matter what.
 	mrsStuckWithDelete bool
+	maintenancePhase   string
+	maintenanceShard   string
+	cleanupRemaining   int
+	cleanupChecks      int
 }
 
 func (f *fakeDuckling) Get(context.Context, string) (*DucklingStatus, error) {
@@ -314,6 +339,7 @@ func (f *fakeDuckling) SetMetadataStoreCnpg(_ context.Context, _ string, shard s
 	f.status.MetadataStore.Database = "mdstore_org"
 	f.status.MetadataStore.Password = "pinned-pw"
 	f.status.ReadyCondition = true
+	f.reconcileMaintenanceStatus()
 	return nil
 }
 
@@ -380,17 +406,83 @@ func (f *fakeDuckling) SetMetadataStoreCnpgAdopt(_ context.Context, _ string, sh
 	f.status.MetadataStore.Password = "pinned-pw"
 	f.status.ReadyCondition = true
 	f.retainFlag = false
+	f.reconcileMaintenanceStatus()
 	return nil
+}
+
+func (f *fakeDuckling) SetReshardMaintenance(_ context.Context, _ string, maintenance *ReshardMaintenanceSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := ducklingCall{kind: "maintenance"}
+	if maintenance != nil {
+		call.phase = maintenance.Phase
+	}
+	f.calls = append(f.calls, call)
+	if maintenance == nil {
+		f.status.ReshardMaintenance = ReshardMaintenanceStatus{}
+		f.maintenancePhase = ""
+		f.maintenanceShard = ""
+		return nil
+	}
+	f.maintenancePhase = maintenance.Phase
+	f.maintenanceShard = maintenance.SourceShard
+	m := &f.status.ReshardMaintenance
+	m.OperationID = maintenance.OperationID
+	m.User = fmt.Sprintf("reshard_%d", maintenance.OperationID)
+	m.CredentialSecretRef = SecretReference{Name: fmt.Sprintf("reshard-%d", maintenance.OperationID), Namespace: ducklingNamespace, Key: "password"}
+	m.Password = "maintenance-password"
+	f.reconcileMaintenanceStatus()
+	return nil
+}
+
+func (f *fakeDuckling) ReshardMaintenanceCleanupComplete(context.Context, string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleanupChecks++
+	if f.cleanupRemaining > 0 {
+		f.cleanupRemaining--
+		return false, "maintenance resources still deleting", nil
+	}
+	return true, "all operation-scoped maintenance resources deleted", nil
+}
+
+func (f *fakeDuckling) reconcileMaintenanceStatus() {
+	m := &f.status.ReshardMaintenance
+	if f.maintenancePhase == "" {
+		return
+	}
+	m.Prepared = true
+	m.Fenced = f.maintenancePhase == ReshardMaintenancePhaseFenced
+	m.MaintenanceLogin = f.maintenancePhase != ReshardMaintenancePhaseDisabled
+	m.MaintenanceNoLogin = f.maintenancePhase == ReshardMaintenancePhaseDisabled
+	onSource := strings.HasPrefix(f.status.MetadataStore.Endpoint, f.maintenanceShard+"-pooler.")
+	m.TenantNoLogin = f.maintenancePhase == ReshardMaintenancePhaseFenced && onSource
+	m.TenantLogin = !m.TenantNoLogin
 }
 
 func (f *fakeDuckling) callKinds() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	kinds := make([]string, len(f.calls))
-	for i, c := range f.calls {
-		kinds[i] = c.kind
+	kinds := make([]string, 0, len(f.calls))
+	for _, c := range f.calls {
+		if c.kind == "maintenance" {
+			continue
+		}
+		kinds = append(kinds, c.kind)
 	}
 	return kinds
+}
+
+func (f *fakeDuckling) maintenancePhases() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var phases []string
+	for _, call := range f.calls {
+		if call.kind == "maintenance" {
+			phases = append(phases, call.phase)
+		}
+	}
+	return phases
 }
 
 type copierCall struct {
@@ -497,6 +589,43 @@ type fakeBackuper struct {
 	size      int64
 }
 
+type fakeSourceFencer struct {
+	mu               sync.Mutex
+	calls            int
+	before           func() error
+	err              error
+	disableCalls     int
+	disableErrsAfter int
+}
+
+func (f *fakeSourceFencer) DisableMaintenanceAndTerminate(_ context.Context, _ CatalogEndpoint, disableAndWait func() error) error {
+	f.mu.Lock()
+	f.disableCalls++
+	f.mu.Unlock()
+	if err := disableAndWait(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.disableErrsAfter > 0 {
+		f.disableErrsAfter--
+		return errors.New("injected crash after maintenance NOLOGIN")
+	}
+	return nil
+}
+
+func (f *fakeSourceFencer) TerminateAndWait(context.Context, CatalogEndpoint, string, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.before != nil {
+		if err := f.before(); err != nil {
+			return err
+		}
+	}
+	f.calls++
+	return f.err
+}
+
 func (f *fakeBackuper) Backup(_ context.Context, source CatalogEndpoint, dest BackupDestination) (string, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -530,6 +659,7 @@ func testRunner(store *fakeReshardStore, duckling reshardDucklingClient, copier 
 		duckling:           duckling,
 		copier:             copier,
 		backuper:           &fakeBackuper{},
+		fencer:             &fakeSourceFencer{},
 		cpID:               "cp-test",
 		configPollInterval: time.Millisecond,
 		heartbeatInterval:  time.Hour,
@@ -602,7 +732,7 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	if store.op.State != configstore.ReshardStateSucceeded {
 		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
 	}
-	wantSteps := []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "cutover", "copying", "verifying", "cleaning_up", "finalizing"}
+	wantSteps := []string{"blocking", "preparing_access", "draining", "fencing_source", "pausing_compaction", "backup_catalog", "cutover", "copying", "verifying", "cleaning_up", "finalizing"}
 	if fmt.Sprint(store.steps) != fmt.Sprint(wantSteps) {
 		t.Fatalf("steps = %v, want %v", store.steps, wantSteps)
 	}
@@ -638,10 +768,16 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	if fmt.Sprint(dkinds) != fmt.Sprint([]string{"compaction", "cnpg", "compaction"}) {
 		t.Fatalf("duckling calls = %v", dkinds)
 	}
-	if duckling.calls[0].comp == nil || *duckling.calls[0].comp {
+	var compactionCalls []ducklingCall
+	for _, call := range duckling.calls {
+		if call.kind == "compaction" {
+			compactionCalls = append(compactionCalls, call)
+		}
+	}
+	if compactionCalls[0].comp == nil || *compactionCalls[0].comp {
 		t.Fatal("compaction was not paused to explicit false")
 	}
-	if duckling.calls[2].comp == nil || !*duckling.calls[2].comp {
+	if compactionCalls[1].comp == nil || !*compactionCalls[1].comp {
 		t.Fatal("compaction was not restored to explicit true")
 	}
 	if store.warehouseState != configstore.ManagedWarehouseStateReady {
@@ -766,7 +902,7 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	if len(retainVals) != 2 || retainVals[0] != true || retainVals[1] != false {
 		t.Fatalf("retain patches = %v, want [true false]", retainVals)
 	}
-	wantSteps := []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "copying", "verifying", "orphaning_source", "cutover", "verifying_external", "cleaning_up", "finalizing"}
+	wantSteps := []string{"blocking", "preparing_access", "draining", "fencing_source", "pausing_compaction", "backup_catalog", "copying", "verifying", "orphaning_source", "cutover", "verifying_external", "cleaning_up", "finalizing"}
 	if fmt.Sprint(store.steps) != fmt.Sprint(wantSteps) {
 		t.Fatalf("steps = %v, want %v", store.steps, wantSteps)
 	}
@@ -782,6 +918,39 @@ func TestReshardHappyPathCnpgToExt(t *testing.T) {
 	}
 	if !store.hasLog("external target catalog copy completed") {
 		t.Fatalf("external-verify announce missing from log: %v", store.logs)
+	}
+}
+
+func TestReshardFencesSourceOnlyAfterDuckgresWorkersDrain(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	store.drainSeq = []configstore.OrgConnectionDrainStatus{
+		{ActiveLeases: 1},
+		{},
+	}
+	store.workerSeq = [][]configstore.WorkerRecord{
+		{{WorkerID: 7}},
+		{},
+	}
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
+	runner := testRunner(store, duckling, copier)
+	fencer := &fakeSourceFencer{before: func() error {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if store.drainIdx != len(store.drainSeq)-1 || store.workerIdx != len(store.workerSeq)-1 {
+			return fmt.Errorf("source fenced before drain completed: drain index %d worker index %d", store.drainIdx, store.workerIdx)
+		}
+		return nil
+	}}
+	runner.fencer = fencer
+
+	runOp(t, runner, store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s error=%q, want succeeded", store.op.State, store.op.Error)
+	}
+	if fencer.calls != 1 {
+		t.Fatalf("source termination calls = %d, want 1 after drain", fencer.calls)
 	}
 }
 
@@ -1103,11 +1272,21 @@ func TestReshardTakeoverAfterCutoverDoesNotReplaySourceDiscovery(t *testing.T) {
 	store.warehouseState = configstore.ManagedWarehouseStateResharding
 	targetStatus := cnpgSourceStatus()
 	targetStatus.MetadataStore.Endpoint = "shard-002-pooler.cnpg-shards.svc.cluster.local"
-	duckling := &fakeDuckling{status: targetStatus, compPresent: true, compEnabled: false}
+	targetStatus.ReshardMaintenance = ReshardMaintenanceStatus{
+		OperationID: op.ID, User: "reshard_1", Password: "maintenance-password",
+		Prepared: true, Fenced: true, TenantLogin: true, MaintenanceLogin: true,
+	}
+	duckling := &fakeDuckling{
+		status: targetStatus, compPresent: true, compEnabled: false,
+		maintenancePhase: ReshardMaintenancePhaseFenced, maintenanceShard: op.FromShard,
+	}
 	copier := &fakeCopier{copyResult: CatalogCopyResult{}}
 
 	runOp(t, testRunner(store, duckling, copier), store)
 
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
+	}
 	if store.op.SourceEndpoint != "shard-001-pooler.cnpg-shards.svc.cluster.local" {
 		t.Fatalf("durable source overwritten with live target: %q", store.op.SourceEndpoint)
 	}
@@ -1125,6 +1304,183 @@ func TestReshardTakeoverAfterCutoverDoesNotReplaySourceDiscovery(t *testing.T) {
 		if call.kind == "dropdb" && call.target.Host == "shard-002-pooler.cnpg-shards.svc.cluster.local" {
 			t.Fatal("takeover attempted destructive cleanup against the live target")
 		}
+	}
+}
+
+func TestReshardRollbackDoesNotAcceptStaleTargetLoginAsSourceRecovery(t *testing.T) {
+	op := cnpgOp()
+	op.Step = "copying"
+	op.SourceEndpoint = "shard-001-pooler.cnpg-shards.svc.cluster.local"
+	op.SourceUser = "mdstore_org"
+	op.SourceDatabase = "mdstore_org"
+	blocked := time.Now().UTC().Add(-time.Minute)
+	prepared := blocked.Add(time.Second)
+	op.BlockedAt = &blocked
+	op.MaintenancePreparedAt = &prepared
+	store := newFakeReshardStore(op)
+	store.warehouseState = configstore.ManagedWarehouseStateResharding
+
+	target := cnpgSourceStatus()
+	target.MetadataStore.Endpoint = "shard-002-pooler.cnpg-shards.svc.cluster.local"
+	target.ReshardMaintenance = ReshardMaintenanceStatus{
+		OperationID: op.ID, User: "reshard_1", Password: "maintenance-password",
+		Prepared: true, TenantLogin: true, MaintenanceLogin: true,
+	}
+	base := &fakeDuckling{status: target, maintenancePhase: ReshardMaintenancePhasePrepared, maintenanceShard: op.FromShard}
+	duckling := &stuckCnpgDuckling{fakeDuckling: base}
+	copier := &fakeCopier{copyErr: errors.New("injected takeover copy failure")}
+	runner := testRunner(store, duckling, copier)
+	runner.flipTimeout = 30 * time.Millisecond
+
+	runOp(t, runner, store)
+
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding {
+		t.Fatalf("warehouse state = %s, want blocked while endpoint is still target", store.warehouseState)
+	}
+	if !store.hasLog("source tenant access recovery failed") {
+		t.Fatalf("missing source recovery refusal log: %v", store.logs)
+	}
+}
+
+// A takeover can observe an old status snapshot even though the fenced spec
+// has already reached PostgreSQL. Recovery must positively restore tenant
+// LOGIN before disabling and deleting the operation-scoped administrator.
+func TestReshardTakeoverAfterFencePatchRestoresLoginBeforeCleanup(t *testing.T) {
+	op := cnpgOp()
+	op.Step = "fencing_source"
+	blocked := time.Now().UTC().Add(-time.Minute)
+	prepared := blocked.Add(time.Second)
+	requested := prepared.Add(time.Second)
+	op.BlockedAt = &blocked
+	op.MaintenancePreparedAt = &prepared
+	op.SourceFenceRequestedAt = &requested
+
+	store := newFakeReshardStore(op)
+	store.warehouseState = configstore.ManagedWarehouseStateResharding
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+
+	runOp(t, testRunner(store, duckling, &fakeCopier{}), store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s, want failed takeover followed by rollback", store.op.State)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after verified rollback", store.warehouseState)
+	}
+	want := []string{ReshardMaintenancePhasePrepared, ReshardMaintenancePhaseDisabled, ""}
+	if got := duckling.maintenancePhases(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("maintenance phases = %v, want %v", got, want)
+	}
+}
+
+func TestReshardTakeoverAfterWarehouseCASBeforeBlockedMilestoneUnblocks(t *testing.T) {
+	op := cnpgOp()
+	op.Step = "blocking"
+	op.BlockedAt = nil
+	store := newFakeReshardStore(op)
+	store.warehouseState = configstore.ManagedWarehouseStateResharding
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+
+	runOp(t, testRunner(store, duckling, &fakeCopier{}), store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s, want failed takeover followed by rollback", store.op.State)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after blocking-CAS crash recovery", store.warehouseState)
+	}
+}
+
+// Removing the maintenance block from Duckling status is not proof that the
+// provider Role, Secret, password generator, ESO, and transient RBAC objects
+// are gone. Finalization must wait for explicit object-level observations.
+func TestReshardFinalizationWaitsForMaintenanceResourcesToDisappear(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &fakeDuckling{
+		status:           cnpgSourceStatus(),
+		cleanupRemaining: 2,
+	}
+
+	runOp(t, testRunner(store, duckling, &fakeCopier{}), store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
+	}
+	if duckling.cleanupChecks < 3 {
+		t.Fatalf("cleanup observations = %d, want at least 3", duckling.cleanupChecks)
+	}
+	if store.op.MaintenanceDisabledAt == nil || store.op.MaintenanceCleanedAt == nil {
+		t.Fatalf("maintenance milestones disabled=%v cleaned=%v, want both recorded",
+			store.op.MaintenanceDisabledAt, store.op.MaintenanceCleanedAt)
+	}
+}
+
+func TestReshardCrashAfterSourceDropRollsForwardInsteadOfRepointingEmptySource(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	runner := testRunner(store, duckling, &fakeCopier{})
+	fencer := &fakeSourceFencer{disableErrsAfter: 1}
+	runner.fencer = fencer
+
+	runOp(t, runner, store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want roll-forward success", store.op.State, store.op.Error)
+	}
+	if store.op.SourceDroppedAt == nil || store.op.MaintenanceDisabledAt == nil {
+		t.Fatalf("source_dropped_at=%v maintenance_disabled_at=%v, want durable commit milestones",
+			store.op.SourceDroppedAt, store.op.MaintenanceDisabledAt)
+	}
+	gotKinds := duckling.callKinds()
+	cnpgPatches := 0
+	for _, kind := range gotKinds {
+		if kind == "cnpg" {
+			cnpgPatches++
+		}
+	}
+	if cnpgPatches != 1 {
+		t.Fatalf("metadata-store cnpg patches = %v, want target patch only (no rollback to dropped source)", gotKinds)
+	}
+	wantPhases := []string{
+		ReshardMaintenancePhasePrepared,
+		ReshardMaintenancePhaseFenced,
+		ReshardMaintenancePhaseDisabled,
+		ReshardMaintenancePhasePrepared,
+		ReshardMaintenancePhaseDisabled,
+		"",
+	}
+	if got := duckling.maintenancePhases(); fmt.Sprint(got) != fmt.Sprint(wantPhases) {
+		t.Fatalf("maintenance phases = %v, want idempotent re-enable/disable %v", got, wantPhases)
+	}
+}
+
+func TestReshardExternalCrashAfterSourceDropRollsForwardInsteadOfReadopting(t *testing.T) {
+	op := cnpgOp()
+	op.TargetKind = configstore.MetadataStoreKindExternal
+	op.ToShard = ""
+	op.TargetEndpoint = "escape.rds.amazonaws.com"
+	op.TargetPasswordSecret = "escape-secret"
+	op.TargetUser = "postgres"
+	op.TargetDatabase = "postgres"
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	runner := testRunner(store, duckling, &fakeCopier{})
+	runner.fencer = &fakeSourceFencer{disableErrsAfter: 1}
+	runner.StashExternalPassword(op.ID, "ext-pw")
+
+	runOp(t, runner, store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want roll-forward success", store.op.State, store.op.Error)
+	}
+	for _, kind := range duckling.callKinds() {
+		if kind == "cnpg-adopt" || kind == "cnpg" {
+			t.Fatalf("duckling calls = %v, must not re-adopt dropped source", duckling.callKinds())
+		}
+	}
+	if store.op.ExternalVerifiedAt == nil || store.op.SourceDroppedAt == nil {
+		t.Fatalf("external_verified_at=%v source_dropped_at=%v, want irreversible milestones",
+			store.op.ExternalVerifiedAt, store.op.SourceDroppedAt)
 	}
 }
 
@@ -1201,10 +1557,9 @@ func TestReshardTransientHeartbeatErrorDoesNotFenceRunner(t *testing.T) {
 	}
 }
 
-// TestReshardFinalizeFailureRollsBackBeforeReadmittingTraffic pins the final
-// commit invariant: a failed atomic finalization enters the ordinary rollback
-// path, and only that verified recovery may return the warehouse to ready.
-func TestReshardFinalizeFailureRollsBackBeforeReadmittingTraffic(t *testing.T) {
+// Once the source is dropped, even a final config-store failure must not
+// re-point clients at a database that Crossplane could recreate empty.
+func TestReshardFinalizeFailureAfterSourceDropStaysBlockedForRollForward(t *testing.T) {
 	store := newFakeReshardStore(cnpgOp())
 	store.failUnblockedWrite = true
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}
@@ -1212,11 +1567,12 @@ func TestReshardFinalizeFailureRollsBackBeforeReadmittingTraffic(t *testing.T) {
 
 	runOp(t, testRunner(store, duckling, copier), store)
 
-	if store.warehouseState != configstore.ManagedWarehouseStateReady || store.op.State != configstore.ReshardStateFailed {
-		t.Fatalf("state after failed atomic finalization = warehouse %s/op %s, want verified rollback ready/failed", store.warehouseState, store.op.State)
+	if store.warehouseState != configstore.ManagedWarehouseStateResharding || store.op.State != configstore.ReshardStateRunning {
+		t.Fatalf("state after failed atomic finalization = warehouse %s/op %s, want blocked/running for takeover",
+			store.warehouseState, store.op.State)
 	}
-	if len(store.warehouseUpds) == 0 || store.warehouseUpds[len(store.warehouseUpds)-1]["status_message"] != "metadata-store reshard rolled back" {
-		t.Fatalf("warehouse was not readmitted through rollback: %v", store.warehouseUpds)
+	if got := duckling.callKinds(); len(got) == 0 || got[len(got)-1] != "compaction" {
+		t.Fatalf("duckling calls = %v, want no rollback metadata-store patch after source drop", got)
 	}
 }
 

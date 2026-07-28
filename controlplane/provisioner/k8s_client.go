@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,11 @@ var ducklingGVR = schema.GroupVersionResource{
 }
 
 var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+var externalSecretGVR = schema.GroupVersionResource{Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"}
+var passwordGeneratorGVR = schema.GroupVersionResource{Group: "generators.external-secrets.io", Version: "v1alpha1", Resource: "passwords"}
+var usageGVR = schema.GroupVersionResource{Group: "protection.crossplane.io", Version: "v1beta1", Resource: "usages"}
+var roleGVR = schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
+var roleBindingGVR = schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}
 
 const ducklingNamespace = "ducklings"
 
@@ -44,6 +50,7 @@ type DucklingStatus struct {
 		User              string
 		Database          string
 	}
+	ReshardMaintenance          ReshardMaintenanceStatus
 	MetadataCredentialSecretRef SecretReference
 	DataStore                   struct {
 		Type       string
@@ -65,6 +72,38 @@ type DucklingStatus struct {
 	// falls back to the legacy type-based default — DuckLake on for
 	// external, off for cnpg-shard). Non-nil for decoupled ducklings.
 	DuckLakeEnabled *bool
+}
+
+// ReshardMaintenanceSpec is the transient, source-shard-pinned access used by
+// a reshard runner. "prepared" creates the operation-specific login without
+// changing tenant access. "fenced" additionally makes the tenant role
+// NOLOGIN; the runner only requests that phase after Duckgres leases, queues,
+// and workers have drained.
+type ReshardMaintenanceSpec struct {
+	OperationID int64
+	SourceShard string
+	Phase       string
+}
+
+const (
+	ReshardMaintenancePhasePrepared = "prepared"
+	ReshardMaintenancePhaseFenced   = "fenced"
+	ReshardMaintenancePhaseDisabled = "disabled"
+)
+
+// ReshardMaintenanceStatus contains no credential value, only the Secret
+// reference published by the composition.
+type ReshardMaintenanceStatus struct {
+	OperationID         int64
+	User                string
+	CredentialSecretRef SecretReference
+	Password            string
+	Prepared            bool
+	Fenced              bool
+	TenantLogin         bool
+	TenantNoLogin       bool
+	MaintenanceLogin    bool
+	MaintenanceNoLogin  bool
 }
 
 // SecretReference identifies one key in a namespaced Kubernetes Secret. The
@@ -360,7 +399,90 @@ func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus,
 		return nil, fmt.Errorf("resolve metadata credential Secret for duckling %q: %w", name, err)
 	}
 	status.MetadataStore.Password = password
+	maintenanceRef := status.ReshardMaintenance.CredentialSecretRef
+	if maintenanceRef.Name != "" {
+		password, err := d.readSecretKey(ctx, maintenanceRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolve reshard maintenance credential Secret for duckling %q: %w", name, err)
+		}
+		status.ReshardMaintenance.Password = password
+	}
 	return status, nil
+}
+
+// SetReshardMaintenance prepares, fences, or removes the transient CNPG
+// reshard identity. The composition pins it to sourceShard, so it does not
+// follow the tenant Role managed resource to the target during cutover.
+func (d *DucklingClient) SetReshardMaintenance(ctx context.Context, name string, maintenance *ReshardMaintenanceSpec) error {
+	var value interface{}
+	if maintenance != nil {
+		if maintenance.OperationID <= 0 {
+			return fmt.Errorf("reshard maintenance operationID must be positive")
+		}
+		if !isValidCnpgShardName(maintenance.SourceShard) {
+			return fmt.Errorf("invalid reshard maintenance source shard %q", maintenance.SourceShard)
+		}
+		if maintenance.Phase != ReshardMaintenancePhasePrepared &&
+			maintenance.Phase != ReshardMaintenancePhaseFenced &&
+			maintenance.Phase != ReshardMaintenancePhaseDisabled {
+			return fmt.Errorf("invalid reshard maintenance phase %q", maintenance.Phase)
+		}
+		value = map[string]interface{}{
+			"operationID": maintenance.OperationID,
+			"sourceShard": maintenance.SourceShard,
+			"phase":       maintenance.Phase,
+		}
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"reshardMaintenance": value,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal reshard maintenance patch for %q: %w", name, err)
+	}
+	if _, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	); err != nil {
+		return fmt.Errorf("patch duckling CR %q reshard maintenance: %w", name, err)
+	}
+	return nil
+}
+
+// ReshardMaintenanceCleanupComplete proves that the operation-scoped
+// superuser and every credential-bearing/supporting object are gone. Names are
+// deterministic and the chart leaves an exact-resource GET-only observer RBAC
+// grant behind, so this remains checkable after the maintenance spec/status is
+// removed.
+func (d *DucklingClient) ReshardMaintenanceCleanupComplete(ctx context.Context, name string) (bool, string, error) {
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))[:16]
+	checks := []struct {
+		gvr  schema.GroupVersionResource
+		name string
+	}{
+		{schema.GroupVersionResource{Group: cnpgTenantMRGroup, Version: "v1alpha1", Resource: "roles"}, "cnpg-reshard-" + hash},
+		{secretGVR, "cnpg-reshard-" + hash + "-password"},
+		{externalSecretGVR, "cnpg-reshard-" + hash + "-password"},
+		{passwordGeneratorGVR, "cnpg-reshard-" + hash + "-password"},
+		{usageGVR, "cnpg-reshard-" + hash + "-uses-password"},
+		{usageGVR, "cnpg-reshard-" + hash + "-uses-generator"},
+		{roleGVR, "duckgres-credential-" + hash + "-reshard"},
+		{roleBindingGVR, "duckgres-credential-" + hash + "-reshard"},
+	}
+	for _, check := range checks {
+		_, err := d.client.Resource(check.gvr).Namespace(ducklingNamespace).Get(ctx, check.name, metav1.GetOptions{})
+		switch {
+		case err == nil:
+			return false, fmt.Sprintf("%s %s still exists", check.gvr.Resource, check.name), nil
+		case apierrors.IsNotFound(err):
+			continue
+		default:
+			return false, "", fmt.Errorf("check cleanup of %s %s: %w", check.gvr.Resource, check.name, err)
+		}
+	}
+	return true, "all operation-scoped maintenance resources deleted", nil
 }
 
 func (d *DucklingClient) readSecretKey(ctx context.Context, ref SecretReference) (string, error) {
@@ -1108,6 +1230,35 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 				Name:      getNestedString(ref, "name"),
 				Namespace: getNestedString(ref, "namespace"),
 				Key:       getNestedString(ref, "key"),
+			}
+		}
+		if maintenance, ok := md["reshardMaintenance"].(map[string]interface{}); ok {
+			opID, _ := maintenance["operationID"].(int64)
+			if opID == 0 {
+				if n, ok := maintenance["operationID"].(float64); ok {
+					opID = int64(n)
+				}
+			}
+			ds.ReshardMaintenance = ReshardMaintenanceStatus{
+				OperationID: opID,
+				User:        getNestedString(maintenance, "user"),
+			}
+			if prepared, ok := maintenance["prepared"].(bool); ok {
+				ds.ReshardMaintenance.Prepared = prepared
+			}
+			if fenced, ok := maintenance["fenced"].(bool); ok {
+				ds.ReshardMaintenance.Fenced = fenced
+			}
+			ds.ReshardMaintenance.TenantLogin, _ = maintenance["tenantLogin"].(bool)
+			ds.ReshardMaintenance.TenantNoLogin, _ = maintenance["tenantNoLogin"].(bool)
+			ds.ReshardMaintenance.MaintenanceLogin, _ = maintenance["maintenanceLogin"].(bool)
+			ds.ReshardMaintenance.MaintenanceNoLogin, _ = maintenance["maintenanceNoLogin"].(bool)
+			if ref, ok := maintenance["credentialSecretRef"].(map[string]interface{}); ok {
+				ds.ReshardMaintenance.CredentialSecretRef = SecretReference{
+					Name:      getNestedString(ref, "name"),
+					Namespace: getNestedString(ref, "namespace"),
+					Key:       getNestedString(ref, "key"),
+				}
 			}
 		}
 	}

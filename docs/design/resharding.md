@@ -156,12 +156,17 @@ production chart needs the equivalent (charts repo).
 ## Step machine (→cnpg targets)
 
 ```
-blocking → draining → pausing_compaction → backup_catalog → cutover → copying
+blocking → preparing_access → draining → fencing_source → pausing_compaction → backup_catalog → cutover → copying
         → verifying → cleaning_up → finalizing
 ```
 
 1. **blocking** — CAS warehouse `ready→resharding` inside a transaction
-   holding the org's connection advisory lock. LOAD-BEARING: the lease-GRANT
+   holding the org's connection advisory lock. This is the first mutation in a
+   new operation, so API consumers see the lifecycle signal before the runner
+   provisions credentials or changes source-shard access. `GET
+   /api/v1/warehouses` continues to list the warehouse with
+   `state: "resharding"` and `writable: false`.
+   LOAD-BEARING: the lease-GRANT
    transaction checks warehouse state under the same lock
    (`org_connections.go`), so after the CAS commits no new connection lease
    can ever be granted. The connect-time 57P03 gates (PG wire + Flight) are
@@ -169,7 +174,14 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    queue-timeout later, which is why the grant-path check exists. The runner
    then waits 2× the config poll interval so every CP replica's snapshot
    shows the state.
-2. **draining** — wait until, in one transaction, the org has zero active
+2. **preparing_access** (cnpg sources) — after validating the live Duckling
+   status against the operation's durable source identity, set
+   `spec.metadataStore.reshardMaintenance` to an operation-specific,
+   source-shard-pinned identity in `prepared` phase and wait for the
+   composition to publish and positively observe its credential Secret and
+   both tenant and maintenance roles as `LOGIN`. `prepared` does not change
+   the tenant role.
+3. **draining** — wait until, in one transaction, the org has zero active
    connection leases AND zero queued requests; then until zero live worker
    records. Never kills a running query. Hot-idle workers that linger past a
    grace are retired via the standard CAS retire path (what the janitor's TTL
@@ -178,7 +190,18 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    sessions. Parked reconnectable Flight sessions would hold leases up to the
    token TTL (1h); each CP destroys its own parked (no txn/stream/query)
    Flight sessions for resharding orgs on the session reap tick.
-3. **pausing_compaction** — always patch
+4. **fencing_source** (cnpg sources) — only after draining has observed zero
+   leases, zero queued requests, and zero worker records, switch the
+   maintenance phase to `fenced`. The composition reconciles the ordinary
+   tenant role to `NOLOGIN` and reports `fenced=true` only after provider-sql
+   reads that state back. The runner then connects with the operation-specific
+   maintenance identity, terminates remaining direct tenant-role sessions
+   (filtered by tenant role and database), and waits for zero. This ordering is
+   load-bearing: a worker must never have its metadata connection killed while
+   Duckgres still considers it live. Provider `Ready`/`Synced`
+   acknowledgements count only when their `observedGeneration` matches the
+   Role managed resource generation.
+5. **pausing_compaction** — always patch
    `spec.ducklake.maintenance.compaction.enabled=false`, recording key-presence
    + prior value (restored exactly at the end; key-absent differs from false
    because the chart's name-list can enable compaction when the key is
@@ -201,19 +224,19 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    removing it after a successful flip would hand enablement back to the type
    coupling, whose answer may have CHANGED with the new store type (ext→cnpg
    would re-derive false — the same outage through another door).
-4. **backup_catalog** — the safety net (§ Pre-flip catalog backup below). Dump
+6. **backup_catalog** — the safety net (§ Pre-flip catalog backup below). Dump
    the SOURCE catalog to the org's own S3 data bucket BEFORE any flip. Runs for
    every direction; the source is quiescent here (post-drain, compaction paused)
    and `recordSource` (which the runner runs just before this step) has resolved
    the source endpoint + password.
-5. **cutover** — record the FULL source connection info from CR status first,
+7. **cutover** — record the FULL source connection info from CR status first,
    then patch `cnpgShard` (and `type` for ext→cnpg; the external block is
    left in spec, ignored). Wait: CR status endpoint on the target pooler,
    Ready condition, `SELECT 1` with tenant creds. Timeout → rollback. The
    wait is bounded per-op by `cutover_timeout_seconds` (0 = default 15m /
    `DUCKGRES_RESHARD_FLIP_TIMEOUT`); real cnpg cutovers need minutes —
    provider-sql role/DB creation plus cnpg SASL credential propagation.
-6. **copying** — source read via its recorded pre-flip endpoint (the orphaned
+8. **copying** — source read via its recorded pre-flip endpoint (the orphaned
    role/DB survives a shard flip; an ext source is reached direct-to-RDS with
    TLS because the flip deletes its ESO sync + pgbouncer). One
    REPEATABLE READ transaction = consistent snapshot. The transaction takes
@@ -238,15 +261,17 @@ blocking → draining → pausing_compaction → backup_catalog → cutover → 
    create still hits 42P07 because a live worker's
    `ensureDuckLakeMetadataIndexes` (`CREATE INDEX IF NOT EXISTS` on attach)
    raced the replay on a shared target.
-7. **verifying** — per-table counts (snapshot vs target), then re-read the
+9. **verifying** — per-table counts (snapshot vs target), then re-read the
    source OUTSIDE the transaction: any change means a concurrent writer
    (straggler compactor, stray client) → rollback.
-8. **cleaning_up** — **cnpg sources only**: `DROP DATABASE … WITH (FORCE)`
+10. **cleaning_up** — **cnpg sources only**: `DROP DATABASE … WITH (FORCE)`
    via the source pooler (`dbname=postgres`; the tenant role owns the DB).
    Also the fence that makes any straggler writer fail loudly. Failure is
    ERROR-logged but doesn't fail the op. The role stays (cannot drop itself).
    **External sources are never modified.**
-9. **finalizing** — restore compaction exactly, reconcile the warehouse
+11. **finalizing** — restore compaction exactly, restore the tenant Role to
+   `LOGIN` on the current target, wait for that state to be observed, remove
+   the operation-scoped maintenance identity and Secret, reconcile the warehouse
    config-store row (kind/endpoint/secret fields), CAS `resharding→ready`,
    write the **report** (maintenance duration = blocked→unblocked, per-op
    counters: tables/rows/bytes) into the log. New sessions cold-spawn workers
@@ -528,6 +553,13 @@ never appear in the op log.
   strands an op: the respawned pod re-claims, and for ext targets re-pulls the
   password from the persisted `password_url` (or fails with the clear re-run
   message if the stashing replica died too).
+- Source deletion has a durable pre-drop commit point. For cnpg targets the
+  runner records `source_drop_committed_at` after target verification and
+  before `DROP DATABASE`; for external targets, `external_verified_at` is the
+  commit point. After either marker, failures only roll forward through
+  idempotent drop, maintenance `NOLOGIN`, explicit resource deletion, and
+  finalization. They never re-point or re-adopt the source, because PostgreSQL
+  may already have dropped it even if the post-drop acknowledgement crashed.
 - Takeover rollback reconstructs progress from the persisted row. A runner that
   claims an op a prior epoch advanced starts with all in-process rollback flags
   false, so it calls `reconstructProgress()` before running: `blocked` from

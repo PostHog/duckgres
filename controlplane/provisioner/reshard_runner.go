@@ -78,6 +78,7 @@ type ReshardRunner struct {
 	duckling reshardDucklingClient
 	copier   CatalogCopier
 	backuper CatalogBackuper
+	fencer   ReshardSourceFencer
 	// cpID identifies THIS runner in the fencing columns (runner_cp). In the
 	// pod model it is the reshard pod's own name.
 	cpID string
@@ -140,6 +141,8 @@ type reshardDucklingClient interface {
 	GetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string) (retain, present bool, err error)
 	CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, detail string, err error)
 	SetMetadataStoreCnpgAdopt(ctx context.Context, name, shard string) error
+	SetReshardMaintenance(ctx context.Context, name string, maintenance *ReshardMaintenanceSpec) error
+	ReshardMaintenanceCleanupComplete(ctx context.Context, name string) (complete bool, detail string, err error)
 }
 
 // NewReshardRunner builds a runner over the real config store + duckling
@@ -168,6 +171,7 @@ func NewReshardRunner(store *configstore.ConfigStore, duckling *DucklingClient, 
 		duckling:            duckling,
 		copier:              PGCatalogCopier{},
 		backuper:            backuper,
+		fencer:              PGReshardSourceFencer{},
 		cpID:                cpID,
 		configPollInterval:  configPollInterval,
 		heartbeatInterval:   30 * time.Second,
@@ -292,7 +296,11 @@ type opRun struct {
 	// orphan step). If we roll back BEFORE the flip, reset it to false so the
 	// still-cnpg source keeps full-lifecycle (Delete) MRs and deprovision stays
 	// clean. (After the flip, recoverFromExternal's adopt patch clears it.)
-	retainRequested bool
+	retainRequested     bool
+	maintenancePrepared bool
+	sourceFenced        bool
+	tenantUser          string
+	tenantDatabase      string
 
 	// resolved source/target connection info (source recorded pre-flip)
 	source CatalogEndpoint
@@ -318,8 +326,8 @@ func (o *opRun) logf(level, format string, args ...any) {
 // the in-process opRun progress flags all start false, but the persisted step
 // records the prior runner's position.
 var (
-	reshardStepOrderCnpg     = []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "cutover", "copying", "verifying", "cleaning_up", "finalizing"}
-	reshardStepOrderExternal = []string{"blocking", "draining", "pausing_compaction", "backup_catalog", "copying", "verifying", "orphaning_source", "cutover", "verifying_external", "cleaning_up", "finalizing"}
+	reshardStepOrderCnpg     = []string{"blocking", "preparing_access", "draining", "fencing_source", "pausing_compaction", "backup_catalog", "cutover", "copying", "verifying", "cleaning_up", "finalizing"}
+	reshardStepOrderExternal = []string{"blocking", "preparing_access", "draining", "fencing_source", "pausing_compaction", "backup_catalog", "copying", "verifying", "orphaning_source", "cutover", "verifying_external", "cleaning_up", "finalizing"}
 )
 
 // reshardStepReached reports whether the op's persisted step is at or past
@@ -365,10 +373,13 @@ func reshardStepReached(op *configstore.ReshardOperation, target string) bool {
 //     patch (re-point shard, flip back, adopt) is idempotent and no-ops when the
 //     store never actually moved.
 func (o *opRun) reconstructProgress() {
-	// blocked_at is written just after the ready→resharding CAS; reaching a step
-	// past "blocking" also proves the CAS succeeded (run() aborts on a block
-	// error), covering the sliver between the CAS and the blocked_at write.
-	if o.op.BlockedAt != nil || reshardStepReached(o.op, "draining") {
+	o.maintenancePrepared = o.op.MaintenancePreparedAt != nil
+	o.sourceFenced = o.op.SourceFencedAt != nil
+	// The step is written immediately before the ready→resharding CAS. Treat
+	// entering it as possibly blocked: this conservatively covers a crash after
+	// the CAS but before blocked_at. If the CAS never happened, rollback's
+	// resharding→ready CAS simply finds an already-ready warehouse.
+	if o.op.BlockedAt != nil || reshardStepReached(o.op, "blocking") {
 		o.blocked = true
 	}
 	if reshardStepReached(o.op, "backup_catalog") {
@@ -402,6 +413,14 @@ func (o *opRun) step(step string) error {
 
 func (o *opRun) fields(updates map[string]interface{}) error {
 	return o.r.store.UpdateReshardFields(o.op.ID, o.r.cpID, o.op.RunnerEpoch, updates)
+}
+
+func (o *opRun) mark(field string) (*time.Time, error) {
+	now := time.Now().UTC()
+	if err := o.fields(map[string]interface{}{field: now}); err != nil {
+		return nil, err
+	}
+	return &now, nil
 }
 
 // cancelRequested refetches the op row and reports the cancel flag; a fencing
@@ -485,6 +504,18 @@ func (r *ReshardRunner) execute(ctx context.Context, op *configstore.ReshardOper
 		o.logf("error", "operation fenced: another runner took over; this runner abandons it")
 		return
 	}
+	if o.sourceDropCommitted() {
+		// Source deletion is the irreversible commit point. Re-pointing or
+		// re-adopting it can recreate an empty catalog, so every later failure
+		// must roll forward. If this attempt cannot finish, leave the operation
+		// running and the warehouse blocked; the stale-runner reconciler will
+		// claim it and retry from the durable milestones.
+		o.logf("error", "step %q failed after the source catalog was durably dropped: %v — refusing rollback; retrying disable/cleanup/finalization", o.op.Step, runErr)
+		if err := o.rollForwardAfterSourceDrop(context.WithoutCancel(ctx)); err != nil {
+			o.logf("error", "post-drop roll-forward did not complete: %v — warehouse remains resharding for takeover retry", err)
+		}
+		return
+	}
 
 	cancelled := errors.Is(runErr, errReshardCancelled)
 	if cancelled {
@@ -504,6 +535,30 @@ func (r *ReshardRunner) execute(ctx context.Context, op *configstore.ReshardOper
 	if err := r.store.FinishReshardOperation(op.ID, r.cpID, op.RunnerEpoch, state, msg); err != nil {
 		slog.Error("Reshard: finishing operation failed.", "op", op.ID, "error", err)
 	}
+}
+
+func (o *opRun) rollForwardAfterSourceDrop(ctx context.Context) error {
+	if o.op.SourceDroppedAt == nil {
+		if o.op.TargetKind == configstore.MetadataStoreKindExternal {
+			if err := o.dropOrphanedCnpgSource(ctx); err != nil {
+				return err
+			}
+		} else {
+			if err := o.cleanupSource(ctx); err != nil {
+				return err
+			}
+		}
+	} else if o.op.MaintenanceDisabledAt == nil {
+		if err := o.disableMaintenance(ctx, nil); err != nil {
+			return err
+		}
+	}
+	return o.finalize(ctx)
+}
+
+func (o *opRun) sourceDropCommitted() bool {
+	return o.op.SourceDropCommittedAt != nil ||
+		(o.op.TargetKind == configstore.MetadataStoreKindExternal && o.op.ExternalVerifiedAt != nil)
 }
 
 func describeSource(op *configstore.ReshardOperation) string {
@@ -537,13 +592,22 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 	if err := o.block(ctx); err != nil {
 		return err
 	}
+	// Resolve and validate the authoritative source identity immediately after
+	// publishing the resharding signal, before provisioning or fencing any
+	// source-shard credentials.
+	if err := o.recordSource(ctx); err != nil {
+		return err
+	}
+	if err := o.prepareSourceAccess(ctx); err != nil {
+		return err
+	}
 	if err := o.drain(ctx); err != nil {
 		return err
 	}
-	if err := o.pauseCompaction(ctx); err != nil {
+	if err := o.fenceSource(ctx); err != nil {
 		return err
 	}
-	if err := o.recordSource(ctx); err != nil {
+	if err := o.pauseCompaction(ctx); err != nil {
 		return err
 	}
 	if err := o.backupCatalog(ctx); err != nil {
@@ -603,6 +667,26 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 // the live Duckling status names the target at that point. Earlier and external
 // target phases fail into the conservative rollback path.
 func (o *opRun) resumeTakeover(ctx context.Context) error {
+	if o.sourceDropCommitted() {
+		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+		if err != nil {
+			return fmt.Errorf("read verified target during post-commit takeover: %w", err)
+		}
+		o.flipped = true
+		o.maintenancePrepared = st.ReshardMaintenance.OperationID == o.op.ID
+		o.sourceFenced = o.op.SourceFencedAt != nil
+		o.source = CatalogEndpoint{
+			Host: o.op.SourceEndpoint, Port: 5432,
+			User: st.ReshardMaintenance.User, Password: st.ReshardMaintenance.Password,
+			Database: o.op.SourceDatabase, SSLMode: sslModeFor(o.op.SourceKind),
+		}
+		o.target = CatalogEndpoint{
+			Host: st.MetadataStore.Endpoint, Port: 5432,
+			User: st.MetadataStore.User, Password: st.MetadataStore.Password,
+			Database: st.MetadataStore.Database, SSLMode: sslModeFor(o.op.TargetKind),
+		}
+		return o.rollForwardAfterSourceDrop(ctx)
+	}
 	if o.op.TargetKind != configstore.MetadataStoreKindCnpgShard ||
 		o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
 		return fmt.Errorf("takeover at step %q cannot be resumed safely; rolling back from durable progress", o.op.Step)
@@ -618,6 +702,10 @@ func (o *opRun) resumeTakeover(ctx context.Context) error {
 			return fmt.Errorf("takeover at step %q has incomplete durable source identity", o.op.Step)
 		}
 		o.source, o.target = takeoverEndpoints(o.op, st)
+		if st.ReshardMaintenance.OperationID == o.op.ID && st.ReshardMaintenance.Fenced {
+			o.maintenancePrepared = true
+			o.sourceFenced = true
+		}
 		if err := o.copyCatalog(ctx); err != nil {
 			return err
 		}
@@ -649,9 +737,17 @@ func (o *opRun) resumeTakeover(ctx context.Context) error {
 // must stay kind-correct so relaxing that guard — or a drifted op row — can
 // never reintroduce the wrong sslmode.
 func takeoverEndpoints(op *configstore.ReshardOperation, st *DucklingStatus) (source, target CatalogEndpoint) {
+	sourceUser := op.SourceUser
+	sourcePassword := st.MetadataStore.Password
+	if op.SourceKind == configstore.MetadataStoreKindCnpgShard &&
+		st.ReshardMaintenance.OperationID == op.ID &&
+		st.ReshardMaintenance.Prepared {
+		sourceUser = st.ReshardMaintenance.User
+		sourcePassword = st.ReshardMaintenance.Password
+	}
 	source = CatalogEndpoint{
-		Host: op.SourceEndpoint, Port: 5432, User: op.SourceUser,
-		Password: st.MetadataStore.Password, Database: op.SourceDatabase,
+		Host: op.SourceEndpoint, Port: 5432, User: sourceUser,
+		Password: sourcePassword, Database: op.SourceDatabase,
 		SSLMode: sslModeFor(op.SourceKind),
 	}
 	target = CatalogEndpoint{
@@ -663,6 +759,308 @@ func takeoverEndpoints(op *configstore.ReshardOperation, st *DucklingStatus) (so
 }
 
 // ---- steps ----------------------------------------------------------------
+
+func (o *opRun) maintenanceSpec(phase string) *ReshardMaintenanceSpec {
+	return &ReshardMaintenanceSpec{
+		OperationID: o.op.ID,
+		SourceShard: o.op.FromShard,
+		Phase:       phase,
+	}
+}
+
+func (o *opRun) prepareSourceAccess(ctx context.Context) error {
+	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
+		return nil
+	}
+	if err := o.step("preparing_access"); err != nil {
+		return err
+	}
+	if !isValidCnpgShardName(o.op.FromShard) {
+		// Legacy malformed operations predate the submit-time source identity
+		// guard. Preserve their conservative rollback behavior; there is no
+		// safe shard on which to provision the maintenance role.
+		o.logf("warn", "cannot prepare source maintenance access for invalid source shard %q; continuing only so the existing cutover/rollback guard can leave the warehouse safely blocked", o.op.FromShard)
+		return nil
+	}
+	o.logf("info", "preparing operation-scoped maintenance login on source shard %s (tenant login remains enabled)", o.op.FromShard)
+	if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhasePrepared)); err != nil {
+		return err
+	}
+	st, err := o.waitForMaintenance(ctx, false)
+	if err != nil {
+		return err
+	}
+	o.maintenancePrepared = true
+	at, err := o.mark("maintenance_prepared_at")
+	if err != nil {
+		return err
+	}
+	o.op.MaintenancePreparedAt = at
+	o.tenantUser = st.MetadataStore.User
+	o.tenantDatabase = st.MetadataStore.Database
+	o.logf("info", "source maintenance login prepared; tenant access is unchanged")
+	return nil
+}
+
+func (o *opRun) waitForMaintenance(ctx context.Context, wantFenced bool) (*DucklingStatus, error) {
+	deadline := time.Now().Add(o.flipTimeout())
+	var last string
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+		if err == nil {
+			m := st.ReshardMaintenance
+			last = fmt.Sprintf("operation=%d prepared=%t fenced=%t user=%q secret=%q", m.OperationID, m.Prepared, m.Fenced, m.User, m.CredentialSecretRef.Name)
+			observed := m.MaintenanceLogin && m.TenantLogin
+			if wantFenced {
+				observed = m.MaintenanceLogin && m.TenantNoLogin
+			}
+			if m.OperationID == o.op.ID && m.Prepared && m.User != "" && m.Password != "" &&
+				observed && (!wantFenced || m.Fenced) {
+				return st, nil
+			}
+		} else {
+			last = err.Error()
+		}
+		if err := o.wait(ctx, o.r.loopPoll); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("reshard maintenance did not reach fenced=%t within %s; last observation: %s", wantFenced, o.flipTimeout(), last)
+}
+
+func (o *opRun) waitForSourceMaintenanceUnfenced(ctx context.Context) error {
+	deadline := time.Now().Add(o.flipTimeout())
+	var last string
+	sourcePrefix := o.op.FromShard + "-pooler."
+	for time.Now().Before(deadline) {
+		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+		if err == nil {
+			m := st.ReshardMaintenance
+			last = fmt.Sprintf("endpoint=%q operation=%d prepared=%t fenced=%t tenantLogin=%t maintenanceLogin=%t",
+				st.MetadataStore.Endpoint, m.OperationID, m.Prepared, m.Fenced, m.TenantLogin, m.MaintenanceLogin)
+			if strings.HasPrefix(st.MetadataStore.Endpoint, sourcePrefix) &&
+				m.OperationID == o.op.ID && m.Prepared && !m.Fenced && m.TenantLogin && m.MaintenanceLogin {
+				tenant := CatalogEndpoint{
+					Host: st.MetadataStore.Endpoint, Port: 5432,
+					User: st.MetadataStore.User, Password: st.MetadataStore.Password,
+					Database: st.MetadataStore.Database, SSLMode: sslModeFor(o.op.SourceKind),
+				}
+				if probeErr := o.r.copier.Probe(ctx, tenant); probeErr == nil {
+					return nil
+				} else {
+					last += "; tenant probe failed: " + describeProbeFailure(probeErr, tenant.User)
+				}
+			}
+		} else {
+			last = err.Error()
+		}
+		if err := maintenancePollSleep(ctx, o.r.loopPoll); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("source endpoint and tenant login were not restored within %s; last observation: %s", o.flipTimeout(), last)
+}
+
+func (o *opRun) waitForMaintenanceEnabled(ctx context.Context) (*DucklingStatus, error) {
+	deadline := time.Now().Add(o.flipTimeout())
+	var last string
+	for time.Now().Before(deadline) {
+		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+		if err == nil {
+			m := st.ReshardMaintenance
+			tenantReady := st.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard || m.TenantLogin
+			last = fmt.Sprintf("operation=%d prepared=%t maintenanceLogin=%t tenantLogin=%t type=%q",
+				m.OperationID, m.Prepared, m.MaintenanceLogin, m.TenantLogin, st.MetadataStore.Type)
+			if m.OperationID == o.op.ID && m.Prepared && m.MaintenanceLogin && tenantReady &&
+				m.User != "" && m.Password != "" {
+				return st, nil
+			}
+		} else {
+			last = err.Error()
+		}
+		if err := maintenancePollSleep(ctx, o.r.loopPoll); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("maintenance LOGIN was not observed within %s; last observation: %s", o.flipTimeout(), last)
+}
+
+func (o *opRun) waitForMaintenanceDisabled(ctx context.Context) error {
+	deadline := time.Now().Add(o.flipTimeout())
+	var last string
+	for time.Now().Before(deadline) {
+		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+		if err == nil {
+			m := st.ReshardMaintenance
+			last = fmt.Sprintf("operation=%d tenant_login=%t maintenance_nologin=%t", m.OperationID, m.TenantLogin, m.MaintenanceNoLogin)
+			tenantSafe := st.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard || m.TenantLogin
+			if m.OperationID == o.op.ID && tenantSafe && m.MaintenanceNoLogin {
+				return nil
+			}
+		} else {
+			last = err.Error()
+		}
+		if err := maintenancePollSleep(ctx, o.r.loopPoll); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("maintenance identity was not disabled within %s; last observation: %s", o.flipTimeout(), last)
+}
+
+func (o *opRun) cleanupMaintenance(ctx context.Context) error {
+	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
+		return nil
+	}
+	if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, nil); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(o.flipTimeout())
+	for time.Now().Before(deadline) {
+		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+		statusGone := err == nil && st.ReshardMaintenance.OperationID != o.op.ID
+		if statusGone {
+			complete, detail, cleanupErr := o.r.duckling.ReshardMaintenanceCleanupComplete(ctx, o.op.DucklingName)
+			if cleanupErr != nil {
+				return cleanupErr
+			}
+			if complete {
+				o.maintenancePrepared = false
+				o.logf("info", "%s", detail)
+				return nil
+			}
+		}
+		if err := maintenancePollSleep(ctx, o.r.loopPoll); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("operation-scoped maintenance identity was not removed within %s", o.flipTimeout())
+}
+
+// disableMaintenance closes the privileged-login cleanup race. The fencer
+// establishes a final maintenance session first, runs beforeDisable while
+// LOGIN is still available, then requests/observes maintenance NOLOGIN,
+// terminates every other session for that role, and finally closes itself.
+func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() error) error {
+	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard || o.op.MaintenanceDisabledAt != nil {
+		if beforeDisable != nil {
+			return beforeDisable()
+		}
+		return nil
+	}
+	st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
+	if err != nil {
+		return fmt.Errorf("read maintenance identity before disabling: %w", err)
+	}
+	m := st.ReshardMaintenance
+	if m.OperationID != o.op.ID || m.User == "" || m.Password == "" {
+		return fmt.Errorf("maintenance identity for operation %d is not available before cleanup", o.op.ID)
+	}
+	if m.MaintenanceNoLogin {
+		// A prior runner can crash after PostgreSQL applied NOLOGIN and drained
+		// sessions but before it persisted maintenance_disabled_at. Re-enable
+		// and positively observe the role so we can establish a final session,
+		// then repeat the disable/drain transition idempotently.
+		if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhasePrepared)); err != nil {
+			return fmt.Errorf("re-enable maintenance identity after an interrupted disable: %w", err)
+		}
+		st, err = o.waitForMaintenanceEnabled(ctx)
+		if err != nil {
+			return err
+		}
+		m = st.ReshardMaintenance
+	}
+	host := o.op.SourceEndpoint
+	if host == "" {
+		host = st.MetadataStore.Endpoint
+	}
+	admin := CatalogEndpoint{
+		Host: host, Port: 5432, User: m.User, Password: m.Password,
+		Database: "postgres", SSLMode: sslModeFor(o.op.SourceKind),
+	}
+	disableCtx, cancel := context.WithTimeout(ctx, o.flipTimeout())
+	defer cancel()
+	if err := o.r.fencer.DisableMaintenanceAndTerminate(disableCtx, admin, func() error {
+		if beforeDisable != nil {
+			if err := beforeDisable(); err != nil {
+				return err
+			}
+		}
+		if err := o.r.duckling.SetReshardMaintenance(disableCtx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhaseDisabled)); err != nil {
+			return err
+		}
+		return o.waitForMaintenanceDisabled(disableCtx)
+	}); err != nil {
+		return fmt.Errorf("disable and drain maintenance identity: %w", err)
+	}
+	at, err := o.mark("maintenance_disabled_at")
+	if err != nil {
+		return err
+	}
+	o.op.MaintenanceDisabledAt = at
+	o.logf("info", "operation-scoped maintenance login set NOLOGIN and all other privileged sessions terminated")
+	return nil
+}
+
+func maintenancePollSleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (o *opRun) fenceSource(ctx context.Context) error {
+	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
+		return nil
+	}
+	if !o.maintenancePrepared {
+		return nil
+	}
+	if err := o.step("fencing_source"); err != nil {
+		return err
+	}
+	at, err := o.mark("source_fence_requested_at")
+	if err != nil {
+		return err
+	}
+	o.op.SourceFenceRequestedAt = at
+	o.logf("info", "Duckgres drain complete; disabling the source tenant login before terminating any residual direct sessions")
+	if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhaseFenced)); err != nil {
+		return err
+	}
+	st, err := o.waitForMaintenance(ctx, true)
+	if err != nil {
+		return err
+	}
+	o.sourceFenced = true
+	ms := st.MetadataStore
+	m := st.ReshardMaintenance
+	o.tenantUser = ms.User
+	o.tenantDatabase = ms.Database
+	maintenance := CatalogEndpoint{
+		Host: ms.Endpoint, Port: 5432, User: m.User, Password: m.Password,
+		Database: ms.Database, SSLMode: sslModeFor(o.op.SourceKind),
+	}
+	fenceCtx, cancel := context.WithTimeout(ctx, o.flipTimeout())
+	defer cancel()
+	if err := o.r.fencer.TerminateAndWait(fenceCtx, maintenance, o.tenantUser, o.tenantDatabase); err != nil {
+		return err
+	}
+	at, err = o.mark("source_fenced_at")
+	if err != nil {
+		return err
+	}
+	o.op.SourceFencedAt = at
+	o.source = maintenance
+	o.logf("info", "source tenant login fenced and all residual direct tenant sessions terminated")
+	return nil
+}
 
 func (o *opRun) block(ctx context.Context) error {
 	if err := o.step("blocking"); err != nil {
@@ -848,10 +1246,17 @@ func (o *opRun) recordSource(ctx context.Context) error {
 	case configstore.MetadataStoreKindCnpgShard:
 		// Post-flip access goes DIRECT to the source pooler endpoint (the
 		// orphaned role/DB and its pinned password survive a shard change).
-		o.source = CatalogEndpoint{
+		tenantSource := CatalogEndpoint{
 			Host: ms.Endpoint, Port: 5432,
 			User: ms.User, Password: ms.Password, Database: ms.Database,
 			SSLMode: sslModeFor(o.op.SourceKind),
+		}
+		if !o.sourceFenced {
+			o.source = tenantSource
+		} else {
+			// fenceSource already installed the operation-scoped identity.
+			o.source.Host = ms.Endpoint
+			o.source.Database = ms.Database
 		}
 	case configstore.MetadataStoreKindExternal:
 		// Post-flip the composition deletes the ESO sync + pgbouncer, so the
@@ -1002,10 +1407,28 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
 		if err == nil && strings.HasPrefix(st.MetadataStore.Endpoint, targetPrefix) && st.ReadyCondition {
+			if o.op.TargetRenderedAt == nil {
+				at, markErr := o.mark("target_rendered_at")
+				if markErr != nil {
+					return markErr
+				}
+				o.op.TargetRenderedAt = at
+			}
 			o.target = CatalogEndpoint{
 				Host: st.MetadataStore.Endpoint, Port: 5432,
 				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,
 				SSLMode: sslModeFor(o.op.TargetKind),
+			}
+			if o.op.SourceKind == configstore.MetadataStoreKindCnpgShard && !st.ReshardMaintenance.TenantLogin {
+				lastObserved = "composition converged, waiting for provider-sql to observe LOGIN on the target tenant role"
+				goto waitForTarget
+			}
+			if o.op.TargetLoginReadyAt == nil {
+				at, markErr := o.mark("target_login_ready_at")
+				if markErr != nil {
+					return markErr
+				}
+				o.op.TargetLoginReadyAt = at
 			}
 			probeErr := o.r.copier.Probe(ctx, o.target)
 			if probeErr == nil {
@@ -1023,6 +1446,7 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 				lastObserved = fmt.Sprintf("duckling endpoint %q, ready=%t", st.MetadataStore.Endpoint, st.ReadyCondition)
 			}
 		}
+	waitForTarget:
 		if time.Since(lastLog) >= o.r.progressLogInterval {
 			o.logf("info", "waiting for target: %s", lastObserved)
 			lastLog = time.Now()
@@ -1176,6 +1600,11 @@ func (o *opRun) verifyExternalCatalog(ctx context.Context) error {
 		return err
 	}
 	o.logf("info", "external target catalog copy completed: source and target COPY command tags matched for %d tables — safe to drop the retained cnpg source", o.copied.Tables)
+	at, err := o.mark("external_verified_at")
+	if err != nil {
+		return err
+	}
+	o.op.ExternalVerifiedAt = at
 	return nil
 }
 
@@ -1191,20 +1620,30 @@ func (o *opRun) dropOrphanedCnpgSource(ctx context.Context) error {
 	if err := o.step("cleaning_up"); err != nil {
 		return err
 	}
-	if o.source.Database == "" {
-		o.logf("error", "source database name is empty (recordSource did not run?) — skipping DROP DATABASE; the orphaned cnpg database on %s must be dropped manually", o.op.FromShard)
-	} else {
+	if err := o.disableMaintenance(ctx, func() error {
+		o.releaseSourceFence()
+		if o.source.Database == "" {
+			o.logf("error", "source database name is empty (recordSource did not run?) — skipping DROP DATABASE; the orphaned cnpg database on %s must be dropped manually", o.op.FromShard)
+			return nil
+		}
 		o.logf("info", "dropping the orphaned cnpg source database %s on %s (WITH FORCE) — external catalog verified complete", o.source.Database, o.op.FromShard)
 		if err := o.r.copier.DropDatabase(ctx, o.source, o.source.Database); err != nil {
 			o.logf("error", "DROP DATABASE on the orphaned cnpg source failed — it still exists on %s and must be dropped manually: %v", o.op.FromShard, err)
-		} else {
-			o.logf("info", "orphaned cnpg source database dropped (the source role remains — orphaned, harmless; roles cannot drop themselves)")
+			return nil
 		}
+		at, err := o.mark("source_dropped_at")
+		if err != nil {
+			return err
+		}
+		o.op.SourceDroppedAt = at
+		o.logf("info", "orphaned cnpg source database dropped (the source role remains NOLOGIN)")
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := o.r.duckling.SetMetadataStoreRetainCnpgOnFlip(ctx, o.op.DucklingName, false); err != nil {
 		o.logf("warn", "clearing retainCnpgOnFlip after cnpg→ext completion failed: %v — harmless while on external; a later ext→cnpg reshard should ensure it is false", err)
 	}
-	o.releaseSourceFence()
 	return nil
 }
 
@@ -1286,24 +1725,35 @@ func (o *opRun) cleanupSource(ctx context.Context) error {
 		o.releaseSourceFence()
 		return nil
 	}
-	// o.source is the copy-path source of truth (recorded from the duckling
-	// status pre-flip); o.op.SourceDatabase mirrors it since recordSource.
-	// Never issue a zero-length identifier: skip loudly instead.
-	if o.source.Database == "" {
-		o.logf("error", "source database name is empty (recordSource did not run?) — skipping DROP DATABASE; the old catalog database on %s must be dropped manually", o.op.FromShard)
-		return nil
+	if o.op.SourceDropCommittedAt == nil {
+		at, err := o.mark("source_drop_committed_at")
+		if err != nil {
+			return err
+		}
+		o.op.SourceDropCommittedAt = at
+		o.logf("info", "target verification committed; all subsequent failures must roll forward and may not re-point to the source")
 	}
-	o.logf("info", "dropping source database %s on %s (WITH FORCE)", o.source.Database, o.op.FromShard)
-	if err := o.r.copier.DropDatabase(ctx, o.source, o.source.Database); err != nil {
-		// Loud but non-fatal: the copy is verified and live; a leftover
-		// source DB is cruft plus a weaker fence, not data loss.
-		o.logf("error", "DROP DATABASE on the source failed — old catalog database still exists on %s and must be dropped manually: %v", o.op.FromShard, err)
+	return o.disableMaintenance(ctx, func() error {
 		o.releaseSourceFence()
+		// o.source is the copy-path source of truth (recorded from the duckling
+		// status pre-flip); o.op.SourceDatabase mirrors it since recordSource.
+		if o.source.Database == "" {
+			o.logf("error", "source database name is empty (recordSource did not run?) — skipping DROP DATABASE; the old catalog database on %s must be dropped manually", o.op.FromShard)
+			return nil
+		}
+		o.logf("info", "dropping source database %s on %s (WITH FORCE)", o.source.Database, o.op.FromShard)
+		if err := o.r.copier.DropDatabase(ctx, o.source, o.source.Database); err != nil {
+			o.logf("error", "DROP DATABASE on the source failed — old catalog database still exists on %s and must be dropped manually: %v", o.op.FromShard, err)
+			return nil
+		}
+		at, err := o.mark("source_dropped_at")
+		if err != nil {
+			return err
+		}
+		o.op.SourceDroppedAt = at
+		o.logf("info", "source database dropped; source tenant and maintenance roles remain NOLOGIN")
 		return nil
-	}
-	o.releaseSourceFence()
-	o.logf("info", "source database dropped (the source role remains; roles cannot drop themselves)")
-	return nil
+	})
 }
 
 func (o *opRun) releaseSourceFence() {
@@ -1318,6 +1768,23 @@ func (o *opRun) finalize(ctx context.Context) error {
 		return err
 	}
 	o.restoreCompaction(ctx)
+	if o.op.SourceKind == configstore.MetadataStoreKindCnpgShard {
+		if o.op.MaintenanceDisabledAt == nil {
+			if err := o.disableMaintenance(ctx, nil); err != nil {
+				return err
+			}
+		}
+		if err := o.cleanupMaintenance(ctx); err != nil {
+			return fmt.Errorf("remove disabled reshard maintenance identity before finalizing: %w", err)
+		}
+		at, err := o.mark("maintenance_cleaned_at")
+		if err != nil {
+			return err
+		}
+		o.op.MaintenanceCleanedAt = at
+		o.sourceFenced = false
+		o.logf("info", "target tenant login confirmed; disabled operation-scoped maintenance resources removed")
+	}
 
 	// Reconcile the warehouse config-store row with the new reality so
 	// provisioning/status surfaces match the CR.
@@ -1468,6 +1935,12 @@ func (o *opRun) rollback(ctx context.Context) {
 	}
 
 	o.restoreCompaction(ctx)
+	if o.op.SourceKind == configstore.MetadataStoreKindCnpgShard {
+		if err := o.restoreAndCleanupMaintenance(ctx); err != nil {
+			o.logf("error", "source tenant access recovery failed: %v — warehouse remains blocked", err)
+			recovered = false
+		}
+	}
 
 	if o.blocked && recovered {
 		if err := o.r.store.UpdateWarehouseState(o.op.OrgID, configstore.ManagedWarehouseStateResharding, map[string]interface{}{
@@ -1484,6 +1957,47 @@ func (o *opRun) rollback(ctx context.Context) {
 	} else if o.blocked {
 		o.logf("error", "warehouse remains blocked because catalog recovery did not complete successfully; repair the metadata-store target, then explicitly restore warehouse readiness")
 	}
+}
+
+func (o *opRun) restoreAndCleanupMaintenance(ctx context.Context) error {
+	if !isValidCnpgShardName(o.op.FromShard) ||
+		(o.op.MaintenancePreparedAt == nil && !reshardStepReached(o.op, "preparing_access")) {
+		return nil
+	}
+	// Always drive and positively observe prepared/LOGIN before cleanup. A
+	// fencing patch may already have reached PostgreSQL while status still
+	// reports fenced=false; treating that stale observation as proof of LOGIN
+	// could admit traffic with the tenant role still NOLOGIN.
+	if o.op.MaintenanceDisabledAt != nil || o.op.MaintenanceCleanedAt != nil {
+		if err := o.fields(map[string]interface{}{
+			"maintenance_disabled_at": nil,
+			"maintenance_cleaned_at":  nil,
+		}); err != nil {
+			return err
+		}
+		o.op.MaintenanceDisabledAt = nil
+		o.op.MaintenanceCleanedAt = nil
+	}
+	if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhasePrepared)); err != nil {
+		return fmt.Errorf("re-enable source tenant login: %w", err)
+	}
+	if err := o.waitForSourceMaintenanceUnfenced(ctx); err != nil {
+		return err
+	}
+	o.logf("info", "source tenant login confirmed during rollback")
+	if err := o.disableMaintenance(ctx, nil); err != nil {
+		return err
+	}
+	if err := o.cleanupMaintenance(ctx); err != nil {
+		return fmt.Errorf("remove operation-scoped maintenance identity: %w", err)
+	}
+	at, err := o.mark("maintenance_cleaned_at")
+	if err != nil {
+		return err
+	}
+	o.op.MaintenanceCleanedAt = at
+	o.sourceFenced = false
+	return nil
 }
 
 // dropPartialTarget best-effort drops the half-copied catalog tables from a
@@ -1534,6 +2048,7 @@ func (o *opRun) recoverFromExternal(ctx context.Context) bool {
 	deadline := time.Now().Add(o.flipTimeout())
 	lastLog := time.Time{}
 	lastObserved := "no successful duckling read yet"
+	preparedRequested := false
 	for {
 		if time.Now().After(deadline) {
 			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s); last observation: %s", o.flipTimeout(), o.op.FromShard, lastObserved)
@@ -1549,6 +2064,18 @@ func (o *opRun) recoverFromExternal(ctx context.Context) bool {
 				lastObserved += "; duckling Synced=False: " + st.SyncedFalseMessage
 			}
 		default:
+			if !st.ReshardMaintenance.TenantLogin {
+				if !preparedRequested {
+					o.logf("info", "recovery: source role re-adopted; requesting LOGIN before tenant probe")
+					if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhasePrepared)); err != nil {
+						o.logf("error", "recovery: restoring source tenant LOGIN failed: %v", err)
+						return false
+					}
+					preparedRequested = true
+				}
+				lastObserved = "source endpoint ready; waiting for provider-sql to observe LOGIN on the tenant role"
+				break
+			}
 			restored := CatalogEndpoint{
 				Host: st.MetadataStore.Endpoint, Port: 5432,
 				User: st.MetadataStore.User, Password: st.MetadataStore.Password, Database: st.MetadataStore.Database,

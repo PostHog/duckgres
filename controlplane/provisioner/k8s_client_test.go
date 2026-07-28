@@ -4,13 +4,16 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -57,6 +60,93 @@ func TestGetResolvesMetadataPasswordFromCredentialSecretRef(t *testing.T) {
 	}
 	if got := status.MetadataStore.Password; got != "live-secret-password" {
 		t.Fatalf("password = %q, want Secret value", got)
+	}
+}
+
+func TestGetResolvesReshardMaintenanceStatusAndPassword(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{
+		Name: "cnpg-tenant-acme-password", Namespace: ducklingNamespace, Key: "password",
+	})
+	metadataStore := cr.Object["status"].(map[string]interface{})["metadataStore"].(map[string]interface{})
+	metadataStore["reshardMaintenance"] = map[string]interface{}{
+		"operationID":        int64(42),
+		"user":               "reshard_42",
+		"prepared":           true,
+		"fenced":             true,
+		"tenantLogin":        false,
+		"tenantNoLogin":      true,
+		"maintenanceLogin":   true,
+		"maintenanceNoLogin": false,
+		"credentialSecretRef": map[string]interface{}{
+			"name": "cnpg-reshard-42-password", "namespace": ducklingNamespace, "key": "password",
+		},
+	}
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr,
+		credentialSecret("cnpg-tenant-acme-password", "tenant-password"),
+		credentialSecret("cnpg-reshard-42-password", "maintenance-password"))
+
+	status, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	m := status.ReshardMaintenance
+	if m.OperationID != 42 || m.User != "reshard_42" || !m.Prepared || !m.Fenced ||
+		m.TenantLogin || !m.TenantNoLogin || !m.MaintenanceLogin || m.MaintenanceNoLogin ||
+		m.Password != "maintenance-password" {
+		t.Fatalf("reshard maintenance status = %#v", m)
+	}
+}
+
+func TestReshardMaintenanceCleanupCompleteObservesNamedResources(t *testing.T) {
+	name := "acme"
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))[:16]
+	roleName := "cnpg-reshard-" + hash
+	usageName := roleName + "-uses-password"
+	role := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": cnpgTenantMRGroup + "/v1alpha1",
+		"kind":       "Role",
+		"metadata":   map[string]interface{}{"name": roleName, "namespace": ducklingNamespace},
+	}}
+	usage := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "protection.crossplane.io/v1beta1",
+		"kind":       "Usage",
+		"metadata":   map[string]interface{}{"name": usageName, "namespace": ducklingNamespace},
+	}}
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), role, usage)
+	client := NewDucklingClientWithDynamic(fakeK8s)
+
+	complete, detail, err := client.ReshardMaintenanceCleanupComplete(context.Background(), name)
+	if err != nil {
+		t.Fatalf("cleanup observation: %v", err)
+	}
+	if complete || !strings.Contains(detail, roleName) {
+		t.Fatalf("complete=%t detail=%q, want existing Role reported", complete, detail)
+	}
+	if err := fakeK8s.Resource(schema.GroupVersionResource{
+		Group: cnpgTenantMRGroup, Version: "v1alpha1", Resource: "roles",
+	}).Namespace(ducklingNamespace).Delete(context.Background(), roleName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete role: %v", err)
+	}
+
+	complete, detail, err = client.ReshardMaintenanceCleanupComplete(context.Background(), name)
+	if err != nil {
+		t.Fatalf("cleanup observation after deletion: %v", err)
+	}
+	if complete || !strings.Contains(detail, usageName) {
+		t.Fatalf("complete=%t detail=%q, want existing Usage reported", complete, detail)
+	}
+	if err := fakeK8s.Resource(schema.GroupVersionResource{
+		Group: "protection.crossplane.io", Version: "v1beta1", Resource: "usages",
+	}).Namespace(ducklingNamespace).Delete(context.Background(), usageName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete usage: %v", err)
+	}
+
+	complete, detail, err = client.ReshardMaintenanceCleanupComplete(context.Background(), name)
+	if err != nil {
+		t.Fatalf("cleanup observation after usage deletion: %v", err)
+	}
+	if !complete {
+		t.Fatalf("complete=false detail=%q, want all resources absent", detail)
 	}
 }
 
