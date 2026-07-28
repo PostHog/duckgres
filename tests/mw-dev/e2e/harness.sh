@@ -1662,6 +1662,161 @@ project_reader_isolation() { # org root_password team_id
   log "project reader OK: whole-schema read, cross-project denial, read-only enforcement, legacy default-named override grant"
 }
 
+# ---- project-scoped read/write users ----------------------------------------
+# A project_user is the reader's read/write sibling: same derived namespaces,
+# but DML and in-project DDL are authorized. The load-bearing property is that
+# write authorization does NOT widen the reachable relation set — a project user
+# must still be unable to touch another project's schema, in a write shape or a
+# read one — and that the two logins stay independent credentials (minting the
+# writer must not make the reader writable).
+project_user_isolation() { # org root_password team_id
+  org="$1"; rootpw="$2"; team="$3"
+  schema="team_$team"
+  other_schema="team_$((team + 999))"
+  log "project user isolation on $org/team $team"
+
+  pg "$org" "$rootpw" ducklake "
+    CREATE SCHEMA IF NOT EXISTS $schema;
+    CREATE TABLE IF NOT EXISTS $schema.writer_probe(value INTEGER);
+    DELETE FROM $schema.writer_probe;
+    CREATE SCHEMA IF NOT EXISTS $other_schema;
+    CREATE TABLE IF NOT EXISTS $other_schema.writer_probe(value INTEGER);
+    DELETE FROM $other_schema.writer_probe;
+    INSERT INTO $other_schema.writer_probe VALUES (7);
+  " >/dev/null
+
+  creds="$(curl -fsS -X PUT -H "$H" "$API/api/v1/orgs/$org/teams/$team/project-user")"
+  writer="$(echo "$creds" | jq -r .username)"
+  writerpw="$(echo "$creds" | jq -r .password)"
+  [ "$writer" = "posthog_team_${team}_rw" ] || fail "project user: unexpected username '$writer'"
+  [ "$(echo "$creds" | jq -r .access_mode)" = "project_user" ] \
+    || fail "project user: endpoint did not report access_mode=project_user"
+  case "$writerpw" in ""|null) fail "project user: endpoint returned no password" ;; esac
+
+  # ---- writes inside the project succeed -----------------------------------
+  # Retry the FIRST connect through pg_try's transient handling (cold worker),
+  # then assert the round trip: the row a project user writes is the row it
+  # reads back.
+  a=0
+  while :; do
+    if out="$(pg_try "$org" "$writerpw" ducklake "INSERT INTO $schema.writer_probe VALUES (42)" "$writer")"; then
+      break
+    fi
+    case "$out" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|*"still provisioning"*|\
+      *"failed to initialize session"*|*"timed out waiting for an available worker"*|\
+      *"failed to start"*|*"spawn sized worker"*|*"failed to detect attached catalogs"*)
+        [ "$a" -lt 12 ] || fail "project user: session setup backpressure never cleared: $out"
+        sleep 10; a=$((a + 1)); continue ;;
+      *) fail "project user: in-project INSERT failed: $out" ;;
+    esac
+  done
+  got="$(pg "$org" "$writerpw" ducklake "SELECT value FROM $schema.writer_probe" "$writer")"
+  [ "$got" = "42" ] || fail "project user: read-back returned '$got', want 42"
+
+  pg "$org" "$writerpw" ducklake "UPDATE $schema.writer_probe SET value = 43" "$writer" >/dev/null
+  got="$(pg "$org" "$writerpw" ducklake "SELECT value FROM $schema.writer_probe" "$writer")"
+  [ "$got" = "43" ] || fail "project user: UPDATE returned '$got', want 43"
+
+  # In-project DDL: create, write, drop — all schema-qualified into the
+  # project's own namespace.
+  pg "$org" "$writerpw" ducklake \
+    "CREATE TABLE $schema.writer_ddl AS SELECT 1 AS v" "$writer" >/dev/null
+  got="$(pg "$org" "$writerpw" ducklake "SELECT v FROM $schema.writer_ddl" "$writer")"
+  [ "$got" = "1" ] || fail "project user: CTAS round-trip returned '$got', want 1"
+  pg "$org" "$writerpw" ducklake \
+    "ALTER TABLE $schema.writer_ddl ADD COLUMN label VARCHAR" "$writer" >/dev/null
+  pg "$org" "$writerpw" ducklake "DROP TABLE $schema.writer_ddl" "$writer" >/dev/null
+
+  pg "$org" "$writerpw" ducklake "DELETE FROM $schema.writer_probe" "$writer" >/dev/null
+  got="$(pg "$org" "$writerpw" ducklake "SELECT count(*) FROM $schema.writer_probe" "$writer")"
+  [ "$got" = "0" ] || fail "project user: DELETE left '$got' rows, want 0"
+
+  # ---- the project boundary still holds, in BOTH directions ----------------
+  # This is the regression that matters: authorizing writes must not have
+  # widened the relation set. A cross-project READ stays denied...
+  if out="$(pg_try "$org" "$writerpw" ducklake "SELECT value FROM $other_schema.writer_probe" "$writer")"; then
+    fail "project user: cross-project read unexpectedly succeeded: $out"
+  fi
+  echo "$out" | grep -qi "permission denied" \
+    || fail "project user: cross-project read failed without permission error: $out"
+
+  # ...and so does every cross-project WRITE shape.
+  for stmt in \
+    "INSERT INTO $other_schema.writer_probe VALUES (99)" \
+    "UPDATE $other_schema.writer_probe SET value = 99" \
+    "DELETE FROM $other_schema.writer_probe" \
+    "CREATE TABLE $other_schema.sneaky(v INTEGER)" \
+    "DROP TABLE $other_schema.writer_probe"; do
+    if out="$(pg_try "$org" "$writerpw" ducklake "$stmt" "$writer")"; then
+      fail "project user: cross-project write unexpectedly succeeded [$stmt]: $out"
+    fi
+    echo "$out" | grep -qi "permission denied" \
+      || fail "project user: cross-project write failed without permission error [$stmt]: $out"
+  done
+  # The other project's row is untouched by all of the above.
+  got="$(pg "$org" "$rootpw" ducklake "SELECT value FROM $other_schema.writer_probe")"
+  [ "$got" = "7" ] || fail "project user: other project's data was modified (value '$got', want 7)"
+
+  # An unqualified write target must not launder its way out of the project.
+  # A write target does NOT bind to a same-named CTE (only reads do), so it
+  # resolves against the session search_path and would reach ducklake.main —
+  # a namespace shared across the whole org. Naming a CTE after the victim
+  # table was a working escape before write targets got their own check.
+  pg "$org" "$rootpw" ducklake "
+    CREATE TABLE IF NOT EXISTS main.writer_escape_probe(value INTEGER);
+    DELETE FROM main.writer_escape_probe;
+    INSERT INTO main.writer_escape_probe VALUES (5);
+  " >/dev/null
+  for stmt in \
+    "WITH writer_escape_probe AS (SELECT 1) INSERT INTO writer_escape_probe VALUES (99)" \
+    "WITH writer_escape_probe AS (SELECT 1) DELETE FROM writer_escape_probe" \
+    "INSERT INTO main.writer_escape_probe VALUES (99)" \
+    "INSERT INTO pg_class VALUES (1)"; do
+    if out="$(pg_try "$org" "$writerpw" ducklake "$stmt" "$writer")"; then
+      fail "project user: unqualified/out-of-project write target succeeded [$stmt]: $out"
+    fi
+    echo "$out" | grep -qi "permission denied" \
+      || fail "project user: unqualified write target failed without permission error [$stmt]: $out"
+  done
+  got="$(pg "$org" "$rootpw" ducklake "SELECT value FROM main.writer_escape_probe")"
+  [ "$got" = "5" ] || fail "project user: shared main schema was written (value '$got', want 5)"
+  pg "$org" "$rootpw" ducklake "DROP TABLE main.writer_escape_probe" >/dev/null
+
+  # Namespace-level DDL escapes the project entirely and stays denied even for
+  # a writer, as do the native-DuckDB escape hatches and file-backed COPY.
+  for stmt in \
+    "CREATE SCHEMA e2e_writer_scratch" \
+    "DROP SCHEMA $schema" \
+    "ALTER TABLE $schema.writer_probe SET SCHEMA $other_schema" \
+    "COPY $schema.writer_probe TO '/tmp/exfil.csv'" \
+    "SELECT * FROM duckdb_settings()" \
+    "ATTACH 'other.duckdb' AS other"; do
+    if out="$(pg_try "$org" "$writerpw" ducklake "$stmt" "$writer")"; then
+      fail "project user: out-of-scope statement unexpectedly succeeded [$stmt]: $out"
+    fi
+  done
+  if pg_try "$org" "$rootpw" ducklake \
+      "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'e2e_writer_scratch'" \
+      | grep -q 1; then
+    fail "project user: CREATE SCHEMA was not actually blocked"
+  fi
+
+  # ---- the reader is a separate, still-read-only credential ----------------
+  # Minting the writer must not have promoted the team's reader.
+  rcreds="$(curl -fsS -X PUT -H "$H" "$API/api/v1/orgs/$org/teams/$team/project-reader")"
+  reader="$(echo "$rcreds" | jq -r .username)"
+  readerpw="$(echo "$rcreds" | jq -r .password)"
+  [ "$reader" != "$writer" ] || fail "project user: reader and writer share a username"
+  if out="$(pg_try "$org" "$readerpw" ducklake "INSERT INTO $schema.writer_probe VALUES (1)" "$reader")"; then
+    fail "project user: the team's reader is still writable: $out"
+  fi
+  echo "$out" | grep -qi "read-only\|permission denied" \
+    || fail "project user: reader write failed without read-only error: $out"
+
+  log "project user OK: in-project DML+DDL round-trip, cross-project read+write denial, unqualified-target denial, namespace-DDL denial, reader stays read-only"
+}
+
 # ---- user persistent secrets ------------------------------------------------
 # CREATE PERSISTENT SECRET must survive across sessions: worker pods are
 # ephemeral, so the CP intercepts the statement, stores it encrypted in the
@@ -3578,6 +3733,9 @@ main() {
   # ---- generated project reader: team-wide reads, no writes/cross-project ----
   project_reader_isolation "$CNPG" "$cnpg_pw" "$CNPG_TEAM_ID"
 
+  # ---- generated project user: team-wide read/write, same project boundary --
+  project_user_isolation "$CNPG" "$cnpg_pw" "$CNPG_TEAM_ID"
+
   # ---- admin ducklings metadata: live cnpg shard assignment ----------------
   admin_ducklings_metadata "$CNPG"
 
@@ -3634,7 +3792,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

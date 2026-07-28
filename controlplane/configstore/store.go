@@ -29,9 +29,20 @@ type OrgUserKey struct {
 }
 
 const (
-	OrgUserAccessModeUnrestricted  = "unrestricted"
+	OrgUserAccessModeUnrestricted = "unrestricted"
+	// OrgUserAccessModeProjectReader is a team-scoped read-only login.
 	OrgUserAccessModeProjectReader = "project_reader"
+	// OrgUserAccessModeProjectUser is a team-scoped read/write login: the same
+	// namespace derivation as a project reader, but DML and DDL are authorized
+	// as long as every target resolves inside the project's schemas.
+	OrgUserAccessModeProjectUser = "project_user"
 )
+
+// IsProjectScopedAccessMode reports whether mode binds a user to one team's
+// namespaces. Both scoped modes require a team_id and forbid passthrough.
+func IsProjectScopedAccessMode(mode string) bool {
+	return mode == OrgUserAccessModeProjectReader || mode == OrgUserAccessModeProjectUser
+}
 
 // OrgUserAccessConfig is the persisted identity binding loaded into a config
 // snapshot. Namespace permissions are derived from the matching OrgTeam row.
@@ -41,7 +52,9 @@ type OrgUserAccessConfig struct {
 }
 
 // OrgUserQueryAccess is the protocol-neutral project policy returned to the
-// PostgreSQL and Flight SQL ingress layers.
+// PostgreSQL and Flight SQL ingress layers. The namespace grant is identical
+// for both scoped modes; ReadOnly is what separates a project reader from a
+// project user.
 type OrgUserQueryAccess struct {
 	ReadOnly         bool
 	AllowedSchemas   []string
@@ -58,9 +71,9 @@ var ErrWorkerRecordUpsertFenceMiss = errors.New("worker record upsert fence miss
 // no row matches (orgID, username). Callers map it to a 404.
 var ErrOrgUserNotFound = errors.New("org user not found")
 
-// ErrProjectReaderTeamUnavailable is returned when a project-reader user is
-// requested for a team that does not exist or is disabled.
-var ErrProjectReaderTeamUnavailable = errors.New("project reader requires an enabled org team")
+// ErrProjectTeamUnavailable is returned when a project-scoped login (reader or
+// user) is requested for a team that does not exist or is disabled.
+var ErrProjectTeamUnavailable = errors.New("project login requires an enabled org team")
 
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
@@ -306,10 +319,11 @@ func (cs *ConfigStore) ReloadSnapshot() error {
 	return nil
 }
 
-// OrgUserQueryAccess returns the project-scoped read policy for a user. A
-// false result means the user is unrestricted. A project reader whose team is
-// absent or disabled returns an empty, read-only policy and therefore fails
-// closed for every persistent project relation.
+// OrgUserQueryAccess returns the project-scoped policy for a user. A false
+// result means the user is unrestricted. A scoped user whose team is absent or
+// disabled returns an empty, read-only policy and therefore fails closed for
+// every persistent project relation — including a project user, who is
+// downgraded to read-only rather than left writing into an unresolvable scope.
 func (cs *ConfigStore) OrgUserQueryAccess(orgID, username string) (OrgUserQueryAccess, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -343,9 +357,11 @@ func (cs *ConfigStore) OrgUserSessionQueryAccess(orgID, username string) (*OrgUs
 
 func orgUserQueryAccessFromSnapshot(snapshot *Snapshot, orgID, username string) (OrgUserQueryAccess, bool) {
 	access, ok := snapshot.OrgUserAccess[OrgUserKey{OrgID: orgID, Username: username}]
-	if !ok || access.Mode != OrgUserAccessModeProjectReader {
+	if !ok || !IsProjectScopedAccessMode(access.Mode) {
 		return OrgUserQueryAccess{}, false
 	}
+	// Fail closed: until the team resolves to an enabled row there are no
+	// allowed namespaces AND no write authorization, whatever the mode says.
 	policy := OrgUserQueryAccess{ReadOnly: true}
 	if access.TeamID == nil {
 		return policy, true
@@ -358,6 +374,7 @@ func orgUserQueryAccessFromSnapshot(snapshot *Snapshot, orgID, username string) 
 		if team.TeamID != *access.TeamID || !team.Enabled {
 			continue
 		}
+		policy.ReadOnly = access.Mode != OrgUserAccessModeProjectUser
 		importsSchema := team.SchemaName + "_data_imports"
 		if team.SchemaDataImportsName != nil && *team.SchemaDataImportsName != "" {
 			importsSchema = *team.SchemaDataImportsName

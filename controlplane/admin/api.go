@@ -125,7 +125,12 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	r.GET("/teams", h.listAllOrgTeams)
 	r.POST("/teams", h.createOrgTeam)
 	r.PUT("/orgs/:id/teams/:team_id", h.updateOrgTeam)
+	// The two project-scoped logins for a team. They are separate credentials
+	// (distinct usernames, one of each per team) so a caller picks read-only or
+	// read/write by which one it connects with, and minting a writer never
+	// widens the reader the PostHog SQL editor already uses.
 	r.PUT("/orgs/:id/teams/:team_id/project-reader", h.upsertProjectReader)
+	r.PUT("/orgs/:id/teams/:team_id/project-user", h.upsertProjectUser)
 
 	// Users CRUD
 	r.GET("/users", h.listUsers)
@@ -177,7 +182,12 @@ type apiStore interface {
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
 	UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
-	UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error)
+	// UpsertProjectLogin creates or rotates one team-scoped login. accessMode
+	// selects the capability (configstore.OrgUserAccessModeProjectReader or
+	// …ProjectUser); the row is otherwise identical, and a per-mode partial
+	// unique index keeps at most one of each per team. Returns
+	// configstore.ErrProjectTeamUnavailable when the team is missing/disabled.
+	UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
@@ -578,7 +588,10 @@ func (s *gormAPIStore) DeleteUser(orgID, username string) (bool, error) {
 	return found, err
 }
 
-func (s *gormAPIStore) UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error) {
+func (s *gormAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error) {
+	if !configstore.IsProjectScopedAccessMode(accessMode) {
+		return nil, fmt.Errorf("access mode %q is not project-scoped", accessMode)
+	}
 	var stored configstore.OrgUser
 	err := s.db().Transaction(func(tx *gorm.DB) error {
 		var team configstore.OrgTeam
@@ -586,7 +599,7 @@ func (s *gormAPIStore) UpsertProjectReader(orgID string, teamID int64, username,
 			&team, "org_id = ? AND team_id = ? AND enabled IS TRUE", orgID, teamID,
 		).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return configstore.ErrProjectReaderTeamUnavailable
+				return configstore.ErrProjectTeamUnavailable
 			}
 			return err
 		}
@@ -612,7 +625,7 @@ func (s *gormAPIStore) UpsertProjectReader(orgID string, teamID int64, username,
 			Username:    username,
 			Password:    passwordHash,
 			Passthrough: false,
-			AccessMode:  configstore.OrgUserAccessModeProjectReader,
+			AccessMode:  accessMode,
 			TeamID:      &boundTeamID,
 			Disabled:    false,
 		}
@@ -621,7 +634,7 @@ func (s *gormAPIStore) UpsertProjectReader(orgID string, teamID int64, username,
 			DoUpdates: clause.Assignments(map[string]interface{}{
 				"password":    passwordHash,
 				"passthrough": false,
-				"access_mode": configstore.OrgUserAccessModeProjectReader,
+				"access_mode": accessMode,
 				"team_id":     teamID,
 				"disabled":    false,
 				"updated_at":  time.Now().UTC(),
@@ -1692,8 +1705,10 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		if user.AccessMode == configstore.OrgUserAccessModeProjectReader {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "project readers cannot enable passthrough"})
+		// Passthrough bypasses the compat layer that enforces the project
+		// scope, so no scoped login — reader or user — may carry it.
+		if configstore.IsProjectScopedAccessMode(user.AccessMode) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "project-scoped users cannot enable passthrough"})
 			return
 		}
 	}
@@ -1751,7 +1766,26 @@ func (h *apiHandler) deleteUser(c *gin.Context) {
 // upsertProjectReader creates or rotates the single read-only credential for
 // one PostHog project. The plaintext password is returned only in this
 // response; the config store persists only its bcrypt hash.
+// upsertProjectReader mints (or rotates) the team's read-only login.
 func (h *apiHandler) upsertProjectReader(c *gin.Context) {
+	h.upsertProjectLogin(c, configstore.OrgUserAccessModeProjectReader, projectReaderUsername)
+}
+
+// upsertProjectUser mints (or rotates) the team's read/write login. It is
+// scoped to exactly the same namespaces as the reader — the difference is that
+// DML and in-project DDL are authorized.
+func (h *apiHandler) upsertProjectUser(c *gin.Context) {
+	h.upsertProjectLogin(c, configstore.OrgUserAccessModeProjectUser, projectUserUsername)
+}
+
+// projectReaderUsername / projectUserUsername derive the two logins' names from
+// the team. They must stay distinct and stable: the name is the credential's
+// identity, so changing a derivation orphans every issued credential.
+func projectReaderUsername(teamID int64) string { return fmt.Sprintf("posthog_team_%d", teamID) }
+
+func projectUserUsername(teamID int64) string { return fmt.Sprintf("posthog_team_%d_rw", teamID) }
+
+func (h *apiHandler) upsertProjectLogin(c *gin.Context, accessMode string, usernameFor func(int64) string) {
 	orgID := c.Param("id")
 	teamID, err := strconv.ParseInt(c.Param("team_id"), 10, 64)
 	if err != nil || teamID <= 0 {
@@ -1780,24 +1814,25 @@ func (h *apiHandler) upsertProjectReader(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password must be at least 32 characters"})
 		return
 	}
-	username := fmt.Sprintf("posthog_team_%d", teamID)
-	user, err := h.store.UpsertProjectReader(orgID, teamID, username, password)
+	username := usernameFor(teamID)
+	user, err := h.store.UpsertProjectLogin(orgID, teamID, username, password, accessMode)
 	if err != nil {
-		if errors.Is(err, configstore.ErrProjectReaderTeamUnavailable) {
+		if errors.Is(err, configstore.ErrProjectTeamUnavailable) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	setAuditDetail(c, fmt.Sprintf("created or rotated project reader for team %d", teamID))
+	setAuditDetail(c, fmt.Sprintf("created or rotated %s for team %d", accessMode, teamID))
 	if err := h.notifyPeersOfChange(c); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"username": user.Username,
-		"password": password,
+		"username":    user.Username,
+		"password":    password,
+		"access_mode": user.AccessMode,
 	})
 }
 

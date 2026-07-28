@@ -242,10 +242,13 @@ func (s *fakeAPIStore) DeleteUser(orgID, username string) (bool, error) {
 	return true, nil
 }
 
-func (s *fakeAPIStore) UpsertProjectReader(orgID string, teamID int64, username, password string) (*configstore.OrgUser, error) {
+func (s *fakeAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error) {
+	if !configstore.IsProjectScopedAccessMode(accessMode) {
+		return nil, fmt.Errorf("access mode %q is not project-scoped", accessMode)
+	}
 	team := s.teams[orgID][teamID]
 	if team == nil || !team.Enabled {
-		return nil, configstore.ErrProjectReaderTeamUnavailable
+		return nil, configstore.ErrProjectTeamUnavailable
 	}
 	boundTeamID := teamID
 	passwordHash, err := configstore.HashPassword(password)
@@ -256,7 +259,7 @@ func (s *fakeAPIStore) UpsertProjectReader(orgID string, teamID int64, username,
 		OrgID:      orgID,
 		Username:   username,
 		Password:   passwordHash,
-		AccessMode: configstore.OrgUserAccessModeProjectReader,
+		AccessMode: accessMode,
 		TeamID:     &boundTeamID,
 	}
 	s.users[orgID+"/"+username] = user
@@ -592,29 +595,39 @@ func TestUpdateUserRejectsNegativeMaxVCPUs(t *testing.T) {
 	}
 }
 
-func TestUpdateUserRejectsPassthroughForProjectReader(t *testing.T) {
-	teamID := int64(42)
-	store := newFakeAPIStore()
-	store.users["analytics/project-reader"] = &configstore.OrgUser{
-		OrgID:       "analytics",
-		Username:    "project-reader",
-		Password:    "hash",
-		AccessMode:  configstore.OrgUserAccessModeProjectReader,
-		TeamID:      &teamID,
-		Passthrough: false,
-	}
-	router := newTestAPIRouter(store)
+// Passthrough bypasses the compat layer that enforces the project scope, so
+// neither scoped mode may take it — a project user especially, since it would
+// pair unscoped SQL with write authorization.
+func TestUpdateUserRejectsPassthroughForProjectScopedUsers(t *testing.T) {
+	for _, mode := range []string{
+		configstore.OrgUserAccessModeProjectReader,
+		configstore.OrgUserAccessModeProjectUser,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			teamID := int64(42)
+			store := newFakeAPIStore()
+			store.users["analytics/scoped"] = &configstore.OrgUser{
+				OrgID:       "analytics",
+				Username:    "scoped",
+				Password:    "hash",
+				AccessMode:  mode,
+				TeamID:      &teamID,
+				Passthrough: false,
+			}
+			router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/project-reader", bytes.NewReader([]byte(`{"passthrough":true}`)))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/scoped", bytes.NewReader([]byte(`{"passthrough":true}`)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
-	}
-	if store.users["analytics/project-reader"].Passthrough {
-		t.Fatal("project reader must remain non-passthrough")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if store.users["analytics/scoped"].Passthrough {
+				t.Fatalf("%s must remain non-passthrough", mode)
+			}
+		})
 	}
 }
 
@@ -821,6 +834,84 @@ func TestUpsertProjectReaderBindsEnabledTeamAndReloadsSnapshot(t *testing.T) {
 	}
 	if store.reloadSnapshotCalls != 1 {
 		t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+	}
+}
+
+// The read/write login is a SEPARATE credential from the reader: a distinct
+// username, its own row, and no effect on the reader the SQL editor uses. A
+// team holding both at once is the expected steady state.
+func TestUpsertProjectUserMintsDistinctReadWriteLogin(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	for _, route := range []string{"project-reader", "project-user"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/"+route, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d: %s", route, rec.Code, http.StatusOK, rec.Body.String())
+		}
+	}
+
+	reader := store.users["acme/posthog_team_42"]
+	if reader == nil || reader.AccessMode != configstore.OrgUserAccessModeProjectReader {
+		t.Fatalf("reader row missing or re-moded: %#v", reader)
+	}
+	writer := store.users["acme/posthog_team_42_rw"]
+	if writer == nil || writer.AccessMode != configstore.OrgUserAccessModeProjectUser {
+		t.Fatalf("project user was not created as project_user: %#v", writer)
+	}
+	if writer.TeamID == nil || *writer.TeamID != 42 {
+		t.Fatalf("project user was not bound to team 42: %#v", writer)
+	}
+	if writer.Passthrough {
+		t.Fatal("project users must never use passthrough mode")
+	}
+	if reader.Password == writer.Password {
+		t.Fatal("reader and project user must not share a credential")
+	}
+}
+
+func TestUpsertProjectUserReportsAccessMode(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 7, SchemaName: "team_7", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/7/project-user", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["username"] != "posthog_team_7_rw" {
+		t.Fatalf("username = %v, want posthog_team_7_rw", body["username"])
+	}
+	if body["access_mode"] != configstore.OrgUserAccessModeProjectUser {
+		t.Fatalf("access_mode = %v, want %s", body["access_mode"], configstore.OrgUserAccessModeProjectUser)
+	}
+	if body["password"] == "" || body["password"] == nil {
+		t.Fatal("response carried no password")
+	}
+}
+
+func TestUpsertProjectUserRejectsDisabledTeam(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: false})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/project-user", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if len(store.users) != 0 {
+		t.Fatal("disabled team must not receive a project user")
 	}
 }
 

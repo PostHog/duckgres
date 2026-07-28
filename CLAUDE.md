@@ -492,6 +492,67 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   `impersonation_*` / `user_kill_switch` / `user_disable_block` assertions in
   `tests/mw-dev/e2e/harness.sh`.
 
+## Project-Scoped Logins (`project_reader` / `project_user`) — LOAD-BEARING CONTRACT
+
+A team can hold two generated logins, both bound to one `duckgres_org_teams`
+row via `duckgres_org_users.access_mode` + `team_id` (migrations `000026`,
+`000031`): `project_reader` (`posthog_team_<id>`, read-only — the PostHog SQL
+editor's login) and `project_user` (`posthog_team_<id>_rw`, read/write). Minted
+by `PUT /api/v1/orgs/:id/teams/:team_id/{project-reader,project-user}` (admin
+API only). Both are enforced by the **query gateway**, not PostgreSQL `GRANT`.
+Invariants:
+
+- **The two modes derive the SAME namespaces.** `ConfigStore.OrgUserQueryAccess`
+  computes `AllowedSchemas` (`<schema>`, `<schema>_data_imports`,
+  `shadow_<team>_models`) + `AllowedRelations` (the legacy `posthog.<events|
+  persons>` overrides — a non-NULL override grants it even when it spells the
+  derived default) identically for both; **`ReadOnly` is the only difference**.
+  Write authorization must NEVER widen the reachable relation set — a project
+  user is a project reader that may also mutate what it can already see. The
+  e2e asserts cross-project denial in read AND write shapes for this reason.
+- **Fail closed on an unresolvable team.** A scoped user whose team row is
+  missing or disabled gets an empty, `ReadOnly` policy — a project user is
+  DOWNGRADED, never left writing into a scope nothing can confirm.
+- **`QueryAccessPolicy.Authorize` (`server/query_access.go`) is the single tap**,
+  called on simple query, extended Parse, and both Flight paths. It is
+  default-deny: the parser is the authorization boundary, so anything
+  `pg_query` cannot describe is rejected (this is why DuckDB-only spellings
+  fail). `CREATE SCHEMA` / `ALTER … SET SCHEMA` stay denied: the schema set IS
+  the project boundary.
+- **A WRITE TARGET is checked by `authorizeWriteTarget`, never by the walk's
+  `authorizeRangeVar`.** The walk's check is the READ-position one: it accepts a
+  bare name that is a visible CTE (sound, because a defined CTE provably shadows
+  a base relation of the same name) or an unqualified pg_catalog compat name.
+  **Neither is sound for a target** — a write target does not bind to the CTE, so
+  it resolves against the session `search_path` (`sessionmeta` leaves it at
+  `main,memory.main`) and reaches a real relation outside the grant;
+  `WITH shared AS (…) INSERT INTO shared VALUES (1)` was a working escape into
+  `ducklake.main.shared` before this split. `authorizeWriteTarget` therefore
+  requires schema qualification unconditionally. Do NOT infer target-ness from
+  proto position: `walk()` descends into a Node's own oneof, so a bare
+  `*RangeVar` message reaches `walkMessage` for reads too. **Adding a case to
+  `authorizeWriteStatement` REQUIRES enumerating that statement's target
+  field(s) there by name** (`DropStmt` scopes its dotted-name lists itself); the
+  `walkMessage` `RangeVar` branch is only the lenient defense-in-depth net for
+  positions that enumeration does not cover (e.g. `Constraint.pktable`).
+  `TestQueryAccessPolicyRejectsUnqualifiedWriteTargets` is the tripwire.
+- **Neither mode may carry passthrough** (it bypasses the compat layer that
+  enforces the scope) — DB check constraint + admin API guard.
+- **A policy change tears down live sessions.** `changedProjectScopedUsers`
+  (`org_router.go`) fires on credential, team, disable AND **mode** flips; the
+  demotion direction is load-bearing (a demoted user must not keep a
+  write-authorized session). Deleting a team deletes BOTH of its logins.
+- **One of each per team**, via two SEPARATE partial unique indexes on
+  `(org_id, team_id)` — deliberately not one index across both modes, so a
+  reader and a writer coexist.
+- Touching any of this → update `server/query_access_test.go`,
+  `controlplane/configstore/query_access_test.go`,
+  `controlplane/admin/api_test.go`, `controlplane/org_router_test.go`,
+  `tests/configstore/org_teams_postgres_test.go` +
+  `migrations_postgres_test.go`, `docs/postgres-compatibility.md`, AND the
+  `project_reader_isolation` / `project_user_isolation` assertions in
+  `tests/mw-dev/e2e/harness.sh`.
+
 ## Compute-Usage Billing (managed-warehouse, remote backend only)
 
 duckgres meters per-org compute usage of worker pods into 60s buckets in the

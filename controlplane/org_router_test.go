@@ -840,7 +840,7 @@ func TestOrgRouterHandleConfigChangeReconcilesAfterRemovalBecomesStaleInFlight(t
 		}
 	}
 	t.Cleanup(releaseBarrier)
-	router.setProjectReaderChangeHandler(func(string, string) {
+	router.setProjectScopedUserChangeHandler(func(string, string) {
 		close(entered)
 		<-release
 	})
@@ -935,7 +935,7 @@ func TestOrgRouterHandleConfigChangeReconcilesLatestConfigAfterCreateBecomesStal
 		}
 	}
 	t.Cleanup(releaseBarrier)
-	router.setProjectReaderChangeHandler(func(string, string) {
+	router.setProjectScopedUserChangeHandler(func(string, string) {
 		close(entered)
 		<-release
 	})
@@ -1051,14 +1051,78 @@ func TestChangedProjectReaderUsersDetectsNamespaceAndCredentialChanges(t *testin
 		OrgUserPassword: old.OrgUserPassword,
 		OrgUserDisabled: old.OrgUserDisabled,
 	}
-	if _, ok := changedProjectReaderUsers(old, updatedNamespace)[key]; !ok {
+	if _, ok := changedProjectScopedUsers(old, updatedNamespace)[key]; !ok {
 		t.Fatal("namespace change did not invalidate project reader")
 	}
 
 	updatedPassword := *old
 	updatedPassword.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new-hash"}
-	if _, ok := changedProjectReaderUsers(old, &updatedPassword)[key]; !ok {
+	if _, ok := changedProjectScopedUsers(old, &updatedPassword)[key]; !ok {
 		t.Fatal("credential change did not invalidate project reader")
+	}
+}
+
+// A mode flip is a policy change: promoting a reader to a project user (or
+// demoting one back) must tear down the live sessions that were established
+// under the old capability, not wait for the user to reconnect. The demotion
+// direction is the load-bearing one — a demoted user keeping a write-authorized
+// session would still be writing after the operator revoked the grant.
+func TestChangedProjectScopedUsersDetectsAccessModeFlips(t *testing.T) {
+	teamID := int64(2)
+	key := configstore.OrgUserKey{OrgID: "org-a", Username: "posthog_team_2_rw"}
+	snapshotWithMode := func(mode string) *configstore.Snapshot {
+		return &configstore.Snapshot{
+			Orgs: map[string]*configstore.OrgConfig{
+				"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "team_2", Enabled: true}}},
+			},
+			OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+				key: {Mode: mode, TeamID: &teamID},
+			},
+			OrgUserPassword: map[configstore.OrgUserKey]string{key: "hash"},
+			OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+		}
+	}
+	reader := snapshotWithMode(configstore.OrgUserAccessModeProjectReader)
+	writer := snapshotWithMode(configstore.OrgUserAccessModeProjectUser)
+
+	if _, ok := changedProjectScopedUsers(reader, writer)[key]; !ok {
+		t.Fatal("promotion to project_user did not invalidate the session")
+	}
+	if _, ok := changedProjectScopedUsers(writer, reader)[key]; !ok {
+		t.Fatal("demotion to project_reader did not invalidate the write-authorized session")
+	}
+	if _, ok := changedProjectScopedUsers(writer, snapshotWithMode(configstore.OrgUserAccessModeProjectUser))[key]; ok {
+		t.Fatal("an unchanged project_user must not be invalidated")
+	}
+}
+
+// A project user's team edits invalidate its sessions the same way a reader's
+// do — the namespace derivation is shared, so a schema rename must not leave a
+// writer pointed at the old namespaces.
+func TestChangedProjectScopedUsersTracksProjectUserNamespaces(t *testing.T) {
+	teamID := int64(2)
+	key := configstore.OrgUserKey{OrgID: "org-a", Username: "posthog_team_2_rw"}
+	access := map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+		key: {Mode: configstore.OrgUserAccessModeProjectUser, TeamID: &teamID},
+	}
+	old := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "team_2", Enabled: true}}},
+		},
+		OrgUserAccess:   access,
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "hash"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+	}
+	renamed := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "renamed", Enabled: true}}},
+		},
+		OrgUserAccess:   access,
+		OrgUserPassword: old.OrgUserPassword,
+		OrgUserDisabled: old.OrgUserDisabled,
+	}
+	if _, ok := changedProjectScopedUsers(old, renamed)[key]; !ok {
+		t.Fatal("namespace change did not invalidate project user")
 	}
 }
 
@@ -1080,7 +1144,7 @@ func TestOrgRouterHandleConfigChangeNotifiesFlightSessionRevocation(t *testing.T
 	router := &OrgRouter{orgs: map[string]*OrgStack{
 		"analytics": {Config: old.Orgs["analytics"]},
 	}}
-	router.setProjectReaderChangeHandler(func(orgID, username string) {
+	router.setProjectScopedUserChangeHandler(func(orgID, username string) {
 		revokedOrg, revokedUser = orgID, username
 	})
 	router.HandleConfigChange(old, &updated)
