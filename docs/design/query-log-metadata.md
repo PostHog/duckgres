@@ -1,6 +1,41 @@
 # Query Log: Event Model, Query Metadata, and RBAC Signals
 
-Status: **plan / not implemented**. Owner: TBD.
+Status: **phases 0–2 implemented**; phases 3–4 outstanding (see §5).
+Owner: TBD.
+
+Implemented so far:
+
+| | |
+| --- | --- |
+| Column registry + `ADD COLUMN` migration + replace-on-drift view | `server/querylog_schema.go`, `querylog_postgres.go`, `querylog_view.go` |
+| `query_id` (UUIDv7), `parent_query_id`, `statement_index` | `server/query_id.go`, `query_metrics.go` |
+| `QueryStart` / terminal pair, `ExceptionBeforeStart` split, `query_log.start_events` | `server/query_event.go`, `query_start_policy.go`, `querylog.go` |
+| Relation/column/function/access extraction + `metadata_complete` | `server/querymeta/`, `server/query_metadata.go` |
+| `query_id` propagation to the worker | `server/wire/protocol.go`, `flightclient`, `duckdbservice/query_id.go` |
+| e2e coverage | `query_log_round_trip`, `query_log_access_metadata` in `tests/mw-dev/e2e/harness.sh` |
+
+Deviations from the plan below, decided during implementation:
+
+- **`event_time` is the statement's start on every event type**, not the
+  event's own timestamp as in ClickHouse. Both rows of a pair land in one
+  monthly partition and join without a window function. A terminal row's finish
+  time is `event_time + query_duration_ms`. No separate `query_start_time`
+  column is needed as a result.
+- **`query_log.metadata` is a boolean**, not `off|basic|full`. Extraction is a
+  single pass; splitting it into tiers would be configuration without a
+  behavioural difference worth the surface.
+- **Extraction is synchronous, with an LRU** rather than routed through an async
+  enricher. It feeds the `QueryStart` event, which is emitted before the
+  statement runs, and a future gate needs it before deciding whether the
+  statement may run at all — neither can wait on a background queue.
+- **Terminal events are still control-plane-owned.** `query_id` reaches the
+  worker and the worker records it, but the ownership transfer described in §2.2
+  is not done; see §5 Phase 1 (remaining).
+- **`QueryAccessPolicy.Authorize` is untouched.** It should eventually be
+  re-expressed over `querymeta.Metadata` (§3.1), but rewriting a fail-closed
+  authorizer belongs in its own change with its own review, not in one that adds
+  logging.
+
 Guide: [`clickhouse.com/docs/reference/system-tables/query_log`](https://clickhouse.com/docs/reference/system-tables/query_log).
 
 ## Goal
@@ -492,7 +527,16 @@ indexable, queryable by the admin console) with the view casting to `JSON`.
 Fallback if lossy: JSON **text** in `TEXT` columns + `CAST(col AS JSON)` in the
 view.
 
-### Phase 1 — the event model
+### Phase 1 — the event model (partly done)
+
+Done: `QueryStart` / `ExceptionBeforeStart` / `start_events` / `query_id`
+propagation to the worker.
+
+Remaining: engine-owned terminals (§2.2), terminal emission anchored on drain
+tokens (§2.4), the batched forward RPC (§2.7), paired sampling, and the free
+`[profile]` / `[session]` columns.
+
+### Phase 1 — the event model (original scope)
 
 `QueryStart` / `ExceptionBeforeStart` reclassification / engine-owned terminals /
 `query_id` propagation via `withSession` / terminal emission anchored on drain
