@@ -118,6 +118,22 @@ errors, trace/span IDs, and profiling-derived resource usage. `cpu_time_s` is
 DuckDB cumulative CPU/thread time in seconds, and `peak_buffer_memory_bytes` is
 DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
 
+`query_id` is a per-statement UUIDv7 minted when the query arrives. It is
+time-ordered, appears on the statement's OTEL span (`duckgres.query_id`) and its
+error logs, and is the key that correlates every query-log event for one
+statement.
+
+The column set has a single source of truth: `queryLogColumns` in
+`server/querylog_schema.go`. It generates the `CREATE TABLE` DDL, the
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration that brings already
+provisioned tenants forward, the `INSERT` column list and argument order, the
+partition-repair copy list, and the `ducklake.system.query_log` view. Adding a
+column means appending one entry there; existing tenants pick it up on the next
+sink initialization, and a view whose columns have drifted is rebuilt with
+`CREATE OR REPLACE VIEW`. Append only — never reorder or remove an entry, and
+an appended column must be nullable or carry a `DEFAULT` (a bare `NOT NULL`
+column cannot be added to a populated table).
+
 ## Runbooks
 
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.

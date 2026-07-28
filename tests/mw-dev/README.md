@@ -161,7 +161,28 @@ client-go:
 kind suite carried as unit tests now live in `tests/manifests/` and run in the
 normal `go test ./...` lane.
 
+- **query log round trip** — a marked query must appear in
+  `ducklake.system.query_log` with a populated `query_id`, the right
+  `type`/`query_kind`/`user_name`. This is the only coverage of the full
+  query-log path (CP builds the entry → Flight `DoAction` to the worker → the
+  worker's batched sink INSERTs into tenant metadata Postgres → the DuckLake
+  view reads it back), and every column added to the registry in
+  `server/querylog_schema.go` rides it. Asserting `query_id` specifically also
+  catches a **stale view**: a tenant's view is created once with
+  `CREATE VIEW IF NOT EXISTS`, so a view that was not replaced when the column
+  set drifted would still be missing the column here. The marker travels in a
+  SQL comment, which only survives if the ORIGINAL inbound text is logged (the
+  transpiler deparses from the AST and drops comments).
+
 ### Deliberately not covered here
+
+- **The query log on an EXTERNAL (RDS) metadata store** — the suite provisions
+  only cnpg-shard orgs, so `query_log_round_trip` runs on cnpg alone. The
+  query-log storage path does not branch on backend: the sink resolves one DSN
+  from the org's DuckLake metadata store and issues the same DDL and INSERT
+  either way (`server/querylog_postgres.go`), so the cnpg run exercises the same
+  code. What an ext org would add is DSN/sslmode resolution, which
+  `reshard_targets` and the activation assertions already cover.
 
 - **Mid-statement STS credential recovery (httpfs `v1.5.3-cred-refresh-write-retry`)** —
   the worker image bundles the PostHog httpfs fork patch that re-resolves the

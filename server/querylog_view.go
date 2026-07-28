@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -104,6 +105,22 @@ func ensureDuckLakeQueryLogViewContext(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if viewExists {
+		current, err := duckLakeQueryLogViewColumnsCurrentContext(ctx, db)
+		if err != nil {
+			return err
+		}
+		if current {
+			return verifyDuckLakeQueryLogViewContext(ctx, db)
+		}
+		// The view predates a column the registry has since gained. Preflight
+		// the new SELECT before replacing, so a source table that has not been
+		// migrated yet leaves the working view in place.
+		if err := preflightDuckLakeQueryLogViewSourceContext(ctx, db); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, duckLakeQueryLogReplaceViewSQL()); err != nil {
+			return fmt.Errorf("replace ducklake query_log view: %w", err)
+		}
 		return verifyDuckLakeQueryLogViewContext(ctx, db)
 	}
 
@@ -145,10 +162,41 @@ func duckLakeQueryLogViewReadyContext(ctx context.Context, db *sql.DB) (bool, er
 	if err != nil || !viewExists {
 		return false, err
 	}
+	current, err := duckLakeQueryLogViewColumnsCurrentContext(ctx, db)
+	if err != nil || !current {
+		return false, err
+	}
 	if err := verifyDuckLakeQueryLogViewContext(ctx, db); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// duckLakeQueryLogViewColumnsCurrentContext reports whether the live view
+// exposes every column the registry expects. A view created by an older build
+// is missing appended columns; CREATE VIEW IF NOT EXISTS would silently leave
+// it that way, so the caller replaces it instead.
+func duckLakeQueryLogViewColumnsCurrentContext(ctx context.Context, db *sql.DB) (bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT * FROM ducklake.system.query_log LIMIT 0")
+	if err != nil {
+		return false, fmt.Errorf("inspect ducklake query_log view columns: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return false, fmt.Errorf("inspect ducklake query_log view columns: %w", err)
+	}
+	present := make(map[string]struct{}, len(columns))
+	for _, column := range columns {
+		present[strings.ToLower(column)] = struct{}{}
+	}
+	for _, want := range queryLogEntryColumnNames() {
+		if _, ok := present[want]; !ok {
+			return false, nil
+		}
+	}
+	return true, rows.Err()
 }
 
 func duckLakeQueryLogViewExistsContext(ctx context.Context, db *sql.DB) (bool, error) {
@@ -199,35 +247,26 @@ func duckLakeQueryLogViewSQL() string {
 	return "CREATE VIEW IF NOT EXISTS ducklake.system.query_log AS\n" + duckLakeQueryLogViewSelectSQL()
 }
 
+// duckLakeQueryLogReplaceViewSQL rebuilds an existing view whose column set has
+// drifted from the registry. CREATE VIEW IF NOT EXISTS is a no-op against a
+// stale view, so a column added to the table would never become visible in
+// DuckLake without this.
+func duckLakeQueryLogReplaceViewSQL() string {
+	return "CREATE OR REPLACE VIEW ducklake.system.query_log AS\n" + duckLakeQueryLogViewSelectSQL()
+}
+
 func duckLakeQueryLogViewSelectSQL() string {
-	return fmt.Sprintf(`SELECT
-	event_time,
-	query_duration_ms,
-	type,
-	query,
-	transpiled_query,
-	query_kind,
-	normalized_query_hash,
-	result_rows,
-	written_rows,
-	exception_code,
-	exception,
-	user_name,
-	org_id,
-	current_database,
-	client_address,
-	client_port,
-	application_name,
-	pid,
-	worker_id,
-	is_transpiled,
-	protocol,
-	trace_id,
-	span_id,
-	postgres_scan_ms,
-	cpu_time_s,
-	peak_buffer_memory_bytes
-FROM "%s".querylog.query_log_entries`, duckLakeMetadataCatalog)
+	var sb strings.Builder
+	sb.WriteString("SELECT")
+	for i, name := range queryLogEntryColumnNames() {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("\n\t")
+		sb.WriteString(name)
+	}
+	fmt.Fprintf(&sb, "\nFROM \"%s\".querylog.query_log_entries", duckLakeMetadataCatalog)
+	return sb.String()
 }
 
 type queryLogSurfaceStateCache struct {

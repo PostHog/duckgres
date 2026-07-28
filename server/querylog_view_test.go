@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -39,6 +40,89 @@ FROM ducklake.system.query_log
 	}
 	if !viewExists {
 		t.Fatal("expected ducklake.system.query_log view to exist")
+	}
+}
+
+// TestEnsureDuckLakeQueryLogViewContextReplacesDriftedView covers the upgrade
+// path for an existing tenant: the view was created by an older build and is
+// missing a column the registry has since gained. CREATE VIEW IF NOT EXISTS is
+// a no-op against it, so without replace-on-drift the new column would never
+// become visible in DuckLake.
+func TestEnsureDuckLakeQueryLogViewContextReplacesDriftedView(t *testing.T) {
+	db := openQueryLogViewTestDB(t)
+
+	if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS ducklake.system`); err != nil {
+		t.Fatalf("create ducklake system schema: %v", err)
+	}
+	staleView := `CREATE VIEW ducklake.system.query_log AS SELECT event_time, query, user_name FROM ` + queryLogViewHiddenTable
+	if _, err := db.Exec(staleView); err != nil {
+		t.Fatalf("create stale view: %v", err)
+	}
+
+	ready, err := duckLakeQueryLogViewReadyContext(context.Background(), db)
+	if err != nil {
+		t.Fatalf("check drifted view readiness: %v", err)
+	}
+	if ready {
+		t.Fatal("a view missing registry columns must not report ready")
+	}
+
+	if err := ensureDuckLakeQueryLogViewContext(context.Background(), db); err != nil {
+		t.Fatalf("ensure query log view: %v", err)
+	}
+
+	// Every registry column must now be selectable, and the pre-existing row
+	// must still be readable through the replaced view.
+	var queryID, query string
+	if err := db.QueryRow(`SELECT query_id, query FROM ducklake.system.query_log`).Scan(&queryID, &query); err != nil {
+		t.Fatalf("query replaced view: %v", err)
+	}
+	if query != "SELECT 1" || queryID != queryLogViewTestEntry().QueryID {
+		t.Fatalf("unexpected replaced-view row: query=%q query_id=%q", query, queryID)
+	}
+
+	ready, err = duckLakeQueryLogViewReadyContext(context.Background(), db)
+	if err != nil {
+		t.Fatalf("check replaced view readiness: %v", err)
+	}
+	if !ready {
+		t.Fatal("replaced view should report ready")
+	}
+}
+
+// TestEnsureDuckLakeQueryLogViewContextKeepsDriftedViewWhenSourceLags guards the
+// deploy ordering: if the view has drifted but the source table has not been
+// migrated yet, replacing would swap a working view for a broken one.
+func TestEnsureDuckLakeQueryLogViewContextKeepsDriftedViewWhenSourceLags(t *testing.T) {
+	db := openQueryLogViewTestDBWithoutHiddenSource(t)
+
+	if _, err := db.Exec(`CREATE SCHEMA "__ducklake_metadata_ducklake".querylog`); err != nil {
+		t.Fatalf("create hidden querylog schema: %v", err)
+	}
+	// Source table predates the newest registry column.
+	if _, err := db.Exec(`CREATE TABLE ` + queryLogViewHiddenTable + ` (event_time TIMESTAMPTZ, query VARCHAR, user_name VARCHAR)`); err != nil {
+		t.Fatalf("create lagging hidden table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO ` + queryLogViewHiddenTable + ` VALUES (TIMESTAMPTZ '2026-07-01 00:00:00+00', 'SELECT 1', 'alice')`); err != nil {
+		t.Fatalf("seed lagging hidden table: %v", err)
+	}
+	if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS ducklake.system`); err != nil {
+		t.Fatalf("create ducklake system schema: %v", err)
+	}
+	if _, err := db.Exec(`CREATE VIEW ducklake.system.query_log AS SELECT event_time, query, user_name FROM ` + queryLogViewHiddenTable); err != nil {
+		t.Fatalf("create stale view: %v", err)
+	}
+
+	if err := ensureDuckLakeQueryLogViewContext(context.Background(), db); err == nil {
+		t.Fatal("expected preflight failure against the lagging source")
+	}
+
+	var query string
+	if err := db.QueryRow(`SELECT query FROM ducklake.system.query_log`).Scan(&query); err != nil {
+		t.Fatalf("existing view must survive a failed replace: %v", err)
+	}
+	if query != "SELECT 1" {
+		t.Fatalf("unexpected row from preserved view: %q", query)
 	}
 }
 
@@ -215,9 +299,7 @@ func openQueryLogViewTestDB(t *testing.T) *sql.DB {
 	if _, err := db.Exec(queryLogViewHiddenTableTestSQL()); err != nil {
 		t.Fatalf("create hidden querylog table: %v", err)
 	}
-	if _, err := db.Exec(queryLogViewHiddenRowTestSQL()); err != nil {
-		t.Fatalf("insert hidden querylog row: %v", err)
-	}
+	insertQueryLogFixtureRow(t, db, queryLogViewHiddenTable, queryLogViewTestEntry())
 
 	return db
 }
@@ -241,94 +323,39 @@ func openQueryLogViewTestDBWithoutHiddenSource(t *testing.T) *sql.DB {
 	return db
 }
 
+const queryLogViewHiddenTable = `"__ducklake_metadata_ducklake".querylog.query_log_entries`
+
+// queryLogViewHiddenTableTestSQL mirrors the tenant Postgres table in DuckDB,
+// generated from the column registry so a new column needs no fixture edit.
 func queryLogViewHiddenTableTestSQL() string {
-	return `CREATE TABLE "__ducklake_metadata_ducklake".querylog.query_log_entries (
-	id BIGINT,
-	event_time TIMESTAMPTZ,
-	query_duration_ms BIGINT,
-	type TEXT,
-	query TEXT,
-	transpiled_query TEXT,
-	query_kind TEXT,
-	normalized_query_hash BIGINT,
-	result_rows BIGINT,
-	written_rows BIGINT,
-	exception_code TEXT,
-	exception TEXT,
-	user_name TEXT,
-	org_id TEXT,
-	current_database TEXT,
-	client_address TEXT,
-	client_port INTEGER,
-	application_name TEXT,
-	pid INTEGER,
-	worker_id INTEGER,
-	is_transpiled BOOLEAN,
-	protocol TEXT,
-	trace_id TEXT,
-	span_id TEXT,
-	postgres_scan_ms BIGINT,
-	cpu_time_s DOUBLE,
-	peak_buffer_memory_bytes BIGINT
-)`
+	return duckDBQueryLogTableSQL(queryLogViewHiddenTable, true)
 }
 
-func queryLogViewHiddenRowTestSQL() string {
-	return `INSERT INTO "__ducklake_metadata_ducklake".querylog.query_log_entries (
-	id,
-	event_time,
-	query_duration_ms,
-	type,
-	query,
-	transpiled_query,
-	query_kind,
-	normalized_query_hash,
-	result_rows,
-	written_rows,
-	exception_code,
-	exception,
-	user_name,
-	org_id,
-	current_database,
-	client_address,
-	client_port,
-	application_name,
-	pid,
-	worker_id,
-	is_transpiled,
-	protocol,
-	trace_id,
-	span_id,
-	postgres_scan_ms,
-	cpu_time_s,
-	peak_buffer_memory_bytes
-) VALUES (
-	1,
-	TIMESTAMPTZ '2026-07-01 00:00:00+00',
-	12,
-	'Select',
-	'SELECT 1',
-	NULL,
-	'Select',
-	42,
-	1,
-	0,
-	NULL,
-	NULL,
-	'alice',
-	'org_1',
-	'ducklake',
-	'127.0.0.1',
-	5432,
-	'psql',
-	123,
-	7,
-	true,
-	'pgwire',
-	'trace-1',
-	'span-1',
-	3,
-	1.25,
-	4096
-)`
+// queryLogViewTestEntry is the single row the view tests read back.
+func queryLogViewTestEntry() QueryLogEntry {
+	return QueryLogEntry{
+		EventTime:             time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+		QueryDurationMs:       12,
+		Type:                  "QueryFinish",
+		Query:                 "SELECT 1",
+		QueryKind:             "Select",
+		NormalizedHash:        42,
+		ResultRows:            1,
+		UserName:              "alice",
+		OrgID:                 "org_1",
+		CurrentDatabase:       "ducklake",
+		ClientAddress:         "127.0.0.1",
+		ClientPort:            5432,
+		ApplicationName:       "psql",
+		PID:                   123,
+		WorkerID:              7,
+		IsTranspiled:          true,
+		Protocol:              "pgwire",
+		TraceID:               "trace-1",
+		SpanID:                "span-1",
+		PostgresScanMs:        3,
+		CPUTimeSeconds:        1.25,
+		PeakBufferMemoryBytes: 4096,
+		QueryID:               "0192f0aa-0000-7000-8000-000000000001",
+	}
 }

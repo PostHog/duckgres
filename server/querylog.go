@@ -237,20 +237,29 @@ func insertQueryLogEntries(ctx context.Context, db *sql.DB, table string, batch 
 	if table == "" {
 		table = "query_log"
 	}
+	// Column list, placeholder count, and argument order all come from the
+	// single registry in querylog_schema.go so they cannot drift apart.
+	colsPerRow := len(queryLogEntryColumns())
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
-	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms, cpu_time_s, peak_buffer_memory_bytes) VALUES ")
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(queryLogEntryColumnNames(), ", "))
+	sb.WriteString(") VALUES ")
 
-	const colsPerRow = 26
 	args := make([]any, 0, len(batch)*colsPerRow)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
 		base := i * colsPerRow
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23, base+24, base+25, base+26)
+		sb.WriteByte('(')
+		for col := range colsPerRow {
+			if col > 0 {
+				sb.WriteByte(',')
+			}
+			fmt.Fprintf(&sb, "$%d", base+col+1)
+		}
+		sb.WriteByte(')')
 
 		args = append(args, queryLogEntryInsertArgs(e)...)
 	}
@@ -259,37 +268,6 @@ func insertQueryLogEntries(ctx context.Context, db *sql.DB, table string, batch 
 		return fmt.Errorf("insert query_log entries: %w", err)
 	}
 	return nil
-}
-
-func queryLogEntryInsertArgs(e QueryLogEntry) []any {
-	return []any{
-		e.EventTime,
-		e.QueryDurationMs,
-		e.Type,
-		truncateQuery(e.Query),
-		truncateNullableQuery(e.TranspiledQuery),
-		e.QueryKind,
-		e.NormalizedHash,
-		e.ResultRows,
-		e.WrittenRows,
-		e.ExceptionCode,
-		e.Exception,
-		e.UserName,
-		e.OrgID,
-		e.CurrentDatabase,
-		e.ClientAddress,
-		e.ClientPort,
-		e.ApplicationName,
-		e.PID,
-		e.WorkerID,
-		e.IsTranspiled,
-		e.Protocol,
-		e.TraceID,
-		e.SpanID,
-		e.PostgresScanMs,
-		e.CPUTimeSeconds,
-		e.PeakBufferMemoryBytes,
-	}
 }
 
 // truncateQuery truncates a query string to maxQueryLength.
@@ -457,6 +435,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	pgScanMs := int64(profilingSummary.PostgresScanSeconds * 1000)
 
 	ql.Log(QueryLogEntry{
+		QueryID:               c.currentQueryID(),
 		EventTime:             start,
 		QueryDurationMs:       time.Since(start).Milliseconds(),
 		Type:                  entryType,

@@ -67,7 +67,10 @@ type WorkerReleaseQueryHandlePayload struct {
 // QueryLogEntry represents a completed client query event that the control
 // plane asks the activated worker to persist in tenant query-log storage.
 type QueryLogEntry struct {
-	EventID               string
+	// QueryID is the per-statement UUIDv7 the control plane mints when the
+	// query arrives. Every event for one statement carries the same value, so
+	// a QueryStart row and its terminal row join on it.
+	QueryID               string
 	EventTime             time.Time
 	QueryDurationMs       int64
 	Type                  string

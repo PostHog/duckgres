@@ -502,6 +502,9 @@ func (c *clientConn) logQueryError(query string, err error) {
 		"query", redactedQuery,
 		"error", redactedErr,
 	}
+	if queryID := c.currentQueryID(); queryID != "" {
+		attrs = append(attrs, "query_id", queryID)
+	}
 	// This shared category also drives query metrics, analytics, and the
 	// recent-error ring so the observability surfaces cannot disagree.
 	category := queryErrorCategory(err)
@@ -1269,6 +1272,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	ctx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
+			attribute.String("duckgres.query_id", queryMetrics.queryID),
 			attribute.String("duckgres.protocol", "simple"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),

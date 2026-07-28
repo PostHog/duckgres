@@ -28,12 +28,26 @@ var queryTotalCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Total number of non-empty query attempts partitioned by terminal status and reason.",
 }, []string{"org", "status", "reason"})
 
+// queryMetricsScope is the per-query observation record. It began life holding
+// only the terminal Prometheus classification; it is now also where per-query
+// metadata is stamped by whichever layer knows it (protocol, transpile, exec,
+// results) and read back by logQuery. Keeping one scope per query means the
+// query log and duckgres_query_total cannot disagree about an outcome.
+//
+// Scopes nest (a batched simple query runs statements inside an outer scope),
+// so `previous` restores the parent on finish.
 type queryMetricsScope struct {
 	start              time.Time
 	errorResponsesSent uint64
 	status             queryStatus
 	reason             queryReason
 	previous           *queryMetricsScope
+
+	// queryID is the statement's UUIDv7. Every query-log event for this
+	// statement carries it, so a QueryStart row and its terminal row join on
+	// it, and an operator can trace one client complaint through logs, spans,
+	// and the query log.
+	queryID string
 }
 
 func (c *clientConn) beginQueryMetrics(start time.Time) *queryMetricsScope {
@@ -43,9 +57,24 @@ func (c *clientConn) beginQueryMetrics(start time.Time) *queryMetricsScope {
 		status:             queryStatusSuccess,
 		reason:             queryReasonNone,
 		previous:           c.activeQueryMetrics,
+		queryID:            newQueryID(),
 	}
 	c.activeQueryMetrics = scope
 	return scope
+}
+
+// currentQueryID returns the active statement's query ID.
+//
+// A logQuery from a path that never opened a scope gets a freshly minted ID
+// rather than an empty one: the ID's job is to identify an event uniquely, and
+// inheriting the previous statement's ID would silently merge two statements in
+// the log. Reusing a stale scope's value is the failure mode this guards
+// against — see the same hazard documented on lastProfilingSummary.
+func (c *clientConn) currentQueryID() string {
+	if c == nil || c.activeQueryMetrics == nil || c.activeQueryMetrics.queryID == "" {
+		return newQueryID()
+	}
+	return c.activeQueryMetrics.queryID
 }
 
 func (c *clientConn) finishQueryMetrics(scope *queryMetricsScope) {
