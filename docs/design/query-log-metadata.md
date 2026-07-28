@@ -362,19 +362,28 @@ Emitted as `columns` (array of `{relation?, name}`) plus `columns_resolved`
 means "requires catalog resolution", which means **deny**, never allow. Full
 resolution needs a catalog snapshot in the CP — real work, explicitly v2.
 
-### 3.5 The bypass that matters: table functions
+### 3.5 Table functions: gate the target, not the function
 
-Table-name-based authorization is trivially defeated by
-`read_parquet('s3://other-tenant/...')`, `read_csv`, `postgres_scan`, `glob`,
-`httpfs`. `server/query_access.go` already knows this — `dangerousReadFunctions`
-plus prefix rules (`read_`, `duckdb_`, `http_`, `postgres_`, `*_scan`) exist for
-exactly this reason.
+`read_parquet('s3://...')`, `read_csv`, `postgres_scan`, `glob` reach data
+without naming a relation, so a policy that only looks at relation names cannot
+see them at all. Extraction therefore records table functions — name **and
+arguments** — as first-class targets alongside relations.
 
-Extraction must therefore record `used_table_functions` — name **and
-arguments** — as first-class access targets alongside relations. Any RBAC model
-built on `read_relations` alone is unsound. Arguments are redacted before
-storage: keep scheme + host/bucket + path prefix, drop query strings and
-userinfo (presigned URLs carry credentials).
+But reading an external location is **supported usage, not an escalation**:
+tenants are meant to read parquet from their own buckets. The cross-tenant
+concern is the *target*, not the function — reads whose path resolves inside the
+warehouse's managed DuckLake storage are how one tenant would reach another's
+data. So:
+
+- external reads classify as `read`, not `admin`. Flagging every `read_parquet`
+  as admin-class would bury shadow-mode analysis in legitimate traffic.
+- the entry is marked `external`, meaning "these args are a path to resolve",
+  and preserves scheme + host + path — enough for the policy's path check.
+- `COPY … TO '<uri>'` keeps `admin`: moving tenant data OUT is a different risk
+  from reading a location in.
+
+Arguments are sanitized before storage: query strings and userinfo are dropped,
+because a presigned URL carries its credential there.
 
 ### 3.6 Soundness invariants
 

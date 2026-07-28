@@ -37,9 +37,11 @@ const (
 	// AccessConfig changes session or global settings.
 	AccessConfig AccessKind = "config"
 	// AccessAdmin changes the security or storage envelope: secrets, ATTACH,
-	// extension installation, writing to an external URI. These are the
-	// statements a table-name-based policy cannot see, so they are called out
-	// separately.
+	// extension installation, or moving tenant data OUT to an external URI.
+	// Reading an external location is NOT admin — pointing read_parquet at your
+	// own bucket is supported usage, and the cross-tenant question there is
+	// whether the path resolves into managed DuckLake storage, which a policy
+	// answers from TableFunction.Args.
 	AccessAdmin AccessKind = "admin"
 	// AccessTransaction is transaction control.
 	AccessTransaction AccessKind = "transaction"
@@ -90,13 +92,23 @@ type Column struct {
 }
 
 // TableFunction is a function used as a data source — read_parquet, read_csv,
-// postgres_scan, glob. These reach data without naming a relation, so an
-// authorization model built on relations alone is unsound without them.
+// postgres_scan, glob. These reach data without naming a relation, so a policy
+// that only looks at relation names cannot see them at all.
+//
+// Reading an external location is ordinary, permitted work: a tenant pointing
+// read_parquet at their own bucket is a feature. What a policy needs to decide
+// is whether the TARGET resolves inside the warehouse's managed DuckLake
+// storage, which is how one tenant would reach another's data. That decision is
+// a path check, so Args preserves enough of the target to make it — scheme,
+// host, and path — while dropping the parts that carry credentials.
 type TableFunction struct {
 	Name string `json:"name"`
 	// Args holds sanitized string arguments: a presigned URL's query string
 	// carries credentials, so only scheme, host, and path survive.
 	Args []string `json:"args,omitempty"`
+	// External marks a function that reads from a location rather than a
+	// relation, i.e. one whose Args are a path a policy should resolve.
+	External bool `json:"external,omitempty"`
 }
 
 // Metadata is the extraction result for one inbound statement.
@@ -339,9 +351,12 @@ func (e *extractor) statement(node *pg_query.Node, cte map[string]struct{}) {
 			e.read(copyStmt.Query, cte)
 		}
 		// COPY ... TO 'file/uri' moves tenant data outside the warehouse.
+		// COPY ... TO a location moves tenant data OUT of the warehouse, which
+		// is a different risk from reading a location in, so it keeps the
+		// admin class.
 		if copyStmt.Filename != "" && !copyStmt.IsFrom {
 			e.addKind(AccessAdmin)
-			e.addTableFunction("copy_to", []string{sanitizeArg(copyStmt.Filename)})
+			e.addTableFunction("copy_to", []string{sanitizeArg(copyStmt.Filename)}, true)
 		}
 
 	case *pg_query.Node_ExplainStmt:
@@ -535,11 +550,15 @@ func (e *extractor) rangeFunction(node *pg_query.Node) {
 			args = append(args, sanitizeArg(c.GetSval().Sval))
 		}
 	}
-	e.addTableFunction(name, args)
-	// A table function reaching outside the warehouse is admin-class access:
-	// relation-name policies cannot see it.
-	if isExternalDataFunction(name) {
-		e.addKind(AccessAdmin)
+	external := isExternalDataFunction(name)
+	e.addTableFunction(name, args, external)
+	if external {
+		// Reading a location is a read, not an escalation — pointing
+		// read_parquet at your own bucket is supported usage. The access class
+		// stays `read`; whether the target resolves into managed DuckLake
+		// storage (one tenant reaching another's data) is a path question the
+		// policy answers from Args, not something the function name decides.
+		e.addKind(AccessRead)
 	}
 	for _, arg := range call.Args {
 		e.read(arg, nil)
@@ -696,7 +715,7 @@ func (e *extractor) addFunction(name string) {
 	e.meta.Functions = append(e.meta.Functions, name)
 }
 
-func (e *extractor) addTableFunction(name string, args []string) {
+func (e *extractor) addTableFunction(name string, args []string, external bool) {
 	if name == "" {
 		return
 	}
@@ -708,7 +727,7 @@ func (e *extractor) addTableFunction(name string, args []string) {
 		return
 	}
 	e.tableFnSeen[name] = struct{}{}
-	e.meta.TableFunctions = append(e.meta.TableFunctions, TableFunction{Name: name, Args: args})
+	e.meta.TableFunctions = append(e.meta.TableFunctions, TableFunction{Name: name, Args: args, External: external})
 }
 
 func (e *extractor) markIncomplete(reason string) {
@@ -815,10 +834,11 @@ func isCatalogSchema(schema string) bool {
 	}
 }
 
-// isExternalDataFunction reports whether a table function reaches data outside
-// the warehouse's own relations. Mirrors the intent of the dangerous-function
-// list in server/query_access.go: these are how a relation-name policy gets
-// bypassed.
+// isExternalDataFunction reports whether a table function reads from a location
+// rather than a relation — i.e. whether its arguments are a path a policy needs
+// to resolve. Mirrors the shape of the function list in
+// server/query_access.go, but note the different purpose: this one marks
+// arguments as targets, it does not mark the statement as dangerous.
 func isExternalDataFunction(name string) bool {
 	switch name {
 	case "glob", "query", "query_table", "sniff_csv", "copy_to":

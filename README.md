@@ -184,11 +184,18 @@ That last column is load-bearing. These signals exist to let an authorization
 policy be evaluated against real traffic before it denies anything, so
 "referenced no relations" and "we could not tell what it referenced" must never
 be the same answer: **a consumer that gates on `query_metadata` must treat
-`metadata_complete = false` as unknown, and deny.** For the same reason,
-`table_functions` is recorded alongside relations — `read_parquet('s3://…')`
-reaches data without naming a relation, so a policy built on relation names
-alone would not see it. Its arguments are sanitized (a presigned URL carries
-credentials in its query string).
+`metadata_complete = false` as unknown, and deny.**
+
+`table_functions` is recorded alongside relations because `read_parquet('s3://…')`
+reaches data without naming a relation, so a policy built on relation names alone
+would not see it at all. Reading an external location is **supported usage** — a
+tenant pointing `read_parquet` at their own bucket is a feature, and it is
+classified as a plain `read`. The cross-tenant question is about the *target*,
+not the function: an entry marked `external` records enough of the path (scheme,
+host, path — credentials in a presigned URL's query string are stripped) for a
+policy to decide whether it resolves inside managed DuckLake storage. Moving data
+the other way, `COPY … TO 's3://…'`, keeps the `admin` class: egress is a
+different risk from reading a location in.
 
 Extraction runs on the **redacted** statement text, so credential material never
 reaches the parser. It costs one parse per distinct statement, memoized per

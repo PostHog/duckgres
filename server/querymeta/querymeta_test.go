@@ -189,11 +189,13 @@ func TestExtractCatalogIntrospectionIsMetadata(t *testing.T) {
 	}
 }
 
-// TestExtractTableFunctionsAreAccessTargets is the bypass that matters:
-// read_parquet reaches data without naming a relation, so a policy built on
-// relations alone would let it through.
-func TestExtractTableFunctionsAreAccessTargets(t *testing.T) {
-	meta := Extract(`SELECT * FROM read_parquet('s3://other-tenant/secrets.parquet')`)
+// TestExtractTableFunctionsRecordTheirTarget covers the case relation-name
+// policies cannot see at all. Reading an external location is permitted usage,
+// so the access class is a plain read; what the policy needs is the TARGET, so
+// it can decide whether the path resolves into managed DuckLake storage (one
+// tenant reaching another's data) or into a location the tenant owns.
+func TestExtractTableFunctionsRecordTheirTarget(t *testing.T) {
+	meta := Extract(`SELECT * FROM read_parquet('s3://customer-bucket/data.parquet')`)
 
 	if len(meta.TableFunctions) != 1 {
 		t.Fatalf("expected the table function to be recorded, got %v", meta.TableFunctions)
@@ -202,11 +204,31 @@ func TestExtractTableFunctionsAreAccessTargets(t *testing.T) {
 	if fn.Name != "read_parquet" {
 		t.Fatalf("table function name = %q", fn.Name)
 	}
-	if len(fn.Args) != 1 || !strings.Contains(fn.Args[0], "other-tenant") {
-		t.Fatalf("table function args = %v, want the target URI", fn.Args)
+	if !fn.External {
+		t.Fatal("read_parquet reads a location, so its args are a path to resolve")
 	}
+	if len(fn.Args) != 1 || !strings.Contains(fn.Args[0], "customer-bucket/data.parquet") {
+		t.Fatalf("table function args = %v, want the resolvable target path", fn.Args)
+	}
+	if !meta.HasKind(AccessRead) {
+		t.Fatalf("reading a location is a read, got %v", meta.AccessKinds)
+	}
+	// Reading someone's own bucket must not be flagged as an escalation, or
+	// shadow-mode analysis drowns in legitimate traffic.
+	if meta.HasKind(AccessAdmin) {
+		t.Fatalf("reading an external location is not admin-class, got %v", meta.AccessKinds)
+	}
+}
+
+// TestCopyToExternalStaysAdmin: moving tenant data OUT is a different risk from
+// reading a location in, and keeps the admin class.
+func TestCopyToExternalStaysAdmin(t *testing.T) {
+	meta := Extract(`COPY main.events TO 's3://bucket/dump.parquet'`)
 	if !meta.HasKind(AccessAdmin) {
-		t.Fatalf("reaching outside the warehouse is admin-class access, got %v", meta.AccessKinds)
+		t.Fatalf("egress to an external URI is admin-class, got %v", meta.AccessKinds)
+	}
+	if len(meta.TableFunctions) != 1 || !meta.TableFunctions[0].External {
+		t.Fatalf("the egress target must be recorded as a path, got %v", meta.TableFunctions)
 	}
 }
 
@@ -233,13 +255,8 @@ func TestSanitizeTableFunctionArgs(t *testing.T) {
 	}
 }
 
-// TestCopyToExternalIsAdmin: COPY TO a URI moves tenant data out of the
-// warehouse.
-func TestCopyToExternalIsAdmin(t *testing.T) {
+func TestCopyToAlsoReadsItsSource(t *testing.T) {
 	meta := Extract(`COPY main.events TO 's3://bucket/dump.parquet'`)
-	if !meta.HasKind(AccessAdmin) {
-		t.Fatalf("COPY TO an external URI is admin-class, got %v", meta.AccessKinds)
-	}
 	if !meta.HasKind(AccessRead) {
 		t.Fatalf("COPY TO also reads, got %v", meta.AccessKinds)
 	}
