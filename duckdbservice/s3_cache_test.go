@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -298,6 +299,116 @@ func TestCredentialRefreshPreservesS3CacheBypass(t *testing.T) {
 	last := refreshCfgs[len(refreshCfgs)-1]
 	if last.HTTPProxy != "http://10.0.0.9:8080" || last.S3UseSSL {
 		t.Fatalf("post-restore rotation rebuild lost the cache-proxy transport: HTTPProxy=%q S3UseSSL=%v", last.HTTPProxy, last.S3UseSSL)
+	}
+}
+
+// TestS3CacheToggleDuringRotationUsesRotatedCreds pins the secretSwapMu
+// hold-through-commit invariant: a `duckgres.s3_cache` toggle that arrives
+// while a credential-rotation re-activation is mid-rebuild must wait until the
+// rotated payload is COMMITTED, so its own rebuild carries the NEW creds. If
+// the refresh path released secretSwapMu before the Phase 3 commit, the toggle
+// could read the stale pre-rotation payload and last-write the secret with the
+// old, soon-to-expire STS credentials while the scheduler records the new
+// expiry — killing the session with ExpiredToken an hour later.
+func TestS3CacheToggleDuringRotationUsesRotatedCreds(t *testing.T) {
+	t.Setenv("DUCKGRES_CACHE_ENABLED", "true")
+	t.Setenv("NODE_IP", "10.0.0.9")
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	var opened *sql.DB
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		opened = db
+		return PairFromMain(db), nil
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+	defer func() {
+		if opened != nil {
+			_ = opened.Close()
+		}
+	}()
+
+	first := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 2, CPInstanceID: "cp-live:boot-a", WorkerID: 17},
+		OrgID:                 "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+			ObjectStore:   "s3://analytics/warehouse/",
+			S3Region:      "us-east-1",
+			S3UseSSL:      true,
+			S3AccessKey:   "OLD_ACCESS_KEY",
+			S3SecretKey:   "OLD_SECRET_KEY",
+		},
+	}
+	if err := pool.activateTenant(first); err != nil {
+		t.Fatalf("first ActivateTenant: %v", err)
+	}
+
+	rotationEntered := make(chan struct{})
+	toggleStarted := make(chan struct{})
+	var mu sync.Mutex
+	var toggleCfg *server.DuckLakeConfig
+	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
+		if dlCfg.HTTPProxy != "" {
+			// The rotation rebuild (proxy transport, cache on). Signal the
+			// toggle goroutine to start, then give it time to block on
+			// secretSwapMu before this rebuild "finishes" — recreating the
+			// window between the refresh exec and the payload commit.
+			close(rotationEntered)
+			<-toggleStarted
+			time.Sleep(50 * time.Millisecond)
+			return nil
+		}
+		// The toggle's bypass rebuild (native transport).
+		mu.Lock()
+		cfg := dlCfg
+		toggleCfg = &cfg
+		mu.Unlock()
+		return nil
+	}
+
+	second := first
+	second.DuckLake.S3AccessKey = "NEW_ACCESS_KEY"
+	second.DuckLake.S3SecretKey = "NEW_SECRET_KEY"
+
+	rotationDone := make(chan error, 1)
+	go func() { rotationDone <- pool.activateTenant(second) }()
+
+	<-rotationEntered
+	toggleDone := make(chan error, 1)
+	go func() {
+		close(toggleStarted)
+		toggleDone <- pool.SetS3CacheEnabled(false)
+	}()
+
+	if err := <-rotationDone; err != nil {
+		t.Fatalf("rotation re-activation: %v", err)
+	}
+	if err := <-toggleDone; err != nil {
+		t.Fatalf("SetS3CacheEnabled(false): %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if toggleCfg == nil {
+		t.Fatal("toggle never rebuilt the secret")
+	}
+	if toggleCfg.S3AccessKey != "NEW_ACCESS_KEY" {
+		t.Fatalf("toggle rebuilt the secret with stale pre-rotation creds: %q (scheduler now believes NEW creds are installed)", toggleCfg.S3AccessKey)
 	}
 }
 

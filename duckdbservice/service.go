@@ -93,8 +93,12 @@ type SessionPool struct {
 	// secretSwapMu serializes rebuilds of the tenant ducklake_s3 secret (the
 	// credential-refresh path in reuseExistingActivation vs the per-session
 	// duckgres.s3_cache toggle in SetS3CacheEnabled) so the last-applied
-	// transport always matches s3CacheBypassed. Never held across p.mu waits;
-	// held across the (slow) CREATE OR REPLACE SECRET, which p.mu must not be.
+	// transport always matches s3CacheBypassed. The refresh path holds it from
+	// before its rebuild until AFTER the rotated payload is committed, so a
+	// concurrent toggle can never rebuild from the stale pre-rotation payload.
+	// Lock order: secretSwapMu → p.mu (both paths); p.mu is never held while
+	// acquiring secretSwapMu. Held across the (slow) CREATE OR REPLACE SECRET,
+	// which p.mu must not be — health checks only need p.mu.RLock.
 	secretSwapMu sync.Mutex
 	// s3CacheBypassed is true while the tenant S3 secret carries the org's
 	// native HTTPS transport instead of the cache-proxy transport, i.e. the

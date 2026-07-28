@@ -321,10 +321,17 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 			// a mid-session credential rotation would silently re-route the
 			// session through the cache. secretSwapMu serializes this rebuild
 			// against SetS3CacheEnabled so the secret always matches
-			// s3CacheBypassed; it is never held while waiting on p.mu, so the
-			// health-check responsiveness this unlocked phase exists for is
-			// preserved.
+			// s3CacheBypassed — and it is held (via defer) all the way through
+			// the Phase 3 payload commit below: released any earlier, a toggle
+			// could sneak in, read the not-yet-committed OLD payload, and
+			// last-write the secret with the OLD (soon-to-expire) STS creds
+			// while Phase 3 records the new expiry — the scheduler would then
+			// skip the worker until the NEW expiry and the session dies with
+			// ExpiredToken mid-flight. Health checks only need p.mu.RLock and
+			// never touch secretSwapMu, so their responsiveness (the reason
+			// this phase runs without p.mu) is unaffected.
 			p.secretSwapMu.Lock()
+			defer p.secretSwapMu.Unlock()
 			p.mu.RLock()
 			bypassed := p.s3CacheBypassed
 			p.mu.RUnlock()
@@ -332,9 +339,7 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 			if !bypassed {
 				overrideS3EndpointForCacheProxy(&refreshCfg)
 			}
-			err := refreshFn(refreshDB, refreshCfg, sem)
-			p.secretSwapMu.Unlock()
-			if err != nil {
+			if err := refreshFn(refreshDB, refreshCfg, sem); err != nil {
 				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
 				return false
 			}
