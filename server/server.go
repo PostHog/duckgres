@@ -2120,36 +2120,40 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 		if isTransactionAborted(err) {
 			_, _ = ae.Exec("ROLLBACK")
 			if _, retryErr := ae.Exec(secretStmt); retryErr != nil {
-				return fmt.Errorf("refresh S3 secret after rollback: %s", redactS3SecretMaterial(dlCfg, retryErr.Error()))
+				return fmt.Errorf("refresh S3 secret after rollback: %s", redactSecretStatementError(retryErr.Error()))
 			}
 		} else {
-			return fmt.Errorf("refresh S3 secret: %s", redactS3SecretMaterial(dlCfg, err.Error()))
+			return fmt.Errorf("refresh S3 secret: %s", redactSecretStatementError(err.Error()))
 		}
 	}
 	slog.Debug("Refreshed S3 secret for hot-idle reuse.", "provider", provider)
 	return nil
 }
 
-// redactS3SecretMaterial scrubs the S3 credential material embedded in the
-// CREATE SECRET statement out of an engine error message. DuckDB errors can
-// echo the offending SQL ("LINE 1: ... SECRET '...' ..."), and RefreshS3Secret
-// errors flow into worker and control-plane logs and — via the
-// duckgres.s3_cache SET / session-create restore paths — into client-facing
-// error messages, the query log, and the admin recent-errors ring, so raw
-// engine text must never leave RefreshS3Secret. Targeted value replacement
-// (rather than usersecrets.RedactErrorForLog's whole-message placeholder)
-// keeps the actual failure reason diagnosable. Covers the config-provider
-// credentials embedded from dlCfg — the managed-warehouse path behind every
-// RefreshS3Secret caller; aws_sdk-provider statements embed credentials
-// fetched inside buildAWSSdkSecret, which this cannot see (pre-existing
-// exposure class on the attach path, tracked by the standing CodeQL alert).
-func redactS3SecretMaterial(dlCfg DuckLakeConfig, msg string) string {
-	for _, v := range []string{dlCfg.S3SecretKey, dlCfg.S3SessionToken, dlCfg.S3AccessKey} {
-		if v != "" {
-			msg = strings.ReplaceAll(msg, v, "[REDACTED]")
-		}
+// redactSecretStatementError reduces an engine error from a CREATE SECRET
+// statement to its error-class prefix ("Parser Error", "IO Error", ...) plus
+// a fixed placeholder. RefreshS3Secret errors flow beyond internal logs —
+// via the duckgres.s3_cache SET / session-create restore paths into
+// client-facing error messages, the query log, and the admin recent-errors
+// ring — so no engine detail may survive: DuckDB errors can echo the
+// offending SQL, and the echo is ELLIPSIZED for long lines ("LINE 1:
+// ...oken' ..."), so matching-and-replacing complete credential values is NOT
+// sufficient — a truncated echo carries credential FRAGMENTS no exact match
+// catches, and even the first line's `at or near "..."` token can hold
+// string-literal content. Dropping everything after the class prefix is the
+// only airtight shape (the repo precedent is usersecrets.RedactErrorForLog's
+// whole-message placeholder; keeping the class preserves triage value at zero
+// leak surface, and works regardless of where the credentials came from —
+// dlCfg or buildAWSSdkSecret's internally-fetched ones).
+func redactSecretStatementError(msg string) string {
+	const placeholder = "[details redacted: engine errors may echo secret SQL]"
+	// An error class is a short leading tag; a "prefix" long enough to carry
+	// echoed SQL means the message doesn't follow the class-colon shape — drop
+	// it entirely.
+	if idx := strings.Index(msg, ":"); idx > 0 && idx <= 64 && !strings.ContainsAny(msg[:idx], "'\"\n") {
+		return msg[:idx] + ": " + placeholder
 	}
-	return msg
+	return placeholder
 }
 
 // resolveS3SecretTransport picks the URL_STYLE and USE_SSL values to embed in

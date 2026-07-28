@@ -289,35 +289,48 @@ func TestS3CacheStartupOption(t *testing.T) {
 	}
 }
 
-// TestRedactS3SecretMaterial asserts RefreshS3Secret's error scrubber: a
-// DuckDB error echoing the CREATE SECRET SQL must have every credential value
-// replaced before the error leaves RefreshS3Secret — its errors reach worker
-// and CP logs and, via the duckgres.s3_cache SET / session-create restore
-// paths, client-facing error messages, the query log, and the admin
-// recent-errors ring.
-func TestRedactS3SecretMaterial(t *testing.T) {
-	cfg := DuckLakeConfig{
-		S3AccessKey:    "ASIAEXAMPLEKEY",
-		S3SecretKey:    "verysecretvalue",
-		S3SessionToken: "sessiontokenvalue",
+// TestRedactSecretStatementError asserts RefreshS3Secret's error scrubber
+// keeps only the engine error-class prefix: its errors reach worker and CP
+// logs and, via the duckgres.s3_cache SET / session-create restore paths,
+// client-facing error messages, the query log, and the admin recent-errors
+// ring. Exact-value replacement is NOT enough — DuckDB ellipsizes long echoed
+// SQL lines, so a truncated echo carries credential FRAGMENTS that no
+// full-value match catches (reproduced against a live DuckDB: a 640-char
+// secret left a 57-char fragment in the "LINE 1: ...xxx' ..." excerpt).
+func TestRedactSecretStatementError(t *testing.T) {
+	secret := strings.Repeat("S", 40) + strings.Repeat("T", 600)
+	// The ellipsized echo shape DuckDB actually produces: full value absent,
+	// contiguous fragment present.
+	echo := "Parser Error: syntax error at or near \"BROKEN\"\n" +
+		"LINE 1: ..." + secret[len(secret)-57:] + "' BROKEN"
+	got := redactSecretStatementError(echo)
+	if got != "Parser Error: [details redacted: engine errors may echo secret SQL]" {
+		t.Fatalf("unexpected redaction: %q", got)
 	}
-	echo := `Parser Error: syntax error at or near "SECRET"
-LINE 1: CREATE OR REPLACE SECRET ducklake_s3 (TYPE s3, KEY_ID 'ASIAEXAMPLEKEY', SECRET 'verysecretvalue', SESSION_TOKEN 'sessiontokenvalue')`
-	got := redactS3SecretMaterial(cfg, echo)
-	for _, leaked := range []string{"verysecretvalue", "sessiontokenvalue", "ASIAEXAMPLEKEY"} {
-		if strings.Contains(got, leaked) {
-			t.Fatalf("redacted message still contains %q: %s", leaked, got)
+	for i := 0; i+12 <= len(secret); i += 4 {
+		if strings.Contains(got, secret[i:i+12]) {
+			t.Fatalf("redacted message still contains a credential fragment: %q", got)
 		}
 	}
-	if !strings.Contains(got, "Parser Error") || !strings.Contains(got, "[REDACTED]") {
-		t.Fatalf("redaction lost the diagnostic context: %s", got)
+
+	// Ordinary runtime errors keep their class for triage, nothing more.
+	if got := redactSecretStatementError("IO Error: Connection refused (s3.us-east-1.amazonaws.com:443)"); got !=
+		"IO Error: [details redacted: engine errors may echo secret SQL]" {
+		t.Fatalf("IO error class not preserved: %q", got)
 	}
 
-	// Empty credential fields must not turn into degenerate replacements, and
-	// messages without credential material pass through unchanged.
-	plain := "IO Error: Connection refused (s3.us-east-1.amazonaws.com:443)"
-	if got := redactS3SecretMaterial(DuckLakeConfig{}, plain); got != plain {
-		t.Fatalf("credential-free message was altered: %q", got)
+	// Messages that don't follow the class-colon shape — or whose "prefix" is
+	// long or quote-bearing enough to carry echoed SQL — drop entirely.
+	for _, msg := range []string{
+		"no colon here at all",
+		"", // empty
+		"prefix with 'quoted " + secret[:24] + "' content: detail",
+		strings.Repeat("x", 80) + ": detail",
+	} {
+		got := redactSecretStatementError(msg)
+		if got != "[details redacted: engine errors may echo secret SQL]" {
+			t.Fatalf("unsafe prefix survived for %.40q: %q", msg, got)
+		}
 	}
 }
 
