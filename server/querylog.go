@@ -15,6 +15,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/posthog/duckgres/internal/analytics"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/posthog/duckgres/server/wire"
@@ -464,13 +465,38 @@ func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
 func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType string,
 	resultRows, writtenRows int64, errCode, errMsg, protocol string) {
 
-	ql := c.queryLogSink()
-	if ql == nil {
-		return
-	}
+	// Consume the profiling rollup left behind by the most recent
+	// EnrichSpanWithProfiling up front, so the per-org analytics event and the
+	// query-log row observe the same values and it is reset even when the
+	// query-log sink is disabled (a later logQuery without a fresh exec must not
+	// reuse stale timings from a previous query).
 	profilingSummary := c.lastProfilingSummary
 	c.lastProfilingSummary = observe.QueryProfilingSummary{}
+
 	if isQueryLogSelfReferential(query) {
+		return
+	}
+
+	// Per-org product analytics for the terminal event of a successful query.
+	// Failures are already captured by query_failed (logQueryError), so gate on
+	// errCode == "" to keep the lifecycle clean (initiated -> completed | failed)
+	// and avoid double-counting. Emitted independently of the query-log sink so
+	// this usage signal does not depend on query-log configuration.
+	if errCode == "" {
+		analytics.Default().Capture("query_completed", c.orgID, map[string]any{
+			"user":        c.username,
+			"team_id":     c.teamID,
+			"trace_id":    observe.TraceIDFromContext(c.ctx),
+			"protocol":    protocol,
+			"query_kind":  classifyQuery(cmdType),
+			"duration_ms": time.Since(start).Milliseconds(),
+			"cpu_seconds": profilingSummary.CPUTimeSeconds,
+			"result_rows": resultRows,
+		})
+	}
+
+	ql := c.queryLogSink()
+	if ql == nil {
 		return
 	}
 
@@ -503,10 +529,6 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 
 	clientAddr, clientPort := c.clientAddrPort()
 
-	// Consume the profiling rollup left behind by the most recent
-	// EnrichSpanWithProfiling on this connection and reset it so a later
-	// logQuery without a fresh exec (e.g. parse-failure path) doesn't
-	// reuse stale timings from a previous query.
 	pgScanMs := int64(profilingSummary.PostgresScanSeconds * 1000)
 
 	parentQueryID, statementIndex := "", 0

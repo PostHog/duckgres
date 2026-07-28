@@ -224,6 +224,13 @@ type clientConn struct {
 	workerMillicores int64
 	workerMiB        int64
 
+	// teamID is the PostHog Team.id this connection is attributed to for product
+	// analytics (the connecting user's team, else the org's oldest team; 0 when
+	// unknown / non-multitenant). Stamped once at setup via SetConnectionTeamID
+	// so per-org analytics events carry a PostHog-native key that joins to the
+	// rest of PostHog. A config-snapshot read, not billing attribution.
+	teamID int64
+
 	// lastProfilingSummary holds the rollup from the most recent
 	// EnrichSpanWithProfiling call on this connection. Consumed by the very
 	// next logQuery and then cleared. Per-connection state is safe because
@@ -500,6 +507,7 @@ func (c *clientConn) logClientQueryReceived(ctx context.Context, protocol, query
 	)
 	analytics.Default().Capture("query_initiated", c.orgID, map[string]any{
 		"user":     c.username,
+		"team_id":  c.teamID,
 		"trace_id": traceID,
 	})
 }
@@ -539,6 +547,7 @@ func (c *clientConn) logQueryError(query string, err error) {
 	// SQLSTATE and category — so this is unaffected by the redaction above.
 	analytics.Default().Capture("query_failed", c.orgID, map[string]any{
 		"user":           c.username,
+		"team_id":        c.teamID,
 		"trace_id":       traceID,
 		"error_code":     sqlState,
 		"error_category": category,

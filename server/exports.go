@@ -206,6 +206,17 @@ func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 	}
 }
 
+// SetConnectionTeamID records the PostHog Team.id this connection is attributed
+// to for product analytics (query_initiated / query_completed / query_failed),
+// giving those per-org events a PostHog-native key. Resolved from the config
+// snapshot at setup (the connecting user's team, else the org's oldest team);
+// 0 when unknown or non-multitenant. Constant for the connection's life.
+func SetConnectionTeamID(cc *clientConn, teamID int64) {
+	if cc != nil {
+		cc.teamID = teamID
+	}
+}
+
 // ConnectionBilling returns the data needed to meter one connection's
 // compute-usage at teardown: the org, the authenticated username (used to
 // resolve the informational team id stamped onto the bucket — the user's own

@@ -167,6 +167,10 @@ func (f *fakeConfigStore) OrgDefaultWorkerProfile(string) (string, string, strin
 	// default (nil) profile semantics.
 	return "", "", ""
 }
+func (f *fakeConfigStore) OrgUsageTeamID(string, string) int64 {
+	// SNI tests don't exercise analytics team attribution.
+	return 0
+}
 func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	panic("UpsertFlightSessionRecord should not be called from SNI tests")
 }

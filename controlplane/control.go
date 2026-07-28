@@ -274,6 +274,10 @@ type ConfigStoreInterface interface {
 	// Empty strings mean "not set" (including unknown orgs). Raw stored
 	// values — validation happens in resolveWorkerProfile.
 	OrgDefaultWorkerProfile(orgID string) (cpu, memory, ttl string)
+	// OrgUsageTeamID resolves the informational PostHog Team.id for a connection
+	// (the connecting user's team, else the org's oldest team; 0 when unknown).
+	// A config-snapshot read, no I/O — the same resolver the compute meter uses.
+	OrgUsageTeamID(orgID, username string) int64
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
@@ -1467,6 +1471,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Create real clientConn with FlightExecutor and worker assignment
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
+	// Stamp the PostHog team id (config-snapshot read, no I/O) so this
+	// connection's product-analytics events carry a PostHog-native key. Same
+	// resolution the compute meter uses: the connecting user's team, else the
+	// org's oldest team, else 0 (unknown / not-yet-loaded snapshot).
+	if cp.configStore != nil && orgID != "" {
+		server.SetConnectionTeamID(cc, cp.configStore.OrgUsageTeamID(orgID, username))
+	}
 	// Stamp the provisioned worker pod size for compute-usage billing. Only the
 	// remote/k8s backend has a per-org worker pod with a known size; the process
 	// backend leaves it zero so metering is skipped. Constant for the

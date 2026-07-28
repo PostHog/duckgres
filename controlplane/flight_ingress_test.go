@@ -35,6 +35,9 @@ func (s *flightSessionAccessConfigStore) OrgWarehouseStatus(string) (string, boo
 func (s *flightSessionAccessConfigStore) OrgDefaultWorkerProfile(string) (string, string, string) {
 	return "", "", ""
 }
+func (s *flightSessionAccessConfigStore) OrgUsageTeamID(string, string) int64 {
+	return 0
+}
 func (s *flightSessionAccessConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	return nil
 }

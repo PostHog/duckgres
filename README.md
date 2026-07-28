@@ -401,6 +401,14 @@ the `distinct_id` is the org name and each event carries a group of type
 single-tenant standalone mode (no org) the `distinct_id` is `standalone` and no
 group is attached.
 
+The org name is duckgres-internal, so the query events additionally carry a
+`team_id` property — the PostHog `Team.id` for the connection (the connecting
+user's team, else the org's oldest team; 0 when unknown or standalone). This is
+the PostHog-native key that joins duckgres usage to the rest of PostHog (e.g.
+product-intent cohorts for managed-warehouse activation). It is a config-snapshot
+read stamped once per connection, and mirrors the informational team id the
+compute-usage meter records.
+
 Events never include SQL text, credentials, or secret values — only metadata.
 
 Provisioning and deprovisioning are asynchronous: the admin API returns `202
@@ -419,8 +427,9 @@ teardown), so you can build a provisioning funnel and alert on failures.
 | `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
 | `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
-| `query_initiated` | An accepted, non-empty client query is received | `user`, `trace_id` |
-| `query_failed` | A query errors | `user`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
+| `query_initiated` | An accepted, non-empty client query is received | `user`, `team_id`, `trace_id` |
+| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows` |
+| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
 
 > Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
 > are terminal and fire exactly once per warehouse (guarded on the state
@@ -437,6 +446,15 @@ teardown), so you can build a provisioning funnel and alert on failures.
 > Query or extended-protocol Execute. Retries, rewrites, cursor helpers, and
 > generated COPY batches do not emit additional events. Capture is asynchronous
 > and batched, so it stays off the query latency path.
+
+> Note: `query_completed` fires on the terminal event of each *successfully*
+> executed statement, carrying that statement's resource cost (`duration_ms`,
+> `cpu_seconds`). Failures are covered by `query_failed` instead. It is emitted
+> at statement granularity, so a single logical client request can produce more
+> than one `query_completed` (e.g. cursor FETCHes or COPY batches) — unlike
+> `query_initiated`. Filter by `query_kind` to isolate real data queries from
+> utility statements. Emitted independently of the query-log configuration;
+> capture is asynchronous and batched, so it stays off the query latency path.
 
 ### Query Logs
 
