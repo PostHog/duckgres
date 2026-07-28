@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -408,4 +409,33 @@ func WriteCopyData(w io.Writer, data []byte) error {
 // writeCopyDone signals the end of COPY data
 func WriteCopyDone(w io.Writer) error {
 	return WriteMessage(w, MsgCopyDone, nil)
+}
+
+// QueryIDMetadataKey carries the control plane's per-statement query ID on
+// worker RPCs. The worker stamps it on its own logs and events, so a statement
+// can be followed from the client connection through to the engine that ran it.
+const QueryIDMetadataKey = "x-duckgres-query-id"
+
+type queryIDContextKey struct{}
+
+// WithQueryID attaches a statement's query ID to a context.
+//
+// Propagation is context-based rather than executor state so it reaches the
+// worker from every front-end: the PostgreSQL wire path and the Flight SQL
+// ingress both funnel into the same executor, and neither has to know the
+// header exists.
+func WithQueryID(ctx context.Context, queryID string) context.Context {
+	if ctx == nil || queryID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, queryIDContextKey{}, queryID)
+}
+
+// QueryIDFromContext returns the statement's query ID, or "" if unset.
+func QueryIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	queryID, _ := ctx.Value(queryIDContextKey{}).(string)
+	return queryID
 }

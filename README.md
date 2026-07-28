@@ -118,6 +118,101 @@ errors, trace/span IDs, and profiling-derived resource usage. `cpu_time_s` is
 DuckDB cumulative CPU/thread time in seconds, and `peak_buffer_memory_bytes` is
 DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
 
+`query_id` is a per-statement UUIDv7 minted when the query arrives. It is
+time-ordered, appears on the statement's OTEL span (`duckgres.query_id`) and its
+error logs, and is the key that correlates every query-log event for one
+statement. A batched simple query (`SELECT 1; SELECT 2`) runs each statement
+under its own `query_id`, with `parent_query_id` and `statement_index`
+identifying the Query message they arrived in.
+
+Statements produce a pair of events, using ClickHouse's `type` vocabulary
+(`QueryStart` = 1, `QueryFinish` = 2, `ExceptionBeforeStart` = 3,
+`ExceptionWhileProcessing` = 4):
+
+- `QueryStart` is emitted when the statement begins executing.
+- One terminal event follows: `QueryFinish`, or `ExceptionWhileProcessing` if it
+  failed after execution began, or `ExceptionBeforeStart` if it failed before
+  any engine saw it (auth or policy denial, a transpile error, a rejected
+  Describe). `ExceptionBeforeStart` events have no `QueryStart`, by definition.
+
+**A `QueryStart` with no terminal event is a query that never came back** — a
+worker OOM-killed mid-statement, a pod evicted. That row is the only evidence
+such a query ever ran, so treat a sustained population of unpaired starts as an
+incident signal, allowing for queries still in flight.
+
+The `query_id` travels to the worker on every statement RPC
+(`x-duckgres-query-id`), and the worker stamps it on its own logs — notably the
+"Query appears stuck" warning. That is what closes the loop on an unpaired
+`QueryStart`: the statement's own log row cannot exist, but the pod's last words
+about it carry the same ID.
+
+`event_time` is the statement's **start** time on every event type, including
+terminal ones. This diverges from ClickHouse, where `event_time` is when the
+event was logged: pinning both rows of a pair to the same instant keeps them in
+one monthly partition and lets them join without a window function. A terminal
+row's finish time is `event_time + query_duration_ms`.
+
+`query_log.start_events` selects which statements get a `QueryStart`:
+
+- `data` (default) — statements that touch data or change schema. Transaction
+  control, `SET`/`RESET`/`SHOW`, and catalog introspection are skipped: they
+  never hang, and they are the noisiest statements a driver sends.
+- `all` — every statement.
+- `off` — no start events.
+
+Terminal events are always logged regardless of this setting, so nothing
+disappears from the log; cheap statements simply have no paired start row. Also
+settable via `DUCKGRES_QUERY_LOG_START_EVENTS`.
+
+Each event also records **what the statement touches**, extracted from its
+parse tree (`server/querymeta`):
+
+- `access_kinds` — the access classes the statement needs, comma-separated:
+  `read`, `write`, `ddl`, `config`, `admin`, `transaction`, `metadata`,
+  `unknown`. A statement can be several at once: `WITH x AS (INSERT …) SELECT`
+  is both a read and a write, which a classifier based on the command tag gets
+  wrong.
+- `query_metadata` — JSON with the resolved detail: `read_relations` and
+  `write_relations` (split, because grants are directional), `columns`,
+  `functions`, and `table_functions`.
+- `metadata_complete` — **false when extraction could not see the whole
+  statement.** DuckDB-native syntax (`ATTACH`, `CREATE SECRET`, `PIVOT`,
+  `SUMMARIZE`) is not parseable as PostgreSQL and falls back to a coarse
+  lexical classification.
+
+That last column is load-bearing. These signals exist to let an authorization
+policy be evaluated against real traffic before it denies anything, so
+"referenced no relations" and "we could not tell what it referenced" must never
+be the same answer: **a consumer that gates on `query_metadata` must treat
+`metadata_complete = false` as unknown, and deny.**
+
+`table_functions` is recorded alongside relations because `read_parquet('s3://…')`
+reaches data without naming a relation, so a policy built on relation names alone
+would not see it at all. Reading an external location is **supported usage** — a
+tenant pointing `read_parquet` at their own bucket is a feature, and it is
+classified as a plain `read`. The cross-tenant question is about the *target*,
+not the function: an entry marked `external` records enough of the path (scheme,
+host, path — credentials in a presigned URL's query string are stripped) for a
+policy to decide whether it resolves inside managed DuckLake storage. Moving data
+the other way, `COPY … TO 's3://…'`, keeps the `admin` class: egress is a
+different risk from reading a location in.
+
+Extraction runs on the **redacted** statement text, so credential material never
+reaches the parser. It costs one parse per distinct statement, memoized per
+process; disable with `query_log.metadata: false` or
+`DUCKGRES_QUERY_LOG_METADATA=false`.
+
+The column set has a single source of truth: `queryLogColumns` in
+`server/querylog_schema.go`. It generates the `CREATE TABLE` DDL, the
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration that brings already
+provisioned tenants forward, the `INSERT` column list and argument order, the
+partition-repair copy list, and the `ducklake.system.query_log` view. Adding a
+column means appending one entry there; existing tenants pick it up on the next
+sink initialization, and a view whose columns have drifted is rebuilt with
+`CREATE OR REPLACE VIEW`. Append only — never reorder or remove an entry, and
+an appended column must be nullable or carry a `DEFAULT` (a bare `NOT NULL`
+column cannot be added to a populated table).
+
 ## Runbooks
 
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.

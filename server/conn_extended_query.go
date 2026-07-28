@@ -539,10 +539,12 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	start := time.Now()
 	queryMetrics := c.beginQueryMetrics(start)
+	queryMetrics.queryText = loggableQuery
 	defer c.finishQueryMetrics(queryMetrics)
 
 	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
+			attribute.String("duckgres.query_id", queryMetrics.queryID),
 			attribute.String("duckgres.protocol", "extended"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),

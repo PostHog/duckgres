@@ -346,7 +346,16 @@ func (c *clientConn) queryContextForCursor() (context.Context, func()) {
 
 func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	c.ensureConnectionContext()
-	ctx, cancel := context.WithCancel(c.ctx)
+	// Registering for cancellation is the moment the statement becomes live to
+	// the client, which makes this the one place every execution path — simple,
+	// batched, extended, COPY, cursor — passes through on its way to an engine.
+	// The QueryStart event and the ExceptionBeforeStart boundary both hang off
+	// it rather than off a call added to each path.
+	c.markExecStarted()
+	// Carry the statement's ID to the engine. The worker stamps it on its own
+	// logs, so a client complaint can be followed from this connection into the
+	// pod that ran the statement.
+	ctx, cancel := context.WithCancel(wire.WithQueryID(c.ctx, c.currentQueryID()))
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 
@@ -500,6 +509,9 @@ func (c *clientConn) logQueryError(query string, err error) {
 	attrs := []any{
 		"query", redactedQuery,
 		"error", redactedErr,
+	}
+	if queryID := c.currentQueryID(); queryID != "" {
+		attrs = append(attrs, "query_id", queryID)
 	}
 	// This shared category also drives query metrics, analytics, and the
 	// recent-error ring so the observability surfaces cannot disagree.
@@ -1254,6 +1266,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	start := time.Now()
 	queryMetrics := c.beginQueryMetrics(start)
+	queryMetrics.queryText = loggableQuery
 	defer func() {
 		if retErr != nil {
 			queryMetrics.markError(retErr)
@@ -1263,6 +1276,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	ctx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
+			attribute.String("duckgres.query_id", queryMetrics.queryID),
 			attribute.String("duckgres.protocol", "simple"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),

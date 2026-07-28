@@ -304,6 +304,14 @@ type QueryLogConfig struct {
 	Enabled       bool
 	FlushInterval time.Duration
 	BatchSize     int
+	// StartEvents selects which statements emit a QueryStart event. Empty
+	// behaves as the default ("data") so a config that predates this field
+	// keeps working.
+	StartEvents QueryStartEvents
+	// Metadata enables per-statement extraction of the relations, columns,
+	// functions, and access classes a statement touches (server/querymeta).
+	// It costs one parse per distinct statement text, memoized.
+	Metadata bool
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.

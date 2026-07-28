@@ -237,20 +237,29 @@ func insertQueryLogEntries(ctx context.Context, db *sql.DB, table string, batch 
 	if table == "" {
 		table = "query_log"
 	}
+	// Column list, placeholder count, and argument order all come from the
+	// single registry in querylog_schema.go so they cannot drift apart.
+	colsPerRow := len(queryLogEntryColumns())
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
-	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms, cpu_time_s, peak_buffer_memory_bytes) VALUES ")
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(queryLogEntryColumnNames(), ", "))
+	sb.WriteString(") VALUES ")
 
-	const colsPerRow = 26
 	args := make([]any, 0, len(batch)*colsPerRow)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
 		base := i * colsPerRow
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23, base+24, base+25, base+26)
+		sb.WriteByte('(')
+		for col := range colsPerRow {
+			if col > 0 {
+				sb.WriteByte(',')
+			}
+			fmt.Fprintf(&sb, "$%d", base+col+1)
+		}
+		sb.WriteByte(')')
 
 		args = append(args, queryLogEntryInsertArgs(e)...)
 	}
@@ -259,37 +268,6 @@ func insertQueryLogEntries(ctx context.Context, db *sql.DB, table string, batch 
 		return fmt.Errorf("insert query_log entries: %w", err)
 	}
 	return nil
-}
-
-func queryLogEntryInsertArgs(e QueryLogEntry) []any {
-	return []any{
-		e.EventTime,
-		e.QueryDurationMs,
-		e.Type,
-		truncateQuery(e.Query),
-		truncateNullableQuery(e.TranspiledQuery),
-		e.QueryKind,
-		e.NormalizedHash,
-		e.ResultRows,
-		e.WrittenRows,
-		e.ExceptionCode,
-		e.Exception,
-		e.UserName,
-		e.OrgID,
-		e.CurrentDatabase,
-		e.ClientAddress,
-		e.ClientPort,
-		e.ApplicationName,
-		e.PID,
-		e.WorkerID,
-		e.IsTranspiled,
-		e.Protocol,
-		e.TraceID,
-		e.SpanID,
-		e.PostgresScanMs,
-		e.CPUTimeSeconds,
-		e.PeakBufferMemoryBytes,
-	}
 }
 
 // truncateQuery truncates a query string to maxQueryLength.
@@ -389,22 +367,104 @@ func isQueryLogSelfReferential(query string) bool {
 	return strings.Contains(upper, "SYSTEM.QUERY_LOG")
 }
 
+// queryLogSink resolves where this connection's query-log entries go. The
+// executor sink (the worker, in control-plane mode) wins: the worker owns the
+// tenant's query-log storage.
+func (c *clientConn) queryLogSink() queryLogEntrySink {
+	if c.server != nil && c.server.cfg.QueryLog.Enabled && c.executor != nil {
+		if sink, ok := c.executor.(queryLogEntrySink); ok {
+			return sink
+		}
+	}
+	if c.server != nil && c.server.queryLogSink != nil {
+		return c.server.queryLogSink
+	}
+	if c.server != nil && c.server.queryLogger != nil {
+		return c.server.queryLogger
+	}
+	return nil
+}
+
+// clientAddrPort splits the peer address for the query log.
+func (c *clientConn) clientAddrPort() (string, int) {
+	addr := c.conn.RemoteAddr()
+	if addr == nil {
+		return "", 0
+	}
+	addrStr := addr.String()
+	host, portStr, err := splitHostPort(addrStr)
+	if err != nil {
+		return addrStr, 0
+	}
+	port, err := parsePort(portStr)
+	if err != nil {
+		return host, 0
+	}
+	return host, port
+}
+
+// logQueryStart emits the QueryStart event for a statement that is about to
+// execute. It carries identity and client context; resource columns stay zero
+// and are filled by the terminal event.
+//
+// This is what makes an in-flight query visible and, more importantly, what
+// makes a query that never returns detectable: a QueryStart with no terminal is
+// the only evidence left when a worker is OOM-killed mid-statement.
+func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
+	if scope == nil || c.server == nil || !c.server.cfg.QueryLog.StartEvents.enabled(scope.queryText) {
+		return
+	}
+	ql := c.queryLogSink()
+	if ql == nil {
+		return
+	}
+	// The scope's text is already redacted by the caller, but a query naming
+	// the log itself must not be logged or the poll recurses.
+	query := boundQueryLogText(scope.queryText)
+	if isQueryLogSelfReferential(query) {
+		return
+	}
+
+	clientAddr, clientPort := c.clientAddrPort()
+	meta := c.queryMetadata(scope)
+	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(meta)
+	// Prefer the parsed kind. A leading-keyword guess reads "WITH ..." as a
+	// utility statement, which would make a start event disagree with its own
+	// terminal about what the statement was.
+	queryKind := meta.QueryKind
+	if queryKind == "" {
+		queryKind = classifyQuery(leadingSQLKeyword(query))
+	}
+	ql.Log(QueryLogEntry{
+		QueryID:          scope.queryID,
+		ParentQueryID:    scope.parentQueryID,
+		StatementIndex:   scope.statementIndex,
+		EventTime:        scope.start,
+		Type:             QueryEventStart,
+		Query:            query,
+		QueryKind:        queryKind,
+		NormalizedHash:   normalizeQueryHash(query),
+		UserName:         c.username,
+		OrgID:            c.orgID,
+		CurrentDatabase:  c.database,
+		ClientAddress:    clientAddr,
+		ClientPort:       clientPort,
+		ApplicationName:  c.applicationName,
+		PID:              c.pid,
+		WorkerID:         c.workerID,
+		TraceID:          observe.TraceIDFromContext(c.ctx),
+		SpanID:           observe.SpanIDFromContext(c.ctx),
+		QueryMetadata:    encodedMeta,
+		AccessKinds:      accessKinds,
+		MetadataComplete: metaComplete,
+	})
+}
+
 // logQuery builds a QueryLogEntry from the connection context and sends it to the logger.
 func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType string,
 	resultRows, writtenRows int64, errCode, errMsg, protocol string) {
 
-	var ql queryLogEntrySink
-	if c.server != nil && c.server.cfg.QueryLog.Enabled && c.executor != nil {
-		if sink, ok := c.executor.(queryLogEntrySink); ok {
-			ql = sink
-		}
-	}
-	if ql == nil && c.server != nil && c.server.queryLogSink != nil {
-		ql = c.server.queryLogSink
-	}
-	if ql == nil && c.server != nil && c.server.queryLogger != nil {
-		ql = c.server.queryLogger
-	}
+	ql := c.queryLogSink()
 	if ql == nil {
 		return
 	}
@@ -422,10 +482,16 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	query = usersecrets.RedactForLog(query)
 	transpiledQuery = usersecrets.RedactForLog(transpiledQuery)
 
-	entryType := "QueryFinish"
-	if errCode != "" {
-		entryType = "ExceptionWhileProcessing"
+	// A failure that never reached an engine is ExceptionBeforeStart and has no
+	// QueryStart row to pair with. Without a scope we cannot know, so assume
+	// the statement started — claiming it never did would be a stronger
+	// statement than the evidence supports.
+	execStarted := true
+	scope := c.activeQueryMetrics
+	if scope != nil {
+		execStarted = scope.execStarted
 	}
+	entryType := terminalQueryEventType(errCode, execStarted)
 
 	isTranspiled := transpiledQuery != "" && transpiledQuery != query
 	query = boundQueryLogText(query)
@@ -435,20 +501,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		transpiled = &boundedTranspiledQuery
 	}
 
-	// Extract client address and port from the connection
-	var clientAddr string
-	var clientPort int
-	if addr := c.conn.RemoteAddr(); addr != nil {
-		addrStr := addr.String()
-		if host, portStr, err := splitHostPort(addrStr); err == nil {
-			clientAddr = host
-			if p, err := parsePort(portStr); err == nil {
-				clientPort = p
-			}
-		} else {
-			clientAddr = addrStr
-		}
-	}
+	clientAddr, clientPort := c.clientAddrPort()
 
 	// Consume the profiling rollup left behind by the most recent
 	// EnrichSpanWithProfiling on this connection and reset it so a later
@@ -456,7 +509,23 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	// reuse stale timings from a previous query.
 	pgScanMs := int64(profilingSummary.PostgresScanSeconds * 1000)
 
+	parentQueryID, statementIndex := "", 0
+	if scope != nil {
+		parentQueryID, statementIndex = scope.parentQueryID, scope.statementIndex
+	}
+	// The terminal event carries the same extraction as the start event. When
+	// the scope has none (a path that logs without one), fall back to the
+	// statement text this call was handed so the row still says what was
+	// touched.
+	meta := c.queryMetadata(scope)
+	if scope == nil && c.server != nil && c.server.cfg.QueryLog.Metadata {
+		meta = extractQueryMetadata(query)
+	}
+	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(meta)
 	ql.Log(QueryLogEntry{
+		QueryID:               c.currentQueryID(),
+		ParentQueryID:         parentQueryID,
+		StatementIndex:        statementIndex,
 		EventTime:             start,
 		QueryDurationMs:       time.Since(start).Milliseconds(),
 		Type:                  entryType,
@@ -483,6 +552,9 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		PostgresScanMs:        pgScanMs,
 		CPUTimeSeconds:        profilingSummary.CPUTimeSeconds,
 		PeakBufferMemoryBytes: profilingSummary.PeakBufferMemoryBytes,
+		QueryMetadata:         encodedMeta,
+		AccessKinds:           accessKinds,
+		MetadataComplete:      metaComplete,
 	})
 }
 

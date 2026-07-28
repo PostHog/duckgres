@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"strings"
 	"testing"
@@ -205,5 +206,26 @@ func TestReadMessageInvalidLength(t *testing.T) {
 				t.Fatalf("unexpected error for length %d: %v", tc.length, err)
 			}
 		})
+	}
+}
+
+func TestQueryIDContextRoundTrip(t *testing.T) {
+	ctx := WithQueryID(context.Background(), "019fa916-0918-76dd-bc75-591a7ec4e8fa")
+	if got := QueryIDFromContext(ctx); got != "019fa916-0918-76dd-bc75-591a7ec4e8fa" {
+		t.Fatalf("query id = %q", got)
+	}
+	if got := QueryIDFromContext(context.Background()); got != "" {
+		t.Fatalf("unset context should yield an empty id, got %q", got)
+	}
+	// An empty id must not put a value in the context: the header is only
+	// appended when there is something to say.
+	if ctx := WithQueryID(context.Background(), ""); QueryIDFromContext(ctx) != "" {
+		t.Fatal("an empty id must not be stored")
+	}
+	// A nil-valued context interface — which a caller can hold without meaning
+	// to. Passing the literal trips staticcheck SA1012.
+	var nilCtx context.Context
+	if QueryIDFromContext(nilCtx) != "" {
+		t.Fatal("a nil context must be safe")
 	}
 }
