@@ -49,7 +49,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 28)
 	requireGooseMigrationRecorded(t, db, 29)
 	requireGooseMigrationRecorded(t, db, 30)
-	requireGooseLatestVersion(t, db, 30)
+	requireGooseMigrationRecorded(t, db, 31)
+	requireGooseLatestVersion(t, db, 31)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -110,6 +111,16 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	// Migration 000029 dropped the billing-team marker: duckgres no longer
 	// owns team-level billing attribution (the external billing service does).
 	requireColumnAbsent(t, db, "duckgres_org_teams", "is_billing_team")
+
+	// Migration 000031 admitted the read/write project login. The two scoped
+	// modes now share one shape constraint (team required, passthrough
+	// forbidden) but keep SEPARATE partial unique indexes, so a team can hold a
+	// reader and a project user simultaneously. Behavior is asserted in
+	// TestProjectUserAccessConstraintsPostgres; this pins the artifacts.
+	requireCheckConstraintPresent(t, db, "duckgres_org_users", "duckgres_org_users_project_scoped_check")
+	requireCheckConstraintAbsent(t, db, "duckgres_org_users", "duckgres_org_users_project_reader_check")
+	requirePartialUniqueIndexPresent(t, db, "idx_duckgres_org_users_project_reader_team")
+	requirePartialUniqueIndexPresent(t, db, "idx_duckgres_org_users_project_user_team")
 
 	// Migration 000007 added the compute-usage billing buffer; 000015 widened
 	// its key for pull-based billing (team_id, query_source, worker size),
@@ -204,7 +215,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -248,7 +259,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 28)
 	requireGooseMigrationRecorded(t, upgradedDB, 29)
 	requireGooseMigrationRecorded(t, upgradedDB, 30)
-	requireGooseLatestVersion(t, upgradedDB, 30)
+	requireGooseMigrationRecorded(t, upgradedDB, 31)
+	requireGooseLatestVersion(t, upgradedDB, 31)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -744,6 +756,66 @@ func requireColumnNullable(t *testing.T, db *sql.DB, tableName, columnName strin
 	}
 	if isNullable != "YES" {
 		t.Fatalf("%s.%s is_nullable = %q, want %q (column must be nullable)", tableName, columnName, isNullable, "YES")
+	}
+}
+
+func checkConstraintCount(t *testing.T, db *sql.DB, tableName, constraintName string) int {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM pg_constraint con
+		JOIN pg_class rel ON rel.oid = con.conrelid
+		JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+		WHERE ns.nspname = current_schema()
+		  AND rel.relname = $1
+		  AND con.conname = $2
+		  AND con.contype = 'c'
+	`, tableName, constraintName).Scan(&count); err != nil {
+		t.Fatalf("query check constraint %s on %s: %v", constraintName, tableName, err)
+	}
+	return count
+}
+
+func requireCheckConstraintPresent(t *testing.T, db *sql.DB, tableName, constraintName string) {
+	t.Helper()
+
+	if got := checkConstraintCount(t, db, tableName, constraintName); got != 1 {
+		t.Fatalf("check constraint %s on %s: count = %d, want 1", constraintName, tableName, got)
+	}
+}
+
+func requireCheckConstraintAbsent(t *testing.T, db *sql.DB, tableName, constraintName string) {
+	t.Helper()
+
+	if got := checkConstraintCount(t, db, tableName, constraintName); got != 0 {
+		t.Fatalf("check constraint %s on %s: count = %d, want 0", constraintName, tableName, got)
+	}
+}
+
+// requirePartialUniqueIndexPresent asserts a unique index exists by NAME and
+// carries a WHERE predicate. The by-name form is what the per-mode project
+// indexes need: they share the same (org_id, team_id) column list, so a
+// column-based lookup cannot tell them apart.
+func requirePartialUniqueIndexPresent(t *testing.T, db *sql.DB, indexName string) {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM pg_index idx
+		JOIN pg_class ind ON ind.oid = idx.indexrelid
+		JOIN pg_namespace ns ON ns.oid = ind.relnamespace
+		WHERE ns.nspname = current_schema()
+		  AND ind.relname = $1
+		  AND idx.indisunique
+		  AND idx.indpred IS NOT NULL
+	`, indexName).Scan(&count); err != nil {
+		t.Fatalf("query partial unique index %s: %v", indexName, err)
+	}
+	if count != 1 {
+		t.Fatalf("partial unique index %s: count = %d, want 1", indexName, count)
 	}
 }
 

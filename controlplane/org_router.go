@@ -39,7 +39,7 @@ type OrgRouter struct {
 	nextWorkerID          atomic.Int32
 	draining              atomic.Bool
 	sharedCancel          context.CancelFunc
-	projectReaderChange   func(orgID, username string)
+	projectScopedUserChange   func(orgID, username string)
 	admissionReclaimer    admissionReclaimer
 	terminal              bool // protected by mu; no stack operation may start after this is set
 	stackOps              sync.WaitGroup
@@ -642,15 +642,15 @@ func (tr *OrgRouter) IsMigrating(orgID string) bool {
 
 // HandleConfigChange reconciles org stacks when the config snapshot changes.
 func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
-	for key := range changedProjectReaderUsers(old, new) {
+	for key := range changedProjectScopedUsers(old, new) {
 		if tr.srv != nil {
 			tr.srv.DrainUserConnections(key.OrgID, key.Username)
 		}
 		tr.mu.RLock()
-		onProjectReaderChange := tr.projectReaderChange
+		onProjectScopedUserChange := tr.projectScopedUserChange
 		tr.mu.RUnlock()
-		if onProjectReaderChange != nil {
-			onProjectReaderChange(key.OrgID, key.Username)
+		if onProjectScopedUserChange != nil {
+			onProjectScopedUserChange(key.OrgID, key.Username)
 		}
 		tr.mu.RLock()
 		stack := tr.orgs[key.OrgID]
@@ -685,13 +685,17 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 	}
 }
 
-func (tr *OrgRouter) setProjectReaderChangeHandler(handler func(orgID, username string)) {
+func (tr *OrgRouter) setProjectScopedUserChangeHandler(handler func(orgID, username string)) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	tr.projectReaderChange = handler
+	tr.projectScopedUserChange = handler
 }
 
-func changedProjectReaderUsers(old, new *configstore.Snapshot) map[configstore.OrgUserKey]struct{} {
+// changedProjectScopedUsers reports the project-scoped logins (reader OR user)
+// whose effective policy moved between two snapshots. A mode flip counts: a
+// project_user demoted to project_reader must lose its live write-authorized
+// sessions immediately, not at the next reconnect.
+func changedProjectScopedUsers(old, new *configstore.Snapshot) map[configstore.OrgUserKey]struct{} {
 	changed := make(map[configstore.OrgUserKey]struct{})
 	keys := make(map[configstore.OrgUserKey]struct{}, len(old.OrgUserAccess)+len(new.OrgUserAccess))
 	for key := range old.OrgUserAccess {
@@ -704,32 +708,32 @@ func changedProjectReaderUsers(old, new *configstore.Snapshot) map[configstore.O
 	for key := range keys {
 		oldAccess := old.OrgUserAccess[key]
 		newAccess := new.OrgUserAccess[key]
-		if oldAccess.Mode != configstore.OrgUserAccessModeProjectReader && newAccess.Mode != configstore.OrgUserAccessModeProjectReader {
+		if !configstore.IsProjectScopedAccessMode(oldAccess.Mode) && !configstore.IsProjectScopedAccessMode(newAccess.Mode) {
 			continue
 		}
-		if !sameProjectReaderAccess(oldAccess, newAccess) ||
+		if !sameProjectScopedAccess(oldAccess, newAccess) ||
 			old.OrgUserPassword[key] != new.OrgUserPassword[key] ||
 			old.OrgUserDisabled[key] != new.OrgUserDisabled[key] ||
-			!sameProjectReaderTeam(old, new, key.OrgID, oldAccess.TeamID, newAccess.TeamID) {
+			!sameProjectScopedTeam(old, new, key.OrgID, oldAccess.TeamID, newAccess.TeamID) {
 			changed[key] = struct{}{}
 		}
 	}
 	return changed
 }
 
-func sameProjectReaderAccess(a, b configstore.OrgUserAccessConfig) bool {
+func sameProjectScopedAccess(a, b configstore.OrgUserAccessConfig) bool {
 	if a.Mode != b.Mode || (a.TeamID == nil) != (b.TeamID == nil) {
 		return false
 	}
 	return a.TeamID == nil || *a.TeamID == *b.TeamID
 }
 
-func sameProjectReaderTeam(old, new *configstore.Snapshot, orgID string, oldTeamID, newTeamID *int64) bool {
+func sameProjectScopedTeam(old, new *configstore.Snapshot, orgID string, oldTeamID, newTeamID *int64) bool {
 	if oldTeamID == nil || newTeamID == nil || *oldTeamID != *newTeamID {
 		return oldTeamID == nil && newTeamID == nil
 	}
-	oldTeam, oldFound := projectReaderTeam(old, orgID, *oldTeamID)
-	newTeam, newFound := projectReaderTeam(new, orgID, *newTeamID)
+	oldTeam, oldFound := projectScopedTeam(old, orgID, *oldTeamID)
+	newTeam, newFound := projectScopedTeam(new, orgID, *newTeamID)
 	return oldFound == newFound && (!oldFound || sameOrgTeam(oldTeam, newTeam))
 }
 
@@ -749,7 +753,7 @@ func sameOptionalString(a, b *string) bool {
 	return *a == *b
 }
 
-func projectReaderTeam(snapshot *configstore.Snapshot, orgID string, teamID int64) (configstore.OrgTeamConfig, bool) {
+func projectScopedTeam(snapshot *configstore.Snapshot, orgID string, teamID int64) (configstore.OrgTeamConfig, bool) {
 	org := snapshot.Orgs[orgID]
 	if org == nil {
 		return configstore.OrgTeamConfig{}, false

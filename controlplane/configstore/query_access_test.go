@@ -46,6 +46,75 @@ func TestOrgUserQueryAccessDerivesProjectNamespaces(t *testing.T) {
 	}
 }
 
+// A project user derives exactly the same namespaces as the reader for the
+// same team — the modes differ only in ReadOnly.
+func TestOrgUserQueryAccessGrantsProjectUserTheSameNamespaces(t *testing.T) {
+	events := "events_prod"
+	teamID := int64(42)
+	team := OrgTeamConfig{
+		TeamID:          teamID,
+		SchemaName:      "team_42",
+		Enabled:         true,
+		EventsTableName: &events,
+	}
+	readerKey := OrgUserKey{OrgID: "acme", Username: "posthog_team_42"}
+	writerKey := OrgUserKey{OrgID: "acme", Username: "posthog_team_42_rw"}
+	cs := &ConfigStore{snapshot: &Snapshot{
+		Orgs: map[string]*OrgConfig{"acme": {Teams: []OrgTeamConfig{team}}},
+		OrgUserAccess: map[OrgUserKey]OrgUserAccessConfig{
+			readerKey: {Mode: OrgUserAccessModeProjectReader, TeamID: &teamID},
+			writerKey: {Mode: OrgUserAccessModeProjectUser, TeamID: &teamID},
+		},
+	}}
+
+	reader, ok := cs.OrgUserQueryAccess("acme", "posthog_team_42")
+	if !ok {
+		t.Fatal("expected a project reader policy")
+	}
+	writer, ok := cs.OrgUserQueryAccess("acme", "posthog_team_42_rw")
+	if !ok {
+		t.Fatal("expected a project user policy")
+	}
+	if !reflect.DeepEqual(reader.AllowedSchemas, writer.AllowedSchemas) {
+		t.Fatalf("AllowedSchemas differ: reader %v, writer %v", reader.AllowedSchemas, writer.AllowedSchemas)
+	}
+	if !reflect.DeepEqual(reader.AllowedRelations, writer.AllowedRelations) {
+		t.Fatalf("AllowedRelations differ: reader %v, writer %v", reader.AllowedRelations, writer.AllowedRelations)
+	}
+	if !reader.ReadOnly {
+		t.Fatal("project reader policy must be read-only")
+	}
+	if writer.ReadOnly {
+		t.Fatal("project user policy must not be read-only")
+	}
+}
+
+// An unresolvable team strips the write grant too: a project user pointed at a
+// missing or disabled team is downgraded to an empty read-only policy rather
+// than left writing into a scope nothing can confirm.
+func TestOrgUserQueryAccessDowngradesProjectUserWithoutTeam(t *testing.T) {
+	teamID := int64(42)
+	key := OrgUserKey{OrgID: "acme", Username: "posthog_team_42_rw"}
+	for name, teams := range map[string][]OrgTeamConfig{
+		"disabled team": {{TeamID: teamID, SchemaName: "team_42", Enabled: false}},
+		"missing team":  {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cs := &ConfigStore{snapshot: &Snapshot{
+				Orgs: map[string]*OrgConfig{"acme": {Teams: teams}},
+				OrgUserAccess: map[OrgUserKey]OrgUserAccessConfig{
+					key: {Mode: OrgUserAccessModeProjectUser, TeamID: &teamID},
+				},
+			}}
+
+			got, ok := cs.OrgUserQueryAccess("acme", "posthog_team_42_rw")
+			if !ok || !got.ReadOnly || len(got.AllowedSchemas) != 0 || len(got.AllowedRelations) != 0 {
+				t.Fatalf("unresolvable team must fail closed: %#v, ok=%v", got, ok)
+			}
+		})
+	}
+}
+
 // A backfilled legacy team can carry overrides that EQUAL the derived default
 // names (posthog org team 2: events_table_name="events" → posthog.events). A
 // non-NULL override always means "this team's table lives in the shared

@@ -19,6 +19,59 @@ func seedOrg(t *testing.T, store *configstore.ConfigStore, name string) {
 	}
 }
 
+// Migration 000031's constraints, exercised against the real migrated schema:
+// project_user is an accepted access mode, it shares the scoped shape rule with
+// project_reader (team required, passthrough forbidden), and the two modes have
+// SEPARATE per-team unique indexes so one team can hold both logins at once.
+func TestProjectUserAccessConstraintsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, created_at, updated_at)
+		VALUES ('acme', 5, 'team_5', TRUE, now(), now())`).Error; err != nil {
+		t.Fatalf("seed team: %v", err)
+	}
+	teamID := int64(5)
+	newUser := func(username, mode string, passthrough bool, team *int64) *configstore.OrgUser {
+		return &configstore.OrgUser{
+			OrgID:       "acme",
+			Username:    username,
+			Password:    "hash",
+			AccessMode:  mode,
+			TeamID:      team,
+			Passthrough: passthrough,
+		}
+	}
+
+	// A reader and a project user coexist on the same team.
+	if err := store.DB().Create(newUser("posthog_team_5", configstore.OrgUserAccessModeProjectReader, false, &teamID)).Error; err != nil {
+		t.Fatalf("create project reader: %v", err)
+	}
+	if err := store.DB().Create(newUser("posthog_team_5_rw", configstore.OrgUserAccessModeProjectUser, false, &teamID)).Error; err != nil {
+		t.Fatalf("create project user alongside reader: %v", err)
+	}
+
+	// ...but only one project user per team.
+	if err := store.DB().Create(newUser("second_writer", configstore.OrgUserAccessModeProjectUser, false, &teamID)).Error; err == nil {
+		t.Fatal("a second project_user for the same team must violate the partial unique index")
+	}
+
+	// The scoped shape rule applies to project_user exactly as it does to
+	// project_reader: a team is mandatory and passthrough is forbidden (it
+	// would bypass the layer that enforces the scope).
+	if err := store.DB().Create(newUser("teamless_writer", configstore.OrgUserAccessModeProjectUser, false, nil)).Error; err == nil {
+		t.Fatal("a project_user without a team must be rejected")
+	}
+	if err := store.DB().Create(newUser("passthrough_writer", configstore.OrgUserAccessModeProjectUser, true, &teamID)).Error; err == nil {
+		t.Fatal("a passthrough project_user must be rejected")
+	}
+
+	// The access_mode enum stays closed.
+	if err := store.DB().Create(newUser("bogus", "project_admin", false, &teamID)).Error; err == nil {
+		t.Fatal("an unknown access_mode must be rejected")
+	}
+}
+
 func readTeam(t *testing.T, store *configstore.ConfigStore, orgID string, teamID int64) configstore.OrgTeam {
 	t.Helper()
 	var team configstore.OrgTeam
@@ -209,15 +262,22 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 			t.Fatalf("seed team %d: %v", seed.team, err)
 		}
 	}
-	readerTeamID := int64(2)
-	if err := store.DB().Create(&configstore.OrgUser{
-		OrgID:      "acme",
-		Username:   "posthog_team_2",
-		Password:   "hash",
-		AccessMode: configstore.OrgUserAccessModeProjectReader,
-		TeamID:     &readerTeamID,
-	}).Error; err != nil {
-		t.Fatalf("seed project reader: %v", err)
+	// Both of the team's scoped logins — the reader AND the read/write project
+	// user — are seeded, so the delete below proves neither survives its team.
+	scopedTeamID := int64(2)
+	for _, login := range []struct{ username, mode string }{
+		{"posthog_team_2", configstore.OrgUserAccessModeProjectReader},
+		{"posthog_team_2_rw", configstore.OrgUserAccessModeProjectUser},
+	} {
+		if err := store.DB().Create(&configstore.OrgUser{
+			OrgID:      "acme",
+			Username:   login.username,
+			Password:   "hash",
+			AccessMode: login.mode,
+			TeamID:     &scopedTeamID,
+		}).Error; err != nil {
+			t.Fatalf("seed %s: %v", login.mode, err)
+		}
 	}
 	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
 	if err := store.FlushComputeUsage([]configstore.ComputeUsageDelta{{
@@ -228,19 +288,21 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 		t.Fatalf("seed compute usage: %v", err)
 	}
 
-	// Deleting a team removes its row and its project-reader login — nothing
-	// else.
+	// Deleting a team removes its row and BOTH of its project-scoped logins —
+	// nothing else. A surviving project user would be the worse leak of the
+	// two: a write-authorized credential outliving the project it was scoped
+	// to, ready to be reactivated by recreating the team.
 	if err := pstore.DeleteOrgTeam("acme", 2); err != nil {
 		t.Fatalf("delete team: %v", err)
 	}
-	var readerCount int64
+	var scopedCount int64
 	if err := store.DB().Model(&configstore.OrgUser{}).
-		Where("org_id = ? AND username = ?", "acme", "posthog_team_2").
-		Count(&readerCount).Error; err != nil {
-		t.Fatalf("count deleted project reader: %v", err)
+		Where("org_id = ? AND username IN ?", "acme", []string{"posthog_team_2", "posthog_team_2_rw"}).
+		Count(&scopedCount).Error; err != nil {
+		t.Fatalf("count deleted project logins: %v", err)
 	}
-	if readerCount != 0 {
-		t.Fatalf("project reader count = %d, want 0 after team deletion", readerCount)
+	if scopedCount != 0 {
+		t.Fatalf("project login count = %d, want 0 after team deletion", scopedCount)
 	}
 	if err := pstore.DeleteOrgTeam("acme", 1); err != nil {
 		t.Fatalf("delete team 1: %v", err)

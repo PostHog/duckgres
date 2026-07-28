@@ -174,7 +174,7 @@ type clientConn struct {
 	lastErrorCode      string                   // most recent SQLSTATE sent via sendError; observed by query metrics
 	activeQueryMetrics *queryMetricsScope       // active query attempt metrics scope for non-ErrorResponse failures
 	passthrough        bool                     // true for passthrough users (skip transpiler + pg_catalog)
-	queryAccessPolicy  *QueryAccessPolicy       // non-nil for project-scoped read-only users
+	queryAccessPolicy  *QueryAccessPolicy       // non-nil for project-scoped users (reader or read/write project user)
 	cursors            map[string]*cursorState  // server-side cursor emulation
 	catalogUseRewrite  bool                     // true when bare `USE ducklake` should expand to the reliable two-part target
 	ctx                context.Context          // connection context, cancelled when connection is closed

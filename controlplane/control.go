@@ -2320,9 +2320,9 @@ func (cp *ControlPlane) startFlightIngress() {
 
 	cp.flight = flightIngress
 	if router, ok := cp.orgRouter.(interface {
-		SetProjectReaderChangeHandler(func(orgID, username string))
+		SetProjectScopedUserChangeHandler(func(orgID, username string))
 	}); ok {
-		router.SetProjectReaderChangeHandler(func(orgID, username string) {
+		router.SetProjectScopedUserChangeHandler(func(orgID, username string) {
 			flightIngress.DrainUserSessions(orgID, username)
 		})
 	}

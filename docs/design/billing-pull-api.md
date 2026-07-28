@@ -39,8 +39,9 @@ Internally, one row per unique key, values accumulated:
   a JSON number on every surface): duckgres does NOT own team-level billing
   attribution — the **external billing service maps org → team(s) itself**. The
   stamped value is a best-effort hint recorded at connection end: the
-  **connecting user's team** (`duckgres_org_users.team_id`, e.g. a
-  project-reader login) when it has one, else the **org's oldest team** (min
+  **connecting user's team** (`duckgres_org_users.team_id`, i.e. either
+  project-scoped login — reader or read/write project user) when it has one,
+  else the **org's oldest team** (min
   `created_at`, ties broken by the smaller `team_id` — in practice the
   provision-time first team), else `0` (defensive: unknown org / stale
   snapshot). Team changes/deletions never re-attribute existing buckets — an
