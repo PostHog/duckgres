@@ -502,19 +502,16 @@ func (c *clientConn) logQueryError(query string, err error) {
 		"query", redactedQuery,
 		"error", redactedErr,
 	}
-	// category mirrors the severity routing below so the dashboard can split
-	// user-attributable failures from genuine system errors per org.
-	var category string
-	switch {
-	case isDuckLakeTransactionConflict(err):
-		category = "conflict"
-	case isDuckLakeMetadataConnectionLost(err):
-		category = "metadata_connection_lost"
-	case isUserQueryError(err):
-		category = "user"
-	default:
-		category = "system"
-	}
+	// This shared category also drives query metrics, analytics, and the
+	// recent-error ring so the observability surfaces cannot disagree.
+	category := queryErrorCategory(err)
+	// Preserve the category on the terminal query metric. Some protocol paths
+	// send an ErrorResponse and then return nil after handling it, so
+	// finishQueryMetrics cannot recover conflict/metadata reasons from the
+	// return value alone. Cancellations reaching this function are infra-driven
+	// (caller cancellations are gated upstream), so use the category rather
+	// than the generic cancellation shortcut in markError.
+	c.markActiveQueryMetricsErrorCategory(category)
 	sqlState := classifyErrorCode(err)
 	traceID := observe.TraceIDFromContext(c.ctx)
 	// Per-org product analytics. No SQL text or secrets are sent — only the

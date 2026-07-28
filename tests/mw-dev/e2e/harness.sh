@@ -2047,9 +2047,10 @@ admin_console_api() {
   # Includes the per-org/per-source worker-acquire-latency panels. (The raw
   # histogram emission — org+source labels on duckgres_worker_acquire_total_seconds
   # — is unit-tested, not asserted here: the :9090 metrics port is
-  # NetworkPolicy-blocked from this in-cluster Job. Same carve-out for the
-  # duckgres_org_info / duckgres_org_teams_info identity metrics:
-  # exposition pinned by TestOrgTeamsInfoCollector.)
+  # NetworkPolicy-blocked from this in-cluster Job. The same carve-out covers
+  # duckgres_query_total's status+reason labels (pinned by query_metrics_test.go)
+  # and the duckgres_org_info / duckgres_org_teams_info identity metrics
+  # (exposition pinned by TestOrgTeamsInfoCollector).
   panels="$(curl -fsS -H "$H" "$API/api/v1/metrics/panels")"
   for p in query_rate acquire_p95 acquire_by_source; do
     echo "$panels" | jq -e --arg p "$p" '.panels | index($p)' >/dev/null \

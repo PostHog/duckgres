@@ -122,7 +122,7 @@ in the org's session accounting. Rows capped at `maxImpersonationRows`.
 Not an open PromQL relay: the client passes a panel KEY (+ optional org/window);
 the PromQL is built server-side from the allow-list (`rangePanels`). Forwards to
 `DUCKGRES_PROMETHEUS_URL` (the in-cluster VictoriaMetrics vmselect, Prometheus-
-compatible). Org-labelled panels (`duckgres_query_total{org,outcome}` etc.) keep
+compatible). Org-labelled panels (`duckgres_query_total{org,status,reason}` etc.) keep
 slicing enforced. Unset URL → 503 so the UI shows "metrics not configured".
 
 ## Local UI development

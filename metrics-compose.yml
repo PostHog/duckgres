@@ -9,7 +9,7 @@
 #
 # Available metrics:
 #   - duckgres_connections_open: current number of open connections
-#   - duckgres_query_total: counter of query attempts by terminal outcome
+#   - duckgres_query_total: counter of query attempts by terminal status and reason
 #   - duckgres_query_duration_seconds: histogram of query execution latencies
 #   - duckgres_perf_query_duration_seconds: per-query perf harness latency histograms
 #
