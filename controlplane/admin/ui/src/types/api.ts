@@ -240,6 +240,99 @@ export interface ManagedWarehouse {
   updated_at: string;
 }
 
+// ---- Warehouse provisioning (the PostHog-backend contract) ----
+//
+// These mirror controlplane/provisioning/api.go EXACTLY. The console posts the
+// same body to the same endpoint the PostHog backend (Django) posts to, so an
+// operator-provisioned warehouse and a user-provisioned one are identical by
+// construction. Do not add console-only fields here — the server would ignore
+// them, which is precisely the divergence this shared contract prevents.
+
+export interface ProvisionMetadataStore {
+  // "cnpg-shard": the composition picks the active shard and provisions a
+  // per-tenant role+database on it. "external": a pre-existing Postgres.
+  type: "cnpg-shard" | "external";
+  external?: {
+    // RDS host.
+    endpoint: string;
+    // AWS Secrets Manager secret NAME holding the password (never the value).
+    password_aws_secret: string;
+    // Both default to "postgres" at the XRD when omitted.
+    user?: string;
+    database?: string;
+  };
+}
+
+export interface ProvisionDataStore {
+  // "s3bucket" provisions a fresh per-org bucket (the control plane names it);
+  // "external" reuses an existing bucket and then requires bucket_name.
+  type: "s3bucket" | "external";
+  bucket_name?: string;
+  region?: string;
+}
+
+export interface ProvisionBody {
+  database_name: string;
+  // The org's first PostHog team. REQUIRED when the provision creates a NEW
+  // org (the server 400s otherwise — a warehouse cannot exist without a team).
+  team_id?: number;
+  // Optional override of the conventional "team_<id>" warehouse schema for
+  // that first team row; requires team_id.
+  schema_name?: string;
+  metadata_store: ProvisionMetadataStore;
+  data_store?: ProvisionDataStore;
+  // Must be true — a warehouse without a catalog has nothing to attach.
+  ducklake: { enabled: boolean };
+}
+
+// 202 response of POST /orgs/:id/provision. `password` is the freshly generated
+// root plaintext and is returned HERE ONLY — it is never stored (only its
+// bcrypt hash is) and cannot be read back. `bucket` is the authoritative
+// control-plane-owned bucket name (absent for an external data store, or when
+// CP-side naming is disabled).
+export interface ProvisionResult {
+  status: string;
+  org: string;
+  username: string;
+  password: string;
+  bucket?: string;
+}
+
+// GET /orgs/:id/warehouse/status — the same lifecycle view the PostHog backend
+// polls after provisioning. `connection` appears only once the state is ready
+// and never carries a password.
+export interface WarehouseStatus {
+  org_id: string;
+  state: WarehouseState;
+  status_message: string;
+  s3_state: WarehouseState;
+  metadata_store_state: WarehouseState;
+  identity_state: WarehouseState;
+  secrets_state: WarehouseState;
+  ready_at?: string | null;
+  failed_at?: string | null;
+  connection?: {
+    host: string;
+    port: number;
+    database: string;
+    username: string;
+  } | null;
+  bucket?: string;
+}
+
+// GET /database-name/check?name=… — global uniqueness pre-flight for the form.
+export interface DatabaseNameCheck {
+  name: string;
+  available: boolean;
+}
+
+// POST /orgs/:id/reset-password — rotates the org's root login and returns the
+// new plaintext once. The recovery path when a provision response was lost.
+export interface ResetPasswordResult {
+  username: string;
+  password: string;
+}
+
 // ---- Duckling drift (admin-only) ----
 
 // One mismatch between a managed warehouse row and its Duckling custom resource.

@@ -11,6 +11,7 @@ import type {
   ClusterSummary,
   CreateUserBody,
   CPInstance,
+  DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
   ErrorEntry,
@@ -32,16 +33,20 @@ import type {
   OrgUser,
   OrgUserSecret,
   PromRangeResponse,
+  ProvisionBody,
+  ProvisionResult,
   QueryDetail,
   QueryResult,
   ReshardLogEntry,
   ReshardOperation,
   ReshardTargetsResponse,
+  ResetPasswordResult,
   RunningQuery,
   SessionStatus,
   StartReshardBody,
   UpdateUserBody,
   UserKillResult,
+  WarehouseStatus,
   WorkerStatus,
 } from "@/types/api";
 
@@ -137,6 +142,25 @@ export const api = {
   getWarehouse: (id: string) => get<ManagedWarehouse>(`/orgs/${enc(id)}/warehouse`),
   updateWarehouse: (id: string, body: Partial<ManagedWarehouse>) =>
     put<ManagedWarehouse>(`/orgs/${enc(id)}/warehouse`, body),
+  // ---- warehouse lifecycle: the PostHog-backend endpoints, verbatim ----
+  //
+  // provisioning/api.go registers these on this same /api/v1 group, so the
+  // console and the PostHog backend hit ONE implementation. Never reimplement
+  // any of them behind an admin-only route: an operator-provisioned warehouse
+  // must be indistinguishable from a user-provisioned one.
+
+  // Starts asynchronous provisioning (202). The response carries the root
+  // password, readable exactly once — it is never stored in plaintext.
+  provisionWarehouse: (id: string, body: ProvisionBody) =>
+    post<ProvisionResult>(`/orgs/${enc(id)}/provision`, body),
+  // Lifecycle view the PostHog backend polls; 404 until a warehouse row exists.
+  getWarehouseStatus: (id: string) => get<WarehouseStatus>(`/orgs/${enc(id)}/warehouse/status`),
+  // Global database-name uniqueness pre-flight (the provision form's check).
+  checkDatabaseName: (name: string) => get<DatabaseNameCheck>("/database-name/check", { name }),
+  // Rotates the org's root password; returns the new plaintext once. 409s
+  // unless the warehouse is ready.
+  resetWarehousePassword: (id: string) =>
+    post<ResetPasswordResult>(`/orgs/${enc(id)}/reset-password`, {}),
   // Kicks off asynchronous teardown of the org's duckling (202). 409s when the
   // warehouse state isn't ready/failed/provisioning.
   deprovisionWarehouse: (id: string) =>

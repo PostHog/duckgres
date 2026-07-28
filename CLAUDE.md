@@ -342,6 +342,28 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   `RoleGate` requires admin for all mutating verbs + the audit GET.
   `AuditMiddleware` records every mutation. Keep new mutating routes under this
   gate; never add a write path that bypasses RoleGate/audit.
+- **Warehouse provisioning has exactly ONE implementation.** The console's
+  Provision-warehouse page (`ui/src/pages/ProvisionWarehouse.tsx`, route
+  `/orgs/provision`) posts to `POST /api/v1/orgs/:id/provision` — the route
+  `controlplane/provisioning.RegisterAPI` mounts on the SAME audited `/api/v1`
+  group (`multitenant.go`), i.e. the exact endpoint the PostHog backend
+  (Django) calls. Same handler, validation, transaction and analytics event ⇒
+  an operator-provisioned warehouse is identical to a user-provisioned one by
+  construction. NEVER add an admin-local provisioning handler (gin only panics
+  on an exactly-matching duplicate, so a near-miss path would fork the contract
+  silently): `provisioning.TestProvisioningAPIRouteTopology` pins the shared
+  route set and `admin.TestAdminAPIRegistersNoProvisioningRoutes` pins the
+  absence of a twin. Same for the siblings the console drives —
+  `warehouse/status`, `database-name/check`, `reset-password`, `deprovision`.
+  The client-side validation mirror (`ui/src/lib/provision.ts`) is a courtesy:
+  LOOSER than the server is safe, STRICTER blocks a body the PostHog backend
+  may legitimately send. Audit actions for these are `warehouse.provision` /
+  `warehouse.deprovision` / `warehouse.reset_password` (`auditActionFor`; keep
+  `ui/src/lib/audit.ts` labels in sync). Touching any of this → update
+  `controlplane/admin/provision_parity_test.go`, `audit_test.go`,
+  `controlplane/provisioning/api_topology_test.go`,
+  `ui/src/lib/provision.test.ts`, `ui/src/pages/ProvisionWarehouse.test.tsx`,
+  AND the `admin_provision_parity` assertion in `tests/mw-dev/e2e/harness.sh`.
 - **Impersonation is a real session** (`impersonate.go` + `admin_providers.go`):
   it reuses `SessionManager.CreateSessionWithProtocol` (workers trust the CP — no
   password) and **always** `DestroySession` in a defer. Admin-only, every

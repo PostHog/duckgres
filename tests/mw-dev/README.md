@@ -141,6 +141,22 @@ client-go:
   reused hot-idle worker (cnpg lane).
 - **isolation** — two CNPG-backed tenants see distinct catalogs; a
   cross-tenant read is denied.
+- **admin-console provisioning parity** (`admin_provision_parity`) — the console's
+  Provision-warehouse form has no provisioning implementation of its own: it posts
+  to the same `/api/v1/orgs/:id/provision` route the PostHog backend uses. The
+  console's exact request body (cnpg-shard + s3bucket + `ducklake.enabled=true` +
+  `team_id`), replayed against the provisioned org, is refused with the
+  warehouse-exists **409** — proving it passed the shared validation and reached
+  the shared store rather than tripping a shape 400; `ducklake.enabled=false` is a
+  400 (why the form offers no toggle); and the org's real provision is recorded in
+  the admin audit log as `warehouse.provision` (with the teardown lane asserting
+  `warehouse.deprovision`), never the generic `org.create` these paths used to
+  fall through to. The SPA itself can't be driven from the in-cluster Job (no
+  browser) — the form's body construction and validation mirror are covered by
+  `ui/src/lib/provision.test.ts` + `ui/src/pages/ProvisionWarehouse.test.tsx`, and
+  the "no second provisioning path" topology by
+  `provisioning.TestProvisioningAPIRouteTopology` +
+  `admin.TestAdminAPIRegistersNoProvisioningRoutes`.
 - **lifecycle** — deprovision → `warehouse=deleted` → the Crossplane Duckling
   CR **fully** deletes (`kubectl wait --for=delete`, asserting the finalizer
   cascade that drops the cnpg role+db completed). Right after the deprovision
