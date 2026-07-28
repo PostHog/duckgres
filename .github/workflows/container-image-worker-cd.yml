@@ -84,20 +84,6 @@ jobs:
                       # commit history for the rationale on each row.
                       pg_scanner_repo: "https://extensions.duckdb.org"
                       default: true
-                    - version: "1.5.2"
-                      go: "v2.10502.0"
-                      bindings: "v0.10502.0"
-                      httpfs: "v1.5.2-stoi-fix"
-                      ducklake: "v1.0-posthog.2"
-                      # Nightly repo: preserves byte-identity with the
-                      # previously-published 1.5.2 worker image, which
-                      # bundled the nightly build for the DuckLake
-                      # metadata-pool reaper fix (PR #447). Stable v1.5.2
-                      # postgres_scanner exists too but the binary differs;
-                      # keep this row aligned with what was last shipped so
-                      # it remains a true rollback target.
-                      pg_scanner_repo: "http://nightly-extensions.duckdb.org"
-                      default: false
                 platform:
                     - platform: linux/arm64
                       runner: ubuntu-24.04-arm
@@ -269,9 +255,9 @@ jobs:
         name: Multi-arch manifest worker ${{ matrix.duckdb.version }}
         needs: build
         if: github.repository == 'PostHog/duckgres'
-        # Mirror the build job's tolerance: if the 1.5.2 manifest fails
-        # (e.g. because that row's build was continue-on-errored), the
-        # default 1.5.3 manifest still publishes and Charts dispatch
+        # Mirror the build job's tolerance: if a non-default row's manifest
+        # fails (e.g. because that row's build was continue-on-errored), the
+        # default row's manifest still publishes and Charts dispatch
         # proceeds.
         continue-on-error: ${{ !matrix.duckdb.default }}
         strategy:
@@ -280,8 +266,6 @@ jobs:
                 duckdb:
                     - version: "1.5.3"
                       default: true
-                    - version: "1.5.2"
-                      default: false
         runs-on: ubuntu-24.04
         permissions:
             id-token: write
